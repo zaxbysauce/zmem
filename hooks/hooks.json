@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-session-start.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-reflect.sh\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

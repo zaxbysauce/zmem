@@ -1,0 +1,15 @@
+# AGENTS.md — <project name> conventions
+
+> Project-level memory, auto-injected at session start by the ZMem SessionStart hook
+> alongside your user-level `core.md`. Drop this file in your repo root. Repo-specific
+> facts and conventions live here. Keep concise.
+
+## Environment
+- Working dir: <path>
+- Shell: <bash/powershell/zsh>
+- Python: <path or "python">
+
+## Conventions
+- <build/test commands>
+- <repo-specific gotchas>
+- <coding standards>

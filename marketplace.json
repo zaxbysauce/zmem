@@ -1,0 +1,10 @@
+{
+  "name": "zaxbyhub",
+  "plugins": [
+    {
+      "name": "zmem",
+      "source": ".",
+      "version": "0.1.0"
+    }
+  ]
+}
