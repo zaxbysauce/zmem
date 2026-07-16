@@ -45,7 +45,7 @@ All commands run `python <store.py path> <subcommand>`. On Windows use `python`
 python <store.py> recall --query "<query>" [--namespace NS] [--limit 5] [--json]
 ```
 Returns live (non-superseded) memories matching the query, filtered by confidence
-floor (>=0.35) and namespace. Prefer `--namespace project:<basename>` to scope to
+floor (>=0.25) and namespace. Prefer `--namespace project:<basename>` to scope to
 the current project; use `user:global` for cross-project.
 
 ### add — capture a memory
@@ -59,7 +59,8 @@ python <store.py> add \
   [--source-ref "file:<path>" | "session:<id>" | "db:<table>:<rowid>"]
 ```
 Signal sets default confidence: test/compile/lint=high (0.85-0.9, promotable to
-skills later), reviewer/user=medium (0.6), none=low (0.3, below retrieval floor).
+skills later), reviewer/user=medium (0.6), none=low (0.3, now above the 0.25
+floor and reachable by recall).
 Dedup-on-write: near-identical live content in the same namespace refreshes the
 existing entry instead of duplicating.
 

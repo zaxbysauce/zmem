@@ -78,7 +78,7 @@ SIGNAL_CONFIDENCE = {
     "none": 0.3,
 }
 
-CONFIDENCE_FLOOR = 0.35
+CONFIDENCE_FLOOR = 0.25
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd|private[_-]?key)\s*[:=]\s*\S{8,}"),

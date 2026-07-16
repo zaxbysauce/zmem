@@ -73,8 +73,13 @@ session_id = sys.argv[3]
 ns = sys.argv[4]
 data_dir_win = sys.argv[5]
 
-# 1. Count failures in this session (non-read-only tools, status=error or exit_code!=0).
+# 1a. Detect failures using ONLY the columns the original count query used
+#     (session_id, read_only, status, exit_code). This is the load-bearing query —
+#     if it fails, reflection is correctly disabled. It must NOT depend on columns
+#     we added for enrichment (error_message, retry_count, etc.) because those are
+#     on the ZCode internal schema and could change across versions.
 fail_count = 0
+conn = None
 try:
     conn = sqlite3.connect(db_path)
     row = conn.execute("""
@@ -87,12 +92,49 @@ try:
           )
     """, (session_id,)).fetchone()
     fail_count = row[0] if row else 0
-    conn.close()
 except Exception:
     fail_count = 0
 
 if fail_count == 0:
+    if conn:
+        conn.close()
     sys.exit(0)
+
+# 1b. Enrichment: fetch per-failure detail in a SEPARATE query with its own
+#     try/except. If these columns do not exist (schema varies across ZCode
+#     versions), fail_details stays empty — the prompt falls back to the count
+#     with no per-error detail. The detection above still fires.
+fail_details = []  # list of (tool_name, error_message, error_type, retry_count, destructive)
+try:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT tool_name, error_message, error_type, retry_count,
+               COALESCE(destructive, 0) AS destructive
+        FROM tool_usage
+        WHERE session_id = ?
+          AND COALESCE(read_only, 0) = 0
+          AND (
+            status = '"'"'error'"'"'
+            OR (exit_code IS NOT NULL AND exit_code != 0)
+          )
+        ORDER BY completed_at DESC
+        LIMIT 10
+    """, (session_id,)).fetchall()
+    for r in rows:
+        fail_details.append((
+            r["tool_name"] or "?",
+            (r["error_message"] or "")[:200],
+            r["error_type"] or "",
+            r["retry_count"] or 0,
+            r["destructive"],
+        ))
+except Exception:
+    pass  # enrichment is optional; detection already succeeded
+finally:
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 # 2. Check whether a lesson was already captured for this session (avoid nagging).
 # Direct column probe on source_ref (NOT FTS — source_ref is not FTS-indexed).
@@ -113,16 +155,40 @@ if os.path.isfile(store_db):
 if lesson_exists:
     sys.exit(0)
 
-# 3. Emit non-blocking reflection prompt. Strict-schema JSON, additionalContext only.
+# 3. Build enriched failure summary for the prompt.
+# Group by tool_name for a compact overview, then list the most recent errors.
+from collections import Counter
+tool_counts = Counter(d[0] for d in fail_details)
+summary_parts = ["%d=%s" % (c, t) for t, c in tool_counts.most_common()]
+tool_summary = ", ".join(summary_parts)
+
+# Build per-error detail lines (up to 5, most recent first).
+detail_lines = []
+for tool_name, err_msg, err_type, retries, destructive in fail_details[:5]:
+    parts = [tool_name]
+    if err_type:
+        parts.append("(%s)" % err_type)
+    if retries > 0:
+        parts.append("[retried %dx]" % retries)
+    if destructive:
+        parts.append("[destructive]")
+    if err_msg:
+        parts.append(": %s" % err_msg)
+    detail_lines.append("  - " + " ".join(parts))
+
+detail_block = "\n".join(detail_lines) if detail_lines else ""
+
+# 4. Emit non-blocking reflection prompt. Strict-schema JSON, additionalContext only.
 msg = (
-    "ZMem reflection prompt: %d failed tool call(s) detected in this session. "
+    "ZMem reflection prompt: %d failed tool call(s) detected in this session (%s). "
+    "Most recent failures:\n%s\n"
     "If a generalizable lesson can be derived from a failure (grounded in a "
     "test/compile/lint/reviewer/user signal — not self-opinion), capture it with "
     "the memory skill: `%s add --namespace \"%s\" --type lesson --content \"...\" "
     "--signal <test|compile|lint|reviewer|user|none> --source-ref \"session:%s\"`. "
     "If no generalizable lesson applies, do nothing. "
     "Only capture lessons that would help a future session facing a similar situation."
-) % (fail_count, store_py, ns, session_id)
+) % (fail_count, tool_summary, detail_block, store_py, ns, session_id)
 
 print(json.dumps({"additionalContext": msg}))
 ' "$DB_PATH_WIN" "$STORE_PY_WIN" "$SESSION_ID" "$NS" "$DATA_DIR_WIN" 2>/dev/null || true

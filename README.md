@@ -15,6 +15,9 @@ recall, and reflection-on-failure. Zero cloud dependency.
   retrieved-nothing).
 - **Reflection loop:** on session stop, if tool failures were detected and no
   lesson was captured, you're prompted to capture a grounded lesson. Non-blocking.
+- **Relevance-based recall:** when you submit a prompt, matching memories are
+  injected as context *before* the agent starts working — not just the 3 most
+  recent at session start.
 
 Signal tiers set how trustworthy a memory is: `test/compile/lint` (high, grounded
 in deterministic verification) > `reviewer/user` (medium) > `none` (low, below the
@@ -91,6 +94,30 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
   or PII in it. The write-time secret scanner is an advisory heuristic (regex +
   entropy), **not a guarantee**.
 - All memory stays on your machine. No telemetry, no cloud calls.
+
+## Windows troubleshooting (WSL bash conflict)
+
+The hook commands use bare `bash`, which on Windows may resolve to WSL's
+`C:\Windows\System32\bash.exe` instead of Git Bash. WSL bash cannot run these
+scripts (no `cygpath`, incompatible path resolution). Symptoms: hooks silently
+fail (`hook.run.failed` in `~/.zcode/cli/log/`), no memory injection or recall.
+
+**Fix:** edit `hooks/hooks.json` and replace each `bash` with the full Git Bash
+path, e.g.:
+
+```json
+"command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-session-start.sh\""
+```
+
+Verify Git Bash exists at that path (`ls "C:\Program Files\Git\usr\bin\bash.exe"`).
+If your Git installation is elsewhere, adjust accordingly. This is a Windows-only
+override; Linux/macOS users need no changes.
+
+**Note:** this edit lives in the plugin cache
+(`~/.zcode/cli/plugins/cache/<marketplace>/zmem/<version>/hooks/hooks.json`) and
+will be reverted on plugin reinstall. Re-apply after each update, or upvote
+[the upstream issue](https://github.com/zaxbysauce/zmem/issues) for a
+runtime-detection fix.
 
 ## License
 
