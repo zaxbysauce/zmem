@@ -18,12 +18,35 @@ set -u
 # --- Read stdin (one JSON line) ---------------------------------------------
 INPUT="$(cat)"
 
-PLUGIN_ROOT="${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
-DATA_DIR="${ZCODE_PLUGIN_DATA:-}"
-PROJECT="${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}"
+# --- Cross-platform setup ---
+IS_WINDOWS=0
+if [[ "$(uname -s 2>/dev/null)" == MINGW* ]] || [[ "$(uname -s 2>/dev/null)" == CYGWIN* ]] || [[ "$(uname -s 2>/dev/null)" == MSYS* ]]; then
+  IS_WINDOWS=1
+fi
 
-# --- Path conversion helper (same as session-start/reflect hooks) -----------
-to_win_path() {
+# Resolve python binary. On Windows, python3 is often a Microsoft Store stub;
+# prefer python. On POSIX, prefer python3. Verify it actually runs.
+PYTHON_BIN=""
+if [ "$IS_WINDOWS" -eq 1 ]; then
+  if python --version >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  elif python3 --version >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  fi
+else
+  if python3 --version >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  elif python --version >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  fi
+fi
+
+# Convert a path for the local python (Windows needs backslash, POSIX passes through).
+to_py_path() {
+  if [ "$IS_WINDOWS" -eq 0 ]; then
+    printf '%s' "$1"
+    return
+  fi
   if command -v cygpath >/dev/null 2>&1; then
     cygpath -w "$1"
   else
@@ -31,29 +54,45 @@ to_win_path() {
     if [[ "$p" =~ ^/([a-zA-Z])/(.*)$ ]]; then
       local drive="${BASH_REMATCH[1]}"
       local rest="${BASH_REMATCH[2]}"
-      printf '%s:%s' "$drive" "${rest//\//\\}"
+      printf '%s:\\%s' "$drive" "${rest//\//\\}"
     else
       printf '%s' "$p"
     fi
   fi
 }
 
-# --- Resolve data dir (Windows format for python) ---------------------------
+# Build a sub-path with the correct separator for the platform.
+join_path() {
+  local base="$1"; shift
+  local sep
+  if [ "$IS_WINDOWS" -eq 1 ]; then
+    sep='\\'
+  else
+    sep='/'
+  fi
+  printf '%s' "$base"
+  for part in "$@"; do
+    printf '%s%s' "$sep" "$part"
+  done
+}
+
+PLUGIN_ROOT="${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
+DATA_DIR="${ZCODE_PLUGIN_DATA:-}"
+PROJECT="${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}"
+
+# --- Resolve data dir --------------------------------------------------------
 if [ -n "$DATA_DIR" ]; then
-  DATA_DIR_WIN="$(to_win_path "$DATA_DIR" 2>/dev/null || cygpath -w "$DATA_DIR" 2>/dev/null || echo "$DATA_DIR")"
+  DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
 else
-  DATA_DIR_WIN="$(to_win_path "$HOME" 2>/dev/null || cygpath -w "$HOME" 2>/dev/null || echo "$HOME")\\.zcode\\memory"
+  DATA_DIR_PY="$(join_path "$(to_py_path "$HOME")" .zcode memory)"
 fi
 
 # --- Resolve store.py path --------------------------------------------------
-if [ -n "$PLUGIN_ROOT" ]; then
-  STORE_PY_WIN="$(to_win_path "$PLUGIN_ROOT" 2>/dev/null || cygpath -w "$PLUGIN_ROOT" 2>/dev/null || echo "$PLUGIN_ROOT")\\skills\\memory\\scripts\\store.py"
-else
-  # Manual install fallback: scripts live alongside this hook.
+if [ -z "$PLUGIN_ROOT" ]; then
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-  STORE_PY_WIN="$(to_win_path "$PLUGIN_ROOT" 2>/dev/null || cygpath -w "$PLUGIN_ROOT" 2>/dev/null || echo "$PLUGIN_ROOT")\\skills\\memory\\scripts\\store.py"
 fi
+STORE_PY_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts store.py)"
 
 # Export env so store.py finds its store via ZCODE_PLUGIN_DATA.
 export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-$DATA_DIR}"
@@ -65,8 +104,7 @@ if [ -n "$PROJECT" ]; then
 fi
 
 # --- Build the recall payload via python (guaranteed-valid JSON) ------------
-# We pass: the stdin JSON, store.py path, namespace, data dir.
-printf '%s' "$INPUT" | python -c '
+printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
 import json, os, sys, subprocess
 
 raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
@@ -128,6 +166,6 @@ for r in rows:
 
 ctx = "\n".join(lines)
 print(json.dumps({"additionalContext": ctx}))
-' "$STORE_PY_WIN" "$NS" 2>/dev/null || echo '{}'
+' "$STORE_PY_PY" "$NS" 2>/dev/null || echo '{}'
 
 exit 0

@@ -17,8 +17,37 @@
 
 set -u
 
-# Convert a path to Windows format for Windows Python (which cannot open /c/...).
-to_win_path() {
+# --- Cross-platform setup ---
+IS_WINDOWS=0
+if [[ "$(uname -s 2>/dev/null)" == MINGW* ]] || [[ "$(uname -s 2>/dev/null)" == CYGWIN* ]] || [[ "$(uname -s 2>/dev/null)" == MSYS* ]]; then
+  IS_WINDOWS=1
+fi
+
+# Resolve python binary. On Windows, python3 is often a Microsoft Store stub
+# that does nothing; prefer python. On POSIX, prefer python3, fall back to python.
+# Verify the binary actually runs (--version) to avoid stubs.
+PYTHON_BIN=""
+if [ "$IS_WINDOWS" -eq 1 ]; then
+  if python --version >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  elif python3 --version >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  fi
+else
+  if python3 --version >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  elif python --version >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  fi
+fi
+
+# Convert a path for the local python. On Windows, python is a Windows build
+# that cannot resolve Cygwin paths (/c/...). On POSIX, paths pass through.
+to_py_path() {
+  if [ "$IS_WINDOWS" -eq 0 ]; then
+    printf '%s' "$1"
+    return
+  fi
   if command -v cygpath >/dev/null 2>&1; then
     cygpath -w "$1"
   else
@@ -26,11 +55,26 @@ to_win_path() {
     if [[ "$p" =~ ^/([a-zA-Z])/(.*)$ ]]; then
       local drive="${BASH_REMATCH[1]}"
       local rest="${BASH_REMATCH[2]}"
-      printf '%s:%s' "$drive" "${rest//\//\\}"
+      printf '%s:\\%s' "$drive" "${rest//\//\\}"
     else
       printf '%s' "$p"
     fi
   fi
+}
+
+# Build a sub-path with the correct separator for the platform.
+join_path() {
+  local base="$1"; shift
+  local sep
+  if [ "$IS_WINDOWS" -eq 1 ]; then
+    sep='\\'
+  else
+    sep='/'
+  fi
+  printf '%s' "$base"
+  for part in "$@"; do
+    printf '%s%s' "$sep" "$part"
+  done
 }
 
 PLUGIN_ROOT="${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
@@ -39,45 +83,40 @@ PROJECT="${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}"
 
 # Resolve the data dir: plugin data dir if running as plugin, else ~/.zcode/memory.
 if [ -n "$DATA_DIR" ]; then
-  DATA_DIR_WIN="$(to_win_path "$DATA_DIR" 2>/dev/null || cygpath -w "$DATA_DIR" 2>/dev/null || echo "$DATA_DIR")"
+  DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
 else
-  DATA_DIR_WIN="$(to_win_path "$HOME" 2>/dev/null || cygpath -w "$HOME" 2>/dev/null || echo "$HOME")\\.zcode\\memory"
   DATA_DIR="$HOME/.zcode/memory"
+  DATA_DIR_PY="$(join_path "$(to_py_path "$HOME")" .zcode memory)"
   mkdir -p "$DATA_DIR" 2>/dev/null || true
 fi
 
 # Resolve plugin root for scripts + templates.
-if [ -n "$PLUGIN_ROOT" ]; then
-  PLUGIN_ROOT_WIN="$(to_win_path "$PLUGIN_ROOT" 2>/dev/null || cygpath -w "$PLUGIN_ROOT" 2>/dev/null || echo "$PLUGIN_ROOT")"
-else
+if [ -z "$PLUGIN_ROOT" ]; then
   # Manual install fallback: scripts live alongside this hook.
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-  PLUGIN_ROOT_WIN="$(to_win_path "$PLUGIN_ROOT" 2>/dev/null || cygpath -w "$PLUGIN_ROOT" 2>/dev/null || echo "$PLUGIN_ROOT")"
 fi
 
-CORE_FILE_WIN="$DATA_DIR_WIN\\core.md"
-STORE_PY_WIN="$PLUGIN_ROOT_WIN\\skills\\memory\\scripts\\store.py"
+CORE_FILE_PY="$(join_path "$DATA_DIR_PY" core.md)"
+STORE_PY_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts store.py)"
 
 # First-run seeding: if core.md absent and template exists, copy it.
-# Ensure the data dir exists first (the runner usually pre-creates it, but not always).
 if [ -n "$PLUGIN_ROOT" ] && [ ! -f "$DATA_DIR/core.md" ] && [ -f "$PLUGIN_ROOT/templates/core.md.template" ]; then
   mkdir -p "$DATA_DIR" 2>/dev/null || true
   cp "$PLUGIN_ROOT/templates/core.md.template" "$DATA_DIR/core.md" 2>/dev/null || true
 fi
 
 # Resolve project AGENTS.md.
-AGENTS_FILE_WIN=""
+AGENTS_FILE_PY=""
 if [ -n "$PROJECT" ]; then
-  AGENTS_FILE_WIN="$(to_win_path "$PROJECT" 2>/dev/null || cygpath -w "$PROJECT" 2>/dev/null || echo "$PROJECT")\\AGENTS.md"
+  AGENTS_FILE_PY="$(join_path "$(to_py_path "$PROJECT")" AGENTS.md)"
 fi
 
 # Export env so store.py finds its store via ZCODE_PLUGIN_DATA.
 export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-$DATA_DIR}"
 
 # Build the additionalContext payload using python for guaranteed-valid JSON.
-# We pass store.py path, core.md path, agents.md path, home, and project.
-CTX_JSON="$(python -c '
+CTX_JSON="$("$PYTHON_BIN" -c '
 import json, os, sys, subprocess
 
 core = sys.argv[1]
@@ -131,7 +170,7 @@ if store_py and os.path.isfile(store_py):
 
 ctx = "\n\n".join(parts) if parts else ""
 print(json.dumps({"additionalContext": ctx}) if ctx else "{}")
-' "$CORE_FILE_WIN" "$AGENTS_FILE_WIN" "$STORE_PY_WIN" "$DATA_DIR_WIN" "$PROJECT" "$DATA_DIR" 2>/dev/null || echo '{}')"
+' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" 2>/dev/null || echo '{}')"
 
 printf '%s\n' "$CTX_JSON"
 exit 0

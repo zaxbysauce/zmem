@@ -42,10 +42,11 @@ if (!existsSync(scriptPath)) {
 }
 
 // --- Find bash ---
-// Priority: explicit env > Git Bash at known locations > bare 'bash'
+// Priority: explicit env > Git Bash at known locations > derive from git > bare 'bash'
 function findBash() {
-    // 1. Explicit override via env
-    const envBash = process.env.ZMEM_BASH_PATH || process.env.SHELL;
+    // 1. Explicit override via env (ZMEM_BASH_PATH only — NOT $SHELL, which on
+    //    macOS defaults to /bin/zsh and the hook scripts use bash-only constructs).
+    const envBash = process.env.ZMEM_BASH_PATH;
     if (envBash && existsSync(envBash)) return envBash;
 
     // 2. On non-Windows, bare 'bash' works (system bash, no WSL conflict)
@@ -68,17 +69,24 @@ function findBash() {
         if (existsSync(c)) return c;
     }
 
-    // 4. Try to derive from git on PATH (where ZCode's own Ck resolver looks)
+    // 4. Try to derive from git on PATH.
+    // Git for Windows has multiple layouts — handle all of them:
+    //   <GitRoot>\mingw64\bin\git.exe  (3 levels deep → 3 dirnames)
+    //   <GitRoot>\cmd\git.exe          (2 levels deep → 2 dirnames)
+    //   <GitRoot>\bin\git.exe          (2 levels deep → 2 dirnames)
     try {
         const { execSync } = require("child_process");
         const gitPath = execSync("where git", { encoding: "utf8", timeout: 3000 }).trim().split("\n")[0].trim();
         if (gitPath && existsSync(gitPath)) {
-            // git is typically at <GitRoot>\mingw64\bin\git.exe
-            // bash is at <GitRoot>\usr\bin\bash.exe or <GitRoot>\bin\bash.exe
-            const gitRoot = dirname(dirname(dirname(gitPath)));
-            for (const sub of ["usr\\bin\\bash.exe", "bin\\bash.exe"]) {
-                const bashCandidate = join(gitRoot, sub);
-                if (existsSync(bashCandidate)) return bashCandidate;
+            const gitDir = dirname(gitPath);        // ...\bin or ...\cmd or ...\mingw64\bin
+            const maybeRoot = dirname(gitDir);       // ...\Git (for cmd/bin) or ...\mingw64
+            // Try both 2-dirname and 3-dirname derivations to cover all layouts
+            const roots = [maybeRoot, dirname(maybeRoot)];
+            for (const root of roots) {
+                for (const sub of ["usr\\bin\\bash.exe", "bin\\bash.exe"]) {
+                    const bashCandidate = join(root, sub);
+                    if (existsSync(bashCandidate)) return bashCandidate;
+                }
             }
         }
     } catch {
