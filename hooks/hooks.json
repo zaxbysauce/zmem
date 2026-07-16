@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-session-start.sh\"",
+            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" session-start",
             "timeout": 15
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-recall.sh\"",
+            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" recall",
             "timeout": 15
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-reflect.sh\"",
+            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" reflect",
             "timeout": 15
           }
         ]

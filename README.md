@@ -95,29 +95,17 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
   entropy), **not a guarantee**.
 - All memory stays on your machine. No telemetry, no cloud calls.
 
-## Windows troubleshooting (WSL bash conflict)
+## Cross-platform hook execution
 
-The hook commands use bare `bash`, which on Windows may resolve to WSL's
-`C:\Windows\System32\bash.exe` instead of Git Bash. WSL bash cannot run these
-scripts (no `cygpath`, incompatible path resolution). Symptoms: hooks silently
-fail (`hook.run.failed` in `~/.zcode/cli/log/`), no memory injection or recall.
+Hook commands are launched via `node hooks/zmem-launch.js`, not `bash` directly.
+This avoids a Windows-specific issue where bare `bash` resolves to WSL's
+`bash.exe` instead of Git Bash (WSL bash cannot run these scripts). Node.js is
+guaranteed to be on the PATH (ZCode is a Node app), so it resolves reliably on
+all platforms. The launcher auto-detects the correct bash and execs the hook
+script under it — no manual configuration needed.
 
-**Fix:** edit `hooks/hooks.json` and replace each `bash` with the full Git Bash
-path, e.g.:
-
-```json
-"command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-session-start.sh\""
-```
-
-Verify Git Bash exists at that path (`ls "C:\Program Files\Git\usr\bin\bash.exe"`).
-If your Git installation is elsewhere, adjust accordingly. This is a Windows-only
-override; Linux/macOS users need no changes.
-
-**Note:** this edit lives in the plugin cache
-(`~/.zcode/cli/plugins/cache/<marketplace>/zmem/<version>/hooks/hooks.json`) and
-will be reverted on plugin reinstall. Re-apply after each update, or upvote
-[the upstream issue](https://github.com/zaxbysauce/zmem/issues) for a
-runtime-detection fix.
+If the auto-detection fails (non-standard Git install), set the
+`ZMEM_BASH_PATH` environment variable to your bash executable path.
 
 ## License
 
