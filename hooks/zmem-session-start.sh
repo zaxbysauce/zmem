@@ -180,6 +180,19 @@ if store_py and os.path.isfile(store_py):
 # Inject the store.py path so the agent knows how to invoke the memory skill.
 if store_py and os.path.isfile(store_py):
     parts.append("# Memory skill: invoke `%s <subcommand>` to recall/add/search memories." % store_py)
+    # Check for promotion candidates (non-blocking, one-line suggestion).
+    try:
+        promote_out = subprocess.check_output(
+            [sys.executable, store_py, "promote", "--dry-run"],
+            stderr=subprocess.DEVNULL, timeout=5,
+        ).decode("utf-8", "replace")
+        # Extract the count from the first line.
+        for line in promote_out.strip().split("\n"):
+            if "promotion candidate" in line.lower():
+                parts.append(line.strip())
+                break
+    except Exception:
+        pass  # fail-open: promotion check errors never block session start
 
 ctx = "\n\n".join(parts) if parts else ""
 print(json.dumps({"additionalContext": ctx}) if ctx else "{}")
