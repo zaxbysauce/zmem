@@ -36,6 +36,7 @@ def _check_available() -> bool:
     try:
         import onnxruntime  # noqa: F401
         from tokenizers import Tokenizer  # noqa: F401
+        import numpy  # noqa: F401
     except ImportError:
         _model_available = False
         return False
