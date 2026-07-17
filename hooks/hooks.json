@@ -23,6 +23,17 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" capture-failure",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
