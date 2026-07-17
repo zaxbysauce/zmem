@@ -15,6 +15,9 @@ recall, and reflection-on-failure. Zero cloud dependency.
   retrieved-nothing).
 - **Reflection loop:** on session stop, if tool failures were detected and no
   lesson was captured, you're prompted to capture a grounded lesson. Non-blocking.
+- **Relevance-based recall:** when you submit a prompt, matching memories are
+  injected as context *before* the agent starts working — not just the 3 most
+  recent at session start.
 
 Signal tiers set how trustworthy a memory is: `test/compile/lint` (high, grounded
 in deterministic verification) > `reviewer/user` (medium) > `none` (low, below the
@@ -91,6 +94,18 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
   or PII in it. The write-time secret scanner is an advisory heuristic (regex +
   entropy), **not a guarantee**.
 - All memory stays on your machine. No telemetry, no cloud calls.
+
+## Cross-platform hook execution
+
+Hook commands are launched via `node hooks/zmem-launch.js`, not `bash` directly.
+This avoids a Windows-specific issue where bare `bash` resolves to WSL's
+`bash.exe` instead of Git Bash (WSL bash cannot run these scripts). Node.js is
+guaranteed to be on the PATH (ZCode is a Node app), so it resolves reliably on
+all platforms. The launcher auto-detects the correct bash and execs the hook
+script under it — no manual configuration needed.
+
+If the auto-detection fails (non-standard Git install), set the
+`ZMEM_BASH_PATH` environment variable to your bash executable path.
 
 ## License
 
