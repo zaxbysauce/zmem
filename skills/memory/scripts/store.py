@@ -886,6 +886,140 @@ def get_memory(conn, mid):
     print(json.dumps(d, indent=2))
 
 
+# --- Skill promotion (T3.1) ---
+PROMOTE_CONFIDENCE_FLOOR = 0.85
+PROMOTE_RETRIEVAL_FLOOR = 3
+PROMOTE_SIGNALS = ("test", "compile", "lint")
+
+
+def _slugify_skill_name(tags: str, fallback_id: str) -> str:
+    """Generate a zmem-prefixed skill directory name from tags."""
+    import re as _re
+    tokens = [t.strip().lower() for t in tags.split(",") if t.strip()]
+    # Filter to alphanumeric + hyphen, join with hyphens.
+    clean = []
+    for t in tokens:
+        t = _re.sub(r"[^a-z0-9-]", "", t)
+        if t:
+            clean.append(t)
+    if clean:
+        name = "zmem-" + "-".join(clean[:4])  # max 4 tag tokens
+    else:
+        name = "zmem-promoted-" + fallback_id[:8]
+    return name
+
+
+def promote_memory(
+    conn: sqlite3.Connection,
+    *,
+    memory_id: str | None = None,
+    dry_run: bool = False,
+    namespace: str | None = None,
+) -> None:
+    """Promote high-confidence lessons to reusable SKILL.md files.
+
+    Candidates: type=lesson, signal in (test/compile/lint), confidence>=0.85,
+    retrieval_count>3, not superseded. Does NOT supersede the source lesson —
+    the lesson and the skill coexist (the lesson costs ~200 bytes; if the skill
+    description fails to trigger, the lesson is still in recall).
+
+    Human-in-the-loop: --dry-run shows candidates; --id <uuid> --confirm writes
+    the SKILL.md after the user reviews the description.
+    """
+    # Candidate query.
+    ns_clause = "AND namespace = ?" if namespace else ""
+    ns_params = [namespace] if namespace else []
+    candidates = conn.execute(
+        f"""SELECT id, namespace, type, content, tags, confidence, signal,
+                  retrieval_count, valid_from
+           FROM memory
+           WHERE superseded_at IS NULL
+             AND type = 'lesson'
+             AND signal IN ('test', 'compile', 'lint')
+             AND confidence >= ?
+             AND retrieval_count > ?
+             {ns_clause}
+           ORDER BY retrieval_count DESC, confidence DESC""",
+        [PROMOTE_CONFIDENCE_FLOOR, PROMOTE_RETRIEVAL_FLOOR] + ns_params,
+    ).fetchall()
+
+    if not candidates:
+        print("[zmem] no promotion candidates found")
+        return
+
+    if dry_run:
+        print(f"[zmem] {len(candidates)} promotion candidate(s):")
+        for c in candidates:
+            skill_name = _slugify_skill_name(c["tags"], c["id"])
+            print(f"\n  [{c['id'][:8]}] (rc={c['retrieval_count']}, conf={c['confidence']}, "
+                  f"signal={c['signal']})")
+            print(f"    content: {c['content'][:80]}...")
+            print(f"    tags: {c['tags']}")
+            print(f"    would create: ~/.zcode/skills/{skill_name}/SKILL.md")
+        return
+
+    if memory_id:
+        # Find the specific memory.
+        row = conn.execute(
+            "SELECT * FROM memory WHERE id=? AND superseded_at IS NULL", (memory_id,)
+        ).fetchone()
+        if not row:
+            print(f"[zmem] no live memory with id {memory_id}", file=sys.stderr)
+            return
+
+        skill_name = _slugify_skill_name(row["tags"], row["id"])
+        skill_dir = Path.home() / ".zcode" / "skills" / skill_name
+
+        # Collision detection.
+        if skill_dir.exists():
+            print(f"[zmem] ERROR: skill directory already exists: {skill_dir}", file=sys.stderr)
+            print(f"  Choose a different memory or rename the existing skill.", file=sys.stderr)
+            return
+
+        # Generate the SKILL.md draft.
+        import textwrap
+        tags_str = row["tags"] or "general"
+        draft = f"""---
+name: {skill_name}
+description: >
+  {row['content'][:120].replace(chr(10), ' ')}...
+  Auto-promoted from zmem lesson {row['id'][:8]} (signal={row['signal']},
+  confidence={row['confidence']}, retrieved {row['retrieval_count']}x).
+  EDIT THIS DESCRIPTION to be pushy and name the exact trigger contexts
+  where this skill should fire — models under-trigger skills with vague
+  descriptions.
+---
+
+# {_slugify_skill_name(row['tags'], row['id']).replace('zmem-', '').replace('-', ' ').title()}
+
+## When to use
+{(row['content'][:200] + '...' if len(row['content']) > 200 else row['content'])}
+
+## The rule
+{row['content']}
+
+## Source
+- Promoted from zmem lesson `{row['id']}` (retrieval_count={row['retrieval_count']},
+  signal={row['signal']}, confidence={row['confidence']})
+- Namespace: {row['namespace']}
+- Tags: {tags_str}
+"""
+
+        # Write the skill file.
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text(draft, encoding="utf-8")
+
+        print(f"[zmem] promoted lesson {row['id'][:8]} -> {skill_file}")
+        print(f"  Source lesson KEPT in store (not superseded).")
+        print(f"  REVIEW AND EDIT the description before relying on this skill.")
+        print(f"  The skill will load on next session restart.")
+        return
+
+    # No --id and not --dry-run: show usage.
+    print("[zmem] use --dry-run to see candidates, or --id <uuid> to promote a specific lesson")
+
+
 # Consolidation threshold and cadence defaults.
 CONSOLIDATE_DEFAULT_THRESHOLD = float(os.environ.get("ZMEM_CONSOLIDATE_THRESHOLD", "0.80"))
 CONSOLIDATE_MIN_INTERVAL_DAYS = 7
@@ -1144,6 +1278,14 @@ def main():
     p_consolidate.add_argument("--namespace", default=None,
                                help="limit consolidation to a specific namespace")
 
+    p_promote = sub.add_parser("promote", help="promote high-confidence lessons to SKILL.md files")
+    p_promote.add_argument("--dry-run", action="store_true",
+                           help="show promotion candidates without creating skills")
+    p_promote.add_argument("--id", default=None,
+                           help="promote a specific memory by UUID")
+    p_promote.add_argument("--namespace", default=None,
+                           help="limit candidates to a specific namespace")
+
     args = ap.parse_args()
     conn = connect()
     init_db(conn)
@@ -1189,6 +1331,9 @@ def main():
     elif args.cmd == "consolidate":
         consolidate(conn, threshold=args.threshold, prune=args.prune,
                     dry_run=args.dry_run, namespace=args.namespace)
+    elif args.cmd == "promote":
+        promote_memory(conn, memory_id=args.id, dry_run=args.dry_run,
+                       namespace=args.namespace)
     conn.close()
 
 
