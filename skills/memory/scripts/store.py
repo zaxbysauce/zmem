@@ -42,7 +42,18 @@ import sys
 import time
 import uuid
 import calendar
+import struct
 from pathlib import Path
+
+# Optional embedding support (degrades gracefully to FTS5-only if unavailable).
+try:
+    import embeddings as _embeddings
+except ImportError:
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        import embeddings as _embeddings
+    except ImportError:
+        _embeddings = None
 
 
 def _resolve_store_path() -> Path:
@@ -102,6 +113,19 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    # Load sqlite-vec extension for vector search. Failures are non-fatal —
+    # the system degrades to FTS5-only recall when vec0 is unavailable.
+    try:
+        _load_vec(conn)
+        # Ensure the vec0 table exists whenever vec loads (handles the case
+        # where sqlite_vec was absent during the v3 migration but installed later).
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0("
+            "embedding float[384] distance_metric=cosine, memory_id TEXT"
+            ")"
+        )
+    except Exception:
+        pass
     return conn
 
 
@@ -200,6 +224,38 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
         conn.commit()
 
+    if ver < 3:
+        # v3: embedding columns + sqlite-vec virtual table for hybrid recall.
+        # The vec0 table stores 384-dim float vectors keyed by memory_id.
+        # Embeddings are optional — if onnxruntime/model is missing, the
+        # embedding column stays NULL and recall degrades to FTS5-only.
+        conn.execute("ALTER TABLE memory ADD COLUMN embedding BLOB")
+        conn.execute("ALTER TABLE memory ADD COLUMN embedding_model TEXT DEFAULT ''")
+        conn.execute("ALTER TABLE memory ADD COLUMN embedded_at TEXT")
+
+        # Try to create the vec0 virtual table. This requires sqlite-vec
+        # to be loaded; if it fails, embedding features are disabled but
+        # the rest of the system continues to work (FTS5-only recall).
+        try:
+            _load_vec(conn)
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0("
+                "embedding float[384] distance_metric=cosine, memory_id TEXT"
+                ")"
+            )
+        except Exception:
+            pass  # sqlite-vec not available — embeddings disabled
+
+        conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
+        conn.commit()
+
+
+def _load_vec(conn: sqlite3.Connection) -> None:
+    """Load the sqlite-vec extension. Raises if unavailable."""
+    import sqlite_vec
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+
 
 def _check_secrets(content: str, source_ref: str) -> list[str]:
     """Advisory only. Returns list of warnings. Never blocks. Scans both content
@@ -281,25 +337,32 @@ def add_memory(
     if confidence is None:
         confidence = SIGNAL_CONFIDENCE.get(signal, 0.3)
 
-    # Dedup-on-write: fetch candidates (same namespace, live) and normalize in Python
-    # for exact match. Normalization must be identical between the query and the check
-    # (collapse all whitespace runs to a single space and lowercase).
-    norm = re.sub(r"\s+", " ", content.strip().lower())
-    candidates = conn.execute(
-        "SELECT id, content FROM memory WHERE namespace=? AND superseded_at IS NULL",
-        (namespace,),
-    ).fetchall()
+    # Dedup-on-write: semantic similarity (if embeddings available) or exact
+    # match fallback. Semantic dedup catches paraphrases the exact-match miss.
+    emb = None
+    if _embeddings and _embeddings.is_available():
+        emb = _embeddings.embed_text(content)
+
     existing = None
-    for c in candidates:
-        c_norm = re.sub(r"\s+", " ", c["content"].strip().lower())
-        if c_norm == norm:
-            existing = c
-            break
+    if emb is not None:
+        # Semantic dedup: query vec0 for nearest neighbor in the same namespace.
+        existing = _find_semantic_duplicate(conn, emb, namespace)
+    if existing is None:
+        # Fallback: exact-match dedup (original logic).
+        norm = re.sub(r"\s+", " ", content.strip().lower())
+        candidates = conn.execute(
+            "SELECT id, content FROM memory WHERE namespace=? AND superseded_at IS NULL",
+            (namespace,),
+        ).fetchall()
+        for c in candidates:
+            c_norm = re.sub(r"\s+", " ", c["content"].strip().lower())
+            if c_norm == norm:
+                existing = c
+                break
+
     if existing:
-        conn.execute(
-            "UPDATE memory SET last_retrieved=?, retrieval_count=retrieval_count+1 WHERE id=?",
-            (now_iso(), existing["id"]),
-        )
+        # Merge: upgrade confidence/signal if the new add is stronger.
+        _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
         conn.commit()
         print(f"[zmem] dedup: existing memory {existing['id']} refreshed (no duplicate inserted)")
         return existing["id"]
@@ -309,18 +372,97 @@ def add_memory(
     ts = now_iso()
     if not valid_from:
         valid_from = ts
+
+    # Determine embedding model name for the embedding_model column.
+    emb_model = "minilm-onnx" if emb is not None else ""
+
     conn.execute(
         """INSERT INTO memory
            (id, namespace, type, content, tags, source_ref, source_hash,
             confidence, signal, valid_from, superseded_at, ingestion_ts,
-            retrieval_count, last_retrieved)
-           VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?)""",
+            retrieval_count, last_retrieved, embedding, embedding_model, embedded_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?,?,?,?)""",
         (mid, namespace, type_, content, tags, source_ref, shash,
-         confidence, signal, valid_from, ts, ts),
+         confidence, signal, valid_from, ts, ts, emb, emb_model,
+         ts if emb is not None else None),
     )
+    # Insert into vec0 table if we have an embedding.
+    if emb is not None:
+        try:
+            conn.execute(
+                "INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
+                [emb, mid],
+            )
+        except sqlite3.OperationalError:
+            pass  # vec0 table not available — embedding stored in memory table only
     conn.commit()
-    print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence})")
+    print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"
+          f"{', embedded' if emb is not None else ''})")
     return mid
+
+
+# Cosine similarity threshold for semantic dedup (0..1, higher = stricter).
+DEDUP_SIMILARITY_THRESHOLD = 0.85
+# Signal rank for merge: higher = stronger.
+_SIGNAL_RANK = {"test": 5, "compile": 4, "lint": 3, "reviewer": 2, "user": 2, "none": 1}
+
+
+def _find_semantic_duplicate(
+    conn: sqlite3.Connection, embedding: bytes, namespace: str, threshold: float = DEDUP_SIMILARITY_THRESHOLD
+) -> sqlite3.Row | None:
+    """Find the closest existing memory by embedding cosine similarity."""
+    try:
+        results = conn.execute(
+            "SELECT memory_id, distance FROM memory_vec "
+            "WHERE embedding MATCH ? AND k = 5 ORDER BY distance",
+            [embedding],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None  # vec0 table not available
+
+    for r in results:
+        row = conn.execute(
+            "SELECT id, confidence, signal, tags FROM memory "
+            "WHERE id=? AND superseded_at IS NULL AND namespace=?",
+            (r["memory_id"], namespace),
+        ).fetchone()
+        if row:
+            # sqlite-vec distance is cosine distance (0 = identical, 2 = opposite).
+            # Convert to cosine similarity: sim = 1 - distance.
+            similarity = 1.0 - r["distance"]
+            if similarity >= threshold:
+                return row
+    return None
+
+
+def _merge_on_dedup(
+    conn: sqlite3.Connection, mid: str, new_confidence: float, new_signal: str, new_tags: str
+) -> None:
+    """Merge a re-observed memory: upgrade confidence/signal/tags if stronger."""
+    row = conn.execute(
+        "SELECT confidence, signal, tags FROM memory WHERE id=?", (mid,)
+    ).fetchone()
+    if not row:
+        return
+
+    # Take the higher confidence.
+    merged_conf = max(row["confidence"], new_confidence)
+
+    # Upgrade signal if the new one is stronger.
+    old_rank = _SIGNAL_RANK.get(row["signal"], 1)
+    new_rank = _SIGNAL_RANK.get(new_signal, 1)
+    merged_signal = new_signal if new_rank > old_rank else row["signal"]
+
+    # Union the tags.
+    old_tags = set(t.strip() for t in row["tags"].split(",") if t.strip())
+    new_tags_set = set(t.strip() for t in new_tags.split(",") if t.strip())
+    merged_tags = ",".join(sorted(old_tags | new_tags_set))
+
+    conn.execute(
+        "UPDATE memory SET confidence=?, signal=?, tags=?, "
+        "last_retrieved=?, retrieval_count=retrieval_count+1 WHERE id=?",
+        (merged_conf, merged_signal, merged_tags, now_iso(), mid),
+    )
 
 
 # --- Ranking formula weights (composite score for recall) ---
@@ -343,20 +485,23 @@ def _parse_iso_to_epoch(ts: str) -> float:
         return 0.0
 
 
-def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: float) -> float:
+def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: float,
+                  vec_sim: float | None = None) -> float:
     """Composite score: BM25 relevance + confidence boost + recency + popularity.
 
-    fts_rank is the raw FTS5 rank value (lower = better match). All other
-    factors come from the memory row itself.
+    fts_rank is the raw FTS5 rank value (lower = better match). For memories
+    that came from the vector path only (no FTS match), fts_rank is None — in
+    that case vec_sim (cosine similarity, 0..1) is used as the relevance proxy.
+    All other factors come from the memory row itself.
     """
-    # BM25 component: FTS5 rank is the negated BM25 value (more negative = better
-    # match). Normalize to 0..1 where better matches get higher scores.
-    # abs(rank)/(1+abs(rank)) is monotonically increasing in abs(rank).
+    # Relevance component: BM25 if available, else vector similarity as proxy.
     if fts_rank is not None:
         ar = abs(fts_rank)
-        bm25_score = ar / (1.0 + ar)
+        relevance = ar / (1.0 + ar)
+    elif vec_sim is not None:
+        relevance = max(0.0, vec_sim)  # cosine sim already 0..1 for normalized vecs
     else:
-        bm25_score = 0.0
+        relevance = 0.0
 
     # Confidence component: already 0..1.
     confidence = float(row["confidence"]) if row["confidence"] is not None else 0.3
@@ -374,11 +519,67 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
     popularity = min(1.0, 0.15 * (rc ** 0.5))
 
     return (
-        W_BM25 * bm25_score
+        W_BM25 * relevance
         + W_CONFIDENCE * confidence
         + W_RECENCY * recency
         + W_POPULARITY * popularity
     )
+
+
+def _vector_knn(conn: sqlite3.Connection, embedding: bytes, k: int) -> list[str]:
+    """Query the vec0 table for k nearest neighbors. Returns memory_id list."""
+    try:
+        results = conn.execute(
+            "SELECT memory_id, distance FROM memory_vec "
+            "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+            [embedding, k],
+        ).fetchall()
+        return [r["memory_id"] for r in results]
+    except sqlite3.OperationalError:
+        return []
+
+
+def _rrf_fuse(bm25_ids: list[str], vec_ids: list[str], k: int = 60) -> list[str]:
+    """Reciprocal Rank Fusion: combine ranked lists by 1/(k+rank).
+
+    Returns a fused list of memory_ids ordered by combined RRF score.
+    k=60 is the industry-standard smoothing constant (Elasticsearch, Azure).
+    """
+    scores: dict[str, float] = {}
+    for rank, mid in enumerate(bm25_ids, 1):
+        scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+    for rank, mid in enumerate(vec_ids, 1):
+        scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+    return sorted(scores, key=scores.get, reverse=True)
+
+
+def _fetch_by_ids(
+    conn: sqlite3.Connection, ids: list[str], namespace: str | None, floor: float
+) -> list:
+    """Fetch full memory rows for a list of IDs, applying the same filters as recall."""
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    ns_clause = "AND namespace = ?" if namespace else ""
+    params = list(ids)
+    if namespace:
+        params.append(namespace)
+    params.append(floor)
+    sql = f"""
+        SELECT id, namespace, type, content, tags, source_ref,
+               source_hash, confidence, signal, valid_from,
+               ingestion_ts, retrieval_count, last_retrieved,
+               NULL AS fts_rank
+        FROM memory
+        WHERE id IN ({placeholders})
+          {ns_clause}
+          AND superseded_at IS NULL
+          AND confidence >= ?
+    """
+    rows = conn.execute(sql, params).fetchall()
+    # Preserve the fused order (IN clause does not guarantee order).
+    row_map = {r["id"]: r for r in rows}
+    return [row_map[mid] for mid in ids if mid in row_map]
 
 
 def recall_memory(
@@ -389,13 +590,15 @@ def recall_memory(
     limit: int = 5,
     as_json: bool = False,
     min_confidence: float | None = None,
+    hybrid: bool = False,
 ) -> list[dict]:
-    """FTS5 keyword recall with composite ranking.
+    """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
     Candidates are fetched via FTS5 BM25, then re-ranked by a composite score
     that incorporates BM25 relevance, confidence, recency decay, and retrieval
-    popularity. This turns the telemetry data (retrieval_count, last_retrieved)
-    into a living ranking signal instead of dead data.
+    popularity. If hybrid=True and embeddings are available, candidates are also
+    fetched via vector KNN and fused via Reciprocal Rank Fusion (RRF) before the
+    composite re-ranking.
 
     Confidence is still a hard floor (high-precision-first principle): memories
     below CONFIDENCE_FLOOR (or min_confidence) are dropped before scoring.
@@ -439,7 +642,37 @@ def recall_memory(
         except sqlite3.OperationalError:
             rows = []
 
-    # Re-rank by composite score (BM25 + confidence + recency + popularity).
+    # --- Hybrid RRF fusion: if enabled and embeddings available, also query
+    # the vector store and fuse ranks via Reciprocal Rank Fusion (k=60). ---
+    vec_sim_map: dict[str, float] = {}  # memory_id -> cosine similarity (for hybrid scoring)
+    fts_rank_map: dict[str, float] = {}  # memory_id -> FTS5 rank (preserved across fusion)
+    if hybrid and _embeddings and _embeddings.is_available() and terms:
+        query_emb = _embeddings.embed_text(query)
+        if query_emb is not None:
+            # Preserve FTS ranks before rows are replaced by _fetch_by_ids.
+            for r in rows:
+                if r["fts_rank"] is not None:
+                    fts_rank_map[r["id"]] = r["fts_rank"]
+            # Get vec results WITH distances for the similarity map.
+            try:
+                vec_results = conn.execute(
+                    "SELECT memory_id, distance FROM memory_vec "
+                    "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                    [query_emb, max(limit * 3, limit + 5)],
+                ).fetchall()
+                vec_ids = [r["memory_id"] for r in vec_results]
+                for vr in vec_results:
+                    vec_sim_map[vr["memory_id"]] = max(0.0, 1.0 - vr["distance"])
+            except sqlite3.OperationalError:
+                vec_ids = []
+            if vec_ids:
+                fts_ids = [r["id"] for r in rows]
+                fused_ids = _rrf_fuse(fts_ids, vec_ids, k=60)
+                # Re-fetch full rows for the fused set (may include IDs not in
+                # the FTS results — these are semantic matches BM25 missed).
+                rows = _fetch_by_ids(conn, fused_ids, namespace, floor)
+
+    # Re-rank by composite score (relevance + confidence + recency + popularity).
     now_epoch = time.time()
     scored = []
     for r in rows:
@@ -454,7 +687,12 @@ def recall_memory(
         # uses the halved value for stale memories (not just the display field).
         row_fields = dict(r)
         row_fields["confidence"] = conf
-        score = compute_score(row_fields, r["fts_rank"], now_epoch)
+        # For vector-only matches (fts_rank is None), use preserved FTS rank or vec_sim.
+        fts_r = r["fts_rank"]
+        if fts_r is None and r["id"] in fts_rank_map:
+            fts_r = fts_rank_map[r["id"]]  # restore rank lost during fusion re-fetch
+        vsim = vec_sim_map.get(r["id"]) if fts_r is None else None
+        score = compute_score(row_fields, fts_r, now_epoch, vec_sim=vsim)
         scored.append((score, {
             "id": r["id"],
             "namespace": r["namespace"],
@@ -653,6 +891,8 @@ def main():
     p_recall.add_argument("--namespace", default=None)
     p_recall.add_argument("--limit", type=int, default=5)
     p_recall.add_argument("--json", action="store_true")
+    p_recall.add_argument("--hybrid", action="store_true",
+                          help="use hybrid BM25+vector recall (requires onnxruntime)")
 
     p_recent = sub.add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
@@ -681,6 +921,8 @@ def main():
 
     sub.add_parser("rebuild-fts", help="rebuild the FTS5 index from scratch")
 
+    sub.add_parser("reembed", help="backfill embeddings for live memories missing them")
+
     args = ap.parse_args()
     conn = connect()
     init_db(conn)
@@ -700,12 +942,14 @@ def main():
             signal=args.signal,
         )
     elif args.cmd == "recall":
-        recall_memory(conn, query=args.query, namespace=args.namespace, limit=args.limit, as_json=args.json)
+        recall_memory(conn, query=args.query, namespace=args.namespace,
+                      limit=args.limit, as_json=args.json, hybrid=args.hybrid)
     elif args.cmd == "recent":
         recent_memory(conn, namespace=args.namespace, limit=args.limit,
                       min_confidence=args.min_confidence, as_json=args.json)
     elif args.cmd == "search":
-        recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit, as_json=False, min_confidence=0.0)
+        recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
+                      as_json=False, min_confidence=0.0)
     elif args.cmd == "supersede":
         ok = supersede_memory(conn, args.id, args.reason)
         sys.exit(0 if ok else 1)
@@ -719,7 +963,92 @@ def main():
         conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
         conn.commit()
         print("[zmem] FTS5 index rebuilt")
+    elif args.cmd == "reembed":
+        _reembed(conn)
     conn.close()
+
+
+def _has_any_embedding(conn: sqlite3.Connection) -> bool:
+    """Check if any live memory has an embedding."""
+    row = conn.execute(
+        "SELECT 1 FROM memory WHERE superseded_at IS NULL AND embedding IS NOT NULL LIMIT 1"
+    ).fetchone()
+    return row is not None
+
+
+def _reembed(conn: sqlite3.Connection) -> None:
+    """Backfill embeddings + vec0 entries for live memories missing them."""
+    if not _embeddings or not _embeddings.is_available():
+        print("[zmem] embeddings unavailable — install onnxruntime + tokenizers "
+              "and ensure the model file is present.", file=sys.stderr)
+        return
+
+    # Phase 1: embed memories that have no embedding at all.
+    need_embed = conn.execute(
+        "SELECT id, content FROM memory WHERE superseded_at IS NULL AND embedding IS NULL"
+    ).fetchall()
+
+    # Phase 2: find memories with embeddings but missing from memory_vec.
+    # This happens when reembed ran before sqlite-vec was loaded on connect().
+    # NOTE: vec_ids is recomputed AFTER Phase 1 to avoid inserting duplicates
+    # for memories that Phase 1 just embedded.
+    try:
+        vec_ids = set(
+            r["memory_id"] for r in conn.execute("SELECT memory_id FROM memory_vec").fetchall()
+        )
+    except sqlite3.OperationalError:
+        vec_ids = set()  # vec0 table not available
+
+    if not need_embed and not vec_ids and not _has_any_embedding(conn):
+        print("[zmem] all live memories already have embeddings and vec0 entries")
+        return
+
+    embed_count = 0
+    for r in need_embed:
+        emb = _embeddings.embed_text(r["content"])
+        if emb is None:
+            continue
+        conn.execute(
+            "UPDATE memory SET embedding=?, embedding_model='minilm-onnx', embedded_at=? WHERE id=?",
+            (emb, now_iso(), r["id"]),
+        )
+        vec_ids.add(r["id"])  # track unconditionally — we embedded it
+        try:
+            conn.execute(
+                "INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
+                [emb, r["id"]],
+            )
+        except sqlite3.OperationalError:
+            pass
+        embed_count += 1
+
+    # Phase 2: populate vec0 for memories that have embeddings but are missing
+    # from memory_vec (e.g. embedded before sqlite-vec was available on connect).
+    # vec_ids was updated during Phase 1 to include newly embedded memories.
+    need_vec = conn.execute(
+        "SELECT id, embedding FROM memory "
+        "WHERE superseded_at IS NULL AND embedding IS NOT NULL"
+    ).fetchall()
+    need_vec = [r for r in need_vec if r["id"] not in vec_ids]
+
+    vec_count = 0
+    for r in need_vec:
+        try:
+            conn.execute(
+                "INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
+                [r["embedding"], r["id"]],
+            )
+            vec_count += 1
+        except sqlite3.OperationalError:
+            pass
+
+    conn.commit()
+    parts = []
+    if embed_count:
+        parts.append(f"embedded {embed_count}")
+    if vec_count:
+        parts.append(f"populated vec0 for {vec_count}")
+    print(f"[zmem] {' + '.join(parts)} memories")
 
 
 if __name__ == "__main__":
