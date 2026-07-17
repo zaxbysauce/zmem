@@ -115,6 +115,19 @@ fi
 # Export env so store.py finds its store via ZCODE_PLUGIN_DATA.
 export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-$DATA_DIR}"
 
+# Background consolidation: run silently if growth threshold met and interval
+# passed. Uses a 5s time budget — aborts if it takes too long.
+if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
+  "$PYTHON_BIN" "$STORE_PY_PY" consolidate 2>/dev/null &
+  CONSOLIDATE_PID=$!
+  # Wait at most 5 seconds for consolidation to finish.
+  for i in $(seq 1 50); do
+    kill -0 $CONSOLIDATE_PID 2>/dev/null || break
+    sleep 0.1
+  done
+  kill $CONSOLIDATE_PID 2>/dev/null || true
+fi
+
 # Build the additionalContext payload using python for guaranteed-valid JSON.
 CTX_JSON="$("$PYTHON_BIN" -c '
 import json, os, sys, subprocess

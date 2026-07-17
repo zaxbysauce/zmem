@@ -249,6 +249,13 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
         conn.commit()
 
+    if ver < 4:
+        # v4: consolidation provenance + supersede reason persistence.
+        conn.execute("ALTER TABLE memory ADD COLUMN consolidated_at TEXT")
+        conn.execute("ALTER TABLE memory ADD COLUMN supersede_reason TEXT DEFAULT ''")
+        conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
+        conn.commit()
+
 
 def _load_vec(conn: sqlite3.Connection) -> None:
     """Load the sqlite-vec extension. Raises if unavailable."""
@@ -815,7 +822,7 @@ def supersede_memory(conn: sqlite3.Connection, mid: str, reason: str = "") -> bo
     if not row:
         print(f"[zmem] no memory with id {mid}", file=sys.stderr)
         return False
-    conn.execute("UPDATE memory SET superseded_at=? WHERE id=?", (now_iso(), mid))
+    conn.execute("UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?", (now_iso(), reason, mid))
     # Also remove from the vec0 table to prevent orphaned vectors consuming KNN slots.
     try:
         conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
@@ -879,6 +886,201 @@ def get_memory(conn, mid):
     print(json.dumps(d, indent=2))
 
 
+# Consolidation threshold and cadence defaults.
+CONSOLIDATE_DEFAULT_THRESHOLD = float(os.environ.get("ZMEM_CONSOLIDATE_THRESHOLD", "0.80"))
+CONSOLIDATE_MIN_INTERVAL_DAYS = 7
+CONSOLIDATE_GROWTH_THRESHOLD = 0.20  # run when live count grew by >20% since last run
+
+
+def consolidate(
+    conn: sqlite3.Connection,
+    *,
+    threshold: float = CONSOLIDATE_DEFAULT_THRESHOLD,
+    prune: bool = False,
+    dry_run: bool = False,
+    namespace: str | None = None,
+) -> None:
+    """Merge near-duplicate memories via embedding similarity.
+
+    For each live memory with an embedding, query vec0 KNN for nearest neighbors.
+    Cluster memories with cosine similarity >= threshold. For each cluster:
+    pick the keeper (highest confidence x retrieval_count), merge metadata
+    into the keeper, supersede the absorbed members. Each cluster commits
+    atomically — interruption is safe because keeper selection is deterministic.
+
+    If prune=True, also supersede memories with retrieval_count=0, signal=none,
+    and age>30d (opt-in, never automatic on SessionStart).
+    """
+    if not _embeddings or not _embeddings.is_available():
+        print("[zmem] consolidate requires embeddings — install onnxruntime + tokenizers", file=sys.stderr)
+        return
+
+    # Growth-based cadence gate: skip if last consolidation was recent AND
+    # the store hasn't grown significantly since. Only applies to automatic
+    # runs (not dry-run or explicit CLI invocation with changed args).
+    last_consolidation = conn.execute(
+        "SELECT value FROM meta WHERE key='last_consolidation'"
+    ).fetchone()
+    last_count = conn.execute(
+        "SELECT value FROM meta WHERE key='last_consolidation_count'"
+    ).fetchone()
+
+    if last_consolidation and not dry_run and threshold == CONSOLIDATE_DEFAULT_THRESHOLD:
+        import calendar as _cal
+        last_ts = last_consolidation[0]
+        last_epoch = _cal.timegm(time.strptime(last_ts, "%Y-%m-%dT%H:%M:%SZ")) if last_ts else 0
+        days_since = (time.time() - last_epoch) / 86400.0 if last_epoch > 0 else 999
+        live_count = conn.execute(
+            "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
+        ).fetchone()[0]
+        last_live = int(last_count[0]) if last_count and last_count[0].isdigit() else 0
+        growth = (live_count - last_live) / max(last_live, 1)
+
+        if days_since < CONSOLIDATE_MIN_INTERVAL_DAYS and growth < CONSOLIDATE_GROWTH_THRESHOLD:
+            return  # not enough time or growth to warrant consolidation
+
+    # Write the consolidation timestamp BEFORE the clustering loop, so a killed
+    # run still creates backpressure on the next session. Count is start-of-run
+    # (pre-clustering) live count.
+    if not dry_run:
+        ts = now_iso()
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidation', ?)",
+            (ts,),
+        )
+        live_count_now = conn.execute(
+            "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidation_count', ?)",
+            (str(live_count_now),),
+        )
+        conn.commit()
+
+    # Load all live memories with embeddings.
+    ns_clause = "AND namespace = ?" if namespace else ""
+    ns_params = [namespace] if namespace else []
+    rows = conn.execute(
+        f"""SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
+                  embedding, embedding_model
+           FROM memory
+           WHERE superseded_at IS NULL AND embedding IS NOT NULL
+           {ns_clause}
+           ORDER BY confidence DESC, retrieval_count DESC""",
+        ns_params,
+    ).fetchall()
+
+    if not rows:
+        print("[zmem] no embeddable memories to consolidate")
+        return
+
+    # Track which memories have been absorbed (to skip them as seeds).
+    absorbed = set()
+    merged_count = 0
+    pruned_count = 0
+
+    for seed in rows:
+        if seed["id"] in absorbed:
+            continue
+
+        # Query vec0 for nearest neighbors of this seed.
+        neighbors = []
+        try:
+            results = conn.execute(
+                "SELECT memory_id, distance FROM memory_vec "
+                "WHERE embedding MATCH ? AND k = 10 ORDER BY distance",
+                [seed["embedding"]],
+            ).fetchall()
+            for r in results:
+                mid = r["memory_id"]
+                if mid == seed["id"] or mid in absorbed:
+                    continue
+                sim = 1.0 - r["distance"]
+                if sim >= threshold:
+                    # Verify it's live and in the right namespace.
+                    row = conn.execute(
+                        "SELECT id, confidence, signal, tags, retrieval_count FROM memory "
+                        "WHERE id=? AND superseded_at IS NULL"
+                        + (f" AND namespace=?" if namespace else ""),
+                        [mid] + ns_params,
+                    ).fetchone()
+                    if row:
+                        neighbors.append((row, sim))
+        except sqlite3.OperationalError:
+            continue  # vec0 unavailable
+
+        if not neighbors:
+            continue
+
+        # The seed is the keeper (it has the highest confidence x retrieval_count
+        # because we ordered by that). Merge each neighbor into it.
+        if dry_run:
+            print(f"[zmem] DRY RUN: cluster around [{seed['id'][:8]}] "
+                  f"(conf={seed['confidence']}, rc={seed['retrieval_count']}):")
+            print(f"    keeper: {seed['content'][:80]}...")
+            for nb_row, nb_sim in neighbors:
+                print(f"    absorb [{nb_row['id'][:8]}] sim={nb_sim:.3f}: "
+                      f"conf={nb_row['confidence']} rc={nb_row['retrieval_count']}")
+                absorbed.add(nb_row["id"])  # track in dry-run too
+            merged_count += len(neighbors)
+            continue
+
+        # Atomic commit per cluster.
+        try:
+            conn.execute("BEGIN")
+            for nb_row, nb_sim in neighbors:
+                # Merge metadata into the keeper.
+                _merge_on_dedup(conn, seed["id"], nb_row["confidence"],
+                                nb_row["signal"], nb_row["tags"])
+                # Supersede the absorbed member.
+                conn.execute(
+                    "UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?",
+                    (now_iso(), f"consolidated into {seed['id']}", nb_row["id"]),
+                )
+                try:
+                    conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (nb_row["id"],))
+                except sqlite3.OperationalError:
+                    pass
+                absorbed.add(nb_row["id"])
+            # Mark the keeper as consolidated.
+            conn.execute(
+                "UPDATE memory SET consolidated_at=? WHERE id=?",
+                (now_iso(), seed["id"]),
+            )
+            conn.execute("COMMIT")
+            merged_count += len(neighbors)
+        except Exception:
+            conn.execute("ROLLBACK")
+            continue
+
+    # Optional prune: supersede low-value never-retrieved memories.
+    if prune:
+        prune_rows = conn.execute(
+            f"""SELECT id, content FROM memory
+               WHERE superseded_at IS NULL
+                 AND retrieval_count = 0
+                 AND signal = 'none'
+                 AND confidence < 0.35
+                 AND ingestion_ts < datetime('now', '-30 days')
+               {ns_clause}""",
+            ns_params,
+        ).fetchall()
+        for r in prune_rows:
+            if dry_run:
+                print(f"[zmem] DRY RUN: prune [{r['id'][:8]}]: {r['content'][:60]}...")
+                pruned_count += 1
+                continue
+            supersede_memory(conn, r["id"], "pruned: never retrieved, low confidence")
+            pruned_count += 1
+
+    parts = [f"merged {merged_count} memories"]
+    if prune:
+        parts.append(f"pruned {pruned_count}")
+    if dry_run:
+        parts.append("(dry run — no changes)")
+    print(f"[zmem] {' + '.join(parts)}")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="store.py", description="ZMem semantic store")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -932,6 +1134,16 @@ def main():
 
     sub.add_parser("reembed", help="backfill embeddings for live memories missing them")
 
+    p_consolidate = sub.add_parser("consolidate", help="merge near-duplicate memories")
+    p_consolidate.add_argument("--threshold", type=float,
+                               default=float(os.environ.get("ZMEM_CONSOLIDATE_THRESHOLD", "0.80")))
+    p_consolidate.add_argument("--prune", action="store_true",
+                               help="also supersede low-value never-retrieved memories")
+    p_consolidate.add_argument("--dry-run", action="store_true",
+                               help="show what would be consolidated without changing anything")
+    p_consolidate.add_argument("--namespace", default=None,
+                               help="limit consolidation to a specific namespace")
+
     args = ap.parse_args()
     conn = connect()
     init_db(conn)
@@ -974,6 +1186,9 @@ def main():
         print("[zmem] FTS5 index rebuilt")
     elif args.cmd == "reembed":
         _reembed(conn)
+    elif args.cmd == "consolidate":
+        consolidate(conn, threshold=args.threshold, prune=args.prune,
+                    dry_run=args.dry_run, namespace=args.namespace)
     conn.close()
 
 

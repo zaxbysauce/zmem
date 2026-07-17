@@ -74,6 +74,16 @@ python <store.py> get --id <uuid>
 python <store.py> stats
 ```
 
+### consolidate — merge near-duplicate memories
+```
+python <store.py> consolidate [--threshold 0.80] [--prune] [--dry-run] [--namespace NS]
+```
+Clusters live memories by embedding cosine similarity, picks the strongest as
+keeper, merges metadata, and supersedes the rest with a persisted reason. Runs
+automatically on SessionStart when the store has grown >20% since the last run
+(min 7 days between runs). Use `--dry-run` to preview clusters without changes.
+`--prune` also removes low-value never-retrieved memories (opt-in, never automatic).
+
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite
   file. The write-time filter is advisory only (regex heuristic), not a guarantee.
