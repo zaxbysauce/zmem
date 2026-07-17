@@ -41,6 +41,7 @@ import sqlite3
 import sys
 import time
 import uuid
+import calendar
 from pathlib import Path
 
 
@@ -100,6 +101,7 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -157,6 +159,46 @@ def init_db(conn: sqlite3.Connection) -> None:
     # executescript() does not accept parameter binding, so set created_at separately.
     conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('created_at', ?)", (now_iso(),))
     conn.commit()
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Versioned migration. Runs after init_db(). Idempotent and crash-safe.
+
+    Each version block is guarded by a version check so it runs exactly once.
+    DDL statements use IF (NOT) EXISTS so they are safe to repeat if a crash
+    interrupts the migration before the version bump. The busy_timeout set in
+    connect() serializes concurrent hook processes; the version guard makes
+    the second one a no-op once the first commits.
+    """
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    ver = int(row[0]) if row else 1
+
+    if ver < 2:
+        # v2: ranking-support indexes + FTS trigger fix (stop write amplification).
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_confidence ON memory(confidence)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_ingestion ON memory(ingestion_ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_retrieval ON memory(retrieval_count)")
+        # Replace the unguarded UPDATE trigger with one that only fires when
+        # FTS-indexed columns (content, tags, namespace) actually change.
+        # Without this, every telemetry UPDATE (retrieval_count bump on recall)
+        # triggers a full FTS delete+reinsert of that row.
+        conn.execute("DROP TRIGGER IF EXISTS memory_au")
+        conn.execute(
+            """
+            CREATE TRIGGER memory_au AFTER UPDATE ON memory
+            WHEN old.content IS NOT new.content
+              OR old.tags IS NOT new.tags
+              OR old.namespace IS NOT new.namespace
+            BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, content, tags, namespace)
+                VALUES ('delete', old.rowid, old.content, old.tags, old.namespace);
+                INSERT INTO memory_fts(rowid, content, tags, namespace)
+                VALUES (new.rowid, new.content, new.tags, new.namespace);
+            END
+            """
+        )
+        conn.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+        conn.commit()
 
 
 def _check_secrets(content: str, source_ref: str) -> list[str]:
@@ -281,6 +323,64 @@ def add_memory(
     return mid
 
 
+# --- Ranking formula weights (composite score for recall) ---
+# BM25 relevance dominates; confidence/recency/popularity are tiebreakers/boosts.
+# These are intentionally simple linear weights — the goal is to turn dead
+# telemetry into a signal, not to over-engineer a learning-to-rank system.
+W_BM25 = 0.55
+W_CONFIDENCE = 0.20
+W_RECENCY = 0.15
+W_POPULARITY = 0.10
+# Recency half-life: a memory from RECENCY_HALF_LIFE_DAYS ago contributes half.
+RECENCY_HALF_LIFE_DAYS = 90
+
+
+def _parse_iso_to_epoch(ts: str) -> float:
+    """Parse an ISO-8601 UTC timestamp to epoch seconds. Returns 0 on failure."""
+    try:
+        return float(calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: float) -> float:
+    """Composite score: BM25 relevance + confidence boost + recency + popularity.
+
+    fts_rank is the raw FTS5 rank value (lower = better match). All other
+    factors come from the memory row itself.
+    """
+    # BM25 component: FTS5 rank is the negated BM25 value (more negative = better
+    # match). Normalize to 0..1 where better matches get higher scores.
+    # abs(rank)/(1+abs(rank)) is monotonically increasing in abs(rank).
+    if fts_rank is not None:
+        ar = abs(fts_rank)
+        bm25_score = ar / (1.0 + ar)
+    else:
+        bm25_score = 0.0
+
+    # Confidence component: already 0..1.
+    confidence = float(row["confidence"]) if row["confidence"] is not None else 0.3
+
+    # Recency component: exponential decay from ingestion_ts.
+    ingested = _parse_iso_to_epoch(row["ingestion_ts"] or "")
+    if ingested > 0 and now_epoch > 0:
+        age_days = max(0.0, (now_epoch - ingested) / 86400.0)
+        recency = 0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)
+    else:
+        recency = 0.5  # unknown age — neutral
+
+    # Popularity component: retrieval_count with diminishing returns.
+    rc = int(row["retrieval_count"]) if row["retrieval_count"] is not None else 0
+    popularity = min(1.0, 0.15 * (rc ** 0.5))
+
+    return (
+        W_BM25 * bm25_score
+        + W_CONFIDENCE * confidence
+        + W_RECENCY * recency
+        + W_POPULARITY * popularity
+    )
+
+
 def recall_memory(
     conn: sqlite3.Connection,
     *,
@@ -290,11 +390,15 @@ def recall_memory(
     as_json: bool = False,
     min_confidence: float | None = None,
 ) -> list[dict]:
-    """FTS5 keyword recall: FTS5 relevance ∩ namespace filter ∩ confidence floor.
+    """FTS5 keyword recall with composite ranking.
 
-    Ordering is pure FTS5 BM25 rank (best match first). Confidence is a hard
-    filter, not a scoring factor: memories below CONFIDENCE_FLOOR (or
-    min_confidence if given) and superseded memories are dropped. High-precision-first.
+    Candidates are fetched via FTS5 BM25, then re-ranked by a composite score
+    that incorporates BM25 relevance, confidence, recency decay, and retrieval
+    popularity. This turns the telemetry data (retrieval_count, last_retrieved)
+    into a living ranking signal instead of dead data.
+
+    Confidence is still a hard floor (high-precision-first principle): memories
+    below CONFIDENCE_FLOOR (or min_confidence) are dropped before scoring.
     """
     terms = [t for t in re.split(r"\s+", query.strip()) if t]
     if not terms:
@@ -312,11 +416,14 @@ def recall_memory(
             params.append(namespace)
         floor = min_confidence if min_confidence is not None else CONFIDENCE_FLOOR
         params.append(floor)
-        params.append(limit)
+        # Fetch more candidates than the limit so the composite re-ranking has
+        # a larger pool to choose from (BM25 rank != final rank).
+        fetch_limit = max(limit * 3, limit + 5)
+        params.append(fetch_limit)
         sql = f"""
             SELECT m.id, m.namespace, m.type, m.content, m.tags, m.source_ref,
                    m.source_hash, m.confidence, m.signal, m.valid_from,
-                   m.ingestion_ts, m.last_retrieved,
+                   m.ingestion_ts, m.retrieval_count, m.last_retrieved,
                    rank AS fts_rank
             FROM memory_fts f
             JOIN memory m ON m.rowid = f.rowid
@@ -332,7 +439,9 @@ def recall_memory(
         except sqlite3.OperationalError:
             rows = []
 
-    results = []
+    # Re-rank by composite score (BM25 + confidence + recency + popularity).
+    now_epoch = time.time()
+    scored = []
     for r in rows:
         conf = r["confidence"]
         stale_note = ""
@@ -341,7 +450,12 @@ def recall_memory(
             if current and current != r["source_hash"]:
                 conf *= 0.5
                 stale_note = " [STALE SOURCE — source file changed since extraction]"
-        results.append({
+        # Build a mutable copy with the demoted confidence so compute_score
+        # uses the halved value for stale memories (not just the display field).
+        row_fields = dict(r)
+        row_fields["confidence"] = conf
+        score = compute_score(row_fields, r["fts_rank"], now_epoch)
+        scored.append((score, {
             "id": r["id"],
             "namespace": r["namespace"],
             "type": r["type"],
@@ -353,7 +467,12 @@ def recall_memory(
             "valid_from": r["valid_from"],
             "stale": bool(stale_note),
             "_stale_note": stale_note,
-        })
+            "_score": round(score, 4),
+        }))
+
+    # Sort by composite score descending, take top `limit`.
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = [item[1] for item in scored[:limit]]
 
     if results:
         ids = [r["id"] for r in results]
@@ -560,9 +679,12 @@ def main():
 
     sub.add_parser("stats", help="store statistics")
 
+    sub.add_parser("rebuild-fts", help="rebuild the FTS5 index from scratch")
+
     args = ap.parse_args()
     conn = connect()
     init_db(conn)
+    migrate(conn)
 
     if args.cmd == "init":
         print(f"[zmem] store ready at {STORE_PATH}")
@@ -593,6 +715,10 @@ def main():
         list_memory(conn, namespace=args.namespace, limit=args.limit, include_superseded=args.include_superseded)
     elif args.cmd == "stats":
         stats(conn)
+    elif args.cmd == "rebuild-fts":
+        conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
+        conn.commit()
+        print("[zmem] FTS5 index rebuilt")
     conn.close()
 
 
