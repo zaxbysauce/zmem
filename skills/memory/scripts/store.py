@@ -344,9 +344,10 @@ def add_memory(
         emb = _embeddings.embed_text(content)
 
     existing = None
+    dedup_sim = 0.0
     if emb is not None:
         # Semantic dedup: query vec0 for nearest neighbor in the same namespace.
-        existing = _find_semantic_duplicate(conn, emb, namespace)
+        existing, dedup_sim = _find_semantic_duplicate(conn, emb, namespace)
     if existing is None:
         # Fallback: exact-match dedup (original logic).
         norm = re.sub(r"\s+", " ", content.strip().lower())
@@ -358,13 +359,15 @@ def add_memory(
             c_norm = re.sub(r"\s+", " ", c["content"].strip().lower())
             if c_norm == norm:
                 existing = c
+                dedup_sim = 1.0  # exact match
                 break
 
     if existing:
         # Merge: upgrade confidence/signal if the new add is stronger.
         _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
         conn.commit()
-        print(f"[zmem] dedup: existing memory {existing['id']} refreshed (no duplicate inserted)")
+        print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
+              f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
         return existing["id"]
 
     mid = str(uuid.uuid4())
@@ -402,7 +405,8 @@ def add_memory(
 
 
 # Cosine similarity threshold for semantic dedup (0..1, higher = stricter).
-DEDUP_SIMILARITY_THRESHOLD = 0.85
+# Override via ZMEM_DEDUP_THRESHOLD env var if false-positive merges occur.
+DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("ZMEM_DEDUP_THRESHOLD", "0.85"))
 # Signal rank for merge: higher = stronger.
 _SIGNAL_RANK = {"test": 5, "compile": 4, "lint": 3, "reviewer": 2, "user": 2, "none": 1}
 
@@ -431,8 +435,8 @@ def _find_semantic_duplicate(
             # Convert to cosine similarity: sim = 1 - distance.
             similarity = 1.0 - r["distance"]
             if similarity >= threshold:
-                return row
-    return None
+                return row, similarity
+    return None, 0.0
 
 
 def _merge_on_dedup(
@@ -812,6 +816,11 @@ def supersede_memory(conn: sqlite3.Connection, mid: str, reason: str = "") -> bo
         print(f"[zmem] no memory with id {mid}", file=sys.stderr)
         return False
     conn.execute("UPDATE memory SET superseded_at=? WHERE id=?", (now_iso(), mid))
+    # Also remove from the vec0 table to prevent orphaned vectors consuming KNN slots.
+    try:
+        conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
+    except sqlite3.OperationalError:
+        pass  # vec0 table not available
     conn.commit()
     note = f": {reason}" if reason else ""
     print(f"[zmem] superseded {mid}{note}")
