@@ -91,9 +91,23 @@ python <store.py> stats
 
 ## How recall works
 FTS5 keyword match intersected with namespace filter and confidence floor, with
-source-staleness demotion. Results are ordered by FTS5 BM25 rank; confidence is a
-hard filter (below the floor is dropped), not a scoring factor. Keyword-first,
-not semantic — vector/embedding recall is a future optional tier, not built yet.
+source-staleness demotion. Results are re-ranked by a **composite score** that
+combines:
+
+- **BM25 relevance** (55%) — the FTS5 keyword match score
+- **Confidence** (20%) — grounded by signal tier (test/compile > reviewer/user > none)
+- **Recency** (15%) — exponential decay with a 90-day half-life
+- **Popularity** (10%) — retrieval frequency with diminishing returns (sqrt dampening)
+
+Confidence is still a hard floor (below 0.25 is dropped before scoring).
+Staleness demotion halves confidence, which feeds into the confidence component.
+Keyword-first, not semantic — vector/embedding recall is a future optional tier.
+
+The `rebuild-fts` subcommand rebuilds the FTS5 index from scratch (useful after
+bulk imports or if the index drifts):
+```
+python <store.py> rebuild-fts
+```
 
 ## The reflection loop (Loop 1)
 The `zmem-reflect.sh` Stop hook checks the episodic db for failed tool calls
