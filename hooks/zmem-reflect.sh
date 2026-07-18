@@ -142,8 +142,38 @@ except Exception:
     fail_count = 0
 
 if fail_count == 0:
+    # No failures — but the session may still have produced generalizable
+    # lessons (conventions, patterns, debugging insights). Check if a lesson
+    # was already captured; if not, emit a lightweight success-reflection prompt.
     if conn:
         conn.close()
+    # Reuse the lesson-exists check below (same pattern).
+    lesson_exists = False
+    store_db_check = data_dir_win
+    store_db_check = os.path.join(store_db_check, "store.sqlite")
+    if os.path.isfile(store_db_check):
+        try:
+            sconn_check = sqlite3.connect(store_db_check)
+            row_check = sconn_check.execute(
+                "SELECT 1 FROM memory WHERE source_ref=? AND superseded_at IS NULL LIMIT 1",
+                ("session:" + session_id,),
+            ).fetchone()
+            lesson_exists = row_check is not None
+            sconn_check.close()
+        except Exception:
+            pass
+    if lesson_exists:
+        sys.exit(0)
+    # Emit success-reflection prompt (non-blocking).
+    msg = (
+        "ZMem reflection: this session had no tool failures, but you may have "
+        "learned something worth capturing — a convention, a debugging insight, "
+        "a workaround, or a pattern you discovered. If you learned a generalizable "
+        "lesson, capture it: `%s add --namespace \"%s\" --type lesson --content \"...\" "
+        "--signal <test|compile|lint|reviewer|user|none> --source-ref \"session:%s\"`. "
+        "If nothing worth capturing, do nothing."
+    ) % (store_py, ns, session_id)
+    print(json.dumps({"additionalContext": msg}))
     sys.exit(0)
 
 # 1b. Enrichment: fetch per-failure detail in a SEPARATE query with its own
