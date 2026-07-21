@@ -57,14 +57,28 @@ except ImportError:
 
 
 def _resolve_store_path() -> Path:
-    """Resolve the store location. Priority: ZMEM_STORE > ZCODE_PLUGIN_DATA > ~/.zcode/memory."""
+    """Resolve the store location.
+
+    Priority: ZMEM_STORE > ZCODE_PLUGIN_DATA > auto-detect plugin data dir > ~/.zcode/memory.
+    The auto-detect prevents store-splitting when env vars aren't set (e.g.
+    when store.py is invoked from a slash command that doesn't inherit hook env).
+    """
     explicit = os.environ.get("ZMEM_STORE")
     if explicit:
         return Path(explicit)
     plugin_data = os.environ.get("ZCODE_PLUGIN_DATA")
     if plugin_data:
         return Path(plugin_data) / "store.sqlite"
-    return Path(os.path.expanduser("~/.zcode/memory/store.sqlite"))
+    # Auto-detect the plugin data dir (the canonical location since v2).
+    # This prevents sessions without ZCODE_PLUGIN_DATA from writing to the
+    # legacy ~/.zcode/memory/ location and splitting the store.
+    home = Path(os.path.expanduser("~"))
+    plugin_data_pattern = home / ".zcode" / "cli" / "plugins" / "data"
+    if plugin_data_pattern.is_dir():
+        for d in plugin_data_pattern.iterdir():
+            if "zmem" in d.name.lower():
+                return d / "store.sqlite"
+    return home / ".zcode" / "memory" / "store.sqlite"
 
 
 def _resolve_core_md_path() -> Path:
