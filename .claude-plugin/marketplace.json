@@ -1,0 +1,11 @@
+{
+  "name": "zmem",
+  "owner": { "name": "Brett", "url": "https://github.com/zaxbysauce" },
+  "plugins": [
+    {
+      "name": "zmem",
+      "source": ".",
+      "description": "Box-wide multi-tier memory for Claude Code, sharing a store with ZCode."
+    }
+  ]
+}
