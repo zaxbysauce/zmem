@@ -76,15 +76,16 @@ join_path() {
   done
 }
 
-PLUGIN_ROOT="${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
-DATA_DIR="${ZCODE_PLUGIN_DATA:-}"
-PROJECT="${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}"
+# Canonical env from the host adapter (zmem-launch.js); legacy vars as fallback.
+PLUGIN_ROOT="${ZMEM_ROOT:-${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}"
+DATA_DIR="${ZMEM_DATA:-${ZCODE_PLUGIN_DATA:-}}"
+PROJECT="${ZMEM_PROJECT:-${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}"
 
 # --- Resolve data dir --------------------------------------------------------
 if [ -n "$DATA_DIR" ]; then
   DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
 else
-  DATA_DIR_PY="$(join_path "$(to_py_path "$HOME")" .zcode memory)"
+  DATA_DIR_PY="$(join_path "$(to_py_path "$HOME")" .zmem)"
 fi
 
 # --- Resolve store.py path --------------------------------------------------
@@ -94,17 +95,28 @@ if [ -z "$PLUGIN_ROOT" ]; then
 fi
 STORE_PY_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts store.py)"
 
-# Export env so store.py finds its store via ZCODE_PLUGIN_DATA.
-export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-$DATA_DIR}"
+# Export the store location so store.py resolves it (chain:
+# ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem > ~/.zcode).
+export ZMEM_DATA="${ZMEM_DATA:-$DATA_DIR}"
+export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 
-# --- Determine namespace from project ---------------------------------------
-NS="user:global"
-if [ -n "$PROJECT" ]; then
-  NS="project:$(basename "$PROJECT")"
+# --- Determine namespace ----------------------------------------------------
+# Canonical key from the host adapter (closes the basename/remote split so
+# migrated projects recall their rows). Fall back to the legacy basename key
+# when the adapter did not run.
+NS="${ZMEM_NAMESPACE:-}"
+if [ -z "$NS" ]; then
+  if [ -n "$PROJECT" ]; then
+    NS="project:$(basename "$PROJECT")"
+  else
+    NS="user:global"
+  fi
 fi
+BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 
 # --- Build the recall payload via python (guaranteed-valid JSON) ------------
-printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
+# Captured (not streamed) so we can wrap it in the sentinel below.
+OUT="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
 import json, os, sys, subprocess
 
 raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
@@ -122,6 +134,10 @@ if not prompt or not prompt.strip() or len(prompt.strip()) < 5:
 
 store_py = sys.argv[1]
 ns = sys.argv[2]
+try:
+    budget = int(sys.argv[3])
+except (IndexError, ValueError):
+    budget = 25000
 
 if not store_py or not os.path.isfile(store_py):
     print("{}")
@@ -160,12 +176,14 @@ for r in rows:
     signal = r.get("signal", "?")
     entry = "- [%s] %s" % (signal, content)
     total_chars += len(entry)
-    if total_chars > 25000:  # stay well under the 32KB budget
+    if budget > 0 and total_chars > budget:  # soft cap; launcher enforces hard encoded budget
         break
     lines.append(entry)
 
 ctx = "\n".join(lines)
 print(json.dumps({"additionalContext": ctx}))
-' "$STORE_PY_PY" "$NS" 2>/dev/null || echo '{}'
+' "$STORE_PY_PY" "$NS" "$BUDGET" 2>/dev/null || echo '{}')"
 
+# Wrap the payload in the sentinel so the host adapter can extract it robustly.
+printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' "$OUT"
 exit 0
