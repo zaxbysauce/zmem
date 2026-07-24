@@ -216,5 +216,16 @@ If CC forces `hooks/hooks.json` exactly AND won't expand `${ZCODE_PLUGIN_ROOT}` 
 
 ---
 
+## 10b. Execution log
+- **P0 ✅** branch `feat/box-wide-memory` off `origin/main` (`97ffe18`); PLAN committed.
+- **P0.5 ✅** dual-manifest probe validated on CC 2.1.217: G1 (loads w/ co-present `.zcode-plugin/`), G9-live (custom hooks path), SessionStart+UserPromptSubmit injection reach the model, real field names captured. No build step. (Prompt-type hooks are rejected on SessionStart — the plan's command-type launcher is the correct/only path; the user has a separate prompt-type Stop self-review hook that ZMem's fail-open reflect hook must coexist with — add a `stop_hook_active`-style loop guard.)
+- **P1 ✅ CONFIRMED** (executor `7017f61`+`609e5ac`, independent verifier): `host.py` (6-link resolution + `assert_local_fs` + owner-only perms + `busy_retry`), `store.py` refactor, source-safe `import-store.py`, 18/18 tests; `~/.zmem` populated (403/383). Source never opened read-write.
+
+### CUTOVER SEQUENCING (surfaced by P1 verifier — must honor)
+The legacy `zmem@zaxbyhub` store is **live** (ZCode keeps writing to it) → `~/.zmem` is a snapshot that drifts, and the dropped auto-detect scan means bare-env `store.py` writes split from deployed-hook writes until P3 sets `ZMEM_DATA`. Therefore:
+1. Between now and P3, treat `~/.zmem` as **dev/validation only**; don't rely on it as authoritative and avoid bare-env `store.py` writes you care about (they'd be lost on re-import).
+2. At the P3/P4 cutover: **freeze or final `--force` re-import** the legacy store, then **re-run the v5 migration** (idempotent, schema-gated) on the fresh copy, THEN flip both hosts' launchers to `ZMEM_DATA=~/.zmem`. Only after that is `~/.zmem` the single source of truth.
+3. P2's v5 migration must therefore be **re-runnable** (already designed schema-gated) — it will run once now for validation and again on the cutover re-import.
+
 ## 11. Effort / sequencing
 Foundation (P0–P3) is the bulk of the design risk and ~half the work; P4–P7 are gated integrations; P8–P10 are hardening. Suggest executing P0→P3 first, re-verifying gates G1/G8/G9 at P4 on a real dual-install before committing to Shape 1 vs §9.
