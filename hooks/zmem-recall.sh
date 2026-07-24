@@ -153,6 +153,7 @@ try:
          "--query", prompt[:500],  # cap query length
          "--namespace", ns,
          "--limit", "5",
+         "--no-bump",  # READ-ONLY: hook-driven recall must not write (PLAN.md §5)
          "--json"],
         stderr=subprocess.DEVNULL, timeout=10,
     ).decode("utf-8", "replace")

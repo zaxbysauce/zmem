@@ -53,7 +53,8 @@ function envWith(overrides) {
     const e = { ...process.env };
     for (const k of [
         "ZMEM_HOST", "ZMEM_ROOT", "ZMEM_DATA", "ZMEM_PROJECT", "ZMEM_SESSION",
-        "ZMEM_TRANSCRIPT", "ZMEM_AGENT_TYPE", "ZMEM_NAMESPACE", "ZMEM_SKILLS_DIRS",
+        "ZMEM_TRANSCRIPT", "ZMEM_AGENT_TRANSCRIPT", "ZMEM_AGENT_TYPE",
+        "ZMEM_AGENT_ID", "ZMEM_NAMESPACE", "ZMEM_SKILLS_DIRS",
         "ZMEM_TIER0", "ZMEM_CTX_BUDGET",
         "CLAUDE_PLUGIN_ROOT", "ZCODE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR",
         "ZCODE_PROJECT_DIR", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
@@ -384,6 +385,169 @@ console.log("\n[8] No ~5s session-start stall");
     const elapsed = Date.now() - t0;
     ok("timing: session-start returns in < 4000ms (no consolidate wait stall)",
         elapsed < 4000, elapsed + "ms");
+}
+
+console.log("\n[9] Phase 7: subagent-recall (SubagentStart) + subagent-reflect (SubagentStop)");
+
+{
+    // Fresh temp store seeded with a namespace-scoped row, a user:global bridge
+    // row, and an UNRELATED namespace row that must NOT be recalled.
+    const SDATA = path.join(TMP, "p7data");
+    fs.mkdirSync(SDATA, { recursive: true });
+    const SNS = resolveNs(PROJ); // non-git → project:<abspath>
+    seed(SDATA, SNS, "lesson", "P7_SCOPED prefer ripgrep over grep here.", 0.9);
+    seed(SDATA, "user:global", "convention", "P7_GLOBAL end commits with a trailer.", 0.9);
+    seed(SDATA, "project:UNRELATED_NS", "fact", "P7_UNRELATED must not appear.", 0.9);
+
+    const rcOf = (content) => {
+        const out = execFileSync(PYTHON, ["-c",
+            "import sqlite3,os,sys\n" +
+            "c=sqlite3.connect(sys.argv[1])\n" +
+            "r=c.execute(\"SELECT retrieval_count FROM memory WHERE content LIKE ?\",('%'+sys.argv[2]+'%',)).fetchone()\n" +
+            "print(r[0] if r else -1)",
+            path.join(SDATA, "store.sqlite"), content], { encoding: "utf8" }).trim();
+        return parseInt(out, 10);
+    };
+
+    const startPayload = JSON.stringify({
+        session_id: "p7-sess", transcript_path: "C:\\tmp\\parent.jsonl", cwd: PROJ,
+        prompt_id: "pp1", agent_id: "agent777", agent_type: "coder",
+        hook_event_name: "SubagentStart",
+    });
+
+    // subagent-recall / claude: SubagentStart envelope, scoped + bridge rows,
+    // unrelated excluded, and READ-ONLY (retrieval_count unchanged).
+    {
+        const r = runLauncher("subagent-recall", startPayload, envWith({
+            ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("subagent-recall/claude: valid JSON", obj !== null, r.stdout.slice(0, 200));
+        eq("subagent-recall/claude: hookEventName == SubagentStart",
+            obj && obj.hookSpecificOutput && obj.hookSpecificOutput.hookEventName, "SubagentStart");
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("subagent-recall: scoped namespace row present", /P7_SCOPED/.test(ac));
+        ok("subagent-recall: user:global bridge row present", /P7_GLOBAL/.test(ac));
+        ok("subagent-recall: unrelated namespace row absent", !/P7_UNRELATED/.test(ac));
+        ok("subagent-recall: agent_type in header", /agent coder/.test(ac));
+        eq("subagent-recall: READ-ONLY — scoped row rc unchanged (0)", rcOf("P7_SCOPED"), 0);
+        eq("subagent-recall: READ-ONLY — global row rc unchanged (0)", rcOf("P7_GLOBAL"), 0);
+    }
+
+    // subagent-recall / zcode: bare additionalContext.
+    {
+        const r = runLauncher("subagent-recall", startPayload, envWith({
+            ZMEM_DATA: SDATA, ZCODE_PLUGIN_ROOT: REPO, ZCODE_PROJECT_DIR: PROJ,
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("subagent-recall/zcode: bare additionalContext (no hookSpecificOutput)",
+            !!(obj && obj.additionalContext && !obj.hookSpecificOutput));
+    }
+
+    // --- subagent-reflect: scans the SUBAGENT's own transcript ---------------
+    // agent_transcript_path has a failed tool call; the PARENT transcript_path
+    // has NONE — proving reflect reads agent_transcript_path, not the parent.
+    const AGENT_TX = path.join(TMP, "p7-agent.jsonl");
+    fs.writeFileSync(AGENT_TX, [
+        JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+            { type: "tool_use", id: "atu1", name: "Bash", input: { command: "npm test" } }] } }),
+        JSON.stringify({ type: "user", message: { role: "user", content: [
+            { type: "tool_result", content: "Exit code 1: tests failed", is_error: true, tool_use_id: "atu1" }] },
+            toolUseResult: "Error: Exit code 1" }),
+    ].join("\n") + "\n");
+    const PARENT_TX = path.join(TMP, "p7-parent.jsonl"); // no failures
+    fs.writeFileSync(PARENT_TX, JSON.stringify({ type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }] } }) + "\n");
+
+    const stopPayload = (opts) => JSON.stringify(Object.assign({
+        session_id: "p7-sess", transcript_path: PARENT_TX, cwd: PROJ,
+        agent_id: "agent777", agent_type: "coder",
+        hook_event_name: "SubagentStop", stop_hook_active: false,
+        agent_transcript_path: AGENT_TX,
+    }, opts || {}));
+
+    // claude: subagent-reflect → SubagentStop envelope with a failure prompt
+    // sourced from agent_transcript_path.
+    {
+        const r = runLauncher("subagent-reflect", stopPayload(), envWith({
+            ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("subagent-reflect/claude: valid JSON", obj !== null, r.stdout.slice(0, 200));
+        eq("subagent-reflect/claude: hookEventName == SubagentStop",
+            obj && obj.hookSpecificOutput && obj.hookSpecificOutput.hookEventName, "SubagentStop");
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("subagent-reflect: detected the subagent's failed tool call",
+            /failed tool call/.test(ac) && /Bash/.test(ac));
+        ok("subagent-reflect: per-subagent source-ref (session+agent)",
+            /session:p7-sess:agent:agent777/.test(ac));
+    }
+
+    // loop guard: stop_hook_active true → {} (never contribute to a subagent stop loop).
+    {
+        const r = runLauncher("subagent-reflect", stopPayload({ stop_hook_active: true }),
+            envWith({ ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+        eq("subagent-reflect: loop guard emits {}", r.stdout.trim(), "{}");
+    }
+
+    // no agent_transcript_path → {} (never fall back to the parent transcript).
+    {
+        const r = runLauncher("subagent-reflect",
+            stopPayload({ agent_transcript_path: undefined }),
+            envWith({ ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+        eq("subagent-reflect: no agent transcript → {}", r.stdout.trim(), "{}");
+    }
+
+    // per-subagent dedup: seed a lesson for agent777, re-fire → {} for agent777,
+    // but a sibling agent999 (same session, own transcript) still reflects.
+    {
+        const NS2 = resolveNs(PROJ);
+        execFileSync(PYTHON, [STORE_PY, "add", "--namespace", NS2, "--type", "lesson",
+            "--content", "captured for agent777", "--source-ref", "session:p7-sess:agent:agent777"],
+            { env: envWith({ ZMEM_DATA: SDATA }), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+        const r1 = runLauncher("subagent-reflect", stopPayload(), envWith({
+            ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+        eq("subagent-reflect: dedup suppresses re-reflection for same agent", r1.stdout.trim(), "{}");
+
+        const siblingTx = path.join(TMP, "p7-agent999.jsonl");
+        fs.copyFileSync(AGENT_TX, siblingTx);
+        const r2 = runLauncher("subagent-reflect",
+            stopPayload({ agent_id: "agent999", agent_transcript_path: siblingTx }),
+            envWith({ ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+        let obj = null; try { obj = JSON.parse(r2.stdout.trim()); } catch (e) { /* */ }
+        ok("subagent-reflect: sibling agent still reflects (per-subagent dedup)",
+            !!(obj && obj.hookSpecificOutput &&
+                /session:p7-sess:agent:agent999/.test(obj.hookSpecificOutput.additionalContext || "")));
+    }
+}
+
+console.log("\n[10] Phase 7 unit: buildCanonicalEnv exports agent transcript + id");
+
+{
+    const meta = {
+        session_id: "u-sess", cwd: "C:\\proj",
+        transcript_path: "C:\\parent.jsonl",
+        agent_transcript_path: "C:\\subagents\\agent-x.jsonl",
+        agent_type: "reviewer", agent_id: "agentXYZ",
+    };
+    const saved = process.env.CLAUDE_PLUGIN_ROOT;
+    process.env.CLAUDE_PLUGIN_ROOT = REPO;
+    const env = launch.buildCanonicalEnv("claude", meta);
+    if (saved === undefined) delete process.env.CLAUDE_PLUGIN_ROOT; else process.env.CLAUDE_PLUGIN_ROOT = saved;
+    eq("buildCanonicalEnv: ZMEM_AGENT_TRANSCRIPT from agent_transcript_path",
+        env.ZMEM_AGENT_TRANSCRIPT, "C:\\subagents\\agent-x.jsonl");
+    eq("buildCanonicalEnv: ZMEM_TRANSCRIPT stays the parent transcript",
+        env.ZMEM_TRANSCRIPT, "C:\\parent.jsonl");
+    eq("buildCanonicalEnv: ZMEM_AGENT_ID from agent_id", env.ZMEM_AGENT_ID, "agentXYZ");
+    eq("buildCanonicalEnv: ZMEM_AGENT_TYPE from agent_type", env.ZMEM_AGENT_TYPE, "reviewer");
+}
+
+// TRANSLATED_HOOKS + EVENT_MAP wiring (unit).
+{
+    ok("TRANSLATED_HOOKS includes subagent-recall", launch.TRANSLATED_HOOKS.has("subagent-recall"));
+    ok("TRANSLATED_HOOKS includes subagent-reflect", launch.TRANSLATED_HOOKS.has("subagent-reflect"));
+    eq("EVENT_MAP subagent-recall → SubagentStart", launch.EVENT_MAP["subagent-recall"], "SubagentStart");
+    eq("EVENT_MAP subagent-reflect → SubagentStop", launch.EVENT_MAP["subagent-reflect"], "SubagentStop");
 }
 
 // --- cleanup + report ------------------------------------------------------

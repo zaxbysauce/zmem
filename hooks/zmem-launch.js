@@ -47,11 +47,19 @@ const { homedir } = require("os");
 // (confirmed empirically, CC 2.1.218); on ZCode it stays bare. reflect relies on
 // the encoded-budget clamp here for its (potentially large, fenced) failure
 // block.
+// subagent-recall (SubagentStart) and subagent-reflect (SubagentStop) both
+// inject additionalContext. Empirically confirmed (CC 2.1.218): CC honors
+// hookSpecificOutput.additionalContext on BOTH events — SubagentStart injects
+// into the fresh subagent's context (cannot block startup); SubagentStop
+// re-loops the subagent turn (flipping stop_hook_active, which the reflect loop
+// guard keys on). Both therefore get envelope translation + the encoded budget.
 const TRANSLATED_HOOKS = new Set([
     "session-start",
     "recall",
     "reflect",
     "capture-failure",
+    "subagent-recall",
+    "subagent-reflect",
 ]);
 
 // Hook-name → Claude Code hookEventName (for the {hookSpecificOutput} rewrap).
@@ -123,6 +131,16 @@ function buildCanonicalEnv(host, meta) {
         process.env.CLAUDE_SESSION_ID || (meta && meta.session_id) || "";
     const transcript = (meta && meta.transcript_path) || "";
     const agentType = (meta && meta.agent_type) || "";
+    // SubagentStop carries the SUBAGENT's own transcript separately in
+    // agent_transcript_path (…/subagents/agent-<id>.jsonl). The top-level
+    // transcript_path on that event is the PARENT session's transcript, which
+    // does NOT contain the subagent's internal failed tool calls (the subagent
+    // shows up there as one opaque Task result). Failure detection for a
+    // subagent must scan agent_transcript_path — confirmed empirically CC
+    // 2.1.218 (Phase 7 discovery). agent_id disambiguates sibling subagents that
+    // share one session_id, so lesson-dedup can be per-subagent, not per-session.
+    const agentTranscript = (meta && meta.agent_transcript_path) || "";
+    const agentId = (meta && meta.agent_id) || "";
 
     // ZMEM_DATA: existing env / userConfig wins; else the box-wide default
     // ~/.zmem (== C:\Users\Brett\.zmem on this box). Exporting this is the
@@ -143,7 +161,9 @@ function buildCanonicalEnv(host, meta) {
     env.ZMEM_PROJECT = project;
     env.ZMEM_SESSION = session;
     env.ZMEM_TRANSCRIPT = transcript;
+    env.ZMEM_AGENT_TRANSCRIPT = agentTranscript;
     env.ZMEM_AGENT_TYPE = agentType;
+    env.ZMEM_AGENT_ID = agentId;
     env.ZMEM_NAMESPACE = resolveNamespace(project);
     env.ZMEM_SKILLS_DIRS = skillsDirs;
     env.ZMEM_TIER0 = tier0;

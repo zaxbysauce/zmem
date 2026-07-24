@@ -761,8 +761,15 @@ def recall_memory(
     as_json: bool = False,
     min_confidence: float | None = None,
     hybrid: bool = False,
+    no_bump: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
+
+    When ``no_bump`` is True the retrieval_count / last_retrieved telemetry write
+    is suppressed, making recall READ-ONLY. Hook-driven recall (UserPromptSubmit,
+    SubagentStart) passes this so heavy subagent fan-out does not turn every
+    delegated agent into a concurrent writer on the shared store (PLAN.md §5).
+    Explicit skill-invoked recall keeps the default (bumps).
 
     Candidates are fetched via FTS5 BM25, then re-ranked by a composite score
     that incorporates BM25 relevance, confidence, recency decay, and retrieval
@@ -889,7 +896,7 @@ def recall_memory(
     scored.sort(key=lambda x: x[0], reverse=True)
     results = [item[1] for item in scored[:limit]]
 
-    if results:
+    if results and not no_bump:
         ids = [r["id"] for r in results]
         placeholders = ",".join("?" * len(ids))
         conn.execute(
@@ -920,8 +927,14 @@ def recent_memory(
     limit: int = 5,
     min_confidence: float = 0.5,
     as_json: bool = False,
+    no_bump: bool = False,
 ) -> list[dict]:
-    """Cheap admin pull of the most recent live memories (no FTS scoring)."""
+    """Cheap admin pull of the most recent live memories (no FTS scoring).
+
+    When ``no_bump`` is True the retrieval_count / last_retrieved telemetry write
+    is suppressed (READ-ONLY). Hook-driven subagent recall passes this so a
+    dispatch fan-out does not make every subagent a concurrent writer on the
+    shared store (PLAN.md §5)."""
     params: list = [min_confidence]
     ns_clause = ""
     if namespace:
@@ -959,7 +972,7 @@ def recent_memory(
             "stale": bool(stale_note),
             "_stale_note": stale_note,
         })
-    if results:
+    if results and not no_bump:
         ids = [r["id"] for r in results]
         placeholders = ",".join("?" * len(ids))
         conn.execute(
@@ -1603,12 +1616,19 @@ def main():
     p_recall.add_argument("--json", action="store_true")
     p_recall.add_argument("--hybrid", action="store_true",
                           help="use hybrid BM25+vector recall (requires onnxruntime)")
+    p_recall.add_argument("--no-bump", action="store_true",
+                          help="suppress the retrieval_count/last_retrieved write "
+                               "(READ-ONLY recall; used by hook-driven recall so "
+                               "subagent fan-out does not create N concurrent writers)")
 
     p_recent = sub.add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
     p_recent.add_argument("--limit", type=int, default=5)
     p_recent.add_argument("--min-confidence", type=float, default=0.5)
     p_recent.add_argument("--json", action="store_true")
+    p_recent.add_argument("--no-bump", action="store_true",
+                          help="suppress the retrieval_count/last_retrieved write "
+                               "(READ-ONLY; used by hook-driven subagent recall)")
 
     p_search = sub.add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
@@ -1690,10 +1710,12 @@ def main():
         )
     elif args.cmd == "recall":
         recall_memory(conn, query=args.query, namespace=args.namespace,
-                      limit=args.limit, as_json=args.json, hybrid=args.hybrid)
+                      limit=args.limit, as_json=args.json, hybrid=args.hybrid,
+                      no_bump=args.no_bump)
     elif args.cmd == "recent":
         recent_memory(conn, namespace=args.namespace, limit=args.limit,
-                      min_confidence=args.min_confidence, as_json=args.json)
+                      min_confidence=args.min_confidence, as_json=args.json,
+                      no_bump=args.no_bump)
     elif args.cmd == "search":
         recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
                       as_json=False, min_confidence=0.0)
