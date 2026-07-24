@@ -138,30 +138,73 @@ def _drive_type_is_remote(path_str: str) -> bool | None:
         return None
 
 
+def _guard_forms(path: Path) -> list[str]:
+    """Normalized forms of `path` that assert_local_fs must inspect: the literal
+    path AND, when obtainable, the symlink/junction-resolved path.
+
+    Both, not just the resolved one, deliberately:
+      * A symlink or NTFS junction pointing into OneDrive or a share would
+        otherwise sail through the guard — os.path.abspath (what _norm uses)
+        normalizes `..` and casing but does NOT follow links, so the literal
+        form of `C:\\local\\link` looks perfectly local. Resolving catches it.
+      * The literal form still has to be checked because Path.resolve() is
+        non-strict for paths that don't exist yet (the normal case for a store
+        we are about to create) and simply hands the input back — and because
+        keeping it means a bad literal path is rejected even when resolution
+        is unavailable.
+
+    A .resolve() failure is SWALLOWED (we fall back to the literal form) rather
+    than propagated. Resolution can fail for reasons that have nothing to do
+    with the two floor cases this guard exists for — an ACL we cannot traverse,
+    a link whose target we lack permission to stat. The function's contract is
+    "conservative, but never hard-fail on a valid local path that merely can't
+    be stat'ed": failing closed here would wedge ordinary local stores on
+    restricted boxes, which is strictly worse than losing the ability to see
+    through a link we are not allowed to follow. The literal-form checks below
+    still run in that case.
+    """
+    forms = [_norm(path)]
+    try:
+        resolved = _norm(Path(path).resolve())
+    except Exception:
+        return forms
+    if resolved not in forms:
+        forms.append(resolved)
+    return forms
+
+
 def assert_local_fs(path: Path) -> None:
     """Refuse a store location that risks WAL corruption or unwanted sync:
     UNC/network paths, and paths under the OneDrive root. Raises ValueError.
+    Symlinks/junctions are followed (see _guard_forms) so a local-looking link
+    into OneDrive or a share cannot bypass the check.
 
     Conservative by design: reject UNC + under-OneDrive unconditionally;
     network-mapped-drive detection is best-effort (skipped silently if it
     can't be determined) so this never hard-fails for reasons unrelated to
     the two floor cases the tests exercise.
     """
-    norm = _norm(path)
+    forms = _guard_forms(path)
 
-    if _is_unc(norm):
-        raise ValueError(f"zmem: refusing UNC/network store path: {path}")
+    for norm in forms:
+        if _is_unc(norm):
+            raise ValueError(f"zmem: refusing UNC/network store path: {path}")
 
     onedrive = _env("OneDrive") or _env("OneDriveConsumer") or _env("OneDriveCommercial")
     if onedrive:
-        if _is_under(norm, _norm(Path(onedrive))):
-            raise ValueError(
-                f"zmem: refusing store path under OneDrive root ({onedrive}): {path}"
-            )
+        # Resolve the ROOT too: a temp/8.3-short-name or symlinked OneDrive root
+        # would otherwise fail to prefix-match an already-resolved candidate.
+        roots = _guard_forms(Path(onedrive))
+        for norm in forms:
+            for root in roots:
+                if _is_under(norm, root):
+                    raise ValueError(
+                        f"zmem: refusing store path under OneDrive root ({onedrive}): {path}"
+                    )
 
-    is_remote = _drive_type_is_remote(norm)
-    if is_remote:
-        raise ValueError(f"zmem: refusing store path on a network-mapped drive: {path}")
+    for norm in forms:
+        if _drive_type_is_remote(norm):
+            raise ValueError(f"zmem: refusing store path on a network-mapped drive: {path}")
 
 
 def set_owner_only_perms(path: Path) -> None:
@@ -180,8 +223,19 @@ def set_owner_only_perms(path: Path) -> None:
     of core.md failed with PermissionError(13) — silently dropping Tier 0 from
     every session after the first on a fresh install. Directories get
     `(OI)(CI)` (object-inherit, container-inherit) so new children inherit
-    read/write; plain files keep the original bare grant."""
+    read/write; plain files keep the original bare grant.
+
+    On non-Windows the equivalent is a plain chmod: 0o700 for directories
+    (owner rwx, nothing for group/other) and 0o600 for files. Without it the
+    store — which holds box-wide plaintext memory — was left at the process
+    umask default and typically group/world-readable on Linux/Mac. The
+    platform branch is checked BEFORE the USERNAME/USER lookup because chmod
+    needs no username, and a POSIX environment with USER unset (containers,
+    some CI) would otherwise skip hardening entirely."""
     try:
+        if os.name != "nt":
+            os.chmod(path, 0o700 if path.is_dir() else 0o600)
+            return
         user = os.environ.get("USERNAME") or os.environ.get("USER")
         if not user:
             return
@@ -471,17 +525,28 @@ def _rename_noreplace(src: str, dst: str) -> bool:
 
 def _try_create_lock(p: Path, token: str) -> bool | None:
     """True = created (we own it); False = already exists; None = unexpected
-    OSError (caller should proceed unlocked)."""
+    OSError (caller should proceed unlocked).
+
+    A failed token write is NOT swallowed into a success. The lock's existence
+    is the lock, but its CONTENT is the owner's identity: release_lock compares
+    the file's bytes to the caller's token, so a lock file created empty (write
+    failed) can never be matched and never be released — it would sit there
+    orphaning the lock until the stale timeout (minutes) elapsed, while its
+    "owner" believed it held a releasable lock. Better to unlink the broken
+    file and return None, which the rest of this module already means as
+    "unexpected OSError -> caller proceeds unlocked".
+    """
     try:
         fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         return False
     except OSError:
         return None
+    write_failed = False
     try:
         os.write(fd, token.encode("utf-8"))
     except OSError:
-        pass
+        write_failed = True
     finally:
         # Close immediately — the lock is the file's existence, not an open
         # handle. Holding it open would block a stale-break unlink on Windows.
@@ -489,6 +554,13 @@ def _try_create_lock(p: Path, token: str) -> bool | None:
             os.close(fd)
         except OSError:
             pass
+    if write_failed:
+        # Unlink AFTER the fd is closed: Windows refuses to delete an open file.
+        try:
+            os.unlink(str(p))
+        except OSError:
+            pass
+        return None
     return True
 
 
@@ -496,7 +568,31 @@ def release_lock(path: str | Path, token: str | None) -> None:
     """Release a lock previously taken with acquire_lock(). Only unlinks the
     file if it still carries OUR token, so a lock that was broken as stale and
     re-taken by someone else is never deleted out from under its new owner.
-    No-op for the unlocked-degraded token. Never raises."""
+    No-op for the unlocked-degraded token. Never raises.
+
+    Why the unlink is not a plain unlink (the TOCTOU this closes): read-then-
+    unlink checks identity at the READ and deletes at the PATH. Between the two
+    syscalls our lock can be broken as stale (possible whenever a releaser is
+    running later than its own stale timeout while genuinely still working) and
+    a brand-new lock installed at the same path by another process — and the
+    unlink would then delete that stranger's LIVE lock. This is precisely the
+    class of bug _break_stale_lock was rebuilt to avoid; the same rename-then-
+    confirm-identity pattern is applied here, just from the release path.
+
+    Divergence from _break_stale_lock, deliberate: no st_mtime_ns is captured
+    before the rename. There, identity had to be inferred from a stat because
+    the token belonged to somebody else; here we hold the exact token, so
+    comparing the moved-aside file's CONTENT to it is a strictly stronger
+    identity witness than mtime.
+
+    The pre-read is also deliberate and is NOT the check being relied on: if it
+    already shows a different token, our lock was broken long ago and release is
+    a pure no-op, so we return without renaming anything. Renaming
+    unconditionally would move a stranger's live lock aside on every such
+    release, opening (on the common path) the very momentarily-empty-path window
+    the module comment above flags as the residual risk. The rename only ever
+    happens when we still appear to be the owner.
+    """
     if not token or token == _NO_LOCK_TOKEN:
         return
     p = Path(path)
@@ -505,11 +601,38 @@ def release_lock(path: str | Path, token: str | None) -> None:
     except OSError:
         return
     if content != token:
-        return
+        return  # already broken and re-taken by someone else — nothing to do
+
+    aside = p.with_name(p.name + f".release.{uuid.uuid4().hex}")
     try:
-        os.unlink(str(p))
+        os.rename(str(p), str(aside))
     except OSError:
-        pass
+        # Already gone, or a sharing violation — someone else is handling it.
+        return
+
+    try:
+        moved = Path(aside).read_text(encoding="utf-8").strip()
+    except OSError:
+        moved = None  # cannot confirm identity => treat as not ours
+
+    if moved == token:
+        try:
+            os.unlink(str(aside))
+        except OSError:
+            pass
+        return
+
+    # We moved a lock that is not ours: ours had already been broken as stale
+    # and this is its live successor. Put it back exactly as _break_stale_lock
+    # does (rename preserves mtime and the owner's token, so its owner's own
+    # release still works).
+    if not _rename_noreplace(str(aside), str(p)):
+        # A third process took the free path in that window. Do not clobber it;
+        # drop the file we should never have moved.
+        try:
+            os.unlink(str(aside))
+        except OSError:
+            pass
 
 
 def busy_retry(fn, attempts: int = 5):

@@ -770,6 +770,205 @@ class StaleBreakRaceTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# single-flight lock — a lock file whose token write failed
+# ---------------------------------------------------------------------------
+# The lock's EXISTENCE is the lock, but its CONTENT is the owner's identity.
+# A create that succeeds while the token write fails leaves an EMPTY lock file
+# that no release_lock token-compare can ever match — the "owner" holds a lock
+# it can never release, and the path stays guarded until the (minutes-long)
+# stale timeout elapses. _try_create_lock must instead drop the broken file and
+# report the unexpected-OSError outcome (None => caller proceeds unlocked).
+class LockTokenWriteFailureTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-lockwrite-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.lock = Path(self.tmp) / ".zmem-write.lock"
+        self.real_write = os.write
+        self.addCleanup(setattr, os, "write", self.real_write)
+
+    def test_failed_token_write_returns_none_and_leaves_no_lock(self):
+        def boom(fd, data, *a, **kw):
+            raise OSError(28, "No space left on device")
+
+        os.write = boom
+        try:
+            result = host._try_create_lock(self.lock, "tok")
+        finally:
+            os.write = self.real_write
+
+        self.assertIsNone(result, "a failed token write must not report success")
+        self.assertFalse(self.lock.exists(),
+                         "an empty, unreleasable lock file must not be left behind")
+
+    def test_acquire_degrades_to_unlocked_when_the_token_write_fails(self):
+        def boom(fd, data, *a, **kw):
+            raise OSError(28, "No space left on device")
+
+        os.write = boom
+        try:
+            tok = host.acquire_lock(self.lock, 600)
+        finally:
+            os.write = self.real_write
+
+        self.assertEqual(tok, "unlocked",
+                         "caller must degrade to running unlocked, not hold a "
+                         "token it can never release")
+        self.assertFalse(self.lock.exists())
+
+    def test_normal_create_still_writes_the_token(self):
+        self.assertIs(host._try_create_lock(self.lock, "tok"), True)
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(), "tok")
+
+
+# ---------------------------------------------------------------------------
+# single-flight lock — release racing a stale break (regression)
+# ---------------------------------------------------------------------------
+# release_lock used to read the file's content, compare it to the caller's
+# token, and then unlink THE PATH in a separate, later syscall. Between the two,
+# our lock can be judged stale and broken (possible whenever a releaser runs
+# past its own stale timeout while genuinely still working) and a fresh, LIVE
+# lock installed at the same path by another process — which the unlink then
+# destroyed. Same class of bug as the acquire-path double-break, so the same
+# rename-then-confirm-identity pattern applies, with the token itself as the
+# identity witness (strictly stronger than _break_stale_lock's mtime).
+class ReleaseBreakRaceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-relrace-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.lock = Path(self.tmp) / ".zmem-rel.lock"
+        self.real_rename = os.rename
+        self.addCleanup(setattr, os, "rename", self.real_rename)
+
+    def _residue(self) -> list:
+        return sorted(p.name for p in Path(self.tmp).iterdir()
+                      if ".stale." in p.name or ".release." in p.name)
+
+    def test_release_never_deletes_a_live_lock_installed_after_our_check(self):
+        """Our lock is broken as stale and replaced by another process's LIVE
+        lock in the window between release_lock's identity check and its
+        unlink. The stranger's lock must survive, untouched."""
+        tok = host.acquire_lock(self.lock, 600)
+        self.assertIsNotNone(tok)
+        swapped = {"done": False}
+        real_rename = self.real_rename
+
+        def instrumented(src, dst, *a, **kw):
+            if not swapped["done"] and str(src) == str(self.lock):
+                swapped["done"] = True
+                # Another process judged our lock stale, broke it, and took it.
+                os.unlink(str(self.lock))
+                self.lock.write_text("other-holder-token", encoding="utf-8")
+            return real_rename(src, dst, *a, **kw)
+
+        os.rename = instrumented
+        try:
+            host.release_lock(self.lock, tok)
+        finally:
+            os.rename = real_rename
+
+        self.assertTrue(swapped["done"], "the release never renamed anything")
+        self.assertTrue(self.lock.exists(),
+                        "THE OTHER PROCESS'S LIVE LOCK WAS DELETED by a stale "
+                        "releaser's unlink")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(),
+                         "other-holder-token")
+        self.assertEqual(self._residue(), [], "aside copy left behind")
+
+    def test_release_of_an_already_broken_lock_moves_nothing(self):
+        """The common already-broken case must stay a pure read-only no-op: no
+        rename at all, so it never opens a momentarily-empty-path window on
+        somebody else's live lock."""
+        tok = host.acquire_lock(self.lock, 600)
+        old = time.time() - 7200
+        os.utime(self.lock, (old, old))
+        tok2 = host.acquire_lock(self.lock, 600)  # breaks ours, takes it
+        self.assertIsNotNone(tok2)
+
+        renames = []
+
+        def instrumented(src, dst, *a, **kw):
+            renames.append((str(src), str(dst)))
+            return self.real_rename(src, dst, *a, **kw)
+
+        os.rename = instrumented
+        try:
+            host.release_lock(self.lock, tok)
+        finally:
+            os.rename = self.real_rename
+
+        self.assertEqual(renames, [], "a no-op release must not rename anything")
+        self.assertTrue(self.lock.exists())
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(), tok2)
+        host.release_lock(self.lock, tok2)
+        self.assertFalse(self.lock.exists())
+
+    def test_failed_put_back_drops_the_aside_copy_and_never_clobbers(self):
+        """A third process takes the free path while we are putting the
+        stranger's lock back. Its lock must win and no debris may remain."""
+        tok = host.acquire_lock(self.lock, 600)
+        real_rename, real_link = self.real_rename, os.link
+        self.addCleanup(setattr, os, "link", real_link)
+        steps = {"swapped": False, "third_party": False}
+
+        def third_party_grabs_the_free_path():
+            if not steps["third_party"]:
+                steps["third_party"] = True
+                self.lock.write_text("third-party-token", encoding="utf-8")
+
+        def instrumented_rename(src, dst, *a, **kw):
+            if not steps["swapped"] and str(src) == str(self.lock):
+                steps["swapped"] = True
+                os.unlink(str(self.lock))
+                self.lock.write_text("other-holder-token", encoding="utf-8")
+            elif ".release." in str(src):
+                third_party_grabs_the_free_path()
+            return real_rename(src, dst, *a, **kw)
+
+        def instrumented_link(src, dst, *a, **kw):
+            # _rename_noreplace's POSIX limb puts the file back with os.link.
+            if ".release." in str(src):
+                third_party_grabs_the_free_path()
+            return real_link(src, dst, *a, **kw)
+
+        os.rename = instrumented_rename
+        os.link = instrumented_link
+        try:
+            host.release_lock(self.lock, tok)
+        finally:
+            os.rename, os.link = real_rename, real_link
+
+        self.assertTrue(steps["third_party"], "put-back was never attempted")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(),
+                         "third-party-token",
+                         "the third party's lock must not be clobbered")
+        self.assertEqual(self._residue(), [], "aside copy must be dropped")
+
+    def test_ordinary_release_still_removes_our_own_lock(self):
+        tok = host.acquire_lock(self.lock, 600)
+        host.release_lock(self.lock, tok)
+        self.assertFalse(self.lock.exists())
+        self.assertEqual(self._residue(), [])
+
+    def test_release_survives_a_rename_that_fails(self):
+        """If the aside-rename itself fails (sharing violation, already gone),
+        release is a silent no-op — never raises, never falls back to a blind
+        unlink."""
+        tok = host.acquire_lock(self.lock, 600)
+
+        def boom(src, dst, *a, **kw):
+            raise OSError(13, "denied")
+
+        os.rename = boom
+        try:
+            host.release_lock(self.lock, tok)
+        finally:
+            os.rename = self.real_rename
+
+        self.assertTrue(self.lock.exists())
+        self.assertEqual(self._residue(), [])
+
+
+# ---------------------------------------------------------------------------
 # single-flight lock — CLI behavior for backup + consolidate
 # ---------------------------------------------------------------------------
 class SingleFlightCliTest(_StoreCase):
