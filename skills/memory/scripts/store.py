@@ -1941,11 +1941,22 @@ def cmd_backup(
               f"live={info['source_live']} - {info['count_note']}")
 
         # Only now — after both checks passed — is this a successful backup.
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_backup', ?)",
-            (now_iso(),),
-        )
-        _commit(conn)
+        # This is bookkeeping for `--if-due`, not part of the snapshot: the
+        # file on disk is already written and verified. A write/commit failure
+        # here must not escape as an unhandled traceback past `finally:
+        # _release_lock` and make a good backup look like a failed one. The
+        # only consequence of a missed row is that the next `--if-due` run
+        # takes an extra snapshot, which is the safe direction to fail.
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_backup', ?)",
+                (now_iso(),),
+            )
+            _commit(conn)
+        except sqlite3.Error as e:
+            print(f"[zmem] backup: WARNING - snapshot is good but recording "
+                  f"last_backup failed ({e}); the next --if-due run will take "
+                  f"another snapshot", file=sys.stderr)
 
         removed = apply_retention(backup_dir, retention)
         kept = len(list_snapshots(backup_dir))
@@ -2072,6 +2083,12 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
         except OSError as e:
             print(f"[zmem] restore FAILED: could not remove stale {sib.name}: {e}",
                   file=sys.stderr)
+            # Sidecar removal is partial at this point, so the destination may
+            # already be inconsistent — the user needs the rollback path, same
+            # as every other post-pre-restore-backup failure branch below.
+            if prerestore_path:
+                print(f"[zmem] restore: roll back with "
+                      f"`store.py restore --from {prerestore_path} --force`", file=sys.stderr)
             return 1
 
     try:
@@ -2084,6 +2101,11 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
                 print(f"[zmem] restore: copied snapshot {src_sib.name}")
     except OSError as e:
         print(f"[zmem] restore FAILED: copy failed: {e}", file=sys.stderr)
+        # The copy may have been partial, so the destination store is not
+        # trustworthy — point at the safety copy taken in step 2.
+        if prerestore_path:
+            print(f"[zmem] restore: roll back with "
+                  f"`store.py restore --from {prerestore_path} --force`", file=sys.stderr)
         return 1
 
     # --- 4. Post-copy verification on the restored destination. ---

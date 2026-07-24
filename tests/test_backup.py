@@ -26,6 +26,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -539,6 +540,233 @@ class LockPrimitiveTest(unittest.TestCase):
         host.release_lock(self.lock, "unlocked")
         self.assertTrue(self.lock.exists())
         host.release_lock(self.lock, t)
+
+
+# ---------------------------------------------------------------------------
+# single-flight lock — the stale-break DOUBLE-BREAK race (regression)
+# ---------------------------------------------------------------------------
+# os.rename(path, victim) moves WHATEVER FILE IS AT `path` when the rename
+# runs — it is not bound to the file instance the caller stat'ed and judged
+# stale. Before the fix, two processes that both saw one stale lock could
+# therefore both "break" it: the second one's rename landed on the FIRST one's
+# freshly created, live lock, and both then believed they held the lock. Worse,
+# the first one's release_lock (a token-compare against a file that no longer
+# exists) silently no-opped, so once the second released, the path was left
+# with no lock at all while the first was still running.
+#
+# These tests pin the instance-identity check that closes it. They drive
+# host.acquire_lock directly and instrument os.rename to force the exact
+# interleaving; every barrier wait is bounded so a regression fails the test
+# instead of hanging the suite.
+class StaleBreakRaceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-lockrace-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.lock = Path(self.tmp) / ".zmem-race.lock"
+        self.real_rename = os.rename
+        self.real_link = os.link
+        self.addCleanup(setattr, os, "rename", self.real_rename)
+        self.addCleanup(setattr, os, "link", self.real_link)
+
+    def _plant_stale_lock(self, token: str = "crashed-holder-token") -> int:
+        """A lockfile left behind by a crashed holder. Returns its st_mtime_ns."""
+        self.lock.write_text(token, encoding="utf-8")
+        old = time.time() - 7200  # far past the 600s stale timeout used below
+        os.utime(self.lock, (old, old))
+        return self.lock.stat().st_mtime_ns
+
+    def _residue(self) -> list:
+        return sorted(p.name for p in Path(self.tmp).glob("*.stale.*"))
+
+    # -- the reviewer's race, with a real second thread --------------------
+    def test_two_breakers_of_one_stale_lock_cannot_both_hold(self):
+        """A and B both judge the SAME stale instance breakable. A wins and
+        installs a fresh lock; B's rename then lands on A's live lock. Only A
+        may end up holding, and A's lock must survive intact."""
+        self._plant_stale_lock()
+
+        b_at_rename = threading.Event()   # B has stat'ed the stale lock
+        a_installed = threading.Event()   # A has broken it and taken the lock
+        state = {"barrier_used": False}
+        real_rename = self.real_rename
+
+        def instrumented(src, dst, *a, **kw):
+            # Deschedule ONLY B's steal-rename (src == the lock path). The
+            # put-back rename has src == the victim, so the barrier cannot
+            # fire twice and deadlock the restore.
+            if (not state["barrier_used"]
+                    and str(src) == str(self.lock)
+                    and threading.current_thread().name == "breaker-B"):
+                state["barrier_used"] = True
+                b_at_rename.set()
+                a_installed.wait(20)
+            return real_rename(src, dst, *a, **kw)
+
+        results = {}
+
+        def run_b():
+            results["b"] = host.acquire_lock(self.lock, 600)
+
+        b = threading.Thread(target=run_b, name="breaker-B", daemon=True)
+        os.rename = instrumented
+        b.start()
+        self.assertTrue(b_at_rename.wait(20), "B never reached its steal-rename")
+
+        # A (this thread) breaks the same stale instance and takes the lock.
+        results["a"] = host.acquire_lock(self.lock, 600)
+        tok_a = results["a"]
+        self.assertIsNotNone(tok_a, "A should have broken the stale lock")
+        self.assertNotEqual(tok_a, "unlocked", "A should hold a real lock")
+        a_mtime_ns = self.lock.stat().st_mtime_ns
+
+        a_installed.set()
+        b.join(20)
+        self.assertFalse(b.is_alive(), "breaker thread B hung")
+
+        tok_b = results.get("b")
+        self.assertIsNone(
+            tok_b,
+            "BOTH PROCESSES HOLD THE LOCK: the second breaker's rename moved "
+            "the first breaker's fresh live lock and it acquired anyway",
+        )
+        # A's lock must still be there, and be the SAME file instance — not a
+        # lookalike re-created by B.
+        self.assertTrue(self.lock.exists(), "A's live lock was destroyed")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(), tok_a)
+        self.assertEqual(self.lock.stat().st_mtime_ns, a_mtime_ns,
+                         "A's lock file was replaced rather than restored")
+        self.assertEqual(self._residue(), [], "victim file left behind")
+
+        # And A's release still works — proof its token survived the round trip.
+        host.release_lock(self.lock, tok_a)
+        self.assertFalse(self.lock.exists())
+
+    # -- same race, deterministic single-threaded form ---------------------
+    def test_breaker_restores_a_lock_it_had_no_right_to_move(self):
+        """Force the mismatch with no threads: between our stat and our rename,
+        another breaker replaces the stale lock with its own live one."""
+        self._plant_stale_lock()
+        real_rename = self.real_rename
+        swapped = {"done": False}
+
+        def instrumented(src, dst, *a, **kw):
+            if not swapped["done"] and str(src) == str(self.lock):
+                swapped["done"] = True
+                # Someone else broke the stale lock and installed a fresh one.
+                os.unlink(str(self.lock))
+                self.lock.write_text("other-holder-token", encoding="utf-8")
+            return real_rename(src, dst, *a, **kw)
+
+        os.rename = instrumented
+        try:
+            tok = host.acquire_lock(self.lock, 600)
+        finally:
+            os.rename = real_rename
+
+        self.assertIsNone(tok, "must not acquire after moving a live lock")
+        self.assertTrue(self.lock.exists(), "the live lock must be put back")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(),
+                         "other-holder-token")
+        self.assertEqual(self._residue(), [])
+
+    def test_failed_put_back_still_never_grants_the_lock(self):
+        """Three-way: our put-back rename fails because a third process took
+        the empty path in the gap. We must drop our victim copy and give up —
+        never acquire on the strength of a break we could not confirm."""
+        self._plant_stale_lock()
+        real_rename, real_link = self.real_rename, self.real_link
+        steps = {"stolen": False, "third_party": False}
+
+        def third_party_grabs_the_free_path():
+            if not steps["third_party"]:
+                steps["third_party"] = True
+                self.lock.write_text("third-party-token", encoding="utf-8")
+
+        def instrumented_rename(src, dst, *a, **kw):
+            if not steps["stolen"] and str(src) == str(self.lock):
+                steps["stolen"] = True
+                os.unlink(str(self.lock))
+                self.lock.write_text("other-holder-token", encoding="utf-8")
+            elif ".stale." in str(src):
+                third_party_grabs_the_free_path()
+            return real_rename(src, dst, *a, **kw)
+
+        def instrumented_link(src, dst, *a, **kw):
+            # _rename_noreplace's POSIX limb puts the lock back with os.link,
+            # not os.rename, so the injection has to hook both to reach the
+            # put-back on every platform CI runs.
+            if ".stale." in str(src):
+                third_party_grabs_the_free_path()
+            return real_link(src, dst, *a, **kw)
+
+        os.rename = instrumented_rename
+        os.link = instrumented_link
+        try:
+            tok = host.acquire_lock(self.lock, 600)
+        finally:
+            os.rename, os.link = real_rename, real_link
+
+        self.assertTrue(steps["third_party"], "put-back was never attempted")
+        self.assertIsNone(tok, "must not acquire when the put-back failed")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(),
+                         "third-party-token",
+                         "the third party's lock must not be clobbered")
+        self.assertEqual(self._residue(), [], "victim copy must be dropped")
+
+    def test_single_breaker_of_a_genuinely_stale_lock_still_wins(self):
+        """The identity check must not break the ordinary crashed-holder path."""
+        self._plant_stale_lock()
+        tok = host.acquire_lock(self.lock, 600)
+        self.assertIsNotNone(tok)
+        self.assertNotEqual(tok, "unlocked")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(), tok)
+        self.assertEqual(self._residue(), [])
+        host.release_lock(self.lock, tok)
+        self.assertFalse(self.lock.exists())
+
+    def test_many_concurrent_breakers_yield_exactly_one_holder(self):
+        """Unsynchronized stress form of the same race."""
+        self._plant_stale_lock()
+        results = []
+        lock = threading.Lock()
+        start = threading.Barrier(8)
+
+        def worker():
+            start.wait(20)
+            t = host.acquire_lock(self.lock, 600)
+            with lock:
+                results.append(t)
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+            self.assertFalse(t.is_alive(), "a breaker thread hung")
+
+        winners = [t for t in results if t is not None and t != "unlocked"]
+        self.assertEqual(len(winners), 1,
+                         f"exactly one breaker may win, got {len(winners)}")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(), winners[0])
+        self.assertEqual(self._residue(), [])
+
+    # -- the no-clobber rename helper's contract ---------------------------
+    def test_rename_noreplace_refuses_an_existing_destination(self):
+        """os.rename silently REPLACES dst on POSIX; the put-back path must
+        never do that to a third party's live lock. CI runs ubuntu-latest, so
+        this contract is exercised on both platforms."""
+        src = Path(self.tmp) / "src.tmp"
+        dst = Path(self.tmp) / "dst.tmp"
+        src.write_text("src", encoding="utf-8")
+        dst.write_text("dst", encoding="utf-8")
+        self.assertFalse(host._rename_noreplace(str(src), str(dst)))
+        self.assertEqual(dst.read_text(encoding="utf-8"), "dst")
+        self.assertTrue(src.exists(), "src must survive a refused rename")
+
+        dst.unlink()
+        self.assertTrue(host._rename_noreplace(str(src), str(dst)))
+        self.assertEqual(dst.read_text(encoding="utf-8"), "src")
+        self.assertFalse(src.exists(), "src must be gone after a real rename")
 
 
 # ---------------------------------------------------------------------------

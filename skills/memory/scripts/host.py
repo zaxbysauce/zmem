@@ -294,13 +294,26 @@ def resolve_namespace(project_dir: str | Path) -> str:
 #     unrelated to contention (no permission, read-only fs), acquisition
 #     returns a token anyway and the caller proceeds UNLOCKED. Memory hygiene
 #     must not be wedged by a lockfile problem.
-#   * STALE RECOVERY IS SINGLE-WINNER — a crashed/killed holder leaves its
+#   * STALE RECOVERY IS INSTANCE-BOUND — a crashed/killed holder leaves its
 #     lockfile behind forever. Any process that sees an over-age lock breaks
-#     it, but the break is claimed by atomically RENAMING the stale file to a
-#     unique name: only one process can rename a given existing file, so two
-#     processes that simultaneously judge the lock stale cannot both break-and-
-#     recreate it (the naive delete-then-create has exactly that race, and the
-#     loser's fresh lock gets deleted out from under it by the winner).
+#     it, but the break only counts if the file it actually removed IS the
+#     over-age file it inspected. See _break_stale_lock() for why "rename it to
+#     a unique name" is NOT by itself enough: rename moves whatever file sits
+#     at the path when it runs, so two processes that judged one lock stale
+#     could both break it, the second landing on the first one's fresh live
+#     lock. Identity is re-confirmed (st_mtime_ns) after the rename, and a
+#     mismatch is undone.
+#
+# Residual, stated honestly because the previous version of this comment
+# overclaimed: two processes that judge the SAME lock instance stale can no
+# longer both end up holding — the loser detects that it moved a different
+# instance and puts it back untouched. But between that mistaken breaker's
+# rename-out and its rename-back the path is momentarily empty, so a third
+# process acquiring inside that window can still coexist with the rightful
+# holder. There is no portable atomic compare-and-delete to close it, and every
+# scheme that would (e.g. an O_EXCL "break claim" file) can wedge the lock
+# permanently if its owner dies mid-break — strictly worse than the floor
+# below, given this API's fail-open contract.
 #
 # Honest caveat: an mtime lease cannot distinguish "crashed" from "slower than
 # the timeout". A live holder that runs longer than its stale timeout WILL have
@@ -334,33 +347,126 @@ def acquire_lock(path: str | Path, stale_seconds: float) -> str | None:
 
     # Someone holds it. Is that holder stale?
     try:
-        age = time.time() - p.stat().st_mtime
+        st = p.stat()
     except FileNotFoundError:
         # Released between our create attempt and the stat — one more try.
         return token if _try_create_lock(p, token) is True else None
     except OSError:
         return None
 
-    if age <= stale_seconds:
+    if (time.time() - st.st_mtime) <= stale_seconds:
         return None  # live holder — skip cleanly
 
-    # Stale. Claim the right to break it by renaming it to a unique name:
-    # exactly one process can rename a given existing file, so simultaneous
-    # breakers cannot both proceed. Losing the rename (FileNotFoundError, or a
-    # Windows sharing violation) means someone else is handling it — skip.
-    victim = p.with_name(p.name + f".stale.{uuid.uuid4().hex}")
-    try:
-        os.rename(str(p), str(victim))
-    except OSError:
+    # Stale. The break must remove THIS file instance, not merely "whatever is
+    # at the path" — see _break_stale_lock. A refused break means skip.
+    if not _break_stale_lock(p, st.st_mtime_ns):
         return None
-    try:
-        os.unlink(str(victim))
-    except OSError:
-        pass
 
     # The break winner still has to win a normal acquisition: a third process
     # may legitimately have created a fresh lock in the gap. If so, skip.
     return token if _try_create_lock(p, token) is True else None
+
+
+def _break_stale_lock(p: Path, stale_mtime_ns: int) -> bool:
+    """Remove the lock file at `p` ONLY IF the file actually sitting there is
+    the same instance the caller stat'ed and judged stale. True => the stale
+    instance is gone and the caller may try to take the lock; False => it was
+    not removed (or we could not prove it was the right one) and the caller
+    must skip. Never raises.
+
+    Why the identity re-check is load-bearing (the bug this replaces): renaming
+    the lock aside was treated as an atomic claim on the break, on the theory
+    that only one process can rename a given existing file. That is true but
+    irrelevant — os.rename operates on the PATH, and moves whatever file is
+    sitting there when it runs, which need not be the file the caller inspected
+    a moment earlier. So process A and process B could both judge one stale
+    lock breakable; A renames it away and creates a fresh lock; B's rename then
+    moves A's fresh, LIVE lock aside and B creates its own. Both then run,
+    which is exactly what the lock exists to prevent — and because A's lock
+    file no longer exists, A's release_lock token-compare silently no-ops, so
+    when B releases, the path is left completely unguarded while A is still
+    working.
+
+    The fix: treat the rename as a claim that must be CONFIRMED. st_mtime_ns of
+    the inspected instance is captured before the rename and re-checked on the
+    renamed file afterwards. Windows exposes no usable inode and no atomic
+    compare-and-delete, so mtime_ns is the identifying attribute available
+    here; it is sufficient because a replacement lock is necessarily created
+    stale_seconds (minutes) after the instance it replaced, so the two can
+    never be confused. Anything other than a positive match — including a stat
+    we cannot perform at all — is treated as "not ours": the file is put back
+    exactly as it was (rename preserves both mtime and the owner's token, so
+    its owner's release_lock still works), and we decline the break.
+    """
+    victim = p.with_name(p.name + f".stale.{uuid.uuid4().hex}")
+    try:
+        os.rename(str(p), str(victim))
+    except OSError:
+        # Lost the rename (already gone, or a Windows sharing violation) —
+        # someone else is handling it.
+        return False
+
+    try:
+        moved_mtime_ns = os.stat(str(victim)).st_mtime_ns
+    except OSError:
+        moved_mtime_ns = None  # cannot confirm identity => not ours
+
+    if moved_mtime_ns is not None and moved_mtime_ns == stale_mtime_ns:
+        try:
+            os.unlink(str(victim))
+        except OSError:
+            pass
+        return True
+
+    # Not the instance we judged stale: someone else broke it first and
+    # installed a live lock, and we just moved THAT. Put it back.
+    if not _rename_noreplace(str(victim), str(p)):
+        # A third process took the free path inside that window. Do not clobber
+        # it; drop the file we should never have moved and decline the break —
+        # we have no evidence whatsoever that the current holder is stale.
+        try:
+            os.unlink(str(victim))
+        except OSError:
+            pass
+    return False
+
+
+def _rename_noreplace(src: str, dst: str) -> bool:
+    """Rename src -> dst WITHOUT ever clobbering an existing dst. True on
+    success; False if dst already existed or the rename otherwise failed.
+
+    Needed because os.rename's semantics are platform-split: on Windows it
+    fails when dst exists (what we want), but on POSIX it SILENTLY REPLACES
+    dst — which on _break_stale_lock's put-back path would destroy the live
+    lock a third process legitimately created in the gap, re-introducing the
+    very double-hold this is fixing. os.link is atomic and raises
+    FileExistsError when dst exists on both platforms, so POSIX goes through
+    link + unlink. CI runs ubuntu-latest as well as windows-latest, so this
+    limb is exercised.
+    """
+    if os.name == "nt":
+        try:
+            os.rename(src, dst)
+            return True
+        except OSError:
+            return False
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        return False
+    except OSError:
+        # Filesystem without hard links (rare). Restoring the owner's lock
+        # matters more than the residual clobber risk of a plain rename.
+        try:
+            os.rename(src, dst)
+            return True
+        except OSError:
+            return False
+    try:
+        os.unlink(src)
+    except OSError:
+        pass
+    return True
 
 
 def _try_create_lock(p: Path, token: str) -> bool | None:
