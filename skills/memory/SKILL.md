@@ -119,6 +119,25 @@ bulk imports or if the index drifts):
 python <store.py> rebuild-fts
 ```
 
+## Sole memory system on Claude Code (replace native)
+When running under Claude Code with native memory turned off (`autoMemoryEnabled:
+false` in `~/.claude/settings.json`, or `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), ZMem
+is the **only** memory system in play — it is not layered on top of CC's own
+memory. In that mode:
+- `store.py add` / `recall` (this skill) is the canonical, sole path for
+  capturing and retrieving durable knowledge. Treat it exactly as you would
+  native memory on any other host.
+- **Do not hand-write** into CC's native `~/.claude/.../memory/` files or
+  `MEMORY.md` — that mechanism is intentionally disabled, and writing to it
+  would silently resurrect the duplicate-memory problem "replace native" exists
+  to avoid.
+- Project-level Tier 0 is `CLAUDE.md` (CC's own always-on mechanism, untouched
+  by ZMem) — not `AGENTS.md`. The SessionStart hook does not inject `AGENTS.md`
+  on Claude Code for this reason; it still does on ZCode.
+- If a SessionStart nudge appears telling you native memory still looks
+  enabled, that is informational for the user (a plugin cannot flip the
+  setting itself) — no action needed from you beyond surfacing it once.
+
 ## The reflection loop (Loop 1)
 The `zmem-reflect.sh` Stop hook checks the episodic db for failed tool calls
 (status=error or exit_code!=0 on non-read-only tools) in the current session.

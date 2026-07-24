@@ -1,14 +1,29 @@
-# ZMem — Multi-Tier Memory for ZCode
+# ZMem — Multi-Tier Memory for ZCode + Claude Code
 
-A local-first memory system for [ZCode](https://z.ai) that gives your agent
-persistent, cross-session knowledge: always-on core memory, FTS5-backed lesson
-recall, and reflection-on-failure. Zero cloud dependency.
+A local-first memory system that gives your agent persistent, cross-session
+knowledge — shared box-wide across [ZCode](https://z.ai) and Claude Code:
+always-on core memory, FTS5-backed lesson recall, and reflection-on-failure.
+Zero cloud dependency.
+
+## Box-wide shared memory
+
+ZMem is designed to be **one memory brain for the whole box**, not a separate
+copy per tool. Both ZCode and Claude Code point at the same store —
+`~/.zmem/store.sqlite` + `~/.zmem/core.md` — so a lesson captured in one tool
+is immediately recallable in the other, including inside delegated subagents.
+The host adapter (`hooks/zmem-launch.js`) detects which tool is running and
+sets a canonical env (`ZMEM_HOST`, `ZMEM_DATA`, `ZMEM_TIER0`, etc.) so the
+hook scripts and `store.py` never need to branch on host. Override the shared
+store location with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
+userConfig setting) if `~/.zmem` isn't where you want it.
 
 ## What it does
 
-- **Tier 0 — Core:** `core.md` (user-level) + `<repo>/AGENTS.md` (project-level)
-  are auto-injected into context at every session start. Stable rules and
-  conventions, always present.
+- **Tier 0 — Core:** `core.md` (user-level) is auto-injected into context at
+  every session start on both hosts. `<repo>/AGENTS.md` (project-level) is also
+  injected on ZCode; on Claude Code, project-level Tier 0 is CC's own
+  `CLAUDE.md` instead (see "Project-level memory" below), so `AGENTS.md` is
+  skipped there to avoid injecting the same tier twice.
 - **Tier 2 — Semantic:** a SQLite store (FTS5 + tombstone supersession) for
   cross-task lessons, facts, conventions, and preferences. Keyword recall with
   a confidence floor — high-precision-first (retrieved-wrong hurts more than
@@ -26,34 +41,58 @@ retrieval floor by default). This follows the finding that intrinsic self-correc
 
 ## Requirements
 
-- ZCode (the plugin registers hooks + a skill via the native plugin system)
+- ZCode and/or Claude Code (the plugin registers hooks + a skill via each
+  tool's native plugin system)
 - Python 3.8+ with sqlite3 + FTS5 (standard in CPython; verify with
   `python -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')"` )
 - Git Bash / Cygwin on Windows (for the hook scripts); or any POSIX shell on macOS/Linux
+- Node.js (the cross-platform hook launcher; both tools already require it)
 
 ## Install
 
-### From this GitHub repo (recommended)
+### ZCode — from this GitHub repo (recommended)
 
 1. In ZCode: **Settings → Plugin Management → Discover → `+`**
 2. Paste this repository's GitHub URL.
 3. Install the **zmem** plugin. It enables by default.
 4. Restart your session (or start a new one). On first start, the hook seeds a
-   default `core.md` in the plugin data dir from the template — edit it to taste.
+   default `core.md` in the shared store from the template — edit it to taste.
+
+### Claude Code — from this GitHub repo
+
+1. Add this repository as a plugin marketplace/source and install the **zmem**
+   plugin (see Claude Code's plugin docs for the current install flow).
+2. **Turn off Claude Code's native memory** by adding to your own
+   `~/.claude/settings.json`:
+   ```json
+   { "autoMemoryEnabled": false }
+   ```
+   (or set env `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`). **A plugin cannot set this
+   for you** — Claude Code only honors a plugin-bundled `settings.json`'s
+   `agent`/`subagentStatusLine` keys, not `autoMemoryEnabled` — so this is a
+   one-time manual step you do yourself. Without it, CC's native memory and
+   ZMem both inject context every session: genuine double-memory, not a
+   supported mode. If you forget, ZMem's SessionStart hook shows a one-time
+   nudge reminding you.
+3. Restart your session. `<repo>/CLAUDE.md` (CC's own always-on project memory)
+   is untouched by ZMem — it keeps working exactly as it always has.
 
 ### Local directory (for testing / air-gapped)
 
 1. Clone or copy this repo to a stable path.
-2. In ZCode: **Settings → Plugin Management → Discover → `+`** → point at the
-   local directory.
+2. In ZCode or Claude Code: point the plugin discovery/marketplace flow at the
+   local directory instead of the GitHub URL.
 3. Install + enable.
 
 ## Project-level memory
 
-ZMem injects `<repo>/AGENTS.md` if present. Copy
+On ZCode, ZMem injects `<repo>/AGENTS.md` if present — this is project-level
+Tier 0. On Claude Code, `AGENTS.md` is **not** injected by ZMem; CC already has
+its own always-on project-level memory (`CLAUDE.md`), and injecting both would
+double up the same tier. Copy
 [`templates/AGENTS.md.template`](templates/AGENTS.md.template) into each repo
-where you want project-scoped conventions, and fill it in (build commands, gotchas,
-standards). This file is repo-owned, not plugin-owned.
+where you want project-scoped conventions (ZCode only), and fill it in
+(build commands, gotchas, standards). This file is repo-owned, not plugin-owned.
 
 ## Usage
 
@@ -82,11 +121,26 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
 
 ## Where data lives
 
-- **Store + core.md:** `${ZCODE_PLUGIN_DATA}/` (per-plugin writable dir, managed
-  by ZCode). On Windows typically
-  `C:\Users\<you>\.zcode\cli\plugins\data\zmem@<marketplace>\`.
+- **Store + core.md (box-wide default):** `~/.zmem/` — one shared, tool-neutral
+  directory holding `store.sqlite` + `core.md`, read and written by both ZCode
+  and Claude Code (and their subagents). This is the box-wide model: a lesson
+  captured in either tool is recallable in the other. Override with the
+  `ZMEM_DATA` env var (or the CC plugin's `storeDirectory` userConfig option)
+  if you want it elsewhere.
+- **Legacy per-plugin data dirs** (`${ZCODE_PLUGIN_DATA}` /
+  `${CLAUDE_PLUGIN_DATA}`) still work as a fallback if `ZMEM_DATA` isn't set
+  and the plugin runner injects one, but these are per-tool and deleted on
+  uninstall — not the box-wide store.
+- **Bare/manual-install default changed:** a manual invocation of `store.py`
+  with none of the above set now resolves to `~/.zmem` (previously
+  `~/.zcode/memory`). If you have an existing store at the old path, run
+  `skills/memory/scripts/import-store.py` to copy it (checkpointed, read-only
+  on the source) into `~/.zmem` — this is the supported migration path, not a
+  manual file copy.
 - **Episodic memory (read-only):** `~/.zcode/cli/db/db.sqlite` — ZCode's own
   session/tool-call database. ZMem reads this for failure detection; never writes it.
+  On Claude Code, failure detection instead scans the session transcript
+  (`transcript_path`) — no separate db.sqlite exists there.
 
 ## Security notes
 

@@ -134,13 +134,26 @@ def set_owner_only_perms(path: Path) -> None:
     """Best-effort: restrict a file or directory to the current user (Windows
     ACL via icacls). Never raises — permission hardening is defense-in-depth,
     not a correctness requirement, and must not break the store on a box
-    without icacls (non-Windows, restricted shell, etc.)."""
+    without icacls (non-Windows, restricted shell, etc.).
+
+    BUG FIX (discovered during P6 verification): a bare `/grant:r user:F` on a
+    DIRECTORY grants rights on the directory object only — it does not carry
+    an inheritable ACE, so files created in that directory afterward (core.md,
+    a freshly-checkpointed store.sqlite, etc.) can end up with an effectively
+    empty DACL and become unreadable to the very same user moments later.
+    Reproduced on a real (non-temp) `C:\\Users\\<you>\\...` path: after the
+    first `connect()` hardens a brand-new ZMEM_DATA dir, every subsequent read
+    of core.md failed with PermissionError(13) — silently dropping Tier 0 from
+    every session after the first on a fresh install. Directories get
+    `(OI)(CI)` (object-inherit, container-inherit) so new children inherit
+    read/write; plain files keep the original bare grant."""
     try:
         user = os.environ.get("USERNAME") or os.environ.get("USER")
         if not user:
             return
+        grant = f"{user}:(OI)(CI)F" if path.is_dir() else f"{user}:F"
         subprocess.run(
-            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+            ["icacls", str(path), "/inheritance:r", "/grant:r", grant],
             capture_output=True, timeout=5, check=False,
         )
     except Exception:

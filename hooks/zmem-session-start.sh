@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
-# zmem-session-start.sh — ZCode SessionStart hook for ZMem (plugin version).
+# zmem-session-start.sh — shared SessionStart hook for ZMem (ZCode + Claude Code).
 #
-# Injects Tier 0 memory (core.md + project AGENTS.md) and a bounded recall of
-# Tier 2 semantic memories into the conversation as additionalContext at session
-# start. Non-blocking: always exits 0.
+# Injects Tier 0 memory (core.md always; project AGENTS.md unless ZMEM_TIER0=
+# native) and a bounded recall of Tier 2 semantic memories into the conversation
+# as additionalContext at session start. Non-blocking: always exits 0.
 #
-# Plugin paths: ZCODE_PLUGIN_ROOT (scripts, templates) and ZCODE_PLUGIN_DATA
-# (store.sqlite, core.md — writable per-plugin data dir) are injected by the
-# ZCode runner for plugin hooks. Falls back to ~/.zcode/memory for manual installs.
+# Tier-0 gating (P6, "replace native"): on ZCode (ZMEM_TIER0=zmem) AGENTS.md is
+# injected as project-level Tier 0, same as always. On Claude Code
+# (ZMEM_TIER0=native) AGENTS.md is skipped — CC's own project-level Tier 0 is
+# CLAUDE.md, a separate always-on mechanism this hook must not double-inject.
+# core.md (user-level Tier 0) and the Tier 2 recall still inject on both hosts.
+#
+# Native-memory nudge (Claude Code only): a one-time, read-only, best-effort
+# check of ~/.claude/settings.json for autoMemoryEnabled — nudges the user to
+# set it to false (a plugin can't set it itself) so CC's native memory and
+# ZMem don't double-run. Guarded by a marker file in ZMEM_DATA; fail-open.
+#
+# Canonical env is supplied by the host adapter (zmem-launch.js): ZMEM_HOST,
+# ZMEM_ROOT, ZMEM_DATA, ZMEM_PROJECT, ZMEM_NAMESPACE, ZMEM_TIER0,
+# ZMEM_CTX_BUDGET. Legacy ZCODE_*/CLAUDE_* vars are the back-compat fallback
+# for manual (non-launcher) invocation.
 #
 # First-run seeding: if core.md is absent in the data dir, copy from the template.
 #
@@ -110,11 +122,27 @@ if [ -n "$PLUGIN_ROOT" ] && [ ! -f "$DATA_DIR/core.md" ] && [ -f "$PLUGIN_ROOT/t
   cp "$PLUGIN_ROOT/templates/core.md.template" "$DATA_DIR/core.md" 2>/dev/null || true
 fi
 
-# Resolve project AGENTS.md.
+# Tier-0 gating (P6 — replace native): ZMEM_TIER0=native means Claude Code, and
+# CC's own project-level Tier 0 is CLAUDE.md (separate, always-on mechanism —
+# see plugins-reference.md). Injecting AGENTS.md too would double-inject
+# project-level Tier 0, exactly the duplication "replace native" exists to
+# avoid. ZCode has no CLAUDE.md equivalent, so ZMEM_TIER0=zmem keeps injecting
+# AGENTS.md as project-level Tier 0 (today's behavior, unchanged).
+TIER0="${ZMEM_TIER0:-zmem}"
+
+# Resolve project AGENTS.md (skipped entirely when TIER0=native).
 AGENTS_FILE_PY=""
-if [ -n "$PROJECT" ]; then
+if [ "$TIER0" != "native" ] && [ -n "$PROJECT" ]; then
   AGENTS_FILE_PY="$(join_path "$(to_py_path "$PROJECT")" AGENTS.md)"
 fi
+
+# Native-memory nudge (CC only): best-effort read of ~/.claude/settings.json
+# (+ settings.local.json) to see if the user has already flipped
+# autoMemoryEnabled:false. Fires at most once, guarded by a marker file in
+# ZMEM_DATA — never touches settings.json, read-only.
+HOST="${ZMEM_HOST:-zcode}"
+SETTINGS_DIR_PY="$(join_path "$(to_py_path "$HOME")" .claude)"
+NUDGE_MARKER_PY="$(join_path "$DATA_DIR_PY" .native-nudge-shown)"
 
 # Export the store location so store.py resolves it. Prefer canonical ZMEM_DATA
 # (host adapter sets this to the box-wide ~/.zmem at cutover); keep the legacy
@@ -161,6 +189,18 @@ try:
     budget = int(sys.argv[8])
 except (IndexError, ValueError):
     budget = 25000
+try:
+    host = sys.argv[9]
+except IndexError:
+    host = ""
+try:
+    settings_dir = sys.argv[10]
+except IndexError:
+    settings_dir = ""
+try:
+    nudge_marker = sys.argv[11]
+except IndexError:
+    nudge_marker = ""
 
 parts = []
 
@@ -215,6 +255,39 @@ if store_py and os.path.isfile(store_py):
     except Exception:
         pass  # fail-open: promotion check errors never block session start
 
+# Native-memory nudge (CC only, P6): one-time, best-effort, fail-open. Never
+# raises - a missing/malformed settings.json just means the nudge stays quiet.
+if host == "claude" and nudge_marker:
+    try:
+        already_shown = os.path.isfile(nudge_marker)
+        native_disabled = bool(os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"))
+        if not native_disabled and settings_dir:
+            for fname in ("settings.json", "settings.local.json"):
+                fpath = os.path.join(settings_dir, fname)
+                try:
+                    with open(fpath, encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict) and data.get("autoMemoryEnabled") is False:
+                        native_disabled = True
+                        break
+                except (OSError, ValueError):
+                    continue  # absent or malformed — treat as "not set here"
+        if not already_shown and not native_disabled:
+            parts.append(
+                "# ZMem notice (one-time): Claude Code native memory still looks "
+                "enabled. ZMem is replacing it as your sole memory system - add "
+                "\"autoMemoryEnabled\": false to ~/.claude/settings.json so the two "
+                "systems do not double-run (a plugin cannot set this for you)."
+            )
+            try:
+                os.makedirs(os.path.dirname(nudge_marker), exist_ok=True)
+                with open(nudge_marker, "w", encoding="utf-8") as f:
+                    f.write("shown\n")
+            except OSError:
+                pass  # fail-open: worst case the nudge repeats next session
+    except Exception:
+        pass  # fail-open: nudge logic never blocks session start
+
 ctx = "\n\n".join(parts) if parts else ""
 # Soft budget cap (belt-and-suspenders; the launcher enforces the hard encoded
 # budget). Trim raw content here so the payload is roughly bounded before the
@@ -222,7 +295,7 @@ ctx = "\n\n".join(parts) if parts else ""
 if budget > 0 and len(ctx) > budget:
     ctx = ctx[:budget] + "\n[recall truncated]"
 print(json.dumps({"additionalContext": ctx}) if ctx else "{}")
-' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" 2>/dev/null || echo '{}')"
+' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" 2>/dev/null || echo '{}')"
 
 # Wrap the payload in the <<<ZMEM_JSON>>>…<<<END>>> sentinel so the host adapter
 # (zmem-launch.js) can extract it even if other stdout noise is present. The

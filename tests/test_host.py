@@ -143,6 +143,44 @@ class TestLocalFsGuard(unittest.TestCase):
         host.assert_local_fs(Path(r"C:\Users\Brett\.zmem"))
 
 
+@unittest.skipUnless(sys.platform == "win32", "icacls is Windows-only")
+class TestSetOwnerOnlyPerms(unittest.TestCase):
+    """Regression test for a real bug found during P6 verification: a bare
+    `icacls DIR /inheritance:r /grant:r user:F` grants rights on the directory
+    object only (no inheritable ACE), so a file created in that directory
+    *after* hardening can end up with an effectively empty DACL and become
+    unreadable to the very same user. Reproduced on a real (non-temp)
+    C:\\Users\\<you>\\... path, not just under AppData\\Local\\Temp: on a
+    fresh ZMEM_DATA dir, every session-start after the first silently lost
+    core.md (PermissionError swallowed by the hook's fail-open error handling).
+    Directories must get (OI)(CI) so children inherit read/write."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-ownerperms-"))
+
+    def tearDown(self):
+        import shutil
+        try:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+        except Exception:
+            pass
+
+    def test_file_created_after_hardening_is_still_readable(self):
+        host.set_owner_only_perms(self.tmp)
+        # Simulate what happens next in the real flow: a file (core.md,
+        # store.sqlite) gets created in the now-hardened directory.
+        f = self.tmp / "core.md"
+        f.write_text("hello from the hardened dir\n", encoding="utf-8")
+        # Must be readable by this same process/user without raising.
+        self.assertEqual(f.read_text(encoding="utf-8"), "hello from the hardened dir\n")
+
+    def test_never_raises_on_missing_username(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("USERNAME", None)
+            os.environ.pop("USER", None)
+            host.set_owner_only_perms(self.tmp)  # must not raise
+
+
 class TestBusyRetry(unittest.TestCase):
     def test_retries_on_locked_then_succeeds(self):
         import sqlite3
