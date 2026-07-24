@@ -126,12 +126,20 @@ class TestResolveSkillsDirs(unittest.TestCase):
         self.assertEqual(dirs, [home / ".claude" / "skills", home / ".zcode" / "skills"])
 
     def test_override_via_pathsep_delimited_env(self):
-        os.environ["ZMEM_SKILLS_DIRS"] = os.pathsep.join([r"C:\a\skills", r"C:\b\skills"])
+        # NOTE: must not use literal Windows drive-letter paths (e.g. r"C:\a\skills")
+        # here: on POSIX, os.pathsep is ":" which collides with the drive-letter
+        # colon, corrupting the split. Use platform-appropriate fixture paths.
+        base = Path(tempfile.gettempdir())
+        dir_a = base / "a" / "skills"
+        dir_b = base / "b" / "skills"
+        os.environ["ZMEM_SKILLS_DIRS"] = os.pathsep.join([str(dir_a), str(dir_b)])
         dirs = host.resolve_skills_dirs()
-        self.assertEqual(dirs, [Path(r"C:\a\skills"), Path(r"C:\b\skills")])
+        self.assertEqual(dirs, [dir_a, dir_b])
 
     def test_override_dedupes_same_resolved_path(self):
-        os.environ["ZMEM_SKILLS_DIRS"] = os.pathsep.join([r"C:\a\skills", r"C:\a\skills"])
+        base = Path(tempfile.gettempdir())
+        dir_a = base / "a" / "skills"
+        os.environ["ZMEM_SKILLS_DIRS"] = os.pathsep.join([str(dir_a), str(dir_a)])
         dirs = host.resolve_skills_dirs()
         self.assertEqual(len(dirs), 1)
 
@@ -150,6 +158,7 @@ class TestLocalFsGuard(unittest.TestCase):
     def tearDown(self):
         self._patcher.stop()
 
+    @unittest.skipUnless(os.name == "nt", "UNC paths are a Windows-only concept")
     def test_rejects_unc_path(self):
         with self.assertRaises(ValueError):
             host.assert_local_fs(Path(r"\\server\share\x"))
@@ -173,6 +182,149 @@ class TestLocalFsGuard(unittest.TestCase):
         os.environ.pop("OneDriveConsumer", None)
         os.environ.pop("OneDriveCommercial", None)
         host.assert_local_fs(Path(r"C:\Users\Brett\.zmem"))
+
+
+class TestLocalFsGuardFollowsLinks(unittest.TestCase):
+    """A symlink/junction must not launder a OneDrive (or share) location into
+    a local-looking one: _norm/os.path.abspath does not follow links, so before
+    the fix a local path linking into OneDrive sailed straight through."""
+
+    def setUp(self):
+        self._patcher = mock.patch.dict(os.environ, {}, clear=False)
+        self._patcher.start()
+        for k in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+            os.environ.pop(k, None)
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-symlinkguard-"))
+
+    def tearDown(self):
+        import shutil
+        self._patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _symlink_or_skip(self, target: Path, link: Path) -> None:
+        try:
+            os.symlink(str(target), str(link), target_is_directory=True)
+            return
+        except (OSError, NotImplementedError, AttributeError) as sym_err:
+            # Unprivileged Windows without Developer Mode cannot create
+            # symlinks — but CAN create a directory JUNCTION, which is the
+            # form of this bypass most likely to exist on a real box anyway
+            # and which Path.resolve() follows identically.
+            if os.name != "nt":
+                self.skipTest(f"symlink creation unavailable: {sym_err}")
+            import subprocess
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                               capture_output=True, text=True)
+            if r.returncode != 0 or not link.exists():
+                self.skipTest(
+                    f"neither symlink ({sym_err}) nor junction ({r.stderr.strip()}) "
+                    "could be created")
+
+    def test_symlink_into_onedrive_is_rejected(self):
+        onedrive = self.tmp / "FakeOneDrive"
+        (onedrive / "zmem").mkdir(parents=True)
+        os.environ["OneDrive"] = str(onedrive)
+        link = self.tmp / "local-looking-link"
+        self._symlink_or_skip(onedrive / "zmem", link)
+        with self.assertRaises(ValueError):
+            host.assert_local_fs(link)
+
+    def test_symlink_to_a_normal_local_dir_is_accepted(self):
+        onedrive = self.tmp / "FakeOneDrive"
+        (onedrive / "zmem").mkdir(parents=True)
+        os.environ["OneDrive"] = str(onedrive)
+        plain = self.tmp / "plain-local"
+        plain.mkdir()
+        link = self.tmp / "ok-link"
+        self._symlink_or_skip(plain, link)
+        host.assert_local_fs(link)  # must not raise
+
+    def test_resolve_failure_falls_back_to_the_literal_path(self):
+        """.resolve() blowing up for an unrelated reason (an ACL we cannot
+        traverse) must not hard-fail a valid local path — and must not stop the
+        literal-form checks from running."""
+        local = self.tmp / "plain-local"
+        local.mkdir()
+        with mock.patch.object(Path, "resolve", side_effect=OSError("nope")):
+            host.assert_local_fs(local)  # no raise
+            with self.assertRaises(ValueError):
+                host.assert_local_fs(Path("//server/share/x"))
+
+
+@unittest.skipIf(os.name == "nt", "POSIX chmod path; Windows uses icacls")
+class TestSetOwnerOnlyPermsPosix(unittest.TestCase):
+    """On non-Windows the hardening used to be a silent no-op, leaving the
+    box-wide plaintext store at the umask default (commonly group- or
+    world-readable)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-posixperms-"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_directory_becomes_owner_only(self):
+        d = self.tmp / "data"
+        d.mkdir()
+        os.chmod(d, 0o777)
+        host.set_owner_only_perms(d)
+        self.assertEqual(d.stat().st_mode & 0o777, 0o700)
+
+    def test_file_becomes_owner_only(self):
+        f = self.tmp / "core.md"
+        f.write_text("secret\n", encoding="utf-8")
+        os.chmod(f, 0o666)
+        host.set_owner_only_perms(f)
+        self.assertEqual(f.stat().st_mode & 0o777, 0o600)
+
+    def test_hardens_even_when_USER_is_unset(self):
+        f = self.tmp / "core2.md"
+        f.write_text("secret\n", encoding="utf-8")
+        os.chmod(f, 0o666)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("USER", None)
+            os.environ.pop("USERNAME", None)
+            host.set_owner_only_perms(f)
+        self.assertEqual(f.stat().st_mode & 0o777, 0o600)
+
+    def test_never_raises_on_a_missing_path(self):
+        host.set_owner_only_perms(self.tmp / "does-not-exist")
+
+
+class TestSetOwnerOnlyPermsBranch(unittest.TestCase):
+    """Platform-independent proof of the non-Windows branch: it must run chmod
+    with owner-only modes and must NOT be gated behind the USERNAME/USER lookup
+    (chmod needs no username, and a container with USER unset would otherwise
+    silently skip hardening entirely)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-permbranch-"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _chmod_calls(self, target: Path):
+        with mock.patch.object(os, "name", "posix"), \
+                mock.patch.object(os, "chmod") as chmod, \
+                mock.patch.object(host.subprocess, "run") as run, \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("USER", None)
+            os.environ.pop("USERNAME", None)
+            host.set_owner_only_perms(target)
+        self.assertFalse(run.called, "icacls must not run off-Windows")
+        return chmod.call_args_list
+
+    def test_directory_gets_0700_without_a_username(self):
+        d = self.tmp / "data"
+        d.mkdir()
+        self.assertEqual(self._chmod_calls(d), [mock.call(d, 0o700)])
+
+    def test_file_gets_0600_without_a_username(self):
+        f = self.tmp / "core.md"
+        f.write_text("secret\n", encoding="utf-8")
+        self.assertEqual(self._chmod_calls(f), [mock.call(f, 0o600)])
 
 
 @unittest.skipUnless(sys.platform == "win32", "icacls is Windows-only")

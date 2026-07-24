@@ -183,6 +183,18 @@ class TestV5MigrationRefusesOnMissingCheckout(unittest.TestCase):
         # genuinely absent on this box is left with its namespace unchanged
         # (and, for the case actually seen on this box, that a present
         # checkout IS migrated) — this is the exact code path production runs.
+        #
+        # NOTE: this test is inherently machine-dependent — whichever branch
+        # runs depends on whether E:\ZCode\opencode-swarm exists on the box
+        # executing the suite, so it can pass without ever having exercised
+        # the "checkout missing -> refuse and report" path (e.g. if that
+        # checkout happens to exist wherever this runs). It is kept as an
+        # opportunistic real-environment sanity check only. The deterministic,
+        # box-independent, and therefore AUTHORITATIVE test for the
+        # refuse-on-missing-checkout behavior is
+        # test_synthetic_missing_checkout_via_relocated_map below, which
+        # monkeypatches Path.is_dir so the missing-checkout branch is always
+        # exercised regardless of what's on disk.
         with tempfile.TemporaryDirectory() as tmp:
             store_path = Path(tmp) / "store.sqlite"
             store_mod = _load_store_module(store_path)
@@ -220,7 +232,13 @@ class TestV5MigrationRefusesOnMissingCheckout(unittest.TestCase):
         # behavior: monkeypatch Path.is_dir so a mapped checkout path looks
         # absent regardless of what's actually on this box, and confirm that
         # specific namespace's rows are left untouched while the migration
-        # still completes (schema_version still bumps to 5).
+        # still completes (schema_version still bumps to 5). Also asserts the
+        # "report" half (a loud warning is printed) so this test alone is the
+        # sole authoritative, deterministic check of the full refuse-and-
+        # report contract — it does not depend on
+        # test_missing_checkout_leaves_namespace_unchanged_and_reports above,
+        # which only exercises the report assertion when the real checkout
+        # happens to be absent on the machine running the suite.
         with tempfile.TemporaryDirectory() as tmp:
             store_path = Path(tmp) / "store.sqlite"
             store_mod = _load_store_module(store_path)
@@ -237,8 +255,21 @@ class TestV5MigrationRefusesOnMissingCheckout(unittest.TestCase):
                     return False
                 return real_is_dir(self)
 
-            with mock.patch.object(Path, "is_dir", fake_is_dir):
+            captured_warnings = []
+            real_print = print
+
+            def spy_print(*args, **kwargs):
+                captured_warnings.append(" ".join(str(a) for a in args))
+                real_print(*args, **kwargs)
+
+            with mock.patch.object(Path, "is_dir", fake_is_dir), \
+                    mock.patch("builtins.print", side_effect=spy_print):
                 store_mod.migrate(conn)
+
+            self.assertTrue(
+                any("trainingapp" in w and "not found" in w for w in captured_warnings),
+                "migrate() must print a loud warning when a mapped checkout is missing",
+            )
 
             row = conn.execute(
                 "SELECT namespace FROM memory WHERE content=?",
@@ -368,44 +399,51 @@ class TestRecallCompatAlias(unittest.TestCase):
             store_path = Path(tmp) / "store.sqlite"
             store_mod = _load_store_module(store_path)
             conn = _fresh_conn_at_v4(store_mod)
-            store_mod.add_memory(
-                conn, namespace="project:opencode-swarm", type_="fact",
-                content="unique lesson about widget frobnication", signal="test",
-            )
-            store_mod.migrate(conn)
+            try:
+                store_mod.add_memory(
+                    conn, namespace="project:opencode-swarm", type_="fact",
+                    content="unique lesson about widget frobnication", signal="test",
+                )
+                store_mod.migrate(conn)
 
-            new_ns = None
-            row = conn.execute(
-                "SELECT namespace FROM memory WHERE content=?",
-                ("unique lesson about widget frobnication",),
-            ).fetchone()
-            new_ns = row["namespace"]
+                new_ns = None
+                row = conn.execute(
+                    "SELECT namespace FROM memory WHERE content=?",
+                    ("unique lesson about widget frobnication",),
+                ).fetchone()
+                new_ns = row["namespace"]
 
-            if new_ns == "project:opencode-swarm":
-                self.skipTest("E:\\ZCode\\opencode-swarm checkout not present; namespace unchanged")
+                if new_ns == "project:opencode-swarm":
+                    self.skipTest("E:\\ZCode\\opencode-swarm checkout not present; namespace unchanged")
 
-            # Recall using the OLD namespace must still find the row via the
-            # compat alias, and must not double-count it.
-            results = store_mod.recall_memory(
-                conn, query="widget frobnication", namespace="project:opencode-swarm",
-                limit=10, as_json=False,
-            )
-            ids = [r["id"] for r in results]
-            self.assertEqual(len(ids), len(set(ids)), "row must not be double-counted")
-            self.assertTrue(
-                any(r["content"] == "unique lesson about widget frobnication" for r in results),
-                "recall by old namespace should find the migrated row via the compat alias",
-            )
+                # Recall using the OLD namespace must still find the row via the
+                # compat alias, and must not double-count it.
+                results = store_mod.recall_memory(
+                    conn, query="widget frobnication", namespace="project:opencode-swarm",
+                    limit=10, as_json=False,
+                )
+                ids = [r["id"] for r in results]
+                self.assertEqual(len(ids), len(set(ids)), "row must not be double-counted")
+                self.assertTrue(
+                    any(r["content"] == "unique lesson about widget frobnication" for r in results),
+                    "recall by old namespace should find the migrated row via the compat alias",
+                )
 
-            # Recall using the NEW namespace must also find it (direct match).
-            results_new = store_mod.recall_memory(
-                conn, query="widget frobnication", namespace=new_ns,
-                limit=10, as_json=False,
-            )
-            self.assertTrue(
-                any(r["content"] == "unique lesson about widget frobnication" for r in results_new)
-            )
-            conn.close()
+                # Recall using the NEW namespace must also find it (direct match).
+                results_new = store_mod.recall_memory(
+                    conn, query="widget frobnication", namespace=new_ns,
+                    limit=10, as_json=False,
+                )
+                self.assertTrue(
+                    any(r["content"] == "unique lesson about widget frobnication" for r in results_new)
+                )
+            finally:
+                # Must close before the enclosing TemporaryDirectory's __exit__
+                # tries to rmtree the dir — otherwise an early exit via
+                # skipTest() (or any other exception) leaves conn holding the
+                # sqlite file open, which raises PermissionError on Windows
+                # during cleanup.
+                conn.close()
 
     def test_recall_synthetic_alias_finds_row_by_old_namespace(self):
         # Environment-independent version of the above: doesn't depend on any
