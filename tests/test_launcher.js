@@ -58,7 +58,8 @@ function envWith(overrides) {
         "ZMEM_TIER0", "ZMEM_CTX_BUDGET",
         "CLAUDE_PLUGIN_ROOT", "ZCODE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR",
         "ZCODE_PROJECT_DIR", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
-        "CLAUDE_SESSION_ID",
+        "CLAUDE_SESSION_ID", "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
+        "ZMEM_CONVENTION_INTERVAL",
     ]) {
         delete e[k];
     }
@@ -298,18 +299,36 @@ console.log("\n[5] Encoded-budget truncation stays <= budget");
 console.log("\n[6] Passthrough hook keeps child exit code + no envelope rewrap");
 
 {
-    // A non-translated hook name (convention-capture) whose script prints noise:
-    // launcher must pass stdout through verbatim and NOT wrap/replace with {}.
+    // A non-translated hook name whose script prints noise: launcher must pass
+    // stdout through verbatim and NOT wrap/replace with {}.
+    //
+    // NOTE: this block used to use "convention-capture" as its vehicle.
+    // convention-capture is now a TRANSLATED hook — it emits the sentinel and
+    // needs the Claude Code hookSpecificOutput rewrap to be injected at all
+    // (see block [12]) — so the passthrough contract is asserted with a
+    // synthetic hook name instead. Coverage is unchanged; only the vehicle moved.
     const PROOT = path.join(TMP, "passroot");
     fs.mkdirSync(path.join(PROOT, "hooks"), { recursive: true });
-    fs.writeFileSync(path.join(PROOT, "hooks", "zmem-convention-capture.sh"),
+    fs.writeFileSync(path.join(PROOT, "hooks", "zmem-passthru.sh"),
         "#!/usr/bin/env bash\necho 'convention-raw-output'\nexit 0\n");
-    const r = runLauncher("convention-capture", "{}", envWith({
+    const r = runLauncher("passthru", "{}", envWith({
         ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: PROOT, CLAUDE_PROJECT_DIR: PROJ,
     }));
     ok("passthrough: raw child stdout preserved (not translated to {})",
         /convention-raw-output/.test(r.stdout));
     ok("passthrough: NOT wrapped in hookSpecificOutput", !/hookSpecificOutput/.test(r.stdout));
+
+    // A non-translated hook whose child script exits nonzero: launcher must
+    // pass the child's real exit code through, not swallow/normalize it.
+    const PROOT2 = path.join(TMP, "passroot-exit");
+    fs.mkdirSync(path.join(PROOT2, "hooks"), { recursive: true });
+    fs.writeFileSync(path.join(PROOT2, "hooks", "zmem-passthru.sh"),
+        "#!/usr/bin/env bash\necho 'convention-raw-output'\nexit 3\n");
+    const r2 = runLauncher("passthru", "{}", envWith({
+        ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: PROOT2, CLAUDE_PROJECT_DIR: PROJ,
+    }));
+    ok("passthrough: nonzero child exit code passed through",
+        r2.status === 3, "status=" + r2.status);
 }
 
 console.log("\n[7] Phase 5: reflect (Stop) + capture-failure (PostToolUseFailure) translation");
@@ -555,20 +574,23 @@ console.log("\n[10] Phase 7 unit: buildCanonicalEnv exports agent transcript + i
 console.log("\n[11] Phase 8 PERF: ZMEM_NAMESPACE resolved only for NEEDS_NAMESPACE consumers");
 
 {
-    // grep -l ZMEM_NAMESPACE hooks/*.sh (Phase 8 evidence) showed every
-    // translated hook EXCEPT convention-capture consumes it. Assert the set
-    // directly, and assert it is NOT the same object identity as
-    // TRANSLATED_HOOKS even though membership coincides today (per the
-    // launcher's own comment: these answer different questions).
+    // Every hook whose script reads $ZMEM_NAMESPACE. convention-capture is
+    // BACK in this set (reversing part of the Phase 8 skip): it renders a
+    // `store.py add --namespace …` suggestion, and its old basename-derived
+    // NS_HINT pointed at a namespace the unified recall path never queries, so
+    // captured conventions were invisible to the shared store. Correctness
+    // beats the ~100ms saving on the per-edit path.
     const expectedConsumers = [
         "session-start", "recall", "subagent-recall", "reflect",
-        "capture-failure", "subagent-reflect",
+        "capture-failure", "subagent-reflect", "convention-capture",
     ];
     for (const h of expectedConsumers) {
         ok(`NEEDS_NAMESPACE includes ${h}`, launch.NEEDS_NAMESPACE.has(h));
     }
-    ok("NEEDS_NAMESPACE excludes convention-capture (per-edit, high-frequency, computes its own NS_HINT)",
-        !launch.NEEDS_NAMESPACE.has("convention-capture"));
+    // An unrecognized hook name is still skipped (the perf mechanism itself is
+    // intact — only convention-capture's membership changed).
+    ok("NEEDS_NAMESPACE excludes an unrecognized hook name (perf-skip mechanism intact)",
+        !launch.NEEDS_NAMESPACE.has("envdump"));
 
     const saved = process.env.CLAUDE_PLUGIN_ROOT;
     process.env.CLAUDE_PLUGIN_ROOT = REPO;
@@ -576,16 +598,15 @@ console.log("\n[11] Phase 8 PERF: ZMEM_NAMESPACE resolved only for NEEDS_NAMESPA
     const expectedNs = resolveNs(REPO);
 
     // Consumers still resolve to the real derived git-remote key.
-    for (const h of ["session-start", "recall", "subagent-recall", "reflect",
-        "capture-failure", "subagent-reflect"]) {
+    for (const h of expectedConsumers) {
         const env = launch.buildCanonicalEnv("claude", metaRepo, h);
         eq(`buildCanonicalEnv(${h}): ZMEM_NAMESPACE == resolve_namespace(repo)`,
             env.ZMEM_NAMESPACE, expectedNs);
     }
-    // The non-consumer: resolution is skipped entirely (empty, not attempted).
+    // A non-consumer: resolution is skipped entirely (empty, not attempted).
     {
-        const env = launch.buildCanonicalEnv("claude", metaRepo, "convention-capture");
-        eq("buildCanonicalEnv(convention-capture): ZMEM_NAMESPACE is EMPTY (perf-skip)",
+        const env = launch.buildCanonicalEnv("claude", metaRepo, "envdump");
+        eq("buildCanonicalEnv(envdump): ZMEM_NAMESPACE is EMPTY (perf-skip)",
             env.ZMEM_NAMESPACE, "");
     }
     // Back-compat: no hookName arg at all still resolves (fail toward
@@ -597,7 +618,7 @@ console.log("\n[11] Phase 8 PERF: ZMEM_NAMESPACE resolved only for NEEDS_NAMESPA
     }
     if (saved === undefined) delete process.env.CLAUDE_PLUGIN_ROOT; else process.env.CLAUDE_PLUGIN_ROOT = saved;
 
-    // Rough before/after latency: convention-capture (skip) vs session-start's
+    // Rough before/after latency: a non-consumer (skip) vs session-start's
     // consumer path (resolve) via buildCanonicalEnv directly, averaged over a
     // few calls (unit-level — isolates the resolution cost from bash/store.py
     // startup noise that dominates a full end-to-end hook timing).
@@ -609,15 +630,232 @@ console.log("\n[11] Phase 8 PERF: ZMEM_NAMESPACE resolved only for NEEDS_NAMESPA
         launch.buildCanonicalEnv("claude", metaRepo, "session-start");
         tResolve += Date.now() - t0;
         t0 = Date.now();
-        launch.buildCanonicalEnv("claude", metaRepo, "convention-capture");
+        launch.buildCanonicalEnv("claude", metaRepo, "envdump");
         tSkip += Date.now() - t0;
     }
     if (saved === undefined) delete process.env.CLAUDE_PLUGIN_ROOT; else process.env.CLAUDE_PLUGIN_ROOT = saved;
     const avgResolve = tResolve / N, avgSkip = tSkip / N;
     console.log(`  INFO  avg buildCanonicalEnv latency: session-start(resolves)=${avgResolve.toFixed(1)}ms ` +
-        `convention-capture(skips)=${avgSkip.toFixed(1)}ms`);
-    ok("perf: convention-capture (skip) is faster than session-start (resolve)",
-        avgSkip < avgResolve, `resolve=${avgResolve.toFixed(1)}ms skip=${avgSkip.toFixed(1)}ms`);
+        `envdump(skips)=${avgSkip.toFixed(1)}ms (informational only - see behavioral ` +
+        `ZMEM_NAMESPACE-emptiness assertions above for the deterministic skip-vs-resolve check)`);
+    // NOTE: a strict wall-clock `avgSkip < avgResolve` assertion used to live
+    // here, but comparing two coarse averages with no margin is flaky under
+    // CI load (shared/throttled runners can make this fail spuriously even
+    // when the underlying behavior is correct). The actual behavioral claim -
+    // a non-consumer skips namespace resolution while session-start performs
+    // it - is already asserted deterministically above via ZMEM_NAMESPACE
+    // emptiness, so timing is logged for visibility only and is not asserted on.
+}
+
+console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was silently dead on CC)");
+
+{
+    // Drives the REAL hooks/zmem-convention-capture.sh through the REAL
+    // launcher against a temp store + temp project. Two bugs are covered:
+    //   (a) envelope: it emits a bare {additionalContext}; Claude Code only
+    //       honors hookSpecificOutput.additionalContext, so before the fix the
+    //       capture prompt was passed through verbatim and NEVER injected.
+    //   (b) namespace: it used to render a basename-derived NS_HINT into the
+    //       suggested `store.py add --namespace …`, pointing captured
+    //       conventions at a namespace no recall path queries.
+    const CDATA = path.join(TMP, "ccdata");
+    fs.mkdirSync(CDATA, { recursive: true });
+    // Seed once so the store (and its `meta` table, which the turn counter
+    // increments) exists.
+    seed(CDATA, "user:global", "fact", "seed row to create the store schema.", 0.9);
+    const CNS = resolveNs(PROJ);
+
+    const ccPayload = (sid) => JSON.stringify({
+        session_id: sid, cwd: PROJ, hook_event_name: "PostToolUse",
+        tool_name: "Edit", tool_input: { file_path: "a.txt" },
+    });
+    // INTERVAL=1 → fires on the first call instead of the tenth.
+    const ccEnv = (extra) => envWith(Object.assign({
+        ZMEM_DATA: CDATA, ZMEM_CONVENTION_INTERVAL: "1", CLAUDE_PROJECT_DIR: PROJ,
+    }, extra));
+
+    // --- claude host -------------------------------------------------------
+    {
+        const r = runLauncher("convention-capture", ccPayload("cc-claude-" + Date.now()),
+            ccEnv({ CLAUDE_PLUGIN_ROOT: REPO }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("convention-capture/claude: stdout is a single valid JSON envelope",
+            obj !== null, r.stdout.slice(0, 300));
+        ok("convention-capture/claude: no raw sentinel leaked to the runner",
+            !/<<<ZMEM_JSON>>>/.test(r.stdout));
+        eq("convention-capture/claude: hookEventName == PostToolUse",
+            obj && obj.hookSpecificOutput && obj.hookSpecificOutput.hookEventName, "PostToolUse");
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("convention-capture/claude: carries the capture prompt",
+            /ZMem convention capture/.test(ac), ac.slice(0, 200));
+        ok("convention-capture/claude: suggests the CANONICAL namespace",
+            ac.indexOf('--namespace "' + CNS + '"') !== -1, ac.slice(0, 400));
+        ok("convention-capture/claude: does NOT suggest the legacy basename namespace",
+            !/--namespace "project:proj"/.test(ac));
+        console.log("  EVIDENCE(claude) " + JSON.stringify(obj).slice(0, 420));
+    }
+
+    // --- zcode host --------------------------------------------------------
+    {
+        const r = runLauncher("convention-capture", ccPayload("cc-zcode-" + Date.now()),
+            ccEnv({ ZCODE_PLUGIN_ROOT: REPO, ZCODE_PROJECT_DIR: PROJ }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("convention-capture/zcode: bare additionalContext (no hookSpecificOutput)",
+            !!(obj && obj.additionalContext && !obj.hookSpecificOutput), r.stdout.slice(0, 300));
+        const ac = (obj && obj.additionalContext) || "";
+        ok("convention-capture/zcode: suggests the CANONICAL namespace",
+            ac.indexOf('--namespace "' + CNS + '"') !== -1, ac.slice(0, 400));
+        console.log("  EVIDENCE(zcode)  " + JSON.stringify(obj).slice(0, 420));
+    }
+
+    // Non-convention tool (Read) → still a well-formed empty envelope, never
+    // stray bytes on the now-buffered stdout.
+    {
+        const r = runLauncher("convention-capture",
+            JSON.stringify({ session_id: "cc-skip", cwd: PROJ, tool_name: "Read", tool_input: {} }),
+            ccEnv({ CLAUDE_PLUGIN_ROOT: REPO }));
+        eq("convention-capture: non-convention tool → {}", r.stdout.trim(), "{}");
+    }
+
+    // Wiring (unit).
+    ok("TRANSLATED_HOOKS includes convention-capture",
+        launch.TRANSLATED_HOOKS.has("convention-capture"));
+    eq("EVENT_MAP convention-capture → PostToolUse",
+        launch.EVENT_MAP["convention-capture"], "PostToolUse");
+}
+
+console.log("\n[13] storeDirectory plugin userConfig feeds ZMEM_DATA (claude host only)");
+
+{
+    const custom = path.join(TMP, "custom-store");
+    const savedRoot = process.env.CLAUDE_PLUGIN_ROOT;
+    const savedOpt = process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY;
+    const savedData = process.env.ZMEM_DATA;
+    const restore = () => {
+        if (savedRoot === undefined) delete process.env.CLAUDE_PLUGIN_ROOT;
+        else process.env.CLAUDE_PLUGIN_ROOT = savedRoot;
+        if (savedOpt === undefined) delete process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY;
+        else process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY = savedOpt;
+        if (savedData === undefined) delete process.env.ZMEM_DATA;
+        else process.env.ZMEM_DATA = savedData;
+    };
+
+    process.env.CLAUDE_PLUGIN_ROOT = REPO;
+    delete process.env.ZMEM_DATA;
+    process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY = custom;
+    eq("storeDirectory: claude + no ZMEM_DATA → plugin option wins",
+        launch.buildCanonicalEnv("claude", { cwd: PROJ }, "recall").ZMEM_DATA, custom);
+
+    // Explicit env still beats the plugin option.
+    process.env.ZMEM_DATA = path.join(TMP, "explicit-store");
+    eq("storeDirectory: explicit ZMEM_DATA still overrides the plugin option",
+        launch.buildCanonicalEnv("claude", { cwd: PROJ }, "recall").ZMEM_DATA,
+        path.join(TMP, "explicit-store"));
+    delete process.env.ZMEM_DATA;
+
+    // zcode never sees the CC-only option.
+    eq("storeDirectory: zcode ignores CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
+        launch.buildCanonicalEnv("zcode", { cwd: PROJ }, "recall").ZMEM_DATA,
+        path.join(os.homedir(), ".zmem"));
+
+    // The manifest default is the LITERAL string "~/.zmem" — CC hands
+    // userConfig values through unexpanded, and neither python nor Windows
+    // resolves a literal tilde path.
+    process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY = "~/.zmem";
+    eq("storeDirectory: leading ~ is expanded to the home dir",
+        launch.buildCanonicalEnv("claude", { cwd: PROJ }, "recall").ZMEM_DATA,
+        path.join(os.homedir(), ".zmem"));
+
+    // Blank/whitespace option falls through to the default rather than
+    // producing an empty ZMEM_DATA.
+    process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY = "   ";
+    eq("storeDirectory: blank option falls through to ~/.zmem",
+        launch.buildCanonicalEnv("claude", { cwd: PROJ }, "recall").ZMEM_DATA,
+        path.join(os.homedir(), ".zmem"));
+
+    restore();
+}
+
+console.log("\n[14] Context budget is measured in ENCODED UTF-8 BYTES, not UTF-16 units");
+
+{
+    // 4000 emoji: 8000 UTF-16 code units (under a 9000 budget by .length) but
+    // 16000 UTF-8 bytes (well over it). The old `.length` check let this
+    // through un-truncated and blew the documented encoded-byte budget.
+    const emoji = "🚀".repeat(4000);
+    const rawEnv = launch.makeEnvelope("claude", "recall", emoji);
+    const rawUnits = JSON.stringify(rawEnv).length;
+    const rawBytes = Buffer.byteLength(JSON.stringify(rawEnv), "utf8");
+    ok("budget(utf8): fixture is UNDER budget by UTF-16 .length (the old check)",
+        rawUnits <= 9000, "utf16units=" + rawUnits);
+    ok("budget(utf8): fixture is OVER budget in encoded bytes (the real limit)",
+        rawBytes > 9000, "bytes=" + rawBytes);
+    const env = launch.fitEnvelope("claude", "recall", emoji, 9000);
+    const bytes = Buffer.byteLength(JSON.stringify(env), "utf8");
+    ok("budget(utf8): encoded envelope <= 9000 BYTES", bytes <= 9000, "bytes=" + bytes);
+    ok("budget(utf8): multi-byte content DID trigger truncation",
+        /\[recall truncated\]/.test(env.hookSpecificOutput.additionalContext));
+    ok("budget(utf8): no lone surrogate left at the cut",
+        !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(env.hookSpecificOutput.additionalContext));
+
+    // Non-Latin script (3 bytes/char, 1 UTF-16 unit) — the case .length
+    // under-counts worst.
+    const cjk = "記".repeat(4000);
+    const cjkEnv = launch.fitEnvelope("claude", "recall", cjk, 9000);
+    ok("budget(utf8): CJK content truncated to <= 9000 bytes",
+        Buffer.byteLength(JSON.stringify(cjkEnv), "utf8") <= 9000,
+        "bytes=" + Buffer.byteLength(JSON.stringify(cjkEnv), "utf8"));
+
+    // ASCII regression: an already-fitting payload is returned untouched.
+    const small = launch.fitEnvelope("claude", "recall", "tiny", 9000);
+    eq("budget(utf8): fitting payload passes through unchanged",
+        small.hookSpecificOutput.additionalContext, "tiny");
+}
+
+console.log("\n[15] Recall survives a memory whose CONTENT contains the sentinel");
+
+{
+    // A stored memory containing the literal "<<<ZMEM_JSON>>>" used to move the
+    // launcher's extraction boundary into the middle of the JSON: the parse
+    // failed and the whole recall silently degraded to {} (a self-DoS of that
+    // turn's recall — fail-open, not an injection vector). The scripts now
+    // neutralize the tokens before wrapping.
+    const HDATA = path.join(TMP, "sentineldata");
+    fs.mkdirSync(HDATA, { recursive: true });
+    const HNS = resolveNs(PROJ);
+    seed(HDATA, HNS, "lesson",
+        "SENTINEL_CANARY the marker <<<ZMEM_JSON>>> and <<<END>>> appear in this memory verbatim.",
+        0.9);
+
+    // main recall path (UserPromptSubmit)
+    {
+        const r = runLauncher("recall",
+            JSON.stringify({ prompt: "tell me about the SENTINEL_CANARY marker memory", cwd: PROJ }),
+            envWith({ ZMEM_DATA: HDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("sentinel-in-content/recall: valid JSON envelope (not dropped)",
+            obj !== null, r.stdout.slice(0, 300));
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("sentinel-in-content/recall: the canary memory survived the round-trip",
+            /SENTINEL_CANARY/.test(ac), ac.slice(0, 300));
+        ok("sentinel-in-content/recall: embedded START token was neutralized",
+            /ZMEM_JSON_NEUTRALIZED/.test(ac) && !/<<<ZMEM_JSON>>>/.test(ac), ac.slice(0, 300));
+    }
+
+    // subagent recall path (SubagentStart) — same wrap pattern, same defense.
+    {
+        const r = runLauncher("subagent-recall",
+            JSON.stringify({ session_id: "sent-sess", cwd: PROJ, agent_id: "a1", agent_type: "coder" }),
+            envWith({ ZMEM_DATA: HDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("sentinel-in-content/subagent-recall: valid JSON envelope (not dropped)",
+            obj !== null, r.stdout.slice(0, 300));
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("sentinel-in-content/subagent-recall: the canary memory survived",
+            /SENTINEL_CANARY/.test(ac), ac.slice(0, 300));
+        ok("sentinel-in-content/subagent-recall: embedded START token was neutralized",
+            /ZMEM_JSON_NEUTRALIZED/.test(ac) && !/<<<ZMEM_JSON>>>/.test(ac), ac.slice(0, 300));
+    }
 }
 
 // --- cleanup + report ------------------------------------------------------

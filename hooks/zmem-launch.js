@@ -36,10 +36,16 @@ const { join, dirname, delimiter } = require("path");
 const { homedir } = require("os");
 
 // Hooks that emit the <<<ZMEM_JSON>>> sentinel and get envelope translation.
-// Every OTHER hook (convention-capture, …) is passed through verbatim with its
-// own exit code preserved — it has not been migrated to the sentinel yet, so
-// translating it would replace its real output with `{}`. Later phases add
-// their names here as they adopt the sentinel.
+// Every OTHER hook is passed through verbatim with its own exit code preserved
+// — a hook that has not been migrated to the sentinel would have its real
+// output replaced with `{}` if it were translated. Later phases add their names
+// here as they adopt the sentinel.
+//
+// convention-capture (PostToolUse) was previously EXCLUDED here, which made it
+// silently non-functional on Claude Code: it emits a bare {additionalContext},
+// but CC only honors hookSpecificOutput.additionalContext, so the capture
+// prompt was passed through verbatim and never injected. It now emits the
+// sentinel (like every other injecting hook) and is translated here.
 //
 // reflect (Stop) and capture-failure (PostToolUseFailure) emit the sentinel and
 // carry a bare {additionalContext}. On Claude Code the launcher rewraps that to
@@ -60,18 +66,23 @@ const TRANSLATED_HOOKS = new Set([
     "capture-failure",
     "subagent-recall",
     "subagent-reflect",
+    "convention-capture",
 ]);
 
-// Hooks whose scripts actually read $ZMEM_NAMESPACE (verified via
-// `grep -l ZMEM_NAMESPACE hooks/*.sh` — see PLAN.md Phase 8). Resolving the
-// namespace spawns a python + git subprocess (~100ms cold-start); every OTHER
-// hook (today: only convention-capture, which fires on every Edit/Write/Bash
-// and computes its own basename-derived NS_HINT instead) gets ZMEM_NAMESPACE
-// left EMPTY so that cost is never paid on the hot per-edit path. This set is
-// intentionally separate from TRANSLATED_HOOKS above — same membership today
-// by coincidence (both happen to be the sentinel-emitting hooks), but they
-// answer different questions (envelope translation vs. namespace need) and
-// must not be aliased; a future hook could need one without the other.
+// Hooks whose scripts actually read $ZMEM_NAMESPACE. Resolving the namespace
+// spawns a python + git subprocess (~100ms cold-start); every OTHER hook gets
+// ZMEM_NAMESPACE left EMPTY so that cost is never paid. This set is
+// intentionally separate from TRANSLATED_HOOKS above — they answer different
+// questions (envelope translation vs. namespace need) and must not be aliased;
+// a future hook could need one without the other.
+//
+// CORRECTNESS OVER PERF (reverses part of the Phase 8 skip): convention-capture
+// is back in this set. It fires on every Edit/Write/Bash, so the skip saved
+// ~100ms on a hot path — but it used to compute its own basename-derived
+// NS_HINT, which suggested storing captured conventions under a namespace the
+// unified (git-remote-derived) recall path never queries. Captured conventions
+// were therefore invisible to the shared store. Paying the resolution here is
+// the correct trade.
 const NEEDS_NAMESPACE = new Set([
     "session-start",
     "recall",
@@ -79,6 +90,7 @@ const NEEDS_NAMESPACE = new Set([
     "reflect",
     "capture-failure",
     "subagent-reflect",
+    "convention-capture",
 ]);
 
 // Hook-name → Claude Code hookEventName (for the {hookSpecificOutput} rewrap).
@@ -137,6 +149,19 @@ function resolveNamespace(projectDir) {
     return "user:global";
 }
 
+// --- Expand a leading ~ in a config-supplied path ---------------------------
+// The plugin manifest's storeDirectory default is the LITERAL string "~/.zmem";
+// Claude Code hands userConfig values through unexpanded, and neither python
+// nor Windows resolves a literal "~" path. Blank/whitespace-only → "" (falls
+// through to the next precedence source).
+function expandHome(p) {
+    const s = (p || "").trim();
+    if (!s) return "";
+    if (s === "~") return homedir();
+    if (s.startsWith("~/") || s.startsWith("~\\")) return join(homedir(), s.slice(2));
+    return s;
+}
+
 // --- Build the canonical ZMEM_* env for the child ---------------------------
 // hookName is optional (back-compat for direct callers/tests that don't care
 // about the namespace-skip): omitted/unrecognized names get the namespace
@@ -164,11 +189,19 @@ function buildCanonicalEnv(host, meta, hookName) {
     const agentTranscript = (meta && meta.agent_transcript_path) || "";
     const agentId = (meta && meta.agent_id) || "";
 
-    // ZMEM_DATA: existing env / userConfig wins; else the box-wide default
-    // ~/.zmem (== C:\Users\Brett\.zmem on this box). Exporting this is the
-    // cutover wiring — store.py resolves <ZMEM_DATA>/store.sqlite ahead of the
-    // legacy per-plugin data dirs.
-    const zmemData = process.env.ZMEM_DATA || join(homedir(), ".zmem");
+    // ZMEM_DATA precedence:
+    //   1. explicit ZMEM_DATA env (an operator override always wins)
+    //   2. the plugin userConfig `storeDirectory` option — Claude Code exports
+    //      each userConfig key to the hook process as
+    //      CLAUDE_PLUGIN_OPTION_<KEY-UPPERCASED>. Only consulted on the claude
+    //      host (it never exists on zcode). Without this the manifest option
+    //      was declared but had NO runtime effect.
+    //   3. the box-wide default ~/.zmem.
+    // Exporting this is the cutover wiring — store.py resolves
+    // <ZMEM_DATA>/store.sqlite ahead of the legacy per-plugin data dirs.
+    const pluginOptData =
+        host === "claude" ? expandHome(process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY) : "";
+    const zmemData = process.env.ZMEM_DATA || pluginOptData || join(homedir(), ".zmem");
 
     // ZMEM_SKILLS_DIRS: existing env wins (mirrors ZMEM_DATA above); else the
     // box-wide default of BOTH skills dirs, delimiter-joined the same way
@@ -281,13 +314,35 @@ function makeEnvelope(host, hookName, content) {
     return { additionalContext: content };
 }
 
+// Encoded size of an envelope in UTF-8 BYTES. `String.prototype.length` counts
+// UTF-16 code units, which UNDER-counts every non-ASCII character (an emoji is
+// 2 UTF-16 units but 4 UTF-8 bytes, CJK is 1 unit but 3 bytes). The budget is
+// documented and enforced downstream in encoded bytes, so measuring with
+// .length let Unicode-heavy recalls blow past it.
+function encodedSize(value) {
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+// content.slice() cuts on UTF-16 code units, so a cut inside a surrogate pair
+// leaves a lone high surrogate (which JSON.stringify escapes as a 6-byte
+// "\udXXX", making byte length non-monotonic in the cut index). Drop a trailing
+// lone high surrogate so the binary search stays monotonic and no truncated
+// envelope ever carries a broken code point.
+function sliceSafe(s, n) {
+    if (n <= 0) return "";
+    if (n >= s.length) return s;
+    const last = s.charCodeAt(n - 1);
+    if (last >= 0xd800 && last <= 0xdbff) return s.slice(0, n - 1);
+    return s.slice(0, n);
+}
+
 // Enforce budget on the ENCODED envelope (JSON escaping of newline/quote-dense
 // blocks inflates length, so raw-content length is not enough). If over, binary
 // search the largest content prefix whose encoded envelope + truncation marker
 // fits within budget.
 function fitEnvelope(host, hookName, content, budget) {
     let env = makeEnvelope(host, hookName, content);
-    if (JSON.stringify(env).length <= budget) return env;
+    if (encodedSize(env) <= budget) return env;
 
     const marker = "\n[recall truncated]";
     let lo = 0;
@@ -295,9 +350,9 @@ function fitEnvelope(host, hookName, content, budget) {
     let best = null;
     while (lo <= hi) {
         const mid = (lo + hi) >> 1;
-        const cand = content.slice(0, mid) + marker;
+        const cand = sliceSafe(content, mid) + marker;
         const e = makeEnvelope(host, hookName, cand);
-        if (JSON.stringify(e).length <= budget) {
+        if (encodedSize(e) <= budget) {
             best = e;
             lo = mid + 1;
         } else {
@@ -309,7 +364,7 @@ function fitEnvelope(host, hookName, content, budget) {
     // emit the marker alone; if that still overflows there is nothing sane to
     // trim to, so fall back to {} (fail-open, never inject a broken payload).
     const minimal = makeEnvelope(host, hookName, marker.trim());
-    return JSON.stringify(minimal).length <= budget ? minimal : {};
+    return encodedSize(minimal) <= budget ? minimal : {};
 }
 
 // Translate the buffered child stdout into the final envelope for a

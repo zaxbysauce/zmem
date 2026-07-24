@@ -175,7 +175,13 @@ total_chars = 0
 for r in rows:
     content = (r.get("content") or "")[:300]
     signal = r.get("signal", "?")
-    entry = "- [%s] %s" % (signal, content)
+    # store.py flags a memory whose file: source_ref changed since extraction
+    # via a separate "stale" boolean (its confidence is halved, but that alone
+    # does NOT push it under the recall floor, so stale rows DO surface).
+    # The note lives only in store.py'"'"'s human-readable print branch, so the
+    # injected context has to render it here or the agent never sees it.
+    stale = " [STALE SOURCE]" if r.get("stale") else ""
+    entry = "- [%s]%s %s" % (signal, stale, content)
     total_chars += len(entry)
     if budget > 0 and total_chars > budget:  # soft cap; launcher enforces hard encoded budget
         break
@@ -184,6 +190,16 @@ for r in rows:
 ctx = "\n".join(lines)
 print(json.dumps({"additionalContext": ctx}))
 ' "$STORE_PY_PY" "$NS" "$BUDGET" 2>/dev/null || echo '{}')"
+
+# Neutralize any sentinel token that a MEMORY'S OWN CONTENT happens to contain
+# before wrapping. The launcher locates the payload by scanning stdout for the
+# literal markers, so a stored memory containing "<<<ZMEM_JSON>>>" would move
+# the extraction boundary into the middle of the JSON, the parse would fail, and
+# the whole recall would silently degrade to {} (a self-DoS of this turn's
+# recall — fail-open, not an injection vector). Both replacements are safe
+# inside the serialized JSON string: neither introduces a quote or a backslash.
+OUT="${OUT//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
+OUT="${OUT//<<<END>>>/<<<END_NEUTRALIZED>>>}"
 
 # Wrap the payload in the sentinel so the host adapter can extract it robustly.
 printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' "$OUT"

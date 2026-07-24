@@ -196,7 +196,12 @@ total = len(header)
 for r in uniq:
     content = (r.get("content") or "")[:300]
     signal = r.get("signal", "?")
-    entry = "- [%s] %s" % (signal, content)
+    # Same stale rendering as zmem-recall.sh: store.py returns a separate
+    # "stale" boolean (content itself is never annotated), and the halved
+    # confidence does not reliably drop the row under the floor, so stale rows
+    # reach the injected context and must be marked for the agent.
+    stale = " [STALE SOURCE]" if r.get("stale") else ""
+    entry = "- [%s]%s %s" % (signal, stale, content)
     total += len(entry)
     if budget > 0 and total > budget:  # soft cap; launcher enforces hard encoded budget
         break
@@ -209,6 +214,16 @@ emit({"additionalContext": ctx})
 if [ -z "$CTX_JSON" ]; then
   CTX_JSON='{}'
 fi
+
+# Neutralize any sentinel token that a MEMORY'S OWN CONTENT happens to contain
+# before wrapping (same defense as zmem-recall.sh). The launcher locates the
+# payload by scanning stdout for the literal markers, so a stored memory
+# containing "<<<ZMEM_JSON>>>" would move the extraction boundary into the
+# middle of the JSON and the whole recall would silently degrade to {}.
+# Both replacements are safe inside the serialized JSON string: neither
+# introduces a quote or a backslash.
+CTX_JSON="${CTX_JSON//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
+CTX_JSON="${CTX_JSON//<<<END>>>/<<<END_NEUTRALIZED>>>}"
 
 # Wrap the payload in the sentinel so the host adapter can extract + rewrap it.
 printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' "$CTX_JSON"

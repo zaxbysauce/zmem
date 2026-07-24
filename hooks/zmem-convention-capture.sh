@@ -7,10 +7,31 @@
 # per session (cooldown via marker file, same pattern as capture-failure).
 #
 # Reads JSON from stdin: {"tool_name":"...", "tool_input":{...}, ...}
-# Emits JSON to stdout: {"additionalContext": "<capture prompt or empty>"}
+#
+# Envelope: emits a bare {"additionalContext": …} wrapped in the
+# <<<ZMEM_JSON>>>…<<<END>>> sentinel, exactly like the other injecting hooks.
+# The host adapter (zmem-launch.js) extracts it and rewraps per host (Claude
+# Code: hookSpecificOutput.additionalContext for PostToolUse — CC only honors
+# that shape, so the previous bare passthrough was never injected at all; ZCode:
+# bare additionalContext) and enforces the encoded context budget.
+#
+# Canonical env (from zmem-launch.js): ZMEM_ROOT, ZMEM_DATA, ZMEM_SESSION,
+# ZMEM_PROJECT, ZMEM_NAMESPACE. Legacy vars kept as fallbacks for manual /
+# pre-adapter runs. The suggested `store.py add --namespace …` command uses the
+# canonical git-remote-derived $ZMEM_NAMESPACE — the old basename-derived
+# NS_HINT pointed captured conventions at a namespace the unified recall path
+# never queries, making them invisible to the shared store.
+#
 # Non-blocking: always exits 0. Fail-open on any error.
 
 set -u
+
+# Every exit path must emit the sentinel: the launcher now buffers this hook's
+# stdout, so a bare `exit 0` yields no payload at all.
+emit_empty() {
+  printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' '{}'
+  exit 0
+}
 
 INPUT="$(cat)"
 
@@ -27,7 +48,7 @@ except Exception:
 
 case "$TOOL_NAME" in
   Edit|Write|MultiEdit|NotebookEdit|Bash) ;;
-  *) exit 0 ;;  # Skip non-convention-revealing tools
+  *) emit_empty ;;  # Skip non-convention-revealing tools
 esac
 
 # --- Cross-platform setup (same pattern as other hooks) ---
@@ -63,38 +84,56 @@ join_path() {
   for part in "$@"; do printf '%s%s' "$sep" "$part"; done
 }
 
-SESSION_ID="${CLAUDE_SESSION_ID:-${ZCODE_SESSION_ID:-}}"
-DATA_DIR="${ZCODE_PLUGIN_DATA:-}"
+# Canonical env from the host adapter first; legacy vars as fallback. The
+# launcher derives ZMEM_SESSION from the stdin payload's session_id, which is
+# the only session value guaranteed to be present under Claude Code —
+# CLAUDE_SESSION_ID is not exported to the hook process.
+SESSION_ID="${ZMEM_SESSION:-${CLAUDE_SESSION_ID:-${ZCODE_SESSION_ID:-}}}"
+DATA_DIR="${ZMEM_DATA:-${ZCODE_PLUGIN_DATA:-}}"
 
-if [ -z "$SESSION_ID" ]; then exit 0; fi
+if [ -z "$SESSION_ID" ]; then emit_empty; fi
 
 if [ -n "$DATA_DIR" ]; then
   DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
 else
-  DATA_DIR_PY="$(join_path "$(to_py_path "$HOME")" .zcode memory)"
+  DATA_DIR_PY="$(join_path "$(to_py_path "$HOME")" .zmem)"
 fi
 
-export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-$DATA_DIR}"
+# Keep store.py resolving the same store (chain:
+# ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem).
+export ZMEM_DATA="${ZMEM_DATA:-$DATA_DIR}"
+export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 
 # --- Resolve store.py path and namespace ---
-PLUGIN_ROOT="${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
+PLUGIN_ROOT="${ZMEM_ROOT:-${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}"
 if [ -z "$PLUGIN_ROOT" ]; then
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
 STORE_PY_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts store.py)"
 
-PROJECT="${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}"
-NS_HINT="user:global"
-if [ -n "$PROJECT" ]; then
-  NS_HINT="project:$(basename "$PROJECT")"
+PROJECT="${ZMEM_PROJECT:-${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}"
+
+# Canonical namespace from the host adapter (git-remote-derived, the same key
+# every recall path queries). The legacy basename fallback only applies when
+# the adapter did not run at all.
+NS_HINT="${ZMEM_NAMESPACE:-}"
+if [ -z "$NS_HINT" ]; then
+  if [ -n "$PROJECT" ]; then
+    NS_HINT="project:$(basename "$PROJECT")"
+  else
+    NS_HINT="user:global"
+  fi
 fi
 
 # --- Per-session cooldown marker (same pattern as capture-failure) ---
 MARKER="$(join_path "$DATA_DIR_PY" ".convention-prompted-${SESSION_ID}")"
 
+# No python → cannot count turns; fail open (no injection).
+if [ -z "$PYTHON_BIN" ]; then emit_empty; fi
+
 # --- Turn counter + cooldown check via Python (atomic meta table update) ---
-"$PYTHON_BIN" -c '
+CTX_JSON="$("$PYTHON_BIN" -c '
 import json, os, sys, sqlite3
 
 session_id = sys.argv[1]
@@ -147,6 +186,21 @@ msg = (
     "(This prompt fires at most once per session.)"
 ) % (store_py_hint, ns_hint, session_id)
 print(json.dumps({"additionalContext": msg}))
-' "$SESSION_ID" "$DATA_DIR_PY" "$MARKER" "$STORE_PY_PY" "$NS_HINT" 2>/dev/null || echo '{}'
+' "$SESSION_ID" "$DATA_DIR_PY" "$MARKER" "$STORE_PY_PY" "$NS_HINT" 2>/dev/null || echo '{}')"
 
+if [ -z "$CTX_JSON" ]; then
+  CTX_JSON='{}'
+fi
+
+# Neutralize any sentinel token the payload happens to contain before wrapping
+# (same defense as zmem-recall.sh): the launcher locates the payload by scanning
+# stdout for the literal markers, so an embedded marker would move the
+# extraction boundary and silently degrade this hook to {}. Both replacements
+# are safe inside the serialized JSON string: neither introduces a quote or a
+# backslash.
+CTX_JSON="${CTX_JSON//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
+CTX_JSON="${CTX_JSON//<<<END>>>/<<<END_NEUTRALIZED>>>}"
+
+# Wrap the payload in the sentinel so the host adapter can extract + rewrap it.
+printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' "$CTX_JSON"
 exit 0
