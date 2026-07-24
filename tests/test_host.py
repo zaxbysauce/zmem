@@ -24,11 +24,6 @@ import host  # noqa: E402
 ENV_KEYS = ["ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA", "ZMEM_CORE_MD", "OneDrive"]
 
 
-def _clean_env():
-    """Context manager-ish helper: clear all zmem-relevant env vars."""
-    return mock.patch.dict(os.environ, {}, clear=False)
-
-
 class TestStorePathPrecedence(unittest.TestCase):
     def setUp(self):
         self._patcher = mock.patch.dict(os.environ, {}, clear=False)
@@ -245,6 +240,15 @@ class TestImportSmoke(unittest.TestCase):
             # second source-untouched proof.
             after_hash = import_store._file_fingerprint(source_store)["sha256"]
             self.assertEqual(after_hash, result["source_sha256_after"])
+
+            # A second import into the same non-empty dest without --force
+            # must refuse rather than silently overwrite.
+            with self.assertRaises(FileExistsError):
+                import_store.run_import(source_store, dest_dir, force=False)
+
+            # --force allows the overwrite.
+            result2 = import_store.run_import(source_store, dest_dir, force=True)
+            self.assertTrue(result2["source_unchanged"])
 
 
 if __name__ == "__main__":
