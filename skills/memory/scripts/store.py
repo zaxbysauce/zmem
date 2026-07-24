@@ -1290,6 +1290,39 @@ CONSOLIDATE_DEFAULT_THRESHOLD = float(os.environ.get("ZMEM_CONSOLIDATE_THRESHOLD
 CONSOLIDATE_MIN_INTERVAL_DAYS = 7
 CONSOLIDATE_GROWTH_THRESHOLD = 0.20  # run when live count grew by >20% since last run
 
+# Lexical (token-overlap) clustering fallback threshold, used by consolidate()
+# when embeddings are unavailable (no onnxruntime/tokenizers, or the model file
+# is absent — Phase 10). Jaccard similarity of content+tags token sets is a
+# coarser signal than cosine similarity of embeddings, so this is deliberately
+# a separate, independently-tunable knob rather than reusing the cosine
+# threshold's scale.
+CONSOLIDATE_LEXICAL_THRESHOLD = float(os.environ.get("ZMEM_CONSOLIDATE_LEXICAL_THRESHOLD", "0.60"))
+
+_LEXICAL_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "is", "are", "was", "were", "be", "been", "being",
+    "this", "that", "these", "those", "it", "its", "as", "by", "from",
+    "not", "no", "so", "if", "then", "than", "into", "onto", "when",
+}
+
+
+def _lexical_tokens(text: str | None) -> set[str]:
+    """Tokenize text into a lowercase word set for Jaccard-overlap clustering.
+    Drops short tokens and common stopwords so similarity reflects content
+    words, not incidental grammar overlap."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {w for w in words if len(w) >= 3 and w not in _LEXICAL_STOPWORDS}
+
+
+def _lexical_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
+    """Jaccard similarity between two token sets. 0.0 if either is empty."""
+    if not tokens_a or not tokens_b:
+        return 0.0
+    union = tokens_a | tokens_b
+    if not union:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(union)
+
 
 def consolidate(
     conn: sqlite3.Connection,
@@ -1299,7 +1332,8 @@ def consolidate(
     dry_run: bool = False,
     namespace: str | None = None,
 ) -> None:
-    """Merge near-duplicate memories via embedding similarity.
+    """Merge near-duplicate memories via embedding similarity (or a lexical
+    token-overlap fallback when embeddings are unavailable — Phase 10).
 
     For each live memory with an embedding, query vec0 KNN for nearest neighbors.
     Cluster memories with cosine similarity >= threshold. For each cluster:
@@ -1307,12 +1341,18 @@ def consolidate(
     into the keeper, supersede the absorbed members. Each cluster commits
     atomically — interruption is safe because keeper selection is deterministic.
 
+    When embeddings are unavailable (no onnxruntime/tokenizers, or the model
+    file is absent/not yet downloaded), clustering falls back to Jaccard
+    similarity of content+tags token sets (CONSOLIDATE_LEXICAL_THRESHOLD)
+    instead of cosine — same keeper/merge/supersede mechanics, just a coarser
+    similarity signal. `consolidate` never hard-requires the model.
+
     If prune=True, also supersede memories with retrieval_count=0, signal=none,
     and age>30d (opt-in, never automatic on SessionStart).
     """
-    if not _embeddings or not _embeddings.is_available():
-        print("[zmem] consolidate requires embeddings — install onnxruntime + tokenizers", file=sys.stderr)
-        return
+    use_lexical = not (_embeddings and _embeddings.is_available())
+    if use_lexical:
+        print("[zmem] embeddings unavailable — consolidating via lexical token overlap", file=sys.stderr)
 
     # Growth-based cadence gate: skip if last consolidation was recent AND
     # the store hasn't grown significantly since. Only applies to automatic
@@ -1356,14 +1396,17 @@ def consolidate(
         )
         conn.commit()
 
-    # Load all live memories with embeddings.
+    # Load all live memories. In embedding mode, only rows with an embedding
+    # are candidates (vec0 KNN needs a query vector); in lexical fallback
+    # mode every live row is a candidate (Jaccard needs only content/tags).
     ns_clause = "AND namespace = ?" if namespace else ""
     ns_params = [namespace] if namespace else []
+    embed_clause = "" if use_lexical else "AND embedding IS NOT NULL"
     rows = conn.execute(
         f"""SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
                   embedding, embedding_model
            FROM memory
-           WHERE superseded_at IS NULL AND embedding IS NOT NULL
+           WHERE superseded_at IS NULL {embed_clause}
            {ns_clause}
            ORDER BY confidence DESC, retrieval_count DESC""",
         ns_params,
@@ -1373,29 +1416,60 @@ def consolidate(
         print("[zmem] no embeddable memories to consolidate")
         return
 
+    # Precompute lexical token sets once per row (only used in fallback mode).
+    lexical_tokens = {}
+    if use_lexical:
+        for r in rows:
+            lexical_tokens[r["id"]] = _lexical_tokens(
+                (r["content"] or "") + " " + (r["tags"] or "")
+            )
+
     # Track which memories have been absorbed (to skip them as seeds).
     absorbed = set()
     merged_count = 0
     pruned_count = 0
 
+    # Cosine threshold and lexical (Jaccard) threshold live on different
+    # scales. If the caller left --threshold at its cosine default while we're
+    # in lexical fallback, swap in the lexical default; an explicit override
+    # is respected either way.
+    effective_threshold = threshold
+    if use_lexical and threshold == CONSOLIDATE_DEFAULT_THRESHOLD:
+        effective_threshold = CONSOLIDATE_LEXICAL_THRESHOLD
+
     for seed in rows:
         if seed["id"] in absorbed:
             continue
 
-        # Query vec0 for nearest neighbors of this seed.
         neighbors = []
-        try:
-            results = conn.execute(
-                "SELECT memory_id, distance FROM memory_vec "
-                "WHERE embedding MATCH ? AND k = 10 ORDER BY distance",
-                [seed["embedding"]],
-            ).fetchall()
+        if use_lexical:
+            # Jaccard token-overlap clustering: compare seed against every
+            # other not-yet-absorbed row. O(n^2) but consolidate runs on a
+            # bounded, infrequent cadence (see the growth-gate above) over a
+            # single user's live memory count, not a large corpus.
+            seed_tokens = lexical_tokens[seed["id"]]
+            for row in rows:
+                if row["id"] == seed["id"] or row["id"] in absorbed:
+                    continue
+                sim = _lexical_similarity(seed_tokens, lexical_tokens[row["id"]])
+                if sim >= effective_threshold:
+                    neighbors.append((row, sim))
+        else:
+            # Query vec0 for nearest neighbors of this seed.
+            try:
+                results = conn.execute(
+                    "SELECT memory_id, distance FROM memory_vec "
+                    "WHERE embedding MATCH ? AND k = 10 ORDER BY distance",
+                    [seed["embedding"]],
+                ).fetchall()
+            except sqlite3.OperationalError:
+                results = []
             for r in results:
                 mid = r["memory_id"]
                 if mid == seed["id"] or mid in absorbed:
                     continue
                 sim = 1.0 - r["distance"]
-                if sim >= threshold:
+                if sim >= effective_threshold:
                     # Verify it's live and in the right namespace.
                     row = conn.execute(
                         "SELECT id, confidence, signal, tags, retrieval_count FROM memory "
@@ -1405,8 +1479,6 @@ def consolidate(
                     ).fetchone()
                     if row:
                         neighbors.append((row, sim))
-        except sqlite3.OperationalError:
-            continue  # vec0 unavailable
 
         if not neighbors:
             continue

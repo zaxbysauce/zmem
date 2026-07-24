@@ -1,0 +1,68 @@
+name: CI
+
+# Runs the full test suite on every push/PR, without the ~90MB embedding
+# model (skills/memory/models/minilm.onnx is gitignored — Phase 10,
+# PLAN.md §7-P10). ZMEM_MODEL_AUTODOWNLOAD=0 guarantees no lazy-download is
+# attempted here either, so this job never fetches the model over the
+# network. All suites must (and do) pass model-absent: recall degrades to
+# FTS5, consolidate degrades to lexical token-overlap clustering — see
+# skills/memory/scripts/embeddings.py and store.py's `consolidate`.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    env:
+      # Never attempt to download the 90MB model in CI — the whole point of
+      # this job is proving the suites pass in degraded (no-embeddings) mode.
+      ZMEM_MODEL_AUTODOWNLOAD: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Confirm model is absent (sanity check for the degraded-mode guarantee)
+        shell: bash
+        run: |
+          if [ -f skills/memory/models/minilm.onnx ]; then
+            echo "::error::minilm.onnx should be gitignored and absent in a fresh checkout"
+            exit 1
+          fi
+          echo "minilm.onnx absent, as expected — suites must pass in degraded mode."
+
+      - name: Run Python test suites
+        shell: bash
+        run: |
+          set -e
+          for f in tests/test_*.py; do
+            echo "=== $f ==="
+            python "$f"
+          done
+
+      - name: Run Node test suites
+        shell: bash
+        run: |
+          set -e
+          for f in tests/test_*.js; do
+            echo "=== $f ==="
+            node "$f"
+          done

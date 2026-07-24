@@ -16,3 +16,12 @@ Thumbs.db
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Embedding model binary (~90MB, Phase 10 — PLAN.md §7-P10). Lazy-downloaded
+# by skills/memory/scripts/embeddings.py (checksum-verified) on first use, or
+# already present on an existing install. NOT committed: it bloats every
+# clone and every git operation. tokenizer.json + config.json are small and
+# stay tracked. See embeddings.py module docstring for the fail-open
+# behavior when this file is absent.
+skills/memory/models/minilm.onnx
+skills/memory/models/*.part
