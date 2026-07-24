@@ -291,8 +291,17 @@ if host == "claude" and nudge_marker:
             )
             try:
                 os.makedirs(os.path.dirname(nudge_marker), exist_ok=True)
-                with open(nudge_marker, "w", encoding="utf-8") as f:
-                    f.write("shown\n")
+                # Atomic exclusive create (matches host.py _try_create_lock
+                # pattern): two sessions starting concurrently could both see
+                # the marker absent under a plain overwrite-open and both
+                # show the nudge. O_EXCL makes only one winner.
+                fd = os.open(nudge_marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(fd, b"shown\n")
+                finally:
+                    os.close(fd)
+            except FileExistsError:
+                pass  # another process already showed it — no-op
             except OSError:
                 pass  # fail-open: worst case the nudge repeats next session
     except Exception:

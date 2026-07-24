@@ -115,7 +115,7 @@ New subcommand `store.py failures --session <id> [--transcript <path>]` → `{co
 ```
 zmem/
 ├─ .claude-plugin/
-│  ├─ plugin.json          # CC manifest; hooks → ../hooks/hooks.claude.json (pending G9)
+│  ├─ plugin.json          # CC manifest; hooks → ../hooks/hooks.claude.json (G9 resolved — confirmed working)
 │  ├─ marketplace.json     # CC self-marketplace ({$schema,name,plugins:[{source:"."}]})
 │  └─ userConfig: store-dir (type directory, default ~/.zmem)
 ├─ .zcode-plugin/plugin.json   # existing; hooks → hooks/hooks.zcode.json
@@ -168,7 +168,7 @@ zmem/
 | **P1** | Shared store: `host.py` resolution chain + box-neutral `~/.zmem`; local-FS guard; SQLITE_BUSY retry wrapper; owner-only perms. **Import (CRITIC 8):** `PRAGMA wal_checkpoint(TRUNCATE)` on the source (or copy its `-wal`/`-shm`) **then** copy `store.sqlite` **and `core.md`** (`store.py:78`) into `~/.zmem`; leave the original `zmem@zaxbyhub` store untouched. | both tools resolve `~/.zmem`; guard rejects a UNC/OneDrive path; all 403 rows (383 live) + core.md present in new store; source store unmodified. | — |
 | **P2** | Namespace scheme + **v5 migration (CRITIC BLOCKER 1).** Keys are produced **only** by calling `host.py:resolve_namespace()` against each namespace's **live checkout path** — never a hand-typed literal. If a checkout for a `project:*` namespace isn't on disk, **refuse and report** rather than guess. | v5 applied; a shipped test asserts `resolve_namespace(<checkout>) == migrated_key` for all mappable namespaces; the 107 live opencode-swarm rows recall from **both** `E:\ZCode\opencode-swarm` and `E:\ClaudeCode\opencode-swarm-dev`. | — |
 | **P3** | Adapter core in `zmem-launch.js`: detect + canonical env + stdin replay + defensive sentinel parse + envelope translation + encoded-budget truncation + detached background stdio. | **End-to-end test (CRITIC BLOCKER 2):** drive the *actual* `zmem-session-start.sh`/`recall.sh` through the launcher (not a synthetic single-JSON fixture) and assert correct per-host envelope even with consolidate noise on stdout; store resolves from all envs; session-start adds no ~5 s stall. | G3 |
-| **P4** | Dual manifest + per-host hooks.json (exec form). Add `.claude-plugin/{plugin,marketplace}.json` + `hooks.claude.json`; keep ZCode side. | both manifests parse; **install each host, confirm hooks fire** (real-install check). | **G1, G8, G9** |
+| **P4** | Dual manifest + per-host hooks.json (string form). Add `.claude-plugin/{plugin,marketplace}.json` + `hooks.claude.json`; keep ZCode side. | both manifests parse; **install each host, confirm hooks fire** (real-install check). | **G1, G8, G9** |
 | **P5** | Unified `store.py failures` (transcript|db); rewire reflect/capture-failure. | CC: a failed Bash call triggers reflection sourced from transcript; ZCode: still from db.sqlite. | uses P0.5 |
 | **P6** | Replace native memory (CC): Tier0 via ZMem; README/skill document `autoMemoryEnabled:false`; SessionStart detects toggle + nudges if still on. | with toggle off, no native memory double-load; nudge shows when on. | G0 |
 | **P7** | `SubagentStart` recall hook + `SubagentStop` reflect hook. | subagent transcript shows injected memory marker; a failing subagent yields a capture prompt. | G5 (via P0.5) |

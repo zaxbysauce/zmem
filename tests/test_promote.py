@@ -126,6 +126,15 @@ class TestPromoteQuality(PromoteTestBase):
             # Single line: the next raw line in the file is the closing '---'.
             frontmatter = text.split("---")[1]
             self.assertEqual(frontmatter.count("description:"), 1)
+            # Guard against a multiline description value: the "description:"
+            # line must be immediately followed by the frontmatter's closing
+            # "---" marker (the shape store.py's promote_memory() emits:
+            # name/description/---), not by more wrapped description text.
+            all_lines = text.splitlines()
+            desc_idx = next(
+                i for i, line in enumerate(all_lines) if line.startswith("description:")
+            )
+            self.assertEqual(all_lines[desc_idx + 1].strip(), "---")
             # No truncation ellipsis mid-word: if present, the char before it
             # must not be inside an alphanumeric token abutting more text -
             # simplest robust check is that the description contains the

@@ -30,7 +30,7 @@ Start one ZCode session and confirm its ZMem hooks still fire. If they don't, re
 `~/.zmem` is a **point-in-time copy** taken during P1; ZCode has kept writing to the legacy store since.
 
 ```bash
-python skills/memory/scripts/import-store.py --force
+python skills/memory/scripts/import-store.py --source "C:\Users\Brett\.zcode\cli\plugins\data\zmem@zaxbyhub\store.sqlite" --dest-dir "C:\Users\Brett\.zmem" --force
 python skills/memory/scripts/store.py stats
 ```
 

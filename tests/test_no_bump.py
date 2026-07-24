@@ -15,6 +15,7 @@ Run: python tests/test_no_bump.py   (no pytest required — repo convention)
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -36,6 +37,9 @@ class NoBumpTest(unittest.TestCase):
         self._run("add", "--namespace", NS, "--type", "lesson",
                   "--content", "always run the linter before committing python code",
                   "--signal", "lint")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _run(self, *args):
         return subprocess.run(
@@ -96,6 +100,7 @@ class NoBumpTest(unittest.TestCase):
         self.assertEqual(self._rc(), 0)
         self._run("recent", "--namespace", NS, "--json")
         self.assertEqual(self._rc(), 1)
+        self.assertIsNotNone(self._last_retrieved())
 
     # --- mixed: no-bump reads never advance the count a later bump starts from
     def test_no_bump_then_bump(self):
