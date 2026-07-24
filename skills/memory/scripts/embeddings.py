@@ -12,10 +12,12 @@ recall / lexical-overlap clustering (see store.py `consolidate`).
 
 The model file itself (skills/memory/models/minilm.onnx, ~90MB) is NOT
 committed to git (Phase 10, PLAN.md §7-P10) — it's gitignored and either
-already present on disk from a prior install, lazy-downloaded on first use,
-or simply absent (degraded mode). A full git-history rewrite to purge the
-90MB blob already committed on this branch's history is a disruptive,
-user-opt-in follow-up — NOT done here (see PLAN.md).
+already present on disk from a prior install, lazy-downloaded on first use
+(opt-in only, via ZMEM_MODEL_AUTODOWNLOAD=1 — never automatic, to preserve
+zero-cloud-dependency by default), or simply absent (degraded mode). A full
+git-history rewrite to purge the 90MB blob already committed on this
+branch's history is a disruptive, user-opt-in follow-up — NOT done here
+(see PLAN.md).
 """
 
 from __future__ import annotations
@@ -96,13 +98,20 @@ def _try_download_model(
     Fail-open by design: any exception, a network error, or a checksum
     mismatch returns False and leaves the caller to degrade to the
     no-embeddings path. Never raises, never leaves a partial/corrupt file at
-    `model_path` (downloads to a .part sibling first, only renamed into
-    place after the checksum passes).
+    `model_path` (downloads to a uniquely-named .part sibling first — unique
+    per attempt via pid + random suffix, so concurrent download attempts
+    from separate processes never collide on the same intermediate file —
+    only renamed into place after the checksum passes).
     """
     import urllib.request
 
     resolved_url = url or os.environ.get("ZMEM_MODEL_URL", _DEFAULT_MODEL_URL)
-    tmp_path = model_path.with_suffix(model_path.suffix + ".part")
+    # Unique per-attempt temp name (pid + random suffix) so two concurrent
+    # download attempts (e.g. multiple hook processes racing on first use)
+    # never write to the same intermediate file.
+    tmp_path = model_path.with_suffix(
+        f"{model_path.suffix}.{os.getpid()}.{os.urandom(4).hex()}.part"
+    )
     try:
         model_path.parent.mkdir(parents=True, exist_ok=True)
         with urllib.request.urlopen(resolved_url, timeout=30) as resp:
@@ -113,8 +122,21 @@ def _try_download_model(
                         break
                     out.write(chunk)
         if not verify_checksum(tmp_path, expected_sha256):
+            print(
+                f"zmem: downloaded model checksum mismatch (url={resolved_url}) "
+                "-- falling back to no-embeddings. The default download URL is "
+                "not guaranteed to produce a build matching the pinned "
+                "ZMEM_MODEL_SHA256; set ZMEM_MODEL_URL to a build matching the "
+                "pinned checksum, or place the file manually at "
+                f"{model_path}.",
+                file=sys.stderr,
+            )
             return False
-        tmp_path.replace(model_path)
+        if not model_path.is_file():
+            # Avoid unnecessary churn if another concurrent attempt already
+            # completed successfully; both would be verified-correct copies
+            # of the same nominal model, so either landing is fine.
+            tmp_path.replace(model_path)
         return True
     except Exception:
         return False
@@ -130,8 +152,10 @@ def _check_available() -> bool:
     """Check if onnxruntime + tokenizers + model files are all present.
 
     If the model file is missing, attempts a lazy download (checksum-
-    verified) unless ZMEM_MODEL_AUTODOWNLOAD=0 (set in CI — never fetch 90MB
-    there). Download failure of any kind is silent and falls through to
+    verified) ONLY when explicitly opted in via ZMEM_MODEL_AUTODOWNLOAD=1.
+    This is opt-in, not opt-out: by default zmem never makes an unsolicited
+    network call, to honor the project's local-first / zero-cloud-dependency
+    promise. Download failure of any kind is silent and falls through to
     the no-embeddings path; it never raises.
     """
     global _model_available
@@ -147,7 +171,7 @@ def _check_available() -> bool:
     models_dir = _resolve_models_dir()
     model_path = models_dir / "minilm.onnx"
     tok_path = models_dir / "tokenizer.json"
-    if not model_path.is_file() and os.environ.get("ZMEM_MODEL_AUTODOWNLOAD", "1") != "0":
+    if not model_path.is_file() and os.environ.get("ZMEM_MODEL_AUTODOWNLOAD", "0") == "1":
         _try_download_model(model_path)
     _model_available = model_path.is_file() and tok_path.is_file()
     return _model_available

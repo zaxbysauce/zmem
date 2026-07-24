@@ -98,6 +98,128 @@ class ChecksumAndDownloadTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertFalse(dest.is_file())
 
+    def test_checksum_mismatch_prints_actionable_message(self):
+        """On checksum mismatch the degrade path must explain WHY, not just
+        silently return False (finding #2: honest/actionable failure mode)."""
+        other = Path(self.tmp) / "different_bytes2.bin"
+        other.write_bytes(b"totally different content" * 50)
+        dest = Path(self.tmp) / "downloaded4" / "minilm.onnx"
+        dest.parent.mkdir(parents=True)
+        url = other.as_uri()
+
+        import io
+        from contextlib import redirect_stderr
+
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            ok = embeddings._try_download_model(dest, url=url, expected_sha256=self.fixture_sha256)
+        self.assertFalse(ok)
+        message = captured.getvalue().lower()
+        self.assertIn("checksum mismatch", message)
+        self.assertIn("no-embeddings", message)
+        # Actionable: tells the user how to fix it.
+        self.assertIn("zmem_model_url", message)
+
+    def test_concurrent_download_attempts_use_distinct_temp_files(self):
+        """Two 'concurrent' download attempts (simulated sequentially here,
+        per repo convention of never doing real network I/O) must not share
+        the same intermediate .part path (finding #3)."""
+        dest = Path(self.tmp) / "downloaded5" / "minilm.onnx"
+        url = self.fixture.as_uri()
+
+        seen_tmp_paths = []
+        real_open = open
+
+        def spy_open(path, *args, **kwargs):
+            p = str(path)
+            if p.endswith(".part") or ".part" in Path(p).name:
+                seen_tmp_paths.append(p)
+            return real_open(path, *args, **kwargs)
+
+        import builtins
+
+        orig_open = builtins.open
+        builtins.open = spy_open
+        try:
+            ok1 = embeddings._try_download_model(dest, url=url, expected_sha256=self.fixture_sha256)
+        finally:
+            builtins.open = orig_open
+        self.assertTrue(ok1)
+
+        # Remove the result so a second attempt downloads again into a fresh
+        # temp file, letting us compare the two temp paths used.
+        dest.unlink()
+        builtins.open = spy_open
+        try:
+            ok2 = embeddings._try_download_model(dest, url=url, expected_sha256=self.fixture_sha256)
+        finally:
+            builtins.open = orig_open
+        self.assertTrue(ok2)
+
+        # Each attempt opens its .part path twice (write, then checksum
+        # read) -- dedupe to the distinct paths used per attempt.
+        unique_paths = sorted(set(seen_tmp_paths))
+        self.assertEqual(len(unique_paths), 2)
+        # Both should embed the pid, proving uniqueness isn't purely random-luck.
+        self.assertIn(str(os.getpid()), unique_paths[0])
+        self.assertIn(str(os.getpid()), unique_paths[1])
+
+    def test_second_download_skips_rename_if_already_present(self):
+        """If a concurrent attempt already placed a verified-correct file at
+        model_path, a later attempt must not error and must leave the
+        already-correct file in place (finding #3's race-harmlessly clause)."""
+        dest = Path(self.tmp) / "downloaded6" / "minilm.onnx"
+        url = self.fixture.as_uri()
+        ok1 = embeddings._try_download_model(dest, url=url, expected_sha256=self.fixture_sha256)
+        self.assertTrue(ok1)
+        mtime_before = dest.stat().st_mtime_ns
+
+        ok2 = embeddings._try_download_model(dest, url=url, expected_sha256=self.fixture_sha256)
+        self.assertTrue(ok2)
+        self.assertEqual(embeddings._sha256_file(dest), self.fixture_sha256)
+        # File wasn't churned (same underlying inode/mtime) since it already
+        # existed and was correct.
+        self.assertEqual(dest.stat().st_mtime_ns, mtime_before)
+
+
+class AutodownloadDefaultTests(unittest.TestCase):
+    """Finding #1: autodownload must be opt-in (default off), never
+    opt-out, so ordinary store operations never make an unsolicited network
+    call. Drives the real CLI so ZMEM_MODEL_AUTODOWNLOAD is genuinely unset,
+    with the download target patched to a file:// fixture -- if the code
+    attempted a download at all (even one that would 404/fail), a marker
+    file gets written, so its absence proves no attempt was made."""
+
+    def test_no_download_attempted_when_env_var_unset(self):
+        tmp = tempfile.mkdtemp()
+        models_dir = os.path.join(tmp, "no_model_here")
+        os.makedirs(models_dir, exist_ok=True)
+        marker = os.path.join(tmp, "download_attempted.marker")
+
+        script = f'''
+import sys
+sys.path.insert(0, {str(SCRIPTS_DIR)!r})
+import embeddings
+
+_orig = embeddings._try_download_model
+def _spy(*a, **k):
+    open({marker!r}, "w").close()
+    return _orig(*a, **k)
+embeddings._try_download_model = _spy
+embeddings._resolve_models_dir = lambda: __import__("pathlib").Path({models_dir!r})
+embeddings._check_available()
+'''
+        env = {**os.environ}
+        env.pop("ZMEM_MODEL_AUTODOWNLOAD", None)  # ensure genuinely unset
+        r = subprocess.run([PYTHON, "-c", script], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(
+            os.path.exists(marker),
+            "embeddings._check_available() attempted a download with "
+            "ZMEM_MODEL_AUTODOWNLOAD unset -- autodownload must be opt-in, "
+            "not opt-out (finding #1).",
+        )
+
 
 class LexicalHelperTests(unittest.TestCase):
     """Unit tests for store.py's Jaccard token-overlap clustering helpers."""
