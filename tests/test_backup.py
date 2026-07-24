@@ -489,6 +489,145 @@ class RestoreTest(_StoreCase):
 
 
 # ---------------------------------------------------------------------------
+# restore — local-filesystem guard
+# ---------------------------------------------------------------------------
+# `restore` writes the same live WAL-mode store.sqlite that connect() refuses to
+# open on a UNC/network/OneDrive path, so it applies the same guard, and it must
+# fire before anything on the destination side is created or touched.
+class RestoreLocalFsGuardTest(_StoreCase):
+    def _snapshot_from_a_good_store(self) -> str:
+        """A verified snapshot built in a normal temp store, to hand to a
+        restore aimed at a rejected destination."""
+        self.add("ALPHA original row")
+        self.assertEqual(self.run_store("backup").returncode, 0)
+        return str(self.backups / self.snapshots()[0])
+
+    def test_refuses_a_unc_destination(self):
+        snap = self._snapshot_from_a_good_store()
+        env = {**self.env, "ZMEM_STORE": r"\\fileserver\share\zmem\store.sqlite"}
+        r = self.run_store("restore", "--from", snap, "--force", env=env)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("UNC", r.stderr)
+        self.assertIn("restore FAILED", r.stderr)
+
+    def test_refuses_a_onedrive_destination(self):
+        snap = self._snapshot_from_a_good_store()
+        onedrive = os.path.join(self.tmp, "OneDrive")
+        os.makedirs(os.path.join(onedrive, "zmem"), exist_ok=True)
+        env = {**self.env,
+               "OneDrive": onedrive,
+               "ZMEM_STORE": os.path.join(onedrive, "zmem", "store.sqlite")}
+        r = self.run_store("restore", "--from", snap, "--force", env=env)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("OneDrive", r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(onedrive, "zmem", "store.sqlite")),
+                         "the guard must fire before the destination is created")
+
+    def test_a_local_destination_is_still_accepted(self):
+        """Control: the guard must not reject an ordinary local temp path."""
+        snap = self._snapshot_from_a_good_store()
+        r = self.run_store("restore", "--from", snap, "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+# ---------------------------------------------------------------------------
+# restore — coordination with the automated background writers
+# ---------------------------------------------------------------------------
+# `restore` overwrites store.sqlite wholesale, and the SessionStart hook fires
+# detached `backup --if-due` and `consolidate` runs that may be mid-flight
+# against it. Both are single-flighted on their own lockfiles, so restore takes
+# BOTH for its whole duration and refuses (exit 2, destination untouched) if it
+# cannot. Exit 2, not 0: unlike a backup — whose lock loss genuinely means
+# "someone else is already doing it" — a silently skipped restore would report
+# success while the user's data is unchanged.
+#
+# NOT covered, by design: a live interactive session writing through the normal
+# add/recall path takes neither lock. See SKILL.md ("run restore when no session
+# is actively writing").
+class RestoreSingleFlightTest(_StoreCase):
+    def _hold(self, name: str) -> Path:
+        p = Path(self.tmp) / f".zmem-{name}.lock"
+        p.write_text("99999:handmade-by-test", encoding="utf-8")
+        return p
+
+    def _seed_and_snapshot(self) -> Path:
+        self.add("ALPHA original row")
+        self.assertEqual(self.run_store("backup").returncode, 0)
+        return self.backups / self.snapshots()[0]
+
+    def _live_contents(self) -> set:
+        conn = sqlite3.connect(self.store)
+        try:
+            return {r[0] for r in conn.execute(
+                "SELECT content FROM memory WHERE superseded_at IS NULL")}
+        finally:
+            conn.close()
+
+    def _assert_refused_untouched(self, r, held: Path, expect: str):
+        self.assertEqual(r.returncode, 2,
+                         f"a skipped restore must not look like a completed one: "
+                         f"{r.stdout}{r.stderr}")
+        self.assertIn(expect, r.stderr)
+        self.assertIn("destination untouched", r.stderr)
+        self.assertEqual(self._live_contents(), {"ALPHA original row", "CHARLIE added later"})
+        self.assertEqual(list(self.backups.glob("prerestore-*")), [],
+                         "a refused restore must not take a pre-restore backup")
+        self.assertTrue(held.exists(), "the other job's lock must survive untouched")
+        self.assertEqual(held.read_text(encoding="utf-8").strip(),
+                         "99999:handmade-by-test")
+
+    def test_refuses_while_a_backup_holds_its_lock(self):
+        snap = self._seed_and_snapshot()
+        self.add("CHARLIE added later")
+        lock = self._hold("backup")
+        r = self.run_store("restore", "--from", str(snap), "--force")
+        self._assert_refused_untouched(r, lock, "a backup is currently running")
+
+    def test_refuses_while_a_consolidate_holds_its_lock(self):
+        snap = self._seed_and_snapshot()
+        self.add("CHARLIE added later")
+        lock = self._hold("consolidate")
+        r = self.run_store("restore", "--from", str(snap), "--force")
+        self._assert_refused_untouched(r, lock, "a consolidation is currently running")
+
+    def test_the_backup_lock_is_released_when_the_consolidate_lock_is_lost(self):
+        """restore takes `backup` first; losing `consolidate` afterwards must
+        not strand the one it already holds."""
+        snap = self._seed_and_snapshot()
+        self.add("CHARLIE added later")
+        self._hold("consolidate")
+        r = self.run_store("restore", "--from", str(snap), "--force")
+        self.assertEqual(r.returncode, 2)
+        self.assertFalse((Path(self.tmp) / ".zmem-backup.lock").exists(),
+                         "the half-acquired backup lock must be released")
+        # Proof it is genuinely free: an ordinary backup still runs.
+        self.assertEqual(self.run_store("backup").returncode, 0)
+
+    def test_restore_proceeds_and_releases_both_locks_when_unlocked(self):
+        snap = self._seed_and_snapshot()
+        self.add("CHARLIE added later")
+        r = self.run_store("restore", "--from", str(snap), "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restore: OK", r.stdout)
+        self.assertEqual(self._live_contents(), {"ALPHA original row"})
+        for name in ("backup", "consolidate"):
+            self.assertFalse((Path(self.tmp) / f".zmem-{name}.lock").exists(),
+                             f"restore must not leave the {name} lock behind")
+
+    def test_a_stale_lock_does_not_block_restore_forever(self):
+        """Same stale-lease recovery every other lock holder gets: a crashed
+        backup must not wedge restore permanently."""
+        snap = self._seed_and_snapshot()
+        self.add("CHARLIE added later")
+        lock = self._hold("backup")
+        old = time.time() - 7200          # >> the 600s backup stale timeout
+        os.utime(lock, (old, old))
+        r = self.run_store("restore", "--from", str(snap), "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._live_contents(), {"ALPHA original row"})
+
+
+# ---------------------------------------------------------------------------
 # single-flight lock — host.py primitives
 # ---------------------------------------------------------------------------
 class LockPrimitiveTest(unittest.TestCase):

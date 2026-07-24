@@ -75,6 +75,23 @@ except ImportError:
         _host = None
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back to `default` on absent/garbage input.
+    Never raises at import time (a typo'd env var must not break every
+    subcommand).
+
+    Defined this early on purpose: every module-level tunable below is parsed
+    through it, and a bare float(os.environ[...]) at module scope turns one
+    malformed env var into an import-time crash of *every* store.py command
+    (including ones that have nothing to do with the knob).
+    """
+    raw = os.environ.get(name, "")
+    try:
+        return float(raw.strip())
+    except (AttributeError, ValueError):
+        return default
+
+
 def _resolve_store_path() -> Path:
     """Resolve the store location. Delegates to host.py's box-wide chain:
     ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
@@ -261,6 +278,124 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# Old-style (`project:<basename>`) namespace keys and the live checkout each one
+# must be re-derived from. Module-level so the v5 migration block and the
+# unconditional retry pass below share ONE list (and so tests can point it at a
+# fixture dir). See the v5 block for why an explicit map is unavoidable.
+_NS_MIGRATION_CHECKOUTS = {
+    "project:opencode-swarm": r"E:\ZCode\opencode-swarm",
+    "project:ragappv3": r"E:\ZCode\ragappv3",
+    "project:trainingapp": r"E:\ZCode\trainingapp",
+    "project:zmem": r"C:\Users\Brett\.graphify\repos\zaxbysauce\zmem",
+}
+
+
+def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces) -> dict[str, str]:
+    """Re-derive and rewrite the namespace key for each entry of
+    `old_namespaces` (a subset of _NS_MIGRATION_CHECKOUTS's keys). Returns the
+    {old: new} map of the ones actually resolved.
+
+    Never guesses: a key whose checkout is not on disk right now is left
+    completely untouched and reported, so it can be retried later (see
+    _retry_pending_ns_migration). Rewrites ALL rows under the old key, tombstones
+    included — a superseded row left behind under a dead key would be stranded
+    from its own namespace's history. Does not commit; the caller does.
+    """
+    mapping: dict[str, str] = {}
+    if _host is None:
+        print(
+            "[zmem] ns migration: host.py unavailable — cannot derive "
+            "namespace keys, skipping re-key (namespaces left unchanged)",
+            file=sys.stderr,
+        )
+        return mapping
+    for old_ns in old_namespaces:
+        checkout = _NS_MIGRATION_CHECKOUTS[old_ns]
+        checkout_path = Path(checkout)
+        if not checkout_path.is_dir():
+            print(
+                f"[zmem] ns migration WARNING: checkout for {old_ns} "
+                f"not found at {checkout} — refusing to guess; "
+                f"namespace left unchanged (will be retried on a later run)",
+                file=sys.stderr,
+            )
+            continue
+        new_ns = _host.resolve_namespace(checkout_path)
+        mapping[old_ns] = new_ns
+        if new_ns != old_ns:
+            conn.execute(
+                "UPDATE memory SET namespace=? WHERE namespace=?",
+                (new_ns, old_ns),
+            )
+    return mapping
+
+
+def _record_ns_migration(
+    conn: sqlite3.Connection, mapping: dict[str, str], *, merge: bool = True
+) -> None:
+    """Write `mapping` into the `ns_migration_v5` meta record.
+
+    merge=True (the retry pass) folds the mapping into whatever is already
+    recorded, so a retry adds its newly-resolved namespaces without erasing the
+    original migration's provenance. merge=False (the one-time v5 block)
+    REPLACES the record: that block recomputes the entire map from scratch
+    every time it runs, and its record is meant to say exactly what THAT run
+    resolved — no more.
+    """
+    existing: dict = {}
+    if merge:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='ns_migration_v5'"
+        ).fetchone()
+        if row and row[0]:
+            try:
+                loaded = json.loads(row[0])
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (ValueError, TypeError):
+                existing = {}
+    existing.update(mapping)
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('ns_migration_v5', ?)",
+        (json.dumps(existing),),
+    )
+
+
+def _retry_pending_ns_migration(conn: sqlite3.Connection) -> None:
+    """Re-attempt the v5 re-key for any namespace the original migration had to
+    skip. Runs on EVERY migrate(), independent of schema_version.
+
+    The v5 block is version-gated and therefore fires exactly once. Any
+    namespace whose checkout happened to be absent at that instant (unmounted
+    drive, not-yet-cloned repo) was skipped — and, because schema_version was
+    bumped to 5 regardless, was skipped *permanently*, stranding those rows
+    under a dead key forever. Decoupling the retry from the version gate fixes
+    that: the cost when there is nothing to do (the overwhelmingly common case)
+    is one indexed SELECT against a four-element IN-list, and it is a strict
+    no-op unless a row still carries an old-style key AND its checkout is now
+    present.
+    """
+    keys = list(_NS_MIGRATION_CHECKOUTS)
+    placeholders = ",".join("?" * len(keys))
+    try:
+        stranded = [
+            r[0] for r in conn.execute(
+                f"SELECT DISTINCT namespace FROM memory WHERE namespace IN ({placeholders})",
+                keys,
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        return  # never let a retry probe break an otherwise-fine migrate()
+    if not stranded:
+        return  # nothing left under an old-style key — no-op
+    mapping = _rekey_namespaces(conn, stranded)
+    if mapping:
+        _record_ns_migration(conn, mapping)
+        print(f"[zmem] ns migration: re-keyed {len(mapping)} previously-skipped "
+              f"namespace(s): {', '.join(sorted(mapping))}", file=sys.stderr)
+    conn.commit()
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Versioned migration. Runs after init_db(). Idempotent and crash-safe.
 
@@ -354,47 +489,22 @@ def migrate(conn: sqlite3.Connection) -> None:
         # Schema-gated (this whole block only runs when ver < 5) and built
         # entirely from a fresh recomputation each time it runs, so it is
         # both a no-op on immediate re-run (ver already 5) and reproducible
-        # on a fresh v4 re-import at cutover (PLAN.md §10b).
-        _NS_MIGRATION_CHECKOUTS = {
-            "project:opencode-swarm": r"E:\ZCode\opencode-swarm",
-            "project:ragappv3": r"E:\ZCode\ragappv3",
-            "project:trainingapp": r"E:\ZCode\trainingapp",
-            "project:zmem": r"C:\Users\Brett\.graphify\repos\zaxbysauce\zmem",
-        }
-        migration_map: dict[str, str] = {}
-        if _host is None:
-            print(
-                "[zmem] v5 migration: host.py unavailable — cannot derive "
-                "namespace keys, skipping re-key (namespaces left unchanged)",
-                file=sys.stderr,
-            )
-        else:
-            for old_ns, checkout in _NS_MIGRATION_CHECKOUTS.items():
-                checkout_path = Path(checkout)
-                if not checkout_path.is_dir():
-                    print(
-                        f"[zmem] v5 migration WARNING: checkout for {old_ns} "
-                        f"not found at {checkout} — refusing to guess; "
-                        f"namespace left unchanged",
-                        file=sys.stderr,
-                    )
-                    continue
-                new_ns = _host.resolve_namespace(checkout_path)
-                migration_map[old_ns] = new_ns
-                if new_ns != old_ns:
-                    conn.execute(
-                        "UPDATE memory SET namespace=? WHERE namespace=?",
-                        (new_ns, old_ns),
-                    )
+        # on a fresh v4 re-import at cutover (PLAN.md §10b). Namespaces this
+        # pass has to skip (checkout absent) are NOT lost: the unconditional
+        # _retry_pending_ns_migration() below picks them up on a later run,
+        # which is why bumping schema_version here is safe.
+        migration_map = _rekey_namespaces(conn, list(_NS_MIGRATION_CHECKOUTS))
         # `user:global` and any unmapped namespace (e.g. `project:ZCode`,
         # a spurious parent-dir capture with no git remote of its own) are
         # deliberately left untouched.
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('ns_migration_v5', ?)",
-            (json.dumps(migration_map),),
-        )
+        _record_ns_migration(conn, migration_map, merge=False)
         conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
         conn.commit()
+
+    # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
+    # skip. See _retry_pending_ns_migration for why this cannot live behind the
+    # version gate.
+    _retry_pending_ns_migration(conn)
 
 
 def _load_vec(conn: sqlite3.Connection) -> None:
@@ -553,7 +663,7 @@ def add_memory(
 
 # Cosine similarity threshold for semantic dedup (0..1, higher = stricter).
 # Override via ZMEM_DEDUP_THRESHOLD env var if false-positive merges occur.
-DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("ZMEM_DEDUP_THRESHOLD", "0.85"))
+DEDUP_SIMILARITY_THRESHOLD = _env_float("ZMEM_DEDUP_THRESHOLD", 0.85)
 # Signal rank for merge: higher = stronger.
 _SIGNAL_RANK = {"test": 5, "compile": 4, "lint": 3, "reviewer": 2, "user": 2, "none": 1}
 
@@ -1289,7 +1399,7 @@ Use when working with: {trigger_contexts}.
 
 
 # Consolidation threshold and cadence defaults.
-CONSOLIDATE_DEFAULT_THRESHOLD = float(os.environ.get("ZMEM_CONSOLIDATE_THRESHOLD", "0.80"))
+CONSOLIDATE_DEFAULT_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_THRESHOLD", 0.80)
 CONSOLIDATE_MIN_INTERVAL_DAYS = 7
 CONSOLIDATE_GROWTH_THRESHOLD = 0.20  # run when live count grew by >20% since last run
 
@@ -1299,7 +1409,7 @@ CONSOLIDATE_GROWTH_THRESHOLD = 0.20  # run when live count grew by >20% since la
 # coarser signal than cosine similarity of embeddings, so this is deliberately
 # a separate, independently-tunable knob rather than reusing the cosine
 # threshold's scale.
-CONSOLIDATE_LEXICAL_THRESHOLD = float(os.environ.get("ZMEM_CONSOLIDATE_LEXICAL_THRESHOLD", "0.60"))
+CONSOLIDATE_LEXICAL_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_LEXICAL_THRESHOLD", 0.60)
 
 _LEXICAL_STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
@@ -1440,6 +1550,13 @@ def consolidate(
     if use_lexical and threshold == CONSOLIDATE_DEFAULT_THRESHOLD:
         effective_threshold = CONSOLIDATE_LEXICAL_THRESHOLD
 
+    # NAMESPACE CONTAINMENT (data-integrity invariant, both clustering paths):
+    # a cluster is ALWAYS scoped to the seed's own namespace, whether or not the
+    # caller passed `namespace`. The `ns_clause`/`ns_params` above only narrow
+    # which rows are *considered*; they are not a containment guarantee, because
+    # the auto-triggered background run (zmem-session-start.sh) passes no
+    # --namespace at all. Without the seed-namespace check below, that run could
+    # supersede one project's memory into an unrelated project's memory.
     for seed in rows:
         if seed["id"] in absorbed:
             continue
@@ -1454,6 +1571,8 @@ def consolidate(
             for row in rows:
                 if row["id"] == seed["id"] or row["id"] in absorbed:
                     continue
+                if row["namespace"] != seed["namespace"]:
+                    continue  # namespace containment — see the note above
                 sim = _lexical_similarity(seed_tokens, lexical_tokens[row["id"]])
                 if sim >= effective_threshold:
                     neighbors.append((row, sim))
@@ -1473,12 +1592,15 @@ def consolidate(
                     continue
                 sim = 1.0 - r["distance"]
                 if sim >= effective_threshold:
-                    # Verify it's live and in the right namespace.
+                    # Verify it's live AND in the seed's own namespace —
+                    # namespace containment, see the note above the loop. vec0
+                    # KNN is namespace-blind, so this is the only thing standing
+                    # between a background (no --namespace) run and a
+                    # cross-project merge.
                     row = conn.execute(
                         "SELECT id, confidence, signal, tags, retrieval_count FROM memory "
-                        "WHERE id=? AND superseded_at IS NULL"
-                        + (f" AND namespace=?" if namespace else ""),
-                        [mid] + ns_params,
+                        "WHERE id=? AND superseded_at IS NULL AND namespace=?",
+                        (mid, seed["namespace"]),
                     ).fetchone()
                     if row:
                         neighbors.append((row, sim))
@@ -1563,17 +1685,17 @@ def consolidate(
 # a single-flight guard so the detached background writers the SessionStart
 # hook fires cannot pile up on each other.
 #
-# SNAPSHOT METHOD — SQLite's Online Backup API (`sqlite3.Connection.backup`),
-# not the fingerprint+file-copy dance import-store.py uses. import-store.py's
-# pattern exists to prove a LEGACY store was never touched during a one-shot
-# migration, and it copies `-wal`/`-shm` siblings by hand, which is only safe
-# if no writer commits mid-copy (hence its before/after sha256 assertion, whose
-# failure mode is "re-run when quiescent"). A periodic snapshot of the LIVE
-# box-wide store has no quiescent window to wait for: hook processes from
-# other sessions may be committing at any moment. The Online Backup API is
-# built for exactly that — it copies pages under SQLite's own locking with
-# automatic restart/retry on concurrent writes, and yields a single
-# self-contained destination file with no WAL sidecars to reason about.
+# SNAPSHOT METHOD — SQLite's Online Backup API (`sqlite3.Connection.backup`).
+# A periodic snapshot of the LIVE box-wide store has no quiescent window to
+# wait for: hook processes from other sessions may be committing at any moment.
+# The Online Backup API is built for exactly that — it copies pages under
+# SQLite's own locking with automatic restart/retry on concurrent writes, and
+# yields a single self-contained destination file with no WAL sidecars to
+# reason about. import-store.py transfers its one-shot legacy migration the
+# same way, for the same reason, adding a before/after sha256 of the source as
+# an independent "the legacy store was never touched" proof (failure mode:
+# "re-run when quiescent"); that extra assertion is specific to migrating
+# someone else's live store and is not needed here.
 
 SNAPSHOT_PREFIX = "store-"
 PRERESTORE_PREFIX = "prerestore-"
@@ -1585,17 +1707,6 @@ SNAPSHOT_SUFFIX = ".sqlite"
 SNAPSHOT_GLOB = SNAPSHOT_PREFIX + "*" + SNAPSHOT_SUFFIX
 
 BACKUP_DEFAULT_RETENTION = 7
-
-
-def _env_float(name: str, default: float) -> float:
-    """Read a float env var, falling back to `default` on absent/garbage input.
-    Never raises at import time (a typo'd env var must not break every
-    subcommand)."""
-    raw = os.environ.get(name, "")
-    try:
-        return float(raw.strip())
-    except (AttributeError, ValueError):
-        return default
 
 
 # Stale-lock timeouts. An mtime lease cannot tell "crashed" from "slower than
@@ -2000,7 +2111,63 @@ def _integrity_check_readonly(path: Path) -> str:
 
 
 def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = None) -> int:
-    """Restore the store from a snapshot. Returns a process exit code.
+    """Restore the store from a snapshot, under the maintenance locks.
+
+    Two guards wrap the real work in `_restore_locked`:
+
+    LOCAL-FS GUARD — the destination is a live WAL-mode sqlite file; a UNC path,
+    a network-mapped drive, or a OneDrive-synced dir risks exactly the
+    corruption `connect()` already refuses to court. `restore` writes the very
+    same file, so it applies the very same guard.
+
+    SINGLE-FLIGHT — `restore` overwrites store.sqlite wholesale while the two
+    automated background writers the SessionStart hook fires (`backup --if-due`
+    and `consolidate`) may be mid-run against it. Both are already
+    single-flighted on their own lockfiles, so restore takes BOTH, in a fixed
+    order, for its whole duration. Losing either means an automated job is
+    running right now: restore refuses (exit 2) WITHOUT touching the
+    destination, rather than proceeding. Unlike `backup`, whose lock loss is a
+    benign "someone else already did it" skip worth exit 0, a silently skipped
+    restore would tell a human "done" while their data is untouched.
+
+    NOT SOLVED, and deliberately so: a live interactive session writing to the
+    store through the normal `add`/`recall` path takes neither lock, so restore
+    still cannot serialize against it. Fixing that means coordinating with every
+    write path; the documented guidance (SKILL.md) remains "run restore when no
+    session is actively writing."
+    """
+    dest = STORE_PATH
+    if _host is not None:
+        try:
+            _host.assert_local_fs(dest.parent)
+        except ValueError as e:
+            print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
+            return 1
+
+    # Fixed acquisition order (backup, then consolidate); nothing else in this
+    # file takes both, so no deadlock is possible, and a half-acquired pair is
+    # always released before returning.
+    b_token = _acquire_lock("backup", BACKUP_LOCK_STALE_SECONDS)
+    if b_token is None:
+        print("[zmem] restore REFUSED: a backup is currently running - "
+              "destination untouched; re-run when it finishes", file=sys.stderr)
+        return 2
+    c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+    if c_token is None:
+        _release_lock("backup", b_token)
+        print("[zmem] restore REFUSED: a consolidation is currently running - "
+              "destination untouched; re-run when it finishes", file=sys.stderr)
+        return 2
+    try:
+        return _restore_locked(from_path=from_path, force=force, out_dir=out_dir)
+    finally:
+        _release_lock("consolidate", c_token)
+        _release_lock("backup", b_token)
+
+
+def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None = None) -> int:
+    """The restore body. Called only by cmd_restore(), which holds the `backup`
+    and `consolidate` locks for the whole of it. Returns a process exit code.
 
     Deliberately NOT routed through main()'s connect()/init_db()/migrate()
     path (see main()'s dispatch, which branches on `restore` before those
@@ -2417,7 +2584,7 @@ def main():
 
     p_consolidate = sub.add_parser("consolidate", help="merge near-duplicate memories")
     p_consolidate.add_argument("--threshold", type=float,
-                               default=float(os.environ.get("ZMEM_CONSOLIDATE_THRESHOLD", "0.80")))
+                               default=CONSOLIDATE_DEFAULT_THRESHOLD)
     p_consolidate.add_argument("--prune", action="store_true",
                                help="also supersede low-value never-retrieved memories")
     p_consolidate.add_argument("--dry-run", action="store_true",

@@ -119,7 +119,15 @@ own `integrity_check` **before** touching the destination, then takes a
 `prerestore-<timestamp>.sqlite` copy of the current store (your rollback path —
 deliberately outside the retention glob so rotation can never prune it), clears
 stale `-wal`/`-shm` sidecars, copies, and re-verifies the restored store.
-Run it when no session is actively writing.
+
+Takes **both** maintenance locks (`backup` and `consolidate`) for its whole
+duration, so it cannot race the automated background snapshot/consolidation the
+SessionStart hook fires, and refuses a destination that is not on a local
+filesystem (no UNC/network/OneDrive path). If either lock is held it exits **2**
+without touching the destination — a skipped restore must never look like a
+completed one. This does *not* serialize against a live interactive session's
+own `add`/`recall` writes, which take no lock: still run `restore` when no
+session is actively writing.
 
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite

@@ -513,5 +513,167 @@ class TestRecallCompatAlias(unittest.TestCase):
             conn.close()
 
 
+class TestV5MigrationRetryAfterCheckoutAppears(unittest.TestCase):
+    """A namespace the v5 pass had to skip must NOT be stranded forever.
+
+    The v5 block is version-gated, so it fires exactly once. Any namespace whose
+    checkout happened to be absent at that instant (unmounted drive, repo not
+    cloned yet) used to be skipped permanently — schema_version went to 5
+    regardless, so the gate never let the block run again. migrate() now also
+    runs a version-INDEPENDENT retry pass over the known old-style keys.
+    """
+
+    def _seed_v5_store_with_a_stranded_row(self, store_mod, old_ns: str):
+        """A store already at schema_version 5 that still carries `old_ns` —
+        exactly the shape the original migration leaves behind when the mapped
+        checkout was missing at the time."""
+        conn = store_mod.connect()
+        store_mod.init_db(conn)
+        store_mod.migrate(conn)
+        self.assertEqual(
+            conn.execute("SELECT value FROM meta WHERE key='schema_version'")
+                .fetchone()["value"], "5")
+        store_mod.add_memory(
+            conn, namespace=old_ns, type_="fact",
+            content="stranded row under an old-style namespace", signal="test",
+        )
+        return conn
+
+    def _namespace_of_the_row(self, conn) -> str:
+        return conn.execute(
+            "SELECT namespace FROM memory WHERE content=?",
+            ("stranded row under an old-style namespace",),
+        ).fetchone()["namespace"]
+
+    def test_row_is_rekeyed_once_the_checkout_appears(self):
+        old_ns = "project:trainingapp"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            checkout = _make_git_repo(tmp_path / "late", "https://github.com/Org/LateRepo.git")
+            store_mod = _load_store_module(tmp_path / "store.sqlite")
+            conn = self._seed_v5_store_with_a_stranded_row(store_mod, old_ns)
+            self.assertEqual(self._namespace_of_the_row(conn), old_ns)
+
+            # The checkout "appears": point the known map at it and re-run
+            # migrate() on the ALREADY-v5 store. Under the old
+            # version-gated-only code this was a guaranteed no-op.
+            with mock.patch.object(store_mod, "_NS_MIGRATION_CHECKOUTS",
+                                   {old_ns: str(checkout)}):
+                store_mod.migrate(conn)
+
+            expected = host.resolve_namespace(checkout)
+            self.assertEqual(expected, "project:github.com/org/laterepo")
+            self.assertEqual(self._namespace_of_the_row(conn), expected)
+
+            recorded = json.loads(
+                conn.execute("SELECT value FROM meta WHERE key='ns_migration_v5'")
+                    .fetchone()["value"])
+            self.assertEqual(recorded[old_ns], expected)
+            # schema_version is untouched by the retry.
+            self.assertEqual(
+                conn.execute("SELECT value FROM meta WHERE key='schema_version'")
+                    .fetchone()["value"], "5")
+            conn.close()
+
+    def test_retry_rekeys_tombstones_too(self):
+        """Supersession is a tombstone UPDATE, never a DELETE. A superseded row
+        left behind under a dead key would be cut off from its own namespace's
+        history, so the re-key covers every row, live or not (same semantics as
+        the original v5 UPDATE)."""
+        old_ns = "project:ragappv3"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            checkout = _make_git_repo(tmp_path / "late", "https://github.com/Org/Tomb.git")
+            store_mod = _load_store_module(tmp_path / "store.sqlite")
+            conn = self._seed_v5_store_with_a_stranded_row(store_mod, old_ns)
+            dead_id = store_mod.add_memory(
+                conn, namespace=old_ns, type_="fact",
+                content="already superseded row", signal="test",
+            )
+            store_mod.supersede_memory(conn, dead_id, "test tombstone")
+
+            with mock.patch.object(store_mod, "_NS_MIGRATION_CHECKOUTS",
+                                   {old_ns: str(checkout)}):
+                store_mod.migrate(conn)
+
+            expected = host.resolve_namespace(checkout)
+            row = conn.execute(
+                "SELECT namespace, superseded_at FROM memory WHERE id=?", (dead_id,)
+            ).fetchone()
+            self.assertEqual(row["namespace"], expected)
+            self.assertIsNotNone(row["superseded_at"])
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM memory WHERE namespace=?",
+                             (old_ns,)).fetchone()[0], 0)
+            conn.close()
+
+    def test_still_refuses_to_guess_while_the_checkout_is_absent(self):
+        """The retry keeps the original safety property: never invent a key.
+        An absent checkout leaves the rows alone and reports, and the SAME store
+        is picked up on a later run once the path exists."""
+        old_ns = "project:trainingapp"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            missing = tmp_path / "not-cloned-yet"
+            store_mod = _load_store_module(tmp_path / "store.sqlite")
+            conn = self._seed_v5_store_with_a_stranded_row(store_mod, old_ns)
+
+            captured = []
+            real_print = print
+
+            def spy_print(*args, **kwargs):
+                captured.append(" ".join(str(a) for a in args))
+                real_print(*args, **kwargs)
+
+            with mock.patch.object(store_mod, "_NS_MIGRATION_CHECKOUTS",
+                                   {old_ns: str(missing)}), \
+                    mock.patch("builtins.print", side_effect=spy_print):
+                store_mod.migrate(conn)
+
+            self.assertEqual(self._namespace_of_the_row(conn), old_ns)
+            self.assertTrue(any("trainingapp" in c and "not found" in c for c in captured),
+                            "an absent checkout must still be reported loudly")
+
+            # ...and the very same store re-keys on the next run once the
+            # checkout is there. That is the whole point of decoupling the retry
+            # from the version gate.
+            checkout = _make_git_repo(tmp_path / "arrived", "https://github.com/Org/Arrived.git")
+            with mock.patch.object(store_mod, "_NS_MIGRATION_CHECKOUTS",
+                                   {old_ns: str(checkout)}):
+                store_mod.migrate(conn)
+            self.assertEqual(self._namespace_of_the_row(conn),
+                             host.resolve_namespace(checkout))
+            conn.close()
+
+    def test_retry_is_a_no_op_when_nothing_is_stranded(self):
+        """Nothing left under an old-style key => no re-derivation and no meta
+        write, so the unconditional pass costs one SELECT. resolve_namespace
+        must not even be called."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store_mod = _load_store_module(tmp_path / "store.sqlite")
+            conn = store_mod.connect()
+            store_mod.init_db(conn)
+            store_mod.migrate(conn)
+            store_mod.add_memory(
+                conn, namespace="user:global", type_="fact",
+                content="nothing stranded here", signal="test",
+            )
+            before = conn.execute(
+                "SELECT value FROM meta WHERE key='ns_migration_v5'").fetchone()
+
+            with mock.patch.object(host, "resolve_namespace") as resolver:
+                store_mod.migrate(conn)
+                resolver.assert_not_called()
+
+            after = conn.execute(
+                "SELECT value FROM meta WHERE key='ns_migration_v5'").fetchone()
+            self.assertEqual(
+                before["value"] if before else None,
+                after["value"] if after else None,
+            )
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
