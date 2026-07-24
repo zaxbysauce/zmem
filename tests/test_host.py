@@ -21,7 +21,8 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import host  # noqa: E402
 
 
-ENV_KEYS = ["ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA", "ZMEM_CORE_MD", "OneDrive"]
+ENV_KEYS = ["ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA", "ZMEM_CORE_MD",
+            "ZMEM_SKILLS_DIRS", "OneDrive"]
 
 
 class TestStorePathPrecedence(unittest.TestCase):
@@ -107,6 +108,37 @@ class TestCoreMdPath(unittest.TestCase):
     def test_derives_from_store_dir(self):
         os.environ["ZMEM_DATA"] = r"C:\zmemdata"
         self.assertEqual(host.resolve_core_md_path(), Path(r"C:\zmemdata") / "core.md")
+
+
+class TestResolveSkillsDirs(unittest.TestCase):
+    def setUp(self):
+        self._patcher = mock.patch.dict(os.environ, {}, clear=False)
+        self._patcher.start()
+        for k in ENV_KEYS:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        self._patcher.stop()
+
+    def test_default_is_both_claude_and_zcode_skills_dirs(self):
+        home = Path(os.path.expanduser("~"))
+        dirs = host.resolve_skills_dirs()
+        self.assertEqual(dirs, [home / ".claude" / "skills", home / ".zcode" / "skills"])
+
+    def test_override_via_pathsep_delimited_env(self):
+        os.environ["ZMEM_SKILLS_DIRS"] = os.pathsep.join([r"C:\a\skills", r"C:\b\skills"])
+        dirs = host.resolve_skills_dirs()
+        self.assertEqual(dirs, [Path(r"C:\a\skills"), Path(r"C:\b\skills")])
+
+    def test_override_dedupes_same_resolved_path(self):
+        os.environ["ZMEM_SKILLS_DIRS"] = os.pathsep.join([r"C:\a\skills", r"C:\a\skills"])
+        dirs = host.resolve_skills_dirs()
+        self.assertEqual(len(dirs), 1)
+
+    def test_override_expands_tilde(self):
+        os.environ["ZMEM_SKILLS_DIRS"] = "~/customskills"
+        dirs = host.resolve_skills_dirs()
+        self.assertEqual(dirs, [Path(os.path.expanduser("~/customskills"))])
 
 
 class TestLocalFsGuard(unittest.TestCase):

@@ -32,7 +32,7 @@
 
 const { spawn, execFileSync } = require("child_process");
 const { existsSync } = require("fs");
-const { join, dirname } = require("path");
+const { join, dirname, delimiter } = require("path");
 const { homedir } = require("os");
 
 // Hooks that emit the <<<ZMEM_JSON>>> sentinel and get envelope translation.
@@ -170,10 +170,16 @@ function buildCanonicalEnv(host, meta, hookName) {
     // legacy per-plugin data dirs.
     const zmemData = process.env.ZMEM_DATA || join(homedir(), ".zmem");
 
+    // ZMEM_SKILLS_DIRS: existing env wins (mirrors ZMEM_DATA above); else the
+    // box-wide default of BOTH skills dirs, delimiter-joined the same way
+    // host.py's resolve_skills_dirs() parses it (os.pathsep — ';' on win32,
+    // ':' elsewhere), so hook-context and skill-context (store.py invoked
+    // directly by a skill/agent) always agree on the same target set.
+    // Promotion writes to every dir here regardless of which host promoted —
+    // a lesson promoted from either tool becomes a skill visible to both.
     const skillsDirs =
-        host === "claude"
-            ? join(homedir(), ".claude", "skills")
-            : join(homedir(), ".zcode", "skills");
+        process.env.ZMEM_SKILLS_DIRS ||
+        [join(homedir(), ".claude", "skills"), join(homedir(), ".zcode", "skills")].join(delimiter);
     const tier0 = host === "claude" ? "native" : "zmem";
     const ctxBudget = host === "claude" ? "9000" : "25000";
 

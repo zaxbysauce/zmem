@@ -72,6 +72,39 @@ def resolve_core_md_path() -> Path:
     return resolve_store_path().parent / "core.md"
 
 
+def resolve_skills_dirs() -> list[Path]:
+    """Resolve the skills dirs promotion writes SKILL.md into.
+
+    Default (box-wide): BOTH `~/.claude/skills` and `~/.zcode/skills`, so a
+    lesson promoted from either host becomes a skill visible to both. This
+    is deliberately not host-conditional (unlike resolve_store_path) — a
+    promoted skill is meant to be usable by whichever tool is in front of
+    the user next, not just the one that promoted it.
+
+    Override: ZMEM_SKILLS_DIRS, an os.pathsep-delimited list of directories
+    (matches zmem-launch.js's ZMEM_SKILLS_DIRS export so hook-context and
+    skill-context agree on the same set). Each entry is `~`-expanded.
+    Order is preserved; duplicates (same resolved path) are dropped.
+    """
+    explicit = _env("ZMEM_SKILLS_DIRS")
+    if explicit:
+        raw = [p for p in explicit.split(os.pathsep) if p.strip()]
+    else:
+        home = Path(os.path.expanduser("~"))
+        raw = [str(home / ".claude" / "skills"), str(home / ".zcode" / "skills")]
+
+    seen: set[str] = set()
+    dirs: list[Path] = []
+    for p in raw:
+        expanded = Path(p).expanduser()
+        key = _norm(expanded)
+        if key in seen:
+            continue
+        seen.add(key)
+        dirs.append(expanded)
+    return dirs
+
+
 def _norm(path: Path) -> str:
     """Normalized, absolute, lowercase string form of a path for comparisons.
     Works even when the path (or its parents) doesn't exist yet."""

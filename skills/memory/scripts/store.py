@@ -112,6 +112,20 @@ def _resolve_core_md_path() -> Path:
     return Path(os.path.expanduser("~/.zcode/memory/core.md"))
 
 
+def _resolve_skills_dirs() -> list[Path]:
+    """Resolve the skills dirs promotion writes into. Delegates to host.py's
+    box-wide default (both ~/.claude/skills and ~/.zcode/skills, overridable
+    via ZMEM_SKILLS_DIRS). Falls back to the old single ~/.zcode/skills dir
+    if host.py could not be imported at all."""
+    if _host is not None:
+        return _host.resolve_skills_dirs()
+    # --- inline fallback (host.py absent) ---
+    explicit = os.environ.get("ZMEM_SKILLS_DIRS")
+    if explicit:
+        return [Path(p).expanduser() for p in explicit.split(os.pathsep) if p.strip()]
+    return [Path(os.path.expanduser("~/.zcode/skills"))]
+
+
 STORE_PATH = _resolve_store_path()
 CORE_MD_PATH = _resolve_core_md_path()
 
@@ -1088,12 +1102,62 @@ def _slugify_skill_name(tags: str, fallback_id: str) -> str:
     return name
 
 
+def _first_sentence(content: str, max_len: int = 220) -> str:
+    """Return the first whole sentence of `content`, never cut mid-word.
+
+    Splits on ". " (and other sentence terminators) rather than a raw
+    character slice — the old draft did `content[:120]`, which truncates
+    mid-word whenever the 120th character lands inside a token. If even the
+    first sentence exceeds max_len, truncate at the last whole-word boundary
+    before max_len and mark it with an ellipsis (still never mid-word).
+    """
+    text = re.sub(r"\s+", " ", content.strip())
+    if not text:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    sentence = parts[0] if parts else text
+    if len(sentence) <= max_len:
+        if not sentence.endswith((".", "!", "?")):
+            sentence += "."
+        return sentence
+    truncated = sentence[:max_len]
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    return truncated.rstrip(".,;:- ") + "…"
+
+
+def _yaml_dquote(s: str) -> str:
+    """Escape a string for a YAML double-quoted scalar, collapsed to one line."""
+    s = re.sub(r"\s+", " ", s.strip())
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _synthesize_trigger_description(tags: str, content: str) -> str:
+    """Build a clean, single-line, trigger-focused description from a memory.
+
+    Format: "Use when working with <tag>, <tag>, ... - <first full sentence
+    of content>." Trigger contexts come from `tags` (the explicit signal for
+    when this lesson applies); the lesson itself is the first *whole*
+    sentence of `content` (never a mid-word slice). This never emits
+    placeholder text — it is meant to be usable verbatim, though
+    --description lets a human override it with something punchier.
+    """
+    tokens = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    lesson = _first_sentence(content)
+    if tokens:
+        trigger_contexts = ", ".join(tokens[:5])
+        return f"Use when working with {trigger_contexts} - {lesson}"
+    return f"Use when this situation recurs - {lesson}"
+
+
 def promote_memory(
     conn: sqlite3.Connection,
     *,
     memory_id: str | None = None,
     dry_run: bool = False,
     namespace: str | None = None,
+    description: str | None = None,
 ) -> None:
     """Promote high-confidence lessons to reusable SKILL.md files.
 
@@ -1102,8 +1166,11 @@ def promote_memory(
     the lesson and the skill coexist (the lesson costs ~200 bytes; if the skill
     description fails to trigger, the lesson is still in recall).
 
-    Human-in-the-loop: --dry-run shows candidates; --id <uuid> --confirm writes
-    the SKILL.md after the user reviews the description.
+    Human-in-the-loop: --dry-run shows candidates (and both write targets);
+    --id <uuid> --confirm writes the SKILL.md to every dir in
+    host.resolve_skills_dirs() (box-wide default: ~/.claude/skills AND
+    ~/.zcode/skills). --description overrides the synthesized trigger line
+    verbatim, for a human/orchestrator to supply something punchier.
     """
     # Candidate query.
     ns_clause = "AND namespace = ?" if namespace else ""
@@ -1126,6 +1193,8 @@ def promote_memory(
         print("[zmem] no promotion candidates found")
         return
 
+    skills_dirs = _resolve_skills_dirs()
+
     if dry_run:
         print(f"[zmem] {len(candidates)} promotion candidate(s):")
         for c in candidates:
@@ -1134,7 +1203,9 @@ def promote_memory(
                   f"signal={c['signal']})")
             print(f"    content: {c['content'][:80]}...")
             print(f"    tags: {c['tags']}")
-            print(f"    would create: ~/.zcode/skills/{skill_name}/SKILL.md")
+            print(f"    description would be: {_synthesize_trigger_description(c['tags'], c['content'])}")
+            for d in skills_dirs:
+                print(f"    would create: {d / skill_name / 'SKILL.md'}")
         return
 
     if memory_id:
@@ -1147,32 +1218,43 @@ def promote_memory(
             return
 
         skill_name = _slugify_skill_name(row["tags"], row["id"])
-        skill_dir = Path.home() / ".zcode" / "skills" / skill_name
+        skill_targets = [d / skill_name for d in skills_dirs]
 
-        # Collision detection.
-        if skill_dir.exists():
-            print(f"[zmem] ERROR: skill directory already exists: {skill_dir}", file=sys.stderr)
+        # Collision detection — check every target BEFORE writing to any of
+        # them, so a collision in one dir never leaves a partial promotion
+        # (a skill in one tool's dir but not the other's).
+        collisions = [d for d in skill_targets if (d / "SKILL.md").exists()]
+        if collisions:
+            print(f"[zmem] ERROR: skill already exists in {len(collisions)} target dir(s):", file=sys.stderr)
+            for d in collisions:
+                print(f"  {d}", file=sys.stderr)
             print(f"  Choose a different memory or rename the existing skill.", file=sys.stderr)
             return
 
-        # Generate the SKILL.md draft.
-        import textwrap
+        # Trigger description: explicit --description wins verbatim; else
+        # synthesize from tags (trigger contexts) + the first whole sentence
+        # of content (the lesson) — never a mid-word slice, never
+        # placeholder text.
+        trigger_line = description if description else _synthesize_trigger_description(row["tags"], row["content"])
+
         tags_str = row["tags"] or "general"
+        trigger_contexts = ", ".join(t.strip() for t in tags_str.split(",") if t.strip()) or "general"
+        display_name = skill_name.replace("zmem-", "").replace("-", " ").title()
+
+        # Body sections deliberately carry different content: "When to use"
+        # is the trigger contexts (when this should fire), "The rule" is the
+        # full lesson content (what to do) — the old draft repeated the same
+        # sentence in both plus the description, tripling one idea instead
+        # of conveying three.
         draft = f"""---
 name: {skill_name}
-description: >
-  {row['content'][:120].replace(chr(10), ' ')}...
-  Auto-promoted from zmem lesson {row['id'][:8]} (signal={row['signal']},
-  confidence={row['confidence']}, retrieved {row['retrieval_count']}x).
-  EDIT THIS DESCRIPTION to be pushy and name the exact trigger contexts
-  where this skill should fire — models under-trigger skills with vague
-  descriptions.
+description: {_yaml_dquote(trigger_line)}
 ---
 
-# {_slugify_skill_name(row['tags'], row['id']).replace('zmem-', '').replace('-', ' ').title()}
+# {display_name}
 
 ## When to use
-{(row['content'][:200] + '...' if len(row['content']) > 200 else row['content'])}
+Use when working with: {trigger_contexts}.
 
 ## The rule
 {row['content']}
@@ -1184,14 +1266,18 @@ description: >
 - Tags: {tags_str}
 """
 
-        # Write the skill file.
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        skill_file = skill_dir / "SKILL.md"
-        skill_file.write_text(draft, encoding="utf-8")
+        # Write the skill file to every configured target dir.
+        written = []
+        for skill_dir in skill_targets:
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            skill_file = skill_dir / "SKILL.md"
+            skill_file.write_text(draft, encoding="utf-8")
+            written.append(skill_file)
 
-        print(f"[zmem] promoted lesson {row['id'][:8]} -> {skill_file}")
+        print(f"[zmem] promoted lesson {row['id'][:8]} ->")
+        for skill_file in written:
+            print(f"  {skill_file}")
         print(f"  Source lesson KEPT in store (not superseded).")
-        print(f"  REVIEW AND EDIT the description before relying on this skill.")
         print(f"  The skill will load on next session restart.")
         return
 
@@ -1683,6 +1769,14 @@ def main():
                            help="promote a specific memory by UUID")
     p_promote.add_argument("--namespace", default=None,
                            help="limit candidates to a specific namespace")
+    p_promote.add_argument("--description", default=None,
+                           help="override the synthesized trigger description verbatim "
+                                "(used with --id --confirm)")
+    p_promote.add_argument("--confirm", action="store_true",
+                           help="explicit human-in-the-loop confirmation for the write path "
+                                "(documented gate: --id <uuid> --confirm); optional/no-op — "
+                                "--id alone is sufficient, this flag exists so the "
+                                "--id/--confirm pairing reads unambiguously at the call site")
 
     p_fail = sub.add_parser(
         "failures",
@@ -1752,7 +1846,7 @@ def main():
                     dry_run=args.dry_run, namespace=args.namespace)
     elif args.cmd == "promote":
         promote_memory(conn, memory_id=args.id, dry_run=args.dry_run,
-                       namespace=args.namespace)
+                       namespace=args.namespace, description=args.description)
     conn.close()
 
 
