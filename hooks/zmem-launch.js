@@ -36,11 +36,23 @@ const { join, dirname } = require("path");
 const { homedir } = require("os");
 
 // Hooks that emit the <<<ZMEM_JSON>>> sentinel and get envelope translation.
-// Every OTHER hook (reflect, capture-failure, convention-capture, …) is passed
-// through verbatim with its own exit code preserved — they have not been
-// migrated to the sentinel yet, so translating them would replace their real
-// output with `{}`. Later phases add their names here as they adopt the sentinel.
-const TRANSLATED_HOOKS = new Set(["session-start", "recall"]);
+// Every OTHER hook (convention-capture, …) is passed through verbatim with its
+// own exit code preserved — it has not been migrated to the sentinel yet, so
+// translating it would replace its real output with `{}`. Later phases add
+// their names here as they adopt the sentinel.
+//
+// reflect (Stop) and capture-failure (PostToolUseFailure) emit the sentinel and
+// carry a bare {additionalContext}. On Claude Code the launcher rewraps that to
+// hookSpecificOutput.additionalContext, which CC honors on BOTH events
+// (confirmed empirically, CC 2.1.218); on ZCode it stays bare. reflect relies on
+// the encoded-budget clamp here for its (potentially large, fenced) failure
+// block.
+const TRANSLATED_HOOKS = new Set([
+    "session-start",
+    "recall",
+    "reflect",
+    "capture-failure",
+]);
 
 // Hook-name → Claude Code hookEventName (for the {hookSpecificOutput} rewrap).
 const EVENT_MAP = {

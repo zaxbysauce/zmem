@@ -295,21 +295,86 @@ console.log("\n[5] Encoded-budget truncation stays <= budget");
 console.log("\n[6] Passthrough hook keeps child exit code + no envelope rewrap");
 
 {
-    // A non-translated hook name whose script exits non-zero and prints noise:
+    // A non-translated hook name (convention-capture) whose script prints noise:
     // launcher must pass stdout through verbatim and NOT wrap/replace with {}.
     const PROOT = path.join(TMP, "passroot");
     fs.mkdirSync(path.join(PROOT, "hooks"), { recursive: true });
-    fs.writeFileSync(path.join(PROOT, "hooks", "zmem-reflect.sh"),
-        "#!/usr/bin/env bash\necho 'reflect-raw-output'\nexit 0\n");
-    const r = runLauncher("reflect", "{}", envWith({
+    fs.writeFileSync(path.join(PROOT, "hooks", "zmem-convention-capture.sh"),
+        "#!/usr/bin/env bash\necho 'convention-raw-output'\nexit 0\n");
+    const r = runLauncher("convention-capture", "{}", envWith({
         ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: PROOT, CLAUDE_PROJECT_DIR: PROJ,
     }));
     ok("passthrough: raw child stdout preserved (not translated to {})",
-        /reflect-raw-output/.test(r.stdout));
+        /convention-raw-output/.test(r.stdout));
     ok("passthrough: NOT wrapped in hookSpecificOutput", !/hookSpecificOutput/.test(r.stdout));
 }
 
-console.log("\n[7] No ~5s session-start stall");
+console.log("\n[7] Phase 5: reflect (Stop) + capture-failure (PostToolUseFailure) translation");
+
+{
+    // A minimal real CC transcript with one failed Bash tool call.
+    const TRANSCRIPT = path.join(TMP, "p5-transcript.jsonl");
+    fs.writeFileSync(TRANSCRIPT, [
+        JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+            { type: "tool_use", id: "tu1", name: "Bash", input: { command: "false" } }] } }),
+        JSON.stringify({ type: "user", message: { role: "user", content: [
+            { type: "tool_result", content: "Exit code 1", is_error: true, tool_use_id: "tu1" }] },
+            toolUseResult: "Error: Exit code 1" }),
+    ].join("\n") + "\n");
+
+    const stopPayload = (stopActive) => JSON.stringify({
+        session_id: "p5-sess", transcript_path: TRANSCRIPT, cwd: PROJ,
+        hook_event_name: "Stop", stop_hook_active: stopActive,
+    });
+
+    // claude: reflect → hookSpecificOutput{Stop} carrying the failure prompt.
+    {
+        const r = runLauncher("reflect", stopPayload(false), envWith({
+            ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("reflect/claude: valid JSON", obj !== null, r.stdout.slice(0, 200));
+        eq("reflect/claude: hookEventName == Stop",
+            obj && obj.hookSpecificOutput && obj.hookSpecificOutput.hookEventName, "Stop");
+        ok("reflect/claude: prompt mentions failed tool call",
+            !!(obj && obj.hookSpecificOutput &&
+                /failed tool call/.test(obj.hookSpecificOutput.additionalContext)));
+    }
+
+    // loop guard: stop_hook_active true → {} (never contribute to a stop loop).
+    {
+        const r = runLauncher("reflect", stopPayload(true), envWith({
+            ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+        }));
+        eq("reflect/claude: loop guard emits {}", r.stdout.trim(), "{}");
+    }
+
+    // zcode: reflect → bare additionalContext.
+    {
+        const r = runLauncher("reflect", stopPayload(false), envWith({
+            ZMEM_DATA: DATA, ZCODE_PLUGIN_ROOT: REPO, ZCODE_PROJECT_DIR: PROJ,
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("reflect/zcode: bare additionalContext",
+            !!(obj && obj.additionalContext && !obj.hookSpecificOutput));
+    }
+
+    // capture-failure: claude, error as a STRING (the real CC shape).
+    {
+        const r = runLauncher("capture-failure",
+            JSON.stringify({ session_id: "p5-cf-" + Date.now(), tool_name: "Bash",
+                tool_input: { command: "false" }, error: "Exit code 1" }),
+            envWith({ ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        eq("capture-failure/claude: hookEventName == PostToolUseFailure",
+            obj && obj.hookSpecificOutput && obj.hookSpecificOutput.hookEventName, "PostToolUseFailure");
+        ok("capture-failure/claude: prompt mentions auto-capture",
+            !!(obj && obj.hookSpecificOutput &&
+                /auto-capture/.test(obj.hookSpecificOutput.additionalContext)));
+    }
+}
+
+console.log("\n[8] No ~5s session-start stall");
 
 {
     const t0 = Date.now();

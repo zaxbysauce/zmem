@@ -1381,6 +1381,205 @@ def consolidate(
     print(f"[zmem] {' + '.join(parts)}")
 
 
+# ---------------------------------------------------------------------------
+# Unified failure detection (`failures` subcommand)
+# ---------------------------------------------------------------------------
+# Detects failed tool calls for a session from one of two substrates:
+#   - a Claude Code transcript JSONL (--transcript) — scanned for tool_result
+#     blocks with is_error:true (and/or a top-level toolUseResult "Error…"), OR
+#   - the ZCode episodic db.sqlite (--session) — the tool_usage table query the
+#     reflect hook used to run inline.
+# Returns {"count": N, "details": [...]} JSON. FAIL-OPEN: on ANY error or parse
+# failure it returns an empty result — a memory hiccup must never wedge a hook.
+#
+# The untrusted-error-text fencing lives here (`_sanitize_error_text`): each
+# detail's error string is stripped of newlines/CR and truncated. Newline
+# removal is the load-bearing fence-integrity mechanism — with no newlines, an
+# embedded ``` or fake "SYSTEM:" directive in tool output can never form its own
+# line and therefore can never break out of the code fence the consumer wraps it
+# in. The consumer (reflect.sh) does the ``` fence-wrap + "untrusted data only"
+# framing; this function guarantees the strings it hands back are fence-safe.
+
+def _sanitize_error_text(text, limit: int = 200) -> str:
+    """Make an untrusted tool-error string safe to embed in a fenced block:
+    collapse CR/newlines to spaces (fence-integrity), then truncate. Preserves
+    the error's characters otherwise so it stays diagnostically useful."""
+    if not text:
+        return ""
+    s = str(text).replace("\r", " ").replace("\n", " ")
+    return s[:limit].strip()
+
+
+def _result_text(content) -> str:
+    """Extract text from a tool_result block's `content`, which CC emits as
+    either a plain string or a list of {type:"text", text:"..."} blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text") or "")
+            elif isinstance(b, str):
+                parts.append(b)
+        return " ".join(p for p in parts if p)
+    return ""
+
+
+def _failures_from_transcript(path: str):
+    """Scan a Claude Code transcript JSONL for failed tool calls. Returns a list
+    of {tool, error} dicts (one per distinct failed tool_use_id). Fail-open:
+    returns [] on any read/parse error. Never raises."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            raw_lines = [ln for ln in f if ln.strip()]
+    except OSError:
+        return []
+
+    records = []
+    for ln in raw_lines:
+        try:
+            records.append(json.loads(ln))
+        except Exception:
+            continue  # skip malformed lines, keep scanning
+
+    # Pass 1: map tool_use_id -> tool name from assistant tool_use blocks.
+    tool_names = {}
+    for o in records:
+        msg = o.get("message") if isinstance(o, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    tid = b.get("id")
+                    if tid:
+                        tool_names[tid] = b.get("name") or "?"
+
+    # Pass 2: collect failed tool_result blocks, deduped by tool_use_id so the
+    # is_error flag and the sibling toolUseResult "Error…" string on the same
+    # record never double-count one failure.
+    details = []
+    seen = set()
+    for o in records:
+        if not isinstance(o, dict):
+            continue
+        msg = o.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        tur = o.get("toolUseResult")
+        tur_is_err = isinstance(tur, str) and tur.strip().lower().startswith("error")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict) or b.get("type") != "tool_result":
+                continue
+            is_err = b.get("is_error") is True
+            if not (is_err or tur_is_err):
+                continue
+            tid = b.get("tool_use_id")
+            key = tid if tid else ("anon:%d" % len(seen))
+            if key in seen:
+                continue
+            seen.add(key)
+            err_text = _result_text(b.get("content"))
+            if not err_text and isinstance(tur, str):
+                err_text = tur
+            details.append({
+                "tool": tool_names.get(tid, "?"),
+                "error": _sanitize_error_text(err_text),
+            })
+    return details
+
+
+def _failures_from_db(db_path: str, session_id: str):
+    """Detect failed tool calls for a session from the ZCode episodic db.sqlite.
+    Returns (count, details). The load-bearing detection uses ONLY the columns
+    the original reflect query used (session_id, read_only, status, exit_code);
+    enrichment columns (error_message, error_type, retry_count, destructive) are
+    read in a SEPARATE try/except so a schema drift degrades to bare counts but
+    never disables detection. Fail-open: (0, []) on any error."""
+    if not session_id or not db_path or not os.path.isfile(db_path):
+        return 0, []
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            """
+            SELECT count(*) FROM tool_usage
+            WHERE session_id = ?
+              AND COALESCE(read_only, 0) = 0
+              AND (status = 'error' OR (exit_code IS NOT NULL AND exit_code != 0))
+            """,
+            (session_id,),
+        ).fetchone()
+        count = row[0] if row else 0
+    except Exception:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return 0, []
+
+    if count == 0:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return 0, []
+
+    details = []
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT tool_name, error_message, error_type, retry_count,
+                   COALESCE(destructive, 0) AS destructive
+            FROM tool_usage
+            WHERE session_id = ?
+              AND COALESCE(read_only, 0) = 0
+              AND (status = 'error' OR (exit_code IS NOT NULL AND exit_code != 0))
+            ORDER BY completed_at DESC
+            LIMIT 50
+            """,
+            (session_id,),
+        ).fetchall()
+        for r in rows:
+            details.append({
+                "tool": r["tool_name"] or "?",
+                "error": _sanitize_error_text(r["error_message"] or ""),
+                "error_type": r["error_type"] or "",
+                "retry_count": r["retry_count"] or 0,
+                "destructive": bool(r["destructive"]),
+            })
+    except Exception:
+        # Enrichment columns absent — detection already succeeded, so surface
+        # bare placeholders so the count is still actionable.
+        details = [{"tool": "?", "error": ""} for _ in range(count)]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return count, details
+
+
+def cmd_failures(session: str, transcript: str, db: str) -> None:
+    """Print {"count":N,"details":[...]} for the session's failed tool calls.
+    Transcript wins when given and present (Claude Code); else the db substrate
+    (ZCode). Entirely self-contained — does NOT open the ZMem store — and
+    fail-open: prints an empty result on any error, always exits 0."""
+    try:
+        if transcript and os.path.isfile(transcript):
+            details = _failures_from_transcript(transcript)
+            result = {"count": len(details), "details": details}
+        else:
+            count, details = _failures_from_db(db, session)
+            result = {"count": count, "details": details}
+    except Exception:
+        result = {"count": 0, "details": []}
+    print(json.dumps(result))
+
+
 def main():
     ap = argparse.ArgumentParser(prog="store.py", description="ZMem semantic store")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1452,7 +1651,26 @@ def main():
     p_promote.add_argument("--namespace", default=None,
                            help="limit candidates to a specific namespace")
 
+    p_fail = sub.add_parser(
+        "failures",
+        help="detect failed tool calls for a session (transcript JSONL or db.sqlite)")
+    p_fail.add_argument("--session", default="",
+                        help="session id (used with the db.sqlite substrate)")
+    p_fail.add_argument("--transcript", default="",
+                        help="Claude Code transcript JSONL path (wins when present)")
+    p_fail.add_argument("--db", default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
+                        help="ZCode episodic db.sqlite path (default ~/.zcode/cli/db/db.sqlite)")
+
     args = ap.parse_args()
+
+    # `failures` is store-independent (it reads a transcript JSONL or the ZCode
+    # episodic db, never the ZMem store) and must be fail-open: branch BEFORE
+    # connect()/assert_local_fs()/migrate() so a bad ZMEM_DATA location, a
+    # locked store, or a mid-migration state can never break failure detection.
+    if args.cmd == "failures":
+        cmd_failures(session=args.session, transcript=args.transcript, db=args.db)
+        return
+
     conn = connect()
     init_db(conn)
     migrate(conn)
