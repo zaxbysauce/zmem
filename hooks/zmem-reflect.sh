@@ -266,6 +266,13 @@ if [ -z "$CTX_JSON" ]; then
   CTX_JSON='{}'
 fi
 
+# Neutralize any sentinel token untrusted content (e.g. a captured tool error)
+# happens to contain, so it can't move the launcher's extraction boundary and
+# silently degrade the whole injection to {} (fail-open self-DoS, not an
+# injection vector — see zmem-recall.sh for the full rationale).
+CTX_JSON="${CTX_JSON//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
+CTX_JSON="${CTX_JSON//<<<END>>>/<<<END_NEUTRALIZED>>>}"
+
 # Wrap in the sentinel for the host adapter to extract + rewrap per host.
 printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' "$CTX_JSON"
 exit 0

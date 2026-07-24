@@ -316,6 +316,16 @@ if budget > 0 and len(ctx) > budget:
 print(json.dumps({"additionalContext": ctx}) if ctx else "{}")
 ' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" 2>/dev/null || echo '{}')"
 
+# Neutralize any sentinel token a MEMORY'S OWN CONTENT happens to contain
+# before wrapping. The launcher locates the payload by scanning stdout for the
+# literal markers, so a stored memory containing "<<<ZMEM_JSON>>>" would move
+# the extraction boundary into the middle of the JSON, the parse would fail,
+# and the whole injection would silently degrade to {} (a self-DoS of this
+# turn — fail-open, not an injection vector). Both replacements are safe
+# inside the serialized JSON string: neither introduces a quote or a backslash.
+CTX_JSON="${CTX_JSON//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
+CTX_JSON="${CTX_JSON//<<<END>>>/<<<END_NEUTRALIZED>>>}"
+
 # Wrap the payload in the <<<ZMEM_JSON>>>…<<<END>>> sentinel so the host adapter
 # (zmem-launch.js) can extract it even if other stdout noise is present. The
 # payload stays a bare {"additionalContext":…}; the launcher does host-envelope
