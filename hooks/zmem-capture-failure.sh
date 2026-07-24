@@ -76,7 +76,7 @@ join_path() {
   local base="$1"; shift
   local sep
   if [ "$IS_WINDOWS" -eq 1 ]; then
-    sep='\\'
+    sep='\'
   else
     sep='/'
   fi
@@ -139,6 +139,12 @@ def emit(o):
     sys.exit(0)
 
 tool_name = obj.get("tool_name", "?") or "?"
+# Defense-in-depth: strip CR/newlines before this is interpolated into the
+# fenced err_block below (fence-integrity, mirrors _sanitize_error_text in
+# store.py). Not currently exploitable -- tool_name comes from the harness,
+# not untrusted tool output -- but a newline here would let a forged
+# fence-close slip past the same guarantee the error text gets.
+tool_name = tool_name.replace("\r", " ").replace("\n", " ").strip() or "?"
 
 # error is a STRING on Claude Code ("Exit code 1") and an OBJECT on ZCode
 # ({message, type}). Handle both; anything else degrades to empty.

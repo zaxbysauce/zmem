@@ -1423,6 +1423,19 @@ def _sanitize_error_text(text, limit: int = 200) -> str:
     return s[:limit].strip()
 
 
+def _sanitize_tool_name(name, limit: int = 100) -> str:
+    """Defense-in-depth (Phase 8): strip CR/newlines from a tool name before it
+    is interpolated into a fenced block by reflect.sh/subagent-reflect.sh. Not
+    currently exploitable — tool names come from the harness's own tool_use
+    blocks / tool_usage rows, not from untrusted tool output — but a newline
+    here would let a forged fence-close ('\\n```') slip past the same
+    fence-integrity guarantee _sanitize_error_text gives the error text."""
+    if not name:
+        return "?"
+    s = str(name).replace("\r", " ").replace("\n", " ").strip()
+    return s[:limit] or "?"
+
+
 def _result_text(content) -> str:
     """Extract text from a tool_result block's `content`, which CC emits as
     either a plain string or a list of {type:"text", text:"..."} blocks."""
@@ -1497,7 +1510,7 @@ def _failures_from_transcript(path: str):
             if not err_text and isinstance(tur, str):
                 err_text = tur
             details.append({
-                "tool": tool_names.get(tid, "?"),
+                "tool": _sanitize_tool_name(tool_names.get(tid, "?")),
                 "error": _sanitize_error_text(err_text),
             })
     return details
@@ -1558,7 +1571,7 @@ def _failures_from_db(db_path: str, session_id: str):
         ).fetchall()
         for r in rows:
             details.append({
-                "tool": r["tool_name"] or "?",
+                "tool": _sanitize_tool_name(r["tool_name"] or "?"),
                 "error": _sanitize_error_text(r["error_message"] or ""),
                 "error_type": r["error_type"] or "",
                 "retry_count": r["retry_count"] or 0,

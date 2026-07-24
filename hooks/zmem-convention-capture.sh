@@ -58,7 +58,7 @@ to_py_path() {
 
 join_path() {
   local base="$1"; shift
-  local sep; if [ "$IS_WINDOWS" -eq 1 ]; then sep='\\'; else sep='/'; fi
+  local sep; if [ "$IS_WINDOWS" -eq 1 ]; then sep='\'; else sep='/'; fi
   printf '%s' "$base"
   for part in "$@"; do printf '%s%s' "$sep" "$part"; done
 }

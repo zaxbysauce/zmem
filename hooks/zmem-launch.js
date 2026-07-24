@@ -62,6 +62,25 @@ const TRANSLATED_HOOKS = new Set([
     "subagent-reflect",
 ]);
 
+// Hooks whose scripts actually read $ZMEM_NAMESPACE (verified via
+// `grep -l ZMEM_NAMESPACE hooks/*.sh` — see PLAN.md Phase 8). Resolving the
+// namespace spawns a python + git subprocess (~100ms cold-start); every OTHER
+// hook (today: only convention-capture, which fires on every Edit/Write/Bash
+// and computes its own basename-derived NS_HINT instead) gets ZMEM_NAMESPACE
+// left EMPTY so that cost is never paid on the hot per-edit path. This set is
+// intentionally separate from TRANSLATED_HOOKS above — same membership today
+// by coincidence (both happen to be the sentinel-emitting hooks), but they
+// answer different questions (envelope translation vs. namespace need) and
+// must not be aliased; a future hook could need one without the other.
+const NEEDS_NAMESPACE = new Set([
+    "session-start",
+    "recall",
+    "subagent-recall",
+    "reflect",
+    "capture-failure",
+    "subagent-reflect",
+]);
+
 // Hook-name → Claude Code hookEventName (for the {hookSpecificOutput} rewrap).
 const EVENT_MAP = {
     "session-start": "SessionStart",
@@ -119,7 +138,10 @@ function resolveNamespace(projectDir) {
 }
 
 // --- Build the canonical ZMEM_* env for the child ---------------------------
-function buildCanonicalEnv(host, meta) {
+// hookName is optional (back-compat for direct callers/tests that don't care
+// about the namespace-skip): omitted/unrecognized names get the namespace
+// resolved (safe default — never SILENTLY skip for a hook that needs it).
+function buildCanonicalEnv(host, meta, hookName) {
     const env = { ...process.env };
 
     const project =
@@ -164,7 +186,12 @@ function buildCanonicalEnv(host, meta) {
     env.ZMEM_AGENT_TRANSCRIPT = agentTranscript;
     env.ZMEM_AGENT_TYPE = agentType;
     env.ZMEM_AGENT_ID = agentId;
-    env.ZMEM_NAMESPACE = resolveNamespace(project);
+    // PERF (Phase 8): only resolve the namespace (python + git subprocess,
+    // ~100ms cold-start) for hooks that actually consume ZMEM_NAMESPACE. An
+    // unrecognized/omitted hookName resolves anyway (fail safe toward
+    // correctness, not silently toward speed).
+    env.ZMEM_NAMESPACE =
+        !hookName || NEEDS_NAMESPACE.has(hookName) ? resolveNamespace(project) : "";
     env.ZMEM_SKILLS_DIRS = skillsDirs;
     env.ZMEM_TIER0 = tier0;
     env.ZMEM_CTX_BUDGET = ctxBudget;
@@ -332,7 +359,7 @@ async function main() {
     }
 
     const host = detectHost();
-    const env = buildCanonicalEnv(host, meta);
+    const env = buildCanonicalEnv(host, meta, hookName);
     const budget = parseInt(env.ZMEM_CTX_BUDGET, 10) || 9000;
     const translated = TRANSLATED_HOOKS.has(hookName);
     const bashPath = findBash();
@@ -398,4 +425,5 @@ module.exports = {
     translate,
     EVENT_MAP,
     TRANSLATED_HOOKS,
+    NEEDS_NAMESPACE,
 };

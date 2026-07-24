@@ -227,7 +227,6 @@ console.log("\n[4] Canonical ZMEM_NAMESPACE == host.resolve_namespace(project)")
 
     // Use the repo itself as the project — it is a git checkout, so the
     // namespace comes from the git remote (the interesting P2/P3 path).
-    const expectedNs = resolveNs(REPO);
     const weird = '{"session_id":"s\\u00e9","cwd":"' +
         REPO.replace(/\\/g, "\\\\") +
         '","transcript_path":"C:\\\\t\\\\x.jsonl","agent_type":"coder","emoji":"✅"}';
@@ -242,9 +241,12 @@ console.log("\n[4] Canonical ZMEM_NAMESPACE == host.resolve_namespace(project)")
         if (i > 0) kv[l.slice(0, i)] = l.slice(i + 1);
     }
     eq("envdump: ZMEM_HOST", kv.ZMEM_HOST, "claude");
-    eq("envdump: ZMEM_NAMESPACE == resolve_namespace(repo checkout)", kv.ZMEM_NAMESPACE, expectedNs);
-    ok("envdump: namespace is the derived git-remote key (not basename)",
-        /^project:github\.com\//.test(kv.ZMEM_NAMESPACE || ""), kv.ZMEM_NAMESPACE);
+    // Phase 8: "envdump" is not in NEEDS_NAMESPACE (it's a synthetic test hook
+    // name, not a real one), so the perf-skip leaves ZMEM_NAMESPACE empty here
+    // — this is the load-bearing proof that non-consumers no longer pay the
+    // python+git resolution cost. The "resolves to the git-remote key" proof
+    // for an ACTUAL consumer lives in the NEEDS_NAMESPACE unit block below.
+    eq("envdump: ZMEM_NAMESPACE is EMPTY (non-consumer, perf-skip)", kv.ZMEM_NAMESPACE, "");
     eq("envdump: ZMEM_TIER0 (claude→native)", kv.ZMEM_TIER0, "native");
     eq("envdump: ZMEM_CTX_BUDGET (claude→9000)", kv.ZMEM_CTX_BUDGET, "9000");
     eq("envdump: ZMEM_SESSION from stdin session_id", kv.ZMEM_SESSION, "sé");
@@ -548,6 +550,74 @@ console.log("\n[10] Phase 7 unit: buildCanonicalEnv exports agent transcript + i
     ok("TRANSLATED_HOOKS includes subagent-reflect", launch.TRANSLATED_HOOKS.has("subagent-reflect"));
     eq("EVENT_MAP subagent-recall → SubagentStart", launch.EVENT_MAP["subagent-recall"], "SubagentStart");
     eq("EVENT_MAP subagent-reflect → SubagentStop", launch.EVENT_MAP["subagent-reflect"], "SubagentStop");
+}
+
+console.log("\n[11] Phase 8 PERF: ZMEM_NAMESPACE resolved only for NEEDS_NAMESPACE consumers");
+
+{
+    // grep -l ZMEM_NAMESPACE hooks/*.sh (Phase 8 evidence) showed every
+    // translated hook EXCEPT convention-capture consumes it. Assert the set
+    // directly, and assert it is NOT the same object identity as
+    // TRANSLATED_HOOKS even though membership coincides today (per the
+    // launcher's own comment: these answer different questions).
+    const expectedConsumers = [
+        "session-start", "recall", "subagent-recall", "reflect",
+        "capture-failure", "subagent-reflect",
+    ];
+    for (const h of expectedConsumers) {
+        ok(`NEEDS_NAMESPACE includes ${h}`, launch.NEEDS_NAMESPACE.has(h));
+    }
+    ok("NEEDS_NAMESPACE excludes convention-capture (per-edit, high-frequency, computes its own NS_HINT)",
+        !launch.NEEDS_NAMESPACE.has("convention-capture"));
+
+    const saved = process.env.CLAUDE_PLUGIN_ROOT;
+    process.env.CLAUDE_PLUGIN_ROOT = REPO;
+    const metaRepo = { cwd: REPO };
+    const expectedNs = resolveNs(REPO);
+
+    // Consumers still resolve to the real derived git-remote key.
+    for (const h of ["session-start", "recall", "subagent-recall", "reflect",
+        "capture-failure", "subagent-reflect"]) {
+        const env = launch.buildCanonicalEnv("claude", metaRepo, h);
+        eq(`buildCanonicalEnv(${h}): ZMEM_NAMESPACE == resolve_namespace(repo)`,
+            env.ZMEM_NAMESPACE, expectedNs);
+    }
+    // The non-consumer: resolution is skipped entirely (empty, not attempted).
+    {
+        const env = launch.buildCanonicalEnv("claude", metaRepo, "convention-capture");
+        eq("buildCanonicalEnv(convention-capture): ZMEM_NAMESPACE is EMPTY (perf-skip)",
+            env.ZMEM_NAMESPACE, "");
+    }
+    // Back-compat: no hookName arg at all still resolves (fail toward
+    // correctness, never silently toward speed, for an unrecognized caller).
+    {
+        const env = launch.buildCanonicalEnv("claude", metaRepo);
+        eq("buildCanonicalEnv(no hookName): still resolves (safe default)",
+            env.ZMEM_NAMESPACE, expectedNs);
+    }
+    if (saved === undefined) delete process.env.CLAUDE_PLUGIN_ROOT; else process.env.CLAUDE_PLUGIN_ROOT = saved;
+
+    // Rough before/after latency: convention-capture (skip) vs session-start's
+    // consumer path (resolve) via buildCanonicalEnv directly, averaged over a
+    // few calls (unit-level — isolates the resolution cost from bash/store.py
+    // startup noise that dominates a full end-to-end hook timing).
+    process.env.CLAUDE_PLUGIN_ROOT = REPO;
+    const N = 5;
+    let tResolve = 0, tSkip = 0;
+    for (let i = 0; i < N; i++) {
+        let t0 = Date.now();
+        launch.buildCanonicalEnv("claude", metaRepo, "session-start");
+        tResolve += Date.now() - t0;
+        t0 = Date.now();
+        launch.buildCanonicalEnv("claude", metaRepo, "convention-capture");
+        tSkip += Date.now() - t0;
+    }
+    if (saved === undefined) delete process.env.CLAUDE_PLUGIN_ROOT; else process.env.CLAUDE_PLUGIN_ROOT = saved;
+    const avgResolve = tResolve / N, avgSkip = tSkip / N;
+    console.log(`  INFO  avg buildCanonicalEnv latency: session-start(resolves)=${avgResolve.toFixed(1)}ms ` +
+        `convention-capture(skips)=${avgSkip.toFixed(1)}ms`);
+    ok("perf: convention-capture (skip) is faster than session-start (resolve)",
+        avgSkip < avgResolve, `resolve=${avgResolve.toFixed(1)}ms skip=${avgSkip.toFixed(1)}ms`);
 }
 
 // --- cleanup + report ------------------------------------------------------

@@ -89,7 +89,7 @@ join_path() {
   local base="$1"; shift
   local sep
   if [ "$IS_WINDOWS" -eq 1 ]; then
-    sep='\\'
+    sep='\'
   else
     sep='/'
   fi
