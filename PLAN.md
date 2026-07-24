@@ -34,11 +34,16 @@ Sourced from current Claude Code docs (`hooks.md`, `memory.md`, `plugins-referen
 | **G6** | additionalContext envelope + limits? | `{"hookSpecificOutput":{"hookEventName":"…","additionalContext":"…"}}`. **10,000-char cap** on hook output strings. | `hooks.md` |
 | **G7** | Env vars for the store path? | `CLAUDE_PLUGIN_ROOT` (ephemeral), `CLAUDE_PLUGIN_DATA` (**deleted on uninstall**), `CLAUDE_PROJECT_DIR`. Use a **fixed path via env/userConfig**, not plugin-data. | `plugins-reference.md` |
 
-### Still OPEN (must verify before/at the phase that depends on them)
-- **G1** — does each host tolerate the *other's* manifest dir + files co-present? (Almost certainly yes; disjoint paths. Verify on real installs.)
-- **G8** — does each host expand the other's `${*_PLUGIN_ROOT}` var, or must each host get its own hooks.json? → We **sidestep** by shipping per-host hooks.json (see §4). Only matters if we later want a single shared hooks.json.
-- **G9** — does CC's `plugin.json` allow pointing `hooks` at a custom path (so `.claude-plugin/` can own its hooks file)? If not, hooks.json must live at `hooks/hooks.json` and G8 resurfaces → build-step fallback (§9).
-- **G10** — unknown-hook-event-name behavior (error vs ignore) is undocumented. We avoid relying on it by declaring only host-appropriate events per host.
+### P0.5 EMPIRICAL RESULTS (2026-07-23, Claude Code 2.1.217, this Windows box)
+Ran the throwaway dual-manifest probe plugin via `claude --plugin-dir <dir> -p …`. The nested session hit an OAuth-refresh error (child can't reuse the parent token) so the turn didn't complete — but SessionStart + UserPromptSubmit hooks **fired and dumped** before that, which answers the structural gates:
+- **G1 — RESOLVED ✅** CC loaded the plugin with a **co-present `.zcode-plugin/`** dir present, no error; hooks fired. → the no-build-step dual-manifest approach is validated.
+- **G9 — RESOLVED ✅ (static + live)** `plugin.json "hooks": "./hooks/hooks.claude.json"` (custom path) was honored; official example confirms it's a path field.
+- **G8 — MOOT** we ship per-host hooks.json (§4); the probe used exactly that and it worked. No single-shared-hooks.json needed.
+- **Field names — CONFIRMED** SessionStart → `{session_id, transcript_path, cwd, hook_event_name, source}`; UserPromptSubmit → `{…, prompt_id, permission_mode, prompt}`. Env present: `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PROJECT_DIR`. Matches docs exactly.
+
+### Still OPEN (low-risk; verify opportunistically during the phase that uses them)
+- **Stop / PostToolUse / PostToolUseFailure / SubagentStart / SubagentStop field names** — doc-confirmed (`transcript_path`, `tool_name`/`tool_input`/`tool_response`, `agent_type`/`agent_id`) but not empirically dumped (the nested-auth error blocked a completed turn / tool use / subagent). Docs proved accurate on the 2 events verified, so risk is low; capture live while wiring P5 (failures) and P7 (subagent). `transcript_path` — the load-bearing field — is confirmed present on the events checked.
+- **G10** — unknown-hook-event-name behavior (error vs ignore) undocumented; avoided by declaring only host-appropriate events per host.
 
 ### Store facts (verified in `store.py`)
 - Already **WAL + `synchronous=NORMAL` + `busy_timeout=5000`** (`store.py:113-115`); versioned migrations via `meta.schema_version`, currently **v4**; `vec0`/sqlite-vec embedding table present (semantic recall scaffolded; degrades to FTS5 when the model is absent).
