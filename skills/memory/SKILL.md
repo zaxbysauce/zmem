@@ -84,6 +84,43 @@ automatically on SessionStart when the store has grown >20% since the last run
 (min 7 days between runs). Use `--dry-run` to preview clusters without changes.
 `--prune` also removes low-value never-retrieved memories (opt-in, never automatic).
 
+Consolidation is **single-flighted**: concurrent runs (several sessions starting
+at once) take an advisory lockfile in the store dir, and the losers skip cleanly
+and exit 0 rather than clustering the same rows twice.
+
+### backup — verified snapshot with retention
+```
+python <store.py> backup [--retention 7] [--out-dir DIR] [--if-due]
+```
+Writes `store-<UTC timestamp>.sqlite` into the backup dir (`--out-dir`, else
+`$ZMEM_BACKUP_DIR`, else `<store dir>/backups`) using SQLite's Online Backup API,
+which is safe while other sessions are writing to the store. The snapshot is
+verified (`PRAGMA integrity_check` **and** a total/live row-count comparison
+against the source) before it counts as a backup — if either check fails the
+snapshot file is deleted, the command exits non-zero, and neither the
+`last_backup` marker nor retention rotation happens.
+
+Retention deletes only the **oldest** files matching `store-*.sqlite` beyond the
+newest N. Nothing else in the directory is ever touched — including the
+`prerestore-*` safety copies `restore` leaves behind. `--retention 0` disables
+pruning.
+
+`--if-due` makes the command a no-op unless `$ZMEM_BACKUP_INTERVAL_DAYS`
+(default 1) has elapsed since the last successful backup; the SessionStart hook
+uses it so the automatic snapshot is cheap almost every session. Without the
+flag the backup always runs. Also single-flighted (its own lockfile).
+
+### restore — recover the store from a snapshot
+```
+python <store.py> restore --from <snapshot.sqlite> [--force] [--out-dir DIR]
+```
+Refuses unless `--force` when a store already exists. Verifies the snapshot's
+own `integrity_check` **before** touching the destination, then takes a
+`prerestore-<timestamp>.sqlite` copy of the current store (your rollback path —
+deliberately outside the retention glob so rotation can never prune it), clears
+stale `-wal`/`-shm` sidecars, copies, and re-verifies the restored store.
+Run it when no session is actively writing.
+
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite
   file. The write-time filter is advisory only (regex heuristic), not a guarantee.

@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 
@@ -266,6 +267,143 @@ def resolve_namespace(project_dir: str | Path) -> str:
     if remote:
         return f"project:{_normalize_remote(remote)}"
     return f"project:{_norm_abspath_key(p)}"
+
+
+# ---------------------------------------------------------------------------
+# Single-flight advisory locks (P11)
+# ---------------------------------------------------------------------------
+# The box-wide store now has multiple unreaped background writers: every
+# SessionStart fires a detached `store.py consolidate` (and, from P11, a
+# detached `store.py backup --if-due`), and multiple CC sessions + subagents +
+# ZCode can start within seconds of each other. `consolidate()`'s meta-key
+# cadence gate (`last_consolidation` + growth threshold) is a SOFT gate: it
+# reads the timestamp, and only later writes it, so two processes can both
+# pass the "not recent enough" check before either commits and both then run
+# the clustering loop concurrently.
+#
+# The guard is a lockfile whose *existence* is the lock — created with
+# O_CREAT|O_EXCL|O_WRONLY, which is atomic on every platform we support
+# (including Windows, where it maps to CREATE_NEW). The fd is closed
+# immediately; nothing holds an open handle, so a stale lock can always be
+# unlinked by another process (Windows will not let you delete an open file).
+#
+# Three properties this API guarantees:
+#   * FAIL-OPEN FOR THE LOSER — a caller that cannot get the lock is told to
+#     skip its own work and exit 0. It never blocks, never waits, never raises.
+#   * FAIL-OPEN FOR THE BROKEN — if the lock dir/file is unusable for reasons
+#     unrelated to contention (no permission, read-only fs), acquisition
+#     returns a token anyway and the caller proceeds UNLOCKED. Memory hygiene
+#     must not be wedged by a lockfile problem.
+#   * STALE RECOVERY IS SINGLE-WINNER — a crashed/killed holder leaves its
+#     lockfile behind forever. Any process that sees an over-age lock breaks
+#     it, but the break is claimed by atomically RENAMING the stale file to a
+#     unique name: only one process can rename a given existing file, so two
+#     processes that simultaneously judge the lock stale cannot both break-and-
+#     recreate it (the naive delete-then-create has exactly that race, and the
+#     loser's fresh lock gets deleted out from under it by the winner).
+#
+# Honest caveat: an mtime lease cannot distinguish "crashed" from "slower than
+# the timeout". A live holder that runs longer than its stale timeout WILL have
+# its lock broken. Timeouts are therefore set far above any realistic run
+# (see store.py's *_LOCK_STALE_SECONDS), and the worst case degrades to
+# today's behavior (two concurrent runs), not to corruption.
+
+_NO_LOCK_TOKEN = "unlocked"
+
+
+def acquire_lock(path: str | Path, stale_seconds: float) -> str | None:
+    """Try to take the advisory lock at `path`.
+
+    Returns an opaque token on success — pass it to release_lock() — or None
+    if another live holder has it, in which case the caller must skip its work
+    and exit 0. Never blocks, never raises.
+    """
+    p = Path(path)
+    token = f"{os.getpid()}:{uuid.uuid4().hex}"
+
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return _NO_LOCK_TOKEN  # unusable lock dir — proceed unlocked
+
+    acquired = _try_create_lock(p, token)
+    if acquired is True:
+        return token
+    if acquired is None:
+        return _NO_LOCK_TOKEN  # unexpected OSError — proceed unlocked
+
+    # Someone holds it. Is that holder stale?
+    try:
+        age = time.time() - p.stat().st_mtime
+    except FileNotFoundError:
+        # Released between our create attempt and the stat — one more try.
+        return token if _try_create_lock(p, token) is True else None
+    except OSError:
+        return None
+
+    if age <= stale_seconds:
+        return None  # live holder — skip cleanly
+
+    # Stale. Claim the right to break it by renaming it to a unique name:
+    # exactly one process can rename a given existing file, so simultaneous
+    # breakers cannot both proceed. Losing the rename (FileNotFoundError, or a
+    # Windows sharing violation) means someone else is handling it — skip.
+    victim = p.with_name(p.name + f".stale.{uuid.uuid4().hex}")
+    try:
+        os.rename(str(p), str(victim))
+    except OSError:
+        return None
+    try:
+        os.unlink(str(victim))
+    except OSError:
+        pass
+
+    # The break winner still has to win a normal acquisition: a third process
+    # may legitimately have created a fresh lock in the gap. If so, skip.
+    return token if _try_create_lock(p, token) is True else None
+
+
+def _try_create_lock(p: Path, token: str) -> bool | None:
+    """True = created (we own it); False = already exists; None = unexpected
+    OSError (caller should proceed unlocked)."""
+    try:
+        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    except OSError:
+        return None
+    try:
+        os.write(fd, token.encode("utf-8"))
+    except OSError:
+        pass
+    finally:
+        # Close immediately — the lock is the file's existence, not an open
+        # handle. Holding it open would block a stale-break unlink on Windows.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return True
+
+
+def release_lock(path: str | Path, token: str | None) -> None:
+    """Release a lock previously taken with acquire_lock(). Only unlinks the
+    file if it still carries OUR token, so a lock that was broken as stale and
+    re-taken by someone else is never deleted out from under its new owner.
+    No-op for the unlocked-degraded token. Never raises."""
+    if not token or token == _NO_LOCK_TOKEN:
+        return
+    p = Path(path)
+    try:
+        content = p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if content != token:
+        return
+    try:
+        os.unlink(str(p))
+    except OSError:
+        pass
 
 
 def busy_retry(fn, attempts: int = 5):

@@ -157,8 +157,18 @@ export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 # moment THIS script exits. No wait/kill loop: blocking up to 5s here is exactly
 # the ~5s session-start stall Phase 3 removes; consolidate has its own internal
 # growth-threshold + interval guard, so an orphaned run is safe.
+#
+# Auto-snapshot (P11) rides the exact same detachment discipline for the exact
+# same reasons: fully redirected stdio so nothing can leak into the
+# <<<ZMEM_JSON>>>…<<<END>>> payload the launcher parses (it reads stdout to
+# EOF), and no wait/kill loop so session start never gains latency. `--if-due`
+# makes it a cheap no-op almost every session — it only snapshots once per
+# $ZMEM_BACKUP_INTERVAL_DAYS (default 1). Both commands take their own
+# single-flight lock, so several sessions starting at once produce one
+# consolidation and one snapshot, not N of each.
 if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   "$PYTHON_BIN" "$STORE_PY_PY" consolidate >/dev/null 2>&1 &
+  "$PYTHON_BIN" "$STORE_PY_PY" backup --if-due --retention "${ZMEM_BACKUP_RETENTION:-7}" >/dev/null 2>&1 &
 fi
 
 # Canonical namespace from the host adapter (single derived key, closes the
