@@ -4,10 +4,14 @@
 A local-first, FTS5-backed, tombstone-supersession memory store. Operated via
 subcommands so it can be called from the memory SKILL and from hook scripts.
 
-Path resolution (in priority order):
-  1. ZMEM_STORE env var (explicit override; hooks set this)
-  2. ${ZCODE_PLUGIN_DATA}/store.sqlite (plugin data dir, when running as a plugin)
-  3. ~/.zcode/memory/store.sqlite (legacy/manual install fallback)
+Path resolution (in priority order; see host.py for the authoritative chain):
+  1. ZMEM_STORE env var (explicit full path override)
+  2. ${ZMEM_DATA}/store.sqlite (box-wide data dir, shared by Claude Code + ZCode)
+  3. ${CLAUDE_PLUGIN_DATA}/store.sqlite (Claude Code plugin data dir)
+  4. ${ZCODE_PLUGIN_DATA}/store.sqlite (ZCode plugin data dir)
+  5. ~/.zmem/store.sqlite (new box-neutral default)
+  6. ~/.zcode/memory/store.sqlite (legacy/manual install fallback, only if it
+     already exists and (5) does not yet)
 
 Usage:
   python store.py init
@@ -55,23 +59,35 @@ except ImportError:
     except ImportError:
         _embeddings = None
 
+# Shared host adapter: path resolution, local-FS safety guard, perms, retry.
+# Imported with a safe inline fallback so store.py still runs (with the old,
+# pre-Phase-1 resolution chain) if host.py is somehow missing from the checkout.
+try:
+    import host as _host
+except ImportError:
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        import host as _host
+    except ImportError:
+        _host = None
+
 
 def _resolve_store_path() -> Path:
-    """Resolve the store location.
-
-    Priority: ZMEM_STORE > ZCODE_PLUGIN_DATA > auto-detect plugin data dir > ~/.zcode/memory.
-    The auto-detect prevents store-splitting when env vars aren't set (e.g.
-    when store.py is invoked from a slash command that doesn't inherit hook env).
+    """Resolve the store location. Delegates to host.py's box-wide chain:
+    ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
+    ~/.zmem (new default) > ~/.zcode/memory (legacy, if already present).
+    Falls back to the original ZCODE_PLUGIN_DATA/~/.zcode/memory-only chain
+    if host.py could not be imported at all.
     """
+    if _host is not None:
+        return _host.resolve_store_path()
+    # --- inline fallback (host.py absent) ---
     explicit = os.environ.get("ZMEM_STORE")
     if explicit:
         return Path(explicit)
     plugin_data = os.environ.get("ZCODE_PLUGIN_DATA")
     if plugin_data:
         return Path(plugin_data) / "store.sqlite"
-    # Auto-detect the plugin data dir (the canonical location since v2).
-    # This prevents sessions without ZCODE_PLUGIN_DATA from writing to the
-    # legacy ~/.zcode/memory/ location and splitting the store.
     home = Path(os.path.expanduser("~"))
     plugin_data_pattern = home / ".zcode" / "cli" / "plugins" / "data"
     if plugin_data_pattern.is_dir():
@@ -82,7 +98,11 @@ def _resolve_store_path() -> Path:
 
 
 def _resolve_core_md_path() -> Path:
-    """Resolve the Tier 0 core.md location. Priority: ZMEM_CORE_MD > ZCODE_PLUGIN_DATA > ~/.zcode/memory."""
+    """Resolve the Tier 0 core.md location. Delegates to host.py; see
+    _resolve_store_path() for the fallback rationale."""
+    if _host is not None:
+        return _host.resolve_core_md_path()
+    # --- inline fallback (host.py absent) ---
     explicit = os.environ.get("ZMEM_CORE_MD")
     if explicit:
         return Path(explicit)
@@ -120,13 +140,38 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _commit(conn: sqlite3.Connection) -> None:
+    """conn.commit() with a bounded retry on 'database is locked' — belt and
+    suspenders past PRAGMA busy_timeout for the multi-writer box-wide store
+    (concurrent CC sessions + subagents + ZCode). Falls back to a plain
+    commit if host.py is unavailable."""
+    if _host is not None:
+        _host.busy_retry(conn.commit)
+    else:
+        conn.commit()
+
+
 def connect() -> sqlite3.Connection:
+    if _host is not None:
+        # Refuse UNC/network/OneDrive store locations before touching disk —
+        # WAL mode on a network share or a sync-managed dir risks corruption.
+        _host.assert_local_fs(STORE_PATH.parent)
+
+    dir_existed = STORE_PATH.parent.is_dir()
+    file_existed = STORE_PATH.exists()
     STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(STORE_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
+
+    if _host is not None and (not dir_existed or not file_existed):
+        # Only harden perms right after we created the dir/file — icacls on
+        # every connect() would be a needless perf hit on the hot recall path.
+        _host.set_owner_only_perms(STORE_PATH.parent)
+        if STORE_PATH.exists():
+            _host.set_owner_only_perms(STORE_PATH)
     # Load sqlite-vec extension for vector search. Failures are non-fatal —
     # the system degrades to FTS5-only recall when vec0 is unavailable.
     try:
@@ -386,7 +431,7 @@ def add_memory(
     if existing:
         # Merge: upgrade confidence/signal if the new add is stronger.
         _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
-        conn.commit()
+        _commit(conn)
         print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
               f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
         return existing["id"]
@@ -419,7 +464,7 @@ def add_memory(
             )
         except sqlite3.OperationalError:
             pass  # vec0 table not available — embedding stored in memory table only
-    conn.commit()
+    _commit(conn)
     print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"
           f"{', embedded' if emb is not None else ''})")
     return mid
@@ -745,7 +790,7 @@ def recall_memory(
             f"WHERE id IN ({placeholders})",
             [now_iso(), *ids],
         )
-        conn.commit()
+        _commit(conn)
 
     if as_json:
         print(json.dumps(results, indent=2))
@@ -815,7 +860,7 @@ def recent_memory(
             f"WHERE id IN ({placeholders})",
             [now_iso(), *ids],
         )
-        conn.commit()
+        _commit(conn)
     if as_json:
         print(json.dumps(results, indent=2))
     else:
@@ -842,7 +887,7 @@ def supersede_memory(conn: sqlite3.Connection, mid: str, reason: str = "") -> bo
         conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
     except sqlite3.OperationalError:
         pass  # vec0 table not available
-    conn.commit()
+    _commit(conn)
     note = f": {reason}" if reason else ""
     print(f"[zmem] superseded {mid}{note}")
     return True
