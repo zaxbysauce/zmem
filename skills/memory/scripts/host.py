@@ -59,10 +59,52 @@ def resolve_store_path() -> Path:
 
     home = Path(os.path.expanduser("~"))
     zmem_default = home / ".zmem" / "store.sqlite"
-    legacy = home / ".zcode" / "memory" / "store.sqlite"
-    if not zmem_default.exists() and legacy.exists():
-        return legacy
+
+    # Once the box-wide store exists, it always wins — this is what keeps the
+    # legacy probes below from re-defeating the migration (the P1 concern).
+    if zmem_default.exists():
+        return zmem_default
+
+    # No box-wide store yet. Prefer a real pre-migration store over handing back
+    # an empty new path, so an un-migrated install is never silently stranded
+    # with an invisible store (PR review PRR-002).
+    legacy_manual = home / ".zcode" / "memory" / "store.sqlite"
+    if legacy_manual.exists():
+        return legacy_manual
+
+    legacy_plugin = _legacy_plugin_store(home)
+    if legacy_plugin is not None:
+        return legacy_plugin
+
     return zmem_default
+
+
+def _legacy_plugin_store(home: Path) -> Path | None:
+    """Newest `~/.zcode/cli/plugins/data/*zmem*/store.sqlite`, or None.
+
+    This is the pre-box-wide per-plugin location. P1 removed the original
+    unconditional scan because it out-ranked `~/.zmem` and so would have
+    silently defeated the migration. It is restored here strictly as a
+    LAST resort — only reached when no env var is set AND no box-wide store
+    exists yet — which preserves P1's intent while fixing the regression it
+    introduced: before this, a user who had not yet run `import-store.py` got
+    a brand-new empty store and their existing memory simply vanished from
+    every bare `store.py` invocation.
+
+    Newest-by-mtime when several plugin dirs match (e.g. the same plugin
+    installed from two marketplaces). Never raises.
+    """
+    try:
+        data_dir = home / ".zcode" / "cli" / "plugins" / "data"
+        matches = [p for p in data_dir.glob("*zmem*/store.sqlite") if p.exists()]
+    except OSError:
+        return None
+    if not matches:
+        return None
+    try:
+        return max(matches, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return matches[0]
 
 
 def resolve_core_md_path() -> Path:

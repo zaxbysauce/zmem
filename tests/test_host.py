@@ -473,5 +473,71 @@ class TestImportSmoke(unittest.TestCase):
             self.assertTrue(result2["source_unchanged"])
 
 
+class TestLegacyPluginStoreFallback(unittest.TestCase):
+    """PR review PRR-002 (HIGH): a user who has not yet run import-store.py must
+    not have their existing per-plugin store become invisible.
+
+    P1 removed the original unconditional `~/.zcode/cli/plugins/data/*zmem*/`
+    scan because it out-ranked `~/.zmem` and would have defeated the box-wide
+    migration. These tests pin the corrected ordering: the legacy store is found
+    ONLY as a last resort, and `~/.zmem` reclaims priority the moment it exists.
+    """
+
+    def setUp(self):
+        self._patcher = mock.patch.dict(os.environ, {}, clear=False)
+        self._patcher.start()
+        for k in ENV_KEYS:
+            os.environ.pop(k, None)
+        self.tmp = tempfile.mkdtemp()
+        self.home = Path(self.tmp)
+        self._home_patcher = mock.patch.object(
+            os.path, "expanduser", lambda p: p.replace("~", str(self.home), 1)
+        )
+        self._home_patcher.start()
+
+    def tearDown(self):
+        self._home_patcher.stop()
+        self._patcher.stop()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make(self, rel: str) -> Path:
+        p = self.home / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x", encoding="utf-8")
+        return p
+
+    def test_legacy_plugin_store_found_when_nothing_else_exists(self):
+        legacy = self._make(".zcode/cli/plugins/data/zmem@zaxbyhub/store.sqlite")
+        self.assertEqual(host.resolve_store_path(), legacy)
+
+    def test_zmem_default_outranks_legacy_plugin_store(self):
+        self._make(".zcode/cli/plugins/data/zmem@zaxbyhub/store.sqlite")
+        box_wide = self._make(".zmem/store.sqlite")
+        # Post-cutover: the box-wide store must win, or the migration is defeated.
+        self.assertEqual(host.resolve_store_path(), box_wide)
+
+    def test_manual_legacy_outranks_plugin_legacy(self):
+        self._make(".zcode/cli/plugins/data/zmem@zaxbyhub/store.sqlite")
+        manual = self._make(".zcode/memory/store.sqlite")
+        self.assertEqual(host.resolve_store_path(), manual)
+
+    def test_env_still_outranks_every_legacy_probe(self):
+        self._make(".zcode/cli/plugins/data/zmem@zaxbyhub/store.sqlite")
+        os.environ["ZMEM_DATA"] = str(self.home / "explicit")
+        self.assertEqual(host.resolve_store_path(), self.home / "explicit" / "store.sqlite")
+
+    def test_no_store_anywhere_returns_new_box_wide_default(self):
+        self.assertEqual(host.resolve_store_path(), self.home / ".zmem" / "store.sqlite")
+
+    def test_newest_plugin_store_wins_when_several_match(self):
+        import time
+        older = self._make(".zcode/cli/plugins/data/zmem@old/store.sqlite")
+        newer = self._make(".zcode/cli/plugins/data/zmem@new/store.sqlite")
+        old_t = time.time() - 10_000
+        os.utime(older, (old_t, old_t))
+        self.assertEqual(host.resolve_store_path(), newer)
+
+
 if __name__ == "__main__":
     unittest.main()
