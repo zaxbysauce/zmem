@@ -315,6 +315,70 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
         conn.commit()
 
+    if ver < 5:
+        # v5: box-wide namespace re-key (PLAN.md §2b/§8, CRITIC BLOCKER 1).
+        #
+        # Old namespaces were `project:<basename>` (e.g. `project:opencode-swarm`),
+        # which silently splits one project across multiple checkouts/worktrees
+        # (see PLAN.md §1 — the same opencode-swarm remote checked out at both
+        # E:\ZCode\opencode-swarm and E:\ClaudeCode\opencode-swarm-dev used to
+        # resolve to two different namespaces). The new key is produced by
+        # host.resolve_namespace() against each namespace's *live checkout
+        # path* — never hand-typed — so it is guaranteed identical to what the
+        # runtime derives for that same checkout (and any sibling worktree/
+        # clone of the same remote).
+        #
+        # `source_ref` is `session:<id>` — the origin checkout is NOT
+        # recoverable from stored data, so this explicit old-namespace ->
+        # checkout-path map is unavoidable. If a mapped checkout is missing
+        # from disk, refuse to guess: leave that namespace's rows untouched
+        # and report it loudly, rather than fail the whole migration.
+        #
+        # Schema-gated (this whole block only runs when ver < 5) and built
+        # entirely from a fresh recomputation each time it runs, so it is
+        # both a no-op on immediate re-run (ver already 5) and reproducible
+        # on a fresh v4 re-import at cutover (PLAN.md §10b).
+        _NS_MIGRATION_CHECKOUTS = {
+            "project:opencode-swarm": r"E:\ZCode\opencode-swarm",
+            "project:ragappv3": r"E:\ZCode\ragappv3",
+            "project:trainingapp": r"E:\ZCode\trainingapp",
+            "project:zmem": r"C:\Users\Brett\.graphify\repos\zaxbysauce\zmem",
+        }
+        migration_map: dict[str, str] = {}
+        if _host is None:
+            print(
+                "[zmem] v5 migration: host.py unavailable — cannot derive "
+                "namespace keys, skipping re-key (namespaces left unchanged)",
+                file=sys.stderr,
+            )
+        else:
+            for old_ns, checkout in _NS_MIGRATION_CHECKOUTS.items():
+                checkout_path = Path(checkout)
+                if not checkout_path.is_dir():
+                    print(
+                        f"[zmem] v5 migration WARNING: checkout for {old_ns} "
+                        f"not found at {checkout} — refusing to guess; "
+                        f"namespace left unchanged",
+                        file=sys.stderr,
+                    )
+                    continue
+                new_ns = _host.resolve_namespace(checkout_path)
+                migration_map[old_ns] = new_ns
+                if new_ns != old_ns:
+                    conn.execute(
+                        "UPDATE memory SET namespace=? WHERE namespace=?",
+                        (new_ns, old_ns),
+                    )
+        # `user:global` and any unmapped namespace (e.g. `project:ZCode`,
+        # a spurious parent-dir capture with no git remote of its own) are
+        # deliberately left untouched.
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('ns_migration_v5', ?)",
+            (json.dumps(migration_map),),
+        )
+        conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+        conn.commit()
+
 
 def _load_vec(conn: sqlite3.Connection) -> None:
     """Load the sqlite-vec extension. Raises if unavailable."""
@@ -623,17 +687,53 @@ def _rrf_fuse(bm25_ids: list[str], vec_ids: list[str], k: int = 60) -> list[str]
     return sorted(scores, key=scores.get, reverse=True)
 
 
+def _ns_migration_map(conn: sqlite3.Connection) -> dict:
+    """The {old_namespace: new_namespace} map recorded by the v5 migration
+    (meta key 'ns_migration_v5'), or {} if absent/unparseable."""
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='ns_migration_v5'"
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return {}
+
+
+def _expand_namespace_aliases(conn: sqlite3.Connection, namespace: str | None) -> list[str] | None:
+    """Given a namespace as passed by a caller (pre- or post-v5-migration),
+    return the list of namespace values to match: the namespace itself, plus
+    its pre-migration alias if one exists in either direction (old->new or
+    new->old), per the recall compat-alias (PLAN.md §8) kept for one release
+    so nothing strands mid-cutover. A row has exactly one namespace, so this
+    never double-counts — it only widens the WHERE IN (...) match set."""
+    if not namespace:
+        return None
+    aliases = {namespace}
+    migration_map = _ns_migration_map(conn)
+    if namespace in migration_map:
+        aliases.add(migration_map[namespace])
+    else:
+        for old_ns, new_ns in migration_map.items():
+            if new_ns == namespace:
+                aliases.add(old_ns)
+    return list(aliases)
+
+
 def _fetch_by_ids(
-    conn: sqlite3.Connection, ids: list[str], namespace: str | None, floor: float
+    conn: sqlite3.Connection, ids: list[str], namespaces: list[str] | None, floor: float
 ) -> list:
     """Fetch full memory rows for a list of IDs, applying the same filters as recall."""
     if not ids:
         return []
     placeholders = ",".join("?" * len(ids))
-    ns_clause = "AND namespace = ?" if namespace else ""
+    ns_clause = ""
     params = list(ids)
-    if namespace:
-        params.append(namespace)
+    if namespaces:
+        ns_placeholders = ",".join("?" * len(namespaces))
+        ns_clause = f"AND namespace IN ({ns_placeholders})"
+        params.extend(namespaces)
     params.append(floor)
     sql = f"""
         SELECT id, namespace, type, content, tags, source_ref,
@@ -673,6 +773,12 @@ def recall_memory(
     Confidence is still a hard floor (high-precision-first principle): memories
     below CONFIDENCE_FLOOR (or min_confidence) are dropped before scoring.
     """
+    # Expand a single namespace into itself + its pre-v5-migration alias (if
+    # any) so recall keeps finding rows on either side of the rename for one
+    # release (PLAN.md §8 compat alias). A row has exactly one namespace, so
+    # this only widens the match set — it never double-counts a row.
+    ns_list = _expand_namespace_aliases(conn, namespace)
+
     terms = [t for t in re.split(r"\s+", query.strip()) if t]
     if not terms:
         rows = []
@@ -684,9 +790,10 @@ def recall_memory(
         fts_query = " OR ".join(safe_terms)
         params: list = [fts_query]
         ns_clause = ""
-        if namespace:
-            ns_clause = "AND m.namespace = ?"
-            params.append(namespace)
+        if ns_list:
+            ns_placeholders = ",".join("?" * len(ns_list))
+            ns_clause = f"AND m.namespace IN ({ns_placeholders})"
+            params.extend(ns_list)
         floor = min_confidence if min_confidence is not None else CONFIDENCE_FLOOR
         params.append(floor)
         # Fetch more candidates than the limit so the composite re-ranking has
@@ -740,7 +847,7 @@ def recall_memory(
                 fused_ids = _rrf_fuse(fts_ids, vec_ids, k=60)
                 # Re-fetch full rows for the fused set (may include IDs not in
                 # the FTS results — these are semantic matches BM25 missed).
-                rows = _fetch_by_ids(conn, fused_ids, namespace, floor)
+                rows = _fetch_by_ids(conn, fused_ids, ns_list, floor)
 
     # Re-rank by composite score (relevance + confidence + recency + popularity).
     now_epoch = time.time()

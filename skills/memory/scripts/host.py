@@ -26,6 +26,7 @@ explicit callout.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -144,6 +145,81 @@ def set_owner_only_perms(path: Path) -> None:
         )
     except Exception:
         pass
+
+
+def _get_git_remote_url(project_dir: Path) -> str | None:
+    """Return `origin`'s remote URL for project_dir, or None if project_dir is
+    not a git checkout (or has no `origin` remote). Works for worktrees and
+    second clones alike — `git -C <dir> remote get-url origin` resolves via
+    the checkout's own .git pointer, so it does not require project_dir to be
+    a repo's top-level root."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_dir), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    return url or None
+
+
+def _normalize_remote(url: str) -> str:
+    """Normalize a git remote URL to a bare `host/org/repo` form, lowercased,
+    with any `.git` suffix and trailing slash stripped. Handles both the SSH
+    scp-like form (`git@host:org/repo.git`) and URL forms
+    (`https://host/org/repo.git`, `ssh://git@host/org/repo`), with or without
+    a trailing slash or `.git` suffix — all normalize to the same key."""
+    u = url.strip().rstrip("/")
+    if u.lower().endswith(".git"):
+        u = u[: -len(".git")]
+
+    # SSH scp-like shorthand: user@host:path (no scheme).
+    m = re.match(r"^[^/@:\s]+@([^/:\s]+):(.+)$", u)
+    if m:
+        host, path = m.group(1), m.group(2)
+    else:
+        # Any scheme://[user@]host/path form (https, ssh, git, http, ...).
+        m2 = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]+@)?([^/]+)/(.+)$", u)
+        if m2:
+            host, path = m2.group(1), m2.group(2)
+        else:
+            # Unrecognized shape — normalize what we have rather than guessing.
+            host, path = "", u
+
+    path = path.strip("/")
+    combined = f"{host}/{path}" if host else path
+    return combined.lower()
+
+
+def _norm_abspath_key(project_dir: Path) -> str:
+    """Absolute path form used for the no-remote fallback namespace: drive
+    letter lowercased, forward-slashed. Fully lowercased (Windows paths are
+    case-insensitive) so casing differences never split one directory into
+    two namespaces."""
+    ap = os.path.abspath(str(project_dir))
+    return ap.replace("\\", "/").lower()
+
+
+def resolve_namespace(project_dir: str | Path) -> str:
+    """The SOLE producer of `project:*` namespace keys — called both by the
+    runtime hook launcher (recall) and by the v5 migration (store.py). Never
+    hand-type a namespace key; always derive it through this function so
+    runtime and migration keys are guaranteed identical.
+
+    - If project_dir is a git checkout with an `origin` remote: normalize the
+      remote to `host/org/repo` (lowercased, `.git`/trailing-slash stripped;
+      SSH and HTTPS forms collapse to the same key) -> `project:<host/org/repo>`.
+      Worktrees and second clones of the same remote yield the same key.
+    - Else (no remote / not a checkout): `project:<normalized-abspath>`.
+    """
+    p = Path(project_dir)
+    remote = _get_git_remote_url(p)
+    if remote:
+        return f"project:{_normalize_remote(remote)}"
+    return f"project:{_norm_abspath_key(p)}"
 
 
 def busy_retry(fn, attempts: int = 5):
