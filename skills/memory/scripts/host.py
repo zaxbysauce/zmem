@@ -400,16 +400,63 @@ def resolve_namespace(project_dir: str | Path) -> str:
 #     lock. Identity is re-confirmed (st_mtime_ns) after the rename, and a
 #     mismatch is undone.
 #
-# Residual, stated honestly because the previous version of this comment
-# overclaimed: two processes that judge the SAME lock instance stale can no
-# longer both end up holding — the loser detects that it moved a different
-# instance and puts it back untouched. But between that mistaken breaker's
-# rename-out and its rename-back the path is momentarily empty, so a third
-# process acquiring inside that window can still coexist with the rightful
-# holder. There is no portable atomic compare-and-delete to close it, and every
-# scheme that would (e.g. an O_EXCL "break claim" file) can wedge the lock
-# permanently if its owner dies mid-break — strictly worse than the floor
-# below, given this API's fail-open contract.
+# BREAKS ARE SERIALIZED (the fix for the residual the previous comment
+# described). Identity re-confirmation alone was not enough: a breaker that had
+# moved a live lock aside had to put it back, and between its rename-out and
+# its rename-back the path was momentarily EMPTY, so a third process could
+# acquire there and coexist with the rightful holder. Measured, not theorized —
+# 16 threads racing one planted stale lock produced 2-3 simultaneous holders in
+# 277 of 300 runs on Windows, and the ubuntu CI job failed the same stress test
+# intermittently.
+#
+# So a break now runs under a short-lived O_EXCL claim file (`<lock>.break`,
+# _BREAK_CLAIM_STALE_SECONDS, far below the real locks' 600s/1800s), and the
+# claim holder RE-STATS the real lock before touching it — if it is no longer
+# over-age, the break is abandoned without a rename. A live lock is therefore
+# never renamed aside, which is what removes the empty-path window rather than
+# merely narrowing it.
+#
+# The old objection to a claim file was that it "can wedge the lock permanently
+# if its owner dies mid-break". It cannot, for two independent reasons:
+#   * the claim carries its own (much shorter) stale lease, so a claim orphaned
+#     by a crash is reclaimed after _BREAK_CLAIM_STALE_SECONDS; and
+#   * a claim mechanism that is unusable for any other reason (EACCES, a
+#     read-only fs) does NOT block the break — _acquire_break_claim reports
+#     UNAVAILABLE and the break proceeds unserialized, i.e. exactly the
+#     pre-change behavior. Losing serialization is a degradation; losing stale
+#     recovery would be a wedge, and this API promises never to wedge.
+# (Precisely: a stray non-file object at the claim path — a directory, say —
+# presents as EEXIST, so it reads as a live claim for the first
+# _BREAK_CLAIM_STALE_SECONDS and as UNAVAILABLE thereafter, once the reclaim's
+# unlink of it fails. Bounded degradation, still not a wedge.)
+# A caller that finds the claim held by a LIVE breaker returns None (skip), not
+# _NO_LOCK_TOKEN: someone is actively breaking-and-taking, so proceeding
+# unlocked would be the very double-worker the lock exists to prevent.
+#
+# Residual, stated honestly (two windows remain; neither is the one that was
+# failing CI):
+#   1. Between the re-stat under the claim and the rename two syscalls later, a
+#      slow-but-alive holder can release and a third process create a fresh
+#      lock — so the rename can still land on a live lock, and the put-back gap
+#      opens for that attempt. Narrowed from "the whole interval since the
+#      caller's first stat" to those two syscalls, not eliminated: there is no
+#      portable atomic compare-and-delete. This is the scenario
+#      test_failed_put_back_still_never_grants_the_lock pins.
+#   2. The claim's own lease has the same limitation the real locks' does. Two
+#      processes that both judge one abandoned claim reclaimable can both end
+#      up holding it (the reclaim is only mtime-verified), and a breaker
+#      suspended for longer than _BREAK_CLAIM_STALE_SECONDS can have its live
+#      claim reclaimed out from under it. Either way two breakers run at once
+#      and that break attempt degrades to the pre-change (unserialized)
+#      behavior. NOT harmless, just rare — the claim is held across ~4
+#      syscalls, so reaching a 30s lease requires a crash or a stopped
+#      process, and a plain _release_break_claim unlink may then remove the
+#      successor's claim.
+# In both cases the failure mode is bounded by the identity confirmation in
+# _break_stale_lock, which is retained as the correctness backstop.
+#
+# Cost: the claim adds syscalls only on the stale-break path, which is rare by
+# construction. The uncontended acquire (single O_EXCL create) is unchanged.
 #
 # Honest caveat: an mtime lease cannot distinguish "crashed" from "slower than
 # the timeout". A live holder that runs longer than its stale timeout WILL have
@@ -418,6 +465,24 @@ def resolve_namespace(project_dir: str | Path) -> str:
 # today's behavior (two concurrent runs), not to corruption.
 
 _NO_LOCK_TOKEN = "unlocked"
+
+# A break claim is held only across a handful of syscalls. The lease exists
+# purely so a process killed mid-break cannot park the claim forever; it is
+# deliberately orders of magnitude below the real locks' stale timeouts
+# (600s backup / 1800s consolidate) so an orphaned claim costs at most this
+# long of "stale locks cannot be broken", never a permanent wedge.
+_BREAK_CLAIM_STALE_SECONDS = 30.0
+_BREAK_CLAIM_SUFFIX = ".break"
+# Consecutive non-EEXIST create failures before the claim mechanism is declared
+# unusable. See _create_break_claim — this is a classifier, not a backoff: it
+# never sleeps, and the transient it exists for resolved within 2 attempts in
+# every one of 473 measured occurrences.
+_CLAIM_CREATE_ATTEMPTS = 5
+
+# _acquire_break_claim outcomes.
+_CLAIM_ACQUIRED = "acquired"      # we own it; we must release it
+_CLAIM_HELD = "held"              # another breaker is mid-break; skip
+_CLAIM_UNAVAILABLE = "unavailable"  # mechanism unusable; break unserialized
 
 
 def acquire_lock(path: str | Path, stale_seconds: float) -> str | None:
@@ -442,8 +507,11 @@ def acquire_lock(path: str | Path, stale_seconds: float) -> str | None:
         return _NO_LOCK_TOKEN  # unexpected OSError — proceed unlocked
 
     # Someone holds it. Is that holder stale?
+    # os.stat(str(p)) rather than p.stat(): pathlib's stat call site moved
+    # between 3.10 and 3.11, and the regression tests patch os.stat to force
+    # the "replaced between the two stats" interleaving deterministically.
     try:
-        st = p.stat()
+        st = os.stat(str(p))
     except FileNotFoundError:
         # Released between our create attempt and the stat — one more try.
         return token if _try_create_lock(p, token) is True else None
@@ -455,7 +523,7 @@ def acquire_lock(path: str | Path, stale_seconds: float) -> str | None:
 
     # Stale. The break must remove THIS file instance, not merely "whatever is
     # at the path" — see _break_stale_lock. A refused break means skip.
-    if not _break_stale_lock(p, st.st_mtime_ns):
+    if not _break_stale_lock(p, st.st_mtime_ns, stale_seconds):
         return None
 
     # The break winner still has to win a normal acquisition: a third process
@@ -463,12 +531,116 @@ def acquire_lock(path: str | Path, stale_seconds: float) -> str | None:
     return token if _try_create_lock(p, token) is True else None
 
 
-def _break_stale_lock(p: Path, stale_mtime_ns: int) -> bool:
+def _claim_path(p: Path) -> Path:
+    return p.with_name(p.name + _BREAK_CLAIM_SUFFIX)
+
+
+def _create_break_claim(claim: Path) -> str:
+    """Create the claim exclusively. _CLAIM_ACQUIRED / _CLAIM_HELD /
+    _CLAIM_UNAVAILABLE. Never raises, never sleeps.
+
+    A non-FileExistsError OSError is retried a few times before the claim
+    mechanism is declared unusable, because on Windows it is NOT necessarily
+    permanent: unlinking a file leaves its name in a delete-pending state in
+    which a concurrent O_EXCL create fails with EACCES instead of EEXIST — and
+    a hot break loop unlinks this very claim constantly. Measured on Windows
+    (6 threads churning create+unlink against 6 threads creating): 473 of 473
+    EACCES failures resolved on the first or second immediate retry — 342 to
+    EEXIST, 131 to a successful create, none persisting. POSIX has no
+    delete-pending state and so does not produce this at all.
+
+    Misreading that transient as "unusable" is not harmless: UNAVAILABLE drops
+    the caller out of the serialized path and back onto the pre-change racy
+    break. Measured cost of getting this wrong: 8 double-holds per 300
+    16-thread stress runs, every single one of them immediately preceded by one
+    of these EACCES.
+    """
+    for _ in range(_CLAIM_CREATE_ATTEMPTS):
+        try:
+            fd = os.open(str(claim), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return _CLAIM_HELD
+        except OSError:
+            continue
+        # Close immediately, exactly as _try_create_lock does: the claim is the
+        # file's existence, and Windows refuses to unlink a file that is still
+        # open — leaving it open would make our own best-effort release fail on
+        # Windows while succeeding on Linux.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return _CLAIM_ACQUIRED
+    return _CLAIM_UNAVAILABLE
+
+
+def _acquire_break_claim(claim: Path) -> str:
+    """Take the short-lived claim that serializes stale-lock breaks.
+
+    Returns _CLAIM_ACQUIRED (caller owns it and MUST release it),
+    _CLAIM_HELD (another breaker is mid-break — the caller must skip its break
+    entirely) or _CLAIM_UNAVAILABLE (the claim mechanism itself is unusable —
+    the caller proceeds with an UNSERIALIZED break, i.e. pre-change behavior,
+    because refusing to break would wedge stale recovery forever). Never
+    raises, never blocks, and makes at most two create attempts so it always
+    terminates.
+
+    An existing claim older than _BREAK_CLAIM_STALE_SECONDS was orphaned by a
+    process that died mid-break; it is unlinked and re-created. The unlink is
+    guarded by an mtime_ns re-check so a competitor that already reclaimed the
+    claim and installed its own fresh one is not clobbered — which narrows, but
+    does not close, the double-reclaim noted in the module comment.
+    """
+    state = _create_break_claim(claim)
+    if state != _CLAIM_HELD:
+        return state
+
+    try:
+        st = os.stat(str(claim))
+    except FileNotFoundError:
+        # Vanished between the create and the stat — one retry, then give up.
+        return _create_break_claim(claim)
+    except OSError:
+        return _CLAIM_UNAVAILABLE
+
+    if (time.time() - st.st_mtime) <= _BREAK_CLAIM_STALE_SECONDS:
+        return _CLAIM_HELD  # a live breaker owns it
+
+    try:
+        if os.stat(str(claim)).st_mtime_ns != st.st_mtime_ns:
+            return _CLAIM_HELD  # reclaimed by someone else since we judged it
+        os.unlink(str(claim))
+    except FileNotFoundError:
+        pass  # someone else reclaimed it first; the create below decides
+    except OSError:
+        return _CLAIM_UNAVAILABLE
+    return _create_break_claim(claim)
+
+
+def _release_break_claim(claim: Path) -> None:
+    """Best-effort release. A failure here costs at most
+    _BREAK_CLAIM_STALE_SECONDS of un-breakable stale locks, never a wedge."""
+    try:
+        os.unlink(str(claim))
+    except OSError:
+        pass
+
+
+def _break_stale_lock(p: Path, stale_mtime_ns: int, stale_seconds: float) -> bool:
     """Remove the lock file at `p` ONLY IF the file actually sitting there is
     the same instance the caller stat'ed and judged stale. True => the stale
     instance is gone and the caller may try to take the lock; False => it was
     not removed (or we could not prove it was the right one) and the caller
     must skip. Never raises.
+
+    Runs under the break claim (see _acquire_break_claim), and RE-STATS `p`
+    while holding it. That re-stat is the step that closes the double-hold the
+    identity check alone could not: a lock that is no longer over-age is left
+    completely untouched, so a live lock is never renamed aside and the
+    momentarily-empty-path window that a put-back opens never occurs for the
+    concurrent-breakers case. The freshly observed st_mtime_ns replaces the
+    caller's as the identity witness — it is the stronger one, having been
+    observed inside the serialized section.
 
     Why the identity re-check is load-bearing (the bug this replaces): renaming
     the lock aside was treated as an atomic claim on the break, on the theory
@@ -493,6 +665,32 @@ def _break_stale_lock(p: Path, stale_mtime_ns: int) -> bool:
     we cannot perform at all — is treated as "not ours": the file is put back
     exactly as it was (rename preserves both mtime and the owner's token, so
     its owner's release_lock still works), and we decline the break.
+    """
+    claim = _claim_path(p)
+    state = _acquire_break_claim(claim)
+    if state == _CLAIM_HELD:
+        return False  # another breaker owns this break — skip, do not touch `p`
+    try:
+        if state == _CLAIM_ACQUIRED:
+            try:
+                cur = os.stat(str(p))
+            except OSError:
+                # Gone (already broken, or released) — nothing for us to break.
+                return False
+            if (time.time() - cur.st_mtime) <= stale_seconds:
+                # Someone broke it and took it while we were queuing for the
+                # claim. It is LIVE: leave it exactly where it is.
+                return False
+            stale_mtime_ns = cur.st_mtime_ns
+        return _break_confirmed_instance(p, stale_mtime_ns)
+    finally:
+        if state == _CLAIM_ACQUIRED:
+            _release_break_claim(claim)
+
+
+def _break_confirmed_instance(p: Path, stale_mtime_ns: int) -> bool:
+    """The rename-aside + identity-confirm + put-back body of _break_stale_lock,
+    split out so the claim's acquire/release brackets it cleanly. Never raises.
     """
     victim = p.with_name(p.name + f".stale.{uuid.uuid4().hex}")
     try:

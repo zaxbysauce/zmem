@@ -502,7 +502,15 @@ class RestoreLocalFsGuardTest(_StoreCase):
         self.assertEqual(self.run_store("backup").returncode, 0)
         return str(self.backups / self.snapshots()[0])
 
+    @unittest.skipUnless(os.name == "nt", "UNC paths are a Windows-only concept")
     def test_refuses_a_unc_destination(self):
+        # Windows-gated for the same reason tests/test_host.py's
+        # test_rejects_unc_path is: on POSIX `\\fileserver\share\...` is not a
+        # UNC path at all, it is an ordinary RELATIVE filename whose every
+        # character is legal, so assert_local_fs correctly does not raise and
+        # the restore correctly succeeds. The guard itself is cross-platform
+        # (test_rejects_forward_slash_unc covers the `//server/share` spelling
+        # everywhere); only this Windows SPELLING of a UNC path is not.
         snap = self._snapshot_from_a_good_store()
         env = {**self.env, "ZMEM_STORE": r"\\fileserver\share\zmem\store.sqlite"}
         r = self.run_store("restore", "--from", snap, "--force", env=env)
@@ -693,10 +701,20 @@ class LockPrimitiveTest(unittest.TestCase):
 # exists) silently no-opped, so once the second released, the path was left
 # with no lock at all while the first was still running.
 #
-# These tests pin the instance-identity check that closes it. They drive
-# host.acquire_lock directly and instrument os.rename to force the exact
-# interleaving; every barrier wait is bounded so a regression fails the test
-# instead of hanging the suite.
+# The instance-identity check alone did NOT close it, which is what the second
+# half of this class pins. A breaker that had moved a live lock aside still had
+# to put it back, and between its rename-out and its rename-back the path was
+# momentarily EMPTY — so a third acquirer could take the lock and coexist with
+# the rightful holder. That leak was intermittent-but-common (2-3 simultaneous
+# holders in 277 of 300 local 16-thread runs, and an intermittent ubuntu CI
+# failure of test_many_concurrent_breakers_yield_exactly_one_holder). Breaks are
+# now SERIALIZED behind a short-lived `<lock>.break` claim whose holder re-stats
+# the lock before touching it, so a live lock is never renamed aside at all.
+#
+# These tests pin both halves. They drive host.acquire_lock directly and
+# instrument os.rename / os.stat / os.open to force exact interleavings; every
+# barrier wait is bounded so a regression fails the test instead of hanging the
+# suite.
 class StaleBreakRaceTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="zmem-lockrace-")
@@ -704,8 +722,12 @@ class StaleBreakRaceTest(unittest.TestCase):
         self.lock = Path(self.tmp) / ".zmem-race.lock"
         self.real_rename = os.rename
         self.real_link = os.link
+        self.real_stat = os.stat
+        self.real_open = os.open
         self.addCleanup(setattr, os, "rename", self.real_rename)
         self.addCleanup(setattr, os, "link", self.real_link)
+        self.addCleanup(setattr, os, "stat", self.real_stat)
+        self.addCleanup(setattr, os, "open", self.real_open)
 
     def _plant_stale_lock(self, token: str = "crashed-holder-token") -> int:
         """A lockfile left behind by a crashed holder. Returns its st_mtime_ns."""
@@ -714,31 +736,69 @@ class StaleBreakRaceTest(unittest.TestCase):
         os.utime(self.lock, (old, old))
         return self.lock.stat().st_mtime_ns
 
+    def _claim(self) -> Path:
+        """The short-lived file that serializes breaks (host._claim_path)."""
+        return Path(str(self.lock) + host._BREAK_CLAIM_SUFFIX)
+
     def _residue(self) -> list:
         return sorted(p.name for p in Path(self.tmp).glob("*.stale.*"))
 
-    # -- the reviewer's race, with a real second thread --------------------
-    def test_two_breakers_of_one_stale_lock_cannot_both_hold(self):
-        """A and B both judge the SAME stale instance breakable. A wins and
-        installs a fresh lock; B's rename then lands on A's live lock. Only A
-        may end up holding, and A's lock must survive intact."""
-        self._plant_stale_lock()
-
-        b_at_rename = threading.Event()   # B has stat'ed the stale lock
-        a_installed = threading.Event()   # A has broken it and taken the lock
-        state = {"barrier_used": False}
+    def _rename_spy(self) -> list:
+        """Install an os.rename that records every src it is handed. Returns
+        the (live) list of recorded srcs."""
+        seen: list = []
         real_rename = self.real_rename
 
+        def spy(src, dst, *a, **kw):
+            seen.append(str(src))
+            return real_rename(src, dst, *a, **kw)
+
+        os.rename = spy
+        return seen
+
+    # -- the reviewer's race, with a real second thread --------------------
+    def test_two_breakers_of_one_stale_lock_cannot_both_hold(self):
+        """A and B both judge the SAME stale instance breakable. B reaches the
+        break first and is descheduled mid-rename while holding the break
+        claim; A must be EXCLUDED by that claim and skip WITHOUT touching the
+        lock. Exactly one of them (B) may end up holding.
+
+        RE-CHOREOGRAPHED, NOT WEAKENED — read this before "fixing" it. The
+        invariant under test is unchanged and is still the one in the name:
+        two breakers of one stale lock cannot both hold. What changed is the
+        protocol that enforces it. Before breaks were serialized, both A and B
+        entered the break concurrently; A won, and B — having stat'ed the
+        original stale mtime — renamed A's fresh LIVE lock aside and put it
+        back. That put-back left the path momentarily EMPTY, and a third
+        acquirer landing in that window ended up holding alongside A. That is
+        the window the 8-thread stress test below kept catching on ubuntu CI
+        (2-3 simultaneous holders in 277/300 local 16-thread runs).
+
+        The assertions below are strictly discriminating against the old
+        behavior: with identity-checking alone and no claim, A would acquire
+        (assertIsNone(a) fails), A would rename the lock it never verified
+        under a claim (assertNotIn(MainThread) fails), and B would come back
+        None (assertIsNotNone(b) fails). Deleting the serialization cannot make
+        this test pass.
+        """
+        self._plant_stale_lock()
+
+        b_at_rename = threading.Event()   # B is inside the break, holding the claim
+        a_attempted = threading.Event()   # A has had its turn
+        state = {"barrier_used": False}
+        real_rename = self.real_rename
+        renamers: list = []
+
         def instrumented(src, dst, *a, **kw):
-            # Deschedule ONLY B's steal-rename (src == the lock path). The
-            # put-back rename has src == the victim, so the barrier cannot
-            # fire twice and deadlock the restore.
-            if (not state["barrier_used"]
-                    and str(src) == str(self.lock)
-                    and threading.current_thread().name == "breaker-B"):
-                state["barrier_used"] = True
-                b_at_rename.set()
-                a_installed.wait(20)
+            if str(src) == str(self.lock):
+                renamers.append(threading.current_thread().name)
+                # Deschedule ONLY B's break-rename. The put-back rename has
+                # src == the victim, so the barrier cannot fire twice.
+                if (not state["barrier_used"]
+                        and threading.current_thread().name == "breaker-B"):
+                    state["barrier_used"] = True
+                    b_at_rename.set()
+                    a_attempted.wait(20)
             return real_rename(src, dst, *a, **kw)
 
         results = {}
@@ -749,36 +809,179 @@ class StaleBreakRaceTest(unittest.TestCase):
         b = threading.Thread(target=run_b, name="breaker-B", daemon=True)
         os.rename = instrumented
         b.start()
-        self.assertTrue(b_at_rename.wait(20), "B never reached its steal-rename")
+        self.assertTrue(b_at_rename.wait(20), "B never reached its break rename")
+        self.assertTrue(self._claim().exists(),
+                        "B should be holding the break claim at this point")
 
-        # A (this thread) breaks the same stale instance and takes the lock.
+        # A (this thread) tries to break the same stale instance mid-B-break.
         results["a"] = host.acquire_lock(self.lock, 600)
-        tok_a = results["a"]
-        self.assertIsNotNone(tok_a, "A should have broken the stale lock")
-        self.assertNotEqual(tok_a, "unlocked", "A should hold a real lock")
-        a_mtime_ns = self.lock.stat().st_mtime_ns
-
-        a_installed.set()
+        a_attempted.set()
         b.join(20)
+        os.rename = real_rename
         self.assertFalse(b.is_alive(), "breaker thread B hung")
 
-        tok_b = results.get("b")
         self.assertIsNone(
-            tok_b,
-            "BOTH PROCESSES HOLD THE LOCK: the second breaker's rename moved "
-            "the first breaker's fresh live lock and it acquired anyway",
+            results["a"],
+            "BOTH PROCESSES HOLD THE LOCK: a second breaker entered a break "
+            "that was already in progress",
         )
-        # A's lock must still be there, and be the SAME file instance — not a
-        # lookalike re-created by B.
-        self.assertTrue(self.lock.exists(), "A's live lock was destroyed")
-        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(), tok_a)
-        self.assertEqual(self.lock.stat().st_mtime_ns, a_mtime_ns,
-                         "A's lock file was replaced rather than restored")
-        self.assertEqual(self._residue(), [], "victim file left behind")
+        self.assertNotIn(
+            threading.main_thread().name, renamers,
+            "A renamed a lock it never verified under the break claim — that "
+            "rename is what opens the empty-path window",
+        )
 
-        # And A's release still works — proof its token survived the round trip.
-        host.release_lock(self.lock, tok_a)
+        tok_b = results.get("b")
+        self.assertIsNotNone(tok_b, "B held the claim and should have won")
+        self.assertNotEqual(tok_b, "unlocked", "B should hold a real lock")
+        self.assertTrue(self.lock.exists(), "B's live lock was destroyed")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(), tok_b)
+        self.assertEqual(self._residue(), [], "victim file left behind")
+        self.assertFalse(self._claim().exists(),
+                         "the break claim must be released on every exit path")
+
+        # And B's release still works — proof its token survived the round trip.
+        host.release_lock(self.lock, tok_b)
         self.assertFalse(self.lock.exists())
+
+    # -- the serialization itself, deterministically ------------------------
+    def test_a_live_break_claim_leaves_the_stale_lock_untouched(self):
+        """A break already in progress must be joined by nobody. The mtime and
+        no-rename assertions are the load-bearing ones: returning None is not
+        enough, the lock must not have been MOVED, because it is the move that
+        empties the path."""
+        planted = self._plant_stale_lock()
+        claim = self._claim()
+        claim.write_text("", encoding="utf-8")   # fresh => a breaker is mid-break
+        renamed = self._rename_spy()
+        try:
+            tok = host.acquire_lock(self.lock, 600)
+        finally:
+            os.rename = self.real_rename
+
+        self.assertIsNone(tok, "a break already in progress must not be joined")
+        self.assertEqual(renamed, [],
+                         "the lock was renamed by a breaker that never held the claim")
+        self.assertEqual(self.lock.stat().st_mtime_ns, planted,
+                         "the stale lock must be left exactly as it was found")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(),
+                         "crashed-holder-token")
+        self.assertEqual(self._residue(), [])
+        self.assertTrue(claim.exists(), "another breaker's live claim must survive")
+
+    def test_a_lock_that_went_live_under_us_is_never_renamed(self):
+        """The re-stat under the claim, deterministically. acquire_lock's
+        staleness stat sees the crashed holder's lock; by the time the claim is
+        held, another process has broken it and installed its own LIVE lock.
+        The break must be abandoned with no rename at all — renaming here is
+        exactly what used to empty the path and let a third party acquire
+        alongside the rightful holder."""
+        self._plant_stale_lock()
+        real_stat = self.real_stat
+        seen = {"n": 0}
+
+        def stat_spy(path, *a, **kw):
+            st = real_stat(path, *a, **kw)
+            if str(path) == str(self.lock):
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    # Between the staleness stat and the re-stat under the
+                    # claim: someone else breaks it and takes it.
+                    os.unlink(str(self.lock))
+                    self.lock.write_text("live-successor-token", encoding="utf-8")
+            return st
+
+        renamed = self._rename_spy()
+        os.stat = stat_spy
+        try:
+            tok = host.acquire_lock(self.lock, 600)
+        finally:
+            os.stat, os.rename = real_stat, self.real_rename
+
+        self.assertGreaterEqual(seen["n"], 2,
+                                "the re-stat under the break claim never happened")
+        self.assertIsNone(tok, "must not acquire alongside the live successor")
+        self.assertEqual(renamed, [],
+                         "a LIVE lock was renamed aside — the empty-path window is back")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(),
+                         "live-successor-token")
+        self.assertEqual(self._residue(), [])
+        self.assertFalse(self._claim().exists(),
+                         "the claim must be released when the break is abandoned")
+
+    # -- the claim must never become a wedge --------------------------------
+    def test_an_orphaned_break_claim_is_reclaimed(self):
+        """A breaker killed mid-break parks its claim forever. The claim's own
+        (much shorter) lease must expire and let stale recovery resume — the
+        historical objection to a claim file was precisely that it could wedge
+        the lock permanently."""
+        self._plant_stale_lock()
+        claim = self._claim()
+        claim.write_text("", encoding="utf-8")
+        dead = time.time() - 300          # >> the 30s claim lease
+        os.utime(claim, (dead, dead))
+
+        tok = host.acquire_lock(self.lock, 600)
+        self.assertIsNotNone(tok, "an orphaned break claim must not wedge stale recovery")
+        self.assertNotEqual(tok, "unlocked")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(), tok)
+        self.assertEqual(self._residue(), [])
+        self.assertFalse(claim.exists(), "the reclaimed claim must be released")
+
+    def test_a_transient_claim_create_error_is_not_read_as_unusable(self):
+        """Windows leaves an unlinked name in a delete-pending state in which a
+        concurrent O_EXCL create fails with EACCES rather than EEXIST — and a
+        hot break loop unlinks this claim constantly. Reading that transient as
+        "the claim mechanism is unusable" silently drops the caller back onto
+        the UNSERIALIZED break. Every one of the residual double-holds measured
+        while this retry was missing (8 per 300 16-thread runs) came from
+        exactly that misclassification, so this is a correctness test, not a
+        flake-suppressor: only a PERSISTENT failure may mean "unusable"."""
+        calls = {"n": 0}
+        real_open = self.real_open
+
+        def flaky(path, *a, **kw):
+            if str(path).endswith(host._BREAK_CLAIM_SUFFIX):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise PermissionError(13, "unlink still pending")
+            return real_open(path, *a, **kw)
+
+        os.open = flaky
+        try:
+            state = host._create_break_claim(self._claim())
+        finally:
+            os.open = real_open
+
+        self.assertEqual(state, host._CLAIM_ACQUIRED,
+                         "a transient claim-create error must not disable serialization")
+        self.assertGreaterEqual(calls["n"], 2, "the transient failure was never retried")
+
+    def test_an_unusable_break_claim_degrades_instead_of_wedging(self):
+        """Fail-open floor. If the claim file PERSISTENTLY cannot be created
+        for a reason that is not contention (read-only fs), the break proceeds
+        UNSERIALIZED — i.e. pre-change behavior, identity check still intact.
+        Declining the break instead would leave a crashed holder's lock in
+        place forever, and this API promises never to wedge."""
+        self._plant_stale_lock()
+        real_open = self.real_open
+
+        def refuse_the_claim(path, *a, **kw):
+            if str(path).endswith(host._BREAK_CLAIM_SUFFIX):
+                raise PermissionError(13, "claim path is not writable")
+            return real_open(path, *a, **kw)
+
+        os.open = refuse_the_claim
+        try:
+            tok = host.acquire_lock(self.lock, 600)
+        finally:
+            os.open = real_open
+
+        self.assertIsNotNone(tok, "an unusable claim must not wedge stale recovery")
+        self.assertNotEqual(tok, "unlocked")
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(), tok)
+        self.assertEqual(self._residue(), [])
+        self.assertFalse(self._claim().exists())
 
     # -- same race, deterministic single-threaded form ---------------------
     def test_breaker_restores_a_lock_it_had_no_right_to_move(self):
