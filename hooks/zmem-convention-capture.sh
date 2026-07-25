@@ -89,28 +89,75 @@ join_path() {
 # the only session value guaranteed to be present under Claude Code —
 # CLAUDE_SESSION_ID is not exported to the hook process.
 SESSION_ID="${ZMEM_SESSION:-${CLAUDE_SESSION_ID:-${ZCODE_SESSION_ID:-}}}"
-DATA_DIR="${ZMEM_DATA:-${ZCODE_PLUGIN_DATA:-}}"
 
 if [ -z "$SESSION_ID" ]; then emit_empty; fi
 
-if [ -n "$DATA_DIR" ]; then
-  DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
-else
-  DATA_DIR_PY="$(join_path "$(to_py_path "$HOME")" .zmem)"
-fi
-
-# Keep store.py resolving the same store (chain:
-# ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem).
-export ZMEM_DATA="${ZMEM_DATA:-$DATA_DIR}"
-export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
-
-# --- Resolve store.py path and namespace ---
+# --- Resolve plugin root (needed below: the DATA_DIR fallback may shell out
+# to host.py, which lives under it) ---
 PLUGIN_ROOT="${ZMEM_ROOT:-${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}"
 if [ -z "$PLUGIN_ROOT" ]; then
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
 STORE_PY_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts store.py)"
+
+# --- Resolve DATA_DIR ---
+# Must match host.py:resolve_store_path()'s precedence chain exactly:
+#   ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
+#   ~/.zmem > ~/.zcode/memory > newest ~/.zcode/cli/plugins/data/*zmem*/
+# so a manual/pre-adapter invocation of this hook targets the same store
+# store.py itself would open. The four explicit-env cases below are cheap
+# checks with no subprocess (the common case, since the host adapter always
+# exports ZMEM_DATA). Only the filesystem-dependent tail of the chain — which
+# of ~/.zmem / ~/.zcode/memory / the legacy per-plugin scan applies — is
+# genuinely ambiguous without re-walking the disk, so that (and only that) is
+# delegated to host.py itself via a tiny subprocess, rather than reimplemented
+# in bash where it would inevitably drift from host.py again.
+DATA_DIR=""
+DATA_DIR_IS_NATIVE=0
+if [ -n "${ZMEM_STORE:-}" ]; then
+  DATA_DIR="$(dirname "$ZMEM_STORE")"
+elif [ -n "${ZMEM_DATA:-}" ]; then
+  DATA_DIR="$ZMEM_DATA"
+elif [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+  DATA_DIR="$CLAUDE_PLUGIN_DATA"
+elif [ -n "${ZCODE_PLUGIN_DATA:-}" ]; then
+  DATA_DIR="$ZCODE_PLUGIN_DATA"
+elif [ -n "$PYTHON_BIN" ]; then
+  HOST_PY_DIR_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts)"
+  RESOLVED="$("$PYTHON_BIN" -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+try:
+    import host
+    print(host.resolve_store_path().parent)
+except Exception:
+    pass
+' "$HOST_PY_DIR_PY" 2>/dev/null)"
+  if [ -n "$RESOLVED" ]; then
+    # host.py ran under $PYTHON_BIN and returned an already-native path for
+    # this platform (e.g. a Windows path under python.exe) — do not run it
+    # back through to_py_path, which would attempt a Cygwin-path conversion
+    # on a string that is not one.
+    DATA_DIR="$RESOLVED"
+    DATA_DIR_IS_NATIVE=1
+  fi
+fi
+if [ -z "$DATA_DIR" ]; then
+  # host.py unavailable/failed (e.g. no python) — last-resort default,
+  # matching host.py's own ultimate fallback.
+  DATA_DIR="$HOME/.zmem"
+fi
+
+if [ "$DATA_DIR_IS_NATIVE" -eq 1 ]; then
+  DATA_DIR_PY="$DATA_DIR"
+else
+  DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
+fi
+
+# Keep store.py resolving the same store (full chain documented above).
+export ZMEM_DATA="${ZMEM_DATA:-$DATA_DIR}"
+export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 
 PROJECT="${ZMEM_PROJECT:-${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}"
 
@@ -134,7 +181,7 @@ if [ -z "$PYTHON_BIN" ]; then emit_empty; fi
 
 # --- Turn counter + cooldown check via Python (atomic meta table update) ---
 CTX_JSON="$("$PYTHON_BIN" -c '
-import json, os, sys, sqlite3
+import json, os, shlex, sys, sqlite3
 
 session_id = sys.argv[1]
 data_dir = sys.argv[2]
@@ -176,15 +223,26 @@ try:
 except OSError:
     pass
 
+# ns_hint is git-remote-derived (repo-controlled: a hostile origin URL can
+# embed quotes / $(...) / backticks) and store_py_hint / session_id are
+# interpolated the same way, so shell-quote all three before rendering them
+# into the suggested command. shlex.quote wraps in single quotes (and escapes
+# any embedded single quote) only when needed, so ordinary values still read
+# as a plain, copy-pasteable command while a hostile value cannot break out of
+# its argument position.
+store_py_arg = shlex.quote(store_py_hint)
+namespace_arg = shlex.quote(ns_hint)
+source_ref_arg = shlex.quote("session:" + session_id)
+
 msg = (
     "ZMem convention capture: you just completed several successful code edits. "
     "If you discovered a reusable convention, pattern, or workaround during this "
     "session — something that would help a future session facing a similar task — "
-    "capture it now: `%s add --namespace \"%s\" --type convention --content \"...\" "
-    "--signal <test|compile|lint|reviewer|user|none> --source-ref \"session:%s\"`. "
+    "capture it now: `%s add --namespace %s --type convention --content \"...\" "
+    "--signal <test|compile|lint|reviewer|user|none> --source-ref %s`. "
     "If nothing generalizable applies, do nothing. "
     "(This prompt fires at most once per session.)"
-) % (store_py_hint, ns_hint, session_id)
+) % (store_py_arg, namespace_arg, source_ref_arg)
 print(json.dumps({"additionalContext": msg}))
 ' "$SESSION_ID" "$DATA_DIR_PY" "$MARKER" "$STORE_PY_PY" "$NS_HINT" 2>/dev/null || echo '{}')"
 

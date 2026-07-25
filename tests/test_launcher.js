@@ -688,10 +688,15 @@ console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was si
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("convention-capture/claude: carries the capture prompt",
             /ZMem convention capture/.test(ac), ac.slice(0, 200));
+        // Rendering is now shlex.quote()'d (PR#10 round-3 fix: repo-controlled
+        // ns_hint/store_py_hint/session_id could otherwise break out of the
+        // suggested shell command). CNS here has no shell-special characters,
+        // so shlex.quote renders it UNQUOTED — same text, no surrounding
+        // quotes. See the injection-safety test below for the quoted case.
         ok("convention-capture/claude: suggests the CANONICAL namespace",
-            ac.indexOf('--namespace "' + CNS + '"') !== -1, ac.slice(0, 400));
+            ac.indexOf('--namespace ' + CNS) !== -1, ac.slice(0, 400));
         ok("convention-capture/claude: does NOT suggest the legacy basename namespace",
-            !/--namespace "project:proj"/.test(ac));
+            !/--namespace project:proj\b/.test(ac));
         console.log("  EVIDENCE(claude) " + JSON.stringify(obj).slice(0, 420));
     }
 
@@ -704,7 +709,7 @@ console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was si
             !!(obj && obj.additionalContext && !obj.hookSpecificOutput), r.stdout.slice(0, 300));
         const ac = (obj && obj.additionalContext) || "";
         ok("convention-capture/zcode: suggests the CANONICAL namespace",
-            ac.indexOf('--namespace "' + CNS + '"') !== -1, ac.slice(0, 400));
+            ac.indexOf('--namespace ' + CNS) !== -1, ac.slice(0, 400));
         console.log("  EVIDENCE(zcode)  " + JSON.stringify(obj).slice(0, 420));
     }
 
@@ -722,6 +727,67 @@ console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was si
         launch.TRANSLATED_HOOKS.has("convention-capture"));
     eq("EVENT_MAP convention-capture → PostToolUse",
         launch.EVENT_MAP["convention-capture"], "PostToolUse");
+
+    // --- injection: a hostile `origin` remote must not escape the rendered
+    // suggested command (PR#10 round-3 finding #2) ---------------------------
+    // ns_hint is derived from the project's git remote — repository-controlled.
+    // host.py's _normalize_remote() only special-cases recognizable URL shapes
+    // (scp-like `user@host:path`, `scheme://host/path`); anything else falls
+    // through its "unrecognized shape" branch UNCHANGED (just lowercased), so
+    // a hostile origin containing quotes/$(...)/backticks reaches this hook's
+    // rendering verbatim. Prove that with a REAL git repo + REAL remote +
+    // the REAL launcher, not a hand-crafted env var.
+    {
+        const GITPROJ = path.join(TMP, "hostile-git-proj");
+        fs.mkdirSync(GITPROJ, { recursive: true });
+        const CANARY = path.join(GITPROJ, "PWNED_CANARY");
+        const HOSTILE_REMOTE = '"; $(touch ' + CANARY.replace(/\\/g, "/") + '); echo "';
+        execFileSync("git", ["init", "-q"], { cwd: GITPROJ });
+        execFileSync("git", ["remote", "add", "origin", HOSTILE_REMOTE], { cwd: GITPROJ });
+
+        // Sanity: confirm the hostile string actually reaches resolve_namespace()
+        // unescaped — otherwise this test would pass for the wrong reason.
+        const hostileNs = resolveNs(GITPROJ);
+        ok("injection: hostile origin survives into the resolved namespace (sanity)",
+            hostileNs.indexOf('"') !== -1 && hostileNs.indexOf("$(") !== -1, hostileNs);
+
+        const HDATA = path.join(TMP, "hostile-data");
+        fs.mkdirSync(HDATA, { recursive: true });
+        seed(HDATA, "user:global", "fact", "seed row to create the store schema.", 0.9);
+
+        const r = runLauncher("convention-capture",
+            JSON.stringify({
+                session_id: "cc-hostile-" + Date.now(), cwd: GITPROJ,
+                hook_event_name: "PostToolUse", tool_name: "Edit", tool_input: { file_path: "a.txt" },
+            }),
+            envWith({
+                ZMEM_DATA: HDATA, ZMEM_CONVENTION_INTERVAL: "1",
+                CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO,
+            }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("injection: hook still renders a well-formed capture prompt",
+            /ZMem convention capture/.test(ac), ac.slice(0, 200));
+
+        // Pull the suggested command out of its backtick fence and actually
+        // run it through bash, exactly as an agent copy-pasting the suggestion
+        // would. Fixed: the malicious content is shlex.quote()'d, so it is
+        // inert single-quoted text as far as bash is concerned. Broken (pre-fix):
+        // bash would expand $(touch ...) while parsing the command line, and
+        // the canary file would exist BEFORE python ever saw an argument.
+        const m = /`([^`]*)`/.exec(ac);
+        ok("injection: rendered a backtick-fenced suggested command", m !== null, ac);
+        if (m) {
+            const suggested = m[1];
+            const runDir = path.join(TMP, "hostile-run-cwd");
+            fs.mkdirSync(runDir, { recursive: true });
+            const br = spawnSync("bash", ["-c", suggested], {
+                cwd: runDir, encoding: "utf8", timeout: 15000,
+            });
+            ok("injection: canary file was NOT created (no command injection)",
+                !fs.existsSync(CANARY), "bash stderr: " + (br.stderr || "").slice(0, 300));
+        }
+    }
 }
 
 console.log("\n[13] storeDirectory plugin userConfig feeds ZMEM_DATA (claude host only)");

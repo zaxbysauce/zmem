@@ -283,12 +283,15 @@ if host == "claude" and nudge_marker:
                 except (OSError, ValueError):
                     continue  # absent or malformed — treat as "not set here"
         if not already_shown and not native_disabled:
-            parts.append(
-                "# ZMem notice (one-time): Claude Code native memory still looks "
-                "enabled. ZMem is replacing it as your sole memory system - add "
-                "\"autoMemoryEnabled\": false to ~/.claude/settings.json so the two "
-                "systems do not double-run (a plugin cannot set this for you)."
-            )
+            # Attempt the exclusive marker create FIRST, and only append the
+            # notice text in the process that actually won the create. This
+            # is the order that matters: appending-then-racing-the-create (the
+            # old order) let two concurrent sessions both queue the notice
+            # before either one touched the marker, so both showed it and only
+            # one "won" a create that, by then, was pointless. Deciding who
+            # gets to show the notice before building any output closes that
+            # race.
+            show_notice = False
             try:
                 os.makedirs(os.path.dirname(nudge_marker), exist_ok=True)
                 # Atomic exclusive create (matches host.py _try_create_lock
@@ -300,10 +303,26 @@ if host == "claude" and nudge_marker:
                     os.write(fd, b"shown\n")
                 finally:
                     os.close(fd)
+                show_notice = True  # we won the race - we are the one to show it
             except FileExistsError:
-                pass  # another process already showed it — no-op
+                show_notice = False  # another process already showed it — no-op
             except OSError:
-                pass  # fail-open: worst case the nudge repeats next session
+                # Marker could not be created for an unrelated reason (e.g. the
+                # data dir is unwritable/read-only, or missing and could not be
+                # made). Deliberate choice: show the notice anyway rather than
+                # silently wedging the user out of it forever. Worst case here
+                # is the notice repeats on a later session (annoying, visible,
+                # self-correcting) instead of the alternative — a
+                # never-writable marker path permanently suppressing a notice
+                # about a real double-run risk. Fail-open toward showing.
+                show_notice = True
+            if show_notice:
+                parts.append(
+                    "# ZMem notice (one-time): Claude Code native memory still looks "
+                    "enabled. ZMem is replacing it as your sole memory system - add "
+                    "\"autoMemoryEnabled\": false to ~/.claude/settings.json so the two "
+                    "systems do not double-run (a plugin cannot set this for you)."
+                )
     except Exception:
         pass  # fail-open: nudge logic never blocks session start
 
