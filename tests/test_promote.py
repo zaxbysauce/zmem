@@ -98,7 +98,9 @@ class TestDryRun(PromoteTestBase):
 
 class TestPromoteQuality(PromoteTestBase):
     def _promote(self, extra=()):
-        r = self._run("promote", "--id", self.memory_id, *extra)
+        # --confirm is the real write gate, so every write path here goes
+        # through it — the same invocation the docs prescribe.
+        r = self._run("promote", "--id", self.memory_id, "--confirm", *extra)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r
 
@@ -170,18 +172,32 @@ class TestPromoteQuality(PromoteTestBase):
             self.assertEqual(desc.strip('"'), custom)
 
     def test_documented_id_confirm_path_writes(self):
-        # The documented write gate is `--id <uuid> --confirm`; --confirm is
-        # accepted (not just --id alone) so that literal invocation works.
+        # The documented write gate is `--id <uuid> --confirm`.
         r = self._run("promote", "--id", self.memory_id, "--confirm")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(self._skill_files()), 2)
+
+    def test_id_without_confirm_refuses_and_writes_nothing(self):
+        # --confirm is a REAL gate: promotion writes into every dir in
+        # ZMEM_SKILLS_DIRS (both hosts' skills dirs by default), so bare --id
+        # must refuse. It was previously accepted-and-ignored while three docs
+        # described it as the gate — protection that did not exist.
+        r = self._run("promote", "--id", self.memory_id)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--confirm", r.stderr)
+        self.assertEqual(self._skill_files(), [], "refused promote must write nothing")
+
+    def test_dry_run_needs_no_confirm(self):
+        r = self._run("promote", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._skill_files(), [])
 
     def test_collision_detection_fires_per_target(self):
         self._promote()
         before = {f: f.read_text(encoding="utf-8") for f in self._skill_files()}
         # Re-promoting the same lesson (still live, id known) should collide
         # in both dirs it already wrote to, and refuse to overwrite either.
-        r = self._run("promote", "--id", self.memory_id)
+        r = self._run("promote", "--id", self.memory_id, "--confirm")
         self.assertIn("ERROR", r.stderr)
         self.assertIn(self.skills_a, r.stderr)
         self.assertIn(self.skills_b, r.stderr)

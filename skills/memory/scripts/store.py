@@ -2632,10 +2632,10 @@ def main():
                            help="override the synthesized trigger description verbatim "
                                 "(used with --id --confirm)")
     p_promote.add_argument("--confirm", action="store_true",
-                           help="explicit human-in-the-loop confirmation for the write path "
-                                "(documented gate: --id <uuid> --confirm); optional/no-op — "
-                                "--id alone is sufficient, this flag exists so the "
-                                "--id/--confirm pairing reads unambiguously at the call site")
+                           help="REQUIRED to write. Promotion creates a SKILL.md in every dir "
+                                "in ZMEM_SKILLS_DIRS (default: both ~/.claude/skills and "
+                                "~/.zcode/skills), so --id alone refuses with exit 2. "
+                                "--dry-run needs no confirmation.")
 
     p_backup = sub.add_parser(
         "backup", help="take a verified, retention-rotated snapshot of the store")
@@ -2761,6 +2761,26 @@ def main():
         conn.close()
         sys.exit(rc)
     elif args.cmd == "promote":
+        # --confirm is a REAL gate, not decoration. Promotion writes a SKILL.md
+        # into every dir in ZMEM_SKILLS_DIRS (by default BOTH ~/.claude/skills
+        # and ~/.zcode/skills), and every promoted skill costs trigger-matching
+        # attention in every future session on both hosts. It was previously
+        # accepted-but-ignored, which is worse than not having it: three
+        # separate docs (CUTOVER.md, the closeout skill, and promote_memory's
+        # own docstring) described `--id <uuid> --confirm` as the write gate,
+        # so the flag read as protection it did not provide.
+        if args.id and not args.dry_run and not args.confirm:
+            print("[zmem] refusing to promote without --confirm.", file=sys.stderr)
+            print(f"[zmem]   promote --id {args.id} --confirm", file=sys.stderr)
+            print("[zmem] (add --description \"...\" to write the trigger line yourself — "
+                  "the description is the entire trigger surface)", file=sys.stderr)
+            conn.close()
+            # sys.exit, not return: main()'s return value is discarded by the
+            # `if __name__ == "__main__": main()` entrypoint, so a bare `return 2`
+            # prints the refusal but still exits 0 — a refusal that looks like a
+            # success to any caller checking $?. Matches how restore/failures
+            # already surface their codes.
+            sys.exit(2)
         promote_memory(conn, memory_id=args.id, dry_run=args.dry_run,
                        namespace=args.namespace, description=args.description)
     conn.close()
