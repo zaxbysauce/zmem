@@ -1302,7 +1302,13 @@ def promote_memory(
         [PROMOTE_CONFIDENCE_FLOOR, PROMOTE_RETRIEVAL_FLOOR] + ns_params,
     ).fetchall()
 
-    if not candidates:
+    if not candidates and not memory_id:
+        # Only short-circuit when we're *surveying*. An explicit --id is a
+        # human override that does its own live-row lookup below and is not
+        # bound by the candidate bar (signal/confidence/retrieval_count), so
+        # returning here would swallow it — an unknown id would print
+        # "no promotion candidates found" and exit 0, i.e. a refusal reported
+        # as success, which is exactly what the --confirm gate exists to stop.
         print("[zmem] no promotion candidates found")
         return
 

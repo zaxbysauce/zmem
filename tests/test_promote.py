@@ -85,6 +85,13 @@ class PromoteTestBase(unittest.TestCase):
     def _skill_files(self):
         return sorted(Path(self.tmp).glob("skills_*/*/SKILL.md"))
 
+    def _supersede_all(self):
+        """Leave the store with zero eligible promotion candidates."""
+        conn = sqlite3.connect(self.store)
+        conn.execute("UPDATE memory SET superseded_at = '2026-01-01T00:00:00Z'")
+        conn.commit()
+        conn.close()
+
 
 class TestDryRun(PromoteTestBase):
     def test_dry_run_shows_candidate_and_both_targets(self):
@@ -199,6 +206,26 @@ class TestPromoteQuality(PromoteTestBase):
                       "--confirm")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertEqual(self._skill_files(), [])
+
+    def test_unknown_id_refuses_even_with_no_eligible_candidates(self):
+        # Regression: the candidate-empty early return used to fire BEFORE the
+        # --id lookup, so on a store with nothing promotable an unknown id
+        # printed "no promotion candidates found" and exited 0. The sibling
+        # test above could not catch it — its fixture always seeds an eligible
+        # candidate, so the early return never fired.
+        self._supersede_all()  # leave zero eligible candidates
+        r = self._run("promote", "--id", "00000000-0000-0000-0000-000000000000",
+                      "--confirm")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(self._skill_files(), [])
+
+    def test_survey_with_no_candidates_is_not_an_error(self):
+        # The short-circuit still applies when surveying (no --id): nothing to
+        # promote is a normal outcome, not a refusal.
+        self._supersede_all()
+        r = self._run("promote", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("no promotion candidates", r.stdout + r.stderr)
 
     def test_collision_detection_fires_per_target(self):
         self._promote()
