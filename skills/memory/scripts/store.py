@@ -1328,7 +1328,7 @@ def promote_memory(
         ).fetchone()
         if not row:
             print(f"[zmem] no live memory with id {memory_id}", file=sys.stderr)
-            return
+            return 2
 
         skill_name = _slugify_skill_name(row["tags"], row["id"])
         skill_targets = [d / skill_name for d in skills_dirs]
@@ -1342,7 +1342,11 @@ def promote_memory(
             for d in collisions:
                 print(f"  {d}", file=sys.stderr)
             print(f"  Choose a different memory or rename the existing skill.", file=sys.stderr)
-            return
+            # Exit 2, same as the no-confirm refusal: refused, nothing written.
+            # Previously a bare `return` here exited 0, so CUTOVER's re-promotion
+            # loop over ~24 existing zmem-* skills would report success to any
+            # caller checking $? while writing nothing.
+            return 2
 
         # Trigger description: explicit --description wins verbatim; else
         # synthesize from tags (trigger contexts) + the first whole sentence
@@ -2635,7 +2639,8 @@ def main():
                            help="REQUIRED to write. Promotion creates a SKILL.md in every dir "
                                 "in ZMEM_SKILLS_DIRS (default: both ~/.claude/skills and "
                                 "~/.zcode/skills), so --id alone refuses with exit 2. "
-                                "--dry-run needs no confirmation.")
+                                "--dry-run needs no confirmation (and lists ALL candidates — "
+                                "it ignores --id).")
 
     p_backup = sub.add_parser(
         "backup", help="take a verified, retention-rotated snapshot of the store")
@@ -2777,12 +2782,18 @@ def main():
             conn.close()
             # sys.exit, not return: main()'s return value is discarded by the
             # `if __name__ == "__main__": main()` entrypoint, so a bare `return 2`
-            # prints the refusal but still exits 0 — a refusal that looks like a
-            # success to any caller checking $?. Matches how restore/failures
-            # already surface their codes.
+            # prints the refusal but still exits 0 — a refusal indistinguishable
+            # from success to any caller checking $?. 2 matches cmd_restore's
+            # "refused, destination untouched" codes (see its refusal branches);
+            # note restore uses 1 for its own missing-flag case, and `failures`
+            # surfaces no code at all, so this is deliberately the refused-and-
+            # nothing-written convention rather than a blanket house style.
             sys.exit(2)
-        promote_memory(conn, memory_id=args.id, dry_run=args.dry_run,
-                       namespace=args.namespace, description=args.description)
+        rc = promote_memory(conn, memory_id=args.id, dry_run=args.dry_run,
+                            namespace=args.namespace, description=args.description)
+        if rc:
+            conn.close()
+            sys.exit(rc)
     conn.close()
 
 

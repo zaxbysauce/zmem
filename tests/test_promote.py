@@ -192,12 +192,24 @@ class TestPromoteQuality(PromoteTestBase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self._skill_files(), [])
 
+    def test_unknown_id_refuses_with_exit_2(self):
+        # Same reasoning as the collision case: a refusal must not report
+        # success. Previously this returned bare, exiting 0.
+        r = self._run("promote", "--id", "00000000-0000-0000-0000-000000000000",
+                      "--confirm")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(self._skill_files(), [])
+
     def test_collision_detection_fires_per_target(self):
         self._promote()
         before = {f: f.read_text(encoding="utf-8") for f in self._skill_files()}
         # Re-promoting the same lesson (still live, id known) should collide
         # in both dirs it already wrote to, and refuse to overwrite either.
         r = self._run("promote", "--id", self.memory_id, "--confirm")
+        # Exit code, not just the message: a collision refusal that exits 0 is
+        # indistinguishable from a successful promote to any caller checking $?
+        # — and CUTOVER's re-promotion loop runs against ~24 existing skills.
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("ERROR", r.stderr)
         self.assertIn(self.skills_a, r.stderr)
         self.assertIn(self.skills_b, r.stderr)

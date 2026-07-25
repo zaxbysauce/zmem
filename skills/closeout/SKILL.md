@@ -28,7 +28,7 @@ The SessionStart hook injects the `store.py` path into context each session
 guessed `project:<foldername>` writes somewhere nothing ever queries. Derive it:
 
 ```bash
-python -c "import sys;sys.path.insert(0,r'<plugin>/skills/memory/scripts');import host;print(host.resolve_namespace('.'))"
+python -c "import sys;sys.path.insert(0,r'$(dirname "$S")');import host;print(host.resolve_namespace('.'))"
 ```
 
 Choose the scope deliberately:
@@ -103,8 +103,12 @@ recall, and only grounded signals are promotable. Never inflate:
 | `user` | the user stated it | they actually did |
 | `none` | your own inference | everything else — including "it seems right" |
 
-Re-running `add` with near-identical content in the same namespace refreshes
-the existing row instead of duplicating, so closeout is safe to run twice.
+Re-running `add` with **identical** content in the same namespace refreshes the
+existing row rather than duplicating it. **Paraphrases** dedup at ≥0.85 cosine,
+but that lookup uses a fixed `k=5` namespace-blind window — on a busy
+multi-namespace store a same-namespace paraphrase can be crowded out by other
+namespaces and land as a duplicate anyway. Step 4's `consolidate` is the
+backstop, which is why it is part of this routine and not optional.
 
 **Aim for 0–5 rows.** If you have more than five, you are probably capturing
 narrative or duplicating docs — re-apply the bar.
