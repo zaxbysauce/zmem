@@ -582,8 +582,9 @@ def _acquire_break_claim(claim: Path) -> str:
     entirely) or _CLAIM_UNAVAILABLE (the claim mechanism itself is unusable —
     the caller proceeds with an UNSERIALIZED break, i.e. pre-change behavior,
     because refusing to break would wedge stale recovery forever). Never
-    raises, never blocks, and makes at most two create attempts so it always
-    terminates.
+    raises, never blocks, and makes at most two _create_break_claim rounds (of
+    up to _CLAIM_CREATE_ATTEMPTS os.open calls each) so it always terminates —
+    there is no recursion and no retry loop around the reclaim.
 
     An existing claim older than _BREAK_CLAIM_STALE_SECONDS was orphaned by a
     process that died mid-break; it is unlinked and re-created. The unlink is
