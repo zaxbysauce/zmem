@@ -97,10 +97,18 @@ def _redact_url_for_logging(url: str) -> str:
     credentials (`https://user:token@host/path`) or a presigned-style query
     string (`?sig=...`, `?token=...`). Neither should ever reach stderr/logs.
     Keeps the message actionable (scheme, host, and path survive) while
-    dropping userinfo entirely and replacing every query value with a
-    placeholder. Uses `urllib.parse` rather than a regex so this can't be
-    fooled by unusual-but-valid URL syntax. Never raises: an unparseable
-    `url` is returned as a fixed placeholder rather than echoed verbatim.
+    dropping userinfo entirely and redacting the query STRING AS A WHOLE.
+    Uses `urllib.parse` rather than a regex so this can't be fooled by
+    unusual-but-valid URL syntax. Never raises: an unparseable `url` is
+    returned as a fixed placeholder rather than echoed verbatim.
+
+    The WHOLE query goes, not just the values. An earlier version preserved
+    parameter names and replaced only values (`?sig=REDACTED`), which still
+    leaks a valueless query token: `?<token>` contains no `=`, so the secret
+    IS the parameter name and was echoed verbatim. Parameter names are
+    user-controlled and cannot be assumed non-sensitive, and knowing which
+    parameters were present is not worth having to reason about which of them
+    happen to be safe.
     """
     import urllib.parse
 
@@ -109,14 +117,7 @@ def _redact_url_for_logging(url: str) -> str:
         netloc = parts.hostname or ""
         if parts.port:
             netloc += f":{parts.port}"
-        redacted_query = ""
-        if parts.query:
-            keys = [
-                kv.split("=", 1)[0]
-                for kv in parts.query.split("&")
-                if kv
-            ]
-            redacted_query = "&".join(f"{k}=REDACTED" for k in keys)
+        redacted_query = "REDACTED" if parts.query else ""
         return urllib.parse.urlunsplit(
             (parts.scheme, netloc, parts.path, redacted_query, "")
         )

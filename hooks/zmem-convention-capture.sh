@@ -116,7 +116,23 @@ STORE_PY_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts st
 DATA_DIR=""
 DATA_DIR_IS_NATIVE=0
 if [ -n "${ZMEM_STORE:-}" ]; then
-  DATA_DIR="$(dirname "$ZMEM_STORE")"
+  # Normalize Windows separators before dirname. MSYS2/Git Bash coreutils does
+  # treat `\` as a separator, so this is a no-op on the launcher's normal
+  # Windows path — but zmem-launch.js's LAST-RESORT bash fallback is bare
+  # `bash`, which on Windows is WSL, whose coreutils is Linux-native: there
+  # `dirname 'C:\...\store.sqlite'` finds no `/`, returns ".", and the
+  # convention counter would land in ./store.sqlite — a file with no zmem
+  # schema, so capture would silently never fire. Windows-only, so a POSIX
+  # filename legitimately containing a backslash is left untouched.
+  # `tr '\134'` (octal backslash), not a ${//} parameter expansion: the
+  # expansion forms silently fail to substitute here (verified — the value
+  # comes back unchanged), and `tr '\\'` warns about a trailing unescaped
+  # backslash. Octal is unambiguous and quiet.
+  if [ "$IS_WINDOWS" -eq 1 ]; then
+    DATA_DIR="$(dirname "$(printf '%s' "$ZMEM_STORE" | tr '\134' '/')")"
+  else
+    DATA_DIR="$(dirname "$ZMEM_STORE")"
+  fi
 elif [ -n "${ZMEM_DATA:-}" ]; then
   DATA_DIR="$ZMEM_DATA"
 elif [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
