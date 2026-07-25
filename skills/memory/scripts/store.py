@@ -1578,14 +1578,43 @@ def consolidate(
                     neighbors.append((row, sim))
         else:
             # Query vec0 for nearest neighbors of this seed.
-            try:
-                results = conn.execute(
-                    "SELECT memory_id, distance FROM memory_vec "
-                    "WHERE embedding MATCH ? AND k = 10 ORDER BY distance",
-                    [seed["embedding"]],
-                ).fetchall()
-            except sqlite3.OperationalError:
-                results = []
+            #
+            # vec0's KNN is NAMESPACE-BLIND: it returns the globally nearest k
+            # rows, and the namespace filter below then discards the ones
+            # belonging to other projects. With a fixed k that silently
+            # UNDER-merges — on a box-wide store holding several projects the
+            # global top-10 can be filled entirely by other namespaces while
+            # the seed's own duplicate sits at rank 11, so consolidation finds
+            # nothing and the duplicate survives forever. (Introduced when the
+            # namespace filter was added to stop cross-project merging; the
+            # filter is right, a fixed k alongside it is not.)
+            #
+            # Escalate k until the answer is provably complete. Rows come back
+            # ORDER BY distance (similarity descending), so the moment we see
+            # one below the threshold, no later row can qualify and the
+            # qualifying set is closed. Only when EVERY returned row is still
+            # above the threshold might more qualify — then widen and re-ask.
+            # Bounded by the live row count, so it always terminates.
+            results = []
+            k = 10
+            k_cap = max(len(rows), 10)
+            while True:
+                try:
+                    results = conn.execute(
+                        "SELECT memory_id, distance FROM memory_vec "
+                        "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                        [seed["embedding"], k],
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    results = []
+                    break
+                if len(results) < k:
+                    break  # vec0 exhausted — this is every row it can offer
+                if any((1.0 - r["distance"]) < effective_threshold for r in results):
+                    break  # saw the cutoff — the qualifying set is complete
+                if k >= k_cap:
+                    break  # bounded: never scan past the live row count
+                k = min(k * 5, k_cap)
             for r in results:
                 mid = r["memory_id"]
                 if mid == seed["id"] or mid in absorbed:

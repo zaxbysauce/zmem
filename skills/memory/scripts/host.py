@@ -92,7 +92,17 @@ def _legacy_plugin_store(home: Path) -> Path | None:
     every bare `store.py` invocation.
 
     Newest-by-mtime when several plugin dirs match (e.g. the same plugin
-    installed from two marketplaces). Never raises.
+    installed from two marketplaces, or ZCode and Claude Code each carrying a
+    live legacy store). Never raises.
+
+    AMBIGUITY IS REPORTED, NOT SWALLOWED: choosing silently would hide every
+    memory in the store(s) not chosen, with nothing to tell the user that half
+    their history had gone quiet. A bare invocation still needs one
+    deterministic answer, so newest-by-mtime stays — but the losers are named
+    on stderr along with the supported fix (`import-store.py` merges a legacy
+    store into the box-wide one). stderr rather than an exception: this is the
+    last-resort limb of a fail-open resolution chain, and hooks must not begin
+    crashing merely because a second plugin dir exists.
     """
     try:
         data_dir = home / ".zcode" / "cli" / "plugins" / "data"
@@ -102,9 +112,29 @@ def _legacy_plugin_store(home: Path) -> Path | None:
     if not matches:
         return None
     try:
-        return max(matches, key=lambda p: p.stat().st_mtime)
+        chosen = max(matches, key=lambda p: p.stat().st_mtime)
     except OSError:
-        return matches[0]
+        chosen = matches[0]
+
+    if len(matches) > 1:
+        try:
+            import sys as _sys
+            others = "".join(
+                f"[zmem]   ignored: {p}\n" for p in matches if p != chosen
+            )
+            print(
+                f"[zmem] WARNING: {len(matches)} legacy plugin stores found; using the "
+                f"most recently modified.\n"
+                f"[zmem]   using:   {chosen}\n"
+                f"{others}"
+                f"[zmem] Memories in the ignored store(s) are NOT visible. Merge each with:\n"
+                f"[zmem]   python import-store.py --source <store.sqlite> "
+                f"--dest-dir ~/.zmem --force",
+                file=_sys.stderr,
+            )
+        except Exception:
+            pass  # a warning must never break resolution
+    return chosen
 
 
 def resolve_core_md_path() -> Path:
