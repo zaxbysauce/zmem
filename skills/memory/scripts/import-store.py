@@ -88,17 +88,23 @@ def _backup_source_to_dest(source_store: Path, dest_store: Path) -> None:
     API then gives a transactionally consistent page copy even if a live writer
     is appending WAL frames underneath us.
 
-    A read-only open of a WAL database MATERIALIZES `-shm`/`-wal` beside the
-    source if they are not already there, and a read-only connection cannot
-    checkpoint them away on close. Remove exactly the sidecars that did NOT
-    exist before we looked — never one that was already there, since that one
-    holds real committed frames. (Same bookkeeping as store.py's
-    _integrity_check_readonly, for the same reason.)
+    A read-only open of a WAL database can MATERIALIZE `-shm`/`-wal` beside the
+    source, and a read-only connection cannot checkpoint them away on close.
+    We deliberately do NOT clean those up.
+
+    An earlier version snapshotted which sidecars existed before opening and
+    deleted any that appeared afterwards, on the theory that those were ours.
+    That snapshot is a TOCTOU: a legacy session that begins writing between the
+    snapshot and the cleanup creates a `-wal` holding REAL COMMITTED FRAMES,
+    which is indistinguishable from one we materialized — and deleting it makes
+    that session's committed data unavailable to later connections. This script
+    reads a store another process may own, so it leaves the source directory
+    exactly as it found it. A stray `-shm`/`-wal` is harmless: SQLite recreates
+    and checkpoints them on the next normal open.
 
     Path -> URI goes through Path.resolve().as_uri(); an f-string
     `file:{path}` does not survive a Windows `C:\\...` path.
     """
-    pre_existing = {s for s in SIDECAR_SUFFIXES if Path(str(source_store) + s).exists()}
     src_uri = source_store.resolve().as_uri() + "?mode=ro"
     src_conn = sqlite3.connect(src_uri, uri=True)
     try:
@@ -109,15 +115,6 @@ def _backup_source_to_dest(source_store: Path, dest_store: Path) -> None:
             dst_conn.close()
     finally:
         src_conn.close()
-        for s in SIDECAR_SUFFIXES:
-            if s in pre_existing:
-                continue
-            try:
-                sib = Path(str(source_store) + s)
-                if sib.exists():
-                    sib.unlink()
-            except OSError:
-                pass
 
 
 def _clear_dest_sidecars(dest_store: Path) -> None:
