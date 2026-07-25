@@ -86,6 +86,24 @@ function resolveNs(projectDir) {
     ).trim();
 }
 
+// Render a value exactly as the hooks do when interpolating it into the
+// suggested `store.py add ...` command — i.e. through shlex.quote.
+//
+// Do NOT assume a value is quote-free just because it looks benign: whether
+// shlex.quote adds quotes depends on the CONTENT, and a test fixture does not
+// control that. A GitHub Windows runner's temp dir resolves to an 8.3 short
+// path (`C:\Users\RUNNER~1\...`); `~` is shell-special, so the namespace
+// derived from it comes back single-quoted there while the identical
+// assertion passes unquoted on a developer box. Asking Python for the answer
+// keeps the expectation right for whatever the path happens to be.
+function shquote(s) {
+    return execFileSync(
+        PYTHON,
+        ["-c", "import shlex,sys; sys.stdout.write(shlex.quote(sys.argv[1]))", s],
+        { encoding: "utf8" }
+    );
+}
+
 function seed(dataDir, namespace, type, content, confidence) {
     execFileSync(
         PYTHON,
@@ -688,13 +706,13 @@ console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was si
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("convention-capture/claude: carries the capture prompt",
             /ZMem convention capture/.test(ac), ac.slice(0, 200));
-        // Rendering is now shlex.quote()'d (PR#10 round-3 fix: repo-controlled
+        // Rendering is shlex.quote()'d (PR#10 round-3 fix: repo-controlled
         // ns_hint/store_py_hint/session_id could otherwise break out of the
-        // suggested shell command). CNS here has no shell-special characters,
-        // so shlex.quote renders it UNQUOTED — same text, no surrounding
-        // quotes. See the injection-safety test below for the quoted case.
+        // suggested shell command). Compare against the SAME quoting rather
+        // than assuming CNS is quote-free — on a Windows CI runner the temp
+        // path is an 8.3 short name containing `~`, which shlex.quote quotes.
         ok("convention-capture/claude: suggests the CANONICAL namespace",
-            ac.indexOf('--namespace ' + CNS) !== -1, ac.slice(0, 400));
+            ac.indexOf('--namespace ' + shquote(CNS)) !== -1, ac.slice(0, 400));
         ok("convention-capture/claude: does NOT suggest the legacy basename namespace",
             !/--namespace project:proj\b/.test(ac));
         console.log("  EVIDENCE(claude) " + JSON.stringify(obj).slice(0, 420));
@@ -709,7 +727,7 @@ console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was si
             !!(obj && obj.additionalContext && !obj.hookSpecificOutput), r.stdout.slice(0, 300));
         const ac = (obj && obj.additionalContext) || "";
         ok("convention-capture/zcode: suggests the CANONICAL namespace",
-            ac.indexOf('--namespace ' + CNS) !== -1, ac.slice(0, 400));
+            ac.indexOf('--namespace ' + shquote(CNS)) !== -1, ac.slice(0, 400));
         console.log("  EVIDENCE(zcode)  " + JSON.stringify(obj).slice(0, 420));
     }
 
