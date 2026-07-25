@@ -4,10 +4,14 @@
 A local-first, FTS5-backed, tombstone-supersession memory store. Operated via
 subcommands so it can be called from the memory SKILL and from hook scripts.
 
-Path resolution (in priority order):
-  1. ZMEM_STORE env var (explicit override; hooks set this)
-  2. ${ZCODE_PLUGIN_DATA}/store.sqlite (plugin data dir, when running as a plugin)
-  3. ~/.zcode/memory/store.sqlite (legacy/manual install fallback)
+Path resolution (in priority order; see host.py for the authoritative chain):
+  1. ZMEM_STORE env var (explicit full path override)
+  2. ${ZMEM_DATA}/store.sqlite (box-wide data dir, shared by Claude Code + ZCode)
+  3. ${CLAUDE_PLUGIN_DATA}/store.sqlite (Claude Code plugin data dir)
+  4. ${ZCODE_PLUGIN_DATA}/store.sqlite (ZCode plugin data dir)
+  5. ~/.zmem/store.sqlite (new box-neutral default)
+  6. ~/.zcode/memory/store.sqlite (legacy/manual install fallback, only if it
+     already exists and (5) does not yet)
 
 Usage:
   python store.py init
@@ -20,6 +24,8 @@ Usage:
   python store.py get --id <id>
   python store.py list [--namespace NS] [--limit 50] [--include-superseded]
   python store.py stats
+  python store.py backup [--retention 7] [--out-dir DIR] [--if-due]
+  python store.py restore --from <snapshot.sqlite> [--force] [--out-dir DIR]
 
 Design (see the memory skill's design doc):
   - Tombstone supersession (superseded_at), NOT full bi-temporal (YAGNI for single user).
@@ -37,6 +43,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -55,23 +62,52 @@ except ImportError:
     except ImportError:
         _embeddings = None
 
+# Shared host adapter: path resolution, local-FS safety guard, perms, retry.
+# Imported with a safe inline fallback so store.py still runs (with the old,
+# pre-Phase-1 resolution chain) if host.py is somehow missing from the checkout.
+try:
+    import host as _host
+except ImportError:
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        import host as _host
+    except ImportError:
+        _host = None
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back to `default` on absent/garbage input.
+    Never raises at import time (a typo'd env var must not break every
+    subcommand).
+
+    Defined this early on purpose: every module-level tunable below is parsed
+    through it, and a bare float(os.environ[...]) at module scope turns one
+    malformed env var into an import-time crash of *every* store.py command
+    (including ones that have nothing to do with the knob).
+    """
+    raw = os.environ.get(name, "")
+    try:
+        return float(raw.strip())
+    except (AttributeError, ValueError):
+        return default
+
 
 def _resolve_store_path() -> Path:
-    """Resolve the store location.
-
-    Priority: ZMEM_STORE > ZCODE_PLUGIN_DATA > auto-detect plugin data dir > ~/.zcode/memory.
-    The auto-detect prevents store-splitting when env vars aren't set (e.g.
-    when store.py is invoked from a slash command that doesn't inherit hook env).
+    """Resolve the store location. Delegates to host.py's box-wide chain:
+    ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
+    ~/.zmem (new default) > ~/.zcode/memory (legacy, if already present).
+    Falls back to the original ZCODE_PLUGIN_DATA/~/.zcode/memory-only chain
+    if host.py could not be imported at all.
     """
+    if _host is not None:
+        return _host.resolve_store_path()
+    # --- inline fallback (host.py absent) ---
     explicit = os.environ.get("ZMEM_STORE")
     if explicit:
         return Path(explicit)
     plugin_data = os.environ.get("ZCODE_PLUGIN_DATA")
     if plugin_data:
         return Path(plugin_data) / "store.sqlite"
-    # Auto-detect the plugin data dir (the canonical location since v2).
-    # This prevents sessions without ZCODE_PLUGIN_DATA from writing to the
-    # legacy ~/.zcode/memory/ location and splitting the store.
     home = Path(os.path.expanduser("~"))
     plugin_data_pattern = home / ".zcode" / "cli" / "plugins" / "data"
     if plugin_data_pattern.is_dir():
@@ -82,7 +118,11 @@ def _resolve_store_path() -> Path:
 
 
 def _resolve_core_md_path() -> Path:
-    """Resolve the Tier 0 core.md location. Priority: ZMEM_CORE_MD > ZCODE_PLUGIN_DATA > ~/.zcode/memory."""
+    """Resolve the Tier 0 core.md location. Delegates to host.py; see
+    _resolve_store_path() for the fallback rationale."""
+    if _host is not None:
+        return _host.resolve_core_md_path()
+    # --- inline fallback (host.py absent) ---
     explicit = os.environ.get("ZMEM_CORE_MD")
     if explicit:
         return Path(explicit)
@@ -90,6 +130,20 @@ def _resolve_core_md_path() -> Path:
     if plugin_data:
         return Path(plugin_data) / "core.md"
     return Path(os.path.expanduser("~/.zcode/memory/core.md"))
+
+
+def _resolve_skills_dirs() -> list[Path]:
+    """Resolve the skills dirs promotion writes into. Delegates to host.py's
+    box-wide default (both ~/.claude/skills and ~/.zcode/skills, overridable
+    via ZMEM_SKILLS_DIRS). Falls back to the old single ~/.zcode/skills dir
+    if host.py could not be imported at all."""
+    if _host is not None:
+        return _host.resolve_skills_dirs()
+    # --- inline fallback (host.py absent) ---
+    explicit = os.environ.get("ZMEM_SKILLS_DIRS")
+    if explicit:
+        return [Path(p).expanduser() for p in explicit.split(os.pathsep) if p.strip()]
+    return [Path(os.path.expanduser("~/.zcode/skills"))]
 
 
 STORE_PATH = _resolve_store_path()
@@ -120,13 +174,38 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _commit(conn: sqlite3.Connection) -> None:
+    """conn.commit() with a bounded retry on 'database is locked' — belt and
+    suspenders past PRAGMA busy_timeout for the multi-writer box-wide store
+    (concurrent CC sessions + subagents + ZCode). Falls back to a plain
+    commit if host.py is unavailable."""
+    if _host is not None:
+        _host.busy_retry(conn.commit)
+    else:
+        conn.commit()
+
+
 def connect() -> sqlite3.Connection:
+    if _host is not None:
+        # Refuse UNC/network/OneDrive store locations before touching disk —
+        # WAL mode on a network share or a sync-managed dir risks corruption.
+        _host.assert_local_fs(STORE_PATH.parent)
+
+    dir_existed = STORE_PATH.parent.is_dir()
+    file_existed = STORE_PATH.exists()
     STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(STORE_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
+
+    if _host is not None and (not dir_existed or not file_existed):
+        # Only harden perms right after we created the dir/file — icacls on
+        # every connect() would be a needless perf hit on the hot recall path.
+        _host.set_owner_only_perms(STORE_PATH.parent)
+        if STORE_PATH.exists():
+            _host.set_owner_only_perms(STORE_PATH)
     # Load sqlite-vec extension for vector search. Failures are non-fatal —
     # the system degrades to FTS5-only recall when vec0 is unavailable.
     try:
@@ -196,6 +275,124 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     # executescript() does not accept parameter binding, so set created_at separately.
     conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('created_at', ?)", (now_iso(),))
+    conn.commit()
+
+
+# Old-style (`project:<basename>`) namespace keys and the live checkout each one
+# must be re-derived from. Module-level so the v5 migration block and the
+# unconditional retry pass below share ONE list (and so tests can point it at a
+# fixture dir). See the v5 block for why an explicit map is unavoidable.
+_NS_MIGRATION_CHECKOUTS = {
+    "project:opencode-swarm": r"E:\ZCode\opencode-swarm",
+    "project:ragappv3": r"E:\ZCode\ragappv3",
+    "project:trainingapp": r"E:\ZCode\trainingapp",
+    "project:zmem": r"C:\Users\Brett\.graphify\repos\zaxbysauce\zmem",
+}
+
+
+def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces) -> dict[str, str]:
+    """Re-derive and rewrite the namespace key for each entry of
+    `old_namespaces` (a subset of _NS_MIGRATION_CHECKOUTS's keys). Returns the
+    {old: new} map of the ones actually resolved.
+
+    Never guesses: a key whose checkout is not on disk right now is left
+    completely untouched and reported, so it can be retried later (see
+    _retry_pending_ns_migration). Rewrites ALL rows under the old key, tombstones
+    included — a superseded row left behind under a dead key would be stranded
+    from its own namespace's history. Does not commit; the caller does.
+    """
+    mapping: dict[str, str] = {}
+    if _host is None:
+        print(
+            "[zmem] ns migration: host.py unavailable — cannot derive "
+            "namespace keys, skipping re-key (namespaces left unchanged)",
+            file=sys.stderr,
+        )
+        return mapping
+    for old_ns in old_namespaces:
+        checkout = _NS_MIGRATION_CHECKOUTS[old_ns]
+        checkout_path = Path(checkout)
+        if not checkout_path.is_dir():
+            print(
+                f"[zmem] ns migration WARNING: checkout for {old_ns} "
+                f"not found at {checkout} — refusing to guess; "
+                f"namespace left unchanged (will be retried on a later run)",
+                file=sys.stderr,
+            )
+            continue
+        new_ns = _host.resolve_namespace(checkout_path)
+        mapping[old_ns] = new_ns
+        if new_ns != old_ns:
+            conn.execute(
+                "UPDATE memory SET namespace=? WHERE namespace=?",
+                (new_ns, old_ns),
+            )
+    return mapping
+
+
+def _record_ns_migration(
+    conn: sqlite3.Connection, mapping: dict[str, str], *, merge: bool = True
+) -> None:
+    """Write `mapping` into the `ns_migration_v5` meta record.
+
+    merge=True (the retry pass) folds the mapping into whatever is already
+    recorded, so a retry adds its newly-resolved namespaces without erasing the
+    original migration's provenance. merge=False (the one-time v5 block)
+    REPLACES the record: that block recomputes the entire map from scratch
+    every time it runs, and its record is meant to say exactly what THAT run
+    resolved — no more.
+    """
+    existing: dict = {}
+    if merge:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='ns_migration_v5'"
+        ).fetchone()
+        if row and row[0]:
+            try:
+                loaded = json.loads(row[0])
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (ValueError, TypeError):
+                existing = {}
+    existing.update(mapping)
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('ns_migration_v5', ?)",
+        (json.dumps(existing),),
+    )
+
+
+def _retry_pending_ns_migration(conn: sqlite3.Connection) -> None:
+    """Re-attempt the v5 re-key for any namespace the original migration had to
+    skip. Runs on EVERY migrate(), independent of schema_version.
+
+    The v5 block is version-gated and therefore fires exactly once. Any
+    namespace whose checkout happened to be absent at that instant (unmounted
+    drive, not-yet-cloned repo) was skipped — and, because schema_version was
+    bumped to 5 regardless, was skipped *permanently*, stranding those rows
+    under a dead key forever. Decoupling the retry from the version gate fixes
+    that: the cost when there is nothing to do (the overwhelmingly common case)
+    is one indexed SELECT against a four-element IN-list, and it is a strict
+    no-op unless a row still carries an old-style key AND its checkout is now
+    present.
+    """
+    keys = list(_NS_MIGRATION_CHECKOUTS)
+    placeholders = ",".join("?" * len(keys))
+    try:
+        stranded = [
+            r[0] for r in conn.execute(
+                f"SELECT DISTINCT namespace FROM memory WHERE namespace IN ({placeholders})",
+                keys,
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        return  # never let a retry probe break an otherwise-fine migrate()
+    if not stranded:
+        return  # nothing left under an old-style key — no-op
+    mapping = _rekey_namespaces(conn, stranded)
+    if mapping:
+        _record_ns_migration(conn, mapping)
+        print(f"[zmem] ns migration: re-keyed {len(mapping)} previously-skipped "
+              f"namespace(s): {', '.join(sorted(mapping))}", file=sys.stderr)
     conn.commit()
 
 
@@ -269,6 +466,45 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE memory ADD COLUMN supersede_reason TEXT DEFAULT ''")
         conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
         conn.commit()
+
+    if ver < 5:
+        # v5: box-wide namespace re-key (PLAN.md §2b/§8, CRITIC BLOCKER 1).
+        #
+        # Old namespaces were `project:<basename>` (e.g. `project:opencode-swarm`),
+        # which silently splits one project across multiple checkouts/worktrees
+        # (see PLAN.md §1 — the same opencode-swarm remote checked out at both
+        # E:\ZCode\opencode-swarm and E:\ClaudeCode\opencode-swarm-dev used to
+        # resolve to two different namespaces). The new key is produced by
+        # host.resolve_namespace() against each namespace's *live checkout
+        # path* — never hand-typed — so it is guaranteed identical to what the
+        # runtime derives for that same checkout (and any sibling worktree/
+        # clone of the same remote).
+        #
+        # `source_ref` is `session:<id>` — the origin checkout is NOT
+        # recoverable from stored data, so this explicit old-namespace ->
+        # checkout-path map is unavoidable. If a mapped checkout is missing
+        # from disk, refuse to guess: leave that namespace's rows untouched
+        # and report it loudly, rather than fail the whole migration.
+        #
+        # Schema-gated (this whole block only runs when ver < 5) and built
+        # entirely from a fresh recomputation each time it runs, so it is
+        # both a no-op on immediate re-run (ver already 5) and reproducible
+        # on a fresh v4 re-import at cutover (PLAN.md §10b). Namespaces this
+        # pass has to skip (checkout absent) are NOT lost: the unconditional
+        # _retry_pending_ns_migration() below picks them up on a later run,
+        # which is why bumping schema_version here is safe.
+        migration_map = _rekey_namespaces(conn, list(_NS_MIGRATION_CHECKOUTS))
+        # `user:global` and any unmapped namespace (e.g. `project:ZCode`,
+        # a spurious parent-dir capture with no git remote of its own) are
+        # deliberately left untouched.
+        _record_ns_migration(conn, migration_map, merge=False)
+        conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+        conn.commit()
+
+    # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
+    # skip. See _retry_pending_ns_migration for why this cannot live behind the
+    # version gate.
+    _retry_pending_ns_migration(conn)
 
 
 def _load_vec(conn: sqlite3.Connection) -> None:
@@ -386,7 +622,7 @@ def add_memory(
     if existing:
         # Merge: upgrade confidence/signal if the new add is stronger.
         _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
-        conn.commit()
+        _commit(conn)
         print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
               f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
         return existing["id"]
@@ -419,7 +655,7 @@ def add_memory(
             )
         except sqlite3.OperationalError:
             pass  # vec0 table not available — embedding stored in memory table only
-    conn.commit()
+    _commit(conn)
     print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"
           f"{', embedded' if emb is not None else ''})")
     return mid
@@ -427,7 +663,7 @@ def add_memory(
 
 # Cosine similarity threshold for semantic dedup (0..1, higher = stricter).
 # Override via ZMEM_DEDUP_THRESHOLD env var if false-positive merges occur.
-DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("ZMEM_DEDUP_THRESHOLD", "0.85"))
+DEDUP_SIMILARITY_THRESHOLD = _env_float("ZMEM_DEDUP_THRESHOLD", 0.85)
 # Signal rank for merge: higher = stronger.
 _SIGNAL_RANK = {"test": 5, "compile": 4, "lint": 3, "reviewer": 2, "user": 2, "none": 1}
 
@@ -578,17 +814,53 @@ def _rrf_fuse(bm25_ids: list[str], vec_ids: list[str], k: int = 60) -> list[str]
     return sorted(scores, key=scores.get, reverse=True)
 
 
+def _ns_migration_map(conn: sqlite3.Connection) -> dict:
+    """The {old_namespace: new_namespace} map recorded by the v5 migration
+    (meta key 'ns_migration_v5'), or {} if absent/unparseable."""
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='ns_migration_v5'"
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return {}
+
+
+def _expand_namespace_aliases(conn: sqlite3.Connection, namespace: str | None) -> list[str] | None:
+    """Given a namespace as passed by a caller (pre- or post-v5-migration),
+    return the list of namespace values to match: the namespace itself, plus
+    its pre-migration alias if one exists in either direction (old->new or
+    new->old), per the recall compat-alias (PLAN.md §8) kept for one release
+    so nothing strands mid-cutover. A row has exactly one namespace, so this
+    never double-counts — it only widens the WHERE IN (...) match set."""
+    if not namespace:
+        return None
+    aliases = {namespace}
+    migration_map = _ns_migration_map(conn)
+    if namespace in migration_map:
+        aliases.add(migration_map[namespace])
+    else:
+        for old_ns, new_ns in migration_map.items():
+            if new_ns == namespace:
+                aliases.add(old_ns)
+    return list(aliases)
+
+
 def _fetch_by_ids(
-    conn: sqlite3.Connection, ids: list[str], namespace: str | None, floor: float
+    conn: sqlite3.Connection, ids: list[str], namespaces: list[str] | None, floor: float
 ) -> list:
     """Fetch full memory rows for a list of IDs, applying the same filters as recall."""
     if not ids:
         return []
     placeholders = ",".join("?" * len(ids))
-    ns_clause = "AND namespace = ?" if namespace else ""
+    ns_clause = ""
     params = list(ids)
-    if namespace:
-        params.append(namespace)
+    if namespaces:
+        ns_placeholders = ",".join("?" * len(namespaces))
+        ns_clause = f"AND namespace IN ({ns_placeholders})"
+        params.extend(namespaces)
     params.append(floor)
     sql = f"""
         SELECT id, namespace, type, content, tags, source_ref,
@@ -616,8 +888,15 @@ def recall_memory(
     as_json: bool = False,
     min_confidence: float | None = None,
     hybrid: bool = False,
+    no_bump: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
+
+    When ``no_bump`` is True the retrieval_count / last_retrieved telemetry write
+    is suppressed, making recall READ-ONLY. Hook-driven recall (UserPromptSubmit,
+    SubagentStart) passes this so heavy subagent fan-out does not turn every
+    delegated agent into a concurrent writer on the shared store (PLAN.md §5).
+    Explicit skill-invoked recall keeps the default (bumps).
 
     Candidates are fetched via FTS5 BM25, then re-ranked by a composite score
     that incorporates BM25 relevance, confidence, recency decay, and retrieval
@@ -628,6 +907,12 @@ def recall_memory(
     Confidence is still a hard floor (high-precision-first principle): memories
     below CONFIDENCE_FLOOR (or min_confidence) are dropped before scoring.
     """
+    # Expand a single namespace into itself + its pre-v5-migration alias (if
+    # any) so recall keeps finding rows on either side of the rename for one
+    # release (PLAN.md §8 compat alias). A row has exactly one namespace, so
+    # this only widens the match set — it never double-counts a row.
+    ns_list = _expand_namespace_aliases(conn, namespace)
+
     terms = [t for t in re.split(r"\s+", query.strip()) if t]
     if not terms:
         rows = []
@@ -639,9 +924,10 @@ def recall_memory(
         fts_query = " OR ".join(safe_terms)
         params: list = [fts_query]
         ns_clause = ""
-        if namespace:
-            ns_clause = "AND m.namespace = ?"
-            params.append(namespace)
+        if ns_list:
+            ns_placeholders = ",".join("?" * len(ns_list))
+            ns_clause = f"AND m.namespace IN ({ns_placeholders})"
+            params.extend(ns_list)
         floor = min_confidence if min_confidence is not None else CONFIDENCE_FLOOR
         params.append(floor)
         # Fetch more candidates than the limit so the composite re-ranking has
@@ -695,7 +981,7 @@ def recall_memory(
                 fused_ids = _rrf_fuse(fts_ids, vec_ids, k=60)
                 # Re-fetch full rows for the fused set (may include IDs not in
                 # the FTS results — these are semantic matches BM25 missed).
-                rows = _fetch_by_ids(conn, fused_ids, namespace, floor)
+                rows = _fetch_by_ids(conn, fused_ids, ns_list, floor)
 
     # Re-rank by composite score (relevance + confidence + recency + popularity).
     now_epoch = time.time()
@@ -737,7 +1023,7 @@ def recall_memory(
     scored.sort(key=lambda x: x[0], reverse=True)
     results = [item[1] for item in scored[:limit]]
 
-    if results:
+    if results and not no_bump:
         ids = [r["id"] for r in results]
         placeholders = ",".join("?" * len(ids))
         conn.execute(
@@ -745,7 +1031,7 @@ def recall_memory(
             f"WHERE id IN ({placeholders})",
             [now_iso(), *ids],
         )
-        conn.commit()
+        _commit(conn)
 
     if as_json:
         print(json.dumps(results, indent=2))
@@ -768,8 +1054,14 @@ def recent_memory(
     limit: int = 5,
     min_confidence: float = 0.5,
     as_json: bool = False,
+    no_bump: bool = False,
 ) -> list[dict]:
-    """Cheap admin pull of the most recent live memories (no FTS scoring)."""
+    """Cheap admin pull of the most recent live memories (no FTS scoring).
+
+    When ``no_bump`` is True the retrieval_count / last_retrieved telemetry write
+    is suppressed (READ-ONLY). Hook-driven subagent recall passes this so a
+    dispatch fan-out does not make every subagent a concurrent writer on the
+    shared store (PLAN.md §5)."""
     params: list = [min_confidence]
     ns_clause = ""
     if namespace:
@@ -807,7 +1099,7 @@ def recent_memory(
             "stale": bool(stale_note),
             "_stale_note": stale_note,
         })
-    if results:
+    if results and not no_bump:
         ids = [r["id"] for r in results]
         placeholders = ",".join("?" * len(ids))
         conn.execute(
@@ -815,7 +1107,7 @@ def recent_memory(
             f"WHERE id IN ({placeholders})",
             [now_iso(), *ids],
         )
-        conn.commit()
+        _commit(conn)
     if as_json:
         print(json.dumps(results, indent=2))
     else:
@@ -842,7 +1134,7 @@ def supersede_memory(conn: sqlite3.Connection, mid: str, reason: str = "") -> bo
         conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
     except sqlite3.OperationalError:
         pass  # vec0 table not available
-    conn.commit()
+    _commit(conn)
     note = f": {reason}" if reason else ""
     print(f"[zmem] superseded {mid}{note}")
     return True
@@ -923,12 +1215,62 @@ def _slugify_skill_name(tags: str, fallback_id: str) -> str:
     return name
 
 
+def _first_sentence(content: str, max_len: int = 220) -> str:
+    """Return the first whole sentence of `content`, never cut mid-word.
+
+    Splits on ". " (and other sentence terminators) rather than a raw
+    character slice — the old draft did `content[:120]`, which truncates
+    mid-word whenever the 120th character lands inside a token. If even the
+    first sentence exceeds max_len, truncate at the last whole-word boundary
+    before max_len and mark it with an ellipsis (still never mid-word).
+    """
+    text = re.sub(r"\s+", " ", content.strip())
+    if not text:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    sentence = parts[0] if parts else text
+    if len(sentence) <= max_len:
+        if not sentence.endswith((".", "!", "?")):
+            sentence += "."
+        return sentence
+    truncated = sentence[:max_len]
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    return truncated.rstrip(".,;:- ") + "…"
+
+
+def _yaml_dquote(s: str) -> str:
+    """Escape a string for a YAML double-quoted scalar, collapsed to one line."""
+    s = re.sub(r"\s+", " ", s.strip())
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _synthesize_trigger_description(tags: str, content: str) -> str:
+    """Build a clean, single-line, trigger-focused description from a memory.
+
+    Format: "Use when working with <tag>, <tag>, ... - <first full sentence
+    of content>." Trigger contexts come from `tags` (the explicit signal for
+    when this lesson applies); the lesson itself is the first *whole*
+    sentence of `content` (never a mid-word slice). This never emits
+    placeholder text — it is meant to be usable verbatim, though
+    --description lets a human override it with something punchier.
+    """
+    tokens = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    lesson = _first_sentence(content)
+    if tokens:
+        trigger_contexts = ", ".join(tokens[:5])
+        return f"Use when working with {trigger_contexts} - {lesson}"
+    return f"Use when this situation recurs - {lesson}"
+
+
 def promote_memory(
     conn: sqlite3.Connection,
     *,
     memory_id: str | None = None,
     dry_run: bool = False,
     namespace: str | None = None,
+    description: str | None = None,
 ) -> None:
     """Promote high-confidence lessons to reusable SKILL.md files.
 
@@ -937,8 +1279,11 @@ def promote_memory(
     the lesson and the skill coexist (the lesson costs ~200 bytes; if the skill
     description fails to trigger, the lesson is still in recall).
 
-    Human-in-the-loop: --dry-run shows candidates; --id <uuid> --confirm writes
-    the SKILL.md after the user reviews the description.
+    Human-in-the-loop: --dry-run shows candidates (and both write targets);
+    --id <uuid> --confirm writes the SKILL.md to every dir in
+    host.resolve_skills_dirs() (box-wide default: ~/.claude/skills AND
+    ~/.zcode/skills). --description overrides the synthesized trigger line
+    verbatim, for a human/orchestrator to supply something punchier.
     """
     # Candidate query.
     ns_clause = "AND namespace = ?" if namespace else ""
@@ -961,6 +1306,8 @@ def promote_memory(
         print("[zmem] no promotion candidates found")
         return
 
+    skills_dirs = _resolve_skills_dirs()
+
     if dry_run:
         print(f"[zmem] {len(candidates)} promotion candidate(s):")
         for c in candidates:
@@ -969,7 +1316,9 @@ def promote_memory(
                   f"signal={c['signal']})")
             print(f"    content: {c['content'][:80]}...")
             print(f"    tags: {c['tags']}")
-            print(f"    would create: ~/.zcode/skills/{skill_name}/SKILL.md")
+            print(f"    description would be: {_synthesize_trigger_description(c['tags'], c['content'])}")
+            for d in skills_dirs:
+                print(f"    would create: {d / skill_name / 'SKILL.md'}")
         return
 
     if memory_id:
@@ -982,32 +1331,43 @@ def promote_memory(
             return
 
         skill_name = _slugify_skill_name(row["tags"], row["id"])
-        skill_dir = Path.home() / ".zcode" / "skills" / skill_name
+        skill_targets = [d / skill_name for d in skills_dirs]
 
-        # Collision detection.
-        if skill_dir.exists():
-            print(f"[zmem] ERROR: skill directory already exists: {skill_dir}", file=sys.stderr)
+        # Collision detection — check every target BEFORE writing to any of
+        # them, so a collision in one dir never leaves a partial promotion
+        # (a skill in one tool's dir but not the other's).
+        collisions = [d for d in skill_targets if (d / "SKILL.md").exists()]
+        if collisions:
+            print(f"[zmem] ERROR: skill already exists in {len(collisions)} target dir(s):", file=sys.stderr)
+            for d in collisions:
+                print(f"  {d}", file=sys.stderr)
             print(f"  Choose a different memory or rename the existing skill.", file=sys.stderr)
             return
 
-        # Generate the SKILL.md draft.
-        import textwrap
+        # Trigger description: explicit --description wins verbatim; else
+        # synthesize from tags (trigger contexts) + the first whole sentence
+        # of content (the lesson) — never a mid-word slice, never
+        # placeholder text.
+        trigger_line = description if description else _synthesize_trigger_description(row["tags"], row["content"])
+
         tags_str = row["tags"] or "general"
+        trigger_contexts = ", ".join(t.strip() for t in tags_str.split(",") if t.strip()) or "general"
+        display_name = skill_name.replace("zmem-", "").replace("-", " ").title()
+
+        # Body sections deliberately carry different content: "When to use"
+        # is the trigger contexts (when this should fire), "The rule" is the
+        # full lesson content (what to do) — the old draft repeated the same
+        # sentence in both plus the description, tripling one idea instead
+        # of conveying three.
         draft = f"""---
 name: {skill_name}
-description: >
-  {row['content'][:120].replace(chr(10), ' ')}...
-  Auto-promoted from zmem lesson {row['id'][:8]} (signal={row['signal']},
-  confidence={row['confidence']}, retrieved {row['retrieval_count']}x).
-  EDIT THIS DESCRIPTION to be pushy and name the exact trigger contexts
-  where this skill should fire — models under-trigger skills with vague
-  descriptions.
+description: {_yaml_dquote(trigger_line)}
 ---
 
-# {_slugify_skill_name(row['tags'], row['id']).replace('zmem-', '').replace('-', ' ').title()}
+# {display_name}
 
 ## When to use
-{(row['content'][:200] + '...' if len(row['content']) > 200 else row['content'])}
+Use when working with: {trigger_contexts}.
 
 ## The rule
 {row['content']}
@@ -1019,14 +1379,18 @@ description: >
 - Tags: {tags_str}
 """
 
-        # Write the skill file.
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        skill_file = skill_dir / "SKILL.md"
-        skill_file.write_text(draft, encoding="utf-8")
+        # Write the skill file to every configured target dir.
+        written = []
+        for skill_dir in skill_targets:
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            skill_file = skill_dir / "SKILL.md"
+            skill_file.write_text(draft, encoding="utf-8")
+            written.append(skill_file)
 
-        print(f"[zmem] promoted lesson {row['id'][:8]} -> {skill_file}")
+        print(f"[zmem] promoted lesson {row['id'][:8]} ->")
+        for skill_file in written:
+            print(f"  {skill_file}")
         print(f"  Source lesson KEPT in store (not superseded).")
-        print(f"  REVIEW AND EDIT the description before relying on this skill.")
         print(f"  The skill will load on next session restart.")
         return
 
@@ -1035,9 +1399,42 @@ description: >
 
 
 # Consolidation threshold and cadence defaults.
-CONSOLIDATE_DEFAULT_THRESHOLD = float(os.environ.get("ZMEM_CONSOLIDATE_THRESHOLD", "0.80"))
+CONSOLIDATE_DEFAULT_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_THRESHOLD", 0.80)
 CONSOLIDATE_MIN_INTERVAL_DAYS = 7
 CONSOLIDATE_GROWTH_THRESHOLD = 0.20  # run when live count grew by >20% since last run
+
+# Lexical (token-overlap) clustering fallback threshold, used by consolidate()
+# when embeddings are unavailable (no onnxruntime/tokenizers, or the model file
+# is absent — Phase 10). Jaccard similarity of content+tags token sets is a
+# coarser signal than cosine similarity of embeddings, so this is deliberately
+# a separate, independently-tunable knob rather than reusing the cosine
+# threshold's scale.
+CONSOLIDATE_LEXICAL_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_LEXICAL_THRESHOLD", 0.60)
+
+_LEXICAL_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "is", "are", "was", "were", "be", "been", "being",
+    "this", "that", "these", "those", "it", "its", "as", "by", "from",
+    "not", "no", "so", "if", "then", "than", "into", "onto", "when",
+}
+
+
+def _lexical_tokens(text: str | None) -> set[str]:
+    """Tokenize text into a lowercase word set for Jaccard-overlap clustering.
+    Drops short tokens and common stopwords so similarity reflects content
+    words, not incidental grammar overlap."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {w for w in words if len(w) >= 3 and w not in _LEXICAL_STOPWORDS}
+
+
+def _lexical_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
+    """Jaccard similarity between two token sets. 0.0 if either is empty."""
+    if not tokens_a or not tokens_b:
+        return 0.0
+    union = tokens_a | tokens_b
+    if not union:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(union)
 
 
 def consolidate(
@@ -1048,7 +1445,8 @@ def consolidate(
     dry_run: bool = False,
     namespace: str | None = None,
 ) -> None:
-    """Merge near-duplicate memories via embedding similarity.
+    """Merge near-duplicate memories via embedding similarity (or a lexical
+    token-overlap fallback when embeddings are unavailable — Phase 10).
 
     For each live memory with an embedding, query vec0 KNN for nearest neighbors.
     Cluster memories with cosine similarity >= threshold. For each cluster:
@@ -1056,12 +1454,18 @@ def consolidate(
     into the keeper, supersede the absorbed members. Each cluster commits
     atomically — interruption is safe because keeper selection is deterministic.
 
+    When embeddings are unavailable (no onnxruntime/tokenizers, or the model
+    file is absent/not yet downloaded), clustering falls back to Jaccard
+    similarity of content+tags token sets (CONSOLIDATE_LEXICAL_THRESHOLD)
+    instead of cosine — same keeper/merge/supersede mechanics, just a coarser
+    similarity signal. `consolidate` never hard-requires the model.
+
     If prune=True, also supersede memories with retrieval_count=0, signal=none,
     and age>30d (opt-in, never automatic on SessionStart).
     """
-    if not _embeddings or not _embeddings.is_available():
-        print("[zmem] consolidate requires embeddings — install onnxruntime + tokenizers", file=sys.stderr)
-        return
+    use_lexical = not (_embeddings and _embeddings.is_available())
+    if use_lexical:
+        print("[zmem] embeddings unavailable — consolidating via lexical token overlap", file=sys.stderr)
 
     # Growth-based cadence gate: skip if last consolidation was recent AND
     # the store hasn't grown significantly since. Only applies to automatic
@@ -1105,14 +1509,17 @@ def consolidate(
         )
         conn.commit()
 
-    # Load all live memories with embeddings.
+    # Load all live memories. In embedding mode, only rows with an embedding
+    # are candidates (vec0 KNN needs a query vector); in lexical fallback
+    # mode every live row is a candidate (Jaccard needs only content/tags).
     ns_clause = "AND namespace = ?" if namespace else ""
     ns_params = [namespace] if namespace else []
+    embed_clause = "" if use_lexical else "AND embedding IS NOT NULL"
     rows = conn.execute(
         f"""SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
                   embedding, embedding_model
            FROM memory
-           WHERE superseded_at IS NULL AND embedding IS NOT NULL
+           WHERE superseded_at IS NULL {embed_clause}
            {ns_clause}
            ORDER BY confidence DESC, retrieval_count DESC""",
         ns_params,
@@ -1122,40 +1529,110 @@ def consolidate(
         print("[zmem] no embeddable memories to consolidate")
         return
 
+    # Precompute lexical token sets once per row (only used in fallback mode).
+    lexical_tokens = {}
+    if use_lexical:
+        for r in rows:
+            lexical_tokens[r["id"]] = _lexical_tokens(
+                (r["content"] or "") + " " + (r["tags"] or "")
+            )
+
     # Track which memories have been absorbed (to skip them as seeds).
     absorbed = set()
     merged_count = 0
     pruned_count = 0
 
+    # Cosine threshold and lexical (Jaccard) threshold live on different
+    # scales. If the caller left --threshold at its cosine default while we're
+    # in lexical fallback, swap in the lexical default; an explicit override
+    # is respected either way.
+    effective_threshold = threshold
+    if use_lexical and threshold == CONSOLIDATE_DEFAULT_THRESHOLD:
+        effective_threshold = CONSOLIDATE_LEXICAL_THRESHOLD
+
+    # NAMESPACE CONTAINMENT (data-integrity invariant, both clustering paths):
+    # a cluster is ALWAYS scoped to the seed's own namespace, whether or not the
+    # caller passed `namespace`. The `ns_clause`/`ns_params` above only narrow
+    # which rows are *considered*; they are not a containment guarantee, because
+    # the auto-triggered background run (zmem-session-start.sh) passes no
+    # --namespace at all. Without the seed-namespace check below, that run could
+    # supersede one project's memory into an unrelated project's memory.
     for seed in rows:
         if seed["id"] in absorbed:
             continue
 
-        # Query vec0 for nearest neighbors of this seed.
         neighbors = []
-        try:
-            results = conn.execute(
-                "SELECT memory_id, distance FROM memory_vec "
-                "WHERE embedding MATCH ? AND k = 10 ORDER BY distance",
-                [seed["embedding"]],
-            ).fetchall()
+        if use_lexical:
+            # Jaccard token-overlap clustering: compare seed against every
+            # other not-yet-absorbed row. O(n^2) but consolidate runs on a
+            # bounded, infrequent cadence (see the growth-gate above) over a
+            # single user's live memory count, not a large corpus.
+            seed_tokens = lexical_tokens[seed["id"]]
+            for row in rows:
+                if row["id"] == seed["id"] or row["id"] in absorbed:
+                    continue
+                if row["namespace"] != seed["namespace"]:
+                    continue  # namespace containment — see the note above
+                sim = _lexical_similarity(seed_tokens, lexical_tokens[row["id"]])
+                if sim >= effective_threshold:
+                    neighbors.append((row, sim))
+        else:
+            # Query vec0 for nearest neighbors of this seed.
+            #
+            # vec0's KNN is NAMESPACE-BLIND: it returns the globally nearest k
+            # rows, and the namespace filter below then discards the ones
+            # belonging to other projects. With a fixed k that silently
+            # UNDER-merges — on a box-wide store holding several projects the
+            # global top-10 can be filled entirely by other namespaces while
+            # the seed's own duplicate sits at rank 11, so consolidation finds
+            # nothing and the duplicate survives forever. (Introduced when the
+            # namespace filter was added to stop cross-project merging; the
+            # filter is right, a fixed k alongside it is not.)
+            #
+            # Escalate k until the answer is provably complete. Rows come back
+            # ORDER BY distance (similarity descending), so the moment we see
+            # one below the threshold, no later row can qualify and the
+            # qualifying set is closed. Only when EVERY returned row is still
+            # above the threshold might more qualify — then widen and re-ask.
+            # Bounded by the live row count, so it always terminates.
+            results = []
+            k = 10
+            k_cap = max(len(rows), 10)
+            while True:
+                try:
+                    results = conn.execute(
+                        "SELECT memory_id, distance FROM memory_vec "
+                        "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                        [seed["embedding"], k],
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    results = []
+                    break
+                if len(results) < k:
+                    break  # vec0 exhausted — this is every row it can offer
+                if any((1.0 - r["distance"]) < effective_threshold for r in results):
+                    break  # saw the cutoff — the qualifying set is complete
+                if k >= k_cap:
+                    break  # bounded: never scan past the live row count
+                k = min(k * 5, k_cap)
             for r in results:
                 mid = r["memory_id"]
                 if mid == seed["id"] or mid in absorbed:
                     continue
                 sim = 1.0 - r["distance"]
-                if sim >= threshold:
-                    # Verify it's live and in the right namespace.
+                if sim >= effective_threshold:
+                    # Verify it's live AND in the seed's own namespace —
+                    # namespace containment, see the note above the loop. vec0
+                    # KNN is namespace-blind, so this is the only thing standing
+                    # between a background (no --namespace) run and a
+                    # cross-project merge.
                     row = conn.execute(
                         "SELECT id, confidence, signal, tags, retrieval_count FROM memory "
-                        "WHERE id=? AND superseded_at IS NULL"
-                        + (f" AND namespace=?" if namespace else ""),
-                        [mid] + ns_params,
+                        "WHERE id=? AND superseded_at IS NULL AND namespace=?",
+                        (mid, seed["namespace"]),
                     ).fetchone()
                     if row:
                         neighbors.append((row, sim))
-        except sqlite3.OperationalError:
-            continue  # vec0 unavailable
 
         if not neighbors:
             continue
@@ -1229,6 +1706,851 @@ def consolidate(
     print(f"[zmem] {' + '.join(parts)}")
 
 
+# ---------------------------------------------------------------------------
+# Backup / restore / retention (P11 — PLAN.md §7 P11, §8 "single point of failure")
+# ---------------------------------------------------------------------------
+# The box-wide store is now the single point of failure for every project and
+# both hosts. P11 adds a snapshot with retention, a verified restore path, and
+# a single-flight guard so the detached background writers the SessionStart
+# hook fires cannot pile up on each other.
+#
+# SNAPSHOT METHOD — SQLite's Online Backup API (`sqlite3.Connection.backup`).
+# A periodic snapshot of the LIVE box-wide store has no quiescent window to
+# wait for: hook processes from other sessions may be committing at any moment.
+# The Online Backup API is built for exactly that — it copies pages under
+# SQLite's own locking with automatic restart/retry on concurrent writes, and
+# yields a single self-contained destination file with no WAL sidecars to
+# reason about. import-store.py transfers its one-shot legacy migration the
+# same way, for the same reason, adding a before/after sha256 of the source as
+# an independent "the legacy store was never touched" proof (failure mode:
+# "re-run when quiescent"); that extra assertion is specific to migrating
+# someone else's live store and is not needed here.
+
+SNAPSHOT_PREFIX = "store-"
+PRERESTORE_PREFIX = "prerestore-"
+SNAPSHOT_SUFFIX = ".sqlite"
+# Retention only ever considers files matching THIS glob. `prerestore-*` files
+# deliberately fall outside it: the safety copy taken right before a restore is
+# the rollback path for that restore and must never be pruned by an unrelated
+# automatic backup rotation.
+SNAPSHOT_GLOB = SNAPSHOT_PREFIX + "*" + SNAPSHOT_SUFFIX
+
+BACKUP_DEFAULT_RETENTION = 7
+
+
+# Stale-lock timeouts. An mtime lease cannot tell "crashed" from "slower than
+# the timeout", so both are set far above any realistic run; the worst case if
+# a genuinely-slow holder is broken is two concurrent runs (today's behavior),
+# never corruption.
+#   backup: a snapshot of this store takes well under a second; 10 minutes
+#     covers a pathologically large store on a slow/contended disk.
+#   consolidate: clustering is O(n^2) over live rows plus optional embedding
+#     work, and is the longer of the two by design, so it gets 30 minutes —
+#     deliberately longer than backup's, per the P11 spec.
+BACKUP_LOCK_STALE_SECONDS = _env_float("ZMEM_BACKUP_LOCK_STALE", 600.0)
+CONSOLIDATE_LOCK_STALE_SECONDS = _env_float("ZMEM_CONSOLIDATE_LOCK_STALE", 1800.0)
+
+
+class SnapshotError(RuntimeError):
+    """A snapshot could not be produced, or failed verification. When raised by
+    verify_snapshot()/create_snapshot() the bad snapshot file has already been
+    deleted — a file left in the backup dir is always a verified one."""
+
+
+def _lock_path(name: str) -> Path:
+    """Advisory lockfile for a single-flight command, in the store dir."""
+    return STORE_PATH.parent / f".zmem-{name}.lock"
+
+
+def _acquire_lock(name: str, stale_seconds: float) -> str | None:
+    """Take the single-flight lock for `name`. None => another run holds it and
+    the caller must skip. Proceeds unlocked (returns a token) when host.py is
+    unavailable — `_host is None` is a supported degraded mode in this file."""
+    if _host is None:
+        return "unlocked"
+    return _host.acquire_lock(_lock_path(name), stale_seconds)
+
+
+def _release_lock(name: str, token: str | None) -> None:
+    if _host is None or not token:
+        return
+    _host.release_lock(_lock_path(name), token)
+
+
+def _backup_dir(out_dir: str | None = None) -> Path:
+    """--out-dir > $ZMEM_BACKUP_DIR > <store dir>/backups."""
+    if out_dir:
+        return Path(out_dir).expanduser()
+    env_dir = os.environ.get("ZMEM_BACKUP_DIR")
+    if env_dir and env_dir.strip():
+        return Path(env_dir).expanduser()
+    return STORE_PATH.parent / "backups"
+
+
+def _ensure_backup_dir(out_dir: str | None = None) -> Path:
+    """Resolve + create the backup dir, hardening perms only on first creation
+    (mirrors connect()'s gate — icacls on every run would be a needless cost on
+    a path the SessionStart hook touches every session)."""
+    d = _backup_dir(out_dir)
+    existed = d.is_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    if not existed and _host is not None:
+        # Dirs get (OI)(CI) so snapshots created inside inherit the ACL.
+        _host.set_owner_only_perms(d)
+    return d
+
+
+def _snapshot_stamp() -> str:
+    """Filename-safe UTC timestamp: now_iso()'s clock, minus the colons that
+    are illegal in Windows filenames."""
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+
+def _new_snapshot_path(backup_dir: Path, prefix: str) -> Path:
+    """A not-yet-existing snapshot path. Two snapshots inside the same wall
+    clock second get a `-N` uniquifier rather than silently overwriting each
+    other (retention orders by mtime, so the suffix never confuses rotation)."""
+    stamp = _snapshot_stamp()
+    p = backup_dir / f"{prefix}{stamp}{SNAPSHOT_SUFFIX}"
+    n = 1
+    while p.exists():
+        p = backup_dir / f"{prefix}{stamp}-{n}{SNAPSHOT_SUFFIX}"
+        n += 1
+    return p
+
+
+def _row_counts(conn: sqlite3.Connection) -> tuple[int, int]:
+    """(total, live) row counts of the memory table."""
+    total = conn.execute("SELECT count(*) FROM memory").fetchone()[0]
+    live = conn.execute(
+        "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
+    ).fetchone()[0]
+    return int(total), int(live)
+
+
+def counts_agree(
+    before: tuple[int, int], after: tuple[int, int], snap: tuple[int, int]
+) -> tuple[bool, str]:
+    """Does the snapshot's (total, live) row count match the source's?
+
+    Pure function so the concurrent-writer branch is directly testable — it is
+    otherwise unreachable without racing a real writer.
+
+    Source counts are sampled BEFORE and AFTER the page copy. In the common
+    case nothing committed in between (before == after) and the snapshot must
+    match EXACTLY — anything else means pages went missing and the snapshot is
+    rejected. If a concurrent writer did commit (before != after), the snapshot
+    legitimately captured some instant between the two samples, so each count
+    only has to land within the observed band. `total` is monotonically
+    non-decreasing (nothing ever DELETEs from `memory`; supersession is a
+    tombstone UPDATE) while `live` can move either way, hence min/max bounds
+    rather than a direction assumption.
+    """
+    if before == after:
+        if snap == before:
+            return True, f"exact match (total={snap[0]} live={snap[1]})"
+        return False, (
+            f"row count mismatch: snapshot total={snap[0]} live={snap[1]} "
+            f"vs source total={before[0]} live={before[1]}"
+        )
+    lo = (min(before[0], after[0]), min(before[1], after[1]))
+    hi = (max(before[0], after[0]), max(before[1], after[1]))
+    ok = all(lo[i] <= snap[i] <= hi[i] for i in (0, 1))
+    band = (
+        f"source changed during snapshot (before total={before[0]} live={before[1]}, "
+        f"after total={after[0]} live={after[1]}); snapshot total={snap[0]} live={snap[1]}"
+    )
+    return ok, (band + " - within band" if ok else band + " - OUTSIDE band")
+
+
+SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _discard_snapshot(path: Path) -> None:
+    """Delete a snapshot that failed verification, plus any sidecars it left.
+    Best-effort: a file we cannot delete is reported by the caller's error, and
+    is never counted as a successful backup."""
+    for candidate in [path] + [Path(str(path) + s) for s in SIDECAR_SUFFIXES]:
+        try:
+            if candidate.exists():
+                candidate.unlink()
+        except OSError:
+            pass
+
+
+def verify_snapshot(
+    snapshot_path: Path, src_before: tuple[int, int], src_after: tuple[int, int]
+) -> dict:
+    """PRAGMA integrity_check + row-count comparison on a freshly written
+    snapshot. On ANY failure the snapshot file is DELETED and SnapshotError is
+    raised, so a caller can never mistake a bad snapshot for a good one (and
+    the caller must therefore not update `last_backup` or run retention)."""
+    try:
+        conn = sqlite3.connect(str(snapshot_path))
+        try:
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            snap = _row_counts(conn)
+        finally:
+            conn.close()
+    except Exception as e:  # unreadable / not a database / no memory table
+        _discard_snapshot(snapshot_path)
+        raise SnapshotError(f"snapshot could not be verified: {e}") from e
+
+    if integrity != "ok":
+        _discard_snapshot(snapshot_path)
+        raise SnapshotError(f"snapshot integrity_check failed: {integrity}")
+
+    ok, note = counts_agree(src_before, src_after, snap)
+    if not ok:
+        _discard_snapshot(snapshot_path)
+        raise SnapshotError(note)
+
+    return {
+        "path": str(snapshot_path),
+        "integrity_check": integrity,
+        "snapshot_total": snap[0],
+        "snapshot_live": snap[1],
+        "source_total": src_after[0],
+        "source_live": src_after[1],
+        "count_note": note,
+    }
+
+
+def create_snapshot(src_path: Path, dest_path: Path) -> dict:
+    """Online-backup `src_path` to `dest_path`, then verify it.
+
+    Safe against concurrent writers on the source: the page copy runs under
+    SQLite's own locking (busy_timeout + the backup API's built-in retry), and
+    the source is never checkpointed, renamed, or otherwise mutated by us.
+    Raises SnapshotError (having deleted the partial/bad destination) if the
+    copy or the verification fails.
+    """
+    if not src_path.exists() or src_path.stat().st_size == 0:
+        raise SnapshotError(f"source store missing or empty: {src_path}")
+
+    try:
+        src = sqlite3.connect(str(src_path))
+    except sqlite3.Error as e:
+        raise SnapshotError(f"cannot open source store {src_path}: {e}") from e
+    try:
+        src.execute("PRAGMA busy_timeout=5000")
+        before = _row_counts(src)
+        dst = sqlite3.connect(str(dest_path))
+        try:
+            # pages=-1 (default) copies the whole db; sleep=0.25 is the
+            # built-in wait between SQLITE_BUSY retries.
+            src.backup(dst)
+            # The page copy includes page 1, so the snapshot inherits the
+            # source's WAL journal mode. Flip it back to the rollback journal:
+            # a WAL-mode snapshot makes every later READER (our own verify,
+            # the restore pre-flight, a human running sqlite3 on it) create
+            # `-wal`/`-shm` sidecars beside it — and a read-only reader cannot
+            # checkpoint them away on close, so they persist as orphans in the
+            # backup dir and get dragged along by a restore. A rollback-journal
+            # snapshot is a single self-contained file with no sidecars at all.
+            # `restore` puts the destination back into WAL right after the copy.
+            dst.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            dst.close()
+        after = _row_counts(src)
+    except Exception as e:
+        _discard_snapshot(dest_path)
+        raise SnapshotError(f"snapshot copy failed: {e}") from e
+    finally:
+        src.close()
+
+    return verify_snapshot(dest_path, before, after)
+
+
+def list_snapshots(backup_dir: Path) -> list[Path]:
+    """Snapshots matching the retention glob, oldest first. Ordered by mtime
+    (then name) rather than by filename alone, so the same-second `-N`
+    uniquifier can never invert chronological order."""
+    items: list[tuple[int, str, Path]] = []
+    try:
+        candidates = list(backup_dir.glob(SNAPSHOT_GLOB))
+    except OSError:
+        return []
+    for p in candidates:
+        try:
+            if not p.is_file():
+                continue
+            st = p.stat()
+        except OSError:
+            continue
+        items.append((st.st_mtime_ns, p.name, p))
+    items.sort(key=lambda t: (t[0], t[1]))
+    return [t[2] for t in items]
+
+
+def apply_retention(backup_dir: Path, retention: int) -> list[Path]:
+    """Delete the OLDEST `store-*.sqlite` snapshots beyond the newest
+    `retention`. Never touches anything else in the directory — a file that
+    does not match the glob (including every `prerestore-*` safety copy) is
+    left strictly alone. `retention <= 0` disables pruning entirely.
+
+    A pruned snapshot's OWN sidecars (`-wal`/`-shm`/`-journal`) go with it:
+    they are files we created, not unrelated ones, and leaving them would
+    orphan them forever (the glob cannot match them).
+    """
+    if retention is None or retention <= 0:
+        return []
+    snaps = list_snapshots(backup_dir)
+    if len(snaps) <= retention:
+        return []
+    removed: list[Path] = []
+    for p in snaps[: len(snaps) - retention]:
+        try:
+            p.unlink()
+        except OSError as e:
+            print(f"[zmem] backup: could not prune {p}: {e}", file=sys.stderr)
+            continue
+        removed.append(p)
+        for suffix in SIDECAR_SUFFIXES:
+            sib = Path(str(p) + suffix)
+            try:
+                if sib.exists():
+                    sib.unlink()
+            except OSError:
+                pass
+    return removed
+
+
+def _backup_interval_days() -> float:
+    """$ZMEM_BACKUP_INTERVAL_DAYS (default 1). Read per call so tests and the
+    launcher can change it without re-importing."""
+    v = _env_float("ZMEM_BACKUP_INTERVAL_DAYS", 1.0)
+    return v if v >= 0 else 1.0
+
+
+def _backup_due(conn: sqlite3.Connection) -> tuple[bool, float, float]:
+    """(due, days_since_last, interval_days) from the `last_backup` meta row.
+    A missing/unparseable timestamp means due (fail toward taking a backup)."""
+    interval = _backup_interval_days()
+    row = conn.execute("SELECT value FROM meta WHERE key='last_backup'").fetchone()
+    if not row or not row[0]:
+        return True, -1.0, interval
+    last_epoch = _parse_iso_to_epoch(row[0])
+    if last_epoch <= 0:
+        return True, -1.0, interval
+    days = (time.time() - last_epoch) / 86400.0
+    return days >= interval, days, interval
+
+
+def cmd_backup(
+    conn: sqlite3.Connection,
+    *,
+    retention: int = BACKUP_DEFAULT_RETENTION,
+    out_dir: str | None = None,
+    if_due: bool = False,
+) -> int:
+    """Take a verified snapshot of the store; return a process exit code.
+
+    Single-flighted against other `backup` runs (the SessionStart hook fires
+    one detached per session, and a human may run one by hand at the same
+    moment). `--if-due` gates on the `last_backup` meta row so the hook's
+    automatic trigger is a cheap no-op almost every session; without it the
+    backup always runs, which is what direct CLI and verification runs want.
+    """
+    token = _acquire_lock("backup", BACKUP_LOCK_STALE_SECONDS)
+    if token is None:
+        print("[zmem] backup: another backup is already running - skipped")
+        return 0
+    try:
+        if if_due:
+            due, days, interval = _backup_due(conn)
+            if not due:
+                print(f"[zmem] backup: not due - last backup {days:.3f}d ago, "
+                      f"interval {interval}d; skipped")
+                return 0
+
+        try:
+            backup_dir = _ensure_backup_dir(out_dir)
+            dest = _new_snapshot_path(backup_dir, SNAPSHOT_PREFIX)
+            info = create_snapshot(STORE_PATH, dest)
+        except (SnapshotError, OSError) as e:
+            print(f"[zmem] backup FAILED: {e}", file=sys.stderr)
+            print("[zmem] backup: bad snapshot deleted; last_backup NOT updated; "
+                  "retention NOT applied", file=sys.stderr)
+            return 1
+
+        print(f"[zmem] backup: snapshot {info['path']}")
+        print(f"[zmem] backup: integrity_check={info['integrity_check']}")
+        print(f"[zmem] backup: rows snapshot total={info['snapshot_total']} "
+              f"live={info['snapshot_live']} vs source total={info['source_total']} "
+              f"live={info['source_live']} - {info['count_note']}")
+
+        # Only now — after both checks passed — is this a successful backup.
+        # This is bookkeeping for `--if-due`, not part of the snapshot: the
+        # file on disk is already written and verified. A write/commit failure
+        # here must not escape as an unhandled traceback past `finally:
+        # _release_lock` and make a good backup look like a failed one. The
+        # only consequence of a missed row is that the next `--if-due` run
+        # takes an extra snapshot, which is the safe direction to fail.
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_backup', ?)",
+                (now_iso(),),
+            )
+            _commit(conn)
+        except sqlite3.Error as e:
+            print(f"[zmem] backup: WARNING - snapshot is good but recording "
+                  f"last_backup failed ({e}); the next --if-due run will take "
+                  f"another snapshot", file=sys.stderr)
+
+        removed = apply_retention(backup_dir, retention)
+        kept = len(list_snapshots(backup_dir))
+        if removed:
+            print(f"[zmem] backup: retention={retention} pruned {len(removed)} "
+                  f"old snapshot(s): {', '.join(p.name for p in removed)}")
+        print(f"[zmem] backup: {kept} snapshot(s) retained in {backup_dir}")
+        return 0
+    finally:
+        _release_lock("backup", token)
+
+
+def _integrity_check_readonly(path: Path) -> str:
+    """PRAGMA integrity_check on `path` opened STRICTLY read-only (uri mode=ro),
+    so a pre-flight check can never mutate the user's snapshot. Raises
+    sqlite3.Error / OSError on failure.
+
+    Our own snapshots are rollback-journal files, so a reader creates no
+    sidecars. A hand-supplied WAL-mode snapshot is different: opening it (even
+    read-only) makes SQLite materialize `-shm`/`-wal`, and a read-only
+    connection cannot checkpoint them away on close. Remove exactly the
+    sidecars that did NOT exist before we looked — never one that was already
+    there, since that one may hold real committed frames.
+    """
+    pre_existing = {s for s in SIDECAR_SUFFIXES if Path(str(path) + s).exists()}
+    uri = path.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        return conn.execute("PRAGMA integrity_check").fetchone()[0]
+    finally:
+        conn.close()
+        for s in SIDECAR_SUFFIXES:
+            if s in pre_existing:
+                continue
+            try:
+                sib = Path(str(path) + s)
+                if sib.exists():
+                    sib.unlink()
+            except OSError:
+                pass
+
+
+def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = None) -> int:
+    """Restore the store from a snapshot, under the maintenance locks.
+
+    Two guards wrap the real work in `_restore_locked`:
+
+    LOCAL-FS GUARD — the destination is a live WAL-mode sqlite file; a UNC path,
+    a network-mapped drive, or a OneDrive-synced dir risks exactly the
+    corruption `connect()` already refuses to court. `restore` writes the very
+    same file, so it applies the very same guard.
+
+    SINGLE-FLIGHT — `restore` overwrites store.sqlite wholesale while the two
+    automated background writers the SessionStart hook fires (`backup --if-due`
+    and `consolidate`) may be mid-run against it. Both are already
+    single-flighted on their own lockfiles, so restore takes BOTH, in a fixed
+    order, for its whole duration. Losing either means an automated job is
+    running right now: restore refuses (exit 2) WITHOUT touching the
+    destination, rather than proceeding. Unlike `backup`, whose lock loss is a
+    benign "someone else already did it" skip worth exit 0, a silently skipped
+    restore would tell a human "done" while their data is untouched.
+
+    NOT SOLVED, and deliberately so: a live interactive session writing to the
+    store through the normal `add`/`recall` path takes neither lock, so restore
+    still cannot serialize against it. Fixing that means coordinating with every
+    write path; the documented guidance (SKILL.md) remains "run restore when no
+    session is actively writing."
+    """
+    dest = STORE_PATH
+    if _host is not None:
+        try:
+            _host.assert_local_fs(dest.parent)
+        except ValueError as e:
+            print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
+            return 1
+
+    # Fixed acquisition order (backup, then consolidate); nothing else in this
+    # file takes both, so no deadlock is possible, and a half-acquired pair is
+    # always released before returning.
+    b_token = _acquire_lock("backup", BACKUP_LOCK_STALE_SECONDS)
+    if b_token is None:
+        print("[zmem] restore REFUSED: a backup is currently running - "
+              "destination untouched; re-run when it finishes", file=sys.stderr)
+        return 2
+    c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+    if c_token is None:
+        _release_lock("backup", b_token)
+        print("[zmem] restore REFUSED: a consolidation is currently running - "
+              "destination untouched; re-run when it finishes", file=sys.stderr)
+        return 2
+    try:
+        return _restore_locked(from_path=from_path, force=force, out_dir=out_dir)
+    finally:
+        _release_lock("consolidate", c_token)
+        _release_lock("backup", b_token)
+
+
+def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None = None) -> int:
+    """The restore body. Called only by cmd_restore(), which holds the `backup`
+    and `consolidate` locks for the whole of it. Returns a process exit code.
+
+    Deliberately NOT routed through main()'s connect()/init_db()/migrate()
+    path (see main()'s dispatch, which branches on `restore` before those
+    calls, exactly as `failures` does): on Windows an open sqlite3 connection
+    holds a file handle on the destination, and overwriting a file another
+    connection in this same process has open is precisely the thing to avoid.
+    Every connection this function opens is closed before the next step.
+
+    Order is load-bearing: verify the snapshot -> take the pre-restore safety
+    copy of the CURRENT store (which must still have its `-wal` frames intact,
+    so this happens BEFORE any sidecar removal) -> clear stale sidecars ->
+    copy -> checkpoint + re-verify.
+    """
+    snap = Path(from_path).expanduser()
+    dest = STORE_PATH
+
+    if not snap.is_file():
+        print(f"[zmem] restore FAILED: snapshot not found: {snap}", file=sys.stderr)
+        return 1
+
+    # --- 1. Verify the snapshot BEFORE touching the destination at all. ---
+    try:
+        snap_integrity = _integrity_check_readonly(snap)
+    except Exception as e:
+        print(f"[zmem] restore FAILED: cannot read snapshot {snap} read-only: {e}",
+              file=sys.stderr)
+        print("[zmem] restore: (a snapshot with a hot -wal sidecar must be "
+              "checkpointed before it can be restored)", file=sys.stderr)
+        return 1
+    if snap_integrity != "ok":
+        print(f"[zmem] restore FAILED: snapshot integrity_check={snap_integrity} "
+              f"- destination untouched", file=sys.stderr)
+        return 1
+    print(f"[zmem] restore: source snapshot {snap}")
+    print(f"[zmem] restore: snapshot integrity_check={snap_integrity}")
+
+    dest_exists = dest.exists()
+    if dest_exists and not force:
+        print(f"[zmem] restore FAILED: destination store already exists: {dest}\n"
+              f"       pass --force to overwrite it (a pre-restore backup of the "
+              f"current store is taken automatically).", file=sys.stderr)
+        return 1
+
+    # --- 2. Pre-restore safety copy of the CURRENT store, before any sidecar
+    # removal so its WAL frames are still part of the online-backup snapshot. ---
+    prerestore_path = None
+    if dest_exists and dest.stat().st_size > 0:
+        try:
+            backup_dir = _ensure_backup_dir(out_dir)
+            # Prefix is outside SNAPSHOT_GLOB on purpose — automatic rotation
+            # must never prune the copy this restore's rollback depends on.
+            pre_dest = _new_snapshot_path(backup_dir, PRERESTORE_PREFIX)
+            pre_info = create_snapshot(dest, pre_dest)
+            prerestore_path = pre_info["path"]
+            print(f"[zmem] restore: pre-restore backup {prerestore_path} "
+                  f"(integrity_check={pre_info['integrity_check']}, "
+                  f"total={pre_info['snapshot_total']} live={pre_info['snapshot_live']})")
+        except Exception as e:
+            print(f"[zmem] restore ABORTED: pre-restore backup of the current store "
+                  f"failed ({e}) — refusing to overwrite the only copy of it.",
+                  file=sys.stderr)
+            return 1
+    elif dest_exists:
+        print("[zmem] restore: pre-restore backup skipped - destination store is "
+              "an empty file (nothing to preserve)")
+    else:
+        print("[zmem] restore: pre-restore backup skipped - destination store "
+              "does not exist yet")
+
+    # --- 3. Clear stale sidecars, then copy. Old `-wal` frames (and any hot
+    # `-journal`) belong to the PREVIOUS store; leaving them next to a restored
+    # main file would let SQLite replay them onto it. ---
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in SIDECAR_SUFFIXES:
+        sib = Path(str(dest) + suffix)
+        try:
+            if sib.exists():
+                sib.unlink()
+                print(f"[zmem] restore: removed stale {sib.name}")
+        except OSError as e:
+            print(f"[zmem] restore FAILED: could not remove stale {sib.name}: {e}",
+                  file=sys.stderr)
+            # Sidecar removal is partial at this point, so the destination may
+            # already be inconsistent — the user needs the rollback path, same
+            # as every other post-pre-restore-backup failure branch below.
+            if prerestore_path:
+                print(f"[zmem] restore: roll back with "
+                      f"`store.py restore --from {prerestore_path} --force`", file=sys.stderr)
+            return 1
+
+    try:
+        shutil.copy2(snap, dest)
+        # A hand-supplied snapshot may carry its own sidecars; ours never do.
+        for suffix in ("-wal", "-shm"):
+            src_sib = Path(str(snap) + suffix)
+            if src_sib.exists():
+                shutil.copy2(src_sib, Path(str(dest) + suffix))
+                print(f"[zmem] restore: copied snapshot {src_sib.name}")
+    except OSError as e:
+        print(f"[zmem] restore FAILED: copy failed: {e}", file=sys.stderr)
+        # The copy may have been partial, so the destination store is not
+        # trustworthy — point at the safety copy taken in step 2.
+        if prerestore_path:
+            print(f"[zmem] restore: roll back with "
+                  f"`store.py restore --from {prerestore_path} --force`", file=sys.stderr)
+        return 1
+
+    # --- 4. Post-copy verification on the restored destination. ---
+    try:
+        conn = sqlite3.connect(str(dest))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            post_integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            total, live = _row_counts(conn)
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[zmem] restore FAILED: restored store could not be verified: {e}",
+              file=sys.stderr)
+        if prerestore_path:
+            print(f"[zmem] restore: roll back with "
+                  f"`store.py restore --from {prerestore_path} --force`", file=sys.stderr)
+        return 1
+
+    if _host is not None:
+        _host.set_owner_only_perms(dest)
+
+    print(f"[zmem] restore: destination {dest}")
+    print(f"[zmem] restore: post-restore integrity_check={post_integrity}")
+    print(f"[zmem] restore: restored rows total={total} live={live}")
+    if post_integrity != "ok":
+        print(f"[zmem] restore FAILED: post-restore integrity_check={post_integrity}",
+              file=sys.stderr)
+        if prerestore_path:
+            print(f"[zmem] restore: roll back with "
+                  f"`store.py restore --from {prerestore_path} --force`", file=sys.stderr)
+        return 1
+    print("[zmem] restore: OK")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Unified failure detection (`failures` subcommand)
+# ---------------------------------------------------------------------------
+# Detects failed tool calls for a session from one of two substrates:
+#   - a Claude Code transcript JSONL (--transcript) — scanned for tool_result
+#     blocks with is_error:true (and/or a top-level toolUseResult "Error…"), OR
+#   - the ZCode episodic db.sqlite (--session) — the tool_usage table query the
+#     reflect hook used to run inline.
+# Returns {"count": N, "details": [...]} JSON. FAIL-OPEN: on ANY error or parse
+# failure it returns an empty result — a memory hiccup must never wedge a hook.
+#
+# The untrusted-error-text fencing lives here (`_sanitize_error_text`): each
+# detail's error string is stripped of newlines/CR and truncated. Newline
+# removal is the load-bearing fence-integrity mechanism — with no newlines, an
+# embedded ``` or fake "SYSTEM:" directive in tool output can never form its own
+# line and therefore can never break out of the code fence the consumer wraps it
+# in. The consumer (reflect.sh) does the ``` fence-wrap + "untrusted data only"
+# framing; this function guarantees the strings it hands back are fence-safe.
+
+def _sanitize_error_text(text, limit: int = 200) -> str:
+    """Make an untrusted tool-error string safe to embed in a fenced block:
+    collapse CR/newlines to spaces (fence-integrity), then truncate. Preserves
+    the error's characters otherwise so it stays diagnostically useful."""
+    if not text:
+        return ""
+    s = str(text).replace("\r", " ").replace("\n", " ")
+    return s[:limit].strip()
+
+
+def _sanitize_tool_name(name, limit: int = 100) -> str:
+    """Defense-in-depth (Phase 8): strip CR/newlines from a tool name before it
+    is interpolated into a fenced block by reflect.sh/subagent-reflect.sh. Not
+    currently exploitable — tool names come from the harness's own tool_use
+    blocks / tool_usage rows, not from untrusted tool output — but a newline
+    here would let a forged fence-close ('\\n```') slip past the same
+    fence-integrity guarantee _sanitize_error_text gives the error text."""
+    if not name:
+        return "?"
+    s = str(name).replace("\r", " ").replace("\n", " ").strip()
+    return s[:limit] or "?"
+
+
+def _result_text(content) -> str:
+    """Extract text from a tool_result block's `content`, which CC emits as
+    either a plain string or a list of {type:"text", text:"..."} blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text") or "")
+            elif isinstance(b, str):
+                parts.append(b)
+        return " ".join(p for p in parts if p)
+    return ""
+
+
+def _failures_from_transcript(path: str):
+    """Scan a Claude Code transcript JSONL for failed tool calls. Returns a list
+    of {tool, error} dicts (one per distinct failed tool_use_id). Fail-open:
+    returns [] on any read/parse error. Never raises."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            raw_lines = [ln for ln in f if ln.strip()]
+    except OSError:
+        return []
+
+    records = []
+    for ln in raw_lines:
+        try:
+            records.append(json.loads(ln))
+        except Exception:
+            continue  # skip malformed lines, keep scanning
+
+    # Pass 1: map tool_use_id -> tool name from assistant tool_use blocks.
+    tool_names = {}
+    for o in records:
+        msg = o.get("message") if isinstance(o, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    tid = b.get("id")
+                    if tid:
+                        tool_names[tid] = b.get("name") or "?"
+
+    # Pass 2: collect failed tool_result blocks, deduped by tool_use_id so the
+    # is_error flag and the sibling toolUseResult "Error…" string on the same
+    # record never double-count one failure.
+    details = []
+    seen = set()
+    for o in records:
+        if not isinstance(o, dict):
+            continue
+        msg = o.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        tur = o.get("toolUseResult")
+        tur_is_err = isinstance(tur, str) and tur.strip().lower().startswith("error")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict) or b.get("type") != "tool_result":
+                continue
+            is_err = b.get("is_error") is True
+            if not (is_err or tur_is_err):
+                continue
+            tid = b.get("tool_use_id")
+            key = tid if tid else ("anon:%d" % len(seen))
+            if key in seen:
+                continue
+            seen.add(key)
+            err_text = _result_text(b.get("content"))
+            if not err_text and isinstance(tur, str):
+                err_text = tur
+            details.append({
+                "tool": _sanitize_tool_name(tool_names.get(tid, "?")),
+                "error": _sanitize_error_text(err_text),
+            })
+    return details
+
+
+def _failures_from_db(db_path: str, session_id: str):
+    """Detect failed tool calls for a session from the ZCode episodic db.sqlite.
+    Returns (count, details). The load-bearing detection uses ONLY the columns
+    the original reflect query used (session_id, read_only, status, exit_code);
+    enrichment columns (error_message, error_type, retry_count, destructive) are
+    read in a SEPARATE try/except so a schema drift degrades to bare counts but
+    never disables detection. Fail-open: (0, []) on any error."""
+    if not session_id or not db_path or not os.path.isfile(db_path):
+        return 0, []
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            """
+            SELECT count(*) FROM tool_usage
+            WHERE session_id = ?
+              AND COALESCE(read_only, 0) = 0
+              AND (status = 'error' OR (exit_code IS NOT NULL AND exit_code != 0))
+            """,
+            (session_id,),
+        ).fetchone()
+        count = row[0] if row else 0
+    except Exception:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return 0, []
+
+    if count == 0:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return 0, []
+
+    details = []
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT tool_name, error_message, error_type, retry_count,
+                   COALESCE(destructive, 0) AS destructive
+            FROM tool_usage
+            WHERE session_id = ?
+              AND COALESCE(read_only, 0) = 0
+              AND (status = 'error' OR (exit_code IS NOT NULL AND exit_code != 0))
+            ORDER BY completed_at DESC
+            LIMIT 50
+            """,
+            (session_id,),
+        ).fetchall()
+        for r in rows:
+            details.append({
+                "tool": _sanitize_tool_name(r["tool_name"] or "?"),
+                "error": _sanitize_error_text(r["error_message"] or ""),
+                "error_type": r["error_type"] or "",
+                "retry_count": r["retry_count"] or 0,
+                "destructive": bool(r["destructive"]),
+            })
+    except Exception:
+        # Enrichment columns absent — detection already succeeded, so surface
+        # bare placeholders so the count is still actionable.
+        details = [{"tool": "?", "error": ""} for _ in range(count)]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return count, details
+
+
+def cmd_failures(session: str, transcript: str, db: str) -> None:
+    """Print {"count":N,"details":[...]} for the session's failed tool calls.
+    Transcript wins when given and present (Claude Code); else the db substrate
+    (ZCode). Entirely self-contained — does NOT open the ZMem store — and
+    fail-open: prints an empty result on any error, always exits 0."""
+    try:
+        if transcript and os.path.isfile(transcript):
+            details = _failures_from_transcript(transcript)
+            result = {"count": len(details), "details": details}
+        else:
+            count, details = _failures_from_db(db, session)
+            result = {"count": count, "details": details}
+    except Exception:
+        result = {"count": 0, "details": []}
+    print(json.dumps(result))
+
+
 def main():
     ap = argparse.ArgumentParser(prog="store.py", description="ZMem semantic store")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1252,12 +2574,19 @@ def main():
     p_recall.add_argument("--json", action="store_true")
     p_recall.add_argument("--hybrid", action="store_true",
                           help="use hybrid BM25+vector recall (requires onnxruntime)")
+    p_recall.add_argument("--no-bump", action="store_true",
+                          help="suppress the retrieval_count/last_retrieved write "
+                               "(READ-ONLY recall; used by hook-driven recall so "
+                               "subagent fan-out does not create N concurrent writers)")
 
     p_recent = sub.add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
     p_recent.add_argument("--limit", type=int, default=5)
     p_recent.add_argument("--min-confidence", type=float, default=0.5)
     p_recent.add_argument("--json", action="store_true")
+    p_recent.add_argument("--no-bump", action="store_true",
+                          help="suppress the retrieval_count/last_retrieved write "
+                               "(READ-ONLY; used by hook-driven subagent recall)")
 
     p_search = sub.add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
@@ -1284,7 +2613,7 @@ def main():
 
     p_consolidate = sub.add_parser("consolidate", help="merge near-duplicate memories")
     p_consolidate.add_argument("--threshold", type=float,
-                               default=float(os.environ.get("ZMEM_CONSOLIDATE_THRESHOLD", "0.80")))
+                               default=CONSOLIDATE_DEFAULT_THRESHOLD)
     p_consolidate.add_argument("--prune", action="store_true",
                                help="also supersede low-value never-retrieved memories")
     p_consolidate.add_argument("--dry-run", action="store_true",
@@ -1299,8 +2628,71 @@ def main():
                            help="promote a specific memory by UUID")
     p_promote.add_argument("--namespace", default=None,
                            help="limit candidates to a specific namespace")
+    p_promote.add_argument("--description", default=None,
+                           help="override the synthesized trigger description verbatim "
+                                "(used with --id --confirm)")
+    p_promote.add_argument("--confirm", action="store_true",
+                           help="explicit human-in-the-loop confirmation for the write path "
+                                "(documented gate: --id <uuid> --confirm); optional/no-op — "
+                                "--id alone is sufficient, this flag exists so the "
+                                "--id/--confirm pairing reads unambiguously at the call site")
+
+    p_backup = sub.add_parser(
+        "backup", help="take a verified, retention-rotated snapshot of the store")
+    p_backup.add_argument("--retention", type=int, default=BACKUP_DEFAULT_RETENTION,
+                          help=f"keep the newest N '{SNAPSHOT_GLOB}' snapshots and delete "
+                               f"only the oldest beyond that (default "
+                               f"{BACKUP_DEFAULT_RETENTION}; 0 disables pruning). "
+                               f"Nothing else in the backup dir is ever touched.")
+    p_backup.add_argument("--out-dir", default=None,
+                          help="backup directory override (default: $ZMEM_BACKUP_DIR, "
+                               "else <store dir>/backups)")
+    p_backup.add_argument("--if-due", action="store_true",
+                          help="no-op unless $ZMEM_BACKUP_INTERVAL_DAYS (default 1) has "
+                               "elapsed since the last successful backup; used by the "
+                               "SessionStart hook so the automatic trigger is cheap. "
+                               "Without this flag the backup always runs.")
+
+    p_restore = sub.add_parser(
+        "restore", help="restore the store from a snapshot (verifies first, "
+                        "backs up the current store first)")
+    p_restore.add_argument("--from", dest="from_path", required=True,
+                           help="path to the snapshot .sqlite to restore from")
+    p_restore.add_argument("--force", action="store_true",
+                           help="required to overwrite an existing destination store")
+    p_restore.add_argument("--out-dir", default=None,
+                           help="where to put the pre-restore backup (default: same as "
+                                "`backup`)")
+
+    p_fail = sub.add_parser(
+        "failures",
+        help="detect failed tool calls for a session (transcript JSONL or db.sqlite)")
+    p_fail.add_argument("--session", default="",
+                        help="session id (used with the db.sqlite substrate)")
+    p_fail.add_argument("--transcript", default="",
+                        help="Claude Code transcript JSONL path (wins when present)")
+    p_fail.add_argument("--db", default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
+                        help="ZCode episodic db.sqlite path (default ~/.zcode/cli/db/db.sqlite)")
 
     args = ap.parse_args()
+
+    # `failures` is store-independent (it reads a transcript JSONL or the ZCode
+    # episodic db, never the ZMem store) and must be fail-open: branch BEFORE
+    # connect()/assert_local_fs()/migrate() so a bad ZMEM_DATA location, a
+    # locked store, or a mid-migration state can never break failure detection.
+    if args.cmd == "failures":
+        cmd_failures(session=args.session, transcript=args.transcript, db=args.db)
+        return
+
+    # `restore` overwrites the destination store FILE. It must not hold an open
+    # sqlite3 connection on that file while doing so (a Windows file handle can
+    # block the overwrite), so — following the `failures` precedent above — it
+    # is dispatched BEFORE connect()/init_db()/migrate() and does its own
+    # minimal, self-contained, open-close-per-step file work.
+    if args.cmd == "restore":
+        sys.exit(cmd_restore(from_path=args.from_path, force=args.force,
+                             out_dir=args.out_dir))
+
     conn = connect()
     init_db(conn)
     migrate(conn)
@@ -1320,10 +2712,12 @@ def main():
         )
     elif args.cmd == "recall":
         recall_memory(conn, query=args.query, namespace=args.namespace,
-                      limit=args.limit, as_json=args.json, hybrid=args.hybrid)
+                      limit=args.limit, as_json=args.json, hybrid=args.hybrid,
+                      no_bump=args.no_bump)
     elif args.cmd == "recent":
         recent_memory(conn, namespace=args.namespace, limit=args.limit,
-                      min_confidence=args.min_confidence, as_json=args.json)
+                      min_confidence=args.min_confidence, as_json=args.json,
+                      no_bump=args.no_bump)
     elif args.cmd == "search":
         recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
                       as_json=False, min_confidence=0.0)
@@ -1343,11 +2737,32 @@ def main():
     elif args.cmd == "reembed":
         _reembed(conn)
     elif args.cmd == "consolidate":
-        consolidate(conn, threshold=args.threshold, prune=args.prune,
-                    dry_run=args.dry_run, namespace=args.namespace)
+        # Single-flight: consolidate() writes, and the SessionStart hook fires a
+        # detached one per session. Its meta-key cadence gate is a SOFT gate
+        # (read-then-later-write), so without this lock two near-simultaneous
+        # runs both pass it and both run the clustering loop. --dry-run writes
+        # nothing, so it is deliberately never gated (and never takes the lock).
+        c_token = None
+        if not args.dry_run:
+            c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+            if c_token is None:
+                print("[zmem] consolidate: another consolidation is already "
+                      "running - skipped")
+                conn.close()
+                return
+        try:
+            consolidate(conn, threshold=args.threshold, prune=args.prune,
+                        dry_run=args.dry_run, namespace=args.namespace)
+        finally:
+            _release_lock("consolidate", c_token)
+    elif args.cmd == "backup":
+        rc = cmd_backup(conn, retention=args.retention, out_dir=args.out_dir,
+                        if_due=args.if_due)
+        conn.close()
+        sys.exit(rc)
     elif args.cmd == "promote":
         promote_memory(conn, memory_id=args.id, dry_run=args.dry_run,
-                       namespace=args.namespace)
+                       namespace=args.namespace, description=args.description)
     conn.close()
 
 

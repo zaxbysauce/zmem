@@ -5,5 +5,5 @@
   "author": { "name": "Brett", "url": "https://github.com/ZaxbyHub" },
   "license": "MIT",
   "skills": "skills",
-  "hooks": "hooks"
+  "hooks": "hooks/hooks.zcode.json"
 }

@@ -84,6 +84,51 @@ automatically on SessionStart when the store has grown >20% since the last run
 (min 7 days between runs). Use `--dry-run` to preview clusters without changes.
 `--prune` also removes low-value never-retrieved memories (opt-in, never automatic).
 
+Consolidation is **single-flighted**: concurrent runs (several sessions starting
+at once) take an advisory lockfile in the store dir, and the losers skip cleanly
+and exit 0 rather than clustering the same rows twice.
+
+### backup — verified snapshot with retention
+```
+python <store.py> backup [--retention 7] [--out-dir DIR] [--if-due]
+```
+Writes `store-<UTC timestamp>.sqlite` into the backup dir (`--out-dir`, else
+`$ZMEM_BACKUP_DIR`, else `<store dir>/backups`) using SQLite's Online Backup API,
+which is safe while other sessions are writing to the store. The snapshot is
+verified (`PRAGMA integrity_check` **and** a total/live row-count comparison
+against the source) before it counts as a backup — if either check fails the
+snapshot file is deleted, the command exits non-zero, and neither the
+`last_backup` marker nor retention rotation happens.
+
+Retention deletes only the **oldest** files matching `store-*.sqlite` beyond the
+newest N. Nothing else in the directory is ever touched — including the
+`prerestore-*` safety copies `restore` leaves behind. `--retention 0` disables
+pruning.
+
+`--if-due` makes the command a no-op unless `$ZMEM_BACKUP_INTERVAL_DAYS`
+(default 1) has elapsed since the last successful backup; the SessionStart hook
+uses it so the automatic snapshot is cheap almost every session. Without the
+flag the backup always runs. Also single-flighted (its own lockfile).
+
+### restore — recover the store from a snapshot
+```
+python <store.py> restore --from <snapshot.sqlite> [--force] [--out-dir DIR]
+```
+Refuses unless `--force` when a store already exists. Verifies the snapshot's
+own `integrity_check` **before** touching the destination, then takes a
+`prerestore-<timestamp>.sqlite` copy of the current store (your rollback path —
+deliberately outside the retention glob so rotation can never prune it), clears
+stale `-wal`/`-shm` sidecars, copies, and re-verifies the restored store.
+
+Takes **both** maintenance locks (`backup` and `consolidate`) for its whole
+duration, so it cannot race the automated background snapshot/consolidation the
+SessionStart hook fires, and refuses a destination that is not on a local
+filesystem (no UNC/network/OneDrive path). If either lock is held it exits **2**
+without touching the destination — a skipped restore must never look like a
+completed one. This does *not* serialize against a live interactive session's
+own `add`/`recall` writes, which take no lock: still run `restore` when no
+session is actively writing.
+
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite
   file. The write-time filter is advisory only (regex heuristic), not a guarantee.
@@ -118,6 +163,25 @@ bulk imports or if the index drifts):
 ```
 python <store.py> rebuild-fts
 ```
+
+## Sole memory system on Claude Code (replace native)
+When running under Claude Code with native memory turned off (`autoMemoryEnabled:
+false` in `~/.claude/settings.json`, or `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), ZMem
+is the **only** memory system in play — it is not layered on top of CC's own
+memory. In that mode:
+- `store.py add` / `recall` (this skill) is the canonical, sole path for
+  capturing and retrieving durable knowledge. Treat it exactly as you would
+  native memory on any other host.
+- **Do not hand-write** into CC's native `~/.claude/.../memory/` files or
+  `MEMORY.md` — that mechanism is intentionally disabled, and writing to it
+  would silently resurrect the duplicate-memory problem "replace native" exists
+  to avoid.
+- Project-level Tier 0 is `CLAUDE.md` (CC's own always-on mechanism, untouched
+  by ZMem) — not `AGENTS.md`. The SessionStart hook does not inject `AGENTS.md`
+  on Claude Code for this reason; it still does on ZCode.
+- If a SessionStart nudge appears telling you native memory still looks
+  enabled, that is informational for the user (a plugin cannot flip the
+  setting itself) — no action needed from you beyond surfacing it once.
 
 ## The reflection loop (Loop 1)
 The `zmem-reflect.sh` Stop hook checks the episodic db for failed tool calls

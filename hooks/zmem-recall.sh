@@ -66,7 +66,7 @@ join_path() {
   local base="$1"; shift
   local sep
   if [ "$IS_WINDOWS" -eq 1 ]; then
-    sep='\\'
+    sep='\'
   else
     sep='/'
   fi
@@ -76,15 +76,16 @@ join_path() {
   done
 }
 
-PLUGIN_ROOT="${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}"
-DATA_DIR="${ZCODE_PLUGIN_DATA:-}"
-PROJECT="${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}"
+# Canonical env from the host adapter (zmem-launch.js); legacy vars as fallback.
+PLUGIN_ROOT="${ZMEM_ROOT:-${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}"
+DATA_DIR="${ZMEM_DATA:-${ZCODE_PLUGIN_DATA:-}}"
+PROJECT="${ZMEM_PROJECT:-${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}"
 
 # --- Resolve data dir --------------------------------------------------------
 if [ -n "$DATA_DIR" ]; then
   DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
 else
-  DATA_DIR_PY="$(join_path "$(to_py_path "$HOME")" .zcode memory)"
+  DATA_DIR_PY="$(join_path "$(to_py_path "$HOME")" .zmem)"
 fi
 
 # --- Resolve store.py path --------------------------------------------------
@@ -94,17 +95,28 @@ if [ -z "$PLUGIN_ROOT" ]; then
 fi
 STORE_PY_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts store.py)"
 
-# Export env so store.py finds its store via ZCODE_PLUGIN_DATA.
-export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-$DATA_DIR}"
+# Export the store location so store.py resolves it (chain:
+# ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem > ~/.zcode).
+export ZMEM_DATA="${ZMEM_DATA:-$DATA_DIR}"
+export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 
-# --- Determine namespace from project ---------------------------------------
-NS="user:global"
-if [ -n "$PROJECT" ]; then
-  NS="project:$(basename "$PROJECT")"
+# --- Determine namespace ----------------------------------------------------
+# Canonical key from the host adapter (closes the basename/remote split so
+# migrated projects recall their rows). Fall back to the legacy basename key
+# when the adapter did not run.
+NS="${ZMEM_NAMESPACE:-}"
+if [ -z "$NS" ]; then
+  if [ -n "$PROJECT" ]; then
+    NS="project:$(basename "$PROJECT")"
+  else
+    NS="user:global"
+  fi
 fi
+BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 
 # --- Build the recall payload via python (guaranteed-valid JSON) ------------
-printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
+# Captured (not streamed) so we can wrap it in the sentinel below.
+OUT="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
 import json, os, sys, subprocess
 
 raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
@@ -122,6 +134,10 @@ if not prompt or not prompt.strip() or len(prompt.strip()) < 5:
 
 store_py = sys.argv[1]
 ns = sys.argv[2]
+try:
+    budget = int(sys.argv[3])
+except (IndexError, ValueError):
+    budget = 25000
 
 if not store_py or not os.path.isfile(store_py):
     print("{}")
@@ -137,6 +153,7 @@ try:
          "--query", prompt[:500],  # cap query length
          "--namespace", ns,
          "--limit", "5",
+         "--no-bump",  # READ-ONLY: hook-driven recall must not write (PLAN.md §5)
          "--json"],
         stderr=subprocess.DEVNULL, timeout=10,
     ).decode("utf-8", "replace")
@@ -158,14 +175,32 @@ total_chars = 0
 for r in rows:
     content = (r.get("content") or "")[:300]
     signal = r.get("signal", "?")
-    entry = "- [%s] %s" % (signal, content)
+    # store.py flags a memory whose file: source_ref changed since extraction
+    # via a separate "stale" boolean (its confidence is halved, but that alone
+    # does NOT push it under the recall floor, so stale rows DO surface).
+    # The note lives only in store.py'"'"'s human-readable print branch, so the
+    # injected context has to render it here or the agent never sees it.
+    stale = " [STALE SOURCE]" if r.get("stale") else ""
+    entry = "- [%s]%s %s" % (signal, stale, content)
     total_chars += len(entry)
-    if total_chars > 25000:  # stay well under the 32KB budget
+    if budget > 0 and total_chars > budget:  # soft cap; launcher enforces hard encoded budget
         break
     lines.append(entry)
 
 ctx = "\n".join(lines)
 print(json.dumps({"additionalContext": ctx}))
-' "$STORE_PY_PY" "$NS" 2>/dev/null || echo '{}'
+' "$STORE_PY_PY" "$NS" "$BUDGET" 2>/dev/null || echo '{}')"
 
+# Neutralize any sentinel token that a MEMORY'S OWN CONTENT happens to contain
+# before wrapping. The launcher locates the payload by scanning stdout for the
+# literal markers, so a stored memory containing "<<<ZMEM_JSON>>>" would move
+# the extraction boundary into the middle of the JSON, the parse would fail, and
+# the whole recall would silently degrade to {} (a self-DoS of this turn's
+# recall — fail-open, not an injection vector). Both replacements are safe
+# inside the serialized JSON string: neither introduces a quote or a backslash.
+OUT="${OUT//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
+OUT="${OUT//<<<END>>>/<<<END_NEUTRALIZED>>>}"
+
+# Wrap the payload in the sentinel so the host adapter can extract it robustly.
+printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' "$OUT"
 exit 0
