@@ -120,6 +120,62 @@ class ChecksumAndDownloadTests(unittest.TestCase):
         # Actionable: tells the user how to fix it.
         self.assertIn("zmem_model_url", message)
 
+    def test_redact_url_for_logging_strips_userinfo_and_query_values(self):
+        """Unit-level: ZMEM_MODEL_URL can legitimately carry credentials
+        (https://user:token@host/path) or presigned-style query tokens
+        (?sig=...), and neither may ever reach a printed/logged message.
+        Tests the helper directly (no network, no _try_download_model
+        involved) since the URL below is not resolvable and must never
+        actually be fetched."""
+        secret_url = "https://user:secrettoken@example.com/model.onnx?sig=abc123"
+        safe = embeddings._redact_url_for_logging(secret_url)
+        self.assertNotIn("secrettoken", safe)
+        self.assertNotIn("abc123", safe)
+        # Stays actionable: scheme + host + path survive.
+        self.assertIn("example.com", safe)
+        self.assertIn("model.onnx", safe)
+
+    def test_checksum_mismatch_message_redacts_url_credentials(self):
+        """finding: the checksum-mismatch message must never leak credentials
+        or query-string tokens from a hostile-looking ZMEM_MODEL_URL, when
+        the real download-and-verify path (_try_download_model) hits a
+        checksum mismatch. `https://user:token@host/...?sig=...` isn't a
+        fetchable `file://` fixture, so urllib.request.urlopen is patched to
+        serve fixture bytes regardless of the requested URL -- never a real
+        network fetch, per repo convention -- while the credentialed/
+        presigned URL string itself still flows through unchanged to the
+        message-building code, exercising the exact path that runs in
+        production."""
+        dest = Path(self.tmp) / "downloaded_redact" / "minilm.onnx"
+        other = Path(self.tmp) / "different_bytes3.bin"
+        other.write_bytes(b"totally different content" * 50)  # mismatches self.fixture_sha256
+
+        secret_url = "https://user:secrettoken@example.com/model.onnx?sig=abc123"
+
+        import io
+        import unittest.mock
+        from contextlib import redirect_stderr
+
+        class _FakeResponse:
+            def __enter__(self):
+                self._f = open(other, "rb")
+                return self._f
+            def __exit__(self, *a):
+                self._f.close()
+
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            with unittest.mock.patch("urllib.request.urlopen", return_value=_FakeResponse()):
+                ok = embeddings._try_download_model(dest, url=secret_url, expected_sha256=self.fixture_sha256)
+        self.assertFalse(ok)
+        message = captured.getvalue()
+        self.assertNotIn("secrettoken", message)
+        self.assertNotIn("abc123", message)
+        # Still actionable.
+        self.assertIn("checksum mismatch", message.lower())
+        self.assertIn("no-embeddings", message.lower())
+        self.assertIn("zmem_model_url", message.lower())
+
     def test_concurrent_download_attempts_use_distinct_temp_files(self):
         """Two 'concurrent' download attempts (simulated sequentially here,
         per repo convention of never doing real network I/O) must not share

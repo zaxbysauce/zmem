@@ -90,6 +90,40 @@ def verify_checksum(path: Path, expected: str | None = None) -> bool:
         return False
 
 
+def _redact_url_for_logging(url: str) -> str:
+    """Return `url` with any credentials/tokens stripped, safe to print/log.
+
+    `ZMEM_MODEL_URL` is user/environment-controlled and can legitimately carry
+    credentials (`https://user:token@host/path`) or a presigned-style query
+    string (`?sig=...`, `?token=...`). Neither should ever reach stderr/logs.
+    Keeps the message actionable (scheme, host, and path survive) while
+    dropping userinfo entirely and replacing every query value with a
+    placeholder. Uses `urllib.parse` rather than a regex so this can't be
+    fooled by unusual-but-valid URL syntax. Never raises: an unparseable
+    `url` is returned as a fixed placeholder rather than echoed verbatim.
+    """
+    import urllib.parse
+
+    try:
+        parts = urllib.parse.urlsplit(url)
+        netloc = parts.hostname or ""
+        if parts.port:
+            netloc += f":{parts.port}"
+        redacted_query = ""
+        if parts.query:
+            keys = [
+                kv.split("=", 1)[0]
+                for kv in parts.query.split("&")
+                if kv
+            ]
+            redacted_query = "&".join(f"{k}=REDACTED" for k in keys)
+        return urllib.parse.urlunsplit(
+            (parts.scheme, netloc, parts.path, redacted_query, "")
+        )
+    except Exception:
+        return "<redacted>"
+
+
 def _try_download_model(
     model_path: Path, url: str | None = None, expected_sha256: str | None = None
 ) -> bool:
@@ -106,6 +140,7 @@ def _try_download_model(
     import urllib.request
 
     resolved_url = url or os.environ.get("ZMEM_MODEL_URL", _DEFAULT_MODEL_URL)
+    safe_url = _redact_url_for_logging(resolved_url)
     # Unique per-attempt temp name (pid + random suffix) so two concurrent
     # download attempts (e.g. multiple hook processes racing on first use)
     # never write to the same intermediate file.
@@ -123,7 +158,7 @@ def _try_download_model(
                     out.write(chunk)
         if not verify_checksum(tmp_path, expected_sha256):
             print(
-                f"zmem: downloaded model checksum mismatch (url={resolved_url}) "
+                f"zmem: downloaded model checksum mismatch (url={safe_url}) "
                 "-- falling back to no-embeddings. The default download URL is "
                 "not guaranteed to produce a build matching the pinned "
                 "ZMEM_MODEL_SHA256; set ZMEM_MODEL_URL to a build matching the "

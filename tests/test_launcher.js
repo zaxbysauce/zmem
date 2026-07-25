@@ -924,6 +924,154 @@ console.log("\n[15] Recall survives a memory whose CONTENT contains the sentinel
     }
 }
 
+console.log("\n[16] injection: hostile origin remote must not escape reflect / capture-failure / subagent-reflect suggested commands");
+
+{
+    // Same vulnerability class as block [12]'s convention-capture test, applied
+    // to the three remaining hooks that render a suggested `store.py add ...`
+    // command from a git-remote-derived (repository-controlled) namespace:
+    // zmem-reflect.sh (two rendered sites: the no-failures success nudge AND
+    // the failures-detected prompt), zmem-capture-failure.sh, and
+    // zmem-subagent-reflect.sh. All three drive the REAL hook through the REAL
+    // launcher against a REAL git repo with a hostile origin remote.
+    function makeHostileRepo(name) {
+        const dir = path.join(TMP, name);
+        fs.mkdirSync(dir, { recursive: true });
+        const canary = path.join(dir, "PWNED_CANARY");
+        const hostileRemote = '"; $(touch ' + canary.replace(/\\/g, "/") + '); echo "';
+        execFileSync("git", ["init", "-q"], { cwd: dir });
+        execFileSync("git", ["remote", "add", "origin", hostileRemote], { cwd: dir });
+        const hostileNs = resolveNs(dir);
+        ok("injection[" + name + "]: hostile origin survives into the resolved namespace (sanity)",
+            hostileNs.indexOf('"') !== -1 && hostileNs.indexOf("$(") !== -1, hostileNs);
+        return { dir, canary };
+    }
+
+    // Extract the suggested `store.py add ...` command from additionalContext,
+    // run it through bash exactly as a copy-pasting agent would, and assert the
+    // canary was NOT created. Fixed: shlex.quote() renders the hostile content as
+    // inert single-quoted text. Broken (pre-fix): bash expands $(touch ...) while
+    // parsing the command line, creating the canary before python ever runs.
+    //
+    // reflect/subagent-reflect/convention-capture wrap the suggested command in
+    // a SINGLE pair of backticks; capture-failure does not backtick-fence it at
+    // all (it's just an indented line terminated by a real newline). Handle
+    // both shapes rather than assuming backtick-fencing everywhere.
+    function extractSuggestedCommand(ac) {
+        const backtick = /`([^`]*store\.py[^`]*)`/.exec(ac);
+        if (backtick) return backtick[1];
+        const line = /^[ \t]*(\S[^\n]*store\.py[^\n]*)$/m.exec(ac);
+        if (line) return line[1].replace(/`/g, "");
+        return null;
+    }
+    function runSuggestedAndCheckCanary(label, ac, canary) {
+        const cmd = extractSuggestedCommand(ac);
+        ok("injection[" + label + "]: rendered a suggested command", cmd !== null, ac.slice(0, 300));
+        if (!cmd) return;
+        const runDir = fs.mkdtempSync(path.join(TMP, "hostile-run-"));
+        const br = spawnSync("bash", ["-c", cmd], { cwd: runDir, encoding: "utf8", timeout: 15000 });
+        ok("injection[" + label + "]: canary file was NOT created (no command injection)",
+            !fs.existsSync(canary), "bash stderr: " + (br.stderr || "").slice(0, 300));
+    }
+
+    // --- reflect: end-to-end, FAILURES branch (the 2nd unquoted site, ~L253) ---
+    {
+        const { dir: GITPROJ, canary: CANARY } = makeHostileRepo("hostile-reflect-fail");
+        const HDATA = path.join(TMP, "hostile-reflect-fail-data");
+        fs.mkdirSync(HDATA, { recursive: true });
+        seed(HDATA, "user:global", "fact", "seed row to create the store schema.", 0.9);
+
+        const TRANSCRIPT = path.join(TMP, "hostile-reflect-fail.jsonl");
+        fs.writeFileSync(TRANSCRIPT, [
+            JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+                { type: "tool_use", id: "htu1", name: "Bash", input: { command: "false" } }] } }),
+            JSON.stringify({ type: "user", message: { role: "user", content: [
+                { type: "tool_result", content: "Exit code 1", is_error: true, tool_use_id: "htu1" }] },
+                toolUseResult: "Error: Exit code 1" }),
+        ].join("\n") + "\n");
+
+        const r = runLauncher("reflect", JSON.stringify({
+            session_id: "reflect-hostile-fail-" + Date.now(), transcript_path: TRANSCRIPT,
+            cwd: GITPROJ, hook_event_name: "Stop", stop_hook_active: false,
+        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("injection[reflect-fail]: hook still renders the failure reflection prompt",
+            /failed tool call/.test(ac), ac.slice(0, 300));
+        runSuggestedAndCheckCanary("reflect-fail", ac, CANARY);
+    }
+
+    // --- reflect: end-to-end, NO-FAILURES branch (the 1st unquoted site, ~L208) ---
+    {
+        const { dir: GITPROJ, canary: CANARY } = makeHostileRepo("hostile-reflect-nofail");
+        const HDATA = path.join(TMP, "hostile-reflect-nofail-data");
+        fs.mkdirSync(HDATA, { recursive: true });
+        seed(HDATA, "user:global", "fact", "seed row to create the store schema.", 0.9);
+
+        const TRANSCRIPT = path.join(TMP, "hostile-reflect-nofail.jsonl");
+        fs.writeFileSync(TRANSCRIPT, JSON.stringify({ type: "assistant",
+            message: { role: "assistant", content: [{ type: "text", text: "done" }] } }) + "\n");
+
+        const r = runLauncher("reflect", JSON.stringify({
+            session_id: "reflect-hostile-nofail-" + Date.now(), transcript_path: TRANSCRIPT,
+            cwd: GITPROJ, hook_event_name: "Stop", stop_hook_active: false,
+        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("injection[reflect-nofail]: hook still renders the success-reflection nudge",
+            /ZMem reflection/.test(ac), ac.slice(0, 300));
+        runSuggestedAndCheckCanary("reflect-nofail", ac, CANARY);
+    }
+
+    // --- capture-failure: end-to-end (PostToolUseFailure) ----------------------
+    {
+        const { dir: GITPROJ, canary: CANARY } = makeHostileRepo("hostile-capture-failure");
+        const HDATA = path.join(TMP, "hostile-capture-failure-data");
+        fs.mkdirSync(HDATA, { recursive: true });
+
+        const r = runLauncher("capture-failure", JSON.stringify({
+            session_id: "cf-hostile-" + Date.now(), cwd: GITPROJ, tool_name: "Bash",
+            tool_input: { command: "false" }, error: "Exit code 1",
+        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("injection[capture-failure]: hook still renders the auto-capture prompt",
+            /auto-capture/.test(ac), ac.slice(0, 300));
+        runSuggestedAndCheckCanary("capture-failure", ac, CANARY);
+    }
+
+    // --- subagent-reflect: end-to-end (SubagentStop, subagent's own transcript) ---
+    {
+        const { dir: GITPROJ, canary: CANARY } = makeHostileRepo("hostile-subagent-reflect");
+        const HDATA = path.join(TMP, "hostile-subagent-reflect-data");
+        fs.mkdirSync(HDATA, { recursive: true });
+        seed(HDATA, "user:global", "fact", "seed row to create the store schema.", 0.9);
+
+        const AGENT_TX = path.join(TMP, "hostile-subagent.jsonl");
+        fs.writeFileSync(AGENT_TX, [
+            JSON.stringify({ type: "assistant", message: { role: "assistant", content: [
+                { type: "tool_use", id: "hatu1", name: "Bash", input: { command: "npm test" } }] } }),
+            JSON.stringify({ type: "user", message: { role: "user", content: [
+                { type: "tool_result", content: "Exit code 1: tests failed", is_error: true, tool_use_id: "hatu1" }] },
+                toolUseResult: "Error: Exit code 1" }),
+        ].join("\n") + "\n");
+        const PARENT_TX = path.join(TMP, "hostile-subagent-parent.jsonl");
+        fs.writeFileSync(PARENT_TX, JSON.stringify({ type: "assistant",
+            message: { role: "assistant", content: [{ type: "text", text: "done" }] } }) + "\n");
+
+        const r = runLauncher("subagent-reflect", JSON.stringify({
+            session_id: "sr-hostile-" + Date.now(), transcript_path: PARENT_TX, cwd: GITPROJ,
+            agent_id: "agentHostile", agent_type: "coder", hook_event_name: "SubagentStop",
+            stop_hook_active: false, agent_transcript_path: AGENT_TX,
+        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("injection[subagent-reflect]: hook still renders the subagent reflection prompt",
+            /subagent reflection/.test(ac), ac.slice(0, 300));
+        runSuggestedAndCheckCanary("subagent-reflect", ac, CANARY);
+    }
+}
+
 // --- cleanup + report ------------------------------------------------------
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }
 
