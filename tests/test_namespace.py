@@ -125,6 +125,99 @@ class TestResolveNamespaceNormalization(unittest.TestCase):
             self.assertEqual(host.resolve_namespace(clone_a), host.resolve_namespace(clone_b))
 
 
+class TestLoopbackProxyRemoteRewrite(unittest.TestCase):
+    """CCR (Claude Code cloud/remote) sessions see their GitHub repo through a
+    local HTTP proxy (`http://local_proxy@127.0.0.1:<port>/git/<org>/<repo>`).
+    Without a rewrite, the ephemeral proxy port lands in the namespace key,
+    fragmenting the same repo's memory across sessions and diverging from the
+    key a local checkout of the same remote gets. These pin the collapse to
+    `github.com/<org>/<repo>` (or `ZMEM_PROXY_FORGE_HOST` if set)."""
+
+    def test_two_observed_proxy_urls_different_ports_collapse_to_same_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo_a = _make_git_repo(
+                tmp_path / "a",
+                "http://local_proxy@127.0.0.1:34567/git/ZaxbyHub/opencode-swarm",
+            )
+            repo_b = _make_git_repo(
+                tmp_path / "b",
+                "http://local_proxy@127.0.0.1:41999/git/ZaxbyHub/opencode-swarm",
+            )
+            expected = "project:github.com/zaxbyhub/opencode-swarm"
+            self.assertEqual(host.resolve_namespace(repo_a), expected)
+            self.assertEqual(host.resolve_namespace(repo_b), expected)
+
+    def test_localhost_form_also_rewrites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp), "http://x@localhost:8080/git/Org/Repo"
+            )
+            self.assertEqual(
+                host.resolve_namespace(repo), "project:github.com/org/repo"
+            )
+
+    def test_git_suffix_on_proxy_path_is_stripped_before_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp),
+                "http://local_proxy@127.0.0.1:34567/git/ZaxbyHub/repo.git",
+            )
+            self.assertEqual(
+                host.resolve_namespace(repo), "project:github.com/zaxbyhub/repo"
+            )
+
+    def test_zmem_proxy_forge_host_env_var_overrides_forge_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp),
+                "http://local_proxy@127.0.0.1:34567/git/ZaxbyHub/opencode-swarm",
+            )
+            with mock.patch.dict(
+                os.environ, {"ZMEM_PROXY_FORGE_HOST": "gitlab.example.com"}, clear=False
+            ):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:gitlab.example.com/zaxbyhub/opencode-swarm")
+
+    def test_non_git_path_loopback_remote_unchanged(self):
+        # Pin today's (pre-existing) behavior for a loopback remote whose path
+        # does NOT start with `git/` — a genuinely local git server keeps its
+        # existing key; the proxy rewrite must not touch it.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp), "http://user@127.0.0.1:9000/some/other/path"
+            )
+            self.assertEqual(
+                host.resolve_namespace(repo),
+                "project:127.0.0.1:9000/some/other/path",
+            )
+
+    def test_loopback_with_only_one_git_path_segment_not_rewritten(self):
+        # Fewer than two segments after `git/` (no repo, only an org-shaped
+        # segment) falls through to the existing (unrewritten) behavior rather
+        # than guessing.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp), "http://u@127.0.0.1:1/git/onlyorg"
+            )
+            self.assertEqual(
+                host.resolve_namespace(repo),
+                "project:127.0.0.1:1/git/onlyorg",
+            )
+
+    def test_existing_ssh_and_https_forms_unaffected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            ssh_repo = _make_git_repo(tmp_path / "a", "git@github.com:ZaxbyHub/x.git")
+            https_repo = _make_git_repo(tmp_path / "b", "https://github.com/a/b")
+            self.assertEqual(
+                host.resolve_namespace(ssh_repo), "project:github.com/zaxbyhub/x"
+            )
+            self.assertEqual(
+                host.resolve_namespace(https_repo), "project:github.com/a/b"
+            )
+
+
 class TestV5MigrationEqualityInvariant(unittest.TestCase):
     """resolve_namespace(checkout) == migrated key, for real on-disk checkouts."""
 

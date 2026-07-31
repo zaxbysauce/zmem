@@ -344,7 +344,22 @@ def _normalize_remote(url: str) -> str:
     with any `.git` suffix and trailing slash stripped. Handles both the SSH
     scp-like form (`git@host:org/repo.git`) and URL forms
     (`https://host/org/repo.git`, `ssh://git@host/org/repo`), with or without
-    a trailing slash or `.git` suffix — all normalize to the same key."""
+    a trailing slash or `.git` suffix — all normalize to the same key.
+
+    Loopback-proxy rewrite: Claude Code cloud/remote (CCR) sessions see their
+    GitHub repo through a local HTTP proxy (`http://local_proxy@127.0.0.1:<port>/git/<org>/<repo>`),
+    so the same repo would otherwise normalize to a different, per-session
+    key (host includes the ephemeral proxy port) than the same repo cloned
+    locally. When the resolved host (port stripped) is a loopback address —
+    `127.0.0.1`, `localhost`, `::1`, or `[::1]`, case-insensitively — and the
+    path's first two segments after a leading `git/` are `<org>/<repo>`,
+    rewrite the key to `<forge_host>/<org>/<repo>` instead, where forge_host
+    is `ZMEM_PROXY_FORGE_HOST` if set (non-empty) else `github.com` (CCR
+    proxies GitHub only today; the env var is the escape hatch for other
+    forges). A loopback path with fewer than two segments after `git/`, or
+    that doesn't start with `git/` at all, falls through unchanged — it's
+    either malformed or a genuinely local git server, which must keep its
+    existing key."""
     u = url.strip().rstrip("/")
     if u.lower().endswith(".git"):
         u = u[: -len(".git")]
@@ -363,6 +378,15 @@ def _normalize_remote(url: str) -> str:
             host, path = "", u
 
     path = path.strip("/")
+
+    host_no_port = re.sub(r":\d+$", "", host)
+    if host_no_port.lower() in ("127.0.0.1", "localhost", "::1", "[::1]"):
+        gm = re.match(r"^git/([^/]+)/([^/]+)", path)
+        if gm:
+            org, repo = gm.group(1), gm.group(2)
+            forge_host = os.environ.get("ZMEM_PROXY_FORGE_HOST") or "github.com"
+            return f"{forge_host}/{org}/{repo}".lower()
+
     combined = f"{host}/{path}" if host else path
     return combined.lower()
 

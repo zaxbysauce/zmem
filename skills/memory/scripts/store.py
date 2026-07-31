@@ -26,6 +26,10 @@ Usage:
   python store.py stats
   python store.py backup [--retention 7] [--out-dir DIR] [--if-due]
   python store.py restore --from <snapshot.sqlite> [--force] [--out-dir DIR]
+  python store.py export-pack --namespace NS [--out FILE] [--project-limit 50] \\
+         [--global-limit 15] [--min-confidence 0.6] [--max-bytes 32768]
+  python store.py export-jsonl [--out FILE] [--namespace NS] [--include-superseded]
+  python store.py ingest-jsonl --in FILE [--source-ref REF]
 
 Design (see the memory skill's design doc):
   - Tombstone supersession (superseded_at), NOT full bi-temporal (YAGNI for single user).
@@ -575,27 +579,18 @@ def _source_hash(source_ref: str) -> str:
         return ""
 
 
-def add_memory(
-    conn: sqlite3.Connection,
-    *,
-    namespace: str,
-    type_: str,
-    content: str,
-    tags: str = "",
-    source_ref: str = "",
-    confidence: float | None = None,
-    signal: str = "none",
-    valid_from: str = "",
-) -> str:
-    warns = _check_secrets(content, source_ref)
-    for w in warns:
-        print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
+def _detect_duplicate(
+    conn: sqlite3.Connection, content: str, namespace: str
+) -> tuple[sqlite3.Row | None, float, bytes | None]:
+    """Find a duplicate live memory for `content` in `namespace`: semantic
+    similarity (if embeddings are available) with an exact-match fallback.
 
-    if confidence is None:
-        confidence = SIGNAL_CONFIDENCE.get(signal, 0.3)
-
-    # Dedup-on-write: semantic similarity (if embeddings available) or exact
-    # match fallback. Semantic dedup catches paraphrases the exact-match miss.
+    Returns (existing_row_or_None, similarity, embedding_or_None). The
+    embedding is returned too so a fresh insert (no duplicate found) does not
+    have to re-embed the same content a second time. Shared by add_memory()
+    and ingest-jsonl's per-row insert path — dedup-on-write must behave
+    identically for a locally-authored add and a synced row.
+    """
     emb = None
     if _embeddings and _embeddings.is_available():
         emb = _embeddings.embed_text(content)
@@ -618,6 +613,33 @@ def add_memory(
                 existing = c
                 dedup_sim = 1.0  # exact match
                 break
+    return existing, dedup_sim, emb
+
+
+def add_memory(
+    conn: sqlite3.Connection,
+    *,
+    namespace: str,
+    type_: str,
+    content: str,
+    tags: str = "",
+    source_ref: str = "",
+    confidence: float | None = None,
+    signal: str = "none",
+    valid_from: str = "",
+) -> str:
+    warns = _check_secrets(content, source_ref)
+    for w in warns:
+        print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
+
+    if confidence is None:
+        confidence = SIGNAL_CONFIDENCE.get(signal, 0.3)
+
+    # Dedup-on-write: semantic similarity (if embeddings available) or exact
+    # match fallback. Semantic dedup catches paraphrases the exact-match miss.
+    # Shared with ingest-jsonl (Tier 3 sync import), which must apply the same
+    # dedup-on-write semantics to incoming rows without duplicating this logic.
+    existing, dedup_sim, emb = _detect_duplicate(conn, content, namespace)
 
     if existing:
         # Merge: upgrade confidence/signal if the new add is stronger.
@@ -1122,13 +1144,22 @@ def recent_memory(
     return results
 
 
-def supersede_memory(conn: sqlite3.Connection, mid: str, reason: str = "") -> bool:
-    """Tombstone a memory (mark superseded_at). Does not delete — keeps history."""
+def supersede_memory(
+    conn: sqlite3.Connection, mid: str, reason: str = "", *, at: str | None = None
+) -> bool:
+    """Tombstone a memory (mark superseded_at). Does not delete — keeps history.
+
+    `at` overrides the superseded_at timestamp (default: now). ingest-jsonl
+    uses this to apply a remote tombstone with the ORIGINATING store's
+    superseded_at, not the local ingest time — otherwise two synced copies of
+    the same tombstone would disagree on when it happened.
+    """
     row = conn.execute("SELECT id FROM memory WHERE id=?", (mid,)).fetchone()
     if not row:
         print(f"[zmem] no memory with id {mid}", file=sys.stderr)
         return False
-    conn.execute("UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?", (now_iso(), reason, mid))
+    conn.execute("UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?",
+                 (at or now_iso(), reason, mid))
     # Also remove from the vec0 table to prevent orphaned vectors consuming KNN slots.
     try:
         conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
@@ -2561,6 +2592,317 @@ def cmd_failures(session: str, transcript: str, db: str) -> None:
     print(json.dumps(result))
 
 
+# --- Tier 1 export: markdown memory pack (P.export-pack) -------------------
+
+GLOBAL_NAMESPACE = "user:global"
+EXPORT_PACK_DEFAULT_PROJECT_LIMIT = 50
+EXPORT_PACK_DEFAULT_GLOBAL_LIMIT = 15
+EXPORT_PACK_DEFAULT_MIN_CONFIDENCE = 0.6
+EXPORT_PACK_DEFAULT_MAX_BYTES = 32768
+
+
+def _pack_query(conn: sqlite3.Connection, namespace: str, limit: int, min_confidence: float):
+    """Live rows for one export-pack section, best candidates first."""
+    return conn.execute(
+        """SELECT type, signal, content FROM memory
+           WHERE namespace=? AND superseded_at IS NULL AND confidence >= ?
+           ORDER BY confidence DESC, retrieval_count DESC, ingestion_ts DESC
+           LIMIT ?""",
+        (namespace, min_confidence, limit),
+    ).fetchall()
+
+
+def _render_pack(namespace: str, store_path: str, project_rows, global_rows, max_bytes: int) -> str:
+    """Render the Tier 1 markdown memory pack.
+
+    Bullets are added greedily in document order (project section, then the
+    global one) and the walk stops the instant the NEXT bullet would push the
+    UTF-8-encoded output past max_bytes -- a bullet is only ever added whole,
+    never truncated, and once the budget is exhausted every remaining row
+    (in either section) counts toward the trailing omitted-count note.
+    Structural text (header comment, titles, section headings, the "(none)"
+    placeholder, the omitted-count note itself) is exempt from the cap: it is
+    small, mandatory framing, not budget-controlled content.
+    """
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    lines: list[str] = [
+        f"<!-- Auto-generated by `zmem export-pack` from {store_path} on {today}. "
+        "Do not hand-edit -- this file is overwritten by the next export-pack run. -->",
+        f"# Memory pack: {namespace}",
+        "",
+    ]
+
+    state = {"exhausted": False, "omitted": 0}
+
+    def _emit_section(title: str, rows) -> None:
+        lines.append(f"## {title}")
+        if not rows:
+            lines.append("(none)")
+            lines.append("")
+            return
+        for row in rows:
+            if state["exhausted"]:
+                state["omitted"] += 1
+                continue
+            bullet = f"- **[{row['type']}/{row['signal']}]** {row['content']}"
+            projected = len(("\n".join(lines + [bullet]) + "\n").encode("utf-8"))
+            if projected > max_bytes:
+                state["exhausted"] = True
+                state["omitted"] += 1
+                continue
+            lines.append(bullet)
+        lines.append("")
+
+    _emit_section("Project knowledge", project_rows)
+    _emit_section(f"Cross-project lessons ({GLOBAL_NAMESPACE})", global_rows)
+
+    if state["omitted"]:
+        lines.append(
+            f"*({state['omitted']} row(s) omitted to stay within --max-bytes={max_bytes})*"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def cmd_export_pack(
+    conn: sqlite3.Connection,
+    *,
+    namespace: str,
+    out: str | None = None,
+    project_limit: int = EXPORT_PACK_DEFAULT_PROJECT_LIMIT,
+    global_limit: int = EXPORT_PACK_DEFAULT_GLOBAL_LIMIT,
+    min_confidence: float = EXPORT_PACK_DEFAULT_MIN_CONFIDENCE,
+    max_bytes: int = EXPORT_PACK_DEFAULT_MAX_BYTES,
+) -> int:
+    """Write (or print) the Tier 1 markdown memory pack for `namespace`.
+    Returns a process exit code."""
+    project_rows = _pack_query(conn, namespace, project_limit, min_confidence)
+    global_rows = _pack_query(conn, GLOBAL_NAMESPACE, global_limit, min_confidence)
+
+    if not project_rows and not global_rows:
+        print(
+            f"[zmem] export-pack: no live memories at/above confidence "
+            f"{min_confidence} in namespace={namespace} (or {GLOBAL_NAMESPACE}) "
+            "-- an empty pack is almost certainly a wrong --namespace; refusing",
+            file=sys.stderr,
+        )
+        return 2
+
+    text = _render_pack(namespace, str(STORE_PATH), project_rows, global_rows, max_bytes)
+
+    if out:
+        out_path = Path(out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        # newline="\n" disables Python's write-side newline translation so the
+        # file keeps LF endings on Windows too (quiet diffs for a regenerated,
+        # checked-in pack).
+        with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        print(f"[zmem] export-pack: wrote {out_path} ({len(text.encode('utf-8'))} bytes)")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+# --- Tier 3 export/import: JSONL sync (P.export-jsonl / P.ingest-jsonl) ----
+
+
+def cmd_export_jsonl(
+    conn: sqlite3.Connection,
+    *,
+    out: str | None = None,
+    namespace: str | None = None,
+    include_superseded: bool = False,
+) -> int:
+    """Write one JSON object per line for LIVE rows (plus tombstoned rows too
+    when include_superseded), sorted by ingestion_ts then id for deterministic
+    diffs. No embedding fields -- bytes are not portable across machines;
+    receivers rebuild via `reembed`."""
+    clauses = []
+    params: list = []
+    if namespace:
+        clauses.append("namespace=?")
+        params.append(namespace)
+    if not include_superseded:
+        clauses.append("superseded_at IS NULL")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"""SELECT id, namespace, type, content, tags, source_ref, confidence, signal,
+                   valid_from, ingestion_ts, superseded_at, supersede_reason
+            FROM memory {where}
+            ORDER BY ingestion_ts, id""",
+        params,
+    ).fetchall()
+
+    lines = []
+    for r in rows:
+        obj = {
+            "id": r["id"],
+            "namespace": r["namespace"],
+            "type": r["type"],
+            "content": r["content"],
+            "tags": r["tags"],
+            "source_ref": r["source_ref"],
+            "confidence": r["confidence"],
+            "signal": r["signal"],
+            "valid_from": r["valid_from"],
+            "ingestion_ts": r["ingestion_ts"],
+            "superseded_at": r["superseded_at"],
+            "supersede_reason": r["supersede_reason"],
+        }
+        lines.append(json.dumps(obj, ensure_ascii=False))
+    text = "".join(line + "\n" for line in lines)
+
+    if out:
+        out_path = Path(out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        print(f"[zmem] export-jsonl: wrote {len(rows)} row(s) to {out_path}")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def _ingest_row(conn: sqlite3.Connection, obj: dict) -> str:
+    """Apply one parsed JSONL sync row to the local store.
+
+    Returns 'added', 'tombstoned', 'deduped', or 'skipped' -- the caller
+    tallies these into the ingest-jsonl summary line. The caller has already
+    validated `obj` has the required keys; malformed-line handling lives
+    there so a bad row never reaches this function.
+    """
+    mid = obj["id"]
+    namespace = obj["namespace"]
+    type_ = obj["type"]
+    content = obj["content"]
+    tags = obj.get("tags") or ""
+    source_ref = obj.get("source_ref") or ""
+    signal = obj.get("signal") or "none"
+    confidence = obj.get("confidence")
+    if confidence is None:
+        confidence = SIGNAL_CONFIDENCE.get(signal, 0.3)
+    ingestion_ts = obj.get("ingestion_ts") or now_iso()
+    valid_from = obj.get("valid_from") or ingestion_ts
+    superseded_at = obj.get("superseded_at") or None
+    supersede_reason = obj.get("supersede_reason") or ""
+
+    local = conn.execute("SELECT superseded_at FROM memory WHERE id=?", (mid,)).fetchone()
+
+    if local is not None:
+        # id already known locally: local content is NEVER overwritten by a
+        # sync import. The only mutation an existing row can receive here is
+        # a tombstone, and only if the incoming row is superseded and the
+        # local one is not already -- everything else is a no-op skip.
+        if superseded_at and local["superseded_at"] is None:
+            ok = supersede_memory(conn, mid, supersede_reason, at=superseded_at)
+            return "tombstoned" if ok else "skipped"
+        return "skipped"
+
+    if superseded_at:
+        # New locally, but already tombstoned upstream: insert as history so
+        # future syncs stay consistent, without letting it participate in
+        # dedup-on-write or recall -- it must not resurface, and it must not
+        # silently absorb a live row into its (dead) dedup slot either.
+        shash = _source_hash(source_ref)
+        conn.execute(
+            """INSERT INTO memory
+               (id, namespace, type, content, tags, source_ref, source_hash,
+                confidence, signal, valid_from, superseded_at, supersede_reason,
+                ingestion_ts, retrieval_count, last_retrieved,
+                embedding, embedding_model, embedded_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL)""",
+            (mid, namespace, type_, content, tags, source_ref, shash,
+             confidence, signal, valid_from, superseded_at, supersede_reason,
+             ingestion_ts),
+        )
+        _commit(conn)
+        return "added"
+
+    # New locally, still live upstream: run the same secret-scan warning and
+    # dedup-on-write check add_memory() applies to a locally-authored add --
+    # a synced row must not bypass either just because it arrived via a file
+    # instead of the `add` subcommand.
+    warns = _check_secrets(content, source_ref)
+    for w in warns:
+        print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
+    existing, _sim, _emb = _detect_duplicate(conn, content, namespace)
+    if existing:
+        _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
+        _commit(conn)
+        return "deduped"
+
+    shash = _source_hash(source_ref)
+    conn.execute(
+        """INSERT INTO memory
+           (id, namespace, type, content, tags, source_ref, source_hash,
+            confidence, signal, valid_from, superseded_at, ingestion_ts,
+            retrieval_count, last_retrieved, embedding, embedding_model, embedded_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,NULL,'',NULL)""",
+        (mid, namespace, type_, content, tags, source_ref, shash,
+         confidence, signal, valid_from, ingestion_ts),
+    )
+    _commit(conn)
+    return "added"
+
+
+def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str, source_ref: str | None) -> int:
+    """Import a JSONL sync file written by export-jsonl. Returns a process
+    exit code: 2 if `in_path` cannot be read or contains no data lines at
+    all, 0 otherwise (malformed/skipped/deduped rows do not fail the run --
+    they are tallied and reported in the summary line)."""
+    try:
+        raw = Path(in_path).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"[zmem] ingest-jsonl: cannot read {in_path}: {e}", file=sys.stderr)
+        return 2
+
+    added = tombstoned = deduped = skipped = malformed = 0
+    saw_line = False
+    for lineno, raw_line in enumerate(raw.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        saw_line = True
+        try:
+            obj = json.loads(line)
+            if not isinstance(obj, dict):
+                raise ValueError("line is not a JSON object")
+            missing = [k for k in ("id", "namespace", "type", "content") if not obj.get(k)]
+            if missing:
+                raise ValueError(f"missing required field(s): {', '.join(missing)}")
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"[zmem] ingest-jsonl: malformed line {lineno}: {e}", file=sys.stderr)
+            malformed += 1
+            continue
+
+        if source_ref:
+            # --source-ref attributes this whole import batch to one place of
+            # origin, overriding whatever source_ref the row carried in --
+            # the original almost always points at a path that does not
+            # exist on this machine.
+            obj = dict(obj)
+            obj["source_ref"] = source_ref
+
+        outcome = _ingest_row(conn, obj)
+        if outcome == "added":
+            added += 1
+        elif outcome == "tombstoned":
+            tombstoned += 1
+        elif outcome == "deduped":
+            deduped += 1
+        else:
+            skipped += 1
+
+    if not saw_line:
+        print(f"[zmem] ingest-jsonl: {in_path} is empty -- nothing to ingest", file=sys.stderr)
+        return 2
+
+    print(f"[zmem] ingest-jsonl: added={added} tombstoned={tombstoned} "
+          f"deduped={deduped} skipped={skipped} malformed={malformed}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="store.py", description="ZMem semantic store")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2674,6 +3016,46 @@ def main():
     p_restore.add_argument("--out-dir", default=None,
                            help="where to put the pre-restore backup (default: same as "
                                 "`backup`)")
+
+    p_export_pack = sub.add_parser(
+        "export-pack",
+        help="render a Tier 1 markdown memory pack for a namespace (project + user:global)")
+    p_export_pack.add_argument("--namespace", required=True,
+                               help="project namespace to pack (e.g. project:foo)")
+    p_export_pack.add_argument("--out", default=None,
+                               help="write the pack to this file (UTF-8, LF); default: stdout")
+    p_export_pack.add_argument("--project-limit", type=int,
+                               default=EXPORT_PACK_DEFAULT_PROJECT_LIMIT,
+                               help=f"max rows from --namespace (default {EXPORT_PACK_DEFAULT_PROJECT_LIMIT})")
+    p_export_pack.add_argument("--global-limit", type=int,
+                               default=EXPORT_PACK_DEFAULT_GLOBAL_LIMIT,
+                               help=f"max rows from {GLOBAL_NAMESPACE} (default {EXPORT_PACK_DEFAULT_GLOBAL_LIMIT})")
+    p_export_pack.add_argument("--min-confidence", type=float,
+                               default=EXPORT_PACK_DEFAULT_MIN_CONFIDENCE,
+                               help=f"confidence floor for both sections (default {EXPORT_PACK_DEFAULT_MIN_CONFIDENCE})")
+    p_export_pack.add_argument("--max-bytes", type=int,
+                               default=EXPORT_PACK_DEFAULT_MAX_BYTES,
+                               help="cap the UTF-8 encoded output; bullets beyond the cap are "
+                                    f"omitted, never truncated (default {EXPORT_PACK_DEFAULT_MAX_BYTES})")
+
+    p_export_jsonl = sub.add_parser(
+        "export-jsonl",
+        help="export Tier 3 sync JSONL (one memory row per line, no embeddings)")
+    p_export_jsonl.add_argument("--out", default=None,
+                                help="write to this file (UTF-8, LF); default: stdout")
+    p_export_jsonl.add_argument("--namespace", default=None,
+                                help="limit to a specific namespace (default: all namespaces)")
+    p_export_jsonl.add_argument("--include-superseded", action="store_true",
+                                help="also export tombstoned rows (default: live rows only)")
+
+    p_ingest_jsonl = sub.add_parser(
+        "ingest-jsonl",
+        help="import Tier 3 sync JSONL written by export-jsonl")
+    p_ingest_jsonl.add_argument("--in", dest="in_path", required=True,
+                                help="JSONL file to ingest")
+    p_ingest_jsonl.add_argument("--source-ref", default=None,
+                                help="override source_ref on every row inserted this run "
+                                     "(default: keep each row's own incoming source_ref)")
 
     p_fail = sub.add_parser(
         "failures",
@@ -2800,6 +3182,25 @@ def main():
         if rc:
             conn.close()
             sys.exit(rc)
+    elif args.cmd == "export-pack":
+        rc = cmd_export_pack(
+            conn, namespace=args.namespace, out=args.out,
+            project_limit=args.project_limit, global_limit=args.global_limit,
+            min_confidence=args.min_confidence, max_bytes=args.max_bytes,
+        )
+        conn.close()
+        sys.exit(rc)
+    elif args.cmd == "export-jsonl":
+        rc = cmd_export_jsonl(
+            conn, out=args.out, namespace=args.namespace,
+            include_superseded=args.include_superseded,
+        )
+        conn.close()
+        sys.exit(rc)
+    elif args.cmd == "ingest-jsonl":
+        rc = cmd_ingest_jsonl(conn, in_path=args.in_path, source_ref=args.source_ref)
+        conn.close()
+        sys.exit(rc)
     conn.close()
 
 
