@@ -2419,17 +2419,25 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
 # framing; this function guarantees the strings it hands back are fence-safe.
 
 def _collapse_line_breaks(text) -> str:
-    """Collapse every CR/LF in `text` to a single space.
+    """Collapse every CR/LF (and Unicode line separator) in `text` to a
+    single space.
 
     The shared fence-integrity primitive: with no newlines, untrusted text can
     never start its own line, so it can never form a fence-close, a markdown
     heading, a list bullet, or a line-oriented directive of any kind. Used by
     _sanitize_error_text (hook output) and _sanitize_pack_content (export-pack
     bullets) — one primitive, two consumers, so the guarantee cannot drift.
+
+    Also collapses U+2028 (LINE SEPARATOR), U+2029 (PARAGRAPH SEPARATOR), and
+    U+0085 (NEXT LINE) -- these are treated as line breaks by str.splitlines()
+    and some renderers even though they are not \\r/\\n, so a memory row
+    carrying one of them could otherwise still open its own visual "line"
+    inside a pack bullet.
     """
     if not text:
         return ""
-    return str(text).replace("\r", " ").replace("\n", " ")
+    return (str(text).replace("\r", " ").replace("\n", " ")
+            .replace("\u2028", " ").replace("\u2029", " ").replace("\u0085", " "))
 
 
 def _sanitize_error_text(text, limit: int = 200) -> str:
@@ -2819,7 +2827,19 @@ def cmd_export_jsonl(
             "superseded_at": r["superseded_at"],
             "supersede_reason": r["supersede_reason"],
         }
-        lines.append(json.dumps(obj, ensure_ascii=False))
+        line = json.dumps(obj, ensure_ascii=False)
+        # json.dumps already escapes every codepoint < 0x20 (\n, \r, and any
+        # other ASCII control char), but U+2028/U+2029/U+0085 are line
+        # terminators recognized by str.splitlines() (and some JS/JSONL
+        # consumers) yet are NOT escaped by json.dumps since they are >=
+        # 0x20. Left raw, one of these inside a content string would split
+        # a single JSON object across multiple physical lines, shattering
+        # the row for any reader that splits on line boundaries rather than
+        # a bare "\n". Escape them explicitly so one JSON object == one line.
+        line = (line.replace("\u2028", "\\u2028")
+                    .replace("\u2029", "\\u2029")
+                    .replace("\u0085", "\\u0085"))
+        lines.append(line)
     text = "".join(line + "\n" for line in lines)
 
     if out:
@@ -3099,8 +3119,15 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     added = tombstoned = tombstones_refused = deduped = skipped = malformed = 0
     first_refused_id = None
     saw_line = False
-    for lineno, raw_line in enumerate(raw.splitlines(), start=1):
-        line = raw_line.strip()
+    # split on "\n" only -- NOT str.splitlines(), which also breaks on
+    # U+2028/U+2029/U+0085 (and other Unicode line separators). This file's
+    # own writer (export_jsonl) escapes those three inside string values, but
+    # a third-party JSONL writer might not; splitlines() would then shatter
+    # one JSON object across several bogus "lines". Splitting on a bare "\n"
+    # treats every embedded separator as ordinary string content instead.
+    # rstrip("\r") tolerates CRLF-terminated files.
+    for lineno, raw_line in enumerate(raw.split("\n"), start=1):
+        line = raw_line.rstrip("\r").strip()
         if not line:
             continue
         saw_line = True
@@ -3109,7 +3136,14 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
             if not isinstance(obj, dict):
                 raise ValueError("line is not a JSON object")
             obj = _validate_sync_row(obj)
-        except (json.JSONDecodeError, ValueError) as e:
+        except Exception as e:
+            # Broad on purpose: a per-line parse guard must never let hostile
+            # input abort the whole file. A pathologically deeply nested JSON
+            # value (a "nesting bomb") raises RecursionError from json.loads,
+            # which is not a subclass of ValueError/JSONDecodeError and would
+            # otherwise escape this guard, unwind past the per-row try/except
+            # below, and kill the run mid-file with no summary line. Malformed
+            # counting/reporting stays identical for every exception type.
             print(f"[zmem] ingest-jsonl: malformed line {lineno}: "
                   f"{_sanitize_error_text(str(e))}", file=sys.stderr)
             malformed += 1

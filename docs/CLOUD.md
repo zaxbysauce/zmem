@@ -60,6 +60,11 @@ python <store.py> export-pack \
     memory does not evict the rest of the pack.
   - Skipped rows are reported in a trailing
     `*(N row(s) omitted to stay within --max-bytes=…)*` note.
+- **Exit code** — `export-pack` exits `2` when the pack would be empty (no
+  live rows at/above `--min-confidence` in `--namespace` **and** none in
+  `user:global` — e.g. a wrong or not-yet-populated namespace), and `0`
+  otherwise. Check the exit code before committing `--out`'s file rather than
+  assuming a nonempty write.
 
 `export-pack` ships in zmem 0.5.0.
 
@@ -220,6 +225,19 @@ compromise of the store, and rebuild rather than "clean up" — see the
   something you already corrected. (See "Which direction gets
   `--allow-tombstones`" below.)
 
+  **Exit code** — `ingest-jsonl` exits `2` when `--in` is missing or otherwise
+  inaccessible (permission denied, is a directory, etc.) or contains no data
+  lines whatsoever (empty or whitespace-only). It exits `0` for every other
+  outcome, including a file full of malformed rows: a bad row is never fatal
+  to the run, it is counted and reported by line number on stderr, and the
+  summary line (`added=… tombstoned=… tombstones_refused=… deduped=…
+  skipped=… malformed=…`) always prints on stdout so "the run finished" and
+  "every row landed" are never confused for each other. Check
+  `malformed`/`tombstones_refused` in that summary, not just the exit code, to
+  know whether the file was clean. (A file that is present and readable but
+  not valid UTF-8 is a separate, unhandled failure mode outside this: it
+  raises past `ingest-jsonl`'s own guard and exits `1` with a traceback.)
+
   This gives the cloud session real `recall`/`search`/`list` against that
   data. Skip installing the ONNX embedding runtime on the cloud box — plain
   `recall` (and `--hybrid` when embeddings are unavailable) already falls
@@ -253,7 +271,10 @@ compromise of the store, and rebuild rather than "clean up" — see the
     --source-ref "cloud:<cloud-session-id>"
   ```
   Repeated ingestion of the same outbox file — or overlap between two cloud
-  sessions' outboxes — is safe (again, see below).
+  sessions' outboxes — is safe (again, see below). Same exit-code contract as
+  the cloud-side ingest above: `2` only for a missing/inaccessible or
+  empty/whitespace-only outbox file, `0` otherwise (malformed rows never fail
+  the run).
 
 - **Re-embed after ingesting an outbox.** Ingest only computes an embedding
   when the embedding runtime is available on the ingesting box; rows that

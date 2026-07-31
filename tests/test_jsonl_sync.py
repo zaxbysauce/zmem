@@ -523,6 +523,142 @@ class Utf8FidelityTest(_TwoStoreCase):
 
 
 # ---------------------------------------------------------------------------
+# Unicode line-separator fidelity: writer escapes U+2028/U+2029/U+0085 so one
+# JSON object == one physical line, and the reader splits on a bare "\n" (not
+# str.splitlines()) so it tolerates a third-party writer that does not escape
+# them. Written as \uXXXX escapes throughout (never a literal glyph) to keep
+# this source ASCII-only and unambiguous under any console codepage.
+# ---------------------------------------------------------------------------
+class LineTerminatorFidelityTest(_TwoStoreCase):
+    def test_export_escapes_separators_and_round_trip_is_byte_identical(self):
+        """The verifier's exact repro shape: before the fix, export-jsonl left
+        U+2028/U+2029/U+0085 raw, and ingest-jsonl's str.splitlines() then
+        split one such row into multiple malformed fragments."""
+        tricky = "alpha\u2028beta\u2029gamma\u0085delta"
+        contents = ["plain row one", tricky, "plain row two", "plain row three"]
+        for c in contents:
+            self.a.add(NS, c, confidence=0.9)
+
+        export_a = os.path.join(self.a.tmp, "separators.jsonl")
+        r = self.a.run("export-jsonl", "--out", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        raw = Path(export_a).read_bytes().decode("utf-8")
+        # One JSON object per line when split on a bare "\n" -- the writer
+        # must not have left a raw separator that would fragment a row.
+        data_lines = [ln for ln in raw.split("\n") if ln.strip()]
+        self.assertEqual(len(data_lines), len(contents))
+        for ln in data_lines:
+            json.loads(ln)  # every line parses standalone as one JSON object
+        # The three separators must not appear as raw characters in the file
+        # at all -- only as their escaped \uXXXX text.
+        self.assertNotIn("\u2028", raw)
+        self.assertNotIn("\u2029", raw)
+        self.assertNotIn("\u0085", raw)
+        self.assertIn("\\u2028", raw)
+        self.assertIn("\\u2029", raw)
+        self.assertIn("\\u0085", raw)
+
+        r = self.b.run("ingest-jsonl", "--in", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], len(contents))
+        self.assertEqual(counts["malformed"], 0)
+
+        stored = self.b.query_one(
+            "SELECT content FROM memory WHERE namespace=? AND content LIKE ?",
+            (NS, "alpha%delta"))
+        self.assertIsNotNone(stored, "the tricky row must have landed in B")
+        # Byte-identical: the separators must be REAL characters in the DB,
+        # not escaped text -- the escaping is a wire-format concern only.
+        self.assertEqual(stored[0], tricky)
+
+    def test_reader_tolerates_a_raw_unicode_separator_from_a_naive_writer(self):
+        """Reader robustness: a third-party JSONL writer might not escape
+        U+2028/U+2029/U+0085 the way this file's own export-jsonl does. With
+        the reader split on a bare "\n" (not str.splitlines()), a raw U+2028
+        inside a JSON string value keeps the line intact and JSON-valid --
+        json.loads permits an unescaped U+2028/U+2029/U+0085 inside a string
+        (JSON only forbids raw codepoints < 0x20)."""
+        content = "naive writer row with a raw U+2028 separator: alpha\u2028beta"
+        row = _sync_row(id="66666666-7777-8888-9999-aaaaaaaaaaaa", content=content)
+        path = os.path.join(self.b.tmp, "naive.jsonl")
+        # Hand-built, NOT via export-jsonl, and NOT escaping the separator --
+        # this is the "naive third-party writer" this test simulates.
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        raw = Path(path).read_bytes().decode("utf-8")
+        self.assertIn("\u2028", raw, "fixture sanity: the raw separator must actually be in the file")
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 1)
+        self.assertEqual(counts["malformed"], 0)
+
+        stored = self.b.query_one(
+            "SELECT content FROM memory WHERE id=?", (row["id"],))[0]
+        self.assertEqual(stored, content)
+        self.assertIn("\u2028", stored, "the real separator character must survive")
+
+
+# ---------------------------------------------------------------------------
+# RecursionError from a nesting bomb must not escape the per-line parse guard
+# ---------------------------------------------------------------------------
+class NestingBombResilienceTest(_TwoStoreCase):
+    def test_deeply_nested_json_value_is_malformed_not_a_run_abort(self):
+        """The verifier's exact repro shape: a 5000-deep nested JSON array
+        blows Python's recursion limit inside json.loads() with RecursionError
+        -- not json.JSONDecodeError/ValueError -- which used to escape the
+        per-line guard entirely and abort the whole run mid-file with no
+        summary line printed."""
+        good = [
+            _sync_row(id="dddddddd-1111-1111-1111-111111111111", content="good row one"),
+            _sync_row(id="dddddddd-2222-2222-2222-222222222222", content="good row two"),
+            _sync_row(id="dddddddd-3333-3333-3333-333333333333", content="good row three"),
+        ]
+        more_good = [
+            _sync_row(id="dddddddd-4444-4444-4444-444444444444", content="good row four"),
+            _sync_row(id="dddddddd-5555-5555-5555-555555555555", content="good row five"),
+            _sync_row(id="dddddddd-6666-6666-6666-666666666666", content="good row six"),
+        ]
+        nested = "[" * 5000 + "]" * 5000
+        bomb_line = (
+            '{"id": "dddddddd-9999-9999-9999-999999999999", "namespace": "' + NS + '", '
+            '"type": "fact", "content": ' + nested + ', "tags": "", "source_ref": "", '
+            '"confidence": 0.8, "signal": "test", "valid_from": "2026-01-01T00:00:00Z", '
+            '"ingestion_ts": "2026-01-01T00:00:00Z", "superseded_at": null, '
+            '"supersede_reason": ""}'
+        )
+
+        path = os.path.join(self.b.tmp, "bomb.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            for row in good:
+                f.write(json.dumps(row) + "\n")
+            f.write(bomb_line + "\n")
+            for row in more_good:
+                f.write(json.dumps(row) + "\n")
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("[zmem] ingest-jsonl: added=", r.stdout,
+                      "the summary line must print even after a RecursionError mid-file")
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 6)
+        self.assertEqual(counts["malformed"], 1)
+        # The bomb is the 4th line (after 3 good rows); reporting its own
+        # line number, same as every other malformed-line case, also proves
+        # the RecursionError was actually handled in place -- a re-raise or a
+        # second stack blow inside the except block would never reach this
+        # print at all.
+        self.assertIn("malformed line 4", r.stderr)
+
+        ids = {row[0] for row in self.b.query_all("SELECT id FROM memory")}
+        self.assertEqual(ids, {row["id"] for row in good + more_good},
+                         "all six well-formed rows must land; the bomb must not abort the run")
+
+
+# ---------------------------------------------------------------------------
 # Validation of remote-authored rows (HIGH-1 / HIGH-2 / MED-5 + recency forgery)
 # ---------------------------------------------------------------------------
 class IngestValidationTest(_TwoStoreCase):

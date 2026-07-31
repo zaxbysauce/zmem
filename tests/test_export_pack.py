@@ -317,6 +317,36 @@ class ContentSanitizationTest(_StoreCase):
 
 
 # ---------------------------------------------------------------------------
+# Unicode line separators (U+2028/U+2029/U+0085) must collapse like CR/LF
+# ---------------------------------------------------------------------------
+# Written as \uXXXX escapes throughout (never a literal glyph) to keep this
+# source ASCII-only and unambiguous under any console codepage.
+class UnicodeLineSeparatorSanitizationTest(_StoreCase):
+    def test_row_with_unicode_separators_renders_as_one_physical_line(self):
+        """_collapse_line_breaks only handled \\r/\\n before this fix. A row
+        carrying U+2028/U+2029/U+0085 -- which str.splitlines() (and some
+        renderers) treat as line breaks even though they are not \\r/\\n --
+        could otherwise still open its own visual "line" inside a bullet."""
+        content = "alpha\u2028beta\u2029gamma\u0085delta"
+        self.add(NS, content, confidence=0.9)
+
+        r = self.run_store("export-pack", "--namespace", NS)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = r.stdout
+
+        bullets = [ln for ln in out.splitlines() if ln.startswith("- **[")]
+        matching = [ln for ln in bullets if "alpha" in ln and "delta" in ln]
+        self.assertEqual(len(matching), 1,
+                         f"the row must render as exactly one bullet, got: {matching!r}")
+        # No raw separator survives -- each is collapsed to a space -- so
+        # str.splitlines() cannot detect any break inside the bullet's text.
+        self.assertIn("alpha beta gamma delta", matching[0])
+        self.assertNotIn("\u2028", matching[0])
+        self.assertNotIn("\u2029", matching[0])
+        self.assertNotIn("\u0085", matching[0])
+
+
+# ---------------------------------------------------------------------------
 # empty pack -> exit 2
 # ---------------------------------------------------------------------------
 class EmptyPackTest(_StoreCase):
