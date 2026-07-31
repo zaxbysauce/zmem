@@ -46,9 +46,20 @@ python <store.py> export-pack \
   portable lessons ride along without drowning out project-specific ones.
 - `--min-confidence` — floor below which a memory is not worth shipping into
   a pack a cloud session can't independently verify (default 0.6).
-- `--max-bytes` — hard cap on the generated file size (default 32768), so a
-  large store can't silently balloon the pack into something that eats
-  context budget.
+- `--max-bytes` — budget, in UTF-8 bytes, for the **bullet lines** (default
+  32768), so a large store can't silently balloon the pack into something
+  that eats context budget. Precisely:
+  - It is not a hard cap on the file. Structural text — the auto-generated
+    header comment, the title, the two section headings, any `(none)`
+    placeholder, and the trailing omitted-count note — is exempt, so a pack
+    always contains its framing even at an absurdly small `--max-bytes`
+    (`--max-bytes 10` still emits a few hundred bytes of structure).
+  - A bullet is emitted whole or not at all — never truncated.
+  - A bullet that would exceed the remaining budget is skipped and counted,
+    and the walk continues: later, smaller rows still make it in. One long
+    memory does not evict the rest of the pack.
+  - Skipped rows are reported in a trailing
+    `*(N row(s) omitted to stay within --max-bytes=…)*` note.
 
 `export-pack` ships in zmem 0.5.0.
 
@@ -148,6 +159,33 @@ becomes friction, Tier 3 gives the cloud session its own real (if smaller)
 copy of the store, kept in sync through a private git repo — no manual
 copy/paste, no waiting for a human to run `/ingest-harvest`.
 
+### Trust model — read this before setting Tier 3 up
+
+**Write access to the sync repo is write access to the content of your local
+memory store.** There is no weaker way to state it. Anyone (or anything) that
+can push a JSONL file the local side later ingests can:
+
+- insert arbitrary rows into any namespace they name — **including
+  `user:global`**, which is injected into the context of *every* future
+  session on this box, in every project;
+- choose the `confidence` and `signal` those rows carry, and therefore how
+  highly they rank in recall and whether they clear `export-pack`'s
+  `--min-confidence` floor into a committed pack;
+- with `--allow-tombstones`, kill live local rows by id.
+
+That is a persistent instruction-injection channel into your own agent, not
+just "some data got synced." zmem reduces the blast radius — incoming rows
+are validated and clamped, remote content is sanitized before it is rendered
+into a pack, tombstones against live rows are refused unless you explicitly
+opt in — but none of that makes an attacker-controlled sync repo safe. It
+makes an *honest* sync repo survivable when a row is corrupt.
+
+So: keep the sync repo **private**, restrict who and what can push to it,
+prefer a PR (reviewable) over a direct push for the outbox, and give it the
+same care you give the store itself. Treat a compromise of the sync repo as a
+compromise of the store, and rebuild rather than "clean up" — see the
+`--allow-tombstones` rule below for which direction of ingest is trusted.
+
 ### The pattern
 
 - **Local side** (the box that owns the real `~/.zmem` store) periodically
@@ -172,8 +210,16 @@ copy/paste, no waiting for a human to run `/ingest-harvest`.
   python zmem/skills/memory/scripts/store.py init
   python zmem/skills/memory/scripts/store.py ingest-jsonl \
     --in sync-repo/sync/memory.jsonl \
+    --allow-tombstones \
     [--source-ref REF]
   ```
+  `--allow-tombstones` belongs **here** and only here in this loop: this file
+  is your own box's export, the authoritative source for these ids, flowing
+  downstream into a throwaway cloud store. A row you superseded locally must
+  actually die in the cloud copy, or the cloud session keeps recalling
+  something you already corrected. (See "Which direction gets
+  `--allow-tombstones`" below.)
+
   This gives the cloud session real `recall`/`search`/`list` against that
   data. Skip installing the ONNX embedding runtime on the cloud box — plain
   `recall` (and `--hybrid` when embeddings are unavailable) already falls
@@ -194,23 +240,70 @@ copy/paste, no waiting for a human to run `/ingest-harvest`.
     --namespace <whatever the cloud session wrote to>
   # commit + push to the sync repo
   ```
-  That overlap is harmless, not wasteful-but-broken: `ingest-jsonl`'s
-  dedup-on-write (below) refreshes an already-known row instead of
-  duplicating it, so re-shipping the same rows costs a little bandwidth, not
+  That overlap is harmless, not wasteful-but-broken: re-shipping a row the
+  receiving store already has does not duplicate it (details under "What
+  re-ingesting the same row actually does"). It costs a little bandwidth, not
   correctness. If bandwidth matters, scope `--namespace` tightly to just the
   namespace(s) the cloud session actually wrote to.
 
-- **Local side ingests the outbox** on its own cadence:
+- **Local side ingests the outbox** on its own cadence — **without**
+  `--allow-tombstones`:
   ```bash
   python <store.py> ingest-jsonl --in sync-repo/outbox/<file>.jsonl \
     --source-ref "cloud:<cloud-session-id>"
   ```
-  `ingest-jsonl`'s dedup-on-write (the same semantic/exact-match dedup
-  `add` uses) means repeated ingestion of the same outbox file — or overlap
-  between two cloud sessions' outboxes — is safe: re-ingesting an unchanged
-  row refreshes it rather than duplicating it.
+  Repeated ingestion of the same outbox file — or overlap between two cloud
+  sessions' outboxes — is safe (again, see below).
 
-`export-jsonl` / `ingest-jsonl` ship in zmem 0.5.0.
+- **Re-embed after ingesting an outbox.** Ingest only computes an embedding
+  when the embedding runtime is available on the ingesting box; rows that
+  land without one are FTS-only until they are embedded, so semantic recall
+  and dedup silently under-perform on exactly the newest knowledge:
+  ```bash
+  python <store.py> reembed
+  ```
+  Cheap and idempotent — it backfills only live rows that are missing an
+  embedding. Put it at the end of your ingest cadence.
+
+### Which direction gets `--allow-tombstones`
+
+`ingest-jsonl` will not let an incoming superseded row kill a **live local
+row** unless you pass `--allow-tombstones`. The rule is about *authority over
+those ids*, not about convenience:
+
+| Ingest | Flag | Why |
+|---|---|---|
+| Local store ← your own export (rebuild, restore, box-to-box move) | `--allow-tombstones` | The file is authoritative for those ids; a supersession you made must propagate. |
+| Cloud store ← `sync/memory.jsonl` (your box's export) | `--allow-tombstones` | Same: your box owns those ids, the cloud copy is downstream. |
+| Local store ← `outbox/*.jsonl` (cloud/remote session output) | **no flag** | A remote session is not authoritative over your local rows. Tombstoning is the one irreversible thing an outbox could ask for. |
+
+Without the flag, such a row is left alone and counted in the summary as
+`tombstones_refused=N`, with a single stderr note naming the first refused
+id. Nothing is lost — re-run with the flag if you decide the file is
+authoritative after all. A brand-new id that arrives *already* tombstoned is
+still inserted as history in both modes: it was never live here, so nothing
+is destroyed, and keeping it makes future syncs consistent.
+
+### What re-ingesting the same row actually does
+
+Two different mechanisms, easy to conflate:
+
+- **Same `id` already present locally** → the row is **skipped**. Local
+  content is never overwritten by a sync import; the local row is not
+  mutated, not refreshed, not re-ranked. (The one exception is the tombstone
+  path above.) This is what makes re-ingesting the same file idempotent.
+- **Different `id`, duplicate content in the same namespace** → the row is
+  **deduped**: the same dedup-on-write `add` uses (semantic when embeddings
+  are available, exact-match otherwise) merges it into the existing local
+  row, taking the higher confidence and the stronger signal and unioning
+  tags, instead of inserting a second copy.
+
+Neither case duplicates the row, which is the property the outbox loop relies
+on — but only the second one updates anything.
+
+`export-jsonl` / `ingest-jsonl` ship in zmem 0.5.0; `--allow-tombstones` and
+the `tombstones_refused=` summary field were added in the hardening pass on
+top of it.
 
 ### Minimal GitHub Actions snippet (cloud side)
 
@@ -245,12 +338,18 @@ jobs:
           python-version: "3.11"
 
       - name: Initialize workspace store and ingest latest sync
+        # --allow-tombstones: sync/memory.jsonl is the owning box's own
+        # export, authoritative for these ids, and this workspace store is a
+        # throwaway downstream copy. The LOCAL side's ingest of outbox/*.jsonl
+        # must NOT use the flag -- see "Which direction gets
+        # --allow-tombstones".
         env:
           ZMEM_DATA: ${{ github.workspace }}/.zmem-cloud
         run: |
           python zmem/skills/memory/scripts/store.py init
           python zmem/skills/memory/scripts/store.py ingest-jsonl \
             --in sync-repo/sync/memory.jsonl \
+            --allow-tombstones \
             --source-ref "sync:${{ github.run_id }}"
 
       # ... run your agent task here, recalling/adding against ZMEM_DATA ...
@@ -258,9 +357,10 @@ jobs:
       - name: Export the workspace store to the outbox
         # Re-exports the whole workspace store (export-jsonl has no
         # "only what changed this run" filter), including rows this run
-        # ingested from sync/memory.jsonl. Harmless: ingest-jsonl's
-        # dedup-on-write refreshes those rather than duplicating them. Add
-        # --namespace here to scope it down if bandwidth matters.
+        # ingested from sync/memory.jsonl. Harmless: on the local side those
+        # ids are already known, so ingest-jsonl skips them -- it does not
+        # duplicate them (and does not update them either). Add --namespace
+        # here to scope it down if bandwidth matters.
         env:
           ZMEM_DATA: ${{ github.workspace }}/.zmem-cloud
         run: |
@@ -279,7 +379,29 @@ jobs:
 
 The local side then runs its own `ingest-jsonl` pass against
 `sync-repo/outbox/*.jsonl` on its normal cadence (a scheduled task, or as
-part of `closeout`) to fold cloud-session writes into the real store.
+part of `closeout`) to fold cloud-session writes into the real store — with
+no `--allow-tombstones`, and followed by a `reembed`.
+
+### `ZMEM_PROXY_FORGE_HOST` — namespace keys behind a loopback git proxy
+
+Remote/CCR sessions reach their repo through a local HTTP proxy
+(`http://local_proxy@127.0.0.1:<port>/git/<org>/<repo>`). The ephemeral port
+would otherwise land in the `project:*` namespace key, fragmenting one repo's
+memory across sessions, so `resolve_namespace` collapses a loopback remote
+whose path starts with `git/` (matched case-insensitively) to
+`<forge>/<org>/<repo>`. The env var has three states:
+
+| `ZMEM_PROXY_FORGE_HOST` | Behavior |
+|---|---|
+| unset | Rewrite to `github.com/<org>/<repo>` (the default; CCR proxies GitHub today). |
+| set, non-empty | Rewrite to `<that host>/<org>/<repo>` — for a proxy fronting another forge. |
+| set but **empty** (`""` or whitespace) | **Opt out.** No rewrite; the remote keeps its literal `127.0.0.1:<port>/git/...` key. |
+
+The empty-string opt-out exists for a genuine **local** git server that serves
+repos under a `/git/` prefix — Gitea's default layout, for instance. Those are
+not proxies for a public forge, and collapsing them onto `github.com/<org>/<repo>`
+would merge an unrelated local repo's memory into a public repo's namespace.
+Set `ZMEM_PROXY_FORGE_HOST=` (empty) in that environment.
 
 ### Never
 
@@ -287,7 +409,11 @@ part of `closeout`) to fold cloud-session writes into the real store.
   a workspace-local temp/ephemeral directory that dies with the job. The
   private sync repo, not a shared `ZMEM_DATA`, is the sync mechanism.
 - Never make the sync repo public — it carries plaintext memory content,
-  same as the real store (see the Security notes in the main `README.md`).
+  same as the real store (see the Security notes in the main `README.md`),
+  and write access to it is write access to the store's content (see "Trust
+  model" above).
+- Never pass `--allow-tombstones` when ingesting an outbox, or any other file
+  a session that is not authoritative over your ids produced.
 - Never skip the outbox review discipline just because it's automated: a
   cloud job's `export-jsonl` output is still only as trustworthy as
   whatever wrote it. If a cloud task's memory writes need human review

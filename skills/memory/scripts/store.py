@@ -29,7 +29,7 @@ Usage:
   python store.py export-pack --namespace NS [--out FILE] [--project-limit 50] \\
          [--global-limit 15] [--min-confidence 0.6] [--max-bytes 32768]
   python store.py export-jsonl [--out FILE] [--namespace NS] [--include-superseded]
-  python store.py ingest-jsonl --in FILE [--source-ref REF]
+  python store.py ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones]
 
 Design (see the memory skill's design doc):
   - Tombstone supersession (superseded_at), NOT full bi-temporal (YAGNI for single user).
@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -161,6 +162,13 @@ SIGNAL_CONFIDENCE = {
     "user": 0.6,
     "none": 0.3,
 }
+
+# The two closed enums the store's own writers already enforce (`add`'s
+# argparse choices). Named here so the Tier 3 ingest validator enforces the
+# SAME sets on remote-authored rows -- a sync file must not be able to widen
+# them by writing straight into the table.
+ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
+ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
 
 CONFIDENCE_FLOOR = 0.25
 
@@ -1166,8 +1174,19 @@ def supersede_memory(
     except sqlite3.OperationalError:
         pass  # vec0 table not available
     _commit(conn)
+    # The confirmation print interpolates `reason`, which on the ingest-jsonl
+    # path is REMOTE-AUTHORED. stdout is strict under a legacy codepage
+    # (PYTHONIOENCODING=cp1252 and friends), so a non-representable character
+    # in `reason` would raise HERE -- after the commit -- and ingest-jsonl's
+    # per-row guard would then count a supersession that actually landed as
+    # `malformed`. A cosmetic status line must never be able to misreport a
+    # durable write, so its failure is swallowed and retried in ASCII.
     note = f": {reason}" if reason else ""
-    print(f"[zmem] superseded {mid}{note}")
+    try:
+        print(f"[zmem] superseded {mid}{note}")
+    except UnicodeEncodeError:
+        safe_note = note.encode("ascii", "replace").decode("ascii")
+        print(f"[zmem] superseded {mid}{safe_note}")
     return True
 
 
@@ -2399,14 +2418,52 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
 # in. The consumer (reflect.sh) does the ``` fence-wrap + "untrusted data only"
 # framing; this function guarantees the strings it hands back are fence-safe.
 
+def _collapse_line_breaks(text) -> str:
+    """Collapse every CR/LF in `text` to a single space.
+
+    The shared fence-integrity primitive: with no newlines, untrusted text can
+    never start its own line, so it can never form a fence-close, a markdown
+    heading, a list bullet, or a line-oriented directive of any kind. Used by
+    _sanitize_error_text (hook output) and _sanitize_pack_content (export-pack
+    bullets) — one primitive, two consumers, so the guarantee cannot drift.
+    """
+    if not text:
+        return ""
+    return str(text).replace("\r", " ").replace("\n", " ")
+
+
 def _sanitize_error_text(text, limit: int = 200) -> str:
     """Make an untrusted tool-error string safe to embed in a fenced block:
     collapse CR/newlines to spaces (fence-integrity), then truncate. Preserves
     the error's characters otherwise so it stays diagnostically useful."""
     if not text:
         return ""
-    s = str(text).replace("\r", " ").replace("\n", " ")
-    return s[:limit].strip()
+    return _collapse_line_breaks(text)[:limit].strip()
+
+
+def _sanitize_pack_content(text) -> str:
+    """Make a stored memory field safe to render as one export-pack bullet.
+
+    Memory content is UNTRUSTED for this purpose: a Tier 3 sync file is
+    remote-authored, and the pack it feeds is read verbatim by other agents
+    as instructions-adjacent context. Without this, one row could close the
+    generated markdown's structure and inject its own — a prompt-injection
+    surface, not just a formatting bug.
+
+    Three neutralizations, no truncation (unlike _sanitize_error_text: a pack
+    bullet must render the whole memory or the pack silently lies):
+      - CR/LF -> spaces, via the shared _collapse_line_breaks primitive. This
+        is the load-bearing one: it alone stops a row from emitting its own
+        '## heading', '- bullet', or leading-'#' line.
+      - ``` -> ''' so a row cannot open/close a code fence a consumer wrapped
+        the pack in.
+      - '<!--' / '-->' spaced apart, so a row cannot close the pack's own
+        auto-generated HTML comment header or comment out the rest of it.
+    """
+    s = _collapse_line_breaks(text)
+    s = s.replace("```", "'''")
+    s = s.replace("<!--", "<!- -").replace("-->", "-- >")
+    return s.strip()
 
 
 def _sanitize_tool_name(name, limit: int = 100) -> str:
@@ -2616,13 +2673,22 @@ def _render_pack(namespace: str, store_path: str, project_rows, global_rows, max
     """Render the Tier 1 markdown memory pack.
 
     Bullets are added greedily in document order (project section, then the
-    global one) and the walk stops the instant the NEXT bullet would push the
-    UTF-8-encoded output past max_bytes -- a bullet is only ever added whole,
-    never truncated, and once the budget is exhausted every remaining row
-    (in either section) counts toward the trailing omitted-count note.
+    global one). Each row is tested INDIVIDUALLY against the budget: if adding
+    that bullet would push the UTF-8-encoded output past max_bytes it is
+    skipped and counted toward the trailing omitted-count note, and the walk
+    CONTINUES -- a later, smaller row still gets its bullet. (Skipping the
+    rest of the pack after the first oversized row would let one long memory
+    silently delete every other memory from the pack.) A bullet is only ever
+    added whole, never truncated.
+
     Structural text (header comment, titles, section headings, the "(none)"
     placeholder, the omitted-count note itself) is exempt from the cap: it is
-    small, mandatory framing, not budget-controlled content.
+    small, mandatory framing, not budget-controlled content. max_bytes is
+    therefore a budget over emitted bullet lines, not a hard cap on the file.
+
+    Every rendered field goes through _sanitize_pack_content first: pack rows
+    can be remote-authored (Tier 3 sync) and the pack is read as context by
+    other agents, so no row may break out of its bullet.
     """
     today = time.strftime("%Y-%m-%d", time.gmtime())
     lines: list[str] = [
@@ -2632,7 +2698,7 @@ def _render_pack(namespace: str, store_path: str, project_rows, global_rows, max
         "",
     ]
 
-    state = {"exhausted": False, "omitted": 0}
+    state = {"omitted": 0}
 
     def _emit_section(title: str, rows) -> None:
         lines.append(f"## {title}")
@@ -2641,13 +2707,16 @@ def _render_pack(namespace: str, store_path: str, project_rows, global_rows, max
             lines.append("")
             return
         for row in rows:
-            if state["exhausted"]:
-                state["omitted"] += 1
-                continue
-            bullet = f"- **[{row['type']}/{row['signal']}]** {row['content']}"
+            bullet = (
+                f"- **[{_sanitize_pack_content(row['type'])}"
+                f"/{_sanitize_pack_content(row['signal'])}]** "
+                f"{_sanitize_pack_content(row['content'])}"
+            )
             projected = len(("\n".join(lines + [bullet]) + "\n").encode("utf-8"))
             if projected > max_bytes:
-                state["exhausted"] = True
+                # Per-row skip, NOT a sticky stop: a single oversized memory
+                # must not evict every smaller row behind it (including the
+                # whole user:global section).
                 state["omitted"] += 1
                 continue
             lines.append(bullet)
@@ -2764,28 +2833,161 @@ def cmd_export_jsonl(
     return 0
 
 
-def _ingest_row(conn: sqlite3.Connection, obj: dict) -> str:
-    """Apply one parsed JSONL sync row to the local store.
+# Hard ceiling on a synced row's content. Nothing the local writers produce
+# comes close; a row past it is either corrupt or a deliberate attempt to
+# bloat the store / the packs and prompts built from it, so it is rejected as
+# malformed rather than clamped (silently truncating memory content would be
+# worse than refusing it).
+INGEST_MAX_CONTENT_CHARS = 65536
 
-    Returns 'added', 'tombstoned', 'deduped', or 'skipped' -- the caller
-    tallies these into the ingest-jsonl summary line. The caller has already
-    validated `obj` has the required keys; malformed-line handling lives
-    there so a bad row never reaches this function.
+# Shape guard for an incoming id: UUID-length hex-and-dashes. This is a
+# charset/length guard, not a UUID parser -- the point is that an id from a
+# remote file can never be an arbitrary string that some later consumer
+# interpolates somewhere it shouldn't.
+_INGEST_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+# Reject a forged-future ingestion_ts beyond this much clock skew. Recency is
+# a ranking input (compute_score), so an unbounded future timestamp is a
+# permanent top-of-recall boost for whoever wrote the sync file.
+INGEST_MAX_FUTURE_SKEW_SECONDS = 86400
+
+
+def _validate_sync_row(obj: dict) -> dict:
+    """Validate + normalize ONE remote-authored JSONL sync row.
+
+    Returns a dict whose every field is already the right Python type for a
+    direct bind into the memory table; raises ValueError (-> the caller counts
+    the line malformed and continues) for anything that isn't recoverable.
+
+    This exists because ingest-jsonl writes straight into the table, bypassing
+    add_memory() and every guard argparse applies to a local `add`: without it
+    a sync file can set any column to any JSON type. The concrete damage that
+    motivated it: a STRING confidence is stored by SQLite as TEXT, and TEXT
+    sorts above every numeric in SQLite's type ordering -- so it passes the
+    `confidence >= ?` floor, hijacks export-pack's `ORDER BY confidence DESC`,
+    and then crashes recall's compute_score with a ValueError on float().
+
+    Recoverable (normalized, not rejected):
+      - unknown/absent/non-str signal -> "none"
+      - non-numeric, non-finite, or out-of-range confidence -> the
+        signal-derived default, clamped to [0.0, 1.0]
+      - a far-future ingestion_ts -> clamped to now
+      - absent/None optional string fields -> ""
+    Rejected as malformed:
+      - id absent or not UUID-shaped; namespace/content absent, non-str, or
+        empty; type not in ALLOWED_TYPES; content over the size cap; any
+        optional field present with a non-str, non-null type.
+    """
+    def _req_str(key: str) -> str:
+        v = obj.get(key)
+        if not isinstance(v, str):
+            raise ValueError(f"field '{key}' must be a string, got {type(v).__name__}")
+        if not v.strip():
+            raise ValueError(f"field '{key}' is empty")
+        return v
+
+    def _opt_str(key: str) -> str:
+        v = obj.get(key)
+        if v is None:
+            return ""
+        if not isinstance(v, str):
+            raise ValueError(f"field '{key}' must be a string or null, "
+                             f"got {type(v).__name__}")
+        return v
+
+    mid = obj.get("id")
+    if not isinstance(mid, str) or not _INGEST_ID_RE.match(mid):
+        raise ValueError("field 'id' must be a 36-char UUID-shaped string")
+
+    namespace = _req_str("namespace")
+    content = _req_str("content")
+    if len(content) > INGEST_MAX_CONTENT_CHARS:
+        raise ValueError(f"field 'content' is {len(content)} chars, over the "
+                         f"{INGEST_MAX_CONTENT_CHARS} limit")
+
+    type_ = obj.get("type")
+    if not isinstance(type_, str) or type_ not in ALLOWED_TYPES:
+        raise ValueError(f"field 'type' must be one of {', '.join(ALLOWED_TYPES)}")
+
+    # Signal is normalized, not rejected: an unknown signal costs the row its
+    # confidence default, which is a fine outcome; losing the row is not.
+    raw_signal = obj.get("signal")
+    signal = raw_signal if (isinstance(raw_signal, str) and raw_signal in ALLOWED_SIGNALS) else "none"
+
+    fallback_conf = SIGNAL_CONFIDENCE.get(signal, 0.3)
+    raw_conf = obj.get("confidence")
+    if raw_conf is None:
+        confidence = fallback_conf
+    else:
+        try:
+            confidence = float(raw_conf)
+        except (TypeError, ValueError):
+            confidence = fallback_conf
+        # float() happily accepts "nan"/"inf": both would defeat the clamp
+        # below (min/max propagate NaN) and poison the same ORDER BY.
+        if not math.isfinite(confidence):
+            confidence = fallback_conf
+    confidence = max(0.0, min(1.0, confidence))
+
+    tags = _opt_str("tags")
+    source_ref = _opt_str("source_ref")
+    supersede_reason = _opt_str("supersede_reason")
+    valid_from = _opt_str("valid_from")
+    ingestion_ts = _opt_str("ingestion_ts")
+    superseded_at = _opt_str("superseded_at") or None
+
+    if not ingestion_ts:
+        ingestion_ts = now_iso()
+    else:
+        # A timestamp we cannot parse keeps today's graceful behavior (stored
+        # verbatim; compute_score already treats an unparsable ingestion_ts as
+        # unknown-age/neutral). Only a PARSED, implausibly-future one is
+        # clamped -- that is the forgeable case.
+        ts_epoch = _parse_iso_to_epoch(ingestion_ts)
+        if ts_epoch > 0 and ts_epoch > time.time() + INGEST_MAX_FUTURE_SKEW_SECONDS:
+            ingestion_ts = now_iso()
+
+    return {
+        "id": mid,
+        "namespace": namespace,
+        "type": type_,
+        "content": content,
+        "tags": tags,
+        "source_ref": source_ref,
+        "signal": signal,
+        "confidence": confidence,
+        "ingestion_ts": ingestion_ts,
+        "valid_from": valid_from or ingestion_ts,
+        "superseded_at": superseded_at,
+        "supersede_reason": supersede_reason,
+    }
+
+
+def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) -> str:
+    """Apply one VALIDATED JSONL sync row (a _validate_sync_row result) to the
+    local store.
+
+    Returns 'added', 'tombstoned', 'tombstone_refused', 'deduped', or
+    'skipped' -- the caller tallies these into the ingest-jsonl summary line.
+    Malformed-row handling lives in the caller, so a bad row never reaches
+    this function; the caller also catches anything raised here (a row that
+    blows up must not abort the rest of the file).
+
+    `allow_tombstones` gates the ONLY destructive thing an import can do to an
+    existing local row (see cmd_ingest_jsonl's flag docs).
     """
     mid = obj["id"]
     namespace = obj["namespace"]
     type_ = obj["type"]
     content = obj["content"]
-    tags = obj.get("tags") or ""
-    source_ref = obj.get("source_ref") or ""
-    signal = obj.get("signal") or "none"
-    confidence = obj.get("confidence")
-    if confidence is None:
-        confidence = SIGNAL_CONFIDENCE.get(signal, 0.3)
-    ingestion_ts = obj.get("ingestion_ts") or now_iso()
-    valid_from = obj.get("valid_from") or ingestion_ts
-    superseded_at = obj.get("superseded_at") or None
-    supersede_reason = obj.get("supersede_reason") or ""
+    tags = obj["tags"]
+    source_ref = obj["source_ref"]
+    signal = obj["signal"]
+    confidence = obj["confidence"]
+    ingestion_ts = obj["ingestion_ts"]
+    valid_from = obj["valid_from"]
+    superseded_at = obj["superseded_at"]
+    supersede_reason = obj["supersede_reason"]
 
     local = conn.execute("SELECT superseded_at FROM memory WHERE id=?", (mid,)).fetchone()
 
@@ -2795,6 +2997,8 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict) -> str:
         # a tombstone, and only if the incoming row is superseded and the
         # local one is not already -- everything else is a no-op skip.
         if superseded_at and local["superseded_at"] is None:
+            if not allow_tombstones:
+                return "tombstone_refused"
             ok = supersede_memory(conn, mid, supersede_reason, at=superseded_at)
             return "tombstoned" if ok else "skipped"
         return "skipped"
@@ -2804,6 +3008,12 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict) -> str:
         # future syncs stay consistent, without letting it participate in
         # dedup-on-write or recall -- it must not resurface, and it must not
         # silently absorb a live row into its (dead) dedup slot either.
+        # The secret scan runs here too: a tombstoned row's content is still
+        # written to disk and still readable via `get`/`list
+        # --include-superseded`, so "it's already dead" is not a reason to
+        # skip the warning. Advisory only, exactly like the live path.
+        for w in _check_secrets(content, source_ref):
+            print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
         shash = _source_hash(source_ref)
         conn.execute(
             """INSERT INTO memory
@@ -2826,38 +3036,68 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict) -> str:
     warns = _check_secrets(content, source_ref)
     for w in warns:
         print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
-    existing, _sim, _emb = _detect_duplicate(conn, content, namespace)
+    existing, _sim, emb = _detect_duplicate(conn, content, namespace)
     if existing:
         _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
         _commit(conn)
         return "deduped"
 
     shash = _source_hash(source_ref)
+    # _detect_duplicate already embedded this content when embeddings are
+    # available; store that vector instead of discarding it and leaving the
+    # row for a later `reembed` to redo. Mirrors add_memory()'s insert. Note
+    # embedded_at is LOCAL now (the vector was computed here, on this box),
+    # not the row's upstream ingestion_ts. When embeddings are unavailable
+    # emb is None and the row keeps today's NULL/'' shape for reembed.
+    emb_model = "minilm-onnx" if emb is not None else ""
+    embedded_at = now_iso() if emb is not None else None
     conn.execute(
         """INSERT INTO memory
            (id, namespace, type, content, tags, source_ref, source_hash,
             confidence, signal, valid_from, superseded_at, ingestion_ts,
             retrieval_count, last_retrieved, embedding, embedding_model, embedded_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,NULL,'',NULL)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?)""",
         (mid, namespace, type_, content, tags, source_ref, shash,
-         confidence, signal, valid_from, ingestion_ts),
+         confidence, signal, valid_from, ingestion_ts, emb, emb_model, embedded_at),
     )
+    if emb is not None:
+        try:
+            conn.execute(
+                "INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
+                [emb, mid],
+            )
+        except sqlite3.OperationalError:
+            pass  # vec0 table not available -- embedding stored in memory table only
     _commit(conn)
     return "added"
 
 
-def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str, source_ref: str | None) -> int:
+def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
+                     source_ref: str | None, allow_tombstones: bool = False) -> int:
     """Import a JSONL sync file written by export-jsonl. Returns a process
     exit code: 2 if `in_path` cannot be read or contains no data lines at
     all, 0 otherwise (malformed/skipped/deduped rows do not fail the run --
-    they are tallied and reported in the summary line)."""
+    they are tallied and reported in the summary line).
+
+    EVERY row is validated (_validate_sync_row) before it can touch the DB,
+    and every row's application is individually guarded: one bad row is
+    counted, reported with its line number, and the file keeps going. The
+    summary line always prints, so "the run finished" and "every row landed"
+    are never confused for each other.
+
+    `allow_tombstones` controls whether an incoming row may kill a LIVE local
+    row (see the --allow-tombstones flag help). Default off: a sync file is
+    remote-authored data, and deleting local memory is the one irreversible
+    thing it could ask for.
+    """
     try:
         raw = Path(in_path).read_text(encoding="utf-8")
     except OSError as e:
         print(f"[zmem] ingest-jsonl: cannot read {in_path}: {e}", file=sys.stderr)
         return 2
 
-    added = tombstoned = deduped = skipped = malformed = 0
+    added = tombstoned = tombstones_refused = deduped = skipped = malformed = 0
+    first_refused_id = None
     saw_line = False
     for lineno, raw_line in enumerate(raw.splitlines(), start=1):
         line = raw_line.strip()
@@ -2868,11 +3108,10 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str, source_ref: str 
             obj = json.loads(line)
             if not isinstance(obj, dict):
                 raise ValueError("line is not a JSON object")
-            missing = [k for k in ("id", "namespace", "type", "content") if not obj.get(k)]
-            if missing:
-                raise ValueError(f"missing required field(s): {', '.join(missing)}")
+            obj = _validate_sync_row(obj)
         except (json.JSONDecodeError, ValueError) as e:
-            print(f"[zmem] ingest-jsonl: malformed line {lineno}: {e}", file=sys.stderr)
+            print(f"[zmem] ingest-jsonl: malformed line {lineno}: "
+                  f"{_sanitize_error_text(str(e))}", file=sys.stderr)
             malformed += 1
             continue
 
@@ -2881,14 +3120,33 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str, source_ref: str 
             # origin, overriding whatever source_ref the row carried in --
             # the original almost always points at a path that does not
             # exist on this machine.
-            obj = dict(obj)
             obj["source_ref"] = source_ref
 
-        outcome = _ingest_row(conn, obj)
+        try:
+            outcome = _ingest_row(conn, obj, allow_tombstones=allow_tombstones)
+        except Exception as e:
+            # A row that raises mid-apply must not abort the file and silently
+            # drop every row after it. Roll back first: _ingest_row commits at
+            # each of its return paths, so an exception between an INSERT and
+            # its commit would otherwise leave a partial write open for the
+            # NEXT row's commit to land.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            print(f"[zmem] ingest-jsonl: malformed line {lineno}: could not apply row: "
+                  f"{type(e).__name__}: {_sanitize_error_text(str(e))}", file=sys.stderr)
+            malformed += 1
+            continue
+
         if outcome == "added":
             added += 1
         elif outcome == "tombstoned":
             tombstoned += 1
+        elif outcome == "tombstone_refused":
+            tombstones_refused += 1
+            if first_refused_id is None:
+                first_refused_id = obj["id"]
         elif outcome == "deduped":
             deduped += 1
         else:
@@ -2898,8 +3156,17 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str, source_ref: str 
         print(f"[zmem] ingest-jsonl: {in_path} is empty -- nothing to ingest", file=sys.stderr)
         return 2
 
+    if tombstones_refused:
+        # ONE note, not one per row: a hostile or corrupt file could otherwise
+        # bury every other warning under thousands of lines.
+        print(f"[zmem] ingest-jsonl: refused {tombstones_refused} tombstone(s) against "
+              f"LIVE local row(s) (first id: {first_refused_id}); those rows are "
+              f"untouched. Re-run with --allow-tombstones ONLY if this file is your "
+              f"own store's export, not a remote/cloud outbox.", file=sys.stderr)
+
     print(f"[zmem] ingest-jsonl: added={added} tombstoned={tombstoned} "
-          f"deduped={deduped} skipped={skipped} malformed={malformed}")
+          f"tombstones_refused={tombstones_refused} deduped={deduped} "
+          f"skipped={skipped} malformed={malformed}")
     return 0
 
 
@@ -2911,13 +3178,12 @@ def main():
 
     p_add = sub.add_parser("add", help="add a memory")
     p_add.add_argument("--namespace", required=True)
-    p_add.add_argument("--type", required=True, choices=["fact", "lesson", "convention", "preference"])
+    p_add.add_argument("--type", required=True, choices=list(ALLOWED_TYPES))
     p_add.add_argument("--content", required=True)
     p_add.add_argument("--tags", default="")
     p_add.add_argument("--source-ref", default="")
     p_add.add_argument("--confidence", type=float, default=None)
-    p_add.add_argument("--signal", default="none",
-                       choices=["test", "compile", "lint", "reviewer", "user", "none"])
+    p_add.add_argument("--signal", default="none", choices=list(ALLOWED_SIGNALS))
 
     p_recall = sub.add_parser("recall", help="recall relevant memories")
     p_recall.add_argument("--query", required=True)
@@ -3035,8 +3301,13 @@ def main():
                                help=f"confidence floor for both sections (default {EXPORT_PACK_DEFAULT_MIN_CONFIDENCE})")
     p_export_pack.add_argument("--max-bytes", type=int,
                                default=EXPORT_PACK_DEFAULT_MAX_BYTES,
-                               help="cap the UTF-8 encoded output; bullets beyond the cap are "
-                                    f"omitted, never truncated (default {EXPORT_PACK_DEFAULT_MAX_BYTES})")
+                               help="budget (UTF-8 bytes) for the bullet lines; a bullet that "
+                                    "would exceed it is omitted whole, never truncated, and "
+                                    "later smaller bullets are still emitted. Structural text "
+                                    "(header, titles, section headings, '(none)', the "
+                                    "omitted-count note) is exempt, so the file itself can "
+                                    "exceed this by that framing "
+                                    f"(default {EXPORT_PACK_DEFAULT_MAX_BYTES})")
 
     p_export_jsonl = sub.add_parser(
         "export-jsonl",
@@ -3056,6 +3327,16 @@ def main():
     p_ingest_jsonl.add_argument("--source-ref", default=None,
                                 help="override source_ref on every row inserted this run "
                                      "(default: keep each row's own incoming source_ref)")
+    p_ingest_jsonl.add_argument("--allow-tombstones", action="store_true",
+                                help="let an incoming superseded row TOMBSTONE a live local "
+                                     "row with the same id. Off by default: use it only when "
+                                     "the file is an export of a store you trust as "
+                                     "authoritative for those ids (e.g. rebuilding a local "
+                                     "store from your own export). Ingesting a cloud/remote "
+                                     "outbox must NOT use it -- without the flag such rows "
+                                     "are counted as tombstones_refused and the local rows "
+                                     "are left alone. A brand-new id that arrives already "
+                                     "tombstoned is still inserted as history either way.")
 
     p_fail = sub.add_parser(
         "failures",
@@ -3198,7 +3479,8 @@ def main():
         conn.close()
         sys.exit(rc)
     elif args.cmd == "ingest-jsonl":
-        rc = cmd_ingest_jsonl(conn, in_path=args.in_path, source_ref=args.source_ref)
+        rc = cmd_ingest_jsonl(conn, in_path=args.in_path, source_ref=args.source_ref,
+                              allow_tombstones=args.allow_tombstones)
         conn.close()
         sys.exit(rc)
     conn.close()

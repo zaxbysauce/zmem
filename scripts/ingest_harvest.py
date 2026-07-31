@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +34,11 @@ from pathlib import Path
 REQUIRED_KEYS = ("namespace", "type", "content", "tags", "signal", "why")
 ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
 ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
+# Same ceiling store.py's Tier 3 ingest validator enforces
+# (INGEST_MAX_CONTENT_CHARS). A harvest is agent-authored text from a remote
+# session; nothing legitimate is this long, and an oversized row bloats the
+# store and every pack/prompt built from it.
+MAX_CONTENT_CHARS = 65536
 
 
 def _ascii(value: object) -> str:
@@ -77,6 +83,11 @@ def validate_row(row: object, index: int) -> tuple[dict | None, str | None]:
         return None, f"row {index}: namespace is empty"
     if not row["content"].strip():
         return None, f"row {index}: content is empty"
+    if len(row["content"]) > MAX_CONTENT_CHARS:
+        return None, (
+            f"row {index}: content is {len(row['content'])} chars, over the "
+            f"{MAX_CONTENT_CHARS} limit"
+        )
     if row["type"] not in ALLOWED_TYPES:
         return None, (
             f"row {index}: invalid type '{row['type']}' "
@@ -98,6 +109,15 @@ def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[bool, str]:
     store.py's add_memory() is intentional, and hand-setting it here would
     let a harvest silently override the honesty check signal is supposed
     to encode.
+
+    Encoding, both directions, because a harvest carries arbitrary non-ASCII:
+      - PYTHONIOENCODING=utf-8 in the CHILD's env, so store.py's own success
+        print (which echoes the namespace) cannot die with UnicodeEncodeError
+        on a legacy Windows codepage AFTER the row was already committed --
+        that made a landed row report as FAILED, the worst possible outcome
+        (the operator re-runs and the store gets a near-duplicate).
+      - encoding/errors on the PARENT's pipe decode, so a child byte sequence
+        this console cannot represent is replaced rather than raising here.
     """
     cmd = [
         sys.executable, str(store_py), "add",
@@ -108,7 +128,11 @@ def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[bool, str]:
         "--signal", row["signal"],
         "--source-ref", source_ref,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    result = subprocess.run(
+        cmd, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env=child_env,
+    )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         return False, detail or f"store.py add exited {result.returncode}"

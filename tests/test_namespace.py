@@ -179,6 +179,61 @@ class TestLoopbackProxyRemoteRewrite(unittest.TestCase):
                 result = host.resolve_namespace(repo)
             self.assertEqual(result, "project:gitlab.example.com/zaxbyhub/opencode-swarm")
 
+    def test_empty_forge_host_env_disables_the_rewrite_entirely(self):
+        """ZMEM_PROXY_FORGE_HOST has THREE states, not two. Set-but-empty is
+        the OPT-OUT, distinct from unset: it is how a genuine local git server
+        that serves repos under a `/git/` prefix (Gitea's default layout) says
+        'I am not a CCR proxy -- keep my literal loopback key'. Collapsing it
+        onto github.com would merge an unrelated local repo's memory into a
+        public repo's namespace."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp), "http://gitea@127.0.0.1:3000/git/MyOrg/MyRepo"
+            )
+            with mock.patch.dict(
+                os.environ, {"ZMEM_PROXY_FORGE_HOST": ""}, clear=False
+            ):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:127.0.0.1:3000/git/myorg/myrepo")
+
+    def test_whitespace_only_forge_host_env_also_disables_the_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp), "http://gitea@localhost:3000/git/MyOrg/MyRepo"
+            )
+            with mock.patch.dict(
+                os.environ, {"ZMEM_PROXY_FORGE_HOST": "   "}, clear=False
+            ):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:localhost:3000/git/myorg/myrepo")
+
+    def test_unset_forge_host_env_still_defaults_to_github(self):
+        """Guards the distinction the opt-out introduces: absent must NOT be
+        treated as empty."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp), "http://local_proxy@127.0.0.1:34567/git/Org/Repo"
+            )
+            env = {k: v for k, v in os.environ.items()
+                   if k != "ZMEM_PROXY_FORGE_HOST"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:github.com/org/repo")
+
+    def test_uppercase_git_path_prefix_still_rewrites(self):
+        """The host check is case-insensitive; the path prefix must match it,
+        or a proxy URL differing only in the case of `git/` fragments the same
+        repo's memory into a second namespace."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            upper = _make_git_repo(
+                tmp_path / "a", "http://local_proxy@127.0.0.1:34567/GIT/Org/Repo")
+            mixed = _make_git_repo(
+                tmp_path / "b", "http://local_proxy@127.0.0.1:41999/Git/Org/Repo")
+            expected = "project:github.com/org/repo"
+            self.assertEqual(host.resolve_namespace(upper), expected)
+            self.assertEqual(host.resolve_namespace(mixed), expected)
+
     def test_non_git_path_loopback_remote_unchanged(self):
         # Pin today's (pre-existing) behavior for a loopback remote whose path
         # does NOT start with `git/` — a genuinely local git server keeps its

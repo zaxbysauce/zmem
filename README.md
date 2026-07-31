@@ -156,6 +156,11 @@ committed snapshot up to a full sync-repo read/write loop: see
   or PII in it. The write-time secret scanner is an advisory heuristic (regex +
   entropy), **not a guarantee**.
 - All memory stays on your machine. No telemetry, no cloud calls.
+- **Tier 3 sync changes that.** If you wire up a private sync repo
+  (`docs/CLOUD.md`), write access to that repo is effectively write access to
+  the *content* of your store — including `user:global` rows, which are
+  injected into every future session on this box. Read the "Trust model"
+  section of [`docs/CLOUD.md`](docs/CLOUD.md) before setting it up.
 
 ## Cross-platform hook execution
 

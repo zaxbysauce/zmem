@@ -352,14 +352,25 @@ def _normalize_remote(url: str) -> str:
     key (host includes the ephemeral proxy port) than the same repo cloned
     locally. When the resolved host (port stripped) is a loopback address —
     `127.0.0.1`, `localhost`, `::1`, or `[::1]`, case-insensitively — and the
-    path's first two segments after a leading `git/` are `<org>/<repo>`,
-    rewrite the key to `<forge_host>/<org>/<repo>` instead, where forge_host
-    is `ZMEM_PROXY_FORGE_HOST` if set (non-empty) else `github.com` (CCR
-    proxies GitHub only today; the env var is the escape hatch for other
-    forges). A loopback path with fewer than two segments after `git/`, or
-    that doesn't start with `git/` at all, falls through unchanged — it's
-    either malformed or a genuinely local git server, which must keep its
-    existing key."""
+    path's first two segments after a leading `git/` (matched
+    case-insensitively, like the host check) are `<org>/<repo>`, rewrite the
+    key to `<forge_host>/<org>/<repo>` instead. A loopback path with fewer
+    than two segments after `git/`, or that doesn't start with `git/` at all,
+    falls through unchanged — it's either malformed or a genuinely local git
+    server, which must keep its existing key.
+
+    `ZMEM_PROXY_FORGE_HOST` has THREE distinct states, not two:
+      - unset            -> rewrite to `github.com` (CCR proxies GitHub only
+                            today; this is the default).
+      - set, non-empty   -> rewrite to that host (escape hatch for other
+                            forges, e.g. `gitlab.example.com`).
+      - set but EMPTY    -> DISABLE the rewrite entirely; the loopback remote
+        (`""` or whitespace)  keeps its legacy `127.0.0.1:<port>/git/...` key.
+                            This is the opt-out for a genuine LOCAL git server
+                            that happens to serve repos under a `/git/`
+                            prefix (Gitea's default layout, for one): those
+                            are not CCR proxies and must not be collapsed
+                            onto a public forge's namespace."""
     u = url.strip().rstrip("/")
     if u.lower().endswith(".git"):
         u = u[: -len(".git")]
@@ -381,11 +392,16 @@ def _normalize_remote(url: str) -> str:
 
     host_no_port = re.sub(r":\d+$", "", host)
     if host_no_port.lower() in ("127.0.0.1", "localhost", "::1", "[::1]"):
-        gm = re.match(r"^git/([^/]+)/([^/]+)", path)
-        if gm:
-            org, repo = gm.group(1), gm.group(2)
-            forge_host = os.environ.get("ZMEM_PROXY_FORGE_HOST") or "github.com"
-            return f"{forge_host}/{org}/{repo}".lower()
+        forge_env = os.environ.get("ZMEM_PROXY_FORGE_HOST")
+        # Set-but-empty is the explicit opt-out (see docstring): skip the
+        # rewrite entirely and fall through to the legacy loopback key.
+        # Unset (None) is NOT the same thing — that means "use the default".
+        if forge_env is None or forge_env.strip():
+            forge_host = forge_env.strip() if forge_env else "github.com"
+            gm = re.match(r"^git/([^/]+)/([^/]+)", path, re.IGNORECASE)
+            if gm:
+                org, repo = gm.group(1), gm.group(2)
+                return f"{forge_host}/{org}/{repo}".lower()
 
     combined = f"{host}/{path}" if host else path
     return combined.lower()
