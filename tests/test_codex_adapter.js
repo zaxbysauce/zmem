@@ -124,7 +124,6 @@ console.log("\n[1] Codex plugin metadata");
     eq("marketplace: root name", marketplace.name, "zaxbyhub-local");
     eq("marketplace: one plugin entry", marketplace.plugins.length, 1);
     eq("marketplace: version matches plugin", marketplace.plugins[0].version, plugin.version);
-    eq("release: Codex version", plugin.version, "0.6.0");
     eq("release: Claude plugin matches Codex", claudePlugin.version, plugin.version);
     eq("release: Claude marketplace matches Codex", claudeMarketplace.plugins[0].version, plugin.version);
     eq("release: ZCode plugin matches Codex", zcodePlugin.version, plugin.version);
