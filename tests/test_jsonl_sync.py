@@ -230,6 +230,22 @@ class RoundTripTest(_TwoStoreCase):
 
         self.assertEqual(rows_a, rows_b, "re-export from B must match A's export exactly")
 
+        # PRR-017: the assertion above compares PARSED json objects, so a
+        # key-order or whitespace regression in export-jsonl's line rendering
+        # is invisible to it (json.loads erases both). Compare the two files
+        # as RAW STRINGS too -- split on raw bytes (NOT str.splitlines(),
+        # which would silently discard the very line-terminator differences
+        # this is meant to catch) and sort each file's non-empty lines (row
+        # order need not match between exports) before requiring the sorted
+        # line lists to be identical.
+        raw_a = [l for l in Path(export_a).read_bytes().split(b"\n") if l.strip()]
+        raw_b = [l for l in Path(export_b).read_bytes().split(b"\n") if l.strip()]
+        self.assertEqual(
+            sorted(raw_a), sorted(raw_b),
+            "re-export from B must be line-identical to A's export (raw strings, "
+            "sorted) -- a key-order or whitespace regression would only show up here",
+        )
+
     def test_id_idempotency_second_ingest_adds_nothing(self):
         self.a.add(NS, "idempotency check row", confidence=0.9)
         export_a = os.path.join(self.a.tmp, "export_a.jsonl")
@@ -398,6 +414,92 @@ class MalformedAndFileErrorsTest(_TwoStoreCase):
         Path(ws_path).write_text("\n\n   \n", encoding="utf-8")
         r = self.b.run("ingest-jsonl", "--in", ws_path)
         self.assertEqual(r.returncode, 2)
+
+
+# ---------------------------------------------------------------------------
+# a hostile single-line file (no newlines) must be rejected at the LINE
+# layer, before ever being held in memory as one giant string -- the fix for
+# the `for lineno, raw_line in enumerate(f)` iteration, which used to buffer
+# a full physical line no matter how long it was.
+# ---------------------------------------------------------------------------
+class OversizedLineTest(_TwoStoreCase):
+    def test_oversized_line_rejected_without_reaching_content_validation(self):
+        good1 = _sync_row(id="55555555-1111-1111-1111-111111111111",
+                           content="good row one")
+        # 2 MiB of content: over BOTH the 1 MiB physical-line cap and the
+        # 65536-char content cap _validate_sync_row would also reject it on.
+        # The point of this test is that it must be rejected at the LINE
+        # layer -- never reaching json.loads/_validate_sync_row -- proven
+        # below by the exact stderr message, not just the malformed count.
+        oversized_row = _sync_row(id="55555555-2222-2222-2222-222222222222",
+                                   content="x" * (2 * 1024 * 1024))
+        good2 = _sync_row(id="55555555-3333-3333-3333-333333333333",
+                           content="trailing valid row after the oversized one")
+
+        path = os.path.join(self.b.tmp, "oversized.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(good1) + "\n")
+            f.write(json.dumps(oversized_row) + "\n")
+            f.write(json.dumps(good2) + "\n")
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 2)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertIn("[zmem] ingest-jsonl: added=", r.stdout)
+
+        # Rejected at the LINE layer at the right line number -- and the
+        # content-cap message from _validate_sync_row must never appear at
+        # all, which is what proves this never reached validation.
+        self.assertIn("malformed line 2: line exceeds 1048576 chars", r.stderr)
+        self.assertNotIn("over the 65536 limit", r.stderr)
+
+        # The trailing valid row (line 3) must still land, distinguishable by
+        # its own content -- proving line numbering survived the drain of
+        # the oversized line 2 intact.
+        stored = self.b.query_one(
+            "SELECT content FROM memory WHERE id=?", (good2["id"],))
+        self.assertIsNotNone(stored, "the trailing valid row must still be ingested")
+        self.assertEqual(stored[0], good2["content"])
+
+    def test_giant_single_line_with_no_trailing_newline_is_rejected(self):
+        """A hostile file that is ONE physical line with no newline anywhere
+        in it -- the exact shape that used to make `for line in f` buffer the
+        entire file into one Python string before a single byte of it was
+        validated."""
+        path = os.path.join(self.b.tmp, "no-newline-giant.jsonl")
+        # ~3 MiB, no trailing newline at all, and not even valid JSON -- the
+        # point is this must never reach json.loads in the first place.
+        Path(path).write_text("z" * (3 * 1024 * 1024), encoding="utf-8")
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 0)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertIn("malformed line 1: line exceeds 1048576 chars", r.stderr)
+        self.assertIn("[zmem] ingest-jsonl: added=", r.stdout)
+
+    def test_final_line_without_trailing_newline_still_ingests(self):
+        """Cheap companion case: a short final line with no trailing newline
+        is the legitimate EOF shape (readline() stops on EOF, not the size
+        cap), and must ingest normally, not get flagged as oversized."""
+        row1 = _sync_row(id="55555555-4444-4444-4444-444444444444",
+                          content="first row, has a trailing newline")
+        row2 = _sync_row(id="55555555-5555-5555-5555-555555555555",
+                          content="second row, no trailing newline")
+
+        path = os.path.join(self.b.tmp, "no-final-newline.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row1) + "\n")
+            f.write(json.dumps(row2))  # deliberately no trailing "\n"
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 2)
+        self.assertEqual(counts["malformed"], 0)
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +1011,27 @@ class IngestValidationTest(_TwoStoreCase):
                 "SELECT signal, confidence FROM memory WHERE content=?", (content,))
             self.assertEqual(signal, "none")
             self.assertEqual(confidence, 0.3)
+
+    def test_unknown_signal_emits_one_stderr_warning_per_occurrence(self):
+        """PRR-011: coercing an unrecognized signal to 'none' must not be
+        silent -- one stderr line per occurrence, naming the line and the
+        rejected value. The row still ingests (see the test above)."""
+        path = self._write_jsonl(self.b, "banana.jsonl", [
+            _sync_row(id="eeeeeeee-0000-0000-0000-00000000000c",
+                      content="row with signal banana", signal="banana",
+                      confidence=None),
+        ])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+        signal, confidence = self.b.query_one(
+            "SELECT signal, confidence FROM memory WHERE content=?",
+            ("row with signal banana",))
+        self.assertEqual(signal, "none")
+        self.assertEqual(confidence, 0.3)
+        self.assertIn(
+            "[zmem] ingest-jsonl: line 1: unknown signal 'banana' treated as 'none'",
+            r.stderr)
 
     def test_content_over_the_size_cap_is_rejected(self):
         over = self._write_jsonl(self.b, "huge.jsonl", [

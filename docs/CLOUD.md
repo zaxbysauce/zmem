@@ -19,6 +19,12 @@ occasional cloud sessions that discover something worth keeping. Tier 3 is
 for cloud sessions that run often enough that a manual harvest loop is
 friction.
 
+These cloud-session "Tiers 1-3" are a distinct numbering from zmem's own
+memory tiers (Tier 0 core.md, Tier 2 semantic store) described in
+`skills/memory/SKILL.md` — the two schemes happen to overlap in the numbers
+1 and 2, but they classify different things (cloud hand-off mechanism here vs.
+where memory physically lives there) and the overlap is coincidental.
+
 ## Tier 1 — Memory pack (read-only snapshot, committed to the repo)
 
 The simplest option: periodically export the store's most relevant memories
@@ -410,13 +416,16 @@ Remote/CCR sessions reach their repo through a local HTTP proxy
 would otherwise land in the `project:*` namespace key, fragmenting one repo's
 memory across sessions, so `resolve_namespace` collapses a loopback remote
 whose path starts with `git/` (matched case-insensitively) to
-`<forge>/<org>/<repo>`. The env var has three states:
+`<forge>/<org>/<repo>`. The rewrite recognizes all four loopback forms a
+proxy URL might use as the host — `127.0.0.1`, `localhost`, `::1`, and
+`[::1]` — not just `127.0.0.1`. The env var has
+three states:
 
 | `ZMEM_PROXY_FORGE_HOST` | Behavior |
 |---|---|
 | unset | Rewrite to `github.com/<org>/<repo>` (the default; CCR proxies GitHub today). |
 | set, non-empty | Rewrite to `<that host>/<org>/<repo>` — for a proxy fronting another forge. |
-| set but **empty** (`""` or whitespace) | **Opt out.** No rewrite; the remote keeps its literal `127.0.0.1:<port>/git/...` key. |
+| set but **empty** (`""` or whitespace) | **Opt out.** No rewrite; the remote keeps its literal `127.0.0.1:<port>/git/...` (or `localhost`/`::1`/`[::1]`) key. |
 
 The empty-string opt-out exists for a genuine **local** git server that serves
 repos under a `/git/` prefix — Gitea's default layout, for instance. Those are

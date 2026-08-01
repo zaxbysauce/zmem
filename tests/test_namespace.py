@@ -234,6 +234,38 @@ class TestLoopbackProxyRemoteRewrite(unittest.TestCase):
                 result = host.resolve_namespace(repo)
             self.assertEqual(result, "project:github.com/org/repo")
 
+    def test_forge_host_env_containing_slash_falls_back_to_github(self):
+        """A malformed ZMEM_PROXY_FORGE_HOST (e.g. containing a path) must not
+        be concatenated verbatim into the namespace key -- that yields a
+        malformed `host/org/repo` key. Fall back to the github.com default
+        instead."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp),
+                "http://local_proxy@127.0.0.1:34567/git/ZaxbyHub/opencode-swarm",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"ZMEM_PROXY_FORGE_HOST": "evil.example.com/../inject"},
+                clear=False,
+            ):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:github.com/zaxbyhub/opencode-swarm")
+
+    def test_forge_host_env_uppercase_is_lowercased(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp),
+                "http://local_proxy@127.0.0.1:34567/git/ZaxbyHub/opencode-swarm",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"ZMEM_PROXY_FORGE_HOST": "GitLab.Example.COM"},
+                clear=False,
+            ):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:gitlab.example.com/zaxbyhub/opencode-swarm")
+
     def test_uppercase_git_path_prefix_still_rewrites(self):
         """The host check is case-insensitive; the path prefix must match it,
         or a proxy URL differing only in the case of `git/` fragments the same

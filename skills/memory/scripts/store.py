@@ -2871,8 +2871,20 @@ _INGEST_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 # permanent top-of-recall boost for whoever wrote the sync file.
 INGEST_MAX_FUTURE_SKEW_SECONDS = 86400
 
+# Hard ceiling on one PHYSICAL line read from a JSONL sync file, in characters
+# (str.readline()'s size argument counts characters in text mode, not bytes --
+# this is not a byte cap). A hostile single-line file with no newlines at all
+# would otherwise buffer the whole file into one Python string before
+# _validate_sync_row ever runs, since the old `for line in f` iteration reads
+# a full physical line regardless of its length. A legitimate row's content
+# is already capped at INGEST_MAX_CONTENT_CHARS (65536) by validation, so 1
+# MiB of physical line -- content plus JSON escaping plus every other field --
+# is generous headroom for any real row and still bounds worst-case memory
+# use per line.
+MAX_LINE_CHARS = 1_048_576
 
-def _validate_sync_row(obj: dict) -> dict:
+
+def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     """Validate + normalize ONE remote-authored JSONL sync row.
 
     Returns a dict whose every field is already the right Python type for a
@@ -2887,8 +2899,16 @@ def _validate_sync_row(obj: dict) -> dict:
     `confidence >= ?` floor, hijacks export-pack's `ORDER BY confidence DESC`,
     and then crashes recall's compute_score with a ValueError on float().
 
+    `lineno` is the 1-based physical line this row came from in the sync
+    file, used ONLY to attribute the unknown-signal warning below to a line
+    a human can go find; it is optional (None) for direct/programmatic
+    callers that have no line to report.
+
     Recoverable (normalized, not rejected):
-      - unknown/absent/non-str signal -> "none"
+      - unknown/absent/non-str signal -> "none" (a stderr line is emitted
+        whenever the key is present but unusable -- a made-up string, or a
+        non-str value like a number; an absent/None signal is the normal,
+        unremarkable case and stays silent)
       - non-numeric, non-finite, or out-of-range confidence -> the
         signal-derived default, clamped to [0.0, 1.0]
       - a far-future ingestion_ts -> clamped to now
@@ -2930,9 +2950,20 @@ def _validate_sync_row(obj: dict) -> dict:
         raise ValueError(f"field 'type' must be one of {', '.join(ALLOWED_TYPES)}")
 
     # Signal is normalized, not rejected: an unknown signal costs the row its
-    # confidence default, which is a fine outcome; losing the row is not.
+    # confidence default, which is a fine outcome; losing the row is not. A
+    # present-but-unrecognized value still gets a stderr line -- silent
+    # coercion would otherwise hide a remote writer sending a signal this
+    # version of zmem doesn't know about. Absent (None) signal is the normal,
+    # unremarkable case and stays silent.
     raw_signal = obj.get("signal")
-    signal = raw_signal if (isinstance(raw_signal, str) and raw_signal in ALLOWED_SIGNALS) else "none"
+    if isinstance(raw_signal, str) and raw_signal in ALLOWED_SIGNALS:
+        signal = raw_signal
+    else:
+        signal = "none"
+        if raw_signal is not None:
+            loc = f"line {lineno}: " if lineno is not None else ""
+            print(f"[zmem] ingest-jsonl: {loc}unknown signal '{raw_signal}' "
+                  f"treated as 'none'", file=sys.stderr)
 
     fallback_conf = SIGNAL_CONFIDENCE.get(signal, 0.3)
     raw_conf = obj.get("confidence")
@@ -3121,6 +3152,14 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     row (see the --allow-tombstones flag help). Default off: a sync file is
     remote-authored data, and deleting local memory is the one irreversible
     thing it could ask for.
+
+    Hostile input (nesting-bomb JSON, an oversized physical line, a bad
+    encoding) is contained per-row/per-file: it never aborts the whole run,
+    and the summary line is always printed regardless of how many rows were
+    rejected. A row that raises mid-apply has any partial DB work rolled back
+    via conn.rollback() before the file continues, so one row's failure
+    between an INSERT and its own commit can never bleed into the next row's
+    commit.
     """
     try:
         f = open(in_path, encoding="utf-8", newline="\n")
@@ -3135,7 +3174,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     try:
         # Stream the file line by line instead of reading it whole into
         # memory first -- a giant hostile file would otherwise exhaust RAM
-        # before a single row is even validated. newline="\n" makes iteration
+        # before a single row is even validated. newline="\n" makes readline()
         # split on a bare "\n" ONLY -- NOT the universal-newline default and
         # NOT str.splitlines(), either of which also breaks on U+2028/U+2029/
         # U+0085 (and other Unicode line separators). This file's own writer
@@ -3144,9 +3183,46 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
         # one JSON object across several bogus "lines". Splitting on a bare
         # "\n" treats every embedded separator as ordinary string content
         # instead. rstrip("\r\n") tolerates CRLF-terminated files (each
-        # yielded line keeps its "\n", and a CRLF line keeps the "\r" too
-        # since "\r" is not a split point).
-        for lineno, raw_line in enumerate(f, start=1):
+        # returned line keeps its "\n", and a CRLF line keeps the "\r" too
+        # since "\r" is not a split point). readline(MAX_LINE_CHARS) below
+        # additionally bounds how much of ONE physical line is ever buffered.
+        lineno = 0
+        while True:
+            # readline(MAX_LINE_CHARS) bounds how much of ONE physical line we
+            # ever hold at once -- unlike `for line in f`, which buffers a
+            # full physical line no matter how long it is. An empty return
+            # here (as opposed to just "\n") means EOF.
+            raw_line = f.readline(MAX_LINE_CHARS)
+            if raw_line == "":
+                break
+            lineno += 1
+
+            if len(raw_line) >= MAX_LINE_CHARS and not raw_line.endswith("\n"):
+                # readline stopped because it hit the size cap, not because it
+                # found a newline or EOF -- this physical line is oversized.
+                # Reject it as malformed without ever accumulating it, then
+                # drain the rest of the same physical line (still bounded,
+                # chunk by chunk) so the NEXT read starts on the following
+                # line and lineno stays one-per-physical-line.
+                # Same as every other malformed line below: it had real
+                # content, so it counts toward "this file had data" even
+                # though the row itself is rejected -- a file consisting of
+                # nothing but one oversized line must not be reported as
+                # empty (exit 2) instead of malformed=1 (exit 0).
+                saw_line = True
+                print(f"[zmem] ingest-jsonl: malformed line {lineno}: line "
+                      f"exceeds {MAX_LINE_CHARS} chars", file=sys.stderr)
+                malformed += 1
+                while True:
+                    chunk = f.readline(MAX_LINE_CHARS)
+                    # Stop draining once this physical line actually ends:
+                    # either a newline was found, or we hit EOF (a short,
+                    # non-full-cap chunk, possibly "", ends the line either
+                    # way since no more cap-sized chunks can follow it).
+                    if chunk.endswith("\n") or len(chunk) < MAX_LINE_CHARS:
+                        break
+                continue
+
             line = raw_line.rstrip("\r\n").strip()
             if not line:
                 continue
@@ -3155,7 +3231,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 obj = json.loads(line)
                 if not isinstance(obj, dict):
                     raise ValueError("line is not a JSON object")
-                obj = _validate_sync_row(obj)
+                obj = _validate_sync_row(obj, lineno)
             except Exception as e:
                 # Broad on purpose: a per-line parse guard must never let hostile
                 # input abort the whole file. A pathologically deeply nested JSON
@@ -3205,10 +3281,14 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 deduped += 1
             else:
                 skipped += 1
-    except UnicodeDecodeError as e:
+    except (UnicodeDecodeError, OSError) as e:
         # Invalid UTF-8 can now surface mid-iteration (streaming, not a single
-        # up-front read_text()). Record it and fall through to the summary --
-        # rows already applied before the bad bytes still count -- then exit 2.
+        # up-front read_text()) -- that's the UnicodeDecodeError case. OSError
+        # covers a read failing mid-file for reasons that have nothing to do
+        # with content: disk error, or the file getting truncated/replaced out
+        # from under us while we're still reading it. Either way, record it
+        # and fall through to the summary -- rows already applied before the
+        # failure still count -- then exit 2, same as an unreadable file.
         decode_error = e
     finally:
         f.close()

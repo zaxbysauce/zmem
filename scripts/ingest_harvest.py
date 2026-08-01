@@ -129,10 +129,14 @@ def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[bool, str]:
         "--source-ref", source_ref,
     ]
     child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-    result = subprocess.run(
-        cmd, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", env=child_env,
-    )
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", env=child_env,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "store.py add timed out after 120s"
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         return False, detail or f"store.py add exited {result.returncode}"

@@ -129,6 +129,38 @@ completed one. This does *not* serialize against a live interactive session's
 own `add`/`recall` writes, which take no lock: still run `restore` when no
 session is actively writing.
 
+### export-pack — render a Tier 1 markdown memory pack
+```
+python <store.py> export-pack --namespace NS [--out FILE] [--project-limit 50] \
+  [--global-limit 15] [--min-confidence 0.6] [--max-bytes 32768]
+```
+Renders live memories from `--namespace` and `user:global` (confidence DESC,
+retrieval_count DESC, ingestion_ts DESC) as a hand-off markdown pack, e.g. for a
+cloud/remote session with no store access. `--max-bytes` budgets the bullet
+lines only: a bullet that would push past it is omitted whole (never
+truncated), and smaller rows behind it are still emitted. Refuses (exit 2) if
+both sections are empty.
+
+### export-jsonl — export Tier 3 sync JSONL
+```
+python <store.py> export-jsonl [--out FILE] [--namespace NS] [--include-superseded]
+```
+Writes one memory row per line (no embeddings) for box-to-box sync via
+`ingest-jsonl`. Default: all namespaces, live rows only; `--namespace` scopes
+to one namespace, `--include-superseded` also exports tombstoned rows.
+
+### ingest-jsonl — import Tier 3 sync JSONL
+```
+python <store.py> ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones]
+```
+Imports a JSONL file written by `export-jsonl`. Every row is validated before
+touching the store, and a bad row is counted and reported by line number
+rather than aborting the file. `--source-ref` overrides source_ref on every
+row inserted this run (default: keep each row's own incoming source_ref).
+`--allow-tombstones` lets an incoming superseded row tombstone a live local
+row with the same id — off by default; use it only when the file is an
+export of a store you trust as authoritative for those ids.
+
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite
   file. The write-time filter is advisory only (regex heuristic), not a guarantee.

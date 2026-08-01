@@ -90,7 +90,11 @@ python "$H" <harvest-file> \
 using a harvest file trimmed to only the surviving rows (write a temp copy if
 you dropped/merged any items — never feed the script items you already
 decided not to keep). `<batch-tag>` should identify this ingestion batch
-(e.g. the remote session id the harvest came from).
+(e.g. the remote session id the harvest came from). If `--source-ref` is
+omitted, `ingest_harvest.py` defaults it to `session:harvest-<file-stem>`
+(the harvest file's name without its extension) — prefer passing it
+explicitly with a batch tag that actually identifies the source session,
+since the default is only as meaningful as the file name it derives from.
 
 Alternatively, for a small number of survivors, call `python "$S" add
 --namespace ... --type ... --content ... --tags ... --signal ... --source-ref

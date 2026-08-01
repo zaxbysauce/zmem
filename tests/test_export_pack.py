@@ -167,6 +167,25 @@ class OrderingAndFilterTest(_StoreCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("low confidence row visible with a lowered floor", r.stdout)
 
+    def test_min_confidence_zero_includes_a_low_confidence_row(self):
+        """PRR-022: 0.0 is a valid, non-default floor -- it must let a very
+        low (but still >= 0.0) confidence row through rather than being
+        treated as falsy/unset."""
+        self.add(NS, "row with 0.3 confidence let through by a zero floor", confidence=0.3)
+        r = self.run_store("export-pack", "--namespace", NS, "--min-confidence", "0.0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("row with 0.3 confidence let through by a zero floor", r.stdout)
+
+    def test_min_confidence_one_excludes_everything_and_exits_2(self):
+        """PRR-023: a 1.0 floor is the strictest possible -- with no row at
+        exactly max confidence, the pack is empty and must take the same
+        refuse-with-exit-2 path as an empty namespace."""
+        self.add(NS, "row below the 1.0 ceiling", confidence=0.99)
+        r = self.run_store("export-pack", "--namespace", NS, "--min-confidence", "1.0")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("[zmem]", r.stderr)
+        self.assertEqual(r.stdout, "")
+
     def test_empty_global_section_renders_none_placeholder(self):
         self.add(NS, "only a project row exists in this store", confidence=0.9)
         r = self.run_store("export-pack", "--namespace", NS)
@@ -243,6 +262,21 @@ class MaxBytesCapTest(_StoreCase):
         m = re.search(r"\((\d+) row\(s\) omitted", text)
         self.assertIsNotNone(m, "missing trailing omitted-rows note")
         self.assertEqual(int(m.group(1)), len(contents) - shown)
+
+    def test_max_bytes_zero_omits_everything_without_crashing(self):
+        """PRR-022: 0 is a valid (if degenerate) budget -- every bullet
+        projects past it, so every row is omitted, but the run must still
+        succeed, still print the two section headings and the '(none)'
+        placeholders, and still print the omitted-count note."""
+        self.add(NS, "row that cannot possibly fit a zero-byte budget", confidence=0.9)
+        r = self.run_store("export-pack", "--namespace", NS, "--max-bytes", "0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("row that cannot possibly fit a zero-byte budget", r.stdout)
+        self.assertIn("## Project knowledge", r.stdout)
+        self.assertIn("## Cross-project lessons", r.stdout)
+        m = re.search(r"\((\d+) row\(s\) omitted", r.stdout)
+        self.assertIsNotNone(m, "missing trailing omitted-rows note")
+        self.assertEqual(int(m.group(1)), 1)
 
     def test_one_oversized_row_does_not_evict_the_smaller_rows_behind_it(self):
         """Regression for the sticky-exhausted bug: the byte cap used to latch

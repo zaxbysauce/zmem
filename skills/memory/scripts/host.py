@@ -397,7 +397,17 @@ def _normalize_remote(url: str) -> str:
         # rewrite entirely and fall through to the legacy loopback key.
         # Unset (None) is NOT the same thing — that means "use the default".
         if forge_env is None or forge_env.strip():
-            forge_host = forge_env.strip() if forge_env else "github.com"
+            if forge_env:
+                candidate = forge_env.strip().lower()
+                if re.match(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$", candidate):
+                    forge_host = candidate
+                else:
+                    # Not a bare hostname (contains "/", whitespace, ":",
+                    # etc.) — fall back rather than emit a malformed key.
+                    # host.py is used by hooks, so no stderr noise here.
+                    forge_host = "github.com"
+            else:
+                forge_host = "github.com"
             gm = re.match(r"^git/([^/]+)/([^/]+)", path, re.IGNORECASE)
             if gm:
                 org, repo = gm.group(1), gm.group(2)
