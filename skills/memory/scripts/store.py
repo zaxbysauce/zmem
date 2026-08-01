@@ -3198,30 +3198,47 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
             lineno += 1
 
             if len(raw_line) >= MAX_LINE_CHARS and not raw_line.endswith("\n"):
-                # readline stopped because it hit the size cap, not because it
-                # found a newline or EOF -- this physical line is oversized.
-                # Reject it as malformed without ever accumulating it, then
-                # drain the rest of the same physical line (still bounded,
-                # chunk by chunk) so the NEXT read starts on the following
-                # line and lineno stays one-per-physical-line.
-                # Same as every other malformed line below: it had real
-                # content, so it counts toward "this file had data" even
-                # though the row itself is rejected -- a file consisting of
-                # nothing but one oversized line must not be reported as
-                # empty (exit 2) instead of malformed=1 (exit 0).
-                saw_line = True
-                print(f"[zmem] ingest-jsonl: malformed line {lineno}: line "
-                      f"exceeds {MAX_LINE_CHARS} chars", file=sys.stderr)
-                malformed += 1
-                while True:
-                    chunk = f.readline(MAX_LINE_CHARS)
-                    # Stop draining once this physical line actually ends:
-                    # either a newline was found, or we hit EOF (a short,
-                    # non-full-cap chunk, possibly "", ends the line either
-                    # way since no more cap-sized chunks can follow it).
-                    if chunk.endswith("\n") or len(chunk) < MAX_LINE_CHARS:
-                        break
-                continue
+                # readline stopping at the cap without a trailing "\n" is
+                # AMBIGUOUS: it could mean this physical line truly exceeds
+                # MAX_LINE_CHARS (more of it still follows), or it could mean
+                # the line is exactly MAX_LINE_CHARS chars and simply ends at
+                # EOF with no trailing newline -- a perfectly valid final
+                # line. One bounded lookahead read resolves it: "" means
+                # nothing followed raw_line at all, so the line was complete
+                # and just happened to land exactly on the cap -- fall
+                # through and process it like any other line instead of
+                # rejecting a well-formed final line as malformed.
+                lookahead = f.readline(MAX_LINE_CHARS)
+                if lookahead != "":
+                    # There really is more of this physical line -- it is
+                    # genuinely oversized. Reject it as malformed without
+                    # ever accumulating it, then drain the rest (still
+                    # bounded, chunk by chunk, starting from the lookahead
+                    # chunk already read) so the NEXT read starts on the
+                    # following line and lineno stays one-per-physical-line.
+                    # Same as every other malformed line below: it had real
+                    # content, so it counts toward "this file had data" even
+                    # though the row itself is rejected -- a file consisting
+                    # of nothing but one oversized line must not be reported
+                    # as empty (exit 2) instead of malformed=1 (exit 0).
+                    saw_line = True
+                    print(f"[zmem] ingest-jsonl: malformed line {lineno}: line "
+                          f"exceeds {MAX_LINE_CHARS} chars", file=sys.stderr)
+                    malformed += 1
+                    chunk = lookahead
+                    while True:
+                        # Stop draining once this physical line actually
+                        # ends: either a newline was found, or we hit EOF (a
+                        # short, non-full-cap chunk, possibly "", ends the
+                        # line either way since no more cap-sized chunks can
+                        # follow it).
+                        if chunk.endswith("\n") or len(chunk) < MAX_LINE_CHARS:
+                            break
+                        chunk = f.readline(MAX_LINE_CHARS)
+                    continue
+                # else: lookahead == "" -- EOF right after raw_line, so the
+                # line was complete at exactly MAX_LINE_CHARS chars. Fall
+                # through to process raw_line normally below.
 
             line = raw_line.rstrip("\r\n").strip()
             if not line:

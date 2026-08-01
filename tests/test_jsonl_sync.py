@@ -501,6 +501,42 @@ class OversizedLineTest(_TwoStoreCase):
         self.assertEqual(counts["added"], 2)
         self.assertEqual(counts["malformed"], 0)
 
+    def test_final_line_exactly_at_the_cap_with_no_trailing_newline_ingests(self):
+        """Exact-cap boundary fix: readline(MAX_LINE_CHARS) hitting the cap
+        without a trailing "\\n" is ambiguous between 'genuinely oversized'
+        and 'this line is exactly cap-sized and ends at EOF with no trailing
+        newline' -- a valid final line. A one-chunk lookahead must
+        disambiguate: EOF right after the first read means the line was
+        complete, not oversized, so it must ingest normally rather than being
+        flagged malformed."""
+        MAX_LINE_CHARS = 1_048_576  # mirrors store.py's module constant
+        row1 = _sync_row(id="55555555-6666-6666-6666-666666666666",
+                          content="first row, ordinary length, has a newline")
+        padded_row = _sync_row(id="55555555-7777-7777-7777-777777777777",
+                                content="final row padded to exactly the cap")
+        # tags has no length cap in _validate_sync_row (unlike content, capped
+        # at 65536), so it's the field to pad -- this keeps the row's content
+        # ordinary while landing the serialized line's total length EXACTLY
+        # on MAX_LINE_CHARS.
+        base_len = len(json.dumps(padded_row))
+        pad_len = MAX_LINE_CHARS - base_len
+        self.assertGreater(pad_len, 0)
+        padded_row["tags"] = "x" * pad_len
+        final_line = json.dumps(padded_row)
+        self.assertEqual(len(final_line), MAX_LINE_CHARS)
+
+        path = os.path.join(self.b.tmp, "exact-cap-final-line.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row1) + "\n")
+            f.write(final_line)  # deliberately no trailing "\n" -- EOF lands exactly on the cap
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 2)
+        self.assertEqual(counts["malformed"], 0)
+        self.assertNotIn("line exceeds", r.stderr)
+
 
 # ---------------------------------------------------------------------------
 # dedup-on-write applies to synced rows

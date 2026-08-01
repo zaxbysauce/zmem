@@ -419,13 +419,33 @@ whose path starts with `git/` (matched case-insensitively) to
 `<forge>/<org>/<repo>`. The rewrite recognizes all four loopback forms a
 proxy URL might use as the host — `127.0.0.1`, `localhost`, `::1`, and
 `[::1]` — not just `127.0.0.1`. The env var has
-three states:
+FOUR states:
 
 | `ZMEM_PROXY_FORGE_HOST` | Behavior |
 |---|---|
 | unset | Rewrite to `github.com/<org>/<repo>` (the default; CCR proxies GitHub today). |
-| set, non-empty | Rewrite to `<that host>/<org>/<repo>` — for a proxy fronting another forge. |
+| set, **valid** `host[:port]` | Rewrite to `<value>/<org>/<repo>`, using the value VERBATIM (lowercased, including `:port` if present) -- for a proxy fronting another forge, e.g. `gitlab.example.com` or `gitea.internal:3000`. |
+| set, non-empty, **unparseable** | **Disabled**, silently (no stderr -- host.py runs in a hook context). No rewrite; the remote keeps its literal `127.0.0.1:<port>/git/...` (or `localhost`/`::1`/`[::1]`) key. |
 | set but **empty** (`""` or whitespace) | **Opt out.** No rewrite; the remote keeps its literal `127.0.0.1:<port>/git/...` (or `localhost`/`::1`/`[::1]`) key. |
+
+A "valid" value must parse as `host[:port]`: the optional port is 1-5 digits,
+and the host is one or more dot-separated labels, each matching
+`^[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?$` (letters, digits, and underscores at each
+label's start/end; hyphens allowed only in the middle; no empty labels). Examples:
+`gitlab.internal:8443` and `my_forge.internal` are valid; `a..b`, `-a.com`, and
+`a-.com` are not. The port is kept verbatim (not stripped) because ordinary,
+non-proxy remote normalization also keeps `host:port` in the key
+(`https://gitea.example:3000/org/repo` -> `gitea.example:3000/org/repo`) -- if
+the proxy override dropped the port, the same forge would key differently
+depending on whether it was reached through the proxy or cloned directly.
+
+A value that is non-empty but fails that grammar is **not** silently coerced to
+`github.com` -- that would wrongly attribute a private forge's repos to the
+public one's namespace -- and it is **not** emitted verbatim into the key either,
+since an unparseable value could produce a malformed key. Instead the rewrite
+is disabled entirely, exactly like the empty-string opt-out below: falling
+through to the legacy loopback key is wrong-but-stable and never collides with
+any real forge's namespace.
 
 The empty-string opt-out exists for a genuine **local** git server that serves
 repos under a `/git/` prefix — Gitea's default layout, for instance. Those are

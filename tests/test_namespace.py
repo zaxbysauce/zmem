@@ -131,7 +131,9 @@ class TestLoopbackProxyRemoteRewrite(unittest.TestCase):
     Without a rewrite, the ephemeral proxy port lands in the namespace key,
     fragmenting the same repo's memory across sessions and diverging from the
     key a local checkout of the same remote gets. These pin the collapse to
-    `github.com/<org>/<repo>` (or `ZMEM_PROXY_FORGE_HOST` if set)."""
+    `github.com/<org>/<repo>` (or `ZMEM_PROXY_FORGE_HOST` if set AND valid --
+    an unset var, an empty/whitespace var, and a set-but-unparseable var are
+    three distinct non-rewrite-to-that-value cases covered below)."""
 
     def setUp(self):
         # Deterministic regardless of the ambient test-runner environment: if
@@ -234,11 +236,14 @@ class TestLoopbackProxyRemoteRewrite(unittest.TestCase):
                 result = host.resolve_namespace(repo)
             self.assertEqual(result, "project:github.com/org/repo")
 
-    def test_forge_host_env_containing_slash_falls_back_to_github(self):
+    def test_forge_host_env_containing_slash_disables_the_rewrite(self):
         """A malformed ZMEM_PROXY_FORGE_HOST (e.g. containing a path) must not
         be concatenated verbatim into the namespace key -- that yields a
-        malformed `host/org/repo` key. Fall back to the github.com default
-        instead."""
+        malformed `host/org/repo` key -- and must NOT silently fall back to
+        github.com either, since that would wrongly attribute a private
+        forge's repos to the public one's namespace. It disables the rewrite
+        entirely, exactly like the set-but-empty case: the loopback remote
+        keeps its legacy `127.0.0.1:<port>/git/...` key."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = _make_git_repo(
                 Path(tmp),
@@ -250,7 +255,9 @@ class TestLoopbackProxyRemoteRewrite(unittest.TestCase):
                 clear=False,
             ):
                 result = host.resolve_namespace(repo)
-            self.assertEqual(result, "project:github.com/zaxbyhub/opencode-swarm")
+            self.assertEqual(
+                result, "project:127.0.0.1:34567/git/zaxbyhub/opencode-swarm"
+            )
 
     def test_forge_host_env_uppercase_is_lowercased(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,6 +272,83 @@ class TestLoopbackProxyRemoteRewrite(unittest.TestCase):
             ):
                 result = host.resolve_namespace(repo)
             self.assertEqual(result, "project:gitlab.example.com/zaxbyhub/opencode-swarm")
+
+    def test_forge_host_env_with_port_is_kept_verbatim(self):
+        """A `host:port` value is valid and must be used VERBATIM (port
+        included) -- ordinary, non-proxy remote normalization also keeps
+        host:port in the key, so the proxy override must too, or the same
+        forge would key differently depending on whether it was reached
+        through the proxy or cloned directly."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp),
+                "http://local_proxy@127.0.0.1:34567/git/org/repo",
+            )
+            with mock.patch.dict(
+                os.environ, {"ZMEM_PROXY_FORGE_HOST": "gitlab.internal:8443"},
+                clear=False,
+            ):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:gitlab.internal:8443/org/repo")
+
+    def test_forge_host_env_with_underscore_label_is_accepted(self):
+        """An underscore in a host label (e.g. an internal DNS name like
+        `my_forge.internal`) is a legitimate value that the old bare-hostname
+        regex rejected, silently falling back to github.com. It must now be
+        accepted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp),
+                "http://local_proxy@127.0.0.1:34567/git/org/repo",
+            )
+            with mock.patch.dict(
+                os.environ, {"ZMEM_PROXY_FORGE_HOST": "my_forge.internal"},
+                clear=False,
+            ):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:my_forge.internal/org/repo")
+
+    def test_forge_host_env_with_empty_label_disables_the_rewrite(self):
+        """`a..b` has an empty label between the two dots -- unparseable, so
+        the rewrite is disabled entirely (never falls back to github.com)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp),
+                "http://local_proxy@127.0.0.1:34567/git/org/repo",
+            )
+            with mock.patch.dict(
+                os.environ, {"ZMEM_PROXY_FORGE_HOST": "a..b"}, clear=False
+            ):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:127.0.0.1:34567/git/org/repo")
+
+    def test_forge_host_env_with_leading_hyphen_label_disables_the_rewrite(self):
+        """`-a.com` has a label starting with a hyphen -- unparseable, so the
+        rewrite is disabled entirely (never falls back to github.com)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp),
+                "http://local_proxy@127.0.0.1:34567/git/org/repo",
+            )
+            with mock.patch.dict(
+                os.environ, {"ZMEM_PROXY_FORGE_HOST": "-a.com"}, clear=False
+            ):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:127.0.0.1:34567/git/org/repo")
+
+    def test_forge_host_env_with_trailing_hyphen_label_disables_the_rewrite(self):
+        """`a-.com` has a label ending with a hyphen -- unparseable, so the
+        rewrite is disabled entirely (never falls back to github.com)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp),
+                "http://local_proxy@127.0.0.1:34567/git/org/repo",
+            )
+            with mock.patch.dict(
+                os.environ, {"ZMEM_PROXY_FORGE_HOST": "a-.com"}, clear=False
+            ):
+                result = host.resolve_namespace(repo)
+            self.assertEqual(result, "project:127.0.0.1:34567/git/org/repo")
 
     def test_uppercase_git_path_prefix_still_rewrites(self):
         """The host check is case-insensitive; the path prefix must match it,
