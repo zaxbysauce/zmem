@@ -22,7 +22,7 @@
 //        host-appropriate shape, and enforce an ENCODED context budget.
 //
 // Usage in hooks.json:
-//   "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" <hook-name>"
+//   "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" <hook-name>"
 //
 // Fail-open everywhere: on any error the launcher emits `{}` (for translated
 // hooks) or passes the child through, and exits 0 — a memory hiccup never
@@ -47,12 +47,13 @@ const { homedir } = require("os");
 // prompt was passed through verbatim and never injected. It now emits the
 // sentinel (like every other injecting hook) and is translated here.
 //
-// reflect (Stop) and capture-failure (PostToolUseFailure) emit the sentinel and
-// carry a bare {additionalContext}. On Claude Code the launcher rewraps that to
+// reflect (Stop) and capture-failure emit the sentinel and carry a bare
+// {additionalContext}. On Claude Code the launcher rewraps that to
 // hookSpecificOutput.additionalContext, which CC honors on BOTH events
-// (confirmed empirically, CC 2.1.218); on ZCode it stays bare. reflect relies on
-// the encoded-budget clamp here for its (potentially large, fenced) failure
-// block.
+// (confirmed empirically, CC 2.1.218); on Codex it uses the same structured
+// envelope but maps capture-failure to PostToolUse because Codex does not
+// expose PostToolUseFailure. On ZCode it stays bare. reflect relies on the
+// encoded-budget clamp here for its (potentially large, fenced) failure block.
 // subagent-recall (SubagentStart) and subagent-reflect (SubagentStop) both
 // inject additionalContext. Empirically confirmed (CC 2.1.218): CC honors
 // hookSpecificOutput.additionalContext on BOTH events — SubagentStart injects
@@ -105,30 +106,35 @@ const EVENT_MAP = {
 };
 
 // --- Detect host ------------------------------------------------------------
-// Explicit ZMEM_HOST wins; else CLAUDE_PLUGIN_ROOT → claude, ZCODE_PLUGIN_ROOT
-// → zcode. Default 'zcode' when neither is present (back-compat: the original
-// tool, and the bare-env manual-install / test case — a bare additionalContext
-// envelope, no Claude rewrap).
+// Explicit ZMEM_HOST wins; else Codex's PLUGIN_ROOT/PLUGIN_DATA, then
+// Claude/ZCode compatibility vars. Default 'zcode' when neither is present
+// (back-compat: the original tool, and the bare-env manual-install / test
+// case — a bare additionalContext envelope, no host-specific rewrap).
 function detectHost() {
     const explicit = process.env.ZMEM_HOST;
     if (explicit) return explicit;
+    if (process.env.PLUGIN_ROOT || process.env.PLUGIN_DATA) return "codex";
     if (process.env.CLAUDE_PLUGIN_ROOT) return "claude";
     if (process.env.ZCODE_PLUGIN_ROOT) return "zcode";
     return "zcode";
 }
 
 // --- Resolve plugin root ----------------------------------------------------
-const pluginRoot =
-    process.env.CLAUDE_PLUGIN_ROOT ||
-    process.env.ZCODE_PLUGIN_ROOT ||
-    dirname(__dirname);
+function getPluginRoot() {
+    return (
+        process.env.PLUGIN_ROOT ||
+        process.env.CLAUDE_PLUGIN_ROOT ||
+        process.env.ZCODE_PLUGIN_ROOT ||
+        dirname(__dirname)
+    );
+}
 
 // --- Find python (for namespace resolution) ---------------------------------
 // Windows: prefer `python` (python3 is often a no-op Store stub). Verified by
 // actually resolving the namespace; on failure we fall back to 'user:global'.
 function resolveNamespace(projectDir) {
     if (!projectDir) return "user:global";
-    const scriptsDir = join(pluginRoot, "skills", "memory", "scripts");
+    const scriptsDir = join(getPluginRoot(), "skills", "memory", "scripts");
     const code =
         "import sys; sys.path.insert(0, sys.argv[1]); import host; " +
         "print(host.resolve_namespace(sys.argv[2]))";
@@ -162,6 +168,111 @@ function expandHome(p) {
     return s;
 }
 
+function hookEventNameFor(host, hookName) {
+    if (host === "codex" && hookName === "capture-failure") return "PostToolUse";
+    return EVENT_MAP[hookName] || hookName;
+}
+
+function isFailureStatus(status) {
+    const normalized = String(status || "").trim().toLowerCase();
+    if (!normalized) return false;
+    return !["ok", "success", "succeeded", "completed", "complete"].includes(normalized);
+}
+
+function firstNonEmpty(...values) {
+    for (const value of values) {
+        if (typeof value === "string" && value.trim()) return value;
+    }
+    return "";
+}
+
+function normalizeErrorValue(value) {
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        return trimmed ? trimmed : null;
+    }
+    if (value && typeof value === "object") {
+        const message = typeof value.message === "string" ? value.message.trim() : "";
+        const type = typeof value.type === "string" ? value.type.trim() : "";
+        if (!message && !type) return null;
+        return {
+            ...value,
+            ...(message ? { message } : {}),
+            ...(type ? { type } : {}),
+        };
+    }
+    return null;
+}
+
+// Codex failure capture runs on PostToolUse because there is no dedicated
+// PostToolUseFailure event. Normalize the stable PostToolUse payload into the
+// shape the existing capture-failure hook script already understands. If the
+// payload does not clearly describe a failure, return null and fail open.
+function normalizeCodexFailurePayload(meta) {
+    if (!meta || typeof meta !== "object") return null;
+
+    const status = firstNonEmpty(
+        meta.status,
+        meta.tool_status,
+        meta.toolStatus,
+        meta.result && meta.result.status,
+        meta.tool_result && meta.tool_result.status
+    );
+    const failed = isFailureStatus(status);
+
+    const error = normalizeErrorValue(
+        meta.error ||
+            meta.tool_error ||
+            meta.toolError ||
+            (meta.result && meta.result.error) ||
+            (meta.tool_result && meta.tool_result.error) ||
+            (meta.tool_output && meta.tool_output.error) ||
+            (failed &&
+                firstNonEmpty(
+                    meta.stderr,
+                    meta.message,
+                    meta.failure,
+                    meta.tool_message,
+                    meta.toolMessage,
+                    meta.result && meta.result.message,
+                    meta.tool_result && meta.tool_result.message
+                ))
+    );
+
+    if (!failed && !error) return null;
+    if (!error) return null;
+
+    return {
+        ...meta,
+        session_id: firstNonEmpty(meta.session_id, meta.sessionId),
+        tool_name: firstNonEmpty(
+            meta.tool_name,
+            meta.toolName,
+            meta.tool && meta.tool.name,
+            meta.name
+        ),
+        tool_input:
+            meta.tool_input ||
+            meta.toolInput ||
+            (meta.tool && meta.tool.input) ||
+            meta.arguments ||
+            {},
+        error,
+    };
+}
+
+function prepareHookPayload(host, hookName, stdinBuf, meta) {
+    if (host !== "codex" || hookName !== "capture-failure") {
+        return { input: stdinBuf, meta };
+    }
+    const normalized = normalizeCodexFailurePayload(meta);
+    if (!normalized) return null;
+    return {
+        input: Buffer.from(JSON.stringify(normalized), "utf8"),
+        meta: normalized,
+    };
+}
+
 // --- Build the canonical ZMEM_* env for the child ---------------------------
 // hookName is optional (back-compat for direct callers/tests that don't care
 // about the namespace-skip): omitted/unrecognized names get the namespace
@@ -170,12 +281,15 @@ function buildCanonicalEnv(host, meta, hookName) {
     const env = { ...process.env };
 
     const project =
+        process.env.CODEX_PROJECT_DIR ||
         process.env.CLAUDE_PROJECT_DIR ||
         process.env.ZCODE_PROJECT_DIR ||
         (meta && meta.cwd) ||
         "";
     const session =
-        process.env.CLAUDE_SESSION_ID || (meta && meta.session_id) || "";
+        process.env.CLAUDE_SESSION_ID ||
+        (meta && (meta.session_id || meta.sessionId)) ||
+        "";
     const transcript = (meta && meta.transcript_path) || "";
     const agentType = (meta && meta.agent_type) || "";
     // SubagentStop carries the SUBAGENT's own transcript separately in
@@ -197,6 +311,10 @@ function buildCanonicalEnv(host, meta, hookName) {
     //      host (it never exists on zcode). Without this the manifest option
     //      was declared but had NO runtime effect.
     //   3. the box-wide default ~/.zmem.
+    //
+    // PLUGIN_DATA is deliberately NOT a store candidate. Codex owns that
+    // directory as per-install plugin state; using it here would silently
+    // split Codex away from the Claude/ZCode box-wide store.
     // Exporting this is the cutover wiring — store.py resolves
     // <ZMEM_DATA>/store.sqlite ahead of the legacy per-plugin data dirs.
     const pluginOptData =
@@ -210,14 +328,20 @@ function buildCanonicalEnv(host, meta, hookName) {
     // directly by a skill/agent) always agree on the same target set.
     // Promotion writes to every dir here regardless of which host promoted —
     // a lesson promoted from either tool becomes a skill visible to both.
-    const skillsDirs =
-        process.env.ZMEM_SKILLS_DIRS ||
-        [join(homedir(), ".claude", "skills"), join(homedir(), ".zcode", "skills")].join(delimiter);
-    const tier0 = host === "claude" ? "native" : "zmem";
-    const ctxBudget = host === "claude" ? "9000" : "25000";
+    const defaultSkillsDirs =
+        host === "codex"
+            ? [
+                  join(homedir(), ".codex", "skills"),
+                  join(homedir(), ".claude", "skills"),
+                  join(homedir(), ".zcode", "skills"),
+              ]
+            : [join(homedir(), ".claude", "skills"), join(homedir(), ".zcode", "skills")];
+    const skillsDirs = process.env.ZMEM_SKILLS_DIRS || defaultSkillsDirs.join(delimiter);
+    const tier0 = host === "zcode" ? "zmem" : "native";
+    const ctxBudget = host === "zcode" ? "25000" : "9000";
 
     env.ZMEM_HOST = host;
-    env.ZMEM_ROOT = pluginRoot;
+    env.ZMEM_ROOT = getPluginRoot();
     env.ZMEM_DATA = zmemData;
     env.ZMEM_PROJECT = project;
     env.ZMEM_SESSION = session;
@@ -281,6 +405,27 @@ function findBash() {
     return "bash";
 }
 
+function buildChildEnv(env, bashPath) {
+    const childEnv = { ...env };
+    if (process.platform !== "win32" || !bashPath || !existsSync(bashPath)) return childEnv;
+
+    const bashDir = dirname(bashPath);
+    const gitRoot = dirname(bashDir);
+    const extraDirs = [
+        bashDir,
+        join(gitRoot, "usr", "bin"),
+        join(gitRoot, "bin"),
+    ].filter((dir, index, items) => existsSync(dir) && items.indexOf(dir) === index);
+
+    if (extraDirs.length === 0) return childEnv;
+
+    const currentPath = childEnv.PATH || childEnv.Path || "";
+    const mergedPath = extraDirs.concat(currentPath ? [currentPath] : []).join(delimiter);
+    childEnv.PATH = mergedPath;
+    childEnv.Path = mergedPath;
+    return childEnv;
+}
+
 // --- Sentinel payload extraction --------------------------------------------
 // Scripts wrap their JSON as <<<ZMEM_JSON>>>{...}<<<END>>>. Extract the JSON of
 // the LAST complete pair (anchor on the last END, then the START that precedes
@@ -303,10 +448,10 @@ function extractPayload(raw) {
 
 // Wrap additionalContext content into the host-appropriate envelope shape.
 function makeEnvelope(host, hookName, content) {
-    if (host === "claude") {
+    if (host === "claude" || host === "codex") {
         return {
             hookSpecificOutput: {
-                hookEventName: EVENT_MAP[hookName] || hookName,
+                hookEventName: hookEventNameFor(host, hookName),
                 additionalContext: content,
             },
         };
@@ -400,7 +545,7 @@ async function main() {
         process.exit(0);
         return;
     }
-    const scriptPath = join(pluginRoot, "hooks", `zmem-${hookName}.sh`);
+    const scriptPath = join(getPluginRoot(), "hooks", `zmem-${hookName}.sh`);
 
     if (!existsSync(scriptPath)) {
         // Target script missing — fail open.
@@ -420,7 +565,14 @@ async function main() {
     }
 
     const host = detectHost();
-    const env = buildCanonicalEnv(host, meta, hookName);
+    const prepared = prepareHookPayload(host, hookName, stdinBuf, meta);
+    if (!prepared) {
+        process.stdout.write("{}\n");
+        process.exit(0);
+        return;
+    }
+
+    const env = buildCanonicalEnv(host, prepared.meta, hookName);
     const budget = parseInt(env.ZMEM_CTX_BUDGET, 10) || 9000;
     const translated = TRANSLATED_HOOKS.has(hookName);
     const bashPath = findBash();
@@ -429,7 +581,7 @@ async function main() {
     // hooks: inherit stdout so their output reaches the runner unchanged.
     const child = spawn(bashPath, [scriptPath], {
         stdio: ["pipe", translated ? "pipe" : "inherit", "inherit"],
-        env,
+        env: buildChildEnv(env, bashPath),
     });
 
     child.on("error", () => {
@@ -443,7 +595,7 @@ async function main() {
     // an already-closed pipe — swallow it rather than crash the launcher.
     if (child.stdin) {
         child.stdin.on("error", () => {});
-        child.stdin.write(stdinBuf);
+        child.stdin.write(prepared.input);
         child.stdin.end();
     }
 
@@ -478,8 +630,12 @@ if (require.main === module) {
 
 module.exports = {
     detectHost,
+    getPluginRoot,
     resolveNamespace,
     buildCanonicalEnv,
+    hookEventNameFor,
+    normalizeCodexFailurePayload,
+    prepareHookPayload,
     extractPayload,
     makeEnvelope,
     fitEnvelope,

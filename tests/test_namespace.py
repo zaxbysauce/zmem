@@ -62,6 +62,23 @@ def _make_git_repo(tmp_path: Path, remote_url: str) -> Path:
     return repo
 
 
+def _synthetic_migration_checkouts(tmp_path: Path) -> dict[str, Path]:
+    return {
+        "project:opencode-swarm": _make_git_repo(
+            tmp_path / "opencode",
+            "https://github.com/Org/OpenCode-Swarm.git",
+        ),
+        "project:ragappv3": _make_git_repo(
+            tmp_path / "ragapp",
+            "https://github.com/Org/RagAppV3.git",
+        ),
+        "project:trainingapp": _make_git_repo(
+            tmp_path / "training",
+            "https://github.com/Org/TrainingApp.git",
+        ),
+    }
+
+
 class TestResolveNamespaceNormalization(unittest.TestCase):
     """git@ vs https vs trailing-slash vs case all collapse to one key."""
 
@@ -404,34 +421,29 @@ class TestLoopbackProxyRemoteRewrite(unittest.TestCase):
 
 
 class TestV5MigrationEqualityInvariant(unittest.TestCase):
-    """resolve_namespace(checkout) == migrated key, for real on-disk checkouts."""
-
-    REAL_CHECKOUTS = {
-        "project:opencode-swarm": r"E:\ZCode\opencode-swarm",
-        "project:ragappv3": r"E:\ZCode\ragappv3",
-        "project:trainingapp": r"E:\ZCode\trainingapp",
-        "project:zmem": r"C:\Users\Brett\.graphify\repos\zaxbysauce\zmem",
-    }
+    """resolve_namespace(checkout) == migrated key, from a portable configured map."""
 
     def test_migration_map_matches_live_resolve_namespace(self):
-        # Skip gracefully if this box's checkouts aren't present (e.g. CI).
-        for old_ns, checkout in self.REAL_CHECKOUTS.items():
-            if not Path(checkout).is_dir():
-                self.skipTest(f"checkout not present on this box: {checkout}")
-
         with tempfile.TemporaryDirectory() as tmp:
-            store_path = Path(tmp) / "store.sqlite"
+            tmp_path = Path(tmp)
+            checkouts = _synthetic_migration_checkouts(tmp_path)
+            store_path = tmp_path / "store.sqlite"
             store_mod = _load_store_module(store_path)
             conn = _fresh_conn_at_v4(store_mod)
             # Seed v4 rows under each old namespace before migrating.
-            for old_ns in self.REAL_CHECKOUTS:
+            for old_ns in checkouts:
                 store_mod.add_memory(
                     conn, namespace=old_ns, type_="fact",
                     content=f"seed row for {old_ns}", signal="test",
                 )
-            store_mod.migrate(conn)
+            with mock.patch.object(
+                store_mod,
+                "_NS_MIGRATION_CHECKOUTS",
+                {k: str(v) for k, v in checkouts.items()},
+            ):
+                store_mod.migrate(conn)
 
-            for old_ns, checkout in self.REAL_CHECKOUTS.items():
+            for old_ns, checkout in checkouts.items():
                 expected = host.resolve_namespace(checkout)
                 row = conn.execute(
                     "SELECT namespace FROM memory WHERE content=?",
@@ -441,40 +453,25 @@ class TestV5MigrationEqualityInvariant(unittest.TestCase):
             conn.close()
 
     def test_opencode_swarm_second_checkout_same_key_as_migrated(self):
-        second_checkout = r"E:\ClaudeCode\opencode-swarm-dev"
-        primary_checkout = r"E:\ZCode\opencode-swarm"
-        if not Path(second_checkout).is_dir() or not Path(primary_checkout).is_dir():
-            self.skipTest("opencode-swarm checkouts not present on this box")
-        self.assertEqual(
-            host.resolve_namespace(second_checkout),
-            host.resolve_namespace(primary_checkout),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            primary_checkout = _make_git_repo(
+                tmp_path / "primary", "https://github.com/Org/OpenCode-Swarm.git"
+            )
+            second_checkout = _make_git_repo(
+                tmp_path / "second", "git@github.com:Org/OpenCode-Swarm.git"
+            )
+            self.assertEqual(
+                host.resolve_namespace(second_checkout),
+                host.resolve_namespace(primary_checkout),
+            )
 
 
 class TestV5MigrationRefusesOnMissingCheckout(unittest.TestCase):
     def test_missing_checkout_leaves_namespace_unchanged_and_reports(self):
-        # store.py hardcodes the {old_ns: checkout_path} map inline rather than
-        # as an importable module-level constant, so we can't inject a fake
-        # "missing" path into it directly. Instead, exercise the real refuse-
-        # on-missing behavior the same way it will actually occur: call
-        # migrate() and assert that whichever of the four mapped checkouts is
-        # genuinely absent on this box is left with its namespace unchanged
-        # (and, for the case actually seen on this box, that a present
-        # checkout IS migrated) — this is the exact code path production runs.
-        #
-        # NOTE: this test is inherently machine-dependent — whichever branch
-        # runs depends on whether E:\ZCode\opencode-swarm exists on the box
-        # executing the suite, so it can pass without ever having exercised
-        # the "checkout missing -> refuse and report" path (e.g. if that
-        # checkout happens to exist wherever this runs). It is kept as an
-        # opportunistic real-environment sanity check only. The deterministic,
-        # box-independent, and therefore AUTHORITATIVE test for the
-        # refuse-on-missing-checkout behavior is
-        # test_synthetic_missing_checkout_via_relocated_map below, which
-        # monkeypatches Path.is_dir so the missing-checkout branch is always
-        # exercised regardless of what's on disk.
         with tempfile.TemporaryDirectory() as tmp:
-            store_path = Path(tmp) / "store.sqlite"
+            tmp_path = Path(tmp)
+            store_path = tmp_path / "store.sqlite"
             store_mod = _load_store_module(store_path)
             conn = _fresh_conn_at_v4(store_mod)
             store_mod.add_memory(
@@ -489,20 +486,20 @@ class TestV5MigrationRefusesOnMissingCheckout(unittest.TestCase):
                 captured_warnings.append(" ".join(str(a) for a in args))
                 real_print(*args, **kwargs)
 
-            with mock.patch("builtins.print", side_effect=spy_print):
+            missing = tmp_path / "missing-opencode-checkout"
+            with mock.patch.object(
+                store_mod,
+                "_NS_MIGRATION_CHECKOUTS",
+                {"project:opencode-swarm": str(missing)},
+            ), mock.patch("builtins.print", side_effect=spy_print):
                 store_mod.migrate(conn)
 
             row = conn.execute(
                 "SELECT namespace FROM memory WHERE content=?",
                 ("row that should be refused/skipped",),
             ).fetchone()
-            if Path(r"E:\ZCode\opencode-swarm").is_dir():
-                self.assertEqual(row["namespace"], host.resolve_namespace(r"E:\ZCode\opencode-swarm"))
-            else:
-                # Checkout genuinely absent -> refuse-and-report: namespace
-                # left unchanged, and a loud warning was printed.
-                self.assertEqual(row["namespace"], "project:opencode-swarm")
-                self.assertTrue(any("opencode-swarm" in w and "not found" in w for w in captured_warnings))
+            self.assertEqual(row["namespace"], "project:opencode-swarm")
+            self.assertTrue(any("opencode-swarm" in w and "not found" in w for w in captured_warnings))
             conn.close()
 
     def test_synthetic_missing_checkout_via_relocated_map(self):
@@ -518,55 +515,54 @@ class TestV5MigrationRefusesOnMissingCheckout(unittest.TestCase):
         # which only exercises the report assertion when the real checkout
         # happens to be absent on the machine running the suite.
         with tempfile.TemporaryDirectory() as tmp:
-            store_path = Path(tmp) / "store.sqlite"
+            tmp_path = Path(tmp)
+            store_path = tmp_path / "store.sqlite"
             store_mod = _load_store_module(store_path)
             conn = _fresh_conn_at_v4(store_mod)
-            store_mod.add_memory(
-                conn, namespace="project:trainingapp", type_="fact",
-                content="trainingapp row under synthetic absence", signal="test",
-            )
+            try:
+                store_mod.add_memory(
+                    conn, namespace="project:trainingapp", type_="fact",
+                    content="trainingapp row under synthetic absence", signal="test",
+                )
 
-            real_is_dir = Path.is_dir
+                captured_warnings = []
+                real_print = print
 
-            def fake_is_dir(self):
-                if str(self) == r"E:\ZCode\trainingapp":
-                    return False
-                return real_is_dir(self)
+                def spy_print(*args, **kwargs):
+                    captured_warnings.append(" ".join(str(a) for a in args))
+                    real_print(*args, **kwargs)
 
-            captured_warnings = []
-            real_print = print
+                with mock.patch.object(
+                    store_mod,
+                    "_NS_MIGRATION_CHECKOUTS",
+                    {"project:trainingapp": str(tmp_path / "not-there")},
+                ), mock.patch("builtins.print", side_effect=spy_print):
+                    store_mod.migrate(conn)
 
-            def spy_print(*args, **kwargs):
-                captured_warnings.append(" ".join(str(a) for a in args))
-                real_print(*args, **kwargs)
+                self.assertTrue(
+                    any("trainingapp" in w and "not found" in w for w in captured_warnings),
+                    "migrate() must print a loud warning when a mapped checkout is missing",
+                )
 
-            with mock.patch.object(Path, "is_dir", fake_is_dir), \
-                    mock.patch("builtins.print", side_effect=spy_print):
-                store_mod.migrate(conn)
+                row = conn.execute(
+                    "SELECT namespace FROM memory WHERE content=?",
+                    ("trainingapp row under synthetic absence",),
+                ).fetchone()
+                self.assertEqual(row["namespace"], "project:trainingapp")
 
-            self.assertTrue(
-                any("trainingapp" in w and "not found" in w for w in captured_warnings),
-                "migrate() must print a loud warning when a mapped checkout is missing",
-            )
+                version_row = conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()
+                self.assertEqual(version_row["value"], "5")
 
-            row = conn.execute(
-                "SELECT namespace FROM memory WHERE content=?",
-                ("trainingapp row under synthetic absence",),
-            ).fetchone()
-            self.assertEqual(row["namespace"], "project:trainingapp")
-
-            version_row = conn.execute(
-                "SELECT value FROM meta WHERE key='schema_version'"
-            ).fetchone()
-            self.assertEqual(version_row["value"], "5")
-
-            migration_map = json.loads(
-                conn.execute(
-                    "SELECT value FROM meta WHERE key='ns_migration_v5'"
-                ).fetchone()["value"]
-            )
-            self.assertNotIn("project:trainingapp", migration_map)
-            conn.close()
+                migration_map = json.loads(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key='ns_migration_v5'"
+                    ).fetchone()["value"]
+                )
+                self.assertNotIn("project:trainingapp", migration_map)
+            finally:
+                conn.close()
 
     def test_unmappable_namespace_project_zcode_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -598,11 +594,18 @@ class TestV5MigrationRefusesOnMissingCheckout(unittest.TestCase):
 class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
     def test_rollback_map_recorded_in_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store_path = Path(tmp) / "store.sqlite"
+            tmp_path = Path(tmp)
+            checkouts = _synthetic_migration_checkouts(tmp_path)
+            store_path = tmp_path / "store.sqlite"
             store_mod = _load_store_module(store_path)
             conn = store_mod.connect()
             store_mod.init_db(conn)
-            store_mod.migrate(conn)
+            with mock.patch.object(
+                store_mod,
+                "_NS_MIGRATION_CHECKOUTS",
+                {k: str(v) for k, v in checkouts.items()},
+            ):
+                store_mod.migrate(conn)
 
             row = conn.execute(
                 "SELECT value FROM meta WHERE key='ns_migration_v5'"
@@ -610,11 +613,9 @@ class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
             self.assertIsNotNone(row)
             migration_map = json.loads(row[0])
             self.assertIsInstance(migration_map, dict)
-            # Every present-on-disk checkout must appear with its derived key.
-            for old_ns, checkout in TestV5MigrationEqualityInvariant.REAL_CHECKOUTS.items():
-                if Path(checkout).is_dir():
-                    self.assertIn(old_ns, migration_map)
-                    self.assertEqual(migration_map[old_ns], host.resolve_namespace(checkout))
+            for old_ns, checkout in checkouts.items():
+                self.assertIn(old_ns, migration_map)
+                self.assertEqual(migration_map[old_ns], host.resolve_namespace(checkout))
             conn.close()
 
     def test_schema_version_bumped_to_5(self):
@@ -632,14 +633,23 @@ class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
 
     def test_second_migrate_run_is_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store_path = Path(tmp) / "store.sqlite"
+            tmp_path = Path(tmp)
+            checkout = _make_git_repo(
+                tmp_path / "opencode", "https://github.com/Org/OpenCode-Swarm.git"
+            )
+            store_path = tmp_path / "store.sqlite"
             store_mod = _load_store_module(store_path)
             conn = _fresh_conn_at_v4(store_mod)
             store_mod.add_memory(
                 conn, namespace="project:opencode-swarm", type_="fact",
                 content="idempotency probe row", signal="test",
             )
-            store_mod.migrate(conn)
+            with mock.patch.object(
+                store_mod,
+                "_NS_MIGRATION_CHECKOUTS",
+                {"project:opencode-swarm": str(checkout)},
+            ):
+                store_mod.migrate(conn)
             row_after_first = conn.execute(
                 "SELECT namespace FROM memory WHERE content=?",
                 ("idempotency probe row",),
@@ -650,7 +660,12 @@ class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
 
             # Second run: schema_version already 5, so the v5 block must be a
             # pure no-op — namespace and rollback map both unchanged.
-            store_mod.migrate(conn)
+            with mock.patch.object(
+                store_mod,
+                "_NS_MIGRATION_CHECKOUTS",
+                {"project:opencode-swarm": str(checkout)},
+            ):
+                store_mod.migrate(conn)
             row_after_second = conn.execute(
                 "SELECT namespace FROM memory WHERE content=?",
                 ("idempotency probe row",),
@@ -674,7 +689,11 @@ class TestRecallCompatAlias(unittest.TestCase):
 
     def test_recall_finds_row_by_old_namespace_after_migration(self):
         with tempfile.TemporaryDirectory() as tmp:
-            store_path = Path(tmp) / "store.sqlite"
+            tmp_path = Path(tmp)
+            checkout = _make_git_repo(
+                tmp_path / "opencode", "https://github.com/Org/OpenCode-Swarm.git"
+            )
+            store_path = tmp_path / "store.sqlite"
             store_mod = _load_store_module(store_path)
             conn = _fresh_conn_at_v4(store_mod)
             try:
@@ -682,7 +701,12 @@ class TestRecallCompatAlias(unittest.TestCase):
                     conn, namespace="project:opencode-swarm", type_="fact",
                     content="unique lesson about widget frobnication", signal="test",
                 )
-                store_mod.migrate(conn)
+                with mock.patch.object(
+                    store_mod,
+                    "_NS_MIGRATION_CHECKOUTS",
+                    {"project:opencode-swarm": str(checkout)},
+                ):
+                    store_mod.migrate(conn)
 
                 new_ns = None
                 row = conn.execute(
@@ -690,9 +714,6 @@ class TestRecallCompatAlias(unittest.TestCase):
                     ("unique lesson about widget frobnication",),
                 ).fetchone()
                 new_ns = row["namespace"]
-
-                if new_ns == "project:opencode-swarm":
-                    self.skipTest("E:\\ZCode\\opencode-swarm checkout not present; namespace unchanged")
 
                 # Recall using the OLD namespace must still find the row via the
                 # compat alias, and must not double-count it.
@@ -725,9 +746,9 @@ class TestRecallCompatAlias(unittest.TestCase):
 
     def test_recall_synthetic_alias_finds_row_by_old_namespace(self):
         # Environment-independent version of the above: doesn't depend on any
-        # real on-disk checkout (E:\ZCode\...), so it still exercises the
+        # configured migration checkout, so it still exercises the
         # alias-matching logic on a box/CI leg where those paths don't exist
-        # and the real-checkout migration test above would have skipped.
+        # and the portable migration test above would otherwise be bypassed.
         with tempfile.TemporaryDirectory() as tmp:
             store_path = Path(tmp) / "store.sqlite"
             store_mod = _load_store_module(store_path)

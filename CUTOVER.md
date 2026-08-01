@@ -1,100 +1,159 @@
-# ZMem box-wide memory — CUTOVER CHECKLIST
+# ZMem Cutover Checklist
 
-Build status: **P0–P11 complete, each independently verified** on branch `feat/box-wide-memory`.
-Nothing below has been done yet — these are the steps that touch the live box. Do them in order.
+This is the supported operator cutover path for moving to one shared zmem
+store. It is intentionally generic. Historical one-off workstation commands are
+not part of the main flow.
 
----
+## 1. Pick one canonical physical store path
 
-## 0. Pre-flight
+- Choose one local, non-OneDrive, non-UNC path for the shared store.
+- Keep that same physical path across ZCode, Claude Code, and Codex.
+- Phase 1 is **single-machine only**. Do not let different hosts on the same
+  box silently fan out to different stores.
+
+Default:
 
 ```bash
-cd C:\Users\Brett\.graphify\repos\zaxbysauce\zmem
-git log --oneline origin/main..feat/box-wide-memory
+~/.zmem/store.sqlite
+~/.zmem/core.md
 ```
-Nothing is pushed. `main` is untouched at `4ff06c8`.
 
-**Quiesce first:** close ZCode and any other Claude Code sessions before step 2 so the legacy store isn't mid-write.
-
----
-
-## 1. Verify ZCode still loads its hooks  ⚠ only source-confirmed
-
-`hooks/hooks.json` was renamed to `hooks/hooks.zcode.json` (required — Claude Code auto-loads any default-named `hooks/hooks.json` *in addition to* the manifest path, which caused a double-load + module errors). ZCode's loader reads `manifest.hooks` as a custom path (confirmed in `zcode.cjs.patched`, fn `ckt`), but this was **never runtime-tested in a real ZCode session**.
-
-Start one ZCode session and confirm its ZMem hooks still fire. If they don't, revert to `"hooks": "hooks"` in `.zcode-plugin/plugin.json` and keep the file named `hooks.zcode.json` (never `hooks.json`).
-
----
-
-## 2. Final re-import of the drifted legacy store
-
-`~/.zmem` is a **point-in-time copy** taken during P1; ZCode has kept writing to the legacy store since.
+## 2. Run the read-only doctor first
 
 ```bash
-python skills/memory/scripts/import-store.py --source "C:\Users\Brett\.zcode\cli\plugins\data\zmem@zaxbyhub\store.sqlite" --dest-dir "C:\Users\Brett\.zmem" --force
+python skills/memory/scripts/doctor.py --project <repo> --format human
+```
+
+`doctor.py` never repairs anything. It only inspects:
+- store-path resolution and split-brain env/config risk
+- local/non-OneDrive path safety
+- Python, SQLite FTS5, Node, and Windows shell prerequisites
+- best-effort read/write access to the target path
+- schema compatibility against current v5
+- Claude and Codex native-memory conflicts
+- canonical namespace derivation for the target project
+- required host surfaces and optional Codex adapter files
+
+Do not proceed on a failing doctor run until the blockers are understood.
+
+## 3. Disable native memory explicitly
+
+zmem should not auto-edit host config. Disable native memory yourself before
+cutover.
+
+### Claude Code
+
+Set either:
+
+```json
+{ "autoMemoryEnabled": false }
+```
+
+in `~/.claude/settings.json` or `~/.claude/settings.local.json`, or set:
+
+```bash
+CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+```
+
+### Codex
+
+Disable the current Codex memory knobs in `~/.codex/config.toml`:
+
+```toml
+[features]
+memories = false
+
+[memories]
+use_memories = false
+generate_memories = false
+```
+
+Target shape for Claude Code and Codex cutover is `ZMEM_TIER0=native`: keep the
+host's native project-instruction surface, and let zmem own the shared Tier 2
+store.
+
+## 4. Make the canonical path reachable from every host
+
+- **ZCode / Claude Code:** use the plugin install surface and point both hosts
+  at the same canonical directory. Claude's `storeDirectory` option is wired at
+  runtime; `ZMEM_DATA` still wins if both are set.
+- **Codex:** do not assume Codex can write `~/.zmem`. If the canonical path is
+  outside Codex's writable roots, add a writable root or use a small local
+  broker that owns the store and exposes read/write actions.
+- Never "solve" a writable-root problem by giving Codex a different physical
+  store path. That creates split-brain memory on the same machine.
+
+## 5. Install and trust the host surfaces
+
+Required surfaces in this repo today:
+- Claude Code plugin surface
+- ZCode plugin surface
+- Memory skill surface
+
+Optional surface:
+- Repo-local Codex adapter files, if and when that lane lands
+
+After any hook-surface change:
+- trust the project again if your host requires it
+- reapprove hooks if your host tracks per-hook trust
+
+This matters most for Codex cutover, where repo-local hook files may arrive
+after the plugin surfaces.
+
+## 6. Import or migrate legacy data once
+
+If you still have a legacy store, import it into the canonical shared path:
+
+```bash
+python skills/memory/scripts/import-store.py --source <legacy-store.sqlite> --dest-dir <canonical-dir> --force
+```
+
+Then re-run:
+
+```bash
+python skills/memory/scripts/doctor.py --project <repo> --format human
 python skills/memory/scripts/store.py stats
 ```
 
-The import is source-safe (never opens the legacy store read-write; asserts its sha256 is unchanged). The v5 namespace migration is idempotent and schema-gated — it re-runs automatically on the fresh copy and reproduces identical keys.
+The goal is one canonical store, one canonical namespace key per project, and
+no fallback to host-specific plugin data directories.
 
-This also wipes two stray test rows that verifier agents accidentally wrote to `~/.zmem` during the build (`f371017d` canary — already superseded; `d191bcb3` "test memory degrade check alpha" — still live). No real memories were affected (superseded count held at 21 throughout).
+## 7. Verify first live use
 
----
-
-## 3. Turn off Claude Code's native memory  ← the "replace" step
-
-A plugin **cannot** set this; only you can. Add to `~/.claude/settings.json`:
-
-```json
-"autoMemoryEnabled": false
-```
-
-(or set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`). `CLAUDE.md` loading is a separate, always-on mechanism and is unaffected.
-
-If you skip this, ZMem still works but runs *alongside* native memory — both inject Tier 0, which is the duplication the design avoids. ZMem shows a one-time nudge in that case.
-
----
-
-## 4. Install the plugin on both hosts
-
-- **Claude Code:** `/plugin marketplace add C:\Users\Brett\.graphify\repos\zaxbysauce\zmem` then install `zmem`. (Requires an interactive terminal; `/plugin` is unavailable in some app surfaces. `claude plugin install` also exists.)
-- **ZCode:** Settings → Plugin Management → point at the same directory; reinstall so it picks up `hooks.zcode.json`.
-
-Verify: a new CC session should register **7 hooks** (SessionStart, UserPromptSubmit, PostToolUse, PostToolUseFailure, Stop, SubagentStart, SubagentStop).
-
----
-
-## 5. Re-promote the old skills
-
-`~/.zcode/skills/` holds ~24 `zmem-*` skills, ~20 still carrying the OLD broken draft (triplicated text, mid-word truncation, and the literal `EDIT THIS DESCRIPTION` leaking into the frontmatter `description:` — the model-facing trigger surface). P9 fixed the generator but deliberately did not rewrite existing files.
+Check at least:
 
 ```bash
-python skills/memory/scripts/store.py promote --dry-run
-python skills/memory/scripts/store.py promote --id <uuid> --confirm            # regenerate
-python skills/memory/scripts/store.py promote --id <uuid> --description "..." --confirm   # hand-written trigger
+python skills/memory/scripts/store.py recall --query "<known phrase>" --namespace "<canonical namespace>" --json
+python skills/memory/scripts/store.py stats
 ```
-Promotion now dual-writes to **both** `~/.claude/skills` and `~/.zcode/skills` (all-or-nothing on collision). Delete the stale versions first, or promotion will refuse on collision.
 
----
+On Windows plugin hosts, also confirm a usable Git Bash/Cygwin shell is the one
+running hooks, not the WSL `bash.exe` shim.
 
-## 6. Host the embedding model (optional but recommended)
+## 8. Keep maintenance explicit
 
-`minilm.onnx` (90 MB) is no longer git-tracked (still on disk here). The lazy-download default URL points at a HuggingFace ONNX export that is **not byte-identical** to the pinned sha256 `bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5`, so a fresh clone will fail the checksum and **fail open to lexical mode** (recall still works via FTS5; consolidation via Jaccard token overlap).
+- Back up regularly:
+  ```bash
+  python skills/memory/scripts/store.py backup
+  ```
+- Restore only when no session is actively writing:
+  ```bash
+  python skills/memory/scripts/store.py restore --from <snapshot.sqlite> --force
+  ```
+- Treat promotion as a reviewed step. `promote --confirm` writes into the host
+  skill surfaces and should not be made an unattended background action.
 
-To make fresh installs get real embeddings: upload this box's `skills/memory/models/minilm.onnx` as a GitHub release asset and set that URL (+ its sha) as the default, or set `ZMEM_MODEL_URL`.
+## 9. Respect the trust and plaintext risks
 
----
+- The store is a **local plaintext SQLite file**. Do not put secrets, creds, or
+  PII in it.
+- Remote harvests, sync repos, and any broker-fed content are **untrusted until
+  reviewed**.
+- If a sync repo or broker is compromised, treat that as a memory-store content
+  compromise, not a minor metadata issue.
 
-## 7. Optional / deferred
+## Historical notes
 
-- **Git history rewrite** — `git rm --cached` stopped future tracking, but the 90 MB blob is still in history. A `filter-repo`/BFG purge + force-push is disruptive and deliberately left to you.
-- **`userConfig.storeDirectory`** — the manifest field parses and validates, but is not yet wired to `ZMEM_DATA` at runtime; env remains the real override.
-- **Teardown throwaway probes:** `C:\Users\Brett\zmem-p05-smoketest`, `C:\Users\Brett\.zmem-p05`.
-
----
-
-## Operating notes
-
-- **Backups:** auto-snapshot runs at most once/day (`ZMEM_BACKUP_INTERVAL_DAYS`), keeping 7 (`store.py backup --retention N`). Restore with `store.py restore --from <snap> --force` — it takes a pre-restore safety backup first, so a restore is itself undoable. Run restores when no session is actively writing.
-- **A bare `store.py add` with no `ZMEM_DATA` writes the shared store** (`~/.zmem`) by default. Always set `ZMEM_DATA` to a temp dir when experimenting.
-- **Secrets:** the store is local plaintext, now aggregating every project and both tools. The write-time scanner is advisory only. Store dir is owner-only ACL.
-- **Namespaces** key on git remote, so worktrees and second clones of one repo share memory (e.g. `E:\ZCode\opencode-swarm` and `E:\ClaudeCode\opencode-swarm-dev` → the same 107 lessons).
+Any personal workstation paths, branch names, and one-time remediation commands
+from earlier development are intentionally excluded from this checklist. Keep
+them in issue notes or rollout logs, not in the supported operator path.

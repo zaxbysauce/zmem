@@ -1,21 +1,25 @@
 # ZMem — Multi-Tier Memory for ZCode + Claude Code
 
 A local-first memory system that gives your agent persistent, cross-session
-knowledge — shared box-wide across [ZCode](https://z.ai) and Claude Code:
-always-on core memory, FTS5-backed lesson recall, and reflection-on-failure.
-Zero cloud dependency.
+knowledge — shared box-wide across [ZCode](https://z.ai), Claude Code, and
+Codex workflows that can reach the same physical store: always-on core memory,
+FTS5-backed lesson recall, and reflection-on-failure. Zero cloud dependency.
 
 ## Box-wide shared memory
 
 ZMem is designed to be **one memory brain for the whole box**, not a separate
-copy per tool. Both ZCode and Claude Code point at the same store —
-`~/.zmem/store.sqlite` + `~/.zmem/core.md` — so a lesson captured in one tool
-is immediately recallable in the other, including inside delegated subagents.
-The host adapter (`hooks/zmem-launch.js`) detects which tool is running and
-sets a canonical env (`ZMEM_HOST`, `ZMEM_DATA`, `ZMEM_TIER0`, etc.) so the
-hook scripts and `store.py` never need to branch on host. Override the shared
-store location with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
-userConfig setting) if `~/.zmem` isn't where you want it.
+copy per tool. ZCode and Claude Code point at the same store —
+`~/.zmem/store.sqlite` + `~/.zmem/core.md` by default — and Codex can use that
+same store when the path is inside its writable roots or when a local broker
+owns the store on Codex's behalf. The host adapter (`hooks/zmem-launch.js`)
+detects which tool is running and sets a canonical env (`ZMEM_HOST`,
+`ZMEM_DATA`, `ZMEM_TIER0`, etc.) so the hook scripts and `store.py` never need
+to branch on host. Override the shared store location with the `ZMEM_DATA` env
+var (or the CC plugin's `storeDirectory` userConfig setting) if `~/.zmem`
+isn't where you want it.
+
+**Phase-1 limitation:** keep one canonical physical store path on one machine.
+Do not let different hosts silently fan out to different physical stores.
 
 ## What it does
 
@@ -43,12 +47,27 @@ retrieval floor by default). This follows the finding that intrinsic self-correc
 
 - ZCode and/or Claude Code (the plugin registers hooks + a skill via each
   tool's native plugin system)
+- Codex, if you want Codex to share the same store, with either:
+  - the shared store path added as a writable root, or
+  - a local broker process that owns the store and exposes read/write actions
 - Python 3.8+ with sqlite3 + FTS5 (standard in CPython; verify with
   `python -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')"` )
 - Git Bash / Cygwin on Windows (for the hook scripts); or any POSIX shell on macOS/Linux
 - Node.js (the cross-platform hook launcher; both tools already require it)
 
 ## Install
+
+### Preflight
+
+Before cutover, run the read-only doctor:
+
+```bash
+python skills/memory/scripts/doctor.py --project <repo> --format human
+```
+
+It checks the resolved store path, split-brain env/config risks, native-memory
+conflicts, schema compatibility, Windows shell requirements, canonical
+namespace derivation, and whether the expected host surfaces are present.
 
 ### ZCode — from this GitHub repo (recommended)
 
@@ -76,6 +95,32 @@ retrieval floor by default). This follows the finding that intrinsic self-correc
    nudge reminding you.
 3. Restart your session. `<repo>/CLAUDE.md` (CC's own always-on project memory)
    is untouched by ZMem — it keeps working exactly as it always has.
+
+### Codex — shared-store skill / broker mode
+
+Codex does not need a second physical store. Point it at the same canonical
+store directory the plugin hosts use.
+
+1. Disable Codex native memories in your own `~/.codex/config.toml` before
+   cutover. The current doctor inspects these keys read-only:
+   ```toml
+   [features]
+   memories = false
+
+   [memories]
+   use_memories = false
+   generate_memories = false
+   ```
+   Do this yourself; zmem should never auto-edit Codex config.
+2. Make the canonical shared store path writable from Codex. If Codex cannot
+   write that path directly, add it as a writable root or use a small local
+   broker that owns the store.
+3. Use `ZMEM_TIER0=native` for Codex cutover: keep Codex project instructions
+   as the host's native Tier 0 and let zmem own the shared Tier 2 store.
+4. If you add a repo-local Codex hook surface later, trust the project and
+   reapprove hooks after the cutover change. The current repo's Claude/ZCode
+   plugin surfaces are first-class now; repo-local Codex adapter files may lag
+   behind and are treated as optional by `doctor.py`.
 
 ### Local directory (for testing / air-gapped)
 
@@ -123,8 +168,9 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
 
 - **Store + core.md (box-wide default):** `~/.zmem/` — one shared, tool-neutral
   directory holding `store.sqlite` + `core.md`, read and written by both ZCode
-  and Claude Code (and their subagents). This is the box-wide model: a lesson
-  captured in either tool is recallable in the other. Override with the
+  and Claude Code (and their subagents), and by Codex when that path is
+  explicitly reachable. This is the box-wide model: a lesson captured in one
+  host is recallable in the others. Override with the
   `ZMEM_DATA` env var (or the CC plugin's `storeDirectory` userConfig option)
   if you want it elsewhere.
 - **Legacy per-plugin data dirs** (`${ZCODE_PLUGIN_DATA}` /
@@ -156,11 +202,24 @@ committed snapshot up to a full sync-repo read/write loop: see
   or PII in it. The write-time secret scanner is an advisory heuristic (regex +
   entropy), **not a guarantee**.
 - All memory stays on your machine. No telemetry, no cloud calls.
+- Remote harvests, sync outboxes, and any future broker inputs are **untrusted
+  until reviewed**. Only promote or ingest reviewed content into the shared
+  store.
 - **Tier 3 sync changes that.** If you wire up a private sync repo
   (`docs/CLOUD.md`), write access to that repo is effectively write access to
   the *content* of your store — including `user:global` rows, which are
   injected into every future session on this box. Read the "Trust model"
   section of [`docs/CLOUD.md`](docs/CLOUD.md) before setting it up.
+
+## Operations notes
+
+- Keep **one canonical physical store path** per machine. If two hosts resolve
+  to different physical stores, that is a cutover failure, not a supported mode.
+- Backups and restores are first-class maintenance commands:
+  `python <store.py> backup` and `python <store.py> restore --from <snapshot> --force`.
+  Run restores when no session is actively writing.
+- Review skill promotion before writing it. `promote --confirm` writes into the
+  host skill surfaces and should stay a reviewed step, not an automatic one.
 
 ## Cross-platform hook execution
 

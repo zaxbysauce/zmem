@@ -169,6 +169,8 @@ SIGNAL_CONFIDENCE = {
 # them by writing straight into the table.
 ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
 ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
+SUPPORTED_SCHEMA_VERSION = 5
+SCHEMA_VERSION_KEY = "schema_version"
 
 CONFIDENCE_FLOOR = 0.25
 
@@ -181,9 +183,66 @@ SECRET_PATTERNS = [
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 ]
 
+PROMPT_INJECTION_PATTERNS = [
+    re.compile(r"(?i)\bignore (all|any|the|previous|prior) instructions\b"),
+    re.compile(r"(?i)\b(system prompt|developer message|tool call|function call)\b"),
+    re.compile(r"(?i)</?(system|assistant|developer|tool)>"),
+    re.compile(r"```"),
+]
+
+CAPTURE_MODES = ("auto", "reviewed", "manual")
+
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _read_schema_version(path: Path) -> int | None:
+    """Best-effort readonly schema_version probe for preflight checks.
+
+    Returns None when the file does not exist yet, is empty, or is not far
+    enough initialized to answer the question. Raises RuntimeError only for the
+    fail-closed case: a recorded schema_version that is newer than this client
+    supports, or a recorded value that is not an integer.
+    """
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+    except OSError:
+        return None
+
+    uri = path.resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return None
+    try:
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (SCHEMA_VERSION_KEY,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    finally:
+        conn.close()
+
+    if not row:
+        return None
+    try:
+        version = int(row[0])
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"zmem: store {path} has a non-integer schema_version {row[0]!r}; "
+            "refusing to modify it"
+        )
+    if version > SUPPORTED_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"zmem: store {path} uses schema_version {version}, newer than this "
+            f"client's supported version {SUPPORTED_SCHEMA_VERSION}; refusing "
+            "to modify it"
+        )
+    return version
 
 
 def _commit(conn: sqlite3.Connection) -> None:
@@ -198,6 +257,7 @@ def _commit(conn: sqlite3.Connection) -> None:
 
 
 def connect() -> sqlite3.Connection:
+    _read_schema_version(STORE_PATH)
     if _host is not None:
         # Refuse UNC/network/OneDrive store locations before touching disk —
         # WAL mode on a network share or a sync-managed dir risks corruption.
@@ -206,9 +266,8 @@ def connect() -> sqlite3.Connection:
     dir_existed = STORE_PATH.parent.is_dir()
     file_existed = STORE_PATH.exists()
     STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(STORE_PATH))
+    conn = sqlite3.connect(str(STORE_PATH), timeout=5.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
 
@@ -232,6 +291,154 @@ def connect() -> sqlite3.Connection:
     except Exception:
         pass
     return conn
+
+
+SCHEMA_LOCK_STALE_SECONDS = _env_float("ZMEM_SCHEMA_LOCK_STALE_SECONDS", 300.0)
+SCHEMA_LOCK_WAIT_SECONDS = _env_float("ZMEM_SCHEMA_LOCK_WAIT_SECONDS", 15.0)
+SCHEMA_LOCK_POLL_SECONDS = _env_float("ZMEM_SCHEMA_LOCK_POLL_SECONDS", 0.05)
+MAINTENANCE_LOCK_STALE_SECONDS = _env_float("ZMEM_MAINTENANCE_LOCK_STALE_SECONDS", 1800.0)
+MAINTENANCE_WAIT_SECONDS = _env_float("ZMEM_MAINTENANCE_WAIT_SECONDS", 5.0)
+MAINTENANCE_POLL_SECONDS = _env_float("ZMEM_MAINTENANCE_POLL_SECONDS", 0.05)
+WRITER_LEASE_STALE_SECONDS = _env_float("ZMEM_WRITER_LEASE_STALE_SECONDS", 300.0)
+
+
+def _lock_path(name: str) -> Path:
+    return STORE_PATH.parent / f".zmem-{name}.lock"
+
+
+def _writer_dir() -> Path:
+    return STORE_PATH.parent / ".zmem-writers"
+
+
+def _strict_acquire_lock(
+    name: str,
+    stale_seconds: float,
+    *,
+    wait_seconds: float = 0.0,
+    poll_seconds: float = 0.05,
+) -> str | None:
+    """Acquire a host lock with bounded waiting and fail-closed degradation."""
+    if _host is None:
+        raise RuntimeError("zmem: host lock support unavailable")
+    path = _lock_path(name)
+    deadline = time.time() + max(0.0, wait_seconds)
+    while True:
+        token = _host.acquire_lock(path, stale_seconds)
+        if token == getattr(_host, "_NO_LOCK_TOKEN", "unlocked"):
+            raise RuntimeError(
+                f"zmem: could not safely acquire the {name} lock at {path}"
+            )
+        if token is not None:
+            return token
+        if time.time() >= deadline:
+            return None
+        time.sleep(poll_seconds)
+
+
+def _release_named_lock(name: str, token: str | None) -> None:
+    if _host is None:
+        return
+    _host.release_lock(_lock_path(name), token)
+
+
+def _wait_for_maintenance_clear(op: str) -> None:
+    """Block briefly while restore owns maintenance, then fail clearly."""
+    if _host is None:
+        return
+    deadline = time.time() + MAINTENANCE_WAIT_SECONDS
+    while True:
+        token = _strict_acquire_lock(
+            "maintenance",
+            MAINTENANCE_LOCK_STALE_SECONDS,
+            wait_seconds=0.0,
+        )
+        if token is not None:
+            _release_named_lock("maintenance", token)
+            return
+        if time.time() >= deadline:
+            raise RuntimeError(
+                f"zmem: maintenance is active; {op} timed out after "
+                f"{MAINTENANCE_WAIT_SECONDS:.1f}s waiting for restore to finish"
+            )
+        time.sleep(MAINTENANCE_POLL_SECONDS)
+
+
+def _cleanup_stale_writer_leases() -> list[Path]:
+    """Drop obviously-stale writer leases and return the live ones."""
+    writer_dir = _writer_dir()
+    try:
+        entries = list(writer_dir.glob("*.lease"))
+    except OSError:
+        return []
+    live: list[Path] = []
+    now = time.time()
+    for lease in entries:
+        try:
+            age = now - lease.stat().st_mtime
+        except OSError:
+            continue
+        if age > WRITER_LEASE_STALE_SECONDS:
+            try:
+                lease.unlink()
+            except OSError:
+                pass
+            continue
+        live.append(lease)
+    return live
+
+
+def _acquire_writer_lease(op: str) -> Path:
+    """Claim a live-writer lease that restore must observe before replacing the store."""
+    _wait_for_maintenance_clear(op)
+    writer_dir = _writer_dir()
+    writer_dir.mkdir(parents=True, exist_ok=True)
+    lease = writer_dir / f"{os.getpid()}-{uuid.uuid4().hex}-{op}.lease"
+    lease.write_text(now_iso(), encoding="utf-8")
+    try:
+        _wait_for_maintenance_clear(op)
+    except Exception:
+        try:
+            lease.unlink()
+        except OSError:
+            pass
+        raise
+    return lease
+
+
+def _release_writer_lease(lease: Path | None) -> None:
+    if lease is None:
+        return
+    try:
+        lease.unlink()
+    except OSError:
+        pass
+
+
+def _prepare_store(conn: sqlite3.Connection) -> None:
+    """Serialize cold-open WAL/init/migrate work behind the schema lock."""
+    token = _strict_acquire_lock(
+        "schema",
+        SCHEMA_LOCK_STALE_SECONDS,
+        wait_seconds=SCHEMA_LOCK_WAIT_SECONDS,
+        poll_seconds=SCHEMA_LOCK_POLL_SECONDS,
+    )
+    if token is None:
+        raise RuntimeError(
+            "zmem: timed out waiting for another process to finish store "
+            "initialization or migration"
+        )
+    try:
+        _read_schema_version(STORE_PATH)
+        if _host is not None:
+            _host.busy_retry(lambda: conn.execute("PRAGMA journal_mode=WAL").fetchone())
+        else:
+            conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        init_db(conn)
+        migrate(conn)
+    finally:
+        _release_named_lock("schema", token)
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -291,15 +498,49 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 # Old-style (`project:<basename>`) namespace keys and the live checkout each one
-# must be re-derived from. Module-level so the v5 migration block and the
-# unconditional retry pass below share ONE list (and so tests can point it at a
-# fixture dir). See the v5 block for why an explicit map is unavoidable.
-_NS_MIGRATION_CHECKOUTS = {
-    "project:opencode-swarm": r"E:\ZCode\opencode-swarm",
-    "project:ragappv3": r"E:\ZCode\ragappv3",
-    "project:trainingapp": r"E:\ZCode\trainingapp",
-    "project:zmem": r"C:\Users\Brett\.graphify\repos\zaxbysauce\zmem",
-}
+# must be re-derived from. The distributable runtime does NOT ship Brett- or
+# machine-specific checkout paths. Instead, operators can provide a portable
+# JSON object via ZMEM_NS_MIGRATION_MAP:
+#   {"project:oldname": "C:/path/to/current/checkout", ...}
+# Tests may also monkeypatch the module-level fallback below.
+_NS_MIGRATION_CHECKOUTS: dict[str, str] = {}
+
+
+def _load_ns_migration_checkouts() -> dict[str, str]:
+    raw = os.environ.get("ZMEM_NS_MIGRATION_MAP", "").strip()
+    if not raw:
+        return dict(_NS_MIGRATION_CHECKOUTS)
+    try:
+        loaded = json.loads(raw)
+    except ValueError:
+        print(
+            "[zmem] ns migration WARNING: ZMEM_NS_MIGRATION_MAP is not valid JSON "
+            "- skipping configured namespace re-key paths",
+            file=sys.stderr,
+        )
+        return dict(_NS_MIGRATION_CHECKOUTS)
+    if not isinstance(loaded, dict):
+        print(
+            "[zmem] ns migration WARNING: ZMEM_NS_MIGRATION_MAP must be a JSON "
+            "object of {old_namespace: checkout_path}; skipping it",
+            file=sys.stderr,
+        )
+        return dict(_NS_MIGRATION_CHECKOUTS)
+    mapping: dict[str, str] = {}
+    for old_ns, checkout in loaded.items():
+        if not isinstance(old_ns, str) or not isinstance(checkout, str):
+            print(
+                "[zmem] ns migration WARNING: ignoring non-string namespace map "
+                f"entry {old_ns!r}: {checkout!r}",
+                file=sys.stderr,
+            )
+            continue
+        if not old_ns.strip() or not checkout.strip():
+            continue
+        mapping[old_ns] = checkout
+    if not mapping:
+        return dict(_NS_MIGRATION_CHECKOUTS)
+    return mapping
 
 
 def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces) -> dict[str, str]:
@@ -321,8 +562,16 @@ def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces) -> dict[str, str
             file=sys.stderr,
         )
         return mapping
+    checkouts = _load_ns_migration_checkouts()
     for old_ns in old_namespaces:
-        checkout = _NS_MIGRATION_CHECKOUTS[old_ns]
+        checkout = checkouts.get(old_ns)
+        if not checkout:
+            print(
+                f"[zmem] ns migration WARNING: no configured checkout path for "
+                f"{old_ns} - namespace left unchanged",
+                file=sys.stderr,
+            )
+            continue
         checkout_path = Path(checkout)
         if not checkout_path.is_dir():
             print(
@@ -387,7 +636,9 @@ def _retry_pending_ns_migration(conn: sqlite3.Connection) -> None:
     no-op unless a row still carries an old-style key AND its checkout is now
     present.
     """
-    keys = list(_NS_MIGRATION_CHECKOUTS)
+    keys = list(_load_ns_migration_checkouts())
+    if not keys:
+        return
     placeholders = ",".join("?" * len(keys))
     try:
         stranded = [
@@ -417,8 +668,14 @@ def migrate(conn: sqlite3.Connection) -> None:
     connect() serializes concurrent hook processes; the version guard makes
     the second one a no-op once the first commits.
     """
-    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    row = conn.execute("SELECT value FROM meta WHERE key=?",
+                       (SCHEMA_VERSION_KEY,)).fetchone()
     ver = int(row[0]) if row else 1
+    if ver > SUPPORTED_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"zmem: store schema_version {ver} is newer than this client's "
+            f"supported version {SUPPORTED_SCHEMA_VERSION}; refusing to modify it"
+        )
 
     if ver < 2:
         # v2: ranking-support indexes + FTS trigger fix (stop write amplification).
@@ -505,7 +762,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         # pass has to skip (checkout absent) are NOT lost: the unconditional
         # _retry_pending_ns_migration() below picks them up on a later run,
         # which is why bumping schema_version here is safe.
-        migration_map = _rekey_namespaces(conn, list(_NS_MIGRATION_CHECKOUTS))
+        migration_map = _rekey_namespaces(conn, list(_load_ns_migration_checkouts()))
         # `user:global` and any unmapped namespace (e.g. `project:ZCode`,
         # a spurious parent-dir capture with no git remote of its own) are
         # deliberately left untouched.
@@ -536,6 +793,64 @@ def _check_secrets(content: str, source_ref: str) -> list[str]:
         if m:
             warnings.append(f"possible secret-like text matched pattern {pat.pattern[:40]!r}: {m.group(0)[:20]!r}...")
     return warnings
+
+
+def _merge_tag_strings(*tag_sets: str) -> str:
+    merged: set[str] = set()
+    for raw in tag_sets:
+        merged.update(t.strip() for t in (raw or "").split(",") if t.strip())
+    return ",".join(sorted(merged))
+
+
+def _normalize_capture_mode(mode: str | None) -> str:
+    value = (mode or os.environ.get("ZMEM_CAPTURE_MODE") or "manual").strip().lower()
+    return value if value in CAPTURE_MODES else "manual"
+
+
+def _redact_secret_like_text(text: str) -> tuple[str, int]:
+    redacted = text or ""
+    count = 0
+    for pat in SECRET_PATTERNS:
+        redacted, changed = pat.subn("[REDACTED_SECRET]", redacted)
+        count += changed
+    return redacted, count
+
+
+def _has_prompt_injection_risk(*values: str) -> bool:
+    combined = " ".join(v for v in values if v)
+    return any(p.search(combined) for p in PROMPT_INJECTION_PATTERNS)
+
+
+def _apply_capture_policy(
+    *,
+    content: str,
+    source_ref: str,
+    tags: str,
+    capture_mode: str,
+) -> tuple[str, str, str, list[str]]:
+    """Apply capture-time redaction/labeling while preserving provenance."""
+    mode = _normalize_capture_mode(capture_mode)
+    warnings = _check_secrets(content, source_ref)
+    out_content = content
+    out_source_ref = source_ref
+    out_tags = tags
+    if mode == "auto" and warnings:
+        out_content, content_redactions = _redact_secret_like_text(content)
+        out_source_ref, source_redactions = _redact_secret_like_text(source_ref)
+        total = content_redactions + source_redactions
+        if total <= 0:
+            raise RuntimeError(
+                "zmem: refusing automatic capture with likely secrets that could "
+                "not be safely redacted"
+            )
+        warnings = [
+            f"automatic capture redacted {total} secret-like value(s); review the "
+            "stored memory before trusting it"
+        ]
+        out_tags = _merge_tag_strings(out_tags, "auto-redacted")
+    if _has_prompt_injection_risk(out_content, out_source_ref):
+        out_tags = _merge_tag_strings(out_tags, "prompt-injection-risk")
+    return out_content, out_source_ref, out_tags, warnings
 
 
 def _to_win_path(p: str) -> str:
@@ -635,60 +950,81 @@ def add_memory(
     confidence: float | None = None,
     signal: str = "none",
     valid_from: str = "",
+    capture_mode: str = "manual",
 ) -> str:
-    warns = _check_secrets(content, source_ref)
+    content, source_ref, tags, warns = _apply_capture_policy(
+        content=content,
+        source_ref=source_ref,
+        tags=tags,
+        capture_mode=capture_mode,
+    )
     for w in warns:
-        print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
+        prefix = "WARNING (advisory, write proceeded)"
+        if _normalize_capture_mode(capture_mode) == "auto":
+            prefix = "NOTICE (automatic capture sanitized)"
+        print(f"[zmem] {prefix}: {w}", file=sys.stderr)
 
     if confidence is None:
         confidence = SIGNAL_CONFIDENCE.get(signal, 0.3)
 
-    # Dedup-on-write: semantic similarity (if embeddings available) or exact
-    # match fallback. Semantic dedup catches paraphrases the exact-match miss.
-    # Shared with ingest-jsonl (Tier 3 sync import), which must apply the same
-    # dedup-on-write semantics to incoming rows without duplicating this logic.
-    existing, dedup_sim, emb = _detect_duplicate(conn, content, namespace)
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
 
-    if existing:
-        # Merge: upgrade confidence/signal if the new add is stronger.
-        _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
-        _commit(conn)
-        print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
-              f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
-        return existing["id"]
+        # Dedup-on-write: semantic similarity (if embeddings available) or exact
+        # match fallback. Semantic dedup catches paraphrases the exact-match miss.
+        # Shared with ingest-jsonl (Tier 3 sync import), which must apply the same
+        # dedup-on-write semantics to incoming rows without duplicating this logic.
+        existing, dedup_sim, emb = _detect_duplicate(conn, content, namespace)
 
-    mid = str(uuid.uuid4())
-    shash = _source_hash(source_ref)
-    ts = now_iso()
-    if not valid_from:
-        valid_from = ts
+        if existing:
+            # Merge: upgrade confidence/signal if the new add is stronger.
+            _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
+            if started_tx:
+                _commit(conn)
+            print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
+                  f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
+            return existing["id"]
 
-    # Determine embedding model name for the embedding_model column.
-    emb_model = "minilm-onnx" if emb is not None else ""
+        mid = str(uuid.uuid4())
+        shash = _source_hash(source_ref)
+        ts = now_iso()
+        if not valid_from:
+            valid_from = ts
 
-    conn.execute(
-        """INSERT INTO memory
-           (id, namespace, type, content, tags, source_ref, source_hash,
-            confidence, signal, valid_from, superseded_at, ingestion_ts,
-            retrieval_count, last_retrieved, embedding, embedding_model, embedded_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?,?,?,?)""",
-        (mid, namespace, type_, content, tags, source_ref, shash,
-         confidence, signal, valid_from, ts, ts, emb, emb_model,
-         ts if emb is not None else None),
-    )
-    # Insert into vec0 table if we have an embedding.
-    if emb is not None:
-        try:
-            conn.execute(
-                "INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
-                [emb, mid],
-            )
-        except sqlite3.OperationalError:
-            pass  # vec0 table not available — embedding stored in memory table only
-    _commit(conn)
-    print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"
-          f"{', embedded' if emb is not None else ''})")
-    return mid
+        # Determine embedding model name for the embedding_model column.
+        emb_model = "minilm-onnx" if emb is not None else ""
+
+        conn.execute(
+            """INSERT INTO memory
+               (id, namespace, type, content, tags, source_ref, source_hash,
+                confidence, signal, valid_from, superseded_at, ingestion_ts,
+                retrieval_count, last_retrieved, embedding, embedding_model, embedded_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?,?,?,?)""",
+            (mid, namespace, type_, content, tags, source_ref, shash,
+             confidence, signal, valid_from, ts, ts, emb, emb_model,
+             ts if emb is not None else None),
+        )
+        # Insert into vec0 table if we have an embedding.
+        if emb is not None:
+            try:
+                conn.execute(
+                    "INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
+                    [emb, mid],
+                )
+            except sqlite3.OperationalError:
+                pass  # vec0 table not available — embedding stored in memory table only
+        if started_tx:
+            _commit(conn)
+        print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"
+              f"{', embedded' if emb is not None else ''})")
+        return mid
+    except Exception:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 # Cosine similarity threshold for semantic dedup (0..1, higher = stricter).
@@ -745,9 +1081,7 @@ def _merge_on_dedup(
     merged_signal = new_signal if new_rank > old_rank else row["signal"]
 
     # Union the tags.
-    old_tags = set(t.strip() for t in row["tags"].split(",") if t.strip())
-    new_tags_set = set(t.strip() for t in new_tags.split(",") if t.strip())
-    merged_tags = ",".join(sorted(old_tags | new_tags_set))
+    merged_tags = _merge_tag_strings(row["tags"], new_tags)
 
     conn.execute(
         "UPDATE memory SET confidence=?, signal=?, tags=?, "
@@ -1162,18 +1496,30 @@ def supersede_memory(
     superseded_at, not the local ingest time — otherwise two synced copies of
     the same tombstone would disagree on when it happened.
     """
-    row = conn.execute("SELECT id FROM memory WHERE id=?", (mid,)).fetchone()
-    if not row:
-        print(f"[zmem] no memory with id {mid}", file=sys.stderr)
-        return False
-    conn.execute("UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?",
-                 (at or now_iso(), reason, mid))
-    # Also remove from the vec0 table to prevent orphaned vectors consuming KNN slots.
+    started_tx = False
     try:
-        conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
-    except sqlite3.OperationalError:
-        pass  # vec0 table not available
-    _commit(conn)
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
+        row = conn.execute("SELECT id FROM memory WHERE id=?", (mid,)).fetchone()
+        if not row:
+            print(f"[zmem] no memory with id {mid}", file=sys.stderr)
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            return False
+        conn.execute("UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?",
+                     (at or now_iso(), reason, mid))
+        # Also remove from the vec0 table to prevent orphaned vectors consuming KNN slots.
+        try:
+            conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
+        except sqlite3.OperationalError:
+            pass  # vec0 table not available
+        if started_tx:
+            _commit(conn)
+    except Exception:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        raise
     # The confirmation print interpolates `reason`, which on the ingest-jsonl
     # path is REMOTE-AUTHORED. stdout is strict under a legacy codepage
     # (PYTHONIOENCODING=cp1252 and friends), so a non-representable character
@@ -1246,6 +1592,7 @@ def get_memory(conn, mid):
 PROMOTE_CONFIDENCE_FLOOR = 0.85
 PROMOTE_RETRIEVAL_FLOOR = 3
 PROMOTE_SIGNALS = ("test", "compile", "lint")
+PROMOTION_REVIEW_DIRNAME = "promotion-candidates"
 
 
 def _slugify_skill_name(tags: str, fallback_id: str) -> str:
@@ -1296,6 +1643,13 @@ def _yaml_dquote(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _resolve_promotion_review_dir() -> Path:
+    explicit = os.environ.get("ZMEM_PROMOTION_REVIEW_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    return STORE_PATH.parent / PROMOTION_REVIEW_DIRNAME
+
+
 def _synthesize_trigger_description(tags: str, content: str) -> str:
     """Build a clean, single-line, trigger-focused description from a memory.
 
@@ -1321,6 +1675,7 @@ def promote_memory(
     dry_run: bool = False,
     namespace: str | None = None,
     description: str | None = None,
+    install_approved: bool = False,
 ) -> None:
     """Promote high-confidence lessons to reusable SKILL.md files.
 
@@ -1329,11 +1684,11 @@ def promote_memory(
     the lesson and the skill coexist (the lesson costs ~200 bytes; if the skill
     description fails to trigger, the lesson is still in recall).
 
-    Human-in-the-loop: --dry-run shows candidates (and both write targets);
-    --id <uuid> --confirm writes the SKILL.md to every dir in
-    host.resolve_skills_dirs() (box-wide default: ~/.claude/skills AND
-    ~/.zcode/skills). --description overrides the synthesized trigger line
-    verbatim, for a human/orchestrator to supply something punchier.
+    Human-in-the-loop: --dry-run shows candidates, the generated review-candidate
+    path, and the eventual install targets. `--id <uuid> --confirm` writes only
+    the review candidate. `--install-approved` is the explicit, programmatic
+    opt-in that also installs the generated SKILL.md into the live host skill
+    dirs. --description overrides the synthesized trigger line verbatim.
     """
     # Candidate query.
     ns_clause = "AND namespace = ?" if namespace else ""
@@ -1363,18 +1718,21 @@ def promote_memory(
         return
 
     skills_dirs = _resolve_skills_dirs()
+    review_root = _resolve_promotion_review_dir()
 
     if dry_run:
         print(f"[zmem] {len(candidates)} promotion candidate(s):")
         for c in candidates:
             skill_name = _slugify_skill_name(c["tags"], c["id"])
+            review_skill = review_root / f"{skill_name}-{c['id'][:8]}" / "SKILL.md"
             print(f"\n  [{c['id'][:8]}] (rc={c['retrieval_count']}, conf={c['confidence']}, "
                   f"signal={c['signal']})")
             print(f"    content: {c['content'][:80]}...")
             print(f"    tags: {c['tags']}")
             print(f"    description would be: {_synthesize_trigger_description(c['tags'], c['content'])}")
+            print(f"    would create review candidate: {review_skill}")
             for d in skills_dirs:
-                print(f"    would create: {d / skill_name / 'SKILL.md'}")
+                print(f"    install target: {d / skill_name / 'SKILL.md'}")
         return
 
     if memory_id:
@@ -1388,12 +1746,14 @@ def promote_memory(
 
         skill_name = _slugify_skill_name(row["tags"], row["id"])
         skill_targets = [d / skill_name for d in skills_dirs]
+        review_dir = review_root / f"{skill_name}-{row['id'][:8]}"
+        review_file = review_dir / "SKILL.md"
 
         # Collision detection — check every target BEFORE writing to any of
         # them, so a collision in one dir never leaves a partial promotion
         # (a skill in one tool's dir but not the other's).
         collisions = [d for d in skill_targets if (d / "SKILL.md").exists()]
-        if collisions:
+        if install_approved and collisions:
             print(f"[zmem] ERROR: skill already exists in {len(collisions)} target dir(s):", file=sys.stderr)
             for d in collisions:
                 print(f"  {d}", file=sys.stderr)
@@ -1439,19 +1799,28 @@ Use when working with: {trigger_contexts}.
 - Tags: {tags_str}
 """
 
-        # Write the skill file to every configured target dir.
-        written = []
-        for skill_dir in skill_targets:
-            skill_dir.mkdir(parents=True, exist_ok=True)
-            skill_file = skill_dir / "SKILL.md"
-            skill_file.write_text(draft, encoding="utf-8")
-            written.append(skill_file)
+        review_dir.mkdir(parents=True, exist_ok=True)
+        review_file.write_text(draft, encoding="utf-8")
 
-        print(f"[zmem] promoted lesson {row['id'][:8]} ->")
-        for skill_file in written:
-            print(f"  {skill_file}")
-        print(f"  Source lesson KEPT in store (not superseded).")
-        print(f"  The skill will load on next session restart.")
+        written = []
+        if install_approved:
+            for skill_dir in skill_targets:
+                skill_dir.mkdir(parents=True, exist_ok=True)
+                skill_file = skill_dir / "SKILL.md"
+                skill_file.write_text(draft, encoding="utf-8")
+                written.append(skill_file)
+
+        print(f"[zmem] promotion review candidate for lesson {row['id'][:8]} ->")
+        print(f"  {review_file}")
+        if written:
+            print("[zmem] approved install targets ->")
+            for skill_file in written:
+                print(f"  {skill_file}")
+            print("  The installed skill will load on next session restart.")
+        else:
+            print("[zmem] candidate only; re-run with --install-approved to install it "
+                  "into the live skills dirs.")
+        print("  Source lesson KEPT in store (not superseded).")
         return
 
     # No --id and not --dry-run: show usage.
@@ -2219,13 +2588,19 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
     benign "someone else already did it" skip worth exit 0, a silently skipped
     restore would tell a human "done" while their data is untouched.
 
-    NOT SOLVED, and deliberately so: a live interactive session writing to the
-    store through the normal `add`/`recall` path takes neither lock, so restore
-    still cannot serialize against it. Fixing that means coordinating with every
-    write path; the documented guidance (SKILL.md) remains "run restore when no
-    session is actively writing."
+    MAINTENANCE / WRITER PROTOCOL — restore now acquires a maintenance lock
+    first. New store commands wait briefly and then fail clearly while that lock
+    is held, and any writer already in flight must carry a live lease file.
+    Restore checks those leases before it touches the destination; if any are
+    still live, it refuses and leaves the destination untouched.
     """
     dest = STORE_PATH
+    try:
+        _read_schema_version(dest)
+        _read_schema_version(Path(from_path).expanduser())
+    except RuntimeError as e:
+        print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
+        return 2
     if _host is not None:
         try:
             _host.assert_local_fs(dest.parent)
@@ -2233,25 +2608,61 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
             print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
             return 1
 
+    m_token = _strict_acquire_lock(
+        "maintenance",
+        MAINTENANCE_LOCK_STALE_SECONDS,
+        wait_seconds=0.0,
+    )
+    if m_token is None:
+        print("[zmem] restore REFUSED: another maintenance operation is currently "
+              "running - destination untouched; re-run when it finishes",
+              file=sys.stderr)
+        return 2
+    s_token = _strict_acquire_lock(
+        "schema",
+        SCHEMA_LOCK_STALE_SECONDS,
+        wait_seconds=SCHEMA_LOCK_WAIT_SECONDS,
+        poll_seconds=SCHEMA_LOCK_POLL_SECONDS,
+    )
+    if s_token is None:
+        _release_named_lock("maintenance", m_token)
+        print("[zmem] restore REFUSED: store initialization or migration is "
+              "currently running - destination untouched; re-run when it finishes",
+              file=sys.stderr)
+        return 2
+
     # Fixed acquisition order (backup, then consolidate); nothing else in this
     # file takes both, so no deadlock is possible, and a half-acquired pair is
     # always released before returning.
     b_token = _acquire_lock("backup", BACKUP_LOCK_STALE_SECONDS)
     if b_token is None:
+        _release_named_lock("schema", s_token)
+        _release_named_lock("maintenance", m_token)
         print("[zmem] restore REFUSED: a backup is currently running - "
               "destination untouched; re-run when it finishes", file=sys.stderr)
         return 2
     c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
     if c_token is None:
         _release_lock("backup", b_token)
+        _release_named_lock("schema", s_token)
+        _release_named_lock("maintenance", m_token)
         print("[zmem] restore REFUSED: a consolidation is currently running - "
               "destination untouched; re-run when it finishes", file=sys.stderr)
         return 2
     try:
+        live_writers = _cleanup_stale_writer_leases()
+        if live_writers:
+            print("[zmem] restore REFUSED: a normal writer is currently active - "
+                  "destination untouched; re-run when it finishes", file=sys.stderr)
+            for lease in live_writers[:5]:
+                print(f"[zmem]   active writer lease: {lease.name}", file=sys.stderr)
+            return 2
         return _restore_locked(from_path=from_path, force=force, out_dir=out_dir)
     finally:
         _release_lock("consolidate", c_token)
         _release_lock("backup", b_token)
+        _release_named_lock("schema", s_token)
+        _release_named_lock("maintenance", m_token)
 
 
 def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None = None) -> int:
@@ -3040,99 +3451,92 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
     superseded_at = obj["superseded_at"]
     supersede_reason = obj["supersede_reason"]
 
-    local = conn.execute("SELECT superseded_at FROM memory WHERE id=?", (mid,)).fetchone()
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
 
-    if local is not None:
-        # id already known locally: local content is NEVER overwritten by a
-        # sync import. The only mutation an existing row can receive here is
-        # a tombstone, and only if the incoming row is superseded and the
-        # local one is not already -- everything else is a no-op skip.
-        if superseded_at and local["superseded_at"] is None:
-            if not allow_tombstones:
-                return "tombstone_refused"
-            ok = supersede_memory(conn, mid, supersede_reason, at=superseded_at)
-            return "tombstoned" if ok else "skipped"
-        return "skipped"
+        local = conn.execute("SELECT superseded_at FROM memory WHERE id=?", (mid,)).fetchone()
 
-    if superseded_at:
-        # New locally, but already tombstoned upstream: insert as history so
-        # future syncs stay consistent, without letting it participate in
-        # dedup-on-write or recall -- it must not resurface, and it must not
-        # silently absorb a live row into its (dead) dedup slot either.
-        # The secret scan runs here too: a tombstoned row's content is still
-        # written to disk and still readable via `get`/`list
-        # --include-superseded`, so "it's already dead" is not a reason to
-        # skip the warning. Advisory only, exactly like the live path.
-        for w in _check_secrets(content, source_ref):
+        if local is not None:
+            # id already known locally: local content is NEVER overwritten by a
+            # sync import. The only mutation an existing row can receive here is
+            # a tombstone, and only if the incoming row is superseded and the
+            # local one is not already -- everything else is a no-op skip.
+            if superseded_at and local["superseded_at"] is None:
+                if not allow_tombstones:
+                    if started_tx and conn.in_transaction:
+                        conn.rollback()
+                    return "tombstone_refused"
+                ok = supersede_memory(conn, mid, supersede_reason, at=superseded_at)
+                if started_tx and conn.in_transaction:
+                    _commit(conn)
+                return "tombstoned" if ok else "skipped"
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            return "skipped"
+
+        if superseded_at:
+            # New locally, but already tombstoned upstream: insert as history so
+            # future syncs stay consistent, without letting it participate in
+            # dedup-on-write or recall -- it must not resurface, and it must not
+            # silently absorb a live row into its (dead) dedup slot either.
+            for w in _check_secrets(content, source_ref):
+                print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
+            shash = ""
+            conn.execute(
+                """INSERT INTO memory
+                   (id, namespace, type, content, tags, source_ref, source_hash,
+                    confidence, signal, valid_from, superseded_at, supersede_reason,
+                    ingestion_ts, retrieval_count, last_retrieved,
+                    embedding, embedding_model, embedded_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL)""",
+                (mid, namespace, type_, content, tags, source_ref, shash,
+                 confidence, signal, valid_from, superseded_at, supersede_reason,
+                 ingestion_ts),
+            )
+            if started_tx:
+                _commit(conn)
+            return "added"
+
+        warns = _check_secrets(content, source_ref)
+        for w in warns:
             print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
-        # Never hash a synced row's source_ref: a 'file:' ref here names a path
-        # on the ORIGINATING machine, not this one, so hashing whatever happens
-        # to live at that path locally is semantically meaningless -- and since
-        # source_ref is remote-authored, a hostile row could point _source_hash
-        # at an arbitrary huge file (memory blowup) or a FIFO (indefinite block
-        # on POSIX). Leave staleness hashing to the box that actually owns the
-        # file; ingested rows just don't get it.
+        existing, _sim, emb = _detect_duplicate(conn, content, namespace)
+        if existing:
+            _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
+            if started_tx:
+                _commit(conn)
+            return "deduped"
+
         shash = ""
+        emb_model = "minilm-onnx" if emb is not None else ""
+        embedded_at = now_iso() if emb is not None else None
         conn.execute(
             """INSERT INTO memory
                (id, namespace, type, content, tags, source_ref, source_hash,
-                confidence, signal, valid_from, superseded_at, supersede_reason,
-                ingestion_ts, retrieval_count, last_retrieved,
-                embedding, embedding_model, embedded_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL)""",
+                confidence, signal, valid_from, superseded_at, ingestion_ts,
+                retrieval_count, last_retrieved, embedding, embedding_model, embedded_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?)""",
             (mid, namespace, type_, content, tags, source_ref, shash,
-             confidence, signal, valid_from, superseded_at, supersede_reason,
-             ingestion_ts),
+             confidence, signal, valid_from, ingestion_ts, emb, emb_model, embedded_at),
         )
-        _commit(conn)
+        if emb is not None:
+            try:
+                conn.execute(
+                    "INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
+                    [emb, mid],
+                )
+            except sqlite3.OperationalError:
+                pass  # vec0 table not available -- embedding stored in memory table only
+        if started_tx:
+            _commit(conn)
         return "added"
-
-    # New locally, still live upstream: run the same secret-scan warning and
-    # dedup-on-write check add_memory() applies to a locally-authored add --
-    # a synced row must not bypass either just because it arrived via a file
-    # instead of the `add` subcommand.
-    warns = _check_secrets(content, source_ref)
-    for w in warns:
-        print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
-    existing, _sim, emb = _detect_duplicate(conn, content, namespace)
-    if existing:
-        _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
-        _commit(conn)
-        return "deduped"
-
-    # See the tombstone-branch comment above: a synced row's source_ref is
-    # remote-authored and describes a file on the ORIGINATING machine, so
-    # hashing it here would be both meaningless and a DoS vector (arbitrary
-    # path, huge file, or a blocking FIFO on POSIX). Ingested rows never get
-    # a local staleness hash.
-    shash = ""
-    # _detect_duplicate already embedded this content when embeddings are
-    # available; store that vector instead of discarding it and leaving the
-    # row for a later `reembed` to redo. Mirrors add_memory()'s insert. Note
-    # embedded_at is LOCAL now (the vector was computed here, on this box),
-    # not the row's upstream ingestion_ts. When embeddings are unavailable
-    # emb is None and the row keeps today's NULL/'' shape for reembed.
-    emb_model = "minilm-onnx" if emb is not None else ""
-    embedded_at = now_iso() if emb is not None else None
-    conn.execute(
-        """INSERT INTO memory
-           (id, namespace, type, content, tags, source_ref, source_hash,
-            confidence, signal, valid_from, superseded_at, ingestion_ts,
-            retrieval_count, last_retrieved, embedding, embedding_model, embedded_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?)""",
-        (mid, namespace, type_, content, tags, source_ref, shash,
-         confidence, signal, valid_from, ingestion_ts, emb, emb_model, embedded_at),
-    )
-    if emb is not None:
-        try:
-            conn.execute(
-                "INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
-                [emb, mid],
-            )
-        except sqlite3.OperationalError:
-            pass  # vec0 table not available -- embedding stored in memory table only
-    _commit(conn)
-    return "added"
+    except Exception:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
@@ -3354,6 +3758,9 @@ def main():
     p_add.add_argument("--source-ref", default="")
     p_add.add_argument("--confidence", type=float, default=None)
     p_add.add_argument("--signal", default="none", choices=list(ALLOWED_SIGNALS))
+    p_add.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
+                       help="manual/reviewed keep the original text with warnings; "
+                            "auto redacts likely secrets by default before writing")
 
     p_recall = sub.add_parser("recall", help="recall relevant memories")
     p_recall.add_argument("--query", required=True)
@@ -3421,10 +3828,14 @@ def main():
                                 "(used with --id --confirm)")
     p_promote.add_argument("--confirm", action="store_true",
                            help="REQUIRED to write. Promotion creates a SKILL.md in every dir "
-                                "in ZMEM_SKILLS_DIRS (default: both ~/.claude/skills and "
-                                "~/.zcode/skills), so --id alone refuses with exit 2. "
-                                "--dry-run needs no confirmation (and lists ALL candidates — "
-                                "it ignores --id).")
+                                "in the review-candidate area; add --install-approved for the "
+                                "explicit live install into ZMEM_SKILLS_DIRS (default: both "
+                                "~/.claude/skills and ~/.zcode/skills). --id alone refuses "
+                                "with exit 2. --dry-run needs no confirmation (and lists ALL "
+                                "candidates — it ignores --id).")
+    p_promote.add_argument("--install-approved", action="store_true",
+                           help="explicitly install the generated SKILL.md into the live "
+                                "skills dirs after writing the review candidate")
 
     p_backup = sub.add_parser(
         "backup", help="take a verified, retention-rotated snapshot of the store")
@@ -3537,88 +3948,95 @@ def main():
         sys.exit(cmd_restore(from_path=args.from_path, force=args.force,
                              out_dir=args.out_dir))
 
-    conn = connect()
-    init_db(conn)
-    migrate(conn)
+    try:
+        _wait_for_maintenance_clear(args.cmd)
+        conn = connect()
+        _prepare_store(conn)
+    except RuntimeError as e:
+        print(f"[zmem] {e}", file=sys.stderr)
+        sys.exit(2)
 
-    if args.cmd == "init":
-        print(f"[zmem] store ready at {STORE_PATH}")
-    elif args.cmd == "add":
-        add_memory(
-            conn,
-            namespace=args.namespace,
-            type_=args.type,
-            content=args.content,
-            tags=args.tags,
-            source_ref=args.source_ref,
-            confidence=args.confidence,
-            signal=args.signal,
-        )
-    elif args.cmd == "recall":
-        recall_memory(conn, query=args.query, namespace=args.namespace,
-                      limit=args.limit, as_json=args.json, hybrid=args.hybrid,
-                      no_bump=args.no_bump)
-    elif args.cmd == "recent":
-        recent_memory(conn, namespace=args.namespace, limit=args.limit,
-                      min_confidence=args.min_confidence, as_json=args.json,
-                      no_bump=args.no_bump)
-    elif args.cmd == "search":
-        recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
-                      as_json=False, min_confidence=0.0)
-    elif args.cmd == "supersede":
-        ok = supersede_memory(conn, args.id, args.reason)
-        sys.exit(0 if ok else 1)
-    elif args.cmd == "get":
-        get_memory(conn, args.id)
-    elif args.cmd == "list":
-        list_memory(conn, namespace=args.namespace, limit=args.limit, include_superseded=args.include_superseded)
-    elif args.cmd == "stats":
-        stats(conn)
-    elif args.cmd == "rebuild-fts":
-        conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
-        conn.commit()
-        print("[zmem] FTS5 index rebuilt")
-    elif args.cmd == "reembed":
-        _reembed(conn)
-    elif args.cmd == "consolidate":
-        # Single-flight: consolidate() writes, and the SessionStart hook fires a
-        # detached one per session. Its meta-key cadence gate is a SOFT gate
-        # (read-then-later-write), so without this lock two near-simultaneous
-        # runs both pass it and both run the clustering loop. --dry-run writes
-        # nothing, so it is deliberately never gated (and never takes the lock).
-        c_token = None
-        if not args.dry_run:
-            c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
-            if c_token is None:
-                print("[zmem] consolidate: another consolidation is already "
-                      "running - skipped")
-                conn.close()
-                return
-        try:
-            consolidate(conn, threshold=args.threshold, prune=args.prune,
-                        dry_run=args.dry_run, namespace=args.namespace)
-        finally:
-            _release_lock("consolidate", c_token)
-    elif args.cmd == "backup":
-        rc = cmd_backup(conn, retention=args.retention, out_dir=args.out_dir,
-                        if_due=args.if_due)
-        conn.close()
-        sys.exit(rc)
-    elif args.cmd == "promote":
-        # --confirm is a REAL gate, not decoration. Promotion writes a SKILL.md
-        # into every dir in ZMEM_SKILLS_DIRS (by default BOTH ~/.claude/skills
-        # and ~/.zcode/skills), and every promoted skill costs trigger-matching
-        # attention in every future session on both hosts. It was previously
-        # accepted-but-ignored, which is worse than not having it: three
-        # separate docs (CUTOVER.md, the closeout skill, and promote_memory's
-        # own docstring) described `--id <uuid> --confirm` as the write gate,
-        # so the flag read as protection it did not provide.
-        if args.id and not args.dry_run and not args.confirm:
-            print("[zmem] refusing to promote without --confirm.", file=sys.stderr)
-            print(f"[zmem]   promote --id {args.id} --confirm", file=sys.stderr)
-            print("[zmem] (add --description \"...\" to write the trigger line yourself — "
-                  "the description is the entire trigger surface)", file=sys.stderr)
-            conn.close()
+    writer_lease = None
+    if (
+        args.cmd in {"add", "supersede", "rebuild-fts", "reembed", "ingest-jsonl"}
+        or (args.cmd == "recall" and not args.no_bump)
+        or (args.cmd == "recent" and not args.no_bump)
+    ):
+        writer_lease = _acquire_writer_lease(args.cmd)
+
+    try:
+        if args.cmd == "init":
+            print(f"[zmem] store ready at {STORE_PATH}")
+        elif args.cmd == "add":
+            add_memory(
+                conn,
+                namespace=args.namespace,
+                type_=args.type,
+                content=args.content,
+                tags=args.tags,
+                source_ref=args.source_ref,
+                confidence=args.confidence,
+                signal=args.signal,
+                capture_mode=args.capture_mode,
+            )
+        elif args.cmd == "recall":
+            recall_memory(conn, query=args.query, namespace=args.namespace,
+                          limit=args.limit, as_json=args.json, hybrid=args.hybrid,
+                          no_bump=args.no_bump)
+        elif args.cmd == "recent":
+            recent_memory(conn, namespace=args.namespace, limit=args.limit,
+                          min_confidence=args.min_confidence, as_json=args.json,
+                          no_bump=args.no_bump)
+        elif args.cmd == "search":
+            recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
+                          as_json=False, min_confidence=0.0)
+        elif args.cmd == "supersede":
+            ok = supersede_memory(conn, args.id, args.reason)
+            sys.exit(0 if ok else 1)
+        elif args.cmd == "get":
+            get_memory(conn, args.id)
+        elif args.cmd == "list":
+            list_memory(conn, namespace=args.namespace, limit=args.limit, include_superseded=args.include_superseded)
+        elif args.cmd == "stats":
+            stats(conn)
+        elif args.cmd == "rebuild-fts":
+            conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
+            conn.commit()
+            print("[zmem] FTS5 index rebuilt")
+        elif args.cmd == "reembed":
+            _reembed(conn)
+        elif args.cmd == "consolidate":
+            # Single-flight: consolidate() writes, and the SessionStart hook fires a
+            # detached one per session. Its meta-key cadence gate is a SOFT gate
+            # (read-then-later-write), so without this lock two near-simultaneous
+            # runs both pass it and both run the clustering loop. --dry-run writes
+            # nothing, so it is deliberately never gated (and never takes the lock).
+            c_token = None
+            if not args.dry_run:
+                c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+                if c_token is None:
+                    print("[zmem] consolidate: another consolidation is already "
+                          "running - skipped")
+                    conn.close()
+                    return
+            try:
+                consolidate(conn, threshold=args.threshold, prune=args.prune,
+                            dry_run=args.dry_run, namespace=args.namespace)
+            finally:
+                _release_lock("consolidate", c_token)
+        elif args.cmd == "backup":
+            rc = cmd_backup(conn, retention=args.retention, out_dir=args.out_dir,
+                            if_due=args.if_due)
+            sys.exit(rc)
+        elif args.cmd == "promote":
+            # --confirm is a REAL gate, not decoration. Promotion writes a SKILL.md
+            # into the review-candidate area, and live installation now needs the
+            # extra explicit --install-approved gate.
+            if args.id and not args.dry_run and not args.confirm:
+                print("[zmem] refusing to promote without --confirm.", file=sys.stderr)
+                print(f"[zmem]   promote --id {args.id} --confirm", file=sys.stderr)
+                print("[zmem] (add --description \"...\" to write the trigger line yourself — "
+                      "the description is the entire trigger surface)", file=sys.stderr)
             # sys.exit, not return: main()'s return value is discarded by the
             # `if __name__ == "__main__": main()` entrypoint, so a bare `return 2`
             # prints the refusal but still exits 0 — a refusal indistinguishable
@@ -3627,33 +4045,32 @@ def main():
             # note restore uses 1 for its own missing-flag case, and `failures`
             # surfaces no code at all, so this is deliberately the refused-and-
             # nothing-written convention rather than a blanket house style.
-            sys.exit(2)
-        rc = promote_memory(conn, memory_id=args.id, dry_run=args.dry_run,
-                            namespace=args.namespace, description=args.description)
-        if rc:
-            conn.close()
+                sys.exit(2)
+            rc = promote_memory(conn, memory_id=args.id, dry_run=args.dry_run,
+                                namespace=args.namespace, description=args.description,
+                                install_approved=args.install_approved)
+            if rc:
+                sys.exit(rc)
+        elif args.cmd == "export-pack":
+            rc = cmd_export_pack(
+                conn, namespace=args.namespace, out=args.out,
+                project_limit=args.project_limit, global_limit=args.global_limit,
+                min_confidence=args.min_confidence, max_bytes=args.max_bytes,
+            )
             sys.exit(rc)
-    elif args.cmd == "export-pack":
-        rc = cmd_export_pack(
-            conn, namespace=args.namespace, out=args.out,
-            project_limit=args.project_limit, global_limit=args.global_limit,
-            min_confidence=args.min_confidence, max_bytes=args.max_bytes,
-        )
+        elif args.cmd == "export-jsonl":
+            rc = cmd_export_jsonl(
+                conn, out=args.out, namespace=args.namespace,
+                include_superseded=args.include_superseded,
+            )
+            sys.exit(rc)
+        elif args.cmd == "ingest-jsonl":
+            rc = cmd_ingest_jsonl(conn, in_path=args.in_path, source_ref=args.source_ref,
+                                  allow_tombstones=args.allow_tombstones)
+            sys.exit(rc)
+    finally:
+        _release_writer_lease(writer_lease)
         conn.close()
-        sys.exit(rc)
-    elif args.cmd == "export-jsonl":
-        rc = cmd_export_jsonl(
-            conn, out=args.out, namespace=args.namespace,
-            include_superseded=args.include_superseded,
-        )
-        conn.close()
-        sys.exit(rc)
-    elif args.cmd == "ingest-jsonl":
-        rc = cmd_ingest_jsonl(conn, in_path=args.in_path, source_ref=args.source_ref,
-                              allow_tombstones=args.allow_tombstones)
-        conn.close()
-        sys.exit(rc)
-    conn.close()
 
 
 def _has_any_embedding(conn: sqlite3.Connection) -> bool:

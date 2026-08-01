@@ -11,9 +11,10 @@ description: >
 # Memory (ZMem)
 
 ZCode's memory system has three tiers:
-- **Tier 0 — Core:** `core.md` (user-level, in the plugin data dir) + `<repo>/AGENTS.md`
-  (project-level). Auto-injected every session by the SessionStart hook. Edit
-  `core.md` directly for stable rules/preferences. Keep <2KB.
+- **Tier 0 — Core:** `core.md` (user-level, in the canonical shared store dir)
+  + `<repo>/AGENTS.md` (project-level on ZCode). Auto-injected every session by
+  the SessionStart hook. Edit `core.md` directly for stable rules/preferences.
+  Keep <2KB.
 - **Tier 2 — Semantic:** `store.sqlite` (in the plugin data dir). Cross-task lessons,
   facts, conventions, preferences. Operated by this skill via `scripts/store.py`.
 - **Tier 4 — Procedural:** the skills library. (Extended later with evals + index.)
@@ -39,6 +40,26 @@ If you cannot find the injected path, the script is at the plugin root under
 
 All commands run `python <store.py path> <subcommand>`. On Windows use `python`
 (NOT `python3` — that is a Windows Store stub).
+
+### doctor — read-only install diagnostics
+```
+python <doctor.py path> [--project <repo>] [--repo-root <zmem-repo>] [--format human|json|both]
+```
+Read-only preflight for cutover and operator debugging. It never mutates the
+store or host config. Checks:
+- resolved store path and split-brain env/config risk
+- local/non-OneDrive store path safety
+- Python version + SQLite FTS5
+- Node and a usable Git Bash/Cygwin shell on Windows
+- best-effort read/write access to the store path
+- schema compatibility against current v5
+- Claude/Codex native-memory conflicts via read-only config inspection
+- canonical namespace for the provided project
+- host surface presence (Claude plugin, ZCode plugin, memory skill; repo-local
+  Codex adapter files are optional until that lane exists)
+
+Use it before first install, before cutover, and after any store-path or hook
+surface change.
 
 ### recall — surface relevant memories (high-precision)
 ```
@@ -164,6 +185,8 @@ export of a store you trust as authoritative for those ids.
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite
   file. The write-time filter is advisory only (regex heuristic), not a guarantee.
+- **`doctor.py` is read-only.** It should inspect, never repair. Do not let it
+  create the store, rewrite config, or "fix" hook trust for the operator.
 - **Signal honesty:** `signal=none` means no external grounding — the lesson is the
   agent's self-opinion. Never set `signal=test` unless a test actually ran.
 - **Wrap, do not replace:** this skill never writes to `tasks/<slug>/*.md` or
@@ -214,6 +237,20 @@ memory. In that mode:
 - If a SessionStart nudge appears telling you native memory still looks
   enabled, that is informational for the user (a plugin cannot flip the
   setting itself) — no action needed from you beyond surfacing it once.
+
+## Codex shared-store mode
+For Codex, the safe cutover shape is:
+- **Disable Codex native memories yourself** in `~/.codex/config.toml`; do not
+  let zmem auto-edit Codex config.
+- **Use one canonical physical store path** shared with the plugin hosts.
+- **Treat `ZMEM_TIER0=native` as the target shape**: keep Codex's own project
+  instruction surface native, and use zmem for shared Tier 2 durable memory.
+- **Do not assume Codex can write `~/.zmem`.** If the shared store path is
+  outside Codex's writable roots, add a writable root or use a local broker
+  that owns the store and mediates read/write operations.
+- **Reapprove hooks after hook-surface changes.** If a repo-local Codex hook
+  adapter is added later, trust the project and reapprove that surface as part
+  of cutover.
 
 ## The reflection loop (Loop 1)
 The `zmem-reflect.sh` Stop hook checks the episodic db for failed tool calls

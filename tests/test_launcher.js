@@ -56,6 +56,7 @@ function envWith(overrides) {
         "ZMEM_TRANSCRIPT", "ZMEM_AGENT_TRANSCRIPT", "ZMEM_AGENT_TYPE",
         "ZMEM_AGENT_ID", "ZMEM_NAMESPACE", "ZMEM_SKILLS_DIRS",
         "ZMEM_TIER0", "ZMEM_CTX_BUDGET",
+        "PLUGIN_ROOT", "PLUGIN_DATA", "CODEX_PROJECT_DIR",
         "CLAUDE_PLUGIN_ROOT", "ZCODE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR",
         "ZCODE_PROJECT_DIR", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
         "CLAUDE_SESSION_ID", "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
@@ -114,7 +115,9 @@ function seed(dataDir, namespace, type, content, confidence) {
 }
 
 // --- temp workspace --------------------------------------------------------
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-p3-"));
+const TMP_ROOT = path.join(REPO, ".tmp-tests");
+fs.mkdirSync(TMP_ROOT, { recursive: true });
+const TMP = fs.mkdtempSync(path.join(TMP_ROOT, "zmem-p3-"));
 const DATA = path.join(TMP, "data");
 const PROJ = path.join(TMP, "proj");
 fs.mkdirSync(DATA, { recursive: true });
