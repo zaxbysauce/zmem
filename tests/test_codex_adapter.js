@@ -100,6 +100,15 @@ console.log("\n[1] Codex plugin metadata");
 
 {
     const plugin = JSON.parse(fs.readFileSync(path.join(REPO, ".codex-plugin", "plugin.json"), "utf8"));
+    const claudePlugin = JSON.parse(
+        fs.readFileSync(path.join(REPO, ".claude-plugin", "plugin.json"), "utf8")
+    );
+    const claudeMarketplace = JSON.parse(
+        fs.readFileSync(path.join(REPO, ".claude-plugin", "marketplace.json"), "utf8")
+    );
+    const zcodePlugin = JSON.parse(
+        fs.readFileSync(path.join(REPO, ".zcode-plugin", "plugin.json"), "utf8")
+    );
     const marketplace = JSON.parse(
         fs.readFileSync(path.join(REPO, ".agents", "plugins", "marketplace.json"), "utf8")
     );
@@ -115,6 +124,10 @@ console.log("\n[1] Codex plugin metadata");
     eq("marketplace: root name", marketplace.name, "zaxbyhub-local");
     eq("marketplace: one plugin entry", marketplace.plugins.length, 1);
     eq("marketplace: version matches plugin", marketplace.plugins[0].version, plugin.version);
+    eq("release: Codex version", plugin.version, "0.6.0");
+    eq("release: Claude plugin matches Codex", claudePlugin.version, plugin.version);
+    eq("release: Claude marketplace matches Codex", claudeMarketplace.plugins[0].version, plugin.version);
+    eq("release: ZCode plugin matches Codex", zcodePlugin.version, plugin.version);
     eq("marketplace: plugin source kind", marketplace.plugins[0].source.source, "local");
     eq("marketplace: plugin source path points at repo root", marketplace.plugins[0].source.path, "./");
     eq("marketplace: installation policy", marketplace.plugins[0].policy.installation, "AVAILABLE");
