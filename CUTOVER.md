@@ -108,6 +108,18 @@ If you still have a legacy store, import it into the canonical shared path:
 python skills/memory/scripts/import-store.py --source <legacy-store.sqlite> --dest-dir <canonical-dir> --force
 ```
 
+Before opening a v4 store with the v5 runtime, provide every legacy project
+namespace that must be re-keyed:
+
+```powershell
+$env:ZMEM_NS_MIGRATION_MAP='{"project:oldname":"C:/src/owner/repo"}'
+```
+
+The value is a JSON object of `{old_namespace: live_checkout_path}`. ZMem reads
+the checkout's current Git remote to derive the canonical namespace. Omitted
+entries are retried on later opens, but they remain under their old namespace
+until the map is supplied, so verify each expected project before cutover.
+
 Then re-run:
 
 ```bash
@@ -140,6 +152,10 @@ running hooks, not the WSL `bash.exe` shim.
   ```bash
   python skills/memory/scripts/store.py restore --from <snapshot.sqlite> --force
   ```
+  A crashed writer lease is deliberately treated as live for up to 300 seconds
+  (`ZMEM_WRITER_LEASE_STALE_SECONDS`) because deleting a merely slow writer's
+  lease could let restore overwrite an active store. Wait for that bounded
+  fail-safe window rather than lowering it casually.
 - Treat promotion as a reviewed step. `promote --confirm` writes into the host
   skill surfaces and should not be made an unattended background action.
 

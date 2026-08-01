@@ -32,7 +32,7 @@
 
 const { spawn, execFileSync } = require("child_process");
 const { existsSync } = require("fs");
-const { join, dirname, delimiter } = require("path");
+const { join, dirname, basename, delimiter } = require("path");
 const { homedir } = require("os");
 
 // Hooks that emit the <<<ZMEM_JSON>>> sentinel and get envelope translation.
@@ -410,7 +410,11 @@ function buildChildEnv(env, bashPath) {
     if (process.platform !== "win32" || !bashPath || !existsSync(bashPath)) return childEnv;
 
     const bashDir = dirname(bashPath);
-    const gitRoot = dirname(bashDir);
+    const parentDir = dirname(bashDir);
+    const gitRoot = basename(bashDir).toLowerCase() === "bin" &&
+        basename(parentDir).toLowerCase() === "usr"
+        ? dirname(parentDir)
+        : parentDir;
     const extraDirs = [
         bashDir,
         join(gitRoot, "usr", "bin"),
@@ -633,6 +637,7 @@ module.exports = {
     getPluginRoot,
     resolveNamespace,
     buildCanonicalEnv,
+    buildChildEnv,
     hookEventNameFor,
     normalizeCodexFailurePayload,
     prepareHookPayload,

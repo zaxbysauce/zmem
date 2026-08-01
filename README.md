@@ -183,6 +183,11 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
   `skills/memory/scripts/import-store.py` to copy it (checkpointed, read-only
   on the source) into `~/.zmem` — this is the supported migration path, not a
   manual file copy.
+- **Legacy project namespaces:** before the first v5 open, set
+  `ZMEM_NS_MIGRATION_MAP` to a JSON object from each old namespace to a live
+  checkout, for example `{"project:oldname":"C:/src/owner/repo"}`. ZMem uses
+  each checkout's current remote to derive the canonical key. Missing entries
+  are retried on later opens but remain under the old key until supplied.
 - **Episodic memory (read-only):** `~/.zcode/cli/db/db.sqlite` — ZCode's own
   session/tool-call database. ZMem reads this for failure detection; never writes it.
   On Claude Code, failure detection instead scans the session transcript

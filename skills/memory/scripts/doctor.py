@@ -398,8 +398,8 @@ def _check_node_and_bash() -> list[dict]:
         reason = f"Usable Windows shell found via {source}."
         status = "pass"
     elif ok:
-        reason = f"bash runs, but the path does not look like Git Bash/Cygwin: {bash_path}"
-        status = "warn"
+        reason = f"bash runs, but the path is not recognized as Git Bash/Cygwin: {bash_path}"
+        status = "fail"
     else:
         reason = f"bash invocation failed: {version}"
         status = "fail"
@@ -599,7 +599,10 @@ def _lookup_project_trust(codex_cfg: dict, project: Path) -> str | None:
 
 
 def _hook_state_for_repo(codex_cfg: dict, repo_root: Path) -> list[str]:
-    state = codex_cfg.get("hooks", {}).get("state")
+    hooks = codex_cfg.get("hooks")
+    if not isinstance(hooks, dict):
+        return []
+    state = hooks.get("state")
     if not isinstance(state, dict):
         return []
     repo_norm = _norm_path(repo_root)

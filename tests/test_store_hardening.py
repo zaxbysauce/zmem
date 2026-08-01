@@ -36,13 +36,18 @@ import host  # noqa: E402
 
 def _base_env(tmp: str) -> dict:
     env = {**os.environ}
+    stress_workers = int(env.get("ZMEM_COLD_OPEN_WORKERS", "6"))
     env["ZMEM_STORE"] = os.path.join(tmp, "store.sqlite")
     env["ZMEM_MODELS_DIR"] = os.path.join(tmp, "no-such-models")
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
-    env["ZMEM_MAINTENANCE_WAIT_SECONDS"] = "0.2"
-    env["ZMEM_MAINTENANCE_POLL_SECONDS"] = "0.02"
-    env["ZMEM_SCHEMA_LOCK_WAIT_SECONDS"] = "5"
-    env["ZMEM_SCHEMA_LOCK_POLL_SECONDS"] = "0.02"
+    env.setdefault(
+        "ZMEM_MAINTENANCE_WAIT_SECONDS", "15" if stress_workers > 6 else "0.2"
+    )
+    env.setdefault("ZMEM_MAINTENANCE_POLL_SECONDS", "0.02")
+    env.setdefault(
+        "ZMEM_SCHEMA_LOCK_WAIT_SECONDS", "30" if stress_workers > 6 else "5"
+    )
+    env.setdefault("ZMEM_SCHEMA_LOCK_POLL_SECONDS", "0.02")
     return env
 
 
@@ -230,9 +235,12 @@ class TestConcurrentColdOpenAndDedup(HardeningStoreCase):
         return results
 
     def test_simultaneous_cold_open_initializes_once_and_keeps_all_rows(self):
+        worker_count = int(os.environ.get("ZMEM_COLD_OPEN_WORKERS", "6"))
+        self.assertGreaterEqual(worker_count, 1)
+        self.assertLessEqual(worker_count, 80)
         rows = [
             (f"cold-open row {i}", f"tag{i}", 0.9, "test")
-            for i in range(6)
+            for i in range(worker_count)
         ]
         results = self._run_parallel_adds(rows)
         for r in results:
@@ -250,7 +258,7 @@ class TestConcurrentColdOpenAndDedup(HardeningStoreCase):
             journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(live, 6)
+        self.assertEqual(live, worker_count)
         self.assertEqual(schema, "5")
         self.assertEqual(journal_mode.lower(), "wal")
 
@@ -374,6 +382,57 @@ class TestAutomaticCaptureSecurity(HardeningStoreCase):
         tags = set(row[1].split(","))
         self.assertIn("auto-redacted", tags)
         self.assertIn("prompt-injection-risk", tags)
+
+    def test_auto_capture_redacts_secret_like_tags(self):
+        r = self.run_store(
+            "add",
+            "--namespace",
+            NS,
+            "--type",
+            "fact",
+            "--content",
+            "safe content",
+            "--tags",
+            "api_key=supersecretvalue12345678,seed",
+            "--source-ref",
+            "session:security-tags",
+            "--signal",
+            "test",
+            "--capture-mode",
+            "auto",
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        row = self.query_one(
+            "SELECT tags, source_ref FROM memory WHERE superseded_at IS NULL"
+        )
+        self.assertNotIn("supersecretvalue12345678", row[0])
+        self.assertIn("[REDACTED_SECRET]", row[0])
+        self.assertIn("auto-redacted", set(row[0].split(",")))
+        self.assertEqual(row[1], "session:security-tags")
+
+    def test_auto_capture_refuses_secret_like_source_ref_without_writing(self):
+        source = "file:C:/private/api_key=supersecretvalue12345678/notes.md"
+        r = self.run_store(
+            "add",
+            "--namespace",
+            NS,
+            "--type",
+            "fact",
+            "--content",
+            "safe content",
+            "--tags",
+            "seed",
+            "--source-ref",
+            source,
+            "--signal",
+            "test",
+            "--capture-mode",
+            "auto",
+        )
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("provenance and staleness", r.stderr)
+        row = self.query_one("SELECT count(*) FROM memory")
+        self.assertEqual(row[0], 0)
 
     def test_reviewed_capture_keeps_original_text(self):
         secret = "api_key=supersecretvalue12345678"

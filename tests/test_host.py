@@ -120,10 +120,17 @@ class TestResolveSkillsDirs(unittest.TestCase):
     def tearDown(self):
         self._patcher.stop()
 
-    def test_default_is_both_claude_and_zcode_skills_dirs(self):
+    def test_default_includes_codex_claude_and_zcode_skills_dirs(self):
         home = Path(os.path.expanduser("~"))
         dirs = host.resolve_skills_dirs()
-        self.assertEqual(dirs, [home / ".claude" / "skills", home / ".zcode" / "skills"])
+        self.assertEqual(
+            dirs,
+            [
+                home / ".codex" / "skills",
+                home / ".claude" / "skills",
+                home / ".zcode" / "skills",
+            ],
+        )
 
     def test_override_via_pathsep_delimited_env(self):
         # NOTE: must not use literal Windows drive-letter paths (e.g. r"C:\a\skills")

@@ -38,7 +38,8 @@ If you cannot find the injected path, the script is at the plugin root under
 
 ## Commands
 
-All commands run `python <store.py path> <subcommand>`. On Windows use `python`
+Store commands run `python <store.py path> <subcommand>`; `doctor` is the one
+separate diagnostic script shown below. On Windows use `python`
 (NOT `python3` — that is a Windows Store stub).
 
 ### doctor — read-only install diagnostics
@@ -94,6 +95,23 @@ python <store.py> list [--namespace NS] [--include-superseded]
 python <store.py> get --id <uuid>
 python <store.py> stats
 ```
+
+### reembed — backfill semantic embeddings
+```
+python <store.py> reembed
+```
+Backfills missing embeddings for live memories when the optional embedding
+runtime and model are available. Existing embeddings are preserved.
+
+### promote — review and install a reusable skill
+```
+python <store.py> promote --dry-run [--namespace NS]
+python <store.py> promote --id <uuid> --confirm [--description "..."]
+python <store.py> promote --id <uuid> --confirm --install-approved
+```
+`--confirm` writes a review candidate; `--install-approved` is the additional
+explicit gate that installs the reviewed skill into Codex, Claude Code, and
+ZCode skill directories. Promotion is never an unattended hook action.
 
 ### consolidate — merge near-duplicate memories
 ```
@@ -187,6 +205,12 @@ export of a store you trust as authoritative for those ids.
   file. The write-time filter is advisory only (regex heuristic), not a guarantee.
 - **`doctor.py` is read-only.** It should inspect, never repair. Do not let it
   create the store, rewrite config, or "fix" hook trust for the operator.
+- **Legacy namespace cutover:** before first v5 use, set
+  `ZMEM_NS_MIGRATION_MAP` to a JSON object mapping each old namespace to a live
+  checkout path, for example `{"project:oldname":"C:/src/owner/repo"}`. The
+  migration re-derives canonical remote-based keys from those checkouts; it
+  retries the map on later opens, but an omitted entry remains under its old key
+  until the map is supplied.
 - **Signal honesty:** `signal=none` means no external grounding — the lesson is the
   agent's self-opinion. Never set `signal=test` unless a test actually ran.
 - **Wrap, do not replace:** this skill never writes to `tasks/<slug>/*.md` or

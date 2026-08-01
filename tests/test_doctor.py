@@ -77,7 +77,7 @@ class DoctorCliTest(unittest.TestCase):
     def _write_fake_tools(self):
         node = self.bin / "node.cmd"
         git = self.bin / "git.cmd"
-        bash = self.bin / "bash.cmd"
+        bash = self.bin / "Git" / "bin" / "bash.cmd"
         _write_text(node, _cmd_script('echo v20.11.0'))
         _write_text(git, _cmd_script('echo https://github.com/Example/Widget.git'))
         _write_text(bash, _cmd_script('echo GNU bash, version 5.2.0'))
@@ -106,7 +106,7 @@ class DoctorCliTest(unittest.TestCase):
         env["HOME"] = str(self.home)
         env["USERPROFILE"] = str(self.home)
         env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
-        env["ZMEM_BASH_PATH"] = str(self.bin / "bash.cmd")
+        env["ZMEM_BASH_PATH"] = str(self.bin / "Git" / "bin" / "bash.cmd")
         for key in (
             "ZMEM_STORE",
             "ZMEM_DATA",
@@ -174,6 +174,8 @@ class DoctorCliTest(unittest.TestCase):
         self.assertEqual(statuses["claude-native-memory"], "pass")
         self.assertEqual(statuses["codex-native-memory"], "pass")
         self.assertEqual(statuses["host-surfaces"], "pass")
+        if os.name == "nt":
+            self.assertEqual(statuses["windows-bash"], "pass")
 
         surfaces = next(c for c in report["checks"] if c["id"] == "host-surfaces")
         self.assertEqual(
@@ -215,6 +217,59 @@ class DoctorCliTest(unittest.TestCase):
         self.assertIn("claude-native-memory", result.stdout)
         self.assertIn("codex-native-memory", result.stdout)
         self.assertIn("BLOCKED", result.stdout)
+
+    def test_scalar_hooks_false_is_accepted_without_traceback(self):
+        store_dir = self.home / ".zmem"
+        _make_store(store_dir / "store.sqlite", schema_version=5)
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "hooks = false\n\n[features]\nmemories = false\n",
+        )
+        result = self._run(
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["ok"], report)
+
+    @unittest.skipUnless(os.name == "nt", "Windows shell classification only")
+    def test_unrecognized_runnable_windows_shell_fails_closed(self):
+        store_dir = self.home / ".zmem"
+        _make_store(store_dir / "store.sqlite", schema_version=5)
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "[features]\nmemories = false\n",
+        )
+        env = self._base_env()
+        env["ZMEM_BASH_PATH"] = str(self.bin / "node.cmd")
+        result = self._run(
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+            env=env,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        shell = next(c for c in report["checks"] if c["id"] == "windows-bash")
+        self.assertEqual(shell["status"], "fail")
+        self.assertIn("not recognized", shell["summary"])
 
     def test_conflicting_env_and_onedrive_path_are_reported_read_only(self):
         onedrive_root = self.home / "OneDrive"

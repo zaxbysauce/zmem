@@ -783,11 +783,15 @@ def _load_vec(conn: sqlite3.Connection) -> None:
     sqlite_vec.load(conn)
 
 
-def _check_secrets(content: str, source_ref: str) -> list[str]:
+class CapturePolicyRefusal(ValueError):
+    """Automatic capture could not safely preserve the record contract."""
+
+
+def _check_secrets(content: str, source_ref: str, tags: str = "") -> list[str]:
     """Advisory only. Returns list of warnings. Never blocks. Scans both content
-    and source_ref (a token in a file path would otherwise slip through)."""
+    source_ref, and tags (a token in metadata would otherwise slip through)."""
     warnings = []
-    combined = content + " " + source_ref
+    combined = " ".join((content, source_ref, tags))
     for pat in SECRET_PATTERNS:
         m = pat.search(combined)
         if m:
@@ -830,14 +834,21 @@ def _apply_capture_policy(
 ) -> tuple[str, str, str, list[str]]:
     """Apply capture-time redaction/labeling while preserving provenance."""
     mode = _normalize_capture_mode(capture_mode)
-    warnings = _check_secrets(content, source_ref)
+    warnings = _check_secrets(content, source_ref, tags)
     out_content = content
     out_source_ref = source_ref
     out_tags = tags
+    source_warnings = _check_secrets("", source_ref)
+    if mode == "auto" and source_warnings:
+        raise CapturePolicyRefusal(
+            "refusing automatic capture because source_ref contains secret-like "
+            "text; review it manually so provenance and staleness tracking are "
+            "not silently destroyed"
+        )
     if mode == "auto" and warnings:
         out_content, content_redactions = _redact_secret_like_text(content)
-        out_source_ref, source_redactions = _redact_secret_like_text(source_ref)
-        total = content_redactions + source_redactions
+        out_tags, tag_redactions = _redact_secret_like_text(tags)
+        total = content_redactions + tag_redactions
         if total <= 0:
             raise RuntimeError(
                 "zmem: refusing automatic capture with likely secrets that could "
@@ -3482,7 +3493,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
             # future syncs stay consistent, without letting it participate in
             # dedup-on-write or recall -- it must not resurface, and it must not
             # silently absorb a live row into its (dead) dedup slot either.
-            for w in _check_secrets(content, source_ref):
+            for w in _check_secrets(content, source_ref, tags):
                 print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
             shash = ""
             conn.execute(
@@ -3500,7 +3511,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
                 _commit(conn)
             return "added"
 
-        warns = _check_secrets(content, source_ref)
+        warns = _check_secrets(content, source_ref, tags)
         for w in warns:
             print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
         existing, _sim, emb = _detect_duplicate(conn, content, namespace)
@@ -3968,17 +3979,21 @@ def main():
         if args.cmd == "init":
             print(f"[zmem] store ready at {STORE_PATH}")
         elif args.cmd == "add":
-            add_memory(
-                conn,
-                namespace=args.namespace,
-                type_=args.type,
-                content=args.content,
-                tags=args.tags,
-                source_ref=args.source_ref,
-                confidence=args.confidence,
-                signal=args.signal,
-                capture_mode=args.capture_mode,
-            )
+            try:
+                add_memory(
+                    conn,
+                    namespace=args.namespace,
+                    type_=args.type,
+                    content=args.content,
+                    tags=args.tags,
+                    source_ref=args.source_ref,
+                    confidence=args.confidence,
+                    signal=args.signal,
+                    capture_mode=args.capture_mode,
+                )
+            except CapturePolicyRefusal as exc:
+                print(f"[zmem] {exc}", file=sys.stderr)
+                sys.exit(2)
         elif args.cmd == "recall":
             recall_memory(conn, query=args.query, namespace=args.namespace,
                           limit=args.limit, as_json=args.json, hybrid=args.hybrid,

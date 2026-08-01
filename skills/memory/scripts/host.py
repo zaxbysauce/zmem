@@ -148,8 +148,9 @@ def resolve_core_md_path() -> Path:
 def resolve_skills_dirs() -> list[Path]:
     """Resolve the skills dirs promotion writes SKILL.md into.
 
-    Default (box-wide): BOTH `~/.claude/skills` and `~/.zcode/skills`, so a
-    lesson promoted from either host becomes a skill visible to both. This
+    Default (box-wide): `~/.codex/skills`, `~/.claude/skills`, and
+    `~/.zcode/skills`, so a lesson promoted from any host becomes a skill
+    visible to all three. This
     is deliberately not host-conditional (unlike resolve_store_path) — a
     promoted skill is meant to be usable by whichever tool is in front of
     the user next, not just the one that promoted it.
@@ -164,7 +165,11 @@ def resolve_skills_dirs() -> list[Path]:
         raw = [p for p in explicit.split(os.pathsep) if p.strip()]
     else:
         home = Path(os.path.expanduser("~"))
-        raw = [str(home / ".claude" / "skills"), str(home / ".zcode" / "skills")]
+        raw = [
+            str(home / ".codex" / "skills"),
+            str(home / ".claude" / "skills"),
+            str(home / ".zcode" / "skills"),
+        ]
 
     seen: set[str] = set()
     dirs: list[Path] = []

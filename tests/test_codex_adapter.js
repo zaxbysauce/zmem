@@ -114,6 +114,7 @@ console.log("\n[1] Codex plugin metadata");
 
     eq("marketplace: root name", marketplace.name, "zaxbyhub-local");
     eq("marketplace: one plugin entry", marketplace.plugins.length, 1);
+    eq("marketplace: version matches plugin", marketplace.plugins[0].version, plugin.version);
     eq("marketplace: plugin source kind", marketplace.plugins[0].source.source, "local");
     eq("marketplace: plugin source path points at repo root", marketplace.plugins[0].source.path, "./");
     eq("marketplace: installation policy", marketplace.plugins[0].policy.installation, "AVAILABLE");
