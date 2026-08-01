@@ -285,16 +285,18 @@ class SourceRefOverrideTest(_TwoStoreCase):
         r = self.b.run("ingest-jsonl", "--in", export_a)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
-        self.assertEqual(self.b.query_one(
-            "SELECT source_ref FROM memory WHERE content=?",
-            ("row referencing a file: source_ref",))[0], f"file:{missing_path}")
-        # The referenced file does not exist under this path -- _source_hash's
-        # existing fail-loud staleness warning fires for a synced row exactly
-        # as it would for a local add referencing a moved/deleted file. This
-        # is the concrete reason --source-ref exists: a real cross-box sync
-        # would otherwise print this warning for every row whose source_ref
-        # is a local path meaningless on the receiving box.
-        self.assertIn("could not read source_ref", r.stderr)
+        row = self.b.query_one(
+            "SELECT source_ref, source_hash FROM memory WHERE content=?",
+            ("row referencing a file: source_ref",))
+        self.assertEqual(row[0], f"file:{missing_path}")
+        # A synced row's source_ref names a path on the ORIGINATING machine
+        # (box A), not this one -- ingest must never call _source_hash on it,
+        # so no staleness warning fires here even though the path is missing
+        # on box B, and the stored hash stays empty. (Hashing a remote-
+        # authored path would also be a DoS vector: a hostile row could point
+        # it at an arbitrary huge file or a blocking FIFO on POSIX.)
+        self.assertEqual(row[1], "")
+        self.assertNotIn("could not read source_ref", r.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +658,109 @@ class NestingBombResilienceTest(_TwoStoreCase):
         ids = {row[0] for row in self.b.query_all("SELECT id FROM memory")}
         self.assertEqual(ids, {row["id"] for row in good + more_good},
                          "all six well-formed rows must land; the bomb must not abort the run")
+
+
+# ---------------------------------------------------------------------------
+# a synced row's source_ref must never be hashed at ingest -- it names a file
+# on the ORIGINATING machine, so local staleness hashing is meaningless, and
+# a hostile row could otherwise point _source_hash at an arbitrary/huge local
+# path (memory blowup) or a blocking FIFO (POSIX DoS)
+# ---------------------------------------------------------------------------
+class IngestNeverHashesRemoteSourceRefTest(_TwoStoreCase):
+    def test_ingest_of_unreadable_or_huge_path_ref_completes_instantly_with_empty_hash(self):
+        row = _sync_row(
+            id="eeeeeeee-1111-1111-1111-111111111111",
+            content="row whose source_ref names a path on the SENDING machine",
+            source_ref="file:C:/Windows/System32/config/SAM",
+        )
+        path = self._write_jsonl(self.b, "hostile_ref.jsonl", [row])
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 1)
+        self.assertNotIn("staleness", r.stderr,
+                         "ingest must never attempt (and warn about) hashing a remote source_ref")
+
+        stored = self.b.query_one(
+            "SELECT source_hash FROM memory WHERE id=?", (row["id"],))
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored[0], "", "ingested rows must never get a local staleness hash")
+
+    def test_ingest_of_unreadable_path_ref_on_the_tombstoned_history_path_also_skips_hashing(self):
+        # New locally but already tombstoned upstream (_ingest_row's OTHER
+        # insert branch) exercises the same _source_hash call site.
+        row = _sync_row(
+            id="eeeeeeee-2222-2222-2222-222222222222",
+            content="dead-on-arrival row whose source_ref names a path on the SENDING machine",
+            source_ref="file:C:/Windows/System32/config/SAM",
+            superseded_at="2026-01-02T00:00:00Z",
+            supersede_reason="dead on arrival",
+        )
+        path = self._write_jsonl(self.b, "hostile_ref_history.jsonl", [row])
+
+        r = self.b.run("ingest-jsonl", "--in", path, "--allow-tombstones")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 1)
+        self.assertNotIn("staleness", r.stderr)
+
+        stored = self.b.query_one(
+            "SELECT source_hash FROM memory WHERE id=?", (row["id"],))
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored[0], "")
+
+
+# ---------------------------------------------------------------------------
+# streaming ingest-jsonl: invalid UTF-8 must exit 2, not traceback, even when
+# the bad bytes surface mid-file (after the switch away from a whole-file
+# read_text() up front)
+# ---------------------------------------------------------------------------
+class InvalidUtf8MidFileTest(_TwoStoreCase):
+    def test_invalid_utf8_bytes_exit_2_without_traceback(self):
+        good = _sync_row(id="ffffffff-1111-1111-1111-111111111111", content="good row before the bad bytes")
+        path = os.path.join(self.b.tmp, "bad_utf8.jsonl")
+        with open(path, "wb") as f:
+            f.write(json.dumps(good).encode("utf-8") + b"\n")
+            f.write(b"\xff\xfe not valid utf-8 \x80\x81\n")
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("[zmem] ingest-jsonl: cannot read", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        # The always-print-summary guarantee holds even on this error path.
+        self.assertIn("[zmem] ingest-jsonl: added=", r.stdout)
+
+    def test_rows_before_the_bad_bytes_still_land_when_the_error_is_mid_file(self):
+        # TextIOWrapper decodes in ~8KB chunks, so a tiny file's bad bytes
+        # would be hit on the very first chunk read, before any line is ever
+        # yielded -- that would prove nothing about streaming/partial
+        # progress. Pad the file well past that with good rows first so the
+        # decode error genuinely lands in a LATER chunk, after real rows have
+        # already been validated, applied, and committed.
+        rows = [
+            _sync_row(id=f"{i:08x}-1111-1111-1111-111111111111",
+                      content=f"good row number {i} padding padding padding padding")
+            for i in range(400)
+        ]
+        path = os.path.join(self.b.tmp, "bad_utf8_big.jsonl")
+        with open(path, "wb") as f:
+            for row in rows:
+                f.write(json.dumps(row).encode("utf-8") + b"\n")
+            f.write(b"\xff\xfe not valid utf-8 \x80\x81\n")
+        self.assertGreater(os.path.getsize(path), 65536,
+                            "test file must exceed the text decoder's chunk size")
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("[zmem] ingest-jsonl: cannot read", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertGreater(counts["added"], 0,
+                            "rows applied before the bad bytes must still be counted and committed")
+
+        landed = self.b.query_one("SELECT COUNT(*) FROM memory")[0]
+        self.assertEqual(landed, counts["added"])
 
 
 # ---------------------------------------------------------------------------

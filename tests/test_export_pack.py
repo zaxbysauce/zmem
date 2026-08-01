@@ -97,12 +97,20 @@ class _StoreCase(unittest.TestCase):
         finally:
             conn.close()
 
+    def set_ingestion_ts(self, mid: str, ts: str) -> None:
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.execute("UPDATE memory SET ingestion_ts=? WHERE id=?", (ts, mid))
+            conn.commit()
+        finally:
+            conn.close()
+
 
 # ---------------------------------------------------------------------------
 # ordering + min-confidence filter
 # ---------------------------------------------------------------------------
 class OrderingAndFilterTest(_StoreCase):
-    def test_confidence_then_retrieval_then_recency_order_and_min_confidence(self):
+    def test_confidence_then_retrieval_order_and_min_confidence(self):
         # Two rows tie on confidence (0.9); B has a higher retrieval_count so
         # it must win the tiebreak and sort ahead of A.
         mid_a = self.add(NS, "row A: tie on confidence, loses on retrieval_count",
@@ -127,6 +135,31 @@ class OrderingAndFilterTest(_StoreCase):
         pos_c = out.index("row C")
         self.assertLess(pos_b, pos_a, "higher retrieval_count must sort first on a confidence tie")
         self.assertLess(pos_a, pos_c, "higher confidence must sort before lower confidence")
+
+    def test_recency_breaks_a_confidence_and_retrieval_count_tie(self):
+        # Both rows tie on confidence AND retrieval_count, so only the
+        # ingestion_ts DESC tiebreaker (the third ORDER BY key) can decide
+        # the order -- set it directly (add() always stamps "now") so the
+        # two rows are unambiguously ordered by recency alone.
+        mid_older = self.add(NS, "row OLD: same confidence and retrieval_count, ingested earlier",
+                             confidence=0.9)
+        mid_newer = self.add(NS, "row NEW: same confidence and retrieval_count, ingested later",
+                             confidence=0.9)
+        self.bump_retrieval(mid_older, 2)
+        self.bump_retrieval(mid_newer, 2)
+        self.set_ingestion_ts(mid_older, "2020-01-01T00:00:00Z")
+        self.set_ingestion_ts(mid_newer, "2020-01-02T00:00:00Z")
+
+        r = self.run_store("export-pack", "--namespace", NS)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = r.stdout
+
+        self.assertIn("row OLD", out)
+        self.assertIn("row NEW", out)
+        pos_new = out.index("row NEW")
+        pos_old = out.index("row OLD")
+        self.assertLess(pos_new, pos_old,
+                         "newer ingestion_ts must sort first on a confidence+retrieval_count tie")
 
     def test_explicit_min_confidence_override(self):
         self.add(NS, "low confidence row visible with a lowered floor", confidence=0.4)
@@ -368,6 +401,27 @@ class EmptyPackTest(_StoreCase):
         project_idx = r.stdout.index("## Project knowledge")
         global_idx = r.stdout.index("## Cross-project lessons")
         self.assertIn("(none)", r.stdout[project_idx:global_idx])
+
+
+# ---------------------------------------------------------------------------
+# negative --project-limit / --global-limit rejected before touching SQL
+# ---------------------------------------------------------------------------
+class NegativeLimitArgTest(_StoreCase):
+    def test_negative_project_limit_rejected_by_argparse(self):
+        # SQLite treats a negative LIMIT as UNBOUNDED, so a negative value
+        # must never reach the query -- argparse itself must reject it.
+        r0 = self.run_store("init")
+        self.assertEqual(r0.returncode, 0, r0.stderr)
+        r = self.run_store("export-pack", "--namespace", NS, "--project-limit", "-1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--project-limit", r.stderr)
+
+    def test_negative_global_limit_rejected_by_argparse(self):
+        r0 = self.run_store("init")
+        self.assertEqual(r0.returncode, 0, r0.stderr)
+        r = self.run_store("export-pack", "--namespace", NS, "--global-limit", "-1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--global-limit", r.stderr)
 
 
 if __name__ == "__main__":

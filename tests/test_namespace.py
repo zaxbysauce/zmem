@@ -133,6 +133,20 @@ class TestLoopbackProxyRemoteRewrite(unittest.TestCase):
     key a local checkout of the same remote gets. These pin the collapse to
     `github.com/<org>/<repo>` (or `ZMEM_PROXY_FORGE_HOST` if set)."""
 
+    def setUp(self):
+        # Deterministic regardless of the ambient test-runner environment: if
+        # ZMEM_PROXY_FORGE_HOST happens to be set in the shell running the
+        # suite, every "collapses to github.com" assertion below would fail
+        # for a reason that has nothing to do with the code under test. Save
+        # the whole environ (mock.patch.dict's own restore mechanism, the
+        # convention already used elsewhere in this class) and drop the var
+        # for the duration of each test; the dedicated override tests below
+        # keep setting it explicitly via their own nested patch.dict.
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("ZMEM_PROXY_FORGE_HOST", None)
+
     def test_two_observed_proxy_urls_different_ports_collapse_to_same_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

@@ -164,13 +164,16 @@ def main() -> int:
 
     try:
         raw = harvest_path.read_text(encoding="utf-8")
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         _print(f"[ingest-harvest] ERROR: could not read {harvest_path}: {e}", err=True)
         return 1
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, RecursionError) as e:
+        # RecursionError: a hostile/corrupted harvest file can nest arrays/objects
+        # deep enough to blow the JSON decoder's recursion limit; treat that the
+        # same as malformed JSON and exit cleanly instead of a traceback.
         _print(f"[ingest-harvest] ERROR: invalid JSON in {harvest_path}: {e}", err=True)
         return 1
 

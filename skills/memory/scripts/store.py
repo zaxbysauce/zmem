@@ -3034,7 +3034,14 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
         # skip the warning. Advisory only, exactly like the live path.
         for w in _check_secrets(content, source_ref):
             print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
-        shash = _source_hash(source_ref)
+        # Never hash a synced row's source_ref: a 'file:' ref here names a path
+        # on the ORIGINATING machine, not this one, so hashing whatever happens
+        # to live at that path locally is semantically meaningless -- and since
+        # source_ref is remote-authored, a hostile row could point _source_hash
+        # at an arbitrary huge file (memory blowup) or a FIFO (indefinite block
+        # on POSIX). Leave staleness hashing to the box that actually owns the
+        # file; ingested rows just don't get it.
+        shash = ""
         conn.execute(
             """INSERT INTO memory
                (id, namespace, type, content, tags, source_ref, source_hash,
@@ -3062,7 +3069,12 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
         _commit(conn)
         return "deduped"
 
-    shash = _source_hash(source_ref)
+    # See the tombstone-branch comment above: a synced row's source_ref is
+    # remote-authored and describes a file on the ORIGINATING machine, so
+    # hashing it here would be both meaningless and a DoS vector (arbitrary
+    # path, huge file, or a blocking FIFO on POSIX). Ingested rows never get
+    # a local staleness hash.
+    shash = ""
     # _detect_duplicate already embedded this content when embeddings are
     # available; store that vector instead of discarding it and leaving the
     # row for a later `reembed` to redo. Mirrors add_memory()'s insert. Note
@@ -3111,82 +3123,99 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     thing it could ask for.
     """
     try:
-        raw = Path(in_path).read_text(encoding="utf-8")
-    except OSError as e:
+        f = open(in_path, encoding="utf-8", newline="\n")
+    except (OSError, UnicodeDecodeError) as e:
         print(f"[zmem] ingest-jsonl: cannot read {in_path}: {e}", file=sys.stderr)
         return 2
 
     added = tombstoned = tombstones_refused = deduped = skipped = malformed = 0
     first_refused_id = None
     saw_line = False
-    # split on "\n" only -- NOT str.splitlines(), which also breaks on
-    # U+2028/U+2029/U+0085 (and other Unicode line separators). This file's
-    # own writer (export_jsonl) escapes those three inside string values, but
-    # a third-party JSONL writer might not; splitlines() would then shatter
-    # one JSON object across several bogus "lines". Splitting on a bare "\n"
-    # treats every embedded separator as ordinary string content instead.
-    # rstrip("\r") tolerates CRLF-terminated files.
-    for lineno, raw_line in enumerate(raw.split("\n"), start=1):
-        line = raw_line.rstrip("\r").strip()
-        if not line:
-            continue
-        saw_line = True
-        try:
-            obj = json.loads(line)
-            if not isinstance(obj, dict):
-                raise ValueError("line is not a JSON object")
-            obj = _validate_sync_row(obj)
-        except Exception as e:
-            # Broad on purpose: a per-line parse guard must never let hostile
-            # input abort the whole file. A pathologically deeply nested JSON
-            # value (a "nesting bomb") raises RecursionError from json.loads,
-            # which is not a subclass of ValueError/JSONDecodeError and would
-            # otherwise escape this guard, unwind past the per-row try/except
-            # below, and kill the run mid-file with no summary line. Malformed
-            # counting/reporting stays identical for every exception type.
-            print(f"[zmem] ingest-jsonl: malformed line {lineno}: "
-                  f"{_sanitize_error_text(str(e))}", file=sys.stderr)
-            malformed += 1
-            continue
-
-        if source_ref:
-            # --source-ref attributes this whole import batch to one place of
-            # origin, overriding whatever source_ref the row carried in --
-            # the original almost always points at a path that does not
-            # exist on this machine.
-            obj["source_ref"] = source_ref
-
-        try:
-            outcome = _ingest_row(conn, obj, allow_tombstones=allow_tombstones)
-        except Exception as e:
-            # A row that raises mid-apply must not abort the file and silently
-            # drop every row after it. Roll back first: _ingest_row commits at
-            # each of its return paths, so an exception between an INSERT and
-            # its commit would otherwise leave a partial write open for the
-            # NEXT row's commit to land.
+    decode_error = None
+    try:
+        # Stream the file line by line instead of reading it whole into
+        # memory first -- a giant hostile file would otherwise exhaust RAM
+        # before a single row is even validated. newline="\n" makes iteration
+        # split on a bare "\n" ONLY -- NOT the universal-newline default and
+        # NOT str.splitlines(), either of which also breaks on U+2028/U+2029/
+        # U+0085 (and other Unicode line separators). This file's own writer
+        # (export_jsonl) escapes those three inside string values, but a
+        # third-party JSONL writer might not; splitlines() would then shatter
+        # one JSON object across several bogus "lines". Splitting on a bare
+        # "\n" treats every embedded separator as ordinary string content
+        # instead. rstrip("\r\n") tolerates CRLF-terminated files (each
+        # yielded line keeps its "\n", and a CRLF line keeps the "\r" too
+        # since "\r" is not a split point).
+        for lineno, raw_line in enumerate(f, start=1):
+            line = raw_line.rstrip("\r\n").strip()
+            if not line:
+                continue
+            saw_line = True
             try:
-                conn.rollback()
-            except Exception:
-                pass
-            print(f"[zmem] ingest-jsonl: malformed line {lineno}: could not apply row: "
-                  f"{type(e).__name__}: {_sanitize_error_text(str(e))}", file=sys.stderr)
-            malformed += 1
-            continue
+                obj = json.loads(line)
+                if not isinstance(obj, dict):
+                    raise ValueError("line is not a JSON object")
+                obj = _validate_sync_row(obj)
+            except Exception as e:
+                # Broad on purpose: a per-line parse guard must never let hostile
+                # input abort the whole file. A pathologically deeply nested JSON
+                # value (a "nesting bomb") raises RecursionError from json.loads,
+                # which is not a subclass of ValueError/JSONDecodeError and would
+                # otherwise escape this guard, unwind past the per-row try/except
+                # below, and kill the run mid-file with no summary line. Malformed
+                # counting/reporting stays identical for every exception type.
+                print(f"[zmem] ingest-jsonl: malformed line {lineno}: "
+                      f"{_sanitize_error_text(str(e))}", file=sys.stderr)
+                malformed += 1
+                continue
 
-        if outcome == "added":
-            added += 1
-        elif outcome == "tombstoned":
-            tombstoned += 1
-        elif outcome == "tombstone_refused":
-            tombstones_refused += 1
-            if first_refused_id is None:
-                first_refused_id = obj["id"]
-        elif outcome == "deduped":
-            deduped += 1
-        else:
-            skipped += 1
+            if source_ref:
+                # --source-ref attributes this whole import batch to one place of
+                # origin, overriding whatever source_ref the row carried in --
+                # the original almost always points at a path that does not
+                # exist on this machine.
+                obj["source_ref"] = source_ref
 
-    if not saw_line:
+            try:
+                outcome = _ingest_row(conn, obj, allow_tombstones=allow_tombstones)
+            except Exception as e:
+                # A row that raises mid-apply must not abort the file and silently
+                # drop every row after it. Roll back first: _ingest_row commits at
+                # each of its return paths, so an exception between an INSERT and
+                # its commit would otherwise leave a partial write open for the
+                # NEXT row's commit to land.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                print(f"[zmem] ingest-jsonl: malformed line {lineno}: could not apply row: "
+                      f"{type(e).__name__}: {_sanitize_error_text(str(e))}", file=sys.stderr)
+                malformed += 1
+                continue
+
+            if outcome == "added":
+                added += 1
+            elif outcome == "tombstoned":
+                tombstoned += 1
+            elif outcome == "tombstone_refused":
+                tombstones_refused += 1
+                if first_refused_id is None:
+                    first_refused_id = obj["id"]
+            elif outcome == "deduped":
+                deduped += 1
+            else:
+                skipped += 1
+    except UnicodeDecodeError as e:
+        # Invalid UTF-8 can now surface mid-iteration (streaming, not a single
+        # up-front read_text()). Record it and fall through to the summary --
+        # rows already applied before the bad bytes still count -- then exit 2.
+        decode_error = e
+    finally:
+        f.close()
+
+    if decode_error is not None:
+        print(f"[zmem] ingest-jsonl: cannot read {in_path}: {decode_error}", file=sys.stderr)
+    elif not saw_line:
         print(f"[zmem] ingest-jsonl: {in_path} is empty -- nothing to ingest", file=sys.stderr)
         return 2
 
@@ -3201,7 +3230,17 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     print(f"[zmem] ingest-jsonl: added={added} tombstoned={tombstoned} "
           f"tombstones_refused={tombstones_refused} deduped={deduped} "
           f"skipped={skipped} malformed={malformed}")
-    return 0
+    return 2 if decode_error is not None else 0
+
+
+def nonnegative_int(value: str) -> int:
+    """argparse type= for flags fed straight into a SQL LIMIT: SQLite treats a
+    negative LIMIT as UNBOUNDED, so a negative --project-limit/--global-limit
+    would silently defeat the cap instead of erroring. Reject it up front."""
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be a non-negative integer, got {value!r}")
+    return n
 
 
 def main():
@@ -3324,10 +3363,10 @@ def main():
                                help="project namespace to pack (e.g. project:foo)")
     p_export_pack.add_argument("--out", default=None,
                                help="write the pack to this file (UTF-8, LF); default: stdout")
-    p_export_pack.add_argument("--project-limit", type=int,
+    p_export_pack.add_argument("--project-limit", type=nonnegative_int,
                                default=EXPORT_PACK_DEFAULT_PROJECT_LIMIT,
                                help=f"max rows from --namespace (default {EXPORT_PACK_DEFAULT_PROJECT_LIMIT})")
-    p_export_pack.add_argument("--global-limit", type=int,
+    p_export_pack.add_argument("--global-limit", type=nonnegative_int,
                                default=EXPORT_PACK_DEFAULT_GLOBAL_LIMIT,
                                help=f"max rows from {GLOBAL_NAMESPACE} (default {EXPORT_PACK_DEFAULT_GLOBAL_LIMIT})")
     p_export_pack.add_argument("--min-confidence", type=float,
