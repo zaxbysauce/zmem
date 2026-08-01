@@ -120,10 +120,17 @@ class TestResolveSkillsDirs(unittest.TestCase):
     def tearDown(self):
         self._patcher.stop()
 
-    def test_default_is_both_claude_and_zcode_skills_dirs(self):
+    def test_default_includes_codex_claude_and_zcode_skills_dirs(self):
         home = Path(os.path.expanduser("~"))
         dirs = host.resolve_skills_dirs()
-        self.assertEqual(dirs, [home / ".claude" / "skills", home / ".zcode" / "skills"])
+        self.assertEqual(
+            dirs,
+            [
+                home / ".codex" / "skills",
+                home / ".claude" / "skills",
+                home / ".zcode" / "skills",
+            ],
+        )
 
     def test_override_via_pathsep_delimited_env(self):
         # NOTE: must not use literal Windows drive-letter paths (e.g. r"C:\a\skills")
@@ -325,6 +332,30 @@ class TestSetOwnerOnlyPermsBranch(unittest.TestCase):
         f = self.tmp / "core.md"
         f.write_text("secret\n", encoding="utf-8")
         self.assertEqual(self._chmod_calls(f), [mock.call(f, 0o600)])
+
+    def _icacls_args(self, target: Path):
+        with mock.patch.object(os, "name", "nt"), \
+                mock.patch.object(host.subprocess, "run") as run, \
+                mock.patch.dict(os.environ, {"USERNAME": "Brett"}, clear=False):
+            host.set_owner_only_perms(target)
+        self.assertTrue(run.called, "Windows branch must call icacls")
+        return run.call_args[0][0]
+
+    def test_windows_branch_preserves_inheritance_for_directories(self):
+        d = self.tmp / "data"
+        d.mkdir()
+        args = self._icacls_args(d)
+        self.assertEqual(args[:3], ["icacls", str(d), "/grant"])
+        self.assertNotIn("/inheritance:r", args)
+        self.assertIn("Brett:(OI)(CI)F", args)
+
+    def test_windows_branch_preserves_inheritance_for_files(self):
+        f = self.tmp / "core.md"
+        f.write_text("secret\n", encoding="utf-8")
+        args = self._icacls_args(f)
+        self.assertEqual(args[:3], ["icacls", str(f), "/grant"])
+        self.assertNotIn("/inheritance:r", args)
+        self.assertIn("Brett:F", args)
 
 
 @unittest.skipUnless(sys.platform == "win32", "icacls is Windows-only")

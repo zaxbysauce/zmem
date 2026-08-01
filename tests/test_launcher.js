@@ -56,6 +56,7 @@ function envWith(overrides) {
         "ZMEM_TRANSCRIPT", "ZMEM_AGENT_TRANSCRIPT", "ZMEM_AGENT_TYPE",
         "ZMEM_AGENT_ID", "ZMEM_NAMESPACE", "ZMEM_SKILLS_DIRS",
         "ZMEM_TIER0", "ZMEM_CTX_BUDGET",
+        "PLUGIN_ROOT", "PLUGIN_DATA", "CODEX_PROJECT_DIR",
         "CLAUDE_PLUGIN_ROOT", "ZCODE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR",
         "ZCODE_PROJECT_DIR", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
         "CLAUDE_SESSION_ID", "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
@@ -114,11 +115,45 @@ function seed(dataDir, namespace, type, content, confidence) {
 }
 
 // --- temp workspace --------------------------------------------------------
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-p3-"));
+const TMP_ROOT = path.join(REPO, ".tmp-tests");
+fs.mkdirSync(TMP_ROOT, { recursive: true });
+const TMP = fs.mkdtempSync(path.join(TMP_ROOT, "zmem-p3-"));
 const DATA = path.join(TMP, "data");
 const PROJ = path.join(TMP, "proj");
 fs.mkdirSync(DATA, { recursive: true });
 fs.mkdirSync(PROJ, { recursive: true });
+
+console.log("\n[0] Git-for-Windows child PATH derivation");
+
+if (process.platform === "win32") {
+    const fakeGitRoot = path.join(TMP, "PortableGit");
+    const fakeUsrBin = path.join(fakeGitRoot, "usr", "bin");
+    const fakeGitBin = path.join(fakeGitRoot, "bin");
+    fs.mkdirSync(fakeUsrBin, { recursive: true });
+    fs.mkdirSync(fakeGitBin, { recursive: true });
+    const fakeBash = path.join(fakeUsrBin, "bash.exe");
+    fs.writeFileSync(fakeBash, "");
+    const child = launch.buildChildEnv({ PATH: "C:\\Windows" }, fakeBash);
+    const pathParts = child.PATH.split(path.delimiter);
+    ok("child PATH contains Git bin", pathParts.includes(fakeGitBin), child.PATH);
+    ok(
+        "child PATH avoids usr/usr/bin",
+        !pathParts.includes(path.join(fakeGitRoot, "usr", "usr", "bin")),
+        child.PATH
+    );
+
+    const directGitRoot = path.join(TMP, "PortableGit-direct");
+    const directGitBin = path.join(directGitRoot, "bin");
+    const directUsrBin = path.join(directGitRoot, "usr", "bin");
+    fs.mkdirSync(directGitBin, { recursive: true });
+    fs.mkdirSync(directUsrBin, { recursive: true });
+    const directBash = path.join(directGitBin, "bash.exe");
+    fs.writeFileSync(directBash, "");
+    const directChild = launch.buildChildEnv({ PATH: "C:\\Windows" }, directBash);
+    const directParts = directChild.PATH.split(path.delimiter);
+    ok("direct Git bin PATH contains usr/bin", directParts.includes(directUsrBin), directChild.PATH);
+    ok("direct Git bin PATH keeps bin", directParts.includes(directGitBin), directChild.PATH);
+}
 
 const NS = resolveNs(PROJ); // non-git dir → project:<abspath key>
 seed(DATA, NS, "lesson", "Always run the launcher tests before pushing.", 0.9);

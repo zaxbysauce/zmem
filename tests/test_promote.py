@@ -1,5 +1,4 @@
-"""Tests for store.py's `promote` command (Phase 9: promotion quality fix +
-dual-target write).
+"""Tests for store.py's `promote` command (review candidate + explicit install).
 
 Covers:
   - the synthesized `description:` is a clean single trigger line: no
@@ -9,7 +8,8 @@ Covers:
   - body sections ("When to use" / "The rule" / "Source") are not the same
     repeated sentence.
   - `--description` override lands verbatim.
-  - dual-target write: promotion writes SKILL.md to every dir in
+  - default promotion writes a review candidate, not a live skill install.
+  - explicit `--install-approved` writes SKILL.md to every dir in
     ZMEM_SKILLS_DIRS, and collision detection fires per-target.
 
 Drives the REAL store.py CLI via subprocess against a throwaway temp store
@@ -48,10 +48,12 @@ class PromoteTestBase(unittest.TestCase):
         self.store = os.path.join(self.tmp, "store.sqlite")
         self.skills_a = os.path.join(self.tmp, "skills_a")
         self.skills_b = os.path.join(self.tmp, "skills_b")
+        self.review_dir = os.path.join(self.tmp, "promotion-candidates")
         self.env = {
             **os.environ,
             "ZMEM_STORE": self.store,
             "ZMEM_SKILLS_DIRS": os.pathsep.join([self.skills_a, self.skills_b]),
+            "ZMEM_PROMOTION_REVIEW_DIR": self.review_dir,
         }
         r = self._run(
             "add", "--namespace", NS, "--type", "lesson",
@@ -85,6 +87,9 @@ class PromoteTestBase(unittest.TestCase):
     def _skill_files(self):
         return sorted(Path(self.tmp).glob("skills_*/*/SKILL.md"))
 
+    def _review_files(self):
+        return sorted(Path(self.review_dir).glob("*/SKILL.md"))
+
     def _supersede_all(self):
         """Leave the store with zero eligible promotion candidates."""
         conn = sqlite3.connect(self.store)
@@ -98,6 +103,7 @@ class TestDryRun(PromoteTestBase):
         r = self._run("promote", "--dry-run", "--namespace", NS)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(self.memory_id[:8], r.stdout)
+        self.assertIn(self.review_dir, r.stdout)
         self.assertIn(self.skills_a, r.stdout)
         self.assertIn(self.skills_b, r.stdout)
         self.assertNotIn("EDIT THIS DESCRIPTION", r.stdout)
@@ -111,25 +117,37 @@ class TestPromoteQuality(PromoteTestBase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return r
 
+    def _install(self, extra=()):
+        r = self._run(
+            "promote", "--id", self.memory_id, "--confirm", "--install-approved", *extra
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
     def _frontmatter_description(self, text):
         m = re.search(r'^description:\s*(.*)$', text, re.MULTILINE)
         self.assertIsNotNone(m, "no description: line found in frontmatter")
         return m.group(1).strip()
 
-    def test_writes_to_both_target_dirs(self):
+    def test_confirm_writes_review_candidate_not_live_skills(self):
         self._promote()
+        self.assertEqual(len(self._review_files()), 1)
+        self.assertEqual(self._skill_files(), [])
+
+    def test_install_approved_writes_to_both_target_dirs(self):
+        self._install()
         files = self._skill_files()
         self.assertEqual(len(files), 2, files)
 
     def test_description_has_no_placeholder_text(self):
         self._promote()
-        for f in self._skill_files():
+        for f in self._review_files():
             text = f.read_text(encoding="utf-8")
             self.assertNotIn("EDIT THIS DESCRIPTION", text)
 
     def test_description_is_single_line_and_not_mid_word_truncated(self):
         self._promote()
-        for f in self._skill_files():
+        for f in self._review_files():
             text = f.read_text(encoding="utf-8")
             desc = self._frontmatter_description(text)
             # Single line: the next raw line in the file is the closing '---'.
@@ -155,7 +173,7 @@ class TestPromoteQuality(PromoteTestBase):
 
     def test_description_not_triplicated_across_sections(self):
         self._promote()
-        for f in self._skill_files():
+        for f in self._review_files():
             text = f.read_text(encoding="utf-8")
             desc = self._frontmatter_description(text)
             when_section = text.split("## When to use")[1].split("## The rule")[0]
@@ -173,15 +191,23 @@ class TestPromoteQuality(PromoteTestBase):
     def test_description_override_used_verbatim(self):
         custom = "Use when touching the parser tokenizer tests"
         self._promote(extra=["--description", custom])
-        for f in self._skill_files():
+        for f in self._review_files():
             text = f.read_text(encoding="utf-8")
             desc = self._frontmatter_description(text)
             self.assertEqual(desc.strip('"'), custom)
 
-    def test_documented_id_confirm_path_writes(self):
-        # The documented write gate is `--id <uuid> --confirm`.
+    def test_documented_id_confirm_path_writes_review_candidate(self):
         r = self._run("promote", "--id", self.memory_id, "--confirm")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self._review_files()), 1)
+        self.assertEqual(self._skill_files(), [])
+
+    def test_explicit_install_path_writes_live_skills(self):
+        r = self._run(
+            "promote", "--id", self.memory_id, "--confirm", "--install-approved"
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self._review_files()), 1)
         self.assertEqual(len(self._skill_files()), 2)
 
     def test_id_without_confirm_refuses_and_writes_nothing(self):
@@ -192,11 +218,13 @@ class TestPromoteQuality(PromoteTestBase):
         r = self._run("promote", "--id", self.memory_id)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("--confirm", r.stderr)
+        self.assertEqual(self._review_files(), [])
         self.assertEqual(self._skill_files(), [], "refused promote must write nothing")
 
     def test_dry_run_needs_no_confirm(self):
         r = self._run("promote", "--dry-run")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._review_files(), [])
         self.assertEqual(self._skill_files(), [])
 
     def test_unknown_id_refuses_with_exit_2(self):
@@ -205,6 +233,7 @@ class TestPromoteQuality(PromoteTestBase):
         r = self._run("promote", "--id", "00000000-0000-0000-0000-000000000000",
                       "--confirm")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(self._review_files(), [])
         self.assertEqual(self._skill_files(), [])
 
     def test_unknown_id_refuses_even_with_no_eligible_candidates(self):
@@ -217,6 +246,7 @@ class TestPromoteQuality(PromoteTestBase):
         r = self._run("promote", "--id", "00000000-0000-0000-0000-000000000000",
                       "--confirm")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(self._review_files(), [])
         self.assertEqual(self._skill_files(), [])
 
     def test_survey_with_no_candidates_is_not_an_error(self):
@@ -228,11 +258,13 @@ class TestPromoteQuality(PromoteTestBase):
         self.assertIn("no promotion candidates", r.stdout + r.stderr)
 
     def test_collision_detection_fires_per_target(self):
-        self._promote()
+        self._install()
         before = {f: f.read_text(encoding="utf-8") for f in self._skill_files()}
         # Re-promoting the same lesson (still live, id known) should collide
         # in both dirs it already wrote to, and refuse to overwrite either.
-        r = self._run("promote", "--id", self.memory_id, "--confirm")
+        r = self._run(
+            "promote", "--id", self.memory_id, "--confirm", "--install-approved"
+        )
         # Exit code, not just the message: a collision refusal that exits 0 is
         # indistinguishable from a successful promote to any caller checking $?
         # — and CUTOVER's re-promotion loop runs against ~24 existing skills.

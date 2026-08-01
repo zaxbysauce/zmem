@@ -148,8 +148,9 @@ def resolve_core_md_path() -> Path:
 def resolve_skills_dirs() -> list[Path]:
     """Resolve the skills dirs promotion writes SKILL.md into.
 
-    Default (box-wide): BOTH `~/.claude/skills` and `~/.zcode/skills`, so a
-    lesson promoted from either host becomes a skill visible to both. This
+    Default (box-wide): `~/.codex/skills`, `~/.claude/skills`, and
+    `~/.zcode/skills`, so a lesson promoted from any host becomes a skill
+    visible to all three. This
     is deliberately not host-conditional (unlike resolve_store_path) — a
     promoted skill is meant to be usable by whichever tool is in front of
     the user next, not just the one that promoted it.
@@ -164,7 +165,11 @@ def resolve_skills_dirs() -> list[Path]:
         raw = [p for p in explicit.split(os.pathsep) if p.strip()]
     else:
         home = Path(os.path.expanduser("~"))
-        raw = [str(home / ".claude" / "skills"), str(home / ".zcode" / "skills")]
+        raw = [
+            str(home / ".codex" / "skills"),
+            str(home / ".claude" / "skills"),
+            str(home / ".zcode" / "skills"),
+        ]
 
     seen: set[str] = set()
     dirs: list[Path] = []
@@ -297,6 +302,15 @@ def set_owner_only_perms(path: Path) -> None:
     `(OI)(CI)` (object-inherit, container-inherit) so new children inherit
     read/write; plain files keep the original bare grant.
 
+    SHARED-SANDBOX COMPATIBILITY: do NOT strip inherited ACEs at runtime.
+    `/inheritance:r` hardens by subtraction and can lock out another principal
+    that legitimately needs the shared store (for example a sibling normal-user
+    Codex sandbox or another host process running under a required inherited
+    ACE). The runtime hardening therefore only ENSURES the current user has an
+    explicit full-control ACE; it leaves inherited/other ACEs intact. This is a
+    weaker privacy posture than an owner-only DACL, but it is enforceable
+    without breaking shared-store correctness.
+
     On non-Windows the equivalent is a plain chmod: 0o700 for directories
     (owner rwx, nothing for group/other) and 0o600 for files. Without it the
     store — which holds box-wide plaintext memory — was left at the process
@@ -313,7 +327,7 @@ def set_owner_only_perms(path: Path) -> None:
             return
         grant = f"{user}:(OI)(CI)F" if path.is_dir() else f"{user}:F"
         subprocess.run(
-            ["icacls", str(path), "/inheritance:r", "/grant:r", grant],
+            ["icacls", str(path), "/grant", grant],
             capture_output=True, timeout=5, check=False,
         )
     except Exception:

@@ -19,6 +19,17 @@ occasional cloud sessions that discover something worth keeping. Tier 3 is
 for cloud sessions that run often enough that a manual harvest loop is
 friction.
 
+Codex sandbox note: a local Codex session that cannot write the canonical
+shared store path behaves like a cloud/remote session for store access
+purposes. Do **not** silently point it at a second physical store. Either:
+- add the canonical store directory as a writable root, or
+- keep one canonical store on the machine and use a local broker that owns it
+  while Codex calls into that broker.
+
+This doc still assumes **single-machine phase 1**: one canonical physical
+store path on one machine. The tiers below are hand-off/sync mechanisms, not a
+license to let each host invent its own store path.
+
 These cloud-session "Tiers 1-3" are a distinct numbering from zmem's own
 memory tiers (Tier 0 core.md, Tier 2 semantic store) described in
 `skills/memory/SKILL.md` — the two schemes happen to overlap in the numbers
@@ -458,6 +469,9 @@ Set `ZMEM_PROXY_FORGE_HOST=` (empty) in that environment.
 - Never point `ZMEM_DATA` at a shared/synced path from a cloud job — always
   a workspace-local temp/ephemeral directory that dies with the job. The
   private sync repo, not a shared `ZMEM_DATA`, is the sync mechanism.
+- Never "fix" a Codex writable-root problem by aiming Codex at a different
+  local store path than the plugin hosts use. Add the writable root or use a
+  broker; do not create split-brain memory on the same machine.
 - Never make the sync repo public — it carries plaintext memory content,
   same as the real store (see the Security notes in the main `README.md`),
   and write access to it is write access to the store's content (see "Trust

@@ -1,0 +1,37 @@
+{
+  "name": "zmem",
+  "version": "0.6.0",
+  "description": "Local-first shared memory, recall, and reflection hooks for Codex.",
+  "author": {
+    "name": "Brett",
+    "url": "https://github.com/zaxbysauce"
+  },
+  "homepage": "https://github.com/zaxbysauce/zmem",
+  "repository": "https://github.com/zaxbysauce/zmem",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "codex",
+    "claude-code",
+    "zcode",
+    "sqlite"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ZMem",
+    "shortDescription": "Shared local memory for Codex sessions.",
+    "longDescription": "Local-first shared memory with recall, convention capture, and reflection hooks across Codex, Claude Code, and ZCode.",
+    "developerName": "Brett",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Recall prior project conventions before I code.",
+      "Capture a reusable lesson from this failure.",
+      "Summarize recent shared memory for this repo."
+    ],
+    "brandColor": "#2563EB"
+  }
+}
