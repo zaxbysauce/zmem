@@ -142,12 +142,25 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
   On Claude Code, failure detection instead scans the session transcript
   (`transcript_path`) — no separate db.sqlite exists there.
 
+## Cloud sessions
+
+The store is local-first, so a session with no filesystem access to this box
+— a Claude Code cloud session, Claude Code Remote (CCR), a GitHub Action —
+can't reach it directly. Three supported tiers cover that, from a read-only
+committed snapshot up to a full sync-repo read/write loop: see
+[`docs/CLOUD.md`](docs/CLOUD.md).
+
 ## Security notes
 
 - The store is a **local plaintext SQLite file**. Do not store secrets, credentials,
   or PII in it. The write-time secret scanner is an advisory heuristic (regex +
   entropy), **not a guarantee**.
 - All memory stays on your machine. No telemetry, no cloud calls.
+- **Tier 3 sync changes that.** If you wire up a private sync repo
+  (`docs/CLOUD.md`), write access to that repo is effectively write access to
+  the *content* of your store — including `user:global` rows, which are
+  injected into every future session on this box. Read the "Trust model"
+  section of [`docs/CLOUD.md`](docs/CLOUD.md) before setting it up.
 
 ## Cross-platform hook execution
 

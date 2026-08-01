@@ -320,6 +320,17 @@ def set_owner_only_perms(path: Path) -> None:
         pass
 
 
+# A single dot-separated label: starts and ends with an alnum or underscore,
+# with alnum/underscore/hyphen allowed in between (no empty labels, no
+# leading/trailing hyphen). Used to validate ZMEM_PROXY_FORGE_HOST below --
+# see _normalize_remote's docstring for the full host[:port] grammar and why
+# it must match ordinary remote normalization (which keeps host:port intact).
+_FORGE_HOST_LABEL = r"[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?"
+_FORGE_HOST_RE = re.compile(
+    rf"^{_FORGE_HOST_LABEL}(?:\.{_FORGE_HOST_LABEL})*(?::[0-9]{{1,5}})?$"
+)
+
+
 def _get_git_remote_url(project_dir: Path) -> str | None:
     """Return `origin`'s remote URL for project_dir, or None if project_dir is
     not a git checkout (or has no `origin` remote). Works for worktrees and
@@ -344,7 +355,59 @@ def _normalize_remote(url: str) -> str:
     with any `.git` suffix and trailing slash stripped. Handles both the SSH
     scp-like form (`git@host:org/repo.git`) and URL forms
     (`https://host/org/repo.git`, `ssh://git@host/org/repo`), with or without
-    a trailing slash or `.git` suffix — all normalize to the same key."""
+    a trailing slash or `.git` suffix — all normalize to the same key.
+
+    Loopback-proxy rewrite: Claude Code cloud/remote (CCR) sessions see their
+    GitHub repo through a local HTTP proxy (`http://local_proxy@127.0.0.1:<port>/git/<org>/<repo>`),
+    so the same repo would otherwise normalize to a different, per-session
+    key (host includes the ephemeral proxy port) than the same repo cloned
+    locally. When the resolved host (port stripped) is a loopback address —
+    `127.0.0.1`, `localhost`, `::1`, or `[::1]`, case-insensitively — and the
+    path's first two segments after a leading `git/` (matched
+    case-insensitively, like the host check) are `<org>/<repo>`, rewrite the
+    key to `<forge_host>/<org>/<repo>` instead. A loopback path with fewer
+    than two segments after `git/`, or that doesn't start with `git/` at all,
+    falls through unchanged — it's either malformed or a genuinely local git
+    server, which must keep its existing key.
+
+    `ZMEM_PROXY_FORGE_HOST` has FOUR distinct states, not two:
+      - unset              -> rewrite to `github.com` (CCR proxies GitHub
+                              only today; this is the default).
+      - set, valid         -> rewrite to that value VERBATIM, lowercased,
+                              including a `:port` if present (escape hatch
+                              for other forges, e.g. `gitlab.example.com` or
+                              `gitea.internal:3000`). "Valid" means it
+                              parses as `host[:port]`: the port (if any) is
+                              1-5 digits, and the host is one or more
+                              dot-separated labels, each matching
+                              `_FORGE_HOST_RE` (alnum/underscore endpoints,
+                              alnum/underscore/hyphen in between, no empty
+                              labels). Keeping `:port` verbatim matters
+                              because ordinary (non-proxy) remote
+                              normalization also keeps host:port in the key
+                              (`https://gitea.example:3000/org/repo` ->
+                              `gitea.example:3000/org/repo`) -- if the proxy
+                              override stripped the port, the same forge
+                              would key differently depending on whether it
+                              was reached via the proxy or directly.
+      - set, non-empty,    -> DISABLE the rewrite entirely, exactly like the
+        but UNPARSEABLE        set-but-empty case below: a value that
+                              doesn't parse as `host[:port]` must never be
+                              silently coerced to `github.com` (that would
+                              wrongly attribute a private forge's repos to
+                              the public one) NOR emitted verbatim into the
+                              key (that could produce a malformed key).
+                              Falling through to the legacy loopback key is
+                              wrong-but-stable and never collides with any
+                              real forge's namespace. No stderr -- host.py
+                              runs in a hook context.
+      - set but EMPTY      -> DISABLE the rewrite entirely; the loopback
+        (`""` or whitespace)  remote keeps its legacy `127.0.0.1:<port>/git/...`
+                              key. This is the opt-out for a genuine LOCAL
+                              git server that happens to serve repos under a
+                              `/git/` prefix (Gitea's default layout, for
+                              one): those are not CCR proxies and must not be
+                              collapsed onto a public forge's namespace."""
     u = url.strip().rstrip("/")
     if u.lower().endswith(".git"):
         u = u[: -len(".git")]
@@ -363,6 +426,44 @@ def _normalize_remote(url: str) -> str:
             host, path = "", u
 
     path = path.strip("/")
+
+    host_no_port = re.sub(r":\d+$", "", host)
+    if host_no_port.lower() in ("127.0.0.1", "localhost", "::1", "[::1]"):
+        forge_env = os.environ.get("ZMEM_PROXY_FORGE_HOST")
+        # forge_host is None whenever the rewrite must be DISABLED (either
+        # of the two opt-out states below) -- that's the one signal that
+        # falls all the way through to the legacy loopback key instead of
+        # returning a rewritten one. Unset (None env var) is NOT an opt-out
+        # -- that means "use the default", github.com.
+        if forge_env is None:
+            forge_host = "github.com"
+        elif not forge_env.strip():
+            # Set-but-empty/whitespace is the explicit opt-out (see
+            # docstring): skip the rewrite entirely and fall through to the
+            # legacy loopback key.
+            forge_host = None
+        else:
+            candidate = forge_env.strip().lower()
+            if _FORGE_HOST_RE.match(candidate):
+                forge_host = candidate
+            else:
+                # Non-empty but unparseable as host[:port] (e.g. contains
+                # "/", whitespace, an empty label, or a leading/trailing
+                # hyphen). Disable the rewrite rather than coercing to
+                # github.com or emitting the value verbatim: a mis-parsed
+                # config must never silently attribute a private forge's
+                # repos to github.com's namespace, and falling through to
+                # the legacy loopback key is wrong-but-stable and never
+                # collides with another forge. host.py runs in a hook
+                # context, so no stderr noise here.
+                forge_host = None
+
+        if forge_host is not None:
+            gm = re.match(r"^git/([^/]+)/([^/]+)", path, re.IGNORECASE)
+            if gm:
+                org, repo = gm.group(1), gm.group(2)
+                return f"{forge_host}/{org}/{repo}".lower()
+
     combined = f"{host}/{path}" if host else path
     return combined.lower()
 
