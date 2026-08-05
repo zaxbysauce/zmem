@@ -62,7 +62,10 @@ def _assert_local_fs(path: Path) -> bool:
     (it shells out to store.py), but hooks open sqlite directly and would
     otherwise bypass the guard. Returns True if safe, False if the path is
     network-mounted (the hook silently no-ops rather than corrupting the store).
-    Best-effort: if host.py can't be imported, fall back to a UNC prefix check.
+
+    host.py's ``assert_local_fs`` raises ``ValueError`` as its refusal signal
+    (host.py:253-284) — that MUST map to ``return False``, not be swallowed.
+    Import-failure (host.py absent) degrades to the UNC-prefix check only.
     """
     s = str(path)
     if s.startswith("\\\\") or s.startswith("//"):
@@ -70,11 +73,19 @@ def _assert_local_fs(path: Path) -> bool:
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "skills" / "memory" / "scripts"))
         import host  # type: ignore[import-not-found]
+    except Exception:
+        # host.py absent — best-effort UNC check only.
+        return not (s.startswith("\\\\") or s.startswith("//"))
+    # host.py imported — honor its refusal (ValueError) as False.
+    try:
         host.assert_local_fs(path)
         return True
+    except ValueError:
+        # host.py refused: OneDrive, network-mapped drive, etc.
+        return False
     except Exception:
-        # host.py unavailable or raised (network path) — trust the UNC check above
-        return s.startswith("\\\\") is False and s.startswith("//") is False
+        # Unexpected guard error — fail open (never wedge the hook).
+        return True
 
 
 def _connect() -> sqlite3.Connection | None:

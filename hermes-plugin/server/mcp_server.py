@@ -18,7 +18,8 @@ Run:
     ZMEM_MCP_TOKEN=<secret> \\
     python mcp_server.py --host <lan-ip> --port 8765
 
-See README.md for Windows Task Scheduler persistence and TLS options.
+See the repo README's "Hermes Agent" section for Windows Task Scheduler
+persistence, TLS options, and the full env-var reference.
 """
 
 from __future__ import annotations

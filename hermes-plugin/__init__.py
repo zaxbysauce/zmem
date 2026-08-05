@@ -95,9 +95,12 @@ def _resolve_store_data_dir() -> Path:
     """
     try:
         return _host().resolve_store_path().parent
-    except Exception:
-        # host.py absent or broken — fall back to the historical default so
-        # the provider degrades rather than crashes.
+    except Exception as exc:
+        # host.py absent/broken, or a module-name collision in sys.modules.
+        # Fall back to the historical default so the provider degrades rather
+        # than crashes — but log it so the divergence from store.py is visible
+        # (store.py subprocesses resolve via host.py's full chain regardless).
+        logger.warning("zmem: host.py resolution failed (%s); falling back to ~/.zmem", exc)
         return Path.home() / ".zmem"
 
 
@@ -112,18 +115,25 @@ def _resolve_core_md() -> Path:
 def _host():
     """Lazily import zmem's host.py from the resolved checkout.
 
-    host.py lives at ``$ZMEM_HOME/skills/memory/scripts/host.py`` (or the
-    in-tree equivalent). We import it lazily so the provider module loads even
-    when host.py isn't on sys.path at import time (e.g. during syntax checks).
+    Uses ``spec_from_file_location`` with a unique module name (``zmem_host``)
+    rather than polluting ``sys.path`` with ``import host`` — in a long-lived
+    agent process another plugin/module named ``host`` could already occupy
+    that sys.modules slot, silently returning the wrong module. The file-path
+    import is collision-proof.
     """
-    import importlib
+    import importlib.util
     home = _resolve_zmem_home()
     if home is None:
         raise RuntimeError("ZMEM_HOME not resolved")
-    scripts_dir = str(home / "skills" / "memory" / "scripts")
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-    return importlib.import_module("host")
+    host_path = home / "skills" / "memory" / "scripts" / "host.py"
+    if not host_path.is_file():
+        raise RuntimeError(f"host.py not found at {host_path}")
+    spec = importlib.util.spec_from_file_location("zmem_host", host_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load host.py spec from {host_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _python_bin() -> str:

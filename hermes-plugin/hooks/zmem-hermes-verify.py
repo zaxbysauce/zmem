@@ -39,8 +39,8 @@ def _resolve_store_path() -> Path:
 def _assert_local_fs(path: Path) -> bool:
     """Reject UNC/network/OneDrive store paths (WAL-corruption guard).
 
-    Mirrors zmem's host.py assert_local_fs. Best-effort: falls back to a UNC
-    prefix check if host.py can't be imported.
+    host.py's assert_local_fs raises ValueError as its refusal signal — that
+    MUST map to False, not be swallowed. Import-failure degrades to UNC check.
     """
     s = str(path)
     if s.startswith("\\\\") or s.startswith("//"):
@@ -48,8 +48,13 @@ def _assert_local_fs(path: Path) -> bool:
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "skills" / "memory" / "scripts"))
         import host  # type: ignore[import-not-found]
+    except Exception:
+        return not (s.startswith("\\\\") or s.startswith("//"))
+    try:
         host.assert_local_fs(path)
         return True
+    except ValueError:
+        return False
     except Exception:
         return True
 
