@@ -1,17 +1,21 @@
-# ZMem — Multi-Tier Memory for ZCode + Claude Code
+# ZMem — Multi-Tier Memory for ZCode + Claude Code + Codex + Hermes
 
 A local-first memory system that gives your agent persistent, cross-session
-knowledge — shared box-wide across [ZCode](https://z.ai), Claude Code, and
-Codex workflows that can reach the same physical store: always-on core memory,
+knowledge — shared box-wide across [ZCode](https://z.ai), Claude Code, Codex,
+and [Hermes Agent](https://github.com/NousResearch/hermes-agent) workflows
+that can reach the same physical store: always-on core memory,
 FTS5-backed lesson recall, and reflection-on-failure. Zero cloud dependency.
 
 ## Box-wide shared memory
 
 ZMem is designed to be **one memory brain for the whole box**, not a separate
 copy per tool. ZCode and Claude Code point at the same store —
-`~/.zmem/store.sqlite` + `~/.zmem/core.md` by default — and Codex can use that
+`~/.zmem/store.sqlite` + `~/.zmem/core.md` by default — Codex can use that
 same store when the path is inside its writable roots or when a local broker
-owns the store on Codex's behalf. The host adapter (`hooks/zmem-launch.js`)
+owns the store on Codex's behalf, and Hermes reads/writes the same store via
+its memory-provider adapter (`hermes-plugin/`). A Hermes agent on a **different
+machine** reaches the same store over the LAN through the bundled MCP server.
+The host adapter (`hooks/zmem-launch.js`)
 detects which tool is running and sets a canonical env (`ZMEM_HOST`,
 `ZMEM_DATA`, `ZMEM_TIER0`, etc.) so the hook scripts and `store.py` never need
 to branch on host. Override the shared store location with the `ZMEM_DATA` env
@@ -50,10 +54,18 @@ retrieval floor by default). This follows the finding that intrinsic self-correc
 - Codex, if you want Codex to share the same store, with either:
   - the shared store path added as a writable root, or
   - a local broker process that owns the store and exposes read/write actions
+- Hermes Agent (optional), if you want Hermes to share the same store:
+  - local Hermes: Python 3.11+ (Hermes already requires it); the
+    `hermes-plugin/` adapter auto-detects `store.py` relative to this repo
+  - remote Hermes (different machine): the MCP server needs
+    `pip install -r hermes-plugin/server/requirements.txt` (`mcp` + `uvicorn`)
+    on the store-host box; the remote box needs only the `mcp_servers:` config
+    entry (Hermes bundles the MCP client SDK)
 - Python 3.8+ with sqlite3 + FTS5 (standard in CPython; verify with
   `python -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')"` )
-- Git Bash / Cygwin on Windows (for the hook scripts); or any POSIX shell on macOS/Linux
-- Node.js (the cross-platform hook launcher; both tools already require it)
+- Git Bash / Cygwin on Windows (for the ZCode/CC hook scripts); or any POSIX shell on macOS/Linux.
+  The Hermes hooks are pure stdlib Python — no shell dependency.
+- Node.js (the ZCode/CC cross-platform hook launcher; both tools already require it)
 
 ## Install
 
@@ -121,6 +133,116 @@ store directory the plugin hosts use.
    reapprove hooks after the cutover change. The current repo's Claude/ZCode
    plugin surfaces are first-class now; repo-local Codex adapter files may lag
    behind and are treated as optional by `doctor.py`.
+
+### Hermes Agent — local (memory provider + reflection hooks)
+
+Hermes reads/writes the same canonical store via a `MemoryProvider` adapter.
+Unlike ZCode/CC/Codex (which use the host adapter + bash hooks), Hermes has
+its own first-class memory-provider ABC and a shell-hook system, so the
+adapter is native Python: passive recall before each turn, explicit memory
+tools (`zmem_add` / `zmem_search` / `zmem_supersede`), Tier-0 `core.md`
+injection, and an optional reflection loop.
+
+Hermes' plugin discovery scans `~/.hermes/plugins/memory/<name>/`, so install
+the adapter there. **`ZMEM_HOME` is optional** — the adapter auto-detects
+`store.py` relative to its own location when this repo is checked out
+alongside it.
+
+1. Clone this repo to a stable path (if you haven't already for ZCode/CC).
+2. Symlink or copy the adapter into Hermes' plugin dir:
+   ```bash
+   # symlink (recommended — stays in sync with this repo):
+   ln -s /path/to/zmem/hermes-plugin ~/.hermes/plugins/memory/zmem
+   # or copy:
+   cp -r /path/to/zmem/hermes-plugin ~/.hermes/plugins/memory/zmem
+   ```
+   On Windows (no symlinks without admin): copy the directory, or use a
+   directory junction (`mklink /J`).
+3. Enable the provider in `~/.hermes/config.yaml`:
+   ```yaml
+   memory:
+     provider: zmem
+   ```
+4. (Optional, recommended) Enable the reflection loop. Find your absolute
+   plugin path first:
+   ```bash
+   python -c "from hermes_constants import get_hermes_home; print(get_hermes_home())"
+   ```
+   Then add to `~/.hermes/config.yaml` (replace `<hh>` with that path):
+   ```yaml
+   hooks:
+     post_tool_call:
+       - command: "python <hh>/plugins/memory/zmem/hooks/zmem-hermes-convention.py"
+         matcher: "^(terminal|file_edit|read_file|search_files|write_file|delegate_task)$"
+         timeout: 15
+     pre_llm_call:
+       - command: "python <hh>/plugins/memory/zmem/hooks/zmem-hermes-reflect.py"
+         timeout: 15
+     pre_verify:
+       - command: "python <hh>/plugins/memory/zmem/hooks/zmem-hermes-verify.py"
+         timeout: 15
+
+   # Required for the reflection hooks to register without a TTY prompt:
+   hooks_auto_accept: true
+   ```
+   > **`hooks_auto_accept: true` is required.** Hermes gates shell hooks behind
+   > a per-`(event, command)` consent prompt on first use. Without this flag
+   > (or `HERMES_ACCEPT_HOOKS=1` / `--accept-hooks`), each hook prompts at the
+   > TTY once and is **skipped silently** in non-TTY contexts (gateway, cron).
+   >
+   > The convention/failure hooks record signal on `post_tool_call` (an
+   > observational event in Hermes — its results are discarded) and the
+   > `pre_llm_call` reflect hook delivers the nudges on the next turn. This
+   > split respects Hermes' hook-consumption contract.
+
+### Hermes Agent — remote (MCP server, different machine on the LAN)
+
+A Hermes agent running on a **different machine** (e.g. a gateway box serving
+Telegram/Discord) cannot read this box's `~/.zmem/store.sqlite` directly —
+zmem deliberately refuses network-mounted paths (SQLite WAL corruption risk).
+Instead, run the **zmem MCP server** on this box (the store host) and point
+the remote Hermes at it. The remote gets the same `recall` / `add` / `search`
+/ `supersede` / `recent` tools over the network.
+
+**On the store-host box** (this machine, with `~/.zmem/store.sqlite`):
+
+```bash
+pip install -r hermes-plugin/server/requirements.txt   # mcp==1.28.1, uvicorn
+
+# Generate a strong token:
+python -c "import secrets; print(secrets.token_hex(32))"
+
+# Start the server (auto-detects your LAN IP; refuses 0.0.0.0 by default):
+ZMEM_MCP_TOKEN=<the-generated-secret> \
+  python hermes-plugin/server/mcp_server.py --port 8765
+```
+
+**On the remote Hermes box**, add to `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  zmem:
+    url: "http://192.168.1.X:8765/mcp"
+    headers:
+      Authorization: "Bearer <the-same-secret>"
+    timeout: 30
+```
+
+The remote Hermes auto-discovers `mcp__zmem__recall`, `mcp__zmem__add`, etc.
+No zmem checkout or plugin install needed on the remote box.
+
+> **Security:** the Bearer token is the only authentication — generate a long
+> random secret. Over plain HTTP on a trusted LAN the token travels in
+> cleartext; for untrusted networks use TLS (`--tls-keyfile` / `--tls-certfile`,
+> which must be provided together, or a reverse proxy). The server refuses to
+> start without a token and refuses wildcard binds unless
+> `ZMEM_MCP_ALLOW_INSECURE_BIND=1` is set. See
+> [`hermes-plugin/README.md`](hermes-plugin/README.md) for Windows Task
+> Scheduler persistence and full config reference.
+>
+> **Limitation:** the remote Hermes gets explicit `mcp__zmem__*` tools (the
+> model calls them when it needs a memory), not automatic passive recall
+> before each turn. That's a planned v2.
 
 ### Local directory (for testing / air-gapped)
 

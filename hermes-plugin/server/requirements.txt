@@ -1,0 +1,4 @@
+# zmem MCP server dependencies.
+# mcp version pins to match Hermes' bundled client (hermes/pyproject.toml).
+mcp==1.28.1
+uvicorn>=0.30.0,<1.0.0
