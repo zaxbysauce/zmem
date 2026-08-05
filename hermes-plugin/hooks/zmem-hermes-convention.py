@@ -55,14 +55,41 @@ def _resolve_store_path() -> Path:
     return Path.home() / ".zmem" / "store.sqlite"
 
 
+def _assert_local_fs(path: Path) -> bool:
+    """Reject UNC/network/OneDrive store paths (WAL-corruption guard).
+
+    Mirrors zmem's host.py ``assert_local_fs`` — the provider gets it for free
+    (it shells out to store.py), but hooks open sqlite directly and would
+    otherwise bypass the guard. Returns True if safe, False if the path is
+    network-mounted (the hook silently no-ops rather than corrupting the store).
+    Best-effort: if host.py can't be imported, fall back to a UNC prefix check.
+    """
+    s = str(path)
+    if s.startswith("\\\\") or s.startswith("//"):
+        return False
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "skills" / "memory" / "scripts"))
+        import host  # type: ignore[import-not-found]
+        host.assert_local_fs(path)
+        return True
+    except Exception:
+        # host.py unavailable or raised (network path) — trust the UNC check above
+        return s.startswith("\\\\") is False and s.startswith("//") is False
+
+
 def _connect() -> sqlite3.Connection | None:
-    """Open the store. None if absent or missing the meta table.
+    """Open the store. None if absent, missing the meta table, or on a
+    network-mounted path (WAL-safety guard).
 
     Hooks never create the store — the memory provider's initialize() owns
-    that. If the store isn't there, the hook silently no-ops.
+    that. If the store isn't there (or is on a network share), the hook
+    silently no-ops.
     """
     p = _resolve_store_path()
     if not p.is_file():
+        return None
+    if not _assert_local_fs(p):
+        # Network/OneDrive path — refuse to open (WAL corruption risk).
         return None
     conn = sqlite3.connect(str(p), timeout=5.0)
     conn.execute("PRAGMA busy_timeout=5000")
@@ -155,6 +182,14 @@ def main() -> int:
             _meta_set_if_absent(
                 conn, _PENDING_CONVENTION_KEY.format(session=session)
             )
+        _emit_empty()
+        return 0
+    except (sqlite3.Error, ValueError) as exc:
+        # Fail-open: lock contention past busy_timeout, disk errors, or a
+        # corrupted meta.value (CAST yields NULL → int(None) raises ValueError)
+        # must NOT crash the agent turn. Emit {} and exit 0, matching the
+        # sibling hooks (reflect.py, verify.py) which guard the same way.
+        sys.stderr.write(f"zmem-convention: sqlite/value error: {exc}\n")
         _emit_empty()
         return 0
     finally:

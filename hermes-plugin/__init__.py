@@ -85,18 +85,45 @@ def _resolve_store_py() -> Optional[Path]:
 def _resolve_store_data_dir() -> Path:
     """Resolve the zmem data dir holding ``store.sqlite`` and ``core.md``.
 
-    Mirrors zmem's own resolution (``host.py``): explicit ``ZMEM_DATA`` wins,
-    then the box-wide default ``~/.zmem``. The store.sqlite itself is created
-    by ``store.py init`` if absent.
+    Delegates to zmem's own ``host.py`` so the provider's view NEVER diverges
+    from the ``store.py`` subprocess it shells out to. host.py honors the full
+    chain: ``ZMEM_STORE`` > ``ZMEM_DATA`` > ``CLAUDE_PLUGIN_DATA`` >
+    ``ZCODE_PLUGIN_DATA`` > ``~/.zmem`` (+ legacy). Previously this was
+    reimplemented with a truncated chain (only ``ZMEM_DATA`` > ``~/.zmem``),
+    which silently broke core.md injection, init gating, and backup_paths on
+    boxes where ``ZMEM_STORE`` / plugin-data env vars are set.
     """
-    raw = os.environ.get("ZMEM_DATA", "").strip()
-    if raw:
-        return Path(raw).expanduser()
-    return Path.home() / ".zmem"
+    try:
+        return _host().resolve_store_path().parent
+    except Exception:
+        # host.py absent or broken — fall back to the historical default so
+        # the provider degrades rather than crashes.
+        return Path.home() / ".zmem"
 
 
 def _resolve_core_md() -> Path:
-    return _resolve_store_data_dir() / _CORE_MD_REL
+    """Resolve core.md via host.py (honors ZMEM_CORE_MD + store-path parent)."""
+    try:
+        return _host().resolve_core_md_path()
+    except Exception:
+        return _resolve_store_data_dir() / _CORE_MD_REL
+
+
+def _host():
+    """Lazily import zmem's host.py from the resolved checkout.
+
+    host.py lives at ``$ZMEM_HOME/skills/memory/scripts/host.py`` (or the
+    in-tree equivalent). We import it lazily so the provider module loads even
+    when host.py isn't on sys.path at import time (e.g. during syntax checks).
+    """
+    import importlib
+    home = _resolve_zmem_home()
+    if home is None:
+        raise RuntimeError("ZMEM_HOME not resolved")
+    scripts_dir = str(home / "skills" / "memory" / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    return importlib.import_module("host")
 
 
 def _python_bin() -> str:
@@ -507,10 +534,13 @@ class ZmemMemoryProvider(MemoryProvider):
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Detached housekeeping — consolidate + backup if due.
 
-        Cheap to invoke; store.py guards its own cadence (--if-due).
+        ``consolidate`` runs WITHOUT ``--dry-run``: store.py's own cadence gate
+        (meta-key ``last_consolidation``) + single-flight lock make the real
+        call cheap when not due, and ``--dry-run`` was an expensive no-op that
+        paid the full clustering scan without ever merging.
         """
         try:
-            _run_store(["consolidate", "--dry-run"])
+            _run_store(["consolidate"])
             _run_store(["backup", "--if-due"])
         except Exception as exc:  # pragma: no cover — defensive
             logger.debug("zmem on_session_end housekeeping failed: %s", exc)

@@ -144,20 +144,24 @@ tools (`zmem_add` / `zmem_search` / `zmem_supersede`), Tier-0 `core.md`
 injection, and an optional reflection loop.
 
 Hermes' plugin discovery scans `~/.hermes/plugins/memory/<name>/`, so install
-the adapter there. **`ZMEM_HOME` is optional** — the adapter auto-detects
-`store.py` relative to its own location when this repo is checked out
-alongside it.
+the adapter there. The adapter auto-detects `store.py` relative to its own
+location **when installed via symlink or junction** (it follows the link back
+into this repo). If you copy instead (the Windows `cp -r` path), the copy
+isn't inside the repo, so auto-detection fails silently and the provider stays
+inactive — **copy users must set `ZMEM_HOME`** to this repo's checkout path
+(see step 5).
 
 1. Clone this repo to a stable path (if you haven't already for ZCode/CC).
 2. Symlink or copy the adapter into Hermes' plugin dir:
    ```bash
-   # symlink (recommended — stays in sync with this repo):
+   # symlink (recommended — stays in sync with this repo, auto-detect works):
    ln -s /path/to/zmem/hermes-plugin ~/.hermes/plugins/memory/zmem
-   # or copy:
+   # or copy (auto-detect BREAKS — you MUST set ZMEM_HOME in step 5):
    cp -r /path/to/zmem/hermes-plugin ~/.hermes/plugins/memory/zmem
    ```
-   On Windows (no symlinks without admin): copy the directory, or use a
-   directory junction (`mklink /J`).
+   On Windows (no symlinks without admin): a directory junction
+   (`mklink /J C:\Users\you\.hermes\plugins\memory\zmem C:\code\zmem\hermes-plugin`)
+   preserves auto-detection; a plain copy does not.
 3. Enable the provider in `~/.hermes/config.yaml`:
    ```yaml
    memory:
@@ -194,6 +198,13 @@ alongside it.
    > observational event in Hermes — its results are discarded) and the
    > `pre_llm_call` reflect hook delivers the nudges on the next turn. This
    > split respects Hermes' hook-consumption contract.
+5. **If you copied (not symlinked/junctioned) in step 2**, set `ZMEM_HOME` so
+   the provider can locate `store.py`. Add to `~/.hermes/.env` (or your
+   shell environment):
+   ```ini
+   ZMEM_HOME=/path/to/zmem
+   ```
+   Symlink/junction installs skip this — auto-detection handles it.
 
 ### Hermes Agent — remote (MCP server, different machine on the LAN)
 
@@ -236,13 +247,28 @@ No zmem checkout or plugin install needed on the remote box.
 > cleartext; for untrusted networks use TLS (`--tls-keyfile` / `--tls-certfile`,
 > which must be provided together, or a reverse proxy). The server refuses to
 > start without a token and refuses wildcard binds unless
-> `ZMEM_MCP_ALLOW_INSECURE_BIND=1` is set. See
-> [`hermes-plugin/README.md`](hermes-plugin/README.md) for Windows Task
-> Scheduler persistence and full config reference.
+> `ZMEM_MCP_ALLOW_INSECURE_BIND=1` is set. For Windows persistence, register
+> the server as a Scheduled Task (`New-ScheduledTaskAction -Execute python.exe
+> -Argument "hermes-plugin/server/mcp_server.py --port 8765"`) or wrap it with
+> [nssm](https://nssm.cc/); set `ZMEM_MCP_TOKEN` and `ZMEM_HOME` as system env
+> vars.
 >
 > **Limitation:** the remote Hermes gets explicit `mcp__zmem__*` tools (the
 > model calls them when it needs a memory), not automatic passive recall
 > before each turn. That's a planned v2.
+
+#### Hermes adapter env vars
+
+| Var | Purpose | Default |
+|-----|---------|---------|
+| `ZMEM_HOME` | Path to the zmem checkout (where `store.py` lives). **Required for copy installs;** optional for symlink/junction. | — |
+| `ZMEM_DATA` | Override the store data directory (holds `store.sqlite` + `core.md`). | `~/.zmem` |
+| `ZMEM_STORE` | Override the store SQLite path directly (wins over `ZMEM_DATA`). | — |
+| `ZMEM_NAMESPACE` | Force a namespace for the local provider (e.g. `project:myrepo`). Default derives from gateway `user_id`. | derived |
+| `ZMEM_CONVENTION_INTERVAL` | Fire the convention nudge every N successful tool calls. | `10` |
+| `ZMEM_MCP_TOKEN` | Bearer token for the MCP server. **Required** to start the server. | — |
+| `ZMEM_MCP_TOKEN_FILE` | Path to a file containing the token (alternative to `ZMEM_MCP_TOKEN`). | — |
+| `ZMEM_MCP_ALLOW_INSECURE_BIND` | Set to `1` to allow `0.0.0.0` / `::` bind. | unset |
 
 ### Local directory (for testing / air-gapped)
 

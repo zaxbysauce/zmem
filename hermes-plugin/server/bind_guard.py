@@ -14,13 +14,38 @@ having to look up the IP manually.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import socket
 import sys
 from typing import Optional
 
 
-_INSECURE_HOSTS = {"0.0.0.0", "::", "[::]"}
+def _is_wildcard(host: str) -> bool:
+    """True if ``host`` resolves to an unspecified (wildcard) bind address.
+
+    Covers all equivalent forms — ``0.0.0.0``, ``::``, ``[::]``, ``0``, ``0.0``,
+    ``0:0:0:0:0:0:0:0`` — by parsing with :mod:`ipaddress` (for standard
+    literals) and :func:`socket.inet_aton` (for the inet_aton shorthands ``0``
+    and ``0.0`` that uvicorn/socket accept but ipaddress rejects). Hostnames
+    can't be statically classified, so they pass (the operator named it).
+    """
+    h = (host or "").strip().lower().strip("[]")
+    if h in {"", "0.0.0.0", "::"}:
+        return True
+    try:
+        return ipaddress.ip_address(h).is_unspecified
+    except ValueError:
+        pass
+    # inet_aton shorthands: socket.inet_aton("0") == 0.0.0.0, ("0.0") == 0.0.0.0.
+    # These are accepted by uvicorn's bind but rejected by ipaddress.
+    try:
+        packed = socket.inet_aton(h)
+        return packed == b"\x00\x00\x00\x00"  # 0.0.0.0
+    except OSError:
+        # Not a literal IP (e.g. a hostname). uvicorn/socket will resolve it;
+        # we can't statically know, so don't block — the operator named it.
+        return False
 
 
 def detect_lan_ip() -> str:
@@ -55,8 +80,8 @@ def enforce_bind_host(host: str) -> str:
     behind a reverse proxy or firewall, or the network is fully trusted and
     air-gapped). Absent that opt-in, wildcards abort startup.
     """
-    h = (host or "").strip().lower()
-    if h in _INSECURE_HOSTS:
+    h = (host or "").strip()
+    if _is_wildcard(h):
         if os.environ.get("ZMEM_MCP_ALLOW_INSECURE_BIND", "").strip() != "1":
             sys.stderr.write(
                 "zmem-mcp: refusing to bind to wildcard address '%s'. The store "

@@ -29,28 +29,33 @@ def load_expected_token() -> str:
     """Load the expected Bearer token from env or token file.
 
     Env ``ZMEM_MCP_TOKEN`` wins; otherwise ``ZMEM_MCP_TOKEN_FILE`` is read.
-    Aborts startup (exit 2) if neither is set — auth is mandatory for a
-    network-exposed store, never optional.
+    Aborts startup (exit 2) if neither is set OR the resolved value is empty —
+    an empty token would let the server boot but reject every request (every
+    Bearer comparison against ``""`` is False), leaving the operator with a
+    silently-unusable server. Auth is mandatory for a network-exposed store.
     """
     tok = os.environ.get("ZMEM_MCP_TOKEN", "").strip()
-    if tok:
-        return tok
-    tok_file = os.environ.get("ZMEM_MCP_TOKEN_FILE", "").strip()
-    if tok_file:
-        p = Path(tok_file).expanduser()
-        try:
-            return p.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            sys.stderr.write(
-                f"zmem-mcp: ZMEM_MCP_TOKEN_FILE ({tok_file}) unreadable: {exc}\n"
-            )
-            sys.exit(2)
-    sys.stderr.write(
-        "zmem-mcp: no token configured. Set ZMEM_MCP_TOKEN (or "
-        "ZMEM_MCP_TOKEN_FILE) before starting the server — auth is mandatory "
-        "for a network-exposed store.\n"
-    )
-    sys.exit(2)
+    source = "ZMEM_MCP_TOKEN"
+    if not tok:
+        tok_file = os.environ.get("ZMEM_MCP_TOKEN_FILE", "").strip()
+        if tok_file:
+            p = Path(tok_file).expanduser()
+            try:
+                tok = p.read_text(encoding="utf-8").strip()
+                source = f"ZMEM_MCP_TOKEN_FILE ({tok_file})"
+            except OSError as exc:
+                sys.stderr.write(
+                    f"zmem-mcp: ZMEM_MCP_TOKEN_FILE ({tok_file}) unreadable: {exc}\n"
+                )
+                sys.exit(2)
+    if not tok:
+        sys.stderr.write(
+            "zmem-mcp: no token configured. Set ZMEM_MCP_TOKEN (or "
+            "ZMEM_MCP_TOKEN_FILE) before starting the server — auth is "
+            "mandatory for a network-exposed store.\n"
+        )
+        sys.exit(2)
+    return tok
 
 
 class StaticTokenVerifier(TokenVerifier):

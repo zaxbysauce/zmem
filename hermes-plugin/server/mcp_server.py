@@ -46,6 +46,9 @@ logger = logging.getLogger("zmem-mcp")
 _STORE_PY_REL = Path("skills") / "memory" / "scripts" / "store.py"
 _STORE_TIMEOUT_S = 30  # network clients can tolerate a longer cap
 _MAX_QUERY_CHARS = 1000
+# Cap on a single add() content payload — prevents a misconfigured/buggy remote
+# from submitting an arbitrarily large string that stalls the subprocess.
+_MAX_CONTENT_CHARS = 32000
 _DEFAULT_LIMIT = 5
 _HARD_LIMIT_MAX = 50
 
@@ -132,15 +135,67 @@ def _error(message: str) -> dict[str, Any]:
     return {"error": message}
 
 
+def _build_resource_url(host: str, port: int, use_tls: bool) -> str:
+    """Build the auth-metadata URL with the correct scheme + bracketed IPv6.
+
+    Hardcoding ``http://`` was a two-part bug: (1) under TLS the OAuth
+    protected-resource metadata advertised the wrong scheme, directing clients
+    to send the Bearer token in cleartext; (2) an IPv6 literal host (e.g.
+    ``::1``) produced ``http://::1:8765`` which pydantic's AnyHttpUrl rejects
+    (unbracketed IPv6), crashing startup. Bracket IPv6 per RFC 2732 and derive
+    the scheme from whether TLS is configured.
+    """
+    scheme = "https" if use_tls else "http"
+    # Bracket IPv6 literals (contain ':' but aren't IPv4).
+    bracketed = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"{scheme}://{bracketed}:{port}"
+
+
+def _namespace_flag(namespace: Optional[str]) -> list[str]:
+    """Build the ``--namespace`` argv slice, treating ``'*'`` as "all".
+
+    A bare ``'*'`` means "search every namespace" — store.py implements that by
+    OMITTING ``--namespace`` (no filter). Passing ``--namespace '*'`` literally
+    would search for a namespace named ``*`` (returns nothing). Default
+    (``None``) also omits the flag: the MCP server is multi-user/network and has
+    no single "session namespace" concept, so the safe default is the full
+    store — callers who want isolation pass an explicit namespace.
+    """
+    ns = (namespace or "").strip()
+    if ns and ns != "*":
+        return ["--namespace", ns]
+    return []
+
+
+def _parse_results(r: dict[str, Any]) -> dict[str, Any]:
+    """Parse store.py's ``--json`` stdout into ``{results, count}``.
+
+    Shared by ``recall`` and ``recent`` (was duplicated). Handles empty stdout,
+    non-JSON, and non-list shapes uniformly.
+    """
+    if not r["ok"]:
+        return _error(r["stderr"] or r["stdout"][:200])
+    stdout = (r["stdout"] or "").strip()
+    if not stdout:
+        return {"results": [], "count": 0}
+    try:
+        results = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        return _error(f"non-JSON from store.py: {exc}")
+    if not isinstance(results, list):
+        results = []
+    return {"results": results, "count": len(results)}
+
+
 # -- FastMCP construction ----------------------------------------------------
 
-def build_server(host: str, port: int) -> "FastMCP":  # type: ignore[name-defined]
+def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # type: ignore[name-defined]
     from mcp.server.auth.settings import AuthSettings
     from mcp.server.fastmcp import FastMCP
 
     token = load_expected_token()
     verifier = StaticTokenVerifier(token)
-    resource_url = f"http://{host}:{port}"
+    resource_url = _build_resource_url(host, port, use_tls=use_tls)
 
     mcp = FastMCP(
         "zmem",
@@ -166,7 +221,8 @@ def build_server(host: str, port: int) -> "FastMCP":  # type: ignore[name-define
 
         Returns the top matches from the shared cross-session store. Use this
         to surface lessons, conventions, and facts before answering anything
-        that may depend on past work.
+        that may depend on past work. Pass namespace='*' (or omit) to search
+        all namespaces; pass an explicit namespace to scope.
         """
         q = (query or "").strip()
         if not q:
@@ -177,22 +233,8 @@ def build_server(host: str, port: int) -> "FastMCP":  # type: ignore[name-define
             "--query", q[:_MAX_QUERY_CHARS],
             "--limit", str(n),
             "--json",
-        ]
-        if namespace:
-            args += ["--namespace", str(namespace)]
-        r = _run_store(args)
-        if not r["ok"]:
-            return _error(r["stderr"] or r["stdout"][:200])
-        stdout = (r["stdout"] or "").strip()
-        if not stdout:
-            return {"results": [], "count": 0}
-        try:
-            results = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            return _error(f"non-JSON from store.py: {exc}")
-        if not isinstance(results, list):
-            results = []
-        return {"results": results, "count": len(results)}
+        ] + _namespace_flag(namespace)
+        return _parse_results(_run_store(args))
 
     @mcp.tool()
     def add(
@@ -216,6 +258,9 @@ def build_server(host: str, port: int) -> "FastMCP":  # type: ignore[name-define
             )
         if not body:
             return _error("content is required")
+        # Cap content length — recall clamps query; add should clamp content
+        # symmetrically to prevent a bloat-DoS on the write path.
+        body = body[:_MAX_CONTENT_CHARS]
         sig = (signal or "none").strip()
         if sig not in ("test", "compile", "lint", "reviewer", "user", "none"):
             return _error(
@@ -269,22 +314,8 @@ def build_server(host: str, port: int) -> "FastMCP":  # type: ignore[name-define
     ) -> dict[str, Any]:
         """Return the most recently ingested memories."""
         n = _clamp_limit(limit)
-        args = ["recent", "--limit", str(n), "--json"]
-        if namespace:
-            args += ["--namespace", str(namespace)]
-        r = _run_store(args)
-        if not r["ok"]:
-            return _error(r["stderr"] or r["stdout"][:200])
-        stdout = (r["stdout"] or "").strip()
-        if not stdout:
-            return {"results": [], "count": 0}
-        try:
-            results = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            return _error(f"non-JSON from store.py: {exc}")
-        if not isinstance(results, list):
-            results = []
-        return {"results": results, "count": len(results)}
+        args = ["recent", "--limit", str(n), "--json"] + _namespace_flag(namespace)
+        return _parse_results(_run_store(args))
 
     return mcp
 
@@ -325,8 +356,9 @@ def main() -> int:
 
     host = enforce_bind_host(args.host)
     tls_kwargs = resolve_tls_kwargs(args.tls_keyfile, args.tls_certfile)
+    use_tls = bool(tls_kwargs)
 
-    mcp = build_server(host=host, port=args.port)
+    mcp = build_server(host=host, port=args.port, use_tls=use_tls)
 
     if tls_kwargs:
         # uvicorn honors ssl_keyfile/ssl_certfile via Config kwargs. We use the

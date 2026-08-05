@@ -36,9 +36,29 @@ def _resolve_store_path() -> Path:
     return Path.home() / ".zmem" / "store.sqlite"
 
 
+def _assert_local_fs(path: Path) -> bool:
+    """Reject UNC/network/OneDrive store paths (WAL-corruption guard).
+
+    Mirrors zmem's host.py assert_local_fs. Best-effort: falls back to a UNC
+    prefix check if host.py can't be imported.
+    """
+    s = str(path)
+    if s.startswith("\\\\") or s.startswith("//"):
+        return False
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "skills" / "memory" / "scripts"))
+        import host  # type: ignore[import-not-found]
+        host.assert_local_fs(path)
+        return True
+    except Exception:
+        return True
+
+
 def _connect() -> sqlite3.Connection | None:
     p = _resolve_store_path()
     if not p.is_file():
+        return None
+    if not _assert_local_fs(p):
         return None
     conn = sqlite3.connect(str(p), timeout=5.0)
     conn.execute("PRAGMA busy_timeout=5000")
@@ -80,10 +100,9 @@ def _verify_nudge(session: str) -> str:
         "ZMem reflect-before-stop: you're about to finish a coding turn. "
         "Before you do, consider whether you discovered anything worth "
         "capturing for future sessions — a gotcha, a convention, a corrected "
-        "assumption. If so, capture it now:\n"
-        f"  python -m store add --namespace user:global --type lesson "
-        f'--content "<the lesson>" --signal <test|reviewer|user|none> '
-        f"--source-ref session:{session}\n"
+        "assumption. If so, capture it now by calling the zmem_add tool:\n"
+        f'  zmem_add with type="lesson", content="<the lesson>", '
+        f'signal="<test|reviewer|user|none>", source_ref="session:{session}"\n'
         "If nothing generalizable, finish the turn."
     )
 

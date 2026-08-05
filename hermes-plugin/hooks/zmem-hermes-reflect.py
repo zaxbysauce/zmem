@@ -32,6 +32,10 @@ from pathlib import Path
 _CONVENTION_COUNT_KEY = "hermes_convention_count_{session}"
 _PENDING_CONVENTION_KEY = "hermes_pending_convention_{session}"
 _PENDING_FAILURE_KEY = "hermes_pending_failure_{session}"
+# Cleared alongside _PENDING_FAILURE_KEY on delivery so a LATER failure in the
+# same session can re-arm (without this, the one-shot _FAILURE_CAPTURED_KEY in
+# the convention hook would suppress every failure after the first delivered).
+_FAILURE_CAPTURED_KEY = "hermes_failure_captured_{session}"
 _REFLECT_PROMPTED_KEY = "hermes_reflect_prompted_{session}"
 
 
@@ -45,9 +49,29 @@ def _resolve_store_path() -> Path:
     return Path.home() / ".zmem" / "store.sqlite"
 
 
+def _assert_local_fs(path: Path) -> bool:
+    """Reject UNC/network/OneDrive store paths (WAL-corruption guard).
+
+    Mirrors zmem's host.py assert_local_fs. Best-effort: falls back to a UNC
+    prefix check if host.py can't be imported.
+    """
+    s = str(path)
+    if s.startswith("\\\\") or s.startswith("//"):
+        return False
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "skills" / "memory" / "scripts"))
+        import host  # type: ignore[import-not-found]
+        host.assert_local_fs(path)
+        return True
+    except Exception:
+        return True
+
+
 def _connect() -> sqlite3.Connection | None:
     p = _resolve_store_path()
     if not p.is_file():
+        return None
+    if not _assert_local_fs(p):
         return None
     conn = sqlite3.connect(str(p), timeout=5.0)
     conn.execute("PRAGMA busy_timeout=5000")
@@ -112,10 +136,9 @@ def _convention_nudge(session: str) -> str:
         "ZMem convention capture: you just completed several tool calls. If you "
         "discovered a reusable convention, pattern, or workaround during this "
         "session — something that would help a future session facing a similar "
-        "task — capture it now. Run:\n"
-        f"  python -m store add --namespace user:global --type convention "
-        f'--content "<the lesson>" --signal <test|reviewer|user|none> '
-        f"--source-ref session:{session}\n"
+        "task — capture it now by calling the zmem_add tool:\n"
+        f'  zmem_add with type="convention", content="<the lesson>", '
+        f'signal="<test|reviewer|user|none>", source_ref="session:{session}"\n'
         "If nothing generalizable applies, do nothing."
     )
 
@@ -128,10 +151,9 @@ def _failure_nudge(session: str) -> str:
         f"ZMem auto-capture: a tool failed earlier this session "
         f"(source_ref=session:{session}). If a generalizable lesson can be "
         "derived from that failure — a gotcha, a misconfiguration, a wrong "
-        "assumption — capture it now. Run:\n"
-        f"  python -m store add --namespace user:global --type lesson "
-        f'--content "<the lesson, with the error context>" --signal none '
-        f"--source-ref session:{session}\n"
+        "assumption — capture it now by calling the zmem_add tool:\n"
+        f'  zmem_add with type="lesson", content="<the lesson, with the error '
+        f'context>", signal="none", source_ref="session:{session}"\n'
         "If the failure was transient or not generalizable, do nothing."
     )
 
@@ -142,10 +164,10 @@ def _reflect_nudge(session: str, count: int) -> str:
         f"{count} tool call(s) but no lesson has been captured yet "
         f"(source_ref=session:{session}). If you learned something this session "
         "that a future session would benefit from — a workaround, a corrected "
-        "assumption, a project convention — capture it now:\n"
-        f"  python -m store add --namespace user:global --type lesson "
-        f'--content "<the lesson>" --signal <test|reviewer|user|none> '
-        f"--source-ref session:{session}\n"
+        "assumption, a project convention — capture it now by calling the "
+        "zmem_add tool:\n"
+        f'  zmem_add with type="lesson", content="<the lesson>", '
+        f'signal="<test|reviewer|user|none>", source_ref="session:{session}"\n'
         "If nothing generalizable, do nothing."
     )
 
@@ -165,6 +187,11 @@ def main() -> int:
         if _meta_get(conn, fail_key):
             _emit_context(_failure_nudge(session))
             _meta_clear(conn, fail_key)
+            # Also clear the one-shot captured marker so a subsequent failure
+            # in the same session can re-arm a nudge. Without this, the
+            # convention hook's _FAILURE_CAPTURED_KEY would suppress every
+            # failure after the first delivered one.
+            _meta_clear(conn, _FAILURE_CAPTURED_KEY.format(session=session))
             return 0
 
         # Priority 2: pending convention nudge.
