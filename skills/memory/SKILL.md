@@ -64,11 +64,20 @@ surface change.
 
 ### recall — surface relevant memories (high-precision)
 ```
-python <store.py> recall --query "<query>" [--namespace NS] [--limit 5] [--json]
+python <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
+                          [--include-global] [--global-limit 3] [--json]
 ```
 Returns live (non-superseded) memories matching the query, filtered by confidence
 floor (>=0.25) and namespace. Prefer `--namespace project:<basename>` to scope to
 the current project; use `user:global` for cross-project.
+
+`--include-global` (opt-in) ALSO surfaces up to `--global-limit` query-relevant
+rows from the `user:global` tier, merged project-first so a global row never
+crowds out a project row. The three automatic hooks pass this so cross-project
+lessons reach project-scoped sessions. Without it, behaviour is strict-namespaced
+(byte-identical to before). When you want the global tier unioned in but still
+want a per-tier budget, use `recall --namespace project:<x> --include-global`
+rather than going unscoped.
 
 ### add — capture a memory
 ```
@@ -85,16 +94,30 @@ skills later), reviewer/user=medium (0.6), none=low (0.3, now above the 0.25
 floor and reachable by recall).
 Dedup-on-write: near-identical live content in the same namespace refreshes the
 existing entry instead of duplicating.
+Namespace validation: obvious misspellings of the global namespace (`global`,
+`userglobal`, `users:global`, …) are rejected at `add` time AND on `ingest-jsonl`
+sync import with a message naming the canonical `user:global` — such rows would
+be unreachable from the automatic hooks. `project:<x>` and arbitrary namespaces
+pass through untouched. Legacy rows already stranded under a near-miss namespace
+(before this guard existed) can be remediated with `rekey-namespace
+--near-miss-global --confirm` (see below).
 
 ### recent / search / supersede / list / get / stats
 ```
-python <store.py> recent [--namespace NS] [--limit 5] [--min-confidence 0.5] [--json]
+python <store.py> recent [--namespace NS] [--limit 5] [--min-confidence 0.5]
+                         [--include-global] [--global-limit 3] [--json]
 python <store.py> search --text "<text>" [--namespace NS] [--limit 10]
+                        [--include-global] [--global-limit 3] [--no-bump]
 python <store.py> supersede --id <full-uuid> [--reason "..."]
 python <store.py> list [--namespace NS] [--include-superseded]
 python <store.py> get --id <uuid>
 python <store.py> stats
 ```
+`recent`/`search` accept the same `--include-global`/`--global-limit` pair as
+`recall` (project-first global tier union). `recent` now ALSO honours v5
+migration aliases (so `recent --namespace <old pre-v5 key>` finds rows migrated
+to the new key). `search` now accepts `--no-bump` for read-only queries (it
+defaults to bumping like `recall`).
 
 ### reembed — backfill semantic embeddings
 ```
@@ -126,6 +149,20 @@ automatically on SessionStart when the store has grown >20% since the last run
 Consolidation is **single-flighted**: concurrent runs (several sessions starting
 at once) take an advisory lockfile in the store dir, and the losers skip cleanly
 and exit 0 rather than clustering the same rows twice.
+
+### rekey-namespace — remediate stranded namespace rows (admin)
+```
+python <store.py> rekey-namespace --near-miss-global [--to user:global] [--dry-run] --confirm
+python <store.py> rekey-namespace --from <old-namespace> --to <new-namespace> [--dry-run] --confirm
+```
+Rewrites the `namespace` column of live rows. The primary use is remediating
+legacy rows stranded under a global near-miss namespace (`global`,
+`userglobal`, …) that pre-date the `add`/`ingest-jsonl` write-time guard — such
+rows are unreachable from the automatic hooks. `--near-miss-global` rekeys EVERY
+live near-miss row to `--to` (default `user:global`); `--from` rekeys one exact
+namespace. `--to` may not itself be a near-miss. `--confirm` is required to
+write (without it, or with `--dry-run`, the command only previews). Superseded
+rows are left untouched (history preserved).
 
 ### backup — verified snapshot with retention
 ```
