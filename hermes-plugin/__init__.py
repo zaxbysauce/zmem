@@ -378,12 +378,20 @@ class ZmemMemoryProvider(MemoryProvider):
         if not query or not query.strip():
             return ""
         q = query.strip()[:_MAX_QUERY_CHARS]
+        # Mirror the Claude Code UserPromptSubmit hook: union the user:global
+        # tier into a project-scoped prefetch so cross-project lessons surface
+        # (issue #18). When self._namespace IS user:global (the Hermes default),
+        # the store treats --include-global as a no-op, so this is safe in all
+        # cases and one fewer subprocess than a separate global pull.
         r = _run_store(
             [
                 "recall",
                 "--query", q,
                 "--namespace", self._namespace,
                 "--limit", str(_PREFETCH_LIMIT),
+                "--include-global",
+                "--global-limit", "3",
+                "--no-bump",  # passive path: read-only, mirroring UserPromptSubmit
                 "--json",
             ]
         )
@@ -449,10 +457,16 @@ class ZmemMemoryProvider(MemoryProvider):
         ]
         if ns_arg and ns_arg != "*":
             cli_args += ["--namespace", ns_arg]
+            # When scoped to a specific namespace, union the user:global tier
+            # (parity with the CLI search subcommand and prefetch, issue #18).
+            # The store treats it as a no-op when ns_arg is user:global.
+            cli_args += ["--include-global", "--global-limit", "3"]
         elif not ns_arg:
             # Default to the session namespace (mirror prefetch/add isolation).
             cli_args += ["--namespace", self._namespace]
-        # Empty/ns_arg == '*' → no --namespace flag → store.py searches all.
+            cli_args += ["--include-global", "--global-limit", "3"]
+        # Empty/ns_arg == '*' → no --namespace flag → store.py searches all
+        # (unscoped already covers every namespace, so no --include-global).
         r = _run_store(cli_args)
         if not r["ok"]:
             return _tool_error(f"Search failed: {r['stderr'] or r['stdout'][:200]}")

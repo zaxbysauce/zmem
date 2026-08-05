@@ -25,3 +25,6 @@ __pycache__/
 # behavior when this file is absent.
 skills/memory/models/minilm.onnx
 skills/memory/models/*.part
+
+# ZCode working state (trace artifacts, never commit)
+.zcode/

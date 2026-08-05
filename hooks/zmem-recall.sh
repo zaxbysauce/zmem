@@ -153,6 +153,8 @@ try:
          "--query", prompt[:500],  # cap query length
          "--namespace", ns,
          "--limit", "5",
+         "--include-global",  # surface cross-project user:global lessons (issue #18)
+         "--global-limit", "3",  # per-tier budget: global cannot crowd out project
          "--no-bump",  # READ-ONLY: hook-driven recall must not write (PLAN.md §5)
          "--json"],
         stderr=subprocess.DEVNULL, timeout=10,

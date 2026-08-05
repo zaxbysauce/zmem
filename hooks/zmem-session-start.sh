@@ -236,7 +236,7 @@ if agents and os.path.isfile(agents):
 if store_py and os.path.isfile(store_py):
     try:
         out = subprocess.check_output(
-            [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", "0.5", "--json"],
+            [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", "0.5", "--include-global", "--global-limit", "2", "--no-bump", "--json"],
             stderr=subprocess.DEVNULL, timeout=8,
         ).decode("utf-8", "replace")
         rows = json.loads(out) if out.strip() else []
