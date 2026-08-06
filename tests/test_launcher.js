@@ -52,7 +52,7 @@ function eq(name, actual, expected) {
 function envWith(overrides) {
     const e = { ...process.env };
     for (const k of [
-        "ZMEM_HOST", "ZMEM_ROOT", "ZMEM_DATA", "ZMEM_PROJECT", "ZMEM_SESSION",
+        "ZMEM_HOST", "ZMEM_ROOT", "ZMEM_DATA", "ZMEM_STORE", "ZMEM_PROJECT", "ZMEM_SESSION",
         "ZMEM_TRANSCRIPT", "ZMEM_AGENT_TRANSCRIPT", "ZMEM_AGENT_TYPE",
         "ZMEM_AGENT_ID", "ZMEM_NAMESPACE", "ZMEM_SKILLS_DIRS",
         "ZMEM_TIER0", "ZMEM_CTX_BUDGET",
@@ -65,6 +65,20 @@ function envWith(overrides) {
         delete e[k];
     }
     return Object.assign(e, overrides);
+}
+
+// Guardrail the envWith contract: stripping ZMEM_STORE is load-bearing (it
+// outranks ZMEM_DATA in host.resolve_store_path), so an ambient value must
+// never survive into a sandboxed subprocess env.
+{
+    const saved = process.env.ZMEM_STORE;
+    process.env.ZMEM_STORE = "C:\\ambient-store\\store.sqlite";
+    const out = envWith({ ZMEM_DATA: "C:\\sandbox" });
+    if (saved === undefined) delete process.env.ZMEM_STORE;
+    else process.env.ZMEM_STORE = saved;
+    ok("envWith: strips ambient ZMEM_STORE (would otherwise outrank the sandbox ZMEM_DATA)",
+        !("ZMEM_STORE" in out) && out.ZMEM_DATA === "C:\\sandbox",
+        "ZMEM_STORE present: " + Object.prototype.hasOwnProperty.call(out, "ZMEM_STORE"));
 }
 
 function runLauncher(hook, payload, env) {
@@ -103,6 +117,66 @@ function shquote(s) {
         ["-c", "import shlex,sys; sys.stdout.write(shlex.quote(sys.argv[1]))", s],
         { encoding: "utf8" }
     );
+}
+
+// Resolve the store path store.py would pick from the AMBIENT (raw process.env)
+// environment — the path an env-less subprocess would open. Delegated to
+// host.resolve_store_path() (same pattern as resolveNs above) so the precedence
+// cannot drift between the test and the runtime. Used by the hostile-injection
+// isolation guard to detect writes into a real (non-sandbox) store.
+function defaultStorePath() {
+    const code =
+        "import sys; sys.path.insert(0, sys.argv[1]); import host; " +
+        "print(host.resolve_store_path())";
+    return execFileSync(
+        PYTHON,
+        ["-c", code, path.dirname(HOST_PY)],
+        { encoding: "utf8" }
+    ).trim();
+}
+
+// Read-only total row count of a store. 0 when the file does not exist. Throws
+// (rather than returning a sentinel) if the file exists but cannot be read, so
+// the isolation guard can never pass vacuously on a broken store.
+function countStoreRows(dbPath) {
+    if (!fs.existsSync(dbPath)) return 0;
+    // A concurrent live zmem writer can transiently hold the DB lock; retry a
+    // few times so the isolation guard doesn't fail spuriously on a locked
+    // table read (the lock clears once the writer commits).
+    const code = [
+        "import sqlite3, sys, time",
+        "for attempt in range(4):",
+        "    try:",
+        "        c = sqlite3.connect(sys.argv[1], timeout=5.0)",
+        "        print(c.execute(\"SELECT COUNT(*) FROM memory\").fetchone()[0])",
+        "        break",
+        "    except sqlite3.OperationalError as e:",
+        "        if 'locked' not in str(e).lower() or attempt == 3:",
+        "            print('ERR')",
+        "            break",
+        "        time.sleep(0.2)",
+    ].join("\n");
+    const r = execFileSync(PYTHON, ["-c", code, dbPath], { encoding: "utf8" }).trim();
+    if (r === "ERR") throw new Error("countStoreRows: could not read store " + dbPath);
+    return parseInt(r, 10);
+}
+
+// Isolation guard: the hostile sub-tests execute a rendered `store.py add ...`
+// through bash. If that child ever inherits the ambient environment instead of a
+// sandboxed ZMEM_DATA, it opens/creates and writes the DEFAULT store. Assert the
+// default store is untouched (same file existence, same total row count) across
+// fn. This fails the suite if any of the guarded calls leaks, so the class cannot
+// regress silently.
+function assertNoDefaultStoreLeak(label, fn) {
+    const db = defaultStorePath();
+    const existedBefore = fs.existsSync(db);
+    const rowsBefore = countStoreRows(db);
+    fn();
+    const existedAfter = fs.existsSync(db);
+    const rowsAfter = countStoreRows(db);
+    ok("isolation[" + label + "]: hostile subprocess must not open/write the default store (" + db + ")",
+        existedAfter === existedBefore && rowsAfter === rowsBefore,
+        `exists ${existedBefore}->${existedAfter}, rows ${rowsBefore}->${rowsAfter}`);
 }
 
 function seed(dataDir, namespace, type, content, confidence) {
@@ -828,18 +902,21 @@ console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was si
         // inert single-quoted text as far as bash is concerned. Broken (pre-fix):
         // bash would expand $(touch ...) while parsing the command line, and
         // the canary file would exist BEFORE python ever saw an argument.
-        const m = /`([^`]*)`/.exec(ac);
-        ok("injection: rendered a backtick-fenced suggested command", m !== null, ac);
-        if (m) {
-            const suggested = m[1];
-            const runDir = path.join(TMP, "hostile-run-cwd");
-            fs.mkdirSync(runDir, { recursive: true });
-            const br = spawnSync("bash", ["-c", suggested], {
-                cwd: runDir, encoding: "utf8", timeout: 15000,
-            });
-            ok("injection: canary file was NOT created (no command injection)",
-                !fs.existsSync(CANARY), "bash stderr: " + (br.stderr || "").slice(0, 300));
-        }
+        assertNoDefaultStoreLeak("hostile-git-proj", () => {
+            const m = /`([^`]*)`/.exec(ac);
+            ok("injection: rendered a backtick-fenced suggested command", m !== null, ac);
+            if (m) {
+                const suggested = m[1];
+                const runDir = path.join(TMP, "hostile-run-cwd");
+                fs.mkdirSync(runDir, { recursive: true });
+                const br = spawnSync("bash", ["-c", suggested], {
+                    cwd: runDir, encoding: "utf8", timeout: 15000,
+                    env: envWith({ ZMEM_DATA: HDATA }),
+                });
+                ok("injection: canary file was NOT created (no command injection)",
+                    !fs.existsSync(CANARY), "bash stderr: " + (br.stderr || "").slice(0, 300));
+            }
+        });
     }
 }
 
@@ -1017,12 +1094,23 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
         if (line) return line[1].replace(/`/g, "");
         return null;
     }
-    function runSuggestedAndCheckCanary(label, ac, canary) {
+    function runSuggestedAndCheckCanary(label, ac, canary, dataDir) {
         const cmd = extractSuggestedCommand(ac);
         ok("injection[" + label + "]: rendered a suggested command", cmd !== null, ac.slice(0, 300));
         if (!cmd) return;
         const runDir = fs.mkdtempSync(path.join(TMP, "hostile-run-"));
-        const br = spawnSync("bash", ["-c", cmd], { cwd: runDir, encoding: "utf8", timeout: 15000 });
+        // The rendered command is a real `store.py add`; run it against THIS
+        // sub-test's sandbox store, never the ambient/default store. envWith()
+        // strips every store-path var (incl. ZMEM_STORE, which outranks ZMEM_DATA
+        // in host.resolve_store_path), so a stray higher-precedence var cannot
+        // defeat the sandbox. Pass dataDir even though the command may fail before
+        // writing (reflect/convention render an invalid --signal); the isolation
+        // guard (assertNoDefaultStoreLeak) enforces the default-store untouched.
+        const br = spawnSync("bash", ["-c", cmd], {
+            cwd: runDir,
+            env: envWith({ ZMEM_DATA: dataDir }),
+            encoding: "utf8", timeout: 15000,
+        });
         ok("injection[" + label + "]: canary file was NOT created (no command injection)",
             !fs.existsSync(canary), "bash stderr: " + (br.stderr || "").slice(0, 300));
     }
@@ -1051,7 +1139,7 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("injection[reflect-fail]: hook still renders the failure reflection prompt",
             /failed tool call/.test(ac), ac.slice(0, 300));
-        runSuggestedAndCheckCanary("reflect-fail", ac, CANARY);
+        assertNoDefaultStoreLeak("reflect-fail", () => runSuggestedAndCheckCanary("reflect-fail", ac, CANARY, HDATA));
     }
 
     // --- reflect: end-to-end, NO-FAILURES branch (the 1st unquoted site, ~L208) ---
@@ -1073,7 +1161,7 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("injection[reflect-nofail]: hook still renders the success-reflection nudge",
             /ZMem reflection/.test(ac), ac.slice(0, 300));
-        runSuggestedAndCheckCanary("reflect-nofail", ac, CANARY);
+        assertNoDefaultStoreLeak("reflect-nofail", () => runSuggestedAndCheckCanary("reflect-nofail", ac, CANARY, HDATA));
     }
 
     // --- capture-failure: end-to-end (PostToolUseFailure) ----------------------
@@ -1090,7 +1178,21 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("injection[capture-failure]: hook still renders the auto-capture prompt",
             /auto-capture/.test(ac), ac.slice(0, 300));
-        runSuggestedAndCheckCanary("capture-failure", ac, CANARY);
+        assertNoDefaultStoreLeak("capture-failure", () => runSuggestedAndCheckCanary("capture-failure", ac, CANARY, HDATA));
+        // Positive case: confirm the SANDBOX store accepts a capture. Use the
+        // canonical `python store.py add` invocation (not the copy-paste
+        // rendered command) because the rendered store.py is not guaranteed
+        // directly executable on a fresh POSIX checkout (git mode 100644), so
+        // a direct-exec write would be platform-fragile. This proves capture
+        // lands in the sandbox independent of shell exec semantics.
+        const sandboxBefore = countStoreRows(path.join(HDATA, "store.sqlite"));
+        execFileSync(PYTHON, [STORE_PY, "add", "--namespace", "user:global", "--type", "lesson",
+            "--content", "sandbox positive capture probe", "--signal", "test",
+            "--source-ref", "session:fb-positive"],
+            { env: envWith({ ZMEM_DATA: HDATA }), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+        const sandboxAfter = countStoreRows(path.join(HDATA, "store.sqlite"));
+        ok("injection[capture-failure]: the sandbox store accepts captures (positive case)",
+            sandboxAfter > sandboxBefore, "sandbox rows before/after: " + sandboxBefore + " -> " + sandboxAfter);
     }
 
     // --- subagent-reflect: end-to-end (SubagentStop, subagent's own transcript) ---
@@ -1121,7 +1223,7 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("injection[subagent-reflect]: hook still renders the subagent reflection prompt",
             /subagent reflection/.test(ac), ac.slice(0, 300));
-        runSuggestedAndCheckCanary("subagent-reflect", ac, CANARY);
+        assertNoDefaultStoreLeak("subagent-reflect", () => runSuggestedAndCheckCanary("subagent-reflect", ac, CANARY, HDATA));
     }
 }
 

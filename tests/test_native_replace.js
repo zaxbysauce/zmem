@@ -46,7 +46,7 @@ function ok(name, cond, detail) {
 function envWith(overrides) {
     const e = { ...process.env };
     for (const k of [
-        "ZMEM_HOST", "ZMEM_ROOT", "ZMEM_DATA", "ZMEM_PROJECT", "ZMEM_SESSION",
+        "ZMEM_HOST", "ZMEM_ROOT", "ZMEM_DATA", "ZMEM_STORE", "ZMEM_PROJECT", "ZMEM_SESSION",
         "ZMEM_TRANSCRIPT", "ZMEM_AGENT_TYPE", "ZMEM_NAMESPACE", "ZMEM_SKILLS_DIRS",
         "ZMEM_TIER0", "ZMEM_CTX_BUDGET",
         "PLUGIN_ROOT", "PLUGIN_DATA", "CODEX_PROJECT_DIR",
@@ -104,7 +104,7 @@ const NS = resolveNs(PROJ);
 // file_existed already True and never re-triggers the hardening path.
 const TEMPLATE_DIR = fs.mkdtempSync(path.join(TMP, "template-store-"));
 execFileSync(PYTHON, [STORE_PY, "stats"], {
-    env: Object.assign({}, process.env, { ZMEM_DATA: TEMPLATE_DIR }),
+    env: envWith({ ZMEM_DATA: TEMPLATE_DIR }),
     encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
 });
 const TEMPLATE_STORE = path.join(TEMPLATE_DIR, "store.sqlite");
