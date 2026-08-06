@@ -53,7 +53,7 @@ store or host config. Checks:
 - Python version + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v5
+- schema compatibility against current v6
 - Claude/Codex native-memory conflicts via read-only config inspection
 - canonical namespace for the provided project
 - host surface presence (Claude plugin, ZCode plugin, memory skill; repo-local
@@ -140,10 +140,34 @@ ZCode skill directories. Promotion is never an unattended hook action.
 ```
 python <store.py> consolidate [--threshold 0.80] [--prune] [--dry-run] [--namespace NS]
 ```
-Clusters live memories by embedding cosine similarity, picks the strongest as
-keeper, merges metadata, and supersedes the rest with a persisted reason. Runs
-automatically on SessionStart when the store has grown >20% since the last run
-(min 7 days between runs). Use `--dry-run` to preview clusters without changes.
+Clusters live memories by embedding cosine similarity (Jaccard token overlap when
+embeddings are unavailable), picks a keeper, merges metadata, and supersedes the
+rest with a persisted reason. Runs automatically on SessionStart once 7 days
+have elapsed since the last run OR the live store has grown >20% since then (an
+automatic run is skipped only when the last run was <7 days ago AND growth was
+<20%; both bounds are env-tunable via `ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS` /
+`ZMEM_CONSOLIDATE_GROWTH_THRESHOLD`). Use `--dry-run` to preview clusters and the
+exact merge decision per row without mutating the store.
+
+Keeper selection: within a cluster, the survivor is the row with the highest
+`confidence * retrieval_count` product (ties broken by confidence, then earliest
+ingestion). Absorbed rows are NOT lost on merge: a near-duplicate that is not
+fully subsumed by the keeper has its ENTIRE text appended to the keeper's content
+(live-recallable + FTS-indexed), and its id is recorded in the keeper's
+`merged_from` provenance column, so consolidated memory is non-lossy. Note this
+is a whole-text append, not a unique-tail diff — a partially-overlapping row
+duplicates the span it already shares with the keeper (deliberate
+over-preservation, bounded by the size cap below). Reordered same-token phrasing
+(e.g. "call foo before bar" vs "call bar before foo") is likewise preserved as
+distinct content — only genuinely subsumed/duplicate text is omitted.
+
+Size cap: a keeper's content is never allowed to exceed
+`INGEST_MAX_CONTENT_CHARS` (the JSONL round-trip ceiling, 65536). An absorb that
+would push the keeper over the cap is NOT appended — its id is recorded with a
+`:truncated` marker in `merged_from` and the absorbed row is still superseded;
+that is the one bounded case where an absorbed row's text is not migrated live
+(it remains only in the tombstoned history row). `--dry-run` shows would-lose
+tokens for this case.
 `--prune` also removes low-value never-retrieved memories (opt-in, never automatic).
 
 Consolidation is **single-flighted**: concurrent runs (several sessions starting

@@ -553,7 +553,7 @@ class TestV5MigrationRefusesOnMissingCheckout(unittest.TestCase):
                 version_row = conn.execute(
                     "SELECT value FROM meta WHERE key='schema_version'"
                 ).fetchone()
-                self.assertEqual(version_row["value"], "5")
+                self.assertEqual(version_row["value"], str(store_mod.SUPPORTED_SCHEMA_VERSION))
 
                 migration_map = json.loads(
                     conn.execute(
@@ -618,7 +618,7 @@ class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
                 self.assertEqual(migration_map[old_ns], host.resolve_namespace(checkout))
             conn.close()
 
-    def test_schema_version_bumped_to_5(self):
+    def test_schema_version_bumped_after_migrate(self):
         with tempfile.TemporaryDirectory() as tmp:
             store_path = Path(tmp) / "store.sqlite"
             store_mod = _load_store_module(store_path)
@@ -628,7 +628,12 @@ class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
             row = conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
-            self.assertEqual(row["value"], "5")
+            # migrate() runs every version block up to the current supported
+            # version (v6 adds the merged_from consolidation-provenance column;
+            # see store.py migrate). The v5 namespace migration it includes is
+            # verified separately via the ns_migration_v5 meta key + namespace
+            # rekeying in the surrounding tests.
+            self.assertEqual(row["value"], str(store_mod.SUPPORTED_SCHEMA_VERSION))
             conn.close()
 
     def test_second_migrate_run_is_noop(self):
@@ -658,8 +663,9 @@ class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
                 "SELECT value FROM meta WHERE key='ns_migration_v5'"
             ).fetchone()["value"]
 
-            # Second run: schema_version already 5, so the v5 block must be a
-            # pure no-op — namespace and rollback map both unchanged.
+            # Second run: the v5 block must be a pure no-op — namespace and
+            # rollback map both unchanged. (schema_version is already at the
+            # final supported version after the first run.)
             with mock.patch.object(
                 store_mod,
                 "_NS_MIGRATION_CHECKOUTS",
@@ -679,7 +685,7 @@ class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
             version_row = conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
-            self.assertEqual(version_row["value"], "5")
+            self.assertEqual(version_row["value"], str(store_mod.SUPPORTED_SCHEMA_VERSION))
             conn.close()
 
 
@@ -823,15 +829,17 @@ class TestV5MigrationRetryAfterCheckoutAppears(unittest.TestCase):
     """
 
     def _seed_v5_store_with_a_stranded_row(self, store_mod, old_ns: str):
-        """A store already at schema_version 5 that still carries `old_ns` —
-        exactly the shape the original migration leaves behind when the mapped
-        checkout was missing at the time."""
+        """A store that has run the full migration suite (so it is at the
+        current supported schema_version) but still carries `old_ns` — exactly
+        the shape the original v5 migration leaves behind when the mapped
+        checkout was missing at the time. The version-INDEPENDENT retry pass
+        picks such rows up later."""
         conn = store_mod.connect()
         store_mod.init_db(conn)
         store_mod.migrate(conn)
         self.assertEqual(
             conn.execute("SELECT value FROM meta WHERE key='schema_version'")
-                .fetchone()["value"], "5")
+                .fetchone()["value"], str(store_mod.SUPPORTED_SCHEMA_VERSION))
         store_mod.add_memory(
             conn, namespace=old_ns, type_="fact",
             content="stranded row under an old-style namespace", signal="test",
@@ -868,10 +876,11 @@ class TestV5MigrationRetryAfterCheckoutAppears(unittest.TestCase):
                 conn.execute("SELECT value FROM meta WHERE key='ns_migration_v5'")
                     .fetchone()["value"])
             self.assertEqual(recorded[old_ns], expected)
-            # schema_version is untouched by the retry.
+            # schema_version is untouched by the retry (it stays at whatever the
+            # last full migrate() left it at — the current supported version).
             self.assertEqual(
                 conn.execute("SELECT value FROM meta WHERE key='schema_version'")
-                    .fetchone()["value"], "5")
+                    .fetchone()["value"], str(store_mod.SUPPORTED_SCHEMA_VERSION))
             conn.close()
 
     def test_retry_rekeys_tombstones_too(self):
