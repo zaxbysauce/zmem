@@ -169,7 +169,7 @@ SIGNAL_CONFIDENCE = {
 # them by writing straight into the table.
 ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
 ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
-SUPPORTED_SCHEMA_VERSION = 5
+SUPPORTED_SCHEMA_VERSION = 6
 SCHEMA_VERSION_KEY = "schema_version"
 
 CONFIDENCE_FLOOR = 0.25
@@ -459,7 +459,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             superseded_at   TEXT,
             ingestion_ts    TEXT NOT NULL,
             retrieval_count INTEGER NOT NULL DEFAULT 0,
-            last_retrieved  TEXT
+            last_retrieved  TEXT,
+            -- v6: consolidation provenance. Comma-joined ids of rows absorbed
+            -- into this keeper by consolidate() (appends across runs). A
+            -- `:truncated` marker after an id means that row's content could
+            -- not be appended (the keeper was already at the content-size cap)
+            -- the id is still recorded for traceability. Write-only provenance
+            -- today, queryable by users/future tooling. See _absorb_into_keeper.
+            merged_from     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory(namespace);
         CREATE INDEX IF NOT EXISTS idx_memory_live ON memory(superseded_at) WHERE superseded_at IS NULL;
@@ -768,6 +775,26 @@ def migrate(conn: sqlite3.Connection) -> None:
         # deliberately left untouched.
         _record_ns_migration(conn, migration_map, merge=False)
         conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+        conn.commit()
+
+    if ver < 6:
+        # v6: consolidation content-provenance (issue #19).
+        #
+        # consolidate() now PRESERVES information unique to an absorbed row by
+        # appending it to the keeper's content and recording the absorbed id in
+        # `merged_from` (previously the absorbed content was tombstoned and lost
+        # from live recall). This column is the queryable provenance trail of
+        # which rows were folded into a keeper.
+        #
+        # init_db() (which runs before migrate() on a fresh store) ALREADY
+        # creates this column and sets schema_version=1, so on a fresh store
+        # migrate() runs every version block 1->6 and this ALTER would hit an
+        # existing column. Guard with a table_info probe so the ALTER is a true
+        # no-op when the column already exists (idempotent on re-migrate too).
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+        if "merged_from" not in cols:
+            conn.execute("ALTER TABLE memory ADD COLUMN merged_from TEXT")
+        conn.execute("UPDATE meta SET value='6' WHERE key='schema_version'")
         conn.commit()
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
@@ -2269,6 +2296,162 @@ def _lexical_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
     return len(tokens_a & tokens_b) / len(union)
 
 
+def _normalize_text(text: str) -> str:
+    """Normalize text for substring/overlap comparison: collapse runs of
+    whitespace to a single space and strip+lowercase. Used by
+    _absorb_into_keeper to decide whether an absorbed row's content is already
+    represented in the keeper (so we don't duplicate exact-duplicate text) and
+    by the dry-run preview to label what would be lost."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _unique_tokens(text: str | None) -> set[str]:
+    """All ``[a-z0-9]+`` runs in ``text`` (lowercased), regardless of length.
+
+    Unlike ``_lexical_tokens`` (which drops tokens shorter than 3 chars and
+    stopwords for Jaccard CLUSTERING), this retains 1-2 char tokens — including
+    1-2 digit numbers, version codes, exit codes, IP fragments — so the
+    uniqueness check in ``_absorb_decision`` does not silently classify a row
+    that differs only in such tokens as "already represented" and lose them.
+    Reusing the clustering tokenizer for "what is unique about this row"
+    conflated "structurally significant for similarity" with "carries unique
+    information" (implementation-review finding #2)."""
+    return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+
+def _absorb_decision(keeper_content: str, absorbed_content: str, absorbed_id: str) -> dict:
+    """PURE decision: would `_absorb_into_keeper` append `absorbed_content` to a
+    keeper holding `keeper_content`, and what unique tokens would be gained?
+
+    Read-only and side-effect-free so the dry-run preview reports EXACTLY what
+    the real merge does (same predicate). Returns:
+      {"will_append": bool,
+       "reason": "unique"|"already-represented"|"size-cap"|"empty",
+       "new_tokens": list[str]}  # tokens in absorbed not in keeper
+    """
+    norm_keeper = _normalize_text(keeper_content)
+    norm_absorbed = _normalize_text(absorbed_content)
+
+    if not norm_absorbed:
+        return {"will_append": False, "reason": "empty", "new_tokens": []}
+    if norm_absorbed in norm_keeper:
+        # The absorbed row's text is fully contained in the keeper -> nothing
+        # unique to preserve. (Note: the REVERSE — keeper a substring of
+        # absorbed — is NOT already-represented: the absorbed row carries a
+        # longer text with a unique tail that must be preserved. Issue #19.)
+        return {"will_append": False, "reason": "already-represented", "new_tokens": []}
+
+    # Use the length-agnostic tokenizer (not the clustering tokenizer) so 1-2
+    # digit numbers / short codes that differ between rows count as unique
+    # information to preserve (implementation-review finding #2).
+    new_tokens = sorted(_unique_tokens(absorbed_content) - _unique_tokens(keeper_content))
+    if not new_tokens:
+        # No new tokens at all; don't append (avoid duplicating near-identical text).
+        return {"will_append": False, "reason": "already-represented", "new_tokens": []}
+
+    # Size cap (issue #19 critic finding #3): never let a merged keeper exceed
+    # INGEST_MAX_CONTENT_CHARS, or an export-jsonl -> ingest-jsonl round-trip
+    # would reject it (the ingest validator enforces this ceiling). Skip the
+    # content-append but still record the id (with a `:truncated` marker) and
+    # still run the metadata merge + supersede. Never truncate memory content
+    # mid-string (see the cap's own rationale at its definition).
+    #
+    # NOTE: this check is against the keeper content AS PASSED IN.
+    # _absorb_into_keeper re-reads the keeper's GROWN content from the DB before
+    # calling this, so in a multi-absorb cluster the cap (and the uniqueness
+    # check) are evaluated against content already grown by earlier absorbs in
+    # the same cluster — matching what the dry-run preview reports. This closes
+    # both the cumulative-cap-exceed path (implementation-review finding #1) and
+    # the stale-keeper-content path (final-critic finding #1).
+    separator = f"\n\n--- merged from {absorbed_id} ---\n"
+    projected = len(keeper_content) + len(separator) + len(absorbed_content)
+    if projected > INGEST_MAX_CONTENT_CHARS:
+        return {"will_append": False, "reason": "size-cap", "new_tokens": new_tokens}
+
+    return {"will_append": True, "reason": "unique", "new_tokens": new_tokens}
+
+
+def _absorb_into_keeper(
+    conn: sqlite3.Connection,
+    keeper: sqlite3.Row,
+    absorbed: sqlite3.Row,
+) -> dict:
+    """Fold ONE absorbed near-duplicate row into its cluster keeper (issue #19).
+
+    This is consolidate()-ONLY: it preserves information unique to the absorbed
+    row by appending that text to the keeper's content (so it stays
+    live-recallable and FTS-indexed) and recording the absorbed id in the
+    keeper's ``merged_from`` provenance column. The absorbed row is then
+    superseded (tombstoned, kept for history). Metadata (confidence/signal/tags)
+    is upgraded via the shared ``_merge_on_dedup``.
+
+    This is deliberately NOT ``_merge_on_dedup``: that helper is also the
+    write-time dedup path for ``add``/``ingest-jsonl``, where re-observing a
+    paraphrase must refresh metadata only -- growing content there would let
+    every re-add bloat a memory. Content preservation is a consolidate-only
+    concern (see issue #19 root cause).
+
+    MUST be called inside the caller's transaction (consolidate opens a
+    BEGIN/COMMIT per cluster); this helper never commits/rollbacks on its own.
+
+    Returns the dict from ``_absorb_decision`` (will_append / reason / new_tokens)
+    so the caller's bookkeeping reflects the real merge decision.
+    """
+    keeper_id = keeper["id"]
+    absorbed_content = absorbed["content"] or ""
+
+    # IMPORTANT (final-critic finding #1): decide against the keeper's content AS
+    # GROWN by earlier absorbs in this same cluster, not the seed row's original
+    # content. The seed row is fetched ONCE before the cluster loop, so
+    # `keeper["content"]` is stale for the 2nd+ absorb. Re-read the current
+    # keeper content from the DB each time (the prior _absorb_into_keeper
+    # updated it in-tx). This makes the real merge decide on the SAME input the
+    # dry-run accumulates, so the preview matches reality — and it prevents
+    # appending text already present in the grown keeper (which would both
+    # duplicate content and waste size-cap budget, the latter able to push a
+    # later genuinely-unique absorb to :truncated and back into issue #19's
+    # data-loss class).
+    cur = conn.execute("SELECT content FROM memory WHERE id=?", (keeper_id,)).fetchone()
+    keeper_content = cur["content"] if cur else (keeper["content"] or "")
+
+    decision = _absorb_decision(keeper_content, absorbed_content, absorbed["id"])
+    will_append = decision["will_append"]
+
+    if will_append:
+        # _absorb_decision already checked the size cap against the grown keeper
+        # content (re-read above), so the projection is current. Append.
+        separator = f"\n\n--- merged from {absorbed['id']} ---\n"
+        new_content = keeper_content + separator + absorbed_content
+        conn.execute("UPDATE memory SET content=? WHERE id=?", (new_content, keeper_id))
+
+    # Record provenance: append the absorbed id to merged_from (comma-joined,
+    # accumulates across runs). `:truncated` marks an id whose content could
+    # not be appended due to the size cap; the id is still recorded for
+    # traceability. Format is documented for future consumers.
+    marker = ":truncated" if decision["reason"] == "size-cap" else ""
+    id_entry = f"{absorbed['id']}{marker}"
+    row = conn.execute("SELECT merged_from FROM memory WHERE id=?", (keeper_id,)).fetchone()
+    existing = (row["merged_from"] if row and row["merged_from"] else "").strip()
+    merged_from = f"{existing},{id_entry}" if existing else id_entry
+    conn.execute("UPDATE memory SET merged_from=? WHERE id=?", (merged_from, keeper_id))
+
+    # Metadata upgrade (confidence/signal/tags + retrieval_count bump). Shared
+    # with write-time dedup semantics; no content change here.
+    _merge_on_dedup(conn, keeper_id, absorbed["confidence"], absorbed["signal"], absorbed["tags"])
+
+    # Tombstone the absorbed row (kept for history; removed from live recall).
+    conn.execute(
+        "UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?",
+        (now_iso(), f"consolidated into {keeper_id}", absorbed["id"]),
+    )
+    try:
+        conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (absorbed["id"],))
+    except sqlite3.OperationalError:
+        pass
+
+    return decision
+
+
 def consolidate(
     conn: sqlite3.Connection,
     *,
@@ -2282,9 +2465,27 @@ def consolidate(
 
     For each live memory with an embedding, query vec0 KNN for nearest neighbors.
     Cluster memories with cosine similarity >= threshold. For each cluster:
-    pick the keeper (highest confidence x retrieval_count), merge metadata
-    into the keeper, supersede the absorbed members. Each cluster commits
+    pick the keeper (highest confidence * retrieval_count), merge the absorbed
+    members into the keeper (preserving content unique to each absorbed row —
+    issue #19), and supersede the absorbed members. Each cluster commits
     atomically — interruption is safe because keeper selection is deterministic.
+
+    The keeper is chosen by the highest ``confidence * retrieval_count`` product.
+    Ties are broken by ``confidence`` DESC (so when every retrieval_count is 0 —
+    the common fresh-store case where the product is 0 for all rows — the
+    higher-confidence row still wins instead of the order becoming UUID-noise),
+    then earliest ``ingestion_ts``, then ``id`` for single-writer determinism.
+    The rows query below orders by exactly that key so the first row of a
+    cluster is the keeper. (Issue #19 defect 2: the previous ``ORDER BY
+    confidence DESC, retrieval_count DESC`` was lexicographic — confidence
+    dominated absolutely, contradicting the documented product rule and
+    destroying higher-product rows.)
+
+    Content preservation (issue #19 defect 1): an absorbed row's text is
+    appended to the keeper under a provenance separator (and its id recorded in
+    the keeper's ``merged_from`` column), so information unique to an absorbed
+    row stays live-recallable and FTS-indexed rather than being lost when the
+    absorbed row is tombstoned. See ``_absorb_into_keeper``.
 
     When embeddings are unavailable (no onnxruntime/tokenizers, or the model
     file is absent/not yet downloaded), clustering falls back to Jaccard
@@ -2349,11 +2550,12 @@ def consolidate(
     embed_clause = "" if use_lexical else "AND embedding IS NOT NULL"
     rows = conn.execute(
         f"""SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
-                  embedding, embedding_model
+                  embedding, embedding_model, ingestion_ts
            FROM memory
            WHERE superseded_at IS NULL {embed_clause}
            {ns_clause}
-           ORDER BY confidence DESC, retrieval_count DESC""",
+           ORDER BY confidence * retrieval_count DESC, confidence DESC,
+                    ingestion_ts ASC, id ASC""",
         ns_params,
     ).fetchall()
 
@@ -2459,7 +2661,8 @@ def consolidate(
                     # between a background (no --namespace) run and a
                     # cross-project merge.
                     row = conn.execute(
-                        "SELECT id, confidence, signal, tags, retrieval_count FROM memory "
+                        "SELECT id, confidence, signal, tags, retrieval_count, content "
+                        "FROM memory "
                         "WHERE id=? AND superseded_at IS NULL AND namespace=?",
                         (mid, seed["namespace"]),
                     ).fetchone()
@@ -2469,15 +2672,43 @@ def consolidate(
         if not neighbors:
             continue
 
-        # The seed is the keeper (it has the highest confidence x retrieval_count
-        # because we ordered by that). Merge each neighbor into it.
+        # The seed is the keeper. With the rows query ordered by
+        # (confidence * retrieval_count DESC, confidence DESC, ingestion_ts ASC,
+        # id ASC), the seed has the highest confidence*retrieval_count product
+        # in its cluster (and the highest confidence on a product tie — the
+        # fresh-store case where every retrieval_count is 0) — matching the
+        # documented keeper rule (issue #19 defect 2: previously the ORDER BY
+        # was lexicographic on confidence, contradicting the rule and destroying
+        # higher-product rows). Merge each neighbor into it.
         if dry_run:
             print(f"[zmem] DRY RUN: cluster around [{seed['id'][:8]}] "
-                  f"(conf={seed['confidence']}, rc={seed['retrieval_count']}):")
-            print(f"    keeper: {seed['content'][:80]}...")
+                  f"(conf={seed['confidence']}, rc={seed['retrieval_count']}, "
+                  f"prod={seed['confidence'] * seed['retrieval_count']:.2f}):")
+            print(f"    keeper: {seed['content']}")
+            # Dry-run uses the SAME decision predicate as the real merge, so the
+            # preview reflects what would actually happen (issue #19 defect 3:
+            # the previous dry-run only printed a cluster count, hiding the text
+            # that would be lost). Accumulate the keeper's grown content as we
+            # go so successive absorbs see the keeper as the real merge would.
+            dry_keeper_content = seed["content"] or ""
             for nb_row, nb_sim in neighbors:
+                dec = _absorb_decision(dry_keeper_content, nb_row["content"] or "", nb_row["id"])
                 print(f"    absorb [{nb_row['id'][:8]}] sim={nb_sim:.3f}: "
-                      f"conf={nb_row['confidence']} rc={nb_row['retrieval_count']}")
+                      f"conf={nb_row['confidence']} rc={nb_row['retrieval_count']} "
+                      f"prod={nb_row['confidence'] * nb_row['retrieval_count']:.2f}")
+                print(f"        content: {nb_row['content']}")
+                if dec["reason"] == "unique":
+                    print(f"        would APPEND (gains tokens: {dec['new_tokens']})")
+                    sep = f"\n\n--- merged from {nb_row['id']} ---\n"
+                    dry_keeper_content = dry_keeper_content + sep + (nb_row["content"] or "")
+                elif dec["reason"] == "size-cap":
+                    print(f"        size-cap: id recorded (:truncated); content NOT appended "
+                          f"(would exceed {INGEST_MAX_CONTENT_CHARS}). Would-lose tokens: "
+                          f"{dec['new_tokens']}")
+                elif dec["reason"] == "empty":
+                    print("        empty content; nothing to append (id recorded)")
+                else:
+                    print("        already represented in keeper; nothing to append")
                 absorbed.add(nb_row["id"])  # track in dry-run too
             merged_count += len(neighbors)
             continue
@@ -2486,18 +2717,9 @@ def consolidate(
         try:
             conn.execute("BEGIN")
             for nb_row, nb_sim in neighbors:
-                # Merge metadata into the keeper.
-                _merge_on_dedup(conn, seed["id"], nb_row["confidence"],
-                                nb_row["signal"], nb_row["tags"])
-                # Supersede the absorbed member.
-                conn.execute(
-                    "UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?",
-                    (now_iso(), f"consolidated into {seed['id']}", nb_row["id"]),
-                )
-                try:
-                    conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (nb_row["id"],))
-                except sqlite3.OperationalError:
-                    pass
+                # Preserve absorbed content + record provenance + merge metadata
+                # + supersede (issue #19). consolidate-ONLY helper.
+                _absorb_into_keeper(conn, seed, nb_row)
                 absorbed.add(nb_row["id"])
             # Mark the keeper as consolidated.
             conn.execute(
@@ -2506,8 +2728,18 @@ def consolidate(
             )
             conn.execute("COMMIT")
             merged_count += len(neighbors)
-        except Exception:
+        except Exception as exc:
+            # A per-cluster failure (e.g. a DB error mid-merge) rolls the whole
+            # cluster back and leaves its rows live to be re-clustered next run.
+            # Surface it to stderr so content preservation (issue #19) failing
+            # for a cluster is visible rather than silently voiding AC1 — the
+            # swallowed-exception catch is pre-existing, but the new multi-write
+            # _absorb_into_keeper enlarges what this transaction must succeed at
+            # (implementation-review finding #3).
             conn.execute("ROLLBACK")
+            print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] failed "
+                  f"({type(exc).__name__}: {exc}); rolled back, will retry next run",
+                  file=sys.stderr)
             continue
 
     # Optional prune: supersede low-value never-retrieved memories.
@@ -3619,7 +3851,7 @@ def cmd_export_jsonl(
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(
         f"""SELECT id, namespace, type, content, tags, source_ref, confidence, signal,
-                   valid_from, ingestion_ts, superseded_at, supersede_reason
+                   valid_from, ingestion_ts, superseded_at, supersede_reason, merged_from
             FROM memory {where}
             ORDER BY ingestion_ts, id""",
         params,
@@ -3640,6 +3872,7 @@ def cmd_export_jsonl(
             "ingestion_ts": r["ingestion_ts"],
             "superseded_at": r["superseded_at"],
             "supersede_reason": r["supersede_reason"],
+            "merged_from": r["merged_from"],
         }
         line = json.dumps(obj, ensure_ascii=False)
         # json.dumps already escapes every codepoint < 0x20 (\n, \r, and any
@@ -3815,6 +4048,7 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     valid_from = _opt_str("valid_from")
     ingestion_ts = _opt_str("ingestion_ts")
     superseded_at = _opt_str("superseded_at") or None
+    merged_from = _opt_str("merged_from") or None
 
     if not ingestion_ts:
         ingestion_ts = now_iso()
@@ -3840,6 +4074,7 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
         "valid_from": valid_from or ingestion_ts,
         "superseded_at": superseded_at,
         "supersede_reason": supersede_reason,
+        "merged_from": merged_from,
     }
 
 
@@ -3868,6 +4103,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
     valid_from = obj["valid_from"]
     superseded_at = obj["superseded_at"]
     supersede_reason = obj["supersede_reason"]
+    merged_from = obj.get("merged_from")
 
     started_tx = False
     try:
@@ -3908,11 +4144,11 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
                    (id, namespace, type, content, tags, source_ref, source_hash,
                     confidence, signal, valid_from, superseded_at, supersede_reason,
                     ingestion_ts, retrieval_count, last_retrieved,
-                    embedding, embedding_model, embedded_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL)""",
+                    embedding, embedding_model, embedded_at, merged_from)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL,?)""",
                 (mid, namespace, type_, content, tags, source_ref, shash,
                  confidence, signal, valid_from, superseded_at, supersede_reason,
-                 ingestion_ts),
+                 ingestion_ts, merged_from),
             )
             if started_tx:
                 _commit(conn)
@@ -3935,10 +4171,12 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
             """INSERT INTO memory
                (id, namespace, type, content, tags, source_ref, source_hash,
                 confidence, signal, valid_from, superseded_at, ingestion_ts,
-                retrieval_count, last_retrieved, embedding, embedding_model, embedded_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?)""",
+                retrieval_count, last_retrieved, embedding, embedding_model, embedded_at,
+                merged_from)
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?,?)""",
             (mid, namespace, type_, content, tags, source_ref, shash,
-             confidence, signal, valid_from, ingestion_ts, emb, emb_model, embedded_at),
+             confidence, signal, valid_from, ingestion_ts, emb, emb_model, embedded_at,
+             merged_from),
         )
         if emb is not None:
             try:
