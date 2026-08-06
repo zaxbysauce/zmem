@@ -169,7 +169,7 @@ SIGNAL_CONFIDENCE = {
 # them by writing straight into the table.
 ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
 ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
-SUPPORTED_SCHEMA_VERSION = 6
+SUPPORTED_SCHEMA_VERSION = 7
 SCHEMA_VERSION_KEY = "schema_version"
 
 CONFIDENCE_FLOOR = 0.25
@@ -460,6 +460,16 @@ def init_db(conn: sqlite3.Connection) -> None:
             ingestion_ts    TEXT NOT NULL,
             retrieval_count INTEGER NOT NULL DEFAULT 0,
             last_retrieved  TEXT,
+            -- v7 (issue #21): passive/hook-driven surface telemetry. Hook recall passes
+            -- `--no-bump`, which must NOT advance retrieval_count (write contention under
+            -- subagent fan-out, PLAN.md §5) but SHOULD record that the memory was surfaced
+            -- into context. Per recall event exactly ONE of retrieval_count / surfaced_count
+            -- advances, so retrieval_count + surfaced_count is a non-double-counted "times
+            -- surfaced" metric. Explicit skill-invoked recall bumps retrieval_count; passive
+            -- (--no-bump) recall bumps surfaced_count. Consumers that rank by usefulness
+            -- (promote, consolidate keeper/prune, recall popularity, export-pack) blend the two.
+            surfaced_count INTEGER NOT NULL DEFAULT 0,
+            last_surfaced  TEXT,
             -- v6: consolidation provenance. Comma-joined ids of rows absorbed
             -- into this keeper by consolidate() (appends across runs). A
             -- `:truncated` marker after an id means that row's content could
@@ -795,6 +805,24 @@ def migrate(conn: sqlite3.Connection) -> None:
         if "merged_from" not in cols:
             conn.execute("ALTER TABLE memory ADD COLUMN merged_from TEXT")
         conn.execute("UPDATE meta SET value='6' WHERE key='schema_version'")
+        conn.commit()
+
+    if ver < 7:
+        # v7 (issue #21): passive surface telemetry.
+        #
+        # Hook-driven recall passes `--no-bump` and never advanced retrieval_count, so the
+        # ONLY usefulness signal (retrieval_count) was biased toward explicit/manual use and
+        # promote/prune decisions rested on incomplete data. Add surfaced_count/last_surfaced,
+        # the counter that passive (`--no-bump`) recall IS allowed to advance. Same pattern as
+        # the v6 block above: init_db() already creates these columns on a fresh store (and sets
+        # schema_version=1, so migrate() walks 1->7), so guard the ALTER with a table_info probe
+        # to keep it a true no-op when they already exist (idempotent on re-migrate too).
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+        if "surfaced_count" not in cols:
+            conn.execute("ALTER TABLE memory ADD COLUMN surfaced_count INTEGER NOT NULL DEFAULT 0")
+        if "last_surfaced" not in cols:
+            conn.execute("ALTER TABLE memory ADD COLUMN last_surfaced TEXT")
+        conn.execute("UPDATE meta SET value='7' WHERE key='schema_version'")
         conn.commit()
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
@@ -1370,6 +1398,30 @@ def _parse_iso_to_epoch(ts: str) -> float:
         return 0.0
 
 
+def _uses_count(row: sqlite3.Row | dict) -> int:
+    """Total times a memory was surfaced into context = retrieval_count + surfaced_count.
+
+    Issue #21: the two counters are mutually exclusive per recall event (explicit recall
+    bumps retrieval_count, passive `--no-bump` recall bumps surfaced_count), so their sum
+    is a non-double-counted usefulness metric. Used everywhere retrieval_count was
+    previously the SOLE usefulness signal.
+
+    Compute score accepts sqlite3.Row OR dict; both raise (KeyError / IndexError / absent
+    column) on a missing/mismatched key, so default to 0 via try/except — not dict-style
+    `.get`, which sqlite3.Row does not have.
+    """
+    total = 0
+    try:
+        total += int(row["retrieval_count"] or 0)
+    except (KeyError, IndexError, TypeError):
+        pass
+    try:
+        total += int(row["surfaced_count"] or 0)
+    except (KeyError, IndexError, TypeError):
+        pass
+    return total
+
+
 def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: float,
                   vec_sim: float | None = None) -> float:
     """Composite score: BM25 relevance + confidence boost + recency + popularity.
@@ -1399,8 +1451,10 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
     else:
         recency = 0.5  # unknown age — neutral
 
-    # Popularity component: retrieval_count with diminishing returns.
-    rc = int(row["retrieval_count"]) if row["retrieval_count"] is not None else 0
+    # Popularity component: total surface events (retrieval_count + surfaced_count)
+    # with diminishing returns — blends the passive signals that retrieval_count alone
+    # missed (issue #21).
+    rc = _uses_count(row)
     popularity = min(1.0, 0.15 * (rc ** 0.5))
 
     return (
@@ -1489,7 +1543,7 @@ def _fetch_by_ids(
     sql = f"""
         SELECT id, namespace, type, content, tags, source_ref,
                source_hash, confidence, signal, valid_from,
-               ingestion_ts, retrieval_count, last_retrieved,
+               ingestion_ts, retrieval_count, surfaced_count, last_retrieved,
                NULL AS fts_rank
         FROM memory
         WHERE id IN ({placeholders})
@@ -1548,7 +1602,7 @@ def _recall_one_tier(
         sql = f"""
             SELECT m.id, m.namespace, m.type, m.content, m.tags, m.source_ref,
                    m.source_hash, m.confidence, m.signal, m.valid_from,
-                   m.ingestion_ts, m.retrieval_count, m.last_retrieved,
+                   m.ingestion_ts, m.retrieval_count, m.surfaced_count, m.last_retrieved,
                    rank AS fts_rank
             FROM memory_fts f
             JOIN memory m ON m.rowid = f.rowid
@@ -1678,6 +1732,32 @@ def _merge_tiers(
     return results
 
 
+def _bump_telemetry(conn: sqlite3.Connection, ids: list[str], *, no_bump: bool) -> None:
+    """Record recall/recent/search telemetry for the returned ids.
+
+    Issue #21: the two counters are mutually exclusive PER EVENT. Explicit recall
+    (no_bump=False) advances retrieval_count/last_retrieved — the "deliberate fetch"
+    signal. Passive (`--no-bump`) recall advances surfaced_count/last_surfaced — the
+    "was surfaced into context" signal that hook-driven recall previously failed to
+    record (so promote/prune/ranking inherited a manual-only bias). Their sum is the
+    non-double-counted "times surfaced" metric (see _uses_count).
+    """
+    placeholders = ",".join("?" * len(ids))
+    if no_bump:
+        conn.execute(
+            f"UPDATE memory SET surfaced_count=surfaced_count+1, last_surfaced=? "
+            f"WHERE id IN ({placeholders})",
+            [now_iso(), *ids],
+        )
+    else:
+        conn.execute(
+            f"UPDATE memory SET retrieval_count=retrieval_count+1, last_retrieved=? "
+            f"WHERE id IN ({placeholders})",
+            [now_iso(), *ids],
+        )
+    _commit(conn)
+
+
 def recall_memory(
     conn: sqlite3.Connection,
     *,
@@ -1693,11 +1773,12 @@ def recall_memory(
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
-    When ``no_bump`` is True the retrieval_count / last_retrieved telemetry write
-    is suppressed, making recall READ-ONLY. Hook-driven recall (UserPromptSubmit,
-    SubagentStart) passes this so heavy subagent fan-out does not turn every
-    delegated agent into a concurrent writer on the shared store (PLAN.md §5).
-    Explicit skill-invoked recall keeps the default (bumps).
+    When ``no_bump`` is True the retrieval_count / last_retrieved write is suppressed —
+    recall instead records the passive *surface* on surfaced_count / last_surfaced
+    (issue #21). Hook-driven recall (UserPromptSubmit, SubagentStart) passes this so heavy
+    subagent fan-out does not turn every delegated agent into a concurrent
+    retrieval_count writer on the shared store (PLAN.md §5), while the surface event is
+    still counted. Explicit skill-invoked recall keeps the default (bumps retrieval_count).
 
     Candidates are fetched via FTS5 BM25, then re-ranked by a composite score
     that incorporates BM25 relevance, confidence, recency decay, and retrieval
@@ -1758,15 +1839,9 @@ def recall_memory(
     else:
         results = [item for _score, item in project_scored[:limit]]
 
-    if results and not no_bump:
+    if results:
         ids = [r["id"] for r in results]
-        placeholders = ",".join("?" * len(ids))
-        conn.execute(
-            f"UPDATE memory SET retrieval_count=retrieval_count+1, last_retrieved=? "
-            f"WHERE id IN ({placeholders})",
-            [now_iso(), *ids],
-        )
-        _commit(conn)
+        _bump_telemetry(conn, ids, no_bump=no_bump)
 
     if as_json:
         print(json.dumps(results, indent=2))
@@ -1853,10 +1928,11 @@ def recent_memory(
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
-    When ``no_bump`` is True the retrieval_count / last_retrieved telemetry write
-    is suppressed (READ-ONLY). Hook-driven subagent recall passes this so a
-    dispatch fan-out does not make every subagent a concurrent writer on the
-    shared store (PLAN.md §5).
+    When ``no_bump`` is True the retrieval_count / last_retrieved write is suppressed —
+    recent instead records the passive *surface* on surfaced_count / last_surfaced
+    (issue #21). Hook-driven subagent recall passes this so a dispatch fan-out does not
+    make every subagent a concurrent retrieval_count writer on the shared store
+    (PLAN.md §5), while the surface event is still counted.
 
     When ``include_global`` is True and ``namespace`` is set to something other
     than ``GLOBAL_NAMESPACE`` ("user:global"), the result ALSO includes up to
@@ -1893,15 +1969,9 @@ def recent_memory(
                 seen.add(r["id"])
 
     results = project_rows
-    if results and not no_bump:
+    if results:
         ids = [r["id"] for r in results]
-        placeholders = ",".join("?" * len(ids))
-        conn.execute(
-            f"UPDATE memory SET retrieval_count=retrieval_count+1, last_retrieved=? "
-            f"WHERE id IN ({placeholders})",
-            [now_iso(), *ids],
-        )
-        _commit(conn)
+        _bump_telemetry(conn, ids, no_bump=no_bump)
     if as_json:
         print(json.dumps(results, indent=2))
     else:
@@ -2020,7 +2090,11 @@ def get_memory(conn, mid):
 
 # --- Skill promotion (T3.1) ---
 PROMOTE_CONFIDENCE_FLOOR = 0.85
-PROMOTE_RETRIEVAL_FLOOR = 3
+# Issue #21: eligibility uses TOTAL surface events (retrieval_count + surfaced_count),
+# not retrieval_count alone. A grounded lesson surfaced many times only by the hook
+# path (retrieval_count=0) must remain promotable — it is clearly useful, just never
+# explicitly fetched.
+PROMOTE_USE_FLOOR = 3
 PROMOTE_SIGNALS = ("test", "compile", "lint")
 PROMOTION_REVIEW_DIRNAME = "promotion-candidates"
 
@@ -2110,9 +2184,11 @@ def promote_memory(
     """Promote high-confidence lessons to reusable SKILL.md files.
 
     Candidates: type=lesson, signal in (test/compile/lint), confidence>=0.85,
-    retrieval_count>3, not superseded. Does NOT supersede the source lesson —
-    the lesson and the skill coexist (the lesson costs ~200 bytes; if the skill
-    description fails to trigger, the lesson is still in recall).
+    total surface events (retrieval_count + surfaced_count) > PROMOTE_USE_FLOOR,
+    not superseded. Does NOT supersede the source lesson — the lesson and the
+    skill coexist (the lesson costs ~200 bytes; if the skill description fails
+    to trigger, the lesson is still in recall). Ranking blends surfaced + retrieval
+    activity so hook-surfaced-only lessons (retrieval_count=0) stay promotable (issue #21).
 
     Human-in-the-loop: --dry-run shows candidates, the generated review-candidate
     path, and the eventual install targets. `--id <uuid> --confirm` writes only
@@ -2125,22 +2201,22 @@ def promote_memory(
     ns_params = [namespace] if namespace else []
     candidates = conn.execute(
         f"""SELECT id, namespace, type, content, tags, confidence, signal,
-                  retrieval_count, valid_from
+                  retrieval_count, surfaced_count, valid_from
            FROM memory
            WHERE superseded_at IS NULL
              AND type = 'lesson'
              AND signal IN ('test', 'compile', 'lint')
              AND confidence >= ?
-             AND retrieval_count > ?
+             AND (retrieval_count + surfaced_count) > ?
              {ns_clause}
-           ORDER BY retrieval_count DESC, confidence DESC""",
-        [PROMOTE_CONFIDENCE_FLOOR, PROMOTE_RETRIEVAL_FLOOR] + ns_params,
+           ORDER BY (retrieval_count + surfaced_count) DESC, confidence DESC""",
+        [PROMOTE_CONFIDENCE_FLOOR, PROMOTE_USE_FLOOR] + ns_params,
     ).fetchall()
 
     if not candidates and not memory_id:
         # Only short-circuit when we're *surveying*. An explicit --id is a
         # human override that does its own live-row lookup below and is not
-        # bound by the candidate bar (signal/confidence/retrieval_count), so
+        # bound by the candidate bar (signal/confidence/total surface events), so
         # returning here would swallow it — an unknown id would print
         # "no promotion candidates found" and exit 0, i.e. a refusal reported
         # as success, which is exactly what the --confirm gate exists to stop.
@@ -2155,8 +2231,9 @@ def promote_memory(
         for c in candidates:
             skill_name = _slugify_skill_name(c["tags"], c["id"])
             review_skill = review_root / f"{skill_name}-{c['id'][:8]}" / "SKILL.md"
-            print(f"\n  [{c['id'][:8]}] (rc={c['retrieval_count']}, conf={c['confidence']}, "
-                  f"signal={c['signal']})")
+            print(f"\n  [{c['id'][:8]}] (rc={c['retrieval_count']}, sc={c['surfaced_count']}, "
+                  f"uses={c['retrieval_count'] + c['surfaced_count']}, "
+                  f"conf={c['confidence']}, signal={c['signal']})")
             print(f"    content: {c['content'][:80]}...")
             print(f"    tags: {c['tags']}")
             print(f"    description would be: {_synthesize_trigger_description(c['tags'], c['content'])}")
@@ -2223,8 +2300,9 @@ Use when working with: {trigger_contexts}.
 {row['content']}
 
 ## Source
-- Promoted from zmem lesson `{row['id']}` (retrieval_count={row['retrieval_count']},
-  signal={row['signal']}, confidence={row['confidence']})
+- Promoted from zmem lesson `{row['id']}` (surfaced_count={row['surfaced_count']},
+  retrieval_count={row['retrieval_count']}, signal={row['signal']},
+  confidence={row['confidence']})
 - Namespace: {row['namespace']}
 - Tags: {tags_str}
 """
@@ -2486,14 +2564,16 @@ def consolidate(
 
     For each live memory with an embedding, query vec0 KNN for nearest neighbors.
     Cluster memories with cosine similarity >= threshold. For each cluster:
-    pick the keeper (highest confidence * retrieval_count), merge the absorbed
+    pick the keeper (highest confidence * total surface events, where total surface
+    events = retrieval_count + surfaced_count — issue #21), merge the absorbed
     members into the keeper (preserving content unique to each absorbed row —
     issue #19), and supersede the absorbed members. Each cluster commits
     atomically — interruption is safe because keeper selection is deterministic.
 
-    The keeper is chosen by the highest ``confidence * retrieval_count`` product.
-    Ties are broken by ``confidence`` DESC (so when every retrieval_count is 0 —
-    the common fresh-store case where the product is 0 for all rows — the
+    The keeper is chosen by the highest ``confidence * (retrieval_count +
+    surfaced_count)`` product — total surface events, blend-aware for hook-surfaced
+    memories (issue #21). Ties are broken by ``confidence`` DESC (so when every count
+    is 0 — the common fresh-store case where the product is 0 for all rows — the
     higher-confidence row still wins instead of the order becoming UUID-noise),
     then earliest ``ingestion_ts``, then ``id`` for single-writer determinism.
     The rows query below orders by exactly that key so the first row of a
@@ -2514,8 +2594,11 @@ def consolidate(
     instead of cosine — same keeper/merge/supersede mechanics, just a coarser
     similarity signal. `consolidate` never hard-requires the model.
 
-    If prune=True, also supersede memories with retrieval_count=0, signal=none,
-    and age>30d (opt-in, never automatic on SessionStart).
+    If prune=True, also supersede memories that were NEVER surfaced and NEVER
+    retrieved — retrieval_count=0 AND surfaced_count=0, signal=none, confidence<0.35,
+    age>30d (opt-in, never automatic on SessionStart). A memory surfaced by the hook
+    path (surfaced_count>0) is protected: `retrieval_count = 0` alone is NOT evidence
+    of unused (issue #21).
     """
     use_lexical = not (_embeddings and _embeddings.is_available())
     if use_lexical:
@@ -2571,11 +2654,11 @@ def consolidate(
     embed_clause = "" if use_lexical else "AND embedding IS NOT NULL"
     rows = conn.execute(
         f"""SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
-                  embedding, embedding_model, ingestion_ts
+                  surfaced_count, embedding, embedding_model, ingestion_ts
            FROM memory
            WHERE superseded_at IS NULL {embed_clause}
            {ns_clause}
-           ORDER BY confidence * retrieval_count DESC, confidence DESC,
+           ORDER BY confidence * (retrieval_count + surfaced_count) DESC, confidence DESC,
                     ingestion_ts ASC, id ASC""",
         ns_params,
     ).fetchall()
@@ -2682,7 +2765,8 @@ def consolidate(
                     # between a background (no --namespace) run and a
                     # cross-project merge.
                     row = conn.execute(
-                        "SELECT id, confidence, signal, tags, retrieval_count, content "
+                        "SELECT id, confidence, signal, tags, retrieval_count, "
+                        "surfaced_count, content "
                         "FROM memory "
                         "WHERE id=? AND superseded_at IS NULL AND namespace=?",
                         (mid, seed["namespace"]),
@@ -2694,17 +2778,20 @@ def consolidate(
             continue
 
         # The seed is the keeper. With the rows query ordered by
-        # (confidence * retrieval_count DESC, confidence DESC, ingestion_ts ASC,
-        # id ASC), the seed has the highest confidence*retrieval_count product
-        # in its cluster (and the highest confidence on a product tie — the
-        # fresh-store case where every retrieval_count is 0) — matching the
-        # documented keeper rule (issue #19 defect 2: previously the ORDER BY
-        # was lexicographic on confidence, contradicting the rule and destroying
-        # higher-product rows). Merge each neighbor into it.
+        # (confidence * (retrieval_count + surfaced_count) DESC, confidence DESC,
+        # ingestion_ts ASC, id ASC), the seed has the highest
+        # confidence*total-uses product in its cluster (and the highest confidence
+        # on a product tie — the fresh-store case where every count is 0) — matching
+        # the documented keeper rule, now blend-aware for hook-surfaced memories
+        # (issue #21; issue #19 defect 2: previously the ORDER BY was lexicographic
+        # on confidence, contradicting the rule and destroying higher-product rows).
+        # Merge each neighbor into it.
         if dry_run:
+            seed_uses = (seed["retrieval_count"] or 0) + (seed["surfaced_count"] or 0)
             print(f"[zmem] DRY RUN: cluster around [{seed['id'][:8]}] "
                   f"(conf={seed['confidence']}, rc={seed['retrieval_count']}, "
-                  f"prod={seed['confidence'] * seed['retrieval_count']:.2f}):")
+                  f"sc={seed['surfaced_count']}, "
+                  f"prod={seed['confidence'] * seed_uses:.2f}):")
             print(f"    keeper: {seed['content']}")
             # Dry-run uses the SAME decision predicate as the real merge, so the
             # preview reflects what would actually happen (issue #19 defect 3:
@@ -2716,7 +2803,7 @@ def consolidate(
                 dec = _absorb_decision(dry_keeper_content, nb_row["content"] or "", nb_row["id"])
                 print(f"    absorb [{nb_row['id'][:8]}] sim={nb_sim:.3f}: "
                       f"conf={nb_row['confidence']} rc={nb_row['retrieval_count']} "
-                      f"prod={nb_row['confidence'] * nb_row['retrieval_count']:.2f}")
+                      f"prod={nb_row['confidence'] * ((nb_row['retrieval_count'] or 0) + (nb_row['surfaced_count'] or 0)):.2f}")
                 print(f"        content: {nb_row['content']}")
                 if dec["reason"] == "unique":
                     if dec["new_tokens"]:
@@ -2768,12 +2855,15 @@ def consolidate(
                   file=sys.stderr)
             continue
 
-    # Optional prune: supersede low-value never-retrieved memories.
+    # Optional prune: supersede low-value memories that were NEVER surfaced and NEVER
+    # retrieved. `surfaced_count = 0` is required so a hook-surfaced memory (issue #21)
+    # is protected — `retrieval_count = 0` alone is NOT evidence of unused.
     if prune:
         prune_rows = conn.execute(
             f"""SELECT id, content FROM memory
                WHERE superseded_at IS NULL
                  AND retrieval_count = 0
+                 AND surfaced_count = 0
                  AND signal = 'none'
                  AND confidence < 0.35
                  AND ingestion_ts < datetime('now', '-30 days')
@@ -3743,7 +3833,8 @@ def _pack_query(conn: sqlite3.Connection, namespace: str, limit: int, min_confid
     return conn.execute(
         """SELECT type, signal, content FROM memory
            WHERE namespace=? AND superseded_at IS NULL AND confidence >= ?
-           ORDER BY confidence DESC, retrieval_count DESC, ingestion_ts DESC
+           ORDER BY confidence DESC, (retrieval_count + surfaced_count) DESC,
+                    ingestion_ts DESC
            LIMIT ?""",
         (namespace, min_confidence, limit),
     ).fetchall()
@@ -4457,9 +4548,10 @@ def main():
     p_recall.add_argument("--hybrid", action="store_true",
                           help="use hybrid BM25+vector recall (requires onnxruntime)")
     p_recall.add_argument("--no-bump", action="store_true",
-                          help="suppress the retrieval_count/last_retrieved write "
-                               "(READ-ONLY recall; used by hook-driven recall so "
-                               "subagent fan-out does not create N concurrent writers)")
+                          help="suppress the retrieval_count/last_retrieved write; record "
+                               "surfaced_count/last_surfaced instead (passive recall, used "
+                               "by hook-driven recall so subagent fan-out does not create N "
+                               "concurrent retrieval_count writers — issue #21)")
     p_recall.add_argument("--include-global", action="store_true",
                           help="also surface user:global rows (project-first merge; "
                                "a global row never crowds out a project row). The "
@@ -4475,8 +4567,9 @@ def main():
     p_recent.add_argument("--min-confidence", type=float, default=0.5)
     p_recent.add_argument("--json", action="store_true")
     p_recent.add_argument("--no-bump", action="store_true",
-                          help="suppress the retrieval_count/last_retrieved write "
-                               "(READ-ONLY; used by hook-driven subagent recall)")
+                          help="suppress the retrieval_count/last_retrieved write; record "
+                               "surfaced_count/last_surfaced instead (passive recent, used "
+                               "by hook-driven subagent recall — issue #21)")
     p_recent.add_argument("--include-global", action="store_true",
                           help="also surface user:global rows (project-first merge). "
                                "The automatic hooks pass this so cross-project "
@@ -4498,9 +4591,10 @@ def main():
                           help="max user:global rows when --include-global is set "
                                f"(default 3). No effect without --include-global.")
     p_search.add_argument("--no-bump", action="store_true",
-                          help="suppress the retrieval_count/last_retrieved write "
-                               "(READ-ONLY search). Search defaults to bumping like "
-                               "recall; pass this for a read-only query.")
+                          help="suppress the retrieval_count/last_retrieved write; record "
+                               "surfaced_count/last_surfaced instead (passive search). Search "
+                               "defaults to bumping retrieval like recall; pass this for an "
+                               "audit query that still counts the surface — issue #21")
 
     p_sup = sub.add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
@@ -4694,6 +4788,17 @@ def main():
     writer_lease = None
     if (
         args.cmd in {"add", "supersede", "rebuild-fts", "reembed", "ingest-jsonl"}
+        # recall/recent/search DO write on the `--no-bump` path now that it records a
+        # surface (issue #21), but they must NOT take a writer lease when passive:
+        # the SubagentStart/UserPromptSubmit/prefetch hook fires at high fan-out, and
+        # _acquire_writer_lease() would put a host-lock `_wait_for_maintenance_clear`
+        # (up to MAINTENANCE_WAIT_SECONDS) on every hot-path recall — the hot-path
+        # latency/write-contention PLAN.md §5 and the issue's "bounded" guidance exist
+        # to avoid. The dispatch ALREADY runs `_wait_for_maintenance_clear` before
+        # connect for every command (incl. no_bump recall), so a passive writer cannot
+        # START during an active restore; the residual mid-flight window is fail-open
+        # (lost surface telemetry on POSIX, clean restore refusal on Windows), never
+        # corruption. See issue #21 implementation-review closure.
         or (args.cmd == "recall" and not args.no_bump)
         or (args.cmd == "recent" and not args.no_bump)
         or (args.cmd == "search" and not args.no_bump)

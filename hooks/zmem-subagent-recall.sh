@@ -17,8 +17,9 @@
 # exactly the query-less `recent` pull session-start already uses for Tier 2.
 # agent_type only biases the header label (kept simple, no query machinery).
 #
-# READ-ONLY (CRITIC 6): recall runs with `--no-bump` so a dispatch fan-out does
-# NOT turn N subagents into N concurrent writers on the shared store.
+# PASSIVE (CRITIC 6 / issue #21): recall runs with `--no-bump` so a dispatch fan-out
+# does NOT turn N subagents into N concurrent retrieval_count writers on the shared
+# store; the surface event is still recorded on surfaced_count.
 #
 # Envelope: emits a bare {"additionalContext": …} wrapped in the
 # <<<ZMEM_JSON>>>…<<<END>>> sentinel. The host adapter (zmem-launch.js) extracts
@@ -137,7 +138,8 @@ BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 
 # Build the recall payload. A single python process pulls recent high-confidence
 # memories from the subagent's namespace AND the user:global tier in ONE
-# `recent` call (--include-global), READ-ONLY via --no-bump. The store does the
+# `recent` call (--include-global), PASSIVE via --no-bump (surface counted, retrieval
+# not bumped — issue #21). The store does the
 # project-first merge and id dedup, so this is now one subprocess instead of the
 # old two-pull shell bridge (issue #18). Result is byte-equivalent to the old
 # bridge: up to 5 namespace rows then up to 3 user:global rows, deduped.
@@ -160,7 +162,8 @@ if not store_py or not os.path.isfile(store_py):
     emit({})
 
 def recent(namespace, limit, global_limit):
-    """READ-ONLY recent pull for a namespace + the user:global tier (fail-open to []).
+    """PASSIVE recent pull (records a surface, does not bump retrieval) for a namespace
+    + the user:global tier (fail-open to []).
 
     --include-global folds the user:global tier into one call with a per-tier
     budget; the store merges project-first and dedups by id. When namespace IS
@@ -172,7 +175,7 @@ def recent(namespace, limit, global_limit):
             [sys.executable, store_py, "recent",
              "--namespace", namespace, "--limit", str(limit),
              "--include-global", "--global-limit", str(global_limit),
-             "--min-confidence", "0.5", "--no-bump", "--json"],
+             "--min-confidence", "0.5", "--no-bump", "--json"],  # passive: surface not retrieval
             stderr=subprocess.DEVNULL, timeout=10,
         ).decode("utf-8", "replace")
         return json.loads(out) if out.strip() else []

@@ -155,7 +155,7 @@ try:
          "--limit", "5",
          "--include-global",  # surface cross-project user:global lessons (issue #18)
          "--global-limit", "3",  # per-tier budget: global cannot crowd out project
-         "--no-bump",  # READ-ONLY: hook-driven recall must not write (PLAN.md §5)
+         "--no-bump",  # passive: retr not bumped; records surfaced (issue #21, PLAN.md §5)
          "--json"],
         stderr=subprocess.DEVNULL, timeout=10,
     ).decode("utf-8", "replace")

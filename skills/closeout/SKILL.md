@@ -58,9 +58,9 @@ Three outcomes, and they lead to different actions:
   honest.
 - **Not there** → capture it (Step 2).
 
-`--no-bump` keeps this audit from inflating retrieval counts, which feed
-promotion ranking. `--hybrid` blends vector and keyword matching so you find
-near-misses phrased differently from your query.
+`--no-bump` keeps this audit from inflating retrieval counts (it records a passive
+*surface* on `surfaced_count`, not a retrieval — issue #21). `--hybrid` blends vector
+and keyword matching so you find near-misses phrased differently from your query.
 
 ## Step 2 — Capture, with a hard bar
 
@@ -139,12 +139,19 @@ glance. If the clusters look right:
 python "$S" consolidate
 ```
 
-Pruning low-value, never-retrieved rows is opt-in and destructive-ish; inspect
+Pruning low-value, never-surfaced, never-retrieved rows is opt-in and destructive-ish; inspect
 first and only proceed if they are genuinely noise:
 
 ```bash
 python "$S" consolidate --prune --dry-run
 ```
+
+**`retrieval_count = 0` is NOT evidence a memory is unused.** Since hook-driven recall is
+passive (`--no-bump`) and records the surface on `surfaced_count` (issue #21), a memory
+surfaced into context on every prompt still shows `retrieval_count = 0`. `consolidate --prune`
+only retires rows with BOTH `retrieval_count = 0` AND `surfaced_count = 0` (plus low
+confidence, old age, `signal = none`) — do not hand-prune on `retrieval_count` alone, and do
+not read `retrieval_count = 0` as "dead weight".
 
 ## Step 5 — Review promotion candidates
 
@@ -188,6 +195,9 @@ not skipped.
 - Never put secrets, credentials, tokens, or PII in the store — it is local
   plaintext and the write-time scanner is advisory only.
 - Never inflate a signal to make a lesson look promotable.
+- Never treat `retrieval_count = 0` as evidence a memory is unused — hook-surfaced
+  memories carry their count on `surfaced_count`; base prune/rank decisions on both
+  (issue #21).
 - Never capture in-trajectory refinement ("first tried X, then Y") — capture
   only the conclusion that would help next time.
 - Never write to `tasks/<slug>/*.md` or `issue-traces/<issue>/*.md` from here;

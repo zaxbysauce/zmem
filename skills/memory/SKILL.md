@@ -116,8 +116,9 @@ python <store.py> stats
 `recent`/`search` accept the same `--include-global`/`--global-limit` pair as
 `recall` (project-first global tier union). `recent` now ALSO honours v5
 migration aliases (so `recent --namespace <old pre-v5 key>` finds rows migrated
-to the new key). `search` now accepts `--no-bump` for read-only queries (it
-defaults to bumping like `recall`).
+to the new key). `search` now accepts `--no-bump` for a *passive* query that records a
+surface on `surfaced_count` (never advancing `retrieval_count`) instead of bumping like
+`recall` (issue #21).
 
 ### reembed — backfill semantic embeddings
 ```
@@ -150,8 +151,9 @@ automatic run is skipped only when the last run was <7 days ago AND growth was
 exact merge decision per row without mutating the store.
 
 Keeper selection: within a cluster, the survivor is the row with the highest
-`confidence * retrieval_count` product (ties broken by confidence, then earliest
-ingestion). Absorbed rows are NOT lost on merge: a near-duplicate that is not
+`confidence * (retrieval_count + surfaced_count)` product — total surface events,
+blend-aware for hook-surfaced memories (ties broken by confidence, then earliest
+ingestion) (issue #21). Absorbed rows are NOT lost on merge: a near-duplicate that is not
 fully subsumed by the keeper has its ENTIRE text appended to the keeper's content
 (live-recallable + FTS-indexed), and its id is recorded in the keeper's
 `merged_from` provenance column, so consolidated memory is non-lossy. Note this
@@ -168,7 +170,10 @@ would push the keeper over the cap is NOT appended — its id is recorded with a
 that is the one bounded case where an absorbed row's text is not migrated live
 (it remains only in the tombstoned history row). `--dry-run` shows would-lose
 tokens for this case.
-`--prune` also removes low-value never-retrieved memories (opt-in, never automatic).
+`--prune` also removes low-value NEVER-surfaced and never-retrieved memories
+(`retrieval_count = 0` AND `surfaced_count = 0`, low confidence, old, `signal = none`;
+opt-in, never automatic). A hook-surfaced memory is protected — `retrieval_count = 0`
+alone is not evidence of unused (issue #21).
 
 Consolidation is **single-flighted**: concurrent runs (several sessions starting
 at once) take an advisory lockfile in the store dir, and the losers skip cleanly
@@ -235,8 +240,8 @@ python <store.py> export-pack --namespace NS [--out FILE] [--project-limit 50] \
   [--global-limit 15] [--min-confidence 0.6] [--max-bytes 32768]
 ```
 Renders live memories from `--namespace` and `user:global` (confidence DESC,
-retrieval_count DESC, ingestion_ts DESC) as a hand-off markdown pack, e.g. for a
-cloud/remote session with no store access. `--max-bytes` budgets the bullet
+retrieval_count + surfaced_count DESC, ingestion_ts DESC) as a hand-off markdown pack,
+e.g. for a cloud/remote session with no store access. `--max-bytes` budgets the bullet
 lines only: a bullet that would push past it is omitted whole (never
 truncated), and smaller rows behind it are still emitted. Refuses (exit 2) if
 both sections are empty.
