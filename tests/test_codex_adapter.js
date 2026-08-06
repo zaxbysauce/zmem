@@ -51,7 +51,7 @@ function parseJson(text) {
 function envWith(overrides) {
     const e = { ...process.env };
     for (const k of [
-        "ZMEM_HOST", "ZMEM_ROOT", "ZMEM_DATA", "ZMEM_PROJECT", "ZMEM_SESSION",
+        "ZMEM_HOST", "ZMEM_ROOT", "ZMEM_DATA", "ZMEM_STORE", "ZMEM_PROJECT", "ZMEM_SESSION",
         "ZMEM_TRANSCRIPT", "ZMEM_AGENT_TRANSCRIPT", "ZMEM_AGENT_TYPE",
         "ZMEM_AGENT_ID", "ZMEM_NAMESPACE", "ZMEM_SKILLS_DIRS",
         "ZMEM_TIER0", "ZMEM_CTX_BUDGET",
@@ -353,6 +353,10 @@ console.log("\n[5] Three-host shared-store round trip");
     const common = {
         ZMEM_DATA: sharedData,
         ZMEM_MODEL_AUTODOWNLOAD: "0",
+        // Must be undefined (deleted) here: ZMEM_STORE outranks ZMEM_DATA in
+        // host.resolve_store_path, and buildCanonicalEnv starts from
+        // { ...process.env }, so an ambient value would defeat the sandbox.
+        ZMEM_STORE: undefined,
         PLUGIN_ROOT: undefined,
         PLUGIN_DATA: undefined,
         CLAUDE_PLUGIN_ROOT: undefined,

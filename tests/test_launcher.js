@@ -67,6 +67,20 @@ function envWith(overrides) {
     return Object.assign(e, overrides);
 }
 
+// Guardrail the envWith contract: stripping ZMEM_STORE is load-bearing (it
+// outranks ZMEM_DATA in host.resolve_store_path), so an ambient value must
+// never survive into a sandboxed subprocess env.
+{
+    const saved = process.env.ZMEM_STORE;
+    process.env.ZMEM_STORE = "C:\\ambient-store\\store.sqlite";
+    const out = envWith({ ZMEM_DATA: "C:\\sandbox" });
+    if (saved === undefined) delete process.env.ZMEM_STORE;
+    else process.env.ZMEM_STORE = saved;
+    ok("envWith: strips ambient ZMEM_STORE (would otherwise outrank the sandbox ZMEM_DATA)",
+        !("ZMEM_STORE" in out) && out.ZMEM_DATA === "C:\\sandbox",
+        "ZMEM_STORE present: " + Object.prototype.hasOwnProperty.call(out, "ZMEM_STORE"));
+}
+
 function runLauncher(hook, payload, env) {
     return spawnSync("node", [LAUNCHER, hook], {
         input: payload,
@@ -126,13 +140,21 @@ function defaultStorePath() {
 // the isolation guard can never pass vacuously on a broken store.
 function countStoreRows(dbPath) {
     if (!fs.existsSync(dbPath)) return 0;
+    // A concurrent live zmem writer can transiently hold the DB lock; retry a
+    // few times so the isolation guard doesn't fail spuriously on a locked
+    // table read (the lock clears once the writer commits).
     const code = [
-        "import sqlite3,sys",
-        "c = sqlite3.connect(sys.argv[1])",
-        "try:",
-        "    print(c.execute(\"SELECT COUNT(*) FROM memory\").fetchone()[0])",
-        "except Exception:",
-        "    print('ERR')",
+        "import sqlite3, sys, time",
+        "for attempt in range(4):",
+        "    try:",
+        "        c = sqlite3.connect(sys.argv[1], timeout=5.0)",
+        "        print(c.execute(\"SELECT COUNT(*) FROM memory\").fetchone()[0])",
+        "        break",
+        "    except sqlite3.OperationalError as e:",
+        "        if 'locked' not in str(e).lower() or attempt == 3:",
+        "            print('ERR')",
+        "            break",
+        "        time.sleep(0.2)",
     ].join("\n");
     const r = execFileSync(PYTHON, ["-c", code, dbPath], { encoding: "utf8" }).trim();
     if (r === "ERR") throw new Error("countStoreRows: could not read store " + dbPath);
@@ -1157,6 +1179,12 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
         ok("injection[capture-failure]: hook still renders the auto-capture prompt",
             /auto-capture/.test(ac), ac.slice(0, 300));
         assertNoDefaultStoreLeak("capture-failure", () => runSuggestedAndCheckCanary("capture-failure", ac, CANARY, HDATA));
+        // Positive case: the rendered `store.py add` (valid --signal test) must
+        // actually land a row in the SANDBOX store — proving capture really
+        // happens and the isolation guarantee isn't just "default untouched".
+        const sandboxRows = countStoreRows(path.join(HDATA, "store.sqlite"));
+        ok("injection[capture-failure]: the rendered command wrote a row to the sandbox store",
+            sandboxRows > 0, "sandbox rows: " + sandboxRows);
     }
 
     // --- subagent-reflect: end-to-end (SubagentStop, subagent's own transcript) ---
