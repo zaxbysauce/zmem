@@ -2259,8 +2259,11 @@ Use when working with: {trigger_contexts}.
 
 # Consolidation threshold and cadence defaults.
 CONSOLIDATE_DEFAULT_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_THRESHOLD", 0.80)
-CONSOLIDATE_MIN_INTERVAL_DAYS = 7
-CONSOLIDATE_GROWTH_THRESHOLD = 0.20  # run when live count grew by >20% since last run
+# Cadence gate knobs (env-overridable for parity with the thresholds above):
+# how much time must elapse and how much the live set must have grown since the
+# last automatic run before consolidate() proceeds.
+CONSOLIDATE_MIN_INTERVAL_DAYS = _env_float("ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS", 7.0)
+CONSOLIDATE_GROWTH_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_GROWTH_THRESHOLD", 0.20)
 
 # Lexical (token-overlap) clustering fallback threshold, used by consolidate()
 # when embeddings are unavailable (no onnxruntime/tokenizers, or the model file
@@ -2341,13 +2344,25 @@ def _absorb_decision(keeper_content: str, absorbed_content: str, absorbed_id: st
         # longer text with a unique tail that must be preserved. Issue #19.)
         return {"will_append": False, "reason": "already-represented", "new_tokens": []}
 
-    # Use the length-agnostic tokenizer (not the clustering tokenizer) so 1-2
-    # digit numbers / short codes that differ between rows count as unique
-    # information to preserve (implementation-review finding #2).
+    # Token-level uniqueness, used for preview bookkeeping and the size-cap
+    # "would-lose tokens" list. Length-agnostic tokenizer (NOT the clustering
+    # tokenizer) so 1-2 digit numbers / short codes that differ between rows
+    # count as unique information to preserve (implementation-review #2).
     new_tokens = sorted(_unique_tokens(absorbed_content) - _unique_tokens(keeper_content))
-    if not new_tokens:
-        # No new tokens at all; don't append (avoid duplicating near-identical text).
-        return {"will_append": False, "reason": "already-represented", "new_tokens": []}
+
+    # NOTE: an EMPTY new_tokens set is deliberately NOT "already-represented"
+    # (swarm-pr-review PRR-001). Two rows can share the same word SET in a
+    # different ORDER (e.g. "call foo before bar" vs "call bar before foo") and
+    # that ordering carries meaning we must not drop from live recall. The ONLY
+    # grounds for suppressing the append is the substring check above
+    # (`norm_absorbed in norm_keeper`), which covers exact duplicates plus
+    # case- and whitespace-only differences (those normalize to the SAME string,
+    # so they are substrings of each other). _normalize_text does NOT strip
+    # punctuation, so a punctuation-only difference is a distinct surface form
+    # and is also appended. Reordered / identical-token / punctuation-different
+    # content all fall through and are appended — deliberate over-preservation
+    # (issue #19 AC1): an append is lossless, and the size cap below still
+    # bounds keeper growth.
 
     # Size cap (issue #19 critic finding #3): never let a merged keeper exceed
     # INGEST_MAX_CONTENT_CHARS, or an export-jsonl -> ingest-jsonl round-trip
@@ -2428,6 +2443,12 @@ def _absorb_into_keeper(
     # accumulates across runs). `:truncated` marks an id whose content could
     # not be appended due to the size cap; the id is still recorded for
     # traceability. Format is documented for future consumers.
+    #
+    # SAFETY: the comma-joined format relies on the invariant that every id is
+    # a UUID (enforced by _INGEST_ID_RE during import), which cannot contain a
+    # comma — so split(",") round-trips losslessly today. If id schemes are
+    # ever widened beyond UUIDs, migrate this to a self-delimiting encoding
+    # (e.g. JSON array) before allowing non-UUID ids into merged_from.
     marker = ":truncated" if decision["reason"] == "size-cap" else ""
     id_entry = f"{absorbed['id']}{marker}"
     row = conn.execute("SELECT merged_from FROM memory WHERE id=?", (keeper_id,)).fetchone()
@@ -2698,7 +2719,12 @@ def consolidate(
                       f"prod={nb_row['confidence'] * nb_row['retrieval_count']:.2f}")
                 print(f"        content: {nb_row['content']}")
                 if dec["reason"] == "unique":
-                    print(f"        would APPEND (gains tokens: {dec['new_tokens']})")
+                    if dec["new_tokens"]:
+                        print(f"        would APPEND (gains tokens: {dec['new_tokens']})")
+                    else:
+                        # Same token set in a different ORDER — still unique
+                        # phrasing that must be preserved (PRR-001).
+                        print("        would APPEND (same tokens, different order — preserved)")
                     sep = f"\n\n--- merged from {nb_row['id']} ---\n"
                     dry_keeper_content = dry_keeper_content + sep + (nb_row["content"] or "")
                 elif dec["reason"] == "size-cap":
@@ -3905,6 +3931,11 @@ def cmd_export_jsonl(
 # bloat the store / the packs and prompts built from it, so it is rejected as
 # malformed rather than clamped (silently truncating memory content would be
 # worse than refusing it).
+#
+# NOTE: this is a deliberate PROTOCOL-ONLY constant (not env-overridable) —
+# it is the contract the export-jsonl -> ingest-jsonl round-trip must satisfy,
+# so changing it locally would let a store export rows its own ingest rejects
+# (or vice-versa across versions). Keep hardcoded unless the wire format changes.
 INGEST_MAX_CONTENT_CHARS = 65536
 
 # Shape guard for an incoming id: UUID-length hex-and-dashes. This is a

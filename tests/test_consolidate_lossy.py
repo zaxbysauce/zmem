@@ -211,8 +211,15 @@ class ContentPreservationTest(unittest.TestCase):
             "SELECT content FROM memory WHERE superseded_at IS NULL AND namespace=?",
             (NS,),
         ).fetchall()
-        # Second run.
-        self.mod.consolidate(self.conn)
+        # Second run. MUST truly re-run the clustering loop, not silently
+        # return early: with the default threshold the growth cadence gate
+        # (store.py) short-circuits a back-to-back call (days_since≈0, growth
+        # ≈0) into a no-op, so the test would pass without ever exercising
+        # re-consolidation (swarm-pr-review PRR-002). Passing an explicit
+        # non-default threshold bypasses the gate and forces the loop to run
+        # over the post-first-run live set (the absorbed row is already
+        # tombstoned), verifying re-clustering is idempotent.
+        self.mod.consolidate(self.conn, threshold=0.3)
         live_after_2 = self.conn.execute(
             "SELECT content FROM memory WHERE superseded_at IS NULL AND namespace=?",
             (NS,),
@@ -237,6 +244,69 @@ class ContentPreservationTest(unittest.TestCase):
         # The unique code "47" must survive in the keeper.
         self.assertIn("47", row["content"],
                       "numeric-only difference '47' was lost")
+
+    def test_reordered_same_tokens_are_preserved(self):
+        # swarm-pr-review PRR-001: two rows can share the same word SET in a
+        # different ORDER -- and that ordering can carry meaning ("call foo
+        # before bar" vs "call bar before foo"). The old token-set-emptiness
+        # check classified these "already-represented" and tombstoned the
+        # absorbed row, silently dropping the reordered phrasing from live
+        # recall. A reorder must be APPENDED (over-preserve rather than lose).
+        base = "call foo before bar during init"
+        keeper = _add(self.mod, self.conn, base, 0.90, rc=50)
+        # Same token set, subject/object order reversed -> different meaning.
+        absorbed_content = "call bar before foo during init"
+        absorbed = _add_raw(self.mod, self.conn, absorbed_content, 0.85, rc=1)
+        # Sanity that the fixture is a true same-token, different-order pair.
+        self.assertEqual(self.mod._unique_tokens(base),
+                         self.mod._unique_tokens(absorbed_content),
+                         "fixture must share an identical token set")
+        self.assertNotEqual(self.mod._normalize_text(base),
+                            self.mod._normalize_text(absorbed_content),
+                            "fixture must differ in surface form (order)")
+        self.mod.consolidate(self.conn)
+        row = self.conn.execute(
+            "SELECT content, merged_from FROM memory WHERE id=?", (keeper,)
+        ).fetchone()
+        # The reordered phrasing survives in the keeper (appended).
+        self.assertIn("call bar before foo during init", row["content"],
+                      "reordered same-token content was silently dropped")
+        self.assertIn("--- merged from", row["content"],
+                      "reorder must append, not be treated as a duplicate")
+        self.assertIn(absorbed, row["merged_from"])
+
+    def test_punctuation_only_difference_is_preserved(self):
+        # PRR-001 companion: a punctuation-only difference is a DISTINCT surface
+        # form (normalization lowercases and collapses whitespace but keeps
+        # punctuation), so it carries information (emphasis, sentence boundary)
+        # and MUST be preserved by appending — not treated as a duplicate.
+        keeper = _add(self.mod, self.conn, "hello, world! how are you?", 0.90, rc=50)
+        absorbed = _add_raw(self.mod, self.conn, "hello world how are you",
+                            0.85, rc=1)
+        # Sanity: normalization does NOT erase the punctuation difference.
+        self.assertNotEqual(self.mod._normalize_text("hello, world! how are you?"),
+                            self.mod._normalize_text("hello world how are you"))
+        self.mod.consolidate(self.conn)
+        row = self.conn.execute(
+            "SELECT content, merged_from FROM memory WHERE id=?", (keeper,)
+        ).fetchone()
+        self.assertIn("hello world how are you", row["content"],
+                      "punctuation-only difference was silently dropped")
+        self.assertIn("--- merged from", row["content"],
+                      "punctuation difference must be appended (preserved)")
+        self.assertIn(absorbed, row["merged_from"])
+
+    def test_case_only_difference_is_deduped(self):
+        # PRR-001 companion: a case-only difference is a true duplicate (dedup).
+        keeper = _add(self.mod, self.conn, "the quick brown fox jumps", 0.90, rc=50)
+        absorbed = _add_raw(self.mod, self.conn, "The Quick Brown Fox Jumps",
+                            0.85, rc=1)
+        self.mod.consolidate(self.conn)
+        row = self.conn.execute(
+            "SELECT content FROM memory WHERE id=?", (keeper,)
+        ).fetchone()
+        self.assertNotIn("--- merged from", row["content"],
+                         "case-only difference must NOT be appended")
 
     def test_multi_absorb_decides_against_grown_keeper_content(self):
         # Final-critic finding #1: in a multi-absorb cluster, the decision for
@@ -415,6 +485,43 @@ class MigrationTest(unittest.TestCase):
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         self.assertEqual(sv, "6")
+        conn.close()
+
+    def test_v5_to_v6_populated_migration_preserves_rows(self):
+        # swarm-pr-review PRR-006: migrate() must preserve existing rows when
+        # upgrading a POPULATED v5 store to v6 (merged_from added, all data
+        # intact), not just work on an empty fresh store. Build a v5 store by
+        # creating the v6 schema, then removing the v6-only column and rewinding
+        # the recorded version.
+        mod = _load_store_module(Path(self.tmp) / "s3.sqlite", self.models)
+        conn = mod.connect()
+        mod.init_db(conn)
+        mod.migrate(conn)
+        conn.execute("ALTER TABLE memory DROP COLUMN merged_from")
+        conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+        conn.commit()
+        # Populate while in v5 state (raw inserts avoid any merged_from dep).
+        a = _add_raw(mod, conn, "preserve alpha content for migration", 0.90, rc=3)
+        _add_raw(mod, conn, "preserve beta content for migration", 0.70, rc=1)
+        cols_sel = ("SELECT id, content, tags, confidence, signal, "
+                    "retrieval_count, superseded_at, ingestion_ts FROM memory "
+                    "ORDER BY id")
+        before = [tuple(r) for r in conn.execute(cols_sel)]
+        # Upgrade to v6.
+        mod.migrate(conn)
+        sv = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        self.assertEqual(sv, "6")
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
+        self.assertIn("merged_from", cols)
+        after = [tuple(r) for r in conn.execute(cols_sel)]
+        self.assertEqual(before, after,
+                         "v5->v6 migration altered existing row data")
+        # Newly-added column is present on populated rows (ADD COLUMN default).
+        ma = conn.execute(
+            "SELECT merged_from FROM memory WHERE id=?", (a,)).fetchone()[0]
+        self.assertIsNone(ma,
+                          "fresh merged_from column should default to NULL")
         conn.close()
 
 
