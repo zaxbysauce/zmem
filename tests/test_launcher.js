@@ -880,19 +880,21 @@ console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was si
         // inert single-quoted text as far as bash is concerned. Broken (pre-fix):
         // bash would expand $(touch ...) while parsing the command line, and
         // the canary file would exist BEFORE python ever saw an argument.
-        const m = /`([^`]*)`/.exec(ac);
-        ok("injection: rendered a backtick-fenced suggested command", m !== null, ac);
-        if (m) {
-            const suggested = m[1];
-            const runDir = path.join(TMP, "hostile-run-cwd");
-            fs.mkdirSync(runDir, { recursive: true });
-            const br = spawnSync("bash", ["-c", suggested], {
-                cwd: runDir, encoding: "utf8", timeout: 15000,
-                env: envWith({ ZMEM_DATA: HDATA }),
-            });
-            ok("injection: canary file was NOT created (no command injection)",
-                !fs.existsSync(CANARY), "bash stderr: " + (br.stderr || "").slice(0, 300));
-        }
+        assertNoDefaultStoreLeak("hostile-git-proj", () => {
+            const m = /`([^`]*)`/.exec(ac);
+            ok("injection: rendered a backtick-fenced suggested command", m !== null, ac);
+            if (m) {
+                const suggested = m[1];
+                const runDir = path.join(TMP, "hostile-run-cwd");
+                fs.mkdirSync(runDir, { recursive: true });
+                const br = spawnSync("bash", ["-c", suggested], {
+                    cwd: runDir, encoding: "utf8", timeout: 15000,
+                    env: envWith({ ZMEM_DATA: HDATA }),
+                });
+                ok("injection: canary file was NOT created (no command injection)",
+                    !fs.existsSync(CANARY), "bash stderr: " + (br.stderr || "").slice(0, 300));
+            }
+        });
     }
 }
 
