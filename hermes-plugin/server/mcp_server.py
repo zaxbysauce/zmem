@@ -223,7 +223,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         Returns the top matches from the shared cross-session store. Use this
         to surface lessons, conventions, and facts before answering anything
         that may depend on past work. Pass namespace='*' (or omit) to search
-        all namespaces; pass an explicit namespace to scope.
+        all namespaces; pass an explicit namespace to scope. When a namespace
+        is given, user:global memories are also unioned in (project-first, no
+        crowding) so cross-project lessons surface — matching the local
+        provider's prefetch behavior (PR #24).
         """
         q = (query or "").strip()
         if not q:
@@ -233,6 +236,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "recall",
             "--query", q[:_MAX_QUERY_CHARS],
             "--limit", str(n),
+            "--include-global",
+            "--global-limit", "3",
             "--json",
         ] + _namespace_flag(namespace)
         return _parse_results(_run_store(args))
