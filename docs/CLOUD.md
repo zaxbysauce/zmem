@@ -262,6 +262,14 @@ compromise of the store, and rebuild rather than "clean up" — see the
   mostly needs "what does the project already know", without paying for a
   model runtime on every ephemeral cloud workspace.
 
+  **Cross-project recall:** `recall`/`recent`/`search` accept
+  `--include-global` (with `--global-limit`, default 3) to union the
+  `user:global` tier into a project-scoped query, project-first so global rows
+  never crowd out project rows (issue #18). This is what the automatic hooks
+  use, so a cloud project-scoped session inherits cross-project lessons
+  alongside the project ones. Going unscoped (no `--namespace`) still searches
+  everything.
+
 - **Cloud writes** go to an **outbox JSONL** rather than back into the real
   store directly, so the local side controls what actually merges into it
   (same principle as Tier 2's ingesting-agent review, just automated instead

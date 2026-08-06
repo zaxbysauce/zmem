@@ -32,6 +32,7 @@ NS = "project:hardeningtest"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 import host  # noqa: E402
+import store  # noqa: E402  -- for SUPPORTED_SCHEMA_VERSION (fail-closed fixture)
 
 
 def _base_env(tmp: str) -> dict:
@@ -158,7 +159,14 @@ class TestNewerSchemaFailClosed(HardeningStoreCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '6')")
+            # A schema_version strictly NEWER than this client's supported
+            # version, to exercise the fail-closed guard. Keep it one ahead of
+            # store.SUPPORTED_SCHEMA_VERSION so this stays correct across future
+            # version bumps.
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
+                (str(store.SUPPORTED_SCHEMA_VERSION + 1),),
+            )
             conn.commit()
         finally:
             conn.close()
@@ -259,7 +267,7 @@ class TestConcurrentColdOpenAndDedup(HardeningStoreCase):
         finally:
             conn.close()
         self.assertEqual(live, worker_count)
-        self.assertEqual(schema, "5")
+        self.assertEqual(schema, str(store.SUPPORTED_SCHEMA_VERSION))
         self.assertEqual(journal_mode.lower(), "wal")
 
     def test_concurrent_duplicate_writers_merge_to_one_row(self):

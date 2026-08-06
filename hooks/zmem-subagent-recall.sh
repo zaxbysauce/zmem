@@ -136,8 +136,11 @@ fi
 BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 
 # Build the recall payload. A single python process pulls recent high-confidence
-# memories from the subagent's namespace and the user:global bridge (both
-# READ-ONLY via --no-bump), dedups by id, and emits a bare {"additionalContext"}.
+# memories from the subagent's namespace AND the user:global tier in ONE
+# `recent` call (--include-global), READ-ONLY via --no-bump. The store does the
+# project-first merge and id dedup, so this is now one subprocess instead of the
+# old two-pull shell bridge (issue #18). Result is byte-equivalent to the old
+# bridge: up to 5 namespace rows then up to 3 user:global rows, deduped.
 CTX_JSON="$("$PYTHON_BIN" -c '
 import json, os, subprocess, sys
 
@@ -156,12 +159,19 @@ def emit(obj):
 if not store_py or not os.path.isfile(store_py):
     emit({})
 
-def recent(namespace, limit):
-    """READ-ONLY recent pull for a namespace (fail-open to [])."""
+def recent(namespace, limit, global_limit):
+    """READ-ONLY recent pull for a namespace + the user:global tier (fail-open to []).
+
+    --include-global folds the user:global tier into one call with a per-tier
+    budget; the store merges project-first and dedups by id. When namespace IS
+    user:global the store treats --include-global as a no-op (the project tier
+    already is global), matching the old `if ns != user:global` bridge guard.
+    """
     try:
         out = subprocess.check_output(
             [sys.executable, store_py, "recent",
              "--namespace", namespace, "--limit", str(limit),
+             "--include-global", "--global-limit", str(global_limit),
              "--min-confidence", "0.5", "--no-bump", "--json"],
             stderr=subprocess.DEVNULL, timeout=10,
         ).decode("utf-8", "replace")
@@ -169,22 +179,9 @@ def recent(namespace, limit):
     except Exception:
         return []
 
-rows = recent(ns, 5)
-# Bridge in user:global unless the subagent IS in user:global already.
-if ns != "user:global":
-    rows += recent("user:global", 3)
+rows = recent(ns, 5, 3)
 
-# Dedup by id, preserve order (namespace rows first, then the global bridge).
-seen = set()
-uniq = []
-for r in rows:
-    rid = r.get("id")
-    if rid in seen:
-        continue
-    seen.add(rid)
-    uniq.append(r)
-
-if not uniq:
+if not rows:
     emit({})
 
 header = "# Box-wide memory (zmem subagent recall, namespace %s" % ns
@@ -193,7 +190,7 @@ if agent_type:
 header += "). Consider if relevant to your task; ignore if not."
 lines = [header, ""]
 total = len(header)
-for r in uniq:
+for r in rows:
     content = (r.get("content") or "")[:300]
     signal = r.get("signal", "?")
     # Same stale rendering as zmem-recall.sh: store.py returns a separate

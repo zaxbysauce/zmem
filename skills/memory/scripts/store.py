@@ -169,7 +169,7 @@ SIGNAL_CONFIDENCE = {
 # them by writing straight into the table.
 ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
 ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
-SUPPORTED_SCHEMA_VERSION = 5
+SUPPORTED_SCHEMA_VERSION = 6
 SCHEMA_VERSION_KEY = "schema_version"
 
 CONFIDENCE_FLOOR = 0.25
@@ -459,7 +459,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             superseded_at   TEXT,
             ingestion_ts    TEXT NOT NULL,
             retrieval_count INTEGER NOT NULL DEFAULT 0,
-            last_retrieved  TEXT
+            last_retrieved  TEXT,
+            -- v6: consolidation provenance. Comma-joined ids of rows absorbed
+            -- into this keeper by consolidate() (appends across runs). A
+            -- `:truncated` marker after an id means that row's content could
+            -- not be appended (the keeper was already at the content-size cap)
+            -- the id is still recorded for traceability. Write-only provenance
+            -- today, queryable by users/future tooling. See _absorb_into_keeper.
+            merged_from     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory(namespace);
         CREATE INDEX IF NOT EXISTS idx_memory_live ON memory(superseded_at) WHERE superseded_at IS NULL;
@@ -770,6 +777,26 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
         conn.commit()
 
+    if ver < 6:
+        # v6: consolidation content-provenance (issue #19).
+        #
+        # consolidate() now PRESERVES information unique to an absorbed row by
+        # appending it to the keeper's content and recording the absorbed id in
+        # `merged_from` (previously the absorbed content was tombstoned and lost
+        # from live recall). This column is the queryable provenance trail of
+        # which rows were folded into a keeper.
+        #
+        # init_db() (which runs before migrate() on a fresh store) ALREADY
+        # creates this column and sets schema_version=1, so on a fresh store
+        # migrate() runs every version block 1->6 and this ALTER would hit an
+        # existing column. Guard with a table_info probe so the ALTER is a true
+        # no-op when the column already exists (idempotent on re-migrate too).
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+        if "merged_from" not in cols:
+            conn.execute("ALTER TABLE memory ADD COLUMN merged_from TEXT")
+        conn.execute("UPDATE meta SET value='6' WHERE key='schema_version'")
+        conn.commit()
+
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
     # skip. See _retry_pending_ns_migration for why this cannot live behind the
     # version gate.
@@ -950,6 +977,222 @@ def _detect_duplicate(
     return existing, dedup_sim, emb
 
 
+# Obvious misspellings/variations of the global namespace. Matched
+# case-insensitively after stripping common separators (s, _, -, :) so
+# `global`, `globals`, `userglobal`, `users:global`, `user-global`,
+# `user_global`, `global:user`, `globals:user` all collapse to one comparison
+# key and are rejected at write time with a message naming the canonical form.
+# This prevents new "dead letter" rows that no automatic hook could reach
+# (issue #18, "Related observation"). It does NOT touch arbitrary namespaces
+# (e.g. legitimate `project:global-thing`) — only obvious global near-misses.
+
+# Known normalized stems that are clearly meant to be the global namespace.
+# `userglobal` is the canonical stem (from `user:global`); the others are the
+# common ways to misspell it without the `user:` prefix, with the words
+# swapped, or with the plural `s`. A namespace is a near-miss iff its
+# normalized stem (separators stripped, lowercased) is in this set.
+_GLOBAL_NEAR_MISS_STEMS = {
+    "global", "globals",
+    "userglobal", "globaluser",
+    "usersglobal", "globalsusers", "usersusersglobal",
+    "userglobals", "globalsuser",
+}
+
+
+def _global_near_miss_key(ns: str) -> str:
+    """Normalize a namespace for global-near-miss comparison: lowercase, then
+    strip separators (space, _, -, :, and .) so the common typos collapse
+    together. `.` is included because it is a common typo for `:` on US
+    keyboards (`user.global`). `user:global` → `userglobal`;
+    `users:global` → `usersglobal`; etc. (PRR-009, swarm-pr-review.)"""
+    return re.sub(r"[\s:_\-.]+", "", ns.lower())
+
+
+def _validate_namespace(conn: sqlite3.Connection, namespace: str) -> str:
+    """Validate/canonicalize a namespace at write time.
+
+    - Reject empty/None/whitespace-only namespaces.
+    - Reject obvious near-miss variants of the global namespace (e.g.
+      ``global``, ``userglobal``, ``users:global``) by raising
+      ``CapturePolicyRefusal`` naming the canonical ``user:global``. Such rows
+      would be unreachable from every automatic hook (issue #18).
+    - Trim surrounding whitespace (intentional canonicalization —
+      ``add --namespace "  user:global  "`` stores under ``user:global``).
+    - Emit a non-fatal note in the refusal message when existing live rows are
+      already stranded under the rejected near-miss namespace, naming the
+      count. Reconciliation of those legacy rows is a separate data-hygiene
+      task (doctor/consolidate); this guard only prevents NEW ones.
+
+    Arbitrary namespaces (``project:<x>``, custom keys) pass through untouched.
+    """
+    if namespace is None or not namespace.strip():
+        raise CapturePolicyRefusal(
+            "refusing write: namespace is empty; use 'user:global' for "
+            "cross-project knowledge or 'project:<name>' for project-scoped"
+        )
+    trimmed = namespace.strip()
+
+    # The canonical form passes through untouched.
+    if trimmed == GLOBAL_NAMESPACE:
+        return trimmed
+
+    key = _global_near_miss_key(trimmed)
+    is_near_miss = key in _GLOBAL_NEAR_MISS_STEMS
+
+    if is_near_miss:
+        # Report ALL already-stranded near-miss rows (any variant sharing a
+        # global-near-miss stem), not just the exact spelling the operator
+        # typed — otherwise the "0 existing" message is misleading when other
+        # variants exist. _global_near_miss_key is a Python helper (not a SQL
+        # UDF), so pull the distinct live namespaces and count in Python. This
+        # is the rare refusal path, so the small scan is acceptable.
+        stranded = 0
+        try:
+            distinct_ns = conn.execute(
+                "SELECT namespace FROM memory WHERE superseded_at IS NULL"
+            ).fetchall()
+            for row in distinct_ns:
+                # Count only NON-canonical near-miss rows. The canonical
+                # `user:global` also normalizes to "userglobal" (a stem), so
+                # without this exclusion healthy global rows would be falsely
+                # reported as stranded. (PRR-001, swarm-pr-review.)
+                if (row["namespace"] != GLOBAL_NAMESPACE
+                        and _global_near_miss_key(row["namespace"]) in _GLOBAL_NEAR_MISS_STEMS):
+                    stranded += 1
+        except sqlite3.OperationalError:
+            stranded = 0
+        msg = (
+            f"refusing write: namespace {trimmed!r} looks like a misspelling of "
+            f"the global namespace; use {GLOBAL_NAMESPACE!r} instead."
+        )
+        if stranded:
+            msg += (
+                f" ({stranded} existing live row(s) are already stranded under "
+                f"a global-near-miss namespace and are unreachable from the "
+                "automatic hooks — rekey them with `rekey-namespace "
+                "--near-miss-global --confirm`.)"
+            )
+        raise CapturePolicyRefusal(msg)
+    return trimmed
+
+
+def rekey_namespace(
+    conn: sqlite3.Connection,
+    *,
+    from_namespace: str | None = None,
+    to_namespace: str | None = None,
+    near_miss_global: bool = False,
+    dry_run: bool = False,
+) -> int:
+    """Admin re-key: rewrite the ``namespace`` column of live rows.
+
+    This is the remediation path for legacy rows stranded under a global
+    near-miss namespace (``global``, ``userglobal``, …) that the write-time
+    ``_validate_namespace`` guard now rejects. Such rows are unreachable from
+    every automatic hook (issue #18 "Related observation"); this moves them to a
+    reachable namespace (default: ``user:global``) so they surface again.
+
+    Two modes:
+      - ``near_miss_global=True``: rekeys EVERY live row whose namespace
+        normalizes (via ``_global_near_miss_key``) to a stem in
+        ``_GLOBAL_NEAR_MISS_STEMS`` to ``to_namespace`` (default ``user:global``).
+        ``from_namespace`` is ignored in this mode.
+      - ``near_miss_global=False`` (default): rekeys live rows whose namespace
+        exactly equals ``from_namespace`` (case-sensitive) to ``to_namespace``.
+        ``from_namespace`` is required in this mode.
+
+    ``to_namespace`` is itself validated (must not itself be a near-miss) so the
+    command cannot move rows FROM one dead-letter key TO another.
+
+    Returns the number of rows rekeyed. ``dry_run`` reports the count and the
+    candidate namespaces without writing. The write is a single UPDATE under a
+    BEGIN IMMEDIATE transaction; superseded rows are left untouched (history).
+    """
+    # Resolve the default lazily — GLOBAL_NAMESPACE is defined later in the
+    # module, so it cannot be a parameter default (evaluated at def time).
+    if to_namespace is None:
+        to_namespace = GLOBAL_NAMESPACE
+    # Validate the destination: trim, reject empty/whitespace (mirror
+    # _validate_namespace's empty rule), and never move rows to another dead
+    # letter. Without this, `--to ""` (e.g. an unset shell var) would write an
+    # empty namespace — a one-way door, since `--from ""` is treated as missing
+    # and rows stranded under "" cannot be rekeyed back. (PRR-002/PRR-013.)
+    to_namespace = to_namespace.strip()
+    if not to_namespace:
+        raise ValueError(
+            "refusing rekey: destination namespace is empty; use "
+            f"{GLOBAL_NAMESPACE!r} or a project:<name> namespace"
+        )
+    dest_key = _global_near_miss_key(to_namespace)
+    if to_namespace != GLOBAL_NAMESPACE and dest_key in _GLOBAL_NEAR_MISS_STEMS:
+        raise ValueError(
+            f"refusing rekey: destination {to_namespace!r} is itself a global "
+            f"near-miss; use {GLOBAL_NAMESPACE!r}"
+        )
+
+    # Build the set of source namespaces to rekey.
+    if near_miss_global:
+        # Scan distinct live namespaces and keep those that normalize to a stem.
+        # EXCLUDE the canonical GLOBAL_NAMESPACE: it also normalizes to
+        # "userglobal" (a stem), so without this guard `--near-miss-global
+        # --to project:x` would silently bulk-move every legit user:global row
+        # to project:x — data corruption of the exact tier this tool exists to
+        # remediate. (PRR-001, swarm-pr-review.)
+        try:
+            distinct = conn.execute(
+                "SELECT DISTINCT namespace FROM memory WHERE superseded_at IS NULL"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            distinct = []
+        sources = [r["namespace"] for r in distinct
+                   if r["namespace"] != GLOBAL_NAMESPACE
+                   and _global_near_miss_key(r["namespace"]) in _GLOBAL_NEAR_MISS_STEMS]
+    else:
+        if not from_namespace or not from_namespace.strip():
+            raise ValueError(
+                "rekey-namespace needs either --near-miss-global or "
+                "--from <namespace>"
+            )
+        sources = [from_namespace]
+
+    if not sources:
+        print("[zmem] rekey-namespace: no matching live rows found.")
+        return 0
+
+    # Count candidates.
+    placeholders = ",".join("?" * len(sources))
+    count = conn.execute(
+        f"SELECT COUNT(*) AS n FROM memory "
+        f"WHERE superseded_at IS NULL AND namespace IN ({placeholders})",
+        sources,
+    ).fetchone()["n"]
+
+    print(f"[zmem] rekey-namespace: {count} live row(s) under "
+          f"{', '.join(repr(s) for s in sources)} -> {to_namespace!r}")
+    if dry_run:
+        print("[zmem] rekey-namespace: --dry-run, no rows written.")
+        return count
+
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
+        conn.execute(
+            f"UPDATE memory SET namespace=? "
+            f"WHERE superseded_at IS NULL AND namespace IN ({placeholders})",
+            [to_namespace, *sources],
+        )
+        if started_tx:
+            _commit(conn)
+    except Exception:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        raise
+    print(f"[zmem] rekey-namespace: rekeyed {count} row(s).")
+    return count
+
+
 def add_memory(
     conn: sqlite3.Connection,
     *,
@@ -969,6 +1212,12 @@ def add_memory(
         tags=tags,
         capture_mode=capture_mode,
     )
+    # Validate the namespace: reject empty and obvious near-miss variants of
+    # the global namespace so they cannot be created silently. A row stored
+    # under e.g. `global` (instead of `user:global`) is unreachable from every
+    # automatic hook (issue #18 "Related observation"). Whitespace is trimmed
+    # (intentional — `add --namespace "  user:global  "` canonicalizes).
+    namespace = _validate_namespace(conn, namespace)
     for w in warns:
         prefix = "WARNING (advisory, write proceeded)"
         if _normalize_capture_mode(capture_mode) == "auto":
@@ -1254,41 +1503,29 @@ def _fetch_by_ids(
     return [row_map[mid] for mid in ids if mid in row_map]
 
 
-def recall_memory(
+def _recall_one_tier(
     conn: sqlite3.Connection,
     *,
     query: str,
-    namespace: str | None = None,
-    limit: int = 5,
-    as_json: bool = False,
-    min_confidence: float | None = None,
-    hybrid: bool = False,
-    no_bump: bool = False,
-) -> list[dict]:
-    """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
+    ns_list: list[str] | None,
+    limit: int,
+    min_confidence: float | None,
+    hybrid: bool,
+    now_epoch: float,
+) -> list[tuple[float, dict]]:
+    """FTS5 + composite scoring for ONE namespace set (a single recall tier).
 
-    When ``no_bump`` is True the retrieval_count / last_retrieved telemetry write
-    is suppressed, making recall READ-ONLY. Hook-driven recall (UserPromptSubmit,
-    SubagentStart) passes this so heavy subagent fan-out does not turn every
-    delegated agent into a concurrent writer on the shared store (PLAN.md §5).
-    Explicit skill-invoked recall keeps the default (bumps).
+    Returns the scored ``(score, result_dict)`` list (highest score first), up
+    to ``limit`` rows. No bump, no print — the caller merges tiers, bumps the
+    final set once, and prints.
 
-    Candidates are fetched via FTS5 BM25, then re-ranked by a composite score
-    that incorporates BM25 relevance, confidence, recency decay, and retrieval
-    popularity. If hybrid=True and embeddings are available, candidates are also
-    fetched via vector KNN and fused via Reciprocal Rank Fusion (RRF) before the
-    composite re-ranking.
-
-    Confidence is still a hard floor (high-precision-first principle): memories
-    below CONFIDENCE_FLOOR (or min_confidence) are dropped before scoring.
+    ``ns_list`` is the already-expanded namespace match set for this tier (the
+    output of ``_expand_namespace_aliases``). ``None`` ⇒ no namespace filter
+    (search everything — the unscoped path). The same set is used for both the
+    FTS filter and the hybrid RRF ``_fetch_by_ids`` re-fetch namespace filter.
     """
-    # Expand a single namespace into itself + its pre-v5-migration alias (if
-    # any) so recall keeps finding rows on either side of the rename for one
-    # release (PLAN.md §8 compat alias). A row has exactly one namespace, so
-    # this only widens the match set — it never double-counts a row.
-    ns_list = _expand_namespace_aliases(conn, namespace)
-
     terms = [t for t in re.split(r"\s+", query.strip()) if t]
+    floor = min_confidence if min_confidence is not None else CONFIDENCE_FLOOR
     if not terms:
         rows = []
     else:
@@ -1303,7 +1540,6 @@ def recall_memory(
             ns_placeholders = ",".join("?" * len(ns_list))
             ns_clause = f"AND m.namespace IN ({ns_placeholders})"
             params.extend(ns_list)
-        floor = min_confidence if min_confidence is not None else CONFIDENCE_FLOOR
         params.append(floor)
         # Fetch more candidates than the limit so the composite re-ranking has
         # a larger pool to choose from (BM25 rank != final rank).
@@ -1339,12 +1575,14 @@ def recall_memory(
             for r in rows:
                 if r["fts_rank"] is not None:
                     fts_rank_map[r["id"]] = r["fts_rank"]
-            # Get vec results WITH distances for the similarity map.
+            # Get vec results WITH distances for the similarity map. Per-tier K
+            # is generous (limit*5) so the global tier's best vec neighbors are
+            # not silently excluded by a small K (issue #18 plan-critic I1).
             try:
                 vec_results = conn.execute(
                     "SELECT memory_id, distance FROM memory_vec "
                     "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                    [query_emb, max(limit * 3, limit + 5)],
+                    [query_emb, max(limit * 5, limit + 10)],
                 ).fetchall()
                 vec_ids = [r["memory_id"] for r in vec_results]
                 for vr in vec_results:
@@ -1356,11 +1594,17 @@ def recall_memory(
                 fused_ids = _rrf_fuse(fts_ids, vec_ids, k=60)
                 # Re-fetch full rows for the fused set (may include IDs not in
                 # the FTS results — these are semantic matches BM25 missed).
+                # The namespace filter is this tier's own ns_list (the same set
+                # used for the FTS filter). vec KNN is namespace-agnostic, so a
+                # fused id that lives outside this tier is dropped here — that is
+                # correct: it is found by ITS OWN tier's run (recall_memory runs
+                # the global tier separately when --include-global is on). This
+                # keeps the per-tier-budget / hard-floor contract unconditional.
+                # (Final-critic F1.)
                 rows = _fetch_by_ids(conn, fused_ids, ns_list, floor)
 
     # Re-rank by composite score (relevance + confidence + recency + popularity).
-    now_epoch = time.time()
-    scored = []
+    scored: list[tuple[float, dict]] = []
     for r in rows:
         conf = r["confidence"]
         stale_note = ""
@@ -1394,9 +1638,125 @@ def recall_memory(
             "_score": round(score, 4),
         }))
 
-    # Sort by composite score descending, take top `limit`.
+    # Sort by composite score descending within this tier, take top `limit`.
     scored.sort(key=lambda x: x[0], reverse=True)
-    results = [item[1] for item in scored[:limit]]
+    return scored[:limit]
+
+
+def _merge_tiers(
+    project_scored: list[tuple[float, dict]],
+    global_scored: list[tuple[float, dict]],
+    project_limit: int,
+    global_limit: int,
+) -> list[dict]:
+    """Merge two recall tiers per the include-global contract (issue #18).
+
+    Project tier is a HARD FLOOR: it always contributes up to ``project_limit``
+    rows first. Global rows then fill up to ``global_limit`` slots. A global row
+    can NEVER push out a project row — this mirrors ``export_pack``'s
+    project-then-global rendering and the old SubagentStart bridge order, and
+    satisfies the issue's "neither tier crowds the other" requirement.
+
+    A row has exactly one namespace, so project and global tiers are disjoint;
+    the id-based dedup below is defensive (it also covers the case where a v5
+    migration alias made the same logical row appear under two keys).
+    """
+    results: list[dict] = []
+    seen: set[str] = set()
+    for _score, item in project_scored[:project_limit]:
+        rid = item["id"]
+        if rid in seen:
+            continue
+        seen.add(rid)
+        results.append(item)
+    for _score, item in global_scored[:global_limit]:
+        rid = item["id"]
+        if rid in seen:
+            continue
+        seen.add(rid)
+        results.append(item)
+    return results
+
+
+def recall_memory(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    namespace: str | None = None,
+    limit: int = 5,
+    as_json: bool = False,
+    min_confidence: float | None = None,
+    hybrid: bool = False,
+    no_bump: bool = False,
+    include_global: bool = False,
+    global_limit: int = 3,
+) -> list[dict]:
+    """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
+
+    When ``no_bump`` is True the retrieval_count / last_retrieved telemetry write
+    is suppressed, making recall READ-ONLY. Hook-driven recall (UserPromptSubmit,
+    SubagentStart) passes this so heavy subagent fan-out does not turn every
+    delegated agent into a concurrent writer on the shared store (PLAN.md §5).
+    Explicit skill-invoked recall keeps the default (bumps).
+
+    Candidates are fetched via FTS5 BM25, then re-ranked by a composite score
+    that incorporates BM25 relevance, confidence, recency decay, and retrieval
+    popularity. If hybrid=True and embeddings are available, candidates are also
+    fetched via vector KNN and fused via Reciprocal Rank Fusion (RRF) before the
+    composite re-ranking.
+
+    Confidence is still a hard floor (high-precision-first principle): memories
+    below CONFIDENCE_FLOOR (or min_confidence) are dropped before scoring.
+
+    When ``include_global`` is True and ``namespace`` is set to something other
+    than ``GLOBAL_NAMESPACE`` ("user:global"), the result ALSO surfaces up to
+    ``global_limit`` query-relevant rows from the global tier — so a
+    project-scoped session can finally reach cross-project lessons. The merge is
+    project-first-then-global (a global row never crowds out a project row),
+    mirroring ``export-pack`` (issue #18). Strict-by-default: with
+    ``include_global=False`` (the default) behaviour is byte-identical to before.
+    """
+    now_epoch = time.time()
+    ns_list = _expand_namespace_aliases(conn, namespace)
+
+    # The global tier is folded in only when explicitly requested AND a specific
+    # non-global namespace was asked for. When namespace is None (unscoped) the
+    # project tier already searches everything, so folding global would be
+    # redundant; when namespace IS user:global, the project tier already covers
+    # it (possibly via a v5 migration alias), so folding would only risk
+    # double-counting. This guard is therefore both a correctness and a perf
+    # shortcut. (issue #18 plan-critic M2)
+    do_global = bool(include_global and namespace and namespace != GLOBAL_NAMESPACE)
+
+    if do_global:
+        global_ns_list = _expand_namespace_aliases(conn, GLOBAL_NAMESPACE)
+    else:
+        global_ns_list = None
+
+    # Project tier: scoped to the project namespace aliases only. It is NOT
+    # widened to include global aliases on the hybrid path — the global tier's
+    # own _recall_one_tier run below performs the same namespace-agnostic vec
+    # KNN and re-fetches filtered to global aliases, so a global-only vec
+    # neighbor surfaces via the global tier (counted against global_limit) rather
+    # than leaking into the project tier and breaking the per-tier-budget /
+    # hard-floor contract. (Final-critic F1: the widening was redundant and
+    # contract-violating.)
+    project_scored = _recall_one_tier(
+        conn, query=query, ns_list=ns_list, limit=limit,
+        min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+    )
+
+    global_scored: list[tuple[float, dict]] = []
+    if do_global:
+        global_scored = _recall_one_tier(
+            conn, query=query, ns_list=global_ns_list, limit=global_limit,
+            min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+        )
+
+    if do_global:
+        results = _merge_tiers(project_scored, global_scored, limit, global_limit)
+    else:
+        results = [item for _score, item in project_scored[:limit]]
 
     if results and not no_bump:
         ids = [r["id"] for r in results]
@@ -1422,26 +1782,29 @@ def recall_memory(
     return results
 
 
-def recent_memory(
+def _recent_one_tier(
     conn: sqlite3.Connection,
     *,
-    namespace: str | None = None,
-    limit: int = 5,
-    min_confidence: float = 0.5,
-    as_json: bool = False,
-    no_bump: bool = False,
+    ns_list: list[str] | None,
+    limit: int,
+    min_confidence: float,
 ) -> list[dict]:
-    """Cheap admin pull of the most recent live memories (no FTS scoring).
+    """Cheap admin pull of the most recent live memories for ONE namespace set
+    (a single recent tier). No FTS, no bump, no print — caller merges, bumps,
+    prints.
 
-    When ``no_bump`` is True the retrieval_count / last_retrieved telemetry write
-    is suppressed (READ-ONLY). Hook-driven subagent recall passes this so a
-    dispatch fan-out does not make every subagent a concurrent writer on the
-    shared store (PLAN.md §5)."""
+    ``ns_list`` is the already-expanded namespace match set (the output of
+    ``_expand_namespace_aliases``). ``None`` ⇒ no namespace filter (all rows).
+    Accepting an expanded set (rather than a single strict value) is the
+    defect-2 fix: ``recent`` now honours v5 migration aliases the way
+    ``recall`` already did. (issue #18)
+    """
     params: list = [min_confidence]
     ns_clause = ""
-    if namespace:
-        ns_clause = "AND namespace = ?"
-        params.append(namespace)
+    if ns_list:
+        ns_placeholders = ",".join("?" * len(ns_list))
+        ns_clause = f"AND namespace IN ({ns_placeholders})"
+        params.extend(ns_list)
     params.append(limit)
     rows = conn.execute(
         f"""SELECT id, namespace, type, content, tags, source_ref, source_hash,
@@ -1474,6 +1837,62 @@ def recent_memory(
             "stale": bool(stale_note),
             "_stale_note": stale_note,
         })
+    return results
+
+
+def recent_memory(
+    conn: sqlite3.Connection,
+    *,
+    namespace: str | None = None,
+    limit: int = 5,
+    min_confidence: float = 0.5,
+    as_json: bool = False,
+    no_bump: bool = False,
+    include_global: bool = False,
+    global_limit: int = 3,
+) -> list[dict]:
+    """Cheap admin pull of the most recent live memories (no FTS scoring).
+
+    When ``no_bump`` is True the retrieval_count / last_retrieved telemetry write
+    is suppressed (READ-ONLY). Hook-driven subagent recall passes this so a
+    dispatch fan-out does not make every subagent a concurrent writer on the
+    shared store (PLAN.md §5).
+
+    When ``include_global`` is True and ``namespace`` is set to something other
+    than ``GLOBAL_NAMESPACE`` ("user:global"), the result ALSO includes up to
+    ``global_limit`` recent rows from the global tier, merged project-first
+    (a global row never crowds out a project row). Strict-by-default: with
+    ``include_global=False`` behaviour is byte-identical to before — except
+    that ``recent`` now ALSO honours v5 migration aliases (the defect-2 fix),
+    so ``recent --namespace <old pre-v5 key>`` finds rows migrated to the new
+    key. (issue #18)
+    """
+    project_rows: list[dict] = []
+    if namespace:
+        project_rows = _recent_one_tier(
+            conn, ns_list=_expand_namespace_aliases(conn, namespace),
+            limit=limit, min_confidence=min_confidence,
+        )
+    else:
+        # Unscoped: one tier, no namespace filter (searches everything).
+        project_rows = _recent_one_tier(
+            conn, ns_list=None, limit=limit, min_confidence=min_confidence,
+        )
+
+    # Global tier fold-in — same guard/rationale as recall_memory (see M2).
+    if include_global and namespace and namespace != GLOBAL_NAMESPACE:
+        global_rows = _recent_one_tier(
+            conn, ns_list=_expand_namespace_aliases(conn, GLOBAL_NAMESPACE),
+            limit=global_limit, min_confidence=min_confidence,
+        )
+        # Merge project-first (hard floor) then global, dedup by id.
+        seen: set[str] = {r["id"] for r in project_rows}
+        for r in global_rows:
+            if r["id"] not in seen:
+                project_rows.append(r)
+                seen.add(r["id"])
+
+    results = project_rows
     if results and not no_bump:
         ids = [r["id"] for r in results]
         placeholders = ",".join("?" * len(ids))
@@ -1840,8 +2259,11 @@ Use when working with: {trigger_contexts}.
 
 # Consolidation threshold and cadence defaults.
 CONSOLIDATE_DEFAULT_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_THRESHOLD", 0.80)
-CONSOLIDATE_MIN_INTERVAL_DAYS = 7
-CONSOLIDATE_GROWTH_THRESHOLD = 0.20  # run when live count grew by >20% since last run
+# Cadence gate knobs (env-overridable for parity with the thresholds above):
+# how much time must elapse and how much the live set must have grown since the
+# last automatic run before consolidate() proceeds.
+CONSOLIDATE_MIN_INTERVAL_DAYS = _env_float("ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS", 7.0)
+CONSOLIDATE_GROWTH_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_GROWTH_THRESHOLD", 0.20)
 
 # Lexical (token-overlap) clustering fallback threshold, used by consolidate()
 # when embeddings are unavailable (no onnxruntime/tokenizers, or the model file
@@ -1877,6 +2299,180 @@ def _lexical_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
     return len(tokens_a & tokens_b) / len(union)
 
 
+def _normalize_text(text: str) -> str:
+    """Normalize text for substring/overlap comparison: collapse runs of
+    whitespace to a single space and strip+lowercase. Used by
+    _absorb_into_keeper to decide whether an absorbed row's content is already
+    represented in the keeper (so we don't duplicate exact-duplicate text) and
+    by the dry-run preview to label what would be lost."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _unique_tokens(text: str | None) -> set[str]:
+    """All ``[a-z0-9]+`` runs in ``text`` (lowercased), regardless of length.
+
+    Unlike ``_lexical_tokens`` (which drops tokens shorter than 3 chars and
+    stopwords for Jaccard CLUSTERING), this retains 1-2 char tokens — including
+    1-2 digit numbers, version codes, exit codes, IP fragments — so the
+    uniqueness check in ``_absorb_decision`` does not silently classify a row
+    that differs only in such tokens as "already represented" and lose them.
+    Reusing the clustering tokenizer for "what is unique about this row"
+    conflated "structurally significant for similarity" with "carries unique
+    information" (implementation-review finding #2)."""
+    return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+
+def _absorb_decision(keeper_content: str, absorbed_content: str, absorbed_id: str) -> dict:
+    """PURE decision: would `_absorb_into_keeper` append `absorbed_content` to a
+    keeper holding `keeper_content`, and what unique tokens would be gained?
+
+    Read-only and side-effect-free so the dry-run preview reports EXACTLY what
+    the real merge does (same predicate). Returns:
+      {"will_append": bool,
+       "reason": "unique"|"already-represented"|"size-cap"|"empty",
+       "new_tokens": list[str]}  # tokens in absorbed not in keeper
+    """
+    norm_keeper = _normalize_text(keeper_content)
+    norm_absorbed = _normalize_text(absorbed_content)
+
+    if not norm_absorbed:
+        return {"will_append": False, "reason": "empty", "new_tokens": []}
+    if norm_absorbed in norm_keeper:
+        # The absorbed row's text is fully contained in the keeper -> nothing
+        # unique to preserve. (Note: the REVERSE — keeper a substring of
+        # absorbed — is NOT already-represented: the absorbed row carries a
+        # longer text with a unique tail that must be preserved. Issue #19.)
+        return {"will_append": False, "reason": "already-represented", "new_tokens": []}
+
+    # Token-level uniqueness, used for preview bookkeeping and the size-cap
+    # "would-lose tokens" list. Length-agnostic tokenizer (NOT the clustering
+    # tokenizer) so 1-2 digit numbers / short codes that differ between rows
+    # count as unique information to preserve (implementation-review #2).
+    new_tokens = sorted(_unique_tokens(absorbed_content) - _unique_tokens(keeper_content))
+
+    # NOTE: an EMPTY new_tokens set is deliberately NOT "already-represented"
+    # (swarm-pr-review PRR-001). Two rows can share the same word SET in a
+    # different ORDER (e.g. "call foo before bar" vs "call bar before foo") and
+    # that ordering carries meaning we must not drop from live recall. The ONLY
+    # grounds for suppressing the append is the substring check above
+    # (`norm_absorbed in norm_keeper`), which covers exact duplicates plus
+    # case- and whitespace-only differences (those normalize to the SAME string,
+    # so they are substrings of each other). _normalize_text does NOT strip
+    # punctuation, so a punctuation-only difference is a distinct surface form
+    # and is also appended. Reordered / identical-token / punctuation-different
+    # content all fall through and are appended — deliberate over-preservation
+    # (issue #19 AC1): an append is lossless, and the size cap below still
+    # bounds keeper growth.
+
+    # Size cap (issue #19 critic finding #3): never let a merged keeper exceed
+    # INGEST_MAX_CONTENT_CHARS, or an export-jsonl -> ingest-jsonl round-trip
+    # would reject it (the ingest validator enforces this ceiling). Skip the
+    # content-append but still record the id (with a `:truncated` marker) and
+    # still run the metadata merge + supersede. Never truncate memory content
+    # mid-string (see the cap's own rationale at its definition).
+    #
+    # NOTE: this check is against the keeper content AS PASSED IN.
+    # _absorb_into_keeper re-reads the keeper's GROWN content from the DB before
+    # calling this, so in a multi-absorb cluster the cap (and the uniqueness
+    # check) are evaluated against content already grown by earlier absorbs in
+    # the same cluster — matching what the dry-run preview reports. This closes
+    # both the cumulative-cap-exceed path (implementation-review finding #1) and
+    # the stale-keeper-content path (final-critic finding #1).
+    separator = f"\n\n--- merged from {absorbed_id} ---\n"
+    projected = len(keeper_content) + len(separator) + len(absorbed_content)
+    if projected > INGEST_MAX_CONTENT_CHARS:
+        return {"will_append": False, "reason": "size-cap", "new_tokens": new_tokens}
+
+    return {"will_append": True, "reason": "unique", "new_tokens": new_tokens}
+
+
+def _absorb_into_keeper(
+    conn: sqlite3.Connection,
+    keeper: sqlite3.Row,
+    absorbed: sqlite3.Row,
+) -> dict:
+    """Fold ONE absorbed near-duplicate row into its cluster keeper (issue #19).
+
+    This is consolidate()-ONLY: it preserves information unique to the absorbed
+    row by appending that text to the keeper's content (so it stays
+    live-recallable and FTS-indexed) and recording the absorbed id in the
+    keeper's ``merged_from`` provenance column. The absorbed row is then
+    superseded (tombstoned, kept for history). Metadata (confidence/signal/tags)
+    is upgraded via the shared ``_merge_on_dedup``.
+
+    This is deliberately NOT ``_merge_on_dedup``: that helper is also the
+    write-time dedup path for ``add``/``ingest-jsonl``, where re-observing a
+    paraphrase must refresh metadata only -- growing content there would let
+    every re-add bloat a memory. Content preservation is a consolidate-only
+    concern (see issue #19 root cause).
+
+    MUST be called inside the caller's transaction (consolidate opens a
+    BEGIN/COMMIT per cluster); this helper never commits/rollbacks on its own.
+
+    Returns the dict from ``_absorb_decision`` (will_append / reason / new_tokens)
+    so the caller's bookkeeping reflects the real merge decision.
+    """
+    keeper_id = keeper["id"]
+    absorbed_content = absorbed["content"] or ""
+
+    # IMPORTANT (final-critic finding #1): decide against the keeper's content AS
+    # GROWN by earlier absorbs in this same cluster, not the seed row's original
+    # content. The seed row is fetched ONCE before the cluster loop, so
+    # `keeper["content"]` is stale for the 2nd+ absorb. Re-read the current
+    # keeper content from the DB each time (the prior _absorb_into_keeper
+    # updated it in-tx). This makes the real merge decide on the SAME input the
+    # dry-run accumulates, so the preview matches reality — and it prevents
+    # appending text already present in the grown keeper (which would both
+    # duplicate content and waste size-cap budget, the latter able to push a
+    # later genuinely-unique absorb to :truncated and back into issue #19's
+    # data-loss class).
+    cur = conn.execute("SELECT content FROM memory WHERE id=?", (keeper_id,)).fetchone()
+    keeper_content = cur["content"] if cur else (keeper["content"] or "")
+
+    decision = _absorb_decision(keeper_content, absorbed_content, absorbed["id"])
+    will_append = decision["will_append"]
+
+    if will_append:
+        # _absorb_decision already checked the size cap against the grown keeper
+        # content (re-read above), so the projection is current. Append.
+        separator = f"\n\n--- merged from {absorbed['id']} ---\n"
+        new_content = keeper_content + separator + absorbed_content
+        conn.execute("UPDATE memory SET content=? WHERE id=?", (new_content, keeper_id))
+
+    # Record provenance: append the absorbed id to merged_from (comma-joined,
+    # accumulates across runs). `:truncated` marks an id whose content could
+    # not be appended due to the size cap; the id is still recorded for
+    # traceability. Format is documented for future consumers.
+    #
+    # SAFETY: the comma-joined format relies on the invariant that every id is
+    # a UUID (enforced by _INGEST_ID_RE during import), which cannot contain a
+    # comma — so split(",") round-trips losslessly today. If id schemes are
+    # ever widened beyond UUIDs, migrate this to a self-delimiting encoding
+    # (e.g. JSON array) before allowing non-UUID ids into merged_from.
+    marker = ":truncated" if decision["reason"] == "size-cap" else ""
+    id_entry = f"{absorbed['id']}{marker}"
+    row = conn.execute("SELECT merged_from FROM memory WHERE id=?", (keeper_id,)).fetchone()
+    existing = (row["merged_from"] if row and row["merged_from"] else "").strip()
+    merged_from = f"{existing},{id_entry}" if existing else id_entry
+    conn.execute("UPDATE memory SET merged_from=? WHERE id=?", (merged_from, keeper_id))
+
+    # Metadata upgrade (confidence/signal/tags + retrieval_count bump). Shared
+    # with write-time dedup semantics; no content change here.
+    _merge_on_dedup(conn, keeper_id, absorbed["confidence"], absorbed["signal"], absorbed["tags"])
+
+    # Tombstone the absorbed row (kept for history; removed from live recall).
+    conn.execute(
+        "UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?",
+        (now_iso(), f"consolidated into {keeper_id}", absorbed["id"]),
+    )
+    try:
+        conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (absorbed["id"],))
+    except sqlite3.OperationalError:
+        pass
+
+    return decision
+
+
 def consolidate(
     conn: sqlite3.Connection,
     *,
@@ -1890,9 +2486,27 @@ def consolidate(
 
     For each live memory with an embedding, query vec0 KNN for nearest neighbors.
     Cluster memories with cosine similarity >= threshold. For each cluster:
-    pick the keeper (highest confidence x retrieval_count), merge metadata
-    into the keeper, supersede the absorbed members. Each cluster commits
+    pick the keeper (highest confidence * retrieval_count), merge the absorbed
+    members into the keeper (preserving content unique to each absorbed row —
+    issue #19), and supersede the absorbed members. Each cluster commits
     atomically — interruption is safe because keeper selection is deterministic.
+
+    The keeper is chosen by the highest ``confidence * retrieval_count`` product.
+    Ties are broken by ``confidence`` DESC (so when every retrieval_count is 0 —
+    the common fresh-store case where the product is 0 for all rows — the
+    higher-confidence row still wins instead of the order becoming UUID-noise),
+    then earliest ``ingestion_ts``, then ``id`` for single-writer determinism.
+    The rows query below orders by exactly that key so the first row of a
+    cluster is the keeper. (Issue #19 defect 2: the previous ``ORDER BY
+    confidence DESC, retrieval_count DESC`` was lexicographic — confidence
+    dominated absolutely, contradicting the documented product rule and
+    destroying higher-product rows.)
+
+    Content preservation (issue #19 defect 1): an absorbed row's text is
+    appended to the keeper under a provenance separator (and its id recorded in
+    the keeper's ``merged_from`` column), so information unique to an absorbed
+    row stays live-recallable and FTS-indexed rather than being lost when the
+    absorbed row is tombstoned. See ``_absorb_into_keeper``.
 
     When embeddings are unavailable (no onnxruntime/tokenizers, or the model
     file is absent/not yet downloaded), clustering falls back to Jaccard
@@ -1957,11 +2571,12 @@ def consolidate(
     embed_clause = "" if use_lexical else "AND embedding IS NOT NULL"
     rows = conn.execute(
         f"""SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
-                  embedding, embedding_model
+                  embedding, embedding_model, ingestion_ts
            FROM memory
            WHERE superseded_at IS NULL {embed_clause}
            {ns_clause}
-           ORDER BY confidence DESC, retrieval_count DESC""",
+           ORDER BY confidence * retrieval_count DESC, confidence DESC,
+                    ingestion_ts ASC, id ASC""",
         ns_params,
     ).fetchall()
 
@@ -2067,7 +2682,8 @@ def consolidate(
                     # between a background (no --namespace) run and a
                     # cross-project merge.
                     row = conn.execute(
-                        "SELECT id, confidence, signal, tags, retrieval_count FROM memory "
+                        "SELECT id, confidence, signal, tags, retrieval_count, content "
+                        "FROM memory "
                         "WHERE id=? AND superseded_at IS NULL AND namespace=?",
                         (mid, seed["namespace"]),
                     ).fetchone()
@@ -2077,15 +2693,48 @@ def consolidate(
         if not neighbors:
             continue
 
-        # The seed is the keeper (it has the highest confidence x retrieval_count
-        # because we ordered by that). Merge each neighbor into it.
+        # The seed is the keeper. With the rows query ordered by
+        # (confidence * retrieval_count DESC, confidence DESC, ingestion_ts ASC,
+        # id ASC), the seed has the highest confidence*retrieval_count product
+        # in its cluster (and the highest confidence on a product tie — the
+        # fresh-store case where every retrieval_count is 0) — matching the
+        # documented keeper rule (issue #19 defect 2: previously the ORDER BY
+        # was lexicographic on confidence, contradicting the rule and destroying
+        # higher-product rows). Merge each neighbor into it.
         if dry_run:
             print(f"[zmem] DRY RUN: cluster around [{seed['id'][:8]}] "
-                  f"(conf={seed['confidence']}, rc={seed['retrieval_count']}):")
-            print(f"    keeper: {seed['content'][:80]}...")
+                  f"(conf={seed['confidence']}, rc={seed['retrieval_count']}, "
+                  f"prod={seed['confidence'] * seed['retrieval_count']:.2f}):")
+            print(f"    keeper: {seed['content']}")
+            # Dry-run uses the SAME decision predicate as the real merge, so the
+            # preview reflects what would actually happen (issue #19 defect 3:
+            # the previous dry-run only printed a cluster count, hiding the text
+            # that would be lost). Accumulate the keeper's grown content as we
+            # go so successive absorbs see the keeper as the real merge would.
+            dry_keeper_content = seed["content"] or ""
             for nb_row, nb_sim in neighbors:
+                dec = _absorb_decision(dry_keeper_content, nb_row["content"] or "", nb_row["id"])
                 print(f"    absorb [{nb_row['id'][:8]}] sim={nb_sim:.3f}: "
-                      f"conf={nb_row['confidence']} rc={nb_row['retrieval_count']}")
+                      f"conf={nb_row['confidence']} rc={nb_row['retrieval_count']} "
+                      f"prod={nb_row['confidence'] * nb_row['retrieval_count']:.2f}")
+                print(f"        content: {nb_row['content']}")
+                if dec["reason"] == "unique":
+                    if dec["new_tokens"]:
+                        print(f"        would APPEND (gains tokens: {dec['new_tokens']})")
+                    else:
+                        # Same token set in a different ORDER — still unique
+                        # phrasing that must be preserved (PRR-001).
+                        print("        would APPEND (same tokens, different order — preserved)")
+                    sep = f"\n\n--- merged from {nb_row['id']} ---\n"
+                    dry_keeper_content = dry_keeper_content + sep + (nb_row["content"] or "")
+                elif dec["reason"] == "size-cap":
+                    print(f"        size-cap: id recorded (:truncated); content NOT appended "
+                          f"(would exceed {INGEST_MAX_CONTENT_CHARS}). Would-lose tokens: "
+                          f"{dec['new_tokens']}")
+                elif dec["reason"] == "empty":
+                    print("        empty content; nothing to append (id recorded)")
+                else:
+                    print("        already represented in keeper; nothing to append")
                 absorbed.add(nb_row["id"])  # track in dry-run too
             merged_count += len(neighbors)
             continue
@@ -2094,18 +2743,9 @@ def consolidate(
         try:
             conn.execute("BEGIN")
             for nb_row, nb_sim in neighbors:
-                # Merge metadata into the keeper.
-                _merge_on_dedup(conn, seed["id"], nb_row["confidence"],
-                                nb_row["signal"], nb_row["tags"])
-                # Supersede the absorbed member.
-                conn.execute(
-                    "UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?",
-                    (now_iso(), f"consolidated into {seed['id']}", nb_row["id"]),
-                )
-                try:
-                    conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (nb_row["id"],))
-                except sqlite3.OperationalError:
-                    pass
+                # Preserve absorbed content + record provenance + merge metadata
+                # + supersede (issue #19). consolidate-ONLY helper.
+                _absorb_into_keeper(conn, seed, nb_row)
                 absorbed.add(nb_row["id"])
             # Mark the keeper as consolidated.
             conn.execute(
@@ -2114,8 +2754,18 @@ def consolidate(
             )
             conn.execute("COMMIT")
             merged_count += len(neighbors)
-        except Exception:
+        except Exception as exc:
+            # A per-cluster failure (e.g. a DB error mid-merge) rolls the whole
+            # cluster back and leaves its rows live to be re-clustered next run.
+            # Surface it to stderr so content preservation (issue #19) failing
+            # for a cluster is visible rather than silently voiding AC1 — the
+            # swallowed-exception catch is pre-existing, but the new multi-write
+            # _absorb_into_keeper enlarges what this transaction must succeed at
+            # (implementation-review finding #3).
             conn.execute("ROLLBACK")
+            print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] failed "
+                  f"({type(exc).__name__}: {exc}); rolled back, will retry next run",
+                  file=sys.stderr)
             continue
 
     # Optional prune: supersede low-value never-retrieved memories.
@@ -3227,7 +3877,7 @@ def cmd_export_jsonl(
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(
         f"""SELECT id, namespace, type, content, tags, source_ref, confidence, signal,
-                   valid_from, ingestion_ts, superseded_at, supersede_reason
+                   valid_from, ingestion_ts, superseded_at, supersede_reason, merged_from
             FROM memory {where}
             ORDER BY ingestion_ts, id""",
         params,
@@ -3248,6 +3898,7 @@ def cmd_export_jsonl(
             "ingestion_ts": r["ingestion_ts"],
             "superseded_at": r["superseded_at"],
             "supersede_reason": r["supersede_reason"],
+            "merged_from": r["merged_from"],
         }
         line = json.dumps(obj, ensure_ascii=False)
         # json.dumps already escapes every codepoint < 0x20 (\n, \r, and any
@@ -3280,6 +3931,11 @@ def cmd_export_jsonl(
 # bloat the store / the packs and prompts built from it, so it is rejected as
 # malformed rather than clamped (silently truncating memory content would be
 # worse than refusing it).
+#
+# NOTE: this is a deliberate PROTOCOL-ONLY constant (not env-overridable) —
+# it is the contract the export-jsonl -> ingest-jsonl round-trip must satisfy,
+# so changing it locally would let a store export rows its own ingest rejects
+# (or vice-versa across versions). Keep hardcoded unless the wire format changes.
 INGEST_MAX_CONTENT_CHARS = 65536
 
 # Shape guard for an incoming id: UUID-length hex-and-dashes. This is a
@@ -3362,6 +4018,21 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
         raise ValueError("field 'id' must be a 36-char UUID-shaped string")
 
     namespace = _req_str("namespace")
+    # Apply the same global-near-miss rejection as add_memory() so a remote
+    # peer (or a hand-authored sync file) cannot strand rows under `global` /
+    # `userglobal` / etc. on this store — those rows would be unreachable from
+    # every automatic hook (issue #18 "Related observation"). Reject as
+    # malformed (caller counts the line and continues) rather than crashing;
+    # canonicalize `user:global` to itself (no-op). (Final-critic F2.)
+    ns_trimmed = namespace.strip()
+    if ns_trimmed != GLOBAL_NAMESPACE:
+        ns_key = _global_near_miss_key(ns_trimmed)
+        if ns_key in _GLOBAL_NEAR_MISS_STEMS:
+            raise ValueError(
+                f"field 'namespace' value {ns_trimmed!r} looks like a "
+                f"misspelling of the global namespace; use {GLOBAL_NAMESPACE!r}"
+            )
+    namespace = ns_trimmed
     content = _req_str("content")
     if len(content) > INGEST_MAX_CONTENT_CHARS:
         raise ValueError(f"field 'content' is {len(content)} chars, over the "
@@ -3408,6 +4079,7 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     valid_from = _opt_str("valid_from")
     ingestion_ts = _opt_str("ingestion_ts")
     superseded_at = _opt_str("superseded_at") or None
+    merged_from = _opt_str("merged_from") or None
 
     if not ingestion_ts:
         ingestion_ts = now_iso()
@@ -3433,6 +4105,7 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
         "valid_from": valid_from or ingestion_ts,
         "superseded_at": superseded_at,
         "supersede_reason": supersede_reason,
+        "merged_from": merged_from,
     }
 
 
@@ -3461,6 +4134,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
     valid_from = obj["valid_from"]
     superseded_at = obj["superseded_at"]
     supersede_reason = obj["supersede_reason"]
+    merged_from = obj.get("merged_from")
 
     started_tx = False
     try:
@@ -3501,11 +4175,11 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
                    (id, namespace, type, content, tags, source_ref, source_hash,
                     confidence, signal, valid_from, superseded_at, supersede_reason,
                     ingestion_ts, retrieval_count, last_retrieved,
-                    embedding, embedding_model, embedded_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL)""",
+                    embedding, embedding_model, embedded_at, merged_from)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL,?)""",
                 (mid, namespace, type_, content, tags, source_ref, shash,
                  confidence, signal, valid_from, superseded_at, supersede_reason,
-                 ingestion_ts),
+                 ingestion_ts, merged_from),
             )
             if started_tx:
                 _commit(conn)
@@ -3528,10 +4202,12 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
             """INSERT INTO memory
                (id, namespace, type, content, tags, source_ref, source_hash,
                 confidence, signal, valid_from, superseded_at, ingestion_ts,
-                retrieval_count, last_retrieved, embedding, embedding_model, embedded_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?)""",
+                retrieval_count, last_retrieved, embedding, embedding_model, embedded_at,
+                merged_from)
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?,?)""",
             (mid, namespace, type_, content, tags, source_ref, shash,
-             confidence, signal, valid_from, ingestion_ts, emb, emb_model, embedded_at),
+             confidence, signal, valid_from, ingestion_ts, emb, emb_model, embedded_at,
+             merged_from),
         )
         if emb is not None:
             try:
@@ -3784,6 +4460,14 @@ def main():
                           help="suppress the retrieval_count/last_retrieved write "
                                "(READ-ONLY recall; used by hook-driven recall so "
                                "subagent fan-out does not create N concurrent writers)")
+    p_recall.add_argument("--include-global", action="store_true",
+                          help="also surface user:global rows (project-first merge; "
+                               "a global row never crowds out a project row). The "
+                               "automatic hooks pass this so cross-project lessons "
+                               "reach project-scoped sessions (issue #18).")
+    p_recall.add_argument("--global-limit", type=nonnegative_int, default=3,
+                          help="max user:global rows when --include-global is set "
+                               f"(default 3). No effect without --include-global.")
 
     p_recent = sub.add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
@@ -3793,11 +4477,30 @@ def main():
     p_recent.add_argument("--no-bump", action="store_true",
                           help="suppress the retrieval_count/last_retrieved write "
                                "(READ-ONLY; used by hook-driven subagent recall)")
+    p_recent.add_argument("--include-global", action="store_true",
+                          help="also surface user:global rows (project-first merge). "
+                               "The automatic hooks pass this so cross-project "
+                               "lessons reach project-scoped sessions (issue #18).")
+    p_recent.add_argument("--global-limit", type=nonnegative_int, default=3,
+                          help="max user:global rows when --include-global is set "
+                               f"(default 3). No effect without --include-global.")
 
     p_search = sub.add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
     p_search.add_argument("--namespace", default=None)
     p_search.add_argument("--limit", type=int, default=10)
+    p_search.add_argument("--include-global", action="store_true",
+                          help="also surface user:global rows (project-first merge). "
+                               "Use this instead of going unscoped when you want the "
+                               "global tier unioned in but still want a per-tier "
+                               "budget (issue #18).")
+    p_search.add_argument("--global-limit", type=nonnegative_int, default=3,
+                          help="max user:global rows when --include-global is set "
+                               f"(default 3). No effect without --include-global.")
+    p_search.add_argument("--no-bump", action="store_true",
+                          help="suppress the retrieval_count/last_retrieved write "
+                               "(READ-ONLY search). Search defaults to bumping like "
+                               "recall; pass this for a read-only query.")
 
     p_sup = sub.add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
@@ -3847,6 +4550,27 @@ def main():
     p_promote.add_argument("--install-approved", action="store_true",
                            help="explicitly install the generated SKILL.md into the live "
                                 "skills dirs after writing the review candidate")
+
+    p_rekey = sub.add_parser(
+        "rekey-namespace",
+        help="admin: rewrite the namespace of live rows (remediate stranded "
+             "global-near-miss rows so they surface again)")
+    p_rekey.add_argument("--from", dest="from_namespace", default=None,
+                         help="source namespace to rekey from (required unless "
+                              "--near-miss-global is set). Case-sensitive exact match.")
+    p_rekey.add_argument("--to", dest="to_namespace", default=GLOBAL_NAMESPACE,
+                         help=f"destination namespace (default {GLOBAL_NAMESPACE}). "
+                              "Must not itself be a global near-miss.")
+    p_rekey.add_argument("--near-miss-global", action="store_true",
+                         help="rekey EVERY live row whose namespace is a global "
+                              "near-miss (global, userglobal, users:global, ...) to "
+                              "--to. Ignores --from. This is the remediation for "
+                              "legacy rows stranded before the write-time guard.")
+    p_rekey.add_argument("--dry-run", action="store_true",
+                         help="report the candidate count and namespaces without writing")
+    p_rekey.add_argument("--confirm", action="store_true",
+                         help="REQUIRED to actually write. rekey-namespace without "
+                              "--confirm (and without --dry-run) refuses with exit 2.")
 
     p_backup = sub.add_parser(
         "backup", help="take a verified, retention-rotated snapshot of the store")
@@ -3972,6 +4696,8 @@ def main():
         args.cmd in {"add", "supersede", "rebuild-fts", "reembed", "ingest-jsonl"}
         or (args.cmd == "recall" and not args.no_bump)
         or (args.cmd == "recent" and not args.no_bump)
+        or (args.cmd == "search" and not args.no_bump)
+        or (args.cmd == "rekey-namespace" and not args.dry_run and args.confirm)
     ):
         writer_lease = _acquire_writer_lease(args.cmd)
 
@@ -3997,14 +4723,18 @@ def main():
         elif args.cmd == "recall":
             recall_memory(conn, query=args.query, namespace=args.namespace,
                           limit=args.limit, as_json=args.json, hybrid=args.hybrid,
-                          no_bump=args.no_bump)
+                          no_bump=args.no_bump, include_global=args.include_global,
+                          global_limit=args.global_limit)
         elif args.cmd == "recent":
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
                           min_confidence=args.min_confidence, as_json=args.json,
-                          no_bump=args.no_bump)
+                          no_bump=args.no_bump, include_global=args.include_global,
+                          global_limit=args.global_limit)
         elif args.cmd == "search":
             recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
-                          as_json=False, min_confidence=0.0)
+                          as_json=False, min_confidence=0.0,
+                          include_global=args.include_global,
+                          global_limit=args.global_limit, no_bump=args.no_bump)
         elif args.cmd == "supersede":
             ok = supersede_memory(conn, args.id, args.reason)
             sys.exit(0 if ok else 1)
@@ -4043,6 +4773,22 @@ def main():
             rc = cmd_backup(conn, retention=args.retention, out_dir=args.out_dir,
                             if_due=args.if_due)
             sys.exit(rc)
+        elif args.cmd == "rekey-namespace":
+            # --confirm (or --dry-run) is a REAL gate: this rewrites the
+            # namespace column of live rows. Without either flag it refuses.
+            if not args.confirm and not args.dry_run:
+                print("[zmem] rekey-namespace: refusing to write without "
+                      "--confirm (or --dry-run to preview).", file=sys.stderr)
+                sys.exit(2)
+            try:
+                rekey_namespace(
+                    conn, from_namespace=args.from_namespace,
+                    to_namespace=args.to_namespace,
+                    near_miss_global=args.near_miss_global, dry_run=args.dry_run,
+                )
+            except ValueError as exc:
+                print(f"[zmem] rekey-namespace: {exc}", file=sys.stderr)
+                sys.exit(2)
         elif args.cmd == "promote":
             # --confirm is a REAL gate, not decoration. Promotion writes a SKILL.md
             # into the review-candidate area, and live installation now needs the
