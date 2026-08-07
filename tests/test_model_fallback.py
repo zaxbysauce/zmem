@@ -41,6 +41,26 @@ import embeddings  # noqa: E402
 import store  # noqa: E402
 
 
+# Whether THIS interpreter has the embedding runtime installed. CI runs in a
+# bare Python 3.11 without onnxruntime/tokenizers/numpy (the whole point of the
+# degraded-mode suite), so tests that assert the file-level availability reasons
+# ('ok' / 'model_file_missing' / 'tokenizer_missing') are only meaningful when
+# the deps import — otherwise availability_status short-circuits to
+# 'imports_missing' before the file checks. Behavior tests (the degraded warning,
+# stats, doctor) accept either reason, since the degraded state is valid via
+# both triggers (issue #22).
+def _check_embedding_deps_importable() -> bool:
+    for _mod in ("onnxruntime", "tokenizers", "numpy"):
+        try:
+            __import__(_mod)
+        except Exception:
+            return False
+    return True
+
+
+_EMBEDDING_DEPS_IMPORTABLE = _check_embedding_deps_importable()
+
+
 def _run(args, env):
     return subprocess.run(
         [PYTHON, str(STORE_PY), *args],
@@ -415,6 +435,10 @@ class AvailabilityStatusTests(unittest.TestCase):
 
     def test_status_reports_ok_when_model_and_tokenizer_present(self):
         """A dir with both files + importable deps reports reason='ok'."""
+        if not _EMBEDDING_DEPS_IMPORTABLE:
+            self.skipTest("embedding deps not installed in this interpreter "
+                          "(CI runs without them) — file-level 'ok' reason "
+                          "requires importable deps")
         d = Path(self.tmp) / "full"
         d.mkdir()
         (d / "minilm.onnx").write_bytes(b"x")
@@ -428,7 +452,13 @@ class AvailabilityStatusTests(unittest.TestCase):
         self.assertTrue(st["models_dir"])
 
     def test_status_reports_model_file_missing(self):
-        """Tokenizer present, model absent -> reason='model_file_missing'."""
+        """Tokenizer present, model absent -> reason='model_file_missing'
+        (only reachable when the deps ARE importable; in a bare CI interpreter
+        the imports_missing reason short-circuits first)."""
+        if not _EMBEDDING_DEPS_IMPORTABLE:
+            self.skipTest("embedding deps not installed in this interpreter "
+                          "(CI runs without them) — the file-level reasons are "
+                          "unreachable until imports succeed")
         d = Path(self.tmp) / "notok"
         d.mkdir()
         (d / "tokenizer.json").write_bytes(b"x")
@@ -439,7 +469,12 @@ class AvailabilityStatusTests(unittest.TestCase):
         self.assertTrue(st["tokenizer_file"])
 
     def test_status_reports_tokenizer_missing(self):
-        """Model present, tokenizer absent -> reason='tokenizer_missing'."""
+        """Model present, tokenizer absent -> reason='tokenizer_missing'
+        (deps must be importable; see test_status_reports_model_file_missing)."""
+        if not _EMBEDDING_DEPS_IMPORTABLE:
+            self.skipTest("embedding deps not installed in this interpreter "
+                          "(CI runs without them) — the file-level reasons are "
+                          "unreachable until imports succeed")
         d = Path(self.tmp) / "notok2"
         d.mkdir()
         (d / "minilm.onnx").write_bytes(b"x")
@@ -451,7 +486,10 @@ class AvailabilityStatusTests(unittest.TestCase):
 
     def test_status_reports_imports_missing_with_list(self):
         """When the runtime deps can't import, reason='imports_missing' and
-        missing_imports lists which of onnxruntime/tokenizers/numpy failed."""
+        missing_imports lists which of onnxruntime/tokenizers/numpy failed.
+        This case is the CI/bare-interpreter default and one of issue #22's
+        two triggers — so it MUST be exercised regardless of whether the host
+        interpreter has the deps."""
         d = Path(self.tmp) / "imports"
         d.mkdir()
         (d / "minilm.onnx").write_bytes(b"x")
@@ -466,12 +504,38 @@ class AvailabilityStatusTests(unittest.TestCase):
         # an honest snapshot of both axes, not a single collapsed bool.
         self.assertTrue(st["model_file"])
 
+    def test_status_unavailable_when_deps_absent(self):
+        """In a bare interpreter (e.g. CI) the status must report unavailable
+        with reason='imports_missing', naming the missing modules — this is the
+        default CI outcome and one of issue #22's triggers. Only runs when the
+        host interpreter actually lacks the deps. Calls availability_status()
+        IN-PROCESS (not via the subprocess helper, which would inherit a
+        different interpreter state)."""
+        if _EMBEDDING_DEPS_IMPORTABLE:
+            self.skipTest("embedding deps ARE installed here; this asserts the "
+                          "bare-interpreter (CI) behavior")
+        d = Path(self.tmp) / "bare"
+        d.mkdir()
+        os.environ["ZMEM_MODELS_DIR"] = str(d)
+        try:
+            st = embeddings.availability_status()
+        finally:
+            os.environ.pop("ZMEM_MODELS_DIR", None)
+        self.assertFalse(st["available"])
+        self.assertEqual(st["reason"], "imports_missing")
+        self.assertEqual(
+            sorted(st["missing_imports"]), ["numpy", "onnxruntime", "tokenizers"]
+        )
+
     def test_status_never_raises_on_bad_models_dir(self):
         """availability_status must never raise — point it at a path that does
-        not exist; it should report missing files, not crash."""
+        not exist; it should report unavailable, not crash. The reason depends
+        on whether deps import (imports_missing in a bare interpreter, else a
+        file reason)."""
         st = self._status_with(os.path.join(self.tmp, "does_not_exist"))
         self.assertFalse(st["available"])
-        self.assertIn(st["reason"], ("model_file_missing", "tokenizer_missing"))
+        self.assertIn(st["reason"],
+                      ("imports_missing", "model_file_missing", "tokenizer_missing"))
         self.assertFalse(st["model_file"])
 
 
@@ -508,8 +572,14 @@ class DegradedAddWarningTests(unittest.TestCase):
         err = r.stderr.lower()
         self.assertIn("warning", err)
         self.assertIn("without an embedding", err)
-        # Names the reason.
-        self.assertIn("model_file_missing", err)
+        # Names a reason — either trigger is valid (issue #22 has TWO:
+        # missing model file when deps are present, OR missing imports in a bare
+        # interpreter like CI). The point is the warning names A reason.
+        self.assertTrue(
+            "model_file_missing" in err or "imports_missing" in err
+            or "tokenizer_missing" in err,
+            f"warning should name an availability reason, got: {r.stderr}",
+        )
         # Names the resolved models dir (the empty temp dir).
         self.assertIn(self.empty_models_dir.lower(), err)
         # Actionable: points at a remedy.
@@ -606,10 +676,17 @@ class StatsEmbeddingCoverageTests(unittest.TestCase):
         self.assertIn("embedding coverage (live):", out)
         self.assertIn("with_embedding=0", out)
         self.assertIn("without_embedding=1", out)
-        # Availability + reason + resolved models dir.
+        # Availability + resolved models dir.
         self.assertIn("embeddings=unavailable", out)
-        self.assertIn("reason=model_file_missing", out)
         self.assertIn(self.empty_models_dir, out)
+        # Names A reason — either trigger is valid (missing model file when deps
+        # are present, OR missing imports in a bare CI interpreter).
+        self.assertTrue(
+            "reason=model_file_missing" in out
+            or "reason=imports_missing" in out
+            or "reason=tokenizer_missing" in out,
+            f"stats should name an availability reason, got: {out}",
+        )
         # Existing fields are still present (appended, not replaced).
         self.assertIn("by namespace (live):", out)
         self.assertIn("by signal (live):", out)
@@ -621,13 +698,17 @@ class DoctorEmbeddingsTests(unittest.TestCase):
     install. Drives the real doctor.py CLI against an isolated store so the
     box store's schema version doesn't influence the result."""
 
-    def test_doctor_reports_embeddings_warn_and_keeps_ok_true(self):
+    def test_doctor_reports_embeddings_warn_not_fail(self):
+        """The embeddings check reports `warn` (NOT `fail`) when unavailable,
+        names a reason + the resolved interpreter, and does not itself
+        contribute to the fail count. We do NOT assert the overall returncode,
+        because other env-specific checks (host surfaces, codex config) may
+        legitimately fail in a bare CI box — the contract this test guards is
+        that a degraded EMBEDDINGS state is advisory, not blocking."""
         tmp = tempfile.mkdtemp()
         # Point the store at a non-existent path so the schema-version check
         # reports `warn` (no store yet) rather than tripping the pre-existing
         # store.py(v7) vs doctor.py(v5) schema-version drift on an init'd store.
-        # The embedding check is independent of the store (presence-only), so a
-        # missing store does not affect what we are asserting here.
         store_path = os.path.join(tmp, "fresh_store.sqlite")
         models_dir = os.path.join(tmp, "nomodel")
         os.makedirs(models_dir, exist_ok=True)
@@ -640,19 +721,45 @@ class DoctorEmbeddingsTests(unittest.TestCase):
             [PYTHON, str(doctor_py), "--project", str(REPO_ROOT), "--format", "json"],
             capture_output=True, text=True, env=env,
         )
-        self.assertEqual(r.returncode, 0, r.stderr)
+        # Doctor prints the JSON report regardless of overall ok/fail (other
+        # env-specific checks may legitimately fail in a bare CI box). We parse
+        # the report and assert about the EMBEDDINGS check specifically.
+        self.assertTrue(r.stdout.strip(), f"doctor produced no JSON output: {r.stderr}")
         report = json.loads(r.stdout)
         emb = next(c for c in report["checks"] if c["id"] == "embeddings")
+        # Degraded embeddings are advisory, never a hard failure.
         self.assertEqual(emb["status"], "warn")
         self.assertIn(emb["details"]["reason"],
-                      ("model_file_missing", "tokenizer_missing"))
-        # The embedding check must NOT contribute to a top-level failure.
-        # (ok == fail count == 0; a degraded install is supported.)
-        self.assertNotIn(emb["status"], ("fail",))
+                      ("model_file_missing", "tokenizer_missing", "imports_missing"))
         # The python check now reports the resolved interpreter (multi-Python
         # diagnosability).
         py = next(c for c in report["checks"] if c["id"] == "python")
         self.assertTrue(py["details"].get("interpreter"))
+
+    def test_doctor_embeddings_check_does_not_fail_when_unavailable(self):
+        """The embeddings check must be status `warn`, never `fail`, so a
+        degraded install is not reported as broken. Run the embeddings check
+        directly (in-process) so we isolate it from other env-specific checks
+        that may legitimately fail in CI."""
+        models_dir = os.path.join(tempfile.mkdtemp(), "nomodel")
+        os.makedirs(models_dir, exist_ok=True)
+        scripts_dir = str(REPO_ROOT / "skills" / "memory" / "scripts")
+        lines = [
+            "import sys, os, json",
+            f"os.environ['ZMEM_MODELS_DIR'] = {models_dir!r}",
+            "os.environ['ZMEM_MODEL_AUTODOWNLOAD'] = '0'",
+            f"sys.path.insert(0, {scripts_dir!r})",
+            "import doctor",
+            "print(json.dumps(doctor._check_embeddings()))",
+        ]
+        r = subprocess.run([PYTHON, "-c", "\n".join(lines)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        check = json.loads(r.stdout.strip())
+        self.assertNotEqual(check["status"], "fail",
+                            f"embeddings check must not be 'fail' when unavailable "
+                            f"(degraded is supported): {check}")
+        self.assertIn(check["status"], ("warn", "pass"))
 
 
 class IngestJsonlWarningTests(unittest.TestCase):
