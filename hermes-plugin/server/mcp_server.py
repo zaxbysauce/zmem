@@ -87,6 +87,49 @@ def _resolve_store_py() -> Path:
     return _resolve_zmem_home() / _STORE_PY_REL
 
 
+def _log_embedding_availability() -> None:
+    """Probe embedding availability at server startup and log it.
+
+    Surface the degraded state LOUDLY at boot rather than discovering it
+    hundreds of unembedded rows later (issue #22). Best-effort and fail-open:
+    a probe failure logs a warning and never blocks startup. Imports the
+    embeddings module from the SAME checkout the `add` subprocesses run, under
+    THIS server's interpreter (== the `sys.executable` _run_store uses), so
+    the reported state matches what writes will actually experience.
+    """
+    store_py = _resolve_store_py()
+    scripts_dir = str(store_py.parent)
+    try:
+        import importlib
+
+        saved_path = sys.path[:]
+        sys.path.insert(0, scripts_dir)
+        try:
+            emb = importlib.import_module("embeddings")
+            status = emb.availability_status()
+        finally:
+            sys.path[:] = saved_path
+        if status.get("available"):
+            logger.info("zmem embeddings: available (semantic recall/dedup active)")
+        else:
+            logger.warning(
+                "zmem embeddings: UNAVAILABLE (reason=%s, models_dir=%s) — "
+                "add() will store rows WITHOUT embeddings; install "
+                "onnxruntime/tokenizers/numpy (see "
+                "hermes-plugin/server/requirements-embeddings.txt) and place a "
+                "verified minilm.onnx, then run `reembed` to backfill.",
+                status.get("reason"),
+                status.get("models_dir"),
+            )
+    except Exception as exc:  # never block startup on a diagnostic
+        logger.warning(
+            "zmem embeddings: probe failed (%s: %s) — assuming degraded; "
+            "add() may store rows without embeddings.",
+            type(exc).__name__,
+            exc,
+        )
+
+
 def _run_store(args: list[str]) -> dict[str, Any]:
     """Run ``store.py <args>``; returns {ok, stdout, stderr, returncode}."""
     store_py = _resolve_store_py()
@@ -365,6 +408,10 @@ def main() -> int:
     use_tls = bool(tls_kwargs)
 
     mcp = build_server(host=host, port=args.port, use_tls=use_tls)
+
+    # Surface embedding availability at startup so a degraded server is loud
+    # immediately, not 700 unembedded rows later (issue #22). Fail-open.
+    _log_embedding_availability()
 
     if tls_kwargs:
         # uvicorn honors ssl_keyfile/ssl_certfile via Config kwargs. We use the

@@ -57,9 +57,12 @@ _DEFAULT_MODEL_URL = (
 def _resolve_models_dir() -> Path:
     """Resolve the models directory.
 
-    ZMEM_MODELS_DIR overrides (used by tests to point at an empty/missing
-    dir without touching the real installed model). Defaults to the plugin's
-    bundled models directory relative to this script.
+    ZMEM_MODELS_DIR overrides the default models directory. It is supported
+    both as a test affordance (tests point it at an empty/missing dir so they
+    never touch a real installed model) AND as a production configuration
+    knob (point it at a populated, checksum-verified models dir, e.g. a shared
+    model cache across checkouts). Defaults to the plugin's bundled models
+    directory relative to this script.
     """
     override = os.environ.get("ZMEM_MODELS_DIR")
     if override:
@@ -282,3 +285,64 @@ def cosine_similarity_from_blob(blob1: bytes, blob2: bytes) -> float:
 def is_available() -> bool:
     """Public API: check if embeddings are available without loading the model."""
     return _check_available()
+
+
+def availability_status() -> dict:
+    """Structured, shallow availability diagnostic for stats/doctor/warnings.
+
+    Returns a dict describing WHY embeddings are (un)available, computed fresh
+    on each call (NOT cached) so it reflects the current filesystem/import
+    state at the call site:
+
+        {
+          "available": bool,            # True iff deps import AND both files exist
+          "reason": str | None,         # 'ok' | 'imports_missing' |
+                                        # 'model_file_missing' | 'tokenizer_missing' | None
+          "missing_imports": list[str], # subset of onnxruntime/tokenizers/numpy
+          "models_dir": str,            # resolved models dir (ZMEM_MODELS_DIR or default)
+          "interpreter": str,           # sys.executable — which Python is resolving deps
+          "model_file": bool,           # minilm.onnx present?
+          "tokenizer_file": bool,       # tokenizer.json present?
+        }
+
+    Presence-only: checks importability + file existence. NEVER hashes the
+    model, NEVER loads the ONNX session, NEVER triggers autodownload, NEVER
+    raises. This is deliberately distinct from the cached `is_available()`/
+    `_check_available()` fast path used by the embed hot-path: that one caches
+    a bool for speed; this one inspects current state for diagnostics. In a
+    short-lived CLI process they never disagree; in a long-lived process
+    (e.g. the Hermes server) this reflects install state at call time, which
+    is exactly what startup/diagnostic logging needs.
+    """
+    missing: list[str] = []
+    for mod in ("onnxruntime", "tokenizers", "numpy"):
+        try:
+            __import__(mod)
+        except Exception:
+            missing.append(mod)
+    models_dir = _resolve_models_dir()
+    model_file = (models_dir / "minilm.onnx").is_file()
+    tokenizer_file = (models_dir / "tokenizer.json").is_file()
+
+    if missing:
+        reason = "imports_missing"
+        available = False
+    elif not model_file:
+        reason = "model_file_missing"
+        available = False
+    elif not tokenizer_file:
+        reason = "tokenizer_missing"
+        available = False
+    else:
+        reason = "ok"
+        available = True
+
+    return {
+        "available": available,
+        "reason": reason,
+        "missing_imports": missing,
+        "models_dir": str(models_dir),
+        "interpreter": sys.executable or "",
+        "model_file": model_file,
+        "tokenizer_file": tokenizer_file,
+    }

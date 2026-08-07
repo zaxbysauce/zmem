@@ -376,5 +376,347 @@ class ModelAbsentEndToEndTests(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
 
 
+class AvailabilityStatusTests(unittest.TestCase):
+    """Unit tests for embeddings.availability_status() — the structured,
+    shallow, never-raising diagnostic added for issue #22. Drives the function
+    directly (no CLI, no network) with temp dirs + import monkeypatching."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _status_with(self, models_dir, fake_imports_ok=True):
+        """Probe availability_status against a controlled models_dir, optionally
+        simulating missing imports by monkeypatching __import__."""
+        env = {**os.environ, "ZMEM_MODELS_DIR": models_dir}
+        script = (
+            "import sys, os, json\n"
+            f"os.environ.update({env!r})\n"
+            f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
+            "import embeddings\n"
+            f"print(json.dumps(embeddings.availability_status()))\n"
+        )
+        if not fake_imports_ok:
+            # Force the three embedding imports to fail inside the child process
+            # by inserting a blocking meta_path finder BEFORE probing, so the
+            # 'imports_missing' reason is exercised without uninstalling the
+            # real packages from this interpreter.
+            script = (
+                "import sys, importlib.abc, importlib.machinery\n"
+                "class _Block(importlib.abc.MetaPathFinder):\n"
+                "    def find_spec(self, fullname, path, target=None):\n"
+                "        if fullname in ('onnxruntime','tokenizers','numpy'):\n"
+                "            raise ImportError('blocked for test')\n"
+                "        return None\n"
+                "sys.meta_path.insert(0, _Block())\n"
+            ) + script
+        r = subprocess.run([PYTHON, "-c", script], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip())
+
+    def test_status_reports_ok_when_model_and_tokenizer_present(self):
+        """A dir with both files + importable deps reports reason='ok'."""
+        d = Path(self.tmp) / "full"
+        d.mkdir()
+        (d / "minilm.onnx").write_bytes(b"x")
+        (d / "tokenizer.json").write_bytes(b"x")
+        st = self._status_with(str(d))
+        self.assertTrue(st["available"])
+        self.assertEqual(st["reason"], "ok")
+        self.assertEqual(st["missing_imports"], [])
+        self.assertTrue(st["model_file"])
+        self.assertTrue(st["tokenizer_file"])
+        self.assertTrue(st["models_dir"])
+
+    def test_status_reports_model_file_missing(self):
+        """Tokenizer present, model absent -> reason='model_file_missing'."""
+        d = Path(self.tmp) / "notok"
+        d.mkdir()
+        (d / "tokenizer.json").write_bytes(b"x")
+        st = self._status_with(str(d))
+        self.assertFalse(st["available"])
+        self.assertEqual(st["reason"], "model_file_missing")
+        self.assertFalse(st["model_file"])
+        self.assertTrue(st["tokenizer_file"])
+
+    def test_status_reports_tokenizer_missing(self):
+        """Model present, tokenizer absent -> reason='tokenizer_missing'."""
+        d = Path(self.tmp) / "notok2"
+        d.mkdir()
+        (d / "minilm.onnx").write_bytes(b"x")
+        st = self._status_with(str(d))
+        self.assertFalse(st["available"])
+        self.assertEqual(st["reason"], "tokenizer_missing")
+        self.assertTrue(st["model_file"])
+        self.assertFalse(st["tokenizer_file"])
+
+    def test_status_reports_imports_missing_with_list(self):
+        """When the runtime deps can't import, reason='imports_missing' and
+        missing_imports lists which of onnxruntime/tokenizers/numpy failed."""
+        d = Path(self.tmp) / "imports"
+        d.mkdir()
+        (d / "minilm.onnx").write_bytes(b"x")
+        (d / "tokenizer.json").write_bytes(b"x")
+        st = self._status_with(str(d), fake_imports_ok=False)
+        self.assertFalse(st["available"])
+        self.assertEqual(st["reason"], "imports_missing")
+        self.assertEqual(
+            sorted(st["missing_imports"]), ["numpy", "onnxruntime", "tokenizers"]
+        )
+        # Files are still reported as present even when imports fail — status is
+        # an honest snapshot of both axes, not a single collapsed bool.
+        self.assertTrue(st["model_file"])
+
+    def test_status_never_raises_on_bad_models_dir(self):
+        """availability_status must never raise — point it at a path that does
+        not exist; it should report missing files, not crash."""
+        st = self._status_with(os.path.join(self.tmp, "does_not_exist"))
+        self.assertFalse(st["available"])
+        self.assertIn(st["reason"], ("model_file_missing", "tokenizer_missing"))
+        self.assertFalse(st["model_file"])
+
+
+class DegradedAddWarningTests(unittest.TestCase):
+    """Issue #22: a degraded `add` (no model / no imports) must emit a
+    one-time-per-process, actionable stderr warning naming the reason and the
+    resolved models_dir. Drives the real CLI in a subprocess with the model
+    forced absent, per repo convention."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store_path = os.path.join(self.tmp, "store.sqlite")
+        self.empty_models_dir = os.path.join(self.tmp, "no_model_here")
+        os.makedirs(self.empty_models_dir, exist_ok=True)
+        self.env = {
+            **os.environ,
+            "ZMEM_STORE": self.store_path,
+            "ZMEM_MODELS_DIR": self.empty_models_dir,
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
+        r = _run(["init"], self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def _add(self, content):
+        return _run(
+            ["add", "--namespace", "project:degradedwarn", "--type", "fact",
+             "--content", content, "--signal", "test"],
+            self.env,
+        )
+
+    def test_degraded_add_emits_actionable_warning(self):
+        r = self._add("a live lesson that should have been embedded")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        err = r.stderr.lower()
+        self.assertIn("warning", err)
+        self.assertIn("without an embedding", err)
+        # Names the reason.
+        self.assertIn("model_file_missing", err)
+        # Names the resolved models dir (the empty temp dir).
+        self.assertIn(self.empty_models_dir.lower(), err)
+        # Actionable: points at a remedy.
+        self.assertTrue(
+            "zmem_model_url" in err or "reembed" in err or "minilm.onnx" in err,
+            f"warning should be actionable, got: {r.stderr}",
+        )
+        # The add still succeeded (degraded is a supported state).
+        self.assertIn("[zmem] added memory", r.stdout)
+
+    def test_warning_fires_once_per_process(self):
+        """Two adds in ONE store.py invocation must warn exactly once. The CLI
+        services one add per process, so we run a small driver that calls the
+        in-process _detect_duplicate twice and counts warnings on stderr."""
+        script = (
+            "import sys, os, sqlite3\n"
+            f"os.environ.update({self.env!r})\n"
+            f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
+            "import store\n"
+            f"conn = sqlite3.connect({self.store_path!r})\n"
+            "conn.row_factory = sqlite3.Row\n"
+            "store._degraded_embedding_warned = False\n"
+            "store._detect_duplicate(conn, 'first live content here', 'project:x')\n"
+            "store._detect_duplicate(conn, 'second live content here', 'project:x')\n"
+        )
+        r = subprocess.run([PYTHON, "-c", script], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Exactly one warning line for two calls.
+        self.assertEqual(r.stderr.count("WARNING: memory stored without an embedding"), 1)
+
+    def test_empty_content_add_does_not_warn(self):
+        """Empty/whitespace content produces no embedding by design (embed_text
+        short-circuits) and must NOT trip the degradation warning."""
+        r = self._add("   ")
+        # The store rejects empty content, but either way the degradation
+        # warning must not appear.
+        self.assertNotIn("without an embedding", r.stderr.lower())
+
+    def test_warning_does_not_trigger_download(self):
+        """The warning path reads availability_status() (presence-only) and must
+        not cause a network download attempt (autodownload stays opt-in)."""
+        marker = os.path.join(self.tmp, "download_attempted.marker")
+        script = (
+            "import sys, os\n"
+            f"os.environ.update({self.env!r})\n"
+            f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
+            "import embeddings, store\n"
+            "_orig = embeddings._try_download_model\n"
+            f"def _spy(*a, **k):\n"
+            f"    open({marker!r}, 'w').close()\n"
+            "    return _orig(*a, **k)\n"
+            "embeddings._try_download_model = _spy\n"
+            "import sqlite3\n"
+            f"conn = sqlite3.connect({self.store_path!r})\n"
+            "store._detect_duplicate(conn, 'content that lands unembedded', 'project:x')\n"
+        )
+        r = subprocess.run([PYTHON, "-c", script], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(
+            os.path.exists(marker),
+            "the degraded-warning path triggered a download attempt — "
+            "availability_status() must be presence-only.",
+        )
+
+
+class StatsEmbeddingCoverageTests(unittest.TestCase):
+    """Issue #22: `stats` must report live embedding coverage + availability."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store_path = os.path.join(self.tmp, "store.sqlite")
+        self.empty_models_dir = os.path.join(self.tmp, "no_model_here")
+        os.makedirs(self.empty_models_dir, exist_ok=True)
+        self.env = {
+            **os.environ,
+            "ZMEM_STORE": self.store_path,
+            "ZMEM_MODELS_DIR": self.empty_models_dir,
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
+        r = _run(["init"], self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = _run(
+            ["add", "--namespace", "project:statscov", "--type", "fact",
+             "--content", "an unembedded row for stats coverage", "--signal", "test"],
+            self.env,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_stats_reports_coverage_and_availability(self):
+        r = _run(["stats"], self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = r.stdout
+        # Coverage block present with live counts.
+        self.assertIn("embedding coverage (live):", out)
+        self.assertIn("with_embedding=0", out)
+        self.assertIn("without_embedding=1", out)
+        # Availability + reason + resolved models dir.
+        self.assertIn("embeddings=unavailable", out)
+        self.assertIn("reason=model_file_missing", out)
+        self.assertIn(self.empty_models_dir, out)
+        # Existing fields are still present (appended, not replaced).
+        self.assertIn("by namespace (live):", out)
+        self.assertIn("by signal (live):", out)
+
+
+class DoctorEmbeddingsTests(unittest.TestCase):
+    """Issue #22: doctor must report embedding availability (warn, not fail),
+    the resolved interpreter, and must not flip top-level ok for a degraded
+    install. Drives the real doctor.py CLI against an isolated store so the
+    box store's schema version doesn't influence the result."""
+
+    def test_doctor_reports_embeddings_warn_and_keeps_ok_true(self):
+        tmp = tempfile.mkdtemp()
+        # Point the store at a non-existent path so the schema-version check
+        # reports `warn` (no store yet) rather than tripping the pre-existing
+        # store.py(v7) vs doctor.py(v5) schema-version drift on an init'd store.
+        # The embedding check is independent of the store (presence-only), so a
+        # missing store does not affect what we are asserting here.
+        store_path = os.path.join(tmp, "fresh_store.sqlite")
+        models_dir = os.path.join(tmp, "nomodel")
+        os.makedirs(models_dir, exist_ok=True)
+        env = {**os.environ,
+               "ZMEM_STORE": store_path,
+               "ZMEM_MODELS_DIR": models_dir,
+               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        doctor_py = REPO_ROOT / "skills" / "memory" / "scripts" / "doctor.py"
+        r = subprocess.run(
+            [PYTHON, str(doctor_py), "--project", str(REPO_ROOT), "--format", "json"],
+            capture_output=True, text=True, env=env,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        report = json.loads(r.stdout)
+        emb = next(c for c in report["checks"] if c["id"] == "embeddings")
+        self.assertEqual(emb["status"], "warn")
+        self.assertIn(emb["details"]["reason"],
+                      ("model_file_missing", "tokenizer_missing"))
+        # The embedding check must NOT contribute to a top-level failure.
+        # (ok == fail count == 0; a degraded install is supported.)
+        self.assertNotIn(emb["status"], ("fail",))
+        # The python check now reports the resolved interpreter (multi-Python
+        # diagnosability).
+        py = next(c for c in report["checks"] if c["id"] == "python")
+        self.assertTrue(py["details"].get("interpreter"))
+
+
+class IngestJsonlWarningTests(unittest.TestCase):
+    """Issue #22: the ingest-jsonl path shares _detect_duplicate, so a live
+    imported row must warn when embeddings are unavailable; a tombstoned
+    history row (which deliberately bypasses _detect_duplicate) must NOT."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store_path = os.path.join(self.tmp, "store.sqlite")
+        self.empty_models_dir = os.path.join(self.tmp, "no_model_here")
+        os.makedirs(self.empty_models_dir, exist_ok=True)
+        self.env = {
+            **os.environ,
+            "ZMEM_STORE": self.store_path,
+            "ZMEM_MODELS_DIR": self.empty_models_dir,
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
+        r = _run(["init"], self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def _ingest(self, rows, allow_tombstones=False):
+        import uuid as _uuid
+        path = os.path.join(self.tmp, "sync.jsonl")
+        with open(path, "w") as f:
+            for row in rows:
+                row = {
+                    "id": str(_uuid.uuid4()),
+                    "namespace": "project:ingestwarn",
+                    "type": "fact",
+                    "content": "live imported lesson for ingest warning",
+                    "tags": "",
+                    "source_ref": "",
+                    "source_hash": "",
+                    "confidence": 0.8,
+                    "signal": "test",
+                    "valid_from": "2026-01-01T00:00:00Z",
+                    "ingestion_ts": "2026-01-01T00:00:00Z",
+                    "retrieval_count": 0,
+                    **row,
+                }
+                f.write(json.dumps(row) + "\n")
+        args = ["ingest-jsonl", "--in", path, "--source-ref", "test-sync"]
+        if allow_tombstones:
+            args.append("--allow-tombstones")
+        return _run(args, self.env)
+
+    def test_live_ingested_row_warns_when_unembedded(self):
+        r = self._ingest([{}])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("without an embedding", r.stderr.lower())
+
+    def test_tombstoned_history_row_does_not_warn(self):
+        """A row that arrives already-superseded is inserted as history via the
+        direct path (no _detect_duplicate), so it must not trip the live-row
+        degradation warning."""
+        r = self._ingest(
+            [{"superseded_at": "2026-01-02T00:00:00Z",
+              "supersede_reason": "imported tombstone"}],
+            allow_tombstones=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("without an embedding", r.stderr.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

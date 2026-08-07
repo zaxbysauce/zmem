@@ -1,0 +1,13 @@
+# Optional embedding runtime for the zmem MCP store host.
+#
+# Install these ON THE STORE-HOST BOX to enable semantic recall/dedup for
+# memories written through the MCP server's `add` tool. Without them, `add`
+# stores rows without embeddings and recall falls back to FTS5 keyword
+# matching — a supported mode, but semantic dedup-on-write, vector recall,
+# and embedding-seeded consolidation are disabled. (Cloud/ephemeral boxes
+# that only need keyword recall may skip this — see docs/CLOUD.md.)
+#
+# Install with:  pip install -r hermes-plugin/server/requirements-embeddings.txt
+onnxruntime>=1.16,<2.0
+tokenizers>=0.15,<1.0
+numpy>=1.24,<3.0

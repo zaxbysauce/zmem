@@ -292,8 +292,15 @@ def _check_python() -> dict:
             "fail",
             f"Python {version} is too old; zmem requires Python 3.8+.",
             version=version,
+            interpreter=sys.executable,
         )
-    return _check("python", "pass", f"Python {version}", version=version)
+    return _check(
+        "python",
+        "pass",
+        f"Python {version}",
+        version=version,
+        interpreter=sys.executable,
+    )
 
 
 def _check_sqlite_fts5() -> dict:
@@ -310,6 +317,65 @@ def _check_sqlite_fts5() -> dict:
             f"SQLite FTS5 is unavailable: {type(exc).__name__}: {exc}",
         )
     return _check("sqlite-fts5", "pass", "SQLite FTS5 is available.")
+
+
+def _check_embeddings() -> dict:
+    """Embedding availability (semantic recall/dedup).
+
+    Degraded embeddings are a SUPPORTED state (FTS5 recall + lexical
+    consolidate keep working), so unavailability is `warn`, not `fail` — it
+    must not flip the report's top-level `ok` (which is `fail count == 0`).
+    Pure presence check via embeddings.availability_status(): no store access,
+    no network, no model load, no checksum hash — read-only and side-effect
+    free, per doctor's contract.
+    """
+    try:
+        saved_path = sys.path[:]
+        sys.path.insert(0, os.path.dirname(__file__))
+        try:
+            import embeddings  # type: ignore
+        finally:
+            sys.path[:] = saved_path
+    except Exception as exc:
+        return _check(
+            "embeddings",
+            "warn",
+            "Embeddings module is not importable; semantic recall/dedup disabled.",
+            reason="embeddings_module_missing",
+            error=f"{type(exc).__name__}: {exc}",
+            interpreter=sys.executable,
+        )
+    try:
+        st = embeddings.availability_status()
+    except Exception as exc:
+        return _check(
+            "embeddings",
+            "warn",
+            "Embedding availability could not be determined.",
+            reason="probe_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            interpreter=sys.executable,
+        )
+    status = "pass" if st["available"] else "warn"
+    if st["available"]:
+        summary = "Embeddings available; semantic recall/dedup active."
+    else:
+        summary = (
+            f"Embeddings unavailable (reason={st['reason']}); semantic "
+            "recall/dedup disabled — degraded FTS5/lexical mode is supported."
+        )
+    return _check(
+        "embeddings",
+        status,
+        summary,
+        available=st["available"],
+        reason=st["reason"],
+        missing_imports=st.get("missing_imports", []),
+        models_dir=st.get("models_dir"),
+        interpreter=st.get("interpreter"),
+        model_file=st.get("model_file"),
+        tokenizer_file=st.get("tokenizer_file"),
+    )
 
 
 def _find_windows_bash() -> tuple[Path | None, str]:
@@ -798,6 +864,25 @@ def _recommendations(checks: list[dict]) -> list[str]:
         notes.append(
             "Run the first writable zmem command only after the shared store path is correct; that first run may need to initialize or migrate schema v5."
         )
+    emb = by_id.get("embeddings", {})
+    if emb.get("status") == "warn":
+        reason = emb.get("details", {}).get("reason")
+        if reason == "imports_missing":
+            notes.append(
+                "Embeddings are disabled because the Python interpreter zmem resolves is missing onnxruntime/tokenizers/numpy. "
+                "Install them in that interpreter to enable semantic recall/dedup; degraded FTS5/lexical operation is supported meanwhile."
+            )
+        elif reason in ("model_file_missing", "tokenizer_missing"):
+            notes.append(
+                "Embeddings are disabled because minilm.onnx/tokenizer.json are absent from the resolved models dir. "
+                "Place a checksum-verified minilm.onnx there (or set ZMEM_MODEL_URL to a source matching the pinned SHA-256 plus ZMEM_MODEL_AUTODOWNLOAD=1). "
+                "After enabling, run `reembed` to backfill existing rows. Degraded FTS5/lexical operation is supported meanwhile."
+            )
+        else:
+            notes.append(
+                "Embeddings are disabled; semantic recall/dedup is off (degraded FTS5/lexical mode is supported). "
+                "See the README 'Embeddings' section to enable them, then run `reembed` to backfill."
+            )
     return notes
 
 
@@ -838,6 +923,7 @@ def build_report(project: Path, repo_root: Path) -> dict:
     namespace_check = _check_namespace(project)
     checks.append(namespace_check)
     checks.append(_check_surfaces(repo_root))
+    checks.append(_check_embeddings())
 
     counts = {"pass": 0, "warn": 0, "fail": 0, "skip": 0}
     for check in checks:
