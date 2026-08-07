@@ -166,9 +166,19 @@ export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 # $ZMEM_BACKUP_INTERVAL_DAYS (default 1). Both commands take their own
 # single-flight lock, so several sessions starting at once produce one
 # consolidation and one snapshot, not N of each.
+#
+# `sweep` (issue #23) prunes the per-session cooldown markers the capture/
+# convention hooks leave behind, so they cannot accumulate unboundedly in the
+# data dirs. Its stdio is deliberately redirected exactly like its siblings so
+# nothing can leak into the <<<ZMEM_JSON>>>…<<<END>>> payload the launcher
+# parses. It takes NO advisory lock — the sweep is store-independent and
+# idempotent (listdir + per-file unlink), so concurrent sweeps from two sessions
+# starting at once are safe by construction; do not "harden" it with the
+# consolidate/backup single-flight unless a real race is demonstrated.
 if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   "$PYTHON_BIN" "$STORE_PY_PY" consolidate >/dev/null 2>&1 &
   "$PYTHON_BIN" "$STORE_PY_PY" backup --if-due --retention "${ZMEM_BACKUP_RETENTION:-7}" >/dev/null 2>&1 &
+  "$PYTHON_BIN" "$STORE_PY_PY" sweep >/dev/null 2>&1 &
 fi
 
 # Canonical namespace from the host adapter (single derived key, closes the

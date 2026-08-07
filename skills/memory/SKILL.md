@@ -234,7 +234,19 @@ completed one. This does *not* serialize against a live interactive session's
 own `add`/`recall` writes, which take no lock: still run `restore` when no
 session is actively writing.
 
-### export-pack — render a Tier 1 markdown memory pack
+### sweep — prune stale per-session cooldown sentinels
+```
+python <store.py> sweep [--marker-dir DIR] [--max-age-days 7] [--dry-run]
+```
+Removes the `.capture-prompted-<session>` / `.convention-prompted-<session>`
+cooldown markers the capture/convention hooks leave in the data dirs (issue #23).
+A marker is only meaningful for the session named in its filename, so anything
+older than `--max-age-days` (default `$ZMEM_SENTINEL_SWEEP_DAYS`, else 7) is
+garbage. Sweeps the union of every dir the two hooks can write into (their
+resolution chains differ), never touching anything that is not a sentinel-prefixed
+file. Idempotent and fail-open. The SessionStart hook fires it detached each
+session so the markers stay bounded; `--dry-run` counts without deleting.
+
 ```
 python <store.py> export-pack --namespace NS [--out FILE] [--project-limit 50] \
   [--global-limit 15] [--min-confidence 0.6] [--max-bytes 32768]

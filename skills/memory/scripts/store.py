@@ -1775,8 +1775,8 @@ def recall_memory(
 
     When ``no_bump`` is True the retrieval_count / last_retrieved write is suppressed —
     recall instead records the passive *surface* on surfaced_count / last_surfaced
-    (issue #21). Hook-driven recall (UserPromptSubmit, SubagentStart) passes this so heavy
-    subagent fan-out does not turn every delegated agent into a concurrent
+    (issue #21). Hook-driven recall (UserPromptSubmit, SubagentStart, SessionStart) passes
+    this so heavy subagent fan-out does not turn every delegated agent into a concurrent
     retrieval_count writer on the shared store (PLAN.md §5), while the surface event is
     still counted. Explicit skill-invoked recall keeps the default (bumps retrieval_count).
 
@@ -2917,6 +2917,16 @@ SNAPSHOT_GLOB = SNAPSHOT_PREFIX + "*" + SNAPSHOT_SUFFIX
 
 BACKUP_DEFAULT_RETENTION = 7
 
+# Per-session cooldown sentinel sweep (issue #23 "Minor, related"). The
+# capture/convention hooks write one dot-named marker file per session into the
+# data dir to de-duplicate their prompt within that session; nothing removed
+# them, so they accumulated unboundedly. A marker is only meaningful for the
+# session named in its filename, so anything older than this TTL is garbage.
+# Default matches backup retention. The SessionStart hook fires `sweep` detached
+# each session so the dir stays bounded.
+SENTINEL_PREFIXES = (".capture-prompted-", ".convention-prompted-")
+SENTINEL_SWEEP_DAYS_DEFAULT = _env_float("ZMEM_SENTINEL_SWEEP_DAYS", 7.0)
+
 
 # Stale-lock timeouts. An mtime lease cannot tell "crashed" from "slower than
 # the timeout", so both are set far above any realistic run; the worst case if
@@ -3287,6 +3297,110 @@ def cmd_backup(
         return 0
     finally:
         _release_lock("backup", token)
+
+
+# ---------------------------------------------------------------------------
+# Sentinel sweep (issue #23 "Minor, related")
+# ---------------------------------------------------------------------------
+# The capture/convention hooks write one per-session cooldown marker into the
+# data dir to de-duplicate their prompt within that session. The two hooks
+# resolve that dir on DIFFERENT chains:
+#   hooks/zmem-capture-failure.sh:
+#       ZMEM_DATA > ZCODE_PLUGIN_DATA > ~/.zmem
+#   hooks/zmem-convention-capture.sh:
+#       ZMEM_STORE(dirname) > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA
+#       > host.py filesystem tail (~/.zmem > ~/.zcode/memory > newest
+#         ~/.zcode/cli/plugins/data/*zmem*)
+# so a reaper must sweep the UNION of every directory either hook could pick, or
+# a config that lands a marker in e.g. CLAUDE_PLUGIN_DATA or a legacy plugin dir
+# would never be pruned. The set is small and deduped; each dir is swept with a
+# single listdir that only ever considers sentinel-prefixed names.
+
+def _sweep_candidate_dirs() -> list[Path]:
+    """Every directory the capture/convention hooks may write their per-session
+    cooldown markers into (union of both hooks' resolution chains, deduped)."""
+    dirs: list[Path] = []
+
+    def _add(p: Path) -> None:
+        if p not in dirs:
+            dirs.append(p)
+
+    store = os.environ.get("ZMEM_STORE")
+    if store:
+        _add(Path(store).parent)
+    for var in ("ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+        v = os.environ.get(var)
+        if v:
+            _add(Path(v))
+    _add(Path.home() / ".zmem")
+    legacy = Path.home() / ".zcode" / "memory"
+    if legacy.is_dir():
+        _add(legacy)
+    scan = Path.home() / ".zcode" / "cli" / "plugins" / "data"
+    if scan.is_dir():
+        try:
+            for d in scan.iterdir():
+                if d.is_dir() and "zmem" in d.name.lower():
+                    _add(d)
+        except OSError:
+            pass  # fail-open: an unreadable scan root must never break the sweep
+    return dirs
+
+
+def cmd_sweep(marker_dir: str | None = None,
+              max_age_days: float | None = None,
+              dry_run: bool = False) -> int:
+    """Remove stale per-session cooldown sentinel files (issue #23).
+
+    Idempotent, fail-open, bounded: sweeps only the (few) directories the
+    capture/convention hooks can write markers into (or a single explicit
+    --marker-dir), and within each only considers files whose name starts with a
+    known sentinel prefix — everything else in those dirs (store, lock files,
+    backups, unrelated dot-files) is strictly left alone. A marker older than
+    `max_age_days` is garbage: it only ever gates a re-prompt within the session
+    named in its filename.
+
+    No advisory lock is needed: listdir + per-file unlink is idempotent, so two
+    sessions sweeping the same dir at once are safe by construction (any
+    FileNotFoundError on unlink is caught as an OSError below). Returns a process
+    exit code; never raises on a missing dir or a permission error.
+    """
+    if max_age_days is None:
+        max_age_days = SENTINEL_SWEEP_DAYS_DEFAULT
+    cutoff = time.time() - max_age_days * 86400
+    dirs = [Path(marker_dir)] if marker_dir else _sweep_candidate_dirs()
+    removed = 0
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue  # fail-open: a locked/unreadable dir must never break session start
+        for name in names:
+            if not name.startswith(SENTINEL_PREFIXES):
+                continue
+            p = d / name
+            try:
+                if not p.is_file():
+                    continue
+                # Strict <, NOT <=: a marker just written by the live session has
+                # mtime >= now > cutoff, so it is always kept. Loosening to <= risks
+                # deleting the live session's marker on the boundary second.
+                if p.stat().st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue  # best-effort: unreadable/racy entry, skip
+            if not dry_run:
+                try:
+                    p.unlink()
+                except OSError:
+                    continue
+            removed += 1
+    if removed:
+        verb = "would prune" if dry_run else "pruned"
+        print(f"[zmem] sweep: {verb} {removed} stale session sentinel(s)")
+    return 0
 
 
 def _integrity_check_readonly(path: Path) -> str:
@@ -4758,6 +4872,20 @@ def main():
     p_fail.add_argument("--db", default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
                         help="ZCode episodic db.sqlite path (default ~/.zcode/cli/db/db.sqlite)")
 
+    p_sweep = sub.add_parser(
+        "sweep",
+        help="remove stale per-session cooldown sentinel files (issue #23)")
+    p_sweep.add_argument("--marker-dir", default=None,
+                         help="override the directory to sweep (default: the union of "
+                              "every dir the capture/convention hooks can write markers "
+                              "into)")
+    p_sweep.add_argument("--max-age-days", type=float, default=None,
+                         help=f"drop markers older than this many days (default "
+                              f"{SENTINEL_SWEEP_DAYS_DEFAULT:.0f}; env "
+                              f"ZMEM_SENTINEL_SWEEP_DAYS)")
+    p_sweep.add_argument("--dry-run", action="store_true",
+                         help="count what would be pruned without deleting anything")
+
     args = ap.parse_args()
 
     # `failures` is store-independent (it reads a transcript JSONL or the ZCode
@@ -4776,6 +4904,15 @@ def main():
     if args.cmd == "restore":
         sys.exit(cmd_restore(from_path=args.from_path, force=args.force,
                              out_dir=args.out_dir))
+
+    # `sweep` is pure file maintenance (removes stale cooldown markers), never
+    # touches the store itself, so — like `failures`/`restore` above — it is
+    # dispatched BEFORE connect()/init_db()/migrate(): a locked or mid-migration
+    # store can never block the reaper, and no store.sqlite is required.
+    if args.cmd == "sweep":
+        sys.exit(cmd_sweep(marker_dir=args.marker_dir,
+                           max_age_days=args.max_age_days,
+                           dry_run=args.dry_run))
 
     try:
         _wait_for_maintenance_clear(args.cmd)

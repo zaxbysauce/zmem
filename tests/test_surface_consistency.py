@@ -93,6 +93,20 @@ class AdapterScanTest(unittest.TestCase):
         self.assertNotIn("--no-bump", text,
                          "MCP recall/search are EXPLICIT and must NOT pass --no-bump")
 
+    def test_readonly_invariant_docstring_lists_all_hooks(self):
+        # The passive-recall read-only contract (the recall() docstring) must name
+        # ALL THREE automatic hook sources — UserPromptSubmit, SubagentStart, and
+        # SessionStart — so the read-only invariant stays checkable and a comment
+        # cannot silently drop one hook again (issue #23). SessionStart was the
+        # one omitted here after it was made --no-bump by PR #29.
+        text = (SCRIPTS_DIR / "store.py").read_text(encoding="utf-8")
+        start = text.index("def recall_memory(")
+        end = text.index("def ", start + 1)
+        doc = text[start:end]
+        self.assertIn("UserPromptSubmit", doc)
+        self.assertIn("SubagentStart", doc)
+        self.assertIn("SessionStart", doc)
+
 
 class SurfaceTempStoreTest(unittest.TestCase):
     """Subprocess tests driving the REAL store.py CLI against a temp store."""
