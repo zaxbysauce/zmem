@@ -247,6 +247,7 @@ resolution chains differ), never touching anything that is not a sentinel-prefix
 file. Idempotent and fail-open. The SessionStart hook fires it detached each
 session so the markers stay bounded; `--dry-run` counts without deleting.
 
+### export-pack — render a Tier 1 markdown memory pack
 ```
 python <store.py> export-pack --namespace NS [--out FILE] [--project-limit 50] \
   [--global-limit 15] [--min-confidence 0.6] [--max-bytes 32768]

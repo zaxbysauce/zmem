@@ -3367,6 +3367,17 @@ def cmd_sweep(marker_dir: str | None = None,
     """
     if max_age_days is None:
         max_age_days = SENTINEL_SWEEP_DAYS_DEFAULT
+    # Reject non-finite or negative TTL up front (PRR-001): `float("nan")` and
+    # `float("-inf")`/`-1` parse cleanly through `_env_float` and argparse
+    # `type=float`, but a NaN cutoff makes `mtime >= cutoff` always False and a
+    # negative cutoff lands in the future — either would prune EVERY sentinel,
+    # including the live session's freshly-written marker. 0 is a valid
+    # aggressive setting (prune everything older than now). Same finite-check
+    # pattern used for `confidence` above.
+    if not math.isfinite(max_age_days) or max_age_days < 0:
+        print(f"[zmem] sweep: --max-age-days must be a finite, non-negative number "
+              f"(got {max_age_days!r})", file=sys.stderr)
+        return 2
     cutoff = time.time() - max_age_days * 86400
     dirs = [Path(marker_dir)] if marker_dir else _sweep_candidate_dirs()
     removed = 0
@@ -3386,7 +3397,13 @@ def cmd_sweep(marker_dir: str | None = None,
                     continue
                 # Strict <, NOT <=: a marker just written by the live session has
                 # mtime >= now > cutoff, so it is always kept. Loosening to <= risks
-                # deleting the live session's marker on the boundary second.
+                # deleting the live session's marker on the boundary second. The
+                # guarantee covers a marker that already exists when sweep stats it;
+                # there is a microsecond TOCTOU window between this stat() and the
+                # unlink() below where a hook could create a fresh marker that is then
+                # unlinked — fail-open in practice (the hook re-creates on the next
+                # failure), so no lock is taken, but the comment is not an airtight
+                # concurrency proof.
                 if p.stat().st_mtime >= cutoff:
                     continue
             except OSError:

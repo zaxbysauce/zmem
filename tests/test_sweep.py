@@ -82,6 +82,19 @@ class SweepSingleDirTest(SweepBase):
         self.assertEqual(r.returncode, 0)
         self.assertFalse(p.exists())
 
+    def test_nonfinite_or_negative_max_age_days_rejected(self):
+        # PRR-001: NaN / -inf / -1 must be rejected (exit 2) and delete nothing,
+        # because a NaN or future cutoff would prune EVERY sentinel including the
+        # live session's freshly-written marker. 0 is valid (tested above).
+        live = self._mk(self.tmp, ".capture-prompted-live", 0)
+        stale = self._mk(self.tmp, ".convention-prompted-old", 30)
+        for bad in ("nan", "inf", "-inf", "-1"):
+            with self.subTest(value=bad):
+                r = self._sweep(max_age_days=bad)
+                self.assertEqual(r.returncode, 2, f"{bad!r} must be rejected")
+                self.assertTrue(live.exists(), f"live marker deleted under {bad!r}")
+                self.assertTrue(stale.exists(), f"stale marker deleted under {bad!r}")
+
     def test_dry_run_removes_nothing(self):
         p = self._mk(self.tmp, ".capture-prompted-old", 8)
         r = self._sweep(max_age_days=7, dry_run=True)
@@ -201,6 +214,108 @@ class SweepUnionChainTest(SweepBase):
         self.assertEqual(r.returncode, 0)
         self.assertFalse(p_store.exists(), "dirname(ZMEM_STORE) must be swept")
         self.assertFalse(p_data.exists(), "ZMEM_DATA must be swept")
+
+    def test_env_default_ttl_via_zmem_sentinel_sweep_days(self):
+        # PRR-006: the env-default TTL path (ZMEM_SENTINEL_SWEEP_DAYS) is what the
+        # SessionStart hook exercises (it fires `sweep` with no --max-age-days).
+        d = self.tmp / "envdefault"
+        d.mkdir()
+        stale = self._mk(d, ".capture-prompted-old", 3)
+        fresh = self._mk(d, ".convention-prompted-new", 0)
+        env = self._isolated_env(
+            home=self.tmp / "fh3",
+            overrides={"ZMEM_DATA": str(d), "ZMEM_SENTINEL_SWEEP_DAYS": "2"},
+        )
+        r = self._run("sweep", env_extra=env, env_remove=DATA_DIR_ENV_VARS)
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(stale.exists(), "stale marker must be pruned by env TTL")
+        self.assertTrue(fresh.exists(), "fresh marker must survive env TTL")
+
+    def test_union_sweeps_claude_and_zcode_plugin_data(self):
+        # PRR-007: convention-capture's chain also resolves CLAUDE_PLUGIN_DATA and
+        # ZCODE_PLUGIN_DATA; markers placed there must be pruned too.
+        claude_dir = self.tmp / "claude_data"
+        zcode_dir = self.tmp / "zcode_data"
+        claude_dir.mkdir()
+        zcode_dir.mkdir()
+        p_claude = self._mk(claude_dir, ".convention-prompted-old", 8)
+        p_zcode = self._mk(zcode_dir, ".capture-prompted-old", 9)
+        env = self._isolated_env(
+            home=self.tmp / "fh4",
+            overrides={
+                "CLAUDE_PLUGIN_DATA": str(claude_dir),
+                "ZCODE_PLUGIN_DATA": str(zcode_dir),
+            },
+        )
+        r = self._run("sweep", "--max-age-days", "7", env_extra=env,
+                      env_remove=DATA_DIR_ENV_VARS)
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(p_claude.exists(), "CLAUDE_PLUGIN_DATA must be swept")
+        self.assertFalse(p_zcode.exists(), "ZCODE_PLUGIN_DATA must be swept")
+
+    def test_union_sweeps_home_relative_nodes(self):
+        # PRR-007 (remainder): _sweep_candidate_dirs also adds home-relative
+        # nodes that no env var covers — ~/.zmem (always), ~/.zcode/memory
+        # (if it exists), and each ~/.zcode/cli/plugins/data/*zmem* dir (the
+        # legacy plugin scan, filtered by name). All three must be swept, and
+        # a non-zmem sibling under the scan root must be left alone (pins the
+        # name filter). HOME/USERPROFILE are redirected into a throwaway tree
+        # so the real box store is never touched.
+        home = self.tmp / "fh6"
+        zmem_dir = home / ".zmem"
+        legacy_dir = home / ".zcode" / "memory"
+        scan_root = home / ".zcode" / "cli" / "plugins" / "data"
+        legacy_plugin = scan_root / "zmem-old"
+        other_plugin = scan_root / "other-plugin"  # must NOT be swept
+        for d in (zmem_dir, legacy_dir, legacy_plugin, other_plugin):
+            d.mkdir(parents=True)
+        p_zmem = self._mk(zmem_dir, ".capture-prompted-old", 8)
+        p_legacy = self._mk(legacy_dir, ".convention-prompted-old", 9)
+        p_plugin = self._mk(legacy_plugin, ".capture-prompted-old2", 10)
+        # A sentinel-prefixed file in a NON-zmem plugin dir must survive: the
+        # scan only adds dirs whose name contains "zmem" (store.py:3343).
+        p_other = self._mk(other_plugin, ".convention-prompted-old", 11)
+        env = self._isolated_env(home=home, overrides={})
+        r = self._run("sweep", "--max-age-days", "7", env_extra=env,
+                      env_remove=DATA_DIR_ENV_VARS)
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse(p_zmem.exists(), "~/.zmem node must be swept")
+        self.assertFalse(p_legacy.exists(), "~/.zcode/memory node must be swept")
+        self.assertFalse(p_plugin.exists(),
+                         "~/.zcode/cli/plugins/data/*zmem* node must be swept")
+        self.assertTrue(p_other.exists(),
+                        "a non-zmem plugin dir must NOT be swept (name filter)")
+
+    def test_unreadable_dir_fail_open(self):
+        # PRR-008: a listdir OSError on a candidate dir must fail-open (exit 0),
+        # not crash, and must not block sweeping OTHER candidate dirs. On POSIX a
+        # chmod 000 dir is unreadable; on Windows chmod does not block the owner,
+        # so skip there (the is_file/stat OSError catch is exercised by the
+        # missing-dir and path-with-spaces tests).
+        if os.name == "nt":
+            self.skipTest("POSIX-only: Windows chmod does not deny the owner")
+        locked = self.tmp / "locked"
+        ok = self.tmp / "ok"
+        locked.mkdir()
+        ok.mkdir()
+        ok_marker = self._mk(ok, ".capture-prompted-old", 8)
+        os.chmod(locked, 0o000)
+        try:
+            env = self._isolated_env(
+                home=self.tmp / "fh5",
+                overrides={"ZMEM_DATA": str(locked), "CLAUDE_PLUGIN_DATA": str(ok)},
+            )
+            r = self._run("sweep", "--max-age-days", "7", env_extra=env,
+                          env_remove=DATA_DIR_ENV_VARS)
+            self.assertEqual(r.returncode, 0,
+                             "unreadable dir must fail-open, not crash")
+            # Fail-open must also CONTINUE sweeping: the other candidate dir's
+            # stale marker is still pruned despite the locked sibling.
+            self.assertFalse(ok_marker.exists(),
+                             "sweep must continue past an unreadable dir")
+        finally:
+            # Restore so tearDown can rmtree the tree.
+            os.chmod(locked, 0o755)
 
 
 if __name__ == "__main__":
