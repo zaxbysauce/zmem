@@ -22,6 +22,7 @@ Run: python tests/test_surface_consistency.py   (no pytest required — repo con
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import sqlite3
@@ -92,6 +93,28 @@ class AdapterScanTest(unittest.TestCase):
             encoding="utf-8")
         self.assertNotIn("--no-bump", text,
                          "MCP recall/search are EXPLICIT and must NOT pass --no-bump")
+
+    def test_readonly_invariant_docstring_lists_all_hooks(self):
+        # The passive-recall read-only contract (the recall_memory DOCSTRING) must
+        # name ALL THREE automatic hook sources — UserPromptSubmit, SubagentStart,
+        # and SessionStart — so the read-only invariant stays checkable and a
+        # comment cannot silently drop one hook again (issue #23). SessionStart was
+        # the one omitted here after it was made --no-bump by PR #29.
+        #
+        # Scope the assertion to the docstring ONLY (via ast.get_docstring), not
+        # the whole function body: a body comment or refactor mention of a hook
+        # name must NOT mask a docstring regression (PRR-002).
+        source = (SCRIPTS_DIR / "store.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        doc = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "recall_memory":
+                doc = ast.get_docstring(node)
+                break
+        self.assertIsNotNone(doc, "recall_memory must have a docstring")
+        self.assertIn("UserPromptSubmit", doc)
+        self.assertIn("SubagentStart", doc)
+        self.assertIn("SessionStart", doc)
 
 
 class SurfaceTempStoreTest(unittest.TestCase):
