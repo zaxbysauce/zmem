@@ -564,7 +564,7 @@ console.log("\n[9] Phase 7: subagent-recall (SubagentStart) + subagent-reflect (
     });
 
     // subagent-recall / claude: SubagentStart envelope, scoped + bridge rows,
-    // unrelated excluded, and READ-ONLY (retrieval_count unchanged).
+    // unrelated excluded, and passive (retrieval_count unchanged; surface recorded).
     {
         const r = runLauncher("subagent-recall", startPayload, envWith({
             ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
@@ -578,8 +578,8 @@ console.log("\n[9] Phase 7: subagent-recall (SubagentStart) + subagent-reflect (
         ok("subagent-recall: user:global bridge row present", /P7_GLOBAL/.test(ac));
         ok("subagent-recall: unrelated namespace row absent", !/P7_UNRELATED/.test(ac));
         ok("subagent-recall: agent_type in header", /agent coder/.test(ac));
-        eq("subagent-recall: READ-ONLY — scoped row rc unchanged (0)", rcOf("P7_SCOPED"), 0);
-        eq("subagent-recall: READ-ONLY — global row rc unchanged (0)", rcOf("P7_GLOBAL"), 0);
+        eq("subagent-recall: passive — scoped row rc unchanged (0)", rcOf("P7_SCOPED"), 0);
+        eq("subagent-recall: passive — global row rc unchanged (0)", rcOf("P7_GLOBAL"), 0);
     }
 
     // subagent-recall / zcode: bare additionalContext.

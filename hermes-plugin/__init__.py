@@ -391,7 +391,7 @@ class ZmemMemoryProvider(MemoryProvider):
                 "--limit", str(_PREFETCH_LIMIT),
                 "--include-global",
                 "--global-limit", "3",
-                "--no-bump",  # passive path: read-only, mirroring UserPromptSubmit
+                "--no-bump",  # passive path: surface counted, retrieval not bumped (issue #21)
                 "--json",
             ]
         )

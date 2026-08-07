@@ -453,7 +453,8 @@ class WriteTimeDedupTest(unittest.TestCase):
 
 
 class MigrationTest(unittest.TestCase):
-    """AC5: schema v6 adds merged_from idempotently."""
+    """AC5+issue#21: schema v6 adds merged_from idempotently; v7 adds the
+    passive-surface telemetry columns (surfaced_count / last_surfaced)."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="zmem-mig19-")
@@ -463,7 +464,7 @@ class MigrationTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, True)
 
-    def test_fresh_store_has_merged_from_and_v6(self):
+    def test_fresh_store_has_v7_columns(self):
         mod = _load_store_module(Path(self.tmp) / "s.sqlite", self.models)
         conn = mod.connect()
         mod.init_db(conn)
@@ -471,8 +472,10 @@ class MigrationTest(unittest.TestCase):
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
-        self.assertEqual(sv, "6")
+        self.assertEqual(sv, "7")
         self.assertIn("merged_from", cols)
+        self.assertIn("surfaced_count", cols)
+        self.assertIn("last_surfaced", cols)
         conn.close()
 
     def test_re_migrate_is_idempotent(self):
@@ -484,44 +487,48 @@ class MigrationTest(unittest.TestCase):
         mod.migrate(conn)  # third time
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        self.assertEqual(sv, "6")
+        self.assertEqual(sv, "7")
         conn.close()
 
-    def test_v5_to_v6_populated_migration_preserves_rows(self):
-        # swarm-pr-review PRR-006: migrate() must preserve existing rows when
-        # upgrading a POPULATED v5 store to v6 (merged_from added, all data
-        # intact), not just work on an empty fresh store. Build a v5 store by
-        # creating the v6 schema, then removing the v6-only column and rewinding
-        # the recorded version.
+    def test_v6_to_v7_populated_migration_preserves_rows(self):
+        # swarm-pr-review PRR-006 + issue #21: migrate() must preserve existing rows
+        # when upgrading a POPULATED v6 store to v7 (surfaced_count/last_surfaced
+        # added, all data intact), not just work on an empty fresh store. Build a v6
+        # store by creating the v7 schema, then removing the v7-only columns and
+        # rewinding the recorded version.
         mod = _load_store_module(Path(self.tmp) / "s3.sqlite", self.models)
         conn = mod.connect()
         mod.init_db(conn)
         mod.migrate(conn)
-        conn.execute("ALTER TABLE memory DROP COLUMN merged_from")
-        conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+        conn.execute("ALTER TABLE memory DROP COLUMN last_surfaced")
+        conn.execute("ALTER TABLE memory DROP COLUMN surfaced_count")
+        conn.execute("UPDATE meta SET value='6' WHERE key='schema_version'")
         conn.commit()
-        # Populate while in v5 state (raw inserts avoid any merged_from dep).
+        # Populate while in v6 state (raw inserts avoid any surfaced dep).
         a = _add_raw(mod, conn, "preserve alpha content for migration", 0.90, rc=3)
         _add_raw(mod, conn, "preserve beta content for migration", 0.70, rc=1)
         cols_sel = ("SELECT id, content, tags, confidence, signal, "
                     "retrieval_count, superseded_at, ingestion_ts FROM memory "
                     "ORDER BY id")
         before = [tuple(r) for r in conn.execute(cols_sel)]
-        # Upgrade to v6.
+        # Upgrade to v7.
         mod.migrate(conn)
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        self.assertEqual(sv, "6")
+        self.assertEqual(sv, "7")
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
-        self.assertIn("merged_from", cols)
+        self.assertIn("surfaced_count", cols)
+        self.assertIn("last_surfaced", cols)
         after = [tuple(r) for r in conn.execute(cols_sel)]
         self.assertEqual(before, after,
-                         "v5->v6 migration altered existing row data")
-        # Newly-added column is present on populated rows (ADD COLUMN default).
+                         "v6->v7 migration altered existing row data")
+        # Newly-added columns default correctly on populated rows.
         ma = conn.execute(
-            "SELECT merged_from FROM memory WHERE id=?", (a,)).fetchone()[0]
-        self.assertIsNone(ma,
-                          "fresh merged_from column should default to NULL")
+            "SELECT surfaced_count, last_surfaced FROM memory WHERE id=?", (a,)).fetchone()
+        self.assertEqual(ma["surfaced_count"], 0,
+                         "fresh surfaced_count column should default to 0")
+        self.assertIsNone(ma["last_surfaced"],
+                          "fresh last_surfaced column should default to NULL")
         conn.close()
 
 

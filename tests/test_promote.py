@@ -63,9 +63,10 @@ class PromoteTestBase(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
 
-        # Promotion requires retrieval_count > 3; add_memory always starts a
-        # fresh row at 0, so bump it directly — the store schema, not a CLI
-        # surface, is the fastest/most direct way to set up this fixture.
+        # Promotion requires total surface events (retrieval_count + surfaced_count)
+        # > the floor (issue #21); add_memory always starts a fresh row at 0, so bump it
+        # directly — the store schema, not a CLI surface, is the fastest/most direct way
+        # to set up this fixture.
         conn = sqlite3.connect(self.store)
         try:
             self.memory_id = conn.execute(
@@ -107,6 +108,55 @@ class TestDryRun(PromoteTestBase):
         self.assertIn(self.skills_a, r.stdout)
         self.assertIn(self.skills_b, r.stdout)
         self.assertNotIn("EDIT THIS DESCRIPTION", r.stdout)
+
+
+class TestSurfacedEligibility(PromoteTestBase):
+    """Issue #21: promote ranking/eligibility must blend surfaced + retrieval activity.
+
+    A grounded lesson surfaced many times by the HOOK path (retrieval_count = 0) but
+    never explicitly fetched must be promotable — previously it was invisible because
+    eligibility keyed on retrieval_count alone.
+    """
+
+    def _surface_only_lesson(self):
+        # Add a second, grounded lesson with retrieval_count = 0 but high surfaced_count
+        # (as if only hooks ever surfaced it), and an explicit --id reference.
+        r = self._run(
+            "add", "--namespace", NS, "--type", "lesson",
+            "--content", "Always verify surfaced telemetry before pruning the shared store.",
+            "--tags", "surfaced, telemetry",
+            "--signal", "test", "--confidence", "0.9",
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn = sqlite3.connect(self.store)
+        try:
+            mid = conn.execute(
+                "SELECT id FROM memory WHERE content LIKE 'Always verify surfaced%'"
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE memory SET retrieval_count = 0, surfaced_count = 5 WHERE id = ?",
+                (mid,))
+            conn.commit()
+        finally:
+            conn.close()
+        return mid
+
+    def test_hook_surfaced_only_lesson_is_promotable(self):
+        mid = self._surface_only_lesson()
+        r = self._run("promote", "--dry-run", "--namespace", NS)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(mid[:8], r.stdout,
+                      "a hook-surfaced-only grounded lesson must be a promotion candidate")
+
+    def test_surfaced_only_id_confirm_writes_review_candidate(self):
+        mid = self._surface_only_lesson()
+        r = self._run("promote", "--id", mid, "--confirm")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self._review_files()), 1)
+        text = self._review_files()[0].read_text(encoding="utf-8")
+        # The blended counters must be surfaced in the emitted Source block.
+        self.assertIn("surfaced", text)
+        self.assertNotIn("EDIT THIS DESCRIPTION", text)
 
 
 class TestPromoteQuality(PromoteTestBase):

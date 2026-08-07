@@ -302,8 +302,8 @@ class TestSearchIncludeGlobal(_StoreCase):
     def test_search_include_global_surfaces_user_global_row(self):
         self.add("user:global", "cross-project fact about retry budgets")
         self.add(PROJECT_NS, "project note about widgets")
-        # search has no confidence floor (min_confidence=0.0); --no-bump to keep
-        # it read-only in the test.
+        # search has no confidence floor (min_confidence=0.0); --no-bump avoids
+        # advancing retrieval_count in this test (a surface is recorded instead — issue #21).
         r = self.run_store("search", "--text", "retry budgets",
                            "--namespace", PROJECT_NS, "--include-global",
                            "--no-bump")
@@ -710,7 +710,8 @@ class TestSearchBump(_StoreCase):
         self.add(PROJECT_NS, "gizmo delta epsilon zeta")
         self.run_store("search", "--text", "gizmo delta", "--no-bump")
         self.assertEqual(self._count_retrieval("gizmo delta epsilon zeta"), 0,
-                         "search --no-bump must be read-only")
+                         "search --no-bump must not bump retrieval_count "
+                         "(surface recorded instead — issue #21)")
 
 
 # --------------------------------------------------------------------------
