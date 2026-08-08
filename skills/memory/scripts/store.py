@@ -2760,14 +2760,14 @@ def consolidate(
                 print(f"[zmem] consolidate: dry-run: would skip by cadence gate "
                       f"({days_since:.1f}d since last run < "
                       f"{CONSOLIDATE_MIN_INTERVAL_DAYS:g}d min, {growth:.1%} growth < "
-                      f"{CONSOLIDATE_GROWTH_THRESHOLD:.0%} min; needs more "
+                      f"{CONSOLIDATE_GROWTH_THRESHOLD:.1%} min; needs more "
                       f"time OR more growth; drop --dry-run and pass --force to "
                       f"run anyway)")
             else:
                 print(f"[zmem] consolidate: skipped by cadence gate "
                       f"({days_since:.1f}d since last run < "
                       f"{CONSOLIDATE_MIN_INTERVAL_DAYS:g}d min, {growth:.1%} growth < "
-                      f"{CONSOLIDATE_GROWTH_THRESHOLD:.0%} min; needs more "
+                      f"{CONSOLIDATE_GROWTH_THRESHOLD:.1%} min; needs more "
                       f"time OR more growth)")
             return  # gate declined — leave last_consolidation untouched
 

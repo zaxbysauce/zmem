@@ -142,9 +142,10 @@ If the clusters look right:
 python "$S" consolidate
 ```
 
-A real run that the cadence gate declines prints `consolidate: skipped by cadence
-gate (...)` (it is never silent) and changes nothing. If you want to consolidate
-anyway — e.g. you just imported a large batch of near-duplicates — pass `--force`:
+A real run that the cadence gate declines prints `[zmem] consolidate: skipped by
+cadence gate (...)` (it is never silent) and changes nothing. If you want to
+consolidate anyway — e.g. you just imported a large batch of near-duplicates —
+pass `--force`:
 
 ```bash
 python "$S" consolidate --force

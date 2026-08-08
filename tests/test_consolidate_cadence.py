@@ -341,6 +341,52 @@ class CadenceGateTest(unittest.TestCase):
         self.assertIn("-99.8% growth", out, out)
         self.assertEqual(_live(self.conn), live_before)
 
+    # --- AC10b: a fractional env-overridden growth threshold renders precisely
+    # (regression for cubic-2 / PRR-004: int(threshold*100) and :.0% both lost
+    # sub-percent precision; :.1% must render 0.205 as "20.5%"). ---
+
+    def test_fractional_growth_threshold_renders_precisely(self):
+        # Reload store.py with a fractional growth threshold so the rendered
+        # minimum in the skip message is asserted, not just the growth value.
+        tmp = tempfile.mkdtemp(prefix="zmem-cadence26-thr-")
+        models = Path(tmp) / "no-models"
+        models.mkdir()
+        env = {
+            **os.environ,
+            "ZMEM_STORE": str(Path(tmp) / "store.sqlite"),
+            "ZMEM_MODELS_DIR": str(models),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_CONSOLIDATE_GROWTH_THRESHOLD": "0.205",
+        }
+        # Drop inherited data-dir hints so ZMEM_STORE is authoritative.
+        for k in ("ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+            env.pop(k, None)
+        spec = importlib.util.spec_from_file_location(
+            f"zmem_store_cadence_thr_{id(tmp)}", STORE_PY
+        )
+        with mock.patch.dict(os.environ, env, clear=False):
+            tmod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(tmod)
+        tconn = tmod.connect()
+        tmod.init_db(tconn)
+        tmod.migrate(tconn)
+        try:
+            _forge_recent_cadence(tconn, tmod, days_ago=5.0, last_live=1000)
+            tmod.add_memory(tconn, namespace=NS, type_="fact", content=KEEPER_TEXT,
+                            signal="test", confidence=0.9)
+            tconn.commit()
+            out = _cap(tmod, tconn,
+                       lambda: tmod.consolidate(tconn, namespace=NS))
+            self.assertIn("skipped by cadence gate", out, out)
+            # The threshold renders at one-decimal precision — NOT truncated to
+            # "20%" (int(0.205*100) or :.0%) but "20.5%" (:.1%). This is the
+            # direct regression for the cubic-2 / PRR-004 truncation defect.
+            self.assertIn("20.5% min", out, out)
+            self.assertNotIn("20% min", out, out)
+        finally:
+            tconn.close()
+            shutil.rmtree(tmp, True)
+
     # --- AC11: a dry-run skip writes nothing (no meta refresh) ---
 
     def test_dry_run_skip_writes_nothing(self):
