@@ -275,7 +275,7 @@ to one namespace, `--include-superseded` also exports tombstoned rows.
 
 ### ingest-jsonl — import Tier 3 sync JSONL
 ```
-python <store.py> ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones]
+python <store.py> ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones] [--capture-mode auto|reviewed|manual]
 ```
 Imports a JSONL file written by `export-jsonl`. Every row is validated before
 touching the store, and a bad row is counted and reported by line number
@@ -284,6 +284,18 @@ row inserted this run (default: keep each row's own incoming source_ref).
 `--allow-tombstones` lets an incoming superseded row tombstone a live local
 row with the same id — off by default; use it only when the file is an
 export of a store you trust as authoritative for those ids.
+
+`--capture-mode` routes every inserted row through the same capture policy as
+`add` (a sync file is remote-authored data that can otherwise plant a poisoned
+memory surfacing verbatim into model context, or store secret-like text). The
+default resolves like `add` (`ZMEM_CAPTURE_MODE` env or `manual`): verbatim
+content with prompt-injection-risk tagging (a row matching an injection
+pattern is tagged `prompt-injection-risk` so it can be reviewed, in ALL modes).
+Use `--capture-mode auto` when ingesting an untrusted/remote sync file: it
+additionally redacts secret-like content/tags (tagged `auto-redacted`) and
+refuses rows whose `source_ref` looks like a secret (counted as
+`capture_refused` in the summary, NOT stored). `reviewed`/`manual` keep the
+original text with an advisory notice.
 
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite
