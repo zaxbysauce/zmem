@@ -1055,11 +1055,12 @@ def _detect_duplicate(
     emb = None
     if _embeddings and _embeddings.is_available():
         emb = _embeddings.embed_text(content)
-    # Surface silent degradation: if a live, non-empty row is about to be stored
-    # without an embedding (unavailable, OR embed_text returned None), warn once
-    # per process with an actionable reason. See _warn_degraded_embeddings_once.
-    if emb is None:
-        _warn_degraded_embeddings_once(content)
+    # NOTE: the degraded-embedding warning is NOT emitted here. _detect_duplicate
+    # is called before dedup resolution, so warning here would fire (and consume
+    # the one-time-per-process flag) even on a duplicate add that inserts NO new
+    # row. The warning is emitted at the actual live-row INSERT sites
+    # (add_memory + ingest-jsonl) so it only fires when an unembedded row is
+    # truly persisted. See _warn_degraded_embeddings_once.
 
     existing = None
     dedup_sim = 0.0
@@ -1361,9 +1362,10 @@ def add_memory(
 
         # Determine embedding model name for the embedding_model column.
         emb_model = "minilm-onnx" if emb is not None else ""
-        # Defense-in-depth: _detect_duplicate already warned if emb is None for
-        # non-empty content, but guarantee the visibility at the actual insert
-        # site too, so a future caller that bypasses dedup still surfaces it.
+        # This insert-site guard is the PRIMARY warning site (the warning was
+        # moved out of _detect_duplicate, which runs before dedup resolution and
+        # would consume the one-time flag on a no-op duplicate add). See
+        # _warn_degraded_embeddings_once.
         if emb is None:
             _warn_degraded_embeddings_once(content)
 
@@ -4525,8 +4527,9 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
         shash = ""
         emb_model = "minilm-onnx" if emb is not None else ""
         embedded_at = now_iso() if emb is not None else None
-        # Defense-in-depth: _detect_duplicate already warned if emb is None for
-        # non-empty content, but guarantee visibility at the live insert site.
+        # Primary warning site for the ingest live-row insert (moved out of
+        # _detect_duplicate so a no-op duplicate add cannot consume the one-time
+        # flag). See _warn_degraded_embeddings_once.
         if emb is None:
             _warn_degraded_embeddings_once(content)
         conn.execute(

@@ -867,21 +867,43 @@ def _recommendations(checks: list[dict]) -> list[str]:
     emb = by_id.get("embeddings", {})
     if emb.get("status") == "warn":
         reason = emb.get("details", {}).get("reason")
+        details = emb.get("details", {})
         if reason == "imports_missing":
-            notes.append(
-                "Embeddings are disabled because the Python interpreter zmem resolves is missing onnxruntime/tokenizers/numpy. "
-                "Install them in that interpreter to enable semantic recall/dedup; degraded FTS5/lexical operation is supported meanwhile."
-            )
+            # Name ONLY the modules actually reported missing (a partial install
+            # may lack just one), not all three unconditionally.
+            missing = details.get("missing_imports") or []
+            if missing:
+                pkgs = ", ".join(missing)
+                notes.append(
+                    f"Embeddings are disabled because the Python interpreter zmem "
+                    f"resolves is missing: {pkgs}. Install the missing package(s) "
+                    "in that interpreter to enable semantic recall/dedup; degraded "
+                    "FTS5/lexical operation is supported meanwhile."
+                )
+            else:
+                notes.append(
+                    "Embeddings are disabled because the Python interpreter zmem "
+                    "resolves is missing one or more of onnxruntime/tokenizers/numpy. "
+                    "Install them in that interpreter to enable semantic "
+                    "recall/dedup; degraded FTS5/lexical operation is supported meanwhile."
+                )
         elif reason in ("model_file_missing", "tokenizer_missing"):
+            # Both files are required — say so explicitly so a tokenizer-only
+            # outage isn't mis-diagnosed as "add the model".
             notes.append(
-                "Embeddings are disabled because minilm.onnx/tokenizer.json are absent from the resolved models dir. "
-                "Place a checksum-verified minilm.onnx there (or set ZMEM_MODEL_URL to a source matching the pinned SHA-256 plus ZMEM_MODEL_AUTODOWNLOAD=1). "
-                "After enabling, run `reembed` to backfill existing rows. Degraded FTS5/lexical operation is supported meanwhile."
+                "Embeddings are disabled because minilm.onnx and/or tokenizer.json "
+                "are absent from the resolved models dir. Both files are required: "
+                "place a checksum-verified minilm.onnx AND tokenizer.json there "
+                "(or set ZMEM_MODEL_URL to a source matching the pinned SHA-256 "
+                "plus ZMEM_MODEL_AUTODOWNLOAD=1). After enabling, run `reembed` "
+                "to backfill existing rows. Degraded FTS5/lexical operation is "
+                "supported meanwhile."
             )
         else:
             notes.append(
-                "Embeddings are disabled; semantic recall/dedup is off (degraded FTS5/lexical mode is supported). "
-                "See the README 'Embeddings' section to enable them, then run `reembed` to backfill."
+                "Embeddings are disabled; semantic recall/dedup is off (degraded "
+                "FTS5/lexical mode is supported). See the README 'Embeddings' "
+                "section to enable them, then run `reembed` to backfill."
             )
     return notes
 

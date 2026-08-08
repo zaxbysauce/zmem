@@ -510,7 +510,12 @@ class AvailabilityStatusTests(unittest.TestCase):
         default CI outcome and one of issue #22's triggers. Only runs when the
         host interpreter actually lacks the deps. Calls availability_status()
         IN-PROCESS (not via the subprocess helper, which would inherit a
-        different interpreter state)."""
+        different interpreter state).
+
+        Does NOT hard-code the full set of three: a partial install (e.g. only
+        numpy missing, which also breaks onnxruntime's import) reports a subset.
+        Asserts the reason is imports_missing, at least one module is reported,
+        and every reported module is one of the three candidates."""
         if _EMBEDDING_DEPS_IMPORTABLE:
             self.skipTest("embedding deps ARE installed here; this asserts the "
                           "bare-interpreter (CI) behavior")
@@ -523,8 +528,17 @@ class AvailabilityStatusTests(unittest.TestCase):
             os.environ.pop("ZMEM_MODELS_DIR", None)
         self.assertFalse(st["available"])
         self.assertEqual(st["reason"], "imports_missing")
-        self.assertEqual(
-            sorted(st["missing_imports"]), ["numpy", "onnxruntime", "tokenizers"]
+        candidates = {"numpy", "onnxruntime", "tokenizers"}
+        reported = set(st["missing_imports"])
+        self.assertTrue(
+            reported,
+            "missing_imports should name at least one module when "
+            "reason=imports_missing",
+        )
+        self.assertTrue(
+            reported.issubset(candidates),
+            f"reported modules {reported} should be a subset of the three "
+            f"embedding candidates {candidates}",
         )
 
     def test_status_never_raises_on_bad_models_dir(self):
@@ -592,8 +606,9 @@ class DegradedAddWarningTests(unittest.TestCase):
 
     def test_warning_fires_once_per_process(self):
         """Two adds in ONE store.py invocation must warn exactly once. The CLI
-        services one add per process, so we run a small driver that calls the
-        in-process _detect_duplicate twice and counts warnings on stderr."""
+        services one add per process, so we run a small in-process driver that
+        calls add_memory() twice (the real insert path that fires the insert-site
+        guard) and counts warnings on stderr."""
         script = (
             "import sys, os, sqlite3\n"
             f"os.environ.update({self.env!r})\n"
@@ -602,13 +617,69 @@ class DegradedAddWarningTests(unittest.TestCase):
             f"conn = sqlite3.connect({self.store_path!r})\n"
             "conn.row_factory = sqlite3.Row\n"
             "store._degraded_embedding_warned = False\n"
-            "store._detect_duplicate(conn, 'first live content here', 'project:x')\n"
-            "store._detect_duplicate(conn, 'second live content here', 'project:x')\n"
+            "store.add_memory(conn, namespace='project:oncewarn', type_='fact', "
+            "content='first live content here', signal='test')\n"
+            "store.add_memory(conn, namespace='project:oncewarn', type_='fact', "
+            "content='second live content here distinct', signal='test')\n"
         )
         r = subprocess.run([PYTHON, "-c", script], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        # Exactly one warning line for two calls.
+        # Exactly one warning line for two inserts.
         self.assertEqual(r.stderr.count("WARNING: memory stored without an embedding"), 1)
+
+    def test_duplicate_add_does_not_consume_warning(self):
+        """A duplicate add (exact-match dedup hit) inserts NO new row, so it must
+        NOT consume the one-time-per-process warning — the next genuinely new
+        unembedded row in the same process must still be surfaced. Regression
+        guard for the fix that moved the warning from _detect_duplicate (which
+        runs before dedup resolution) to the live-row insert sites.
+
+        Discriminating sequence (fails on the pre-fix buggy code): PRE-SEED row A
+        in a separate process, then in a FRESH process do add(A) [dup, must NOT
+        warn] followed by add(B) [new, MUST warn]. Pre-fix, the dup-first add
+        warned inside _detect_duplicate and consumed the flag, so add(B) was
+        silent. Post-fix, the dup emits no warning and add(B) warns. The decisive
+        assertion is that the dup add alone leaves the flag False (proven by the
+        DUP_CONSUMED_FLAG marker) — which only holds post-fix."""
+        # Pre-seed row A in its own process (it warns there, then the process
+        # exits — irrelevant to the flag in the next process).
+        self._add("a duplicate candidate row")
+        # Fresh process: dup-first, then a genuinely new row. Emit a marker
+        # AFTER the dup add (before the new add) showing whether the flag was set.
+        script = (
+            "import sys, os, sqlite3\n"
+            f"os.environ.update({self.env!r})\n"
+            f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
+            "import store\n"
+            f"conn = sqlite3.connect({self.store_path!r})\n"
+            "conn.row_factory = sqlite3.Row\n"
+            "store._degraded_embedding_warned = False\n"
+            "# Duplicate of the pre-seeded row — inserts nothing, must NOT warn.\n"
+            "store.add_memory(conn, namespace='project:degradedwarn', type_='fact', "
+            "content='a duplicate candidate row', signal='test')\n"
+            "# Probe the flag RIGHT AFTER the dup add, before the new add.\n"
+            "sys.stderr.write('DUP_CONSUMED_FLAG=' + "
+            "str(store._degraded_embedding_warned) + chr(10))\n"
+            "# Genuinely new row — must still warn (flag was not consumed by the dup).\n"
+            "store.add_memory(conn, namespace='project:degradedwarn', type_='fact', "
+            "content='a genuinely new distinct row', signal='test')\n"
+        )
+        r = subprocess.run([PYTHON, "-c", script], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # The duplicate add must NOT have consumed the flag. Pre-fix, the dup
+        # would have set the flag in _detect_duplicate (DUP_CONSUMED_FLAG=True),
+        # and the new row B would be silent. Post-fix the flag stays False after
+        # the dup, so B warns.
+        self.assertIn(
+            "DUP_CONSUMED_FLAG=False", r.stderr,
+            "the duplicate add consumed the warning flag — pre-fix bug. "
+            f"stderr: {r.stderr}",
+        )
+        # Exactly one warning total, attributable to row B's insert (not the dup).
+        self.assertEqual(
+            r.stderr.count("WARNING: memory stored without an embedding"), 1,
+            f"expected exactly one warning (from the new row insert), got: {r.stderr}",
+        )
 
     def test_empty_content_add_does_not_warn(self):
         """Empty/whitespace content produces no embedding by design (embed_text
@@ -620,7 +691,8 @@ class DegradedAddWarningTests(unittest.TestCase):
 
     def test_warning_does_not_trigger_download(self):
         """The warning path reads availability_status() (presence-only) and must
-        not cause a network download attempt (autodownload stays opt-in)."""
+        not cause a network download attempt (autodownload stays opt-in).
+        Exercises the real insert path (add_memory) that fires the warning."""
         marker = os.path.join(self.tmp, "download_attempted.marker")
         script = (
             "import sys, os\n"
@@ -634,7 +706,9 @@ class DegradedAddWarningTests(unittest.TestCase):
             "embeddings._try_download_model = _spy\n"
             "import sqlite3\n"
             f"conn = sqlite3.connect({self.store_path!r})\n"
-            "store._detect_duplicate(conn, 'content that lands unembedded', 'project:x')\n"
+            "conn.row_factory = sqlite3.Row\n"
+            "store.add_memory(conn, namespace='project:dltest', type_='fact', "
+            "content='content that lands unembedded', signal='test')\n"
         )
         r = subprocess.run([PYTHON, "-c", script], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)

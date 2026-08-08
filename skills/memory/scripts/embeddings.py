@@ -321,8 +321,18 @@ def availability_status() -> dict:
         except Exception:
             missing.append(mod)
     models_dir = _resolve_models_dir()
-    model_file = (models_dir / "minilm.onnx").is_file()
-    tokenizer_file = (models_dir / "tokenizer.json").is_file()
+    # Guard the file probes: Path.is_file() can raise OSError (e.g. a
+    # permission-denied or otherwise inaccessible models dir) on Python 3.11+.
+    # The function's contract is "NEVER raises" — treat any FS error as
+    # "file not available" so stats/doctor/warning paths stay diagnostic.
+    try:
+        model_file = (models_dir / "minilm.onnx").is_file()
+    except (OSError, ValueError):
+        model_file = False
+    try:
+        tokenizer_file = (models_dir / "tokenizer.json").is_file()
+    except (OSError, ValueError):
+        tokenizer_file = False
 
     if missing:
         reason = "imports_missing"

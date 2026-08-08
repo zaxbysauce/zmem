@@ -97,7 +97,25 @@ def _log_embedding_availability() -> None:
     THIS server's interpreter (== the `sys.executable` _run_store uses), so
     the reported state matches what writes will actually experience.
     """
-    store_py = _resolve_store_py()
+    # Resolve the store checkout inside the fail-open guard. _resolve_store_py
+    # -> _resolve_zmem_home can abort the probe (and thus server boot) three
+    # ways: sys.exit(2) on a missing/invalid ZMEM_HOME (SystemExit — NOT caught
+    # by `except Exception` since it's a BaseException); PermissionError (OSError)
+    # from its own is_file() probes on an access-denied dir; or RuntimeError from
+    # Path.expanduser() when home is undeterminable. All three are
+    # misconfiguration, not reasons to kill boot — the same bad config previously
+    # failed on first tool use, not at startup. (Tool calls still fail loudly via
+    # _run_store.) Catch the specific set; do NOT catch BaseException (Ctrl-C must
+    # still terminate the server).
+    try:
+        store_py = _resolve_store_py()
+    except (SystemExit, OSError, RuntimeError):
+        logger.warning(
+            "zmem embeddings: store checkout could not be resolved "
+            "(ZMEM_HOME unset/invalid/inaccessible); skipping the availability "
+            "probe and assuming degraded. add() may store rows without embeddings."
+        )
+        return
     scripts_dir = str(store_py.parent)
     try:
         import importlib
@@ -110,16 +128,30 @@ def _log_embedding_availability() -> None:
         finally:
             sys.path[:] = saved_path
         if status.get("available"):
-            logger.info("zmem embeddings: available (semantic recall/dedup active)")
+            logger.info("zmem embeddings: available (semantic recall/dup active)")
         else:
+            reason = status.get("reason")
+            if reason == "imports_missing":
+                missing = status.get("missing_imports") or []
+                pkgs = ", ".join(missing) if missing else "onnxruntime/tokenizers/numpy"
+                remedy = (
+                    f"install the missing package(s): {pkgs} "
+                    "(see hermes-plugin/server/requirements-embeddings.txt)"
+                )
+            else:
+                remedy = (
+                    "ensure both a checksum-verified minilm.onnx AND "
+                    "tokenizer.json are present at the resolved models dir "
+                    "(or set ZMEM_MODEL_URL to a source matching the pinned "
+                    "SHA-256 plus ZMEM_MODEL_AUTODOWNLOAD=1)"
+                )
             logger.warning(
                 "zmem embeddings: UNAVAILABLE (reason=%s, models_dir=%s) — "
-                "add() will store rows WITHOUT embeddings; install "
-                "onnxruntime/tokenizers/numpy (see "
-                "hermes-plugin/server/requirements-embeddings.txt) and place a "
-                "verified minilm.onnx, then run `reembed` to backfill.",
-                status.get("reason"),
+                "add() will store rows WITHOUT embeddings. %s, then run "
+                "`reembed` to backfill.",
+                reason,
                 status.get("models_dir"),
+                remedy,
             )
     except Exception as exc:  # never block startup on a diagnostic
         logger.warning(
