@@ -139,7 +139,7 @@ ZCode skill directories. Promotion is never an unattended hook action.
 
 ### consolidate — merge near-duplicate memories
 ```
-python <store.py> consolidate [--threshold 0.80] [--prune] [--dry-run] [--namespace NS]
+python <store.py> consolidate [--threshold 0.80] [--prune] [--dry-run] [--namespace NS] [--force]
 ```
 Clusters live memories by embedding cosine similarity (Jaccard token overlap when
 embeddings are unavailable), picks a keeper, merges metadata, and supersedes the
@@ -147,8 +147,14 @@ rest with a persisted reason. Runs automatically on SessionStart once 7 days
 have elapsed since the last run OR the live store has grown >20% since then (an
 automatic run is skipped only when the last run was <7 days ago AND growth was
 <20%; both bounds are env-tunable via `ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS` /
-`ZMEM_CONSOLIDATE_GROWTH_THRESHOLD`). Use `--dry-run` to preview clusters and the
-exact merge decision per row without mutating the store.
+`ZMEM_CONSOLIDATE_GROWTH_THRESHOLD`). When the gate declines, the run prints a
+single `[zmem] consolidate: skipped by cadence gate (...)` line (never silent)
+and changes nothing. Use `--dry-run` to preview clusters and the exact merge
+decision per row without mutating the store — `--dry-run` models the cadence
+gate too, so a gated dry run reports `would skip by cadence gate` rather than
+`merged N`, and a dry run that says "would merge" implies a real run that
+merges. Pass `--force` to bypass the cadence gate and run consolidation now
+(this is the only intentional bypass; `--threshold` does not affect the gate).
 
 Keeper selection: within a cluster, the survivor is the row with the highest
 `confidence * (retrieval_count + surfaced_count)` product — total surface events,
