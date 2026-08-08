@@ -21,9 +21,14 @@ These tests pin the fix:
 - ``--threshold`` no longer affects the gate;
 - the gate is box-wide (not namespace-scoped) and handles negative growth.
 
-Every test asserts on the captured stdout, the live-count delta, AND the
-``last_consolidation`` meta-row state so the gate firing (vs the empty-rows
-return or a successful merge) is proven rather than inferred.
+Across the suite, gate behaviour is proven rather than inferred: each behaviour
+is pinned by a combination of captured stdout (the announced skip / would-skip /
+merged message), the live-count delta (merge happened vs not), and the
+``last_consolidation`` meta-row state (the canonical signal that a skip left the
+cadence clock untouched vs a real merge that reset it). Individual tests assert
+the dimensions most relevant to what they prove — e.g. a "writes nothing" test
+asserts the meta rows are unchanged AND the would-skip message printed; a force
+test asserts the merge ran (live-count dropped) and the message says "merged".
 """
 
 import contextlib
@@ -341,14 +346,22 @@ class CadenceGateTest(unittest.TestCase):
     def test_dry_run_skip_writes_nothing(self):
         _forge_recent_cadence(self.conn, self.mod, days_ago=5.0, last_live=100)
         _add_pair(self.mod, self.conn)
+        live_before = _live(self.conn)
         ts_before = _last_consolidation(self.conn)
         count_before = self.conn.execute(
             "SELECT value FROM meta WHERE key='last_consolidation_count'"
         ).fetchone()[0]
 
-        _cap(self.mod, self.conn,
-             lambda: self.mod.consolidate(self.conn, namespace=NS, dry_run=True))
+        out = _cap(self.mod, self.conn,
+                   lambda: self.mod.consolidate(self.conn, namespace=NS, dry_run=True))
 
+        # The dry-run skip is announced as a would-skip (NOT "merged N") — the
+        # headline behaviour of issue #26. Assert stdout so a regression to the
+        # old silent-then-"merged" dry-run path fails this test.
+        self.assertIn("would skip by cadence gate", out, out)
+        self.assertNotIn("merged", out, out)
+        self.assertEqual(_live(self.conn), live_before,
+                         "dry-run must not merge")
         # Dry-run never writes — even in the skip path the cadence meta is
         # untouched. (The skip returns before the timestamp write block in
         # consolidate(), and dry-run would skip that block anyway.)
