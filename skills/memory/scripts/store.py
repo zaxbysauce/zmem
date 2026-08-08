@@ -67,6 +67,16 @@ except ImportError:
     except ImportError:
         _embeddings = None
 
+# One-time-per-process guard for the degraded-embeddings warning. Hooks, the
+# CLI, and the Hermes MCP server each spawn a fresh `store.py` process per
+# operation, so this is effectively one warning per write batch in those
+# contexts — the right granularity (the user sees it on the capture that
+# landed unembedded). Deliberately NOT persisted: a persisted flag would race
+# across processes, go stale across environments, and let one process silence
+# the warning for another. A second no-embedding add in the same process is
+# silent.
+_degraded_embedding_warned = False
+
 # Shared host adapter: path resolution, local-FS safety guard, perms, retry.
 # Imported with a safe inline fallback so store.py still runs (with the old,
 # pre-Phase-1 resolution chain) if host.py is somehow missing from the checkout.
@@ -968,6 +978,68 @@ def _source_hash(source_ref: str) -> str:
         return ""
 
 
+def _warn_degraded_embeddings_once(content: str) -> None:
+    """Emit a one-time-per-process warning when a LIVE row will be stored
+    without an embedding, naming the reason and the remedy.
+
+    Fires iff `content` is non-empty (so empty/whitespace adds — which produce
+    no embedding by design — stay silent) AND a live, embeddable row is about
+    to land unembedded. Covers BOTH triggers: embeddings unavailable
+    (`is_available()` False) and `embed_text()` returning None despite
+    availability (model load/inference failure). The tombstone-history import
+    path (which deliberately stores NULL embedding for dead rows) does not go
+    through `_detect_duplicate` and so never reaches this warning.
+
+    Scope is one-per-process (see `_degraded_embedding_warned`): hooks/CLI/
+    Hermes-MCP each spawn a fresh process per operation, so this is one warning
+    per write batch — correct, because each such batch IS landing unembedded.
+    """
+    global _degraded_embedding_warned
+    if _degraded_embedding_warned:
+        return
+    if not content or not content.strip():
+        return
+    _degraded_embedding_warned = True
+    if _embeddings:
+        try:
+            st = _embeddings.availability_status()
+        except Exception:
+            st = None
+        if st and not st.get("available"):
+            reason = st.get("reason") or "unknown"
+            models_dir = st.get("models_dir") or "(unknown)"
+            missing = st.get("missing_imports") or []
+            detail = ""
+            if reason == "imports_missing" and missing:
+                detail = f" (missing python modules: {', '.join(missing)})"
+            elif reason == "model_file_missing":
+                detail = " (minilm.onnx absent from the resolved models dir)"
+            elif reason == "tokenizer_missing":
+                detail = " (tokenizer.json absent from the resolved models dir)"
+            print(
+                "[zmem] WARNING: memory stored without an embedding — semantic "
+                "dedup-on-write, vector recall, and embedding-seeded "
+                f"consolidation are disabled for this row. Reason: {reason}{detail}. "
+                f"Resolved models_dir: {models_dir}. To enable embeddings, place a "
+                "checksum-verified minilm.onnx there (or set ZMEM_MODEL_URL to a "
+                "source matching the pinned SHA-256 plus ZMEM_MODEL_AUTODOWNLOAD=1), "
+                "install onnxruntime/tokenizers/numpy, then run `reembed` to "
+                "backfill. Degraded FTS5/lexical operation remains supported.",
+                file=sys.stderr,
+            )
+            return
+    # _embeddings module itself not importable, or availability_status failed.
+    print(
+        "[zmem] WARNING: memory stored without an embedding — the embeddings "
+        "module could not be imported, so semantic dedup-on-write, vector "
+        "recall, and embedding-seeded consolidation are disabled. Reinstall "
+        "the plugin (or fix sys.path so skills/memory/scripts is importable), "
+        "then run `reembed` to backfill. Degraded FTS5/lexical operation "
+        "remains supported.",
+        file=sys.stderr,
+    )
+
+
 def _detect_duplicate(
     conn: sqlite3.Connection, content: str, namespace: str
 ) -> tuple[sqlite3.Row | None, float, bytes | None]:
@@ -983,6 +1055,12 @@ def _detect_duplicate(
     emb = None
     if _embeddings and _embeddings.is_available():
         emb = _embeddings.embed_text(content)
+    # NOTE: the degraded-embedding warning is NOT emitted here. _detect_duplicate
+    # is called before dedup resolution, so warning here would fire (and consume
+    # the one-time-per-process flag) even on a duplicate add that inserts NO new
+    # row. The warning is emitted at the actual live-row INSERT sites
+    # (add_memory + ingest-jsonl) so it only fires when an unembedded row is
+    # truly persisted. See _warn_degraded_embeddings_once.
 
     existing = None
     dedup_sim = 0.0
@@ -1284,6 +1362,12 @@ def add_memory(
 
         # Determine embedding model name for the embedding_model column.
         emb_model = "minilm-onnx" if emb is not None else ""
+        # This insert-site guard is the PRIMARY warning site (the warning was
+        # moved out of _detect_duplicate, which runs before dedup resolution and
+        # would consume the one-time flag on a no-op duplicate add). See
+        # _warn_degraded_embeddings_once.
+        if emb is None:
+            _warn_degraded_embeddings_once(content)
 
         conn.execute(
             """INSERT INTO memory
@@ -2077,6 +2161,29 @@ def stats(conn):
     print("by signal (live):")
     for r in by_signal:
         print(f"  {r['signal']}: {r['c']}")
+    # Embedding coverage (live rows only). A store can be partially or fully
+    # unembedded when captures run in an environment without the embedding
+    # runtime — unembedded rows skip semantic dedup-on-write, vector recall,
+    # and embedding-seeded consolidation. Surfacing the ratio here makes drift
+    # one command away from being noticed (issue #22).
+    n_live_emb = conn.execute(
+        "SELECT count(*) AS c FROM memory "
+        "WHERE superseded_at IS NULL AND embedding IS NOT NULL"
+    ).fetchone()["c"]
+    n_live_noemb = n_live - n_live_emb
+    print("embedding coverage (live):")
+    print(f"  with_embedding={n_live_emb} without_embedding={n_live_noemb}")
+    if _embeddings:
+        try:
+            st = _embeddings.availability_status()
+            print(
+                f"  embeddings={'available' if st['available'] else 'unavailable'} "
+                f"(reason={st['reason']}, models_dir={st['models_dir']})"
+            )
+        except Exception:
+            print("  embeddings=unknown (availability probe failed)")
+    else:
+        print("  embeddings=unavailable (embeddings module not importable)")
 
 
 def get_memory(conn, mid):
@@ -4420,6 +4527,11 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
         shash = ""
         emb_model = "minilm-onnx" if emb is not None else ""
         embedded_at = now_iso() if emb is not None else None
+        # Primary warning site for the ingest live-row insert (moved out of
+        # _detect_duplicate so a no-op duplicate add cannot consume the one-time
+        # flag). See _warn_degraded_embeddings_once.
+        if emb is None:
+            _warn_degraded_embeddings_once(content)
         conn.execute(
             """INSERT INTO memory
                (id, namespace, type, content, tags, source_ref, source_hash,

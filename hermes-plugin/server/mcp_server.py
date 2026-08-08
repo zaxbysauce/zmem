@@ -87,6 +87,81 @@ def _resolve_store_py() -> Path:
     return _resolve_zmem_home() / _STORE_PY_REL
 
 
+def _log_embedding_availability() -> None:
+    """Probe embedding availability at server startup and log it.
+
+    Surface the degraded state LOUDLY at boot rather than discovering it
+    hundreds of unembedded rows later (issue #22). Best-effort and fail-open:
+    a probe failure logs a warning and never blocks startup. Imports the
+    embeddings module from the SAME checkout the `add` subprocesses run, under
+    THIS server's interpreter (== the `sys.executable` _run_store uses), so
+    the reported state matches what writes will actually experience.
+    """
+    # Resolve the store checkout inside the fail-open guard. _resolve_store_py
+    # -> _resolve_zmem_home can abort the probe (and thus server boot) three
+    # ways: sys.exit(2) on a missing/invalid ZMEM_HOME (SystemExit — NOT caught
+    # by `except Exception` since it's a BaseException); PermissionError (OSError)
+    # from its own is_file() probes on an access-denied dir; or RuntimeError from
+    # Path.expanduser() when home is undeterminable. All three are
+    # misconfiguration, not reasons to kill boot — the same bad config previously
+    # failed on first tool use, not at startup. (Tool calls still fail loudly via
+    # _run_store.) Catch the specific set; do NOT catch BaseException (Ctrl-C must
+    # still terminate the server).
+    try:
+        store_py = _resolve_store_py()
+    except (SystemExit, OSError, RuntimeError):
+        logger.warning(
+            "zmem embeddings: store checkout could not be resolved "
+            "(ZMEM_HOME unset/invalid/inaccessible); skipping the availability "
+            "probe and assuming degraded. add() may store rows without embeddings."
+        )
+        return
+    scripts_dir = str(store_py.parent)
+    try:
+        import importlib
+
+        saved_path = sys.path[:]
+        sys.path.insert(0, scripts_dir)
+        try:
+            emb = importlib.import_module("embeddings")
+            status = emb.availability_status()
+        finally:
+            sys.path[:] = saved_path
+        if status.get("available"):
+            logger.info("zmem embeddings: available (semantic recall/dup active)")
+        else:
+            reason = status.get("reason")
+            if reason == "imports_missing":
+                missing = status.get("missing_imports") or []
+                pkgs = ", ".join(missing) if missing else "onnxruntime/tokenizers/numpy"
+                remedy = (
+                    f"install the missing package(s): {pkgs} "
+                    "(see hermes-plugin/server/requirements-embeddings.txt)"
+                )
+            else:
+                remedy = (
+                    "ensure both a checksum-verified minilm.onnx AND "
+                    "tokenizer.json are present at the resolved models dir "
+                    "(or set ZMEM_MODEL_URL to a source matching the pinned "
+                    "SHA-256 plus ZMEM_MODEL_AUTODOWNLOAD=1)"
+                )
+            logger.warning(
+                "zmem embeddings: UNAVAILABLE (reason=%s, models_dir=%s) — "
+                "add() will store rows WITHOUT embeddings. %s, then run "
+                "`reembed` to backfill.",
+                reason,
+                status.get("models_dir"),
+                remedy,
+            )
+    except Exception as exc:  # never block startup on a diagnostic
+        logger.warning(
+            "zmem embeddings: probe failed (%s: %s) — assuming degraded; "
+            "add() may store rows without embeddings.",
+            type(exc).__name__,
+            exc,
+        )
+
+
 def _run_store(args: list[str]) -> dict[str, Any]:
     """Run ``store.py <args>``; returns {ok, stdout, stderr, returncode}."""
     store_py = _resolve_store_py()
@@ -365,6 +440,10 @@ def main() -> int:
     use_tls = bool(tls_kwargs)
 
     mcp = build_server(host=host, port=args.port, use_tls=use_tls)
+
+    # Surface embedding availability at startup so a degraded server is loud
+    # immediately, not 700 unembedded rows later (issue #22). Fail-open.
+    _log_embedding_availability()
 
     if tls_kwargs:
         # uvicorn honors ssl_keyfile/ssl_certfile via Config kwargs. We use the

@@ -35,7 +35,10 @@ Do not let different hosts silently fan out to different physical stores.
 - **Tier 2 — Semantic:** a SQLite store (FTS5 + tombstone supersession) for
   cross-task lessons, facts, conventions, and preferences. Keyword recall with
   a confidence floor — high-precision-first (retrieved-wrong hurts more than
-  retrieved-nothing).
+  retrieved-nothing). Optional ONNX embeddings (all-MiniLM-L6-v2) add semantic
+  dedup-on-write, hybrid vector recall, and embedding-seeded consolidation;
+  without the embedding runtime, recall degrades gracefully to FTS5 (see
+  "Embeddings" under Operations notes).
 - **Reflection loop:** on session stop, if tool failures were detected and no
   lesson was captured, you're prompted to capture a grounded lesson. Non-blocking.
 - **Relevance-based recall:** when you submit a prompt, matching memories are
@@ -59,8 +62,11 @@ retrieval floor by default). This follows the finding that intrinsic self-correc
     `hermes-plugin/` adapter auto-detects `store.py` relative to this repo
   - remote Hermes (different machine): the MCP server needs
     `pip install -r hermes-plugin/server/requirements.txt` (`mcp` + `uvicorn`)
-    on the store-host box; the remote box needs only the `mcp_servers:` config
-    entry (Hermes bundles the MCP client SDK)
+    on the store-host box; for semantic recall/dedup on that host, also install
+    `pip install -r hermes-plugin/server/requirements-embeddings.txt`
+    (optional — without it the server logs a startup warning and `add` stores
+    rows without embeddings); the remote box needs only the `mcp_servers:`
+    config entry (Hermes bundles the MCP client SDK)
 - Python 3.8+ with sqlite3 + FTS5 (standard in CPython; verify with
   `python -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')"` )
 - Git Bash / Cygwin on Windows (for the ZCode/CC hook scripts); or any POSIX shell on macOS/Linux.
@@ -373,6 +379,59 @@ committed snapshot up to a full sync-repo read/write loop: see
   Run restores when no session is actively writing.
 - Review skill promotion before writing it. `promote --confirm` writes into the
   host skill surfaces and should stay a reviewed step, not an automatic one.
+
+### Embeddings (semantic recall / dedup)
+
+ZMem's semantic features — semantic dedup-on-write, hybrid vector recall, and
+embedding-seeded consolidation — run on an optional local ONNX model
+(all-MiniLM-L6-v2, 384-dim). **The model file is deliberately NOT bundled**
+(it is ~90MB and gitignored; CI asserts its absence in a fresh checkout). A
+fresh install therefore runs in **degraded mode** (FTS5 keyword recall + lexical
+token-overlap consolidation) until you provide the model. Degraded mode is fully
+supported — `recall`, `consolidate`, and all writes keep working — but semantic
+dedup and vector recall are off, and unembedded rows are skipped as consolidation
+seeds.
+
+**To enable embeddings:**
+
+1. Make sure the embedding runtime is installed in the Python interpreter ZMem
+   resolves (the hooks' interpreter, or the Hermes MCP server's interpreter):
+   `onnxruntime`, `tokenizers`, `numpy`. (For the Hermes MCP store host, run
+   `pip install -r hermes-plugin/server/requirements-embeddings.txt`.)
+2. Obtain a checksum-verified `minilm.onnx` and place it at the resolved models
+   dir (see "Check status" below for the exact path), OR set:
+   - `ZMEM_MODEL_URL` to a source whose bytes match the pinned SHA-256, and
+   - `ZMEM_MODEL_AUTODOWNLOAD=1` (off by default; ZMem never makes an
+     unsolicited network call). On checksum mismatch the download is discarded
+     and ZMem stays in degraded mode rather than loading an unverified binary.
+
+   Note: the default `ZMEM_MODEL_URL` (the widely-used Xenova ONNX export) is
+   NOT byte-identical to the pinned checksum — different ONNX export toolchains
+   produce different bytes for the same weights — so an autodownload from the
+   default URL will fetch-then-reject-checksum and leave you in degraded mode
+   ~100% of the time. Either place a verified `minilm.onnx` manually, or point
+   `ZMEM_MODEL_URL` at a source you have confirmed matches the pin.
+
+`ZMEM_MODELS_DIR` overrides the models directory — point it at a shared,
+populated, checksum-verified model cache to reuse one model across checkouts
+(e.g. `~/.zmem/models`). This is a supported production knob, not just a test
+affordance.
+
+**Check status** (one command away from noticing drift):
+
+- `python <store.py> stats` reports live embedding coverage
+  (`with_embedding=` / `without_embedding=`), whether embeddings are available,
+  the reason if not, and the resolved models dir.
+- `python skills/memory/scripts/doctor.py` reports embedding availability + the
+  reason + the resolved interpreter (so the multi-Python case is diagnosable).
+
+**Backfill existing unembedded rows:** once the root cause is fixed, run
+`python <store.py> reembed` to embed live rows that are missing embeddings.
+Backfilling before fixing the root cause only treats the backlog — new captures
+keep landing unembedded until embeddings are available in the capturing
+environment. When embeddings are unavailable, ZMem prints a one-time-per-process
+warning naming the reason and the resolved models dir on the first unembedded
+capture, so silent drift does not recur.
 
 ## Cross-platform hook execution
 
