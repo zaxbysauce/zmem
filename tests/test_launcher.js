@@ -1181,10 +1181,11 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
         assertNoDefaultStoreLeak("capture-failure", () => runSuggestedAndCheckCanary("capture-failure", ac, CANARY, HDATA));
         // Positive case: confirm the SANDBOX store accepts a capture. Use the
         // canonical `python store.py add` invocation (not the copy-paste
-        // rendered command) because the rendered store.py is not guaranteed
-        // directly executable on a fresh POSIX checkout (git mode 100644), so
-        // a direct-exec write would be platform-fragile. This proves capture
-        // lands in the sandbox independent of shell exec semantics.
+        // rendered command): since PR #28 the rendered `store.py` is committed
+        // executable (git mode 100755), but driving it through the interpreter
+        // keeps this write immune to local shell exec semantics and to the
+        // mirrored-commit MODE on non-POSIX checkouts, so it stays robust
+        // everywhere. This proves capture lands in the sandbox deterministically.
         const sandboxBefore = countStoreRows(path.join(HDATA, "store.sqlite"));
         execFileSync(PYTHON, [STORE_PY, "add", "--namespace", "user:global", "--type", "lesson",
             "--content", "sandbox positive capture probe", "--signal", "test",
