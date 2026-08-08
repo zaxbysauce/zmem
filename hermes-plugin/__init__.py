@@ -561,7 +561,11 @@ class ZmemMemoryProvider(MemoryProvider):
         ``consolidate`` runs WITHOUT ``--dry-run``: store.py's own cadence gate
         (meta-key ``last_consolidation``) + single-flight lock make the real
         call cheap when not due, and ``--dry-run`` was an expensive no-op that
-        paid the full clustering scan without ever merging.
+        paid the full clustering scan without ever merging. Since issue #26 the
+        gate announces a skip (``[zmem] consolidate: skipped by cadence gate ...``) to
+        stdout; this caller discards that output, so the housekeeping run stays
+        silent as intended — the announcement is for the interactive closeout
+        user, not the background hook.
         """
         try:
             _run_store(["consolidate"])

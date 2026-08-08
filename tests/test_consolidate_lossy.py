@@ -212,14 +212,15 @@ class ContentPreservationTest(unittest.TestCase):
             (NS,),
         ).fetchall()
         # Second run. MUST truly re-run the clustering loop, not silently
-        # return early: with the default threshold the growth cadence gate
-        # (store.py) short-circuits a back-to-back call (days_since≈0, growth
-        # ≈0) into a no-op, so the test would pass without ever exercising
-        # re-consolidation (swarm-pr-review PRR-002). Passing an explicit
-        # non-default threshold bypasses the gate and forces the loop to run
-        # over the post-first-run live set (the absorbed row is already
-        # tombstoned), verifying re-clustering is idempotent.
-        self.mod.consolidate(self.conn, threshold=0.3)
+        # return early: the growth cadence gate (store.py) short-circuits a
+        # back-to-back call (days_since≈0, growth ≈0) into an announced no-op,
+        # so the test would pass without ever exercising re-consolidation
+        # (swarm-pr-review PRR-002). force=True intentionally bypasses the gate
+        # and runs the loop over the post-first-run live set (the absorbed row
+        # is already tombstoned), verifying re-clustering is idempotent.
+        # (Previously a non-default `threshold` was the bypass vehicle; issue #26
+        # removed that side-channel in favour of an explicit --force.)
+        self.mod.consolidate(self.conn, force=True)
         live_after_2 = self.conn.execute(
             "SELECT content FROM memory WHERE superseded_at IS NULL AND namespace=?",
             (NS,),
@@ -330,7 +331,10 @@ class ContentPreservationTest(unittest.TestCase):
         # prefix-substring of a1's appended segment but NOT of the stale seed.
         a2 = _add_raw(self.mod, self.conn, base + " unique alpha clause",
                       0.85, rc=1)
-        self.mod.consolidate(self.conn, threshold=0.3)
+        # force=True bypasses the cadence gate so the merge runs on this fresh
+        # store regardless of gate state (issue #26 made forcing explicit; the
+        # old `threshold=0.3` was an incidental side-channel for the same goal).
+        self.mod.consolidate(self.conn, force=True)
         row = self.conn.execute(
             "SELECT content, merged_from FROM memory WHERE id=?", (keeper,)
         ).fetchone()
@@ -415,7 +419,11 @@ class DryRunPreviewTest(unittest.TestCase):
             (NS,)).fetchone()[0]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            self.mod.consolidate(self.conn, dry_run=True, threshold=0.5)
+            # force=True keeps the dry-run preview robust against the cadence
+            # gate (a fresh store has no last_consolidation so the gate is not
+            # armed here, but --force makes the intent explicit). threshold=0.5
+            # is a similarity value ensuring the test pair clusters.
+            self.mod.consolidate(self.conn, dry_run=True, threshold=0.5, force=True)
         out = buf.getvalue()
         live_after = self.conn.execute(
             "SELECT count(*) FROM memory WHERE superseded_at IS NULL AND namespace=?",
@@ -613,7 +621,10 @@ class SizeCapAndJsonlRoundtripTest(unittest.TestCase):
         keeper = _add(self.mod, self.conn, keeper_text, 0.90, rc=50)
         a1 = _add(self.mod, self.conn, a1_text, 0.85, rc=1)
         a2 = _add(self.mod, self.conn, a2_text, 0.85, rc=1)
-        self.mod.consolidate(self.conn, threshold=0.3)
+        # force=True bypasses the cadence gate (issue #26); the threshold here
+        # was only ever a gate-bypass vehicle, not a similarity assertion — the
+        # three texts are near-identical and cluster at any threshold.
+        self.mod.consolidate(self.conn, force=True)
         row = self.conn.execute(
             "SELECT content, merged_from FROM memory WHERE id=?", (keeper,)
         ).fetchone()

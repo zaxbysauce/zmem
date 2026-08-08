@@ -2665,6 +2665,7 @@ def consolidate(
     prune: bool = False,
     dry_run: bool = False,
     namespace: str | None = None,
+    force: bool = False,
 ) -> None:
     """Merge near-duplicate memories via embedding similarity (or a lexical
     token-overlap fallback when embeddings are unavailable — Phase 10).
@@ -2706,14 +2707,31 @@ def consolidate(
     age>30d (opt-in, never automatic on SessionStart). A memory surfaced by the hook
     path (surfaced_count>0) is protected: `retrieval_count = 0` alone is NOT evidence
     of unused (issue #21).
+
+    Cadence gate (issue #26): a run is skipped when the last consolidation was
+    less than ``CONSOLIDATE_MIN_INTERVAL_DAYS`` ago AND the live set has grown
+    less than ``CONSOLIDATE_GROWTH_THRESHOLD`` since. The skip is ALWAYS announced
+    (never silent), and ``dry_run=True`` models the SAME gate so the two modes
+    agree — a dry run that reports "would merge" implies a real run that merges,
+    and a gated dry run reports "would skip" rather than "merged N". ``force=True``
+    is the only intentional bypass. ``threshold`` no longer affects the gate (the
+    previous behaviour where any non-default ``--threshold`` incidentally bypassed
+    it was an undocumented side-channel and is removed).
     """
     use_lexical = not (_embeddings and _embeddings.is_available())
     if use_lexical:
         print("[zmem] embeddings unavailable — consolidating via lexical token overlap", file=sys.stderr)
 
-    # Growth-based cadence gate: skip if last consolidation was recent AND
-    # the store hasn't grown significantly since. Only applies to automatic
-    # runs (not dry-run or explicit CLI invocation with changed args).
+    # Growth-based cadence gate (issue #26): skip if last consolidation was
+    # recent AND the store hasn't grown significantly since. The skip is always
+    # announced. dry_run models the same gate so the two modes agree; only
+    # `force` bypasses it. `threshold` does NOT affect the gate — use --force to
+    # override. (Previously any non-default --threshold incidentally bypassed the
+    # gate and the skip was silent; both defects are fixed here.) NOTE: the
+    # lexical-swap below (effective_threshold) ALSO keys off
+    # `threshold == CONSOLIDATE_DEFAULT_THRESHOLD` but for an UNRELATED purpose
+    # (picking the Jaccard default in lexical fallback mode); the two predicates
+    # are fully decoupled — do not "clean up" one expecting the other to follow.
     last_consolidation = conn.execute(
         "SELECT value FROM meta WHERE key='last_consolidation'"
     ).fetchone()
@@ -2721,7 +2739,7 @@ def consolidate(
         "SELECT value FROM meta WHERE key='last_consolidation_count'"
     ).fetchone()
 
-    if last_consolidation and not dry_run and threshold == CONSOLIDATE_DEFAULT_THRESHOLD:
+    if last_consolidation and not force:
         import calendar as _cal
         last_ts = last_consolidation[0]
         last_epoch = _cal.timegm(time.strptime(last_ts, "%Y-%m-%dT%H:%M:%SZ")) if last_ts else 0
@@ -2733,7 +2751,25 @@ def consolidate(
         growth = (live_count - last_live) / max(last_live, 1)
 
         if days_since < CONSOLIDATE_MIN_INTERVAL_DAYS and growth < CONSOLIDATE_GROWTH_THRESHOLD:
-            return  # not enough time or growth to warrant consolidation
+            # Announce the skip (never silent — issue #26). dry_run and the real
+            # run share the gate so the two modes agree. Background callers
+            # (zmem-session-start.sh, hermes on_session_end) redirect stdout to
+            # /dev/null, so this stays silent there by design; the interactive
+            # closeout user reading stdout is who needs to see it.
+            if dry_run:
+                print(f"[zmem] consolidate: dry-run: would skip by cadence gate "
+                      f"({days_since:.1f}d since last run < "
+                      f"{CONSOLIDATE_MIN_INTERVAL_DAYS:g}d min, {growth:.1%} growth < "
+                      f"{CONSOLIDATE_GROWTH_THRESHOLD:.1%} min; needs more "
+                      f"time OR more growth; drop --dry-run and pass --force to "
+                      f"run anyway)")
+            else:
+                print(f"[zmem] consolidate: skipped by cadence gate "
+                      f"({days_since:.1f}d since last run < "
+                      f"{CONSOLIDATE_MIN_INTERVAL_DAYS:g}d min, {growth:.1%} growth < "
+                      f"{CONSOLIDATE_GROWTH_THRESHOLD:.1%} min; needs more "
+                      f"time OR more growth)")
+            return  # gate declined — leave last_consolidation untouched
 
     # Write the consolidation timestamp BEFORE the clustering loop, so a killed
     # run still creates backpressure on the next session. Count is start-of-run
@@ -4866,6 +4902,8 @@ def main():
                                help="show what would be consolidated without changing anything")
     p_consolidate.add_argument("--namespace", default=None,
                                help="limit consolidation to a specific namespace")
+    p_consolidate.add_argument("--force", action="store_true",
+                               help="bypass the cadence gate and run consolidation now")
 
     p_promote = sub.add_parser("promote", help="promote high-confidence lessons to SKILL.md files")
     p_promote.add_argument("--dry-run", action="store_true",
@@ -5125,8 +5163,10 @@ def main():
             # Single-flight: consolidate() writes, and the SessionStart hook fires a
             # detached one per session. Its meta-key cadence gate is a SOFT gate
             # (read-then-later-write), so without this lock two near-simultaneous
-            # runs both pass it and both run the clustering loop. --dry-run writes
-            # nothing, so it is deliberately never gated (and never takes the lock).
+            # runs both pass it and both run the clustering loop. --dry-run models
+            # the cadence gate (it announces a would-skip) but still writes nothing,
+            # so it still never takes the single-flight lock; only --force bypasses
+            # the gate, and --dry-run --force previews what --force would do.
             c_token = None
             if not args.dry_run:
                 c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
@@ -5137,7 +5177,8 @@ def main():
                     return
             try:
                 consolidate(conn, threshold=args.threshold, prune=args.prune,
-                            dry_run=args.dry_run, namespace=args.namespace)
+                            dry_run=args.dry_run, namespace=args.namespace,
+                            force=args.force)
             finally:
                 _release_lock("consolidate", c_token)
         elif args.cmd == "backup":
