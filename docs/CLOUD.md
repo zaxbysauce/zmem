@@ -247,11 +247,13 @@ compromise of the store, and rebuild rather than "clean up" — see the
   lines whatsoever (empty or whitespace-only). It exits `0` for every other
   outcome, including a file full of malformed rows: a bad row is never fatal
   to the run, it is counted and reported by line number on stderr, and the
-  summary line (`added=… tombstoned=… tombstones_refused=… deduped=…
-  skipped=… malformed=…`) always prints on stdout so "the run finished" and
+  summary line (`added=… tombstoned=… tombstones_refused=… capture_refused=…
+  deduped=… skipped=… malformed=…`) always prints on stdout so "the run finished" and
   "every row landed" are never confused for each other. Check
-  `malformed`/`tombstones_refused` in that summary, not just the exit code, to
-  know whether the file was clean. (A file that is present and readable but
+  `malformed`/`tombstones_refused`/`capture_refused` in that summary, not just the exit code, to
+  know whether the file was clean. `capture_refused` is non-zero only under
+  `--capture-mode auto` when a row's `source_ref` looked like a secret and was
+  refused (not stored) — see the ingest-jsonl capture policy. (A file that is present and readable but
   not valid UTF-8 is a separate, unhandled failure mode outside this: it
   raises past `ingest-jsonl`'s own guard and exits `1` with a traceback.)
 
@@ -299,7 +301,11 @@ compromise of the store, and rebuild rather than "clean up" — see the
   sessions' outboxes — is safe (again, see below). Same exit-code contract as
   the cloud-side ingest above: `2` only for a missing/inaccessible or
   empty/whitespace-only outbox file, `0` otherwise (malformed rows never fail
-  the run).
+  the run). A cloud outbox is remote-authored data: ingest always tags
+  `prompt-injection-risk` on rows matching injection patterns (in every mode),
+  and `--capture-mode auto` additionally redacts secret-like content and
+  refuses rows whose `source_ref` looks like a secret (counted as
+  `capture_refused`). Prefer `auto` for an outbox you do not fully control.
 
 - **Re-embed after ingesting an outbox.** Ingest only computes an embedding
   when the embedding runtime is available on the ingesting box; rows that

@@ -211,8 +211,11 @@ _SEARCH_SCHEMA: Dict[str, Any] = {
             "namespace": {
                 "type": "string",
                 "description": (
-                    "Scope (default: your session's namespace). Pass "
-                    "'user:global' or '*' to search across all namespaces."
+                    "Scope (default: your session's namespace). Pass '*' "
+                    "to search across all namespaces (store-wide); pass a "
+                    "specific namespace (e.g. 'project:repo') to scope to "
+                    "that tier (cross-project lessons from user:global are "
+                    "still surfaced alongside, up to 3)."
                 ),
             },
             "limit": {

@@ -29,7 +29,7 @@ Usage:
   python store.py export-pack --namespace NS [--out FILE] [--project-limit 50] \\
          [--global-limit 15] [--min-confidence 0.6] [--max-bytes 32768]
   python store.py export-jsonl [--out FILE] [--namespace NS] [--include-superseded]
-  python store.py ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones]
+  python store.py ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones] [--capture-mode MODE]
 
 Design (see the memory skill's design doc):
   - Tombstone supersession (superseded_at), NOT full bi-temporal (YAGNI for single user).
@@ -924,7 +924,11 @@ def _apply_capture_policy(
             "stored memory before trusting it"
         ]
         out_tags = _merge_tag_strings(out_tags, "auto-redacted")
-    if _has_prompt_injection_risk(out_content, out_source_ref):
+    # Scan content, source_ref, AND tags for injection risk: tags are free-form
+    # text that is FTS-indexed and surfaced verbatim into model context via
+    # recall, so injection text confined to tags must also be tagged. (Symmetric
+    # with _check_secrets, which already scans all three for secrets.)
+    if _has_prompt_injection_risk(out_content, out_source_ref, out_tags):
         out_tags = _merge_tag_strings(out_tags, "prompt-injection-risk")
     return out_content, out_source_ref, out_tags, warnings
 
@@ -4474,18 +4478,27 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     }
 
 
-def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) -> str:
+def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
+                capture_mode: str | None = None) -> str:
     """Apply one VALIDATED JSONL sync row (a _validate_sync_row result) to the
     local store.
 
-    Returns 'added', 'tombstoned', 'tombstone_refused', 'deduped', or
-    'skipped' -- the caller tallies these into the ingest-jsonl summary line.
-    Malformed-row handling lives in the caller, so a bad row never reaches
-    this function; the caller also catches anything raised here (a row that
-    blows up must not abort the rest of the file).
+    Returns 'added', 'tombstoned', 'tombstone_refused', 'deduped',
+    'capture_refused', or 'skipped' -- the caller tallies these into the
+    ingest-jsonl summary line. Malformed-row handling lives in the caller, so
+    a bad row never reaches this function; the caller also catches anything
+    raised here (a row that blows up must not abort the rest of the file).
 
     `allow_tombstones` gates the ONLY destructive thing an import can do to an
     existing local row (see cmd_ingest_jsonl's flag docs).
+
+    `capture_mode` routes every INSERTED row through the same capture policy
+    as ``add_memory`` (issue #35): prompt-injection-risk is tagged in ALL
+    modes (a sync file is remote-authored data that can plant a poisoned
+    memory surfacing verbatim into model context), and 'auto' mode
+    additionally redacts secret-like content/tags and refuses rows whose
+    source_ref looks like a secret. The existing-local-row path is NOT
+    affected: local content is never overwritten by a sync import.
     """
     mid = obj["id"]
     namespace = obj["namespace"]
@@ -4501,6 +4514,15 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
     supersede_reason = obj["supersede_reason"]
     merged_from = obj.get("merged_from")
 
+    # Existing-local-row short-circuit FIRST (issue #35 refinement): an id
+    # already present locally is NEVER content-overwritten by a sync import --
+    # the only thing it can receive is a tombstone. So resolve that path before
+    # paying for capture policy (which only matters for rows we will actually
+    # INSERT). This read-only SELECT runs under the writer lease held for the
+    # whole ingest command, so there is no concurrent-writer race between this
+    # probe and the BEGIN below. Capture policy thus applies ONLY to genuinely
+    # new rows (live inserts + tombstoned-history inserts) -- exactly the rows
+    # whose content/tags/source_ref will be written to disk.
     started_tx = False
     try:
         if not conn.in_transaction:
@@ -4527,13 +4549,50 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
                 conn.rollback()
             return "skipped"
 
+        # The id is genuinely new -- capture policy now applies. _apply_capture_policy
+        # is pure (no DB, no I/O -- see lines 893-929). It runs inside the open
+        # transaction, so a CapturePolicyRefusal rolls it back before returning
+        # (nothing was written yet: the only DB work so far is the read-only
+        # existence SELECT above). This closes the prompt-injection-via-memory
+        # vector on the sync write path: export-jsonl is the cross-store
+        # propagation channel, so untrusted content -- even an already-superseded
+        # history row -- is sanitized/tagged before it lands locally. Tagging is
+        # mode-independent (prompt-injection-risk in ALL modes); secret
+        # redaction/refusal only in 'auto'.
+        #
+        # NOTE on the dedup path below: capture policy is applied before
+        # _detect_duplicate, so when this row dedups against a pre-existing local
+        # row, _merge_on_dedup unions the (capture-policy-modified) tags into the
+        # SURVIVING local row. That is intentional and symmetric with add_memory
+        # (which applies capture policy before its own dedup-on-write merge): a
+        # re-observation of risky content transfers its labels to the surviving
+        # memory, and prompt-injection-risk is inert advisory metadata (fail-safe
+        # direction). In auto mode, content redacted before dedup means a
+        # secret-bearing near-duplicate will not match and is inserted as a
+        # separate (redacted) row -- acceptable, since a redacted memory is by
+        # definition a different memory.
+        try:
+            content, source_ref, tags, cap_warns = _apply_capture_policy(
+                content=content,
+                source_ref=source_ref,
+                tags=tags,
+                capture_mode=capture_mode,
+            )
+        except CapturePolicyRefusal as exc:
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            print(f"[zmem] ingest-jsonl: refused row {mid}: {exc}", file=sys.stderr)
+            return "capture_refused"
+        for w in cap_warns:
+            print(f"[zmem] ingest-jsonl: capture policy: {w}", file=sys.stderr)
+
         if superseded_at:
             # New locally, but already tombstoned upstream: insert as history so
             # future syncs stay consistent, without letting it participate in
             # dedup-on-write or recall -- it must not resurface, and it must not
             # silently absorb a live row into its (dead) dedup slot either.
-            for w in _check_secrets(content, source_ref, tags):
-                print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
+            # Secret/injection handling is applied just above via
+            # _apply_capture_policy (issue #35); no separate advisory scan here.
             shash = ""
             conn.execute(
                 """INSERT INTO memory
@@ -4550,9 +4609,8 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
                 _commit(conn)
             return "added"
 
-        warns = _check_secrets(content, source_ref, tags)
-        for w in warns:
-            print(f"[zmem] WARNING (advisory, write proceeded): {w}", file=sys.stderr)
+        # Secret/injection handling is applied once above (for new rows) via
+        # _apply_capture_policy (issue #35); no separate advisory scan here.
         existing, _sim, emb = _detect_duplicate(conn, content, namespace)
         if existing:
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
@@ -4597,7 +4655,8 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool) 
 
 
 def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
-                     source_ref: str | None, allow_tombstones: bool = False) -> int:
+                     source_ref: str | None, allow_tombstones: bool = False,
+                     capture_mode: str | None = None) -> int:
     """Import a JSONL sync file written by export-jsonl. Returns a process
     exit code: 2 if `in_path` cannot be read or contains no data lines at
     all, 0 otherwise (malformed/skipped/deduped rows do not fail the run --
@@ -4629,6 +4688,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
         return 2
 
     added = tombstoned = tombstones_refused = deduped = skipped = malformed = 0
+    capture_refused = 0
     first_refused_id = None
     saw_line = False
     decode_error = None
@@ -4731,7 +4791,8 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 obj["source_ref"] = source_ref
 
             try:
-                outcome = _ingest_row(conn, obj, allow_tombstones=allow_tombstones)
+                outcome = _ingest_row(conn, obj, allow_tombstones=allow_tombstones,
+                                      capture_mode=capture_mode)
             except Exception as e:
                 # A row that raises mid-apply must not abort the file and silently
                 # drop every row after it. Roll back first: _ingest_row commits at
@@ -4755,6 +4816,8 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 tombstones_refused += 1
                 if first_refused_id is None:
                     first_refused_id = obj["id"]
+            elif outcome == "capture_refused":
+                capture_refused += 1
             elif outcome == "deduped":
                 deduped += 1
             else:
@@ -4785,9 +4848,18 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
               f"untouched. Re-run with --allow-tombstones ONLY if this file is your "
               f"own store's export, not a remote/cloud outbox.", file=sys.stderr)
 
+    if capture_refused:
+        # Rows refused by the capture policy (auto mode: source_ref looked like a
+        # secret). NOT written. One summary note, not per-row, for the same
+        # noise-suppression reason as tombstones_refused.
+        print(f"[zmem] ingest-jsonl: refused {capture_refused} row(s) under the "
+              f"capture policy (secret-like source_ref in 'auto' mode); those rows "
+              f"are NOT stored. Re-ingest with --capture-mode reviewed/manual only "
+              f"if you have verified the source_ref is safe.", file=sys.stderr)
+
     print(f"[zmem] ingest-jsonl: added={added} tombstoned={tombstoned} "
-          f"tombstones_refused={tombstones_refused} deduped={deduped} "
-          f"skipped={skipped} malformed={malformed}")
+          f"tombstones_refused={tombstones_refused} capture_refused={capture_refused} "
+          f"deduped={deduped} skipped={skipped} malformed={malformed}")
     return 2 if decode_error is not None else 0
 
 
@@ -5028,6 +5100,17 @@ def main():
                                      "are counted as tombstones_refused and the local rows "
                                      "are left alone. A brand-new id that arrives already "
                                      "tombstoned is still inserted as history either way.")
+    p_ingest_jsonl.add_argument("--capture-mode", default=None,
+                                choices=list(CAPTURE_MODES),
+                                help="apply the same capture policy as `add` to every "
+                                     "ingested row. ALWAYS tags prompt-injection-risk "
+                                     "(defends against poisoned sync files surfacing into "
+                                     "model context); 'auto' additionally redacts "
+                                     "secret-like text in content/tags and refuses rows "
+                                     "whose source_ref looks like a secret. Default resolves "
+                                     "like `add` (ZMEM_CAPTURE_MODE env or 'manual'): verbatim "
+                                     "content with injection-risk tagging. Use 'auto' when "
+                                     "ingesting an untrusted/remote sync file.")
 
     p_fail = sub.add_parser(
         "failures",
@@ -5239,7 +5322,8 @@ def main():
             sys.exit(rc)
         elif args.cmd == "ingest-jsonl":
             rc = cmd_ingest_jsonl(conn, in_path=args.in_path, source_ref=args.source_ref,
-                                  allow_tombstones=args.allow_tombstones)
+                                  allow_tombstones=args.allow_tombstones,
+                                  capture_mode=args.capture_mode)
             sys.exit(rc)
     finally:
         _release_writer_lease(writer_lease)
