@@ -46,12 +46,44 @@ _FAILURE_CAPTURED_KEY = "hermes_failure_captured_{session}"
 
 
 def _resolve_store_path() -> Path:
+    """Resolve the store path via the SAME authoritative resolver as the
+    provider and store.py (host.resolve_store_path). Previously this hook
+    hand-rolled a TRUNCATED copy that omitted CLAUDE/ZCODE_PLUGIN_DATA, so on
+    plugin-data-dir boxes it resolved a nonexistent ~/.zmem/store.sqlite and
+    silently no-op'd all session (#36 M10).
+
+    Imports the real resolver when the scripts dir is reachable. In a
+    repo/symlink/junction install `__file__`'s `parents[2]` finds it; in a
+    COPY install (`cp -r hermes-plugin …`, README-documented) the copy has no
+    `skills/` tree, so we also probe `$ZMEM_HOME/skills/memory/scripts` (the
+    env var copy users MUST set) before giving up (#36 M10 / cubic-3,5,8).
+
+    The inline fallback below is a BEST-EFFORT subset (the env-var chain
+    + ~/.zmem) reached only if host.py itself is unimportable from any probe;
+    it does NOT include host.py's legacy probes (~/.zcode/memory,
+    _legacy_plugin_store)."""
+    _rel = Path("skills") / "memory" / "scripts"
+    candidates = [
+        Path(__file__).resolve().parents[2] / _rel,            # in-tree (repo/symlink/junction)
+        Path(os.environ.get("ZMEM_HOME", "")).expanduser() / _rel,  # copy install
+    ]
+    for _scripts_dir in candidates:
+        if (_scripts_dir / "host.py").is_file():
+            sys.path.insert(0, str(_scripts_dir))
+            try:
+                import host  # type: ignore  # noqa: F811
+                return host.resolve_store_path()
+            except Exception:
+                pass
+    # Inline fallback: the env-var chain + ~/.zmem (host.py's legacy probes
+    # omitted — see docstring).
     explicit = os.environ.get("ZMEM_STORE", "").strip()
     if explicit:
         return Path(explicit).expanduser()
-    data_dir = os.environ.get("ZMEM_DATA", "").strip()
-    if data_dir:
-        return Path(data_dir).expanduser() / "store.sqlite"
+    for var in ("ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+        d = os.environ.get(var, "").strip()
+        if d:
+            return Path(d).expanduser() / "store.sqlite"
     return Path.home() / ".zmem" / "store.sqlite"
 
 

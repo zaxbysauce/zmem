@@ -1046,7 +1046,9 @@ class IngestValidationTest(_TwoStoreCase):
             signal, confidence = self.b.query_one(
                 "SELECT signal, confidence FROM memory WHERE content=?", (content,))
             self.assertEqual(signal, "none")
-            self.assertEqual(confidence, 0.3)
+            # 'none' signal confidence default (below the retrieval floor by
+            # design — #36 M3); was 0.3 before the trust-tiering fix.
+            self.assertEqual(confidence, 0.2)
 
     def test_unknown_signal_emits_one_stderr_warning_per_occurrence(self):
         """PRR-011: coercing an unrecognized signal to 'none' must not be
@@ -1064,7 +1066,7 @@ class IngestValidationTest(_TwoStoreCase):
             "SELECT signal, confidence FROM memory WHERE content=?",
             ("row with signal banana",))
         self.assertEqual(signal, "none")
-        self.assertEqual(confidence, 0.3)
+        self.assertEqual(confidence, 0.2)
         self.assertIn(
             "[zmem] ingest-jsonl: line 1: unknown signal 'banana' treated as 'none'",
             r.stderr)

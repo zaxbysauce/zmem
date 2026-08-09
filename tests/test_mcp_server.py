@@ -135,7 +135,8 @@ class McpServerToolSurfaceTest(unittest.TestCase):
     def _add_test_signal(self, content, namespace=None):
         """Add with signal=test so confidence (0.9) clears recent's default
         min_confidence=0.5 filter. The plain add() helper uses signal=none
-        (confidence 0.3), which recent filters out by design."""
+        (confidence 0.2, below the recall floor by design — #36 M3), which
+        recent filters out by design."""
         return self._add(content=content, namespace=namespace or self._ns(),
                          signal="test")
 
@@ -145,8 +146,11 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         # Use a query term that actually appears in the content (FTS5 has no
         # stemming, so "testing" won't match "pytest"). A unique namespace per
         # test isolates it from other tests' rows on the shared store.
+        # Use a grounded signal (test) so the row clears the recall confidence
+        # floor — a 'none'-signal row now sits below the floor by design (#36 M3).
         ns = self._ns()
-        self._add(content="always run pytest before committing changes", namespace=ns)
+        self._add_test_signal(
+            content="always run pytest before committing changes", namespace=ns)
         result = self._call("recall", query="pytest", namespace=ns, limit=5)
         self.assertIsInstance(result, dict)
         self.assertIn("results", result)
@@ -202,12 +206,18 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("signal", result["error"])
 
-    def test_add_long_content_is_truncated_not_rejected(self):
-        # Content over _MAX_CONTENT_CHARS (32000) is clamped, not errored.
-        long_content = "z" * 40000
+    def test_add_long_content_is_rejected_not_truncated(self):
+        # Content over _MAX_CONTENT_CHARS (65536) is REJECTED with a clear
+        # error, not silently truncated. Previously MCP truncated at 32000
+        # while ingest-jsonl rejected at 65536 — a 32k–65k row written here
+        # was silently mangled and broke Tier-3 sync import elsewhere. All
+        # write paths now enforce one cap consistently (#36 M17).
+        cap = self.mcp_server._MAX_CONTENT_CHARS
+        long_content = "z" * (cap + 1)
         result = self._call("add", type="fact", content=long_content,
                             namespace=self._ns())
-        self.assertEqual(result.get("result"), "stored")
+        self.assertIn("error", result)
+        self.assertIn(str(cap), result["error"])
 
     # -- search (alias of recall) ------------------------------------------
 
@@ -227,7 +237,9 @@ class McpServerToolSurfaceTest(unittest.TestCase):
 
     def test_supersede_success(self):
         ns = self._ns()
-        self._add(content="temporary fact to supersede", namespace=ns)
+        # Use a grounded signal (test) so the row clears the recall confidence
+        # floor — a 'none'-signal row now sits below the floor by design (#36 M3).
+        self._add_test_signal(content="temporary fact to supersede", namespace=ns)
         # Recall to find the id of the just-added row.
         recalled = self._call("recall", query="temporary", namespace=ns, limit=5)
         self.assertGreater(recalled["count"], 0, "could not find added row to supersede")
@@ -286,6 +298,175 @@ class McpServerToolSurfaceTest(unittest.TestCase):
             # pydantic raises ValidationError (a ValueError subclass) on the
             # int coercion; the ToolManager propagates it from call_tool.
             self._call("recent", namespace=self._ns(), limit="not-a-number")
+
+    # -- #36 M4: capture-mode auto + warning surfacing ---------------------
+
+    def test_add_secret_content_redacted_and_warnings_surfaced(self):
+        """MCP add defaults to --capture-mode auto, so secret-like content is
+        redacted and a warning surfaces in the response (#36 M4)."""
+        ns = self._ns()
+        # A github PAT-shaped token (ghp_ + 36 alnum) matches SECRET_PATTERNS.
+        result = self._call(
+            "add", type="fact",
+            content="deploy token: ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+            namespace=ns, signal="test")
+        self.assertEqual(result.get("result"), "stored", result)
+        # An advisory/notice warning about redaction must be surfaced.
+        warnings = result.get("warnings") or []
+        redaction_warnings = [w for w in warnings if "redact" in w.lower()]
+        self.assertGreater(len(redaction_warnings), 0,
+                           f"expected a redaction warning, got: {warnings}")
+
+    def test_add_secret_source_ref_returns_structured_error(self):
+        """When source_ref itself carries secret-like text, auto mode refuses
+        (CapturePolicyRefusal → store.py exit 2). The MCP server surfaces a
+        structured error, not a crash (#36 M4)."""
+        ns = self._ns()
+        result = self._call(
+            "add", type="fact",
+            content="benign content with no secrets",
+            namespace=ns, signal="test",
+            source_ref="creds ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789")
+        # Refusal → error path (not "stored").
+        self.assertIn("error", result)
+        self.assertNotEqual(result.get("result"), "stored")
+
+    def test_add_clean_content_no_warnings(self):
+        """A clean add surfaces no SECRET-related warnings. (The test env has no
+        embeddings model, so a degraded-embeddings notice may appear — that is
+        unrelated to capture-mode secret detection and is filtered out here.)"""
+        ns = self._ns()
+        result = self._call("add", type="fact", content="a normal clean lesson",
+                            namespace=ns, signal="test")
+        self.assertEqual(result.get("result"), "stored", result)
+        secret_warnings = [
+            w for w in (result.get("warnings") or [])
+            if "secret" in w.lower() or "redacted" in w.lower()
+        ]
+        self.assertEqual(secret_warnings, [],
+                         f"clean content should not produce secret warnings: {secret_warnings}")
+
+    # -- #36 M6: concurrency cap -------------------------------------------
+
+    def test_concurrency_semaphore_bounds_subprocesses(self):
+        """The asyncio.Semaphore caps concurrent store.py subprocesses. With
+        max_concurrent=1 (forced small), concurrent recall calls serialize
+        (at most one subprocess in flight at a time) (#36 M6).
+
+        Seeds the store AND runs the concurrent gather inside ONE asyncio.run
+        so the lazy semaphore is constructed and used on the same event loop
+        (robust across Python versions — cubic-10)."""
+        import asyncio
+        original = self.mcp_server._MAX_CONCURRENT_STORE
+        # Force a tiny cap and reset the lazy semaphore so it rebuilds.
+        self.mcp_server._MAX_CONCURRENT_STORE = 1
+        self.mcp_server._store_semaphore = None
+        in_flight = {"count": 0, "peak": 0}
+        original_run_store = self.mcp_server._run_store
+
+        def counting_run_store(args):
+            in_flight["count"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["count"])
+            try:
+                return original_run_store(args)
+            finally:
+                in_flight["count"] -= 1
+
+        self.mcp_server._run_store = counting_run_store
+        try:
+            ns = self._ns()
+
+            async def seed_and_gather():
+                # Seed within the same loop that gathers, so the semaphore is
+                # built and acquired on one event loop (cubic-10).
+                await self.server._tool_manager.call_tool(
+                    "add",
+                    {"type": "fact", "content": "seed row for concurrency test",
+                     "namespace": ns, "signal": "test"},
+                    context=None)
+                tasks = [
+                    self.server._tool_manager.call_tool(
+                        "recall",
+                        {"query": "seed", "namespace": ns, "limit": 5},
+                        context=None)
+                    for _ in range(4)
+                ]
+                return await asyncio.gather(*tasks)
+
+            asyncio.run(seed_and_gather())
+            # With max_concurrent=1, peak simultaneous _run_store calls must be 1.
+            self.assertLessEqual(in_flight["peak"], 1,
+                                 f"peak {in_flight['peak']} exceeded cap of 1")
+        finally:
+            self.mcp_server._run_store = original_run_store
+            self.mcp_server._MAX_CONCURRENT_STORE = original
+            self.mcp_server._store_semaphore = None
+
+    def test_cancellation_does_not_release_permit_prematurely(self):
+        """cubic-6: if a request is cancelled while its subprocess is running,
+        the semaphore permit must NOT be freed until the worker actually
+        completes — otherwise the concurrency cap is briefly exceeded. This
+        ties release to the concurrent future (worker completion), not the
+        asyncio wrapper future (which cancels immediately)."""
+        import asyncio
+        original = self.mcp_server._MAX_CONCURRENT_STORE
+        self.mcp_server._MAX_CONCURRENT_STORE = 1
+        self.mcp_server._store_semaphore = None
+        original_run_store = self.mcp_server._run_store
+        # A blocking _run_store that waits on an event we control.
+        release_event = {"go": False}
+
+        def blocking_run_store(args):
+            while not release_event["go"]:
+                import time
+                time.sleep(0.01)
+            return original_run_store(args)
+
+        self.mcp_server._run_store = blocking_run_store
+        try:
+            async def cancel_while_running():
+                loop = asyncio.get_running_loop()
+                sem = self.mcp_server._get_store_semaphore()
+                # Start a call that acquires the single permit and blocks.
+                task = asyncio.ensure_future(
+                    self.mcp_server._run_store_async(["recall", "--query", "x"]))
+                await asyncio.sleep(0.1)  # let it acquire + block in the worker
+                # The permit is held; a second acquire must time out.
+                try:
+                    await asyncio.wait_for(sem.acquire(), timeout=0.3)
+                    sem.release()
+                    held = False
+                except asyncio.TimeoutError:
+                    held = True
+                # Cancel the blocking task.
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                # Even AFTER cancellation, the permit must STILL be held until
+                # the worker finishes (cubic-6: no premature release).
+                try:
+                    await asyncio.wait_for(sem.acquire(), timeout=0.3)
+                    sem.release()
+                    still_held_after_cancel = False
+                except asyncio.TimeoutError:
+                    still_held_after_cancel = True
+                # Now release the worker; the permit should free.
+                release_event["go"] = True
+                await asyncio.sleep(0.3)
+                return held, still_held_after_cancel
+
+            held, still_held = asyncio.run(cancel_while_running())
+            self.assertTrue(held, "permit must be held while worker runs")
+            self.assertTrue(still_held,
+                            "permit must STILL be held after cancellation until "
+                            "the worker completes (cubic-6)")
+        finally:
+            release_event["go"] = True
+            self.mcp_server._run_store = original_run_store
+            self.mcp_server._MAX_CONCURRENT_STORE = original
+            self.mcp_server._store_semaphore = None
 
 
 if __name__ == "__main__":

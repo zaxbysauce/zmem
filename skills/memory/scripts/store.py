@@ -33,7 +33,7 @@ Usage:
 
 Design (see the memory skill's design doc):
   - Tombstone supersession (superseded_at), NOT full bi-temporal (YAGNI for single user).
-  - Signal tiers set default confidence: test/compile/lint=0.9, reviewer/user=0.6, none=0.3.
+  - Signal tiers set default confidence: test/compile/lint=0.9, reviewer/user=0.6, none=0.2 (below the 0.25 retrieval floor by design — ungrounded self-opinion).
   - Advisory secret filter (regex + entropy) — logs a warning, does NOT block writes.
   - Dedup-on-write: if a near-identical live memory exists in the same namespace,
     refresh its last_retrieved instead of inserting a duplicate.
@@ -88,6 +88,16 @@ except ImportError:
         import host as _host
     except ImportError:
         _host = None
+
+# Shared single source of truth for the schema version constant. doctor.py
+# imports the SAME value from schema_meta so the two can never drift (a stale
+# doctor-side copy once made every healthy store fail the schema gate — #36 M11).
+# Dependency-free and side-effect-free; resolved from this directory like `host`.
+try:
+    from schema_meta import SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY  # noqa: F401
+except ImportError:
+    sys.path.insert(0, os.path.dirname(__file__))
+    from schema_meta import SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY  # type: ignore # noqa: F401
 
 
 def _env_float(name: str, default: float) -> float:
@@ -170,7 +180,14 @@ SIGNAL_CONFIDENCE = {
     "lint": 0.85,
     "reviewer": 0.6,
     "user": 0.6,
-    "none": 0.3,
+    # Below CONFIDENCE_FLOOR (0.25) on purpose: `none`-signal memories are
+    # ungrounded self-opinion, and the README's trust-tiering design says they
+    # sit below the default retrieval floor (the cited research finds
+    # ungrounded lessons degrade accuracy). At 0.2 they are excluded from
+    # default recall but still retrievable via an explicit low
+    # --min-confidence / keyword search. Previously 0.3 > 0.25 floor, which
+    # contradicted the docs and let ungrounded content surface by default (#36 M3).
+    "none": 0.2,
 }
 
 # The two closed enums the store's own writers already enforce (`add`'s
@@ -179,10 +196,18 @@ SIGNAL_CONFIDENCE = {
 # them by writing straight into the table.
 ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
 ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
-SUPPORTED_SCHEMA_VERSION = 7
-SCHEMA_VERSION_KEY = "schema_version"
+# SUPPORTED_SCHEMA_VERSION / SCHEMA_VERSION_KEY are imported from schema_meta
+# above (single source of truth shared with doctor.py).
 
 CONFIDENCE_FLOOR = 0.25
+
+# Single source of truth for the maximum memory content size, in Python str
+# length (Unicode code points). Enforced on EVERY write path — CLI add, MCP add,
+# and ingest-jsonl — so a memory written on one box imports cleanly on another
+# (previously CLI add was uncapped, MCP silently truncated at 32k, and
+# ingest-jsonl hard-rejected at 65k — a 32k–65k row written locally broke Tier-3
+# sync import elsewhere). #36 M17.
+MAX_CONTENT_CHARS = 65536
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd|private[_-]?key)\s*[:=]\s*\S{8,}"),
@@ -852,6 +877,14 @@ class CapturePolicyRefusal(ValueError):
     """Automatic capture could not safely preserve the record contract."""
 
 
+class ContentTooLarge(ValueError):
+    """Content exceeds MAX_CONTENT_CHARS. A dedicated subclass (rather than a
+    bare ValueError) so the CLI dispatch can catch it SPECIFICALLY — a broad
+    ``except ValueError`` would also swallow unrelated ValueErrors such as
+    UnicodeEncodeError (a ValueError subclass), changing stdio-encoding failure
+    behavior (#36 M17)."""
+
+
 def _check_secrets(content: str, source_ref: str, tags: str = "") -> list[str]:
     """Advisory only. Returns list of warnings. Never blocks. Scans both content
     source_ref, and tags (a token in metadata would otherwise slip through)."""
@@ -869,6 +902,16 @@ def _merge_tag_strings(*tag_sets: str) -> str:
     for raw in tag_sets:
         merged.update(t.strip() for t in (raw or "").split(",") if t.strip())
     return ",".join(sorted(merged))
+
+
+def _has_injection_risk_tag(tags: str) -> bool:
+    """True if the comma-separated `tags` string carries the
+    `prompt-injection-risk` tag. Used at READ time to surface the flag in
+    recall/recent/list results so the detector is actionable, not write-only
+    (#36 M5)."""
+    return "prompt-injection-risk" in {
+        t.strip() for t in (tags or "").split(",") if t.strip()
+    }
 
 
 def _normalize_capture_mode(mode: str | None) -> str:
@@ -1045,7 +1088,8 @@ def _warn_degraded_embeddings_once(content: str) -> None:
 
 
 def _detect_duplicate(
-    conn: sqlite3.Connection, content: str, namespace: str
+    conn: sqlite3.Connection, content: str, namespace: str,
+    dedup_cache: dict | None = None,
 ) -> tuple[sqlite3.Row | None, float, bytes | None]:
     """Find a duplicate live memory for `content` in `namespace`: semantic
     similarity (if embeddings are available) with an exact-match fallback.
@@ -1055,6 +1099,13 @@ def _detect_duplicate(
     have to re-embed the same content a second time. Shared by add_memory()
     and ingest-jsonl's per-row insert path — dedup-on-write must behave
     identically for a locally-authored add and a synced row.
+
+    ``dedup_cache`` is an optional per-ingest exact-match cache mapping
+    ``(namespace, normalized_content) -> existing_id``. When supplied (by
+    ingest-jsonl's batch loop), the exact-match fallback checks the cache first
+    (O(1)) instead of re-scanning the whole namespace per row — converting the
+    ingest path from O(n²) full scans to one initial scan + n O(1) lookups
+    (#36 M9). ``add_memory`` passes None (single-row path, unchanged).
     """
     emb = None
     if _embeddings and _embeddings.is_available():
@@ -1072,18 +1123,36 @@ def _detect_duplicate(
         # Semantic dedup: query vec0 for nearest neighbor in the same namespace.
         existing, dedup_sim = _find_semantic_duplicate(conn, emb, namespace)
     if existing is None:
-        # Fallback: exact-match dedup (original logic).
+        # Fallback: exact-match dedup.
         norm = re.sub(r"\s+", " ", content.strip().lower())
-        candidates = conn.execute(
-            "SELECT id, content FROM memory WHERE namespace=? AND superseded_at IS NULL",
-            (namespace,),
-        ).fetchall()
-        for c in candidates:
-            c_norm = re.sub(r"\s+", " ", c["content"].strip().lower())
-            if c_norm == norm:
-                existing = c
-                dedup_sim = 1.0  # exact match
-                break
+        cache_key = (namespace, norm)
+        if dedup_cache is not None:
+            # The per-ingest cache was pre-populated with EVERY live row's
+            # normalized content at ingest start (and is updated as rows
+            # insert), so it is AUTHORITATIVE for exact match: a hit means a
+            # duplicate exists (fetch it by id), a miss means none exists (no
+            # namespace scan needed — this is what converts the ingest path
+            # from O(n²) scans to O(1) lookups, #36 M9).
+            if cache_key in dedup_cache:
+                hit_id = dedup_cache[cache_key]
+                existing = conn.execute(
+                    "SELECT id, content FROM memory WHERE id=? AND superseded_at IS NULL",
+                    (hit_id,),
+                ).fetchone()
+                dedup_sim = 1.0 if existing else 0.0
+            # else: cache miss ⇒ no exact-match duplicate; skip the scan.
+        else:
+            # No cache (single-row add path): scan the namespace as before.
+            candidates = conn.execute(
+                "SELECT id, content FROM memory WHERE namespace=? AND superseded_at IS NULL",
+                (namespace,),
+            ).fetchall()
+            for c in candidates:
+                c_norm = re.sub(r"\s+", " ", c["content"].strip().lower())
+                if c_norm == norm:
+                    existing = c
+                    dedup_sim = 1.0  # exact match
+                    break
     return existing, dedup_sim, emb
 
 
@@ -1335,7 +1404,15 @@ def add_memory(
         print(f"[zmem] {prefix}: {w}", file=sys.stderr)
 
     if confidence is None:
-        confidence = SIGNAL_CONFIDENCE.get(signal, 0.3)
+        confidence = SIGNAL_CONFIDENCE.get(signal, SIGNAL_CONFIDENCE["none"])
+
+    # Enforce the single content-size cap on the CLI/local add path too —
+    # previously only ingest-jsonl rejected oversize content, so a >65k row
+    # written here broke Tier-3 sync import on another box (#36 M17).
+    if len(content) > MAX_CONTENT_CHARS:
+        raise ContentTooLarge(
+            f"content is {len(content)} chars, over the {MAX_CONTENT_CHARS} limit"
+        )
 
     started_tx = False
     try:
@@ -1776,6 +1853,7 @@ def _recall_one_tier(
             "source_ref": r["source_ref"],
             "valid_from": r["valid_from"],
             "stale": bool(stale_note),
+            "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
             "_stale_note": stale_note,
             "_score": round(score, 4),
         }))
@@ -1937,8 +2015,9 @@ def recall_memory(
         if not results:
             print("[zmem] no matching memories found.")
         for r in results:
+            marker = " \u26a0injection-risk" if r.get("prompt_injection_risk") else ""
             print(f"--- [{r['id']}] (conf={r['confidence']}, signal={r['signal']}, "
-                  f"ns={r['namespace']}, type={r['type']}){r['_stale_note']}")
+                  f"ns={r['namespace']}, type={r['type']}){marker}{r['_stale_note']}")
             print(f"    {r['content']}")
             if r["tags"]:
                 print(f"    tags: {r['tags']}")
@@ -1998,6 +2077,7 @@ def _recent_one_tier(
             "source_ref": r["source_ref"],
             "valid_from": r["valid_from"],
             "stale": bool(stale_note),
+            "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
             "_stale_note": stale_note,
         })
     return results
@@ -2066,8 +2146,9 @@ def recent_memory(
         if not results:
             print("[zmem] no recent memories.")
         for r in results:
+            marker = " \u26a0injection-risk" if r.get("prompt_injection_risk") else ""
             print(f"--- [{r['id']}] (conf={r['confidence']}, signal={r['signal']}, "
-                  f"ns={r['namespace']}, type={r['type']}){r['_stale_note']}")
+                  f"ns={r['namespace']}, type={r['type']}){marker}{r['_stale_note']}")
             print(f"    {r['content']}")
             if r["tags"]:
                 print(f"    tags: {r['tags']}")
@@ -2136,15 +2217,18 @@ def list_memory(conn, *, namespace=None, limit=50, include_superseded=False):
     params.append(limit)
     rows = conn.execute(
         f"SELECT id, namespace, type, substr(content,1,80) AS preview, confidence, "
-        f"signal, superseded_at FROM memory {where} ORDER BY ingestion_ts DESC LIMIT ?",
+        f"signal, tags, superseded_at FROM memory {where} ORDER BY ingestion_ts DESC LIMIT ?",
         params,
     ).fetchall()
     if not rows:
         print("[zmem] (no memories)")
     for r in rows:
         status = "SUPERSEDED" if r["superseded_at"] else "live"
+        # Surface the prompt-injection-risk tag as a visible marker so the
+        # detector is actionable at read time, not write-only (#36 M5).
+        marker = " \u26a0injection-risk" if _has_injection_risk_tag(r["tags"]) else ""
         print(f"[{r['id']}] {status} ns={r['namespace']} type={r['type']} "
-              f"conf={r['confidence']} sig={r['signal']} :: {r['preview']}")
+              f"conf={r['confidence']} sig={r['signal']}{marker} :: {r['preview']}")
 
 
 def stats(conn):
@@ -2190,13 +2274,18 @@ def stats(conn):
         print("  embeddings=unavailable (embeddings module not importable)")
 
 
-def get_memory(conn, mid):
+def get_memory(conn, mid) -> bool:
+    """Print a memory as JSON. Returns True if found, False if not — so the CLI
+    dispatch can exit non-zero on a miss (fail-closed, matching `supersede`),
+    not silently exit 0 while a caller checking `$?` treats "not found" as
+    success (#36 M2)."""
     r = conn.execute("SELECT * FROM memory WHERE id=?", (mid,)).fetchone()
     if not r:
         print(f"[zmem] no memory with id {mid}", file=sys.stderr)
-        return
+        return False
     d = dict(r)
     print(json.dumps(d, indent=2))
+    return True
 
 
 # --- Skill promotion (T3.1) ---
@@ -2461,6 +2550,17 @@ CONSOLIDATE_GROWTH_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_GROWTH_THRESHOLD", 0
 # a separate, independently-tunable knob rather than reusing the cosine
 # threshold's scale.
 CONSOLIDATE_LEXICAL_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_LEXICAL_THRESHOLD", 0.60)
+
+# Safety cap on how many live rows per namespace consolidate examines in one
+# pass. The lexical fallback is O(n²) and the vec0 KNN escalates k up to
+# len(rows); on a pathological store this is unbounded. Capping the INPUT set
+# (not dropping candidates mid-scan) bounds the cost while preserving
+# completeness WITHIN the batch; namespaces larger than this report a
+# `truncated` status so the operator knows not every pair was examined (#36 M8).
+# 5000 is far above any realistic curated zmem namespace, so real stores see no
+# truncation. Fixed (not env-tunable) to avoid a misconfigured knob silently
+# disabling consolidation completeness.
+CONSOLIDATE_MAX_ROWS_PER_NAMESPACE = 5000
 
 _LEXICAL_STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
@@ -2793,22 +2893,55 @@ def consolidate(
         )
         conn.commit()
 
-    # Load all live memories. In embedding mode, only rows with an embedding
-    # are candidates (vec0 KNN needs a query vector); in lexical fallback
-    # mode every live row is a candidate (Jaccard needs only content/tags).
+    # Load live memories. In embedding mode, only rows with an embedding are
+    # candidates (vec0 KNN needs a query vector); in lexical fallback mode every
+    # live row is a candidate (Jaccard needs only content/tags). The candidate
+    # set is bounded by CONSOLIDATE_MAX_ROWS_PER_NAMESPACE: the lexical fallback
+    # is O(n²) and the vec0 KNN escalates k up to len(rows), so an unbounded
+    # store would make consolidate pathological. We bound the INPUT set (highest
+    # priority first via the existing ORDER BY) — completeness is preserved
+    # WITHIN the batch, and a larger namespace reports a `truncated` status so
+    # the operator knows not every pair was examined (#36 M8).
     ns_clause = "AND namespace = ?" if namespace else ""
     ns_params = [namespace] if namespace else []
     embed_clause = "" if use_lexical else "AND embedding IS NOT NULL"
+    total_eligible = conn.execute(
+        f"""SELECT count(*) AS c FROM memory
+           WHERE superseded_at IS NULL {embed_clause} {ns_clause}""",
+        ns_params,
+    ).fetchone()["c"]
+    # The cap is PER NAMESPACE (the constant is CONSOLIDATE_MAX_ROWS_PER_NAMESPACE):
+    # a window function ranks rows within each namespace by the priority ORDER BY,
+    # then keeps the top-N per namespace. This prevents a single large namespace
+    # from starving smaller ones in a box-wide (namespace=None) run — every
+    # namespace gets its top-N examined regardless of total size (#36 M8).
     rows = conn.execute(
-        f"""SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
+        f"""WITH ranked AS (
+               SELECT id, namespace, content, tags, confidence, signal,
+                      retrieval_count, surfaced_count, embedding,
+                      embedding_model, ingestion_ts,
+                      ROW_NUMBER() OVER (
+                          PARTITION BY namespace
+                          ORDER BY confidence * (retrieval_count + surfaced_count) DESC,
+                                   confidence DESC, ingestion_ts ASC, id ASC
+                      ) AS rn
+               FROM memory
+               WHERE superseded_at IS NULL {embed_clause} {ns_clause}
+           )
+           SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
                   surfaced_count, embedding, embedding_model, ingestion_ts
-           FROM memory
-           WHERE superseded_at IS NULL {embed_clause}
-           {ns_clause}
+           FROM ranked
+           WHERE rn <= ?
            ORDER BY confidence * (retrieval_count + surfaced_count) DESC, confidence DESC,
                     ingestion_ts ASC, id ASC""",
-        ns_params,
+        [*ns_params, CONSOLIDATE_MAX_ROWS_PER_NAMESPACE],
     ).fetchall()
+    truncated = total_eligible > len(rows)
+    # Set True if any seed's vec0 KNN escalation hit the k cap with all-returned
+    # rows still above threshold — i.e. the qualifying set may be INCOMPLETE
+    # (a same-namespace duplicate could sit beyond the cap). Reported in the
+    # summary so the gap is visible, not silent (cubic-4, #36 M8 residual).
+    knn_truncated = False
 
     if not rows:
         print("[zmem] no embeddable memories to consolidate")
@@ -2879,10 +3012,16 @@ def consolidate(
             # one below the threshold, no later row can qualify and the
             # qualifying set is closed. Only when EVERY returned row is still
             # above the threshold might more qualify — then widen and re-ask.
-            # Bounded by the live row count, so it always terminates.
             results = []
             k = 10
-            k_cap = max(len(rows), 10)
+            # Cap k at the bounded candidate set size, never above 500: the
+            # vec0 KNN cost scales with k, and the input set is already bounded
+            # by CONSOLIDATE_MAX_ROWS_PER_NAMESPACE (#36 M8). If the cap binds
+            # while every returned row is still above threshold, the qualifying
+            # set MAY be incomplete (a same-namespace duplicate could sit beyond
+            # rank 500) — that is tracked in knn_truncated and reported in the
+            # summary rather than silently dropped (cubic-4).
+            k_cap = min(max(len(rows), 10), 500)
             while True:
                 try:
                     results = conn.execute(
@@ -2898,7 +3037,10 @@ def consolidate(
                 if any((1.0 - r["distance"]) < effective_threshold for r in results):
                     break  # saw the cutoff — the qualifying set is complete
                 if k >= k_cap:
-                    break  # bounded: never scan past the live row count
+                    # Cap reached with all returned rows above threshold: the
+                    # qualifying set may be incomplete. Flag for the summary.
+                    knn_truncated = True
+                    break
                 k = min(k * 5, k_cap)
             for r in results:
                 mid = r["memory_id"]
@@ -3030,6 +3172,20 @@ def consolidate(
         parts.append(f"pruned {pruned_count}")
     if dry_run:
         parts.append("(dry run — no changes)")
+    if truncated:
+        # The namespace exceeded the per-pass row cap: not every pair was
+        # examined (highest-priority rows first). Surfaced honestly so an
+        # operator does not mistake a bounded pass for a complete one (#36 M8).
+        parts.append(
+            f"truncated: examined {len(rows)} of {total_eligible} eligible "
+            f"(per-pass cap {CONSOLIDATE_MAX_ROWS_PER_NAMESPACE})"
+        )
+    if knn_truncated:
+        # vec0 KNN hit the k cap (500) with all returned rows above threshold:
+        # a same-namespace duplicate could sit beyond the cap and be missed.
+        # Fail-safe (the duplicate survives, no corruption) — reported so the
+        # completeness gap is visible (cubic-4, #36 M8 residual).
+        parts.append("knn_truncated: KNN cap reached; some pairs may be unexamined")
     print(f"[zmem] {' + '.join(parts)}")
 
 
@@ -4013,7 +4169,13 @@ def _failures_from_db(db_path: str, session_id: str):
     the original reflect query used (session_id, read_only, status, exit_code);
     enrichment columns (error_message, error_type, retry_count, destructive) are
     read in a SEPARATE try/except so a schema drift degrades to bare counts but
-    never disables detection. Fail-open: (0, []) on any error."""
+    never disables detection.
+
+    A missing path/session is a legitimate "nothing to check" → (0, []). A
+    genuine substrate error (corrupt/locked db, schema drift on the count
+    query) PROPAGATES so ``cmd_failures`` can distinguish "could not check"
+    from "0 failures found" (#36 M7) — it no longer silently swallows every
+    error into a misleading (0, [])."""
     if not session_id or not db_path or not os.path.isfile(db_path):
         return 0, []
     conn = None
@@ -4030,12 +4192,16 @@ def _failures_from_db(db_path: str, session_id: str):
         ).fetchone()
         count = row[0] if row else 0
     except Exception:
+        # Genuine substrate error (corrupt/locked db, unreadable file). Close
+        # the handle and RE-RAISE so cmd_failures reports it as exit 2 instead
+        # of masquerading as "0 failures found" (#36 M7). The missing-path /
+        # no-session case was handled by the early return above.
         if conn:
             try:
                 conn.close()
             except Exception:
                 pass
-        return 0, []
+        raise
 
     if count == 0:
         try:
@@ -4080,11 +4246,33 @@ def _failures_from_db(db_path: str, session_id: str):
     return count, details
 
 
-def cmd_failures(session: str, transcript: str, db: str) -> None:
-    """Print {"count":N,"details":[...]} for the session's failed tool calls.
-    Transcript wins when given and present (Claude Code); else the db substrate
-    (ZCode). Entirely self-contained — does NOT open the ZMem store — and
-    fail-open: prints an empty result on any error, always exits 0."""
+def _sanitize_exc_text(text: str, limit: int = 300) -> str:
+    """Make an exception message safe to echo in JSON/stderr: collapse filesystem
+    paths and DB URIs to placeholders (paths can leak usernames/structure) and
+    cap length. Never raises (#36 M7)."""
+    s = text or ""
+    # Redact anything that looks like a filesystem path (unix or windows).
+    s = re.sub(r"(?:[A-Za-z]:)?[\\/](?:[^\s'\":<>|?*]+[\\/])+[^\s'\":<>|?*]+",
+               "<path>", s)
+    # Redact sqlite URI-style connect strings.
+    s = re.sub(r"file:[^\s,]+", "<db>", s, flags=re.IGNORECASE)
+    if len(s) > limit:
+        s = s[:limit] + "..."
+    return s
+
+
+def cmd_failures(session: str, transcript: str, db: str) -> int:
+    """Print {"count":N,"details":[...]} for the session's failed tool calls and
+    return an exit code. Transcript wins when given and present (Claude Code);
+    else the db substrate (ZCode). Entirely self-contained — does NOT open the
+    ZMem store.
+
+    Exit-code contract (#36 M7): a *checked* result (empty or not) exits 0; a
+    *broken substrate* (the detection itself raised) exits 2 with an ``error``
+    field so a caller checking ``$?`` no longer treats "could not check" as
+    "0 failures found". The previously-bare ``except`` silently swallowed every
+    error into ``{count:0}`` + exit 0, hiding corrupt/locked/missing substrates.
+    """
     try:
         if transcript and os.path.isfile(transcript):
             details = _failures_from_transcript(transcript)
@@ -4092,9 +4280,14 @@ def cmd_failures(session: str, transcript: str, db: str) -> None:
         else:
             count, details = _failures_from_db(db, session)
             result = {"count": count, "details": details}
-    except Exception:
-        result = {"count": 0, "details": []}
+    except Exception as exc:
+        msg = _sanitize_exc_text(str(exc))
+        result = {"count": 0, "details": [], "error": msg}
+        print(json.dumps(result))
+        print(f"[zmem] failures: detection substrate error: {msg}", file=sys.stderr)
+        return 2
     print(json.dumps(result))
+    return 0
 
 
 # --- Tier 1 export: markdown memory pack (P.export-pack) -------------------
@@ -4304,8 +4497,9 @@ def cmd_export_jsonl(
 # NOTE: this is a deliberate PROTOCOL-ONLY constant (not env-overridable) —
 # it is the contract the export-jsonl -> ingest-jsonl round-trip must satisfy,
 # so changing it locally would let a store export rows its own ingest rejects
-# (or vice-versa across versions). Keep hardcoded unless the wire format changes.
-INGEST_MAX_CONTENT_CHARS = 65536
+# (or vice-versa across versions). Aliased to the shared MAX_CONTENT_CHARS so all
+# write paths enforce one cap (#36 M17).
+INGEST_MAX_CONTENT_CHARS = MAX_CONTENT_CHARS
 
 # Shape guard for an incoming id: UUID-length hex-and-dashes. This is a
 # charset/length guard, not a UUID parser -- the point is that an id from a
@@ -4427,7 +4621,7 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
             print(f"[zmem] ingest-jsonl: {loc}unknown signal '{raw_signal}' "
                   f"treated as 'none'", file=sys.stderr)
 
-    fallback_conf = SIGNAL_CONFIDENCE.get(signal, 0.3)
+    fallback_conf = SIGNAL_CONFIDENCE.get(signal, SIGNAL_CONFIDENCE["none"])
     raw_conf = obj.get("confidence")
     if raw_conf is None:
         confidence = fallback_conf
@@ -4479,7 +4673,8 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
 
 
 def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
-                capture_mode: str | None = None) -> str:
+                capture_mode: str | None = None,
+                dedup_cache: dict | None = None) -> str:
     """Apply one VALIDATED JSONL sync row (a _validate_sync_row result) to the
     local store.
 
@@ -4611,7 +4806,8 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
 
         # Secret/injection handling is applied once above (for new rows) via
         # _apply_capture_policy (issue #35); no separate advisory scan here.
-        existing, _sim, emb = _detect_duplicate(conn, content, namespace)
+        existing, _sim, emb = _detect_duplicate(conn, content, namespace,
+                                                 dedup_cache=dedup_cache)
         if existing:
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
             if started_tx:
@@ -4645,6 +4841,12 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 )
             except sqlite3.OperationalError:
                 pass  # vec0 table not available -- embedding stored in memory table only
+        # Record this newly-inserted row in the per-ingest dedup cache so a
+        # later row in the SAME batch with identical normalized content is
+        # detected as a duplicate without a namespace rescan (#36 M9).
+        if dedup_cache is not None:
+            norm_new = re.sub(r"\s+", " ", content.strip().lower())
+            dedup_cache[(namespace, norm_new)] = mid
         if started_tx:
             _commit(conn)
         return "added"
@@ -4707,6 +4909,27 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
         # returned line keeps its "\n", and a CRLF line keeps the "\r" too
         # since "\r" is not a split point). readline(MAX_LINE_CHARS) below
         # additionally bounds how much of ONE physical line is ever buffered.
+        # Pre-build a per-ingest exact-match dedup cache (ONE namespace scan
+        # total) so the per-row exact-match fallback is O(1) instead of
+        # re-scanning the whole namespace per row (O(n²) — #36 M9). The cache
+        # is updated in-memory as each row is inserted, so in-batch duplicates
+        # are caught too. It lives in memory only; a rollback discards it with
+        # the transaction (it never persists).
+        dedup_cache: dict = {}
+        try:
+            for r in conn.execute(
+                "SELECT id, content, namespace FROM memory WHERE superseded_at IS NULL"
+            ).fetchall():
+                norm = re.sub(r"\s+", " ", (r["content"] or "").strip().lower())
+                if norm:
+                    dedup_cache[(r["namespace"], norm)] = r["id"]
+        except Exception:
+            # If the pre-scan fails (e.g. transient lock/IO error), pass None so
+            # _detect_duplicate falls back to the original per-row namespace
+            # scan. An EMPTY dict ({}) would be treated as AUTHORITATIVE ("no
+            # duplicates exist") and silently disable exact-match dedup for the
+            # whole ingest — None preserves correctness (#36 M9 final-critic).
+            dedup_cache = None  # type: ignore[assignment]
         lineno = 0
         while True:
             # readline(MAX_LINE_CHARS) bounds how much of ONE physical line we
@@ -4792,7 +5015,8 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
 
             try:
                 outcome = _ingest_row(conn, obj, allow_tombstones=allow_tombstones,
-                                      capture_mode=capture_mode)
+                                      capture_mode=capture_mode,
+                                      dedup_cache=dedup_cache)
             except Exception as e:
                 # A row that raises mid-apply must not abort the file and silently
                 # drop every row after it. Roll back first: _ingest_row commits at
@@ -4894,7 +5118,7 @@ def main():
     p_recall = sub.add_parser("recall", help="recall relevant memories")
     p_recall.add_argument("--query", required=True)
     p_recall.add_argument("--namespace", default=None)
-    p_recall.add_argument("--limit", type=int, default=5)
+    p_recall.add_argument("--limit", type=nonnegative_int, default=5)
     p_recall.add_argument("--json", action="store_true")
     p_recall.add_argument("--hybrid", action="store_true",
                           help="use hybrid BM25+vector recall (requires onnxruntime)")
@@ -4914,7 +5138,7 @@ def main():
 
     p_recent = sub.add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
-    p_recent.add_argument("--limit", type=int, default=5)
+    p_recent.add_argument("--limit", type=nonnegative_int, default=5)
     p_recent.add_argument("--min-confidence", type=float, default=0.5)
     p_recent.add_argument("--json", action="store_true")
     p_recent.add_argument("--no-bump", action="store_true",
@@ -4932,7 +5156,7 @@ def main():
     p_search = sub.add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
     p_search.add_argument("--namespace", default=None)
-    p_search.add_argument("--limit", type=int, default=10)
+    p_search.add_argument("--limit", type=nonnegative_int, default=10)
     p_search.add_argument("--include-global", action="store_true",
                           help="also surface user:global rows (project-first merge). "
                                "Use this instead of going unscoped when you want the "
@@ -4956,7 +5180,7 @@ def main():
 
     p_list = sub.add_parser("list", help="list memories")
     p_list.add_argument("--namespace", default=None)
-    p_list.add_argument("--limit", type=int, default=50)
+    p_list.add_argument("--limit", type=nonnegative_int, default=50)
     p_list.add_argument("--include-superseded", action="store_true")
 
     sub.add_parser("stats", help="store statistics")
@@ -5143,8 +5367,7 @@ def main():
     # connect()/assert_local_fs()/migrate() so a bad ZMEM_DATA location, a
     # locked store, or a mid-migration state can never break failure detection.
     if args.cmd == "failures":
-        cmd_failures(session=args.session, transcript=args.transcript, db=args.db)
-        return
+        sys.exit(cmd_failures(session=args.session, transcript=args.transcript, db=args.db))
 
     # `restore` overwrites the destination store FILE. It must not hold an open
     # sqlite3 connection on that file while doing so (a Windows file handle can
@@ -5212,6 +5435,12 @@ def main():
             except CapturePolicyRefusal as exc:
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(2)
+            except ContentTooLarge as exc:
+                # Content-size cap — caught SPECIFICALLY (not as a bare
+                # ValueError, which would also swallow UnicodeEncodeError and
+                # change stdio-encoding failure behavior) (#36 M17).
+                print(f"[zmem] {exc}", file=sys.stderr)
+                sys.exit(1)
         elif args.cmd == "recall":
             recall_memory(conn, query=args.query, namespace=args.namespace,
                           limit=args.limit, as_json=args.json, hybrid=args.hybrid,
@@ -5231,7 +5460,7 @@ def main():
             ok = supersede_memory(conn, args.id, args.reason)
             sys.exit(0 if ok else 1)
         elif args.cmd == "get":
-            get_memory(conn, args.id)
+            sys.exit(0 if get_memory(conn, args.id) else 1)
         elif args.cmd == "list":
             list_memory(conn, namespace=args.namespace, limit=args.limit, include_superseded=args.include_superseded)
         elif args.cmd == "stats":

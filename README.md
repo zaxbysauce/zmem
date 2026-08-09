@@ -322,11 +322,14 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
 
 - **Store + core.md (box-wide default):** `~/.zmem/` — one shared, tool-neutral
   directory holding `store.sqlite` + `core.md`, read and written by both ZCode
-  and Claude Code (and their subagents), and by Codex when that path is
-  explicitly reachable. This is the box-wide model: a lesson captured in one
-  host is recallable in the others. Override with the
-  `ZMEM_DATA` env var (or the CC plugin's `storeDirectory` userConfig option)
-  if you want it elsewhere.
+  and Claude Code, and by Codex when that path is explicitly reachable. This is
+  the box-wide model: a lesson captured in one host is recallable in the others.
+  Subagent auto-recall/reflect is wired for Claude Code and Codex (which emit
+  `SubagentStart`/`SubagentStop` hook events); ZCode supports exactly seven hook
+  events and does **not** emit subagent lifecycle hooks, so on ZCode subagent
+  memory is scoped to the parent session rather than getting its own recall/reflect
+  cycle. Override with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
+  userConfig option) if you want it elsewhere.
 - **Legacy per-plugin data dirs** (`${ZCODE_PLUGIN_DATA}` /
   `${CLAUDE_PLUGIN_DATA}`) still work as a fallback if `ZMEM_DATA` isn't set
   and the plugin runner injects one, but these are per-tool and deleted on
@@ -394,10 +397,13 @@ seeds.
 
 **To enable embeddings:**
 
-1. Make sure the embedding runtime is installed in the Python interpreter ZMem
-   resolves (the hooks' interpreter, or the Hermes MCP server's interpreter):
-   `onnxruntime`, `tokenizers`, `numpy`. (For the Hermes MCP store host, run
-   `pip install -r hermes-plugin/server/requirements-embeddings.txt`.)
+1. Make sure the embedding + vector-recall runtime is installed in the Python
+   interpreter ZMem resolves (the hooks' interpreter, or the Hermes MCP server's
+   interpreter): `onnxruntime`, `tokenizers`, `numpy`, and `sqlite-vec` (the
+   `vec0` virtual table that powers vector recall and semantic dedup; without it
+   the store degrades to FTS5 keyword recall). For the Hermes MCP store host,
+   `pip install -r hermes-plugin/server/requirements-embeddings.txt` installs
+   all four.
 2. Obtain a checksum-verified `minilm.onnx` and place it at the resolved models
    dir (see "Check status" below for the exact path), OR set:
    - `ZMEM_MODEL_URL` to a source whose bytes match the pinned SHA-256, and

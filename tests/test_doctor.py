@@ -24,13 +24,18 @@ DOCTOR_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "doctor.py"
 PYTHON = sys.executable
 REAL_GIT = shutil.which("git")
 
+# The schema version doctor must agree with. Imported from the single source of
+# truth (schema_meta) so this test fails loudly if doctor drifts again (#36 M11).
+sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+from schema_meta import SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION  # noqa: E402
+
 
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
 
 
-def _make_store(path: Path, schema_version: int = 5) -> None:
+def _make_store(path: Path, schema_version: int = CURRENT_SCHEMA_VERSION) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     try:
@@ -132,7 +137,7 @@ class DoctorCliTest(unittest.TestCase):
 
     def test_json_report_clean_pass(self):
         store_dir = self.home / ".zmem"
-        _make_store(store_dir / "store.sqlite", schema_version=5)
+        _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)
         _write_text(
             self.home / ".claude" / "settings.json",
             json.dumps({"autoMemoryEnabled": False}),
@@ -186,7 +191,7 @@ class DoctorCliTest(unittest.TestCase):
 
     def test_human_report_returns_nonzero_on_native_memory_blockers(self):
         store_dir = self.home / ".zmem"
-        _make_store(store_dir / "store.sqlite", schema_version=5)
+        _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)
         _write_text(
             self.home / ".claude" / "settings.json",
             json.dumps({"autoMemoryEnabled": True}),
@@ -220,7 +225,7 @@ class DoctorCliTest(unittest.TestCase):
 
     def test_scalar_hooks_false_is_accepted_without_traceback(self):
         store_dir = self.home / ".zmem"
-        _make_store(store_dir / "store.sqlite", schema_version=5)
+        _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)
         _write_text(
             self.home / ".claude" / "settings.json",
             json.dumps({"autoMemoryEnabled": False}),
@@ -245,7 +250,7 @@ class DoctorCliTest(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows shell classification only")
     def test_unrecognized_runnable_windows_shell_fails_closed(self):
         store_dir = self.home / ".zmem"
-        _make_store(store_dir / "store.sqlite", schema_version=5)
+        _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)
         _write_text(
             self.home / ".claude" / "settings.json",
             json.dumps({"autoMemoryEnabled": False}),
@@ -356,6 +361,85 @@ class DoctorCliTest(unittest.TestCase):
         self.assertEqual(access["status"], "warn")
         self.assertEqual(schema["status"], "warn")
         self.assertFalse(target.exists(), "doctor must not initialize the store")
+
+    def test_current_schema_version_store_passes_doctor(self):
+        """Regression for #36 M11: a store at the CURRENT schema version must
+        PASS doctor's schema-version check (not FAIL because doctor hardcoded a
+        stale older version)."""
+        store_dir = self.home / ".zmem"
+        _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "\n".join(
+                ["[features]", "memories = false", "", "[memories]",
+                 "use_memories = false", "generate_memories = false"]
+            ),
+        )
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        schema = next(c for c in report["checks"] if c["id"] == "schema-version")
+        self.assertEqual(schema["status"], "pass", schema)
+        self.assertEqual(schema["details"]["actual"], CURRENT_SCHEMA_VERSION)
+
+    def test_stale_older_schema_version_warns_not_fails(self):
+        """A store at an OLDER schema version than current must WARN (migrate
+        needed), not FAIL — and a store at a NEWER version must FAIL."""
+        store_dir = self.home / ".zmem"
+        # An older store (current-1) should warn, not pass-as-current.
+        _make_store(store_dir / "store.sqlite",
+                    schema_version=CURRENT_SCHEMA_VERSION - 1)
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "\n".join(
+                ["[features]", "memories = false", "", "[memories]",
+                 "use_memories = false", "generate_memories = false"]
+            ),
+        )
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project),
+        )
+        report = json.loads(result.stdout)
+        schema = next(c for c in report["checks"] if c["id"] == "schema-version")
+        # Older-than-current must be a warning (writable migration path), not pass.
+        self.assertEqual(schema["status"], "warn", schema)
+
+    def test_future_schema_version_fails_doctor(self):
+        """A store NEWER than the checkout's expected version must FAIL — the
+        checkout is too old to safely read it."""
+        store_dir = self.home / ".zmem"
+        _make_store(store_dir / "store.sqlite",
+                    schema_version=CURRENT_SCHEMA_VERSION + 1)
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "\n".join(
+                ["[features]", "memories = false", "", "[memories]",
+                 "use_memories = false", "generate_memories = false"]
+            ),
+        )
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project),
+        )
+        report = json.loads(result.stdout)
+        schema = next(c for c in report["checks"] if c["id"] == "schema-version")
+        self.assertEqual(schema["status"], "fail", schema)
 
 
 if __name__ == "__main__":

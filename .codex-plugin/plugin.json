@@ -1,6 +1,6 @@
 {
   "name": "zmem",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Local-first shared memory, recall, and reflection hooks for Codex.",
   "author": {
     "name": "Brett",
@@ -17,6 +17,7 @@
     "sqlite"
   ],
   "skills": "./skills/",
+  "hooks": "hooks/hooks.codex.json",
   "interface": {
     "displayName": "ZMem",
     "shortDescription": "Shared local memory for Codex sessions.",

@@ -297,6 +297,133 @@ embeddings._check_available()
         )
 
 
+class LoadPathChecksumTests(unittest.TestCase):
+    """#36 M15: the LOAD path (not just the download path) must verify the
+    model's checksum before onnxruntime executes it. An attacker able to write
+    to ZMEM_MODELS_DIR could otherwise swap in an arbitrary ONNX binary. A
+    mismatch must fail OPEN to the degraded no-embeddings path, never execute
+    the unverified model."""
+
+    def setUp(self):
+        if not _EMBEDDING_DEPS_IMPORTABLE:
+            self.skipTest("embedding deps not installed (CI) — load-path gate "
+                          "needs importable onnxruntime to be meaningful")
+        self.tmp = tempfile.mkdtemp()
+
+    def test_tampered_model_degrades_and_does_not_load(self):
+        """A model file present but with the WRONG checksum must NOT be loaded
+        by _ensure_loaded; _model_available flips to False and embed_text
+        returns None (degraded), never executing the tampered binary."""
+        d = Path(self.tmp) / "tampered"
+        d.mkdir()
+        # A model file that exists but does NOT match the pinned checksum.
+        (d / "minilm.onnx").write_bytes(b"tampered model bytes that are wrong" * 50)
+        # tokenizer.json present so _check_available's is_file() passes (the
+        # gate we are testing is the checksum, set in _ensure_loaded).
+        (d / "tokenizer.json").write_bytes(b"{}")
+        env = {**os.environ, "ZMEM_MODELS_DIR": str(d),
+               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
+            "import embeddings\n"
+            "import onnxruntime  # ensure load is attempted\n"
+            # _check_available sets _model_available=True (both files present);
+            # the LOAD-path gate must then reject it on checksum mismatch.
+            "print('available_before=', embeddings._check_available())\n"
+            "embeddings._ensure_loaded()\n"
+            "print('session=', embeddings._session)\n"
+            "print('available_after=', embeddings._model_available)\n"
+        )
+        r = subprocess.run([PYTHON, "-c", script], capture_output=True,
+                           text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # The tampered model must NOT have been loaded into a session.
+        self.assertIn("session= None", r.stdout, r.stdout + r.stderr)
+        # And availability must have flipped to False (degraded).
+        self.assertIn("available_after= False", r.stdout, r.stdout + r.stderr)
+
+    def test_correct_checksum_model_loads(self):
+        """A model file matching the pinned checksum IS loaded (the gate must
+        not false-positive on a legitimate file). Only meaningful if the real
+        minilm.onnx is present AND matches the pin; otherwise skip."""
+        real_models = SCRIPTS_DIR.parent / "models"
+        real_model = real_models / "minilm.onnx"
+        if not real_model.is_file():
+            self.skipTest("no real minilm.onnx on this box — skipping the "
+                          "positive-load-path test")
+        if not embeddings.verify_checksum(real_model):
+            self.skipTest("on-disk minilm.onnx does not match the pinned "
+                          "checksum (known: default builds differ) — the "
+                          "positive path is exercised on the reference box")
+        env = {**os.environ, "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
+            "import embeddings\n"
+            "embeddings._ensure_loaded()\n"
+            "print('session_loaded=', embeddings._session is not None)\n"
+        )
+        r = subprocess.run([PYTHON, "-c", script], capture_output=True,
+                           text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("session_loaded= True", r.stdout, r.stdout + r.stderr)
+
+    def test_corrupt_tokenizer_fails_open_not_raises(self):
+        """A load failure AFTER the checksum gate passes (e.g. onnxruntime
+        can't parse a garbage model, or a corrupt tokenizer.json) must NOT
+        raise through _ensure_loaded — it must fail OPEN to the degraded path,
+        and availability_status must NOT report the model as healthy (cubic-1/2,
+        reviewer NEEDS_REVISION).
+
+        This genuinely exercises the post-checksum try/except: we write a fake
+        model whose sha256 we patch into _MODEL_SHA256 (so the checksum gate
+        PASSES), but whose bytes are garbage so InferenceSession raises → the
+        new except branch fires."""
+        d = Path(self.tmp) / "corrupttok"
+        d.mkdir()
+        fake_model = b"not a real onnx model " * 50
+        (d / "minilm.onnx").write_bytes(fake_model)
+        (d / "tokenizer.json").write_bytes(b"{}")  # present so _check_available passes
+        fake_sha = embeddings._sha256_file(d / "minilm.onnx")
+        env = {**os.environ, "ZMEM_MODELS_DIR": str(d),
+               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        # Patch _MODEL_SHA256 so the checksum gate PASSES on the fake model —
+        # forcing execution to reach the InferenceSession load (which fails).
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
+            "import embeddings\n"
+            "import onnxruntime  # present so _check_available passes the import gate\n"
+            f"embeddings._MODEL_SHA256 = {fake_sha!r}\n"  # checksum gate now passes
+            "embeddings._ensure_loaded()\n"
+            "print('raised= False')\n"
+            "print('session=', embeddings._session)\n"
+            "print('checksum_ok=', embeddings._model_checksum_ok)\n"
+            "print('load_failed=', embeddings._model_load_failed)\n"
+            "st = embeddings.availability_status()\n"
+            "print('avail_reason=', st['reason'])\n"
+            "print('avail_available=', st['available'])\n"
+            "print('avail_checksum_ok=', st['checksum_ok'])\n"
+            "print('avail_load_failed=', st['load_failed'])\n"
+        )
+        r = subprocess.run([PYTHON, "-c", script], capture_output=True,
+                           text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("raised= False", r.stdout, r.stdout + r.stderr)
+        # The load failed (garbage model) → session not loaded.
+        self.assertIn("session= None", r.stdout, r.stdout + r.stderr)
+        # Checksum gate PASSED (so checksum_ok is None — never set True because
+        # the load threw before that line) but load_failed is True. availability
+        # must report the distinct model_load_failed reason, NOT ok.
+        self.assertIn("load_failed= True", r.stdout, r.stdout + r.stderr)
+        self.assertIn("avail_available= False", r.stdout, r.stdout + r.stderr)
+        self.assertIn("avail_reason= model_load_failed", r.stdout,
+                      r.stdout + r.stderr)
+        self.assertNotIn("avail_reason= ok", r.stdout,
+                         "load-failed model must not report reason=ok")
+
+
 class LexicalHelperTests(unittest.TestCase):
     """Unit tests for store.py's Jaccard token-overlap clustering helpers."""
 

@@ -25,9 +25,11 @@ persistence, TLS options, and the full env-var reference.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -47,11 +49,20 @@ logger = logging.getLogger("zmem-mcp")
 _STORE_PY_REL = Path("skills") / "memory" / "scripts" / "store.py"
 _STORE_TIMEOUT_S = 30  # network clients can tolerate a longer cap
 _MAX_QUERY_CHARS = 1000
-# Cap on a single add() content payload — prevents a misconfigured/buggy remote
-# from submitting an arbitrarily large string that stalls the subprocess.
-_MAX_CONTENT_CHARS = 32000
+# Cap on a single add() content payload. Matches store.py's MAX_CONTENT_CHARS
+# (65536) so a memory written over the network imports cleanly via Tier-3 sync
+# on another box — previously MCP silently truncated at 32000 while ingest-jsonl
+# rejected at 65536, so a 32k–65k row written here was silently mangled (#36 M17).
+_MAX_CONTENT_CHARS = 65536
 _DEFAULT_LIMIT = 5
 _HARD_LIMIT_MAX = 50
+# Concurrency cap on simultaneous store.py subprocesses. Each tool call spawns a
+# fresh store.py; without a bound an authorized but chatty remote client could
+# exhaust the process table / FDs / memory. Default 8; override via env (#36 M6).
+_MAX_CONCURRENT_STORE = max(1, int(os.environ.get("ZMEM_MCP_MAX_CONCURRENT", "8")))
+# How long a queued tool call waits to acquire the concurrency slot before
+# returning a 503-style overload error (vs. waiting forever).
+_QUEUE_TIMEOUT_S = float(os.environ.get("ZMEM_MCP_QUEUE_TIMEOUT_S", "60"))
 
 
 def _resolve_zmem_home() -> Path:
@@ -197,6 +208,114 @@ def _run_store(args: list[str]) -> dict[str, Any]:
         }
 
 
+# Process-wide concurrency cap. Created lazily inside the running event loop
+# (an asyncio.Semaphore binds to the loop active at construction time), so the
+# first async tool call builds it. Bounds simultaneous store.py subprocesses to
+# prevent process-table/FD exhaustion from an authorized but chatty client (#36 M6).
+_store_semaphore: "asyncio.Semaphore | None" = None
+
+
+def _get_store_semaphore() -> "asyncio.Semaphore":
+    global _store_semaphore
+    if _store_semaphore is None:
+        _store_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_STORE)
+    return _store_semaphore
+
+
+# Shared thread pool for store.py subprocess offload. Bounded large enough that
+# the semaphore (not the pool) is the real concurrency limit. Lazily created so
+# it's reused across requests (#36 M6 / cubic-6: we submit directly to it to
+# hold the concurrent future whose done-callback fires on worker completion).
+_store_executor: "ThreadPoolExecutor | None" = None
+
+
+def _get_executor() -> "ThreadPoolExecutor":
+    global _store_executor
+    if _store_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _store_executor = ThreadPoolExecutor(
+            max_workers=max(_MAX_CONCURRENT_STORE * 2, 16),
+            thread_name_prefix="zmem-store",
+        )
+    return _store_executor
+
+
+async def _run_store_async(args: list[str]) -> dict[str, Any]:
+    """Async, concurrency-bounded wrapper around the sync ``_run_store``.
+
+    FastMCP invokes tool functions directly in the event-loop thread, so a
+    bare sync ``subprocess.run`` would BLOCK the whole loop (serializing every
+    request and stalling health/auth handling). This offloads the subprocess to
+    a worker thread (``loop.run_in_executor``) AND bounds how many run at once
+    via an ``asyncio.Semaphore`` (#36 M6). A queued call that cannot acquire a
+    slot within ``_QUEUE_TIMEOUT_S`` returns an overload error instead of
+    waiting forever.
+
+    The permit is released only AFTER the worker thread actually completes.
+    This is done by attaching the release callback to the underlying
+    ``concurrent.futures.Future`` (NOT the asyncio wrapper future, which
+    transitions to CANCELLED on task cancellation before the worker finishes)
+    and marshalling the release back to the event-loop thread via
+    ``loop.call_soon_threadsafe`` (concurrent-future callbacks run in the
+    worker thread, where ``asyncio.Semaphore.release`` is not safe). So a
+    cancelled request cannot free its slot while its subprocess is still
+    running and briefly exceed the cap (cubic-6). A cancelled call's subprocess
+    runs to completion (Python threads can't be killed); its result is
+    discarded.
+    """
+    sem = _get_store_semaphore()
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=_QUEUE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "stdout": "",
+            "stderr": (
+                f"zmem-mcp: overloaded — { _MAX_CONCURRENT_STORE } concurrent "
+                "store.py subprocesses in flight; retry shortly"
+            ),
+            "returncode": 503,
+        }
+    loop = asyncio.get_running_loop()
+    # Submit directly to the executor so we hold the CONCURRENT future (whose
+    # done-callback fires when the worker thread returns), not the asyncio
+    # wrapper (whose callback fires on cancellation, too early).
+    executor = _get_executor()
+    cfut = executor.submit(_run_store, args)
+
+    def _release_on_worker_done(_cfut, _loop=loop, _sem=sem):
+        # Runs in the worker thread on completion — marshal release to the loop.
+        try:
+            _loop.call_soon_threadsafe(_sem.release)
+        except RuntimeError:
+            # Loop closed (shutdown) before the worker finished: release here is
+            # safe because no asyncio code is touching the semaphore anymore.
+            _sem.release()
+
+    cfut.add_done_callback(_release_on_worker_done)
+    return await asyncio.wrap_future(cfut)
+
+
+_WARN_RE = re.compile(r"^\[zmem\].*\b(WARNING|NOTICE)\b.*:")
+
+
+def _parse_store_warnings(stderr: str) -> list[str]:
+    """Pull zmem advisory/notice lines out of store.py stderr into a clean list.
+
+    Matches any ``[zmem] ... WARNING/NOTICE ...:`` line — including topic-
+    prefixed ones like ``[zmem] backup: WARNING - ...`` — so a structured
+    warning is never silently dropped. Arbitrary stderr (tracebacks, debug
+    noise) is ignored so we never surface untrusted text as a structured
+    warning (#36 M4)."""
+    out: list[str] = []
+    for line in (stderr or "").splitlines():
+        if _WARN_RE.match(line.strip()):
+            # Keep the descriptive part after the first colon, trimmed.
+            text = line.split(":", 1)[1].strip() if ":" in line else line.strip()
+            out.append(text)
+    return out
+
+
 def _clamp_limit(raw: Any) -> int:
     if raw is None:
         return _DEFAULT_LIMIT
@@ -288,7 +407,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
     )
 
     @mcp.tool()
-    def recall(
+    async def recall(
         query: str,
         namespace: Optional[str] = None,
         limit: int = _DEFAULT_LIMIT,
@@ -315,10 +434,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "--global-limit", "3",
             "--json",
         ] + _namespace_flag(namespace)
-        return _parse_results(_run_store(args))
+        return _parse_results(await _run_store_async(args))
 
     @mcp.tool()
-    def add(
+    async def add(
         type: str,
         content: str,
         namespace: str = "user:global",
@@ -339,9 +458,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             )
         if not body:
             return _error("content is required")
-        # Cap content length — recall clamps query; add should clamp content
-        # symmetrically to prevent a bloat-DoS on the write path.
-        body = body[:_MAX_CONTENT_CHARS]
+        # Reject oversize content rather than silently truncating it — a silent
+        # 32000-char truncation broke Tier-3 sync import elsewhere (the same
+        # row written via CLI/ingest was stored whole or rejected at 65536).
+        # Now all write paths enforce one cap (65536) consistently (#36 M17).
+        if len(body) > _MAX_CONTENT_CHARS:
+            return _error(
+                f"content is {len(body)} chars, over the {_MAX_CONTENT_CHARS} limit"
+            )
         sig = (signal or "none").strip()
         if sig not in ("test", "compile", "lint", "reviewer", "user", "none"):
             return _error(
@@ -353,27 +477,46 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "--type", mtype,
             "--content", body,
             "--signal", sig,
+            # Default network writes to `auto` capture mode so secret-like
+            # content is redacted before it is persisted (the local CLI stays
+            # `manual` for trusted local use). `auto` refuses when source_ref
+            # itself carries secret-like text — that surfaces as a structured
+            # error below (provenance with a secret in it must be reviewed, not
+            # silently stored). Advisory/notice warnings are surfaced in the
+            # response `warnings` field. (#36 M4)
+            "--capture-mode", "auto",
         ]
         if tags:
             args += ["--tags", str(tags)]
         if source_ref:
             args += ["--source-ref", str(source_ref)]
-        r = _run_store(args)
+        r = await _run_store_async(args)
+        warnings = _parse_store_warnings(r.get("stderr", ""))
         if not r["ok"]:
-            return _error(r["stderr"] or r["stdout"][:200])
-        return {"result": "stored", "raw": (r["stdout"] or "").strip()}
+            # returncode 2 == CapturePolicyRefusal (source_ref secret-like) or
+            # argparse/validation error. Surface the (redacted) message + any
+            # warnings parsed so far. Do NOT echo raw stderr verbatim.
+            msg = r.get("stderr") or r.get("stdout", "")[:200] or "add failed"
+            resp = _error(msg)
+            if warnings:
+                resp["warnings"] = warnings
+            return resp
+        resp = {"result": "stored", "raw": (r["stdout"] or "").strip()}
+        if warnings:
+            resp["warnings"] = warnings
+        return resp
 
     @mcp.tool()
-    def search(
+    async def search(
         query: str,
         namespace: Optional[str] = None,
         limit: int = _DEFAULT_LIMIT,
     ) -> dict[str, Any]:
         """Search the shared store (alias of recall; same semantics)."""
-        return recall(query=query, namespace=namespace, limit=limit)
+        return await recall(query=query, namespace=namespace, limit=limit)
 
     @mcp.tool()
-    def supersede(id: str, reason: Optional[str] = None) -> dict[str, Any]:
+    async def supersede(id: str, reason: Optional[str] = None) -> dict[str, Any]:
         """Mark a stored memory obsolete (corrected or OBE)."""
         mid = (id or "").strip()
         if not mid:
@@ -381,7 +524,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         args = ["supersede", "--id", mid]
         if reason:
             args += ["--reason", str(reason)]
-        r = _run_store(args)
+        r = await _run_store_async(args)
         if not r["ok"]:
             return _error(
                 r["stderr"] or r["stdout"][:200] or f"memory id {mid} not found"
@@ -389,14 +532,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         return {"result": "superseded", "id": mid}
 
     @mcp.tool()
-    def recent(
+    async def recent(
         namespace: Optional[str] = None,
         limit: int = _DEFAULT_LIMIT,
     ) -> dict[str, Any]:
         """Return the most recently ingested memories."""
         n = _clamp_limit(limit)
         args = ["recent", "--limit", str(n), "--json"] + _namespace_flag(namespace)
-        return _parse_results(_run_store(args))
+        return _parse_results(await _run_store_async(args))
 
     return mcp
 

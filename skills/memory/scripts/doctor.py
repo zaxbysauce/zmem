@@ -33,7 +33,14 @@ except ImportError:
     import host  # type: ignore
 
 
-CURRENT_SCHEMA_VERSION = 5
+# Single source of truth: import the schema version from schema_meta (the same
+# module store.py uses) so doctor and store can never disagree. A stale local
+# copy here once made every healthy v7 store FAIL doctor's schema gate (#36 M11).
+try:
+    from schema_meta import SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION
+except ImportError:
+    sys.path.insert(0, os.path.dirname(__file__))
+    from schema_meta import SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION  # type: ignore # noqa: E501
 STATUS_ORDER = {"fail": 3, "warn": 2, "pass": 1, "skip": 0}
 WINDOWS_BASH_CANDIDATES = (
     Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
@@ -577,7 +584,7 @@ def _check_schema(store_path: Path, access_check: dict) -> dict:
         return _check(
             "schema-version",
             "warn",
-            "No store schema found yet; the first writable run will initialize v5.",
+            f"No store schema found yet; the first writable run will initialize v{CURRENT_SCHEMA_VERSION}.",
             expected=CURRENT_SCHEMA_VERSION,
             actual=None,
         )
@@ -862,7 +869,7 @@ def _recommendations(checks: list[dict]) -> list[str]:
         )
     if by_id.get("schema-version", {}).get("status") == "warn":
         notes.append(
-            "Run the first writable zmem command only after the shared store path is correct; that first run may need to initialize or migrate schema v5."
+            f"Run the first writable zmem command only after the shared store path is correct; that first run may need to initialize or migrate schema v{CURRENT_SCHEMA_VERSION}."
         )
     emb = by_id.get("embeddings", {})
     if emb.get("status") == "warn":
