@@ -293,5 +293,40 @@ class TestSubstrateSwitch(unittest.TestCase):
         self.assertIsInstance(out["details"], list)
 
 
+class TestFailuresExitCode(unittest.TestCase):
+    """#36 M7: cmd_failures must distinguish a broken substrate (exit 2, with an
+    `error` field) from a checked-but-empty result (exit 0). Previously every
+    exception was swallowed into {count:0} + exit 0."""
+
+    def _run_cmd(self, session, transcript, db):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = store.cmd_failures(session=session, transcript=transcript, db=db)
+        return rc, json.loads(buf.getvalue())
+
+    def test_missing_db_session_is_exit0_empty(self):
+        # Legitimate "nothing to check": missing path/session → 0 failures, exit 0.
+        rc, out = self._run_cmd(session="", transcript="", db=r"C:\nope.sqlite")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, {"count": 0, "details": []})
+        self.assertNotIn("error", out)
+
+    def test_corrupt_db_exits2_with_error(self):
+        # A file that exists but is not a valid SQLite db is a BROKEN substrate,
+        # not "0 failures": it must surface an error and exit 2.
+        fd, junk = tempfile.mkstemp(suffix=".sqlite")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("this is not a sqlite database")
+        try:
+            rc, out = self._run_cmd(session="s1", transcript="", db=junk)
+            self.assertEqual(rc, 2)
+            self.assertIn("error", out)
+            self.assertEqual(out["count"], 0)
+            # The error message must not leak the raw filesystem path verbatim.
+            self.assertNotIn(junk.replace("\\", "/"), (out.get("error") or "").replace("\\", "/"))
+        finally:
+            os.remove(junk)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

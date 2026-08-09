@@ -227,7 +227,30 @@ def _ensure_loaded():
     from tokenizers import Tokenizer
 
     models_dir = _resolve_models_dir()
-    _session = ort.InferenceSession(str(models_dir / "minilm.onnx"))
+    model_path = models_dir / "minilm.onnx"
+    # Verify the model's integrity on the LOAD path too, not just the download
+    # path. _check_available only tests is_file(); without this gate, an attacker
+    # able to write to ZMEM_MODELS_DIR (or control the env var) could swap in an
+    # arbitrary ONNX binary that onnxruntime would load and execute. The pinned
+    # _MODEL_SHA256 is the trust root (a code constant, not attacker-writable).
+    # On mismatch we fail OPEN to the degraded no-embeddings path rather than
+    # executing an unverified model. (#36 M15.)
+    if not verify_checksum(model_path):
+        global _model_available
+        _model_available = False
+        try:
+            print(
+                "[zmem] WARNING: refusing to load minilm.onnx — checksum mismatch "
+                "(the file at the models dir does not match the pinned SHA-256). "
+                "Falling back to degraded FTS5/lexical operation. Re-install the "
+                "model or set ZMEM_MODEL_URL to a source matching the pinned "
+                "checksum plus ZMEM_MODEL_AUTODOWNLOAD=1.",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+        return
+    _session = ort.InferenceSession(str(model_path))
     _tokenizer = Tokenizer.from_file(str(models_dir / "tokenizer.json"))
     _tokenizer.enable_padding(length=128)
     _tokenizer.enable_truncation(max_length=128)

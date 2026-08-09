@@ -3,7 +3,7 @@
 //
 // Covers:
 //   - .codex-plugin/plugin.json + repo-local marketplace metadata
-//   - hooks/hooks.json supported-event wiring using PLUGIN_ROOT
+//   - hooks/hooks.codex.json supported-event wiring using PLUGIN_ROOT
 //   - Codex host precedence over Claude/ZCode compatibility vars
 //   - Codex canonical env, event mapping, envelopes, and native Tier0
 //   - stable PostToolUse failure capture, fail-open success path, loop guards
@@ -112,11 +112,14 @@ console.log("\n[1] Codex plugin metadata");
     const marketplace = JSON.parse(
         fs.readFileSync(path.join(REPO, ".agents", "plugins", "marketplace.json"), "utf8")
     );
-    const hooks = JSON.parse(fs.readFileSync(path.join(REPO, "hooks", "hooks.json"), "utf8"));
+    const hooks = JSON.parse(fs.readFileSync(path.join(REPO, "hooks", "hooks.codex.json"), "utf8"));
 
     eq("plugin: name", plugin.name, "zmem");
     eq("plugin: skills path", plugin.skills, "./skills/");
-    ok("plugin: omits unsupported manifest hooks field", !Object.prototype.hasOwnProperty.call(plugin, "hooks"));
+    // The Codex manifest declares its hooks file explicitly (hooks/hooks.codex.json)
+    // rather than relying on the default-named hooks/hooks.json, which CC would
+    // ALSO auto-load and double-register (#36 M12).
+    eq("plugin: declares codex hooks file explicitly", plugin.hooks, "hooks/hooks.codex.json");
     ok("plugin: author.name present", !!(plugin.author && plugin.author.name));
     ok("plugin: interface.displayName present", !!(plugin.interface && plugin.interface.displayName));
     ok("plugin: interface.category present", !!(plugin.interface && plugin.interface.category));

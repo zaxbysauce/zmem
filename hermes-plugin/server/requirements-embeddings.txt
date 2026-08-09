@@ -1,4 +1,4 @@
-# Optional embedding runtime for the zmem MCP store host.
+# Optional embedding + vector-recall runtime for the zmem store host.
 #
 # Install these ON THE STORE-HOST BOX to enable semantic recall/dedup for
 # memories written through the MCP server's `add` tool. Without them, `add`
@@ -7,7 +7,14 @@
 # and embedding-seeded consolidation are disabled. (Cloud/ephemeral boxes
 # that only need keyword recall may skip this — see docs/CLOUD.md.)
 #
+# sqlite-vec provides the vec0 virtual table the store uses for vector recall
+# and semantic dedup. It degrades safely to FTS5 if absent (store.py's _load_vec
+# is try/except-guarded), but it was previously an UNDECLARED phantom dependency
+# — a fresh install had no documented way to enable vector recall (#36 M16).
+# The PyPI distribution is `sqlite-vec` (the import name is `sqlite_vec`).
+#
 # Install with:  pip install -r hermes-plugin/server/requirements-embeddings.txt
 onnxruntime>=1.16,<2.0
 tokenizers>=0.15,<1.0
 numpy>=1.24,<3.0
+sqlite-vec>=0.1.6,<1.0

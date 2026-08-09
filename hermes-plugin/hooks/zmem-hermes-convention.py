@@ -46,12 +46,33 @@ _FAILURE_CAPTURED_KEY = "hermes_failure_captured_{session}"
 
 
 def _resolve_store_path() -> Path:
+    """Resolve the store path via the SAME authoritative resolver as the
+    provider and store.py (host.resolve_store_path). Previously this hook
+    hand-rolled a TRUNCATED copy that omitted CLAUDE/ZCODE_PLUGIN_DATA, so on
+    plugin-data-dir boxes it resolved a nonexistent ~/.zmem/store.sqlite and
+    silently no-op'd all session (#36 M10).
+
+    Imports the real resolver when the scripts dir is reachable (the normal
+    case). The inline fallback below is a BEST-EFFORT subset (the env-var chain
+    + ~/.zmem) reached only if host.py itself is unimportable; it does NOT
+    include host.py's legacy probes (~/.zcode/memory, _legacy_plugin_store) —
+    if you need those on a broken-import box, fix the import path instead."""
+    try:
+        _scripts_dir = Path(__file__).resolve().parents[2] / "skills" / "memory" / "scripts"
+        sys.path.insert(0, str(_scripts_dir))
+        import host  # type: ignore  # noqa: F811
+        return host.resolve_store_path()
+    except Exception:
+        pass
+    # Inline fallback: the env-var chain + ~/.zmem (host.py's legacy probes
+    # omitted — see docstring).
     explicit = os.environ.get("ZMEM_STORE", "").strip()
     if explicit:
         return Path(explicit).expanduser()
-    data_dir = os.environ.get("ZMEM_DATA", "").strip()
-    if data_dir:
-        return Path(data_dir).expanduser() / "store.sqlite"
+    for var in ("ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+        d = os.environ.get(var, "").strip()
+        if d:
+            return Path(d).expanduser() / "store.sqlite"
     return Path.home() / ".zmem" / "store.sqlite"
 
 

@@ -35,23 +35,12 @@ emit_empty() {
 
 INPUT="$(cat)"
 
-# Only fire for convention-revealing tools (Edit/Write/Bash), not Read/Glob/Grep.
-# PostToolUse provides tool_name on stdin.
-TOOL_NAME=$(printf '%s' "$INPUT" | python -c "
-import json, sys
-try:
-    obj = json.load(sys.stdin)
-    print(obj.get('tool_name', ''))
-except Exception:
-    print('')
-" 2>/dev/null)
-
-case "$TOOL_NAME" in
-  Edit|Write|MultiEdit|NotebookEdit|Bash) ;;
-  *) emit_empty ;;  # Skip non-convention-revealing tools
-esac
-
 # --- Cross-platform setup (same pattern as other hooks) ---
+# Resolved BEFORE the tool-name parse below: the parse needs a working Python
+# interpreter, and on systems where bare `python` is an MS-Store stub or absent
+# (only `python3` exists), using bare `python` left TOOL_NAME empty → the case
+# below fell through to emit_empty and the convention capture silently never
+# fired (#36 M13).
 IS_WINDOWS=0
 if [[ "$(uname -s 2>/dev/null)" == MINGW* ]] || [[ "$(uname -s 2>/dev/null)" == CYGWIN* ]] || [[ "$(uname -s 2>/dev/null)" == MSYS* ]]; then
   IS_WINDOWS=1
@@ -65,6 +54,27 @@ else
   if python3 --version >/dev/null 2>&1; then PYTHON_BIN="python3"
   elif python --version >/dev/null 2>&1; then PYTHON_BIN="python"; fi
 fi
+
+# Only fire for convention-revealing tools (Edit/Write/Bash), not Read/Glob/Grep.
+# PostToolUse provides tool_name on stdin. Run the parse with "$PYTHON_BIN"
+# (quoted for paths containing spaces). If no interpreter is available, emit
+# empty rather than failing — the convention capture is best-effort.
+if [ -z "$PYTHON_BIN" ]; then
+  emit_empty
+fi
+TOOL_NAME=$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c "
+import json, sys
+try:
+    obj = json.load(sys.stdin)
+    print(obj.get('tool_name', ''))
+except Exception:
+    print('')
+" 2>/dev/null)
+
+case "$TOOL_NAME" in
+  Edit|Write|MultiEdit|NotebookEdit|Bash) ;;
+  *) emit_empty ;;  # Skip non-convention-revealing tools
+esac
 
 to_py_path() {
   if [ "$IS_WINDOWS" -eq 0 ]; then printf '%s' "$1"; return; fi
