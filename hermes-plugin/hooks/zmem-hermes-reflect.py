@@ -51,13 +51,19 @@ def _resolve_store_path() -> Path:
     + ~/.zmem) reached only if host.py itself is unimportable; it does NOT
     include host.py's legacy probes (~/.zcode/memory, _legacy_plugin_store) —
     if you need those on a broken-import box, fix the import path instead."""
-    try:
-        _scripts_dir = Path(__file__).resolve().parents[2] / "skills" / "memory" / "scripts"
-        sys.path.insert(0, str(_scripts_dir))
-        import host  # type: ignore  # noqa: F811
-        return host.resolve_store_path()
-    except Exception:
-        pass
+    _rel = Path("skills") / "memory" / "scripts"
+    candidates = [
+        Path(__file__).resolve().parents[2] / _rel,            # in-tree (repo/symlink/junction)
+        Path(os.environ.get("ZMEM_HOME", "")).expanduser() / _rel,  # copy install
+    ]
+    for _scripts_dir in candidates:
+        if (_scripts_dir / "host.py").is_file():
+            sys.path.insert(0, str(_scripts_dir))
+            try:
+                import host  # type: ignore  # noqa: F811
+                return host.resolve_store_path()
+            except Exception:
+                pass
     # Inline fallback: the env-var chain + ~/.zmem (host.py's legacy probes
     # omitted — see docstring).
     explicit = os.environ.get("ZMEM_STORE", "").strip()

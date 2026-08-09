@@ -37,6 +37,42 @@ def _env(tmp: str) -> dict:
     return env
 
 
+def _parse_results(stdout: str):
+    """Parse recall/recent pretty-printed JSON (indent=2) output into a results
+    list. Shared by the M3/M5 test classes (cubic-7 dedup)."""
+    text = stdout.strip()
+    if not text:
+        return []
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict) and "results" in obj:
+        return obj["results"]
+    return None
+
+
+def _load_fresh_store_module(tmp: str):
+    """Load a fresh store.py module pointed at a throwaway store in `tmp`,
+    with init_db+migrate applied. Shared by the M9/M17 test classes (cubic-7
+    dedup). Returns (store_module, conn). Caller closes conn + rmtree tmp."""
+    import importlib.util
+    store_path = os.path.join(tmp, "store.sqlite")
+    spec = importlib.util.spec_from_file_location(
+        f"zmem_store_mod_{os.getpid()}", str(STORE_PY))
+    with mock.patch.dict(os.environ, {"ZMEM_STORE": store_path,
+                                      "ZMEM_MODELS_DIR": os.path.join(tmp, "none"),
+                                      "ZMEM_MODEL_AUTODOWNLOAD": "0"}):
+        store = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(store)
+    conn = store.connect()
+    store.init_db(conn)
+    store.migrate(conn)
+    return store, conn
+
+
 def _run(env: dict, *args: str, timeout: int = 60):
     return subprocess.run(
         [PYTHON, str(STORE_PY), *args],
@@ -152,20 +188,7 @@ class M3NoneSignalBelowFloor(unittest.TestCase):
 
     @staticmethod
     def _parse_results(stdout: str):
-        # recall/recent print pretty-printed JSON (indent=2), so parse the whole
-        # stdout blob, not line-by-line.
-        text = stdout.strip()
-        if not text:
-            return []
-        try:
-            obj = json.loads(text)
-        except json.JSONDecodeError:
-            return None
-        if isinstance(obj, list):
-            return obj
-        if isinstance(obj, dict) and "results" in obj:
-            return obj["results"]
-        return None
+        return _parse_results(stdout)  # module-level helper (cubic-7)
 
 
 class M5PromptInjectionRiskSurfaced(unittest.TestCase):
@@ -230,20 +253,7 @@ class M5PromptInjectionRiskSurfaced(unittest.TestCase):
 
     @staticmethod
     def _parse_results(stdout: str):
-        # recall/recent print pretty-printed JSON (indent=2), so parse the whole
-        # stdout blob, not line-by-line.
-        text = stdout.strip()
-        if not text:
-            return []
-        try:
-            obj = json.loads(text)
-        except json.JSONDecodeError:
-            return None
-        if isinstance(obj, list):
-            return obj
-        if isinstance(obj, dict) and "results" in obj:
-            return obj["results"]
-        return None
+        return _parse_results(stdout)  # module-level helper (cubic-7)
 
 
 class M9IngestDedupCache(unittest.TestCase):
@@ -253,19 +263,8 @@ class M9IngestDedupCache(unittest.TestCase):
 
     def setUp(self):
         sys.path.insert(0, str(SCRIPTS_DIR))
-        import importlib.util
         self.tmp = tempfile.mkdtemp(prefix="zmem-m9-")
-        store_path = os.path.join(self.tmp, "store.sqlite")
-        spec = importlib.util.spec_from_file_location(
-            f"zmem_store_m9_{os.getpid()}", str(STORE_PY))
-        with mock.patch.dict(os.environ, {"ZMEM_STORE": store_path,
-                                          "ZMEM_MODELS_DIR": os.path.join(self.tmp, "none"),
-                                          "ZMEM_MODEL_AUTODOWNLOAD": "0"}):
-            self.store = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(self.store)
-        self.conn = self.store.connect()
-        self.store.init_db(self.conn)
-        self.store.migrate(self.conn)
+        self.store, self.conn = _load_fresh_store_module(self.tmp)  # cubic-7
 
     def tearDown(self):
         try:
@@ -348,20 +347,8 @@ class M17CliAddContentCap(unittest.TestCase):
 
     def setUp(self):
         sys.path.insert(0, str(SCRIPTS_DIR))
-        import importlib.util
         self.tmp = tempfile.mkdtemp(prefix="zmem-m17-")
-        store_path = os.path.join(self.tmp, "store.sqlite")
-        # Load a fresh store module pointed at a throwaway store.
-        spec = importlib.util.spec_from_file_location(
-            f"zmem_store_m17_{os.getpid()}", str(STORE_PY))
-        with mock.patch.dict(os.environ, {"ZMEM_STORE": store_path,
-                                          "ZMEM_MODELS_DIR": os.path.join(self.tmp, "none"),
-                                          "ZMEM_MODEL_AUTODOWNLOAD": "0"}):
-            self.store = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(self.store)
-        self.conn = self.store.connect()
-        self.store.init_db(self.conn)
-        self.store.migrate(self.conn)
+        self.store, self.conn = _load_fresh_store_module(self.tmp)  # cubic-7
 
     def tearDown(self):
         try:

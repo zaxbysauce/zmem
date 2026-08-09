@@ -2937,6 +2937,11 @@ def consolidate(
         [*ns_params, CONSOLIDATE_MAX_ROWS_PER_NAMESPACE],
     ).fetchall()
     truncated = total_eligible > len(rows)
+    # Set True if any seed's vec0 KNN escalation hit the k cap with all-returned
+    # rows still above threshold — i.e. the qualifying set may be INCOMPLETE
+    # (a same-namespace duplicate could sit beyond the cap). Reported in the
+    # summary so the gap is visible, not silent (cubic-4, #36 M8 residual).
+    knn_truncated = False
 
     if not rows:
         print("[zmem] no embeddable memories to consolidate")
@@ -3007,12 +3012,15 @@ def consolidate(
             # one below the threshold, no later row can qualify and the
             # qualifying set is closed. Only when EVERY returned row is still
             # above the threshold might more qualify — then widen and re-ask.
-            # Bounded by the live row count, so it always terminates.
             results = []
             k = 10
             # Cap k at the bounded candidate set size, never above 500: the
             # vec0 KNN cost scales with k, and the input set is already bounded
-            # by CONSOLIDATE_MAX_ROWS_PER_NAMESPACE (#36 M8).
+            # by CONSOLIDATE_MAX_ROWS_PER_NAMESPACE (#36 M8). If the cap binds
+            # while every returned row is still above threshold, the qualifying
+            # set MAY be incomplete (a same-namespace duplicate could sit beyond
+            # rank 500) — that is tracked in knn_truncated and reported in the
+            # summary rather than silently dropped (cubic-4).
             k_cap = min(max(len(rows), 10), 500)
             while True:
                 try:
@@ -3029,7 +3037,10 @@ def consolidate(
                 if any((1.0 - r["distance"]) < effective_threshold for r in results):
                     break  # saw the cutoff — the qualifying set is complete
                 if k >= k_cap:
-                    break  # bounded: never scan past the live row count
+                    # Cap reached with all returned rows above threshold: the
+                    # qualifying set may be incomplete. Flag for the summary.
+                    knn_truncated = True
+                    break
                 k = min(k * 5, k_cap)
             for r in results:
                 mid = r["memory_id"]
@@ -3169,6 +3180,12 @@ def consolidate(
             f"truncated: examined {len(rows)} of {total_eligible} eligible "
             f"(per-pass cap {CONSOLIDATE_MAX_ROWS_PER_NAMESPACE})"
         )
+    if knn_truncated:
+        # vec0 KNN hit the k cap (500) with all returned rows above threshold:
+        # a same-namespace duplicate could sit beyond the cap and be missed.
+        # Fail-safe (the duplicate survives, no corruption) — reported so the
+        # completeness gap is visible (cubic-4, #36 M8 residual).
+        parts.append("knn_truncated: KNN cap reached; some pairs may be unexamined")
     print(f"[zmem] {' + '.join(parts)}")
 
 

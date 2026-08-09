@@ -222,16 +222,46 @@ def _get_store_semaphore() -> "asyncio.Semaphore":
     return _store_semaphore
 
 
+# Shared thread pool for store.py subprocess offload. Bounded large enough that
+# the semaphore (not the pool) is the real concurrency limit. Lazily created so
+# it's reused across requests (#36 M6 / cubic-6: we submit directly to it to
+# hold the concurrent future whose done-callback fires on worker completion).
+_store_executor: "ThreadPoolExecutor | None" = None
+
+
+def _get_executor() -> "ThreadPoolExecutor":
+    global _store_executor
+    if _store_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _store_executor = ThreadPoolExecutor(
+            max_workers=max(_MAX_CONCURRENT_STORE * 2, 16),
+            thread_name_prefix="zmem-store",
+        )
+    return _store_executor
+
+
 async def _run_store_async(args: list[str]) -> dict[str, Any]:
     """Async, concurrency-bounded wrapper around the sync ``_run_store``.
 
     FastMCP invokes tool functions directly in the event-loop thread, so a
     bare sync ``subprocess.run`` would BLOCK the whole loop (serializing every
     request and stalling health/auth handling). This offloads the subprocess to
-    a worker thread (``asyncio.to_thread``) AND bounds how many run at once via
-    an ``asyncio.Semaphore`` (#36 M6). A queued call that cannot acquire a slot
-    within ``_QUEUE_TIMEOUT_S`` returns an overload error instead of waiting
-    forever.
+    a worker thread (``loop.run_in_executor``) AND bounds how many run at once
+    via an ``asyncio.Semaphore`` (#36 M6). A queued call that cannot acquire a
+    slot within ``_QUEUE_TIMEOUT_S`` returns an overload error instead of
+    waiting forever.
+
+    The permit is released only AFTER the worker thread actually completes.
+    This is done by attaching the release callback to the underlying
+    ``concurrent.futures.Future`` (NOT the asyncio wrapper future, which
+    transitions to CANCELLED on task cancellation before the worker finishes)
+    and marshalling the release back to the event-loop thread via
+    ``loop.call_soon_threadsafe`` (concurrent-future callbacks run in the
+    worker thread, where ``asyncio.Semaphore.release`` is not safe). So a
+    cancelled request cannot free its slot while its subprocess is still
+    running and briefly exceed the cap (cubic-6). A cancelled call's subprocess
+    runs to completion (Python threads can't be killed); its result is
+    discarded.
     """
     sem = _get_store_semaphore()
     try:
@@ -246,11 +276,24 @@ async def _run_store_async(args: list[str]) -> dict[str, Any]:
             ),
             "returncode": 503,
         }
-    try:
-        # to_thread frees the event loop while subprocess.run blocks.
-        return await asyncio.to_thread(_run_store, args)
-    finally:
-        sem.release()
+    loop = asyncio.get_running_loop()
+    # Submit directly to the executor so we hold the CONCURRENT future (whose
+    # done-callback fires when the worker thread returns), not the asyncio
+    # wrapper (whose callback fires on cancellation, too early).
+    executor = _get_executor()
+    cfut = executor.submit(_run_store, args)
+
+    def _release_on_worker_done(_cfut, _loop=loop, _sem=sem):
+        # Runs in the worker thread on completion — marshal release to the loop.
+        try:
+            _loop.call_soon_threadsafe(_sem.release)
+        except RuntimeError:
+            # Loop closed (shutdown) before the worker finished: release here is
+            # safe because no asyncio code is touching the semaphore anymore.
+            _sem.release()
+
+    cfut.add_done_callback(_release_on_worker_done)
+    return await asyncio.wrap_future(cfut)
 
 
 _WARN_RE = re.compile(r"^\[zmem\].*\b(WARNING|NOTICE)\b.*:")

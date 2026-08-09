@@ -369,6 +369,60 @@ class LoadPathChecksumTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("session_loaded= True", r.stdout, r.stdout + r.stderr)
 
+    def test_corrupt_tokenizer_fails_open_not_raises(self):
+        """A load failure AFTER the checksum gate passes (e.g. onnxruntime
+        can't parse a garbage model, or a corrupt tokenizer.json) must NOT
+        raise through _ensure_loaded — it must fail OPEN to the degraded path,
+        and availability_status must NOT report the model as healthy (cubic-1/2,
+        reviewer NEEDS_REVISION).
+
+        This genuinely exercises the post-checksum try/except: we write a fake
+        model whose sha256 we patch into _MODEL_SHA256 (so the checksum gate
+        PASSES), but whose bytes are garbage so InferenceSession raises → the
+        new except branch fires."""
+        d = Path(self.tmp) / "corrupttok"
+        d.mkdir()
+        fake_model = b"not a real onnx model " * 50
+        (d / "minilm.onnx").write_bytes(fake_model)
+        (d / "tokenizer.json").write_bytes(b"{}")  # present so _check_available passes
+        fake_sha = embeddings._sha256_file(d / "minilm.onnx")
+        env = {**os.environ, "ZMEM_MODELS_DIR": str(d),
+               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        # Patch _MODEL_SHA256 so the checksum gate PASSES on the fake model —
+        # forcing execution to reach the InferenceSession load (which fails).
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
+            "import embeddings\n"
+            "import onnxruntime  # present so _check_available passes the import gate\n"
+            f"embeddings._MODEL_SHA256 = {fake_sha!r}\n"  # checksum gate now passes
+            "embeddings._ensure_loaded()\n"
+            "print('raised= False')\n"
+            "print('session=', embeddings._session)\n"
+            "print('checksum_ok=', embeddings._model_checksum_ok)\n"
+            "print('load_failed=', embeddings._model_load_failed)\n"
+            "st = embeddings.availability_status()\n"
+            "print('avail_reason=', st['reason'])\n"
+            "print('avail_available=', st['available'])\n"
+            "print('avail_checksum_ok=', st['checksum_ok'])\n"
+            "print('avail_load_failed=', st['load_failed'])\n"
+        )
+        r = subprocess.run([PYTHON, "-c", script], capture_output=True,
+                           text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("raised= False", r.stdout, r.stdout + r.stderr)
+        # The load failed (garbage model) → session not loaded.
+        self.assertIn("session= None", r.stdout, r.stdout + r.stderr)
+        # Checksum gate PASSED (so checksum_ok is None — never set True because
+        # the load threw before that line) but load_failed is True. availability
+        # must report the distinct model_load_failed reason, NOT ok.
+        self.assertIn("load_failed= True", r.stdout, r.stdout + r.stderr)
+        self.assertIn("avail_available= False", r.stdout, r.stdout + r.stderr)
+        self.assertIn("avail_reason= model_load_failed", r.stdout,
+                      r.stdout + r.stderr)
+        self.assertNotIn("avail_reason= ok", r.stdout,
+                         "load-failed model must not report reason=ok")
+
 
 class LexicalHelperTests(unittest.TestCase):
     """Unit tests for store.py's Jaccard token-overlap clustering helpers."""

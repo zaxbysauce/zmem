@@ -35,7 +35,7 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _make_store(path: Path, schema_version: int = 7) -> None:
+def _make_store(path: Path, schema_version: int = CURRENT_SCHEMA_VERSION) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     try:

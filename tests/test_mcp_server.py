@@ -351,7 +351,11 @@ class McpServerToolSurfaceTest(unittest.TestCase):
     def test_concurrency_semaphore_bounds_subprocesses(self):
         """The asyncio.Semaphore caps concurrent store.py subprocesses. With
         max_concurrent=1 (forced small), concurrent recall calls serialize
-        (at most one subprocess in flight at a time) (#36 M6)."""
+        (at most one subprocess in flight at a time) (#36 M6).
+
+        Seeds the store AND runs the concurrent gather inside ONE asyncio.run
+        so the lazy semaphore is constructed and used on the same event loop
+        (robust across Python versions — cubic-10)."""
         import asyncio
         original = self.mcp_server._MAX_CONCURRENT_STORE
         # Force a tiny cap and reset the lazy semaphore so it rebuilds.
@@ -371,9 +375,15 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         self.mcp_server._run_store = counting_run_store
         try:
             ns = self._ns()
-            self._add_test_signal(content="seed row for concurrency test", namespace=ns)
 
-            async def run_concurrent():
+            async def seed_and_gather():
+                # Seed within the same loop that gathers, so the semaphore is
+                # built and acquired on one event loop (cubic-10).
+                await self.server._tool_manager.call_tool(
+                    "add",
+                    {"type": "fact", "content": "seed row for concurrency test",
+                     "namespace": ns, "signal": "test"},
+                    context=None)
                 tasks = [
                     self.server._tool_manager.call_tool(
                         "recall",
@@ -383,11 +393,77 @@ class McpServerToolSurfaceTest(unittest.TestCase):
                 ]
                 return await asyncio.gather(*tasks)
 
-            asyncio.run(run_concurrent())
+            asyncio.run(seed_and_gather())
             # With max_concurrent=1, peak simultaneous _run_store calls must be 1.
             self.assertLessEqual(in_flight["peak"], 1,
                                  f"peak {in_flight['peak']} exceeded cap of 1")
         finally:
+            self.mcp_server._run_store = original_run_store
+            self.mcp_server._MAX_CONCURRENT_STORE = original
+            self.mcp_server._store_semaphore = None
+
+    def test_cancellation_does_not_release_permit_prematurely(self):
+        """cubic-6: if a request is cancelled while its subprocess is running,
+        the semaphore permit must NOT be freed until the worker actually
+        completes — otherwise the concurrency cap is briefly exceeded. This
+        ties release to the concurrent future (worker completion), not the
+        asyncio wrapper future (which cancels immediately)."""
+        import asyncio
+        original = self.mcp_server._MAX_CONCURRENT_STORE
+        self.mcp_server._MAX_CONCURRENT_STORE = 1
+        self.mcp_server._store_semaphore = None
+        original_run_store = self.mcp_server._run_store
+        # A blocking _run_store that waits on an event we control.
+        release_event = {"go": False}
+
+        def blocking_run_store(args):
+            while not release_event["go"]:
+                import time
+                time.sleep(0.01)
+            return original_run_store(args)
+
+        self.mcp_server._run_store = blocking_run_store
+        try:
+            async def cancel_while_running():
+                loop = asyncio.get_running_loop()
+                sem = self.mcp_server._get_store_semaphore()
+                # Start a call that acquires the single permit and blocks.
+                task = asyncio.ensure_future(
+                    self.mcp_server._run_store_async(["recall", "--query", "x"]))
+                await asyncio.sleep(0.1)  # let it acquire + block in the worker
+                # The permit is held; a second acquire must time out.
+                try:
+                    await asyncio.wait_for(sem.acquire(), timeout=0.3)
+                    sem.release()
+                    held = False
+                except asyncio.TimeoutError:
+                    held = True
+                # Cancel the blocking task.
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                # Even AFTER cancellation, the permit must STILL be held until
+                # the worker finishes (cubic-6: no premature release).
+                try:
+                    await asyncio.wait_for(sem.acquire(), timeout=0.3)
+                    sem.release()
+                    still_held_after_cancel = False
+                except asyncio.TimeoutError:
+                    still_held_after_cancel = True
+                # Now release the worker; the permit should free.
+                release_event["go"] = True
+                await asyncio.sleep(0.3)
+                return held, still_held_after_cancel
+
+            held, still_held = asyncio.run(cancel_while_running())
+            self.assertTrue(held, "permit must be held while worker runs")
+            self.assertTrue(still_held,
+                            "permit must STILL be held after cancellation until "
+                            "the worker completes (cubic-6)")
+        finally:
+            release_event["go"] = True
             self.mcp_server._run_store = original_run_store
             self.mcp_server._MAX_CONCURRENT_STORE = original
             self.mcp_server._store_semaphore = None

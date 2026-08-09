@@ -52,18 +52,29 @@ def _resolve_store_path() -> Path:
     plugin-data-dir boxes it resolved a nonexistent ~/.zmem/store.sqlite and
     silently no-op'd all session (#36 M10).
 
-    Imports the real resolver when the scripts dir is reachable (the normal
-    case). The inline fallback below is a BEST-EFFORT subset (the env-var chain
-    + ~/.zmem) reached only if host.py itself is unimportable; it does NOT
-    include host.py's legacy probes (~/.zcode/memory, _legacy_plugin_store) —
-    if you need those on a broken-import box, fix the import path instead."""
-    try:
-        _scripts_dir = Path(__file__).resolve().parents[2] / "skills" / "memory" / "scripts"
-        sys.path.insert(0, str(_scripts_dir))
-        import host  # type: ignore  # noqa: F811
-        return host.resolve_store_path()
-    except Exception:
-        pass
+    Imports the real resolver when the scripts dir is reachable. In a
+    repo/symlink/junction install `__file__`'s `parents[2]` finds it; in a
+    COPY install (`cp -r hermes-plugin …`, README-documented) the copy has no
+    `skills/` tree, so we also probe `$ZMEM_HOME/skills/memory/scripts` (the
+    env var copy users MUST set) before giving up (#36 M10 / cubic-3,5,8).
+
+    The inline fallback below is a BEST-EFFORT subset (the env-var chain
+    + ~/.zmem) reached only if host.py itself is unimportable from any probe;
+    it does NOT include host.py's legacy probes (~/.zcode/memory,
+    _legacy_plugin_store)."""
+    _rel = Path("skills") / "memory" / "scripts"
+    candidates = [
+        Path(__file__).resolve().parents[2] / _rel,            # in-tree (repo/symlink/junction)
+        Path(os.environ.get("ZMEM_HOME", "")).expanduser() / _rel,  # copy install
+    ]
+    for _scripts_dir in candidates:
+        if (_scripts_dir / "host.py").is_file():
+            sys.path.insert(0, str(_scripts_dir))
+            try:
+                import host  # type: ignore  # noqa: F811
+                return host.resolve_store_path()
+            except Exception:
+                pass
     # Inline fallback: the env-var chain + ~/.zmem (host.py's legacy probes
     # omitted — see docstring).
     explicit = os.environ.get("ZMEM_STORE", "").strip()

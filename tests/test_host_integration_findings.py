@@ -196,6 +196,66 @@ class M10HermesHooksResolveViaHost(unittest.TestCase):
                 f"{hook_name} resolved {hook_path} but host.resolve_store_path "
                 f"resolved {host_path} — drift!")
 
+    def test_copy_install_hook_finds_host_via_zmem_home(self):
+        """In a copy install (`cp -r hermes-plugin …`), the hook file has no
+        skills/ tree alongside it. The hook must locate host.py via the
+        $ZMEM_HOME probe (README requires copy users to set it) — otherwise it
+        silently no-ops against the wrong store (#36 M10 / cubic-3,5,8).
+
+        Discrimination: we verify (a) the in-tree candidate (parents[2]) does
+        NOT exist in the copied layout, AND (b) the hook's `_resolve_store_path`
+        actually imported `host` (presence in the module namespace + the
+        resolved path matches host.resolve_store_path). If the ZMEM_HOME probe
+        were absent/broken, `host` would not be importable and the hook would
+        fall to the inline fallback."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import host as _host_ref  # noqa: F401 — ensure importable
+        copy_root = tempfile.mkdtemp(prefix="zmem-copy-")
+        self.addCleanup(shutil.rmtree, copy_root, True)
+        copy_hooks = Path(copy_root) / "deep" / "hooks"
+        copy_hooks.mkdir(parents=True)
+        hook_dst = copy_hooks / "zmem-hermes-convention.py"
+        shutil.copy(HOOKS_DIR / "zmem-hermes-convention.py", hook_dst)
+        # Confirm the in-tree candidate does NOT exist (copy has no skills/).
+        in_tree = hook_dst.resolve().parents[2] / "skills" / "memory" / "scripts"
+        self.assertFalse((in_tree / "host.py").is_file(),
+                         "test setup: in-tree candidate must be absent in copy install")
+        explicit = os.path.join(copy_root, "store.sqlite")
+        env = {**os.environ}
+        for v in ("ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+            env.pop(v, None)
+        env["ZMEM_STORE"] = explicit
+        env["ZMEM_HOME"] = str(REPO_ROOT)
+        spec = importlib.util.spec_from_file_location("hook_copy_disc", str(hook_dst))
+        zmem_home_scripts = str(Path(REPO_ROOT) / "skills" / "memory" / "scripts")
+        with mock.patch.dict(os.environ, env, clear=False):
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            # Count occurrences of the ZMEM_HOME scripts dir in sys.path BEFORE
+            # the hook runs. The probe does sys.path.insert(0, ...) which adds
+            # a DUPLICATE entry; the inline fallback never touches sys.path. So
+            # a count increase after _resolve_store_path is causal proof the
+            # probe fired (not vacuous like an existential any() check, which
+            # this test's own setUp pre-satisfies). (PRR-006 final-critic.)
+            before = sum(1 for p in sys.path
+                         if os.path.normcase(p) == os.path.normcase(zmem_home_scripts))
+            hook_path = str(mod._resolve_store_path())
+            after = sum(1 for p in sys.path
+                        if os.path.normcase(p) == os.path.normcase(zmem_home_scripts))
+            # host.py's resolution under the same env.
+            host_path = str(_host_ref.resolve_store_path())
+        # The hook must match host.py (delegation produced the same result).
+        self.assertEqual(os.path.normcase(hook_path), os.path.normcase(host_path),
+                         f"hook ({hook_path}) != host.py ({host_path}) — delegation failed")
+        # DISCRIMINATOR: the probe's sys.path.insert must have increased the
+        # occurrence count of the ZMEM_HOME scripts dir. Deleting the probe
+        # (falling to the inline fallback, which never touches sys.path) leaves
+        # after == before → this fails. (PRR-006 final-critic.)
+        self.assertGreater(after, before,
+                           f"ZMEM_HOME probe did not run (sys.path count "
+                           f"unchanged: before={before} after={after}) — inline "
+                           f"fallback was used instead")
+
 
 class M13ConventionCaptureInterpreterDiscovery(unittest.TestCase):
     """M13: the convention-capture shell hook must parse the tool name with the

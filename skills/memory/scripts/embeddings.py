@@ -32,6 +32,14 @@ from pathlib import Path
 _session = None
 _tokenizer = None
 _model_available: bool | None = None
+# None = not yet checked; True = checksum verified at load; False = mismatch
+# (model present but rejected). availability_status() surfaces this so doctor
+# does not report a checksum-rejected model as healthy (cubic-2, #36 M15).
+_model_checksum_ok: bool | None = None
+# True if the model PASSED checksum but then FAILED to load (corrupt
+# tokenizer.json, unparseable ONNX, etc.). Distinct from a checksum mismatch so
+# availability_status can report an accurate reason (cubic-2 final-critic).
+_model_load_failed: bool = False
 _MODEL_DIM = 384
 
 # sha256 of the minilm.onnx currently shipped/installed on the reference box
@@ -218,7 +226,7 @@ def _check_available() -> bool:
 
 def _ensure_loaded():
     """Lazy-load the ONNX session and tokenizer. Called on first embed."""
-    global _session, _tokenizer
+    global _session, _tokenizer, _model_available, _model_checksum_ok, _model_load_failed
     if _session is not None:
         return
     if not _check_available():
@@ -236,8 +244,8 @@ def _ensure_loaded():
     # On mismatch we fail OPEN to the degraded no-embeddings path rather than
     # executing an unverified model. (#36 M15.)
     if not verify_checksum(model_path):
-        global _model_available
         _model_available = False
+        _model_checksum_ok = False
         try:
             print(
                 "[zmem] WARNING: refusing to load minilm.onnx — checksum mismatch "
@@ -250,10 +258,32 @@ def _ensure_loaded():
         except Exception:
             pass
         return
-    _session = ort.InferenceSession(str(model_path))
-    _tokenizer = Tokenizer.from_file(str(models_dir / "tokenizer.json"))
-    _tokenizer.enable_padding(length=128)
-    _tokenizer.enable_truncation(max_length=128)
+    # Load the session + tokenizer. A corrupt/unreadable tokenizer.json (or any
+    # load-time error) must fail OPEN to the degraded path, not propagate into
+    # unguarded callers (add/hybrid-search hard-failing). This mirrors the
+    # checksum-mismatch fail-open above (cubic-1/2, #36 M15 residual).
+    try:
+        _session = ort.InferenceSession(str(model_path))
+        _tokenizer = Tokenizer.from_file(str(models_dir / "tokenizer.json"))
+        _tokenizer.enable_padding(length=128)
+        _tokenizer.enable_truncation(max_length=128)
+        _model_checksum_ok = True
+    except Exception as exc:
+        _model_available = False
+        # The checksum PASSED but the load failed (corrupt tokenizer.json,
+        # unparseable ONNX). Record a DISTINCT flag so availability_status can
+        # report an accurate reason (model_load_failed, not a checksum mismatch)
+        # rather than conflating the two (cubic-2 final-critic).
+        _model_load_failed = True
+        try:
+            print(
+                "[zmem] WARNING: failed to load the embedding model/tokenizer "
+                f"({type(exc).__name__}); falling back to degraded FTS5/lexical "
+                "operation. Re-install the model files or check ZMEM_MODELS_DIR.",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
 
 
 def embed_text(text: str) -> bytes | None:
@@ -319,13 +349,17 @@ def availability_status() -> dict:
 
         {
           "available": bool,            # True iff deps import AND both files exist
+                                        #   (AND the model passed checksum if loaded)
           "reason": str | None,         # 'ok' | 'imports_missing' |
-                                        # 'model_file_missing' | 'tokenizer_missing' | None
+                                        # 'model_file_missing' | 'tokenizer_missing' |
+                                        # 'model_checksum_mismatch' | None
           "missing_imports": list[str], # subset of onnxruntime/tokenizers/numpy
           "models_dir": str,            # resolved models dir (ZMEM_MODELS_DIR or default)
           "interpreter": str,           # sys.executable — which Python is resolving deps
           "model_file": bool,           # minilm.onnx present?
           "tokenizer_file": bool,       # tokenizer.json present?
+          "checksum_ok": bool | None,   # None=not yet checked, True=verified,
+                                        #   False=rejected at load (M15)
         }
 
     Presence-only: checks importability + file existence. NEVER hashes the
@@ -366,6 +400,21 @@ def availability_status() -> dict:
     elif not tokenizer_file:
         reason = "tokenizer_missing"
         available = False
+    elif _model_load_failed:
+        # Checksum PASSED but the model/tokenizer failed to load (corrupt
+        # tokenizer.json, unparseable ONNX). Distinct from a checksum mismatch
+        # so the diagnostic is accurate (cubic-2 final-critic).
+        reason = "model_load_failed"
+        available = False
+    elif _model_checksum_ok is False:
+        # Files present, but the load path already REJECTED the model on a
+        # checksum mismatch (M15). Report unavailable so doctor does not show a
+        # checksum-rejected model as healthy (cubic-2). `_model_checksum_ok` is
+        # None until the first load attempt; a short-lived CLI process that has
+        # not yet embedded leaves it None (treated as 'ok' here — the checksum
+        # gate fires on first embed).
+        reason = "model_checksum_mismatch"
+        available = False
     else:
         reason = "ok"
         available = True
@@ -378,4 +427,6 @@ def availability_status() -> dict:
         "interpreter": sys.executable or "",
         "model_file": model_file,
         "tokenizer_file": tokenizer_file,
+        "checksum_ok": _model_checksum_ok,
+        "load_failed": _model_load_failed,
     }
