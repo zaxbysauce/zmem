@@ -29,14 +29,32 @@ def _is_wildcard(host: str) -> bool:
     literals) and :func:`socket.inet_aton` (for the inet_aton shorthands ``0``
     and ``0.0`` that uvicorn/socket accept but ipaddress rejects). Hostnames
     can't be statically classified, so they pass (the operator named it).
+
+    IPv4-mapped IPv6 wildcard forms (``::ffff:0.0.0.0`` and its equivalents)
+    are also treated as wildcard: ``IPv6Address.is_unspecified`` is False for a
+    mapped address even when the mapped IPv4 IS unspecified, so the mapped form
+    would otherwise slip past the guard (#37 L10). Low exploitability — an
+    operator must deliberately type the literal, and a Windows bind on it fails
+    — but the allowlist should cover the form for completeness.
     """
     h = (host or "").strip().lower().strip("[]")
     if h in {"", "0.0.0.0", "::"}:
         return True
     try:
-        return ipaddress.ip_address(h).is_unspecified
+        ip = ipaddress.ip_address(h)
     except ValueError:
         pass
+    else:
+        if ip.is_unspecified:
+            return True
+        # IPv4-mapped IPv6 form: ::ffff:0.0.0.0 is the mapped equivalent of
+        # 0.0.0.0. is_unspecified is False for the mapped address, but the
+        # mapped IPv4 (0.0.0.0) IS unspecified, so treat the whole thing as a
+        # wildcard bind.
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None and mapped.is_unspecified:
+            return True
+        return False
     # inet_aton shorthands: socket.inet_aton("0") == 0.0.0.0, ("0.0") == 0.0.0.0.
     # These are accepted by uvicorn's bind but rejected by ipaddress.
     try:

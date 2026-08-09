@@ -169,13 +169,26 @@ def _try_download_model(
                         break
                     out.write(chunk)
         if not verify_checksum(tmp_path, expected_sha256):
+            # Loud, actionable failure (safe-by-default preserved: we discard
+            # the mismatched file and fall through to no-embeddings, NEVER load
+            # an unverified binary). The default Xenova URL is documented (PLAN
+            # §7-P10, #37 L14) as NOT byte-identical to the pinned checksum, so
+            # a fresh-clone autodownload will fail-closed by design. Surface the
+            # expected sha256 so the operator can verify their own replacement,
+            # and name the two working remediation paths (#37 L14).
+            expected = expected_sha256 or _MODEL_SHA256
             print(
-                f"zmem: downloaded model checksum mismatch (url={safe_url}) "
-                "-- falling back to no-embeddings. The default download URL is "
-                "not guaranteed to produce a build matching the pinned "
-                "ZMEM_MODEL_SHA256; set ZMEM_MODEL_URL to a build matching the "
-                "pinned checksum, or place the file manually at "
-                f"{model_path}.",
+                f"WARNING: zmem embedding model unavailable — downloaded model "
+                f"from {safe_url} failed checksum verification "
+                f"(expected sha256 {expected}). This is a KNOWN state, not a "
+                f"bug in your setup: the default download URL is not "
+                f"byte-identical to the pinned checksum (different ONNX export "
+                f"toolchains produce different bytes for the same weights; see "
+                f"PLAN.md §7-P10). zmem will run in degraded (no-embeddings) "
+                f"mode — recall falls back to FTS5, consolidate to lexical "
+                f"clustering. To enable embeddings, either (a) set "
+                f"ZMEM_MODEL_URL to a build whose sha256 matches {expected}, "
+                f"or (b) place a verified minilm.onnx at {model_path}.",
                 file=sys.stderr,
             )
             return False

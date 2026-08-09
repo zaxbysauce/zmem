@@ -135,10 +135,16 @@ class ChecksumAndDownloadTests(unittest.TestCase):
             ok = embeddings._try_download_model(dest, url=url, expected_sha256=self.fixture_sha256)
         self.assertFalse(ok)
         message = captured.getvalue().lower()
-        self.assertIn("checksum mismatch", message)
+        # The mismatch is announced as a failed checksum verification (the
+        # message was made louder/more actionable in #37 L14: it now leads with
+        # "WARNING: zmem embedding model unavailable" and names the expected
+        # sha256 + the PLAN.md known-gap reference).
+        self.assertIn("checksum verification", message)
         self.assertIn("no-embeddings", message)
-        # Actionable: tells the user how to fix it.
+        # Actionable: Tells the user how to fix it.
         self.assertIn("zmem_model_url", message)
+        # The expected sha256 is surfaced so the operator can verify a replacement.
+        self.assertIn(self.fixture_sha256, message)
 
     def test_redact_url_for_logging_strips_userinfo_and_query_values(self):
         """Unit-level: ZMEM_MODEL_URL can legitimately carry credentials
@@ -191,8 +197,10 @@ class ChecksumAndDownloadTests(unittest.TestCase):
         message = captured.getvalue()
         self.assertNotIn("secrettoken", message)
         self.assertNotIn("abc123", message)
-        # Still actionable.
-        self.assertIn("checksum mismatch", message.lower())
+        # Still actionable (message wording updated in #37 L14 to lead with
+        # "WARNING: zmem embedding model unavailable" + "failed checksum
+        # verification" rather than "checksum mismatch").
+        self.assertIn("checksum verification", message.lower())
         self.assertIn("no-embeddings", message.lower())
         self.assertIn("zmem_model_url", message.lower())
 

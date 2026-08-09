@@ -32,13 +32,23 @@ import sys
 from pathlib import Path
 
 REQUIRED_KEYS = ("namespace", "type", "content", "tags", "signal", "why")
-ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
-ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
-# Same ceiling store.py's Tier 3 ingest validator enforces
-# (INGEST_MAX_CONTENT_CHARS). A harvest is agent-authored text from a remote
-# session; nothing legitimate is this long, and an oversized row bloats the
-# store and every pack/prompt built from it.
-MAX_CONTENT_CHARS = 65536
+
+# Import the write-path constants from schema_meta (the single source of truth
+# shared with store.py, the MCP server, and the local Hermes provider) so this
+# validator can never drift from the other surfaces (#37 L7/L8 closed that drift
+# class everywhere else; this 4th copy was the last one). The directory layout
+# is <repo>/scripts/ingest_harvest.py -> <repo>/skills/memory/scripts/schema_meta.py.
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "memory" / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+try:
+    from schema_meta import ALLOWED_TYPES, ALLOWED_SIGNALS, MAX_CONTENT_CHARS  # noqa: F401
+except ImportError:
+    # Defensive fallback (should not happen in a normal checkout): keep the
+    # historical literals so a broken import never silently disables validation.
+    ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
+    ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
+    MAX_CONTENT_CHARS = 65536
 
 
 def _ascii(value: object) -> str:

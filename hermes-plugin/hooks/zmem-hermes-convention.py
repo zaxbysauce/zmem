@@ -30,6 +30,14 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# Shared WAL-safety guard + store resolver (single copy across the three Hermes
+# hooks — #37 L25). The hook's own dir must be on sys.path for the sibling
+# import to resolve when run as a standalone script.
+_HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOK_DIR not in sys.path:
+    sys.path.insert(0, _HOOK_DIR)
+from _zmem_hook_common import assert_local_fs as _assert_local_fs  # noqa: E402
+
 # Fire a convention nudge every N successful tool calls.
 try:
     _INTERVAL = max(1, int(os.environ.get("ZMEM_CONVENTION_INTERVAL", "10")))
@@ -85,39 +93,6 @@ def _resolve_store_path() -> Path:
         if d:
             return Path(d).expanduser() / "store.sqlite"
     return Path.home() / ".zmem" / "store.sqlite"
-
-
-def _assert_local_fs(path: Path) -> bool:
-    """Reject UNC/network/OneDrive store paths (WAL-corruption guard).
-
-    Mirrors zmem's host.py ``assert_local_fs`` — the provider gets it for free
-    (it shells out to store.py), but hooks open sqlite directly and would
-    otherwise bypass the guard. Returns True if safe, False if the path is
-    network-mounted (the hook silently no-ops rather than corrupting the store).
-
-    host.py's ``assert_local_fs`` raises ``ValueError`` as its refusal signal
-    (host.py:253-284) — that MUST map to ``return False``, not be swallowed.
-    Import-failure (host.py absent) degrades to the UNC-prefix check only.
-    """
-    s = str(path)
-    if s.startswith("\\\\") or s.startswith("//"):
-        return False
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "skills" / "memory" / "scripts"))
-        import host  # type: ignore[import-not-found]
-    except Exception:
-        # host.py absent — best-effort UNC check only.
-        return not (s.startswith("\\\\") or s.startswith("//"))
-    # host.py imported — honor its refusal (ValueError) as False.
-    try:
-        host.assert_local_fs(path)
-        return True
-    except ValueError:
-        # host.py refused: OneDrive, network-mapped drive, etc.
-        return False
-    except Exception:
-        # Unexpected guard error — fail open (never wedge the hook).
-        return True
 
 
 def _connect() -> sqlite3.Connection | None:

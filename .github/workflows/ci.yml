@@ -18,6 +18,14 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Least-privilege token scope (#37 L13). This workflow runs on push/PR
+    # (never pull_request_target), uses no secrets, and only needs to read the
+    # repo to check it out — so scope the GITHUB_TOKEN to read-only. `actions:
+    # read` is included so a future `cache:` directive on setup-python/setup-
+    # node does not silently fail (cache-key resolution needs it).
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +35,11 @@ jobs:
       # this job is proving the suites pass in degraded (no-embeddings) mode.
       ZMEM_MODEL_AUTODOWNLOAD: "0"
     steps:
+      # Actions are tag-pinned. This workflow uses no secrets and no
+      # pull_request_target, so the threat model for tag-repointing is low
+      # (the GITHUB_TOKEN is read-only above and nothing exfiltratable is
+      # produced). SHA-pinning would add a manual-update burden with little
+      # marginal gain here; revisit if secrets or pull_request_target are added.
       - name: Checkout
         uses: actions/checkout@v4
 

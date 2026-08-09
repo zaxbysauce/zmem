@@ -89,15 +89,30 @@ except ImportError:
     except ImportError:
         _host = None
 
-# Shared single source of truth for the schema version constant. doctor.py
-# imports the SAME value from schema_meta so the two can never drift (a stale
-# doctor-side copy once made every healthy store fail the schema gate — #36 M11).
+# Shared single source of truth for the schema version constant AND the
+# write-path constants (content cap, allowed type/signal enums). doctor.py and
+# the Hermes provider surfaces import the SAME values from schema_meta so they
+# can never drift (a stale doctor-side schema copy once made every healthy store
+# fail the schema gate — #36 M11; #37 L7/L8 logged the same drift on the content
+# cap and signal enum across the MCP/Hermes paths).
 # Dependency-free and side-effect-free; resolved from this directory like `host`.
 try:
-    from schema_meta import SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY  # noqa: F401
+    from schema_meta import (  # noqa: F401
+        SUPPORTED_SCHEMA_VERSION,
+        SCHEMA_VERSION_KEY,
+        MAX_CONTENT_CHARS,
+        ALLOWED_TYPES,
+        ALLOWED_SIGNALS,
+    )
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
-    from schema_meta import SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY  # type: ignore # noqa: F401
+    from schema_meta import (  # type: ignore # noqa: F401
+        SUPPORTED_SCHEMA_VERSION,
+        SCHEMA_VERSION_KEY,
+        MAX_CONTENT_CHARS,
+        ALLOWED_TYPES,
+        ALLOWED_SIGNALS,
+    )
 
 
 def _env_float(name: str, default: float) -> float:
@@ -190,24 +205,14 @@ SIGNAL_CONFIDENCE = {
     "none": 0.2,
 }
 
-# The two closed enums the store's own writers already enforce (`add`'s
-# argparse choices). Named here so the Tier 3 ingest validator enforces the
-# SAME sets on remote-authored rows -- a sync file must not be able to widen
-# them by writing straight into the table.
-ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
-ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
-# SUPPORTED_SCHEMA_VERSION / SCHEMA_VERSION_KEY are imported from schema_meta
-# above (single source of truth shared with doctor.py).
+# ALLOWED_TYPES / ALLOWED_SIGNALS / MAX_CONTENT_CHARS are imported from
+# schema_meta above (single source of truth shared with doctor.py and the
+# Hermes provider surfaces). The two closed enums are the sets the store's own
+# writers already enforce (`add`'s argparse choices); naming them once here lets
+# the Tier 3 ingest validator enforce the SAME sets on remote-authored rows --
+# a sync file must not be able to widen them by writing straight into the table.
 
 CONFIDENCE_FLOOR = 0.25
-
-# Single source of truth for the maximum memory content size, in Python str
-# length (Unicode code points). Enforced on EVERY write path — CLI add, MCP add,
-# and ingest-jsonl — so a memory written on one box imports cleanly on another
-# (previously CLI add was uncapped, MCP silently truncated at 32k, and
-# ingest-jsonl hard-rejected at 65k — a 32k–65k row written locally broke Tier-3
-# sync import elsewhere). #36 M17.
-MAX_CONTENT_CHARS = 65536
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd|private[_-]?key)\s*[:=]\s*\S{8,}"),
@@ -2273,6 +2278,20 @@ def stats(conn):
     else:
         print("  embeddings=unavailable (embeddings module not importable)")
 
+    # Operational health: surface when maintenance last ran so an operator can
+    # tell from one command whether backup/consolidation are healthy (#37 L21).
+    # Both timestamps are written to the `meta` table by consolidate/backup;
+    # absence means "never" (a fresh store or one where the hooks never fired).
+    print("operational health:")
+    for label, key in (("last_backup", "last_backup"),
+                       ("last_consolidation", "last_consolidation")):
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        except Exception:
+            row = None
+        ts = row[0] if row and row[0] else None
+        print(f"  {label}: {ts if ts else '(never)'}")
+
 
 def get_memory(conn, mid) -> bool:
     """Print a memory as JSON. Returns True if found, False if not — so the CLI
@@ -4323,10 +4342,16 @@ def _render_pack(namespace: str, store_path: str, project_rows, global_rows, max
     silently delete every other memory from the pack.) A bullet is only ever
     added whole, never truncated.
 
-    Structural text (header comment, titles, section headings, the "(none)"
-    placeholder, the omitted-count note itself) is exempt from the cap: it is
-    small, mandatory framing, not budget-controlled content. max_bytes is
-    therefore a budget over emitted bullet lines, not a hard cap on the file.
+    Budget accounting: `max_bytes` is a budget over the WHOLE rendered pack
+    measured as UTF-8 bytes -- structural framing included. Each candidate
+    bullet is tested against the running `lines` (which already contains the
+    header comment, title, and any section headings/"(none)" placeholders
+    appended so far), so structural text DOES count toward the cap. The one
+    exception is the trailing omitted-count footer (appended after the budget
+    loop finishes), which is not budget-controlled -- it is a mandatory
+    accounting note and must always render so an operator can see rows were
+    dropped (#37 L1: earlier prose claimed structural text was "exempt from
+    the cap", but the budget check sums all accumulated lines).
 
     Every rendered field goes through _sanitize_pack_content first: pack rows
     can be remote-authored (Tier 3 sync) and the pack is read as context by

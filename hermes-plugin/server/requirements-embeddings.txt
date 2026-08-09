@@ -13,8 +13,16 @@
 # — a fresh install had no documented way to enable vector recall (#36 M16).
 # The PyPI distribution is `sqlite-vec` (the import name is `sqlite_vec`).
 #
+# All deps are RANGE-pinned (>=lower, <upper) on purpose: the store-host box
+# typically has its OWN numpy/onnxruntime (often a much larger ML stack), and an
+# exact pin here would force pip to clobber or conflict with the host's pins.
+# The ranges constrain to a known-compatible major band while letting the host
+# environment satisfy the install. No lockfile for the same reason (#37 L15) —
+# a lockfile would fight the host env.
+#
 # Install with:  pip install -r hermes-plugin/server/requirements-embeddings.txt
 onnxruntime>=1.16,<2.0
 tokenizers>=0.15,<1.0
 numpy>=1.24,<3.0
 sqlite-vec>=0.1.6,<1.0
+

@@ -1,4 +1,16 @@
 # zmem MCP server dependencies.
-# mcp version pins to match Hermes' bundled client (hermes/pyproject.toml).
-mcp==1.28.1
+#
+# All deps are RANGE-pinned on purpose (>=lower, <upper): the MCP server runs
+# inside a Hermes host / store-host environment that has its OWN copy of these
+# libraries, and an exact pin here would force pip to clobber or conflict with
+# the host's pins. The ranges constrain to a known-compatible major/minor band
+# while letting the host environment satisfy the install. No lockfile is
+# generated for the same reason — a lockfile pins an exact transitive set that
+# would fight the host env (#37 L15). If reproducible CI installs become a
+# requirement, scope a lockfile to the CI matrix only, not to this install spec.
+#
+# mcp: pinned to a band matching Hermes' bundled client (hermes/pyproject.toml).
+mcp>=1.28.1,<2.0.0
+# uvicorn: the ASGI server. The 0.x line is stable; cap below 1.0 until a 1.0
+# release is validated against the StreamableHTTP app.
 uvicorn>=0.30.0,<1.0.0
