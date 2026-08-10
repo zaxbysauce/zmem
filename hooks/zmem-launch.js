@@ -338,7 +338,13 @@ function buildCanonicalEnv(host, meta, hookName) {
             : [join(homedir(), ".claude", "skills"), join(homedir(), ".zcode", "skills")];
     const skillsDirs = process.env.ZMEM_SKILLS_DIRS || defaultSkillsDirs.join(delimiter);
     const tier0 = host === "zcode" ? "zmem" : "native";
-    const ctxBudget = host === "zcode" ? "25000" : "9000";
+    // Respect an operator-set ZMEM_CTX_BUDGET so resolveBudget() can actually
+    // observe, validate, and clamp it (#39 E3 / PRR-001). The former
+    // unconditional host default overwrote the env var before resolveBudget
+    // ran, making the validation unreachable and the knob dead end-to-end.
+    // Falls back to the host default when unset, matching the skillsDirs/zmemData
+    // pattern above.
+    const ctxBudget = process.env.ZMEM_CTX_BUDGET || (host === "zcode" ? "25000" : "9000");
 
     env.ZMEM_HOST = host;
     env.ZMEM_ROOT = getPluginRoot();
@@ -526,6 +532,33 @@ function translate(raw, host, hookName, budget) {
     return fitEnvelope(host, hookName, String(content), budget);
 }
 
+// Resolve and VALIDATE the context budget (issue #39 E3). A negative value is
+// truthy after parseInt (e.g. parseInt("-5") === -5), so the former
+// `parseInt(env.ZMEM_CTX_BUDGET, 10) || 9000` let it through: fitEnvelope then
+// saw `encodedSize(env) <= -5` as always false and returned {} — silently
+// injecting zero memory with no error anywhere. Non-numeric and zero are
+// already safe (NaN/0 are falsy → 9000), but this helper handles all invalid
+// shapes uniformly with a clear stderr warning, and clamps an absurdly large
+// value rather than letting the envelope swallow the whole context window.
+const BUDGET_DEFAULT = 9000;
+const BUDGET_MAX = 1000000; // ~15 max-size (65536-char) memories in one envelope
+function resolveBudget(env, stderrWriter) {
+    const raw = env && env.ZMEM_CTX_BUDGET;
+    const parsed = parseInt(raw, 10);
+    const warn = typeof stderrWriter === "function" ? stderrWriter
+        : (s) => process.stderr.write(s);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        warn(`zmem: invalid ZMEM_CTX_BUDGET=${JSON.stringify(raw)} `
+             + `(must be a positive integer); using default ${BUDGET_DEFAULT}\n`);
+        return BUDGET_DEFAULT;
+    }
+    if (parsed > BUDGET_MAX) {
+        warn(`zmem: ZMEM_CTX_BUDGET=${parsed} exceeds sane max ${BUDGET_MAX}; clamping\n`);
+        return BUDGET_MAX;
+    }
+    return parsed;
+}
+
 // --- Read all of stdin (buffered, for parse + verbatim replay) --------------
 function readStdin() {
     return new Promise((resolve) => {
@@ -577,7 +610,13 @@ async function main() {
     }
 
     const env = buildCanonicalEnv(host, prepared.meta, hookName);
-    const budget = parseInt(env.ZMEM_CTX_BUDGET, 10) || 9000;
+    const budget = resolveBudget(env);
+    // Export the validated/clamped budget so spawned hook scripts see the same
+    // effective value the launcher uses internally (#39 E3 / cubic-re #1).
+    // Without this, a huge operator-set ZMEM_CTX_BUDGET is clamped for
+    // fitEnvelope but propagated unclamped to child shell scripts that read
+    // $ZMEM_CTX_BUDGET directly.
+    env.ZMEM_CTX_BUDGET = String(budget);
     const translated = TRANSLATED_HOOKS.has(hookName);
     const bashPath = findBash();
 
@@ -645,6 +684,7 @@ module.exports = {
     makeEnvelope,
     fitEnvelope,
     translate,
+    resolveBudget,
     EVENT_MAP,
     TRANSLATED_HOOKS,
     NEEDS_NAMESPACE,

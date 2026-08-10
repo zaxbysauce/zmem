@@ -207,9 +207,12 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
       BG_SINK="$BG_LOG_PATH"
     fi
   fi
-  "$PYTHON_BIN" "$STORE_PY_PY" consolidate >>"$BG_SINK" 2>&1 &
-  "$PYTHON_BIN" "$STORE_PY_PY" backup --if-due --retention "${ZMEM_BACKUP_RETENTION:-7}" >>"$BG_SINK" 2>&1 &
-  "$PYTHON_BIN" "$STORE_PY_PY" sweep >>"$BG_SINK" 2>&1 &
+  # Batch the three cadence ops into ONE detached python process (#39 E9):
+  # consolidate + backup --if-due + sweep. Each keeps its own cadence gate /
+  # single-flight lock inside session-cadence, so this is behavior-equivalent
+  # to the former three-line spawn but starts one interpreter instead of three.
+  "$PYTHON_BIN" "$STORE_PY_PY" session-cadence \
+    --backup-retention "${ZMEM_BACKUP_RETENTION:-7}" >>"$BG_SINK" 2>&1 &
 fi
 
 # Canonical namespace from the host adapter (single derived key, closes the

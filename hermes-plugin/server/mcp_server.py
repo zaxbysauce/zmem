@@ -168,7 +168,7 @@ def _load_store_constants() -> None:
 _load_store_constants()
 
 
-def _log_embedding_availability() -> None:
+def _log_embedding_availability(return_status: bool = False):
     """Probe embedding availability at server startup and log it.
 
     Surface the degraded state LOUDLY at boot rather than discovering it
@@ -177,6 +177,11 @@ def _log_embedding_availability() -> None:
     embeddings module from the SAME checkout the `add` subprocesses run, under
     THIS server's interpreter (== the `sys.executable` _run_store uses), so
     the reported state matches what writes will actually experience.
+
+    When ``return_status`` is True, returns the embeddings ``availability_status``
+    dict (or {} if the probe could not run) so callers like the /health endpoint
+    (#39 E2) can reuse the data without re-probing. Default False preserves the
+    original log-only behavior.
     """
     # Resolve the store checkout inside the fail-open guard. _resolve_store_py
     # -> _resolve_zmem_home can abort the probe (and thus server boot) three
@@ -196,7 +201,7 @@ def _log_embedding_availability() -> None:
             "(ZMEM_HOME unset/invalid/inaccessible); skipping the availability "
             "probe and assuming degraded. add() may store rows without embeddings."
         )
-        return
+        return {} if return_status else None
     scripts_dir = str(store_py.parent)
     try:
         import importlib
@@ -234,6 +239,7 @@ def _log_embedding_availability() -> None:
                 status.get("models_dir"),
                 remedy,
             )
+        return status if return_status else None
     except Exception as exc:  # never block startup on a diagnostic
         logger.warning(
             "zmem embeddings: probe failed (%s: %s) — assuming degraded; "
@@ -241,6 +247,39 @@ def _log_embedding_availability() -> None:
             type(exc).__name__,
             exc,
         )
+        return {} if return_status else None
+
+
+def _compute_health() -> dict:
+    """Minimal liveness + readiness payload for the /health endpoint (#39 E2).
+
+    Returns ``{"ok": True, "store_resolved": <bool>, "embeddings_available": <bool>}``.
+    Deliberately minimal: no paths, no tokens, no introspection — the server is
+    unauthenticated by design, so the response must not leak install details.
+    Never raises; a probe failure degrades to the matching False field. ``ok`` is
+    always True if the handler itself ran (the server process is alive).
+    """
+    store_resolved = False
+    try:
+        _resolve_zmem_home()
+        store_resolved = True
+    except (Exception, SystemExit):
+        # _resolve_zmem_home raises SystemExit(2) on a missing/invalid ZMEM_HOME
+        # (BaseException, NOT caught by bare `except Exception`). A misconfigured
+        # home must degrade to store_resolved=False, not 500 the health endpoint.
+        store_resolved = False
+    embeddings_available = False
+    try:
+        status = _log_embedding_availability(return_status=True) or {}
+        embeddings_available = bool(status.get("available"))
+    except (Exception, SystemExit):
+        embeddings_available = False
+    return {
+        "ok": True,
+        "store_resolved": store_resolved,
+        "embeddings_available": embeddings_available,
+    }
+
 
 
 def _run_store(args: list[str]) -> dict[str, Any]:
@@ -475,6 +514,20 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ),
         token_verifier=verifier,
     )
+
+    # Minimal unauthenticated liveness + readiness route (#39 E2). FastMCP's
+    # custom_route decorator registers a Starlette route that does NOT require
+    # authorization — the documented pattern for public health checks. Wrapped
+    # in try/except so an mcp version without custom_route degrades gracefully
+    # (the server still starts; /health just 404s). The response carries no
+    # paths, tokens, or introspection — only ok/store_resolved/embeddings_available.
+    try:
+        @mcp.custom_route("/health", methods=["GET"])
+        async def _health(request):  # type: ignore[no-untyped-def]  # noqa: ANN001
+            from starlette.responses import JSONResponse
+            return JSONResponse(_compute_health())
+    except (AttributeError, TypeError):
+        logger.info("zmem: /health route not registered (mcp version lacks custom_route)")
 
     @mcp.tool()
     async def recall(

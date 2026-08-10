@@ -236,8 +236,15 @@ class L21StatsOperationalHealth(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertIn("last_backup:", r2.stdout)
         self.assertNotIn("last_backup: (never)", r2.stdout)
-        # The timestamp is an ISO 8601 UTC string.
-        self.assertRegex(r2.stdout, r"last_backup: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+        # E1 (#39) added relative recency ("just now"/"Nd ago") before the raw
+        # ISO timestamp, which is now in parentheses. The ISO value must still
+        # be present so the exact time is recoverable. The recency prefix is
+        # matched explicitly (not a .+ wildcard) so a regression that drops it
+        # fails (PRR-010).
+        self.assertRegex(
+            r2.stdout,
+            r"last_backup: (just now|\d+[mhd] ago) \(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\)",
+        )
 
 
 # ---------------------------------------------------------------------------

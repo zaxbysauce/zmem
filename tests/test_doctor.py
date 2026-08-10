@@ -441,6 +441,134 @@ class DoctorCliTest(unittest.TestCase):
         schema = next(c for c in report["checks"] if c["id"] == "schema-version")
         self.assertEqual(schema["status"], "fail", schema)
 
+    # ------------------------------------------------------------------
+    # E8 (#39): pending namespace-migration preview in doctor
+    # ------------------------------------------------------------------
+    def _make_store_with_rows(self, store_path: Path, rows: list[tuple[str, str]],
+                              schema_version: int = CURRENT_SCHEMA_VERSION) -> None:
+        """Create a minimal store with a meta + memory table populated with
+        (namespace, content) rows. Used by the ns-migration preview tests."""
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(store_path))
+        try:
+            conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
+                (str(schema_version),),
+            )
+            conn.execute(
+                "CREATE TABLE memory(id TEXT PRIMARY KEY, namespace TEXT, "
+                "content TEXT, superseded_at TEXT)"
+            )
+            for i, (ns, content) in enumerate(rows):
+                conn.execute(
+                    "INSERT INTO memory(id, namespace, content, superseded_at) "
+                    "VALUES (?, ?, ?, NULL)",
+                    (f"row-{i}", ns, content),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _disable_native_memory(self):
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "\n".join(
+                ["[features]", "memories = false", "", "[memories]",
+                 "use_memories = false", "generate_memories = false"]
+            ),
+        )
+
+    def test_ns_migration_pass_when_no_map_configured(self):
+        """No ZMEM_NS_MIGRATION_MAP -> the self-heal is inactive; doctor passes."""
+        self._disable_native_memory()
+        store_dir = self.home / ".zmem"
+        self._make_store_with_rows(
+            store_dir / "store.sqlite",
+            [("project:foo", "some content")],
+        )
+        env = self._base_env()
+        env.pop("ZMEM_NS_MIGRATION_MAP", None)
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project), env=env,
+        )
+        report = json.loads(result.stdout)
+        nsm = next(c for c in report["checks"] if c["id"] == "ns-migration")
+        self.assertEqual(nsm["status"], "pass", nsm)
+
+    def test_ns_migration_pass_when_map_set_but_no_stranded_rows(self):
+        """Map configured but no rows carry old-style keys -> pass."""
+        self._disable_native_memory()
+        store_dir = self.home / ".zmem"
+        self._make_store_with_rows(
+            store_dir / "store.sqlite",
+            [("project:github.com/Example/Widget", "content")],  # already re-keyed
+        )
+        env = self._base_env()
+        env["ZMEM_NS_MIGRATION_MAP"] = json.dumps(
+            {"project:oldwidget": str(self.project)}
+        )
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project), env=env,
+        )
+        report = json.loads(result.stdout)
+        nsm = next(c for c in report["checks"] if c["id"] == "ns-migration")
+        self.assertEqual(nsm["status"], "pass", nsm)
+
+    def test_ns_migration_warn_when_stranded_rows_present(self):
+        """Rows still carrying an old-style namespace key -> warn with count."""
+        self._disable_native_memory()
+        store_dir = self.home / ".zmem"
+        self._make_store_with_rows(
+            store_dir / "store.sqlite",
+            [
+                ("project:oldwidget", "content one"),
+                ("project:oldwidget", "content two"),  # same old ns, 2 rows
+                ("user:global", "unrelated"),          # not in the map
+            ],
+        )
+        env = self._base_env()
+        env["ZMEM_NS_MIGRATION_MAP"] = json.dumps(
+            {"project:oldwidget": str(self.project)}
+        )
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project), env=env,
+        )
+        report = json.loads(result.stdout)
+        nsm = next(c for c in report["checks"] if c["id"] == "ns-migration")
+        self.assertEqual(nsm["status"], "warn", nsm)
+        self.assertEqual(nsm["details"].get("stranded_count"), 1,
+                         "count is DISTINCT namespaces, so 2 rows under one "
+                         "old-style key count as 1")
+        self.assertIn("oldwidget", nsm["summary"])
+
+    def test_ns_migration_invalid_json_does_not_crash(self):
+        """Invalid ZMEM_NS_MIGRATION_MAP JSON -> treated as unconfigured (pass),
+        never a crash."""
+        self._disable_native_memory()
+        store_dir = self.home / ".zmem"
+        self._make_store_with_rows(
+            store_dir / "store.sqlite",
+            [("project:foo", "content")],
+        )
+        env = self._base_env()
+        env["ZMEM_NS_MIGRATION_MAP"] = "{not valid json"
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project), env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        nsm = next(c for c in report["checks"] if c["id"] == "ns-migration")
+        self.assertEqual(nsm["status"], "pass", nsm)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

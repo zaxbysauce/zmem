@@ -23,7 +23,7 @@ from __future__ import annotations
 
 # Bumped by store.py's migration machinery; doctor.py reads it to decide
 # pass/warn/fail. Edit HERE and both consumers stay in sync.
-SUPPORTED_SCHEMA_VERSION = 7
+SUPPORTED_SCHEMA_VERSION = 8
 
 # The meta-table key under which the version is stored in the store.
 SCHEMA_VERSION_KEY = "schema_version"

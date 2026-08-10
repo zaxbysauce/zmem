@@ -432,6 +432,126 @@ class LoadPathChecksumTests(unittest.TestCase):
                          "load-failed model must not report reason=ok")
 
 
+class AvailabilityChecksumBoundaryTests(unittest.TestCase):
+    """#39 E6 (test gap G-05): pin the boundary between the AVAILABILITY probe
+    (presence-only, `_check_available`/`is_available`/`availability_status`) and
+    the TRUSTWORTHINESS gate (checksum, enforced only in `_ensure_loaded`).
+
+    The load-path checksum rejection is covered by LoadPathChecksumTests above.
+    What is NOT pinned there: availability_status() reports a pre-existing model
+    file as `available=True` with `checksum_ok=None` (not yet checked) — even
+    when the file is tampered. This is a deliberate two-layer design: a short-
+    lived CLI process that never embeds must not pay the checksum cost, and must
+    not false-negative a legitimate-but-unchecked file. A future refactor that
+    collapses the layers (checksum-gating availability, or reporting checksum_ok
+    before any load) would break this invariant, so we pin it here."""
+
+    def setUp(self):
+        if not _EMBEDDING_DEPS_IMPORTABLE:
+            self.skipTest("embedding deps not installed (CI) — the availability/"
+                          "checksum boundary needs importable onnxruntime to reach "
+                          "the file-existence checks")
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_model_files(self, model_bytes: bytes) -> Path:
+        d = Path(self.tmp) / "models"
+        d.mkdir(exist_ok=True)
+        (d / "minilm.onnx").write_bytes(model_bytes)
+        (d / "tokenizer.json").write_bytes(b"{}")
+        return d
+
+    def _availability_in_subprocess(self, models_dir: Path) -> dict:
+        """Probe availability_status() in a FRESH interpreter so the module-level
+        state (_model_checksum_ok=None, _model_load_failed=False, _model_available=None)
+        is exactly what a short-lived CLI process sees before any embed."""
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
+            "import embeddings\n"
+            "import onnxruntime  # present so the import gate passes\n"
+            "st = embeddings.availability_status()\n"
+            "import json\n"
+            "print('JSON=' + json.dumps(st))\n"
+        )
+        env = {**os.environ, "ZMEM_MODELS_DIR": str(models_dir),
+               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        r = subprocess.run([PYTHON, "-c", script], capture_output=True,
+                           text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for line in r.stdout.splitlines():
+            if line.startswith("JSON="):
+                import json
+                return json.loads(line[len("JSON="):])
+        self.fail(f"no JSON= line in subprocess output: {r.stdout!r} / {r.stderr!r}")
+
+    def test_availability_is_presence_only_before_any_load(self):
+        """A pre-existing, UNTAMPERED-looking model file (correct shape, both
+        files present, deps importable) is reported available=True with
+        checksum_ok=None — the availability probe does NOT checksum."""
+        d = self._write_model_files(b"fake-but-present model bytes" * 50)
+        st = self._availability_in_subprocess(d)
+        self.assertTrue(st["available"], f"expected available=True, got {st}")
+        self.assertEqual(st["reason"], "ok", st)
+        self.assertTrue(st["model_file"], st)
+        self.assertTrue(st["tokenizer_file"], st)
+        # The key invariant: availability does NOT checksum before any load.
+        self.assertIsNone(st["checksum_ok"],
+                          "checksum_ok must be None before any load attempt — "
+                          "availability is presence-only (G-05 boundary)")
+        self.assertFalse(st["load_failed"], st)
+
+    def test_availability_reports_tampered_file_as_present_before_load(self):
+        """The boundary invariant, stressed: a TAMPERED model file (wrong
+        checksum) is STILL reported available=True / model_file=True /
+        checksum_ok=None by the availability probe, because availability only
+        checks file existence. The checksum gate fires separately on the load
+        path (tested in LoadPathChecksumTests). Pinning this prevents a refactor
+        that collapses availability and trustworthiness."""
+        d = self._write_model_files(b"tampered model bytes that are wrong" * 50)
+        st = self._availability_in_subprocess(d)
+        # File exists → availability reports present, even though checksum is wrong.
+        self.assertTrue(st["model_file"], st)
+        # Before any load, availability has not checksummed → still 'ok' shape.
+        self.assertTrue(st["available"],
+                        "availability is presence-only: a tampered-but-present "
+                        f"file is available=True before any load. got {st}")
+        self.assertEqual(st["reason"], "ok", st)
+        # checksum_ok is None (not False) because NO load has run in this fresh
+        # process. _ensure_loaded is what would flip it to False.
+        self.assertIsNone(st["checksum_ok"], st)
+
+
+class AvailabilityChecksumBoundaryDepsAbsentTests(unittest.TestCase):
+    """#39 E6 / PRR-007: a CI-RUNNABLE (deps-absent) pin for the
+    availability/checksum boundary. When embedding deps are NOT importable
+    (the CI state), availability_status() short-circuits to
+    reason='imports_missing' / available=False — but the key boundary
+    invariant still holds: checksum_ok is None (availability NEVER checksums,
+    even in the degraded state). This runs in CI (no skip), complementing the
+    deps-present tests above which only run on a dev box."""
+
+    def test_checksum_ok_is_none_when_deps_absent(self):
+        """availability_status() must report checksum_ok=None when deps are
+        absent — the availability probe never checksums, so the two-layer
+        boundary holds even in the imports-missing state. available=False
+        because imports are missing (NOT because of a checksum)."""
+        st = embeddings.availability_status()
+        # The boundary invariant: availability does not checksum.
+        self.assertIsNone(st["checksum_ok"],
+                          "checksum_ok must be None — availability is presence-"
+                          "only and never checksums, even when deps are absent")
+        # When deps are absent, the reason is imports_missing (not a checksum
+        # or file problem). This is the deps-absent shape.
+        if not _EMBEDDING_DEPS_IMPORTABLE:
+            self.assertFalse(st["available"], st)
+            self.assertEqual(st["reason"], "imports_missing", st)
+
+
 class LexicalHelperTests(unittest.TestCase):
     """Unit tests for store.py's Jaccard token-overlap clustering helpers."""
 

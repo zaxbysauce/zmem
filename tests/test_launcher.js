@@ -1228,6 +1228,54 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
     }
 }
 
+// --- E3 (#39): ZMEM_CTX_BUDGET validation + clamping -----------------------
+// A negative value is truthy after parseInt and previously bypassed the
+// `|| 9000` fallback, making fitEnvelope return {} (silent zero-memory
+// injection). resolveBudget must reject/clamp invalid shapes.
+(function budgetTests() {
+    console.log("\n# E3: ZMEM_CTX_BUDGET validation");
+    const { resolveBudget } = launch;
+    const warned = [];
+    const w = (s) => warned.push(s);
+
+    eq("budget[-5]: negative is invalid -> default 9000", resolveBudget({ ZMEM_CTX_BUDGET: "-5" }, w), 9000);
+    eq("budget[0]: zero is invalid -> default 9000", resolveBudget({ ZMEM_CTX_BUDGET: "0" }, w), 9000);
+    eq("budget[abc]: non-numeric -> default 9000", resolveBudget({ ZMEM_CTX_BUDGET: "abc" }, w), 9000);
+    eq("budget[undefined]: missing -> default 9000", resolveBudget({ ZMEM_CTX_BUDGET: undefined }, w), 9000);
+    eq("budget[empty]: empty string -> default 9000", resolveBudget({ ZMEM_CTX_BUDGET: "" }, w), 9000);
+    eq("budget[null env]: no env -> default 9000", resolveBudget({}, w), 9000);
+    eq("budget[25000]: valid -> 25000", resolveBudget({ ZMEM_CTX_BUDGET: "25000" }, w), 25000);
+    eq("budget[30000]: valid -> 30000", resolveBudget({ ZMEM_CTX_BUDGET: "30000" }, w), 30000);
+    eq("budget[1]: minimum valid positive -> 1", resolveBudget({ ZMEM_CTX_BUDGET: "1" }, w), 1);
+    // Clamp: an absurdly large value is clamped to the sane max, not passed through.
+    eq("budget[1000001]: over max -> clamped to 1000000", resolveBudget({ ZMEM_CTX_BUDGET: "1000001" }, w), 1000000);
+    eq("budget[1000000]: exactly max -> 1000000", resolveBudget({ ZMEM_CTX_BUDGET: "1000000" }, w), 1000000);
+
+    // Warnings: invalid shapes emit a stderr warning (so the footgun is
+    // diagnosable); valid values do not.
+    warned.length = 0;
+    resolveBudget({ ZMEM_CTX_BUDGET: "-5" }, w);
+    ok("budget[-5] emits a stderr warning", warned.length === 1 && /ZMEM_CTX_BUDGET/.test(warned[0]),
+       `got ${JSON.stringify(warned)}`);
+    warned.length = 0;
+    resolveBudget({ ZMEM_CTX_BUDGET: "25000" }, w);
+    ok("budget[25000] emits NO warning", warned.length === 0, `got ${JSON.stringify(warned)}`);
+    warned.length = 0;
+    resolveBudget({ ZMEM_CTX_BUDGET: "1000001" }, w);
+    ok("budget[1000001] emits a clamp warning", warned.length === 1 && /clamp/.test(warned[0]),
+       `got ${JSON.stringify(warned)}`);
+
+    // The original silent-zero-injection vector is closed: a negative budget
+    // no longer reaches fitEnvelope. Demonstrate by confirming resolveBudget
+    // never returns a non-positive value for any input shape.
+    let allPositive = true;
+    for (const v of ["-5", "-1", "0", "", "abc", null, undefined, "NaN", "-999999"]) {
+        const b = resolveBudget({ ZMEM_CTX_BUDGET: v }, () => {});
+        if (!(b > 0)) { allPositive = false; break; }
+    }
+    ok("budget: resolveBudget never returns a non-positive value (closes silent-injection vector)", allPositive);
+})();
+
 // --- cleanup + report ------------------------------------------------------
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }
 

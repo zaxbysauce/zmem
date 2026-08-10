@@ -458,5 +458,39 @@ class NegativeLimitArgTest(_StoreCase):
         self.assertIn("--global-limit", r.stderr)
 
 
+class ExportPackHelpTests(unittest.TestCase):
+    """#39 E7: export-pack's argparse help documents the exit-code contract
+    (0 success / 2 empty), with newlines preserved via
+    RawDescriptionHelpFormatter. Without the formatter, argparse collapses the
+    multi-line epilog into one line."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-packhelp-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.env = _base_env(self.tmp)
+
+    def test_help_documents_exit_codes(self):
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), "export-pack", "--help"],
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Exit codes", r.stdout)
+        self.assertIn("0", r.stdout)
+        self.assertIn("2", r.stdout)
+        # Newlines preserved: "Exit codes:" is followed by a newline and the
+        # "0" entry on its own line (RawDescriptionHelpFormatter). If the
+        # formatter were missing, argparse would collapse this to one line.
+        self.assertRegex(r.stdout, r"Exit codes:\s*\n\s*0\s")
+
+    def test_help_references_docs(self):
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), "export-pack", "--help"],
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("CLOUD.md", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

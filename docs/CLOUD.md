@@ -13,6 +13,12 @@ capability:
 | 2 — closeout-remote + /ingest-harvest | Write path, but staged through human/agent review before it lands | Medium |
 | 3 — Private sync repo | Full read (FTS-only recall) + write (outbox) loop, no manual copy/paste | Highest |
 
+**Quick decision tree:**
+
+- Need the cloud session to just *know* your conventions (read-only)? → **Tier 1**
+- Need it to occasionally *write back* discoveries for review before they land? → **Tier 2**
+- Need a frequent, no-copy-paste read + write loop? → **Tier 3**
+
 Pick the lowest tier that solves your problem. Tier 1 alone is enough for
 "the cloud session should know our conventions." Tier 2 is enough for
 occasional cloud sessions that discover something worth keeping. Tier 3 is
