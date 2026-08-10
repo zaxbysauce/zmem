@@ -176,9 +176,40 @@ export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 # starting at once are safe by construction; do not "harden" it with the
 # consolidate/backup single-flight unless a real race is demonstrated.
 if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
-  "$PYTHON_BIN" "$STORE_PY_PY" consolidate >/dev/null 2>&1 &
-  "$PYTHON_BIN" "$STORE_PY_PY" backup --if-due --retention "${ZMEM_BACKUP_RETENTION:-7}" >/dev/null 2>&1 &
-  "$PYTHON_BIN" "$STORE_PY_PY" sweep >/dev/null 2>&1 &
+  # Background maintenance log (#37 L22): consolidate/backup/sweep previously
+  # redirected to /dev/null, which hid cadence skips and errors completely —
+  # an operator had no way to tell maintenance had silently stopped running.
+  # Now the three detached jobs append to a log file under the data dir (shell
+  # `>>` opens with O_APPEND, so concurrent appends from the three jobs never
+  # corrupt — lines may interleave, never tear). `ZMEM_BG_LOG=0` restores the
+  # old silent (/dev/null) behavior. Best-effort: if the data dir is missing
+  # or the path is unwritable, the redirect target falls back to /dev/null so
+  # the hook never wedges session-start on a logging failure. The log is
+  # unbounded by design — operators truncate or rotate it manually (it only
+  # grows when a maintenance job actually runs, which is cadence-gated, so in
+  # steady state it gains a handful of lines per day). Note: the log captures
+  # the maintenance commands' stdout/stderr, which may include absolute store
+  # paths and snapshot filenames — it is a plaintext file under the (typically
+  # owner-only) data dir, and ZMEM_BG_LOG=0 disables it entirely if the info
+  # surface is undesirable on a shared/co-located box (PRR-011).
+  BG_SINK="/dev/null"
+  if [ "${ZMEM_BG_LOG:-1}" != "0" ] && [ -n "$DATA_DIR" ]; then
+    BG_LOG_PATH="$DATA_DIR/zmem-bg.log"
+    # Ensure the dir exists, is writable, AND the log file itself is appendable
+    # before redirecting into it. The `{ : 2>/dev/null >>file ; }` probe opens
+    # the file for append (creating it if absent) with stderr silenced FIRST —
+    # if an EXISTING log file is read-only or locked, the probe fails quietly
+    # and we fall through to /dev/null rather than leaking a "Permission denied"
+    # to the hook's stderr or letting the later `>>"$BG_SINK"` redirect fail
+    # silently and drop all maintenance output (PRR-004). Strict conjunction
+    # (no `||`) so any failure falls through to /dev/null.
+    if mkdir -p "$DATA_DIR" 2>/dev/null && [ -w "$DATA_DIR" ] && { : 2>/dev/null >>"$BG_LOG_PATH"; }; then
+      BG_SINK="$BG_LOG_PATH"
+    fi
+  fi
+  "$PYTHON_BIN" "$STORE_PY_PY" consolidate >>"$BG_SINK" 2>&1 &
+  "$PYTHON_BIN" "$STORE_PY_PY" backup --if-due --retention "${ZMEM_BACKUP_RETENTION:-7}" >>"$BG_SINK" 2>&1 &
+  "$PYTHON_BIN" "$STORE_PY_PY" sweep >>"$BG_SINK" 2>&1 &
 fi
 
 # Canonical namespace from the host adapter (single derived key, closes the

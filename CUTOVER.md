@@ -29,7 +29,7 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 - local/non-OneDrive path safety
 - Python, SQLite FTS5, Node, and Windows shell prerequisites
 - best-effort read/write access to the target path
-- schema compatibility against current v5
+- schema compatibility against current v7
 - Claude and Codex native-memory conflicts
 - canonical namespace derivation for the target project
 - required host surfaces and optional Codex adapter files
@@ -108,7 +108,7 @@ If you still have a legacy store, import it into the canonical shared path:
 python skills/memory/scripts/import-store.py --source <legacy-store.sqlite> --dest-dir <canonical-dir> --force
 ```
 
-Before opening a v4 store with the v5 runtime, provide every legacy project
+Before opening a v4 store with the v7 runtime, provide every legacy project
 namespace that must be re-keyed:
 
 ```powershell

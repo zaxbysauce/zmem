@@ -26,7 +26,23 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+try:
+    from agent.memory_provider import MemoryProvider
+except ModuleNotFoundError as _exc:
+    # Only rewrap when the missing module is agent/agent.memory_provider itself.
+    # A ModuleNotFoundError raised TRANSITIVELY (a broken sub-dependency inside
+    # agent.memory_provider) carries a different `.name` and must propagate with
+    # its original traceback so the operator sees the real cause — wrapping it
+    # as "host module missing" here would misreport and hide it (PRR-003).
+    if _exc.name not in {"agent", "agent.memory_provider"}:
+        raise
+    raise ImportError(
+        "zmem: 'agent.memory_provider' could not be imported. It is provided by "
+        "the Hermes host runtime (it is NOT a pip package and is intentionally "
+        "not declared in requirements.txt), so this provider can only be loaded "
+        "inside a Hermes host process that places it on sys.path. If you are "
+        "seeing this outside Hermes, this import is expected to fail."
+    ) from None
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +152,54 @@ def _host():
     return mod
 
 
+# Lazily-resolved write-path constants, imported once from the dependency-free,
+# side-effect-free schema_meta module (the SAME source of truth store.py uses).
+# Re-resolved on each call so a test that repoints ZMEM_HOME picks up the move;
+# returns module-level Python defaults if the module can't be located (so the
+# provider degrades rather than crashing agent init — the values are stable
+# enough that a stale local copy is safer than a hard failure here).
+_STORE_CONSTANTS = {
+    "ALLOWED_SIGNALS": ("test", "compile", "lint", "reviewer", "user", "none"),
+    "ALLOWED_TYPES": ("fact", "lesson", "convention", "preference"),
+    "MAX_CONTENT_CHARS": 65536,
+}
+
+
+def _store_constants() -> Dict[str, Any]:
+    """Best-effort load of ALLOWED_SIGNALS / ALLOWED_TYPES / MAX_CONTENT_CHARS
+    from ``schema_meta`` (the single source of truth shared with store.py).
+
+    Importing store.py itself just to read three constants is risky — it is a
+    ~250 KB CLI module with env-var reads and embedding/sqlite side effects at
+    import time. ``schema_meta`` is deliberately tiny and dependency-free so it
+    imports with no side effects. Falls back to the module-level defaults above
+    if the file can't be located, and logs the divergence (#37 L7/L8: keeps the
+    local Hermes validation in lock-step with the MCP and CLI paths without
+    re-typing the literals).
+    """
+    try:
+        import importlib.util
+        home = _resolve_zmem_home()
+        if home is None:
+            return dict(_STORE_CONSTANTS)
+        meta_path = home / "skills" / "memory" / "scripts" / "schema_meta.py"
+        if not meta_path.is_file():
+            return dict(_STORE_CONSTANTS)
+        spec = importlib.util.spec_from_file_location("zmem_schema_meta", meta_path)
+        if spec is None or spec.loader is None:
+            return dict(_STORE_CONSTANTS)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return {
+            "ALLOWED_SIGNALS": getattr(mod, "ALLOWED_SIGNALS", _STORE_CONSTANTS["ALLOWED_SIGNALS"]),
+            "ALLOWED_TYPES": getattr(mod, "ALLOWED_TYPES", _STORE_CONSTANTS["ALLOWED_TYPES"]),
+            "MAX_CONTENT_CHARS": getattr(mod, "MAX_CONTENT_CHARS", _STORE_CONSTANTS["MAX_CONTENT_CHARS"]),
+        }
+    except Exception as exc:
+        logger.debug("zmem: schema_meta constants load failed (%s); using defaults", exc)
+        return dict(_STORE_CONSTANTS)
+
+
 def _python_bin() -> str:
     """Python interpreter for store.py subprocess. Prefer the current one."""
     return sys.executable or "python"
@@ -227,6 +291,17 @@ _SEARCH_SCHEMA: Dict[str, Any] = {
     },
 }
 
+# Source the type/signal enums from schema_meta (via the same loader _tool_add
+# uses) so the tool SCHEMA the agent sees and the runtime VALIDATION share one
+# source of truth — previously this was a 5th hard-coded copy of the enums that
+# bypassed schema_meta entirely (PRR-014). The schema snapshot is taken once at
+# import (MCP tool schemas are static by contract), while _tool_add re-resolves
+# per call so a test that repoints ZMEM_HOME picks up the move; in steady state
+# (no mid-process ZMEM_HOME change) the two are identical.
+_SCHEMA_CONSTANTS = _store_constants()
+_ADD_TYPE_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_TYPES"])
+_ADD_SIGNAL_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_SIGNALS"])
+
 _ADD_SCHEMA: Dict[str, Any] = {
     "name": "zmem_add",
     "description": (
@@ -241,7 +316,7 @@ _ADD_SCHEMA: Dict[str, Any] = {
         "properties": {
             "type": {
                 "type": "string",
-                "enum": ["fact", "lesson", "convention", "preference"],
+                "enum": _ADD_TYPE_ENUM,
                 "description": "Memory type.",
             },
             "content": {
@@ -258,7 +333,7 @@ _ADD_SCHEMA: Dict[str, Any] = {
             },
             "signal": {
                 "type": "string",
-                "enum": ["test", "compile", "lint", "reviewer", "user", "none"],
+                "enum": _ADD_SIGNAL_ENUM,
                 "description": "How strongly grounded this memory is.",
             },
             "source_ref": {
@@ -497,16 +572,36 @@ class ZmemMemoryProvider(MemoryProvider):
         return json.dumps({"results": items, "count": len(items)})
 
     def _tool_add(self, args: Dict[str, Any]) -> str:
+        consts = _store_constants()
         mtype = (args.get("type") or "").strip()
         content = (args.get("content") or "").strip()
         if not mtype:
             return _tool_error("Missing required parameter: type")
         if not content:
             return _tool_error("Missing required parameter: content")
-        if mtype not in ("fact", "lesson", "convention", "preference"):
-            return _tool_error(f"Invalid type: {mtype}")
+        if mtype not in consts["ALLOWED_TYPES"]:
+            return _tool_error(
+                "type must be one of: " + ", ".join(consts["ALLOWED_TYPES"])
+            )
+        # Reject oversize content at the boundary with a clean message, mirroring
+        # the MCP path — without this the local Hermes path forwarded raw,
+        # unclamped content to store.py and surfaced an opaque stderr blob on
+        # the cap (#37 L8). Both paths now enforce the same MAX_CONTENT_CHARS.
+        if len(content) > consts["MAX_CONTENT_CHARS"]:
+            return _tool_error(
+                f"content is {len(content)} chars, over the "
+                f"{consts['MAX_CONTENT_CHARS']} limit"
+            )
         ns = (args.get("namespace") or self._namespace).strip()
         signal = (args.get("signal") or "none").strip()
+        # Validate --signal against the allowed enum at the boundary (mirrors the
+        # MCP path) so an invalid signal gets a clean message instead of an opaque
+        # store.py argparse `invalid choice` blob wrapped in "Add failed: ..."
+        # (#37 L7).
+        if signal not in consts["ALLOWED_SIGNALS"]:
+            return _tool_error(
+                "signal must be one of: " + ", ".join(consts["ALLOWED_SIGNALS"])
+            )
         tags = (args.get("tags") or "").strip()
         source_ref = (args.get("source_ref") or "").strip()
         if not source_ref and self._session_id:

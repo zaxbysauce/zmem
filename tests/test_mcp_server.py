@@ -115,7 +115,8 @@ class McpServerToolSurfaceTest(unittest.TestCase):
     def _call(self, name: str, **args):
         """Invoke a tool through the ToolManager (context-free) and return the
         raw result. FastMCP tool closures return a dict, so this returns the
-        dict directly (verified against mcp==1.28.1)."""
+        dict directly (verified against mcp 1.28.1; requirements pin
+        mcp>=1.28.1,<2.0.0)."""
         return asyncio.run(
             self.server._tool_manager.call_tool(name, args, context=None))
 

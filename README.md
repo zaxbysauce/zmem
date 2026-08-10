@@ -224,7 +224,7 @@ the remote Hermes at it. The remote gets the same `recall` / `add` / `search`
 **On the store-host box** (this machine, with `~/.zmem/store.sqlite`):
 
 ```bash
-pip install -r hermes-plugin/server/requirements.txt   # mcp==1.28.1, uvicorn
+pip install -r hermes-plugin/server/requirements.txt   # mcp>=1.28.1,<2.0.0, uvicorn
 
 # Generate a strong token:
 python -c "import secrets; print(secrets.token_hex(32))"
@@ -265,16 +265,82 @@ No zmem checkout or plugin install needed on the remote box.
 
 #### Hermes adapter env vars
 
+Paths / store resolution:
+
 | Var | Purpose | Default |
 |-----|---------|---------|
 | `ZMEM_HOME` | Path to the zmem checkout (where `store.py` lives). **Required for copy installs;** optional for symlink/junction. | — |
 | `ZMEM_DATA` | Override the store data directory (holds `store.sqlite` + `core.md`). | `~/.zmem` |
 | `ZMEM_STORE` | Override the store SQLite path directly (wins over `ZMEM_DATA`). | — |
-| `ZMEM_NAMESPACE` | Force a namespace for the local provider (e.g. `project:myrepo`). Default derives from gateway `user_id`. | derived |
+| `ZMEM_BACKUP_DIR` | Override the directory snapshots are written to (`store.py backup`). Off-volume recommended for drive-loss protection. | `<store dir>/backups` |
+| `ZMEM_CORE_MD` | Override the Tier-0 `core.md` path directly (wins over the store-dir default). | `<data dir>/core.md` |
+| `ZMEM_SKILLS_DIRS` | Extra directories searched for skill-promotion scanning (`;`-delimited on Windows, `:` elsewhere). | derived |
+| `ZMEM_PROMOTION_REVIEW_DIR` | Directory holding promotion-review artifacts (the `promote` flow). | derived |
+
+Namespace / host:
+
+| Var | Purpose | Default |
+|-----|---------|---------|
+| `ZMEM_NAMESPACE` | Force a namespace for the local provider (e.g. `project:myrepo`). Default derives from the git remote. | derived |
+| `ZMEM_HOST` | Identify the host adapter (`zmem` / `claude` / `codex`) for host-specific gating (Tier-0 injection, native-memory nudge). | derived |
+| `ZMEM_TIER0` | Tier-0 gating mode: `zmem` (inject core.md + AGENTS.md) vs `native` (CC native memory). | derived |
+| `ZMEM_PROXY_FORGE_HOST` | Forward the local provider's tools through a host adapter's forge endpoint. | unset |
+| `ZMEM_BASH_PATH` | Path to a bash binary (used when the default `bash` is not on PATH, e.g. some Windows setups). | `bash` |
+
+Maintenance cadence (the session-start hook runs `backup --if-due`, `consolidate`, and `sweep` on these cadences):
+
+| Var | Purpose | Default |
+|-----|---------|---------|
+| `ZMEM_BACKUP_INTERVAL_DAYS` | `backup --if-due` runs at most once per this many days. | `1` |
+| `ZMEM_BACKUP_RETENTION` | Number of snapshots kept by `backup --retention`. | `7` |
+| `ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS` | Minimum days between consolidate runs (unless `--force` or growth exceeds the threshold). | `7` |
+| `ZMEM_CONSOLIDATE_GROWTH_THRESHOLD` | Consolidate runs early if live rows grew by at least this fraction since the last run. | `0.20` |
+| `ZMEM_SENTINEL_SWEEP_DAYS` | `sweep` prunes per-session cooldown markers older than this many days. | `7` |
+| `ZMEM_BG_LOG` | Set `0` to send session-start maintenance output (consolidate/backup/sweep) to `/dev/null` instead of `<data dir>/zmem-bg.log`. | `1` |
+
+Consolidate / recall / dedup tuning:
+
+| Var | Purpose | Default |
+|-----|---------|---------|
+| `ZMEM_CONSOLIDATE_THRESHOLD` | Cosine similarity above which two memories consolidate (embedding mode). | `0.80` |
+| `ZMEM_CONSOLIDATE_LEXICAL_THRESHOLD` | Jaccard token-overlap threshold used in the no-embeddings lexical fallback. | `0.60` |
+| `ZMEM_DEDUP_THRESHOLD` | Cosine similarity above which an incoming memory is deduped against an existing one. | `0.85` |
+| `ZMEM_CTX_BUDGET` | Approx byte budget for the Tier-1 pack / context payload. Host-dependent when unset: `25000` (ZCode) vs `9000` (Claude Code / Codex). | `25000` / `9000` |
 | `ZMEM_CONVENTION_INTERVAL` | Fire the convention nudge every N successful tool calls. | `10` |
+
+Capture:
+
+| Var | Purpose | Default |
+|-----|---------|---------|
+| `ZMEM_CAPTURE_MODE` | Capture policy for writes: `manual` (advisory secret warnings only, trusted local use) or `auto` (redact secret-like content, refuse secret-like provenance — the MCP/network default). | `manual` |
+
+Embedding model (the model file is gitignored; these control how/whether it is obtained):
+
+| Var | Purpose | Default |
+|-----|---------|---------|
+| `ZMEM_MODEL_AUTODOWNLOAD` | Set `1` to attempt a lazy download of the embedding model when absent. Defaults to `0` (off; the download is opt-in and the CI sets it to `0`). | `0` |
+| `ZMEM_MODEL_URL` | URL fetched for the lazy download. The default Xenova export is NOT byte-identical to the pinned checksum (`_MODEL_SHA256` in `embeddings.py`, a deliberately hard-coded trust root — there is no env override for it); see the PLAN.md §7-P10 known gap. | Xenova HF URL |
+| `ZMEM_MODELS_DIR` | Override the directory holding `minilm.onnx` (+ tokenizer/config). | `<checkout>/skills/memory/models` |
+
+MCP server:
+
+| Var | Purpose | Default |
+|-----|---------|---------|
 | `ZMEM_MCP_TOKEN` | Bearer token for the MCP server. **Required** to start the server. | — |
 | `ZMEM_MCP_TOKEN_FILE` | Path to a file containing the token (alternative to `ZMEM_MCP_TOKEN`). | — |
-| `ZMEM_MCP_ALLOW_INSECURE_BIND` | Set to `1` to allow `0.0.0.0` / `::` bind. | unset |
+| `ZMEM_MCP_ALLOW_INSECURE_BIND` | Set to `1` to allow `0.0.0.0` / `::` (and IPv4-mapped) wildcard binds. | unset |
+| `ZMEM_MCP_MAX_CONCURRENT` | Cap on simultaneous `store.py` subprocesses the MCP server will run (overload protection). | `8` |
+| `ZMEM_MCP_QUEUE_TIMEOUT_S` | How long a queued tool call waits for a concurrency slot before returning an overload error. | `60` |
+
+> **Performance characteristics (inherent, not bugs):** `store.py backup` is
+> O(store size) by nature — SQLite's Online Backup API copies the live database
+> page-by-page. This is mitigated by the `--if-due` cadence (the session-start
+> hook only snapshots once per `ZMEM_BACKUP_INTERVAL_DAYS`). Separately, the
+> launcher's `fitEnvelope` content truncation is O(n log n) in content length
+> (it binary-searches a truncation point, re-serializing the envelope each
+> iteration), but only ever runs on content already over the context budget — a
+> rare path bounded by `MAX_CONTENT_CHARS`. Neither is a defect; both are noted
+> here so operators can reason about steady-state cost. (#37 L19/L20)
 
 ### Local directory (for testing / air-gapped)
 

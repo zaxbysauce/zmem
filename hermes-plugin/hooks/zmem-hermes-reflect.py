@@ -29,6 +29,12 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# Shared WAL-safety guard (single copy across the three Hermes hooks — #37 L25).
+_HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOK_DIR not in sys.path:
+    sys.path.insert(0, _HOOK_DIR)
+from _zmem_hook_common import assert_local_fs as _assert_local_fs  # noqa: E402
+
 _CONVENTION_COUNT_KEY = "hermes_convention_count_{session}"
 _PENDING_CONVENTION_KEY = "hermes_pending_convention_{session}"
 _PENDING_FAILURE_KEY = "hermes_pending_failure_{session}"
@@ -74,29 +80,6 @@ def _resolve_store_path() -> Path:
         if d:
             return Path(d).expanduser() / "store.sqlite"
     return Path.home() / ".zmem" / "store.sqlite"
-
-
-def _assert_local_fs(path: Path) -> bool:
-    """Reject UNC/network/OneDrive store paths (WAL-corruption guard).
-
-    host.py's assert_local_fs raises ValueError as its refusal signal — that
-    MUST map to False, not be swallowed. Import-failure degrades to UNC check.
-    """
-    s = str(path)
-    if s.startswith("\\\\") or s.startswith("//"):
-        return False
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "skills" / "memory" / "scripts"))
-        import host  # type: ignore[import-not-found]
-    except Exception:
-        return not (s.startswith("\\\\") or s.startswith("//"))
-    try:
-        host.assert_local_fs(path)
-        return True
-    except ValueError:
-        return False
-    except Exception:
-        return True
 
 
 def _connect() -> sqlite3.Connection | None:

@@ -47,13 +47,18 @@ logger = logging.getLogger("zmem-mcp")
 # -- store.py location -------------------------------------------------------
 
 _STORE_PY_REL = Path("skills") / "memory" / "scripts" / "store.py"
+_SCHEMA_META_REL = Path("skills") / "memory" / "scripts" / "schema_meta.py"
 _STORE_TIMEOUT_S = 30  # network clients can tolerate a longer cap
 _MAX_QUERY_CHARS = 1000
-# Cap on a single add() content payload. Matches store.py's MAX_CONTENT_CHARS
-# (65536) so a memory written over the network imports cleanly via Tier-3 sync
-# on another box — previously MCP silently truncated at 32000 while ingest-jsonl
-# rejected at 65536, so a 32k–65k row written here was silently mangled (#36 M17).
+# Cap on a single add() content payload and the allowed type/signal enums.
+# Loaded from schema_meta (the single source of truth shared with store.py and
+# the local Hermes provider) so all write surfaces stay in lock-step without
+# re-typing the literals — #37 L7/L8 closed the drift where this path
+# hard-coded 65536 / the signal tuple while the local Hermes path had no cap.
+# Falls back to the historical literals if schema_meta can't be located.
 _MAX_CONTENT_CHARS = 65536
+_ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
+_ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
 _DEFAULT_LIMIT = 5
 _HARD_LIMIT_MAX = 50
 # Concurrency cap on simultaneous store.py subprocesses. Each tool call spawns a
@@ -96,6 +101,71 @@ def _resolve_zmem_home() -> Path:
 
 def _resolve_store_py() -> Path:
     return _resolve_zmem_home() / _STORE_PY_REL
+
+
+def _load_store_constants() -> None:
+    """Import ALLOWED_SIGNALS / ALLOWED_TYPES / MAX_CONTENT_CHARS from schema_meta
+    (the single source of truth shared with store.py). schema_meta is tiny and
+    dependency-free so it imports with no side effects — unlike store.py itself,
+    which is a ~250 KB CLI module with env reads and embedding/sqlite side
+    effects at import time. Best-effort: on any failure the module-level
+    fallbacks (the historical literals) stay in effect, so a missing file never
+    wedges the server (#37 L7/L8).
+
+    This locates schema_meta DIRECTLY via the in-tree relative path (this file
+    is at <repo>/hermes-plugin/server/mcp_server.py, so the checkout root is
+    two parents up). It deliberately does NOT call _resolve_zmem_home(), which
+    writes a fatal-looking stderr message and sys.exit(2)s on a missing
+    checkout — calling it here would emit that noise on every import outside a
+    checkout (e.g. a lint pass or a test reading a constant), even though the
+    SystemExit is caught (PRR-009). ZMEM_HOME-override checkouts are still
+    covered because the tool paths that actually NEED store.py resolve it
+    lazily via _resolve_zmem_home() at first use.
+    """
+    global _MAX_CONTENT_CHARS, _ALLOWED_SIGNALS, _ALLOWED_TYPES
+    try:
+        import importlib.util
+        # Resolve schema_meta with the SAME precedence _resolve_zmem_home() uses
+        # (ZMEM_HOME first, then in-tree), so the tool-VALIDATION constants and
+        # the store.py subprocess that actually WRITES stay sourced from one
+        # checkout (no split-brain if the server runs from checkout A with
+        # ZMEM_HOME pointed at checkout B). Unlike _resolve_zmem_home(), this
+        # does NOT sys.exit or write stderr on a missing checkout — it silently
+        # falls through to the module-level defaults (PRR-009).
+        meta_path = None
+        home_env = os.environ.get("ZMEM_HOME", "").strip()
+        if home_env:
+            candidate = Path(home_env).expanduser() / _SCHEMA_META_REL
+            if candidate.is_file():
+                meta_path = candidate
+        if meta_path is None:
+            # In-tree: <repo>/hermes-plugin/server/mcp_server.py -> <repo>/skills/...
+            candidate = Path(__file__).resolve().parents[2] / _SCHEMA_META_REL
+            if candidate.is_file():
+                meta_path = candidate
+        if meta_path is None:
+            return
+        spec = importlib.util.spec_from_file_location("zmem_schema_meta_mcp", meta_path)
+        if spec is None or spec.loader is None:
+            return
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _MAX_CONTENT_CHARS = int(getattr(mod, "MAX_CONTENT_CHARS", _MAX_CONTENT_CHARS))
+        sig = getattr(mod, "ALLOWED_SIGNALS", None)
+        if sig:
+            _ALLOWED_SIGNALS = tuple(sig)
+        types = getattr(mod, "ALLOWED_TYPES", None)
+        if types:
+            _ALLOWED_TYPES = tuple(types)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("schema_meta constants load failed (%s); using defaults", exc)
+
+
+# Load the shared constants once at import. Best-effort + side-effect-free: a
+# missing checkout at import time falls back to the module-level defaults with
+# NO stderr noise and NO sys.exit (the real server entrypoint resolves store.py
+# and sys.exits with a clear message when it actually needs it).
+_load_store_constants()
 
 
 def _log_embedding_availability() -> None:
@@ -452,24 +522,25 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         mtype = (type or "").strip()
         body = (content or "").strip()
-        if mtype not in ("fact", "lesson", "convention", "preference"):
+        if mtype not in _ALLOWED_TYPES:
             return _error(
-                "type must be one of: fact, lesson, convention, preference"
+                "type must be one of: " + ", ".join(_ALLOWED_TYPES)
             )
         if not body:
             return _error("content is required")
         # Reject oversize content rather than silently truncating it — a silent
         # 32000-char truncation broke Tier-3 sync import elsewhere (the same
         # row written via CLI/ingest was stored whole or rejected at 65536).
-        # Now all write paths enforce one cap (65536) consistently (#36 M17).
+        # Now all write paths enforce one cap consistently (#36 M17), sourced
+        # from schema_meta so this path can't drift from the CLI/Hermes paths.
         if len(body) > _MAX_CONTENT_CHARS:
             return _error(
                 f"content is {len(body)} chars, over the {_MAX_CONTENT_CHARS} limit"
             )
         sig = (signal or "none").strip()
-        if sig not in ("test", "compile", "lint", "reviewer", "user", "none"):
+        if sig not in _ALLOWED_SIGNALS:
             return _error(
-                "signal must be one of: test, compile, lint, reviewer, user, none"
+                "signal must be one of: " + ", ".join(_ALLOWED_SIGNALS)
             )
         args = [
             "add",

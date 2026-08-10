@@ -621,6 +621,151 @@ def _check_schema(store_path: Path, access_check: dict) -> dict:
     )
 
 
+# Operational-health cadence thresholds. These are the same defaults store.py
+# uses (CONSOLIDATE_MIN_INTERVAL_DAYS=7.0, ZMEM_BACKUP_INTERVAL_DAYS=1.0); they
+# are WARN thresholds here, not enforcement, so a local copy is safe (doctor is
+# a read-only diagnostic). doctor warns at 2x the cadence — "more than two
+# intervals overdue" is a clear "maintenance has stopped running" signal without
+# false-alarming on a single missed cadence tick. Env overrides are honored so
+# an operator who lengthened the cadence does not get a spurious warn (#37 L23).
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _cadence_days(name: str, default: float) -> float:
+    """Read a cadence env var and clamp negative/NaN values to the default.
+
+    This matches store.py's `_backup_interval_days` (which clamps with
+    `v if v >= 0 else 1.0`) so doctor's backup warn threshold and the backup
+    writer's --if-due gate agree on a malformed `ZMEM_BACKUP_INTERVAL_DAYS`.
+    store.py's consolidate cadence (`CONSOLIDATE_MIN_INTERVAL_DAYS`) is NOT
+    clamped upstream (a negative value there makes consolidate always run),
+    so doctor deliberately normalizes it here to a sensible warn threshold
+    rather than mirroring the unclamped upstream behavior (PRR-002).
+    """
+    v = _float_env(name, default)
+    if v != v or v < 0:  # NaN check (v != v) + negative check
+        v = default
+    return v
+
+
+def _consolidate_warn_days() -> float:
+    return _cadence_days("ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS", 7.0) * 2.0
+
+
+def _backup_warn_days() -> float:
+    return _cadence_days("ZMEM_BACKUP_INTERVAL_DAYS", 1.0) * 2.0
+
+
+def _open_store_ro(store_path: Path) -> sqlite3.Connection | None:
+    """Open the store read-only. None if absent or unreadable.
+
+    doctor is read-only by contract; the mode=ro URI guarantees no write can
+    ever happen here, and reuses the same pattern as _read_schema_version.
+    """
+    if not store_path.exists():
+        return None
+    try:
+        uri = store_path.resolve().as_uri() + "?mode=ro"
+        return sqlite3.connect(uri, uri=True)
+    except Exception:
+        return None
+
+
+def _meta_ts_days_ago(conn: sqlite3.Connection, key: str) -> tuple[float | None, str | None]:
+    """Return (days since the meta `key` ISO timestamp, value) — (None, None) if
+    the row is absent, (None, err) if unreadable. Uses the same calendar/timegm
+    parsing store.py's cadence gate uses."""
+    import calendar as _cal
+    import time as _time
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if not row or not row[0]:
+        return None, None
+    ts = row[0]
+    try:
+        # ts is guaranteed truthy here: the `if not row or not row[0]` guard
+        # above already returned (None, None) for an absent/empty cell.
+        epoch = _cal.timegm(_time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return None, f"unparseable {key}={ts!r}"
+    days = ((_time.time() - epoch) / 86400.0) if epoch > 0 else 999.0
+    return days, ts
+
+
+def _check_operational_health(resolved_store: Path) -> list[dict]:
+    """Backup + consolidation cadence health from the `meta` table (#37 L23).
+
+    Reads last_backup / last_consolidation read-only and warns when maintenance
+    has never run or is more than 2x its cadence overdue. Skips (not fails) when
+    the store is absent or unreadable — a missing store is already flagged by
+    the store-access check, and an unreadable one must not wedge doctor.
+    """
+    conn = _open_store_ro(resolved_store)
+    if conn is None:
+        return [
+            _check("operational-health", "skip",
+                   "Store not available; skipped backup/consolidation cadence checks."),
+        ]
+    checks: list[dict] = []
+    try:
+        for name, key, warn_days in (
+            ("backup", "last_backup", _backup_warn_days()),
+            ("consolidation", "last_consolidation", _consolidate_warn_days()),
+        ):
+            days, ts_or_err = _meta_ts_days_ago(conn, key)
+            if ts_or_err and days is None:
+                # unreadable row — warn (do not fail the whole report)
+                checks.append(_check(
+                    f"operational-health-{name}", "warn",
+                    f"last_{name} present but unreadable: {ts_or_err}",
+                    key=key,
+                ))
+                continue
+            if days is None:
+                checks.append(_check(
+                    f"operational-health-{name}", "warn",
+                    f"last_{name}: (never) — maintenance has not run yet. The "
+                    f"session-start hook fires {name} on a cadence; if this store "
+                    f"predates the hook or the hook is disabled, run "
+                    f"`store.py {'backup --if-due' if name == 'backup' else 'consolidate'}` manually.",
+                    key=key,
+                ))
+                continue
+            if days > warn_days:
+                checks.append(_check(
+                    f"operational-health-{name}", "warn",
+                    f"last_{name}: {ts_or_err} ({days:.1f}d ago, more than "
+                    f"{warn_days:.1f}d / 2x cadence overdue). Maintenance may not "
+                    f"be running on the session-start hook.",
+                    key=key, last_value=ts_or_err, days_ago=round(days, 1),
+                    warn_days=round(warn_days, 1),
+                ))
+            else:
+                # "within warning threshold" (not "within cadence"): the pass
+                # threshold is 2x the real cadence, so a value between 1x and
+                # 2x may already be past the writer's --if-due gate. Phrase the
+                # status as healthy (under the 2x warn line) without implying
+                # the cadence tick is fully current (PRR-007).
+                checks.append(_check(
+                    f"operational-health-{name}", "pass",
+                    f"last_{name}: {ts_or_err} ({days:.1f}d ago, under the "
+                    f"{warn_days:.1f}d warning threshold).",
+                    key=key, last_value=ts_or_err, days_ago=round(days, 1),
+                ))
+    finally:
+        conn.close()
+    return checks
+
+
 def _check_claude_native_memory(home: Path) -> dict:
     inspected: list[dict] = []
     if _bool_env("CLAUDE_CODE_DISABLE_AUTO_MEMORY"):
@@ -953,6 +1098,9 @@ def build_report(project: Path, repo_root: Path) -> dict:
     checks.append(namespace_check)
     checks.append(_check_surfaces(repo_root))
     checks.append(_check_embeddings())
+    # Operational health (backup/consolidation cadence) — read-only, best-effort
+    # skip if the store is absent/unreadable (#37 L23).
+    checks.extend(_check_operational_health(resolved_store))
 
     counts = {"pass": 0, "warn": 0, "fail": 0, "skip": 0}
     for check in checks:

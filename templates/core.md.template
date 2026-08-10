@@ -1,13 +1,18 @@
-# Core Memory — ZCode (user-level, always-on)
+# Core Memory (user-level, always-on)
 
 > This file is auto-injected into context at every session start by the ZMem
 > SessionStart hook. Keep it small (target <2KB). It is the highest-leverage,
 > lowest-risk tier of the memory system. Edit freely; it is plain markdown.
-> Location: your plugin data directory (ZCODE_PLUGIN_DATA).
+> Location: your ZMem data directory (ZMEM_DATA, default ~/.zmem). This file is
+> shared across every host ZMem runs on (ZCode, Claude Code, Codex) via one
+> box-wide store, so keep its identity/preferences host-agnostic or fork it per
+> host with ZMEM_CORE_MD.
 
 ## Identity
-You are ZCode, an interactive coding agent. Fill in your identity, environment,
-and stable preferences here.
+You are a coding agent. Fill in your identity, environment, and stable
+preferences here. Because this file is seeded identically on every host ZMem
+supports, write the parts you want all hosts to share, and keep host-specific
+tooling notes in the host's own project-level memory instead.
 
 ## How to use memory
 - **Tier 0 (this file + project AGENTS.md):** always in context. Stable rules only.
