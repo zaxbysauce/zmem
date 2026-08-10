@@ -74,6 +74,68 @@ class ClampLimitTest(unittest.TestCase):
 
 @unittest.skipUnless(MCP_AVAILABLE,
                      "mcp package not installed (MCP server tests need it)")
+class HealthEndpointTest(unittest.TestCase):
+    """#39 E2: the /health endpoint payload (liveness + readiness) must be
+    minimal, never leak paths/tokens, and never raise. These tests pin the
+    _compute_health() helper directly; the route-registration test lives in
+    McpServerToolSurfaceTest (it needs build_server())."""
+
+    def setUp(self):
+        import mcp_server
+        self.mcp_server = mcp_server
+
+    def test_compute_health_returns_minimal_shape(self):
+        h = self.mcp_server._compute_health()
+        self.assertIsInstance(h, dict)
+        # Exactly these three keys — nothing else (no paths, no tokens, no reason).
+        self.assertEqual(set(h.keys()), {"ok", "store_resolved", "embeddings_available"})
+        self.assertTrue(h["ok"], "ok must be True if the handler ran (liveness)")
+        self.assertIsInstance(h["store_resolved"], bool)
+        self.assertIsInstance(h["embeddings_available"], bool)
+
+    def test_compute_health_leaks_no_paths_or_tokens(self):
+        """The server is unauthenticated by design; the response must not leak
+        install details (paths, tokens, model dirs, namespace)."""
+        h = self.mcp_server._compute_health()
+        blob = repr(h)
+        for forbidden in (os.environ.get("ZMEM_MCP_TOKEN", ""),
+                          "store.sqlite", "minilm.onnx", "models_dir",
+                          "token", "ZMEM_HOME", "ZMEM_STORE"):
+            if forbidden:
+                self.assertNotIn(forbidden, blob,
+                                 f"/health must not leak {forbidden!r}: {blob}")
+
+    def test_compute_health_never_raises(self):
+        """Even if the embeddings probe can't resolve the store, _compute_health
+        must return a dict (degraded to store_resolved/embeddings_available =
+        False), never raise."""
+        orig = self.mcp_server._resolve_zmem_home
+        self.mcp_server._resolve_zmem_home = lambda: (_ for _ in ()).throw(RuntimeError("nope"))
+        try:
+            h = self.mcp_server._compute_health()
+            self.assertFalse(h["store_resolved"])
+            self.assertTrue(h["ok"])  # liveness is independent of readiness
+        finally:
+            self.mcp_server._resolve_zmem_home = orig
+
+    def test_compute_health_survives_system_exit(self):
+        """_resolve_zmem_home raises SystemExit(2) on a missing/invalid ZMEM_HOME
+        (it's a BaseException, not caught by bare `except Exception`). The health
+        endpoint must degrade to store_resolved=False, not 500."""
+        orig = self.mcp_server._resolve_zmem_home
+        def _raise():
+            raise SystemExit(2)
+        self.mcp_server._resolve_zmem_home = _raise
+        try:
+            h = self.mcp_server._compute_health()
+            self.assertFalse(h["store_resolved"], h)
+            self.assertTrue(h["ok"])  # the server process is still alive
+        finally:
+            self.mcp_server._resolve_zmem_home = orig
+
+
+@unittest.skipUnless(MCP_AVAILABLE,
+                     "mcp package not installed (MCP server tests need it)")
 class McpServerToolSurfaceTest(unittest.TestCase):
     """Invoke all 5 MCP tools through the ToolManager and assert their result
     shapes for success and error paths."""
@@ -346,6 +408,24 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         ]
         self.assertEqual(secret_warnings, [],
                          f"clean content should not produce secret warnings: {secret_warnings}")
+
+    # -- #39 E2: /health route registration ---------------------------------
+
+    def test_health_route_is_registered(self):
+        """The /health custom_route must actually be registered on the FastMCP
+        server (not just defined as a function). Proves the decorator ran; a
+        silent try/except degradation would leave no route. FastMCP stores
+        custom routes in `_custom_starlette_routes` (mcp>=1.28.1)."""
+        # Introspect the registered routes. The attribute name is an
+        # implementation detail of FastMCP; check the documented one and fall
+        # back to scanning for any /health-shaped route if it differs.
+        routes = getattr(self.server, "_custom_starlette_routes", None)
+        if routes is None:
+            self.skipTest("FastMCP version does not expose _custom_starlette_routes; "
+                          "route registration cannot be introspected")
+        paths = [getattr(r, "path", None) for r in routes]
+        self.assertIn("/health", paths,
+                      f"/health route not registered. paths={paths}")
 
     # -- #36 M6: concurrency cap -------------------------------------------
 

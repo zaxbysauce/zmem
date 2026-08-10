@@ -480,10 +480,12 @@ class MigrationTest(unittest.TestCase):
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
-        self.assertEqual(sv, "7")
+        # migrate() walks to the CURRENT supported version (now 8 after #39 E4).
+        self.assertEqual(sv, "8")
         self.assertIn("merged_from", cols)
         self.assertIn("surfaced_count", cols)
         self.assertIn("last_surfaced", cols)
+        self.assertIn("content_norm", cols)
         conn.close()
 
     def test_re_migrate_is_idempotent(self):
@@ -495,7 +497,8 @@ class MigrationTest(unittest.TestCase):
         mod.migrate(conn)  # third time
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        self.assertEqual(sv, "7")
+        # Idempotent: re-migrate stays at the current version (now 8).
+        self.assertEqual(sv, "8")
         conn.close()
 
     def test_v6_to_v7_populated_migration_preserves_rows(self):
@@ -519,11 +522,12 @@ class MigrationTest(unittest.TestCase):
                     "retrieval_count, superseded_at, ingestion_ts FROM memory "
                     "ORDER BY id")
         before = [tuple(r) for r in conn.execute(cols_sel)]
-        # Upgrade to v7.
+        # Upgrade — migrate() walks to the CURRENT version (v8 after #39 E4),
+        # passing through the v7 block (re-adding surfaced_count/last_surfaced).
         mod.migrate(conn)
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        self.assertEqual(sv, "7")
+        self.assertEqual(sv, "8")
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
         self.assertIn("surfaced_count", cols)
         self.assertIn("last_surfaced", cols)

@@ -55,6 +55,7 @@ import time
 import uuid
 import calendar
 import struct
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Optional embedding support (degrades gracefully to FTS5-only if unavailable).
@@ -235,6 +236,33 @@ CAPTURE_MODES = ("auto", "reviewed", "manual")
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _format_recency(ts: str | None) -> str:
+    """Humanize an ISO-8601 UTC timestamp from now_iso() as 'Nd/Nh/Nm ago'.
+
+    Used by stats() so backup/consolidation cadence health is one glance away
+    (#39 E1). Strict parse: a value that does not match now_iso()'s exact
+    format ('%Y-%m-%dT%H:%M:%SZ') is returned verbatim, so writer-format drift
+    stays visible rather than being silently mis-aged. None/empty -> '(never)'.
+    A future-dated value (clock skew) is also returned verbatim.
+    """
+    if not ts:
+        return "(never)"
+    try:
+        then = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return ts
+    secs = int((datetime.now(timezone.utc) - then).total_seconds())
+    if secs < 0:
+        return ts  # future-dated clock skew — don't fabricate a negative age
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
 
 
 def _read_schema_version(path: Path) -> int | None:
@@ -516,11 +544,23 @@ def init_db(conn: sqlite3.Connection) -> None:
             -- not be appended (the keeper was already at the content-size cap)
             -- the id is still recorded for traceability. Write-only provenance
             -- today, queryable by users/future tooling. See _absorb_into_keeper.
-            merged_from     TEXT
+            merged_from     TEXT,
+            -- v8 (issue #39 E4): canonical normalized content for O(log N)
+            -- exact-match dedup. Populated in application code at every write
+            -- path by _normalize_content() — NOT a SQL GENERATED column
+            -- (SQLite can't replicate Python's Unicode-aware .lower() + \s+
+            -- collapse, so a generated column would silently diverge). Indexed
+            -- with a partial index on live rows to match the dedup-query predicate.
+            content_norm    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory(namespace);
         CREATE INDEX IF NOT EXISTS idx_memory_live ON memory(superseded_at) WHERE superseded_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type);
+        -- NOTE: idx_memory_content_norm is created separately below (and in the
+        -- v8 migrate block) because it references content_norm, which legacy
+        -- stores lack until the v8 migration ALTERs the table. Creating it here
+        -- inside executescript would fail on a pre-v8 store where the column
+        -- does not yet exist.
 
         CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
             content, tags, namespace,
@@ -551,6 +591,19 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     # executescript() does not accept parameter binding, so set created_at separately.
     conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('created_at', ?)", (now_iso(),))
+    conn.commit()
+    # Ensure the content_norm column + its partial index exist (v8, #39 E4).
+    # On a fresh store the CREATE TABLE above already added the column; on a
+    # legacy pre-v8 store it is absent until migrate()'s v8 block runs. Probe
+    # + add idempotently so the index (referenced by the dedup read path) is
+    # always available regardless of migration ordering.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+    if "content_norm" not in cols:
+        conn.execute("ALTER TABLE memory ADD COLUMN content_norm TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_content_norm "
+        "ON memory(namespace, content_norm) WHERE superseded_at IS NULL"
+    )
     conn.commit()
 
 
@@ -865,6 +918,40 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE meta SET value='7' WHERE key='schema_version'")
         conn.commit()
 
+    if ver < 8:
+        # v8 (issue #39 E4): indexed content_norm for O(log N) exact-match dedup,
+        # replacing the O(n^2) per-row Python normalize/compare that ran in
+        # degraded (no-embeddings) mode. The column is populated in APPLICATION
+        # code (not a SQL GENERATED column — SQLite can't replicate Python's
+        # Unicode-aware .lower() + \s+ collapse). Backfill walks existing rows in
+        # batches so a large store does not hold an exclusive write lock for one
+        # giant UPDATE (concurrent hook writers would get SQLITE_BUSY). The
+        # version bump happens AFTER the backfill so a crash mid-backfill re-runs
+        # on the next start (a half-backfilled v8 store would leave NULL
+        # content_norms that the indexed dedup lookup would miss).
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+        if "content_norm" not in cols:
+            conn.execute("ALTER TABLE memory ADD COLUMN content_norm TEXT")
+        batch_size = 500
+        while True:
+            rows = conn.execute(
+                "SELECT rowid, content FROM memory WHERE content_norm IS NULL LIMIT ?",
+                (batch_size,),
+            ).fetchall()
+            if not rows:
+                break
+            conn.executemany(
+                "UPDATE memory SET content_norm=? WHERE rowid=?",
+                [(_normalize_content(r["content"]), r["rowid"]) for r in rows],
+            )
+            conn.commit()
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_content_norm "
+            "ON memory(namespace, content_norm) WHERE superseded_at IS NULL"
+        )
+        conn.execute("UPDATE meta SET value='8' WHERE key='schema_version'")
+        conn.commit()
+
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
     # skip. See _retry_pending_ns_migration for why this cannot live behind the
     # version gate.
@@ -1129,7 +1216,7 @@ def _detect_duplicate(
         existing, dedup_sim = _find_semantic_duplicate(conn, emb, namespace)
     if existing is None:
         # Fallback: exact-match dedup.
-        norm = re.sub(r"\s+", " ", content.strip().lower())
+        norm = _normalize_content(content)
         cache_key = (namespace, norm)
         if dedup_cache is not None:
             # The per-ingest cache was pre-populated with EVERY live row's
@@ -1147,17 +1234,33 @@ def _detect_duplicate(
                 dedup_sim = 1.0 if existing else 0.0
             # else: cache miss ⇒ no exact-match duplicate; skip the scan.
         else:
-            # No cache (single-row add path): scan the namespace as before.
-            candidates = conn.execute(
-                "SELECT id, content FROM memory WHERE namespace=? AND superseded_at IS NULL",
-                (namespace,),
-            ).fetchall()
-            for c in candidates:
-                c_norm = re.sub(r"\s+", " ", c["content"].strip().lower())
-                if c_norm == norm:
-                    existing = c
-                    dedup_sim = 1.0  # exact match
-                    break
+            # No cache (single-row add path): indexed lookup on content_norm
+            # (#39 E4). The v8 migration backfilled this column for all rows
+            # and created idx_memory_content_norm(namespace, content_norm)
+            # WHERE superseded_at IS NULL, so this is O(log N) instead of the
+            # former O(n) per-row Python normalize/compare. Fall back to the
+            # legacy scan if the column is somehow absent (defensive: a
+            # pre-v8 store that has not yet run migrate()).
+            try:
+                existing = conn.execute(
+                    "SELECT id, content FROM memory "
+                    "WHERE namespace=? AND content_norm=? AND superseded_at IS NULL "
+                    "LIMIT 1",
+                    (namespace, norm),
+                ).fetchone()
+                dedup_sim = 1.0 if existing else 0.0
+            except sqlite3.OperationalError:
+                # content_norm column absent (pre-v8, unmigrated store): fall
+                # back to the legacy per-row scan so dedup still works.
+                candidates = conn.execute(
+                    "SELECT id, content FROM memory WHERE namespace=? AND superseded_at IS NULL",
+                    (namespace,),
+                ).fetchall()
+                for c in candidates:
+                    if _normalize_content(c["content"]) == norm:
+                        existing = c
+                        dedup_sim = 1.0  # exact match
+                        break
     return existing, dedup_sim, emb
 
 
@@ -1459,11 +1562,12 @@ def add_memory(
             """INSERT INTO memory
                (id, namespace, type, content, tags, source_ref, source_hash,
                 confidence, signal, valid_from, superseded_at, ingestion_ts,
-                retrieval_count, last_retrieved, embedding, embedding_model, embedded_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?,?,?,?)""",
+                retrieval_count, last_retrieved, embedding, embedding_model, embedded_at,
+                content_norm)
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?,?,?,?,?)""",
             (mid, namespace, type_, content, tags, source_ref, shash,
              confidence, signal, valid_from, ts, ts, emb, emb_model,
-             ts if emb is not None else None),
+             ts if emb is not None else None, _normalize_content(content)),
         )
         # Insert into vec0 table if we have an embedding.
         if emb is not None:
@@ -1490,6 +1594,21 @@ def add_memory(
 DEDUP_SIMILARITY_THRESHOLD = _env_float("ZMEM_DEDUP_THRESHOLD", 0.85)
 # Signal rank for merge: higher = stronger.
 _SIGNAL_RANK = {"test": 5, "compile": 4, "lint": 3, "reviewer": 2, "user": 2, "none": 1}
+
+
+def _normalize_content(s: str) -> str:
+    """Canonical content form for exact-match dedup (#39 E4).
+
+    Single source of truth: MUST be used at every dedup comparison AND every
+    content_norm write (add_memory INSERT, _ingest_row INSERT,
+    _absorb_into_keeper UPDATE, backfill) so the content_norm index never
+    diverges from the comparison semantics. Mirrors the former inline
+    ``re.sub(r"\\s+", " ", s.strip().lower())`` at the dedup call sites.
+    NOT a SQL GENERATED ALWAYS AS column — SQLite cannot replicate Python's
+    Unicode-aware ``.lower()`` + ``\\s+`` collapse, so a DB-generated column
+    would silently diverge and cause false-negative dedup misses.
+    """
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
 def _find_semantic_duplicate(
@@ -2290,7 +2409,10 @@ def stats(conn):
         except Exception:
             row = None
         ts = row[0] if row and row[0] else None
-        print(f"  {label}: {ts if ts else '(never)'}")
+        # Recency first (one-glance cadence health, #39 E1), with the raw
+        # ISO timestamp appended so the exact time is still recoverable.
+        recency = _format_recency(ts)
+        print(f"  {label}: {recency}" + (f" ({ts})" if ts else ""))
 
 
 def get_memory(conn, mid) -> bool:
@@ -2745,7 +2867,8 @@ def _absorb_into_keeper(
         # content (re-read above), so the projection is current. Append.
         separator = f"\n\n--- merged from {absorbed['id']} ---\n"
         new_content = keeper_content + separator + absorbed_content
-        conn.execute("UPDATE memory SET content=? WHERE id=?", (new_content, keeper_id))
+        conn.execute("UPDATE memory SET content=?, content_norm=? WHERE id=?",
+                     (new_content, _normalize_content(new_content), keeper_id))
 
     # Record provenance: append the absorbed id to merged_from (comma-joined,
     # accumulates across runs). `:truncated` marks an id whose content could
@@ -4819,11 +4942,11 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                    (id, namespace, type, content, tags, source_ref, source_hash,
                     confidence, signal, valid_from, superseded_at, supersede_reason,
                     ingestion_ts, retrieval_count, last_retrieved,
-                    embedding, embedding_model, embedded_at, merged_from)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL,?)""",
+                    embedding, embedding_model, embedded_at, merged_from, content_norm)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL,?,?)""",
                 (mid, namespace, type_, content, tags, source_ref, shash,
                  confidence, signal, valid_from, superseded_at, supersede_reason,
-                 ingestion_ts, merged_from),
+                 ingestion_ts, merged_from, _normalize_content(content)),
             )
             if started_tx:
                 _commit(conn)
@@ -4852,11 +4975,11 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                (id, namespace, type, content, tags, source_ref, source_hash,
                 confidence, signal, valid_from, superseded_at, ingestion_ts,
                 retrieval_count, last_retrieved, embedding, embedding_model, embedded_at,
-                merged_from)
-               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?,?)""",
+                merged_from, content_norm)
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?,?,?)""",
             (mid, namespace, type_, content, tags, source_ref, shash,
              confidence, signal, valid_from, ingestion_ts, emb, emb_model, embedded_at,
-             merged_from),
+             merged_from, _normalize_content(content)),
         )
         if emb is not None:
             try:
@@ -4870,7 +4993,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         # later row in the SAME batch with identical normalized content is
         # detected as a duplicate without a namespace rescan (#36 M9).
         if dedup_cache is not None:
-            norm_new = re.sub(r"\s+", " ", content.strip().lower())
+            norm_new = _normalize_content(content)
             dedup_cache[(namespace, norm_new)] = mid
         if started_tx:
             _commit(conn)
@@ -4945,7 +5068,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
             for r in conn.execute(
                 "SELECT id, content, namespace FROM memory WHERE superseded_at IS NULL"
             ).fetchall():
-                norm = re.sub(r"\s+", " ", (r["content"] or "").strip().lower())
+                norm = _normalize_content(r["content"])
                 if norm:
                     dedup_cache[(r["namespace"], norm)] = r["id"]
         except Exception:
@@ -5210,6 +5333,23 @@ def main():
 
     sub.add_parser("stats", help="store statistics")
 
+    # Print only the resolved store path (the 6-level ZMEM_STORE > ZMEM_DATA >
+    # CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem > legacy chain). Lets
+    # scripts/tooling query the path without parsing `stats` output (#39 E5).
+    sub.add_parser("path", help="print the resolved store path")
+
+    # Run the three session-start cadence ops (consolidate, backup --if-due,
+    # sweep) in ONE process instead of three detached python invocations
+    # (#39 E9). Each op keeps its own cadence gate / single-flight lock / exit
+    # semantics — this entrypoint only sequences them.
+    p_session_cadence = sub.add_parser(
+        "session-cadence",
+        help="run consolidate + backup --if-due + sweep in one process "
+             "(session-start cadence batch)")
+    p_session_cadence.add_argument("--backup-retention", type=int,
+                                   default=BACKUP_DEFAULT_RETENTION,
+                                   help=f"backup retention in days (default {BACKUP_DEFAULT_RETENTION})")
+
     sub.add_parser("rebuild-fts", help="rebuild the FTS5 index from scratch")
 
     sub.add_parser("reembed", help="backfill embeddings for live memories missing them")
@@ -5297,7 +5437,18 @@ def main():
 
     p_export_pack = sub.add_parser(
         "export-pack",
-        help="render a Tier 1 markdown memory pack for a namespace (project + user:global)")
+        help="render a Tier 1 markdown memory pack for a namespace (project + user:global)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Exit codes:\n"
+            "  0  pack written/printed successfully\n"
+            "  2  pack would be empty (no live rows at/above --min-confidence in\n"
+            "     --namespace AND user:global -- usually a wrong or not-yet-populated\n"
+            "     --namespace). Check the exit code before committing --out's file\n"
+            "     rather than assuming a nonempty write.\n"
+            "\n"
+            "See docs/CLOUD.md for the full Tier 1 contract."
+        ))
     p_export_pack.add_argument("--namespace", required=True,
                                help="project namespace to pack (e.g. project:foo)")
     p_export_pack.add_argument("--out", default=None,
@@ -5490,6 +5641,8 @@ def main():
             list_memory(conn, namespace=args.namespace, limit=args.limit, include_superseded=args.include_superseded)
         elif args.cmd == "stats":
             stats(conn)
+        elif args.cmd == "path":
+            print(STORE_PATH)
         elif args.cmd == "rebuild-fts":
             conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
             conn.commit()
@@ -5522,6 +5675,39 @@ def main():
             rc = cmd_backup(conn, retention=args.retention, out_dir=args.out_dir,
                             if_due=args.if_due)
             sys.exit(rc)
+        elif args.cmd == "session-cadence":
+            # Batch the three session-start cadence ops into one process (#39 E9).
+            # Each op keeps its EXACT standalone semantics: consolidate takes its
+            # single-flight lock + cadence gate (force=False respects it), backup
+            # runs with --if-due (cheap no-op when not due), and sweep is the same
+            # store-independent file reaper. A failure in any one op is reported
+            # but does not abort the others (cadence ops are independent).
+            steps: list[str] = []
+            # 1) consolidate (cadence-gated via force=False, single-flighted)
+            c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+            if c_token is None:
+                steps.append("consolidate: already running - skipped")
+            else:
+                try:
+                    consolidate(conn, force=False)
+                    steps.append("consolidate: ok")
+                except Exception as exc:  # never let one cadence op abort the batch
+                    steps.append(f"consolidate: error - {type(exc).__name__}: {exc}")
+                finally:
+                    _release_lock("consolidate", c_token)
+            # 2) backup --if-due (cheap no-op almost every session)
+            try:
+                rc_b = cmd_backup(conn, retention=args.backup_retention, if_due=True)
+                steps.append(f"backup: {'ok' if rc_b == 0 else f'exit {rc_b}'}")
+            except Exception as exc:
+                steps.append(f"backup: error - {type(exc).__name__}: {exc}")
+            # 3) sweep (store-independent file reaper)
+            try:
+                rc_s = cmd_sweep()
+                steps.append(f"sweep: {'ok' if rc_s == 0 else f'exit {rc_s}'}")
+            except Exception as exc:
+                steps.append(f"sweep: error - {type(exc).__name__}: {exc}")
+            print("[zmem] session-cadence: " + "; ".join(steps))
         elif args.cmd == "rekey-namespace":
             # --confirm (or --dry-run) is a REAL gate: this rewrites the
             # namespace column of live rows. Without either flag it refuses.

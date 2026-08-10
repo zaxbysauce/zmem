@@ -469,5 +469,32 @@ class TestAutomaticCaptureSecurity(HardeningStoreCase):
         self.assertNotIn("auto-redacted", set((row[1] or "").split(",")))
 
 
+class TestPathSubcommand(HardeningStoreCase):
+    """#39 E5: `store.py path` prints the resolved store path directly, so
+    scripts/tooling can query the 6-level resolution chain without parsing
+    `stats` output."""
+
+    def test_path_prints_resolved_store_path(self):
+        r = self.run_store("init")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.run_store("path")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Output is exactly the resolved store path (the ZMEM_STORE we set),
+        # with no extra formatting — trailing newline is stripped by stdout.
+        expected = self.env["ZMEM_STORE"].replace("/", os.sep)
+        self.assertEqual(r.stdout.strip(), expected,
+                         f"path subcommand should print the store path; "
+                         f"got {r.stdout.strip()!r}")
+
+    def test_path_reflects_env_override(self):
+        """A different ZMEM_STORE must be reflected in `path` output."""
+        self.run_store("init")
+        other = os.path.join(self.tmp, "other.sqlite")
+        env = {**self.env, "ZMEM_STORE": other}
+        r = self.run_store("path", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), other.replace("/", os.sep))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

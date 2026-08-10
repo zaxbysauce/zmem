@@ -526,6 +526,33 @@ function translate(raw, host, hookName, budget) {
     return fitEnvelope(host, hookName, String(content), budget);
 }
 
+// Resolve and VALIDATE the context budget (issue #39 E3). A negative value is
+// truthy after parseInt (e.g. parseInt("-5") === -5), so the former
+// `parseInt(env.ZMEM_CTX_BUDGET, 10) || 9000` let it through: fitEnvelope then
+// saw `encodedSize(env) <= -5` as always false and returned {} — silently
+// injecting zero memory with no error anywhere. Non-numeric and zero are
+// already safe (NaN/0 are falsy → 9000), but this helper handles all invalid
+// shapes uniformly with a clear stderr warning, and clamps an absurdly large
+// value rather than letting the envelope swallow the whole context window.
+const BUDGET_DEFAULT = 9000;
+const BUDGET_MAX = 1000000; // ~15 max-size (65536-char) memories in one envelope
+function resolveBudget(env, stderrWriter) {
+    const raw = env && env.ZMEM_CTX_BUDGET;
+    const parsed = parseInt(raw, 10);
+    const warn = typeof stderrWriter === "function" ? stderrWriter
+        : (s) => process.stderr.write(s);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        warn(`zmem: invalid ZMEM_CTX_BUDGET=${JSON.stringify(raw)} `
+             + `(must be a positive integer); using default ${BUDGET_DEFAULT}\n`);
+        return BUDGET_DEFAULT;
+    }
+    if (parsed > BUDGET_MAX) {
+        warn(`zmem: ZMEM_CTX_BUDGET=${parsed} exceeds sane max ${BUDGET_MAX}; clamping\n`);
+        return BUDGET_MAX;
+    }
+    return parsed;
+}
+
 // --- Read all of stdin (buffered, for parse + verbatim replay) --------------
 function readStdin() {
     return new Promise((resolve) => {
@@ -577,7 +604,7 @@ async function main() {
     }
 
     const env = buildCanonicalEnv(host, prepared.meta, hookName);
-    const budget = parseInt(env.ZMEM_CTX_BUDGET, 10) || 9000;
+    const budget = resolveBudget(env);
     const translated = TRANSLATED_HOOKS.has(hookName);
     const bashPath = findBash();
 
@@ -645,6 +672,7 @@ module.exports = {
     makeEnvelope,
     fitEnvelope,
     translate,
+    resolveBudget,
     EVENT_MAP,
     TRANSLATED_HOOKS,
     NEEDS_NAMESPACE,
