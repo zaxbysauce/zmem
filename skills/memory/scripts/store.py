@@ -5563,6 +5563,29 @@ def main():
                            max_age_days=args.max_age_days,
                            dry_run=args.dry_run))
 
+    # `session-cadence` runs sweep BEFORE connect()/_prepare_store() (PRR-004):
+    # sweep is store-independent file maintenance, so a locked/mid-restore store
+    # must never block the reaper. The sweep result is stashed as (step_str,
+    # failed_bool) so the post-connect block folds the summary line in AND counts
+    # the failure from the real rc, not by substring-matching the display string
+    # (cubic-re #5).
+    _cadence_sweep: tuple[str, bool] | None = None
+    if args.cmd == "session-cadence":
+        try:
+            rc_s = cmd_sweep()
+            _cadence_sweep = (f"sweep: {'ok' if rc_s == 0 else f'exit {rc_s}'}", rc_s != 0)
+        except Exception as exc:
+            _cadence_sweep = (f"sweep: error - {type(exc).__name__}: {exc}", True)
+
+    # `path` is a read-only query of the 6-level resolution chain (#39 E5).
+    # Dispatch it BEFORE connect()/_prepare_store() so it never creates a
+    # store file, blocks on a locked store, or fails on a newer-schema store
+    # (PRR-002). STORE_PATH is resolved at module import (line 190), so it is
+    # available without opening a connection.
+    if args.cmd == "path":
+        print(STORE_PATH)
+        sys.exit(0)
+
     try:
         _wait_for_maintenance_clear(args.cmd)
         conn = connect()
@@ -5641,8 +5664,6 @@ def main():
             list_memory(conn, namespace=args.namespace, limit=args.limit, include_superseded=args.include_superseded)
         elif args.cmd == "stats":
             stats(conn)
-        elif args.cmd == "path":
-            print(STORE_PATH)
         elif args.cmd == "rebuild-fts":
             conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
             conn.commit()
@@ -5682,7 +5703,10 @@ def main():
             # runs with --if-due (cheap no-op when not due), and sweep is the same
             # store-independent file reaper. A failure in any one op is reported
             # but does not abort the others (cadence ops are independent).
+            # sweep already ran BEFORE connect() (store-independence, PRR-004)
+            # — fold its result into the summary here.
             steps: list[str] = []
+            failures = 0
             # 1) consolidate (cadence-gated via force=False, single-flighted)
             c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
             if c_token is None:
@@ -5693,21 +5717,32 @@ def main():
                     steps.append("consolidate: ok")
                 except Exception as exc:  # never let one cadence op abort the batch
                     steps.append(f"consolidate: error - {type(exc).__name__}: {exc}")
+                    failures += 1
                 finally:
                     _release_lock("consolidate", c_token)
             # 2) backup --if-due (cheap no-op almost every session)
             try:
                 rc_b = cmd_backup(conn, retention=args.backup_retention, if_due=True)
                 steps.append(f"backup: {'ok' if rc_b == 0 else f'exit {rc_b}'}")
+                if rc_b != 0:
+                    failures += 1
             except Exception as exc:
                 steps.append(f"backup: error - {type(exc).__name__}: {exc}")
-            # 3) sweep (store-independent file reaper)
-            try:
-                rc_s = cmd_sweep()
-                steps.append(f"sweep: {'ok' if rc_s == 0 else f'exit {rc_s}'}")
-            except Exception as exc:
-                steps.append(f"sweep: error - {type(exc).__name__}: {exc}")
+                failures += 1
+            # 3) sweep result (already computed pre-connect): fold the summary
+            # line in and count the failure from the stashed bool (not by
+            # substring-matching the display string — cubic-re #5).
+            if _cadence_sweep is not None:
+                steps.append(_cadence_sweep[0])
+                if _cadence_sweep[1]:
+                    failures += 1
             print("[zmem] session-cadence: " + "; ".join(steps))
+            # Exit nonzero if any op failed (PRR-003): former separate processes
+            # surfaced per-op exit codes; preserve that signal. The hook runs
+            # this detached and does not check $?, so the impact is for direct
+            # CLI/metrics consumers only.
+            if failures:
+                sys.exit(1)
         elif args.cmd == "rekey-namespace":
             # --confirm (or --dry-run) is a REAL gate: this rewrites the
             # namespace column of live rows. Without either flag it refuses.

@@ -526,6 +526,32 @@ class AvailabilityChecksumBoundaryTests(unittest.TestCase):
         self.assertIsNone(st["checksum_ok"], st)
 
 
+class AvailabilityChecksumBoundaryDepsAbsentTests(unittest.TestCase):
+    """#39 E6 / PRR-007: a CI-RUNNABLE (deps-absent) pin for the
+    availability/checksum boundary. When embedding deps are NOT importable
+    (the CI state), availability_status() short-circuits to
+    reason='imports_missing' / available=False — but the key boundary
+    invariant still holds: checksum_ok is None (availability NEVER checksums,
+    even in the degraded state). This runs in CI (no skip), complementing the
+    deps-present tests above which only run on a dev box."""
+
+    def test_checksum_ok_is_none_when_deps_absent(self):
+        """availability_status() must report checksum_ok=None when deps are
+        absent — the availability probe never checksums, so the two-layer
+        boundary holds even in the imports-missing state. available=False
+        because imports are missing (NOT because of a checksum)."""
+        st = embeddings.availability_status()
+        # The boundary invariant: availability does not checksum.
+        self.assertIsNone(st["checksum_ok"],
+                          "checksum_ok must be None — availability is presence-"
+                          "only and never checksums, even when deps are absent")
+        # When deps are absent, the reason is imports_missing (not a checksum
+        # or file problem). This is the deps-absent shape.
+        if not _EMBEDDING_DEPS_IMPORTABLE:
+            self.assertFalse(st["available"], st)
+            self.assertEqual(st["reason"], "imports_missing", st)
+
+
 class LexicalHelperTests(unittest.TestCase):
     """Unit tests for store.py's Jaccard token-overlap clustering helpers."""
 

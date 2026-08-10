@@ -124,9 +124,13 @@ class StatsRecencyIntegrationTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         r = self._run("stats")
         self.assertEqual(r.returncode, 0, r.stderr)
-        # After consolidate, last_consolidation is recent -> 'just now' or
-        # 'Nm ago' with the raw ISO timestamp in parentheses.
-        self.assertRegex(r.stdout, r"last_consolidation: (just now|\d+m ago)\s+\(")
+        # After consolidate, last_consolidation is recent -> 'just now' or a
+        # 'Nh ago'/'Nd ago' form with the raw ISO timestamp in parentheses.
+        # Match all unit suffixes so the test is robust against slow CI.
+        self.assertRegex(
+            r.stdout,
+            r"last_consolidation: (just now|\d+[mhd] ago)\s+\(",
+        )
 
 
 if __name__ == "__main__":

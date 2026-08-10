@@ -72,17 +72,37 @@ class ClampLimitTest(unittest.TestCase):
         self.assertEqual(self.clamp(None), self.default)
 
 
-@unittest.skipUnless(MCP_AVAILABLE,
-                     "mcp package not installed (MCP server tests need it)")
-class HealthEndpointTest(unittest.TestCase):
-    """#39 E2: the /health endpoint payload (liveness + readiness) must be
-    minimal, never leak paths/tokens, and never raise. These tests pin the
-    _compute_health() helper directly; the route-registration test lives in
-    McpServerToolSurfaceTest (it needs build_server())."""
+class HealthHelperCITest(unittest.TestCase):
+    """#39 E2 / PRR-007: the /health payload (liveness + readiness) must be
+    minimal, never leak paths/tokens, and never raise. This is the SINGLE
+    source of truth for the _compute_health() contract — it runs in every
+    environment (no skip guard), so CI validates it even when the mcp package
+    is absent (CI is stdlib-only). When mcp IS absent, setUp injects a minimal
+    stub of mcp.server.auth.provider into sys.modules (mcp_server transitively
+    imports mcp via auth.py) and tearDown restores it (cubic-re #2/#3). The
+    route-registration test (which needs the real FastMCP object) lives in the
+    MCP-guarded McpServerToolSurfaceTest class below."""
 
     def setUp(self):
+        # Snapshot sys.modules so tearDown can restore exactly (cubic-re #3:
+        # never leak the injected stub into a shared-process runner).
+        self._saved_sys_modules = sys.modules.copy()
+        if not MCP_AVAILABLE:
+            import types
+            for mod_name in ("mcp", "mcp.server", "mcp.server.auth",
+                             "mcp.server.auth.provider"):
+                sys.modules[mod_name] = types.ModuleType(mod_name)
+            provider = sys.modules["mcp.server.auth.provider"]
+            provider.AccessToken = type("AccessToken", (), {})
+            provider.TokenVerifier = type("TokenVerifier", (), {})
         import mcp_server
         self.mcp_server = mcp_server
+
+    def tearDown(self):
+        # Restore sys.modules to the pre-setUp snapshot so injected stubs don't
+        # leak to other test modules in a shared-process run (cubic-re #3).
+        sys.modules.clear()
+        sys.modules.update(self._saved_sys_modules)
 
     def test_compute_health_returns_minimal_shape(self):
         h = self.mcp_server._compute_health()
@@ -123,6 +143,7 @@ class HealthEndpointTest(unittest.TestCase):
         (it's a BaseException, not caught by bare `except Exception`). The health
         endpoint must degrade to store_resolved=False, not 500."""
         orig = self.mcp_server._resolve_zmem_home
+
         def _raise():
             raise SystemExit(2)
         self.mcp_server._resolve_zmem_home = _raise

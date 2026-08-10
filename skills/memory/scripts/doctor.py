@@ -745,6 +745,15 @@ def _check_ns_migration(resolved_store: Path) -> dict:
             "ZMEM_NS_MIGRATION_MAP not configured — namespace-migration self-heal "
             "is inactive (fine unless this store predates the v5 box-wide re-key).",
         )
+    # Match store.py's _retry_pending_ns_migration / _rekey_namespaces: only
+    # namespaces whose checkout dir is PRESENT on disk are actually re-keyed.
+    # An absent checkout is skipped and retried later (PRR-008). Filter the map
+    # so the preview only counts namespaces that would really be re-keyed.
+    actionable = {
+        old_ns: checkout for old_ns, checkout in migration_map.items()
+        if Path(checkout).is_dir()
+    }
+    skipped_absent = len(migration_map) - len(actionable)
     conn = _open_store_ro(resolved_store)
     if conn is None:
         return _check(
@@ -753,36 +762,44 @@ def _check_ns_migration(resolved_store: Path) -> dict:
             "Store not available; skipped namespace-migration preview.",
         )
     try:
-        placeholders = ",".join("?" * len(migration_map))
-        try:
-            count = conn.execute(
-                f"SELECT COUNT(DISTINCT namespace) FROM memory "
-                f"WHERE namespace IN ({placeholders})",
-                list(migration_map.keys()),
-            ).fetchone()[0]
-        except Exception as exc:
-            return _check(
-                "ns-migration",
-                "warn",
-                f"Could not probe namespace-migration state: "
-                f"{type(exc).__name__}: {exc}",
-            )
+        if not actionable:
+            count = 0
+        else:
+            placeholders = ",".join("?" * len(actionable))
+            try:
+                count = conn.execute(
+                    f"SELECT COUNT(DISTINCT namespace) FROM memory "
+                    f"WHERE namespace IN ({placeholders})",
+                    list(actionable.keys()),
+                ).fetchone()[0]
+            except Exception as exc:
+                return _check(
+                    "ns-migration",
+                    "warn",
+                    f"Could not probe namespace-migration state: "
+                    f"{type(exc).__name__}: {exc}",
+                )
     finally:
         conn.close()
     if count == 0:
+        note = ""
+        if skipped_absent:
+            note = (f" ({skipped_absent} mapped namespace(s) have an absent "
+                    f"checkout dir — their rows will be skipped until the "
+                    f"checkout appears, then re-keyed automatically.)")
         return _check(
             "ns-migration",
             "pass",
-            "No namespaces stranded under old-style keys — the v5 self-heal has "
-            "nothing left to do.",
+            "No namespaces stranded under old-style keys with a present checkout "
+            "— the v5 self-heal has nothing left to do." + note,
         )
     return _check(
         "ns-migration",
         "warn",
         f"{count} namespace(s) still carry old-style keys and would be re-keyed "
         f"on the next store.py invocation (the retry self-heals automatically). "
-        f"Old keys: {', '.join(sorted(migration_map)[:5])}"
-        + (" ..." if len(migration_map) > 5 else ""),
+        f"Old keys: {', '.join(sorted(actionable)[:5])}"
+        + (" ..." if len(actionable) > 5 else ""),
         stranded_count=count,
     )
 

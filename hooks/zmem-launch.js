@@ -338,7 +338,13 @@ function buildCanonicalEnv(host, meta, hookName) {
             : [join(homedir(), ".claude", "skills"), join(homedir(), ".zcode", "skills")];
     const skillsDirs = process.env.ZMEM_SKILLS_DIRS || defaultSkillsDirs.join(delimiter);
     const tier0 = host === "zcode" ? "zmem" : "native";
-    const ctxBudget = host === "zcode" ? "25000" : "9000";
+    // Respect an operator-set ZMEM_CTX_BUDGET so resolveBudget() can actually
+    // observe, validate, and clamp it (#39 E3 / PRR-001). The former
+    // unconditional host default overwrote the env var before resolveBudget
+    // ran, making the validation unreachable and the knob dead end-to-end.
+    // Falls back to the host default when unset, matching the skillsDirs/zmemData
+    // pattern above.
+    const ctxBudget = process.env.ZMEM_CTX_BUDGET || (host === "zcode" ? "25000" : "9000");
 
     env.ZMEM_HOST = host;
     env.ZMEM_ROOT = getPluginRoot();
@@ -605,6 +611,12 @@ async function main() {
 
     const env = buildCanonicalEnv(host, prepared.meta, hookName);
     const budget = resolveBudget(env);
+    // Export the validated/clamped budget so spawned hook scripts see the same
+    // effective value the launcher uses internally (#39 E3 / cubic-re #1).
+    // Without this, a huge operator-set ZMEM_CTX_BUDGET is clamped for
+    // fitEnvelope but propagated unclamped to child shell scripts that read
+    // $ZMEM_CTX_BUDGET directly.
+    env.ZMEM_CTX_BUDGET = String(budget);
     const translated = TRANSLATED_HOOKS.has(hookName);
     const bashPath = findBash();
 
