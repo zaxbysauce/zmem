@@ -133,8 +133,8 @@ python "$S" consolidate --dry-run
 
 Review the proposed clusters. Merging is namespace-scoped — it will not fold one
 project's memory into another's — but the *keeper* choice still deserves a
-glance. The dry run models the cadence gate, so if it reports `merged N` you can
-trust a real run will merge; if it reports `would skip by cadence gate`, the
+glance. The dry run models the cadence gate, so if it reports `would merge N`
+you can trust a real run will merge; if it reports `would skip by cadence gate`, the
 store was consolidated recently and has not grown enough to warrant another pass.
 If the clusters look right:
 

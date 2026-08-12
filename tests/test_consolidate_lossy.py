@@ -433,6 +433,38 @@ class DryRunPreviewTest(unittest.TestCase):
         self.assertIn("would APPEND", out)
         # The absorbed content itself must be in the preview.
         self.assertIn("lane ordering", out)
+        # Issue #44: the final SUMMARY line (not just the per-row preview) must
+        # use the mode-dependent verb. "would merge" deliberately lacks the
+        # substring "merged" (no trailing d), so a dry-run summary can never be
+        # skimmed as a completed merge. The old code printed
+        # "merged N memories + (dry run -- no changes)" -- past tense even though
+        # nothing happened -- which produced false closeout reports.
+        self.assertIn("would merge", out, out)
+        self.assertNotIn("merged", out, out)
+
+    def test_dry_run_prune_summary_uses_would_prune(self):
+        # Issue #44 companion: the prune verb is mode-dependent in lockstep with
+        # the merge verb. A dry run with --prune must report "would prune" (never
+        # the past-tense "pruned"), even when zero rows are prune-eligible -- the
+        # summary appends the prune clause whenever the --prune flag is set, so
+        # this pins the WORDING rather than the prune-selection logic (which has
+        # its own coverage). "would prune" lacks the substring "pruned".
+        _add(self.mod, self.conn, KEEPER_BASE, 0.90, rc=50)
+        _add(self.mod, self.conn, ABSORBED_EXTRA, 0.85, rc=1)
+        live_before = self.conn.execute(
+            "SELECT count(*) FROM memory WHERE superseded_at IS NULL AND namespace=?",
+            (NS,)).fetchone()[0]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.mod.consolidate(self.conn, dry_run=True, prune=True,
+                                 threshold=0.5, force=True)
+        out = buf.getvalue()
+        live_after = self.conn.execute(
+            "SELECT count(*) FROM memory WHERE superseded_at IS NULL AND namespace=?",
+            (NS,)).fetchone()[0]
+        self.assertEqual(live_before, live_after, "dry-run mutated the store")
+        self.assertIn("would prune", out, out)
+        self.assertNotIn("pruned", out, out)
 
 
 class WriteTimeDedupTest(unittest.TestCase):

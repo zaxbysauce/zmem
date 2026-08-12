@@ -349,6 +349,32 @@ MCP server:
    local directory instead of the GitHub URL.
 3. Install + enable.
 
+### Upgrade
+
+The host tool (ZCode / Claude Code / Codex) discovers new versions by comparing
+the `version` field in your installed plugin manifest against the marketplace
+entry. Released versions are marked with a git tag (`vX.Y.Z`) and a GitHub
+Release — see [`CHANGELOG.md`](CHANGELOG.md) for what each release contains.
+
+To pick up a new release:
+
+1. Re-run the same install/discovery flow you used above (the GitHub URL or the
+   marketplace source). The host tool sees the higher `version` and offers the
+   update.
+2. Reinstall / update the **zmem** plugin and restart your session.
+
+Notes:
+
+- Plugin caches **pin a version directory** (e.g.
+  `.../cache/zmem/zmem/<version>/`). A cache for an older version is not
+  overwritten by a bump — it coexists until the host tool refreshes it, so after
+  upgrading confirm the active path points at the new version directory.
+- The plugin has no built-in "update available" notifier of its own; update
+  signalling is handled entirely by the host tool's plugin manager comparing the
+  marketplace `version` field.
+- To pin a specific version, install from a checked-out git tag rather than the
+  rolling `main` branch.
+
 ## Project-level memory
 
 On ZCode, ZMem injects `<repo>/AGENTS.md` if present — this is project-level
