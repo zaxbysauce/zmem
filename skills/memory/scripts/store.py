@@ -3309,10 +3309,23 @@ def consolidate(
             supersede_memory(conn, r["id"], "pruned: never retrieved, low confidence")
             pruned_count += 1
 
-    parts = [f"merged {merged_count} memories"]
+    # Mode-dependent verb (issue #44): a dry run must read as "would", never as
+    # a completed merge. The old fixed "merged N" verb made a dry-run summary
+    # indistinguishable from a real run to a skimming reader (only a trailing
+    # parenthetical differed), which produced false closeout reports claiming a
+    # merge that never happened. "would merge" deliberately lacks the substring
+    # "merged", so a dry-run line cannot be skimmed as past-tense success. This
+    # mirrors the cmd_sweep idiom (would prune/pruned) and finally makes the code
+    # match the contract the docstring (above) already promised.
+    merge_verb = "would merge" if dry_run else "merged"
+    parts = [f"{merge_verb} {merged_count} memories"]
     if prune:
-        parts.append(f"pruned {pruned_count}")
+        prune_verb = "would prune" if dry_run else "pruned"
+        parts.append(f"{prune_verb} {pruned_count}")
     if dry_run:
+        # Retained as a second, grep-friendly signal and to reinforce the
+        # zero-change outcome when merged_count == 0; the verb already conveys
+        # the mode, so this is intentionally redundant (defense in depth).
         parts.append("(dry run — no changes)")
     if truncated:
         # The namespace exceeded the per-pass row cap: not every pair was

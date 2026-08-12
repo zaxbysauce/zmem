@@ -152,7 +152,7 @@ single `[zmem] consolidate: skipped by cadence gate (...)` line (never silent)
 and changes nothing. Use `--dry-run` to preview clusters and the exact merge
 decision per row without mutating the store — `--dry-run` models the cadence
 gate too, so a gated dry run reports `would skip by cadence gate` rather than
-`merged N`, and a dry run that says "would merge" implies a real run that
+`would merge N`, and a dry run that says "would merge" implies a real run that
 merges. Pass `--force` to bypass the cadence gate and run consolidation now
 (this is the only intentional bypass; `--threshold` does not affect the gate).
 
