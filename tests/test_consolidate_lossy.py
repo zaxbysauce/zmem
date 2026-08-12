@@ -122,6 +122,21 @@ def _add_raw(mod, conn, content, confidence, rc=0, signal="test"):
     return mid
 
 
+def _summary_line(out):
+    """Return the single [zmem] summary line that reports the merge/prune counts.
+
+    Isolated so negative assertions on the verb cannot be tripped by verbatim
+    memory content echoed in the per-row dry-run preview (``keeper: ...`` /
+    ``content: ...`` lines start with whitespace, not ``[zmem]``). The summary is
+    the only ``[zmem]``-prefixed line containing "memories" — the cluster/prune
+    preview lines say ``DRY RUN: cluster`` / ``DRY RUN: prune`` instead.
+    (swarm-pr-review PRR-001 / PRR-002.)
+    """
+    matches = [ln for ln in out.splitlines()
+               if ln.startswith("[zmem]") and "memories" in ln]
+    return matches[-1] if matches else ""
+
+
 class ContentPreservationTest(unittest.TestCase):
     """AC1: an absorbed row's unique content survives in the keeper and is
     live-recallable."""
@@ -434,23 +449,38 @@ class DryRunPreviewTest(unittest.TestCase):
         # The absorbed content itself must be in the preview.
         self.assertIn("lane ordering", out)
         # Issue #44: the final SUMMARY line (not just the per-row preview) must
-        # use the mode-dependent verb. "would merge" deliberately lacks the
-        # substring "merged" (no trailing d), so a dry-run summary can never be
-        # skimmed as a completed merge. The old code printed
+        # use the mode-dependent verb. Assert on the SUMMARY line specifically
+        # (via _summary_line) so the check cannot be tripped by verbatim memory
+        # content echoed elsewhere in the buffer. "would merge" deliberately
+        # lacks the substring "merged" (no trailing d), so a dry-run summary can
+        # never be skimmed as a completed merge. The old code printed
         # "merged N memories + (dry run -- no changes)" -- past tense even though
         # nothing happened -- which produced false closeout reports.
-        self.assertIn("would merge", out, out)
-        self.assertNotIn("merged", out, out)
+        summary = _summary_line(out)
+        self.assertTrue(summary, out)
+        self.assertIn("would merge", summary, out)
+        self.assertNotIn("merged", summary, out)
 
     def test_dry_run_prune_summary_uses_would_prune(self):
         # Issue #44 companion: the prune verb is mode-dependent in lockstep with
         # the merge verb. A dry run with --prune must report "would prune" (never
-        # the past-tense "pruned"), even when zero rows are prune-eligible -- the
-        # summary appends the prune clause whenever the --prune flag is set, so
-        # this pins the WORDING rather than the prune-selection logic (which has
-        # its own coverage). "would prune" lacks the substring "pruned".
+        # the past-tense "pruned"). To prove this on a REAL prune candidate
+        # (not a hard-coded zero), add a genuinely prune-eligible row:
+        # signal=none, confidence<0.35, retrieval_count=0, surfaced_count=0,
+        # backdated >30d -- the prune SQL predicates. pruned_count is then 1, so
+        # the assertion is "would prune 1", not a vacuous "would prune 0".
+        # "would prune" lacks the substring "pruned".
         _add(self.mod, self.conn, KEEPER_BASE, 0.90, rc=50)
         _add(self.mod, self.conn, ABSORBED_EXTRA, 0.85, rc=1)
+        prune_id = _add(self.mod, self.conn,
+                        "stale low-signal row that is prune eligible alpha beta gamma",
+                        0.20, rc=0, signal="none")
+        # Backdate + zero surfaced_count so the row satisfies the prune SQL.
+        self.conn.execute(
+            "UPDATE memory SET surfaced_count=0, "
+            "ingestion_ts=datetime('now','-60 days') WHERE id=?",
+            (prune_id,))
+        self.conn.commit()
         live_before = self.conn.execute(
             "SELECT count(*) FROM memory WHERE superseded_at IS NULL AND namespace=?",
             (NS,)).fetchone()[0]
@@ -463,8 +493,10 @@ class DryRunPreviewTest(unittest.TestCase):
             "SELECT count(*) FROM memory WHERE superseded_at IS NULL AND namespace=?",
             (NS,)).fetchone()[0]
         self.assertEqual(live_before, live_after, "dry-run mutated the store")
-        self.assertIn("would prune", out, out)
-        self.assertNotIn("pruned", out, out)
+        summary = _summary_line(out)
+        self.assertTrue(summary, out)
+        self.assertIn("would prune 1", summary, out)
+        self.assertNotIn("pruned", summary, out)
 
 
 class WriteTimeDedupTest(unittest.TestCase):

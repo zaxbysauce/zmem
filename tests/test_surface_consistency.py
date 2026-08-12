@@ -170,6 +170,14 @@ class SurfaceTempStoreTest(unittest.TestCase):
         # consolidate prints a summary regardless; embeddings may be absent (lexical
         # fallback) but the run must still succeed or at least not abort the prune.
         self.assertEqual(r.returncode, 0, r.stderr)
+        # Issue #44: a REAL run (no --dry-run) must report the prune in the
+        # past tense ("pruned N"), symmetric with the dry-run "would prune 1"
+        # coverage in test_consolidate_lossy.py. Pin the count too (the prune
+        # clause is appended whenever --prune is set, even at N=0, so asserting
+        # the exact "pruned 1" is stronger than the bare verb). Real-run stdout
+        # carries no verbatim content echo (the preview prints only under
+        # --dry-run), so a whole-buffer assertIn is safe here.
+        self.assertIn("pruned 1", r.stdout, r.stdout)
 
         inert_counts = self._counts(inert)
         surfaced_counts = self._counts(surfaced)

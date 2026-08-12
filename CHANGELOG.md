@@ -10,7 +10,7 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.8.4] — 2026-08-11
+## [0.8.4] — 2026-08-12
 
 ### Fixed
 - **`consolidate --dry-run` no longer reports a completed merge it did not
@@ -33,11 +33,12 @@ README.
   `would prune` (never past-tense `pruned`).
 
 ### Distribution
-- Introduces the first tagged release (`v0.8.4`), to be cut from the merge
-  commit of this change so installed plugin caches — which pin a version
-  directory — have a resolvable target to advance to. Prior `0.8.x`
-  development versions shipped no git tags or GitHub Releases; see the note
-  below.
+- Bumps the plugin version so marketplace version-comparison can signal an
+  update to installed clients. Once `v0.8.4` is cut from the merge commit of
+  this change, installed plugin caches — which pin a version directory — will
+  have a resolvable target to advance to. This will be the project's first
+  tagged release; prior `0.8.x` development versions shipped no git tags or
+  GitHub Releases. See the note below.
 
 [#44]: https://github.com/zaxbysauce/zmem/issues/44
 
