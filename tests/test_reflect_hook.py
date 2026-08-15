@@ -33,7 +33,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-_BASH = shutil.which("bash") or shutil.which("sh")
+# The hooks are bash scripts (they use bash-only constructs). Require `bash`
+# specifically; falling back to `sh` (usually dash on Debian/Ubuntu) would make
+# the tests fail spuriously instead of skipping. Test bodies skip when unset.
+_BASH = shutil.which("bash")
 
 
 def _write_transcript(records) -> str:

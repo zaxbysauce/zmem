@@ -18,7 +18,7 @@ README.
   claude-reflect port). Ported the MIT claude-reflect correction-pattern
   library as a host-agnostic module `skills/memory/scripts/corrections.py`
   (strong/weak/tiered English + CJK patterns, guardrails, false-positive vetoes,
-  explicit `remember:` handling, `--signal user` guidance).
+  explicit `remember:` handling).
 - **`store.py failures` now splits user rejections out of genuine failures.** A
   Claude Code tool rejection (`The user doesn't want to proceed`) is no longer
   counted as a failed tool call; it is reported in a new `rejections:

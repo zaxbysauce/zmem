@@ -182,8 +182,33 @@ class TestRejectionExtraction(unittest.TestCase):
         self.assertEqual(len(rejections), 1)
         os.remove(path)
 
+    def test_non_hashable_tool_use_id_failopen(self):
+        # PRR-002: a list/dict tool_use_id (malformed/foreign record) must not
+        # raise TypeError in either pass (name-map write or dedup) — fail open.
+        path = _write_jsonl([
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": ["x", "y"], "name": "Bash", "input": {}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "content": "boom", "is_error": True,
+                 "tool_use_id": ["x", "y"]}]}},
+            _assistant_tool_use("t1", "Edit"),
+            _rejected_block("t1", "The user doesn't want to proceed.\nthe user said:\nno need"),
+        ])
+        try:
+            details, rejections = store._failures_from_transcript(path)
+            # The malformed id's failure is still detected (tool name unknown),
+            # and the normal rejection is extracted; no crash.
+            self.assertEqual(details, [{"tool": "?", "error": "boom"}])
+            self.assertEqual(len(rejections), 1)
+            self.assertEqual(rejections[0]["tool"], "Edit")
+            self.assertEqual(rejections[0]["reason"], "no need")
+        finally:
+            os.remove(path)
+
     def test_rejections_empty_on_db_substrate(self):
-        # ZCode db.sqlite substrate has no rejection records — must be empty.
+        # ZCode db.sqlite substrate has no rejection records — must be empty on
+        # the PUBLIC cmd_failures surface (not just the internal _failures_from_db
+        # return), so this stays a genuine assertion and cannot regress silently.
         fd, db = tempfile.mkstemp(suffix=".sqlite")
         os.close(fd)
         import sqlite3
@@ -197,8 +222,13 @@ class TestRejectionExtraction(unittest.TestCase):
         ])
         conn.commit()
         conn.close()
-        count, details = store._failures_from_db(db, "s1")
-        self.assertEqual(count, 1)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = store.cmd_failures(session="s1", transcript="", db=db)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["rejections"], [])
         os.remove(db)
 
     def test_nonexistent_transcript_failopen(self):
@@ -314,6 +344,110 @@ class TestPatternLibrary(unittest.TestCase):
 
     def test_plain_user_message_kept(self):
         self.assertTrue(cmod.should_include_message("no, use uv not pip"))
+
+    def test_strong_correction_overrides_bug_report_false_positive(self):
+        # PRR-003: a structural bug-report FP ("is not broken") must not veto a
+        # genuine strong correction ("use X not Y").
+        t, pat, conf, sent, decay = cmod.detect_patterns(
+            "no, the build is not broken; use uv not pip")
+        self.assertEqual(t, "auto")
+        self.assertEqual(sent, "correction")
+
+    def test_plain_bug_report_still_vetoed(self):
+        # Without a strong correction, a bug-report message remains vetoed.
+        t, _, _, _, _ = cmod.detect_patterns("the build is not broken")
+        self.assertIsNone(t)
+
+    def test_cjk_never_matches_ma_chigae_te_accidentally(self):
+        # PRR-004: 間違えて ("accidentally") must not be classed as a correction.
+        t, _, _, _, _ = cmod.detect_patterns("間違えて")
+        self.assertIsNone(t)
+
+    def test_cjk_machigatte_correction_matches(self):
+        # 間違って / 間違ってる ("it's wrong") still matches.
+        for text in ("間違ってる", "間違って"):
+            t, _, conf, sent, _ = cmod.detect_patterns(text)
+            self.assertEqual(t, "auto", repr(text))
+            self.assertEqual(sent, "correction", repr(text))
+
+    def test_cjk_strong_overrides_question_false_positive(self):
+        # Symmetric with English "that's wrong?": a strong CJK correction ending
+        # in a question mark must not be vetoed as a false positive.
+        t, _, _, sent, _ = cmod.detect_patterns("間違ってる？")
+        self.assertEqual(t, "auto")
+        self.assertEqual(sent, "correction")
+
+
+class TestRenderRejectionSection(unittest.TestCase):
+    """PRR-005/PRR-009: the shared helper both reflect hooks call must render the
+    same fenced, newline-free, context-budget-capped block."""
+
+    def test_empty(self):
+        self.assertEqual(cmod.render_rejection_section([]), "")
+
+    def test_single_with_reason(self):
+        msg = cmod.render_rejection_section([{"tool": "Edit", "reason": "don't touch CI"}])
+        self.assertIn("User rejected 1 tool call(s)", msg)
+        self.assertIn("don't touch CI", msg)
+        self.assertIn("--signal user", msg)
+        self.assertNotIn("the user said:", msg)
+        self.assertEqual(msg.count("don't touch CI"), 1)  # newline-free → 1 line
+
+    def test_no_reason_wording(self):
+        msg = cmod.render_rejection_section([{"tool": "Bash", "reason": ""}])
+        self.assertIn("(no reason given)", msg)
+        self.assertNotIn("--signal user", msg)
+
+    def test_capped_at_detail_limit(self):
+        # Most-recent rejections are kept (chronological tail), oldest dropped.
+        # Indexes t0..t11; cap 5 → t7..t11 shown, t0..t6 hidden.
+        rejs = [{"tool": "t%d" % i, "reason": "r%d" % i} for i in range(12)]
+        msg = cmod.render_rejection_section(rejs, detail_limit=5)
+        self.assertIn("User rejected 12 tool call(s) (showing most recent 5 of 12)", msg)
+        self.assertIn("r7", msg)
+        self.assertIn("r11", msg)
+        self.assertNotIn("r0", msg)
+        self.assertNotIn("r6", msg)
+        self.assertIn("--signal user", msg)
+
+    def test_no_cap_shows_all_in_order(self):
+        rejs = [{"tool": "t%d" % i, "reason": "r%d" % i} for i in range(3)]
+        msg = cmod.render_rejection_section(rejs, detail_limit=5)
+        self.assertIn("User rejected 3 tool call(s).", msg)
+        for i in range(3):
+            self.assertIn("r%d" % i, msg)
+
+
+class TestExtractFailOpen(unittest.TestCase):
+    """PRR-001: extract_user_messages must never raise on a malformed/foreign
+    record (non-dict message, non-str text) — fail open, skip the record."""
+
+    def _extract(self, records):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+        try:
+            return cmod.extract_user_messages(path)
+        finally:
+            os.remove(path)
+
+    def test_non_dict_message_skipped(self):
+        msgs = self._extract([
+            {"type": "user", "message": "just a bare string"},
+            {"type": "user", "message": None},
+            {"type": "user", "message": {"content": "no, use uv not pip"}},
+        ])
+        self.assertEqual(msgs, ["no, use uv not pip"])
+
+    def test_non_string_text_skipped(self):
+        msgs = self._extract([
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": 123},
+                {"type": "text", "text": "remember: run make lint"},
+            ]}},
+        ])
+        self.assertEqual(msgs, ["remember: run make lint"])
 
 
 class TestCorrectionsSubcommand(unittest.TestCase):

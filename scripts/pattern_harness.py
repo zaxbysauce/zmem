@@ -77,7 +77,12 @@ def find_project_sessions(project_path: str):
 
 
 def collect_messages(paths, limit):
-    """Run extract_user_messages over each path, flatten, and cap at limit."""
+    """Run extract_user_messages over each path, flatten, and cap at limit.
+
+    ``limit`` is validated (must be a positive int or None) by main() before this
+    is called, so a negative/zero value can never silently eat the tail via a
+    ``[:-1]``-style slice.
+    """
     messages = []
     for p in paths:
         messages.extend(extract_user_messages(p))
@@ -101,6 +106,15 @@ def main() -> int:
     parser.add_argument("--json", action="store_true",
                         help="emit a JSON report instead of human-readable text")
     args = parser.parse_args()
+
+    # --limit and --show-nonmatches must be non-negative; a negative value is
+    # almost certainly a user typo and, if passed through, would silently
+    # truncate via a [:-1]-style slice (limit truncates the tail; show-nonmatches
+    # truncates the sample).
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit must be a positive integer (or omit it)")
+    if args.show_nonmatches < 0:
+        parser.error("--show-nonmatches must be a non-negative integer")
 
     paths = list(args.transcripts)
     if args.project:
@@ -143,7 +157,10 @@ def main() -> int:
             },
             "nonmatched_sample": nonmatched[:args.show_nonmatches] if args.show_nonmatches else [],
         }
-        print(json.dumps(report, ensure_ascii=False))
+        print(json.dumps(report, ensure_ascii=True))
+        # ensure_ascii=True keeps the JSON output ASCII-safe, honoring the
+        # module's documented "ASCII-safe output" contract (a legacy Windows
+        # console can otherwise raise UnicodeEncodeError mid-report).
         return 0
 
     _print(f"[pattern-harness] messages analyzed: {len(messages)}")

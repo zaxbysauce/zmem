@@ -101,6 +101,27 @@ class TestTranscriptParsing(unittest.TestCase):
         self.assertEqual({d["tool"] for d in details}, {"Bash"})
         os.remove(path)
 
+    def test_transcript_details_newest_first(self):
+        # PRR-005 sibling (critic NEW-1): details must be newest-first so the
+        # hooks' "showing most recent K of N" on details[:K] is truthful on the
+        # transcript substrate too (matches the db substrate's ORDER BY DESC).
+        # Three chronological failures t1 (oldest) .. t3 (newest) must come back
+        # [t3, t2, t1]. Fails on pre-fix code (returned [t1, t2, t3]).
+        path = _write_jsonl([
+            _assistant_tool_use("t1", "Bash"),
+            _tool_result("t1", "err-A"),
+            _assistant_tool_use("t2", "Bash"),
+            _tool_result("t2", "err-B"),
+            _assistant_tool_use("t3", "Bash"),
+            _tool_result("t3", "err-C"),
+        ])
+        try:
+            details, _ = store._failures_from_transcript(path)
+            self.assertEqual([d["error"] for d in details],
+                             ["err-C", "err-B", "err-A"])
+        finally:
+            os.remove(path)
+
     def test_toolUseResult_error_signal_without_is_error(self):
         # is_error False but toolUseResult begins "Error" => still a failure.
         path = _write_jsonl([
@@ -280,6 +301,8 @@ class TestSubstrateSwitch(unittest.TestCase):
         db = sub._make_db(with_enrichment=True)
         out = self._run_cmd(session="s1", transcript="", db=db)
         self.assertEqual(out["count"], 2)
+        # db substrate has no rejection records → public surface must report [].
+        self.assertEqual(out["rejections"], [])
         os.remove(db)
 
     def test_failopen_empty_when_nothing(self):

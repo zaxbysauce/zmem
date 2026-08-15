@@ -4246,7 +4246,11 @@ def _sanitize_tool_name(name, limit: int = 100) -> str:
     fence-integrity guarantee _sanitize_error_text gives the error text."""
     if not name:
         return "?"
-    s = str(name).replace("\r", " ").replace("\n", " ").strip()
+    s = (str(name).replace("\r", " ")
+         .replace("\n", " ")
+         .replace("\u2028", " ")   # line separator
+         .replace("\u2029", " ")   # paragraph separator
+         .strip())
     return s[:limit] or "?"
 
 
@@ -4312,7 +4316,14 @@ def _failures_from_transcript(path: str):
     generic failure) and its stated reason is captured instead (issue #46).
     Rejections and genuine failures are mutually exclusive by construction: each
     tool_use_id is classified once (rejection branch first, consuming the key),
-    so a record is never both."""
+    so a record is never both.
+
+    ``details`` are returned NEWEST-first (reversed from the chronological file
+    order) to match the db substrate, which returns them ``ORDER BY
+    completed_at DESC`` — so the reflect hooks' "showing most recent K of N" on
+    ``details[:K]`` is truthful on both substrates. ``rejections`` are kept
+    CHRONOLOGICAL (oldest-first) because ``render_rejection_section`` keeps the
+    chronological tail (``rejections[-K:]``) as the most recent."""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             raw_lines = [ln for ln in f if ln.strip()]
@@ -4335,7 +4346,11 @@ def _failures_from_transcript(path: str):
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
                     tid = b.get("id")
-                    if tid:
+                    # Only real string ids belong in the name map; a non-string
+                    # id (malformed/foreign record) must not crash the dict
+                    # write — it just gets no name (classification falls back to
+                    # "?"), consistent with the fail-open contract.
+                    if isinstance(tid, str) and tid:
                         tool_names[tid] = b.get("name") or "?"
 
     # Pass 2: collect failed tool_result blocks (deduped by tool_use_id so the
@@ -4366,6 +4381,10 @@ def _failures_from_transcript(path: str):
                 if not effective and isinstance(tur, str):
                     effective = tur
                 tid = b.get("tool_use_id")
+                # A non-string tool_use_id (a malformed/foreign record) must not
+                # crash the dedup below; keep only real string ids so key-hash /
+                # tool_names lookups stay safe (never-raises fail-open).
+                tid = tid if isinstance(tid, str) and tid else None
                 if tid:
                     block_tids.append(tid)
                 # A block is worth classifying if it is flagged as an error OR
@@ -4411,7 +4430,7 @@ def _failures_from_transcript(path: str):
                 "tool": _sanitize_tool_name(tool_names.get(tid, "?")),
                 "reason": _sanitize_error_text(_rejection_reason(tur)),
             })
-    return details, rejections
+    return details[::-1], rejections
 
 
 def _failures_from_db(db_path: str, session_id: str):
@@ -4576,9 +4595,13 @@ def cmd_corrections(*, transcript: str) -> int:
                 continue
             classified["message"] = _sanitize_correction_message(text)
             # Secrets: run each emitted message through the store's secret
-            # detection (SECRET_PATTERNS). In capture mode "auto" redact
-            # matches; otherwise (e.g. manual) annotate the item but keep the
-            # verbatim text so a reviewer can still read it.
+            # detection (SECRET_PATTERNS). In capture mode "auto" replace the
+            # message with the redacted form; otherwise (e.g. manual) keep the
+            # ORIGINAL (unredacted) wording so a reviewer can still read it.
+            # Note: the newline-collapse + length-truncation applied above is a
+            # fence-integrity/output-safety step that runs in BOTH modes — a
+            # "verbatim" manual-mode message is line-break-free and capped at
+            # 200 chars, only the secret redaction is omitted.
             redacted, redactions = _redact_secret_like_text(classified["message"])
             if redactions:
                 classified["secret_warning"] = True
