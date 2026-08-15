@@ -253,6 +253,23 @@ resolution chains differ), never touching anything that is not a sentinel-prefix
 file. Idempotent and fail-open. The SessionStart hook fires it detached each
 session so the markers stay bounded; `--dry-run` counts without deleting.
 
+### corrections — mine user corrections from a transcript (read-only)
+```
+python <store.py> corrections --transcript <path> [--json]
+```
+Scans a Claude Code transcript JSONL for user corrections. (User *rejections*
+are a separate signal — reported by `store.py failures` and surfaced by the
+Stop / SubagentStop reflection hooks.) Prints `{"count": N, "items": [{message,
+type, patterns, confidence, sentiment, decay_days}]}`. **Read-only** — this
+command never opens or writes the store; candidates are reviewed by an
+agent/human before any `add` (signal honesty). Corrections are detected by the
+ported correction-pattern library (`skills/memory/scripts/corrections.py`, from
+the MIT claude-reflect project). This parses **Claude Code transcript format
+only**; other hosts' histories are out of scope. In `ZMEM_CAPTURE_MODE=auto`
+likely-secret text is redacted; in `manual` matching items are annotated
+`"secret_warning": true` but kept verbatim for review. (`--json` is accepted for
+parity with the issue's syntax; output is always JSON.)
+
 ### export-pack — render a Tier 1 markdown memory pack
 ```
 python <store.py> export-pack --namespace NS [--out FILE] [--project-limit 50] \
