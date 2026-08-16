@@ -309,6 +309,31 @@ if store_py and os.path.isfile(store_py):
     except Exception:
         pass  # fail-open: promotion check errors never block session start
 
+# Pending live-capture correction candidates (issue #47): surface a COUNT only
+# (budget — never the contents) so the agent knows the queue has candidates for
+# the closeout skill to review. The queue is a fail-open sidecar; a read error
+# must never block session start.
+if store_py and os.path.isfile(store_py):
+    try:
+        sys.path.insert(0, os.path.dirname(store_py))
+        import correction_queue as _cq
+        # Surface a COUNT of PENDING (non-stale) candidates. Stale items are
+        # already past decay and are pruned by closeout `--drop-stale`, so they
+        # are not "pending review" - do not nudge the agent about them.
+        _pending = sum(1 for _it in _cq.load_queue(ns) if not _it.get("stale"))
+        if _pending:
+            # PREPEND (not append): the payload is truncated with ctx[:budget],
+            # which keeps the FRONT and drops the tail, so an appended note would
+            # vanish whenever Tier 0 + recall fill the budget. Leading placement
+            # guarantees the agent sees the closeout-work nudge.
+            parts.insert(
+                0,
+                "zmem: %d captured correction candidate(s) pending review — "
+                "run the closeout skill to process." % _pending
+            )
+    except Exception:
+        pass  # fail-open: queue read errors never block session start
+
 # Native-memory nudge (CC only, P6): one-time, best-effort, fail-open. Never
 # raises - a missing/malformed settings.json just means the nudge stays quiet.
 if host == "claude" and nudge_marker:

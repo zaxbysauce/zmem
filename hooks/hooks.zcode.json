@@ -21,6 +21,15 @@
             "timeout": 15
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" capture-correction",
+            "timeout": 15
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [

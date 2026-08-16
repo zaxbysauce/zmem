@@ -68,6 +68,7 @@ const TRANSLATED_HOOKS = new Set([
     "subagent-recall",
     "subagent-reflect",
     "convention-capture",
+    "capture-correction",
 ]);
 
 // Hooks whose scripts actually read $ZMEM_NAMESPACE. Resolving the namespace
@@ -92,6 +93,7 @@ const NEEDS_NAMESPACE = new Set([
     "capture-failure",
     "subagent-reflect",
     "convention-capture",
+    "capture-correction",
 ]);
 
 // Hook-name → Claude Code hookEventName (for the {hookSpecificOutput} rewrap).
@@ -103,6 +105,7 @@ const EVENT_MAP = {
     "subagent-reflect": "SubagentStop",
     "capture-failure": "PostToolUseFailure",
     "convention-capture": "PostToolUse",
+    "capture-correction": "UserPromptSubmit",
 };
 
 // --- Detect host ------------------------------------------------------------

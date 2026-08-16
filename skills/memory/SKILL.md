@@ -270,6 +270,24 @@ likely-secret text is redacted; in `manual` matching items are annotated
 `"secret_warning": true` but kept verbatim for review. (`--json` is accepted for
 parity with the issue's syntax; output is always JSON.)
 
+### queue-list / queue-clear — review live-captured corrections (read-only / clear)
+```
+python <store.py> queue-list --namespace NS [--json]
+python <store.py> queue-clear --namespace NS [--id ID ...] [--all] [--drop-stale]
+```
+The `capture-correction` hook (UserPromptSubmit, Claude Code / ZCode / Codex)
+queues mid-session user corrections ("no, use X", "remember: ...") into a
+namespace-scoped sidecar file (`<store-data-dir>/queue/<ns>.json`, default
+`~/.zmem/queue/<ns>.json`; follows the store's `ZMEM_STORE`/`ZMEM_DATA` override
+chain, not a fixed path) — hooks never write the
+store. `queue-list` shows the pending candidates for review (emit them into the
+store via `add --signal user` only if they clear the closeout rubric);
+`queue-clear` removes processed ids (`--id`), empties the queue (`--all`), or
+prunes stale low-confidence items (`--drop-stale`) — exactly one selector is
+required (a flag-less invocation is rejected, not a silent full wipe). Both are store-independent
+(they never open or write the store), so they work even if the store is locked or
+missing.
+
 ### export-pack — render a Tier 1 markdown memory pack
 ```
 python <store.py> export-pack --namespace NS [--out FILE] [--project-limit 50] \

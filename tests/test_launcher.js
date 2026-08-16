@@ -1276,6 +1276,175 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
     ok("budget: resolveBudget never returns a non-positive value (closes silent-injection vector)", allPositive);
 })();
 
+// --- issue #47: capture-correction hook + SessionStart pending note ---------
+// Wiring (unit): the new hook is a TRANSLATED, namespace-aware UserPromptSubmit
+// consumer on every host (same treatment convention-capture needed for CC).
+{
+    ok("TRANSLATED_HOOKS includes capture-correction",
+        launch.TRANSLATED_HOOKS.has("capture-correction"));
+    ok("NEEDS_NAMESPACE includes capture-correction",
+        launch.NEEDS_NAMESPACE.has("capture-correction"));
+    eq("EVENT_MAP capture-correction → UserPromptSubmit",
+        launch.EVENT_MAP["capture-correction"], "UserPromptSubmit");
+}
+
+console.log("\n[17] capture-correction: end-to-end through the real launcher (sandbox)");
+
+// Count queued correction candidates under a sandbox DATA dir.
+function readQueueItems(dataDir) {
+    const qdir = path.join(dataDir, "queue");
+    if (!fs.existsSync(qdir)) return [];
+    const items = [];
+    for (const f of fs.readdirSync(qdir)) {
+        if (!f.endsWith(".json")) continue;
+        let parsed;
+        try { parsed = JSON.parse(fs.readFileSync(path.join(qdir, f), "utf8")); }
+        catch (e) { continue; }
+        if (Array.isArray(parsed)) items.push(...parsed);
+    }
+    return items;
+}
+
+function encodedNs(namespace) {
+    return execFileSync(
+        PYTHON,
+        ["-c", "import sys; sys.path.insert(0, sys.argv[1]); import correction_queue; sys.stdout.write(correction_queue.encode_namespace(sys.argv[2]))",
+            path.join(REPO, "skills", "memory", "scripts"), namespace],
+        { encoding: "utf8" }
+    );
+}
+
+{
+    const CDATA = path.join(TMP, "capture-data");
+    fs.mkdirSync(CDATA, { recursive: true });
+    const CNS = resolveNs(PROJ); // non-git → project:<abspath>
+
+    // --- claude: a correction prompt silently queues one item (no store write)
+    {
+        const r = runLauncher("capture-correction",
+            JSON.stringify({ prompt: "no, use uv not pip for this repo",
+                session_id: "cc-e2e-claude", cwd: PROJ }),
+            envWith({ ZMEM_DATA: CDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("capture/claude: silent output is a single valid {} envelope (no ack)",
+            obj !== null && JSON.stringify(obj) === "{}", r.stdout.slice(0, 200));
+        ok("capture/claude: no sentinel leaked to runner", !/<<<ZMEM_JSON>>>/.test(r.stdout));
+        const items = readQueueItems(CDATA);
+        ok("capture/claude: a candidate was queued", items.length === 1,
+            "count=" + items.length);
+        ok("capture/claude: queued item is the user correction",
+            items.length === 1 && /uv not pip/.test(items[0].message || ""));
+        ok("capture/claude: item is source=live-capture",
+            items.length === 1 && items[0].source === "live-capture");
+        ok("capture/claude: no store.sqlite created (hook never writes store)",
+            !fs.existsSync(path.join(CDATA, "store.sqlite")));
+    }
+
+    // --- zcode: same, bare envelope, second host writes to the same queue file
+    {
+        const r = runLauncher("capture-correction",
+            JSON.stringify({ prompt: "remember: always pin dependency versions",
+                session_id: "cc-e2e-zcode", cwd: PROJ }),
+            envWith({ ZMEM_DATA: CDATA, ZCODE_PLUGIN_ROOT: REPO, ZCODE_PROJECT_DIR: PROJ }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("capture/zcode: silent output is {}", obj !== null && JSON.stringify(obj) === "{}",
+            r.stdout.slice(0, 200));
+        const items = readQueueItems(CDATA);
+        ok("capture/zcode: a second candidate was queued (cross-host same file)",
+            items.length === 2, "count=" + items.length);
+        ok("capture/zcode: remember: item present",
+            items.some((it) => /pin dependency/.test(it.message || "")));
+    }
+
+    // --- codex: third host appends to the same shared queue file (issue's
+    // "identically whether the host is Claude Code, ZCode, or Codex")
+    {
+        const r = runLauncher("capture-correction",
+            JSON.stringify({ prompt: "no, use X not Y here too",
+                session_id: "cc-e2e-codex", cwd: PROJ }),
+            envWith({ ZMEM_DATA: CDATA, PLUGIN_ROOT: REPO, CODEX_PROJECT_DIR: PROJ }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("capture/codex: silent output is {}", obj !== null && JSON.stringify(obj) === "{}",
+            r.stdout.slice(0, 200));
+        const items = readQueueItems(CDATA);
+        ok("capture/codex: a third candidate was queued (cross-host same file)",
+            items.length === 3, "count=" + items.length);
+        ok("capture/codex: 'use X not Y' item present",
+            items.some((it) => /X not Y/.test(it.message || "")));
+    }
+
+    // --- feedback=1: claude emits a translated, non-empty UserPromptSubmit ack
+    {
+        const r = runLauncher("capture-correction",
+            JSON.stringify({ prompt: "use pyright not mypy here",
+                session_id: "cc-fb", cwd: PROJ }),
+            envWith({ ZMEM_DATA: CDATA, ZMEM_CAPTURE_FEEDBACK: "1",
+                CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("capture/feedback/claude: translated to hookSpecificOutput",
+            obj && obj.hookSpecificOutput, r.stdout.slice(0, 200));
+        eq("capture/feedback/claude: hookEventName == UserPromptSubmit",
+            obj && obj.hookSpecificOutput && obj.hookSpecificOutput.hookEventName,
+            "UserPromptSubmit");
+        ok("capture/feedback/claude: carries the one-line ack",
+            obj && obj.hookSpecificOutput &&
+                /correction candidate captured/.test(obj.hookSpecificOutput.additionalContext));
+    }
+
+    // --- question / non-correction: nothing queued
+    {
+        const before = readQueueItems(CDATA).length;
+        const r = runLauncher("capture-correction",
+            JSON.stringify({ prompt: "can you fix the bug?",
+                session_id: "cc-q", cwd: PROJ }),
+            envWith({ ZMEM_DATA: CDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("capture/question: output {}", obj !== null && JSON.stringify(obj) === "{}",
+            r.stdout.slice(0, 200));
+        ok("capture/question: nothing new queued", readQueueItems(CDATA).length === before,
+            "before=" + before);
+    }
+}
+
+console.log("\n[18] SessionStart pending-candidate note (real session-start.sh)");
+
+{
+    const SDATA = path.join(TMP, "sessionnote-data");
+    fs.mkdirSync(path.join(SDATA, "queue"), { recursive: true });
+    const SNS = resolveNs(PROJ);
+
+    // Seed a queue item for the namespace the hook will resolve.
+    const enc = encodedNs(SNS);
+    fs.writeFileSync(path.join(SDATA, "queue", enc + ".json"),
+        JSON.stringify([{ schema_version: 1, id: "pending1", message: "no, use uv",
+            type: "auto", patterns: "use-X-not-Y", confidence: 0.7,
+            sentiment: "correction", decay_days: 60, timestamp: "2026-08-15T00:00:00Z",
+            session: "s", namespace: SNS, host: "claude", source: "live-capture" }]));
+
+    // claude
+    {
+        const r = runLauncher("session-start", SESSION_PAYLOAD, envWith({
+            ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("session-note/claude: pending-count note present when queue non-empty",
+            /correction candidate/.test(ac) && /1 captured/.test(ac), ac.slice(0, 300));
+    }
+
+    // empty queue -> no note
+    {
+        fs.rmSync(path.join(SDATA, "queue", enc + ".json"));
+        const r = runLauncher("session-start", SESSION_PAYLOAD, envWith({
+            ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("session-note/claude: no note when queue empty",
+            !/correction candidate/.test(ac), ac.slice(0, 300));
+    }
+}
+
 // --- cleanup + report ------------------------------------------------------
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }
 

@@ -42,6 +42,55 @@ When in doubt prefer `user:global` for genuinely portable knowledge and the
 project key for anything that references this repo's structure. Worktrees and
 second clones of the same remote resolve to the same key automatically.
 
+## Step 0.5 — Review captured correction candidates
+
+The live-capture hook (`capture-correction`, issue #47) queues corrections the
+user typed mid-session ("no, use X", "don't refactor unrelated code",
+"remember: ...") into a namespace-scoped sidecar queue — it NEVER writes the
+store (hooks only queue; this skill writes). If this session-start hook surface
+mentioned a pending count, or you want to check, review the queue now:
+
+```bash
+python "$S" queue-list --namespace "<derived namespace>" --json
+```
+
+The `items[]` shape is a superset of transcript-mining (`corrections`) items, so
+the same review discipline applies. For each item, apply the adapted
+claude-reflect rubric — executed by YOU (the session's agent) reading this
+skill, never by shelling out to an LLM CLI:
+
+- **Keep only corrections reusable across sessions** — reject questions,
+  one-time task instructions, context-specific requests, and vague feedback
+  ("fix it", "wrong").
+- **`remember:` items are always presented, never silently dropped** — they are
+  explicit, highest-confidence capture requests.
+- **Trust user corrections as authoritative** for model names, API versions,
+  tool availability, and flag values — do not second-guess them against your
+  training data.
+- **Rewrite accepted items** as actionable imperative claims with trigger
+  conditions (Step 2 guidance below).
+
+Accepted items then flow through the existing pipeline unchanged: Step 1
+recall-before-write (dedupe/supersede check) → Step 2 `add` with
+`--signal user` (never higher — SIGNAL_CONFIDENCE maps `user` → 0.6) and
+`--source-ref "session:<id>"`.
+
+**Secrets:** an item flagged `secret_warning: true` carried secret-like text at
+capture time. Render the warning to yourself, and write that item via
+`add --capture-mode auto` so any remaining secret-like text is redacted before
+it reaches the store (the default manual mode would keep the original wording).
+
+After processing, clear the processed items from the queue (leave explicitly
+deferred items in place), and prune stale low-confidence candidates:
+
+```bash
+# remove the specific processed item ids
+python "$S" queue-clear --namespace "<derived namespace>" --id <id> --id <id>
+
+# prune stale (past decay) items with confidence < 0.6
+python "$S" queue-clear --namespace "<derived namespace>" --drop-stale
+```
+
 ## Step 1 — Recall before you write
 
 For each candidate lesson, check what the store already believes:
@@ -196,6 +245,8 @@ State plainly:
 - Lessons captured, with signal and namespace for each
 - Anything **superseded**, and what replaced it
 - Whether consolidation merged anything
+- Correction candidates reviewed (from Step 0.5's queue): reviewed N, captured M,
+  rejected K (and why)
 - Skills promoted (and why those, not the others)
 - What you deliberately did **not** capture, and why
 
