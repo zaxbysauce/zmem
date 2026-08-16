@@ -127,6 +127,16 @@ except ImportError:
     from corrections import detect_patterns as _detect_patterns  # type: ignore # noqa: F401
     from corrections import extract_user_messages as _extract_user_messages  # type: ignore # noqa: F401
 
+# Live-correction queue (issue #47). `SECRET_PATTERNS` lives here as the single
+# source of truth shared by the store's capture-policy helpers AND the queue's
+# write-time redaction (so they can never drift). Stdlib-only, resolved like
+# `corrections`.
+try:
+    from correction_queue import SECRET_PATTERNS  # noqa: F401
+except ImportError:
+    sys.path.insert(0, os.path.dirname(__file__))
+    from correction_queue import SECRET_PATTERNS  # type: ignore # noqa: F401
+
 
 def _env_float(name: str, default: float) -> float:
     """Read a float env var, falling back to `default` on absent/garbage input.
@@ -227,14 +237,8 @@ SIGNAL_CONFIDENCE = {
 
 CONFIDENCE_FLOOR = 0.25
 
-SECRET_PATTERNS = [
-    re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd|private[_-]?key)\s*[:=]\s*\S{8,}"),
-    re.compile(r"-----BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY-----"),
-    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
-    re.compile(r"\b[0-9a-fA-F]{32,}\b"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-]
+# SECRET_PATTERNS is imported from correction_queue (single source of truth for
+# the store's capture policy AND the live-capture queue's redaction).
 
 PROMPT_INJECTION_PATTERNS = [
     re.compile(r"(?i)\bignore (all|any|the|previous|prior) instructions\b"),
@@ -4598,6 +4602,9 @@ def cmd_corrections(*, transcript: str) -> int:
             # detection (SECRET_PATTERNS). In capture mode "auto" replace the
             # message with the redacted form; otherwise (e.g. manual) keep the
             # ORIGINAL (unredacted) wording so a reviewer can still read it.
+            # (Note: corrections.detect_patterns applies its OWN secret
+            # confidence penalty during classification — this is a second,
+            # independent pass for redaction/annotation only.)
             # Note: the newline-collapse + length-truncation applied above is a
             # fence-integrity/output-safety step that runs in BOTH modes — a
             # "verbatim" manual-mode message is line-break-free and capped at
@@ -4629,6 +4636,63 @@ def _classify_correction(text: str):
         "sentiment": sentiment,
         "decay_days": decay_days,
     }
+
+
+def cmd_queue_list(*, namespace: str, as_json: bool) -> int:
+    """List a namespace's live-capture correction candidates (issue #47).
+
+    Always read-only and STORE-INDEPENDENT: it reads the sidecar queue file via
+    correction_queue, never the ZMem store, so it is dispatched BEFORE
+    connect() — a bad/locked/missing store can never block closeout review
+    (same policy as `failures`/`corrections`/`sweep`). Fail-open: an unreadable
+    queue yields {"count": 0, "items": []} without raising.
+
+    The emitted `items[]` shape is a superset of cmd_corrections' item (it adds
+    schema_version/id/timestamp/session/namespace/host/source), so the closeout
+    Step 0.5 review rubric is identical to transcript mining.
+    """
+    try:
+        import correction_queue as _cq
+        items = _cq.load_queue(namespace)
+    except Exception:
+        items = []
+    if as_json:
+        print(json.dumps({"count": len(items), "items": items}))
+        return 0
+    if not items:
+        print("(no correction candidates pending)")
+        return 0
+    for it in items:
+        flag = "[stale] " if it.get("stale") else ""
+        warning = "[secret] " if it.get("secret_warning") else ""
+        print("- %s%s[%s] %s" % (flag, warning, it.get("type", "?"), it.get("message", "")))
+    return 0
+
+
+def cmd_queue_clear(*, namespace: str, ids, clear_all: bool, drop_stale: bool) -> int:
+    """Clear processed/deferred live-capture correction candidates (issue #47).
+
+    Operates on the STORE-INDEPENDENT sidecar queue file (never the store), so
+    it dispatches BEFORE connect() like queue-list. --id removes specific
+    items (closeout clears processed ones and leaves deferred in place);
+    --all empties the whole namespace queue; --drop-stale prunes stale items
+    with confidence < 0.6. The three are mutually exclusive (argparse group),
+    so --all is never silently dropped. Fail-open: a write failure leaves the
+    file untouched and reports 0 removed.
+    """
+    try:
+        import correction_queue as _cq
+        if clear_all:
+            before = len(_cq.load_queue(namespace))
+            _cq.clear_queue(namespace)
+            print("[zmem] queue-clear: cleared %s (%d item(s))" % (namespace, before))
+            return 0
+        removed = _cq.clear_queue(namespace, ids=ids or None, drop_stale=drop_stale)
+        print("[zmem] queue-clear: removed %d item(s) from %s" % (removed, namespace))
+        return 0
+    except Exception:
+        print("[zmem] queue-clear: failed (queue untouched)")
+        return 0
 
 
 # --- Tier 1 export: markdown memory pack (P.export-pack) -------------------
@@ -5729,6 +5793,31 @@ def main():
     p_corr.add_argument("--json", action="store_true",
                        help="emit JSON (default output is already JSON; kept for parity)")
 
+    p_queue_list = sub.add_parser(
+        "queue-list",
+        help="list live-capture correction candidates for a namespace "
+             "(read-only sidecar, store-independent)")
+    p_queue_list.add_argument("--namespace", required=True,
+                              help="namespace to list (e.g. the derived project key)")
+    p_queue_list.add_argument("--json", action="store_true",
+                              help="emit {\"count\": N, \"items\": [...]} "
+                                   "(default: human list)")
+
+    p_queue_clear = sub.add_parser(
+        "queue-clear",
+        help="clear processed/deferred live-capture correction candidates "
+             "(sidecar, store-independent)")
+    p_queue_clear.add_argument("--namespace", required=True)
+    # --id / --all / --drop-stale are mutually exclusive: passing --all with
+    # --id or --drop-stale was silently dropping --all (a surprising no-op).
+    _qc_grp = p_queue_clear.add_mutually_exclusive_group()
+    _qc_grp.add_argument("--id", action="append", default=[],
+                         help="remove specific item id(s) (repeatable)")
+    _qc_grp.add_argument("--all", action="store_true",
+                         help="clear the entire namespace queue")
+    _qc_grp.add_argument("--drop-stale", action="store_true",
+                         help="remove stale items with confidence < 0.6")
+
     p_sweep = sub.add_parser(
         "sweep",
         help="remove stale per-session cooldown sentinel files (issue #23)")
@@ -5759,6 +5848,16 @@ def main():
     # break correction mining (same policy as `failures`).
     if args.cmd == "corrections":
         sys.exit(cmd_corrections(transcript=args.transcript))
+
+    # `queue-list` / `queue-clear` operate on the store-INDEPENDENT sidecar
+    # queue file (correction_queue), never the ZMem store, so they branch
+    # BEFORE connect()/migrate() — a bad/locked/missing store can never block
+    # closeout queue review (same policy as `failures`/`corrections`/`sweep`).
+    if args.cmd == "queue-list":
+        sys.exit(cmd_queue_list(namespace=args.namespace, as_json=args.json))
+    if args.cmd == "queue-clear":
+        sys.exit(cmd_queue_clear(namespace=args.namespace, ids=args.id,
+                                 clear_all=args.all, drop_stale=args.drop_stale))
 
     # `restore` overwrites the destination store FILE. It must not hold an open
     # sqlite3 connection on that file while doing so (a Windows file handle can

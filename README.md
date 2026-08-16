@@ -44,6 +44,12 @@ Do not let different hosts silently fan out to different physical stores.
 - **Relevance-based recall:** when you submit a prompt, matching memories are
   injected as context *before* the agent starts working — not just the 3 most
   recent at session start.
+- **Live correction capture:** a `capture-correction` hook registered under
+  `UserPromptSubmit` (Claude Code, ZCode, and Codex) silently queues mid-session
+  user corrections ("no, use X", "don't refactor unrelated code",
+  "remember: ...") to a namespace-scoped sidecar file — it never writes the store.
+  The next session shows a pending count, and the closeout skill reviews the
+  queue and writes only what clears the bar as `--signal user` rows.
 
 Signal tiers set how trustworthy a memory is: `test/compile/lint` (high, grounded
 in deterministic verification) > `reviewer/user` (medium) > `none` (low, below the
@@ -441,6 +447,20 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
   session/tool-call database. ZMem reads this for failure detection; never writes it.
   On Claude Code, failure detection instead scans the session transcript
   (`transcript_path`) — no separate db.sqlite exists there.
+- **Live-capture correction queue:** `~/.zmem/queue/<namespace>.json` — one file
+  per namespace (namespace names are encoded filesystem-safely: `_` → `__`,
+  `:` → `_c`, `/` → `_s`, `\` → `_b`, other invalid chars → `_x<hex>`). It holds
+  candidates captured by the `capture-correction` hook until the closeout skill
+  reviews them. The queue shares the store's data dir, so a candidate captured in
+  one host is reviewable from any other host on the same box (same single-brain
+  model as the store). `ZMEM_CAPTURE_FEEDBACK=1` makes the hook emit a one-line
+  acknowledgment; `ZMEM_CAPTURE_MODE=auto` redacts secrets at capture time
+  (default `manual` keeps the original wording and flags `secret_warning`). The
+  queue is capped at 100 items (oldest first) and stale items are flagged, never
+  auto-deleted. **Hermes is intentionally NOT wired for live capture** — its hook
+  surface is `post_tool_call` (observational, results discarded) + `pre_llm_call`
+  (context injected), so a Hermes correction-capture would use that flag pattern
+  and is a separate follow-up.
 
 ## Cloud sessions
 
