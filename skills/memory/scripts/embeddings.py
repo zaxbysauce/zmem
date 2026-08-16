@@ -62,6 +62,26 @@ _DEFAULT_MODEL_URL = (
 )
 
 
+# The plugin's bundled models directory, relative to this script. Kept as a
+# module-level constant so tests can redirect it deterministically without
+# touching the real file layout.
+_BUNDLED_MODELS_DIR = Path(__file__).parent.parent / "models"
+
+
+def _models_dir_usable(path: Path | None) -> bool:
+    """Cheap, never-raising check that a models dir can serve the embedding
+    model. The model file is the only one whose absence makes embeddings
+    unavailable at load time, so its presence is the discriminator used to
+    decide whether a candidate dir is worth preferring. Everything else (token
+    consistency, checksum, importability) is validated later by the loaders."""
+    if path is None:
+        return False
+    try:
+        return (path / "minilm.onnx").is_file()
+    except OSError:
+        return False
+
+
 def _resolve_models_dir() -> Path:
     """Resolve the models directory.
 
@@ -69,13 +89,30 @@ def _resolve_models_dir() -> Path:
     both as a test affordance (tests point it at an empty/missing dir so they
     never touch a real installed model) AND as a production configuration
     knob (point it at a populated, checksum-verified models dir, e.g. a shared
-    model cache across checkouts). Defaults to the plugin's bundled models
-    directory relative to this script.
+    model cache across checkouts).
+
+    When ZMEM_MODELS_DIR is unset, prefer the plugin's bundled models
+    directory. If the bundled dir has no model file, fall back to the box-wide
+    shared models cache (the 'models' sibling of the store data dir) so
+    embeddings keep working without any env var on hosts where the installed
+    model lives in the shared cache but not in this checkout. If neither has a
+    model, return the bundled dir (the pre-fallback default) so downstream
+    code reports the usual model_file_missing state instead of raising.
     """
     override = os.environ.get("ZMEM_MODELS_DIR")
     if override:
         return Path(override)
-    return Path(__file__).parent.parent / "models"
+    bundled = _BUNDLED_MODELS_DIR
+    if _models_dir_usable(bundled):
+        return bundled
+    try:
+        import host  # local import: avoid import-time coupling at module load
+        shared = Path(host.resolve_store_path()).parent / "models"
+        if _models_dir_usable(shared):
+            return shared
+    except Exception:
+        pass  # never raise; fall through to the bundled default below
+    return bundled
 
 
 def _sha256_file(path: Path) -> str:

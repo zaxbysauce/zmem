@@ -365,6 +365,11 @@ class LoadPathChecksumTests(unittest.TestCase):
                           "checksum (known: default builds differ) — the "
                           "positive path is exercised on the reference box")
         env = {**os.environ, "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        # This child must resolve the real bundled/shared model, so scrub any
+        # inherited ZMEM_MODELS_DIR (e.g. a module-scope pin leaked by another
+        # suite under a single-process runner): if one leaked through, the child
+        # would point at that dir and fail to load.
+        env.pop("ZMEM_MODELS_DIR", None)
         script = (
             "import sys\n"
             f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
@@ -1152,6 +1157,109 @@ class IngestJsonlWarningTests(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("without an embedding", r.stderr.lower())
+
+
+class ResolveModelsDirTests(unittest.TestCase):
+    """Unit tests for models-dir resolution fallback: ZMEM_MODELS_DIR
+    precedence, bundled-dir preference, and fallback to the shared store-dir
+    models cache when the bundled dir lacks the model. Drives
+    `_resolve_models_dir()` directly with monkeypatched env, constants, and a
+    fake `host` — no real model, no store, no network. The whole point is that
+    a fresh checkout with no model file keeps working because the resolver
+    finds the box-wide shared cache (host's `<store>/../models`)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._env = dict(os.environ)
+        self._saved_bundled = embeddings._BUNDLED_MODELS_DIR
+        self._saved_host = sys.modules.get("host")
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+        embeddings._BUNDLED_MODELS_DIR = self._saved_bundled
+        if self._saved_host is None:
+            sys.modules.pop("host", None)
+        else:
+            sys.modules["host"] = self._saved_host
+
+    def _make_dir_with_model(self, name):
+        d = Path(self.tmp) / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "minilm.onnx").write_bytes(b"x")
+        return d
+
+    def _fake_host_returning_store(self, store_sqlite):
+        import types
+        fake = types.ModuleType("host")
+        fake.resolve_store_path = lambda: store_sqlite
+        sys.modules["host"] = fake
+        return fake
+
+    def _unset_override(self):
+        os.environ.pop("ZMEM_MODELS_DIR", None)
+
+    def test_models_dir_usable_predicate(self):
+        present = self._make_dir_with_model("present")
+        self.assertTrue(embeddings._models_dir_usable(present))
+        absent = Path(self.tmp) / "absent"
+        absent.mkdir()
+        self.assertFalse(embeddings._models_dir_usable(absent))
+        self.assertFalse(embeddings._models_dir_usable(None))
+
+    def test_override_takes_precedence_over_everything(self):
+        override = Path(self.tmp) / "override"
+        override.mkdir()
+        # Both the bundled dir and the shared cache have a model; the override
+        # must still win.
+        embeddings._BUNDLED_MODELS_DIR = self._make_dir_with_model("bundled")
+        self._fake_host_returning_store(
+            self._make_dir_with_model("models").parent / "store.sqlite"
+        )
+        os.environ["ZMEM_MODELS_DIR"] = str(override)
+        self.assertEqual(embeddings._resolve_models_dir(), override)
+
+    def test_bundled_dir_preferred_when_it_has_the_model(self):
+        bundled = self._make_dir_with_model("bundled")
+        embeddings._BUNDLED_MODELS_DIR = bundled
+        self._unset_override()
+        # host must NOT be consulted when the bundled dir already has a model:
+        # evict it from sys.modules and prove the resolver never re-imports it.
+        sys.modules.pop("host", None)
+        self.assertEqual(embeddings._resolve_models_dir(), bundled)
+        self.assertNotIn("host", sys.modules)
+
+    def test_falls_back_to_shared_cache_when_bundled_lacks_model(self):
+        bundled = Path(self.tmp) / "bundled_no_model"
+        bundled.mkdir()
+        shared = self._make_dir_with_model("models")  # resolves to <tmp>/models
+        self._fake_host_returning_store(Path(self.tmp) / "store.sqlite")
+        embeddings._BUNDLED_MODELS_DIR = bundled
+        self._unset_override()
+        self.assertEqual(embeddings._resolve_models_dir(), shared)
+
+    def test_returns_bundled_when_neither_has_model(self):
+        # Neither the bundled dir nor an absent shared cache carries the model:
+        # resolver falls back to the bundled default (no raise), preserving the
+        # old model_file_missing reporting path.
+        bundled = Path(self.tmp) / "bundled_no_model"
+        bundled.mkdir()
+        self._fake_host_returning_store(Path(self.tmp) / "store.sqlite")
+        embeddings._BUNDLED_MODELS_DIR = bundled
+        self._unset_override()
+        self.assertEqual(embeddings._resolve_models_dir(), bundled)
+
+    def test_returns_bundled_when_host_unavailable(self):
+        bundled = Path(self.tmp) / "bundled_no_model"
+        bundled.mkdir()
+        embeddings._BUNDLED_MODELS_DIR = bundled
+        self._unset_override()
+        # Fake host whose resolve_store_path raises — the resolver must swallow
+        # it and return the bundled default rather than propagate.
+        self._fake_host_returning_store(
+            Path(self.tmp) / "store.sqlite"
+        ).resolve_store_path = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        self.assertEqual(embeddings._resolve_models_dir(), bundled)
 
 
 if __name__ == "__main__":

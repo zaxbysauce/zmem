@@ -55,6 +55,16 @@ KEEPER_BASE = ("pytest xdist workers share a tmpdir causing a race condition "
 ABSORBED_EXTRA = (KEEPER_BASE + " and lane ordering must be deterministic "
                   "across lane ids")
 
+# Force embeddings deterministically OUT of scope for every op in this module.
+# store.py only imports the embeddings module at exec time; the actual
+# availability check runs lazily at add/consolidate time, by which point the
+# per-store mock env has been restored. Under ambient env a host with the
+# shared model cache (~/.zmem/models) would make embeddings available, so these
+# consolidate tests would exercise embedding semantics instead of the lexical
+# fallback they assert. Point ZMEM_MODELS_DIR at a dir that can never carry the
+# model, for the whole module.
+os.environ["ZMEM_MODELS_DIR"] = str(REPO_ROOT / "no-such-models")
+
 
 def _load_store_module(store_path: Path, models_dir: Path):
     """A fresh store.py module instance pinned to a throwaway store, with the

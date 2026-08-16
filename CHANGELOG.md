@@ -48,6 +48,17 @@ README.
 
 ### Fixed
 
+- **Embeddings now resolve to the shared model cache without an env var.** The
+  models-dir resolver (`embeddings._resolve_models_dir`) now falls back to the
+  box-wide shared cache (`<store data dir>/../models`, e.g. `~/.zmem/models`)
+  when the plugin's bundled `skills/memory/models` dir lacks the (gitignored)
+  `minilm.onnx`. Resolution order: `ZMEM_MODELS_DIR` override → bundled
+  if it has the model → shared cache if it has the model → bundled default. A
+  fresh checkout or host whose model lives once under `~/.zmem` now keeps
+  semantic recall working with no configuration. The embedding/availability and
+  consolidate test suites pin `ZMEM_MODELS_DIR` at module scope so they stay
+  deterministic on hosts where the shared cache is present.
+
 - **Queue hardening** (from an independent swarm-pr-review): `queue-clear` no
   longer silently wipes the whole namespace when invoked without a selector;
   the namespace filename encoding is now collision-free for all Unicode (one

@@ -33,6 +33,13 @@ STORE_PY = SCRIPTS_DIR / "store.py"
 PYTHON = sys.executable
 HOOKS_DIR = REPO_ROOT / "hermes-plugin" / "hooks"
 
+# Force embeddings deterministically OUT of scope for every op in this module
+# (see test_consolidate_lossy for the full rationale): the lazy availability
+# check runs under ambient env after the per-store mock env is restored, so a
+# host with the shared model cache would flip host integration behavior to
+# embedding semantics and change what these tests observe.
+os.environ["ZMEM_MODELS_DIR"] = str(REPO_ROOT / "no-such-models")
+
 
 def _load_store_module(store_path: str, models_dir: str):
     spec = importlib.util.spec_from_file_location(
