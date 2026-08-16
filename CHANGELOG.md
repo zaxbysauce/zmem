@@ -10,6 +10,43 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [Unreleased]
+
+### Added
+
+- **Transcript correction mining core** (issue [#46], PR 1/4 of the
+  claude-reflect port). Ported the MIT claude-reflect correction-pattern
+  library as a host-agnostic module `skills/memory/scripts/corrections.py`
+  (strong/weak/tiered English + CJK patterns, guardrails, false-positive vetoes,
+  explicit `remember:` handling).
+- **`store.py failures` now splits user rejections out of genuine failures.** A
+  Claude Code tool rejection (`The user doesn't want to proceed`) is no longer
+  counted as a failed tool call; it is reported in a new `rejections:
+  [{tool, reason}]` array, with the user's stated reason extracted (multi-line
+  reasons joined, marker stripped, newline-free for fence-integrity). The Stop
+  hook (`hooks/zmem-reflect.sh`) and the SubagentStop hook
+  (`hooks/zmem-subagent-reflect.sh`) surface these as a distinct fenced section
+  with a `--signal user` hint, and the failure count no longer miscounts
+  rejections. The ZCode db substrate and unknown/non-CC schemas fail open to
+  empty `rejections`, so their prompt output is unchanged.
+- **New `store.py corrections --transcript <path>` subcommand** (read-only, CC
+  transcript format): mines detected corrections, sanitizes message text, and
+  applies the capture-policy secret redaction/annotation.
+- **New dev harness `scripts/pattern_harness.py`** for tuning the correction
+  patterns against real transcripts (offline, stdlib-only, never shells out to
+  a model).
+
+### Tests
+
+- Added `tests/test_corrections.py`: rejection extraction (both transcript
+  formats, with/without reason, multi-line + marker-stripped + newline-free,
+  dedup by `tool_use_id`), non-CC schema fail-open, pattern-library coverage,
+  `corrections` read-only + secret handling, and `failures` output shape
+  stability. Extended `tests/test_failures.py` for the new `(details,
+  rejections)` return and `rejections` key.
+
+[#46]: https://github.com/zaxbysauce/zmem/issues/46
+
 ## [0.8.4] — 2026-08-12
 
 ### Fixed

@@ -30,6 +30,8 @@ Usage:
          [--global-limit 15] [--min-confidence 0.6] [--max-bytes 32768]
   python store.py export-jsonl [--out FILE] [--namespace NS] [--include-superseded]
   python store.py ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones] [--capture-mode MODE]
+  python store.py failures [--session SID] [--transcript PATH] [--db PATH]
+  python store.py corrections --transcript PATH   (read-only CC transcript mining)
 
 Design (see the memory skill's design doc):
   - Tombstone supersession (superseded_at), NOT full bi-temporal (YAGNI for single user).
@@ -114,6 +116,16 @@ except ImportError:
         ALLOWED_TYPES,
         ALLOWED_SIGNALS,
     )
+
+# Host-agnostic correction-pattern engine (issue #46). Pure text library, no
+# store I/O, stdlib-only. Resolved from this directory like `host`/`schema_meta`.
+try:
+    from corrections import detect_patterns as _detect_patterns  # noqa: F401
+    from corrections import extract_user_messages as _extract_user_messages  # noqa: F401
+except ImportError:
+    sys.path.insert(0, os.path.dirname(__file__))
+    from corrections import detect_patterns as _detect_patterns  # type: ignore # noqa: F401
+    from corrections import extract_user_messages as _extract_user_messages  # type: ignore # noqa: F401
 
 
 def _env_float(name: str, default: float) -> float:
@@ -4234,8 +4246,46 @@ def _sanitize_tool_name(name, limit: int = 100) -> str:
     fence-integrity guarantee _sanitize_error_text gives the error text."""
     if not name:
         return "?"
-    s = str(name).replace("\r", " ").replace("\n", " ").strip()
+    s = (str(name).replace("\r", " ")
+         .replace("\n", " ")
+         .replace("\u2028", " ")   # line separator
+         .replace("\u2029", " ")   # paragraph separator
+         .strip())
     return s[:limit] or "?"
+
+
+def _is_rejection_text(text) -> bool:
+    """True when tool-result text is a Claude Code user rejection of a tool.
+
+    A rejected tool_call in CC records a tool_result with is_error:true whose
+    text contains the harness marker ``The user doesn't want to proceed``.
+    Case-insensitive match (issue #46). This exact CC-harness marker is the
+    ONLY thing that routes a record to ``rejections`` — an unrecognized schema
+    simply never contains it, so we fail open (no false rejections).
+    """
+    return bool(text) and "the user doesn't want to proceed" in str(text).lower()
+
+
+def _rejection_reason(text) -> str:
+    """Extract the user's stated reason from a CC rejection text.
+
+    The reason appears after the ``user said:`` marker. CC localizes the marker
+    — both ``user said:`` and ``the user said:`` occur across transcript forms
+    (the content-block form prefixes "the ", the sibling toolUseResult form
+    does not). Matching ``user said:`` covers both, since the longer form
+    contains it. The reason may span multiple lines; we join all non-empty lines
+    after the marker with single spaces and strip the marker itself. Returns
+    ``""`` when there is no marker (a rejection without a stated reason).
+    """
+    s = str(text or "")
+    lower = s.lower()
+    marker = "user said:"
+    idx = lower.find(marker)
+    if idx < 0:
+        return ""
+    after = s[idx + len(marker):]
+    lines = [ln.strip() for ln in after.splitlines() if ln.strip()]
+    return " ".join(lines)
 
 
 def _result_text(content) -> str:
@@ -4255,14 +4305,30 @@ def _result_text(content) -> str:
 
 
 def _failures_from_transcript(path: str):
-    """Scan a Claude Code transcript JSONL for failed tool calls. Returns a list
-    of {tool, error} dicts (one per distinct failed tool_use_id). Fail-open:
-    returns [] on any read/parse error. Never raises."""
+    """Scan a Claude Code transcript JSONL for failed tool calls and user
+    rejections. Returns ``(details, rejections)`` where each is a list of dicts
+    (details: one {tool, error} per distinct failed tool_use_id; rejections: one
+    {tool, reason} per distinct rejected tool_use_id). Fail-open: returns
+    ([], []) on any read/parse error. Never raises.
+
+    A user rejection (CC: is_error:true with ``The user doesn't want to
+    proceed``) is split OUT of ``details`` (where it previously counted as a
+    generic failure) and its stated reason is captured instead (issue #46).
+    Rejections and genuine failures are mutually exclusive by construction: each
+    tool_use_id is classified once (rejection branch first, consuming the key),
+    so a record is never both.
+
+    ``details`` are returned NEWEST-first (reversed from the chronological file
+    order) to match the db substrate, which returns them ``ORDER BY
+    completed_at DESC`` — so the reflect hooks' "showing most recent K of N" on
+    ``details[:K]`` is truthful on both substrates. ``rejections`` are kept
+    CHRONOLOGICAL (oldest-first) because ``render_rejection_section`` keeps the
+    chronological tail (``rejections[-K:]``) as the most recent."""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             raw_lines = [ln for ln in f if ln.strip()]
     except OSError:
-        return []
+        return [], []
 
     records = []
     for ln in raw_lines:
@@ -4280,14 +4346,21 @@ def _failures_from_transcript(path: str):
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "tool_use":
                     tid = b.get("id")
-                    if tid:
+                    # Only real string ids belong in the name map; a non-string
+                    # id (malformed/foreign record) must not crash the dict
+                    # write — it just gets no name (classification falls back to
+                    # "?"), consistent with the fail-open contract.
+                    if isinstance(tid, str) and tid:
                         tool_names[tid] = b.get("name") or "?"
 
-    # Pass 2: collect failed tool_result blocks, deduped by tool_use_id so the
+    # Pass 2: collect failed tool_result blocks (deduped by tool_use_id so the
     # is_error flag and the sibling toolUseResult "Error…" string on the same
-    # record never double-count one failure.
+    # record never double-count one failure), routing user rejections to a
+    # separate list.
     details = []
+    rejections = []
     seen = set()
+    anon = 0
     for o in records:
         if not isinstance(o, dict):
             continue
@@ -4295,27 +4368,69 @@ def _failures_from_transcript(path: str):
         content = msg.get("content") if isinstance(msg, dict) else None
         tur = o.get("toolUseResult")
         tur_is_err = isinstance(tur, str) and tur.strip().lower().startswith("error")
-        if not isinstance(content, list):
-            continue
-        for b in content:
-            if not isinstance(b, dict) or b.get("type") != "tool_result":
-                continue
-            is_err = b.get("is_error") is True
-            if not (is_err or tur_is_err):
-                continue
-            tid = b.get("tool_use_id")
-            key = tid if tid else ("anon:%d" % len(seen))
+        tur_is_rejection = isinstance(tur, str) and _is_rejection_text(tur)
+        classified_record = False
+        block_tids = []
+        if isinstance(content, list):
+            for b in content:
+                if not isinstance(b, dict) or b.get("type") != "tool_result":
+                    continue
+                is_err = b.get("is_error") is True
+                block_text = _result_text(b.get("content"))
+                effective = block_text
+                if not effective and isinstance(tur, str):
+                    effective = tur
+                tid = b.get("tool_use_id")
+                # A non-string tool_use_id (a malformed/foreign record) must not
+                # crash the dedup below; keep only real string ids so key-hash /
+                # tool_names lookups stay safe (never-raises fail-open).
+                tid = tid if isinstance(tid, str) and tid else None
+                if tid:
+                    block_tids.append(tid)
+                # A block is worth classifying if it is flagged as an error OR
+                # its effective text is itself a rejection (covers the sibling
+                # toolUseResult fallback for empty block content).
+                if not (is_err or tur_is_err or (effective and _is_rejection_text(effective))):
+                    continue
+                key = tid if tid else ("anon:%d" % anon)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not tid:
+                    anon += 1
+                classified_record = True
+                if _is_rejection_text(effective):
+                    rejections.append({
+                        "tool": _sanitize_tool_name(tool_names.get(tid, "?")),
+                        "reason": _sanitize_error_text(_rejection_reason(effective)),
+                    })
+                else:
+                    details.append({
+                        "tool": _sanitize_tool_name(tool_names.get(tid, "?")),
+                        "error": _sanitize_error_text(effective),
+                    })
+        # Pure sibling-string form: the top-level toolUseResult is itself a
+        # rejection but no tool_result block classified this record (e.g. the
+        # record carried no content array, or its block had no error/rejection
+        # signal of its own). Extends (does not regress) the existing
+        # toolUseResult path — an unrecognized non-rejection, non-"error…" string
+        # remains ignored exactly as today. Reuse the first block's tool_use_id
+        # (if any) so the tool name is not needlessly dropped, and honour the
+        # `seen` dedup so a sibling on an already-classified id is not double
+        # counted.
+        if not classified_record and tur_is_rejection:
+            tid = block_tids[0] if block_tids else None
+            key = tid if tid else ("anon:%d" % anon)
             if key in seen:
                 continue
             seen.add(key)
-            err_text = _result_text(b.get("content"))
-            if not err_text and isinstance(tur, str):
-                err_text = tur
-            details.append({
+            if not tid:
+                anon += 1
+            rejections.append({
                 "tool": _sanitize_tool_name(tool_names.get(tid, "?")),
-                "error": _sanitize_error_text(err_text),
+                "reason": _sanitize_error_text(_rejection_reason(tur)),
             })
-    return details
+    return details[::-1], rejections
 
 
 def _failures_from_db(db_path: str, session_id: str):
@@ -4417,10 +4532,14 @@ def _sanitize_exc_text(text: str, limit: int = 300) -> str:
 
 
 def cmd_failures(session: str, transcript: str, db: str) -> int:
-    """Print {"count":N,"details":[...]} for the session's failed tool calls and
-    return an exit code. Transcript wins when given and present (Claude Code);
-    else the db substrate (ZCode). Entirely self-contained — does NOT open the
-    ZMem store.
+    """Print {"count":N,"details":[...],"rejections":[...]} for the session's
+    failed tool calls and return an exit code. Transcript wins when given and
+    present (Claude Code); else the db substrate (ZCode). Entirely
+    self-contained — does NOT open the ZMem store.
+
+    ``count``/``details`` mean GENUINE failures only; user rejections are split
+    into ``rejections`` [{tool, reason}] (issue #46). On the db substrate there
+    is no rejection record, so ``rejections`` is always ``[]`` there.
 
     Exit-code contract (#36 M7): a *checked* result (empty or not) exits 0; a
     *broken substrate* (the detection itself raised) exits 2 with an ``error``
@@ -4430,19 +4549,86 @@ def cmd_failures(session: str, transcript: str, db: str) -> int:
     """
     try:
         if transcript and os.path.isfile(transcript):
-            details = _failures_from_transcript(transcript)
-            result = {"count": len(details), "details": details}
+            details, rejections = _failures_from_transcript(transcript)
+            result = {"count": len(details), "details": details, "rejections": rejections}
         else:
             count, details = _failures_from_db(db, session)
-            result = {"count": count, "details": details}
+            result = {"count": count, "details": details, "rejections": []}
     except Exception as exc:
         msg = _sanitize_exc_text(str(exc))
-        result = {"count": 0, "details": [], "error": msg}
+        result = {"count": 0, "details": [], "rejections": [], "error": msg}
         print(json.dumps(result))
         print(f"[zmem] failures: detection substrate error: {msg}", file=sys.stderr)
         return 2
     print(json.dumps(result))
     return 0
+
+
+def _sanitize_correction_message(text, limit: int = 200) -> str:
+    """Make a user-correction message safe for the `corrections` JSON output:
+    collapse CR/newlines to spaces (fence-integrity, same discipline as
+    `failures`), then truncate. Returns "" for empty input."""
+    if not text:
+        return ""
+    return _collapse_line_breaks(text)[:limit].strip()
+
+
+def cmd_corrections(*, transcript: str) -> int:
+    """Mine user corrections from a Claude Code transcript JSONL (issue #46).
+
+    Always read-only: this command NEVER opens the ZMem store (it is dispatched
+    before connect(), so a bad/locked/missing store can never break it) and
+    never writes anything. Candidates are reviewed by an agent/human before any
+    `add` (signal honesty per skills/closeout/SKILL.md).
+
+    Parses Claude Code transcript format only; other hosts' histories are out of
+    scope (see the zmem host matrix). Fail-open: an unreadable/unrecognized
+    transcript yields {"count": 0, "items": []}.
+    """
+    items = []
+    try:
+        raw_texts = _extract_user_messages(transcript)
+        mode = _normalize_capture_mode(None)
+        for text in raw_texts:
+            classified = _classify_correction(text)
+            if not classified:
+                continue
+            classified["message"] = _sanitize_correction_message(text)
+            # Secrets: run each emitted message through the store's secret
+            # detection (SECRET_PATTERNS). In capture mode "auto" replace the
+            # message with the redacted form; otherwise (e.g. manual) keep the
+            # ORIGINAL (unredacted) wording so a reviewer can still read it.
+            # Note: the newline-collapse + length-truncation applied above is a
+            # fence-integrity/output-safety step that runs in BOTH modes — a
+            # "verbatim" manual-mode message is line-break-free and capped at
+            # 200 chars, only the secret redaction is omitted.
+            redacted, redactions = _redact_secret_like_text(classified["message"])
+            if redactions:
+                classified["secret_warning"] = True
+                if mode == "auto":
+                    classified["message"] = redacted
+            items.append(classified)
+    except Exception:
+        items = []
+    print(json.dumps({"count": len(items), "items": items}))
+    return 0
+
+
+def _classify_correction(text: str):
+    """Run the ported detect_patterns and return a correction item dict (or None
+    when the text is not a detectable correction/positive); the `message` key is
+    filled in by the caller with the sanitized text. Defined as a small shim so
+    cmd_corrections stays readable."""
+    item_type, patterns, confidence, sentiment, decay_days = _detect_patterns(text)
+    if not item_type:
+        return None
+    return {
+        "type": item_type,
+        "patterns": patterns,
+        "confidence": confidence,
+        "sentiment": sentiment,
+        "decay_days": decay_days,
+    }
 
 
 # --- Tier 1 export: markdown memory pack (P.export-pack) -------------------
@@ -5535,6 +5721,14 @@ def main():
     p_fail.add_argument("--db", default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
                         help="ZCode episodic db.sqlite path (default ~/.zcode/cli/db/db.sqlite)")
 
+    p_corr = sub.add_parser(
+        "corrections",
+        help="mine user corrections from a Claude Code transcript JSONL (read-only)")
+    p_corr.add_argument("--transcript", default="",
+                       help="Claude Code transcript JSONL path")
+    p_corr.add_argument("--json", action="store_true",
+                       help="emit JSON (default output is already JSON; kept for parity)")
+
     p_sweep = sub.add_parser(
         "sweep",
         help="remove stale per-session cooldown sentinel files (issue #23)")
@@ -5557,6 +5751,14 @@ def main():
     # locked store, or a mid-migration state can never break failure detection.
     if args.cmd == "failures":
         sys.exit(cmd_failures(session=args.session, transcript=args.transcript, db=args.db))
+
+    # `corrections` is store-independent (it mines a transcript JSONL, never the
+    # ZMem store) and read-only by design (candidates are reviewed by an
+    # agent/human before any `add`). Branch BEFORE connect()/migrate() so a bad
+    # ZMEM_DATA location, a locked store, or a mid-migration state can never
+    # break correction mining (same policy as `failures`).
+    if args.cmd == "corrections":
+        sys.exit(cmd_corrections(transcript=args.transcript))
 
     # `restore` overwrites the destination store FILE. It must not hold an open
     # sqlite3 connection on that file while doing so (a Windows file handle can
