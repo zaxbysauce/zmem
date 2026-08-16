@@ -125,6 +125,19 @@ class TestNamespaceEncoding(unittest.TestCase):
         encs = [cq.encode_namespace(n) for n in namespaces]
         self.assertEqual(len(encs), len(set(encs)), "collision across non-ASCII namespaces")
 
+    def test_unpaired_surrogate_does_not_raise(self):
+        # A lone surrogate in a namespace must not crash encode_namespace; the
+        # lossy 'replace' encoding keeps the module total/no-raise (was a
+        # UnicodeEncodeError regression under the UTF-8-byte scheme). The exact
+        # replacement byte is implementation-defined (CPython emits '?'), so
+        # assert totality + determinism, not a specific replacement char.
+        ns = "project:bad\ud800name"
+        enc = cq.encode_namespace(ns)  # must not raise
+        self.assertIsInstance(enc, str)
+        self.assertEqual(cq.encode_namespace(ns), enc)  # deterministic
+        # Decoding the encoded (lossy) form never raises either.
+        self.assertIsInstance(cq.decode_namespace(enc), str)
+
 
 class TestQueueRoundTrip(unittest.TestCase):
     def _fresh(self):
@@ -495,6 +508,25 @@ class TestStoreSubcommands(unittest.TestCase):
     def test_queue_clear_all_reports_failure_not_false_clear(self):
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             self.skipTest("root unlink is not blocked by dir perms")
+        # Some rootless containers / CI do not enforce directory write bits, so
+        # probe first: if setting a dir read-only does NOT block unlink on this
+        # box, the failure path cannot be exercised with real FS perms -> skip
+        # rather than spuriously fail.
+        probe = tempfile.mkdtemp()
+        probe_file = os.path.join(probe, "p")
+        with open(probe_file, "w") as f:
+            f.write("x")
+        os.chmod(probe, 0o500)
+        try:
+            try:
+                os.unlink(probe_file)
+                enforced = False
+            except OSError:
+                enforced = True
+        finally:
+            os.chmod(probe, 0o700)
+        if not enforced:
+            self.skipTest("filesystem does not enforce dir write perms")
         # When the whole-queue unlink cannot execute (write-protected dir), the
         # CLI `--all` path must NOT fabricate a "cleared N"; it must report the
         # failure and leave the queue intact (F-H wired end-to-end).

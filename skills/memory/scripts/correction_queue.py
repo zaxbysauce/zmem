@@ -170,7 +170,9 @@ def encode_namespace(namespace: str) -> str:
             # One token per UTF-8 byte so the full code point is captured:
             # encoding only the low 8 bits of ord(ch) would let two DIFFERENT
             # chars sharing a low byte (e.g. U+00C0 'À' and U+01C0 'ǀ') collide.
-            for b in ch.encode("utf-8"):
+            # 'replace' keeps this total/no-raise even for an unpaired surrogate
+            # in a namespace string (a pathological input -> lossy, never a crash).
+            for b in ch.encode("utf-8", "replace"):
                 out.append("_x" + _HEX[(b >> 4) & 0xF] + _HEX[b & 0xF])
     return "".join(out)
 
@@ -344,19 +346,22 @@ def _atomic_write(path: Path, items: List[dict]) -> bool:
         return False
     try:
         parent = path.parent
-        created_dir = not parent.exists()
         parent.mkdir(parents=True, exist_ok=True)
-        if created_dir:
-            _harden(parent)
+        # Harden the queue dir on EVERY write (not just when newly created): a
+        # dir created by an earlier/unhardened version would otherwise stay
+        # outside owner-only protection. Idempotent and never raises.
+        _harden(parent)
         tmp = path.with_name(path.name + ".tmp." + uuid.uuid4().hex)
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(items, f)
                 f.flush()
                 os.fsync(f.fileno())
+            # Harden the temp BEFORE os.replace so no reader can catch verbatim
+            # content in the rename-to-final window; retain final-path hardening
+            # afterward for defense in depth (perms survive the atomic rename).
+            _harden(tmp)
             os.replace(str(tmp), str(path))
-            # The temp file is recreated (and re-masked) on every write, so
-            # harden the final file each time; the fresh dir was hardened above.
             _harden(path)
             return True
         finally:

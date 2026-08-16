@@ -35,6 +35,29 @@ README.
 - **New dev harness `scripts/pattern_harness.py`** for tuning the correction
   patterns against real transcripts (offline, stdlib-only, never shells out to
   a model).
+- **Live correction capture** (issue [#47], PR 2/4 of the claude-reflect port).
+  A new `capture-correction` hook (registered 2nd under `UserPromptSubmit` on
+  Claude Code, ZCode, and Codex) queues mid-session user corrections
+  ("no, use X", "remember: …") into a namespace-scoped plaintext sidecar queue
+  (`<store-data-dir>/queue/<ns>.json`) — hooks never write the store. New
+  `store.py queue-list` / `queue-clear` subcommands (store-independent,
+  pre-connect); `queue-clear` requires exactly one of `--id`/`--all`/
+  `--drop-stale`. SessionStart shows a pending (non-stale) candidate count; the
+  closeout skill gained a Step 0.5 queue-review pass that writes only what
+  clears the bar via `add --signal user`.
+
+### Fixed
+
+- **Queue hardening** (from an independent swarm-pr-review): `queue-clear` no
+  longer silently wipes the whole namespace when invoked without a selector;
+  the namespace filename encoding is now collision-free for all Unicode (one
+  `_xNN` token per UTF-8 byte, lossy-no-raise for lone surrogates); a failed
+  whole-queue unlink reports "failed (queue untouched)" instead of a fabricated
+  "cleared N"; capture acknowledgement is emitted only when the append
+  persisted; queue files/dirs are best-effort owner-only hardened (chmod/icacls)
+  including on the rename window and on pre-existing dirs; and README/SKILL.md
+  document the queue path as derived from the store data dir rather than a
+  fixed `~/.zmem` path.
 
 ### Tests
 
