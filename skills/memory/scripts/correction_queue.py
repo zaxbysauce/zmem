@@ -134,15 +134,21 @@ def now_iso() -> str:
 #   ':'  -> '_c'
 #   '/'  -> '_s'
 #   '\\' -> '_b'
-#   any other char not in [A-Za-z0-9.-] -> '_x' + 2-digit lowercase hex
-#                                          (covers Windows-invalid < > : " | ? *
-#                                           and control chars)
+#   any other char not in [A-Za-z0-9.-] -> '_x' + 2-digit lowercase hex PER
+#                                          UTF-8 BYTE of the code point (1-4
+#                                          bytes), e.g. 'é' (U+00E9) ->
+#                                          '_xc3_xa9'. Covers Windows-invalid
+#                                          < > : " | ? * and control chars, and
+#                                          stays collision-free for EVERY
+#                                          Unicode code point because the full
+#                                          UTF-8 encoding (not just the low
+#                                          byte) is represented.
 #   [A-Za-z0-9.-] -> literal             ('.' is valid mid-filename on Windows)
 #
 # Example: 'project:github.com/foo/bar' -> 'project_cgithub.com_sfoo_sbar'.
 # Every output char belongs to a unique class (literal / '__' / '_c' / '_s' /
-# '_b' / '_x'+2hex), so two distinct inputs can never map to the same filename
-# and the inverse is deterministic.
+# '_b' / '_x'+2hex for one UTF-8 byte), so two distinct inputs can never map to
+# the same filename and the inverse is deterministic.
 _SAFE_CH = re.compile(r"[A-Za-z0-9.-]")
 _HEX = "0123456789abcdef"
 
@@ -161,7 +167,11 @@ def encode_namespace(namespace: str) -> str:
         elif _SAFE_CH.match(ch):
             out.append(ch)
         else:
-            out.append("_x" + _HEX[(ord(ch) >> 4) & 0xF] + _HEX[ord(ch) & 0xF])
+            # One token per UTF-8 byte so the full code point is captured:
+            # encoding only the low 8 bits of ord(ch) would let two DIFFERENT
+            # chars sharing a low byte (e.g. U+00C0 'À' and U+01C0 'ǀ') collide.
+            for b in ch.encode("utf-8"):
+                out.append("_x" + _HEX[(b >> 4) & 0xF] + _HEX[b & 0xF])
     return "".join(out)
 
 
@@ -182,12 +192,25 @@ def decode_namespace(filename: str) -> str:
                 out.append("_"); i += 2; continue
             if nxt in ("c", "s", "b"):
                 out.append({"_c": ":", "_s": "/", "_b": "\\"}["_" + nxt]); i += 2; continue
-            if nxt == "x" and i + 3 < n:
-                try:
-                    code = int(f[i + 2:i + 4], 16)
-                    out.append(chr(code)); i += 4; continue
-                except ValueError:
-                    pass
+            if nxt == "x":
+                # One UTF-8 byte per '_xNN' token; gather the contiguous byte
+                # run and decode it back to the original code point(s).
+                j = i
+                raw = bytearray()
+                while j + 3 < n and f[j] == "_" and f[j + 1] == "x":
+                    hb = f[j + 2:j + 4]
+                    if len(hb) != 2 or not all(_h in _HEX for _h in hb):
+                        break
+                    raw.append(int(hb, 16))
+                    j += 4
+                if raw:
+                    try:
+                        out.append(raw.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        # Fail-soft: never raise on a malformed encoded name.
+                        out.append("".join(chr(b) for b in raw))
+                    i = j
+                    continue
         out.append(ch); i += 1
     return "".join(out)
 
@@ -229,6 +252,20 @@ def _assert_local_fs(queue_dir: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def _harden(path: Path) -> None:
+    """Best-effort owner-only permission hardening (chmod 0600/0700 or Windows
+    ACL), mirroring the store's `set_owner_only_perms`. Never raises. The queue
+    can hold verbatim (possibly secret-bearing) corrections, so it gets the same
+    defense-in-depth as the store even though an unwritable location can never
+    block capture (the write still happens; only the permission layer is best-
+    effort)."""
+    try:
+        import host as _host
+        _host.set_owner_only_perms(path)
+    except Exception:
+        pass
 
 
 def _load_raw(path: Path) -> List[dict]:
@@ -306,7 +343,11 @@ def _atomic_write(path: Path, items: List[dict]) -> bool:
     if not _assert_local_fs(path.parent):
         return False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        parent = path.parent
+        created_dir = not parent.exists()
+        parent.mkdir(parents=True, exist_ok=True)
+        if created_dir:
+            _harden(parent)
         tmp = path.with_name(path.name + ".tmp." + uuid.uuid4().hex)
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -314,6 +355,9 @@ def _atomic_write(path: Path, items: List[dict]) -> bool:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(str(tmp), str(path))
+            # The temp file is recreated (and re-masked) on every write, so
+            # harden the final file each time; the fresh dir was hardened above.
+            _harden(path)
             return True
         finally:
             try:
@@ -370,7 +414,9 @@ def clear_queue(
             if path.exists():
                 path.unlink()
         except OSError:
-            pass
+            # Fail-open: report 0 removed (nothing was actually deleted) so the
+            # CLI cannot print a fabricated "cleared N" when the unlink failed.
+            return 0
         return before
 
     items = load_queue(namespace, queue_dir)

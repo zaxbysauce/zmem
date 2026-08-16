@@ -4684,8 +4684,16 @@ def cmd_queue_clear(*, namespace: str, ids, clear_all: bool, drop_stale: bool) -
         import correction_queue as _cq
         if clear_all:
             before = len(_cq.load_queue(namespace))
-            _cq.clear_queue(namespace)
-            print("[zmem] queue-clear: cleared %s (%d item(s))" % (namespace, before))
+            # Use the return value: clear_queue reports 0 when the whole-queue
+            # unlink FAILED (and 0 when the queue was already empty). Distinguish
+            # the two via the pre-count so an unlink failure routes to the
+            # honest "failed (queue untouched)" message instead of fabricating a
+            # "cleared N" that never deleted anything.
+            removed = _cq.clear_queue(namespace)
+            if removed != before:
+                print("[zmem] queue-clear: failed (queue untouched)")
+                return 0
+            print("[zmem] queue-clear: cleared %s (%d item(s))" % (namespace, removed))
             return 0
         removed = _cq.clear_queue(namespace, ids=ids or None, drop_stale=drop_stale)
         print("[zmem] queue-clear: removed %d item(s) from %s" % (removed, namespace))
@@ -5810,7 +5818,9 @@ def main():
     p_queue_clear.add_argument("--namespace", required=True)
     # --id / --all / --drop-stale are mutually exclusive: passing --all with
     # --id or --drop-stale was silently dropping --all (a surprising no-op).
-    _qc_grp = p_queue_clear.add_mutually_exclusive_group()
+    # required=True also makes a FLAG-LESS `queue-clear --namespace X` a hard
+    # argparse error (rc 2) instead of silently wiping the whole namespace queue.
+    _qc_grp = p_queue_clear.add_mutually_exclusive_group(required=True)
     _qc_grp.add_argument("--id", action="append", default=[],
                          help="remove specific item id(s) (repeatable)")
     _qc_grp.add_argument("--all", action="store_true",

@@ -447,9 +447,12 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
   session/tool-call database. ZMem reads this for failure detection; never writes it.
   On Claude Code, failure detection instead scans the session transcript
   (`transcript_path`) — no separate db.sqlite exists there.
-- **Live-capture correction queue:** `~/.zmem/queue/<namespace>.json` — one file
+- **Live-capture correction queue:** `<store-data-dir>/queue/<namespace>.json`
+  (default `~/.zmem/queue/<namespace>.json`; follows the same `ZMEM_STORE` /
+  `ZMEM_DATA` override chain as the store, not a fixed path) — one file
   per namespace (namespace names are encoded filesystem-safely: `_` → `__`,
-  `:` → `_c`, `/` → `_s`, `\` → `_b`, other invalid chars → `_x<hex>`). It holds
+  `:` → `_c`, `/` → `_s`, `\` → `_b`, other chars → their UTF-8 bytes as
+  `_x<hex>`). It holds
   candidates captured by the `capture-correction` hook until the closeout skill
   reviews them. The queue shares the store's data dir, so a candidate captured in
   one host is reviewable from any other host on the same box (same single-brain

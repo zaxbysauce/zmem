@@ -94,6 +94,37 @@ class TestNamespaceEncoding(unittest.TestCase):
         for n in namespaces:
             self.assertEqual(cq.decode_namespace(cq.encode_namespace(n)), n)
 
+    def test_non_ascii_round_trip(self):
+        # The encoder must capture the FULL code point (not just its low byte),
+        # so Greek/Cyrillic/CJK/accents/astral all round-trip exactly.
+        for ns in [
+            "project:λambda/папка/repo",
+            "project:中文/日本語/repo",
+            "project:café/naïve/repo",
+            "project:emoji/😀/repo",
+        ]:
+            enc = cq.encode_namespace(ns)
+            self.assertEqual(cq.decode_namespace(enc), ns)
+
+    def test_non_ascii_low_byte_no_collision(self):
+        # U+00C0 'À' and U+01C0 'ǀ' share the same low byte (0xC0). A scheme
+        # that encoded only the low 8 bits would map BOTH to '_xc0' and mix the
+        # two namespaces' queue files. The full-UTF-8 scheme must not.
+        self.assertNotEqual(
+            cq.encode_namespace("project:À"),
+            cq.encode_namespace("project:ǀ"),
+        )
+        self.assertEqual(
+            cq.decode_namespace(cq.encode_namespace("project:À")), "project:À"
+        )
+        self.assertEqual(
+            cq.decode_namespace(cq.encode_namespace("project:ǀ")), "project:ǀ"
+        )
+        # Every distinct namespace still maps to a distinct filename.
+        namespaces = ["project:À", "project:ǀ", "project:中", "project:一", "project:a"]
+        encs = [cq.encode_namespace(n) for n in namespaces]
+        self.assertEqual(len(encs), len(set(encs)), "collision across non-ASCII namespaces")
+
 
 class TestQueueRoundTrip(unittest.TestCase):
     def _fresh(self):
@@ -124,6 +155,17 @@ class TestQueueRoundTrip(unittest.TestCase):
         cq.append_queue(ns, _make_item(), queue_dir=d)
         cq.clear_queue(ns, queue_dir=d)
         self.assertEqual(cq.load_queue(ns, queue_dir=d), [])
+
+    def test_whole_queue_clear_returns_count(self):
+        d = self._fresh()
+        ns = "project:countreturn"
+        self.assertTrue(cq.append_queue(ns, _make_item(), queue_dir=d))
+        self.assertTrue(cq.append_queue(ns, _make_item(), queue_dir=d))
+        removed = cq.clear_queue(ns, queue_dir=d)
+        self.assertEqual(removed, 2)
+        self.assertEqual(cq.load_queue(ns, queue_dir=d), [])
+        # clearing an already-empty queue returns 0 (not a fabricated count)
+        self.assertEqual(cq.clear_queue(ns, queue_dir=d), 0)
 
     def test_missing_file_is_empty(self):
         d = self._fresh()
@@ -274,6 +316,20 @@ class TestAtomicity(unittest.TestCase):
         self.assertEqual(len({it["id"] for it in items}), len(items))
         json.loads((Path(d) / (cq.encode_namespace(ns) + ".json")).read_text("utf-8"))
 
+    @unittest.skipIf(os.name == "nt", "POSIX file mode only")
+    def test_queue_file_is_owner_only_on_posix(self):
+        # The queue can hold verbatim corrections (possibly secret-bearing), so
+        # _atomic_write must chmod the file 0o600 like the store, not leave it at
+        # the umask default (world-readable).
+        d = self._fresh()
+        ns = "project:perms"
+        self.assertTrue(cq.append_queue(ns, _make_item(), queue_dir=d))
+        p = Path(d) / (cq.encode_namespace(ns) + ".json")
+        self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+        # A re-write re-hardens the freshly-replaced file too.
+        self.assertTrue(cq.append_queue(ns, _make_item(), queue_dir=d))
+        self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+
 
 class TestCaptureDecision(unittest.TestCase):
     """The hook's DECISION gate, tested deterministically (not via bash):
@@ -419,6 +475,47 @@ class TestStoreSubcommands(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         r2 = self._run(env, "queue-clear", "--namespace", ns, "--all", "--drop-stale")
         self.assertEqual(r2.returncode, 2)
+
+    def test_queue_clear_no_selector_rejected(self):
+        # A flag-less `queue-clear --namespace X` must be a hard argparse error
+        # (rc 2), NOT a silent whole-queue wipe (F-A must-fix).
+        tmp = tempfile.mkdtemp()
+        d = os.path.join(tmp, "data")
+        ns = "project:github.com/example/noselector"
+        cq.append_queue(ns, _make_item(namespace=ns), queue_dir=self._queue_dir(d))
+        cq.append_queue(ns, _make_item(namespace=ns, message="second"), queue_dir=self._queue_dir(d))
+        env = self._env(d)
+        r = self._run(env, "queue-clear", "--namespace", ns)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        # The queue must be left fully intact.
+        self.assertEqual(len(cq.load_queue(ns, queue_dir=self._queue_dir(d))), 2)
+        self.assertFalse(os.path.exists(os.path.join(d, "store.sqlite")))
+
+    @unittest.skipIf(os.name == "nt", "POSIX dir-permission semantics only")
+    def test_queue_clear_all_reports_failure_not_false_clear(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root unlink is not blocked by dir perms")
+        # When the whole-queue unlink cannot execute (write-protected dir), the
+        # CLI `--all` path must NOT fabricate a "cleared N"; it must report the
+        # failure and leave the queue intact (F-H wired end-to-end).
+        tmp = tempfile.mkdtemp()
+        d = os.path.join(tmp, "data")
+        ns = "project:github.com/example/clearblock"
+        qdir = self._queue_dir(d)
+        cq.append_queue(ns, _make_item(namespace=ns), queue_dir=qdir)
+        qfile = os.path.join(qdir, cq.encode_namespace(ns) + ".json")
+        self.assertTrue(os.path.exists(qfile))
+        os.chmod(qdir, 0o500)  # dir no longer writable -> unlink fails
+        try:
+            env = self._env(d)
+            r = self._run(env, "queue-clear", "--namespace", ns, "--all")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("failed (queue untouched)", r.stdout)
+            self.assertNotIn("cleared", r.stdout)
+            # The candidate must still be queued.
+            self.assertEqual(len(cq.load_queue(ns, queue_dir=qdir)), 1)
+        finally:
+            os.chmod(qdir, 0o700)
 
 
 class TestStoreSecretPatternsAlias(unittest.TestCase):

@@ -322,7 +322,12 @@ if store_py and os.path.isfile(store_py):
         # are not "pending review" - do not nudge the agent about them.
         _pending = sum(1 for _it in _cq.load_queue(ns) if not _it.get("stale"))
         if _pending:
-            parts.append(
+            # PREPEND (not append): the payload is truncated with ctx[:budget],
+            # which keeps the FRONT and drops the tail, so an appended note would
+            # vanish whenever Tier 0 + recall fill the budget. Leading placement
+            # guarantees the agent sees the closeout-work nudge.
+            parts.insert(
+                0,
                 "zmem: %d captured correction candidate(s) pending review — "
                 "run the closeout skill to process." % _pending
             )

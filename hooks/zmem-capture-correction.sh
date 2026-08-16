@@ -175,12 +175,13 @@ item = cq.make_item(
     namespace=sys.argv[3],
     host=sys.argv[4],
 )
-cq.append_queue(sys.argv[3], item)
+_ok = cq.append_queue(sys.argv[3], item)
 
 # Silent by default (empty {} — preserve the context budget). ZMEM_CAPTURE_FEEDBACK=1
 # emits a one-line acknowledgment (the claude-reflect "Learning captured" behavior);
-# the launcher rewraps additionalContext per host.
-if os.environ.get("ZMEM_CAPTURE_FEEDBACK", "") == "1":
+# the launcher rewraps additionalContext per host. Only ack when the append actually
+# persisted — a failed write must not claim the candidate was captured.
+if os.environ.get("ZMEM_CAPTURE_FEEDBACK", "") == "1" and _ok:
     print(json.dumps({"additionalContext": "zmem: correction candidate captured (will be reviewed at closeout)."}))
 else:
     print("{}")
