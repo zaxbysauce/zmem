@@ -55,6 +55,13 @@ NS = "project:consolidate-cadence-26"
 KEEPER_TEXT = "pytest xdist workers share a tmpdir causing a race condition under flaky quarantine windows"
 ABSORB_TEXT = KEEPER_TEXT + " and lane ordering must be deterministic across lane ids"
 
+# Force embeddings deterministically OUT of scope for every op in this module
+# (see test_consolidate_lossy for the full rationale): the lazy availability
+# check runs under ambient env after the per-store mock env is restored, so a
+# host with the shared model cache would flip these consolidate tests to
+# embedding semantics.
+os.environ["ZMEM_MODELS_DIR"] = str(REPO_ROOT / "no-such-models")
+
 
 def _load_store_module(store_path: Path, models_dir: Path):
     """A fresh store.py module instance pinned to a throwaway store, with the

@@ -538,6 +538,17 @@ populated, checksum-verified model cache to reuse one model across checkouts
 (e.g. `~/.zmem/models`). This is a supported production knob, not just a test
 affordance.
 
+When `ZMEM_MODELS_DIR` is unset, ZMem resolves the models directory in this
+order: (1) the plugin's bundled `<checkout>/skills/memory/models` if it
+contains a model; (2) otherwise the box-wide shared cache at
+`<store data dir>/../models` (the `models` sibling of the store `data`/`store`
+file — e.g. `~/.zmem/models` for the default `~/.zmem` store) if it contains a
+model; (3) otherwise the bundled directory, which reports `model_file_missing`.
+The shared-cache fallback is what lets a checkout that does not ship the
+gitignored model keep embeddings working with no env var, so a fresh checkout
+or a host where the model is installed once under `~/.zmem` does not silently
+lose semantic recall.
+
 **Check status** (one command away from noticing drift):
 
 - `python <store.py> stats` reports live embedding coverage
