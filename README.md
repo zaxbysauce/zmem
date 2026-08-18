@@ -416,6 +416,47 @@ python <store.py> supersede --id <uuid> --reason "no longer applies"
 
 The full command reference is in the `memory` skill (type `/memory` in ZCode).
 
+## Bootstrap / cold start
+
+zmem installs empty and learns going forward (live capture, issue #47). If you
+have existing Claude Code transcripts on this machine, `mine-history` (issue
+#48) salvages the high-signal parts *for you to review* — it never auto-writes:
+
+```bash
+# Scan the current project's Claude Code transcripts (read-only)
+python <store.py> mine-history --days 90 --json          # report only
+# OR queue candidates for the closeout review flow (source=history-mine)
+python <store.py> mine-history --days 90 --queue
+# sweep everything, not just the current project
+python <store.py> mine-history --all-projects --days 90 --queue
+```
+
+Then run the **closeout** skill (`/closeout`) to review the queued candidates:
+the Step 2 closeout bar applies to mined candidates exactly as to live ones —
+recall-before-write, supersede what's wrong, 0–5 rows per review sitting (a
+first bootstrap may reasonably accept more). The queue lists `kind: "correction"`
+(mined corrections, with an `occurrences` count) and `kind: "error_pattern"`
+(recurring tool errors; rewrite each `suggested_guideline` draft as a `lesson`
+with the real trigger condition). Mined candidates are reviewed and written with
+the agent-assigned *honest* signal — repeated errors do not auto-qualify as
+`test`/`compile` grounding.
+
+Notes:
+- **Input is Claude Code history only** (the sole transcript substrate zmem
+  reads); ZCode/Codex/Hermes are out of scope for mining and gain coverage
+  going forward via live capture. A box with no `~/.claude` exits cleanly with
+  a message, not a crash.
+- **Output is host-agnostic:** accepted rows land in the single shared
+  `~/.zmem/store.sqlite`, so a bootstrap seeds memory for all four hosts
+  (Claude Code, ZCode, Codex, Hermes) from one box.
+- `mine-history` is read-only against transcripts AND the store; `--queue` is
+  its only write surface (the sidecar review queue). `env ZMEM_CAPTURE_MODE=auto`
+  redacts secret-like text in mined output.
+- **Retention caveat:** Claude Code deletes transcripts after
+  `cleanupPeriodDays` (default 30), so mining sees only what still exists. (The
+  doctor check for this ships separately; cross-referenced from the doctor
+  roadmap.)
+
 ## Where data lives
 
 - **Store + core.md (box-wide default):** `~/.zmem/` — one shared, tool-neutral

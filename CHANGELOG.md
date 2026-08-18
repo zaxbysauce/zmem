@@ -45,6 +45,20 @@ README.
   `--drop-stale`. SessionStart shows a pending (non-stale) candidate count; the
   closeout skill gained a Step 0.5 queue-review pass that writes only what
   clears the bar via `add --signal user`.
+- **Cold-start bootstrap** (issue [#48], PR 3/4 of the claude-reflect port).
+  New read-only `store.py mine-history` subcommand mines HISTORICAL Claude Code
+  transcripts (`~/.claude/projects/**/*.jsonl`, incl. `agent-*.jsonl`) into one
+  merged candidate report — corrections, user rejections (with reasons), and
+  cross-session aggregated tool-error patterns. Ported `TOOL_ERROR_EXCLUDE_
+  PATTERNS` + `PROJECT_SPECIFIC_ERROR_PATTERNS` + `aggregate_errors` into
+  `corrections.py`, whose occurrence→weight mapping is named `review_priority`
+  (review ORDERING, never a zmem confidence). Flags: `--transcript-dir`,
+  `--all-projects`, `--days`, `--min-count`, `--limit`, `--queue`, `--json`.
+  Never writes the store in any mode; `--queue` appends `source=history-mine`
+  candidates (corrections + `error_pattern` kinds) to the #47 sidecar queue for
+  closeout review. A box with no `~/.claude` exits cleanly (rc 1, message, no
+  traceback). New module `history_mining.py` (discovery/folder-encoding/dedup/
+  queue-synthesis); README gained a "Bootstrap / cold start" section.
 
 ### Fixed
 
