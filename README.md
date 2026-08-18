@@ -450,8 +450,12 @@ Notes:
   `~/.zmem/store.sqlite`, so a bootstrap seeds memory for all four hosts
   (Claude Code, ZCode, Codex, Hermes) from one box.
 - `mine-history` is read-only against transcripts AND the store; `--queue` is
-  its only write surface (the sidecar review queue). `env ZMEM_CAPTURE_MODE=auto`
-  redacts secret-like text in mined output.
+  its only write surface (the sidecar review queue). `--queue` resolves the
+  store namespace from the current project's git origin, so it may spawn one
+  short `git` subprocess. `ZMEM_CAPTURE_MODE` applies to mined candidates too:
+  `auto` redacts secret-like text in correction messages, error_pattern
+  messages, and repeated-error samples; `manual`/`reviewed` keeps wording
+  verbatim and flags those candidates with `secret_warning` for the reviewer.
 - **Retention caveat:** Claude Code deletes transcripts after
   `cleanupPeriodDays` (default 30), so mining sees only what still exists. (The
   doctor check for this ships separately; cross-referenced from the doctor

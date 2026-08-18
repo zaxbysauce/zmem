@@ -465,6 +465,10 @@ TOOL_ERROR_EXCLUDE_PATTERNS = [
 # Project/env-context error patterns. Format: (error_type, regex, suggested_guideline).
 # The first 8 are taken verbatim from claude-reflect; we ADD 3 (command_not_found,
 # git_error, permission_denied) that reveal common project/env structure issues.
+# `module_not_found` is deliberately checked BEFORE the service-name patterns
+# (supabase/postgres/redis): a `ModuleNotFoundError: No module named 'supabase'`
+# carries the unambiguous import marker and must yield the import-path guideline,
+# not a service-.env guideline (the service patterns match on the module name too).
 PROJECT_SPECIFIC_ERROR_PATTERNS = [
     ("connection_refused",
      r"Connection refused|ECONNREFUSED|connect ECONNREFUSED",
@@ -472,6 +476,9 @@ PROJECT_SPECIFIC_ERROR_PATTERNS = [
     ("env_undefined",
      r"(\w+_URL|DATABASE_URL|API_KEY|SECRET).*undefined|not set|is not defined",
      "Load .env file before accessing environment variables"),
+    ("module_not_found",
+     r"ModuleNotFoundError|Cannot find module|No module named",
+     "Check import paths - verify project structure"),
     ("supabase_error",
      r"supabase|Supabase|SUPABASE",
      "Check SUPABASE_URL and SUPABASE_KEY in .env"),
@@ -481,11 +488,8 @@ PROJECT_SPECIFIC_ERROR_PATTERNS = [
     ("redis_error",
      r"redis|REDIS|:6379",
      "Check REDIS_URL in .env for Redis connection"),
-    ("module_not_found",
-     r"ModuleNotFoundError|Cannot find module|No module named",
-     "Check import paths - verify project structure"),
     ("venv_not_found",
-     r"venv.*No such file|activate: No such file|\.venv.*not found",
+     r"venv.*No such file|activate: No such file|\.venv.*not found|No such file[^\n]*\.venv",
      "Check virtual environment location"),
     ("port_in_use",
      r"address already in use|EADDRINUSE|port.*already.*use",
@@ -498,7 +502,7 @@ PROJECT_SPECIFIC_ERROR_PATTERNS = [
      r"fatal: (not a git repository|.*merge conflict)|You have unmerged|CONFLICT",
      "Confirm the cwd is the git worktree and resolve conflicts before continuing"),
     ("permission_denied",
-     r"EACCES|permission denied|Permission denied",
+     r"EACCES|permission denied|Permission denied|Access is denied",
      "Check filesystem/ownership permissions on the target path"),
 ]
 

@@ -127,12 +127,14 @@ try:
     from corrections import extract_user_messages as _extract_user_messages  # noqa: F401
     from corrections import classify_error_type as _classify_error_type  # noqa: F401
     from corrections import aggregate_errors as _aggregate_errors  # noqa: F401
+    from corrections import SAMPLE_EXTRACT_LIMIT as _SAMPLE_EXTRACT_LIMIT  # noqa: F401
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from corrections import detect_patterns as _detect_patterns  # type: ignore # noqa: F401
     from corrections import extract_user_messages as _extract_user_messages  # type: ignore # noqa: F401
     from corrections import classify_error_type as _classify_error_type  # type: ignore # noqa: F401
     from corrections import aggregate_errors as _aggregate_errors  # type: ignore # noqa: F401
+    from corrections import SAMPLE_EXTRACT_LIMIT as _SAMPLE_EXTRACT_LIMIT  # type: ignore # noqa: F401
 
 # Live-correction queue (issue #47). `SECRET_PATTERNS` lives here as the single
 # source of truth shared by the store's capture-policy helpers AND the queue's
@@ -4682,12 +4684,39 @@ def _mine_corrections_from_transcript(transcript, project_folder: str) -> list:
     return items
 
 
-def _queue_mined(report, host: str) -> int:
+def _redact_error_pattern_samples(error_patterns) -> None:
+    """Redact/annotate error_pattern ``sample_errors`` per capture mode for the
+    ``--json`` report (issue #48 / PRR-001). A secret embedded in a repeated
+    failing command (e.g. a retried auth/setup invocation) must not reach stdout
+    raw. In 'auto' each sample is redacted; in 'manual'/'reviewed' it is kept
+    verbatim and the pattern is flagged ``secret_warning``. Idempotent:
+    already-redacted text won't re-match. Mutates the list in place."""
+    mode = _normalize_capture_mode(None)
+    for e in error_patterns or []:
+        flagged = False
+        out = []
+        for s in e.get("sample_errors") or []:
+            redacted, n = _redact_secret_like_text(str(s))
+            if n:
+                flagged = True
+            out.append(redacted if (n and mode == "auto") else str(s))
+        if flagged:
+            e["secret_warning"] = True
+        e["sample_errors"] = out
+
+
+def _queue_mined(report, host: str, as_json: bool = False) -> int:
     """Append mined candidates to the #47 sidecar review queue (source
     'history-mine') under the canonical namespace of the box's current
     project. Idempotent: an item whose dedup_key already exists is skipped so a
     re-run never double-appends. Fail-open: a missing/unwritable queue module
-    yields a clean non-zero message, never a crash."""
+    yields a clean non-zero message, never a crash.
+
+    Honest accounting (PRR-005): an ``append_queue`` returning False or raising
+    is tracked as a FAILED write (NOT folded into the "already present" count),
+    reported, and makes the command return non-zero — a silent write loss must
+    not look like success. In ``as_json`` mode the human summary is routed to
+    stderr so stdout stays a pure ``json.loads``-able report (PRR-004)."""
     try:
         import correction_queue as _cq
         namespace = _host.resolve_namespace(os.getcwd()) if _host else "user:global"
@@ -4713,6 +4742,7 @@ def _queue_mined(report, host: str) -> int:
     except Exception:
         existing_keys = set()
     added = 0
+    failed = 0
     for it in items:
         key = it.get("dedup_key")
         if key in existing_keys:
@@ -4721,11 +4751,20 @@ def _queue_mined(report, host: str) -> int:
             if _cq.append_queue(namespace, it):
                 added += 1
                 existing_keys.add(key)
+            else:
+                failed += 1
         except Exception:
-            continue
-    print("[zmem] mine-history: queued %d candidate(s) to %s (source=history-mine); "
-          "%d already present" % (added, namespace, len(items) - added))
-    return 0
+            failed += 1
+    already = len(items) - added - failed
+    summary = ("[zmem] mine-history: queued %d candidate(s) to %s (source=history-mine); "
+               "%d already present" % (added, namespace, already))
+    if failed:
+        summary += "; %d write(s) FAILED" % failed
+    if as_json:
+        print(summary, file=sys.stderr)
+    else:
+        print(summary)
+    return 2 if failed else 0
 
 
 def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int,
@@ -4802,15 +4841,16 @@ def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int
                 continue
             errors.append({
                 "error_type": etype,
-                "content": _sanitize_error_text(etext, 500),  # claude-reflect extract cap
+                "content": _sanitize_error_text(etext, _SAMPLE_EXTRACT_LIMIT),
                 "project_folder": folder,
                 "suggested_guideline": guideline,
             })
 
     corrections = _hm.dedupe_corrections(corrections)
     error_patterns = _aggregate_errors(errors, min_occurrences=min_count)
+    _redact_error_pattern_samples(error_patterns)  # PRR-001: --json samples never leak
 
-    if limit and limit > 0:
+    if limit is not None:
         corrections = corrections[:limit]
 
     report = {
@@ -4819,6 +4859,13 @@ def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int
         "error_patterns": error_patterns,
         "scanned": {"files": len(files), "skipped": skipped},
     }
+
+    if not missing and not all_projects and not files:
+        # Scoped discovery found nothing for the current project: make the
+        # likely cause obvious instead of a bare "scanned 0" rc 0 (PRR-009).
+        print("[zmem] mine-history: no Claude Code transcript folder matched the "
+              "current project under %s; try --all-projects to scan every project "
+              "or --transcript-dir for a custom root." % root, file=sys.stderr)
 
     if as_json:
         print(json.dumps(report))
@@ -4842,7 +4889,8 @@ def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int
                      e.get("project_folder"), (e.get("suggested_guideline") or "")))
 
     if queue:
-        return _queue_mined(report, host=os.environ.get("ZMEM_HOST") or "cli")
+        return _queue_mined(report, host=os.environ.get("ZMEM_HOST") or "cli",
+                            as_json=as_json)
     return 0
 
 
@@ -6044,14 +6092,19 @@ def main():
                         help="Claude Code transcript root (default ~/.claude/projects)")
     p_mine.add_argument("--all-projects", action="store_true",
                         help="walk every project folder (default: current project only)")
-    p_mine.add_argument("--days", type=int, default=None,
-                        help="only transcripts modified within this many days")
-    p_mine.add_argument("--min-count", type=int, default=2,
+    p_mine.add_argument("--days", type=nonnegative_int, default=None,
+                        help="only transcripts modified within this many days "
+                             "(default: no time filter)")
+    p_mine.add_argument("--min-count", type=nonnegative_int, default=2,
                         help="error-aggregation threshold (default 2)")
-    p_mine.add_argument("--limit", type=int, default=None,
-                        help="cap the number of correction candidates in output")
+    p_mine.add_argument("--limit", type=nonnegative_int, default=None,
+                        help="cap the number of correction candidates in output "
+                             "(default: no cap; 0 emits none, negatives rejected)")
     p_mine.add_argument("--queue", action="store_true",
-                        help="append candidates to the PR-2 review queue (source=history-mine)")
+                        help="append candidates to the PR-2 review queue "
+                             "(source=history-mine; resolves the store namespace "
+                             "from the current project's git origin, so it may "
+                             "spawn one short `git` subprocess)")
     p_mine.add_argument("--json", action="store_true",
                         help="emit the full merged candidate report as JSON")
 

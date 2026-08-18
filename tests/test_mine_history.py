@@ -109,6 +109,32 @@ class TestClassifyErrorType(unittest.TestCase):
         self.assertEqual(t, "module_not_found")
         self.assertTrue(g)
 
+    def test_module_not_found_takes_precedence_over_service_name(self):
+        # A missing module whose NAME is a service (supabase/postgres/redis) must
+        # classify as the import error, not the service-.env guideline (PRR-008:
+        # module_not_found is matched before the service-name patterns).
+        for txt in ["ModuleNotFoundError: No module named 'supabase'",
+                    "Cannot find module 'redis'",
+                    "ModuleNotFoundError: No module named 'psycopg2' (postgres driver)"]:
+            with self.subTest(txt=txt):
+                t, g = cmod.classify_error_type(txt)
+                self.assertEqual(t, "module_not_found")
+                self.assertIn("import paths", g)
+
+    def test_venv_missing_via_no_such_file(self):
+        # "No such file or directory: '.venv/...'" must classify as venv_not_found
+        # (PRR-008 broadened the venv regex to cover this shell wording).
+        t, g = cmod.classify_error_type(
+            "bash: .venv/bin/activate: No such file or directory")
+        self.assertEqual(t, "venv_not_found")
+        self.assertTrue(g)
+
+    def test_permission_denied_windows_words(self):
+        # Windows "Access is denied." must classify as permission_denied (PRR-008).
+        t, g = cmod.classify_error_type("Access is denied.")
+        self.assertEqual(t, "permission_denied")
+        self.assertTrue(g)
+
     def test_empty_safe(self):
         self.assertEqual(cmod.classify_error_type(""), (None, None))
         self.assertEqual(cmod.classify_error_type(None), (None, None))
@@ -349,6 +375,18 @@ class TestDedupeCorrections(unittest.TestCase):
         out = hm.dedupe_corrections([self._c("no, use uv"), self._c("don't refactor unrelated code")])
         self.assertEqual(len(out), 2)
 
+    def test_cross_project_same_message_kept(self):
+        # Identical wording in TWO DIFFERENT projects must stay two candidates
+        # (their provenance is not collapsed away), matching the project-scoped
+        # queue dedup_key (PRR-002).
+        out = hm.dedupe_corrections([
+            self._c("no, use uv not pip", folder="proj_a"),
+            self._c("no, use uv not pip", folder="proj_b")])
+        self.assertEqual(len(out), 2)
+        self.assertEqual({o["project_folder"] for o in out}, {"proj_a", "proj_b"})
+        self.assertEqual(out[0]["occurrences"], 1)
+        self.assertEqual(out[1]["occurrences"], 1)
+
 
 # ===========================================================================
 # store.py mine-history CLI (subprocess)
@@ -486,6 +524,52 @@ class TestMineHistorySubcommand(unittest.TestCase):
         self.assertIn("already present", r2.stdout)
 
 
+    def test_limit_zero_emits_no_corrections_negative_rejected(self):
+        self._write_fixture()
+        env = self._env()
+        r0 = self._run(env, "mine-history", "--transcript-dir", self.root,
+                       "--all-projects", "--limit", "0", "--json")
+        self.assertEqual(r0.returncode, 0, r0.stderr)
+        rep0 = json.loads(r0.stdout)
+        self.assertEqual(rep0["corrections"], [])       # 0 is explicit, not "all"
+        self.assertEqual(len(rep0["error_patterns"]), 1)  # --limit caps corrections only
+        rneg = self._run(env, "mine-history", "--transcript-dir", self.root,
+                         "--all-projects", "--limit", "-1", "--json")
+        self.assertEqual(rneg.returncode, 2)             # negatives rejected by argparse
+
+    def test_queue_json_stdout_is_pure_json(self):
+        # `--queue --json` must keep stdout a parseable JSON report; the human
+        # queue summary routes to stderr so json.loads never fails (PRR-004).
+        self._write_fixture()
+        r = self._run(self._env(), "mine-history", "--transcript-dir", self.root,
+                      "--all-projects", "--queue", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        parsed = json.loads(r.stdout)  # raises if any human line leaked to stdout
+        self.assertIn("corrections", parsed)
+        self.assertIn("queued", r.stderr)  # human queue summary on stderr
+
+    def test_error_pattern_sample_redaction_in_json_report(self):
+        # A secret embedded in a repeated failing command is redacted in the
+        # --json report's sample_errors and flags the pattern (PRR-001).
+        fake_key = "AKIA" + "ABCDEFGHIJKLMNOP"
+        body = ("Error: connect ECONNREFUSED 127.0.0.1:5432 using api_key=%s"
+                % fake_key)
+        for name in ("s1.jsonl", "s2.jsonl"):
+            _write_jsonl(os.path.join(self.proj, name), [
+                _assistant_tool_use(name + "-t"), _tool_result(name + "-t", body)])
+        env = dict(self._env(), ZMEM_CAPTURE_MODE="auto")
+        r = self._run(env, "mine-history", "--transcript-dir", self.root,
+                      "--all-projects", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        eps = json.loads(r.stdout)["error_patterns"]
+        self.assertEqual(len(eps), 1)
+        ep = eps[0]
+        self.assertEqual(ep["error_type"], "connection_refused")
+        self.assertTrue(ep.get("secret_warning"))
+        for s in ep["sample_errors"]:
+            self.assertNotIn(fake_key, s)
+            self.assertIn("REDACTED_SECRET", s)
+
 # ===========================================================================
 # build_mined_items — (dependency-injected) queue synthesis details
 # ===========================================================================
@@ -546,18 +630,82 @@ class TestBuildMinedItems(unittest.TestCase):
                 "sentiment": "correction", "decay_days": 60, "project_folder": "proj_foo",
                 "timestamp": "2026-01-01T00:00:00Z", "occurrences": 1}
         report = {"corrections": [corr], "error_patterns": [], "rejections": []}
-        # manual (default): original wording kept, secret_warning flagged
-        with mock.patch.dict(os.environ, {}, clear=False):
+        # manual: original wording kept, secret_warning flagged (force the mode
+        # explicitly — the process env must not dictate the branch).
+        with mock.patch.dict(os.environ, {"ZMEM_CAPTURE_MODE": "manual"}):
             items = hm.build_mined_items(report, namespace="user:test")
         self.assertEqual(len(items), 1)
         self.assertTrue(items[0]["secret_warning"])
         self.assertIn("api_key=", items[0]["message"])
         # auto: secret-like text redacted before it reaches the queue
-        with mock.patch.dict(os.environ, {"ZMEM_CAPTURE_MODE": "auto"}, clear=False):
+        with mock.patch.dict(os.environ, {"ZMEM_CAPTURE_MODE": "auto"}):
             items2 = hm.build_mined_items(report, namespace="user:test")
         self.assertTrue(items2[0]["secret_warning"])
         self.assertIn("REDACTED_SECRET", items2[0]["message"])
         self.assertNotIn(fake_key, items2[0]["message"])
+
+    def test_error_pattern_sample_redaction_per_capture_mode(self):
+        # A secret embedded in a repeated failing command must reach the queue
+        # redacted (auto) or verbatim+flagged (manual) — never raw (PRR-001).
+        fake_key = "AKIA" + "ABCDEFGHIJKLMNOP"
+        report = {"corrections": [], "rejections": [],
+                  "error_patterns": [{
+                      "error_type": "connection_refused", "count": 3,
+                      "review_priority": 0.85,
+                      "suggested_guideline": "Check .env for service URLs",
+                      "project_folder": "proj_foo",
+                      "sample_errors": ["connect ECONNREFUSED with api_key=%s" % fake_key]}]}
+        with mock.patch.dict(os.environ, {"ZMEM_CAPTURE_MODE": "manual"}):
+            m = hm.build_mined_items(report, namespace="user:test")[0]
+        self.assertTrue(m["secret_warning"])
+        self.assertIn(fake_key, m["sample_errors"][0])  # manual keeps verbatim
+        with mock.patch.dict(os.environ, {"ZMEM_CAPTURE_MODE": "auto"}):
+            a = hm.build_mined_items(report, namespace="user:test")[0]
+        self.assertTrue(a["secret_warning"])
+        self.assertNotIn(fake_key, a["sample_errors"][0])   # auto redacts
+        self.assertIn("REDACTED_SECRET", a["sample_errors"][0])
+
+    def test_error_pattern_secret_warning_propagates_from_flagged_report(self):
+        # A caller that already redacted the samples (cmd_mine_history's
+        # _redact_error_pattern_samples) and flagged the pattern must have that
+        # flag propagated onto the queue item (PRR-001/006).
+        report = {"corrections": [], "rejections": [],
+                  "error_patterns": [{
+                      "error_type": "connection_refused", "count": 2,
+                      "review_priority": 0.7,
+                      "suggested_guideline": "Check .env",
+                      "project_folder": "proj_foo", "secret_warning": True,
+                      "sample_errors": ["[REDACTED_SECRET] failed"]}]}
+        it = hm.build_mined_items(report, namespace="user:test")[0]
+        self.assertTrue(it["secret_warning"])
+
+
+class TestQueueMinedAppendFailure(unittest.TestCase):
+    def test_append_failure_reported_and_nonzero(self):
+        # When append_queue returns False (a write was lost), the failure must be
+        # tracked as FAILED (not folded into "already present") and returned as a
+        # non-zero rc (PRR-005).
+        report = {"corrections": [{
+            "message": "no, use uv not pip", "type": "auto", "patterns": "no,",
+            "confidence": 0.9, "sentiment": "correction", "decay_days": 60,
+            "project_folder": "proj_foo", "timestamp": "2026-01-01T00:00:00Z",
+            "occurrences": 1}], "error_patterns": [], "rejections": []}
+        fake_cq = mock.MagicMock()
+        fake_cq.load_queue.return_value = []
+        fake_cq.append_queue.return_value = False
+        fake_cq.normalize_capture_mode.return_value = "manual"
+        fake_cq.redact_secret_like_text.return_value = ("no, use uv not pip", 0)
+        fake_cq.SCHEMA_VERSION = 1
+        fake_cq.now_iso.return_value = "2026-01-01T00:00:00Z"
+        saved = sys.modules.get("correction_queue")
+        try:
+            with mock.patch.dict(sys.modules, {"correction_queue": fake_cq}):
+                rc = store_mod._queue_mined(report, host="cli")
+        finally:
+            if saved is not None:
+                sys.modules["correction_queue"] = saved
+        self.assertEqual(rc, 2)
+        self.assertEqual(fake_cq.append_queue.call_count, 1)
 
 
 if __name__ == "__main__":

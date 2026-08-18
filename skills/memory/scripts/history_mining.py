@@ -202,13 +202,19 @@ def dedupe_corrections(items) -> List[dict]:
     transcripts. Within a normalized group we keep the MOST RECENT (max
     transcript timestamp) and record an ``occurrences`` count on it; order is
     first-seen preserved. Returns the collapsed list (callers may then apply
-    ``--limit``)."""
+    ``--limit``).
+
+    The dedup key is scoped by ``(project_folder, normalized message)`` so
+    identical wording in two DIFFERENT projects stays two candidates — matching
+    the project-scoped ``dedup_key`` of the #47 queue (issue #48 provenance is
+    not lost by collapsing across projects)."""
     best = {}
-    order: List[str] = []
+    order: List[Tuple[str, str]] = []
     for it in items:
-        key = _norm_dedup(it.get("message") or "")
-        if not key:
+        norm = _norm_dedup(it.get("message") or "")
+        if not norm:
             continue
+        key = (str(it.get("project_folder") or ""), norm)
         cur = best.get(key)
         if cur is None:
             best[key] = dict(it)
@@ -281,7 +287,7 @@ def build_mined_items(report, *, namespace: str, host: Optional[str] = None) -> 
             "occurrences": int(c.get("occurrences") or 1),
             "dedup_key": "cor|%s|%s" % (str(c.get("project_folder") or ""), _norm_dedup(stored)),
         }
-        if red:
+        if red or c.get("secret_warning"):
             it["secret_warning"] = True
         items.append(it)
 
@@ -290,6 +296,18 @@ def build_mined_items(report, *, namespace: str, host: Optional[str] = None) -> 
         redacted, red = _cq.redact_secret_like_text(msg)
         stored = redacted if (red and mode == "auto") else msg
         folder = str(e.get("project_folder") or "")
+        # Redact each sample per capture mode too: a secret in a repeated
+        # failing command (e.g. a retried auth/setup invocation) must not reach
+        # the queue raw. Same policy as the message — redact in 'auto', keep
+        # verbatim + flag in 'manual'. Already-redacted text won't re-match, so
+        # this is idempotent even when a caller pre-redacted the report.
+        samples = []
+        samples_secret = False
+        for s in e.get("sample_errors") or []:
+            s_red, s_count = _cq.redact_secret_like_text(str(s))
+            if s_count:
+                samples_secret = True
+            samples.append(s_red if (s_count and mode == "auto") else str(s))
         it = {
             "schema_version": _cq.SCHEMA_VERSION,
             "id": uuid.uuid4().hex,
@@ -309,11 +327,11 @@ def build_mined_items(report, *, namespace: str, host: Optional[str] = None) -> 
             "error_type": str(e.get("error_type") or ""),
             "count": int(e.get("count") or 0),
             "suggested_guideline": (e.get("suggested_guideline") or "") or "",
-            "sample_errors": list(e.get("sample_errors") or []),
+            "sample_errors": samples,
             "project_folder": folder,
             "dedup_key": "err|%s|%s" % (folder, str(e.get("error_type") or "")),
         }
-        if red:
+        if red or samples_secret or e.get("secret_warning"):
             it["secret_warning"] = True
         items.append(it)
 

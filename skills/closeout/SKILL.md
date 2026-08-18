@@ -83,8 +83,9 @@ same rubric. Two queue-item `kind`s exist:
 
 - `kind: "correction"` (`source: "history-mine"`) — a mined user correction.
   Treat exactly like a live correction above. Its `occurrences` field says how
-  many transcripts contained the same (near-identical) message; `review_priority`
-  is ordering only — never read it as a store signal.
+  many transcripts contained the same (near-identical) message; corrections do
+  NOT carry `review_priority` (that flag is exclusive to `error_pattern` items),
+  so give the row its honest signal-derived confidence like any other correction.
 - `kind: "error_pattern"` (`source: "history-mine"`) — a recurring tool error
   aggregated across sessions (grouped by `error_type` + `project_folder`, count
   `N`). It is NOT a corrective claim yet. Rewrite its `suggested_guideline` as a
