@@ -425,3 +425,173 @@ def extract_user_messages(transcript_path, corrections_only: bool = False) -> Li
         messages = [m for m in messages if re.search(correction_pattern, m, re.IGNORECASE)]
 
     return messages
+
+
+# =============================================================================
+# Tool-execution error classification + cross-session aggregation (issue #48)
+# =============================================================================
+# Ported from claude-reflect scripts/lib/reflect_utils.py (MIT), which extracts
+# and aggregates repeated tool errors across transcripts. Two adaptations per
+# the issue:
+#   - The occurrence -> weight mapping is named `review_priority`, NOT
+#     `confidence` (repeated errors are candidate *review ordering*, never a
+#     zmem confidence; the final signal is assigned by the reviewing agent at
+#     closeout, per skills/closeout/SKILL.md signal-honesty rules).
+#   - Aggregated output carries `project_folder` so a merged multi-project
+#     report keeps each pattern's provenance for cross-project applicability
+#     review.
+# These symbols are HOST-AGNOSTIC (pure functions over strings / already shaped
+# lists), matching the module charter; only store.py's `mine-history` walks
+# transcript directories.
+
+# Harness/guardrail-level noise that must NEVER become a candidate (taken
+# verbatim from claude-reflect): token/validation chatter and bash-syntax noise
+# are not actionable project lessons. `The user doesn't want to proceed` is
+# belt-and-suspenders — user rejections are already split out by store.py's
+# `_failures_from_transcript` (#46) before errors reach classification.
+TOOL_ERROR_EXCLUDE_PATTERNS = [
+    # Claude Code guardrails - system enforcing its rules
+    r"File has not been read yet",
+    r"exceeds maximum allowed tokens",
+    r"InputValidationError",
+    r"not valid JSON",
+    r"The user doesn't want to proceed",  # User rejections handled separately by #46
+    # Global Claude behavior issues - not project-specific
+    r"unexpected EOF while looking for matching",  # Bash quoting
+    r"EISDIR|illegal operation on a directory",    # File vs dir confusion
+    r"syntax error.*eval",                          # Bash syntax errors
+]
+
+# Project/env-context error patterns. Format: (error_type, regex, suggested_guideline).
+# The first 8 are taken verbatim from claude-reflect; we ADD 3 (command_not_found,
+# git_error, permission_denied) that reveal common project/env structure issues.
+# `module_not_found` is deliberately checked BEFORE the service-name patterns
+# (supabase/postgres/redis): a `ModuleNotFoundError: No module named 'supabase'`
+# carries the unambiguous import marker and must yield the import-path guideline,
+# not a service-.env guideline (the service patterns match on the module name too).
+PROJECT_SPECIFIC_ERROR_PATTERNS = [
+    ("connection_refused",
+     r"Connection refused|ECONNREFUSED|connect ECONNREFUSED",
+     "Check .env for service URLs - don't assume localhost"),
+    ("env_undefined",
+     r"(\w+_URL|DATABASE_URL|API_KEY|SECRET).*undefined|not set|is not defined",
+     "Load .env file before accessing environment variables"),
+    ("module_not_found",
+     r"ModuleNotFoundError|Cannot find module|No module named",
+     "Check import paths - verify project structure"),
+    ("supabase_error",
+     r"supabase|Supabase|SUPABASE",
+     "Check SUPABASE_URL and SUPABASE_KEY in .env"),
+    ("postgres_error",
+     r"postgres|PostgreSQL|PGHOST|:5432|password authentication failed",
+     "Check DATABASE_URL in .env for PostgreSQL connection"),
+    ("redis_error",
+     r"redis|REDIS|:6379",
+     "Check REDIS_URL in .env for Redis connection"),
+    ("venv_not_found",
+     r"venv.*No such file|activate: No such file|\.venv.*not found|No such file[^\n]*\.venv",
+     "Check virtual environment location"),
+    ("port_in_use",
+     r"address already in use|EADDRINUSE|port.*already.*use",
+     "Check if service is already running on this port"),
+    # --- zmem extension beyond claude-reflect ---
+    ("command_not_found",
+     r"command not found|is not recognized|: not found",
+     "Confirm the executable/VIRTUAL_ENV/PATH is set before invoking"),
+    ("git_error",
+     r"fatal: (not a git repository|.*merge conflict)|You have unmerged|CONFLICT",
+     "Confirm the cwd is the git worktree and resolve conflicts before continuing"),
+    ("permission_denied",
+     r"EACCES|permission denied|Permission denied|Access is denied",
+     "Check filesystem/ownership permissions on the target path"),
+]
+
+# Sample-length caps, matching claude-reflect (500 on extract, 200 on aggregate).
+SAMPLE_EXTRACT_LIMIT = 500
+SAMPLE_AGGREGATE_LIMIT = 200
+
+
+def classify_error_type(text) -> Tuple[Optional[str], Optional[str]]:
+    """Classify a single tool-error string.
+
+    Returns ``(error_type, suggested_guideline)`` for a PROJECT-SPECIFIC error
+    pattern match, or ``(None, None)`` for harness/guardrail noise (matched by
+    TOOL_ERROR_EXCLUDE_PATTERNS) or an unrecognized error. Excluded text can
+    therefore never become a candidate (issue #48). Ignore-case matching like
+    claude-reflect. Never raises."""
+    if not text:
+        return None, None
+    low = str(text)
+    for pat in TOOL_ERROR_EXCLUDE_PATTERNS:
+        if re.search(pat, low, re.IGNORECASE):
+            return None, None
+    for etype, pattern, guideline in PROJECT_SPECIFIC_ERROR_PATTERNS:
+        if re.search(pattern, low, re.IGNORECASE):
+            return etype, guideline
+    return None, None
+
+
+def aggregate_errors(errors, min_occurrences: int = 2) -> List[dict]:
+    """Aggregate tool-error dicts by ``(error_type, project_folder)``.
+
+    Input is a list of ``{error_type, content, project_folder,
+    suggested_guideline}`` (as produced by classify_error_type + store.py's
+    mine loop). Behavior:
+      - Drops groups below ``min_occurrences`` (one-off errors are noise).
+      - Keeps up to 3 sample error texts, each truncated to 200 chars (the
+        claude-reflect aggregate cap; the extract side caps at 500).
+      - Maps occurrence count -> ``review_priority``: 2 -> 0.70, 3-4 -> 0.85,
+        >=5 -> 0.90.
+
+    ``review_priority`` is REVIEW ORDERING for the agent, NOT a zmem confidence
+    (repeated tool errors do not automatically qualify as test/compile
+    grounding; the reviewing agent assigns the honest signal at closeout). The
+    distinct name prevents that confusion (issue #48).
+
+    Returns [{error_type, count, review_priority, suggested_guideline,
+    sample_errors[<=3], project_folder}] sorted by count descending."""
+    groups = {}
+    order: List[Tuple[str, str]] = []
+    for err in errors or []:
+        etype = (err or {}).get("error_type")
+        if not etype:
+            continue
+        folder = (err or {}).get("project_folder") or ""
+        key = (etype, folder)
+        g = groups.get(key)
+        if g is None:
+            g = {
+                "error_type": etype,
+                "project_folder": folder,
+                "suggested_guideline": (err or {}).get("suggested_guideline"),
+                "samples": [],
+                "count": 0,
+            }
+            groups[key] = g
+            order.append(key)
+        g["count"] += 1
+        if len(g["samples"]) < 3:
+            g["samples"].append(str((err or {}).get("content") or "")[:SAMPLE_AGGREGATE_LIMIT])
+
+    out = []
+    for key in order:
+        g = groups[key]
+        if g["count"] < min_occurrences:
+            continue
+        count = g["count"]
+        if count >= 5:
+            priority = 0.90
+        elif count >= 3:
+            priority = 0.85
+        else:
+            priority = 0.70
+        out.append({
+            "error_type": g["error_type"],
+            "count": count,
+            "review_priority": priority,
+            "suggested_guideline": g["suggested_guideline"],
+            "sample_errors": g["samples"],
+            "project_folder": g["project_folder"],
+        })
+    out.sort(key=lambda x: x["count"], reverse=True)
+    return out

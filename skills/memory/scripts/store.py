@@ -32,6 +32,9 @@ Usage:
   python store.py ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones] [--capture-mode MODE]
   python store.py failures [--session SID] [--transcript PATH] [--db PATH]
   python store.py corrections --transcript PATH   (read-only CC transcript mining)
+  python store.py mine-history [--transcript-dir DIR] [--all-projects] [--days N] \\
+         [--min-count N] [--limit N] [--queue] [--json]
+                 (read-only cold-start bootstrap mining, issue #48)
 
 Design (see the memory skill's design doc):
   - Tombstone supersession (superseded_at), NOT full bi-temporal (YAGNI for single user).
@@ -122,10 +125,16 @@ except ImportError:
 try:
     from corrections import detect_patterns as _detect_patterns  # noqa: F401
     from corrections import extract_user_messages as _extract_user_messages  # noqa: F401
+    from corrections import classify_error_type as _classify_error_type  # noqa: F401
+    from corrections import aggregate_errors as _aggregate_errors  # noqa: F401
+    from corrections import SAMPLE_EXTRACT_LIMIT as _SAMPLE_EXTRACT_LIMIT  # noqa: F401
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from corrections import detect_patterns as _detect_patterns  # type: ignore # noqa: F401
     from corrections import extract_user_messages as _extract_user_messages  # type: ignore # noqa: F401
+    from corrections import classify_error_type as _classify_error_type  # type: ignore # noqa: F401
+    from corrections import aggregate_errors as _aggregate_errors  # type: ignore # noqa: F401
+    from corrections import SAMPLE_EXTRACT_LIMIT as _SAMPLE_EXTRACT_LIMIT  # type: ignore # noqa: F401
 
 # Live-correction queue (issue #47). `SECRET_PATTERNS` lives here as the single
 # source of truth shared by the store's capture-policy helpers AND the queue's
@@ -4638,6 +4647,253 @@ def _classify_correction(text: str):
     }
 
 
+def _transcript_mtime_iso(path) -> str:
+    """ISO-8601 UTC timestamp of a transcript file's mtime (used as each mined
+    candidate's event time for cross-session 'keep most recent' ordering)."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(path)))
+    except OSError:
+        return ""
+
+
+def _mine_corrections_from_transcript(transcript, project_folder: str) -> list:
+    """Mine correction candidates from a single CC transcript, tagged with
+    transcript-side provenance (project_folder/transcript/timestamp). Mirrors
+    cmd_corrections' per-message pipeline per message: classify -> sanitize ->
+    capture-mode redact/annotate. Fail-open to [] on any read/parse error."""
+    items = []
+    mode = _normalize_capture_mode(None)
+    try:
+        raw_texts = _extract_user_messages(transcript)
+    except Exception:
+        raw_texts = []
+    for text in raw_texts:
+        classified = _classify_correction(text)
+        if not classified:
+            continue
+        classified["message"] = _sanitize_correction_message(text)
+        redacted, redactions = _redact_secret_like_text(classified["message"])
+        if redactions:
+            classified["secret_warning"] = True
+            if mode == "auto":
+                classified["message"] = redacted
+        classified["project_folder"] = project_folder
+        classified["transcript"] = str(transcript)
+        classified["timestamp"] = _transcript_mtime_iso(transcript)
+        items.append(classified)
+    return items
+
+
+def _redact_error_pattern_samples(error_patterns) -> None:
+    """Redact/annotate error_pattern ``sample_errors`` per capture mode for the
+    ``--json`` report (issue #48 / PRR-001). A secret embedded in a repeated
+    failing command (e.g. a retried auth/setup invocation) must not reach stdout
+    raw. In 'auto' each sample is redacted; in 'manual'/'reviewed' it is kept
+    verbatim and the pattern is flagged ``secret_warning``. Idempotent:
+    already-redacted text won't re-match. Mutates the list in place."""
+    mode = _normalize_capture_mode(None)
+    for e in error_patterns or []:
+        flagged = False
+        out = []
+        for s in e.get("sample_errors") or []:
+            redacted, n = _redact_secret_like_text(str(s))
+            if n:
+                flagged = True
+            out.append(redacted if (n and mode == "auto") else str(s))
+        if flagged:
+            e["secret_warning"] = True
+        e["sample_errors"] = out
+
+
+def _queue_mined(report, host: str, as_json: bool = False) -> int:
+    """Append mined candidates to the #47 sidecar review queue (source
+    'history-mine') under the canonical namespace of the box's current
+    project. Idempotent: an item whose dedup_key already exists is skipped so a
+    re-run never double-appends. Fail-open: a missing/unwritable queue module
+    yields a clean non-zero message, never a crash.
+
+    Honest accounting (PRR-005): an ``append_queue`` returning False or raising
+    is tracked as a FAILED write (NOT folded into the "already present" count),
+    reported, and makes the command return non-zero — a silent write loss must
+    not look like success. In ``as_json`` mode the human summary is routed to
+    stderr so stdout stays a pure ``json.loads``-able report (PRR-004)."""
+    try:
+        import correction_queue as _cq
+        namespace = _host.resolve_namespace(os.getcwd()) if _host else "user:global"
+    except Exception as exc:
+        _sanitized = _sanitize_exc_text(str(exc))
+        print("[zmem] mine-history: --queue failed (queue unavailable): %s" % _sanitized,
+              file=sys.stderr)
+        return 2
+    try:
+        import history_mining as _hm
+        items = _hm.build_mined_items(report, namespace=namespace, host=host)
+    except Exception as exc:
+        _sanitized = _sanitize_exc_text(str(exc))
+        print("[zmem] mine-history: --queue failed (candidate build error): %s" % _sanitized,
+              file=sys.stderr)
+        return 2
+    try:
+        existing_keys = {
+            it.get("dedup_key")
+            for it in _cq.load_queue(namespace)
+            if isinstance(it, dict) and it.get("dedup_key")
+        }
+    except Exception:
+        existing_keys = set()
+    added = 0
+    failed = 0
+    for it in items:
+        key = it.get("dedup_key")
+        if key in existing_keys:
+            continue
+        try:
+            if _cq.append_queue(namespace, it):
+                added += 1
+                existing_keys.add(key)
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+    already = len(items) - added - failed
+    summary = ("[zmem] mine-history: queued %d candidate(s) to %s (source=history-mine); "
+               "%d already present" % (added, namespace, already))
+    if failed:
+        summary += "; %d write(s) FAILED" % failed
+    if as_json:
+        print(summary, file=sys.stderr)
+    else:
+        print(summary)
+    return 2 if failed else 0
+
+
+def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int,
+                     limit, queue: bool, as_json: bool) -> int:
+    """Mine user corrections, tool rejections, and repeated tool-error patterns
+    from HISTORICAL Claude Code transcripts (issue #48; PR 3/4 claude-reflect).
+
+    READ-ONLY against transcripts AND the store: this command NEVER opens the
+    ZMem store (it is dispatched before connect()), and the only write surface
+    is the #47 sidecar review queue when ``--queue`` is given. Candidates are
+    REVIEWED by an agent before any row enters the store (signal honesty per
+    skills/closeout/SKILL.md).
+
+    Host input surface is Claude Code transcripts only (host matrix; ZCode /
+    Codex / Hermes out of scope by design — see README Bootstrap section).
+    A missing transcript dir is a CLEAN non-zero exit with a clear message (the
+    expected outcome on a ZCode/Codex-only box), not a crash; "scanned N files,
+    found nothing" exits 0.
+    """
+    try:
+        import history_mining as _hm
+    except Exception:
+        _fail = {
+            "corrections": [], "rejections": [], "error_patterns": [],
+            "scanned": {"files": 0, "skipped": 0},
+        }
+        if as_json:
+            print(json.dumps(_fail))
+        print("[zmem] mine-history: history_mining module unavailable", file=sys.stderr)
+        return 2
+
+    root = _hm.resolve_transcript_root(transcript_dir)
+    files, missing = _hm.discover_transcripts(
+        root, all_projects=bool(all_projects), project_dir=os.getcwd(), days=days)
+
+    if missing:
+        msg = (
+            "[zmem] mine-history: no Claude Code transcript directory found at %s. "
+            "Mining reads Claude Code history only (see README 'Bootstrap / cold "
+            "start'); run --transcript-dir with a custom path, or expect no "
+            "candidates on a ZCode/Codex-only box." % root
+        )
+        if as_json:
+            print(json.dumps({
+                "corrections": [], "rejections": [], "error_patterns": [],
+                "scanned": {"files": 0, "skipped": 0},
+                "error": "no transcript dir",
+            }))
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+
+    corrections = []
+    rejections = []
+    errors = []  # raw classified errors awaiting aggregation
+    skipped = 0
+    for path, folder in files:
+        if not _hm.is_cc_transcript(path):
+            skipped += 1
+            continue
+        corrections.extend(_mine_corrections_from_transcript(path, folder))
+        try:
+            details, rejs = _failures_from_transcript(str(path))
+        except Exception:
+            details, rejs = [], []
+        for r in rejs:
+            r["project_folder"] = folder
+            r["transcript"] = str(path)
+            rejections.append(r)
+        for d in details:
+            etext = d.get("error")
+            etype, guideline = _classify_error_type(etext) if etext else (None, None)
+            if not etype:
+                continue
+            errors.append({
+                "error_type": etype,
+                "content": _sanitize_error_text(etext, _SAMPLE_EXTRACT_LIMIT),
+                "project_folder": folder,
+                "suggested_guideline": guideline,
+            })
+
+    corrections = _hm.dedupe_corrections(corrections)
+    error_patterns = _aggregate_errors(errors, min_occurrences=min_count)
+    _redact_error_pattern_samples(error_patterns)  # PRR-001: --json samples never leak
+
+    if limit is not None:
+        corrections = corrections[:limit]
+
+    report = {
+        "corrections": corrections,
+        "rejections": rejections,
+        "error_patterns": error_patterns,
+        "scanned": {"files": len(files), "skipped": skipped},
+    }
+
+    if not missing and not all_projects and not files:
+        # Scoped discovery found nothing for the current project: make the
+        # likely cause obvious instead of a bare "scanned 0" rc 0 (PRR-009).
+        print("[zmem] mine-history: no Claude Code transcript folder matched the "
+              "current project under %s; try --all-projects to scan every project "
+              "or --transcript-dir for a custom root." % root, file=sys.stderr)
+
+    if as_json:
+        print(json.dumps(report))
+    else:
+        print("[zmem] mine-history: scanned %d file(s), skipped %d, %d correction(s), "
+              "%d rejection(s), %d error pattern(s)"
+              % (len(files), skipped, len(corrections), len(rejections), len(error_patterns)))
+        if rejections:
+            print("  rejections:")
+            for r in rejections:
+                print("    - %s: %s [%s]" % (r.get("tool"), r.get("reason"),
+                                             r.get("project_folder")))
+        for c in corrections:
+            warn = "[secret] " if c.get("secret_warning") else ""
+            print("  %scorrection %s (x%d) [%s]: %s"
+                  % (warn, c.get("type"), c.get("occurrences", 1),
+                     c.get("project_folder"), c.get("message")))
+        for e in error_patterns:
+            print("  error %s x%d (priority %.2f) [%s]: %s"
+                  % (e.get("error_type"), e.get("count"), e.get("review_priority"),
+                     e.get("project_folder"), (e.get("suggested_guideline") or "")))
+
+    if queue:
+        return _queue_mined(report, host=os.environ.get("ZMEM_HOST") or "cli",
+                            as_json=as_json)
+    return 0
+
+
 def cmd_queue_list(*, namespace: str, as_json: bool) -> int:
     """List a namespace's live-capture correction candidates (issue #47).
 
@@ -5828,6 +6084,30 @@ def main():
     _qc_grp.add_argument("--drop-stale", action="store_true",
                          help="remove stale items with confidence < 0.6")
 
+    p_mine = sub.add_parser(
+        "mine-history",
+        help="mine corrections/rejections/error-patterns from HISTORICAL Claude Code "
+             "transcripts (read-only; CC-transcript host surface only)")
+    p_mine.add_argument("--transcript-dir", default="",
+                        help="Claude Code transcript root (default ~/.claude/projects)")
+    p_mine.add_argument("--all-projects", action="store_true",
+                        help="walk every project folder (default: current project only)")
+    p_mine.add_argument("--days", type=nonnegative_int, default=None,
+                        help="only transcripts modified within this many days "
+                             "(default: no time filter)")
+    p_mine.add_argument("--min-count", type=nonnegative_int, default=2,
+                        help="error-aggregation threshold (default 2)")
+    p_mine.add_argument("--limit", type=nonnegative_int, default=None,
+                        help="cap the number of correction candidates in output "
+                             "(default: no cap; 0 emits none, negatives rejected)")
+    p_mine.add_argument("--queue", action="store_true",
+                        help="append candidates to the PR-2 review queue "
+                             "(source=history-mine; resolves the store namespace "
+                             "from the current project's git origin, so it may "
+                             "spawn one short `git` subprocess)")
+    p_mine.add_argument("--json", action="store_true",
+                        help="emit the full merged candidate report as JSON")
+
     p_sweep = sub.add_parser(
         "sweep",
         help="remove stale per-session cooldown sentinel files (issue #23)")
@@ -5868,6 +6148,22 @@ def main():
     if args.cmd == "queue-clear":
         sys.exit(cmd_queue_clear(namespace=args.namespace, ids=args.id,
                                  clear_all=args.all, drop_stale=args.drop_stale))
+
+    # `mine-history` is READ-ONLY against transcripts AND the store (the only
+    # write surface is the #47 sidecar queue under --queue), so like
+    # `failures`/`corrections`/`queue-list`/`sweep` it dispatches BEFORE
+    # connect()/migrate() — a bad/locked/missing store can never break cold-start
+    # mining. Host input surface is Claude-Code-transcript-only by design.
+    if args.cmd == "mine-history":
+        sys.exit(cmd_mine_history(
+            transcript_dir=args.transcript_dir or None,
+            all_projects=args.all_projects,
+            days=args.days,
+            min_count=args.min_count,
+            limit=args.limit,
+            queue=args.queue,
+            as_json=args.json,
+        ))
 
     # `restore` overwrites the destination store FILE. It must not hold an open
     # sqlite3 connection on that file while doing so (a Windows file handle can

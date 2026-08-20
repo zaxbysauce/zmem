@@ -75,6 +75,31 @@ recall-before-write (dedupe/supersede check) → Step 2 `add` with
 `--signal user` (never higher — SIGNAL_CONFIDENCE maps `user` → 0.6) and
 `--source-ref "session:<id>"`.
 
+**Cold-start (bootstrap) candidates:** the `mine-history` command (issue #48)
+can also queue mined candidates with `source: "history-mine"` — salvaged from
+HISTORICAL Claude Code transcripts (`~/.claude/projects/**/*.jsonl`), not
+live-captured. They appear in `queue-list` exactly like live items; apply the
+same rubric. Two queue-item `kind`s exist:
+
+- `kind: "correction"` (`source: "history-mine"`) — a mined user correction.
+  Treat exactly like a live correction above. Its `occurrences` field says how
+  many transcripts contained the same (near-identical) message; corrections do
+  NOT carry `review_priority` (that flag is exclusive to `error_pattern` items),
+  so give the row its honest signal-derived confidence like any other correction.
+- `kind: "error_pattern"` (`source: "history-mine"`) — a recurring tool error
+  aggregated across sessions (grouped by `error_type` + `project_folder`, count
+  `N`). It is NOT a corrective claim yet. Rewrite its `suggested_guideline` as a
+  starting draft into a **`lesson`** with the ACTUAL trigger condition you
+  observed ("when X fails with `error_type`, do Y"), then write it via Step 2
+  `add --type lesson`. Signal honesty applies: repeated tool errors do NOT
+  automatically qualify as `test`/`compile` grounding — assign the signal the
+  evidence actually supports. `review_priority` (their ordering weight) must not
+  become the row's confidence; give the row the honest signal-derived one.
+
+Rejections mined into the report (not queued) are context for judging whether a
+feature/tool is being misused; they are a #46 report surface, not a queue
+candidate. `mine-history` never writes the store in any mode.
+
 **Secrets:** an item flagged `secret_warning: true` carried secret-like text at
 capture time. Render the warning to yourself, and write that item via
 `add --capture-mode auto` so any remaining secret-like text is redacted before
