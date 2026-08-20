@@ -48,6 +48,7 @@ Design (see the memory skill's design doc):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -2754,6 +2755,33 @@ def _lexical_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
     return len(tokens_a & tokens_b) / len(union)
 
 
+# Negation-polarity heuristic for the consolidate contradiction guard (issue
+# #49, Deliverable A — ported concept from claude-reflect's
+# detect_contradictions; zmem's version is a deterministic stdlib heuristic,
+# never an LLM call). Similarity alone ranks "always use tabs" and "never use
+# tabs" as near-duplicates, so merging by similarity alone can absorb a
+# memory's own refutation into the row it contradicts. A cluster whose members
+# differ in negation polarity is CONTESTED and is never auto-merged (not even
+# with --force; --merge-contested is the explicit override for heuristic false
+# positives — false contests are the safe direction).
+_CONSOLIDATE_NEGATOR_RE = re.compile(
+    r"\b(?:never|don'?t|do not|doesn'?t|can'?t|cannot|won'?t|not|avoid|stop|no longer)\b",
+    re.IGNORECASE,
+)
+
+
+def _polarity_signature(content: str | None) -> bool:
+    """True when ``content`` carries negation polarity: it contains a negator
+    OUTSIDE code spans and double-quoted strings (the issue's suggested cheap
+    refinement — a quoted error message like ``"module not found"`` inside
+    otherwise-positive guidance must not flip the polarity). Curly apostrophes
+    are normalized so ``don’t`` matches like ``don't``."""
+    text = (content or "").replace("\u2019", "'")
+    text = re.sub(r"`[^`]*`", " ", text)      # code spans
+    text = re.sub(r'"[^"\n]*"', " ", text)    # double-quoted spans
+    return bool(_CONSOLIDATE_NEGATOR_RE.search(text))
+
+
 def _normalize_text(text: str) -> str:
     """Normalize text for substring/overlap comparison: collapse runs of
     whitespace to a single space and strip+lowercase. Used by
@@ -2937,9 +2965,26 @@ def consolidate(
     dry_run: bool = False,
     namespace: str | None = None,
     force: bool = False,
-) -> None:
+    merge_contested: bool = False,
+) -> dict:
     """Merge near-duplicate memories via embedding similarity (or a lexical
     token-overlap fallback when embeddings are unavailable — Phase 10).
+
+    Returns a machine-readable report dict (issue #49): ``{mode, dry_run,
+    threshold, skipped_by_cadence_gate, merged, pruned, contested_clusters,
+    truncated, knn_truncated}``. ``contested_clusters`` lists clusters whose
+    members differ in negation polarity (see ``_polarity_signature``): they
+    are NEVER auto-merged — not even with ``force`` (which bypasses only the
+    cadence gate) — because similarity alone cannot distinguish "always X"
+    from "never X", and merging would absorb a memory's own refutation into
+    the row it contradicts. Contested clusters are reported for human/agent
+    resolution via ``supersede`` instead (issue #49 Deliverable A; concept
+    ported from claude-reflect's contradiction category). ``merge_contested``
+    is the explicit override for heuristic false positives; when set, the
+    contested clusters merge like any other and the report marks them
+    ``merged: true``. Contested members stay live and remain eligible as
+    NEIGHBORS of later clusters, but do not re-seed within the same run (no
+    duplicate mirror report).
 
     For each live memory with an embedding, query vec0 KNN for nearest neighbors.
     Cluster memories with cosine similarity >= threshold. For each cluster:
@@ -2993,6 +3038,23 @@ def consolidate(
     if use_lexical:
         print("[zmem] embeddings unavailable — consolidating via lexical token overlap", file=sys.stderr)
 
+    # Machine-readable run report (issue #49). Returned from EVERY exit path;
+    # the CLI's --json mode prints it as the sole stdout payload (all human
+    # prose is redirected to stderr there), so agents on any host — including
+    # Hermes via its own tooling — can act on contested clusters without
+    # scraping human text.
+    report: dict = {
+        "mode": "lexical" if use_lexical else "cosine",
+        "dry_run": dry_run,
+        "threshold": threshold,
+        "skipped_by_cadence_gate": False,
+        "merged": 0,
+        "pruned": 0,
+        "contested_clusters": [],
+        "truncated": False,
+        "knn_truncated": False,
+    }
+
     # Growth-based cadence gate (issue #26): skip if last consolidation was
     # recent AND the store hasn't grown significantly since. The skip is always
     # announced. dry_run models the same gate so the two modes agree; only
@@ -3040,7 +3102,8 @@ def consolidate(
                       f"{CONSOLIDATE_MIN_INTERVAL_DAYS:g}d min, {growth:.1%} growth < "
                       f"{CONSOLIDATE_GROWTH_THRESHOLD:.1%} min; needs more "
                       f"time OR more growth)")
-            return  # gate declined — leave last_consolidation untouched
+            report["skipped_by_cadence_gate"] = True
+            return report  # gate declined — leave last_consolidation untouched
 
     # Write the consolidation timestamp BEFORE the clustering loop, so a killed
     # run still creates backpressure on the next session. Count is start-of-run
@@ -3112,7 +3175,7 @@ def consolidate(
 
     if not rows:
         print("[zmem] no embeddable memories to consolidate")
-        return
+        return report
 
     # Precompute lexical token sets once per row (only used in fallback mode).
     lexical_tokens = {}
@@ -3124,6 +3187,11 @@ def consolidate(
 
     # Track which memories have been absorbed (to skip them as seeds).
     absorbed = set()
+    # Members of contested (mixed-polarity) clusters excluded from merging this
+    # run (issue #49): they do not re-seed (no duplicate mirror report) but are
+    # deliberately NOT in `absorbed`, so they stay live and remain eligible as
+    # neighbors of later clusters formed around a fresh seed.
+    contested_ids = set()
     merged_count = 0
     pruned_count = 0
 
@@ -3134,6 +3202,7 @@ def consolidate(
     effective_threshold = threshold
     if use_lexical and threshold == CONSOLIDATE_DEFAULT_THRESHOLD:
         effective_threshold = CONSOLIDATE_LEXICAL_THRESHOLD
+    report["threshold"] = effective_threshold
 
     # NAMESPACE CONTAINMENT (data-integrity invariant, both clustering paths):
     # a cluster is ALWAYS scoped to the seed's own namespace, whether or not the
@@ -3143,7 +3212,7 @@ def consolidate(
     # --namespace at all. Without the seed-namespace check below, that run could
     # supersede one project's memory into an unrelated project's memory.
     for seed in rows:
-        if seed["id"] in absorbed:
+        if seed["id"] in absorbed or seed["id"] in contested_ids:
             continue
 
         neighbors = []
@@ -3232,6 +3301,62 @@ def consolidate(
 
         if not neighbors:
             continue
+
+        # Contradiction guard (issue #49 Deliverable A): similarity cannot
+        # distinguish "always X" from "never X" — they are near-duplicates by
+        # cosine/Jaccard — so before merging, check negation polarity across
+        # the cluster (keeper + neighbors). A mixed-polarity cluster is
+        # CONTESTED: never auto-merged (not even with --force, which bypasses
+        # only the cadence gate), always reported. This runs BEFORE the
+        # dry_run split so the dry-run preview reports exactly what a real run
+        # would do: a contested cluster never appears as a would-APPEND
+        # preview, only as the CONTESTED block below.
+        member_pols = [(seed["id"], seed["content"], _polarity_signature(seed["content"]))]
+        member_pols += [
+            (nb["id"], nb["content"], _polarity_signature(nb["content"]))
+            for nb, _sim in neighbors
+        ]
+        if len({pol for _, _, pol in member_pols}) > 1:
+            if merge_contested:
+                # Explicit override for a confirmed heuristic false positive:
+                # merge like any other cluster, but record it in the report so
+                # the override is visible after the fact.
+                report["contested_clusters"].append({
+                    "keeper": seed["id"],
+                    "namespace": seed["namespace"],
+                    "merged": True,
+                    "members": [
+                        {"id": mid, "polarity": "neg" if pol else "pos",
+                         "content_preview": (mcontent or "")[:60]}
+                        for mid, mcontent, pol in member_pols
+                    ],
+                })
+            else:
+                verb = "would NOT merge (contested)" if dry_run else "NOT merged (contested)"
+                print(f"[zmem] consolidate: CONTESTED cluster around [{seed['id'][:8]}] — "
+                      f"negation polarity differs; {verb}:")
+                for mid, mcontent, mpol in member_pols:
+                    print(f"    [{mid[:8]}] {'neg' if mpol else 'pos'}: "
+                          f"{(mcontent or '')[:60]}")
+                print("    one side likely needs `supersede --id <full-uuid> --reason ...` "
+                      "(Step 3 of closeout), not merging; pass --merge-contested only for a "
+                      "confirmed heuristic false positive")
+                report["contested_clusters"].append({
+                    "keeper": seed["id"],
+                    "namespace": seed["namespace"],
+                    "merged": False,
+                    "members": [
+                        {"id": mid, "polarity": "neg" if pol else "pos",
+                         "content_preview": (mcontent or "")[:60]}
+                        for mid, mcontent, pol in member_pols
+                    ],
+                })
+                # Park members for this run: no re-seeding (which would only
+                # re-report the same contested cluster from the mirror side),
+                # but NOT absorbed — they stay live and neighbor-eligible for
+                # later clusters that form around a fresh seed.
+                contested_ids.update(mid for mid, _, _ in member_pols)
+                continue
 
         # The seed is the keeper. With the rows query ordered by
         # (confidence * (retrieval_count + surfaced_count) DESC, confidence DESC,
@@ -3366,7 +3491,22 @@ def consolidate(
         # Fail-safe (the duplicate survives, no corruption) — reported so the
         # completeness gap is visible (cubic-4, #36 M8 residual).
         parts.append("knn_truncated: KNN cap reached; some pairs may be unexamined")
+    contested_excluded = sum(1 for c in report["contested_clusters"] if not c["merged"])
+    if contested_excluded:
+        # Never silent (issue #49): a contested exclusion that only appeared in
+        # the per-cluster block above could be missed when skimming the tail of
+        # the output, so the summary repeats the count and the resolution path.
+        parts.append(
+            f"contested {contested_excluded} cluster(s) (not merged — resolve via "
+            f"supersede, or pass --merge-contested for a confirmed false positive)"
+        )
     print(f"[zmem] {' + '.join(parts)}")
+
+    report["merged"] = merged_count
+    report["pruned"] = pruned_count
+    report["truncated"] = truncated
+    report["knn_truncated"] = knn_truncated
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -5892,6 +6032,14 @@ def main():
                                help="limit consolidation to a specific namespace")
     p_consolidate.add_argument("--force", action="store_true",
                                help="bypass the cadence gate and run consolidation now")
+    p_consolidate.add_argument("--merge-contested", action="store_true",
+                               help="also merge contested (mixed negation-polarity) clusters; "
+                                    "use only for confirmed heuristic false positives — by "
+                                    "default they are reported, never merged")
+    p_consolidate.add_argument("--json", action="store_true",
+                               help="print a machine-readable run report (contested clusters "
+                                    "included) as the ONLY stdout content; human output goes "
+                                    "to stderr")
 
     p_promote = sub.add_parser("promote", help="promote high-confidence lessons to SKILL.md files")
     p_promote.add_argument("--dry-run", action="store_true",
@@ -6298,20 +6446,42 @@ def main():
             # the cadence gate (it announces a would-skip) but still writes nothing,
             # so it still never takes the single-flight lock; only --force bypasses
             # the gate, and --dry-run --force previews what --force would do.
+            #
+            # --json (issue #49): stdout must remain strictly json.loads-parseable,
+            # so under --json every human print from the lock path AND from
+            # consolidate() itself is routed to stderr (PRR-004 discipline), and
+            # the machine report — or a lock-busy error object — is printed to
+            # the RESTORED stdout after the redirect block exits.
             c_token = None
-            if not args.dry_run:
-                c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
-                if c_token is None:
-                    print("[zmem] consolidate: another consolidation is already "
-                          "running - skipped")
-                    conn.close()
-                    return
-            try:
-                consolidate(conn, threshold=args.threshold, prune=args.prune,
+            lock_busy = False
+            c_report = None
+            redirect = (
+                contextlib.redirect_stdout(sys.stderr)
+                if args.json else contextlib.nullcontext()
+            )
+            with redirect:
+                if not args.dry_run:
+                    c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+                    if c_token is None:
+                        print("[zmem] consolidate: another consolidation is already "
+                              "running - skipped")
+                        lock_busy = True
+                if not lock_busy:
+                    try:
+                        c_report = consolidate(
+                            conn, threshold=args.threshold, prune=args.prune,
                             dry_run=args.dry_run, namespace=args.namespace,
-                            force=args.force)
-            finally:
-                _release_lock("consolidate", c_token)
+                            force=args.force, merge_contested=args.merge_contested)
+                    finally:
+                        _release_lock("consolidate", c_token)
+            if lock_busy:
+                # conn is closed exactly once by main()'s outer finally — the
+                # historical explicit close here was a harmless double-close.
+                if args.json:
+                    print('{"error": "consolidate lock busy"}')
+                return
+            if args.json:
+                print(json.dumps(c_report))
         elif args.cmd == "backup":
             rc = cmd_backup(conn, retention=args.retention, out_dir=args.out_dir,
                             if_due=args.if_due)
