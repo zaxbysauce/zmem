@@ -91,7 +91,11 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 
 It checks the resolved store path, split-brain env/config risks, native-memory
 conflicts, schema compatibility, Windows shell requirements, canonical
-namespace derivation, and whether the expected host surfaces are present.
+namespace derivation, whether the expected host surfaces are present, the
+size of the always-injected Tier-0 files (`core.md`, project `AGENTS.md`) so
+an overgrown file cannot silently eat the context budget, and the Claude Code
+transcript retention window (`cleanupPeriodDays`) that bounds how far back
+the transcript-mining commands can see.
 
 ### ZCode — from this GitHub repo (recommended)
 
@@ -457,9 +461,8 @@ Notes:
   messages, and repeated-error samples; `manual`/`reviewed` keeps wording
   verbatim and flags those candidates with `secret_warning` for the reviewer.
 - **Retention caveat:** Claude Code deletes transcripts after
-  `cleanupPeriodDays` (default 30), so mining sees only what still exists. (The
-  doctor check for this ships separately; cross-referenced from the doctor
-  roadmap.)
+  `cleanupPeriodDays` (default 30), so mining sees only what still exists. The
+  `session-retention` doctor check reports this window (see *Preflight*).
 
 ## Where data lives
 

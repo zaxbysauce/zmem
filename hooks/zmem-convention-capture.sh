@@ -59,17 +59,40 @@ fi
 # PostToolUse provides tool_name on stdin. Run the parse with "$PYTHON_BIN"
 # (quoted for paths containing spaces). If no interpreter is available, emit
 # empty rather than failing — the convention capture is best-effort.
+#
+# Line 2 of the parse is commit detection (issue #49 B): 1 when this call is
+# tool_name=Bash with a `git commit` command (and not `--amend`) — the
+# semantically strongest "unit of work finished" moment for a capture nudge.
+# Concept ported from MIT claude-reflect scripts/post_commit_reminder.py
+# (commit detection incl. --amend exclusion, queue-count enrichment).
+# The Bash gate is explicit (not implied by payload shape) so a future
+# Edit/Write payload that happens to carry a `command` subkey cannot fire the
+# nudge. Substring semantics are the issue's literal spec; a non-dict
+# tool_input or non-string command degrades to 0. Windows Python emits \r\n
+# per line even piped and $() strips only the trailing pair, so normalize \r
+# BEFORE the split or TOOL_NAME would carry a trailing \r and silently fail
+# the case gate.
 if [ -z "$PYTHON_BIN" ]; then
   emit_empty
 fi
-TOOL_NAME=$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c "
+TOOL_META="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c "
 import json, sys
 try:
     obj = json.load(sys.stdin)
-    print(obj.get('tool_name', ''))
+    name = obj.get('tool_name', '')
+    name = name if isinstance(name, str) else ''
+    ti = obj.get('tool_input')
+    cmd = ti.get('command') if isinstance(ti, dict) else None
+    print(name)
+    print(int(name == 'Bash' and isinstance(cmd, str)
+              and 'git commit' in cmd and '--amend' not in cmd))
 except Exception:
     print('')
-" 2>/dev/null)
+    print(0)
+" 2>/dev/null)"
+TOOL_META="${TOOL_META//$'\r'/}"
+TOOL_NAME="${TOOL_META%%$'\n'*}"
+IS_COMMIT="${TOOL_META#*$'\n'}"
 
 case "$TOOL_NAME" in
   Edit|Write|MultiEdit|NotebookEdit|Bash) ;;
@@ -199,13 +222,19 @@ if [ -z "$NS_HINT" ]; then
   fi
 fi
 
-# --- Per-session cooldown marker (same pattern as capture-failure) ---
+# --- Per-session cooldown markers (same pattern as capture-failure) ---
 MARKER="$(join_path "$DATA_DIR_PY" ".convention-prompted-${SESSION_ID}")"
+# Commit-nudge cooldown (issue #49 B): OWN marker key, deliberately separate
+# from the cadence marker so the two nudges never suppress each other — a
+# commit nudge must fire even if the cadence nudge already did (and vice
+# versa), but at most once per session itself. Reaped by `sweep` via
+# SENTINEL_PREFIXES in store.py.
+COMMIT_MARKER="$(join_path "$DATA_DIR_PY" ".convention-commit-prompted-${SESSION_ID}")"
 
 # No python → cannot count turns; fail open (no injection).
 if [ -z "$PYTHON_BIN" ]; then emit_empty; fi
 
-# --- Turn counter + cooldown check via Python (atomic meta table update) ---
+# --- Turn counter + nudges via Python (atomic meta table update) ---
 CTX_JSON="$("$PYTHON_BIN" -c '
 import json, os, shlex, sys, sqlite3
 
@@ -214,13 +243,16 @@ data_dir = sys.argv[2]
 marker = sys.argv[3]
 store_py_hint = sys.argv[4]
 ns_hint = sys.argv[5]
+is_commit = sys.argv[6]
+commit_marker = sys.argv[7]
 
-# Cooldown: one convention prompt per session.
-if os.path.isfile(marker):
-    print("{}")
-    sys.exit(0)
-
-# Turn counter in the meta table — atomic increment via UPDATE.
+# Turn counter in the meta table — atomic increment via UPDATE. Runs FIRST
+# (issue #49 B) so a commit-firing Bash call still counts toward the cadence
+# interval. The counter now counts every convention-tool call of the session;
+# previously it froze once the cadence marker existed, but nothing ever read
+# the frozen value, so only the (still marker-gated) nudge behavior matters.
+# A successful increment also proves data_dir exists, so the commit-marker
+# write below cannot fail on a missing directory.
 store_db = os.path.join(data_dir, "store.sqlite")
 try:
     conn = sqlite3.connect(store_db, timeout=3)
@@ -233,6 +265,43 @@ try:
     conn.close()
     count = int(row[0]) if row else 0
 except Exception:
+    print("{}")
+    sys.exit(0)
+
+# Commit-boundary nudge (issue #49 B): a `git commit` (not `--amend`) is the
+# strongest natural "unit of work finished" moment. At most once per session
+# via its OWN marker, checked BEFORE the cadence marker below so an
+# already-fired cadence nudge never suppresses it — and the commit marker
+# never suppresses the cadence nudge (independent keys, independent checks).
+if is_commit == "1" and not os.path.isfile(commit_marker):
+    try:
+        with open(commit_marker, "w") as f:
+            f.write("1")
+    except OSError:
+        pass  # best-effort; worst case the nudge can re-fire this session
+    # Enrich with the pending #47 correction-queue count when the module and
+    # a non-empty queue are available; degrade silently (no count) otherwise —
+    # the nudge must not depend on the queue existing.
+    pending = None
+    try:
+        sys.path.insert(0, os.path.dirname(store_py_hint))
+        import correction_queue as _cq
+        pending = sum(1 for _it in _cq.load_queue(ns_hint) if not _it.get("stale"))
+    except Exception:
+        pending = None
+    queue_note = ""
+    if pending:
+        queue_note = " %d correction-queue item(s) pending review." % pending
+    msg = (
+        "zmem: commit detected — if this completes a unit of work, consider "
+        "running the closeout skill to capture lessons.%s "
+        "(fires at most once per session)"
+    ) % queue_note
+    print(json.dumps({"additionalContext": msg}))
+    sys.exit(0)
+
+# Cooldown: one convention prompt per session.
+if os.path.isfile(marker):
     print("{}")
     sys.exit(0)
 
@@ -270,7 +339,7 @@ msg = (
     "(This prompt fires at most once per session.)"
 ) % (store_py_arg, namespace_arg, source_ref_arg)
 print(json.dumps({"additionalContext": msg}))
-' "$SESSION_ID" "$DATA_DIR_PY" "$MARKER" "$STORE_PY_PY" "$NS_HINT" 2>/dev/null || echo '{}')"
+' "$SESSION_ID" "$DATA_DIR_PY" "$MARKER" "$STORE_PY_PY" "$NS_HINT" "$IS_COMMIT" "$COMMIT_MARKER" 2>/dev/null || echo '{}')"
 
 if [ -z "$CTX_JSON" ]; then
   CTX_JSON='{}'

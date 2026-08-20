@@ -113,11 +113,23 @@ if [ -z "$PLUGIN_ROOT" ]; then
   PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
 
-CORE_FILE_PY="$(join_path "$DATA_DIR_PY" core.md)"
+# Tier-0 core.md: honor the canonical ZMEM_CORE_MD override exactly like
+# host.resolve_core_md_path() does, so doctor's tier0-size check measures the
+# same file this hook injects (PR feedback PRR-003 — the hook previously
+# hardcoded <data dir>/core.md and silently ignored the documented override).
+# Default is <store data dir>/core.md either way.
+if [ -n "${ZMEM_CORE_MD:-}" ]; then
+  CORE_FILE_PY="$(to_py_path "$ZMEM_CORE_MD")"
+else
+  CORE_FILE_PY="$(join_path "$DATA_DIR_PY" core.md)"
+fi
 STORE_PY_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts store.py)"
 
-# First-run seeding: if core.md absent and template exists, copy it.
-if [ -n "$PLUGIN_ROOT" ] && [ ! -f "$DATA_DIR/core.md" ] && [ -f "$PLUGIN_ROOT/templates/core.md.template" ]; then
+# First-run seeding: if core.md absent and template exists, copy it. Skipped
+# when ZMEM_CORE_MD is set — the user manages an explicit override path, so
+# seeding the default location would write a file this hook never injects and
+# doctor never measures (final-critic round on PR feedback PRR-003).
+if [ -z "${ZMEM_CORE_MD:-}" ] && [ -n "$PLUGIN_ROOT" ] && [ ! -f "$DATA_DIR/core.md" ] && [ -f "$PLUGIN_ROOT/templates/core.md.template" ]; then
   mkdir -p "$DATA_DIR" 2>/dev/null || true
   cp "$PLUGIN_ROOT/templates/core.md.template" "$DATA_DIR/core.md" 2>/dev/null || true
 fi

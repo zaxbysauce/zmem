@@ -225,6 +225,18 @@ pass `--force`:
 python "$S" consolidate --force
 ```
 
+**Contested clusters are never auto-merged — not even by `--force`.** Similarity
+alone cannot tell "always X" from "never X", so when a cluster's members differ
+in negation polarity (a negator like *never / don't / not / avoid* on one side
+only) consolidate reports it as a `CONTESTED cluster ... NOT merged` block and
+leaves every member live. Resolve a contested pair with Step 3 (`supersede` the
+wrong side, then recapture the corrected lesson) — do not merge contradictions;
+merging would absorb a memory's own refutation into the row it contradicts.
+Pass `--merge-contested` only when you have confirmed the contest is a heuristic
+false positive (both sides mean the same thing). For machine-readable output
+(including the contested list), pass `--json`: stdout then carries only the JSON
+run report, with human output moved to stderr.
+
 Pruning low-value, never-surfaced, never-retrieved rows is opt-in and destructive-ish; inspect
 first and only proceed if they are genuinely noise:
 

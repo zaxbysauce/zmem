@@ -570,5 +570,237 @@ class DoctorCliTest(unittest.TestCase):
         self.assertEqual(nsm["status"], "pass", nsm)
 
 
+class DoctorIssue49ChecksTest(unittest.TestCase):
+    """The issue #49 C checks: Tier-0 size (core.md / project AGENTS.md) and
+    Claude Code transcript retention (cleanupPeriodDays). Same isolation
+    contract as DoctorCliTest: temp HOME/config/tooling, read-only doctor."""
+
+    def setUp(self):
+        if not REAL_GIT:
+            self.skipTest("git is required for the namespace fixture")
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor49-"))
+        self.home = self.tmp / "home"
+        self.repo = self.tmp / "repo"
+        self.project = self.tmp / "project"
+        self.bin = self.tmp / "bin"
+        for d in (self.home, self.repo, self.project, self.bin):
+            d.mkdir()
+        # Minimal surfaces so doctor can run to completion; only the two new
+        # checks' statuses are asserted.
+        _write_text(self.repo / ".claude-plugin" / "plugin.json", "{}\n")
+        _write_text(self.repo / "hooks" / "hooks.claude.json", "{}\n")
+        _write_text(self.repo / ".zcode-plugin" / "plugin.json", "{}\n")
+        _write_text(self.repo / "hooks" / "hooks.zcode.json", "{}\n")
+        _write_text(self.repo / "skills" / "memory" / "SKILL.md", "# memory\n")
+        node = self.bin / "node.cmd"
+        _write_text(node, _cmd_script("echo v20.11.0"))
+        subprocess.run([REAL_GIT, "init", "-q"], cwd=str(self.project), check=True)
+        subprocess.run(
+            [REAL_GIT, "remote", "add", "origin",
+             "https://github.com/Example/Widget.git"],
+            cwd=str(self.project), check=True,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _env(self) -> dict:
+        env = {**os.environ}
+        env["HOME"] = str(self.home)
+        env["USERPROFILE"] = str(self.home)
+        env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
+        env["ZMEM_BASH_PATH"] = str(self.bin / "Git" / "bin" / "bash.cmd")
+        for key in (
+            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_CORE_MD",
+            "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+            "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+            "OneDrive", "OneDriveConsumer", "OneDriveCommercial",
+        ):
+            env.pop(key, None)
+        return env
+
+    def _run_doctor(self):
+        result = subprocess.run(
+            [PYTHON, str(DOCTOR_PY), "--format", "json",
+             "--repo-root", str(self.repo), "--project", str(self.project)],
+            env=self._env(), capture_output=True, text=True, timeout=60,
+        )
+        self.assertNotIn("Traceback", result.stderr, result.stderr)
+        return result, json.loads(result.stdout)
+
+    def _check(self, report, check_id):
+        return next(c for c in report["checks"] if c["id"] == check_id)
+
+    # --- tier0-size ---------------------------------------------------------
+
+    def test_tier0_absent_reports_skip(self):
+        _, report = self._run_doctor()
+        check = self._check(report, "tier0-size")
+        self.assertEqual(check["status"], "skip", check)
+        self.assertIn("No Tier-0", check["summary"])
+
+    def test_tier0_small_core_md_passes_with_stats(self):
+        _write_text(self.home / ".zmem" / "core.md",
+                    "\n".join(f"line {i}" for i in range(10)) + "\n")
+        _, report = self._run_doctor()
+        check = self._check(report, "tier0-size")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertEqual(len(check["details"]["files"]), 1)
+        stats = check["details"]["files"][0]
+        self.assertEqual(stats["lines"], 10)
+        self.assertGreater(stats["bytes"], 0)
+
+    def test_tier0_300_line_core_md_warns(self):
+        _write_text(self.home / ".zmem" / "core.md",
+                    "\n".join(f"rule {i}" for i in range(300)) + "\n")
+        _, report = self._run_doctor()
+        check = self._check(report, "tier0-size")
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIn("exceed", check["summary"])
+        self.assertIn("store", check["summary"])  # remediation names the store
+
+    def test_tier0_oversized_agents_md_alone_warns(self):
+        _write_text(self.home / ".zmem" / "core.md", "small\n")
+        _write_text(self.project / "AGENTS.md",
+                    "\n".join(f"agent rule {i}" for i in range(250)) + "\n")
+        _, report = self._run_doctor()
+        check = self._check(report, "tier0-size")
+        self.assertEqual(check["status"], "warn", check)
+        paths = [f["path"] for f in check["details"]["files"]]
+        self.assertEqual(len(paths), 2)  # core.md AND AGENTS.md measured
+
+    def test_tier0_bytes_threshold_independent_of_lines(self):
+        # 60 lines but > 16KB (each line ~300 bytes): byte cap must trip alone.
+        _write_text(self.home / ".zmem" / "core.md",
+                    "\n".join("x" * 300 for _ in range(60)) + "\n")
+        _, report = self._run_doctor()
+        check = self._check(report, "tier0-size")
+        self.assertEqual(check["status"], "warn", check)
+
+    # --- session-retention --------------------------------------------------
+
+    def test_retention_no_claude_dir_reports_not_applicable(self):
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "skip", check)
+        self.assertIn("not applicable", check["summary"])
+        self.assertIn("no Claude Code installation", check["summary"])
+
+    def test_retention_settings_absent_passes_with_default_note(self):
+        (self.home / ".claude").mkdir()
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertFalse(check["details"]["configured"])
+        self.assertEqual(check["details"]["default"], 30)
+        self.assertIn("cleanupPeriodDays", check["summary"])
+
+    def test_retention_malformed_settings_passes(self):
+        _write_text(self.home / ".claude" / "settings.json", "{not valid json")
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertFalse(check["details"]["configured"])
+
+    def test_retention_unset_key_passes(self):
+        _write_text(self.home / ".claude" / "settings.json",
+                    json.dumps({"autoMemoryEnabled": False}))
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertFalse(check["details"]["configured"])
+
+    def test_retention_thirty_days_is_pass_default_like(self):
+        # 30 is the CC default: info-shaped pass, never a warn.
+        _write_text(self.home / ".claude" / "settings.json",
+                    json.dumps({"cleanupPeriodDays": 30}))
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertTrue(check["details"]["configured"])
+        self.assertEqual(check["details"]["cleanup_period_days"], 30)
+
+    def test_retention_large_value_passes_with_retains_summary(self):
+        _write_text(self.home / ".claude" / "settings.json",
+                    json.dumps({"cleanupPeriodDays": 99999}))
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertIn("retains transcripts for 99999", check["summary"])
+
+    def test_retention_bool_and_nonpositive_count_as_unset(self):
+        """PR feedback PRR-019/PRR-027: booleans and non-positive ints read as
+        unset (default-30 note), never echoed as valid configuration."""
+        _write_text(self.home / ".claude" / "settings.json",
+                    json.dumps({"cleanupPeriodDays": True}))
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertFalse(check["details"]["configured"])
+
+        _write_text(self.home / ".claude" / "settings.json",
+                    json.dumps({"cleanupPeriodDays": -5}))
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertFalse(check["details"]["configured"])
+        self.assertNotIn("-5", check["summary"])
+
+    def test_retention_local_settings_override_shared(self):
+        _write_text(self.home / ".claude" / "settings.json",
+                    json.dumps({"cleanupPeriodDays": 30}))
+        _write_text(self.home / ".claude" / "settings.local.json",
+                    json.dumps({"cleanupPeriodDays": 365}))
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertEqual(check["details"]["cleanup_period_days"], 365)
+        self.assertTrue(check["details"]["configured"])
+
+    def test_retention_invalid_local_does_not_clobber_shared(self):
+        """Feedback-reviewer finding: an INVALID local override (e.g. -5) must
+        fail to override — it must not silently discard a valid shared value."""
+        _write_text(self.home / ".claude" / "settings.json",
+                    json.dumps({"cleanupPeriodDays": 60}))
+        _write_text(self.home / ".claude" / "settings.local.json",
+                    json.dumps({"cleanupPeriodDays": -5}))
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertTrue(check["details"]["configured"])
+        self.assertEqual(check["details"]["cleanup_period_days"], 60)
+
+    def test_new_checks_never_contribute_a_fail(self):
+        # Retention is informational and tier0 warns at most: neither may add
+        # a fail (warn/skip/pass only), whatever the fixture.
+        _write_text(self.home / ".zmem" / "core.md",
+                    "\n".join(f"rule {i}" for i in range(300)) + "\n")
+        (self.home / ".claude").mkdir()
+        _, report = self._run_doctor()
+        self.assertEqual(self._check(report, "tier0-size")["status"], "warn")
+        self.assertEqual(self._check(report, "session-retention")["status"], "pass")
+        statuses = {c["status"] for c in report["checks"]
+                    if c["id"] in ("tier0-size", "session-retention")}
+        self.assertNotIn("fail", statuses)
+
+
+class DoctorUnitFailOpenTest(unittest.TestCase):
+    """Import-level fail-open tests that cannot be driven through the CLI
+    subprocess (PR feedback PRR-027)."""
+
+    def test_tier0_size_survives_resolver_raise(self):
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        import doctor  # noqa: E402
+        from unittest import mock  # noqa: E402
+
+        with mock.patch.object(doctor.host, "resolve_core_md_path",
+                               side_effect=RuntimeError("hostile store env")):
+            check = doctor._check_tier0_size(Path("/nonexistent-project"))
+        # The unresolvable core.md simply is not measured — doctor never
+        # tracebacks on a hostile store env.
+        self.assertEqual(check["status"], "skip", check)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

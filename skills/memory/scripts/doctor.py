@@ -1095,6 +1095,169 @@ def _check_surfaces(repo_root: Path) -> dict:
     return _check("host-surfaces", status, summary, surfaces=details)
 
 
+# Tier-0 size guard thresholds (issue #49 C). core.md is injected into EVERY
+# session on EVERY hook host, so an overgrown file silently eats context
+# budget and dilutes instruction-following (~150-200 reliably-handled
+# instructions, per claude-reflect's memory-file health threshold; zmem's
+# bound is slightly more generous). Fixed constants, not env-tunable, matching
+# CONSOLIDATE_MAX_ROWS_PER_NAMESPACE's rationale in store.py: a misconfigured
+# knob silently disabling a health guard is worse than a conservative bound.
+TIER0_WARN_LINES = 200
+TIER0_WARN_BYTES = 16 * 1024
+
+
+def _tier0_file_stats(path: Path) -> dict | None:
+    """Line/byte stats for one Tier-0 file, or None when absent/unreadable.
+    Never raises (doctor is read-only, fail-open diagnostics). Bytes come from
+    stat() and lines are counted incrementally, so an oversized file — the
+    exact case this guard exists to catch — is measured without ever holding
+    its full contents in memory (PR feedback PRR-002)."""
+    try:
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        lines = 0
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for _line in fh:
+                lines += 1
+        return {
+            "path": _display_path(path),
+            "lines": lines,
+            "bytes": size,
+        }
+    except Exception:
+        return None
+
+
+def _check_tier0_size(project: Path) -> dict:
+    """Tier-0 always-injected surface size (issue #49 C): core.md, resolved
+    the same canonical way the session hook resolves it
+    (host.resolve_core_md_path: ZMEM_CORE_MD override, else <store dir>/
+    core.md), plus the ZCode project-level AGENTS.md when present — both are
+    injected every session and compete with recall output for the context
+    budget. Measured paths appear in the summary so what was measured is
+    visible (the AGENTS.md scope is the --project argument, matching how the
+    session hook scopes PROJECT/AGENTS.md)."""
+    files: list[dict] = []
+    try:
+        core_path = host.resolve_core_md_path()
+    except Exception:
+        # Doctor is fail-open diagnostics: a hostile/unresolvable store env
+        # must never traceback the whole report (the docstring's "never
+        # raises" covers the resolution step too, not just the file read).
+        core_path = None
+    core_stats = _tier0_file_stats(core_path) if core_path is not None else None
+    if core_stats is not None:
+        files.append(core_stats)
+    agents_stats = _tier0_file_stats(project / "AGENTS.md")
+    if agents_stats is not None:
+        files.append(agents_stats)
+
+    if not files:
+        return _check(
+            "tier0-size",
+            "skip",
+            "No Tier-0 core.md (or project AGENTS.md) found — nothing "
+            "always-injected to size-check.",
+        )
+
+    described = "; ".join(
+        f"{f['path']}: {f['lines']} lines / {f['bytes']} bytes" for f in files
+    )
+    over = [
+        f for f in files
+        if f["lines"] > TIER0_WARN_LINES or f["bytes"] > TIER0_WARN_BYTES
+    ]
+    if over:
+        return _check(
+            "tier0-size",
+            "warn",
+            f"Tier-0 file(s) exceed the {TIER0_WARN_LINES}-line / "
+            f"{TIER0_WARN_BYTES // 1024}KB context-budget guideline ({described}). "
+            "Prune them, or move durable knowledge into the store (retrieved on "
+            "relevance, not always-injected).",
+            files=files, warn_lines=TIER0_WARN_LINES, warn_bytes=TIER0_WARN_BYTES,
+        )
+    return _check(
+        "tier0-size",
+        "pass",
+        f"Tier-0 always-injected file(s) within the size guideline ({described}).",
+        files=files, warn_lines=TIER0_WARN_LINES, warn_bytes=TIER0_WARN_BYTES,
+    )
+
+
+def _check_session_retention(home: Path) -> dict:
+    """Claude Code transcript retention (issue #49 C): CC deletes transcripts
+    after `cleanupPeriodDays` (default 30) from ~/.claude/settings.json, and
+    zmem's transcript-based features (failures on Stop; the #46/#48 mining
+    commands) lose history accordingly. Concept ported from MIT claude-reflect
+    (scripts/session_start_reminder.py + reflect_utils.get_cleanup_period_days).
+    Deliberately `pass` (never warn or fail): the default is a host policy,
+    not a misconfiguration, and the remediation only matters if the user wants
+    historical mining. Claude-Code scoped — a box with no ~/.claude reports a
+    clean not-applicable skip."""
+    settings_dir = home / ".claude"
+    if not settings_dir.is_dir():
+        return _check(
+            "session-retention",
+            "skip",
+            "not applicable — no Claude Code installation detected",
+        )
+
+    # settings.local.json overrides settings.json when the key is present
+    # there; a non-int value counts as unset (fail toward the default note,
+    # never an error — doctor is read-only diagnostics).
+    days = None
+    source = None
+    inspected: list[dict] = []
+    for name in ("settings.json", "settings.local.json"):
+        path = settings_dir / name
+        data, err = _load_json(path)
+        inspected.append({"path": _display_path(path), "status": err or "ok"})
+        if isinstance(data, dict) and "cleanupPeriodDays" in data:
+            value = data["cleanupPeriodDays"]
+            # Non-positive ints count as unset (PR feedback PRR-019): CC has
+            # no meaningful <=0 retention, and echoing "-5 day(s)" into the
+            # summary would read as valid configuration. An INVALID value is
+            # also non-destructive: it must not clobber a valid value already
+            # read from the other file (feedback reviewer finding) — an
+            # invalid local override just fails to override.
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                days = value
+                source = name
+
+    if days is None:
+        return _check(
+            "session-retention",
+            "pass",
+            "Claude Code transcript retention is unset (or unreadable/invalid), so the "
+            "30-day default applies. Only matters if you want historical "
+            "transcript mining; to extend it, set "
+            '{"cleanupPeriodDays": <larger int>} in ~/.claude/settings.json.',
+            cleanup_period_days=None, configured=False, default=30,
+            inspected=inspected,
+        )
+    if days <= 30:
+        return _check(
+            "session-retention",
+            "pass",
+            f"Claude Code deletes transcripts after {days} day(s) ({source}) — "
+            "default-like retention. Only matters if you want historical "
+            "transcript mining; to extend it, raise cleanupPeriodDays in "
+            "~/.claude/settings.json.",
+            cleanup_period_days=days, configured=True, default=30,
+            inspected=inspected,
+        )
+    return _check(
+        "session-retention",
+        "pass",
+        f"Claude Code retains transcripts for {days} day(s) ({source}) — "
+        "transcript mining history preserved.",
+        cleanup_period_days=days, configured=True, default=30,
+        inspected=inspected,
+    )
+
+
 def _recommendations(checks: list[dict]) -> list[str]:
     by_id = {check["id"]: check for check in checks}
     notes: list[str] = []
@@ -1196,10 +1359,12 @@ def build_report(project: Path, repo_root: Path) -> dict:
     checks.append(access_check)
     checks.append(_check_schema(resolved_store, access_check))
     checks.append(_check_claude_native_memory(Path.home()))
+    checks.append(_check_session_retention(Path.home()))
     checks.extend(_check_codex_memory_and_trust(Path.home(), project, repo_root))
     namespace_check = _check_namespace(project)
     checks.append(namespace_check)
     checks.append(_check_surfaces(repo_root))
+    checks.append(_check_tier0_size(project))
     checks.append(_check_embeddings())
     # Operational health (backup/consolidation cadence) — read-only, best-effort
     # skip if the store is absent/unreadable (#37 L23).
