@@ -59,6 +59,41 @@ README.
   closeout review. A box with no `~/.claude` exits cleanly (rc 1, message, no
   traceback). New module `history_mining.py` (discovery/folder-encoding/dedup/
   queue-synthesis); README gained a "Bootstrap / cold start" section.
+- **Contradiction-aware consolidate** (issue [#49], PR 4/4 of the
+  claude-reflect port). Similarity alone ranks "always X" / "never X" as
+  near-duplicates, so `consolidate` could merge a memory's own refutation into
+  the row it contradicts. A deterministic stdlib negation-polarity heuristic
+  (ported concept from claude-reflect's `detect_contradictions`, MIT) now marks
+  mixed-polarity clusters **contested**: never auto-merged — not even with
+  `--force` — and always reported (per-cluster block + summary line + a new
+  `--json` machine-readable run report whose stdout stays strictly
+  parseable, human prose moved to stderr). `--merge-contested` is the explicit
+  override for confirmed heuristic false positives. Contested members stay
+  live and neighbor-eligible for later clusters. The closeout skill's Step 4
+  now routes contested clusters to Step 3 `supersede` + recapture instead of
+  merging. Works identically on the lexical (no-embeddings) and cosine
+  clustering paths, and for every host including Hermes via the shared store.
+- **Commit-boundary closeout nudge** (issue [#49]). The convention-capture
+  PostToolUse hook (Claude Code, ZCode, Codex) now also nudges the closeout
+  skill on the first `git commit` of a session (not `--amend`) — the strongest
+  natural "unit of work finished" moment (concept ported from claude-reflect's
+  `post_commit_reminder.py`, MIT). The nudge uses its own per-session cooldown
+  marker (independent of the cadence nudge in both directions, reaped by
+  `sweep`), still counts the call toward the cadence interval, and enriches
+  with the pending #47 correction-queue count when one exists (degrades
+  silently otherwise). All hook invariants kept: fail-open, exit 0, sentinel
+  envelope, no store writes.
+- **Two new doctor checks** (issue [#49]). `tier0-size` reports lines/bytes of
+  the always-injected Tier-0 files (`core.md` via the canonical
+  `host.resolve_core_md_path()`, plus the ZCode project `AGENTS.md`) and warns
+  above fixed 200-line / 16KB constants — an overgrown Tier-0 silently eats
+  the context budget (threshold concept from claude-reflect, MIT).
+  `session-retention` reports Claude Code's transcript retention window
+  (`cleanupPeriodDays`, default 30, `settings.local.json` overriding) with the
+  raise-it remediation for historical-mining users, and reports a clean
+  "not applicable — no Claude Code installation detected" skip on CC-less
+  boxes (port of claude-reflect's `get_cleanup_period_days`, MIT). Neither
+  check can fail the report; doctor stays read-only and fail-open.
 
 ### Fixed
 
