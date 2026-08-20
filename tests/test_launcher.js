@@ -920,6 +920,186 @@ console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was si
     }
 }
 
+console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
+
+{
+    // Drives the REAL hook through the REAL launcher: a `git commit` (not
+    // `--amend`) is the strongest "unit of work finished" moment, so the
+    // first commit of a session emits a one-line closeout nudge with its OWN
+    // per-session marker — independent of the cadence nudge (fires even after
+    // it, at most once per session, and never suppresses it).
+    const NDATA = path.join(TMP, "nudgedata");
+    fs.mkdirSync(NDATA, { recursive: true });
+    seed(NDATA, "user:global", "fact", "seed row to create the store schema.", 0.9);
+    const NNS = resolveNs(PROJ);
+
+    // Correction_queue.encode_namespace, replicated so the queue file can be
+    // seeded for exactly the namespace the hook will look up (the launcher
+    // derives ZMEM_NAMESPACE from the project, so it is resolveNs(PROJ)).
+    // Order matters: `_` must be escaped first.
+    function encodeNs(ns) {
+        return ns.replace(/_/g, "__").replace(/:/g, "_c")
+                 .replace(/\//g, "_s").replace(/\\/g, "_b");
+    }
+    function seedQueue(items) {
+        const qdir = path.join(NDATA, "queue");
+        fs.mkdirSync(qdir, { recursive: true });
+        fs.writeFileSync(path.join(qdir, encodeNs(NNS) + ".json"), JSON.stringify(items));
+    }
+    const isoNow = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    const isoStale = new Date(Date.now() - 40 * 86400 * 1000).toISOString().replace(/\.\d+Z$/, "Z");
+
+    const commitPayload = (sid) => JSON.stringify({
+        session_id: sid, cwd: PROJ, hook_event_name: "PostToolUse",
+        tool_name: "Bash", tool_input: { command: "git commit -m 'finish the thing'" },
+    });
+    const amendPayload = (sid) => JSON.stringify({
+        session_id: sid, cwd: PROJ, hook_event_name: "PostToolUse",
+        tool_name: "Bash", tool_input: { command: "git commit --amend -m x" },
+    });
+    // INTERVAL stays at the default 10 so the cadence path can never fire
+    // within these short sessions — isolating the commit branch.
+    const nudgeEnv = (extra) => envWith(Object.assign({
+        ZMEM_DATA: NDATA, CLAUDE_PROJECT_DIR: PROJ, CLAUDE_PLUGIN_ROOT: REPO,
+    }, extra));
+    const acOf = (r) => {
+        try {
+            const obj = JSON.parse(r.stdout.trim());
+            return (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        } catch (e) { return ""; }
+    };
+
+    // First commit of a session → exactly one nudge naming the closeout skill.
+    let r = runLauncher("convention-capture", commitPayload("cc-commit-1"), nudgeEnv());
+    let ac = acOf(r);
+    ok("commit-nudge: first git commit nudges the closeout skill",
+        /commit detected/.test(ac) && /closeout skill/.test(ac), r.stdout.slice(0, 300));
+
+    // ZCode host leg of AC2: the same commit nudge through the zcode envelope
+    // (bare additionalContext, no hookSpecificOutput).
+    {
+        const rz = runLauncher("convention-capture", commitPayload("cc-commit-zcode"),
+            envWith({ ZMEM_DATA: NDATA, ZCODE_PLUGIN_ROOT: REPO, ZCODE_PROJECT_DIR: PROJ }));
+        let objz = null; try { objz = JSON.parse(rz.stdout.trim()); } catch (e) { /* */ }
+        const acz = (objz && objz.additionalContext) || "";
+        ok("commit-nudge: zcode host envelope carries the nudge",
+            /commit detected/.test(acz) && /closeout skill/.test(acz)
+                && !objz.hookSpecificOutput,
+            rz.stdout.slice(0, 300));
+    }
+
+    // Second commit in the SAME session → {} (own marker, once per session).
+    r = runLauncher("convention-capture", commitPayload("cc-commit-1"), nudgeEnv());
+    eq("commit-nudge: second commit same session is silent", r.stdout.trim(), "{}");
+
+    // --amend is never a "unit of work finished" boundary.
+    r = runLauncher("convention-capture", amendPayload("cc-commit-2"), nudgeEnv());
+    eq("commit-nudge: git commit --amend is silent", r.stdout.trim(), "{}");
+
+    // Commit detection requires tool_name=Bash + tool_input.command: an Edit
+    // whose payload merely CONTAINS the string "git commit" must not nudge —
+    // covered twice (without and WITH a command key) so the Bash gate itself
+    // is proven rather than implied by payload shape.
+    r = runLauncher("convention-capture", JSON.stringify({
+        session_id: "cc-commit-3", cwd: PROJ, hook_event_name: "PostToolUse",
+        tool_name: "Edit", tool_input: { file_path: "notes/git commit.md" },
+    }), nudgeEnv());
+    eq("commit-nudge: Edit tool with commit-like text is silent", r.stdout.trim(), "{}");
+    r = runLauncher("convention-capture", JSON.stringify({
+        session_id: "cc-commit-4", cwd: PROJ, hook_event_name: "PostToolUse",
+        tool_name: "Edit", tool_input: { command: "git commit -m x" },
+    }), nudgeEnv());
+    eq("commit-nudge: Edit tool carrying a command key is silent (Bash gate)", r.stdout.trim(), "{}");
+
+    // Independence from the cadence nudge, both directions:
+    //   (a) cadence fired first (marker written) → commit nudge still fires;
+    //   (b) commit marker present → cadence can still fire on a later call.
+    {
+        const env1 = nudgeEnv({ ZMEM_CONVENTION_INTERVAL: "1" });
+        r = runLauncher("convention-capture", JSON.stringify({
+            session_id: "cc-mix", cwd: PROJ, hook_event_name: "PostToolUse",
+            tool_name: "Edit", tool_input: { file_path: "a.txt" },
+        }), env1);
+        ok("commit-nudge: cadence nudge still fires at interval=1 (unchanged)",
+            /ZMem convention capture/.test(acOf(r)), r.stdout.slice(0, 200));
+        r = runLauncher("convention-capture", commitPayload("cc-mix"), env1);
+        ok("commit-nudge: commit fires even after the cadence nudge fired",
+            /commit detected/.test(acOf(r)), r.stdout.slice(0, 300));
+        r = runLauncher("convention-capture", JSON.stringify({
+            session_id: "cc-mix2", cwd: PROJ, hook_event_name: "PostToolUse",
+            tool_name: "Bash", tool_input: { command: "git commit -m once" },
+        }), env1);
+        ok("commit-nudge: commit marker alone does not satisfy the cadence marker",
+            /commit detected/.test(acOf(r)));
+        // Same session as cc-mix2's commit; cadence marker for cc-mix2 was
+        // never written (the commit branch exits before writing it), but the
+        // counter did increment — prove the counter counted the commit call:
+        // interval=2 means the NEXT call must fire the cadence nudge.
+        r = runLauncher("convention-capture", JSON.stringify({
+            session_id: "cc-mix2", cwd: PROJ, hook_event_name: "PostToolUse",
+            tool_name: "Edit", tool_input: { file_path: "b.txt" },
+        }), nudgeEnv({ ZMEM_CONVENTION_INTERVAL: "2" }));
+        ok("commit-nudge: the commit call still incremented the cadence counter",
+            /ZMem convention capture/.test(acOf(r)), r.stdout.slice(0, 200));
+    }
+
+    // Queue enrichment: non-stale pending items append a count; stale-only or
+    // absent queue degrades to no count (never an error, never a dependency).
+    seedQueue([{ id: "q1", timestamp: isoNow, decay_days: 7, message: "x" }]);
+    r = runLauncher("convention-capture", commitPayload("cc-queue-1"), nudgeEnv());
+    ac = acOf(r);
+    ok("commit-nudge: pending correction-queue count enriches the nudge",
+        /1 correction-queue item\(s\) pending review/.test(ac), ac.slice(0, 300));
+    seedQueue([{ id: "q2", timestamp: isoStale, decay_days: 7, message: "x" }]);
+    r = runLauncher("convention-capture", commitPayload("cc-queue-2"), nudgeEnv());
+    ac = acOf(r);
+    ok("commit-nudge: stale-only queue adds no count",
+        /commit detected/.test(ac) && !/correction-queue/.test(ac), ac.slice(0, 300));
+    fs.rmSync(path.join(NDATA, "queue", encodeNs(NNS) + ".json"));
+    r = runLauncher("convention-capture", commitPayload("cc-queue-3"), nudgeEnv());
+    ac = acOf(r);
+    ok("commit-nudge: absent queue degrades gracefully (nudge still fires)",
+        /commit detected/.test(ac) && !/correction-queue/.test(ac), ac.slice(0, 300));
+
+    // Codex host path (AC2's third host): the codex PostToolUse entry routes
+    // convention-capture the same way; the nudge must survive the codex
+    // envelope. PLUGIN_ROOT is what makes the launcher detect the codex host.
+    {
+        const codexEnv = envWith({
+            ZMEM_DATA: NDATA, PLUGIN_ROOT: REPO, CODEX_PROJECT_DIR: PROJ,
+        });
+        r = runLauncher("convention-capture", commitPayload("cc-commit-codex"), codexEnv);
+        ok("commit-nudge: codex host envelope carries the nudge",
+            /commit detected/.test(r.stdout) && /closeout skill/.test(r.stdout),
+            r.stdout.slice(0, 300));
+        // The codex hooks.json keeps TWO PostToolUse entries — the second
+        // (capture-failure) must stay independently registered (no matcher,
+        // different verb) so the commit branch inside convention-capture
+        // cannot perturb it.
+        const codexHooks = JSON.parse(fs.readFileSync(path.join(REPO, "hooks", "hooks.codex.json"), "utf8"));
+        eq("commit-nudge: codex PostToolUse still has two entries",
+            codexHooks.hooks.PostToolUse.length, 2);
+        const verbs = codexHooks.hooks.PostToolUse
+            .flatMap((e) => e.hooks || [])
+            .map((h) => (h.command || ""));
+        ok("commit-nudge: convention-capture and capture-failure stay independent verbs",
+            verbs.some((c) => c.indexOf("convention-capture") !== -1)
+                && verbs.some((c) => c.indexOf("capture-failure") !== -1),
+            JSON.stringify(verbs));
+    }
+
+    // Commit markers must be sweepable: the SENTINEL_PREFIXES tuple in
+    // store.py has to cover the new .convention-commit-prompted- prefix, or
+    // the per-session markers would accumulate forever.
+    {
+        const storeSrc = fs.readFileSync(STORE_PY, "utf8");
+        ok("commit-nudge: SENTINEL_PREFIXES covers the commit marker prefix",
+            storeSrc.indexOf('".convention-commit-prompted-"') !== -1);
+        ok("commit-nudge: commit marker was actually written for the nudged session",
+            fs.existsSync(path.join(NDATA, ".convention-commit-prompted-cc-commit-1")));
+    }
+}
+
 console.log("\n[13] storeDirectory plugin userConfig feeds ZMEM_DATA (claude host only)");
 
 {

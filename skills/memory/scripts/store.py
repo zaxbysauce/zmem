@@ -3547,7 +3547,7 @@ BACKUP_DEFAULT_RETENTION = 7
 # session named in its filename, so anything older than this TTL is garbage.
 # Default matches backup retention. The SessionStart hook fires `sweep` detached
 # each session so the dir stays bounded.
-SENTINEL_PREFIXES = (".capture-prompted-", ".convention-prompted-")
+SENTINEL_PREFIXES = (".capture-prompted-", ".convention-prompted-", ".convention-commit-prompted-")
 SENTINEL_SWEEP_DAYS_DEFAULT = _env_float("ZMEM_SENTINEL_SWEEP_DAYS", 7.0)
 
 
