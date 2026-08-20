@@ -139,7 +139,7 @@ ZCode skill directories. Promotion is never an unattended hook action.
 
 ### consolidate — merge near-duplicate memories
 ```
-python <store.py> consolidate [--threshold 0.80] [--prune] [--dry-run] [--namespace NS] [--force]
+python <store.py> consolidate [--threshold 0.80] [--prune] [--dry-run] [--namespace NS] [--force] [--merge-contested] [--json]
 ```
 Clusters live memories by embedding cosine similarity (Jaccard token overlap when
 embeddings are unavailable), picks a keeper, merges metadata, and supersedes the

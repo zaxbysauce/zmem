@@ -2971,8 +2971,14 @@ def consolidate(
     token-overlap fallback when embeddings are unavailable — Phase 10).
 
     Returns a machine-readable report dict (issue #49): ``{mode, dry_run,
-    threshold, skipped_by_cadence_gate, merged, pruned, contested_clusters,
-    truncated, knn_truncated}``. ``contested_clusters`` lists clusters whose
+    merge_contested, threshold, skipped_by_cadence_gate, merged, pruned,
+    contested_clusters, truncated, knn_truncated}``. NOTE: in dry-run mode ``merged``/``pruned``
+    are COUNTERFACTUAL would-be counts — qualify with ``dry_run`` (PR
+    feedback PRR-010), mirroring the hardened human "would merge" verb.
+    ``merged`` in a ``contested_clusters`` entry is a plain fact-claim about
+    the store: True only after that cluster's transaction COMMITted; False in
+    dry runs, after a rollback, and for parked contested clusters.
+    ``contested_clusters`` lists clusters whose
     members differ in negation polarity (see ``_polarity_signature``): they
     are NEVER auto-merged — not even with ``force`` (which bypasses only the
     cadence gate) — because similarity alone cannot distinguish "always X"
@@ -3046,6 +3052,7 @@ def consolidate(
     report: dict = {
         "mode": "lexical" if use_lexical else "cosine",
         "dry_run": dry_run,
+        "merge_contested": merge_contested,
         "threshold": threshold,
         "skipped_by_cadence_gate": False,
         "merged": 0,
@@ -3316,21 +3323,19 @@ def consolidate(
             (nb["id"], nb["content"], _polarity_signature(nb["content"]))
             for nb, _sim in neighbors
         ]
+        contested_override = False
         if len({pol for _, _, pol in member_pols}) > 1:
             if merge_contested:
                 # Explicit override for a confirmed heuristic false positive:
-                # merge like any other cluster, but record it in the report so
-                # the override is visible after the fact.
-                report["contested_clusters"].append({
-                    "keeper": seed["id"],
-                    "namespace": seed["namespace"],
-                    "merged": True,
-                    "members": [
-                        {"id": mid, "polarity": "neg" if pol else "pos",
-                         "content_preview": (mcontent or "")[:60]}
-                        for mid, mcontent, pol in member_pols
-                    ],
-                })
+                # merge like any other cluster. The report entry is appended
+                # only AFTER the outcome is known (dry run → merged: False —
+                # nothing happened; COMMIT → merged: True; ROLLBACK → merged:
+                # False), so the machine report can never claim a merge that
+                # did not happen (PR feedback PRR-001: a premature merged:
+                # True lied in --dry-run --merge-contested and after a
+                # mid-merge rollback, and suppressed the contested summary
+                # line via contested_excluded).
+                contested_override = True
             else:
                 verb = "would NOT merge (contested)" if dry_run else "NOT merged (contested)"
                 print(f"[zmem] consolidate: CONTESTED cluster around [{seed['id'][:8]}] — "
@@ -3405,6 +3410,22 @@ def consolidate(
                     print("        already represented in keeper; nothing to append")
                 absorbed.add(nb_row["id"])  # track in dry-run too
             merged_count += len(neighbors)
+            if contested_override:
+                # Dry run: nothing merged — merged must be False (PRR-001).
+                # The print is the only override-preview trace; the report
+                # carries dry_run: true as the machine-side qualifier.
+                print(f"[zmem] DRY RUN: would merge CONTESTED cluster around "
+                      f"[{seed['id'][:8]}] (--merge-contested override)")
+                report["contested_clusters"].append({
+                    "keeper": seed["id"],
+                    "namespace": seed["namespace"],
+                    "merged": False,
+                    "members": [
+                        {"id": mid, "polarity": "neg" if pol else "pos",
+                         "content_preview": (mcontent or "")[:60]}
+                        for mid, mcontent, pol in member_pols
+                    ],
+                })
             continue
 
         # Atomic commit per cluster.
@@ -3422,6 +3443,24 @@ def consolidate(
             )
             conn.execute("COMMIT")
             merged_count += len(neighbors)
+            if contested_override:
+                # Appended only after the successful COMMIT, and printed so a
+                # real-run override is never invisible in human output (the
+                # JSON report was previously the sole — and lying — audit
+                # trail; PRR-001).
+                print(f"[zmem] consolidate: merged CONTESTED cluster around "
+                      f"[{seed['id'][:8]}] (--merge-contested override; "
+                      f"{len(neighbors) + 1} members)")
+                report["contested_clusters"].append({
+                    "keeper": seed["id"],
+                    "namespace": seed["namespace"],
+                    "merged": True,
+                    "members": [
+                        {"id": mid, "polarity": "neg" if pol else "pos",
+                         "content_preview": (mcontent or "")[:60]}
+                        for mid, mcontent, pol in member_pols
+                    ],
+                })
         except Exception as exc:
             # A per-cluster failure (e.g. a DB error mid-merge) rolls the whole
             # cluster back and leaves its rows live to be re-clustered next run.
@@ -3434,6 +3473,21 @@ def consolidate(
             print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] failed "
                   f"({type(exc).__name__}: {exc}); rolled back, will retry next run",
                   file=sys.stderr)
+            if contested_override:
+                # The override did NOT take effect: record it as contested-
+                # not-merged (so the summary line counts it) and park the
+                # members like the non-override path (PRR-001).
+                report["contested_clusters"].append({
+                    "keeper": seed["id"],
+                    "namespace": seed["namespace"],
+                    "merged": False,
+                    "members": [
+                        {"id": mid, "polarity": "neg" if pol else "pos",
+                         "content_preview": (mcontent or "")[:60]}
+                        for mid, mcontent, pol in member_pols
+                    ],
+                })
+                contested_ids.update(mid for mid, _, _ in member_pols)
             continue
 
     # Optional prune: supersede low-value memories that were NEVER surfaced and NEVER
@@ -3496,10 +3550,29 @@ def consolidate(
         # Never silent (issue #49): a contested exclusion that only appeared in
         # the per-cluster block above could be missed when skimming the tail of
         # the output, so the summary repeats the count and the resolution path.
-        parts.append(
-            f"contested {contested_excluded} cluster(s) (not merged — resolve via "
-            f"supersede, or pass --merge-contested for a confirmed false positive)"
-        )
+        # Mode-aware wording (PR feedback PRR-008 + final-critic round): the
+        # dry-run forms deliberately avoid the substring "merged" — the #44
+        # discipline (six existing assertNotIn("merged", summary) assertions)
+        # forbids it in dry-run summaries — and under --merge-contested the
+        # advice must not tell the operator to pass a flag they already passed
+        # (a non-merged entry there means "override preview" in dry runs and
+        # "merge failed and rolled back" in real runs, never "was skipped").
+        if merge_contested and dry_run:
+            parts.append(
+                f"contested {contested_excluded} cluster(s) (would merge under "
+                f"--merge-contested override)"
+            )
+        elif merge_contested:
+            parts.append(
+                f"contested {contested_excluded} cluster(s) (not merged — the "
+                f"override merge failed and rolled back; will retry next run)"
+            )
+        else:
+            contested_verb = "would not merge" if dry_run else "not merged"
+            parts.append(
+                f"contested {contested_excluded} cluster(s) ({contested_verb} — resolve via "
+                f"supersede, or pass --merge-contested for a confirmed false positive)"
+            )
     print(f"[zmem] {' + '.join(parts)}")
 
     report["merged"] = merged_count

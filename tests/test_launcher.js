@@ -933,13 +933,21 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
     seed(NDATA, "user:global", "fact", "seed row to create the store schema.", 0.9);
     const NNS = resolveNs(PROJ);
 
-    // Correction_queue.encode_namespace, replicated so the queue file can be
-    // seeded for exactly the namespace the hook will look up (the launcher
-    // derives ZMEM_NAMESPACE from the project, so it is resolveNs(PROJ)).
-    // Order matters: `_` must be escaped first.
+    // Correction_queue.encode_namespace, invoked via a python one-shot so the
+    // seeded queue file can NEVER drift from the encoding the real hook uses
+    // (PR feedback PRR-009: the previous JS replica omitted the _xNN escapes,
+    // so a namespace containing spaces/non-ASCII would have seeded the wrong
+    // path and made the queue assertions pass or fail for the wrong reason).
     function encodeNs(ns) {
-        return ns.replace(/_/g, "__").replace(/:/g, "_c")
-                 .replace(/\//g, "_s").replace(/\\/g, "_b");
+        return execFileSync(
+            PYTHON,
+            ["-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); "
+             + "import correction_queue; "
+             + "sys.stdout.write(correction_queue.encode_namespace(sys.argv[2]))",
+             path.dirname(STORE_PY), ns],
+            { encoding: "utf8" }
+        );
     }
     function seedQueue(items) {
         const qdir = path.join(NDATA, "queue");
@@ -974,6 +982,16 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
     let ac = acOf(r);
     ok("commit-nudge: first git commit nudges the closeout skill",
         /commit detected/.test(ac) && /closeout skill/.test(ac), r.stdout.slice(0, 300));
+
+    // Commit branch with an unreachable store must fail open to {} (PR
+    // feedback PRR-027: the counter connection cannot even be opened).
+    {
+        const dead = path.join(TMP, "no-such-data-dir");
+        const rd = runLauncher("convention-capture", commitPayload("cc-commit-dead"),
+            envWith({ ZMEM_DATA: dead, CLAUDE_PROJECT_DIR: PROJ, CLAUDE_PLUGIN_ROOT: REPO }));
+        eq("commit-nudge: unreachable store degrades to {} (fail-open)",
+            rd.stdout.trim(), "{}");
+    }
 
     // ZCode host leg of AC2: the same commit nudge through the zcode envelope
     // (bare additionalContext, no hookSpecificOutput).
@@ -1045,6 +1063,8 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
 
     // Queue enrichment: non-stale pending items append a count; stale-only or
     // absent queue degrades to no count (never an error, never a dependency).
+    // (encodeNs now shells out to the real encoder, so the seeded path is
+    // authoritative regardless of namespace character content.)
     seedQueue([{ id: "q1", timestamp: isoNow, decay_days: 7, message: "x" }]);
     r = runLauncher("convention-capture", commitPayload("cc-queue-1"), nudgeEnv());
     ac = acOf(r);

@@ -729,6 +729,24 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         self.assertEqual(check["status"], "pass", check)
         self.assertIn("retains transcripts for 99999", check["summary"])
 
+    def test_retention_bool_and_nonpositive_count_as_unset(self):
+        """PR feedback PRR-019/PRR-027: booleans and non-positive ints read as
+        unset (default-30 note), never echoed as valid configuration."""
+        _write_text(self.home / ".claude" / "settings.json",
+                    json.dumps({"cleanupPeriodDays": True}))
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertFalse(check["details"]["configured"])
+
+        _write_text(self.home / ".claude" / "settings.json",
+                    json.dumps({"cleanupPeriodDays": -5}))
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertFalse(check["details"]["configured"])
+        self.assertNotIn("-5", check["summary"])
+
     def test_retention_local_settings_override_shared(self):
         _write_text(self.home / ".claude" / "settings.json",
                     json.dumps({"cleanupPeriodDays": 30}))
@@ -739,6 +757,19 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         self.assertEqual(check["status"], "pass", check)
         self.assertEqual(check["details"]["cleanup_period_days"], 365)
         self.assertTrue(check["details"]["configured"])
+
+    def test_retention_invalid_local_does_not_clobber_shared(self):
+        """Feedback-reviewer finding: an INVALID local override (e.g. -5) must
+        fail to override — it must not silently discard a valid shared value."""
+        _write_text(self.home / ".claude" / "settings.json",
+                    json.dumps({"cleanupPeriodDays": 60}))
+        _write_text(self.home / ".claude" / "settings.local.json",
+                    json.dumps({"cleanupPeriodDays": -5}))
+        _, report = self._run_doctor()
+        check = self._check(report, "session-retention")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertTrue(check["details"]["configured"])
+        self.assertEqual(check["details"]["cleanup_period_days"], 60)
 
     def test_new_checks_never_contribute_a_fail(self):
         # Retention is informational and tier0 warns at most: neither may add
@@ -752,6 +783,23 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         statuses = {c["status"] for c in report["checks"]
                     if c["id"] in ("tier0-size", "session-retention")}
         self.assertNotIn("fail", statuses)
+
+
+class DoctorUnitFailOpenTest(unittest.TestCase):
+    """Import-level fail-open tests that cannot be driven through the CLI
+    subprocess (PR feedback PRR-027)."""
+
+    def test_tier0_size_survives_resolver_raise(self):
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        import doctor  # noqa: E402
+        from unittest import mock  # noqa: E402
+
+        with mock.patch.object(doctor.host, "resolve_core_md_path",
+                               side_effect=RuntimeError("hostile store env")):
+            check = doctor._check_tier0_size(Path("/nonexistent-project"))
+        # The unresolvable core.md simply is not measured — doctor never
+        # tracebacks on a hostile store env.
+        self.assertEqual(check["status"], "skip", check)
 
 
 if __name__ == "__main__":

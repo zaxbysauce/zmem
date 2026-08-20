@@ -67,7 +67,8 @@ README.
   mixed-polarity clusters **contested**: never auto-merged — not even with
   `--force` — and always reported (per-cluster block + summary line + a new
   `--json` machine-readable run report whose stdout stays strictly
-  parseable, human prose moved to stderr). `--merge-contested` is the explicit
+  parseable, human prose moved to stderr; override runs print a
+  merged-CONTESTED trace instead of the contested block). `--merge-contested` is the explicit
   override for confirmed heuristic false positives. Contested members stay
   live and neighbor-eligible for later clusters. The closeout skill's Step 4
   now routes contested clusters to Step 3 `supersede` + recapture instead of
@@ -82,7 +83,8 @@ README.
   `sweep`), still counts the call toward the cadence interval, and enriches
   with the pending #47 correction-queue count when one exists (degrades
   silently otherwise). All hook invariants kept: fail-open, exit 0, sentinel
-  envelope, no store writes.
+  envelope, and no memory writes — the only store touch is the pre-existing
+  per-session cadence-counter increment in the `meta` table.
 - **Two new doctor checks** (issue [#49]). `tier0-size` reports lines/bytes of
   the always-injected Tier-0 files (`core.md` via the canonical
   `host.resolve_core_md_path()`, plus the ZCode project `AGENTS.md`) and warns
@@ -129,6 +131,9 @@ README.
   rejections)` return and `rejections` key.
 
 [#46]: https://github.com/zaxbysauce/zmem/issues/46
+[#47]: https://github.com/zaxbysauce/zmem/issues/47
+[#48]: https://github.com/zaxbysauce/zmem/issues/48
+[#49]: https://github.com/zaxbysauce/zmem/issues/49
 
 ## [0.8.4] — 2026-08-12
 

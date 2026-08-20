@@ -223,14 +223,88 @@ class LexicalContestedTest(unittest.TestCase):
     def test_merge_contested_overrides_and_reports_merged(self):
         pos = _add_raw(self.mod, self.conn, POS, 0.9)
         neg = _add_raw(self.mod, self.conn, NEG, 0.9)
-        report, _ = _run_consolidate(self.mod, self.conn, force=True,
+        report, out = _run_consolidate(self.mod, self.conn, force=True,
                                      merge_contested=True)
 
         self.assertEqual(report["merged"], 1)
         self.assertEqual(len(report["contested_clusters"]), 1)
         self.assertTrue(report["contested_clusters"][0]["merged"])
+        # The override must leave a human-visible trace too (PRR-001: the
+        # JSON report was previously the sole — and sometimes lying — audit
+        # trail).
+        self.assertIn("merged CONTESTED cluster", out)
+        self.assertIn("--merge-contested override", out)
         live = _live_rows(self.conn, pos, neg)
         self.assertEqual(sum(1 for v in live.values() if v is None), 1)
+
+    def test_dry_run_merge_contested_reports_not_merged(self):
+        """PRR-001: --dry-run --merge-contested must NOT claim merged:true —
+        nothing happened. The report entry is a fact-claim about the store."""
+        pos = _add_raw(self.mod, self.conn, POS, 0.9)
+        neg = _add_raw(self.mod, self.conn, NEG, 0.9)
+        report, out = _run_consolidate(self.mod, self.conn, dry_run=True,
+                                       force=True, merge_contested=True)
+
+        self.assertTrue(report["dry_run"])
+        self.assertTrue(report["merge_contested"])
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        # Counterfactual aggregate (would-merge) stays distinct from the
+        # per-cluster fact-claim.
+        self.assertEqual(report["merged"], 1)
+        self.assertIn("would merge CONTESTED cluster", out)
+        # Summary must AGREE with the per-cluster preview (final-critic round):
+        # "would merge under --merge-contested override", never the generic
+        # "would not merge … pass --merge-contested" advice for a flag already
+        # passed, and never the substring "merged" (#44 discipline).
+        summary = [ln for ln in out.splitlines()
+                   if ln.startswith("[zmem]") and "memories" in ln][-1]
+        self.assertIn("would merge under --merge-contested override", summary)
+        self.assertNotIn("would not merge", summary)
+        self.assertNotIn("pass --merge-contested", summary)
+        self.assertNotIn("merged", summary)
+        # Nothing mutated: both rows live, no provenance.
+        live = _live_rows(self.conn, pos, neg)
+        self.assertTrue(all(v is None for v in live.values()))
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM memory WHERE merged_from IS NOT NULL"
+        ).fetchone()[0], 0)
+
+    def test_merge_contested_rollback_reports_not_merged(self):
+        """PRR-001: a failed merge under --merge-contested rolls back; the
+        report entry must say merged:False (and the summary must count it)."""
+        pos = _add_raw(self.mod, self.conn, POS, 0.9)
+        neg = _add_raw(self.mod, self.conn, NEG, 0.9)
+
+        def _boom(conn, keeper, absorbed):
+            raise RuntimeError("injected mid-merge failure")
+
+        with mock.patch.object(self.mod, "_absorb_into_keeper", _boom):
+            report, out = _run_consolidate(self.mod, self.conn, force=True,
+                                           merge_contested=True)
+
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        self.assertIn("contested 1 cluster(s) (not merged", out)
+        self.assertIn("rolled back", out)  # override-specific summary, not the generic advice
+        live = _live_rows(self.conn, pos, neg)
+        self.assertTrue(all(v is None for v in live.values()))
+
+    def test_dry_run_summary_avoids_merged_substring(self):
+        """PR feedback PRR-008: the #44 discipline (assertNotIn("merged",
+        summary) in six existing tests) — a dry-run summary with a contested
+        cluster must use the would-verb. The full stdout check is stronger:
+        no dry-run line may carry the substring (the fixtures' content does
+        not contain it)."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        _, out = _run_consolidate(self.mod, self.conn, dry_run=True, force=True)
+        summary = [ln for ln in out.splitlines()
+                   if ln.startswith("[zmem]") and "memories" in ln][-1]
+        self.assertIn("would not merge", summary)
+        self.assertNotIn("merged", summary)
+        self.assertNotIn("merged", out)
 
     def test_mixed_cluster_reported_once_no_mirror(self):
         """A three-row mutually-similar cluster with mixed polarity is reported
@@ -258,6 +332,18 @@ class LexicalContestedTest(unittest.TestCase):
         self.assertTrue(report["skipped_by_cadence_gate"])
         self.assertIn("skipped by cadence gate", out)
         self.assertEqual(report["merged"], 0)
+
+    def test_cadence_gate_skip_with_contested_pair(self):
+        """PR feedback PRR-027: a gated second run reports the skip and does
+        not populate contested_clusters (no clustering ran)."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        first, _ = _run_consolidate(self.mod, self.conn, force=True)
+        self.assertEqual(len(first["contested_clusters"]), 1)
+        second, out = _run_consolidate(self.mod, self.conn)
+        self.assertTrue(second["skipped_by_cadence_gate"])
+        self.assertEqual(second["contested_clusters"], [])
+        self.assertIn("skipped by cadence gate", out)
 
 
 class CliJsonTest(unittest.TestCase):
@@ -309,6 +395,31 @@ class CliJsonTest(unittest.TestCase):
         self.assertEqual(report["merged"], 1)
         self.assertEqual(len(report["contested_clusters"]), 1)
         self.assertTrue(report["contested_clusters"][0]["merged"])
+
+    def test_json_with_prune_round_trip(self):
+        """PR feedback PRR-027: --json --prune stays parseable and carries the
+        prune field."""
+        result = self._cli("--prune", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIn("pruned", report)
+        self.assertNotIn("[zmem]", result.stdout)
+
+    def test_json_lock_busy_emits_parseable_error(self):
+        """PR feedback PRR-011: when another consolidation holds the
+        single-flight lock, --json stdout must be exactly the error object
+        (never the human skip line)."""
+        token = self.mod._acquire_lock(
+            "consolidate", self.mod.CONSOLIDATE_LOCK_STALE_SECONDS)
+        self.assertIsNotNone(token)
+        try:
+            result = self._cli("--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(),
+                             '{"error": "consolidate lock busy"}')
+            self.assertIn("[zmem]", result.stderr)  # human line went to stderr
+        finally:
+            self.mod._release_lock("consolidate", token)
 
     def test_plain_cli_both_rows_live_after_force(self):
         """AC1 host-independence: plain CLI invocation (what a CC session or a
@@ -429,6 +540,49 @@ class CosineContestedTest(unittest.TestCase):
         self.assertIsNone(_live_rows(self.conn, a)[a])
         b_state = _live_rows(self.conn, b)[b]
         self.assertIsNotNone(b_state)
+        row = self.conn.execute(
+            "SELECT merged_from FROM memory WHERE id=?", (d,)).fetchone()
+        self.assertEqual(row["merged_from"], b)
+
+    def test_cosine_rollback_parking_keeps_members_neighbor_eligible(self):
+        """Feedback-reviewer finding: a contested-override cluster that
+        ROLLs BACK parks its members (merged:False in the report) WITHOUT
+        blocking a later fresh-seed merge — same geometry as above, with the
+        first absorb injected to fail."""
+        import math
+        a = self._add_embedded(POS, 0.95, self._vec(1.0, 0.0), rc=5)
+        b = self._add_embedded(NEG, 0.9, self._vec(math.cos(0.4), math.sin(0.4)))
+        d = self._add_embedded(
+            "don't run migrations before deploy",
+            0.8, self._vec(math.cos(0.96), math.sin(0.96)))
+
+        real = self.mod._absorb_into_keeper
+        calls = {"n": 0}
+
+        def _flaky(conn, keeper, absorbed):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("injected first-cluster failure")
+            return real(conn, keeper, absorbed)
+
+        stub = mock.Mock()
+        stub.is_available.return_value = True
+        buf = io.StringIO()
+        with mock.patch.object(self.mod, "_embeddings", stub):
+            with mock.patch.object(self.mod, "_absorb_into_keeper", _flaky):
+                with redirect_stdout(buf):
+                    report = self.mod.consolidate(self.conn, force=True,
+                                                  merge_contested=True)
+        out = buf.getvalue()
+
+        # The {A, B} contested-override cluster rolled back (call 1 raised):
+        # reported merged:False, nothing tombstoned for it.
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        self.assertEqual(report["merged"], 1)  # D's merge of B succeeded
+        # A stayed live (rollback); B was merged into the fresh seed D.
+        self.assertIsNone(_live_rows(self.conn, a)[a])
+        self.assertIsNotNone(_live_rows(self.conn, b)[b])
         row = self.conn.execute(
             "SELECT merged_from FROM memory WHERE id=?", (d,)).fetchone()
         self.assertEqual(row["merged_from"], b)

@@ -1108,16 +1108,22 @@ TIER0_WARN_BYTES = 16 * 1024
 
 def _tier0_file_stats(path: Path) -> dict | None:
     """Line/byte stats for one Tier-0 file, or None when absent/unreadable.
-    Never raises (doctor is read-only, fail-open diagnostics)."""
+    Never raises (doctor is read-only, fail-open diagnostics). Bytes come from
+    stat() and lines are counted incrementally, so an oversized file — the
+    exact case this guard exists to catch — is measured without ever holding
+    its full contents in memory (PR feedback PRR-002)."""
     try:
         if not path.is_file():
             return None
-        data = path.read_bytes()
-        text = data.decode("utf-8", errors="replace")
+        size = path.stat().st_size
+        lines = 0
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for _line in fh:
+                lines += 1
         return {
             "path": _display_path(path),
-            "lines": len(text.splitlines()),
-            "bytes": len(data),
+            "lines": lines,
+            "bytes": size,
         }
     except Exception:
         return None
@@ -1210,14 +1216,21 @@ def _check_session_retention(home: Path) -> dict:
         inspected.append({"path": _display_path(path), "status": err or "ok"})
         if isinstance(data, dict) and "cleanupPeriodDays" in data:
             value = data["cleanupPeriodDays"]
-            days = value if isinstance(value, int) and not isinstance(value, bool) else None
-            source = name
+            # Non-positive ints count as unset (PR feedback PRR-019): CC has
+            # no meaningful <=0 retention, and echoing "-5 day(s)" into the
+            # summary would read as valid configuration. An INVALID value is
+            # also non-destructive: it must not clobber a valid value already
+            # read from the other file (feedback reviewer finding) — an
+            # invalid local override just fails to override.
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                days = value
+                source = name
 
     if days is None:
         return _check(
             "session-retention",
             "pass",
-            "Claude Code transcript retention is unset (or unreadable), so the "
+            "Claude Code transcript retention is unset (or unreadable/invalid), so the "
             "30-day default applies. Only matters if you want historical "
             "transcript mining; to extend it, set "
             '{"cleanupPeriodDays": <larger int>} in ~/.claude/settings.json.',
