@@ -802,5 +802,32 @@ class DoctorUnitFailOpenTest(unittest.TestCase):
         self.assertEqual(check["status"], "skip", check)
 
 
+class PythonFloorTest(unittest.TestCase):
+    """Issue #56 / 1.6: the supported Python floor is 3.11 (CI and the Hermes
+    lane both run 3.11). Doctor must WARN below the floor — not fail (a
+    3.8–3.10 interpreter still runs most of the store; the floor is a support
+    contract, not a hard ABI gate) and not silently pass (the old behavior on
+    3.8–3.10)."""
+
+    def test_below_floor_warns_and_names_the_floor(self):
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        import doctor  # noqa: E402
+        from unittest import mock  # noqa: E402
+
+        with mock.patch("sys.version_info", (3, 10, 9, "final", 0)):
+            check = doctor._check_python()
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIn("3.11", check["summary"], check)
+
+    def test_at_or_above_floor_passes(self):
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        import doctor  # noqa: E402
+
+        if sys.version_info < (3, 11):
+            self.skipTest("interpreter is below the 3.11 floor")
+        check = doctor._check_python()
+        self.assertEqual(check["status"], "pass", check)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

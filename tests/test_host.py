@@ -181,14 +181,16 @@ class TestLocalFsGuard(unittest.TestCase):
 
     def test_allows_local_drive_letter(self):
         os.environ["OneDrive"] = r"D:\Cloud\OneDrive"
-        # Should not raise.
-        host.assert_local_fs(Path(r"C:\Users\Brett\.zmem"))
+        # Should not raise. (Placeholder username: assert_local_fs is a
+        # UNC/OneDrive/remote-drive string guard, so a non-real path with the
+        # same shape exercises the same branch without leaking a home path.)
+        host.assert_local_fs(Path(r"C:\Users\<user>\.zmem"))
 
     def test_no_crash_when_onedrive_env_unset(self):
         os.environ.pop("OneDrive", None)
         os.environ.pop("OneDriveConsumer", None)
         os.environ.pop("OneDriveCommercial", None)
-        host.assert_local_fs(Path(r"C:\Users\Brett\.zmem"))
+        host.assert_local_fs(Path(r"C:\Users\<user>\.zmem"))
 
 
 class TestLocalFsGuardFollowsLinks(unittest.TestCase):

@@ -12,7 +12,7 @@ mining) reuse them directly, which is why they cannot assume any host. Only
 `extract_user_messages` is Claude-Code-format-specific (it walks the CC JSONL
 shape); that is stated in its docstring.
 
-Stdlib-only, Python 3.8+ compatible, cross-platform (Windows CI). Never opens
+Stdlib-only, Python 3.11+ compatible, cross-platform (Windows CI). Never opens
 the zmem store, never writes to disk, never shells out.
 
 Only `extract_user_messages` reads a transcript; every other symbol here is a
