@@ -12,6 +12,8 @@ README.
 
 ## [Unreleased]
 
+## [0.8.7] — 2026-08-22
+
 ### Added
 
 - **Transcript correction mining core** (issue [#46], PR 1/4 of the
@@ -97,6 +99,45 @@ README.
   boxes (port of claude-reflect's `get_cleanup_period_days`, MIT). Neither
   check can fail the report; doctor stays read-only and fail-open.
 
+- **Documentation truth pass (issue [#56], first PR of the SOTA train).** Every
+  agent-facing contract now matches code at schema v8 / plugin 0.8.7: SKILL.md
+  and CUTOVER.md claim the current schema v8 (were v6 / v7); SKILL.md documents
+  the shipped `--hybrid` BM25+vector recall (RRF fusion, k=60, fail-open to
+  FTS5 when the embedding runtime is absent) and drops the stale
+  "vector/embedding recall is a future optional tier" sentence; `--hybrid`,
+  `--no-bump`, and `--include-global` are documented together with the
+  passive-vs-explicit bump split (hooks and Hermes prefetch are passive surface
+  events; explicit CLI/MCP/Hermes recall bumps `retrieval_count`, issue #21);
+  the `add` signal-tier text matches code (`none`=0.2 below the 0.25 recall
+  floor by design, #36 M3); PLAN.md carries an executed-history banner (which
+  discloses that the §10b execution log lacks P3/P7/P9 entries, points at their
+  in-tree surfaces, and appends retrospective entries for those three) and
+  corrects the stale claim that `userConfig.storeDirectory` is unwired (#38 I6 —
+  `zmem-launch.js` consumes `CLAUDE_PLUGIN_OPTION_STOREDIRECTORY`; `ZMEM_DATA`
+  still wins when both are set).
+
+- **`get --id` not-found exit contract is documented — and `get` no longer
+  crashes on embedded rows (#38 I7).** A missing id exits 1 with the stable
+  stderr line `[zmem] no memory with id <id>` (found: exit 0 + JSON) — the
+  same not-found code as `supersede`, now stated in `--help` and the module
+  docstring instead of being an undocumented accident. Additionally, on hosts
+  where the optional embedding runtime is installed, `get --id <existing>`
+  tracebacked with `TypeError: Object of type bytes is not JSON serializable`
+  (the row's embedding BLOB went through `json.dumps` raw) — invisible to the
+  model-absent CI matrix and caught by the new contract test on a
+  model-present host. Binary columns now render as a `<N-byte blob>` marker
+  so `get` always emits JSON and exits 0 for an existing id.
+
+- **Python floor is 3.11.** README, the memory skill, doctor messaging, and
+  script docstrings now state Python 3.11+ (CI and the Hermes lane run 3.11).
+  Doctor WARNS below 3.11 (previously: hard-fail below 3.8, silent pass on
+  3.8–3.10).
+
+- **Repo hygiene (#38 I12).** `.swarm/` and `graphify-out/` are gitignored;
+  the 33 tracked graphify cache files (whose keys embedded absolute operator
+  home paths) are untracked; every remaining absolute home path in tracked
+  files was replaced with a placeholder/env-var form, enforced by test.
+
 ### Fixed
 
 - **Embeddings now resolve to the shared model cache without an env var.** The
@@ -121,6 +162,21 @@ README.
   document the queue path as derived from the store data dir rather than a
   fixed `~/.zmem` path.
 
+- **`export-pack --max-bytes` help now matches the (safer) behavior (#38 I8).**
+  The help claimed structural text was exempt from the budget; in code the
+  budget covers the whole rendered pack (structural framing included) and only
+  framing appended after the budget walk (an empty later section's heading and
+  the trailing omitted-count note) can exceed it. Help text, SKILL.md,
+  docs/CLOUD.md (the Tier 1 contract the help points at — still carried the
+  pre-#37-L1 claim until this pass), and a help-vs-behavior test now state the
+  truth; no behavior changed.
+
+- **MCP `recall` docstring documents the intentional `retrieval_count` bump on
+  explicit tool recall (#38 I2).** Behavior is unchanged (and pinned by
+  `tests/test_surface_consistency.py`): explicit tool reads bump by design;
+  only the docstring note was missing, so the tested design stopped being
+  re-discovered as a bug.
+
 ### Tests
 
 - Added `tests/test_corrections.py`: rejection extraction (both transcript
@@ -130,7 +186,23 @@ README.
   stability. Extended `tests/test_failures.py` for the new `(details,
   rejections)` return and `rejections` key.
 
+- Added `tests/test_schema_version.py` and `tests/test_doc_drift.py` (issue
+  [#56]): a doc-vs-code ratchet pinning the schema-version claims in SKILL.md
+  and CUTOVER.md against `schema_meta.SUPPORTED_SCHEMA_VERSION`, the
+  recall-flag documentation (`--hybrid`/`--no-bump`), the PLAN.md
+  storeDirectory correction, the Python 3.11 floor, and a
+  no-absolute-home-path scan over all tracked files. Extended
+  `tests/test_doctor.py` (warn below the 3.11 floor), `tests/test_mcp_server.py`
+  (MCP `search` ≡ `recall` equivalence on identical args, #38 I13),
+  `tests/test_surface_consistency.py` (MCP recall docstring documents the bump;
+  `get --id` exit contract, including a model-free direct-BLOB test pinning the
+  `<N-byte blob>` marker and a superseded-row forensic-read pin), and
+  `tests/test_export_pack.py` (`--max-bytes` help-vs-behavior pin). The
+  floor-claim ratchet matches the plus-suffixed, wordy "requires", and >=
+  phrasings, with positive/negative controls.
+
 [#46]: https://github.com/zaxbysauce/zmem/issues/46
+[#56]: https://github.com/zaxbysauce/zmem/issues/56
 [#47]: https://github.com/zaxbysauce/zmem/issues/47
 [#48]: https://github.com/zaxbysauce/zmem/issues/48
 [#49]: https://github.com/zaxbysauce/zmem/issues/49

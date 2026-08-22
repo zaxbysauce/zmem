@@ -34,7 +34,7 @@ Refuses to overwrite a non-empty existing destination store.sqlite unless
 --force is passed.
 
 Usage:
-  python import-store.py --source "C:\\path\\to\\store.sqlite" --dest-dir "C:\\Users\\Brett\\.zmem" [--force]
+  python import-store.py --source "C:\\path\\to\\store.sqlite" --dest-dir "C:\\Users\\<user>\\.zmem" [--force]
 """
 
 from __future__ import annotations

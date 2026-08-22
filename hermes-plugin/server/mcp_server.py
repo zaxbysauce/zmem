@@ -544,6 +544,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         is given, user:global memories are also unioned in (project-first, no
         crowding) so cross-project lessons surface — matching the local
         provider's prefetch behavior (PR #24).
+
+        Explicit tool recall bumps the memory's retrieval_count (the
+        popularity signal) by design: an operator-initiated read is
+        usefulness evidence, unlike the passive hook/provider-prefetch
+        surfaces which record only a surface event (issue #21; the
+        explicit-vs-passive split is pinned by tests/test_surface_consistency.py).
         """
         q = (query or "").strip()
         if not q:

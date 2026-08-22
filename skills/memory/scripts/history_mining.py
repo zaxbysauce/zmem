@@ -16,7 +16,7 @@ existing #46 extractors (corrections.extract_user_messages + store's
 merges/dedupes/queues them.
 
 Host input surface is Claude Code transcripts only by design (zmem host
-matrix). Stdlib-only, Python 3.8+, cross-platform (Windows CI). Untrusted
+matrix). Stdlib-only, Python 3.11+, cross-platform (Windows CI). Untrusted
 transcript text is sanitized/truncated by the caller before queue synthesis.
 """
 
@@ -45,7 +45,7 @@ def encode_project_folder(project_dir=None) -> str:
     """Claude Code's project-folder encoding (ported from claude-reflect
     get_project_folder_name): cwd `/` and `\\` -> `-`, leading `-` prefix.
 
-    e.g. /home/user/myapp -> -home-user-myapp. The cwd is resolved BEFORE
+    e.g. /home/<user>/myapp -> -home-<user>-myapp. The cwd is resolved BEFORE
     encoding so a symlinked/synced cwd normalizes to the prefix CC recorded
     (Windows drive letters and UNC forms survive; separators uniformly -> `-`).
     """
