@@ -313,6 +313,36 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         # search delegates to recall, so the shape must be identical.
         self.assertEqual(set(search_result.keys()), set(recall_result.keys()))
 
+    def test_search_equivalent_to_recall_on_same_args(self):
+        # I13 (#38 / #56): MCP `search` is a pure alias of `recall`; the alias
+        # relationship needs an equivalence test, not just a shape test.
+        # `_score` is excluded from the comparison on purpose: both tools are
+        # EXPLICIT reads and bump retrieval_count by design (issue #21), and
+        # compute_score's popularity component consumes that counter — so the
+        # second call's per-row _score legitimately differs. Every other
+        # field, and the result order, must match exactly.
+        ns = self._ns()
+        self._add_test_signal(content="equivalence probe quokka zephyr", namespace=ns)
+        search_result = self._call("search", query="quokka", namespace=ns, limit=5)
+        recall_result = self._call("recall", query="quokka", namespace=ns, limit=5)
+        # Non-vacuity guard: equality over two empty result sets would pass
+        # even if search stopped delegating.
+        self.assertGreater(search_result.get("count", 0), 0,
+                           search_result)
+        self.assertEqual(search_result.get("count"), recall_result.get("count"))
+
+        def strip_scores(res):
+            stripped = []
+            for item in res["results"]:
+                item = dict(item)
+                self.assertIn("_score", item,
+                              "recall payload must carry _score (shape pin)")
+                item.pop("_score")
+                stripped.append(item)
+            return stripped
+
+        self.assertEqual(strip_scores(search_result), strip_scores(recall_result))
+
     def test_search_empty_query_returns_error(self):
         result = self._call("search", query="", namespace=self._ns(), limit=5)
         self.assertIn("error", result)

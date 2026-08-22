@@ -231,10 +231,12 @@ class MaxBytesCapTest(_StoreCase):
         raw = Path(out_path).read_bytes()
         text = raw.decode("utf-8")
         # The bullet-bearing prefix (through the last emitted bullet) is what
-        # --max-bytes actually governs; the section headings, the "(none)"
-        # placeholder for the untouched user:global section, and the trailing
-        # omitted-count note are exempt structural framing (see _render_pack).
-        # Assert on that governed prefix specifically, not the whole file.
+        # --max-bytes governs: every bullet projection sums ALL accumulated
+        # lines, so structural framing counts toward the cap; only framing
+        # appended after the last projection (an empty later section's
+        # heading/"(none)" and the trailing omitted-count note) can push the
+        # file past it (see _render_pack). Assert on the governed prefix
+        # specifically, not the whole file.
         last_bullet_end = max(
             (m.end() for m in re.finditer(r"^- \*\*\[.*$", text, re.MULTILINE)),
             default=0,
@@ -490,6 +492,34 @@ class ExportPackHelpTests(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("CLOUD.md", r.stdout)
+
+    def test_max_bytes_help_matches_budget_semantics(self):
+        # I8 (#38 / #56): the --max-bytes help once claimed structural text
+        # was "exempt" from the budget while the code (correctly, since
+        # #37 L1) counts structural framing toward the cap and exempts only
+        # the trailing omitted-count note. Pin the help to the true
+        # semantics — prose must not drift from behavior again.
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), "export-pack", "--help"],
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Normalize whitespace: argparse wraps help text at the terminal
+        # width, so multi-word needles must be matched against the unwrapped
+        # stream or a mid-phrase linebreak reads as a missing clause. A
+        # linebreak can even land inside a hyphenated word ("omitted-
+        # count"), so a hyphen followed by the join's space is closed up too.
+        h = " ".join(r.stdout.split()).replace("- ", "-")
+        # The always-true behavior clauses (unchanged by 0.8.7):
+        self.assertIn("omitted whole", h)
+        self.assertIn("never truncated", h)
+        self.assertIn("later smaller bullets are still emitted", h)
+        # The corrected budget semantics:
+        self.assertIn("structural framing", h)
+        self.assertIn("counts", h)
+        self.assertIn("omitted-count note", h)
+        # The stale pre-#37-L1 claim must not return:
+        self.assertNotIn("is exempt, so the file itself can exceed", h)
 
 
 if __name__ == "__main__":

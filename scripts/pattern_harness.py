@@ -19,7 +19,7 @@ Output: per-pattern hit counts, all matched messages grouped by pattern with
 confidence, and a `--show-nonmatches N` sample so a reviewer can eyeball
 false negatives. Use `--json` for programmatic consumption.
 
-Python 3.8+, stdlib only, ASCII-safe output.
+Python 3.11+, stdlib only, ASCII-safe output.
 
 Usage:
   python pattern_harness.py <transcript.jsonl> [more.jsonl ...]

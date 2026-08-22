@@ -23,6 +23,7 @@ Run: python tests/test_surface_consistency.py   (no pytest required — repo con
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import sqlite3
@@ -93,6 +94,32 @@ class AdapterScanTest(unittest.TestCase):
             encoding="utf-8")
         self.assertNotIn("--no-bump", text,
                          "MCP recall/search are EXPLICIT and must NOT pass --no-bump")
+
+    def test_explicit_mcp_recall_docstring_documents_bump(self):
+        # I2 (#38 / #56): the explicit-vs-passive bump rule is tested design,
+        # but the MCP recall tool never STATED it, so it kept being
+        # re-discovered as a bug. The docstring must document the intentional
+        # retrieval_count bump. Scoped to the docstring via ast (a body comment
+        # must not mask a docstring regression — same discipline as
+        # test_readonly_invariant_docstring_lists_all_hooks above). The
+        # prohibition on the passive flag literal in this file is pinned
+        # separately by test_explicit_mcp_recall_omits_no_bump.
+        source = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py").read_text(
+            encoding="utf-8")
+        tree = ast.parse(source)
+        doc = None
+        for node in ast.walk(tree):
+            # The MCP tools are `async def` closures, so the recall tool is an
+            # ast.AsyncFunctionDef, not an ast.FunctionDef.
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "recall"):
+                doc = ast.get_docstring(node)
+                break
+        self.assertIsNotNone(doc, "MCP recall tool must have a docstring")
+        self.assertIn("retrieval_count", doc,
+                      "the docstring must name the counter that explicit recall bumps")
+        self.assertIn("passive", doc,
+                      "the docstring must contrast explicit recall with the passive surfaces")
 
     def test_readonly_invariant_docstring_lists_all_hooks(self):
         # The passive-recall read-only contract (the recall_memory DOCSTRING) must
@@ -189,6 +216,53 @@ class SurfaceTempStoreTest(unittest.TestCase):
         self.assertIsNone(
             surfaced_counts[2],
             f"surfaced-but-unretrieved row must NOT be pruned; got {surfaced_counts}")
+
+
+class GetExitContractTest(unittest.TestCase):
+    """I7 (#38 / #56): `store.py get --id` has a documented not-found exit
+    contract — exit 1 plus the stable stderr line, never a traceback; a found
+    row exits 0 with JSON on stdout. Drives the REAL CLI against a temp store."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-get-contract-")
+        self.store = os.path.join(self.tmp, "store.sqlite")
+        self.env = {**os.environ, "ZMEM_STORE": self.store,
+                    "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, *args):
+        return subprocess.run([PYTHON, str(STORE_PY), *args],
+                              env=self.env, capture_output=True, text=True, timeout=60)
+
+    def test_missing_id_exits_1_with_stable_stderr_token(self):
+        missing = "no-such-id-00000000"
+        r = self._run("get", "--id", missing)
+        self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+        self.assertIn(f"[zmem] no memory with id {missing}", r.stderr)
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+
+    def test_existing_id_exits_0_with_json_on_stdout(self):
+        r = self._run("add", "--namespace", NS, "--type", "fact",
+                      "--content", "get exit contract probe row", "--signal", "test")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        m = re.search(r"added memory ([0-9a-f-]{36})", r.stdout)
+        self.assertIsNotNone(m, r.stdout)
+        mid = m.group(1)
+        g = self._run("get", "--id", mid)
+        self.assertEqual(g.returncode, 0, g.stderr)
+        parsed = json.loads(g.stdout)
+        self.assertEqual(parsed["id"], mid)
+        self.assertEqual(parsed["content"], "get exit contract probe row")
+
+    def test_help_documents_the_exit_contract(self):
+        # The contract only exists if it is documented at the surface a caller
+        # can discover (--help) — the original #38 I7 gap was exactly this.
+        r = self._run("get", "--help")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no memory with id", r.stdout)
+        self.assertIn("exit", r.stdout.lower())
 
 
 class ComputeScorePopularityBlendTest(unittest.TestCase):

@@ -69,14 +69,17 @@ python <store.py> export-pack \
   portable lessons ride along without drowning out project-specific ones.
 - `--min-confidence` — floor below which a memory is not worth shipping into
   a pack a cloud session can't independently verify (default 0.6).
-- `--max-bytes` — budget, in UTF-8 bytes, for the **bullet lines** (default
-  32768), so a large store can't silently balloon the pack into something
-  that eats context budget. Precisely:
-  - It is not a hard cap on the file. Structural text — the auto-generated
-    header comment, the title, the two section headings, any `(none)`
-    placeholder, and the trailing omitted-count note — is exempt, so a pack
-    always contains its framing even at an absurdly small `--max-bytes`
-    (`--max-bytes 10` still emits a few hundred bytes of structure).
+- `--max-bytes` — budget, in UTF-8 bytes, over the **whole rendered pack**
+  (default 32768), so a large store can't silently balloon the pack into
+  something that eats context budget. Precisely:
+  - Each bullet is tested against the pack as rendered so far — structural
+    framing (the auto-generated header comment, the title, the section
+    headings, any `(none)` placeholder) counts toward the cap, so at an
+    absurdly small `--max-bytes` every bullet is omitted and only the
+    framing renders. The only text appended after the budget walk is the
+    trailing omitted-count note and, if a later section is empty, that
+    section's heading + `(none)` — which is why the file can exceed the
+    budget by that trailing framing alone, never by an earlier bullet.
   - A bullet is emitted whole or not at all — never truncated.
   - A bullet that would exceed the remaining budget is skipped and counted,
     and the walk continues: later, smaller rows still make it in. One long

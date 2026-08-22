@@ -107,8 +107,8 @@ function resolveNs(projectDir) {
 // Do NOT assume a value is quote-free just because it looks benign: whether
 // shlex.quote adds quotes depends on the CONTENT, and a test fixture does not
 // control that. A GitHub Windows runner's temp dir resolves to an 8.3 short
-// path (`C:\Users\RUNNER~1\...`); `~` is shell-special, so the namespace
-// derived from it comes back single-quoted there while the identical
+// path (a `C:\Users\<runner8.3>\...` form); `~` is shell-special, so the
+// namespace derived from it comes back single-quoted there while the identical
 // assertion passes unquoted on a developer box. Asking Python for the answer
 // keeps the expectation right for whatever the path happens to be.
 function shquote(s) {
