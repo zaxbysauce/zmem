@@ -37,6 +37,13 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 STORE_PY = SCRIPTS_DIR / "store.py"
+
+
+# storelib submodules (issue #57): the store shim cannot forward
+# attribute writes, so tests that mock a mutable global patch the owning submodule.
+sys.path.insert(0, str(SCRIPTS_DIR))
+import importlib as _ii
+_consolidate_mod = _ii.import_module("storelib.consolidate")
 PYTHON = sys.executable
 
 NS_A = "project:consolidate-ns-a"
@@ -234,7 +241,7 @@ class CosineNamespaceContainmentTest(unittest.TestCase):
         # Force the cosine path (the model file is genuinely absent here).
         stub = mock.Mock()
         stub.is_available.return_value = True
-        with mock.patch.object(self.store_mod, "_embeddings", stub):
+        with mock.patch.object(_consolidate_mod, "_embeddings", stub):
             # No `namespace=` argument — the background-run shape.
             self.store_mod.consolidate(self.conn)
 

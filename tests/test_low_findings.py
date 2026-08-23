@@ -73,7 +73,8 @@ POSIX_BASH = _posix_bash_available()
 # ---------------------------------------------------------------------------
 class L1ExportPackDocstring(unittest.TestCase):
     def test_render_pack_docstring_does_not_claim_exempt(self):
-        src = STORE_PY.read_text(encoding="utf-8")
+        # Post-split (issue #57) `_render_pack` lives in storelib/sync.py.
+        src = (STORE_PY.parent / "storelib" / "sync.py").read_text(encoding="utf-8")
         self.assertIn("def _render_pack(", src)
         # The stale claim ("exempt from the cap") must be gone — the budget
         # code counts all accumulated lines including structural framing.

@@ -25,6 +25,13 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import host  # noqa: E402
 
 
+# storelib submodules (issue #57): the store shim cannot forward
+# attribute writes, so tests that mock a mutable global patch the owning submodule.
+sys.path.insert(0, str(SCRIPTS_DIR))
+import importlib as _ii
+_schema_mod = _ii.import_module("storelib.schema")
+
+
 def _load_store_module(zmem_store_path: Path):
     """Load store.py as a fresh module instance pointed at zmem_store_path.
     store.py resolves STORE_PATH at import time from the environment, so
@@ -437,7 +444,7 @@ class TestV5MigrationEqualityInvariant(unittest.TestCase):
                     content=f"seed row for {old_ns}", signal="test",
                 )
             with mock.patch.object(
-                store_mod,
+                _schema_mod,
                 "_NS_MIGRATION_CHECKOUTS",
                 {k: str(v) for k, v in checkouts.items()},
             ):
@@ -488,7 +495,7 @@ class TestV5MigrationRefusesOnMissingCheckout(unittest.TestCase):
 
             missing = tmp_path / "missing-opencode-checkout"
             with mock.patch.object(
-                store_mod,
+                _schema_mod,
                 "_NS_MIGRATION_CHECKOUTS",
                 {"project:opencode-swarm": str(missing)},
             ), mock.patch("builtins.print", side_effect=spy_print):
@@ -533,7 +540,7 @@ class TestV5MigrationRefusesOnMissingCheckout(unittest.TestCase):
                     real_print(*args, **kwargs)
 
                 with mock.patch.object(
-                    store_mod,
+                    _schema_mod,
                     "_NS_MIGRATION_CHECKOUTS",
                     {"project:trainingapp": str(tmp_path / "not-there")},
                 ), mock.patch("builtins.print", side_effect=spy_print):
@@ -601,7 +608,7 @@ class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
             conn = store_mod.connect()
             store_mod.init_db(conn)
             with mock.patch.object(
-                store_mod,
+                _schema_mod,
                 "_NS_MIGRATION_CHECKOUTS",
                 {k: str(v) for k, v in checkouts.items()},
             ):
@@ -650,7 +657,7 @@ class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
                 content="idempotency probe row", signal="test",
             )
             with mock.patch.object(
-                store_mod,
+                _schema_mod,
                 "_NS_MIGRATION_CHECKOUTS",
                 {"project:opencode-swarm": str(checkout)},
             ):
@@ -667,7 +674,7 @@ class TestV5MigrationRollbackMapAndIdempotency(unittest.TestCase):
             # rollback map both unchanged. (schema_version is already at the
             # final supported version after the first run.)
             with mock.patch.object(
-                store_mod,
+                _schema_mod,
                 "_NS_MIGRATION_CHECKOUTS",
                 {"project:opencode-swarm": str(checkout)},
             ):
@@ -708,7 +715,7 @@ class TestRecallCompatAlias(unittest.TestCase):
                     content="unique lesson about widget frobnication", signal="test",
                 )
                 with mock.patch.object(
-                    store_mod,
+                    _schema_mod,
                     "_NS_MIGRATION_CHECKOUTS",
                     {"project:opencode-swarm": str(checkout)},
                 ):
@@ -864,7 +871,7 @@ class TestV5MigrationRetryAfterCheckoutAppears(unittest.TestCase):
             # The checkout "appears": point the known map at it and re-run
             # migrate() on the ALREADY-v5 store. Under the old
             # version-gated-only code this was a guaranteed no-op.
-            with mock.patch.object(store_mod, "_NS_MIGRATION_CHECKOUTS",
+            with mock.patch.object(_schema_mod, "_NS_MIGRATION_CHECKOUTS",
                                    {old_ns: str(checkout)}):
                 store_mod.migrate(conn)
 
@@ -900,7 +907,7 @@ class TestV5MigrationRetryAfterCheckoutAppears(unittest.TestCase):
             )
             store_mod.supersede_memory(conn, dead_id, "test tombstone")
 
-            with mock.patch.object(store_mod, "_NS_MIGRATION_CHECKOUTS",
+            with mock.patch.object(_schema_mod, "_NS_MIGRATION_CHECKOUTS",
                                    {old_ns: str(checkout)}):
                 store_mod.migrate(conn)
 
@@ -933,7 +940,7 @@ class TestV5MigrationRetryAfterCheckoutAppears(unittest.TestCase):
                 captured.append(" ".join(str(a) for a in args))
                 real_print(*args, **kwargs)
 
-            with mock.patch.object(store_mod, "_NS_MIGRATION_CHECKOUTS",
+            with mock.patch.object(_schema_mod, "_NS_MIGRATION_CHECKOUTS",
                                    {old_ns: str(missing)}), \
                     mock.patch("builtins.print", side_effect=spy_print):
                 store_mod.migrate(conn)
@@ -946,7 +953,7 @@ class TestV5MigrationRetryAfterCheckoutAppears(unittest.TestCase):
             # checkout is there. That is the whole point of decoupling the retry
             # from the version gate.
             checkout = _make_git_repo(tmp_path / "arrived", "https://github.com/Org/Arrived.git")
-            with mock.patch.object(store_mod, "_NS_MIGRATION_CHECKOUTS",
+            with mock.patch.object(_schema_mod, "_NS_MIGRATION_CHECKOUTS",
                                    {old_ns: str(checkout)}):
                 store_mod.migrate(conn)
             self.assertEqual(self._namespace_of_the_row(conn),

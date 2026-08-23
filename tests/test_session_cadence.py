@@ -21,6 +21,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STORE_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
+
+
+# Post-split (issue #57) `main()` dispatch calls cli's own by-value
+# `consolidate` import; patch that namespace, not the store shim.
+sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+import importlib as _ii
+_cli_mod = _ii.import_module("storelib.cli")
 PYTHON = sys.executable
 
 
@@ -147,11 +154,11 @@ class SessionCadenceTests(unittest.TestCase):
                 conn.close()
 
             # Monkeypatch consolidate to raise — simulating a real op failure.
-            original_consolidate = mod.consolidate
+            original_consolidate = _cli_mod.consolidate
 
             def _boom(*a, **kw):
                 raise RuntimeError("injected consolidate failure for test")
-            mod.consolidate = _boom
+            _cli_mod.consolidate = _boom
 
             # Drive main() in-process via sys.argv so the REAL dispatch + failure
             # counter + sys.exit(1) path are exercised (PRR-003/006).
@@ -169,7 +176,7 @@ class SessionCadenceTests(unittest.TestCase):
                         exit_code = e.code
             finally:
                 sys.argv = orig_argv
-                mod.consolidate = original_consolidate
+                _cli_mod.consolidate = original_consolidate
 
             output = captured.getvalue()
             # (a) consolidate error reported in the summary
