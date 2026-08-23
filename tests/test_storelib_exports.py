@@ -100,10 +100,15 @@ class ExportSurfaceTests(unittest.TestCase):
 
     @classmethod
     def _restore_import_state(cls):
-        try:
-            sys.path.remove(str(SCRIPTS_DIR))
-        except ValueError:
-            pass
+        # Drain every SCRIPTS_DIR entry from sys.path, not just the first.
+        # store.py unconditionally inserts its dirname at every fresh import;
+        # between this class and other tests in the same process that also
+        # import store, multiple copies can accumulate.
+        while True:
+            try:
+                sys.path.remove(str(SCRIPTS_DIR))
+            except ValueError:
+                break
         # Drop store/storelib from sys.modules so a later `import store` in
         # the same process re-runs load-time setup against the caller's env
         # instead of seeing a singleton pointing at our deleted tmp dir.

@@ -12,6 +12,58 @@ README.
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-08-23
+
+### Changed
+
+- **Behavior-identical split of `store.py` into the `storelib` package**
+  (issue [#57], SOTA PR 2/10). The 6773-line `skills/memory/scripts/store.py`
+  is now a 50-line re-export shim; all behavior lives under
+  `skills/memory/scripts/storelib/` as the modules `schema`, `write`, `recall`,
+  `consolidate`, `sync`, `backup`, `promote`, `mine`, and `cli`, with a
+  re-exporting `__init__.py`. Every hook, MCP subprocess, Hermes provider,
+  SKILL.md and test that invokes `store.py` / `import store` keeps working
+  unchanged.
+- **Live `store.X` reads preserved via module `__getattr__` forwarding to
+  `storelib`** — the shim exposes the full surface including live
+  `__embeddings` / `__NS_MIGRATION_CHECKOUTS` /
+  `CONSOLIDATE_MAX_ROWS_PER_NAMESPACE` / `__absorb_into_keeper` /
+  `__degraded_embedding_warned` forwards for the mutable globals consumers
+  mock or read.
+- **Per-load `storelib._refresh_env_state()`** restores the pre-split
+  contract that each `store.py` load re-derives `STORE_PATH` / `CORE_MD_PATH`
+  from `ZMEM_STORE` / `ZMEM_DATA` and applies any present `ZMEM_*` tunable
+  override (the owning submodules re-parse env-derived tunables on each
+  load; default values are never overwritten).
+
+### Added
+
+- **Behavior-freeze characterization suite**
+  (`tests/test_store_characterization.py`, issue #57, task 2.1): hashes the
+  data-surface output of `stats`/`list`/`recall`/`export-jsonl` on a fixed
+  fixture store (model-absent, LF + time normalized, embeddings-status
+  sentinel-normalized) so future refactors can prove behavior identity. The
+  CLI surface is verified by structural assertions on
+  `KNOWN_SUBCMDS` + per-subcommand custom-flag presence (argparse
+  HelpFormatter's wrap/blank placement is platform-divergent even at fixed
+  `COLUMNS=100` and cannot be frozen as a stable cross-platform hash, so the
+  contract is the structural surface rather than rendered text).
+- **Export-surface inventory** (`tests/test_storelib_exports.py`,
+  issue #57, task 2.6): freezes the ~200-name `store.*` API surface from the
+  pre-split monolith and asserts every name still resolves on the shim,
+  including the recall-weight invariant `W_BM25 + W_CONFIDENCE + W_RECENCY
+  + W_POPULARITY == 1.0`.
+
+### Notes for downstream consumers
+
+- **No action required.** `import store; store.X` continues to resolve every
+  name that resolved on `0.8.7`. `from storelib.X import Y` is also now
+  available as a structural-import surface; consumer code is free to migrate
+  to direct submodule imports at its own pace but need not.
+- The shim calls `storelib._refresh_env_state()` at every load, so env-derived
+  knobs (`ZMEM_STORE`, `ZMEM_MODELS_DIR`, `ZMEM_*` tunables) behave
+  identically to `0.8.7` for every consumer.
+
 ## [0.8.7] — 2026-08-22
 
 ### Added
