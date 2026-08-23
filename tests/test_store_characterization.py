@@ -48,6 +48,7 @@ RECORD = os.environ.get("ZMEM_CHAR_RECORD") == "1"
 _WS_RE = __import__("re").compile(r"  +")          # 2+ spaces -> single space
 _RE_AGO = __import__("re").compile(r"\b\d+[dhs] ago\b")
 _RE_MODELS_DIR = __import__("re").compile(r"models_dir=[^\s)]+")
+_RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 
 # Frozen pre-split snapshots. Compute via ZMEM_CHAR_RECORD=1 (see RECORD mode).
 # Captured from the behavior-identical split (verified byte-identical to
@@ -55,40 +56,40 @@ _RE_MODELS_DIR = __import__("re").compile(r"models_dir=[^\s)]+")
 # (CRLF collapsed to LF) and `stats` relative durations are time-normalized
 # before hashing, so the freeze is deterministic across OS line endings and
 # wall-clock time (the capture method, not just one machine).
-ROOT_HELP_SHA = "9f9b0d3824810e64268c9e41a4b9ba57b7abec9399aff4262c0f7ccf9358dcf2"
+ROOT_HELP_SHA = "d436dfdd85f9fb6f247029d5fa82d94706e41d58c086a8eb0b224d69b0561def"
 SUBCMD_SHA = {
-    "init": "4a5e07e603d6204196f2a41effe4913b5ed0d7ee57315916bf107f63fb827c72",
-    "add": "837c5e6249992e88a5827540c1cce5ad38e671fedbe14f589160339d6f19e8db",
-    "recall": "95b03a32b923aaec9cb026b5ee6572318e4e755e417963ce019edfece27e16f3",
-    "recent": "b4c03f9a85b29fa2a49dc4014ce63e6e9f8f919c9f17d646643454db67741382",
-    "search": "e4d48834bc8a0ed7532da6c5f251649673b7584162386725bc2fb54e66d3f77b",
-    "supersede": "a3dc88b6534285b78c83ded09b24fc27c042001f04a7d4b05ddcc4702b4a1cab",
-    "get": "fbb05d585a857af7a225dc48da8c20355449a3138e2db39cda55f16a7150f6f7",
-    "list": "ccaff6e58329e784b49944101aa52b81a517ba5f72771a3e27f2df7fedd471f9",
-    "stats": "1114b0e55b8e4c114ecdeed54f0450a5e4428aaffe9200bf029f78b319b18acb",
-    "path": "a42f2f7d925ef7e38798e1d2119bfa4e37dce1fe735b16e915e93948ad0c3377",
-    "session-cadence": "c5564e1c3421870b1bfca127b56aca1a1e0272959d61ac89983a919b3d10ae7c",
-    "rebuild-fts": "f334a4f49b51ba386f203ba26fcafbf012c666feb261a93fe328a69762afcda9",
-    "reembed": "ab523cebea15cc8cbc30f89bd950ce564d6dfc032fbfcf58764d3d492a83cd13",
-    "consolidate": "ec7d75e67fe96a043f0a7b4cdd7337cc15e236b43c21aa560c04ca5fdb2b61c9",
-    "promote": "563fc9b899ae1768eba2d88cc81329f4eb2e35af4ccb1c915f8f3dafb040381d",
-    "rekey-namespace": "b562cc3cc6c1d17bb3213c107a0a0a73e4706e6798d09cd01b372e5759ab33b1",
-    "backup": "25b253eac3eaacd8718dab22fc66fbf80351324a67ce6b28317b3b47f542df0f",
-    "restore": "790a2b7e46e4c0d551e4a3e42bca6d15555d3221a53cdd646c739d88e19a6d6c",
-    "export-pack": "fd4314fbd7acba972b0ddbb3106eb5964d5b487147d148c3fcb2f14864297614",
-    "export-jsonl": "5063721b595fe9ceb25c1effcf5cb2901ee9d04a9a96b79bff873d6b668fcb9c",
-    "ingest-jsonl": "00663d3d9f55acb732325b670c7cba8684556f9aaeadef8f357ea82e992a9ec9",
-    "failures": "dc4453c0479b2025d66f67fb35bcf599023d12beea1c211bfe7a1a4db1b89d60",
-    "corrections": "81339f793fe900689fabbcfb4dea12e31222c16eb7907ebf647b3a2b6abeaa71",
-    "queue-list": "4fadd3550777991421446d6c6e292f0c1693d5de0abccea962462f2abacead0e",
-    "queue-clear": "6331cca34ba06810dfa88b5536a68187c1ce29847d4617303e7bc6d423617de9",
-    "mine-history": "395d7e86cc9f3e48f88209dccb8156ca940736f330ad01ca0584deb86f0ed9ac",
-    "sweep": "2a84ed3a01faa2c1e0f6187d778506c726b43586022f49d3fa1c3f8015e1b962",
+    "init": "30fc42c1e762cc80f303addaef7e27b1aa3f2a1f68a7fc601737af8245364b0c",
+    "add": "6e18acaf33a95173c14178ae72778016d3f487d87d86547a7f52ff4bf75a7d33",
+    "recall": "49f68802f88a3a595b73f68cb3be4f327e83342bbdaa9ebf876b557f0d81a09e",
+    "recent": "aededbd9b93ca0bf39c2aa30eba05faffbb6ab86a90061f7e2af1febfe2350d6",
+    "search": "a1719d6946efb2df46c97851e471b252b3491589949b2267efcd810523560fa6",
+    "supersede": "fac31e7a2071d8e1880213bcbb4379a52fead5ab1b5c9e560a9ef8479463328f",
+    "get": "cd0b8d4fb998e7376a956352c21b087a82f8f8647d347be7c97e386499bd0be7",
+    "list": "9cc0f45e439623685d20fb6fb3164ac5fbb45753a95f4e00aba2954e525b9138",
+    "stats": "b6c0ac4d2c0eb66fdba02934fa6f5cd56eb38130065723d820b776ea7736a5ec",
+    "path": "6f24f6dc2858cbac740d7b340fd5d629dde4a0e1662b77f3abac7444a3e71dbe",
+    "session-cadence": "4024a6b79ff2a3c4384287a8dfeefff7f2084172189ccd1a823dfb06534c3728",
+    "rebuild-fts": "b2e139de801f5275a70e874581d6188837a70461433e3b8761a656116fdec5e4",
+    "reembed": "365507b2cf0b58bd077122758f2218e5149e4f92f962c2574165ceec1e7fbbdd",
+    "consolidate": "54c7461045e2164abd13da6c16a69d79d9ee09307455dc35a7690341c67314ae",
+    "promote": "b928882e7e3a05c5b38224473ac765c521ff5e248d7d9782a48baa6663989abd",
+    "rekey-namespace": "1a574bc38f59dcacdfafac5f8f21d04b25852fd77484b6448227e5bc1168eb69",
+    "backup": "0d8dd5a18ee888bf2a495680e64a1b15d7b1bdb5c28471810fcfaba2b47f3dfa",
+    "restore": "68d072cf031c309e58396817dbf5dc254834e613d1f1b0f923cb4182f051c756",
+    "export-pack": "5b7ec35e229aca634029c4029092719515647806aed021daa91ed35577008e88",
+    "export-jsonl": "d0e8109eb72a6babae9e84de19763a41b2018df68395e3101c8102aa0c31ff8e",
+    "ingest-jsonl": "633362416c98f426913c4b8afa56713083a42ba4d324097481599cb631782cfe",
+    "failures": "bd1051e97a82ef4fbb2c8a506e277a3480ed77ef784fad55f9e0563a023fcbc0",
+    "corrections": "7789555ba725576801eadc2624ce7bbedcebcd9185dfa9b40432db0649fb7808",
+    "queue-list": "3d0858c0dff65354d84f3800c4026175a8ac41bd8d9a6e3eeedb87895eef998a",
+    "queue-clear": "6a068f865e962eb5d518acbb52193fe8904aaec090ce4dd32969007ab8c71862",
+    "mine-history": "2542313e42fbc786fb11458b0503f52386f8921121ed9964a28babf645ee1741",
+    "sweep": "7b4b6437702447a05ad33151da75a4e8d39aa9ed0c33a519bf034e1de83f0a9e",
 }
 DATA_SHA = {
-    "stats": "01d4d5cfd861585517eb9818828556a25ae7bcd10cc2e66b142a51d617799328",
+    "stats": "11ac804ebd82da80a80772814b5507f233d58e259b4c9c3498fa1311500630c8",
     "list": "c2e285928d3ee75154a12e4a61947d6793d3bc8f55edb0b3319e73ff4b75a598",
-    "recall": "d9dfc946c923c8c38d76cd7bdf828e09926881d1a33a3d86b031e9074d3d17a0",
+    "recall": "24226d852d52ebf3be91d6f12e813c8d6876342049077f093d2ac7810e300e79",
     "export_jsonl": "24d7c3b13cecc31fa3a845ee5a181369627298410bc3d41ccf90c043e460ce65",
 }
 KNOWN_SUBCMDS = [
@@ -104,23 +105,27 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _norm(text: str) -> str:
-    """Normalize platform-dependent text before hashing so the freeze is
-    deterministic across OS line endings, argparse wrap width, and wall-clock
-    time."""
-    # CRLF vs LF: Windows-touched checkouts write \r\n to stdout; Linux CI \n.
+def _norm_help(text: str) -> str:
+    """Width-insensitive normalization for argparse help surfaces.
+
+    Argparse HelpFormatter wraps long descriptions at the runner's terminal
+    width (shutil.get_terminal_size()), so the same help text produces
+    different line breaks across hosts even with COLUMNS pinned. Splitting on
+    blank lines and collapsing all whitespace within each block makes the
+    result a width-stable canonical form (block content is preserved; only
+    the wrap point changes).
+    """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Per-line: argparse HelpFormatter pads columns based on terminal width
-    # (shutil.get_terminal_size()), so the same help text wraps/pads
-    # differently across runners. Strip trailing whitespace and collapse runs
-    # of 2+ spaces (inter-column padding) to a single space, preserving
-    # newlines. This is content-preserving (argparse uses single spaces as
-    # real separators) but width-insensitive.
-    lines = [_WS_RE.sub(" ", ln).rstrip() for ln in text.split("\n")]
-    text = "\n".join(lines)
-    # Wall-clock relative durations ("201d ago") drift daily from the pinned
-    # fixture timestamps; collapse to a sentinel. The absolute ISO timestamps
-    # beside them are pinned/static, so only the `Nd ago` prefix moves.
+    blocks = text.split("\n\n")
+    norm_blocks = [" ".join(b.split()) for b in blocks]
+    return "\n\n".join(norm_blocks)
+
+
+def _norm(text: str) -> str:
+    """Normalization for data surfaces (list/recall/export). LF + time only;
+    whitespace is preserved because JSON has structural spaces that must not
+    be collapsed (the help surfaces use _norm_help instead)."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _RE_AGO.sub("X ago", text)
     return text
 
@@ -138,6 +143,14 @@ def _norm_stats(text: str) -> str:
     # also normalize the literal token form to a sentinel so a re-capture on
     # a different OS cannot leave a divergent path.
     normed = _RE_MODELS_DIR.sub("models_dir=__MODELS_DIR__", normed)
+    # The whole `embeddings=... (reason=..., models_dir=..., ...)` line varies
+    # with the embedding availability probe (reason can be model_file_missing,
+    # checksum_mismatch, or others depending on env). Collapse the entire line
+    # to a sentinel so the freeze does not depend on which probe branch runs.
+    normed = _RE_EMBED_STATUS.sub("embeddings=__EMBED_STATUS__", normed)
+    # Now run the LF + time normalizer (no WS collapse: stats output is
+    # human-aligned, not JSON, and preserving single-space alignment is fine
+    # as long as the content tokens are deterministic).
     return _norm(normed)
 
 
@@ -167,10 +180,10 @@ def _run_cli(env: dict, *args: str) -> subprocess.CompletedProcess:
 def _capture_snapshot() -> dict:
     snap: dict = {}
     r = _run_cli({}, "--help")
-    snap["root_help_sha"] = _sha(_norm(r.stdout))
+    snap["root_help_sha"] = _sha(_norm_help(r.stdout))
     for cmd in KNOWN_SUBCMDS:
         r = _run_cli({}, cmd, "--help")
-        snap.setdefault("subcmd_sha", {})[cmd] = _sha(_norm(r.stdout))
+        snap.setdefault("subcmd_sha", {})[cmd] = _sha(_norm_help(r.stdout))
 
     tmp = tempfile.mkdtemp(prefix="zmem-char-snap-")
     store = builder.build_store(tmp)
@@ -211,7 +224,7 @@ class CharacterizationTests(unittest.TestCase):
     def test_root_help_surface(self):
         r = _run_cli({}, "--help")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self._assert_sha("root --help", _sha(_norm(r.stdout)), ROOT_HELP_SHA)
+        self._assert_sha("root --help", _sha(_norm_help(r.stdout)), ROOT_HELP_SHA)
         # Every known subcommand must still appear in the root help.
         for cmd in KNOWN_SUBCMDS:
             self.assertIn(cmd, r.stdout)
@@ -220,7 +233,7 @@ class CharacterizationTests(unittest.TestCase):
         for cmd in KNOWN_SUBCMDS:
             r = _run_cli({}, cmd, "--help")
             self.assertEqual(r.returncode, 0, f"{cmd} --help rc={r.returncode}")
-            self._assert_sha(f"{cmd} --help", _sha(_norm(r.stdout)), SUBCMD_SHA.get(cmd, ""))
+            self._assert_sha(f"{cmd} --help", _sha(_norm_help(r.stdout)), SUBCMD_SHA.get(cmd, ""))
 
     def test_data_stats(self):
         r = _run_cli(self.env, "stats")
