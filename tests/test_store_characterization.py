@@ -89,6 +89,14 @@ KNOWN_SUBCMDS = [
     "queue-clear", "mine-history", "sweep",
 ]
 
+# Subcommands whose argparse parser exposes ONLY the universal -h/--help
+# option (no custom flags). These pass the "exposes at least one flag" check
+# by definition; they are tracked here so the per-subcommand assertion is
+# NON-vacuous (a regression that drops a real flag must trip the test).
+# Adding a subcommand here without removing its real flags from the CLI is
+# the only way this allowlist grows, so it forces a conscious decision.
+FLAGLESS_SUBCMDS = frozenset({"init", "stats", "path", "rebuild-fts", "reembed"})
+
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -233,11 +241,42 @@ class CharacterizationTests(unittest.TestCase):
                 f"usage line")
             self.assertIn("usage:", out)
             self.assertIn("options:", out)
-            # Every subcommand exposes at least one flag (argparse renders
-            # them as '--foo' or '-x' / '--foo BAR').
-            self.assertRegex(out, r"(--[A-Za-z][\w-]+|-[A-Za-z])",
-                f"{cmd} --help exposes no flags — the subcommand's argparse "
-                f"parser is empty or wiring changed")
+            # Every subcommand in the `options:` section exposes at least one
+            # CUSTOM flag (argparse always renders `-h, --help` too — exclude
+            # those, otherwise the assertion is vacuous on flag-less
+            # subcommands like `init` or `path` and cannot detect a regression
+            # that drops a real flag). Subcommands that legitimately have only
+            # the universal help option must be in FLAGLESS_SUBCMDS.
+            in_options = False
+            custom_flags = []
+            for ln in out.splitlines():
+                if ln.startswith("options:"):
+                    in_options = True
+                    continue
+                if not in_options or not ln.strip():
+                    continue
+                stripped = ln.lstrip()
+                if not stripped.startswith("-"):
+                    continue
+                token = stripped.split()[0].rstrip(",")
+                if token in ("-h", "--help"):
+                    continue
+                custom_flags.append(token)
+            if cmd in FLAGLESS_SUBCMDS:
+                self.assertEqual(
+                    custom_flags, [],
+                    f"{cmd} is in FLAGLESS_SUBCMDS but its --help now exposes "
+                    f"custom flags {custom_flags!r} — remove it from the "
+                    f"allowlist (or the flag was added, update the freeze).",
+                )
+            else:
+                self.assertGreater(
+                    len(custom_flags), 0,
+                    f"{cmd} --help exposes no custom flags (only -h/--help) — "
+                    f"either this subcommand lost its real flags (regression), "
+                    f"or it has always been flag-less and was missed when "
+                    f"FLAGLESS_SUBCMDS was last reviewed.",
+                )
 
     def test_data_stats(self):
         r = _run_cli(self.env, "stats")

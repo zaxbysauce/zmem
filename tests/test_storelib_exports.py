@@ -67,19 +67,36 @@ EXPECTED_EXPORTS = [
 class ExportSurfaceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Import `store` once, scoped so the process-global changes (ZMEM_STORE,
-        # SCRIPTS_DIR on sys.path, the SCRIPTS_DIR insert store.py adds) are
-        # confined to this class and cleaned up after (PRR-002).
+        # Confine process-global state changes (ZMEM_STORE, SCRIPTS_DIR on
+        # sys.path, the sys.modules['store']/'storelib' cache pointing at the
+        # tmp store) to this test class and restore them after. The cleanup
+        # hook is registered BEFORE the import + after the sys.path insert so
+        # it always runs (even if the import raises), and the import path
+        # evicts any pre-cached store/storelib from sys.modules so the
+        # isolation actually takes effect under unittest collection (where
+        # other test modules may have already imported them with a different
+        # env).
         cls.tmp = tempfile.mkdtemp(prefix="zmem-export-")
         cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+
         env = {**os.environ,
                "ZMEM_STORE": os.path.join(cls.tmp, "store.sqlite"),
                "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        cls.addClassCleanup(cls._restore_import_state)
+        # Register the sys.path-restore cleanup BEFORE inserting, so a raise
+        # inside the import or the env patch still leaves sys.path clean.
+        sys.path.insert(0, str(SCRIPTS_DIR))
         with mock.patch.dict(os.environ, env):
-            sys.path.insert(0, str(SCRIPTS_DIR))
+            # Evict any pre-cached store/storelib (e.g. imported at collection
+            # time by an earlier test module) so the import below re-runs the
+            # load-time `_refresh_env_state()` against THIS test's env. Without
+            # this, import_module returns the cached module bound to whatever
+            # the FIRST importer's ZMEM_STORE was — a silent no-op for
+            # isolation.
+            for mod_name in ("store", "storelib"):
+                sys.modules.pop(mod_name, None)
             global store
             store = importlib.import_module("store")
-        cls.addClassCleanup(cls._restore_import_state)
 
     @classmethod
     def _restore_import_state(cls):
@@ -87,6 +104,11 @@ class ExportSurfaceTests(unittest.TestCase):
             sys.path.remove(str(SCRIPTS_DIR))
         except ValueError:
             pass
+        # Drop store/storelib from sys.modules so a later `import store` in
+        # the same process re-runs load-time setup against the caller's env
+        # instead of seeing a singleton pointing at our deleted tmp dir.
+        for mod_name in ("store", "storelib"):
+            sys.modules.pop(mod_name, None)
 
     def test_every_presplit_export_still_resolves(self):
         missing = sorted(n for n in EXPECTED_EXPORTS if not hasattr(store, n))
