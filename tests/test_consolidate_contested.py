@@ -26,6 +26,13 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 STORE_PY = SCRIPTS_DIR / "store.py"
+
+
+# storelib submodules (issue #57): the store shim cannot forward
+# attribute writes, so tests that mock a mutable global patch the owning submodule.
+sys.path.insert(0, str(SCRIPTS_DIR))
+import importlib as _ii
+_consolidate_mod = _ii.import_module("storelib.consolidate")
 PYTHON = sys.executable
 
 NS = "project:consolidate-contested-49"
@@ -279,7 +286,7 @@ class LexicalContestedTest(unittest.TestCase):
         def _boom(conn, keeper, absorbed):
             raise RuntimeError("injected mid-merge failure")
 
-        with mock.patch.object(self.mod, "_absorb_into_keeper", _boom):
+        with mock.patch.object(_consolidate_mod, "_absorb_into_keeper", _boom):
             report, out = _run_consolidate(self.mod, self.conn, force=True,
                                            merge_contested=True)
 
@@ -498,7 +505,7 @@ class CosineContestedTest(unittest.TestCase):
         stub = mock.Mock()
         stub.is_available.return_value = True
         buf = io.StringIO()
-        with mock.patch.object(self.mod, "_embeddings", stub):
+        with mock.patch.object(_consolidate_mod, "_embeddings", stub):
             with redirect_stdout(buf):
                 report = self.mod.consolidate(self.conn, force=True)
         return report, buf.getvalue()
@@ -568,8 +575,8 @@ class CosineContestedTest(unittest.TestCase):
         stub = mock.Mock()
         stub.is_available.return_value = True
         buf = io.StringIO()
-        with mock.patch.object(self.mod, "_embeddings", stub):
-            with mock.patch.object(self.mod, "_absorb_into_keeper", _flaky):
+        with mock.patch.object(_consolidate_mod, "_embeddings", stub):
+            with mock.patch.object(_consolidate_mod, "_absorb_into_keeper", _flaky):
                 with redirect_stdout(buf):
                     report = self.mod.consolidate(self.conn, force=True,
                                                   merge_contested=True)

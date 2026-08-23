@@ -30,6 +30,13 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 STORE_PY = SCRIPTS_DIR / "store.py"
+
+
+# storelib submodules (issue #57): the store shim cannot forward
+# attribute writes, so tests that mock a mutable global patch the owning submodule.
+sys.path.insert(0, str(SCRIPTS_DIR))
+import importlib as _ii
+_consolidate_mod = _ii.import_module("storelib.consolidate")
 PYTHON = sys.executable
 HOOKS_DIR = REPO_ROOT / "hermes-plugin" / "hooks"
 
@@ -109,7 +116,7 @@ class M8ConsolidatePerNamespaceCap(unittest.TestCase):
             self.store.add_memory(self.conn, namespace="project:m8trunc",
                                   type_="fact", content=f"trunc row {i} gamma",
                                   signal="test")
-        with mock.patch.object(self.store, "CONSOLIDATE_MAX_ROWS_PER_NAMESPACE", small_cap):
+        with mock.patch.object(_consolidate_mod, "CONSOLIDATE_MAX_ROWS_PER_NAMESPACE", small_cap):
             import io
             from contextlib import redirect_stdout
             buf = io.StringIO()

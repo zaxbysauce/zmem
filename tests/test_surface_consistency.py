@@ -131,7 +131,8 @@ class AdapterScanTest(unittest.TestCase):
         # Scope the assertion to the docstring ONLY (via ast.get_docstring), not
         # the whole function body: a body comment or refactor mention of a hook
         # name must NOT mask a docstring regression (PRR-002).
-        source = (SCRIPTS_DIR / "store.py").read_text(encoding="utf-8")
+        # Post-split (issue #57) `recall_memory` lives in storelib/recall.py.
+        source = (SCRIPTS_DIR / "storelib" / "recall.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         doc = None
         for node in ast.walk(tree):

@@ -44,6 +44,13 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 STORE_PY = SCRIPTS_DIR / "store.py"
+
+
+# storelib submodules (issue #57): the store shim cannot forward
+# attribute writes, so tests that mock a mutable global patch the owning submodule.
+sys.path.insert(0, str(SCRIPTS_DIR))
+import importlib as _ii
+_consolidate_mod = _ii.import_module("storelib.consolidate")
 PYTHON = sys.executable
 
 NS = "project:consolidate-lossy-19"
@@ -840,7 +847,7 @@ class CosinePathTest(unittest.TestCase):
         absorbed = self._add_embedded(ABSORBED_EXTRA, 0.85, near_vec, rc=1)
         stub = mock.Mock()
         stub.is_available.return_value = True
-        with mock.patch.object(self.mod, "_embeddings", stub):
+        with mock.patch.object(_consolidate_mod, "_embeddings", stub):
             self.mod.consolidate(self.conn)
         row = self.conn.execute(
             "SELECT content, merged_from FROM memory WHERE id=?", (keeper,)).fetchone()

@@ -1112,7 +1112,9 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
     // store.py has to cover the new .convention-commit-prompted- prefix, or
     // the per-session markers would accumulate forever.
     {
-        const storeSrc = fs.readFileSync(STORE_PY, "utf8");
+        // Post-split (issue #57) SENTINEL_PREFIXES lives in storelib/backup.py.
+        const storeSrc = fs.readFileSync(
+            path.join(REPO, "skills", "memory", "scripts", "storelib", "backup.py"), "utf8");
         ok("commit-nudge: SENTINEL_PREFIXES covers the commit marker prefix",
             storeSrc.indexOf('".convention-commit-prompted-"') !== -1);
         ok("commit-nudge: commit marker was actually written for the nudged session",
