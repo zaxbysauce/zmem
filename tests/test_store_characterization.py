@@ -42,43 +42,46 @@ PYTHON = sys.executable
 RECORD = os.environ.get("ZMEM_CHAR_RECORD") == "1"
 
 # Frozen pre-split snapshots. Compute via ZMEM_CHAR_RECORD=1 (see RECORD mode).
-# Captured from `ddce432` (pre-split store.py) on 2026-08-22 — deterministic
-# across runs (verified: build-twice hashes identical).
-ROOT_HELP_SHA = "421bb48e35ed1a0680bb7092181e344d29f910bcf6290e55963f21a05e8130e5"
+# Captured from the behavior-identical split (verified byte-identical to
+# pre-split `ddce432` store.py) on 2026-08-22. Every surface is LF-normalized
+# (CRLF collapsed to LF) and `stats` relative durations are time-normalized
+# before hashing, so the freeze is deterministic across OS line endings and
+# wall-clock time (the capture method, not just one machine).
+ROOT_HELP_SHA = "7522d1c79f7232fb4ad1dc72ad79f0658cd37da9c73a37ef4bc3bbb9056f9f59"
 SUBCMD_SHA = {
-    "init": "4fdbcd3dcadf19c560ca99b39dac2697f092737a9f46a4510f367954968ba225",
-    "add": "eb4305c79535114ec9013a0d5373c5ee072031a794b7fd6f02527cf479c530fa",
-    "recall": "5b7903ecc356527a7f0082178cd598bcc7cd45c4728651f47dc17092374aaedd",
-    "recent": "dcd566553c516e9a228719b586d0e7510230eb7dc2bfa8a0a25904c05c80d06e",
-    "search": "26e223db97b3d663d714cf984a90b79cfd78c88db18e21c81e3cd5c555cb416f",
-    "supersede": "3ea4ca935bb5702918d02009d470cc0e83197698c93d9267f005b9cc971f2b90",
-    "get": "5f5242c92fa699673d04114fa80b4f077232c96f9582e8f49978dfc772b32caa",
-    "list": "93b69486e65495856b682ec5393b750206e2cf026fee94744bc6f248daa572e2",
-    "stats": "4b3871de31bfeba3c0f2e8f0c1826651676d652930045b4a256a2403cf2345b7",
-    "path": "d9d2d5e45d7fbfe6de017e727f0b4f4a3818e3af861cfbd6259cf1d23f1f571a",
-    "session-cadence": "90059a3c99208a8700ab45ee39e8639f48d79b1c69a1dfbb3bddb2e1d78d6aa1",
-    "rebuild-fts": "66b57c6a964f653087b97d1e6108cab82fe05cd7a777f5c74825abf310873562",
-    "reembed": "87f2c1488cc77db41add8a28f1b8e8206349af6dd26706543daa2e01bd74e15a",
-    "consolidate": "d76e6d88469f5cefc03e646e626197d06c11a5e3c7b60cfcbb2bcfa4789de0c6",
-    "promote": "064699be820d08fd4bc001fafd1e0a71a9f2bfcb855bfcda916f3dd40dd84e64",
-    "rekey-namespace": "08d5fb2c4b00d4bc7b4889686336dd71c1165692cc3af1176516ab38d4b6820d",
-    "backup": "aee393da7c6c3f507fa8319588b26fb27a66e3082596e20086e68963bc63e092",
-    "restore": "060c1d35a0b6206b0d5a77678df4fa334aa7320790c3a9c1d72fc39b87863c10",
-    "export-pack": "651e5cc779e3b3dc87d0177843e8c07b7ea9655e5540ab7cc9236339c5ac4e6c",
-    "export-jsonl": "1ba54507d26f0f563a84cb3e9074a0f61f0e5afc41b70744af5b6896d35ee90e",
-    "ingest-jsonl": "7e1ed3c2c9dc745f301e5fec27db779d3c741de9ff3f98d8cd260ab4d2436159",
-    "failures": "9be60158a2be8bb0d7697a4d6284b6eecbbb893e5b611d9808182e63c31dac5b",
-    "corrections": "009deb75d922750efe2f9a9f8b17d6a89cb26f4eb9aae27484f7ffb359e9a396",
-    "queue-list": "e97276152716ccc12db6869912f806fed470f073cd7261dae95c9f4c830e7e87",
-    "queue-clear": "2046822f7094a9369c3ff2c1c2a841b3ed5389bfe60633d454de5a50772629f2",
-    "mine-history": "374e023c814bf515098777c77213f700dd263a3dcec97936f33ad9d42df98aaa",
-    "sweep": "c3dde0db83c036e8066f5d7259c085a37b39d44788dbdf68ab13b1aad6c30c91",
+    "init": "c6248e4bf68fcb949e1af8bf62a73c8169f1bef672f7e56cf6e52b3961a252f0",
+    "add": "ea3811a4d2212bef6e36f13dd9ba16362aea4ce53bed529eae5e80b501a74ad0",
+    "recall": "4b1852913678bd550d40691e4166354e28cdec43a43123c42ba6b3963a3359d2",
+    "recent": "317a60ef86d11c72afba69b92d12c69b026aa57275b70bc4df4c4a0acf13ca8b",
+    "search": "938f20685ffc79cd09178bcab1af1d28d3758340fb35489455ed43fbc2b93c7a",
+    "supersede": "0b9e5755e77671c1fa7785857c63477003dff54a94d524660274eb2073f0a578",
+    "get": "1735bf227e590c7c2fb5b0b9171d173fddd0c2ee4a9b0db8e5c593fddc116510",
+    "list": "71e3a288e92ab6a3ddf287e8854782e9988b704c70e532564b852b25b6e3df10",
+    "stats": "b52bd98a6495f0f4648be512a7ac5cc09670141f2d93fddcd7a2830c6a844c77",
+    "path": "52d7dbd661ed9b94a86e23c3aa4ab6ea6ceeb67057dae0b6c56d1905d7804190",
+    "session-cadence": "f8ef0eecaa355c560943cbefaa10926017afa9cb7768573f2d1384b867614bf8",
+    "rebuild-fts": "80e8c88d05adba518aab2778e4a8084654043a0e81b44691cbc9f53f33d4917a",
+    "reembed": "64ecd65f18aa4a37b9738b5d4db973b4e32ed63bf4ea373c8771a4891072193c",
+    "consolidate": "bff160270d072deaf35ed860e795f6051cc0cbb518d32a918c1e1c77d6fededf",
+    "promote": "4bd6ac0be86583b09cb35a3b8d605280c182b88afaef633cb71d91837d3a0d84",
+    "rekey-namespace": "aeb2f4f5502972b35a9a6f2da4fc605b6ba92767feccdb6e4e53072b89f80e2e",
+    "backup": "c688129c5cc2af61112db9ec4891bc0c7d544e244bee57acfb3d1777e78bc929",
+    "restore": "6b2302a2dffb9766f29bcb31cd71224b990d608e7dfd3b72f21950927775ea8e",
+    "export-pack": "93e83153cb1a79aa98ed0d8583957cc974bdad65342500fd06ba41636b6e07fa",
+    "export-jsonl": "d6d3fb3c8f8e653da7635df70152b7e7f226409e71d85a34467a618f21ba7b56",
+    "ingest-jsonl": "45b4a299c658f7588bd468cfcc28eaea97c5dae487a4d3dd0a5463e465c0d232",
+    "failures": "3c6924a8cb34ffce47554c4d1ea7aa1ef57457b911eed1df3bbc1c18538061da",
+    "corrections": "dbc812034ec316cbbde8d32c16d80f81bf0abf6a9da3cb7c81d8c2ab22b10400",
+    "queue-list": "00ce96c369a3b136c441db89ffce3de574e1d4a8de508da12c16f72a308a485f",
+    "queue-clear": "8db9216aff1b5f201c8c97d8190498899e06237caad162f474c71be6302c60cc",
+    "mine-history": "9d75be80028c6209b83afa189d31f23044d9243f48655b6f9e32a5fc6e31e671",
+    "sweep": "a4470aad9d62bfa4daf1d6fe61386218b8fcf2c6b13e0b34ab6c101161e4c6f0",
 }
 DATA_SHA = {
-    "stats": "5e0047663b98ceac4fa0c510c059d9610ac5cbbfd008917543d310956e8aa788",
-    "list": "dc17f07711c260a67882f22898e22adda2b9a771f8ea1c74cdfdcdc10dd5e2d2",
-    "recall": "99410cf89a456ce111eaf9af2c92f7d36fc0aa8fab1b64eeeec1059ac7529b42",
-    "export_jsonl": "6392c1c33c4344e3c9454f207791da73d21c17933371e8855a2d2d6f72e9ed74",
+    "stats": "a57af2ea9cc6979991b5a326ad2b00a4a66c8b7df78acf3f4315cc27b01b42e7",
+    "list": "c2e285928d3ee75154a12e4a61947d6793d3bc8f55edb0b3319e73ff4b75a598",
+    "recall": "24226d852d52ebf3be91d6f12e813c8d6876342049077f093d2ac7810e300e79",
+    "export_jsonl": "24d7c3b13cecc31fa3a845ee5a181369627298410bc3d41ccf90c043e460ce65",
 }
 KNOWN_SUBCMDS = [
     "init", "add", "recall", "recent", "search", "supersede", "get", "list",
@@ -93,6 +96,19 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _norm(text: str) -> str:
+    """Normalize platform-dependent text before hashing so the freeze is
+    deterministic across OS line endings and wall-clock time."""
+    # CRLF vs LF: Windows-touched checkouts write \r\n to stdout; Linux CI \n.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Wall-clock relative durations ("201d ago") drift daily from the pinned
+    # fixture timestamps; collapse to a sentinel. The absolute ISO timestamps
+    # beside them are pinned/static, so only the `Nd ago` prefix moves.
+    import re as _re
+    text = _re.sub(r"\b\d+[dhs] ago\b", "X ago", text)
+    return text
+
+
 def _norm_stats(text: str) -> str:
     lines = []
     for ln in text.splitlines():
@@ -100,7 +116,7 @@ def _norm_stats(text: str) -> str:
         if ln.startswith("store: "):
             ln = "store: __STORE__"
         lines.append(ln)
-    return "\n".join(lines)
+    return _norm("\n".join(lines))
 
 
 def _run_env(tmp: str) -> dict:
@@ -124,10 +140,10 @@ def _run_cli(env: dict, *args: str) -> subprocess.CompletedProcess:
 def _capture_snapshot() -> dict:
     snap: dict = {}
     r = _run_cli({}, "--help")
-    snap["root_help_sha"] = _sha(r.stdout)
+    snap["root_help_sha"] = _sha(_norm(r.stdout))
     for cmd in KNOWN_SUBCMDS:
         r = _run_cli({}, cmd, "--help")
-        snap.setdefault("subcmd_sha", {})[cmd] = _sha(r.stdout)
+        snap.setdefault("subcmd_sha", {})[cmd] = _sha(_norm(r.stdout))
 
     tmp = tempfile.mkdtemp(prefix="zmem-char-snap-")
     store = builder.build_store(tmp)
@@ -142,11 +158,11 @@ def _capture_snapshot() -> dict:
         ("export_jsonl", ("export-jsonl",)),
     ]:
         h = _run_cli(env, *argv)
-        out = _norm_stats(h.stdout) if label == "stats" else h.stdout
+        out = _norm_stats(h.stdout) if label == "stats" else _norm(h.stdout)
         snap.setdefault("data_sha", {})[label] = _sha(out)
     builder._pin_timestamps(store)  # clear any prior telemetry before recall
     h = _run_cli(env, "recall", "--query", "python insertion", "--json", "--limit", "5")
-    snap.setdefault("data_sha", {})["recall"] = _sha(h.stdout)
+    snap.setdefault("data_sha", {})["recall"] = _sha(_norm(h.stdout))
     return snap
 
 
@@ -168,7 +184,7 @@ class CharacterizationTests(unittest.TestCase):
     def test_root_help_surface(self):
         r = _run_cli({}, "--help")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self._assert_sha("root --help", _sha(r.stdout), ROOT_HELP_SHA)
+        self._assert_sha("root --help", _sha(_norm(r.stdout)), ROOT_HELP_SHA)
         # Every known subcommand must still appear in the root help.
         for cmd in KNOWN_SUBCMDS:
             self.assertIn(cmd, r.stdout)
@@ -177,7 +193,7 @@ class CharacterizationTests(unittest.TestCase):
         for cmd in KNOWN_SUBCMDS:
             r = _run_cli({}, cmd, "--help")
             self.assertEqual(r.returncode, 0, f"{cmd} --help rc={r.returncode}")
-            self._assert_sha(f"{cmd} --help", _sha(r.stdout), SUBCMD_SHA.get(cmd, ""))
+            self._assert_sha(f"{cmd} --help", _sha(_norm(r.stdout)), SUBCMD_SHA.get(cmd, ""))
 
     def test_data_stats(self):
         r = _run_cli(self.env, "stats")
@@ -190,17 +206,17 @@ class CharacterizationTests(unittest.TestCase):
         # NOTE: `list` has no `--json` flag today (issue #57 said "list --json",
         # but the real CLI emits a human format). Characterize the real surface.
         self.assertTrue(r.stdout.strip(), "list emitted no output")
-        self._assert_sha("list", _sha(r.stdout), DATA_SHA["list"])
+        self._assert_sha("list", _sha(_norm(r.stdout)), DATA_SHA["list"])
 
     def test_data_recall_json(self):
         r = _run_cli(self.env, "recall", "--query", "python insertion", "--json", "--limit", "5")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self._assert_sha("recall --json", _sha(r.stdout), DATA_SHA["recall"])
+        self._assert_sha("recall --json", _sha(_norm(r.stdout)), DATA_SHA["recall"])
 
     def test_data_export_jsonl(self):
         r = _run_cli(self.env, "export-jsonl")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self._assert_sha("export-jsonl", _sha(r.stdout), DATA_SHA["export_jsonl"])
+        self._assert_sha("export-jsonl", _sha(_norm(r.stdout)), DATA_SHA["export_jsonl"])
 
 
 if __name__ == "__main__":

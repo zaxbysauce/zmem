@@ -9,25 +9,22 @@ Run: python tests/test_storelib_exports.py
 
 from __future__ import annotations
 
+import importlib
 import os
+import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 
-# Point ZMEM_STORE at a throwaway path BEFORE importing store (host precedence:
-# ZMEM_STORE outranks ZMEM_DATA / home defaults) so the real ~/.zmem is never
-# touched at import time.
-_IMPORT_TMP = tempfile.mkdtemp(prefix="zmem-export-")
-os.environ["ZMEM_STORE"] = os.path.join(_IMPORT_TMP, "store.sqlite")
-os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
-
-sys.path.insert(0, str(SCRIPTS_DIR))
-
-import store  # noqa: E402
+# Imported in setUpClass (not at module import) so the env/sys.path mutations
+# `import store` needs are confined to this test class and do not leak into a
+# shared runner's collection.
+store = None
 
 
 EXPECTED_EXPORTS = [
@@ -68,6 +65,29 @@ EXPECTED_EXPORTS = [
 
 
 class ExportSurfaceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Import `store` once, scoped so the process-global changes (ZMEM_STORE,
+        # SCRIPTS_DIR on sys.path, the SCRIPTS_DIR insert store.py adds) are
+        # confined to this class and cleaned up after (PRR-002).
+        cls.tmp = tempfile.mkdtemp(prefix="zmem-export-")
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        env = {**os.environ,
+               "ZMEM_STORE": os.path.join(cls.tmp, "store.sqlite"),
+               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        with mock.patch.dict(os.environ, env):
+            sys.path.insert(0, str(SCRIPTS_DIR))
+            global store
+            store = importlib.import_module("store")
+        cls.addClassCleanup(cls._restore_import_state)
+
+    @classmethod
+    def _restore_import_state(cls):
+        try:
+            sys.path.remove(str(SCRIPTS_DIR))
+        except ValueError:
+            pass
+
     def test_every_presplit_export_still_resolves(self):
         missing = sorted(n for n in EXPECTED_EXPORTS if not hasattr(store, n))
         self.assertEqual(
