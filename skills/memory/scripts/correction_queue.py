@@ -19,7 +19,7 @@ Why a sidecar queue instead of a direct store write:
     store.
 
 Design rules (zmem invariants):
-  - Stdlib-only, Python 3.8+, cross-platform (Windows CI).
+  - Stdlib-only, Python 3.11+, cross-platform (Windows CI).
   - The queue is a local plaintext file like the store; the write-time secret
     scan is ADVISORY only (never blocks; redacts in `auto`, annotates
     `secret_warning` in `manual`).

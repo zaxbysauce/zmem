@@ -23,7 +23,8 @@ ZCode's memory system has three tiers:
 The SessionStart hook injects the absolute path to `store.py` into context each
 session (look for `# Memory skill: invoke "...store.py" <subcommand>`). Use that
 exact path. On Windows it will be a Windows-format path like
-`C:\Users\...\plugins\data\zmem@...\skills\memory\scripts\store.py`.
+`C:\Users\...\plugins\data\zmem@...\skills\memory\scripts\store.py`
+(the `...` segments are elision placeholders, not real paths).
 If you cannot find the injected path, the script is at the plugin root under
 `skills/memory/scripts/store.py`.
 
@@ -50,10 +51,10 @@ Read-only preflight for cutover and operator debugging. It never mutates the
 store or host config. Checks:
 - resolved store path and split-brain env/config risk
 - local/non-OneDrive store path safety
-- Python version + SQLite FTS5
+- Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v6
+- schema compatibility against current v8
 - Claude/Codex native-memory conflicts via read-only config inspection
 - canonical namespace for the provided project
 - host surface presence (Claude plugin, ZCode plugin, memory skill; repo-local
@@ -65,7 +66,8 @@ surface change.
 ### recall — surface relevant memories (high-precision)
 ```
 python <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
-                          [--include-global] [--global-limit 3] [--json]
+                          [--include-global] [--global-limit 3] [--hybrid]
+                          [--no-bump] [--json]
 ```
 Returns live (non-superseded) memories matching the query, filtered by confidence
 floor (>=0.25) and namespace. Prefer `--namespace project:<basename>` to scope to
@@ -79,6 +81,24 @@ lessons reach project-scoped sessions. Without it, behaviour is strict-namespace
 want a per-tier budget, use `recall --namespace project:<x> --include-global`
 rather than going unscoped.
 
+`--hybrid` (opt-in) adds a vector lane on top of the FTS5/BM25 keyword lane:
+the query is embedded and matched against stored embeddings (sqlite-vec KNN),
+then both lanes' rankings are fused with Reciprocal Rank Fusion (RRF, k=60).
+It requires the optional embedding runtime (onnxruntime + tokenizers, model
+lazy-downloaded and checksum-verified) and fails open: when the runtime or
+model is unavailable, recall silently uses plain keyword ranking — same
+results as without the flag, never an error.
+
+`--no-bump` (opt-in) makes a recall **passive**: it records a surface event
+(`surfaced_count`/`last_surfaced`) instead of advancing `retrieval_count`/
+`last_retrieved`. The explicit-vs-passive split is the system contract: the
+three automatic hooks and the Hermes provider prefetch are passive surfaces
+(they pass `--no-bump` — a background injection is not a usefulness signal);
+explicit recall — this CLI without `--no-bump`, the MCP `recall`/`search`
+tools, and the Hermes `MemoryProvider` search tool — intentionally bumps
+`retrieval_count`, because an explicit read IS evidence the memory was useful
+(issue #21).
+
 ### add — capture a memory
 ```
 python <store.py> add \
@@ -89,9 +109,11 @@ python <store.py> add \
   --signal <test|compile|lint|reviewer|user|none> \
   [--source-ref "file:<path>" | "session:<id>" | "db:<table>:<rowid>"]
 ```
-Signal sets default confidence: test/compile/lint=high (0.85-0.9, promotable to
-skills later), reviewer/user=medium (0.6), none=low (0.3, now above the 0.25
-floor and reachable by recall).
+Signal sets default confidence: test/compile=0.9, lint=0.85, reviewer/user=0.6
+(medium), none=0.2 — deliberately BELOW the 0.25 recall floor: an ungrounded
+lesson is the agent's self-opinion and never surfaces in default recall (still
+reachable via `search --text`, which applies no confidence floor, or
+`recent --min-confidence 0`) (#36 M3).
 Dedup-on-write: near-identical live content in the same namespace refreshes the
 existing entry instead of duplicating.
 Namespace validation: obvious misspellings of the global namespace (`global`,
@@ -295,9 +317,12 @@ python <store.py> export-pack --namespace NS [--out FILE] [--project-limit 50] \
 ```
 Renders live memories from `--namespace` and `user:global` (confidence DESC,
 retrieval_count + surfaced_count DESC, ingestion_ts DESC) as a hand-off markdown pack,
-e.g. for a cloud/remote session with no store access. `--max-bytes` budgets the bullet
-lines only: a bullet that would push past it is omitted whole (never
-truncated), and smaller rows behind it are still emitted. Refuses (exit 2) if
+e.g. for a cloud/remote session with no store access. `--max-bytes` is a UTF-8
+byte budget over the whole rendered pack (structural framing counts toward
+the cap): a bullet that would push past it is omitted whole (never
+truncated), smaller rows behind it are still emitted, and only framing
+appended after the walk (an empty section's heading and the trailing
+omitted-count note) can exceed the budget. Refuses (exit 2) if
 both sections are empty.
 
 ### export-jsonl — export Tier 3 sync JSONL
@@ -367,7 +392,13 @@ combines:
 
 Confidence is still a hard floor (below 0.25 is dropped before scoring).
 Staleness demotion halves confidence, which feeds into the confidence component.
-Keyword-first, not semantic — vector/embedding recall is a future optional tier.
+
+Optional **hybrid recall** (`--hybrid`) adds a vector/embedding lane on top of
+this keyword pipeline: the two lanes' rankings are fused with Reciprocal Rank
+Fusion (RRF, k=60), so a memory BM25 missed can still surface via embedding
+similarity. It needs the optional onnxruntime/tokenizers runtime and embedding
+model; without them recall fails open to plain FTS5 keyword ranking (see the
+`recall` command section above for the full contract).
 
 The `rebuild-fts` subcommand rebuilds the FTS5 index from scratch (useful after
 bulk imports or if the index drifts):

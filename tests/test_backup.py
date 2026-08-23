@@ -38,8 +38,8 @@ PYTHON = sys.executable
 NS = "project:backuptest"
 
 # Point the module-level STORE_PATH at a throwaway location BEFORE importing
-# store.py: `C:\Users\Brett\.zmem` is the real box store and must never be the
-# import-time default in a test process.
+# store.py: the real box store at ~/.zmem (i.e. %USERPROFILE%\.zmem) must never
+# be the import-time default in a test process.
 _IMPORT_TMP = tempfile.mkdtemp(prefix="zmem-import-")
 os.environ["ZMEM_STORE"] = os.path.join(_IMPORT_TMP, "store.sqlite")
 os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")

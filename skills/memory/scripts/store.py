@@ -21,7 +21,8 @@ Usage:
   python store.py recent [--namespace NS] [--limit 5] [--min-confidence 0.5] [--json]
   python store.py search --text "..." [--namespace NS] [--limit 10]
   python store.py supersede --id <id> [--reason "..."]
-  python store.py get --id <id>
+  python store.py get --id <id>    (not-found contract: exit 1 + stderr
+                                    "[zmem] no memory with id <id>"; found: exit 0 + JSON)
   python store.py list [--namespace NS] [--limit 50] [--include-superseded]
   python store.py stats
   python store.py backup [--retention 7] [--out-dir DIR] [--if-due]
@@ -232,9 +233,10 @@ SIGNAL_CONFIDENCE = {
     # ungrounded self-opinion, and the README's trust-tiering design says they
     # sit below the default retrieval floor (the cited research finds
     # ungrounded lessons degrade accuracy). At 0.2 they are excluded from
-    # default recall but still retrievable via an explicit low
-    # --min-confidence / keyword search. Previously 0.3 > 0.25 floor, which
-    # contradicted the docs and let ungrounded content surface by default (#36 M3).
+    # default recall but still retrievable via keyword search (`search --text`
+    # applies no confidence floor) or `recent --min-confidence 0`. Previously
+    # 0.3 > 0.25 floor, which contradicted the docs and let ungrounded
+    # content surface by default (#36 M3).
     "none": 0.2,
 }
 
@@ -634,7 +636,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 # Old-style (`project:<basename>`) namespace keys and the live checkout each one
-# must be re-derived from. The distributable runtime does NOT ship Brett- or
+# must be re-derived from. The distributable runtime does NOT ship operator- or
 # machine-specific checkout paths. Instead, operators can provide a portable
 # JSON object via ZMEM_NS_MIGRATION_MAP:
 #   {"project:oldname": "C:/path/to/current/checkout", ...}
@@ -2445,12 +2447,17 @@ def get_memory(conn, mid) -> bool:
     """Print a memory as JSON. Returns True if found, False if not — so the CLI
     dispatch can exit non-zero on a miss (fail-closed, matching `supersede`),
     not silently exit 0 while a caller checking `$?` treats "not found" as
-    success (#36 M2)."""
+    success (#36 M2). Binary columns (the embedding BLOB on hosts where the
+    optional runtime embedded the row) render as a `<N-byte blob>` marker:
+    `SELECT *` would otherwise raise `TypeError: Object of type bytes is not
+    JSON serializable` on embedding-enabled hosts — a crash the model-absent
+    CI matrix can never see (#38 I7 / #56)."""
     r = conn.execute("SELECT * FROM memory WHERE id=?", (mid,)).fetchone()
     if not r:
         print(f"[zmem] no memory with id {mid}", file=sys.stderr)
         return False
-    d = dict(r)
+    d = {k: (f"<{len(v)}-byte blob>" if isinstance(v, bytes) else v)
+         for k, v in dict(r).items()}
     print(json.dumps(d, indent=2))
     return True
 
@@ -6063,8 +6070,17 @@ def main():
     p_sup.add_argument("--id", required=True)
     p_sup.add_argument("--reason", default="")
 
-    p_get = sub.add_parser("get", help="show a memory by id")
-    p_get.add_argument("--id", required=True)
+    p_get = sub.add_parser(
+        "get",
+        help="show a memory by id",
+        description="Show one memory row as JSON (binary columns render as a "
+                    "'<N-byte blob>' marker). Exit contract: 0 + JSON on "
+                    "stdout when found; 1 with the stable stderr line "
+                    "`[zmem] no memory with id <id>` when no row has that id "
+                    "— the same not-found code as `supersede`, never a "
+                    "traceback.")
+    p_get.add_argument("--id", required=True,
+                       help="id of the memory to show")
 
     p_list = sub.add_parser("list", help="list memories")
     p_list.add_argument("--namespace", default=None)
@@ -6214,11 +6230,13 @@ def main():
                                default=EXPORT_PACK_DEFAULT_MAX_BYTES,
                                help="budget (UTF-8 bytes) for the bullet lines; a bullet that "
                                     "would exceed it is omitted whole, never truncated, and "
-                                    "later smaller bullets are still emitted. Structural text "
-                                    "(header, titles, section headings, '(none)', the "
-                                    "omitted-count note) is exempt, so the file itself can "
-                                    "exceed this by that framing "
-                                    f"(default {EXPORT_PACK_DEFAULT_MAX_BYTES})")
+                                    "later smaller bullets are still emitted. The budget "
+                                    "applies to the whole rendered pack — structural framing "
+                                    "(header, titles, section headings, '(none)') counts "
+                                    "toward the cap — so only framing appended after the "
+                                    "walk (an empty later section's heading/'(none)' and the "
+                                    "trailing omitted-count note, rendered whenever rows "
+                                    f"were omitted) can push the output past it (default {EXPORT_PACK_DEFAULT_MAX_BYTES})")
 
     p_export_jsonl = sub.add_parser(
         "export-jsonl",

@@ -73,7 +73,7 @@ retrieval floor by default). This follows the finding that intrinsic self-correc
     (optional — without it the server logs a startup warning and `add` stores
     rows without embeddings); the remote box needs only the `mcp_servers:`
     config entry (Hermes bundles the MCP client SDK)
-- Python 3.8+ with sqlite3 + FTS5 (standard in CPython; verify with
+- Python 3.11+ with sqlite3 + FTS5 (standard in CPython; verify with
   `python -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')"` )
 - Git Bash / Cygwin on Windows (for the ZCode/CC hook scripts); or any POSIX shell on macOS/Linux.
   The Hermes hooks are pure stdlib Python — no shell dependency.
@@ -176,7 +176,7 @@ inactive — **copy users must set `ZMEM_HOME`** to this repo's checkout path
    cp -r /path/to/zmem/hermes-plugin ~/.hermes/plugins/memory/zmem
    ```
    On Windows (no symlinks without admin): a directory junction
-   (`mklink /J C:\Users\you\.hermes\plugins\memory\zmem C:\code\zmem\hermes-plugin`)
+   (`mklink /J %USERPROFILE%\.hermes\plugins\memory\zmem C:\code\zmem\hermes-plugin`)
    preserves auto-detection; a plain copy does not.
 3. Enable the provider in `~/.hermes/config.yaml`:
    ```yaml

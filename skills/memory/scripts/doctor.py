@@ -291,13 +291,18 @@ def _check_local_path(resolved_store: Path) -> dict:
     )
 
 
+PYTHON_FLOOR = (3, 11)
+
+
 def _check_python() -> dict:
     version = sys.version.split()[0]
-    if sys.version_info < (3, 8):
+    if sys.version_info < PYTHON_FLOOR:
         return _check(
             "python",
-            "fail",
-            f"Python {version} is too old; zmem requires Python 3.8+.",
+            "warn",
+            f"Python {version} is below the supported floor; zmem is tested on "
+            f"Python {PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]}+ (CI and the Hermes lane "
+            "both run 3.11).",
             version=version,
             interpreter=sys.executable,
         )
