@@ -41,46 +41,54 @@ PYTHON = sys.executable
 
 RECORD = os.environ.get("ZMEM_CHAR_RECORD") == "1"
 
+# Width-insensitive whitespace / time / path normalizers used by _norm and
+# _norm_stats. Compiled at import so the freeze is deterministic across
+# argparse HelpFormatter widths (which read shutil.get_terminal_size()),
+# wall-clock relative durations, and OS path separators in `models_dir=...`.
+_WS_RE = __import__("re").compile(r"  +")          # 2+ spaces -> single space
+_RE_AGO = __import__("re").compile(r"\b\d+[dhs] ago\b")
+_RE_MODELS_DIR = __import__("re").compile(r"models_dir=[^\s)]+")
+
 # Frozen pre-split snapshots. Compute via ZMEM_CHAR_RECORD=1 (see RECORD mode).
 # Captured from the behavior-identical split (verified byte-identical to
 # pre-split `ddce432` store.py) on 2026-08-22. Every surface is LF-normalized
 # (CRLF collapsed to LF) and `stats` relative durations are time-normalized
 # before hashing, so the freeze is deterministic across OS line endings and
 # wall-clock time (the capture method, not just one machine).
-ROOT_HELP_SHA = "7522d1c79f7232fb4ad1dc72ad79f0658cd37da9c73a37ef4bc3bbb9056f9f59"
+ROOT_HELP_SHA = "9f9b0d3824810e64268c9e41a4b9ba57b7abec9399aff4262c0f7ccf9358dcf2"
 SUBCMD_SHA = {
-    "init": "c6248e4bf68fcb949e1af8bf62a73c8169f1bef672f7e56cf6e52b3961a252f0",
-    "add": "ea3811a4d2212bef6e36f13dd9ba16362aea4ce53bed529eae5e80b501a74ad0",
-    "recall": "4b1852913678bd550d40691e4166354e28cdec43a43123c42ba6b3963a3359d2",
-    "recent": "317a60ef86d11c72afba69b92d12c69b026aa57275b70bc4df4c4a0acf13ca8b",
-    "search": "938f20685ffc79cd09178bcab1af1d28d3758340fb35489455ed43fbc2b93c7a",
-    "supersede": "0b9e5755e77671c1fa7785857c63477003dff54a94d524660274eb2073f0a578",
-    "get": "1735bf227e590c7c2fb5b0b9171d173fddd0c2ee4a9b0db8e5c593fddc116510",
-    "list": "71e3a288e92ab6a3ddf287e8854782e9988b704c70e532564b852b25b6e3df10",
-    "stats": "b52bd98a6495f0f4648be512a7ac5cc09670141f2d93fddcd7a2830c6a844c77",
-    "path": "52d7dbd661ed9b94a86e23c3aa4ab6ea6ceeb67057dae0b6c56d1905d7804190",
-    "session-cadence": "f8ef0eecaa355c560943cbefaa10926017afa9cb7768573f2d1384b867614bf8",
-    "rebuild-fts": "80e8c88d05adba518aab2778e4a8084654043a0e81b44691cbc9f53f33d4917a",
-    "reembed": "64ecd65f18aa4a37b9738b5d4db973b4e32ed63bf4ea373c8771a4891072193c",
-    "consolidate": "bff160270d072deaf35ed860e795f6051cc0cbb518d32a918c1e1c77d6fededf",
-    "promote": "4bd6ac0be86583b09cb35a3b8d605280c182b88afaef633cb71d91837d3a0d84",
-    "rekey-namespace": "aeb2f4f5502972b35a9a6f2da4fc605b6ba92767feccdb6e4e53072b89f80e2e",
-    "backup": "c688129c5cc2af61112db9ec4891bc0c7d544e244bee57acfb3d1777e78bc929",
-    "restore": "6b2302a2dffb9766f29bcb31cd71224b990d608e7dfd3b72f21950927775ea8e",
-    "export-pack": "93e83153cb1a79aa98ed0d8583957cc974bdad65342500fd06ba41636b6e07fa",
-    "export-jsonl": "d6d3fb3c8f8e653da7635df70152b7e7f226409e71d85a34467a618f21ba7b56",
-    "ingest-jsonl": "45b4a299c658f7588bd468cfcc28eaea97c5dae487a4d3dd0a5463e465c0d232",
-    "failures": "3c6924a8cb34ffce47554c4d1ea7aa1ef57457b911eed1df3bbc1c18538061da",
-    "corrections": "dbc812034ec316cbbde8d32c16d80f81bf0abf6a9da3cb7c81d8c2ab22b10400",
-    "queue-list": "00ce96c369a3b136c441db89ffce3de574e1d4a8de508da12c16f72a308a485f",
-    "queue-clear": "8db9216aff1b5f201c8c97d8190498899e06237caad162f474c71be6302c60cc",
-    "mine-history": "9d75be80028c6209b83afa189d31f23044d9243f48655b6f9e32a5fc6e31e671",
-    "sweep": "a4470aad9d62bfa4daf1d6fe61386218b8fcf2c6b13e0b34ab6c101161e4c6f0",
+    "init": "4a5e07e603d6204196f2a41effe4913b5ed0d7ee57315916bf107f63fb827c72",
+    "add": "837c5e6249992e88a5827540c1cce5ad38e671fedbe14f589160339d6f19e8db",
+    "recall": "95b03a32b923aaec9cb026b5ee6572318e4e755e417963ce019edfece27e16f3",
+    "recent": "b4c03f9a85b29fa2a49dc4014ce63e6e9f8f919c9f17d646643454db67741382",
+    "search": "e4d48834bc8a0ed7532da6c5f251649673b7584162386725bc2fb54e66d3f77b",
+    "supersede": "a3dc88b6534285b78c83ded09b24fc27c042001f04a7d4b05ddcc4702b4a1cab",
+    "get": "fbb05d585a857af7a225dc48da8c20355449a3138e2db39cda55f16a7150f6f7",
+    "list": "ccaff6e58329e784b49944101aa52b81a517ba5f72771a3e27f2df7fedd471f9",
+    "stats": "1114b0e55b8e4c114ecdeed54f0450a5e4428aaffe9200bf029f78b319b18acb",
+    "path": "a42f2f7d925ef7e38798e1d2119bfa4e37dce1fe735b16e915e93948ad0c3377",
+    "session-cadence": "c5564e1c3421870b1bfca127b56aca1a1e0272959d61ac89983a919b3d10ae7c",
+    "rebuild-fts": "f334a4f49b51ba386f203ba26fcafbf012c666feb261a93fe328a69762afcda9",
+    "reembed": "ab523cebea15cc8cbc30f89bd950ce564d6dfc032fbfcf58764d3d492a83cd13",
+    "consolidate": "ec7d75e67fe96a043f0a7b4cdd7337cc15e236b43c21aa560c04ca5fdb2b61c9",
+    "promote": "563fc9b899ae1768eba2d88cc81329f4eb2e35af4ccb1c915f8f3dafb040381d",
+    "rekey-namespace": "b562cc3cc6c1d17bb3213c107a0a0a73e4706e6798d09cd01b372e5759ab33b1",
+    "backup": "25b253eac3eaacd8718dab22fc66fbf80351324a67ce6b28317b3b47f542df0f",
+    "restore": "790a2b7e46e4c0d551e4a3e42bca6d15555d3221a53cdd646c739d88e19a6d6c",
+    "export-pack": "fd4314fbd7acba972b0ddbb3106eb5964d5b487147d148c3fcb2f14864297614",
+    "export-jsonl": "5063721b595fe9ceb25c1effcf5cb2901ee9d04a9a96b79bff873d6b668fcb9c",
+    "ingest-jsonl": "00663d3d9f55acb732325b670c7cba8684556f9aaeadef8f357ea82e992a9ec9",
+    "failures": "dc4453c0479b2025d66f67fb35bcf599023d12beea1c211bfe7a1a4db1b89d60",
+    "corrections": "81339f793fe900689fabbcfb4dea12e31222c16eb7907ebf647b3a2b6abeaa71",
+    "queue-list": "4fadd3550777991421446d6c6e292f0c1693d5de0abccea962462f2abacead0e",
+    "queue-clear": "6331cca34ba06810dfa88b5536a68187c1ce29847d4617303e7bc6d423617de9",
+    "mine-history": "395d7e86cc9f3e48f88209dccb8156ca940736f330ad01ca0584deb86f0ed9ac",
+    "sweep": "2a84ed3a01faa2c1e0f6187d778506c726b43586022f49d3fa1c3f8015e1b962",
 }
 DATA_SHA = {
-    "stats": "a57af2ea9cc6979991b5a326ad2b00a4a66c8b7df78acf3f4315cc27b01b42e7",
+    "stats": "01d4d5cfd861585517eb9818828556a25ae7bcd10cc2e66b142a51d617799328",
     "list": "c2e285928d3ee75154a12e4a61947d6793d3bc8f55edb0b3319e73ff4b75a598",
-    "recall": "24226d852d52ebf3be91d6f12e813c8d6876342049077f093d2ac7810e300e79",
+    "recall": "d9dfc946c923c8c38d76cd7bdf828e09926881d1a33a3d86b031e9074d3d17a0",
     "export_jsonl": "24d7c3b13cecc31fa3a845ee5a181369627298410bc3d41ccf90c043e460ce65",
 }
 KNOWN_SUBCMDS = [
@@ -98,14 +106,22 @@ def _sha(text: str) -> str:
 
 def _norm(text: str) -> str:
     """Normalize platform-dependent text before hashing so the freeze is
-    deterministic across OS line endings and wall-clock time."""
+    deterministic across OS line endings, argparse wrap width, and wall-clock
+    time."""
     # CRLF vs LF: Windows-touched checkouts write \r\n to stdout; Linux CI \n.
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Per-line: argparse HelpFormatter pads columns based on terminal width
+    # (shutil.get_terminal_size()), so the same help text wraps/pads
+    # differently across runners. Strip trailing whitespace and collapse runs
+    # of 2+ spaces (inter-column padding) to a single space, preserving
+    # newlines. This is content-preserving (argparse uses single spaces as
+    # real separators) but width-insensitive.
+    lines = [_WS_RE.sub(" ", ln).rstrip() for ln in text.split("\n")]
+    text = "\n".join(lines)
     # Wall-clock relative durations ("201d ago") drift daily from the pinned
     # fixture timestamps; collapse to a sentinel. The absolute ISO timestamps
     # beside them are pinned/static, so only the `Nd ago` prefix moves.
-    import re as _re
-    text = _re.sub(r"\b\d+[dhs] ago\b", "X ago", text)
+    text = _RE_AGO.sub("X ago", text)
     return text
 
 
@@ -116,7 +132,13 @@ def _norm_stats(text: str) -> str:
         if ln.startswith("store: "):
             ln = "store: __STORE__"
         lines.append(ln)
-    return _norm("\n".join(lines))
+    normed = "\n".join(lines)
+    # The `models_dir=<path>)` token value differs by OS (Windows backslash
+    # vs POSIX slash); the replace above matches the captured env value, but
+    # also normalize the literal token form to a sentinel so a re-capture on
+    # a different OS cannot leave a divergent path.
+    normed = _RE_MODELS_DIR.sub("models_dir=__MODELS_DIR__", normed)
+    return _norm(normed)
 
 
 def _run_env(tmp: str) -> dict:
@@ -127,6 +149,11 @@ def _run_env(tmp: str) -> dict:
 
 
 def _run_cli(env: dict, *args: str) -> subprocess.CompletedProcess:
+    # Pin COLUMNS so argparse HelpFormatter wraps at a deterministic width
+    # regardless of the runner's terminal size. Without this, the same help
+    # text wraps at different line breaks on different hosts, which is the
+    # single biggest source of cross-platform hash drift after CRLF.
+    env = {**env, "COLUMNS": "100"}
     r = subprocess.run([PYTHON, str(STORE_PY), *args], env=env,
                        capture_output=True, timeout=90)
     # Child runs with PYTHONIOENCODING=utf-8 (see builder.BASE_ENV), so bytes
