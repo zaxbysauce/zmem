@@ -163,14 +163,25 @@ class DoctorChecksTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_store = Path(tmp) / "store.sqlite"
             env = {**os.environ, "ZMEM_STORE": str(tmp_store)}
-            try:
-                out = subprocess.run(
-                    [sys.executable, str(scripts_dir / "doctor.py"), "--format", "json"],
-                    capture_output=True, text=True, check=True, env=env,
-                ).stdout
-            except subprocess.CalledProcessError as exc:
-                self.fail(f"doctor.py failed: {exc.stderr}")
-            report = json.loads(out)
+            # doctor exits 1 whenever ANY check is fail-level (e.g.
+            # store-access on the nonexistent tmp store, node/bash
+            # absence on a bare CI runner) — the exit code is about the
+            # OVERALL report, not about our two checks. Accept 0 or 1;
+            # the assertion is on the JSON check ids.
+            r = subprocess.run(
+                [sys.executable, str(scripts_dir / "doctor.py"), "--format", "json"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertIn(
+                r.returncode, (0, 1),
+                f"doctor.py exited {r.returncode} (unexpected; stderr: "
+                f"{r.stderr[:400]})",
+            )
+            self.assertTrue(
+                r.stdout.strip(),
+                f"doctor.py printed no JSON (stderr: {r.stderr[:400]})",
+            )
+            report = json.loads(r.stdout)
             check_ids = {c["id"] for c in report["checks"]}
             self.assertIn(
                 "hybrid-default", check_ids,
