@@ -162,7 +162,7 @@ condition ("when X, do Y, because Z") so recall can match a future situation.
 ```bash
 python "$S" add \
   --namespace "<derived namespace or user:global>" \
-  --type <lesson|convention|fact|preference> \
+  --type <lesson|convention|fact|preference|decision|constraint> \
   --content "<specific, actionable, includes the trigger condition>" \
   --tags "comma,separated" \
   --signal <test|compile|lint|reviewer|user|none> \
@@ -193,14 +193,29 @@ narrative or duplicating docs — re-apply the bar.
 ## Step 3 — Supersede what is now wrong
 
 If this session disproved, replaced, or outdated a stored memory, tombstone it.
-This preserves history while removing it from recall:
+This preserves history while removing it from recall (issue #59):
 
 ```bash
-python "$S" supersede --id <full-uuid> --reason "<what changed and why>"
+python "$S" invalidate --id <full-uuid> --reason "<why the fact is no longer true>"
 ```
 
-Then capture the corrected lesson as a new row. A store whose wrong entries are
-never retired will confidently mislead a future session.
+`invalidate` REQUIRES a reason — it is the preferred form for "this fact is no
+longer true" because the correction is auditable. For a revision that keeps the
+same topic (wrong details, now corrected) use `update` instead, which is
+append-only and preserves point-in-time recall:
+
+```bash
+python "$S" update --id <full-uuid> --content "<the corrected lesson>"
+```
+
+`update` tombstones the old row, creates a NEW live row, and links the new row
+back via `update_of` — `--as-of` before the update still returns the OLD
+content, so the correction never destroys history. Plain `supersede` remains
+for general tombstones (consolidated/pruned rows) where no reason is required.
+
+Then capture the corrected lesson as a new row if `update` was not the right
+shape. A store whose wrong entries are never retired will confidently mislead
+a future session.
 
 ## Step 4 — Consolidate near-duplicates
 

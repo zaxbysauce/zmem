@@ -12,6 +12,53 @@ README.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-24
+
+### Added
+
+- **Schema v9: append-only knowledge lineage** (issue [#59], SOTA PR 4/10).
+  All seven mandatory tasks shipped, with no stubs and no unwired code:
+  - `store.py update` / `store.py invalidate` — schema-validated, append-only
+    history. `update` re-creates the row with `update_of` linkage, tombstones
+    the old row (`superseded_at` + `valid_until`), and inherits provenance
+    (folding into an existing live duplicate when one is found); `invalidate`
+    REQUIRES a reason and tombstones with the closed `valid_from`/`valid_until`
+    interval.
+  - `--as-of ISO-8601` on `recall`/`recent`/`search` now applies the FULL
+    temporal predicate via `_as_of_temporal_predicate`: `valid_from` is
+    INCLUSIVE, `valid_until` is EXCLUSIVE, and the hard `superseded_at IS
+    NULL` filter is dropped when as_of is set — a point-in-time read recovers
+    content that was valid at that instant. Lane bound: in hybrid mode such a
+    row is reachable only through the lexical (FTS5) lane; the vector lane
+    keeps its live-only pool (documented in SKILL.md).
+  - New `type` values `decision` and `constraint` (closed enum, word-exact
+    ratchet), accepted end to end by capture tooling.
+  - Taint provenance with a closed three-rank model
+    (`trusted_internal < untrusted_tool < untrusted_web`): worst-of lineage
+    through update re-creation and consolidate absorb; unknown taint refused;
+    `[UNTRUSTED TOOL]` / `[UNTRUSTED WEB]` markers on the explicit recall
+    text path; passive (`--no-bump`) surfaces omit `untrusted_web` exactly
+    like injection-risk rows.
+  - Hermes and MCP agent surfaces default new memories to `untrusted_tool`
+    and validate taint against the shared `schema_meta` enum.
+  - Wiring everywhere the feature has a surface: CLI, Hermes, MCP tools,
+    JSONL ingest/sync (authoring + validation), doctor checks, CUTOVER.md,
+    and SKILL.md.
+
+### Fixed
+
+- Replaced the earlier `valid_until` placeholder (“Phase 4”) with the real
+  predicate; the `_recall_one_tier`/`_recent_one_tier`/`_fetch_by_ids`
+  docstrings no longer claim a placeholder exists.
+
+### Known issues
+
+- Historic content valid only *before* a supersede is not reachable via the
+  semantic vector lane in hybrid `--as-of` recall (the vector candidate pool
+  is live-only); re-run with `--no-hybrid` to include the lexical lane.
+
+[#59]: https://github.com/zaxbysauce/zmem/issues/59
+
 ## [0.8.9] — 2026-08-24
 
 ### Added

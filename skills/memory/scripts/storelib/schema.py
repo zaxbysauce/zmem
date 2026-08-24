@@ -22,12 +22,14 @@ from pathlib import Path
 # Shared single source of truth (dependency-free, resolved from this dir).
 try:
     from schema_meta import (SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY,
-        MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS,
+        MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS, ALLOWED_TAINTS,
+        TAINT_RANK, TAINT_TRUSTED_SIGNALS, validate_taint, worse_taint,
         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from schema_meta import (SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY,
-        MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS,
+        MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS, ALLOWED_TAINTS,
+        TAINT_RANK, TAINT_TRUSTED_SIGNALS, validate_taint, worse_taint,
         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)  # type: ignore
 
 try:
@@ -562,7 +564,22 @@ def init_db(conn: sqlite3.Connection) -> None:
             -- (SQLite can't replicate Python's Unicode-aware .lower() + \s+
             -- collapse, so a generated column would silently diverge). Indexed
             -- with a partial index on live rows to match the dedup-query predicate.
-            content_norm    TEXT
+            content_norm    TEXT,
+            -- v9 (issue #59): append-only knowledge-update lineage + provenance
+            -- trust. valid_until: the exclusive end of validity (empty = never
+            -- expires). Non-empty valid_until implies the row is tombstoned
+            -- (superseded_at NOT NULL): the two are written together and the
+            -- as-of predicate treats a set valid_until as the row's real end.
+            -- update_of: the id of the row this LIVE row replaces (an `update`
+            -- re-creates a fact: old row tombstones, new row carries update_of
+            -- pointing back at it). taint: provenance/trust rank of the row's
+            -- origin (trusted_internal < untrusted_tool < untrusted_web). The
+            -- CHECK is the schema-level enforcement of the closed three-rank
+            -- enum; application code validates too (issue #59, 4.7).
+            valid_until     TEXT NOT NULL DEFAULT '',
+            update_of       TEXT NOT NULL DEFAULT '',
+            taint           TEXT NOT NULL DEFAULT 'trusted_internal'
+                CHECK (taint IN ('trusted_internal','untrusted_tool','untrusted_web'))
         );
         CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory(namespace);
         CREATE INDEX IF NOT EXISTS idx_memory_live ON memory(superseded_at) WHERE superseded_at IS NULL;
@@ -615,6 +632,18 @@ def init_db(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_memory_content_norm "
         "ON memory(namespace, content_norm) WHERE superseded_at IS NULL"
     )
+    # v9 (issue #59): temporal-history index. Created ONLY when the v9 columns
+    # already exist — on a fresh store the CREATE TABLE above added them, but
+    # on a legacy pre-v9 store init_db()'s CREATE TABLE is a no-op and the v9
+    # migrate block (which runs after init_db) is the one that adds the columns
+    # AND this index. Creating it here unbounded would raise "no such column"
+    # on that legacy path (same trap as idx_memory_content_norm, see the
+    # executecript note above).
+    if "valid_until" in cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_time "
+            "ON memory(namespace, valid_from, valid_until)"
+        )
     conn.commit()
 
 _NS_MIGRATION_CHECKOUTS: dict[str, str] = {}
@@ -953,6 +982,57 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE meta SET value='8' WHERE key='schema_version'")
         conn.commit()
 
+    if ver < 9:
+        # v9 (issue #59): append-only knowledge-update lineage — valid_until,
+        # update_of, taint. Same idempotent pattern as v6/v7/v8: init_db()
+        # already creates these on a fresh store (and sets schema_version=1, so
+        # migrate() walks 1->9 and the ALTERs below are table_info-probe no-ops
+        # there); on a legacy pre-v9 store the probes guard the ALTERs so a
+        # re-run (or a fresh-store walk) never double-adds.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+        if "valid_until" not in cols:
+            conn.execute(
+                "ALTER TABLE memory ADD COLUMN valid_until TEXT NOT NULL DEFAULT ''"
+            )
+        if "update_of" not in cols:
+            conn.execute(
+                "ALTER TABLE memory ADD COLUMN update_of TEXT NOT NULL DEFAULT ''"
+            )
+        if "taint" not in cols:
+            conn.execute(
+                "ALTER TABLE memory ADD COLUMN taint TEXT NOT NULL DEFAULT "
+                "'trusted_internal' CHECK (taint IN "
+                "('trusted_internal','untrusted_tool','untrusted_web'))"
+            )
+        # Backfill valid_until from superseded_at for rows tombstoned under a
+        # pre-v9 schema: point-in-time as-of DROPS the superseded_at filter (a
+        # historically-superseded row may have been valid at that instant), so
+        # a tombstoned row with empty valid_until would otherwise be "valid at
+        # every T" and resurrect at as-of. Setting valid_until=superseded_at
+        # makes the row's validity interval end exactly when it was tombstoned.
+        conn.execute(
+            "UPDATE memory SET valid_until=superseded_at "
+            "WHERE superseded_at IS NOT NULL AND valid_until=''"
+        )
+        # Backfill taint from signal (issue #59, 4.7): the write-time default
+        # is TRUSTED for grounded signals and untrusted_tool for `none`. A
+        # legacy row must not keep the column's blanket 'trusted_internal'
+        # default when a same-content row written post-v9 would derive
+        # untrusted_tool — same row, same trust, regardless of when it landed.
+        # Unconditional recompute is idempotent (recomputes to the same value).
+        trusted_sigs = ','.join('?' * len(TAINT_TRUSTED_SIGNALS))
+        conn.execute(
+            f"UPDATE memory SET taint=CASE WHEN signal IN ({trusted_sigs}) "
+            f"THEN 'trusted_internal' ELSE 'untrusted_tool' END",
+            list(TAINT_TRUSTED_SIGNALS),
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_time "
+            "ON memory(namespace, valid_from, valid_until)"
+        )
+        conn.execute("UPDATE meta SET value='9' WHERE key='schema_version'")
+        conn.commit()
+
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
     # skip. See _retry_pending_ns_migration for why this cannot live behind the
     # version gate.
@@ -984,5 +1064,32 @@ def _parse_iso_to_epoch(ts: str) -> float:
         return float(calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
     except (ValueError, TypeError):
         return 0.0
+
+def _as_of_temporal_predicate(as_of: str | None, alias: str = "") -> tuple[str, list]:
+    """Build the as-of validity predicate for one recall lane (issue #59, 4.4).
+
+    Returns ``(sql_clause, params)``. ``as_of=None`` returns ``("", [])`` — the
+    caller KEEPS its hard ``superseded_at IS NULL`` filter (default recall is
+    "as of now": live rows only). When ``as_of`` is set, the caller must also
+    DROP that hard filter: a historically-superseded row can be valid at an
+    instant before its tombstone, and the issue's point-in-time contract is to
+    return rows that were valid at that instant.
+
+    Validity-interval semantics (matching the write path): ``valid_from`` is
+    INCLUSIVE (the row is born at valid_from) and ``valid_until`` is EXCLUSIVE
+    (the row expires at valid_until, so it is still valid at any T strictly
+    before valid_until). Empty valid_until means "never expires".
+
+    ``alias`` prefixes the column names (e.g. ``m`` for the FTS lane that
+    joins ``memory m``); the other lanes reference the bare table and pass ``""``.
+    """
+    if not as_of:
+        return "", []
+    prefix = f"{alias}." if alias else ""
+    return (
+        f" AND ({prefix}valid_from = '' OR {prefix}valid_from <= ?) "
+        f"AND ({prefix}valid_until = '' OR {prefix}valid_until > ?) ",
+        [as_of, as_of],
+    )
 
 GLOBAL_NAMESPACE = "user:global"

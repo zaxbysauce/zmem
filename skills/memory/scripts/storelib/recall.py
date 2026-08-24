@@ -18,7 +18,7 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
-from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _commit, _embeddings, _format_recency, _parse_iso_to_epoch, now_iso
+from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _format_recency, _parse_iso_to_epoch, now_iso
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from schema_meta import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
 
@@ -192,7 +192,9 @@ def _fetch_by_ids(
     ``as_of`` (PRR-004 fix, issue #58 3.6): the SAME temporal predicate the
     FTS branch applies — vector-only candidates fused in by RRF previously
     bypassed it, so a future-dated row (valid_from > as_of) surfaced via the
-    vec lane despite --as-of. ``valid_until`` half is the Phase 4 placeholder.
+    vec lane despite --as-of. The exact predicate is built by
+    ``_as_of_temporal_predicate`` (issue #59, 4.4): valid_from INCLUSIVE,
+    valid_until EXCLUSIVE, and live-rows-only retained when as_of is absent.
     """
     if not ids:
         return []
@@ -203,21 +205,24 @@ def _fetch_by_ids(
         ns_placeholders = ",".join("?" * len(namespaces))
         ns_clause = f"AND namespace IN ({ns_placeholders})"
         params.extend(namespaces)
-    as_of_clause = ""
-    if as_of:
-        as_of_clause = " AND (valid_from = '' OR valid_from <= ?) AND (1=1) "
-        params.append(as_of)
+    # v9 (#59 4.4): full temporal predicate from the shared helper. With as_of
+    # set we ALSO drop the hard `superseded_at IS NULL` (a fused historical row
+    # may have been valid at that instant); without as_of the live filter stays.
+    as_of_clause, as_of_params = _as_of_temporal_predicate(as_of)
+    params.extend(as_of_params)
+    live_clause = "" if as_of else "AND superseded_at IS NULL"
     params.append(floor)
     sql = f"""
         SELECT id, namespace, type, content, tags, source_ref,
                source_hash, confidence, signal, valid_from,
                ingestion_ts, retrieval_count, surfaced_count, last_retrieved,
+               valid_until, update_of, taint,
                NULL AS fts_rank
         FROM memory
         WHERE id IN ({placeholders})
           {ns_clause}
           {as_of_clause}
-          AND superseded_at IS NULL
+          {live_clause}
           AND confidence >= ?
     """
     rows = conn.execute(sql, params).fetchall()
@@ -274,20 +279,22 @@ def _recall_one_tier(
     (search everything — the unscoped path). The same set is used for both the
     FTS filter and the hybrid RRF ``_fetch_by_ids`` re-fetch namespace filter.
 
-    ``as_of`` (issue #58, 3.6): ISO-8601 timestamp; only return rows with
-    ``valid_from <= as_of``. The ``valid_until`` half of the predicate is
-    a ``(1=1)`` placeholder until Phase 4 adds the column (C1 critic-fix).
+    ``as_of`` (issue #59, 4.4): ISO-8601 timestamp; only return rows whose
+    ``[valid_from, valid_until)`` half-open interval covers the instant
+    (valid_from INCLUSIVE, valid_until EXCLUSIVE) via the shared
+    ``_as_of_temporal_predicate``. With as_of set, the hard
+    ``superseded_at IS NULL`` live filter is DROPPED — a historically-
+    superseded row that was valid at that instant may surface.
     """
     terms = [t for t in re.split(r"\s+", query.strip()) if t]
     floor = min_confidence if min_confidence is not None else CONFIDENCE_FLOOR
-    # Issue #58, 3.6: build the temporal predicate. ``valid_from`` half
-    # is the actual fix; the ``valid_until`` half is a no-op placeholder
-    # until Phase 4.
-    as_of_clause = ""
-    as_of_params: list = []
-    if as_of:
-        as_of_clause = " AND (m.valid_from = '' OR m.valid_from <= ?) AND (1=1) "
-        as_of_params.append(as_of)
+    # v9 (#59, 4.4): full as-of predicate from the shared helper (issue #58
+    # 3.6 built only the valid_from half; the valid_until half was a (1=1)
+    # Phase-4 placeholder). With as_of set, the hard ``superseded_at IS NULL``
+    # is DROPPED — a historically-superseded row that was valid at that instant
+    # may surface; without as_of the live filter stays (default = as of now).
+    as_of_clause, as_of_params = _as_of_temporal_predicate(as_of, alias="m")
+    live_clause = "" if as_of else "AND m.superseded_at IS NULL"
     if not terms:
         rows = []
     else:
@@ -312,13 +319,14 @@ def _recall_one_tier(
             SELECT m.id, m.namespace, m.type, m.content, m.tags, m.source_ref,
                    m.source_hash, m.confidence, m.signal, m.valid_from,
                    m.ingestion_ts, m.retrieval_count, m.surfaced_count, m.last_retrieved,
+                   m.valid_until, m.update_of, m.taint,
                    rank AS fts_rank
             FROM memory_fts f
             JOIN memory m ON m.rowid = f.rowid
             WHERE memory_fts MATCH ?
               {ns_clause}
               {as_of_clause}
-              AND m.superseded_at IS NULL
+              {live_clause}
               AND m.confidence >= ?
             ORDER BY rank
             LIMIT ?
@@ -397,6 +405,9 @@ def _recall_one_tier(
             "signal": r["signal"],
             "source_ref": r["source_ref"],
             "valid_from": r["valid_from"],
+            "valid_until": r["valid_until"],
+            "update_of": r["update_of"],
+            "taint": r["taint"],
             "stale": bool(stale_note),
             "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
             "_stale_note": stale_note,
@@ -474,7 +485,23 @@ def _format_fenced_recall(rows: list[dict], header: str) -> str:
         # the untrusted-data marker immediately. The hook path
         # (``--no-bump``) filters these rows out BEFORE this render —
         # so anything reaching here is the explicit surface.
-        inj_prefix = " [INJECTION RISK]" if r.get("prompt_injection_risk") else ""
+        #
+        # v9 (#59, 4.7): the same explicit surface also prefixes taint
+        # markers — `[UNTRUSTED TOOL]` for agent-authored rows and
+        # `[UNTRUSTED WEB]` for web-sourced rows, so a non-trusted
+        # provenance is visible without the operator having to read the
+        # JSON. (The hook path omits untrusted_web like injection-risk;
+        # that omission happens in recall_memory/recent_memory before this
+        # render.)
+        _taint = r.get("taint")
+        _markers: list[str] = []
+        if r.get("prompt_injection_risk"):
+            _markers.append("[INJECTION RISK]")
+        if _taint == "untrusted_tool":
+            _markers.append("[UNTRUSTED TOOL]")
+        elif _taint == "untrusted_web":
+            _markers.append("[UNTRUSTED WEB]")
+        inj_prefix = (" " + " ".join(_markers)) if _markers else ""
         lines.append(
             f"{inj_prefix}- [{r['id']}] [conf={r['confidence']}] [signal={r['signal']}] "
             f"[ns={r['namespace']}] [type={r['type']}]"
@@ -647,8 +674,19 @@ def recall_memory(
     # Issue #58, 3.4: on `--no-bump` / hook paths, drop injection-risk
     # rows. Explicit `recall` (no_bump=False) keeps the row and
     # prefixes it with `[INJECTION RISK]`.
+    #
+    # v9 (#59, 4.7): the SAME passive path also omits `untrusted_web`
+    # rows — a web-sourced row is untrusted on the auto-inject surface
+    # exactly like an injection-risk row, and this store-side filter is
+    # the single "same path as injection-risk" implementation the hook
+    # scripts inherit (they pass `--no-bump`; no hook script edit is
+    # needed). `untrusted_tool` is NOT omitted — it is trusted enough
+    # to surface passively, and is flagged on the explicit path instead.
     if no_bump:
-        results = [r for r in results if not r.get("prompt_injection_risk")]
+        results = [
+            r for r in results
+            if not r.get("prompt_injection_risk") and r.get("taint") != "untrusted_web"
+        ]
 
     if results:
         ids = [r["id"] for r in results]
@@ -691,8 +729,11 @@ def _recent_one_tier(
     defect-2 fix: ``recent`` now honours v5 migration aliases the way
     ``recall`` already did. (issue #18)
 
-    ``as_of`` (issue #58, 3.6): ISO-8601 timestamp; only return rows with
-    ``valid_from <= as_of``. ``valid_until`` placeholder is Phase 4.
+    ``as_of`` (issue #59, 4.4): ISO-8601 timestamp; only return rows whose
+    ``[valid_from, valid_until)`` half-open interval covers the instant
+    (valid_from INCLUSIVE, valid_until EXCLUSIVE) via
+    ``_as_of_temporal_predicate`` — dropping the ``superseded_at IS NULL``
+    live filter when set.
     """
     params: list = [min_confidence]
     ns_clause = ""
@@ -700,16 +741,18 @@ def _recent_one_tier(
         ns_placeholders = ",".join("?" * len(ns_list))
         ns_clause = f"AND namespace IN ({ns_placeholders})"
         params.extend(ns_list)
-    as_of_clause = ""
-    if as_of:
-        as_of_clause = " AND (valid_from = '' OR valid_from <= ?) AND (1=1) "
-        params.append(as_of)
+    # v9 (#59, 4.4): full temporal predicate; with as_of set the hard
+    # `superseded_at IS NULL` is dropped (see _recall_one_tier).
+    as_of_clause, as_of_params = _as_of_temporal_predicate(as_of)
+    params.extend(as_of_params)
+    live_clause = "" if as_of else "superseded_at IS NULL AND"
     params.append(limit)
     rows = conn.execute(
         f"""SELECT id, namespace, type, content, tags, source_ref, source_hash,
-                  confidence, signal, valid_from, ingestion_ts, last_retrieved
+                  confidence, signal, valid_from, ingestion_ts, last_retrieved,
+                  valid_until, update_of, taint
             FROM memory
-            WHERE superseded_at IS NULL AND confidence >= ?
+            WHERE {live_clause} confidence >= ?
             {ns_clause}
             {as_of_clause}
             ORDER BY ingestion_ts DESC LIMIT ?""",
@@ -734,6 +777,9 @@ def _recent_one_tier(
             "signal": r["signal"],
             "source_ref": r["source_ref"],
             "valid_from": r["valid_from"],
+            "valid_until": r["valid_until"],
+            "update_of": r["update_of"],
+            "taint": r["taint"],
             "stale": bool(stale_note),
             "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
             "_stale_note": stale_note,
@@ -798,12 +844,17 @@ def recent_memory(
                 seen.add(r["id"])
 
     # Issue #58, 3.4: re-classify for injection-risk at emit time
-    # (defense in depth) and drop on `--no-bump` paths.
+    # (defense in depth) and drop on `--no-bump` paths. v9 (#59, 4.7): the
+    # passive path also omits `untrusted_web` rows (same path as
+    # injection-risk), symmetric with recall_memory — see that site.
     for r in project_rows:
         r["prompt_injection_risk"] = _classify_injection(r)
     results = project_rows
     if no_bump:
-        results = [r for r in results if not r.get("prompt_injection_risk")]
+        results = [
+            r for r in results
+            if not r.get("prompt_injection_risk") and r.get("taint") != "untrusted_web"
+        ]
     if results:
         ids = [r["id"] for r in results]
         _bump_telemetry(conn, ids, no_bump=no_bump)

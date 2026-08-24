@@ -23,7 +23,7 @@ from __future__ import annotations
 
 # Bumped by store.py's migration machinery; doctor.py reads it to decide
 # pass/warn/fail. Edit HERE and both consumers stay in sync.
-SUPPORTED_SCHEMA_VERSION = 8
+SUPPORTED_SCHEMA_VERSION = 9
 
 # The meta-table key under which the version is stored in the store.
 SCHEMA_VERSION_KEY = "schema_version"
@@ -35,11 +35,62 @@ SCHEMA_VERSION_KEY = "schema_version"
 MAX_CONTENT_CHARS = 65536
 
 # Memory `type` enum. All write surfaces validate against this tuple.
-ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
+# v9 (#59): `decision` and `constraint` are first-class shipped types.
+ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint")
 
 # Memory `signal` enum. All write surfaces validate against this tuple. Ordered
 # roughly by trustworthiness (test/compile/lint > reviewer/user > none).
 ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
+
+# Memory `taint` enum (issue #59, 4.7). The provenance/trust rank of a row's
+# ORIGIN. There is deliberately NO fourth rank: an unknown taint value is
+# refused at every write surface rather than coerced. Rank order is
+# trusted_internal < untrusted_tool < untrusted_web (see TAINT_RANK). A row's
+# taint is worst-of'd forward through lineage (update re-creation, consolidate
+# absorb); a tombstone (supersede/invalidate) preserves the row's taint — a
+# tombstone creates no new row, so there is no incoming taint to merge.
+ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
+
+# Numeric rank for worst-of propagation. A worse taint strictly dominates a
+# better one when two line items meet (update re-creation, consolidate absorb).
+TAINT_RANK = {"trusted_internal": 0, "untrusted_tool": 1, "untrusted_web": 2}
+
+# Signals that make a NEW write default to trusted_internal (human-authored /
+# closeout / grounded evidence). Any other signal (`none` — an agent's
+# self-opinion) defaults the new row to untrusted_tool. This is the single
+# store-side derivation stored in storelib/write._default_taint_for_signal —
+# the CLI, Hermes, MCP, and ingest surfaces all share it (the remote surfaces
+# additionally pass an explicit--taint when the agent wants to mark a web fetch).
+TAINT_TRUSTED_SIGNALS = frozenset({"test", "compile", "lint", "reviewer", "user"})
+
+
+def validate_taint(value: str) -> str:
+    """Return `value` if it is a known taint rank, else raise ValueError.
+
+    Every writer that accepts a user/remote-supplied taint must call this (or
+    constrain to ALLOWED_TAINTS via argparse choices) FIRST — an unknown taint
+    value is refused, never silently coerced (issue #59, 4.7).
+    """
+    if value not in TAINT_RANK:
+        raise ValueError(
+            f"taint must be one of: {', '.join(ALLOWED_TAINTS)}"
+        )
+    return value
+
+
+def worse_taint(a: str, b: str) -> str:
+    """The worse of two taint ranks (the least trustworthy provenance).
+
+    A row's provenance is only as good as its least-trustworthy contributor:
+    on update re-creation and consolidate absorb, the surviving row's taint is
+    the worst of the two merged sources (issue #59, 4.7). Unknown inputs are
+    impossible by construction (every writer validates first), but an unknown
+    value degrades to the WORST rank for fail-closed safety rather than
+    silently upgrading trust.
+    """
+    ra = TAINT_RANK.get(a, 2)
+    rb = TAINT_RANK.get(b, 2)
+    return a if ra >= rb else b
 
 # Inject-floor constants for hook surfaces (issue #58, 3.8). These three
 # thresholds are intentionally distinct: each reflects a different surface's
@@ -53,8 +104,9 @@ ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
 #    SessionStart / subagent recall. Tighter because the surface is
 #    "high-confidence recent material", not "query-best match".
 #  - GATE_NONE (0.4): hook selective-inject gate. signal=none rows must
-#    clear this floor to ride along with a high-signal match (the gate's
-#    type-relax is empty until Phase 4 ships `decision`/`constraint`).
+#    clear this floor to ride along with a high-signal match. The gate has no
+#    type-relax branch (issue #59 ships `decision`/`constraint` as ordinary
+#    types; they are judged only by signal/confidence like every other type).
 INJECT_FLOOR_PROMPT_DEFAULT = 0.25
 INJECT_FLOOR_RECENT_DEFAULT = 0.5
 INJECT_FLOOR_GATE_NONE_DEFAULT = 0.4

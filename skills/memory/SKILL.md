@@ -35,7 +35,11 @@ If you cannot find the injected path, the script is at the plugin root under
   external signal (test/compile/lint/reviewer/user). The reflection Stop hook will
   prompt you automatically when failures are detected.
 - **When you learn a stable fact or convention:** `add` it.
-- **When a memory is stale/wrong:** `supersede` it (tombstones it; keeps history).
+- **When a memory is stale/wrong:** `supersede` it for a general tombstone; use the
+  dedicated **`invalidate`** command when a fact is *no longer true* (it REQUIRES a
+  reason so the correction is auditable); use **`update`** to revise a memory
+  append-only (the old row is tombstoned, a new live row links back via
+  `update_of`, and point-in-time `--as-of` recall still sees the old content).
 
 ## Commands
 
@@ -54,7 +58,8 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v8
+- schema compatibility against current v9
+- v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - Claude/Codex native-memory conflicts via read-only config inspection
 - canonical namespace for the provided project
 - host surface presence (Claude plugin, ZCode plugin, memory skill; repo-local
@@ -70,7 +75,10 @@ python <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
                           [--no-hybrid] [--no-bump] [--as-of ISO-8601] [--json]
 ```
 Returns live (non-superseded) memories matching the query, filtered by confidence
-floor (>=0.25) and namespace. Prefer `--namespace project:<basename>` to scope to
+floor (>=0.25) and namespace — unless `--as-of ISO-8601` is given, in which case
+it is a point-in-time read that returns rows **valid at that instant** (a row
+superseded after that instant may be included; a row created after it is not;
+see the `--as-of` notes below). Prefer `--namespace project:<basename>` to scope to
 the current project; use `user:global` for cross-project.
 
 #### Confidence floors (issue #58, 3.8)
@@ -120,10 +128,11 @@ tools, and the Hermes `MemoryProvider` search tool — intentionally bumps
 ```
 python <store.py> add \
   --namespace "project:<basename>" \
-  --type <fact|lesson|convention|preference> \
+  --type <fact|lesson|convention|preference|decision|constraint> \
   --content "<the knowledge, specific and actionable>" \
   --tags "comma,separated" \
   --signal <test|compile|lint|reviewer|user|none> \
+  [--taint <trusted_internal|untrusted_tool|untrusted_web>] \
   [--source-ref "file:<path>" | "session:<id>" | "db:<table>:<rowid>"]
 ```
 Signal sets default confidence: test/compile=0.9, lint=0.85, reviewer/user=0.6
@@ -141,7 +150,61 @@ pass through untouched. Legacy rows already stranded under a near-miss namespace
 (before this guard existed) can be remediated with `rekey-namespace
 --near-miss-global --confirm` (see below).
 
-### recent / search / supersede / list / get / stats
+### update / invalidate — append-only revision and contradiction corrections (v9, issue #59)
+```
+python <store.py> update --id <full-uuid> --content "<new content>" \
+  [--namespace NS] [--type ...] [--tags ...] [--source-ref ...] [--confidence F]
+  [--signal ...] [--taint ...] [--capture-mode manual|reviewed|auto]
+python <store.py> invalidate --id <full-uuid> --reason "<why the fact is no longer true>"
+```
+- **`update`** is append-only knowledge revision: it creates a NEW live row with the
+  new content, tombstones the target row (`superseded_at=now, valid_until=now,
+  supersede_reason='updated'`), and links the new row back to it via `update_of`.
+  Namespace/type/tags/source_ref/confidence/signal inherit from the target unless
+  overridden; the old row's content is NEVER mutated. An unknown or
+  already-superseded id is refused (exit 2, nothing written). Dedup runs against
+  OTHER live rows (the replaced row is excluded, so even an unchanged-content
+  "update" creates history). Point-in-time recall (`--as-of` before the update)
+  returns the OLD content; after returns the NEW.
+- **`invalidate`** is `supersede` with a REQUIRED `--reason` — the preferred way to
+  record "this fact is no longer true" so the correction is auditable (issue #59,
+  4.3). `supersede` remains for general tombstones (consolidated/pruned rows)
+  where a reason is optional.
+
+### Provenance trust (`--taint`) — v9 (issue #59, 4.7)
+Every memory carries a **taint** rank marking the trust of its ORIGIN:
+`trusted_internal` (human/closeout/test-grounded) < `untrusted_tool` (agent or
+MCP/Hermes-authored) < `untrusted_web` (web-fetched). There is deliberately no
+fourth rank: an unknown taint value is **refused** at every write surface (the
+write path never silently coerces it). The closed enum is enforced by a CHECK
+constraint AND by application-side validation (CLI argparse choices, ingest
+validator, Hermes/MCP boundary checks) — all sourced from the single
+`schema_meta.ALLOWED_TAINTS`.
+
+The taint default depends on the surface:
+- CLI `add`: derived from `--signal` — grounded signals (`test`/`compile`/`lint`/
+  `reviewer`/`user`) default to `trusted_internal`; `signal=none` (the agent's
+  self-opinion) defaults to `untrusted_tool`. An explicit `--taint` overrides.
+- Hermes/MCP tools (`zmem_add` / the MCP `add` tool): default to EXPLICIT
+  `untrusted_tool` unless the caller passes a taint (e.g. `untrusted_web` for a
+  web fetch, or `trusted_internal` for a human-grounded note).
+Taint propagates **worst-of forward through lineage**: `update` re-creation and
+`consolidate` absorb both set the surviving row's taint to the worse of the two
+merged sources (a merged row never DOWNGRADES a riskier member). A tombstone
+(`supersede`/`invalidate`) preserves the row's taint — it creates no new row.
+
+Recall surfaces the taint so trust is visible, mirroring prompt-injection-risk:
+- The **explicit** text path prefixes rows with `[UNTRUSTED TOOL]` (taint
+  `untrusted_tool`) or `[UNTRUSTED WEB]` (taint `untrusted_web`).
+- The **passive/auto-inject** path (`--no-bump` — used by the automatic hooks and
+  Hermes prefetch) OMITS `untrusted_web` rows entirely, exactly like
+  `prompt-injection-risk` rows (an untrusted web-sourced memory is not trusted
+  enough to inject passively). `untrusted_tool` rows DO surface passively — they
+  are agent-authored and thus safer than web content — and are flagged on the
+  explicit path instead. The hook scripts need no edits: they already pass
+  `--no-bump` and inherit this store-side filter.
+
+### recent / search / supersede / update / invalidate / list / get / stats
 ```
 python <store.py> recent [--namespace NS] [--limit 5] [--min-confidence 0.5]
                          [--include-global] [--global-limit 3] [--as-of ISO-8601]
@@ -150,6 +213,8 @@ python <store.py> search --text "<text>" [--namespace NS] [--limit 10]
                         [--include-global] [--global-limit 3] [--no-bump]
                         [--as-of ISO-8601]
 python <store.py> supersede --id <full-uuid> [--reason "..."]
+python <store.py> invalidate --id <full-uuid> --reason "..."
+python <store.py> update --id <full-uuid> --content "<new content>" [overrides...]
 python <store.py> list [--namespace NS] [--include-superseded]
 python <store.py> get --id <uuid>
 python <store.py> stats
@@ -160,6 +225,24 @@ migration aliases (so `recent --namespace <old pre-v5 key>` finds rows migrated
 to the new key). `search` now accepts `--no-bump` for a *passive* query that records a
 surface on `surfaced_count` (never advancing `retrieval_count`) instead of bumping like
 `recall` (issue #21).
+
+`--as-of ISO-8601` (v9, issue #59 4.4) on `recall`/`recent`/`search` returns rows
+**valid at that instant**: `valid_from <= as_of AND (valid_until empty OR
+valid_until > as_of)`. `valid_from` is INCLUSIVE, `valid_until` is EXCLUSIVE, and
+empty `valid_until` means "never expires". Because a tombstone writes
+`valid_until` at the same instant as `superseded_at`, a point-in-time as-of may
+return rows that were later superseded (they were valid then) — only rows whose
+validity interval contains `as_of` surface. This is what makes `update` history
+readable: `--as-of` before the update returns the OLD content.
+
+`--as-of` recoverability is **lane-bounded** in hybrid mode: a historically
+tombstoned row that was valid at `as_of` is reachable only through the lexical
+(FTS5/BM25) lane. The vector lane's candidate pool always filters
+`superseded_at IS NULL` (live-only), so a row superseded before `as_of` cannot
+surface via semantic KNN even though it was valid at that instant. Model-absent
+runs are lexical-only and unaffected; a hybrid run that misses old content via
+the vec lane should be re-run with `--no-hybrid` to include the FTS lane.
+
 
 ### reembed — backfill semantic embeddings
 ```

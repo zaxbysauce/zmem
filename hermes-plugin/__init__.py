@@ -160,7 +160,8 @@ def _host():
 # enough that a stale local copy is safer than a hard failure here).
 _STORE_CONSTANTS = {
     "ALLOWED_SIGNALS": ("test", "compile", "lint", "reviewer", "user", "none"),
-    "ALLOWED_TYPES": ("fact", "lesson", "convention", "preference"),
+    "ALLOWED_TYPES": ("fact", "lesson", "convention", "preference", "decision", "constraint"),
+    "ALLOWED_TAINTS": ("trusted_internal", "untrusted_tool", "untrusted_web"),
     "MAX_CONTENT_CHARS": 65536,
 }
 
@@ -193,6 +194,7 @@ def _store_constants() -> Dict[str, Any]:
         return {
             "ALLOWED_SIGNALS": getattr(mod, "ALLOWED_SIGNALS", _STORE_CONSTANTS["ALLOWED_SIGNALS"]),
             "ALLOWED_TYPES": getattr(mod, "ALLOWED_TYPES", _STORE_CONSTANTS["ALLOWED_TYPES"]),
+            "ALLOWED_TAINTS": getattr(mod, "ALLOWED_TAINTS", _STORE_CONSTANTS["ALLOWED_TAINTS"]),
             "MAX_CONTENT_CHARS": getattr(mod, "MAX_CONTENT_CHARS", _STORE_CONSTANTS["MAX_CONTENT_CHARS"]),
         }
     except Exception as exc:
@@ -301,6 +303,7 @@ _SEARCH_SCHEMA: Dict[str, Any] = {
 _SCHEMA_CONSTANTS = _store_constants()
 _ADD_TYPE_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_TYPES"])
 _ADD_SIGNAL_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_SIGNALS"])
+_ADD_TAINT_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_TAINTS"])
 
 _ADD_SCHEMA: Dict[str, Any] = {
     "name": "zmem_add",
@@ -336,6 +339,16 @@ _ADD_SCHEMA: Dict[str, Any] = {
                 "enum": _ADD_SIGNAL_ENUM,
                 "description": "How strongly grounded this memory is.",
             },
+            "taint": {
+                "type": "string",
+                "enum": _ADD_TAINT_ENUM,
+                "description": "Provenance/trust origin (issue #59, 4.7). "
+                               "Default is 'untrusted_tool': this agent's "
+                               "write is ungrounded self-opinion unless you "
+                               "claim more. Use 'untrusted_web' for content "
+                               "fetched from the web; 'trusted_internal' only "
+                               "when a human/test/closeout grounded it.",
+            },
             "source_ref": {
                 "type": "string",
                 "description": "Provenance (e.g. session:<id>).",
@@ -368,10 +381,90 @@ _SUPERSEDE_SCHEMA: Dict[str, Any] = {
     },
 }
 
+_UPDATE_SCHEMA: Dict[str, Any] = {
+    "name": "zmem_update",
+    "description": (
+        "Append-only update of a stored memory (issue #59, 4.2): replace its "
+        "content (and optionally metadata) with a NEW live row, tombstone the "
+        "old row (keeping full history), and link the new row back to the old "
+        "via update_of. Point-in-time recall (--as-of) before the update still "
+        "returns the OLD content; after returns the NEW. The id must be a LIVE "
+        "memory (use zmem_search to find one); an unknown or already-superseded "
+        "id is refused. Prefer this over add-then-supersede when revising a fact."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "id of the live memory to update.",
+            },
+            "content": {
+                "type": "string",
+                "description": "The new content (replaces the old row's content).",
+            },
+            "type": {
+                "type": "string",
+                "enum": _ADD_TYPE_ENUM,
+                "description": "Override the memory type (default: inherit).",
+            },
+            "tags": {
+                "type": "string",
+                "description": "Override comma-separated tags (default: inherit).",
+            },
+            "source_ref": {
+                "type": "string",
+                "description": "Override provenance (default: inherit).",
+            },
+            "signal": {
+                "type": "string",
+                "enum": _ADD_SIGNAL_ENUM,
+                "description": "Override grounding signal (default: inherit).",
+            },
+            "taint": {
+                "type": "string",
+                "enum": _ADD_TAINT_ENUM,
+                "description": "Provenance/trust origin override (issue #59, "
+                               "4.7). Default 'untrusted_tool'; the surviving "
+                               "row keeps the WORST of this and the replaced "
+                               "row's taint.",
+            },
+        },
+        "required": ["id", "content"],
+    },
+}
+
+_INVALIDATE_SCHEMA: Dict[str, Any] = {
+    "name": "zmem_invalidate",
+    "description": (
+        "Tombstone a memory BECAUSE THE FACT IS NO LONGER TRUE, with a REQUIRED "
+        "reason so the correction is auditable (issue #59, 4.3). Future recall "
+        "skips it (history preserved). Prefer this over zmem_supersede when the "
+        "old memory is wrong or obsolete — a contradiction correction; "
+        "zmem_supersede remains for general tombstones with no reason."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "id of the live memory to invalidate.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why the fact is no longer true (REQUIRED).",
+            },
+        },
+        "required": ["id", "reason"],
+    },
+}
+
 _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _SEARCH_SCHEMA,
     _ADD_SCHEMA,
     _SUPERSEDE_SCHEMA,
+    _UPDATE_SCHEMA,
+    _INVALIDATE_SCHEMA,
 ]
 
 
@@ -534,6 +627,10 @@ class ZmemMemoryProvider(MemoryProvider):
             return self._tool_add(args)
         if tool_name == "zmem_supersede":
             return self._tool_supersede(args)
+        if tool_name == "zmem_update":
+            return self._tool_update(args)
+        if tool_name == "zmem_invalidate":
+            return self._tool_invalidate(args)
         return _tool_error(f"Unknown tool: {tool_name}")
 
     def _tool_search(self, args: Dict[str, Any]) -> str:
@@ -587,6 +684,13 @@ class ZmemMemoryProvider(MemoryProvider):
                 "confidence": it.get("confidence"),
                 "tags": it.get("tags"),
                 "source_ref": it.get("source_ref"),
+                # Lineage + provenance trust travel with the row so the agent
+                # can see whether a result is an update of another row or an
+                # untrusted-origin note (issue #59, 4.2/4.7).
+                "valid_from": it.get("valid_from"),
+                "valid_until": it.get("valid_until"),
+                "update_of": it.get("update_of"),
+                "taint": it.get("taint"),
             }
             for it in results
             if isinstance(it, dict)
@@ -624,6 +728,18 @@ class ZmemMemoryProvider(MemoryProvider):
             return _tool_error(
                 "signal must be one of: " + ", ".join(consts["ALLOWED_SIGNALS"])
             )
+        # Taint (issue #59, 4.7 / plan M5): the agent surface's default is
+        # EXPLICIT untrusted_tool — an agent's write is ungrounded self-opinion
+        # unless the caller claims more. An explicit taint (e.g. untrusted_web
+        # for a web fetch) overrides; validated at the boundary for a clean
+        # error message (mirrors the signal validation above, #37 L7).
+        taint = (args.get("taint") or "").strip()
+        if not taint:
+            taint = "untrusted_tool"
+        elif taint not in consts["ALLOWED_TAINTS"]:
+            return _tool_error(
+                "taint must be one of: " + ", ".join(consts["ALLOWED_TAINTS"])
+            )
         tags = (args.get("tags") or "").strip()
         source_ref = (args.get("source_ref") or "").strip()
         if not source_ref and self._session_id:
@@ -634,6 +750,7 @@ class ZmemMemoryProvider(MemoryProvider):
             "--type", mtype,
             "--content", content,
             "--signal", signal,
+            "--taint", taint,
         ]
         if tags:
             cli_args += ["--tags", tags]
@@ -659,6 +776,84 @@ class ZmemMemoryProvider(MemoryProvider):
                 f"Supersede failed (id may not exist): {r['stderr'] or r['stdout'][:200]}"
             )
         return json.dumps({"result": "superseded", "id": mid})
+
+    def _tool_update(self, args: Dict[str, Any]) -> str:
+        """Append-only knowledge update (issue #59, 4.2). See _UPDATE_SCHEMA.
+
+        Override params are validated at the boundary (clean error messages,
+        mirroring _tool_add's #37 L7 pattern) before they reach store.py. The
+        taint default/override rule matches _tool_add (plan M5): the agent
+        surface defaults to EXPLICIT untrusted_tool; the store widens it to
+        the worst-of with the replaced row's taint.
+        """
+        consts = _store_constants()
+        mid = (args.get("id") or "").strip()
+        content = (args.get("content") or "").strip()
+        if not mid:
+            return _tool_error("Missing required parameter: id")
+        if not content:
+            return _tool_error("Missing required parameter: content")
+        if len(content) > consts["MAX_CONTENT_CHARS"]:
+            return _tool_error(
+                f"content is {len(content)} chars, over the "
+                f"{consts['MAX_CONTENT_CHARS']} limit"
+            )
+        cli_args = ["update", "--id", mid, "--content", content]
+        mtype = (args.get("type") or "").strip()
+        if mtype:
+            if mtype not in consts["ALLOWED_TYPES"]:
+                return _tool_error(
+                    "type must be one of: " + ", ".join(consts["ALLOWED_TYPES"])
+                )
+            cli_args += ["--type", mtype]
+        tags = (args.get("tags") or "").strip()
+        if tags:
+            cli_args += ["--tags", tags]
+        source_ref = (args.get("source_ref") or "").strip()
+        if source_ref:
+            cli_args += ["--source-ref", source_ref]
+        signal = (args.get("signal") or "").strip()
+        if signal:
+            if signal not in consts["ALLOWED_SIGNALS"]:
+                return _tool_error(
+                    "signal must be one of: " + ", ".join(consts["ALLOWED_SIGNALS"])
+                )
+            cli_args += ["--signal", signal]
+        taint = (args.get("taint") or "").strip()
+        if not taint:
+            taint = "untrusted_tool"
+        elif taint not in consts["ALLOWED_TAINTS"]:
+            return _tool_error(
+                "taint must be one of: " + ", ".join(consts["ALLOWED_TAINTS"])
+            )
+        cli_args += ["--taint", taint]
+        r = _run_store(cli_args)
+        if not r["ok"]:
+            # store.py update exits 2 for refused ids (unknown / already-
+            # superseded) — explain WHY instead of leaking an argparse blob.
+            return _tool_error(
+                f"Update failed (id may not exist or is already superseded): "
+                f"{r['stderr'] or r['stdout'][:200]}"
+            )
+        return json.dumps({"result": "updated", "raw": r["stdout"].strip()})
+
+    def _tool_invalidate(self, args: Dict[str, Any]) -> str:
+        """Tombstone with a REQUIRED reason (issue #59, 4.3). See _INVALIDATE_SCHEMA."""
+        mid = (args.get("id") or "").strip()
+        reason = (args.get("reason") or "").strip()
+        if not mid:
+            return _tool_error("Missing required parameter: id")
+        if not reason:
+            return _tool_error(
+                "Missing required parameter: reason — invalidation records why "
+                "the fact is no longer true and REQUIRES a reason (issue #59, 4.3)"
+            )
+        r = _run_store(["invalidate", "--id", mid, "--reason", reason])
+        if not r["ok"]:
+            return _tool_error(
+                f"Invalidate failed (id may not exist): {r['stderr'] or r['stdout'][:200]}"
+            )
+        return json.dumps({"result": "invalidated", "id": mid})
 
     # -- session / shutdown -------------------------------------------------
 

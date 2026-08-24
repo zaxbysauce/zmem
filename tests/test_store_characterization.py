@@ -63,6 +63,13 @@ _RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 # Captured from the behavior-identical split (verified byte-identical to
 # pre-split `ddce432` store.py) on 2026-08-22.
 #
+# "recall" was RE-CAPTURED on 2026-08-24 for issue #59 (schema v9): the shipped
+# `recall --json` result dict now carries the v9 lineage fields `valid_until` /
+# `update_of` / `taint` (issue #59 4.4/4.6/4.7, plan S3; verified deterministic -
+# every timestamp the fixture seeds is pinned, and the hash reproduces across
+# runs). `stats`/`list`/`export_jsonl` are byte-identical to their pre-v9
+# freeze and unchanged.
+#
 # NOTE on help surfaces: the argparse HelpFormatter renders wrapping, blank-line
 # placement, and indentation from a combination of terminal width and
 # Python-platform internals that we cannot fully normalize across Windows /
@@ -78,11 +85,12 @@ _RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 DATA_SHA = {
     "stats": "11ac804ebd82da80a80772814b5507f233d58e259b4c9c3498fa1311500630c8",
     "list": "c2e285928d3ee75154a12e4a61947d6793d3bc8f55edb0b3319e73ff4b75a598",
-    "recall": "1cc69349449eeb6d3dfc2f7b9cd80823323d3df6bcb2563ebe2bf26ee72af2f8",
-    "export_jsonl": "24d7c3b13cecc31fa3a845ee5a181369627298410bc3d41ccf90c043e460ce65",
+    "recall": "124e6e67610c9ccdfe783adba4867ed14b7e66065eba9bfa63489026ab75862f",
+    "export_jsonl": "5f29cf9006180b77ba39391f8338edd47abfc136c73be6a2f6a7f5ad8eb5ff35",
 }
 KNOWN_SUBCMDS = [
-    "init", "add", "recall", "recent", "search", "supersede", "get", "list",
+    "init", "add", "invalidate", "recall", "recent", "search", "supersede",
+    "update", "get", "list",
     "stats", "path", "session-cadence", "rebuild-fts", "reembed", "consolidate",
     "promote", "rekey-namespace", "backup", "restore", "export-pack",
     "export-jsonl", "ingest-jsonl", "failures", "corrections", "queue-list",

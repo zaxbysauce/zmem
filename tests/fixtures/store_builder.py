@@ -142,8 +142,8 @@ def _pin_timestamps(store: str) -> None:
     and drop any telemetry that would embed a fresh 'now' on a later read."""
     conn = sqlite3.connect(store)
     try:
-        ts_cols = ["valid_from", "superseded_at", "ingestion_ts", "last_retrieved",
-                   "last_surfaced"]
+        ts_cols = ["valid_from", "valid_until", "superseded_at", "ingestion_ts",
+                   "last_retrieved", "last_surfaced"]
         for col in ts_cols:
             conn.execute(f"UPDATE memory SET {col}=? WHERE {col} IS NOT NULL", (PIN_TS,))
         conn.execute("UPDATE memory SET merged_from=NULL, retrieval_count=0, surfaced_count=0")

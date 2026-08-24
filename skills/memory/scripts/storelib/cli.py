@@ -23,9 +23,9 @@ from storelib.consolidate import CONSOLIDATE_DEFAULT_THRESHOLD, consolidate
 from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_queue_clear, cmd_queue_list
 from storelib.promote import promote_memory
 from storelib.recall import _reembed, get_memory, list_memory, recall_memory, recent_memory, stats
-from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl
-from storelib.write import CapturePolicyRefusal, ContentTooLarge, add_memory, rekey_namespace, supersede_memory
+from storelib.write import CapturePolicyRefusal, ContentTooLarge, add_memory, rekey_namespace, supersede_memory, update_memory
 
 def nonnegative_int(value: str) -> int:
     """argparse type= for flags fed straight into a SQL LIMIT: SQLite treats a
@@ -74,6 +74,13 @@ def main():
     p_add.add_argument("--source-ref", default="")
     p_add.add_argument("--confidence", type=float, default=None)
     p_add.add_argument("--signal", default="none", choices=list(ALLOWED_SIGNALS))
+    p_add.add_argument("--taint", default=None, choices=list(ALLOWED_TAINTS),
+                       help="provenance/trust origin (issue #59, 4.7): "
+                            "trusted_internal (human/closeout/grounded), "
+                            "untrusted_tool (agent/MCP/Hermes/mine-history), or "
+                            "untrusted_web (web fetch). Default derives from "
+                            "--signal: grounded signals are trusted_internal, "
+                            "`none` is untrusted_tool. Unknown values are refused.")
     p_add.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
                        help="manual/reviewed keep the original text with warnings; "
                             "auto redacts likely secrets by default before writing")
@@ -96,9 +103,12 @@ def main():
                                "by hook-driven recall so subagent fan-out does not create N "
                                "concurrent retrieval_count writers — issue #21)")
     p_recall.add_argument("--as-of", type=_iso8601, default=None,
-                          help="temporal predicate: only return rows with "
-                               "valid_from <= as_of (issue #58 3.6). "
-                               "valid_until column is Phase 4.")
+                          help="temporal predicate (issue #59, 4.4): only return "
+                               "rows VALID at as_of — valid_from <= as_of AND "
+                               "(valid_until empty OR valid_until > as_of). "
+                               "May return historically-superseded rows that were "
+                               "valid at that instant. Absent = as of now (live "
+                               "rows only).")
     p_recall.add_argument("--include-global", action="store_true",
                           help="also surface user:global rows (project-first merge; "
                                "a global row never crowds out a project row). The "
@@ -125,8 +135,9 @@ def main():
                           help="max user:global rows when --include-global is set "
                                f"(default 3). No effect without --include-global.")
     p_recent.add_argument("--as-of", type=_iso8601, default=None,
-                          help="temporal predicate: only return rows with "
-                               "valid_from <= as_of (issue #58 3.6).")
+                          help="temporal predicate (issue #59, 4.4): only return "
+                               "rows VALID at as_of (valid_from <= as_of AND "
+                               "(valid_until empty OR valid_until > as_of)).")
 
     p_search = sub.add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
@@ -146,12 +157,56 @@ def main():
                                "defaults to bumping retrieval like recall; pass this for an "
                                "audit query that still counts the surface — issue #21")
     p_search.add_argument("--as-of", type=_iso8601, default=None,
-                          help="temporal predicate: only return rows with "
-                               "valid_from <= as_of (issue #58 3.6).")
+                          help="temporal predicate (issue #59, 4.4): only return "
+                               "rows VALID at as_of (valid_from <= as_of AND "
+                               "(valid_until empty OR valid_until > as_of)).")
 
     p_sup = sub.add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
     p_sup.add_argument("--reason", default="")
+
+    p_inv = sub.add_parser(
+        "invalidate",
+        help="tombstone a memory because the fact is no longer true "
+             "(supersede with a REQUIRED reason — issue #59, 4.3)",
+        description="`invalidate` is the preferred way to record \"this fact is "
+                    "no longer true\": it tombstones the row (superseded_at=now, "
+                    "valid_until=now) and REQUIRES --reason so the correction is "
+                    "auditable. `supersede` remains for general tombstone use "
+                    "(e.g. consolidated/pruned rows) where a reason is optional.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_inv.add_argument("--id", required=True, help="id of the memory to invalidate")
+    p_inv.add_argument("--reason", required=True,
+                       help="why the fact is no longer true (REQUIRED)")
+
+    p_upd = sub.add_parser(
+        "update",
+        help="append-only knowledge update: replace a memory, keeping history "
+             "(issue #59, 4.2)",
+        description="Creates a NEW live row carrying the new content, tombstones "
+                    "the target row (superseded_at=now, valid_until=now, "
+                    "supersede_reason='updated'), and links the new row back to it "
+                    "via update_of. Namespace/type/tags/source_ref/confidence/"
+                    "signal are copied from the target unless overridden; the old "
+                    "row's content is NEVER mutated. Unknown or already-superseded "
+                    "ids are refused (exit 2, nothing written). Dedup runs against "
+                    "OTHER live rows (the replaced row is excluded). --as-of before "
+                    "the update returns the OLD content; after returns the NEW.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_upd.add_argument("--id", required=True, help="id of the live memory to update")
+    p_upd.add_argument("--content", required=True, help="the new content")
+    p_upd.add_argument("--namespace", default=None)
+    p_upd.add_argument("--type", default=None, choices=list(ALLOWED_TYPES))
+    p_upd.add_argument("--tags", default=None)
+    p_upd.add_argument("--source-ref", default=None)
+    p_upd.add_argument("--confidence", type=float, default=None)
+    p_upd.add_argument("--signal", default=None, choices=list(ALLOWED_SIGNALS))
+    p_upd.add_argument("--taint", default=None, choices=list(ALLOWED_TAINTS),
+                       help="provenance/trust origin override (default: inherit the "
+                            "target's lineage, worst-of with the caller's origin)")
+    p_upd.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
+                       help="same capture policy as `add` (manual/reviewed keep text "
+                            "with warnings; auto redacts secrets)")
 
     p_get = sub.add_parser(
         "get",
@@ -538,7 +593,7 @@ def main():
 
     writer_lease = None
     if (
-        args.cmd in {"add", "supersede", "rebuild-fts", "reembed", "ingest-jsonl"}
+        args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "reembed", "ingest-jsonl"}
         # recall/recent/search DO write on the `--no-bump` path now that it records a
         # surface (issue #21), but they must NOT take a writer lease when passive:
         # the SubagentStart/UserPromptSubmit/prefetch hook fires at high fan-out, and
@@ -571,6 +626,7 @@ def main():
                     source_ref=args.source_ref,
                     confidence=args.confidence,
                     signal=args.signal,
+                    taint=args.taint,
                     capture_mode=args.capture_mode,
                 )
             except CapturePolicyRefusal as exc:
@@ -582,6 +638,40 @@ def main():
                 # change stdio-encoding failure behavior) (#36 M17).
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(1)
+        elif args.cmd == "invalidate":
+            # `invalidate` IS `supersede` with a required reason (--reason is
+            # required=True on the parser, so argparse refuses missing at rc 2
+            # before we get here) — the preferred "this fact is no longer true"
+            # command (issue #59, 4.3). Both tombstone with valid_until=now.
+            ok = supersede_memory(conn, args.id, args.reason)
+            sys.exit(0 if ok else 1)
+        elif args.cmd == "update":
+            try:
+                update_memory(
+                    conn,
+                    mid=args.id,
+                    content=args.content,
+                    namespace=args.namespace,
+                    type_=args.type,
+                    tags=args.tags,
+                    source_ref=args.source_ref,
+                    confidence=args.confidence,
+                    signal=args.signal,
+                    taint=args.taint,
+                    capture_mode=args.capture_mode,
+                )
+            except CapturePolicyRefusal as exc:
+                print(f"[zmem] {exc}", file=sys.stderr)
+                sys.exit(2)
+            except ContentTooLarge as exc:
+                print(f"[zmem] {exc}", file=sys.stderr)
+                sys.exit(1)
+            except ValueError as exc:
+                # update refusals (unknown / already-superseded id) — refused,
+                # nothing written (exit 2, matching the rekey/promote refusal
+                # convention rather than the 1 used for a not-found `get`).
+                print(f"[zmem] {exc}", file=sys.stderr)
+                sys.exit(2)
         elif args.cmd == "recall":
             # Issue #58, 3.3: --hybrid and --no-hybrid both parse, but
             # the default is hybrid-when-available (sentinel None). PRR-013

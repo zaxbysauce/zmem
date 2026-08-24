@@ -58,7 +58,8 @@ _MAX_QUERY_CHARS = 1000
 # Falls back to the historical literals if schema_meta can't be located.
 _MAX_CONTENT_CHARS = 65536
 _ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
-_ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
+_ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint")
+_ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
 _DEFAULT_LIMIT = 5
 _HARD_LIMIT_MAX = 50
 # Concurrency cap on simultaneous store.py subprocesses. Each tool call spawns a
@@ -104,13 +105,13 @@ def _resolve_store_py() -> Path:
 
 
 def _load_store_constants() -> None:
-    """Import ALLOWED_SIGNALS / ALLOWED_TYPES / MAX_CONTENT_CHARS from schema_meta
-    (the single source of truth shared with store.py). schema_meta is tiny and
-    dependency-free so it imports with no side effects — unlike store.py itself,
-    which is a ~250 KB CLI module with env reads and embedding/sqlite side
-    effects at import time. Best-effort: on any failure the module-level
-    fallbacks (the historical literals) stay in effect, so a missing file never
-    wedges the server (#37 L7/L8).
+    """Import ALLOWED_SIGNALS / ALLOWED_TYPES / ALLOWED_TAINTS / MAX_CONTENT_CHARS
+    from schema_meta (the single source of truth shared with store.py). schema_meta
+    is tiny and dependency-free so it imports with no side effects — unlike
+    store.py itself, which is a ~250 KB CLI module with env reads and
+    embedding/sqlite side effects at import time. Best-effort: on any failure
+    the module-level fallbacks (the historical literals) stay in effect, so a
+    missing file never wedges the server (#37 L7/L8).
 
     This locates schema_meta DIRECTLY via the in-tree relative path (this file
     is at <repo>/hermes-plugin/server/mcp_server.py, so the checkout root is
@@ -122,7 +123,7 @@ def _load_store_constants() -> None:
     covered because the tool paths that actually NEED store.py resolve it
     lazily via _resolve_zmem_home() at first use.
     """
-    global _MAX_CONTENT_CHARS, _ALLOWED_SIGNALS, _ALLOWED_TYPES
+    global _MAX_CONTENT_CHARS, _ALLOWED_SIGNALS, _ALLOWED_TYPES, _ALLOWED_TAINTS
     try:
         import importlib.util
         # Resolve schema_meta with the SAME precedence _resolve_zmem_home() uses
@@ -157,6 +158,9 @@ def _load_store_constants() -> None:
         types = getattr(mod, "ALLOWED_TYPES", None)
         if types:
             _ALLOWED_TYPES = tuple(types)
+        taints = getattr(mod, "ALLOWED_TAINTS", None)
+        if taints:
+            _ALLOWED_TAINTS = tuple(taints)
     except Exception as exc:  # noqa: BLE001
         logger.debug("schema_meta constants load failed (%s); using defaults", exc)
 
@@ -573,11 +577,17 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         tags: Optional[str] = None,
         signal: str = "none",
         source_ref: Optional[str] = None,
+        taint: str = "untrusted_tool",
     ) -> dict[str, Any]:
         """Capture a grounded memory to the shared store.
 
-        type: fact | lesson | convention | preference. signal: test | compile |
-        lint | reviewer | user | none (how strongly grounded this is).
+        type: fact | lesson | convention | preference | decision | constraint.
+        signal: test | compile | lint | reviewer | user | none (how strongly
+        grounded this is). taint: provenance/trust origin — default
+        'untrusted_tool' (this agent's write is ungrounded self-opinion unless
+        you claim more); use 'untrusted_web' for web-fetched content and
+        'trusted_internal' only when a human/test/closeout grounded it (issue
+        #59, 4.7 / plan M5).
         """
         mtype = (type or "").strip()
         body = (content or "").strip()
@@ -601,12 +611,22 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return _error(
                 "signal must be one of: " + ", ".join(_ALLOWED_SIGNALS)
             )
+        # Taint: the network/agent surface defaults to explicit untrusted_tool
+        # (M5); an explicit value is validated at the boundary for a clean error
+        # rather than an opaque store.py argparse blob. Unknown taint is refused,
+        # never coerced (issue #59, 4.7).
+        t = (taint or "untrusted_tool").strip()
+        if t not in _ALLOWED_TAINTS:
+            return _error(
+                "taint must be one of: " + ", ".join(_ALLOWED_TAINTS)
+            )
         args = [
             "add",
             "--namespace", str(namespace),
             "--type", mtype,
             "--content", body,
             "--signal", sig,
+            "--taint", t,
             # Default network writes to `auto` capture mode so secret-like
             # content is redacted before it is persisted (the local CLI stays
             # `manual` for trusted local use). `auto` refuses when source_ref
@@ -679,6 +699,108 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 r["stderr"] or r["stdout"][:200] or f"memory id {mid} not found"
             )
         return {"result": "superseded", "id": mid}
+
+    @mcp.tool()
+    async def update(
+        id: str,
+        content: str,
+        type: Optional[str] = None,
+        tags: Optional[str] = None,
+        source_ref: Optional[str] = None,
+        signal: Optional[str] = None,
+        taint: str = "untrusted_tool",
+    ) -> dict[str, Any]:
+        """Append-only knowledge update (issue #59, 4.2).
+
+        Replaces the content of a LIVE memory with a NEW row, tombstones the
+        old row (full history preserved), and links the new row back via
+        update_of (lineage). Namespace/type/tags/source_ref/confidence/signal
+        inherit from the old row unless overridden. Point-in-time recall before
+        the update returns the OLD content; after returns the NEW. Refused
+        (nothing written) when the id is unknown or already superseded.
+        taint defaults to 'untrusted_tool' (plan M5); the surviving row keeps
+        the WORST of this and the replaced row's taint (issue #59, 4.7).
+        """
+        mid = (id or "").strip()
+        body = (content or "").strip()
+        if not mid:
+            return _error("id is required")
+        if not body:
+            return _error("content is required")
+        if len(body) > _MAX_CONTENT_CHARS:
+            return _error(
+                f"content is {len(body)} chars, over the {_MAX_CONTENT_CHARS} limit"
+            )
+        t = (taint or "untrusted_tool").strip()
+        if t not in _ALLOWED_TAINTS:
+            return _error(
+                "taint must be one of: " + ", ".join(_ALLOWED_TAINTS)
+            )
+        args = [
+            "update",
+            "--id", mid,
+            "--content", body,
+            "--taint", t,
+            # Same network-write capture default as add (secret redaction).
+            "--capture-mode", "auto",
+        ]
+        if type:
+            mt = str(type).strip()
+            if mt not in _ALLOWED_TYPES:
+                return _error(
+                    "type must be one of: " + ", ".join(_ALLOWED_TYPES)
+                )
+            args += ["--type", mt]
+        if tags:
+            args += ["--tags", str(tags)]
+        if source_ref:
+            args += ["--source-ref", str(source_ref)]
+        if signal:
+            s = str(signal).strip()
+            if s not in _ALLOWED_SIGNALS:
+                return _error(
+                    "signal must be one of: " + ", ".join(_ALLOWED_SIGNALS)
+                )
+            args += ["--signal", s]
+        r = await _run_store_async(args)
+        warnings = _parse_store_warnings(r.get("stderr", ""))
+        if not r["ok"]:
+            # returncode 2 == refused id (unknown / already superseded) or a
+            # validation error — explain instead of leaking raw stderr.
+            msg = r.get("stderr") or r.get("stdout", "")[:200] or \
+                f"memory id {mid} not found or already superseded"
+            resp = _error(msg)
+            if warnings:
+                resp["warnings"] = warnings
+            return resp
+        resp = {"result": "updated", "raw": (r["stdout"] or "").strip()}
+        if warnings:
+            resp["warnings"] = warnings
+        return resp
+
+    @mcp.tool()
+    async def invalidate(id: str, reason: str) -> dict[str, Any]:
+        """Tombstone a memory BECAUSE THE FACT IS NO LONGER TRUE (issue #59, 4.3).
+
+        Like ``supersede`` but REQUIRES a ``reason`` so the contradiction
+        correction is auditable. Future recall skips it (history preserved).
+        Prefer this over ``supersede`` when the memory is wrong or obsolete.
+        """
+        mid = (id or "").strip()
+        why = (reason or "").strip()
+        if not mid:
+            return _error("id is required")
+        if not why:
+            return _error(
+                "reason is required — invalidation records why the fact is no "
+                "longer true (issue #59, 4.3)"
+            )
+        r = await _run_store_async(["invalidate", "--id", mid, "--reason", why])
+        if not r["ok"]:
+            return _error(
+                r["stderr"] or r["stdout"][:200] or f"memory id {mid} not found"
+            )
+        return {"result": "invalidated", "id": mid}
 
     @mcp.tool()
     async def recent(
