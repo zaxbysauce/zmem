@@ -54,7 +54,7 @@ EXPECTED_EXPORTS = [
     "_result_text", "_retry_pending_ns_migration", "_row_counts", "_rrf_fuse", "_sanitize_correction_message", "_sanitize_error_text",
     "_sanitize_exc_text", "_sanitize_pack_content", "_sanitize_tool_name", "_slugify_skill_name", "_snapshot_stamp", "_source_hash",
     "_strict_acquire_lock", "_sweep_candidate_dirs", "_synthesize_trigger_description", "_to_win_path", "_transcript_mtime_iso", "_unique_tokens",
-    "_uses_count", "_validate_namespace", "_validate_sync_row", "_vector_knn", "_wait_for_maintenance_clear", "_warn_degraded_embeddings_once",
+    "_uses_count", "_validate_namespace", "_validate_sync_row", "_vec_knn_in_namespace", "_vector_knn", "_wait_for_maintenance_clear", "_warn_degraded_embeddings_once",
     "_writer_dir", "_yaml_dquote", "add_memory", "apply_retention", "cmd_backup", "cmd_corrections",
     "cmd_export_jsonl", "cmd_export_pack", "cmd_failures", "cmd_ingest_jsonl", "cmd_mine_history", "cmd_queue_clear",
     "cmd_queue_list", "cmd_restore", "cmd_sweep", "compute_score", "connect", "consolidate",

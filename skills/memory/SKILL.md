@@ -67,11 +67,27 @@ surface change.
 ```
 python <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
                           [--include-global] [--global-limit 3] [--hybrid]
-                          [--no-bump] [--json]
+                          [--no-hybrid] [--no-bump] [--as-of ISO-8601] [--json]
 ```
 Returns live (non-superseded) memories matching the query, filtered by confidence
 floor (>=0.25) and namespace. Prefer `--namespace project:<basename>` to scope to
 the current project; use `user:global` for cross-project.
+
+#### Confidence floors (issue #58, 3.8)
+
+Three distinct floors live on the recall path. Each reflects a different
+surface's precision-vs-coverage tradeoff. They are env-overridable; the
+constants live in `schema_meta.py`.
+
+| Constant | Default | Env override | Used by |
+|---|---|---|---|
+| `INJECT_FLOOR_PROMPT_DEFAULT` | 0.25 | `ZMEM_INJECT_FLOOR_PROMPT` | `recall` (UserPromptSubmit / PreCompact). Hard floor on FTS/vec results — anything below is dropped before scoring. |
+| `INJECT_FLOOR_RECENT_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_RECENT` | `recent` (SessionStart / subagent recall). Tighter because the surface is high-confidence recent material, not query-best match. |
+| `INJECT_FLOOR_GATE_NONE` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; high-signal rows (`test`/`compile`/`lint`/`reviewer`) keep the 0.25 floor. |
+
+The three floors are intentional. Do not silently unify them. The
+selective-inject gate (3.8) is a hook-only filter; it does not change
+the Python recall path.
 
 `--include-global` (opt-in) ALSO surfaces up to `--global-limit` query-relevant
 rows from the `user:global` tier, merged project-first so a global row never
@@ -127,9 +143,11 @@ pass through untouched. Legacy rows already stranded under a near-miss namespace
 ### recent / search / supersede / list / get / stats
 ```
 python <store.py> recent [--namespace NS] [--limit 5] [--min-confidence 0.5]
-                         [--include-global] [--global-limit 3] [--json]
+                         [--include-global] [--global-limit 3] [--as-of ISO-8601]
+                         [--json]
 python <store.py> search --text "<text>" [--namespace NS] [--limit 10]
                         [--include-global] [--global-limit 3] [--no-bump]
+                        [--as-of ISO-8601]
 python <store.py> supersede --id <full-uuid> [--reason "..."]
 python <store.py> list [--namespace NS] [--include-superseded]
 python <store.py> get --id <uuid>

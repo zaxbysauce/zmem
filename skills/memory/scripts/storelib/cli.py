@@ -36,6 +36,26 @@ def nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"must be a non-negative integer, got {value!r}")
     return n
 
+def _iso8601(value: str) -> str:
+    """argparse type= for --as-of (issue #58, 3.6): accept an ISO-8601
+    timestamp, normalize +00:00 to Z-suffix so the predicate's string
+    comparison against ``valid_from`` (which ``now_iso()`` writes with a
+    Z-suffix) does not silently fail (I6 critic-fix). Phase 4 extends
+    the predicate to ``valid_until``; the column does not exist yet
+    so the predicate references only ``valid_from`` (C1 critic-fix).
+    """
+    from datetime import datetime
+    if not value:
+        raise argparse.ArgumentTypeError("--as-of requires a non-empty ISO-8601 timestamp")
+    normalized = value.strip()
+    if normalized.endswith("+00:00"):
+        normalized = normalized[:-6] + "Z"
+    try:
+        datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid ISO-8601 for --as-of: {exc}")
+    return normalized
+
 def main():
     ap = argparse.ArgumentParser(prog="store.py", description="ZMem semantic store")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -60,12 +80,21 @@ def main():
     p_recall.add_argument("--limit", type=nonnegative_int, default=5)
     p_recall.add_argument("--json", action="store_true")
     p_recall.add_argument("--hybrid", action="store_true",
-                          help="use hybrid BM25+vector recall (requires onnxruntime)")
+                          help="explicit hybrid BM25+vector recall (alias; hybrid is the "
+                               "default when embeddings are available — use --no-hybrid to "
+                               "force lexical, issue #58 3.3)")
+    p_recall.add_argument("--no-hybrid", action="store_true",
+                          help="force lexical-only recall even when embeddings are available "
+                               "(issue #58 3.3)")
     p_recall.add_argument("--no-bump", action="store_true",
                           help="suppress the retrieval_count/last_retrieved write; record "
                                "surfaced_count/last_surfaced instead (passive recall, used "
                                "by hook-driven recall so subagent fan-out does not create N "
                                "concurrent retrieval_count writers — issue #21)")
+    p_recall.add_argument("--as-of", type=_iso8601, default=None,
+                          help="temporal predicate: only return rows with "
+                               "valid_from <= as_of (issue #58 3.6). "
+                               "valid_until column is Phase 4.")
     p_recall.add_argument("--include-global", action="store_true",
                           help="also surface user:global rows (project-first merge; "
                                "a global row never crowds out a project row). The "
@@ -91,6 +120,9 @@ def main():
     p_recent.add_argument("--global-limit", type=nonnegative_int, default=3,
                           help="max user:global rows when --include-global is set "
                                f"(default 3). No effect without --include-global.")
+    p_recent.add_argument("--as-of", type=_iso8601, default=None,
+                          help="temporal predicate: only return rows with "
+                               "valid_from <= as_of (issue #58 3.6).")
 
     p_search = sub.add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
@@ -109,6 +141,9 @@ def main():
                                "surfaced_count/last_surfaced instead (passive search). Search "
                                "defaults to bumping retrieval like recall; pass this for an "
                                "audit query that still counts the surface — issue #21")
+    p_search.add_argument("--as-of", type=_iso8601, default=None,
+                          help="temporal predicate: only return rows with "
+                               "valid_from <= as_of (issue #58 3.6).")
 
     p_sup = sub.add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
@@ -544,20 +579,35 @@ def main():
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(1)
         elif args.cmd == "recall":
+            # Issue #58, 3.3: --hybrid and --no-hybrid both parse, but
+            # the default is hybrid-when-available (sentinel None). This
+            # preserves byte-identical behavior for explicit --hybrid /
+            # --no-hybrid invocations while flipping the default.
+            if args.hybrid:
+                hybrid_arg: bool | None = True
+            elif args.no_hybrid:
+                hybrid_arg = False
+            else:
+                hybrid_arg = None
             recall_memory(conn, query=args.query, namespace=args.namespace,
-                          limit=args.limit, as_json=args.json, hybrid=args.hybrid,
+                          limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
                           no_bump=args.no_bump, include_global=args.include_global,
-                          global_limit=args.global_limit)
+                          global_limit=args.global_limit, as_of=args.as_of)
         elif args.cmd == "recent":
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
                           min_confidence=args.min_confidence, as_json=args.json,
                           no_bump=args.no_bump, include_global=args.include_global,
-                          global_limit=args.global_limit)
+                          global_limit=args.global_limit, as_of=args.as_of)
         elif args.cmd == "search":
+            # I1 critic-fix: ``search`` is keyword-only by contract — pass
+            # hybrid=False explicitly so the new default sentinel does
+            # not silently flip search to vector-hybrid. Search output
+            # stays byte-identical to pre-change.
             recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
                           as_json=False, min_confidence=0.0,
                           include_global=args.include_global,
-                          global_limit=args.global_limit, no_bump=args.no_bump)
+                          global_limit=args.global_limit, no_bump=args.no_bump,
+                          hybrid=False, as_of=args.as_of)
         elif args.cmd == "supersede":
             ok = supersede_memory(conn, args.id, args.reason)
             sys.exit(0 if ok else 1)

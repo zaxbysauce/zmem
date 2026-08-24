@@ -1352,6 +1352,84 @@ def _render_human(report: dict) -> str:
     return "\n".join(lines)
 
 
+def _check_vec_ns_overfetch(resolved_store: Path) -> dict:
+    """Report live-in-namespace vec rows vs ZMEM_VEC_NS_OVERFETCH (issue #58, 3.7).
+
+    Warns when the ratio of live-in-namespace vec rows to the configured
+    over-fetch factor is < 1, meaning the recall path's vec KNN window
+    may not have enough rows to guarantee a same-namespace hit. Skipped
+    when the store is absent/unreadable (already flagged by store-access).
+    """
+    from storelib.schema import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
+    conn = _open_store_ro(resolved_store)
+    if conn is None:
+        return _check(
+            "vec-ns-overfetch", "skip",
+            "Store not available; skipped vec-ns-overfetch check.",
+        )
+    try:
+        ns_rows = conn.execute(
+            "SELECT count(*) AS c FROM memory_vec mv "
+            "JOIN memory m ON m.id = mv.memory_id "
+            "WHERE m.superseded_at IS NULL"
+        ).fetchone()["c"]
+    except (sqlite3.OperationalError, KeyError):
+        return _check(
+            "vec-ns-overfetch", "skip",
+            "memory_vec table not present; vec-ns-overfetch skipped.",
+        )
+    finally:
+        conn.close()
+
+    raw_env = os.environ.get(ZMEM_VEC_NS_OVERFETCH_ENV, "")
+    try:
+        overfetch = float(raw_env) if raw_env else float(ZMEM_VEC_NS_OVERFETCH_DEFAULT)
+    except ValueError:
+        overfetch = float(ZMEM_VEC_NS_OVERFETCH_DEFAULT)
+    ratio = (ns_rows / overfetch) if overfetch > 0 else 0.0
+    status = "pass" if ratio >= 1.0 else "warn"
+    summary = (
+        f"vec-ns-overfetch: live_in_namespace_vec_rows={ns_rows} "
+        f"ZMEM_VEC_NS_OVERFETCH={overfetch:g} ratio={ratio:.2f}"
+    )
+    return _check(
+        "vec-ns-overfetch", status, summary,
+        live_in_namespace_vec_rows=ns_rows,
+        zmem_vec_ns_overfetch=overfetch,
+        ratio=ratio,
+    )
+
+
+def _check_hybrid_default() -> dict:
+    """Report whether the hybrid default can fire (issue #58, 3.7, 3.3).
+
+    Surfaces the embeddings availability so the operator can see whether
+    `recall` will use hybrid (default when embeddings are available) or
+    lexical-only. Status is `pass` when embeddings are available, `info`
+    when unavailable (the default still works — it just falls back to
+    lexical), `warn` when the probe itself errors.
+    """
+    try:
+        st = embeddings.availability_status()
+    except Exception as exc:
+        return _check(
+            "hybrid-default", "warn",
+            f"hybrid-default: availability probe failed: {type(exc).__name__}: {exc}",
+        )
+    available = bool(st.get("available"))
+    reason = st.get("reason") or "unknown"
+    status = "pass" if available else "info"
+    summary = (
+        f"hybrid-default: embeddings.available={available} reason={reason}"
+    )
+    return _check(
+        "hybrid-default", status, summary,
+        available=available,
+        reason=reason,
+        missing_imports=st.get("missing_imports", []),
+    )
+
+
 def build_report(project: Path, repo_root: Path) -> dict:
     resolved_store = host.resolve_store_path()
     checks: list[dict] = []
@@ -1371,6 +1449,9 @@ def build_report(project: Path, repo_root: Path) -> dict:
     checks.append(_check_surfaces(repo_root))
     checks.append(_check_tier0_size(project))
     checks.append(_check_embeddings())
+    # Issue #58, 3.7: hybrid-default (3.3) + vec-ns-overfetch (3.1).
+    checks.append(_check_hybrid_default())
+    checks.append(_check_vec_ns_overfetch(resolved_store))
     # Operational health (backup/consolidation cadence) — read-only, best-effort
     # skip if the store is absent/unreadable (#37 L23).
     checks.extend(_check_operational_health(resolved_store))

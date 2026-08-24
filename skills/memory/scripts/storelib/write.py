@@ -24,7 +24,7 @@ try:
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from correction_queue import SECRET_PATTERNS  # type: ignore # noqa: F401
-from storelib.schema import CAPTURE_MODES, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, PROMPT_INJECTION_PATTERNS, SIGNAL_CONFIDENCE, _commit, _embeddings, _env_float, _normalize_content, now_iso
+from storelib.schema import CAPTURE_MODES, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, PROMPT_INJECTION_PATTERNS, SIGNAL_CONFIDENCE, _commit, _embeddings, _env_float, _normalize_content, _vec_knn_in_namespace, now_iso
 
 _degraded_embedding_warned = False
 
@@ -696,28 +696,39 @@ _SIGNAL_RANK = {"test": 5, "compile": 4, "lint": 3, "reviewer": 2, "user": 2, "n
 
 def _find_semantic_duplicate(
     conn: sqlite3.Connection, embedding: bytes, namespace: str, threshold: float = DEDUP_SIMILARITY_THRESHOLD
-) -> sqlite3.Row | None:
-    """Find the closest existing memory by embedding cosine similarity."""
-    try:
-        results = conn.execute(
-            "SELECT memory_id, distance FROM memory_vec "
-            "WHERE embedding MATCH ? AND k = 5 ORDER BY distance",
-            [embedding],
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return None  # vec0 table not available
+) -> tuple[sqlite3.Row | None, float]:
+    """Find the closest existing memory by embedding cosine similarity.
 
-    for r in results:
-        row = conn.execute(
-            "SELECT id, confidence, signal, tags FROM memory "
-            "WHERE id=? AND superseded_at IS NULL AND namespace=?",
-            (r["memory_id"], namespace),
-        ).fetchone()
-        if row:
-            # sqlite-vec distance is cosine distance (0 = identical, 2 = opposite).
-            # Convert to cosine similarity: sim = 1 - distance.
-            similarity = 1.0 - r["distance"]
-            if similarity >= threshold:
+    Issue #58, 3.2: namespace-aware dedup window. Uses the shared
+    ``_vec_knn_in_namespace`` helper so the dedup window widens by
+    ``ZMEM_VEC_NS_OVERFETCH_DEFAULT`` (default 8) and a same-namespace
+    paraphrase cannot be crowded out by a foreign namespace dominating
+    the global vec0 neighborhood. The threshold stays at
+    ``DEDUP_SIMILARITY_THRESHOLD`` (0.85); cross-namespace merge is
+    still blocked by the helper's namespace filter.
+
+    Returns ``(row, similarity)`` or ``(None, 0.0)`` when no same-
+    namespace duplicate above threshold was found.
+    """
+    # Ask for 5 vec rows but over-fetch by 8x; the helper post-filters
+    # by namespace so we get up to 5 same-namespace rows.
+    knn = _vec_knn_in_namespace(
+        conn, embedding, namespaces=[namespace], k=5, overfetch=8,
+    )
+    if not knn:
+        return None, 0.0
+
+    for mid, distance in knn:
+        # sqlite-vec distance is cosine distance (0 = identical, 2 = opposite).
+        # Convert to cosine similarity: sim = 1 - distance.
+        similarity = 1.0 - distance
+        if similarity >= threshold:
+            row = conn.execute(
+                "SELECT id, confidence, signal, tags FROM memory "
+                "WHERE id=? AND superseded_at IS NULL AND namespace=?",
+                (mid, namespace),
+            ).fetchone()
+            if row:
                 return row, similarity
     return None, 0.0
 

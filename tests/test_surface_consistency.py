@@ -72,10 +72,28 @@ class AdapterScanTest(unittest.TestCase):
         return rest if nxt is None else rest[:nxt.start()]
 
     def test_passive_hooks_carry_no_bump(self):
+        # Issue #58, 3.9: recall (UserPromptSubmit) and precompact share a
+        # single Python body (hooks/lib/zmem-recall-body.py) — the literal
+        # ``--no-bump`` lives in the body, not the .sh wrapper. The session-
+        # start hook still inlines its own store.py invocation, so it must
+        # carry the literal too.
+        body_text = (REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py").read_text(
+            encoding="utf-8"
+        )
         for rel in sorted(self.PASSIVE):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            # session-start still inlines; recall sources the shared body.
+            if rel == "hooks/zmem-recall.sh":
+                self.assertIn(
+                    "lib/zmem-recall-body.py", text,
+                    f"{rel} must source the shared recall body to honor "
+                    f"--no-bump (issue #58, 3.5/3.8/3.9)",
+                )
+                combined = text + "\n" + body_text
+            else:
+                combined = text
             self.assertIn(
-                "--no-bump", text,
+                "--no-bump", combined,
                 f"{rel} is a passive recall path and MUST pass --no-bump so it records "
                 "a surface event, not a retrieval")
 

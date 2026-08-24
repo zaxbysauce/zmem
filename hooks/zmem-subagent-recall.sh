@@ -15,7 +15,8 @@
 # hook_event_name — Phase 7 empirical dump), so there is no query to FTS on. The
 # spec's primary behavior is "scoped to the namespace (+ user:global)", which is
 # exactly the query-less `recent` pull session-start already uses for Tier 2.
-# agent_type only biases the header label (kept simple, no query machinery).
+# (agent_type is parsed by the launcher into ZMEM_AGENT_TYPE but no longer
+# biases output — the shared body's header has no agent_type slot.)
 #
 # PASSIVE (CRITIC 6 / issue #21): recall runs with `--no-bump` so a dispatch fan-out
 # does NOT turn N subagents into N concurrent retrieval_count writers on the shared
@@ -104,7 +105,6 @@ join_path() {
 PLUGIN_ROOT="${ZMEM_ROOT:-${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}"
 DATA_DIR="${ZMEM_DATA:-${ZCODE_PLUGIN_DATA:-}}"
 PROJECT="${ZMEM_PROJECT:-${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}"
-AGENT_TYPE="${ZMEM_AGENT_TYPE:-}"
 
 # Resolve data dir.
 if [ -n "$DATA_DIR" ]; then
@@ -136,80 +136,26 @@ if [ -z "$NS" ]; then
 fi
 BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 
-# Build the recall payload. A single python process pulls recent high-confidence
-# memories from the subagent's namespace AND the user:global tier in ONE
-# `recent` call (--include-global), PASSIVE via --no-bump (surface counted, retrieval
-# not bumped — issue #21). The store does the
-# project-first merge and id dedup, so this is now one subprocess instead of the
-# old two-pull shell bridge (issue #18). Result is byte-equivalent to the old
-# bridge: up to 5 namespace rows then up to 3 user:global rows, deduped.
-CTX_JSON="$("$PYTHON_BIN" -c '
-import json, os, subprocess, sys
+# Build the recall payload via the shared body (issue #58, 3.5 + 3.9).
+# The body lives in hooks/lib/zmem-recall-body.py and is invoked as a
+# subprocess exactly like zmem-recall.sh and zmem-precompact.sh do —
+# the file is HYPHENATED, so it cannot be `import`ed; every consumer
+# runs it as a script (final-critic round 2 fix). Mode "recent" emits
+# the full {"additionalContext": ...} envelope with the fenced,
+# provenance-tagged render and the selective-inject gate applied.
+# Limits 5/3 preserve this hook's pre-existing pull width (up to 5
+# namespace rows then up to 3 user:global rows).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RECALL_BODY="$SCRIPT_DIR/lib/zmem-recall-body.py"
+if [ ! -f "$RECALL_BODY" ]; then
+    RECALL_BODY_MISSING=1
+fi
 
-store_py = sys.argv[1]
-ns = sys.argv[2]
-agent_type = sys.argv[3]
-try:
-    budget = int(sys.argv[4])
-except (IndexError, ValueError):
-    budget = 25000
-
-def emit(obj):
-    print(json.dumps(obj) if obj else "{}")
-    sys.exit(0)
-
-if not store_py or not os.path.isfile(store_py):
-    emit({})
-
-def recent(namespace, limit, global_limit):
-    """PASSIVE recent pull (records a surface, does not bump retrieval) for a namespace
-    + the user:global tier (fail-open to []).
-
-    --include-global folds the user:global tier into one call with a per-tier
-    budget; the store merges project-first and dedups by id. When namespace IS
-    user:global the store treats --include-global as a no-op (the project tier
-    already is global), matching the old `if ns != user:global` bridge guard.
-    """
-    try:
-        out = subprocess.check_output(
-            [sys.executable, store_py, "recent",
-             "--namespace", namespace, "--limit", str(limit),
-             "--include-global", "--global-limit", str(global_limit),
-             "--min-confidence", "0.5", "--no-bump", "--json"],  # passive: surface not retrieval
-            stderr=subprocess.DEVNULL, timeout=10,
-        ).decode("utf-8", "replace")
-        return json.loads(out) if out.strip() else []
-    except Exception:
-        return []
-
-rows = recent(ns, 5, 3)
-
-if not rows:
-    emit({})
-
-header = "# Box-wide memory (zmem subagent recall, namespace %s" % ns
-if agent_type:
-    header += ", agent %s" % agent_type
-header += "). Consider if relevant to your task; ignore if not."
-lines = [header, ""]
-total = len(header)
-for r in rows:
-    content = (r.get("content") or "")[:300]
-    signal = r.get("signal", "?")
-    # Same stale rendering as zmem-recall.sh: store.py returns a separate
-    # "stale" boolean (content itself is never annotated), and the halved
-    # confidence does not reliably drop the row under the floor, so stale rows
-    # reach the injected context and must be marked for the agent.
-    stale = " [STALE SOURCE]" if r.get("stale") else ""
-    entry = "- [%s]%s %s" % (signal, stale, content)
-    total += len(entry)
-    if budget > 0 and total > budget:  # soft cap; launcher enforces hard encoded budget
-        break
-    lines.append(entry)
-
-ctx = "\n".join(lines)
-emit({"additionalContext": ctx})
-' "$STORE_PY_PY" "$NS" "$AGENT_TYPE" "$BUDGET" 2>/dev/null || echo '{}')"
+if [ -n "${RECALL_BODY_MISSING:-}" ]; then
+  CTX_JSON='{}'
+else
+  CTX_JSON="$("$PYTHON_BIN" "$RECALL_BODY" "$STORE_PY_PY" "$NS" "$BUDGET" "recent" "5" "3" 2>/dev/null || echo '{}')"
+fi
 
 if [ -z "$CTX_JSON" ]; then
   CTX_JSON='{}'
@@ -222,8 +168,14 @@ fi
 # middle of the JSON and the whole recall would silently degrade to {}.
 # Both replacements are safe inside the serialized JSON string: neither
 # introduces a quote or a backslash.
+# I7 critic-fix (issue #58, 3.5): also neutralize the new fence markers
+# so a stored memory containing the literal fence opener/closer text
+# cannot break the host adapter's `<<<END>>>` extraction or render a
+# nested fence.
 CTX_JSON="${CTX_JSON//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
 CTX_JSON="${CTX_JSON//<<<END>>>/<<<END_NEUTRALIZED>>>}"
+CTX_JSON="${CTX_JSON//<<<ZMEM_UNTRUSTED_FENCE>>>/<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>}"
+CTX_JSON="${CTX_JSON//<<<END_ZMEM_UNTRUSTED_FENCE>>>/<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>}"
 
 # Wrap the payload in the sentinel so the host adapter can extract + rewrap it.
 printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' "$CTX_JSON"
