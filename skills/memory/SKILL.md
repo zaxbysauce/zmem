@@ -83,7 +83,7 @@ constants live in `schema_meta.py`.
 |---|---|---|---|
 | `INJECT_FLOOR_PROMPT_DEFAULT` | 0.25 | `ZMEM_INJECT_FLOOR_PROMPT` | `recall` (UserPromptSubmit / PreCompact). Hard floor on FTS/vec results — anything below is dropped before scoring. |
 | `INJECT_FLOOR_RECENT_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_RECENT` | `recent` (SessionStart / subagent recall). Tighter because the surface is high-confidence recent material, not query-best match. |
-| `INJECT_FLOOR_GATE_NONE` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; grounded-signal rows (`test`/`compile`/`lint`/`reviewer`/`user`) keep the 0.25 floor. |
+| `INJECT_FLOOR_GATE_NONE_DEFAULT` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; grounded-signal rows (`test`/`compile`/`lint`/`reviewer`/`user`) keep the 0.25 floor. |
 
 The three floors are intentional. Do not silently unify them. The
 selective-inject gate (3.8) is a hook-only filter; it does not change
@@ -97,13 +97,14 @@ lessons reach project-scoped sessions. Without it, behaviour is strict-namespace
 want a per-tier budget, use `recall --namespace project:<x> --include-global`
 rather than going unscoped.
 
-`--hybrid` (opt-in) adds a vector lane on top of the FTS5/BM25 keyword lane:
-the query is embedded and matched against stored embeddings (sqlite-vec KNN),
+**Hybrid is the DEFAULT when embeddings are available** (issue #58 3.3): the
+query is embedded and matched against stored embeddings (sqlite-vec KNN),
 then both lanes' rankings are fused with Reciprocal Rank Fusion (RRF, k=60).
-It requires the optional embedding runtime (onnxruntime + tokenizers, model
-lazy-downloaded and checksum-verified) and fails open: when the runtime or
-model is unavailable, recall silently uses plain keyword ranking — same
-results as without the flag, never an error.
+`--hybrid` is kept as an explicit no-op alias for older invocations;
+`--no-hybrid` forces the lexical (FTS5/BM25-only) lane. The embedding
+runtime (onnxruntime + tokenizers, model lazy-downloaded and
+checksum-verified) is optional and fails open: when it is unavailable,
+recall silently uses plain keyword ranking — never an error.
 
 `--no-bump` (opt-in) makes a recall **passive**: it records a surface event
 (`surfaced_count`/`last_surfaced`) instead of advancing `retrieval_count`/
@@ -411,12 +412,14 @@ combines:
 Confidence is still a hard floor (below 0.25 is dropped before scoring).
 Staleness demotion halves confidence, which feeds into the confidence component.
 
-Optional **hybrid recall** (`--hybrid`) adds a vector/embedding lane on top of
-this keyword pipeline: the two lanes' rankings are fused with Reciprocal Rank
-Fusion (RRF, k=60), so a memory BM25 missed can still surface via embedding
-similarity. It needs the optional onnxruntime/tokenizers runtime and embedding
-model; without them recall fails open to plain FTS5 keyword ranking (see the
-`recall` command section above for the full contract).
+**Hybrid recall is the default** when the embedding runtime is available
+(auto-enabled; `--no-hybrid` forces lexical-only): a vector/embedding lane
+runs on top of this keyword pipeline and the two lanes' rankings are fused
+with Reciprocal Rank Fusion (RRF, k=60), so a memory BM25 missed can still
+surface via embedding similarity. It needs the optional
+onnxruntime/tokenizers runtime and embedding model; without them recall
+fails open to plain FTS5 keyword ranking (see the `recall` command section
+above for the full contract).
 
 The `rebuild-fts` subcommand rebuilds the FTS5 index from scratch (useful after
 bulk imports or if the index drifts):

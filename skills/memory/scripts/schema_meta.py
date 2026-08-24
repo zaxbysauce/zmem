@@ -57,7 +57,7 @@ ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
 #    type-relax is empty until Phase 4 ships `decision`/`constraint`).
 INJECT_FLOOR_PROMPT_DEFAULT = 0.25
 INJECT_FLOOR_RECENT_DEFAULT = 0.5
-INJECT_FLOOR_GATE_NONE = 0.4
+INJECT_FLOOR_GATE_NONE_DEFAULT = 0.4
 
 # Signals considered GROUNDED (trusted) by the hook selective-inject
 # gate (issue #58, 3.8): rows with these signals clear the PROMPT floor

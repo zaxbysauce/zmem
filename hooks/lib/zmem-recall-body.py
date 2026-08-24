@@ -46,10 +46,40 @@ import sys
 import time
 
 
-# Grounded (trusted) signals per the signal hierarchy: test/compile/lint
-# > reviewer/user > none. Anything NOT in here is treated as ungrounded
-# by the gate (in practice: only "none").
-GROUNDED_SIGNALS = {"test", "compile", "lint", "reviewer", "user"}
+# Selective-inject constants are imported from schema_meta (the documented
+# single source of truth, PRR-017 fix) once the scripts dir is known — see
+# _load_schema_meta(). The literals below are ONLY the import-failure
+# fallback so a partially-deployed tree still runs with the documented
+# defaults rather than crashing the hook (fail-open).
+_FALLBACK_GROUNDED_SIGNALS = {"test", "compile", "lint", "reviewer", "user"}
+_FALLBACK_FLOOR_PROMPT = 0.25
+_FALLBACK_FLOOR_GATE_NONE = 0.4
+_FALLBACK_FLOOR_RECENT = 0.5
+
+_schema_meta = None
+
+
+def _load_schema_meta(store_py: str):
+    """Import schema_meta from the scripts dir (next to store.py) so the
+    gate reads the SAME constants every other surface imports (PRR-017).
+    Returns None on import failure; callers then use the literals above.
+    """
+    global _schema_meta
+    if _schema_meta is not None:
+        return _schema_meta
+    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
+    if not scripts_dir:
+        return None
+    saved = sys.path[:]
+    try:
+        sys.path.insert(0, scripts_dir)
+        import schema_meta  # type: ignore
+        _schema_meta = schema_meta
+        return schema_meta
+    except Exception:
+        return None
+    finally:
+        sys.path[:] = saved
 
 
 def _floor(name: str, default: float) -> float:
@@ -57,12 +87,53 @@ def _floor(name: str, default: float) -> float:
     if not raw:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         return default
+    # Reject non-finite overrides (nan/inf parse but poison comparisons).
+    if value != value or value in (float("inf"), float("-inf")):
+        return default
+    return value
 
 
-def _selective_inject_filter(rows, floor: float, gate_none_floor: float):
+def _gate_constants(store_py: str):
+    """Resolve (floor, gate_none_floor, grounded_signals) from schema_meta
+    when importable, else the documented literal defaults."""
+    sm = _load_schema_meta(store_py)
+    if sm is not None:
+        # getattr fallbacks: a partially-updated deployment (older
+        # schema_meta without a constant) degrades to the literal default
+        # instead of crashing the hook (fail-open).
+        return (
+            _floor(
+                getattr(sm, "INJECT_FLOOR_PROMPT_ENV", "ZMEM_INJECT_FLOOR_PROMPT"),
+                getattr(sm, "INJECT_FLOOR_PROMPT_DEFAULT", _FALLBACK_FLOOR_PROMPT),
+            ),
+            _floor(
+                getattr(sm, "INJECT_FLOOR_GATE_NONE_ENV", "ZMEM_INJECT_FLOOR_GATE_NONE"),
+                getattr(sm, "INJECT_FLOOR_GATE_NONE_DEFAULT", _FALLBACK_FLOOR_GATE_NONE),
+            ),
+            set(getattr(sm, "INJECT_GROUNDED_SIGNALS", _FALLBACK_GROUNDED_SIGNALS)),
+        )
+    return (
+        _floor("ZMEM_INJECT_FLOOR_PROMPT", _FALLBACK_FLOOR_PROMPT),
+        _floor("ZMEM_INJECT_FLOOR_GATE_NONE", _FALLBACK_FLOOR_GATE_NONE),
+        set(_FALLBACK_GROUNDED_SIGNALS),
+    )
+
+
+def _recent_floor(store_py: str) -> float:
+    sm = _load_schema_meta(store_py)
+    if sm is not None:
+        return _floor(
+            getattr(sm, "INJECT_FLOOR_RECENT_ENV", "ZMEM_INJECT_FLOOR_RECENT"),
+            getattr(sm, "INJECT_FLOOR_RECENT_DEFAULT", _FALLBACK_FLOOR_RECENT),
+        )
+    return _floor("ZMEM_INJECT_FLOOR_RECENT", _FALLBACK_FLOOR_RECENT)
+
+
+def _selective_inject_filter(rows, floor: float, gate_none_floor: float,
+                             grounded_signals=None):
     """Apply the hook selective-inject gate (issue #58, 3.8).
 
     Issue spec: tighten ONLY ``signal=none`` (the agent's self-opinion)
@@ -77,6 +148,8 @@ def _selective_inject_filter(rows, floor: float, gate_none_floor: float):
     Returns (selected, status) where status is 'injected' (anything
     qualified) or 'silent' (nothing passed).
     """
+    if grounded_signals is None:
+        grounded_signals = _FALLBACK_GROUNDED_SIGNALS
     selected = []
     for r in rows:
         try:
@@ -87,21 +160,43 @@ def _selective_inject_filter(rows, floor: float, gate_none_floor: float):
         if sig == "none":
             if conf >= gate_none_floor:
                 selected.append(r)
-        elif sig in GROUNDED_SIGNALS and conf >= floor:
+        elif sig in grounded_signals and conf >= floor:
             selected.append(r)
     status = "injected" if selected else "silent"
     return selected, status
 
 
+# Log bound (PRR-023 fix): zmem-bg.log was maintenance-only (~lines/day)
+# and is now appended per hook event. Cap it: past this size, truncate to
+# empty before appending (operator can raise the cap via ZMEM_BG_LOG_MAX_BYTES).
+_BG_LOG_DEFAULT_MAX_BYTES = 262144
+
+
 def _log_inject_decision(rows, selected, status: str) -> None:
-    """Append the injected|silent decision to the existing bg log."""
-    data_dir = os.environ.get("ZMEM_DATA_DIR", "") or os.path.join(
-        os.path.expanduser("~"), ".zmem",
-    )
+    """Append the injected|silent decision to the existing bg log.
+
+    PRR-016 fix: read the CANONICAL ``ZMEM_DATA`` env (what every hook
+    wrapper and the launcher export); the previous ``ZMEM_DATA_DIR`` read
+    never matched, so the log always landed in ~/.zmem even on
+    store-overridden deployments. ``ZMEM_STORE``'s parent is the secondary
+    resolution (host.resolve_store_path gives ZMEM_STORE top precedence).
+    """
+    data_dir = os.environ.get("ZMEM_DATA", "")
     if not data_dir:
-        return
+        store = os.environ.get("ZMEM_STORE", "")
+        data_dir = os.path.dirname(store) if store else ""
+    if not data_dir:
+        data_dir = os.path.join(os.path.expanduser("~"), ".zmem")
     log_path = os.path.join(data_dir, "zmem-bg.log")
     try:
+        # PRR-023: bounded growth — truncate to empty when over the cap so
+        # per-event appends cannot grow the log without limit.
+        try:
+            if os.path.getsize(log_path) > _bg_log_max_bytes():
+                with open(log_path, "w", encoding="utf-8"):
+                    pass
+        except OSError:
+            pass
         ids_all = [r.get("id") for r in rows]
         ids_sel = [r.get("id") for r in selected]
         with open(log_path, "a", encoding="utf-8") as f:
@@ -116,6 +211,15 @@ def _log_inject_decision(rows, selected, status: str) -> None:
     except OSError:
         # Fail-open: never let the audit log block the hook.
         pass
+
+
+def _bg_log_max_bytes() -> int:
+    raw = os.environ.get("ZMEM_BG_LOG_MAX_BYTES", "")
+    try:
+        value = int(raw) if raw else _BG_LOG_DEFAULT_MAX_BYTES
+    except ValueError:
+        return _BG_LOG_DEFAULT_MAX_BYTES
+    return value if value > 0 else _BG_LOG_DEFAULT_MAX_BYTES
 
 
 def _format_fence(rows, header: str, store_py: str = "") -> str:
@@ -174,8 +278,9 @@ def main() -> int:
     if not store_py or not os.path.isfile(store_py):
         return 0
 
-    floor = _floor("ZMEM_INJECT_FLOOR_PROMPT", 0.25)
-    gate_none_floor = _floor("ZMEM_INJECT_FLOOR_GATE_NONE", 0.4)
+    # PRR-017 fix: floors + grounded set come from schema_meta (single
+    # source of truth) with literal fallbacks for a partially-deployed tree.
+    floor, gate_none_floor, grounded_signals = _gate_constants(store_py)
 
     try:
         if mode == "precompact" or mode == "recent":
@@ -186,7 +291,7 @@ def main() -> int:
                     sys.executable, store_py, "recent",
                     "--namespace", ns,
                     "--limit", recent_limit,
-                    "--min-confidence", str(_floor("ZMEM_INJECT_FLOOR_RECENT", 0.5)),
+                    "--min-confidence", str(_recent_floor(store_py)),
                     "--include-global",
                     "--global-limit", recent_global_limit,
                     "--no-bump",
@@ -196,9 +301,18 @@ def main() -> int:
                 timeout=8,
             ).decode("utf-8", "replace")
         else:
-            # UserPromptSubmit: prompt text is the QUERY.
-            # Read prompt from stdin if available; otherwise empty.
-            prompt = sys.stdin.read() if not sys.stdin.isatty() else ""
+            # UserPromptSubmit: the prompt text is the QUERY.
+            # PRR-003 fix: stdin carries the host's JSON EVENT
+            # ({"prompt": ..., "session_id": ..., "cwd": ...}); parse out
+            # the prompt field (the pre-#58 wrapper contract). Non-JSON
+            # stdin (plain text) is used verbatim for manual invocation.
+            raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
+            prompt = ""
+            try:
+                obj = json.loads(raw_stdin)
+                prompt = obj.get("prompt", "") if isinstance(obj, dict) else ""
+            except (ValueError, TypeError):
+                prompt = raw_stdin
             if not prompt or len(prompt.strip()) < 5:
                 return 0
             out = subprocess.check_output(
@@ -221,6 +335,7 @@ def main() -> int:
 
     selected, status = _selective_inject_filter(
         rows, floor=floor, gate_none_floor=gate_none_floor,
+        grounded_signals=grounded_signals,
     )
     _log_inject_decision(rows, selected, status)
 
@@ -235,12 +350,14 @@ def main() -> int:
     )
     ctx = _format_fence(selected, header, store_py=store_py)
     if budget > 0 and len(ctx) > budget:
-        # Truncate from the END (preserve fence closer), but only inside
-        # the body — never break an unclosed fence.
-        marker = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
-        idx = ctx.rfind(marker)
-        if idx > 0:
-            ctx = ctx[:idx].rstrip() + "\n" + marker
+        # PRR-015 fix: actually truncate. The previous branch reconstructed
+        # the original string unchanged (no-op), so oversized memories
+        # bypassed the budget. Cut the fence BODY at the budget (minus the
+        # closer), then re-append the closer — the fence is never left
+        # unclosed and the payload respects ZMEM_CTX_BUDGET.
+        closer = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
+        body_budget = max(0, budget - len(closer) - 1)
+        ctx = ctx[:body_budget].rstrip() + "\n" + closer + "\n[recall truncated]"
     _emit_envelope(ctx)
     return 0
 

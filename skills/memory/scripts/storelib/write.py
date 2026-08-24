@@ -710,10 +710,11 @@ def _find_semantic_duplicate(
     Returns ``(row, similarity)`` or ``(None, 0.0)`` when no same-
     namespace duplicate above threshold was found.
     """
-    # Ask for 5 vec rows but over-fetch by 8x; the helper post-filters
-    # by namespace so we get up to 5 same-namespace rows.
+    # Ask for 5 vec rows; PRR-012 fix: pass overfetch=None so the helper
+    # honors ZMEM_VEC_NS_OVERFETCH exactly like the recall path (the
+    # previous explicit overfetch=8 silently ignored the env override).
     knn = _vec_knn_in_namespace(
-        conn, embedding, namespaces=[namespace], k=5, overfetch=8,
+        conn, embedding, namespaces=[namespace], k=5, overfetch=None,
     )
     if not knn:
         return None, 0.0

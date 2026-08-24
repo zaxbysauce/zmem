@@ -38,23 +38,27 @@ def nonnegative_int(value: str) -> int:
 
 def _iso8601(value: str) -> str:
     """argparse type= for --as-of (issue #58, 3.6): accept an ISO-8601
-    timestamp, normalize +00:00 to Z-suffix so the predicate's string
-    comparison against ``valid_from`` (which ``now_iso()`` writes with a
-    Z-suffix) does not silently fail (I6 critic-fix). Phase 4 extends
-    the predicate to ``valid_until``; the column does not exist yet
-    so the predicate references only ``valid_from`` (C1 critic-fix).
+    timestamp, validate strictly (garbage → argparse error), and return the
+    canonical Z-suffixed UTC form the store's lexicographic predicate
+    compares against. PRR-022 fix: normalization now covers ANY zone offset
+    (e.g. +05:30), not just +00:00 — the store compares strings, and
+    'Z' vs '+' ASCII ordering silently mis-filters otherwise. The same
+    normalization is applied at recall_memory/recent_memory entry for
+    programmatic callers; this type= additionally enforces argparse-level
+    validation.
     """
     from datetime import datetime
     if not value:
         raise argparse.ArgumentTypeError("--as-of requires a non-empty ISO-8601 timestamp")
     normalized = value.strip()
-    if normalized.endswith("+00:00"):
-        normalized = normalized[:-6] + "Z"
     try:
-        datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid ISO-8601 for --as-of: {exc}")
-    return normalized
+    if dt.tzinfo is not None:
+        from datetime import timezone
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
 def main():
     ap = argparse.ArgumentParser(prog="store.py", description="ZMem semantic store")
@@ -580,13 +584,13 @@ def main():
                 sys.exit(1)
         elif args.cmd == "recall":
             # Issue #58, 3.3: --hybrid and --no-hybrid both parse, but
-            # the default is hybrid-when-available (sentinel None). This
-            # preserves byte-identical behavior for explicit --hybrid /
-            # --no-hybrid invocations while flipping the default.
-            if args.hybrid:
-                hybrid_arg: bool | None = True
-            elif args.no_hybrid:
-                hybrid_arg = False
+            # the default is hybrid-when-available (sentinel None). PRR-013
+            # fix: --no-hybrid takes PRECEDENCE when both are passed — an
+            # explicit force-lexical must never be silently overridden.
+            if args.no_hybrid:
+                hybrid_arg: bool | None = False
+            elif args.hybrid:
+                hybrid_arg = True
             else:
                 hybrid_arg = None
             recall_memory(conn, query=args.query, namespace=args.namespace,

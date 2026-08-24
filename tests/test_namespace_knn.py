@@ -29,10 +29,12 @@ def _sqlite_vec_available() -> bool:
     CI runners may lack the sqlite-vec extension entirely — connect()
     then silently degrades to FTS-only and memory_vec never exists. The
     direct-KNN tests below insert into memory_vec and must skip there."""
+    # PRR-026 fix: catch Exception (not just ImportError) — a native
+    # library LOAD failure (DLL error) must skip, not break collection.
     try:
         import sqlite_vec  # noqa: F401
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
@@ -53,6 +55,7 @@ class NamespaceKnnTests(unittest.TestCase):
         cls.store_path = Path(cls.tmp) / "store.sqlite"
 
     def setUp(self):
+        self._saved_store = os.environ.get("ZMEM_STORE")
         os.environ["ZMEM_STORE"] = str(self.store_path)
         os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
         # Evict any cached module state from previous tests in this
@@ -126,6 +129,13 @@ class NamespaceKnnTests(unittest.TestCase):
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
+        # PRR-024 fix: restore the ambient env (sibling convention in
+        # tests/test_host.py) — a leaked ZMEM_STORE silently redirects any
+        # later in-process test's store.
+        if self._saved_store is None:
+            os.environ.pop("ZMEM_STORE", None)
+        else:
+            os.environ["ZMEM_STORE"] = self._saved_store
 
     def test_namespace_filter_returns_only_same_namespace(self):
         """Query embedding matches ns-knn-a exactly; the helper must

@@ -343,9 +343,20 @@ def _vec_knn_in_namespace(
         raw_env = os.environ.get(ZMEM_VEC_NS_OVERFETCH_ENV, "")
         if raw_env:
             try:
-                overfetch = float(raw_env)
+                candidate = float(raw_env)
+                # PRR-005 fix: reject non-finite overrides — float() accepts
+                # "nan"/"inf" but int(overfetch) below raises ValueError/
+                # OverflowError outside the SQL guard, crashing recall.
+                if candidate == candidate and candidate not in (
+                    float("inf"), float("-inf")
+                ):
+                    overfetch = candidate
             except ValueError:
                 pass
+    # Belt-and-suspenders: never let a non-finite or non-positive factor
+    # reach the int math regardless of how it arrived.
+    if overfetch != overfetch or overfetch in (float("inf"), float("-inf")) or overfetch < 1:
+        overfetch = float(ZMEM_VEC_NS_OVERFETCH_DEFAULT)
     raw_k = max(int(k) * int(overfetch), int(k) + 1)
     raw_k = min(raw_k, int(k_cap))
 

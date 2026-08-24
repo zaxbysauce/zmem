@@ -642,8 +642,27 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         namespace: Optional[str] = None,
         limit: int = _DEFAULT_LIMIT,
     ) -> dict[str, Any]:
-        """Search the shared store (alias of recall; same semantics)."""
-        return await recall(query=query, namespace=namespace, limit=limit)
+        """Search the shared store (keyword-only, unlike recall).
+
+        PRR-007 fix: search is keyword/lexical BY CONTRACT on every
+        surface — the CLI search subcommand pins --no-hybrid for exactly
+        this reason (issue #58 3.3 I1 fix). The previous alias of recall
+        silently flipped to hybrid-when-available under the new default.
+        """
+        q = (query or "").strip()
+        if not q:
+            return _error("query is required")
+        n = _clamp_limit(limit)
+        args = [
+            "recall",
+            "--query", q[:_MAX_QUERY_CHARS],
+            "--limit", str(n),
+            "--include-global",
+            "--global-limit", "3",
+            "--no-hybrid",
+            "--json",
+        ] + _namespace_flag(namespace)
+        return _parse_results(await _run_store_async(args))
 
     @mcp.tool()
     async def supersede(id: str, reason: Optional[str] = None) -> dict[str, Any]:

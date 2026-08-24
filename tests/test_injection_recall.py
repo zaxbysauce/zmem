@@ -117,6 +117,7 @@ class InjectionFilterBehaviorTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="zmem-inj-")
         self.store_path = Path(self.tmp) / "store.sqlite"
+        self._saved_store = os.environ.get("ZMEM_STORE")
         os.environ["ZMEM_STORE"] = str(self.store_path)
         os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
         for mod in list(sys.modules.keys()):
@@ -141,7 +142,7 @@ class InjectionFilterBehaviorTests(unittest.TestCase):
             "source_ref, source_hash, confidence, signal, valid_from, "
             "ingestion_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("clean-row", "project:inj-test", ALLOWED_TYPES[0],
-             "python idiomatic code structure",
+             "python instructions for idiomatic code structure",
              "", "", "", 0.9, "test",
              "2026-02-03T04:05:06Z", "2026-02-03T04:05:06Z"),
         )
@@ -151,14 +152,28 @@ class InjectionFilterBehaviorTests(unittest.TestCase):
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
+        # PRR-024 fix: restore the ambient env (sibling convention in
+        # tests/test_host.py) — a leaked ZMEM_STORE silently redirects any
+        # later in-process test's store.
+        if self._saved_store is None:
+            os.environ.pop("ZMEM_STORE", None)
+        else:
+            os.environ["ZMEM_STORE"] = self._saved_store
 
     def test_hook_path_omits_injection_risk(self):
         """``recall --no-bump`` (the hook path) returns ONLY the clean
-        row, omitting the injection-risk one entirely."""
+        row, omitting the injection-risk one entirely.
+
+        PRR-008 fix: the query is "instructions" — a token present in BOTH
+        rows' content — so both rows enter the FTS candidate set and the
+        omission filter is actually exercised (the previous query "python"
+        only matched the clean row, so the test passed even with the
+        filter deleted).
+        """
         from storelib import recall_memory, connect
         results = recall_memory(
             connect(),
-            query="python",
+            query="instructions",
             namespace="project:inj-test",
             limit=5,
             as_json=True,
@@ -166,8 +181,11 @@ class InjectionFilterBehaviorTests(unittest.TestCase):
             hybrid=False,
         )
         ids = [r["id"] for r in results]
-        self.assertEqual(len(results), 1,
-                         f"hook path must omit injection-risk row: {ids}")
+        self.assertEqual(
+            ids, ["clean-row"],
+            f"hook path must omit the injection-risk row and keep the clean "
+            f"row (both matched the query): got {ids}",
+        )
         for r in results:
             self.assertFalse(
                 r.get("prompt_injection_risk"),
@@ -176,20 +194,28 @@ class InjectionFilterBehaviorTests(unittest.TestCase):
 
     def test_explicit_path_prefixes_injection_risk(self):
         """``recall`` (no --no-bump, i.e. explicit) keeps the row and
-        the prompt_injection_risk flag is True on the row."""
+        the prompt_injection_risk flag is True on the row. Doubles as the
+        non-vacuous control for the omission test: the query matches BOTH
+        rows, so both appear here."""
         from storelib import recall_memory, connect
         results = recall_memory(
             connect(),
-            query="ignore",
+            query="instructions",
             namespace="project:inj-test",
             limit=5,
             as_json=True,
             no_bump=False,
             hybrid=False,
         )
+        ids = {r["id"] for r in results}
+        self.assertEqual(
+            ids, {"inj-row", "clean-row"},
+            f"control: the query must match BOTH rows so the omission test "
+            f"is non-vacuous; got {ids}",
+        )
         inj_rows = [r for r in results if r.get("prompt_injection_risk")]
-        self.assertGreater(
-            len(inj_rows), 0,
+        self.assertEqual(
+            len(inj_rows), 1,
             "explicit recall must keep the injection-risk row with the "
             "flag set so the text path can render the [INJECTION RISK] prefix",
         )

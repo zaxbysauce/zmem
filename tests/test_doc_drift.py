@@ -182,14 +182,28 @@ class DoctorChecksTest(unittest.TestCase):
                 f"doctor.py printed no JSON (stderr: {r.stderr[:400]})",
             )
             report = json.loads(r.stdout)
-            check_ids = {c["id"] for c in report["checks"]}
+            checks_by_id = {c["id"]: c for c in report["checks"]}
             self.assertIn(
-                "hybrid-default", check_ids,
+                "hybrid-default", checks_by_id,
                 "doctor must report hybrid-default (issue #58 3.7)",
             )
             self.assertIn(
-                "vec-ns-overfetch", check_ids,
+                "vec-ns-overfetch", checks_by_id,
                 "doctor must report vec-ns-overfetch (issue #58 3.7)",
+            )
+            # PRR-001R regression pin: the check must report a REAL
+            # availability status — never the "probe failed: NameError"
+            # warn the pre-fix module-level-reference bug produced.
+            hd = checks_by_id["hybrid-default"]
+            self.assertIn(hd["status"], ("pass", "info"))
+            self.assertNotIn(
+                "NameError", hd["summary"],
+                "hybrid-default must probe embeddings, not NameError into "
+                "the except branch (PRR-001R)",
+            )
+            self.assertIn(
+                "embeddings.available=", hd["summary"],
+                "hybrid-default summary must state the availability verdict",
             )
 
 

@@ -29,6 +29,7 @@ class AsOfBehaviorTests(unittest.TestCase):
         # constraint violations on the deterministic ids).
         self.tmp = tempfile.mkdtemp(prefix="zmem-asof-")
         self.store_path = Path(self.tmp) / "store.sqlite"
+        self._saved_store = os.environ.get("ZMEM_STORE")
         os.environ["ZMEM_STORE"] = str(self.store_path)
         os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
         for mod in list(sys.modules.keys()):
@@ -56,6 +57,13 @@ class AsOfBehaviorTests(unittest.TestCase):
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
+        # PRR-024 fix: restore the ambient env (sibling convention in
+        # tests/test_host.py) — a leaked ZMEM_STORE silently redirects any
+        # later in-process test's store.
+        if self._saved_store is None:
+            os.environ.pop("ZMEM_STORE", None)
+        else:
+            os.environ["ZMEM_STORE"] = self._saved_store
 
     def test_as_of_returns_rows_at_or_before(self):
         """Query at T2 returns the first two rows only."""
@@ -78,19 +86,21 @@ class AsOfBehaviorTests(unittest.TestCase):
 
     def test_as_of_z_suffix_normalization(self):
         """``+00:00`` input must compare correctly against Z-suffixed
-        ``valid_from`` (I6 critic-fix). The _iso8601 helper normalizes
-        ``+00:00`` to ``Z`` so the lex-comparison works.
+        ``valid_from`` — PRR-010 fix: use a BOUNDARY timestamp exactly equal
+        to row T2's valid_from ('2026-02-01T00:00:00Z'). A Z input includes
+        T2 (equal); a RAW un-normalized '+00:00' input would exclude it
+        (ASCII '+' < 'Z'), so identical results prove the entry-point
+        normalization (recall.py _normalize_as_of) fires for programmatic
+        callers, not just the CLI argparse type.
         """
-        from storelib import _expand_namespace_aliases, connect, recent_memory
-        # If this test ran with T2 as_of, recent with +00:00 must match
-        # exactly what Z-suffix does.
+        from storelib import connect, recent_memory
         results_z = recent_memory(
             connect(),
             namespace="project:asof-test",
             limit=10,
             as_json=True,
             no_bump=True,
-            as_of="2026-02-15T00:00:00Z",
+            as_of="2026-02-01T00:00:00Z",
         )
         results_p = recent_memory(
             connect(),
@@ -98,16 +108,56 @@ class AsOfBehaviorTests(unittest.TestCase):
             limit=10,
             as_json=True,
             no_bump=True,
-            as_of="2026-02-15T00:00:00+00:00",
+            as_of="2026-02-01T00:00:00+00:00",
         )
         ids_z = sorted(r["id"] for r in results_z)
         ids_p = sorted(r["id"] for r in results_p)
         self.assertEqual(
             ids_z, ids_p,
-            "Z-suffix and +00:00 inputs must produce identical results "
-            "(I6 critic-fix). Otherwise the lex-comparison silently "
-            "fails for ISO-8601 inputs without the Z-suffix.",
+            "Z-suffix and +00:00 inputs at the SAME instant must produce "
+            "identical results (entry-point normalization). Z=%s, +00:00=%s"
+            % (ids_z, ids_p),
         )
+        self.assertEqual(
+            ids_z, ["asof-row-0", "asof-row-1"],
+            f"boundary as_of == T2.valid_from must include T1 and T2; got {ids_z}",
+        )
+
+    def test_as_of_non_utc_offset_normalized(self):
+        """PRR-022 fix: a non-UTC offset (+05:30) must be converted to the
+        UTC instant, not compared as wall-clock text. 2026-02-01T05:30+05:30
+        == 2026-02-01T00:00Z == T2's valid_from, so T1+T2 return."""
+        from storelib import connect, recent_memory
+        results = recent_memory(
+            connect(),
+            namespace="project:asof-test",
+            limit=10,
+            as_json=True,
+            no_bump=True,
+            as_of="2026-02-01T05:30:00+05:30",
+        )
+        ids = sorted(r["id"] for r in results)
+        self.assertEqual(
+            ids, ["asof-row-0", "asof-row-1"],
+            f"non-UTC offset must resolve to the UTC instant; got {ids}",
+        )
+
+    def test_search_cli_as_of(self):
+        """PRR-010 fix: --as-of must work through the real `search`
+        subcommand (previously only recall/recent were tested)."""
+        import subprocess
+        env = {**os.environ, "ZMEM_STORE": str(self.store_path),
+               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "store.py"), "search",
+             "--text", "row", "--namespace", "project:asof-test",
+             "--no-bump", "--as-of", "2026-02-15T00:00:00Z"],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("row T1", r.stdout)
+        self.assertIn("row T2", r.stdout)
+        self.assertNotIn("row T3", r.stdout)
 
     def test_absent_as_of_returns_all_live(self):
         """Absent flag → no temporal predicate → all live rows."""

@@ -44,17 +44,26 @@ if [ ! -f "$BODY" ]; then
     exit 0
 fi
 
-# Resolve python via direct execution probe (NOT `command -v python
-# --version` — non-portable: some shells treat --version as a second
-# command name for -v lookup). Tries `python` first; the fail-open
-# `|| echo '{}'` below bounds a wrong-interpreter pick to a silent
-# no-op. (Siblings add an IS_WINDOWS branch for python3 ordering; this
-# hook's probe stays flat — both interpreters run the same body.)
+# Resolve python like the sibling hooks (PRR-021 fix): python3 first on
+# POSIX, python first on Windows (the Store python3 stub is a no-op).
+# Direct execution probe — NOT `command -v python --version` (non-portable).
+IS_WINDOWS=0
+if [[ "$(uname -s 2>/dev/null)" == MINGW* ]] || [[ "$(uname -s 2>/dev/null)" == CYGWIN* ]] || [[ "$(uname -s 2>/dev/null)" == MSYS* ]]; then
+  IS_WINDOWS=1
+fi
 PYTHON_BIN=""
-if python --version >/dev/null 2>&1; then
+if [ "$IS_WINDOWS" -eq 1 ]; then
+  if python --version >/dev/null 2>&1; then
     PYTHON_BIN="python"
-elif python3 --version >/dev/null 2>&1; then
+  elif python3 --version >/dev/null 2>&1; then
     PYTHON_BIN="python3"
+  fi
+else
+  if python3 --version >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  elif python --version >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  fi
 fi
 if [ -z "$PYTHON_BIN" ]; then
     echo '{}'

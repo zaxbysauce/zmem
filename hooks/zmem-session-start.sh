@@ -306,35 +306,31 @@ if store_py and os.path.isfile(store_py):
         rows = json.loads(out) if out.strip() else []
         if rows:
             # Issue #58, 3.5: wrap Tier 2 in the same non-executable
-            # fence + provenance render that zmem-recall uses. The
-            # gate + fence helpers live in storelib. The gate is a
-            # local mirror of hooks/lib/zmem-recall-body.py without
-            # the log-write side effect (hook-only). Floors read the
-            # SAME env vars with the SAME defaults as the shared body
-            # so operator tuning applies uniformly (final-critic
-            # round-2 fix).
+            # fence + provenance render that zmem-recall uses. The gate
+            # + fence helpers live in storelib/schema_meta (single source
+            # of truth, PRR-017 fix — floors and the grounded set are
+            # IMPORTED, not re-typed literals).
             try:
                 sys.path.insert(0, os.path.dirname(store_py))
                 sys.path.insert(0, os.path.join(os.path.dirname(store_py), "storelib"))
                 from storelib import _format_fenced_recall
+                import schema_meta as _sm
 
                 def _env_floor(name, default):
                     raw = os.environ.get(name, "")
                     if not raw:
                         return default
                     try:
-                        return float(raw)
+                        value = float(raw)
                     except ValueError:
                         return default
+                    if value != value or value in (float("inf"), float("-inf")):
+                        return default
+                    return value
 
-                _floor_prompt = _env_floor("ZMEM_INJECT_FLOOR_PROMPT", 0.25)
-                _floor_gate_none = _env_floor("ZMEM_INJECT_FLOOR_GATE_NONE", 0.4)
-                # Grounded signals (test/compile/lint/reviewer/user) inject
-                # at the prompt floor; ONLY signal=none is tightened to the
-                # gate-none floor (issue #58 3.8 — mirror of the shared
-                # body gate; dropping `user` here broke the launcher
-                # sentinel round-trip canary).
-                _grounded = {"test", "compile", "lint", "reviewer", "user"}
+                _floor_prompt = _env_floor(_sm.INJECT_FLOOR_PROMPT_ENV, _sm.INJECT_FLOOR_PROMPT_DEFAULT)
+                _floor_gate_none = _env_floor(_sm.INJECT_FLOOR_GATE_NONE_ENV, _sm.INJECT_FLOOR_GATE_NONE_DEFAULT)
+                _grounded = set(_sm.INJECT_GROUNDED_SIGNALS)
                 _selected = []
                 for r in rows:
                     try:
@@ -348,6 +344,27 @@ if store_py and os.path.isfile(store_py):
                     elif _sig in _grounded and _conf >= _floor_prompt:
                         _selected.append(r)
                 rows = _selected
+                # PRR-014 fix: record the injected|silent decision in the
+                # SAME bg log the other hook surfaces use (recall /
+                # precompact / subagent-recall via the shared body).
+                try:
+                    _log_dir = os.environ.get("ZMEM_DATA", "") or (
+                        os.path.dirname(os.environ.get("ZMEM_STORE", ""))
+                        if os.environ.get("ZMEM_STORE") else ""
+                    ) or os.path.join(os.path.expanduser("~"), ".zmem")
+                    _log_path = os.path.join(_log_dir, "zmem-bg.log")
+                    if os.path.isdir(_log_dir):
+                        with open(_log_path, "a", encoding="utf-8") as _lf:
+                            _lf.write(
+                                "[%d] zmem-hook status=%s ids=%s all=%s\n" % (
+                                    int(__import__("time").time()),
+                                    "injected" if rows else "silent",
+                                    [r.get("id") for r in rows],
+                                    [r.get("id") for r in rows],
+                                )
+                            )
+                except Exception:
+                    pass  # fail-open: audit log never blocks session start
                 if rows:
                     block = _format_fenced_recall(
                         rows,
@@ -358,13 +375,12 @@ if store_py and os.path.isfile(store_py):
                     )
                     parts.append(block)
             except Exception:
-                # Storage helper import failed — fall back to the
-                # legacy unfenced render. Fail-open: session-start is
-                # non-blocking.
-                lines = ["# Recent memories (Tier 2 — namespace %s). Consider if relevant; ignore if not." % ns, ""]
-                for r in rows:
-                    lines.append("- [%s] %s" % (r.get("signal","?"), r.get("content","")))
-                parts.append("\n".join(lines))
+                # PRR-006 fix: the storelib/schema_meta import failed, so
+                # the fence renderer and the single-source gate constants
+                # are unavailable. OMIT Tier 2 entirely rather than emit
+                # untrusted retrieved text unfenced/un-gated — a missing
+                # Tier 2 block is a degraded session, not a safety hole.
+                pass
     except Exception:
         pass  # fail-open: recall errors never block session start
 

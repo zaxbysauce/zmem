@@ -12,6 +12,58 @@ README.
 
 ## [Unreleased]
 
+## [0.8.9] — 2026-08-24
+
+### Added
+
+- **Retrieval correctness: namespace KNN, hybrid default, inject safety**
+  (issue [#58], SOTA PR 3/10). All nine task families shipped:
+  - Shared namespace-aware vec0 KNN helper (`ZMEM_VEC_NS_OVERFETCH`, default 8)
+    for recall AND write-time semantic dedup — a foreign namespace can no longer
+    crowd out same-namespace vector slots.
+  - **Hybrid recall is now the DEFAULT when embeddings are available.**
+    `--no-hybrid` forces the lexical lane; `--hybrid` remains a parsing alias.
+    `search` (CLI, MCP, Hermes tool) stays keyword-only by contract.
+  - `prompt-injection-risk` rows are omitted from every passive (`--no-bump`)
+    surface and prefixed `[INJECTION RISK]` on explicit recall; the patterns
+    re-run at emit time as defense in depth.
+  - Every hook that inlines memory text (UserPromptSubmit recall, SubagentStart,
+    SessionStart Tier 2, PreCompact, Hermes prefetch) renders a
+    non-executable fence + "untrusted notes" disclaimer with full provenance
+    (id / confidence / signal / namespace / type / source_ref).
+  - `--as-of ISO-8601` on `recall` / `recent` / `search` (any zone offset is
+    normalized to the UTC instant; the `valid_until` half of the predicate is
+    a Phase 4 placeholder).
+  - Selective inject: grounded signals (test/compile/lint/reviewer/user) inject
+    at the 0.25 floor; only `signal=none` is tightened to 0.4. Three named,
+    env-overridable floors live in `schema_meta.py` (single source of truth).
+    The `injected|silent` decision is logged to `zmem-bg.log` (size-capped).
+  - Claude Code `PreCompact` re-inject (read-only, `--no-bump`), sourced from
+    the new shared `hooks/lib/zmem-recall-body.py` so all hook renders share
+    one implementation. ZCode/Codex configs unchanged (no such event).
+  - Doctor checks `hybrid-default` and `vec-ns-overfetch` (namespace-scoped,
+    sqlite-vec-aware).
+
+### Fixed
+
+- Review-found defects closed in the same release: hook recall queries now
+  parse the `prompt` field from the JSON event (was: raw JSON as the query);
+  doctor's two new checks work on real stores (NameError + tuple-row crashes);
+  `--as-of` filters the hybrid vector lane too; non-UTC offsets compare as
+  instants; `--no-hybrid` wins when combined with `--hybrid`; the recall-body
+  budget truncation actually truncates; the inject log honors `ZMEM_DATA`
+  overrides; session-start's import-failure path omits Tier 2 instead of
+  emitting unfenced text.
+
+### Known issues
+
+- `hooks.zcode.json` registers no `SubagentStart` event, so subagent recall
+  fires only on Claude Code / Codex (pre-existing host capability gap).
+- The launcher's hard-budget truncation can still slice a fence mid-block at
+  the transport layer (pre-existing prefix cut).
+
+[#58]: https://github.com/zaxbysauce/zmem/issues/58
+
 ## [0.8.8] — 2026-08-23
 
 ### Changed

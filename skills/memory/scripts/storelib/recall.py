@@ -184,9 +184,16 @@ def _expand_namespace_aliases(conn: sqlite3.Connection, namespace: str | None) -
     return list(aliases)
 
 def _fetch_by_ids(
-    conn: sqlite3.Connection, ids: list[str], namespaces: list[str] | None, floor: float
+    conn: sqlite3.Connection, ids: list[str], namespaces: list[str] | None, floor: float,
+    as_of: str | None = None,
 ) -> list:
-    """Fetch full memory rows for a list of IDs, applying the same filters as recall."""
+    """Fetch full memory rows for a list of IDs, applying the same filters as recall.
+
+    ``as_of`` (PRR-004 fix, issue #58 3.6): the SAME temporal predicate the
+    FTS branch applies — vector-only candidates fused in by RRF previously
+    bypassed it, so a future-dated row (valid_from > as_of) surfaced via the
+    vec lane despite --as-of. ``valid_until`` half is the Phase 4 placeholder.
+    """
     if not ids:
         return []
     placeholders = ",".join("?" * len(ids))
@@ -196,6 +203,10 @@ def _fetch_by_ids(
         ns_placeholders = ",".join("?" * len(namespaces))
         ns_clause = f"AND namespace IN ({ns_placeholders})"
         params.extend(namespaces)
+    as_of_clause = ""
+    if as_of:
+        as_of_clause = " AND (valid_from = '' OR valid_from <= ?) AND (1=1) "
+        params.append(as_of)
     params.append(floor)
     sql = f"""
         SELECT id, namespace, type, content, tags, source_ref,
@@ -205,6 +216,7 @@ def _fetch_by_ids(
         FROM memory
         WHERE id IN ({placeholders})
           {ns_clause}
+          {as_of_clause}
           AND superseded_at IS NULL
           AND confidence >= ?
     """
@@ -212,6 +224,33 @@ def _fetch_by_ids(
     # Preserve the fused order (IN clause does not guarantee order).
     row_map = {r["id"]: r for r in rows}
     return [row_map[mid] for mid in ids if mid in row_map]
+
+
+def _normalize_as_of(as_of: str | None) -> str | None:
+    """Normalize an --as-of timestamp to the canonical Z-suffixed UTC form
+    the store compares against (PRR-022 fix, issue #58 3.6).
+
+    ``valid_from`` is written by ``now_iso()`` as ``...Z`` and the recall
+    predicate is a lexicographic string compare, so any other zone suffix
+    (``+00:00``, ``+05:30``, ``-0700``) silently compares by ASCII against
+    ``Z`` and mis-filters. The CLI's argparse ``_iso8601`` normalizes only
+    ``+00:00`` — programmatic callers (MCP/Hermes/tests) bypassed it
+    entirely. This helper is the single normalizer every entry point flows
+    through: parse (strict ISO-8601 via fromisoformat), convert to UTC,
+    re-emit with the Z suffix. Unparseable input is returned unchanged so
+    the SQL compare degrades exactly as before (never raises on the hot
+    path).
+    """
+    if not as_of:
+        return as_of
+    candidate = as_of.strip()
+    try:
+        dt = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError:
+        return as_of
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
 def _recall_one_tier(
     conn: sqlite3.Connection,
@@ -326,7 +365,7 @@ def _recall_one_tier(
                 # the global tier separately when --include-global is on). This
                 # keeps the per-tier-budget / hard-floor contract unconditional.
                 # (Final-critic F1.)
-                rows = _fetch_by_ids(conn, fused_ids, ns_list, floor)
+                rows = _fetch_by_ids(conn, fused_ids, ns_list, floor, as_of=as_of)
 
     # Re-rank by composite score (relevance + confidence + recency + popularity).
     scored: list[tuple[float, dict]] = []
@@ -547,6 +586,11 @@ def recall_memory(
     if hybrid is None:
         hybrid = bool(_embeddings and _embeddings.is_available())
 
+    # PRR-022 fix: normalize the temporal predicate ONCE at the entry point
+    # so programmatic callers (MCP/Hermes/tests) get the same Z-suffixed
+    # UTC form the CLI's argparse type produces.
+    as_of = _normalize_as_of(as_of)
+
     ns_list = _expand_namespace_aliases(conn, namespace)
 
     # The global tier is folded in only when explicitly requested AND a specific
@@ -726,6 +770,8 @@ def recent_memory(
     key. (issue #18)
     """
     project_rows: list[dict] = []
+    # PRR-022 fix: same entry-point normalization as recall_memory.
+    as_of = _normalize_as_of(as_of)
     if namespace:
         project_rows = _recent_one_tier(
             conn, ns_list=_expand_namespace_aliases(conn, namespace),
@@ -767,8 +813,9 @@ def recent_memory(
         # Issue #58, 3.5: same fence + provenance as recall. Recent is
         # the high-confidence admin pull used by SessionStart /
         # SubagentStart; the fence still applies (these are still
-        # untrusted retrieved notes) but no `--no-bump`-style omit
-        # happens here because the caller decides whether to inject.
+        # untrusted retrieved notes). Note the injection-risk omit for
+        # no_bump=True happens ABOVE (3.4), before this render — so rows
+        # reaching this branch are the post-filter set.
         if not results:
             print("[zmem] no recent memories.")
         else:
