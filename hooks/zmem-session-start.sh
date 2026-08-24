@@ -329,7 +329,12 @@ if store_py and os.path.isfile(store_py):
 
                 _floor_prompt = _env_floor("ZMEM_INJECT_FLOOR_PROMPT", 0.25)
                 _floor_gate_none = _env_floor("ZMEM_INJECT_FLOOR_GATE_NONE", 0.4)
-                _high_signals = {"test", "compile", "lint", "reviewer"}
+                # Grounded signals (test/compile/lint/reviewer/user) inject
+                # at the prompt floor; ONLY signal=none is tightened to the
+                # gate-none floor (issue #58 3.8 — mirror of the shared
+                # body gate; dropping `user` here broke the launcher
+                # sentinel round-trip canary).
+                _grounded = {"test", "compile", "lint", "reviewer", "user"}
                 _selected = []
                 for r in rows:
                     try:
@@ -337,9 +342,10 @@ if store_py and os.path.isfile(store_py):
                     except (TypeError, ValueError):
                         _conf = 0.0
                     _sig = (r.get("signal") or "none").lower()
-                    if _sig in _high_signals and _conf >= _floor_prompt:
-                        _selected.append(r)
-                    elif _sig == "none" and _conf >= _floor_gate_none:
+                    if _sig == "none":
+                        if _conf >= _floor_gate_none:
+                            _selected.append(r)
+                    elif _sig in _grounded and _conf >= _floor_prompt:
                         _selected.append(r)
                 rows = _selected
                 if rows:

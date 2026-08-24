@@ -59,10 +59,12 @@ INJECT_FLOOR_PROMPT_DEFAULT = 0.25
 INJECT_FLOOR_RECENT_DEFAULT = 0.5
 INJECT_FLOOR_GATE_NONE = 0.4
 
-# Signals considered "high-trust" by the hook selective-inject gate
-# (issue #58, 3.8). Rows with these signals clear the PROMPT floor
-# (0.25); rows with signal=none must clear GATE_NONE (0.4).
-INJECT_HIGH_SIGNALS = frozenset({"test", "compile", "lint", "reviewer"})
+# Signals considered GROUNDED (trusted) by the hook selective-inject
+# gate (issue #58, 3.8): rows with these signals clear the PROMPT floor
+# (0.25); rows with any other signal — in practice only `none`, the
+# agent's self-opinion — must clear the tighter GATE_NONE floor (0.4).
+# Matches the signal hierarchy: test/compile/lint > reviewer/user > none.
+INJECT_GROUNDED_SIGNALS = frozenset({"test", "compile", "lint", "reviewer", "user"})
 
 # Env var names for the floors above. Centralised so the helper and the
 # doc reference the same string.

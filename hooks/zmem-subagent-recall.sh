@@ -13,10 +13,10 @@
 # WHY `recent`, not `recall`: SubagentStart carries NO task/prompt text (payload
 # keys: session_id, transcript_path, cwd, prompt_id, agent_id, agent_type,
 # hook_event_name — Phase 7 empirical dump), so there is no query to FTS on. The
-# spec's primary behavior is "scoped to the namespace (+ user:global)", which is
-# exactly the query-less `recent` pull session-start already uses for Tier 2.
-# (agent_type is parsed by the launcher into ZMEM_AGENT_TYPE but no longer
-# biases output — the shared body's header has no agent_type slot.)
+# spec primary behavior is "scoped to the namespace (+ user:global)", which is
+# exactly the query-less recent pull session-start already uses for Tier 2.
+# (agent_type is passed through to the shared body, which renders it in
+# the header — preserving the pre-#58 header contract.)
 #
 # PASSIVE (CRITIC 6 / issue #21): recall runs with `--no-bump` so a dispatch fan-out
 # does NOT turn N subagents into N concurrent retrieval_count writers on the shared
@@ -105,6 +105,7 @@ join_path() {
 PLUGIN_ROOT="${ZMEM_ROOT:-${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}"
 DATA_DIR="${ZMEM_DATA:-${ZCODE_PLUGIN_DATA:-}}"
 PROJECT="${ZMEM_PROJECT:-${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}"
+AGENT_TYPE="${ZMEM_AGENT_TYPE:-}"
 
 # Resolve data dir.
 if [ -n "$DATA_DIR" ]; then
@@ -154,7 +155,7 @@ fi
 if [ -n "${RECALL_BODY_MISSING:-}" ]; then
   CTX_JSON='{}'
 else
-  CTX_JSON="$("$PYTHON_BIN" "$RECALL_BODY" "$STORE_PY_PY" "$NS" "$BUDGET" "recent" "5" "3" 2>/dev/null || echo '{}')"
+  CTX_JSON="$("$PYTHON_BIN" "$RECALL_BODY" "$STORE_PY_PY" "$NS" "$BUDGET" "recent" "5" "3" "$AGENT_TYPE" 2>/dev/null || echo '{}')"
 fi
 
 if [ -z "$CTX_JSON" ]; then

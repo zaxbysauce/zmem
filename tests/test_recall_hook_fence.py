@@ -250,6 +250,18 @@ class SelectiveInjectGateTests(unittest.TestCase):
         self.assertEqual(status, "silent")
         self.assertEqual(selected, [])
 
+    def test_gate_keeps_user_signal_above_prompt_floor(self):
+        """Regression (CI round on tests/test_launcher.js): a
+        user-signal memory is GROUNDED and must inject at the prompt
+        floor. The first gate draft dropped `user`, silently killing
+        the pre-existing sentinel round-trip canary."""
+        rows = [{"id": "user-90", "confidence": 0.9, "signal": "user"}]
+        selected, status = self.body._selective_inject_filter(
+            rows, floor=0.25, gate_none_floor=0.4,
+        )
+        self.assertEqual(status, "injected")
+        self.assertEqual([r["id"] for r in selected], ["user-90"])
+
     def test_gate_logs_to_bg_log_path(self):
         # _log_inject_decision writes to $DATA_DIR/zmem-bg.log (I5).
         src = inspect.getsource(self.body._log_inject_decision)

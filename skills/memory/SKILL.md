@@ -83,7 +83,7 @@ constants live in `schema_meta.py`.
 |---|---|---|---|
 | `INJECT_FLOOR_PROMPT_DEFAULT` | 0.25 | `ZMEM_INJECT_FLOOR_PROMPT` | `recall` (UserPromptSubmit / PreCompact). Hard floor on FTS/vec results — anything below is dropped before scoring. |
 | `INJECT_FLOOR_RECENT_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_RECENT` | `recent` (SessionStart / subagent recall). Tighter because the surface is high-confidence recent material, not query-best match. |
-| `INJECT_FLOOR_GATE_NONE` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; high-signal rows (`test`/`compile`/`lint`/`reviewer`) keep the 0.25 floor. |
+| `INJECT_FLOOR_GATE_NONE` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; grounded-signal rows (`test`/`compile`/`lint`/`reviewer`/`user`) keep the 0.25 floor. |
 
 The three floors are intentional. Do not silently unify them. The
 selective-inject gate (3.8) is a hook-only filter; it does not change

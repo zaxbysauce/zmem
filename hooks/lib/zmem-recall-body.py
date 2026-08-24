@@ -46,7 +46,10 @@ import sys
 import time
 
 
-PROMPT_HIGH_SIGNALS = {"test", "compile", "lint", "reviewer"}
+# Grounded (trusted) signals per the signal hierarchy: test/compile/lint
+# > reviewer/user > none. Anything NOT in here is treated as ungrounded
+# by the gate (in practice: only "none").
+GROUNDED_SIGNALS = {"test", "compile", "lint", "reviewer", "user"}
 
 
 def _floor(name: str, default: float) -> float:
@@ -62,6 +65,15 @@ def _floor(name: str, default: float) -> float:
 def _selective_inject_filter(rows, floor: float, gate_none_floor: float):
     """Apply the hook selective-inject gate (issue #58, 3.8).
 
+    Issue spec: tighten ONLY ``signal=none`` (the agent's self-opinion)
+    to ``gate_none_floor`` (default 0.4). Every GROUNDED signal
+    (test/compile/lint/reviewer/user — the signal hierarchy's trusted
+    tiers) injects at the prompt floor (default 0.25). The original
+    draft omitted ``user`` from the trusted set, which silently dropped
+    user-stated memories from every hook (caught by the pre-existing
+    tests/test_launcher.js sentinel round-trip canary, seeded
+    signal=user — a regression the Python-only local loop missed).
+
     Returns (selected, status) where status is 'injected' (anything
     qualified) or 'silent' (nothing passed).
     """
@@ -72,9 +84,10 @@ def _selective_inject_filter(rows, floor: float, gate_none_floor: float):
         except (TypeError, ValueError):
             conf = 0.0
         sig = (r.get("signal") or "none").lower()
-        if sig in PROMPT_HIGH_SIGNALS and conf >= floor:
-            selected.append(r)
-        elif sig == "none" and conf >= gate_none_floor:
+        if sig == "none":
+            if conf >= gate_none_floor:
+                selected.append(r)
+        elif sig in GROUNDED_SIGNALS and conf >= floor:
             selected.append(r)
     status = "injected" if selected else "silent"
     return selected, status
@@ -150,6 +163,13 @@ def main() -> int:
         recent_global_limit = sys.argv[6]
     except IndexError:
         recent_global_limit = "2"
+    # Optional agent-type label (SubagentStart consumers only): biases
+    # the rendered header, preserving the pre-#58 header contract
+    # ("... agent <type>") that tests/test_launcher.js pins.
+    try:
+        agent_label = sys.argv[7]
+    except IndexError:
+        agent_label = ""
 
     if not store_py or not os.path.isfile(store_py):
         return 0
@@ -209,8 +229,9 @@ def main() -> int:
         return 0
 
     header = (
-        f"Relevant memories (zmem {mode}, namespace {ns}). "
-        f"Consider if they apply to this task; ignore if not."
+        f"Relevant memories (zmem {mode}, namespace {ns}"
+        + (f", agent {agent_label}" if agent_label else "")
+        + "). Consider if they apply to this task; ignore if not."
     )
     ctx = _format_fence(selected, header, store_py=store_py)
     if budget > 0 and len(ctx) > budget:
