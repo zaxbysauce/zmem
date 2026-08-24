@@ -55,12 +55,15 @@ class AdapterScanTest(unittest.TestCase):
     """Guardrail: one rule across all adapters (the issue-comment ask)."""
 
     # Passive consumers: automatic / hook / prefetch recall paths. Each MUST
-    # carry the literal --no-bump flag so only surfaced_count (+last_surfaced),
-    # never retrieval_count, advances on the passive path.
+    # carry the literal --no-bump flag (directly or via the shared body) so
+    # only surfaced_count (+last_surfaced), never retrieval_count, advances
+    # on the passive path. PRR-025 fix: zmem-precompact.sh is a passive
+    # recall consumer too (SubagentStart-adjacent PreCompact re-inject).
     PASSIVE = {
         "hooks/zmem-recall.sh",
         "hooks/zmem-subagent-recall.sh",
         "hooks/zmem-session-start.sh",
+        "hooks/zmem-precompact.sh",
     }
 
     def _method_body(self, text: str, method: str) -> str:
@@ -72,10 +75,29 @@ class AdapterScanTest(unittest.TestCase):
         return rest if nxt is None else rest[:nxt.start()]
 
     def test_passive_hooks_carry_no_bump(self):
+        # Issue #58, 3.9: recall (UserPromptSubmit) and precompact share a
+        # single Python body (hooks/lib/zmem-recall-body.py) — the literal
+        # ``--no-bump`` lives in the body, not the .sh wrapper. The session-
+        # start hook still inlines its own store.py invocation, so it must
+        # carry the literal too.
+        body_text = (REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py").read_text(
+            encoding="utf-8"
+        )
         for rel in sorted(self.PASSIVE):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            # session-start still inlines; recall AND precompact source the
+            # shared body (the literal --no-bump lives in the body's argv).
+            if rel in ("hooks/zmem-recall.sh", "hooks/zmem-precompact.sh"):
+                self.assertIn(
+                    "lib/zmem-recall-body.py", text,
+                    f"{rel} must source the shared recall body to honor "
+                    f"--no-bump (issue #58, 3.5/3.8/3.9)",
+                )
+                combined = text + "\n" + body_text
+            else:
+                combined = text
             self.assertIn(
-                "--no-bump", text,
+                "--no-bump", combined,
                 f"{rel} is a passive recall path and MUST pass --no-bump so it records "
                 "a surface event, not a retrieval")
 

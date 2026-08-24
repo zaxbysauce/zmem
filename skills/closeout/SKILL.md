@@ -148,9 +148,11 @@ A lesson earns a row only if **all** of these hold:
    now-fixed bug in code you already corrected.
 4. Getting it wrong again would cost real time.
 
-Good: *"vec0 KNN is namespace-blind — filtering after a fixed `k` silently
-starves same-namespace neighbours; escalate `k` until a below-threshold row
-appears."*
+Good: *"vec0 KNN is namespace-blind; the recall path now over-fetches by
+`ZMEM_VEC_NS_OVERFETCH` (default 8) and post-filters by namespace in a single
+helper shared with the dedup window. The footgun is mitigated, still
+over-fetch; consolidate escalates `k` until a below-threshold row appears,
+capped at 500."*
 Bad: *"Fixed the consolidate bug."* (narrative, not reusable)
 Bad: *"Use pytest for tests."* (already in the repo docs)
 
@@ -178,11 +180,12 @@ recall, and only grounded signals are promotable. Never inflate:
 | `none` | your own inference | everything else — including "it seems right" |
 
 Re-running `add` with **identical** content in the same namespace refreshes the
-existing row rather than duplicating it. **Paraphrases** dedup at ≥0.85 cosine,
-but that lookup uses a fixed `k=5` namespace-blind window — on a busy
-multi-namespace store a same-namespace paraphrase can be crowded out by other
-namespaces and land as a duplicate anyway. Step 4's `consolidate` is the
-backstop, which is why it is part of this routine and not optional.
+existing row rather than duplicating it. **Paraphrases** dedup at ≥0.85 cosine;
+the dedup window now uses the same shared `ZMEM_VEC_NS_OVERFETCH`-based
+helper as recall, so a same-namespace paraphrase cannot be crowded out by
+other namespaces on a busy multi-namespace store — the footgun is
+mitigated, still over-fetch. Step 4's `consolidate` is the backstop, which
+is why it is part of this routine and not optional.
 
 **Aim for 0–5 rows.** If you have more than five, you are probably capturing
 narrative or duplicating docs — re-apply the bar.

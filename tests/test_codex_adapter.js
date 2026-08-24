@@ -113,6 +113,15 @@ console.log("\n[1] Codex plugin metadata");
         fs.readFileSync(path.join(REPO, ".agents", "plugins", "marketplace.json"), "utf8")
     );
     const hooks = JSON.parse(fs.readFileSync(path.join(REPO, "hooks", "hooks.codex.json"), "utf8"));
+    // Final-critic fix (PR #69 feedback round): pin ALL SEVEN tracked
+    // version surfaces together — a partial bump leaves a stale
+    // update-discovery surface (root marketplace) that hosts compare
+    // against (README Upgrade section).
+    const rootMarketplace = JSON.parse(
+        fs.readFileSync(path.join(REPO, "marketplace.json"), "utf8")
+    );
+    const hermesYaml = fs.readFileSync(path.join(REPO, "hermes-plugin", "plugin.yaml"), "utf8");
+    const hermesVersion = /version:\s*(\S+)/.exec(hermesYaml)[1];
 
     eq("plugin: name", plugin.name, "zmem");
     eq("plugin: skills path", plugin.skills, "./skills/");
@@ -130,6 +139,8 @@ console.log("\n[1] Codex plugin metadata");
     eq("release: Claude plugin matches Codex", claudePlugin.version, plugin.version);
     eq("release: Claude marketplace matches Codex", claudeMarketplace.plugins[0].version, plugin.version);
     eq("release: ZCode plugin matches Codex", zcodePlugin.version, plugin.version);
+    eq("release: root marketplace matches Codex", rootMarketplace.plugins[0].version, plugin.version);
+    eq("release: hermes plugin.yaml matches Codex", hermesVersion, plugin.version);
     eq("marketplace: plugin source kind", marketplace.plugins[0].source.source, "local");
     eq("marketplace: plugin source path points at repo root", marketplace.plugins[0].source.path, "./");
     eq("marketplace: installation policy", marketplace.plugins[0].policy.installation, "AVAILABLE");

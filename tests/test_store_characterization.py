@@ -78,7 +78,7 @@ _RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 DATA_SHA = {
     "stats": "11ac804ebd82da80a80772814b5507f233d58e259b4c9c3498fa1311500630c8",
     "list": "c2e285928d3ee75154a12e4a61947d6793d3bc8f55edb0b3319e73ff4b75a598",
-    "recall": "24226d852d52ebf3be91d6f12e813c8d6876342049077f093d2ac7810e300e79",
+    "recall": "1cc69349449eeb6d3dfc2f7b9cd80823323d3df6bcb2563ebe2bf26ee72af2f8",
     "export_jsonl": "24d7c3b13cecc31fa3a845ee5a181369627298410bc3d41ccf90c043e460ce65",
 }
 KNOWN_SUBCMDS = [

@@ -22,11 +22,13 @@ from pathlib import Path
 # Shared single source of truth (dependency-free, resolved from this dir).
 try:
     from schema_meta import (SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY,
-        MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS)
+        MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS,
+        ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from schema_meta import (SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY,
-        MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS)  # type: ignore
+        MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS,
+        ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)  # type: ignore
 
 try:
     import host as _host
@@ -297,6 +299,95 @@ MAINTENANCE_POLL_SECONDS = _env_float("ZMEM_MAINTENANCE_POLL_SECONDS", 0.05)
 
 WRITER_LEASE_STALE_SECONDS = _env_float("ZMEM_WRITER_LEASE_STALE_SECONDS", 300.0)
 
+
+def _vec_knn_in_namespace(
+    conn: sqlite3.Connection,
+    embedding: bytes,
+    *,
+    namespaces: list[str] | None,
+    k: int,
+    overfetch: int | None = None,
+    k_cap: int = 500,
+) -> list[tuple[str, float]]:
+    """Shared namespace-aware vec0 KNN for recall + dedup (issue #58, 3.1).
+
+    Over-fetches ``max(k * overfetch, k + 1)`` from vec0, joins to ``memory``
+    to filter by ``namespace IN (...)`` (skipped when ``namespaces is None``)
+    and ``superseded_at IS NULL`` (always applied), and truncates to k. Each
+    returned tuple is ``(memory_id, distance)``, ordered by vec0 ascending
+    distance (closest first).
+
+    ``namespaces=None`` is the unscoped path (no namespace filter, but
+    ``superseded_at IS NULL`` is still applied). The caller decides whether
+    ``None`` is meaningful — recall passes the per-tier expanded alias set;
+    dedup passes a single namespace.
+
+    ``overfetch`` defaults to the module-level constant
+    ``ZMEM_VEC_NS_OVERFETCH_DEFAULT`` (env override ``ZMEM_VEC_NS_OVERFETCH``,
+    parsed here at call time so a reload with a different env value takes
+    effect). The cap ``k_cap`` bounds the vec0 KNN argument so a runaway
+    store cannot OOM the helper.
+
+    Consolidate owns its own escalate-then-verify loop with a 500-row cap
+    and a below-threshold cutoff (it tracks a ``truncated`` flag); this
+    helper is the simpler shared shape used by recall and dedup and does
+    NOT return a truncation flag (issue #58 critic-fix C-4: callers that
+    need truncation semantics go through consolidate).
+
+    Lives in ``storelib.schema`` so both recall (which imports from
+    schema) and write (which also imports from schema) can share the
+    helper without an import cycle.
+    """
+    if overfetch is None:
+        overfetch = ZMEM_VEC_NS_OVERFETCH_DEFAULT
+        raw_env = os.environ.get(ZMEM_VEC_NS_OVERFETCH_ENV, "")
+        if raw_env:
+            try:
+                candidate = float(raw_env)
+                # PRR-005 fix: reject non-finite overrides — float() accepts
+                # "nan"/"inf" but int(overfetch) below raises ValueError/
+                # OverflowError outside the SQL guard, crashing recall.
+                if candidate == candidate and candidate not in (
+                    float("inf"), float("-inf")
+                ):
+                    overfetch = candidate
+            except ValueError:
+                pass
+    # Belt-and-suspenders: never let a non-finite or non-positive factor
+    # reach the int math regardless of how it arrived.
+    if overfetch != overfetch or overfetch in (float("inf"), float("-inf")) or overfetch < 1:
+        overfetch = float(ZMEM_VEC_NS_OVERFETCH_DEFAULT)
+    raw_k = max(int(k) * int(overfetch), int(k) + 1)
+    raw_k = min(raw_k, int(k_cap))
+
+    ns_clause = ""
+    ns_params: list = []
+    if namespaces:
+        ns_clause = (
+            " AND m.namespace IN ("
+            + ",".join("?" * len(namespaces))
+            + ") "
+        )
+        ns_params = list(namespaces)
+
+    try:
+        # vec0 returns rows already ordered by distance ascending when
+        # ``MATCH ... AND k = ?`` is used; an explicit ``ORDER BY
+        # distance`` after a JOIN against the vec0 virtual table raises
+        # ``OperationalError: near "BY": syntax error`` (vec0 syntax
+        # restriction). The caller iterates by the returned order.
+        rows = conn.execute(
+            "SELECT mv.memory_id AS memory_id, mv.distance AS distance "
+            "FROM memory_vec mv "
+            "JOIN memory m ON m.id = mv.memory_id "
+            "WHERE mv.embedding MATCH ? AND k = ? "
+            "  AND m.superseded_at IS NULL"
+            + ns_clause,
+            [embedding, raw_k, *ns_params],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [(r["memory_id"], r["distance"]) for r in rows[:k]]
 
 
 def _lock_path(name: str) -> Path:

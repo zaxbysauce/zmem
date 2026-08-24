@@ -104,6 +104,108 @@ class SkillDocDriftTest(unittest.TestCase):
         self.assertIn("--no-bump", text,
                       "SKILL.md recall documentation must list --no-bump")
 
+    def test_no_hybrid_documented(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("--no-hybrid", text,
+                      "SKILL.md recall documentation must list --no-hybrid")
+
+    def test_as_of_documented(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("--as-of", text,
+                      "SKILL.md recall documentation must list --as-of")
+
+    def test_three_floors_documented(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        # Three distinct floors with distinct env overrides. If any of
+        # these three constants is missing, the floor is ungrounded.
+        self.assertIn("INJECT_FLOOR_PROMPT_DEFAULT", text,
+                      "SKILL.md must document INJECT_FLOOR_PROMPT_DEFAULT")
+        self.assertIn("INJECT_FLOOR_RECENT_DEFAULT", text,
+                      "SKILL.md must document INJECT_FLOOR_RECENT_DEFAULT")
+        self.assertIn("INJECT_FLOOR_GATE_NONE", text,
+                      "SKILL.md must document INJECT_FLOOR_GATE_NONE")
+
+
+class CloseoutDocDriftTest(unittest.TestCase):
+    """Issue #58, 3.7: closeout must reflect that the vec0 KNN footgun
+    is mitigated (still over-fetch), not unmitigated."""
+
+    def test_closeout_knn_wording_is_mitigated(self):
+        text = (REPO_ROOT / "skills" / "closeout" / "SKILL.md").read_text(encoding="utf-8")
+        # The "vec0 KNN is namespace-blind" phrase is acceptable as long as
+        # it is paired with "mitigated" or "still over-fetch". If a future
+        # edit strips the qualifier, this ratchet fires.
+        if "vec0 KNN is namespace-blind" in text:
+            self.assertTrue(
+                "mitigated" in text or "still over-fetch" in text,
+                "closeout SKILL.md says 'vec0 KNN is namespace-blind' "
+                "without 'mitigated' or 'still over-fetch' — the footgun "
+                "is mitigated, not unmitigated (issue #58 3.7).",
+            )
+
+
+class DoctorChecksTest(unittest.TestCase):
+    """Issue #58, 3.7: doctor must include the new hybrid-default and
+    vec-ns-overfetch checks. Run doctor on a tmp store and assert."""
+
+    def test_doctor_reports_hybrid_default_and_vec_ns_overfetch(self):
+        import json
+        import os
+        import sys
+        import tempfile
+
+        scripts_dir = REPO_ROOT / "skills" / "memory" / "scripts"
+        sys.path.insert(0, str(scripts_dir))
+        try:
+            import doctor  # noqa: F401
+        except Exception:
+            self.skipTest("doctor not importable in this environment")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_store = Path(tmp) / "store.sqlite"
+            env = {**os.environ, "ZMEM_STORE": str(tmp_store)}
+            # doctor exits 1 whenever ANY check is fail-level (e.g.
+            # store-access on the nonexistent tmp store, node/bash
+            # absence on a bare CI runner) — the exit code is about the
+            # OVERALL report, not about our two checks. Accept 0 or 1;
+            # the assertion is on the JSON check ids.
+            r = subprocess.run(
+                [sys.executable, str(scripts_dir / "doctor.py"), "--format", "json"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertIn(
+                r.returncode, (0, 1),
+                f"doctor.py exited {r.returncode} (unexpected; stderr: "
+                f"{r.stderr[:400]})",
+            )
+            self.assertTrue(
+                r.stdout.strip(),
+                f"doctor.py printed no JSON (stderr: {r.stderr[:400]})",
+            )
+            report = json.loads(r.stdout)
+            checks_by_id = {c["id"]: c for c in report["checks"]}
+            self.assertIn(
+                "hybrid-default", checks_by_id,
+                "doctor must report hybrid-default (issue #58 3.7)",
+            )
+            self.assertIn(
+                "vec-ns-overfetch", checks_by_id,
+                "doctor must report vec-ns-overfetch (issue #58 3.7)",
+            )
+            # PRR-001R regression pin: the check must report a REAL
+            # availability status — never the "probe failed: NameError"
+            # warn the pre-fix module-level-reference bug produced.
+            hd = checks_by_id["hybrid-default"]
+            self.assertIn(hd["status"], ("pass", "info"))
+            self.assertNotIn(
+                "NameError", hd["summary"],
+                "hybrid-default must probe embeddings, not NameError into "
+                "the except branch (PRR-001R)",
+            )
+            self.assertIn(
+                "embeddings.available=", hd["summary"],
+                "hybrid-default summary must state the availability verdict",
+            )
+
 
 class PlanDocDriftTest(unittest.TestCase):
 

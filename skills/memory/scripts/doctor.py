@@ -1352,6 +1352,141 @@ def _render_human(report: dict) -> str:
     return "\n".join(lines)
 
 
+def _check_vec_ns_overfetch(resolved_store: Path, namespace: str | None = None) -> dict:
+    """Report live-in-namespace vec rows vs ZMEM_VEC_NS_OVERFETCH (issue #58, 3.7).
+
+    Warns when the ratio of live vec rows in the CURRENT namespace to the
+    configured over-fetch factor is < 1, meaning the recall path's vec KNN
+    window may not have enough rows to guarantee a same-namespace hit.
+    PR-review fix PRR-031: the count is scoped to the resolved namespace when
+    one is available (an all-namespaces count let unrelated-namespace volume
+    mask the current namespace having none). Falls back to the all-namespace
+    count when no namespace was resolved. Skipped when the store is
+    absent/unreadable (already flagged by store-access).
+    """
+    from storelib.schema import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV, _load_vec
+    conn = _open_store_ro(resolved_store)
+    if conn is None:
+        return _check(
+            "vec-ns-overfetch", "skip",
+            "Store not available; skipped vec-ns-overfetch check.",
+        )
+    # The vec0 virtual table needs the sqlite-vec extension loaded into the
+    # connection — _open_store_ro (deliberately minimal) does not load it, so
+    # without this the query below raises "no such module: vec0" and the
+    # check could never count anything on a real store (review follow-up to
+    # PRR-002: the check was dead-on-arrival, not merely crash-prone).
+    try:
+        _load_vec(conn)
+    except Exception:
+        conn.close()
+        return _check(
+            "vec-ns-overfetch", "skip",
+            "sqlite-vec extension unavailable; vec-ns-overfetch skipped.",
+        )
+    ns_filter = ""
+    params: list = []
+    if namespace:
+        ns_filter = " AND m.namespace = ? "
+        params.append(namespace)
+    try:
+        # PRR-002 fix: _open_store_ro returns default (tuple) rows — read the
+        # aggregate positionally; the previous fetchone()["c"] raised TypeError
+        # on every readable store containing memory_vec.
+        row = conn.execute(
+            "SELECT count(*) FROM memory_vec mv "
+            "JOIN memory m ON m.id = mv.memory_id "
+            "WHERE m.superseded_at IS NULL"
+            + ns_filter,
+            params,
+        ).fetchone()
+        ns_rows = int(row[0]) if row else 0
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        return _check(
+            "vec-ns-overfetch", "skip",
+            "memory_vec table not present; vec-ns-overfetch skipped.",
+        )
+    finally:
+        conn.close()
+
+    # PRR-005 fix: reject non-finite overrides (nan/inf parse as floats but
+    # poison every downstream int()/ratio computation); fall back to default.
+    raw_env = os.environ.get(ZMEM_VEC_NS_OVERFETCH_ENV, "")
+    overfetch = float(ZMEM_VEC_NS_OVERFETCH_DEFAULT)
+    if raw_env:
+        try:
+            candidate = float(raw_env)
+            if candidate == candidate and candidate not in (
+                float("inf"), float("-inf")
+            ):
+                overfetch = candidate
+        except ValueError:
+            pass
+    ratio = (ns_rows / overfetch) if overfetch > 0 else 0.0
+    status = "pass" if ratio >= 1.0 else "warn"
+    summary = (
+        f"vec-ns-overfetch: live_vec_rows(namespace={namespace or 'ALL'})={ns_rows} "
+        f"ZMEM_VEC_NS_OVERFETCH={overfetch:g} ratio={ratio:.2f}"
+    )
+    return _check(
+        "vec-ns-overfetch", status, summary,
+        namespace=namespace,
+        live_vec_rows=ns_rows,
+        zmem_vec_ns_overfetch=overfetch,
+        ratio=ratio,
+    )
+
+
+def _check_hybrid_default() -> dict:
+    """Report whether the hybrid default can fire (issue #58, 3.7, 3.3).
+
+    Surfaces the embeddings availability so the operator can see whether
+    `recall` will use hybrid (default when embeddings are available) or
+    lexical-only. Status is `pass` when embeddings are available, `info`
+    when unavailable (the default still works — it just falls back to
+    lexical, a SUPPORTED degraded state, so it must not flip `ok`), `warn`
+    when the probe itself errors.
+
+    PRR-001R fix: `embeddings` is NOT importable at module scope (its import
+    may fail on a bare interpreter); use the same sys.path-guarded local
+    import `_check_embeddings` uses. The previous module-level reference
+    NameError'd into the except branch on every box, permanently reporting
+    "probe failed: NameError" and leaving the "info" path (and its counts
+    aggregation) dead code.
+    """
+    saved_path = sys.path[:]
+    sys.path.insert(0, os.path.dirname(__file__))
+    try:
+        import embeddings  # type: ignore
+    except Exception as exc:
+        return _check(
+            "hybrid-default", "warn",
+            f"hybrid-default: embeddings module not importable "
+            f"({type(exc).__name__}); recall defaults to lexical.",
+        )
+    finally:
+        sys.path[:] = saved_path
+    try:
+        st = embeddings.availability_status()
+    except Exception as exc:
+        return _check(
+            "hybrid-default", "warn",
+            f"hybrid-default: availability probe failed: {type(exc).__name__}: {exc}",
+        )
+    available = bool(st.get("available"))
+    reason = st.get("reason") or "unknown"
+    status = "pass" if available else "info"
+    summary = (
+        f"hybrid-default: embeddings.available={available} reason={reason}"
+    )
+    return _check(
+        "hybrid-default", status, summary,
+        available=available,
+        reason=reason,
+        missing_imports=st.get("missing_imports", []),
+    )
+
+
 def build_report(project: Path, repo_root: Path) -> dict:
     resolved_store = host.resolve_store_path()
     checks: list[dict] = []
@@ -1371,6 +1506,14 @@ def build_report(project: Path, repo_root: Path) -> dict:
     checks.append(_check_surfaces(repo_root))
     checks.append(_check_tier0_size(project))
     checks.append(_check_embeddings())
+    # Issue #58, 3.7: hybrid-default (3.3) + vec-ns-overfetch (3.1).
+    # PRR-031: scope the vec count to the resolved namespace when available.
+    checks.append(_check_hybrid_default())
+    ns_for_vec = (
+        namespace_check["details"].get("namespace")
+        if namespace_check["status"] == "pass" else None
+    )
+    checks.append(_check_vec_ns_overfetch(resolved_store, namespace=ns_for_vec))
     # Operational health (backup/consolidation cadence) — read-only, best-effort
     # skip if the store is absent/unreadable (#37 L23).
     checks.extend(_check_operational_health(resolved_store))
@@ -1378,7 +1521,10 @@ def build_report(project: Path, repo_root: Path) -> dict:
     # self-heal retry, so stranded namespaces are visible before they're fixed.
     checks.append(_check_ns_migration(resolved_store))
 
-    counts = {"pass": 0, "warn": 0, "fail": 0, "skip": 0}
+    # "info" is a supported non-ok-flipping status (hybrid-default's
+    # embeddings-unavailable branch: lexical fallback works — PRR-001R fix;
+    # previously the missing key raised KeyError in the aggregation below).
+    counts = {"pass": 0, "warn": 0, "fail": 0, "skip": 0, "info": 0}
     for check in checks:
         counts[check["status"]] += 1
 

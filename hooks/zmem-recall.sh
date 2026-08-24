@@ -114,84 +114,19 @@ if [ -z "$NS" ]; then
 fi
 BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 
-# --- Build the recall payload via python (guaranteed-valid JSON) ------------
-# Captured (not streamed) so we can wrap it in the sentinel below.
-OUT="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
-import json, os, sys, subprocess
+# --- Build the recall payload via the shared body (issue #58, 3.5/3.8) -----
+# The Python body lives in hooks/lib/zmem-recall-body.py and is also
+# invoked by zmem-precompact.sh (3.9). Single source of truth for the
+# fence render, selective-inject gate, and JSON envelope — drift
+# between recall and precompact is structurally impossible.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RECALL_BODY="$SCRIPT_DIR/lib/zmem-recall-body.py"
+if [ ! -f "$RECALL_BODY" ]; then
+    echo '{}'
+    exit 0
+fi
 
-raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
-prompt = ""
-try:
-    obj = json.loads(raw_stdin)
-    prompt = obj.get("prompt", "")
-except Exception:
-    prompt = ""
-
-# Bail on empty/trivial prompts — recall adds latency for no value on one-word prompts.
-if not prompt or not prompt.strip() or len(prompt.strip()) < 5:
-    print("{}")
-    sys.exit(0)
-
-store_py = sys.argv[1]
-ns = sys.argv[2]
-try:
-    budget = int(sys.argv[3])
-except (IndexError, ValueError):
-    budget = 25000
-
-if not store_py or not os.path.isfile(store_py):
-    print("{}")
-    sys.exit(0)
-
-# Run store.py recall against the prompt text.
-# Limit to 5 results to stay within the 32KB additionalContext budget.
-# Use the default confidence floor (do NOT pass --min-confidence so the
-# configured floor applies).
-try:
-    out = subprocess.check_output(
-        [sys.executable, store_py, "recall",
-         "--query", prompt[:500],  # cap query length
-         "--namespace", ns,
-         "--limit", "5",
-         "--include-global",  # surface cross-project user:global lessons (issue #18)
-         "--global-limit", "3",  # per-tier budget: global cannot crowd out project
-         "--no-bump",  # passive: retr not bumped; records surfaced (issue #21, PLAN.md §5)
-         "--json"],
-        stderr=subprocess.DEVNULL, timeout=10,
-    ).decode("utf-8", "replace")
-    rows = json.loads(out) if out.strip() else []
-except Exception:
-    rows = []  # fail-open: recall errors never block the prompt
-
-if not rows:
-    print("{}")
-    sys.exit(0)
-
-# Build a compact, bounded additionalContext block.
-# Each memory: [signal] content (truncated to 300 chars for budget).
-lines = [
-    "# Relevant memories (zmem recall, namespace %s). Consider if they apply to this task; ignore if not." % ns,
-    "",
-]
-total_chars = 0
-for r in rows:
-    content = (r.get("content") or "")[:300]
-    signal = r.get("signal", "?")
-    # store.py flags a memory whose file: source_ref changed since extraction
-    # via a separate "stale" boolean (its confidence is halved, but that alone
-    # does NOT push it under the recall floor, so stale rows DO surface).
-    # The note lives only in store.py'"'"'s human-readable print branch, so the
-    # injected context has to render it here or the agent never sees it.
-    stale = " [STALE SOURCE]" if r.get("stale") else ""
-    entry = "- [%s]%s %s" % (signal, stale, content)
-    total_chars += len(entry)
-    if budget > 0 and total_chars > budget:  # soft cap; launcher enforces hard encoded budget
-        break
-    lines.append(entry)
-
-ctx = "\n".join(lines)
-print(json.dumps({"additionalContext": ctx}))
-' "$STORE_PY_PY" "$NS" "$BUDGET" 2>/dev/null || echo '{}')"
+OUT="$(printf '%s' "$INPUT" | "$PYTHON_BIN" "$RECALL_BODY" "$STORE_PY_PY" "$NS" "$BUDGET" "user_prompt" 2>/dev/null || echo '{}')"
 
 # Neutralize any sentinel token that a MEMORY'S OWN CONTENT happens to contain
 # before wrapping. The launcher locates the payload by scanning stdout for the
@@ -200,8 +135,11 @@ print(json.dumps({"additionalContext": ctx}))
 # the whole recall would silently degrade to {} (a self-DoS of this turn's
 # recall — fail-open, not an injection vector). Both replacements are safe
 # inside the serialized JSON string: neither introduces a quote or a backslash.
+# I7 critic-fix: also neutralize the new fence markers (issue #58, 3.5).
 OUT="${OUT//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
 OUT="${OUT//<<<END>>>/<<<END_NEUTRALIZED>>>}"
+OUT="${OUT//<<<ZMEM_UNTRUSTED_FENCE>>>/<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>}"
+OUT="${OUT//<<<END_ZMEM_UNTRUSTED_FENCE>>>/<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>}"
 
 # Wrap the payload in the sentinel so the host adapter can extract it robustly.
 printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' "$OUT"

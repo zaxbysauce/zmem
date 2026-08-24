@@ -289,18 +289,98 @@ if agents and os.path.isfile(agents):
 
 # Tier 2: bounded recall — cheap admin pull of recent high-confidence live
 # memories. Namespace is the canonical key passed in (ns), NOT basename(project).
+# The recent floor reads ZMEM_INJECT_FLOOR_RECENT (default 0.5) — the SAME
+# env var the shared body reads — so operator tuning applies uniformly
+# (final-critic round-3 fix; was a hardcoded "0.5" literal).
 if store_py and os.path.isfile(store_py):
     try:
+        _rf_raw = os.environ.get("ZMEM_INJECT_FLOOR_RECENT", "")
+        try:
+            _recent_floor = float(_rf_raw) if _rf_raw else 0.5
+        except ValueError:
+            _recent_floor = 0.5
         out = subprocess.check_output(
-            [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", "0.5", "--include-global", "--global-limit", "2", "--no-bump", "--json"],
+            [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", str(_recent_floor), "--include-global", "--global-limit", "2", "--no-bump", "--json"],
             stderr=subprocess.DEVNULL, timeout=8,
         ).decode("utf-8", "replace")
         rows = json.loads(out) if out.strip() else []
         if rows:
-            lines = ["# Recent memories (Tier 2 — namespace %s). Consider if relevant; ignore if not." % ns, ""]
-            for r in rows:
-                lines.append("- [%s] %s" % (r.get("signal","?"), r.get("content","")))
-            parts.append("\n".join(lines))
+            # Issue #58, 3.5: wrap Tier 2 in the same non-executable
+            # fence + provenance render that zmem-recall uses. The gate
+            # + fence helpers live in storelib/schema_meta (single source
+            # of truth, PRR-017 fix — floors and the grounded set are
+            # IMPORTED, not re-typed literals).
+            try:
+                sys.path.insert(0, os.path.dirname(store_py))
+                sys.path.insert(0, os.path.join(os.path.dirname(store_py), "storelib"))
+                from storelib import _format_fenced_recall
+                import schema_meta as _sm
+
+                def _env_floor(name, default):
+                    raw = os.environ.get(name, "")
+                    if not raw:
+                        return default
+                    try:
+                        value = float(raw)
+                    except ValueError:
+                        return default
+                    if value != value or value in (float("inf"), float("-inf")):
+                        return default
+                    return value
+
+                _floor_prompt = _env_floor(_sm.INJECT_FLOOR_PROMPT_ENV, _sm.INJECT_FLOOR_PROMPT_DEFAULT)
+                _floor_gate_none = _env_floor(_sm.INJECT_FLOOR_GATE_NONE_ENV, _sm.INJECT_FLOOR_GATE_NONE_DEFAULT)
+                _grounded = set(_sm.INJECT_GROUNDED_SIGNALS)
+                _selected = []
+                for r in rows:
+                    try:
+                        _conf = float(r.get("confidence", 0) or 0)
+                    except (TypeError, ValueError):
+                        _conf = 0.0
+                    _sig = (r.get("signal") or "none").lower()
+                    if _sig == "none":
+                        if _conf >= _floor_gate_none:
+                            _selected.append(r)
+                    elif _sig in _grounded and _conf >= _floor_prompt:
+                        _selected.append(r)
+                rows = _selected
+                # PRR-014 fix: record the injected|silent decision in the
+                # SAME bg log the other hook surfaces use (recall /
+                # precompact / subagent-recall via the shared body).
+                try:
+                    _log_dir = os.environ.get("ZMEM_DATA", "") or (
+                        os.path.dirname(os.environ.get("ZMEM_STORE", ""))
+                        if os.environ.get("ZMEM_STORE") else ""
+                    ) or os.path.join(os.path.expanduser("~"), ".zmem")
+                    _log_path = os.path.join(_log_dir, "zmem-bg.log")
+                    if os.path.isdir(_log_dir):
+                        with open(_log_path, "a", encoding="utf-8") as _lf:
+                            _lf.write(
+                                "[%d] zmem-hook status=%s ids=%s all=%s\n" % (
+                                    int(__import__("time").time()),
+                                    "injected" if rows else "silent",
+                                    [r.get("id") for r in rows],
+                                    [r.get("id") for r in rows],
+                                )
+                            )
+                except Exception:
+                    pass  # fail-open: audit log never blocks session start
+                if rows:
+                    block = _format_fenced_recall(
+                        rows,
+                        header=(
+                            f"Recent memories (Tier 2 — namespace {ns}). "
+                            f"High-confidence admin pull. Consider if relevant; ignore if not."
+                        ),
+                    )
+                    parts.append(block)
+            except Exception:
+                # PRR-006 fix: the storelib/schema_meta import failed, so
+                # the fence renderer and the single-source gate constants
+                # are unavailable. OMIT Tier 2 entirely rather than emit
+                # untrusted retrieved text unfenced/un-gated — a missing
+                # Tier 2 block is a degraded session, not a safety hole.
+                pass
     except Exception:
         pass  # fail-open: recall errors never block session start
 
@@ -411,8 +491,24 @@ ctx = "\n\n".join(parts) if parts else ""
 # Soft budget cap (belt-and-suspenders; the launcher enforces the hard encoded
 # budget). Trim raw content here so the payload is roughly bounded before the
 # launcher re-measures the JSON-encoded envelope.
+# Final-critic round-2 fix: a naive slice can cut mid-Tier-2-block and drop
+# the <<<END_ZMEM_UNTRUSTED_FENCE>>> closer, leaving a dangling fence opener
+# in the injected context. If a truncation would split a fence, cut at the
+# fence closer instead (the block is simply shorter, never unclosed).
 if budget > 0 and len(ctx) > budget:
-    ctx = ctx[:budget] + "\n[recall truncated]"
+    _closer = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
+    _cut = ctx[:budget]
+    _last_open = _cut.rfind("<<<ZMEM_UNTRUSTED_FENCE>>>")
+    _last_close_in_cut = _cut.rfind(_closer)
+    if _last_open > _last_close_in_cut:
+        # The cut lands inside a fence: KEEP the partial body (up to
+        # the cut) and append the closer so the fence is complete —
+        # never an unclosed or orphaned marker (final-critic round-3
+        # fix: the previous branch dropped the opener and emitted a
+        # dangling closer).
+        ctx = _cut.rstrip() + "\n" + _closer + "\n[recall truncated]"
+    else:
+        ctx = _cut + "\n[recall truncated]"
 print(json.dumps({"additionalContext": ctx}) if ctx else "{}")
 ' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" 2>/dev/null || echo '{}')"
 
@@ -425,6 +521,9 @@ print(json.dumps({"additionalContext": ctx}) if ctx else "{}")
 # inside the serialized JSON string: neither introduces a quote or a backslash.
 CTX_JSON="${CTX_JSON//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
 CTX_JSON="${CTX_JSON//<<<END>>>/<<<END_NEUTRALIZED>>>}"
+# I7 critic-fix (issue #58, 3.5): also neutralize the new fence markers.
+CTX_JSON="${CTX_JSON//<<<ZMEM_UNTRUSTED_FENCE>>>/<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>}"
+CTX_JSON="${CTX_JSON//<<<END_ZMEM_UNTRUSTED_FENCE>>>/<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>}"
 
 # Wrap the payload in the <<<ZMEM_JSON>>>…<<<END>>> sentinel so the host adapter
 # (zmem-launch.js) can extract it even if other stdout noise is present. The
