@@ -24,6 +24,23 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR / "storelib"))
 
 
+def _sqlite_vec_available() -> bool:
+    """Repo convention (tests/test_consolidate_namespace.py): model-absent
+    CI runners may lack the sqlite-vec extension entirely — connect()
+    then silently degrades to FTS-only and memory_vec never exists. The
+    direct-KNN tests below insert into memory_vec and must skip there."""
+    try:
+        import sqlite_vec  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@unittest.skipUnless(
+    _sqlite_vec_available(),
+    "sqlite-vec extension unavailable — vec0 namespace KNN tests skipped "
+    "(CI runs model-absent/degraded)",
+)
 class NamespaceKnnTests(unittest.TestCase):
     """Direct test of ``_vec_knn_in_namespace`` (the shared helper)
     against a hand-built store. Bypasses the embedding runtime by
@@ -60,6 +77,14 @@ class NamespaceKnnTests(unittest.TestCase):
         )
         conn = connect()
         init_db(conn)
+        # Belt-and-suspenders (sibling pattern): even when sqlite_vec
+        # imports, a degraded build may not create the vec0 table.
+        has_vec = conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='memory_vec'"
+        ).fetchone() is not None
+        if not has_vec:
+            conn.close()
+            self.skipTest("memory_vec (vec0) table unavailable in this sqlite build")
         # Insert three namespaces, each with one memory and one vec row.
         # Use distinct embeddings so vec0 can rank them. The query
         # embedding is CLOSE to all three but slightly nearer to
