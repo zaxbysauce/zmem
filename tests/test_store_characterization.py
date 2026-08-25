@@ -99,8 +99,15 @@ DATA_SHA = {
     "stats": "11ac804ebd82da80a80772814b5507f233d58e259b4c9c3498fa1311500630c8",
     "list": "c2e285928d3ee75154a12e4a61947d6793d3bc8f55edb0b3319e73ff4b75a598",
     # RE-CAPTURED for v10 (issue #60): recall rows gained the `entities`
-    # card key (see freeze note above). stats/list/export_jsonl unchanged.
-    "recall": "c3719ff860497cd86da713217c1613e50fe33cae4adaf3d0118d1befaf448529",
+    # card key (see freeze note above). RE-CAPTURED AGAIN on 2026-08-25 for
+    # the scoring-clock seam: composite `_score` embeds wall-clock recency,
+    # so the 4-decimal rounded value drifted past its rounding boundary
+    # ~every few days and flipped this hash on a DAY boundary with zero code
+    # change (a latent time bomb since the freeze's inception — not a v10
+    # regression). The suite now pins ZMEM_TEST_NOW to the fixture sentinel
+    # (_run_env), making the surface time-invariant; stats/list/export_jsonl
+    # are clock-independent and stay byte-identical to their prior freezes.
+    "recall": "745a08e408bcf4dff0bb65a64e91cecfae97e35f60e22c7b951ac74daa0ebe39",
     "export_jsonl": "8552767c0f9148e2b3c5d5d8759148837186386cdc78d309457d98ffa2d8ac73",
 }
 KNOWN_SUBCMDS = [
@@ -180,6 +187,12 @@ def _run_env(tmp: str) -> dict:
     env = {**os.environ, **builder.BASE_ENV, "ZMEM_STORE": os.path.join(tmp, "store.sqlite")}
     for k in ("ZMEM_DATA", "ZMEM_BACKUP_DIR", "ZMEM_BACKUP_INTERVAL_DAYS"):
         env.pop(k, None)
+    # Pin the scoring clock to the fixture's timestamp sentinel. Composite
+    # scores embed wall-clock recency, so a rounded `_score` drifts past its
+    # 4th decimal every few days and flips the frozen recall hash on a DAY
+    # boundary even with zero code change (observed 2026-08-25). With the
+    # clock pinned to PIN_TS the frozen surface is time-invariant forever.
+    env["ZMEM_TEST_NOW"] = builder.PIN_TS
     return env
 
 
@@ -320,6 +333,38 @@ class CharacterizationTests(unittest.TestCase):
         r = _run_cli(self.env, "recall", "--query", "python insertion", "--json", "--limit", "5")
         self.assertEqual(r.returncode, 0, r.stderr)
         self._assert_sha("recall --json", _sha(_norm(r.stdout)), DATA_SHA["recall"])
+
+    def test_recall_clock_seam_is_honored_and_deterministic(self):
+        """ZMEM_TEST_NOW pins the scoring clock (see _run_env). Two pins of
+        the seam contract: (1) HONORED — a different pinned clock changes
+        the recency term and therefore the printed _score; (2) DETERMINISTIC
+        — the same pinned clock on two identical fresh builds is
+        byte-identical, which is exactly the property that keeps the frozen
+        hash stable (every suite run rebuilds the store from scratch). Each
+        invocation runs against a FRESH build because explicit recall bumps
+        retrieval_count on the shared store — a deliberate write, not
+        nondeterminism (the 2026-08-25 failure mode was day-boundary _score
+        drift, not telemetry)."""
+        import shutil
+        args = ("recall", "--query", "python insertion", "--json", "--limit", "5")
+
+        def run_fresh(test_now: str) -> str:
+            tmp = tempfile.mkdtemp(prefix="zmem-char-seam-")
+            self.addCleanup(shutil.rmtree, tmp, True)
+            builder.build_store(tmp)
+            env = {**_run_env(tmp), "ZMEM_TEST_NOW": test_now}
+            return _run_cli(env, *args).stdout
+
+        out_pin = run_fresh(builder.PIN_TS)
+        out_day_later = run_fresh("2026-02-04T04:05:06Z")
+        out_pin_again = run_fresh(builder.PIN_TS)
+        self.assertNotEqual(
+            json.loads(out_pin)[0]["_score"],
+            json.loads(out_day_later)[0]["_score"],
+            "ZMEM_TEST_NOW must control the scoring clock (recency decay)")
+        self.assertEqual(
+            out_pin, out_pin_again,
+            "a pinned clock must be byte-deterministic across fresh builds")
 
     def test_data_export_jsonl(self):
         r = _run_cli(self.env, "export-jsonl")
