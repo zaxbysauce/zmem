@@ -363,8 +363,13 @@ MCP server:
 
 The host tool (ZCode / Claude Code / Codex) discovers new versions by comparing
 the `version` field in your installed plugin manifest against the marketplace
-entry. Released versions are marked with a git tag (`vX.Y.Z`) and a GitHub
-Release — see [`CHANGELOG.md`](CHANGELOG.md) for what each release contains.
+entry. Releases are **cut automatically**: whenever a version bump merges to
+main, the [Release workflow](.github/workflows/release.yml) verifies that every
+host-facing manifest agrees on the version and that
+[`CHANGELOG.md`](CHANGELOG.md) carries the matching section, then tags the
+merge commit and publishes the GitHub Release with those notes. A merge
+without a version bump publishes nothing; a partial bump or a bump without
+its changelog section fails the workflow.
 
 To pick up a new release:
 

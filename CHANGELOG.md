@@ -12,6 +12,50 @@ README.
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-08-25
+
+### Added
+
+- **Automated releases — the release contract is now self-enforcing**
+  (fixes the recurring "merged but never published" failure: v0.8.5 /
+  v0.8.6 / v0.8.8 were never tagged, and v0.9.0 / v0.10.0 merged as
+  manifest bumps with no tag or GitHub Release, so release-tracking
+  downstream installs never saw them until the releases were retrofitted
+  by hand):
+  - New `.github/workflows/release.yml`: on every push to main it runs the
+    gate and, when the version has moved, tags the MAIN COMMIT that carries
+    it (never a PR-branch head — squash merges orphan branch-head tags) and
+    publishes the GitHub Release with the CHANGELOG section as notes.
+    Merges without a version bump are no-ops; the run is idempotent
+    (existing tag ⇒ skip) and serialized by a concurrency group.
+  - New `scripts/release_gate.py`: discovers EVERY tracked host-facing
+    manifest (`git ls-files`, not a hardcoded list), fails the run on any
+    version disagreement (partial bump) or a missing matching CHANGELOG
+    section, and emits the release decision + notes for the workflow.
+    Runnable standalone for local pre-flight.
+  - New `tests/test_release_parity.py`: manifest parity + CHANGELOG
+    alignment against the live repo, unit coverage of the gate's parsing,
+    and structural pins on the workflow (main-push trigger, `contents:
+    write`, no `pull_request_target`, `--target ${{ github.sha }}`, gate
+    invocation).
+  - README release/upgrade section updated: releases are cut automatically
+    when a version bump merges to main; the host-side plugin refresh stays
+    a deliberate user action (documented flow unchanged).
+- **Deterministic frozen surfaces** (flake caught by the full loop during
+  this work): the characterization recall hash flipped on a day boundary
+  with zero code change — composite `_score` embeds continuously-decaying
+  recency, so its 4-decimal rounding drifts every few days (latent since
+  the freeze's inception). New `ZMEM_TEST_NOW` seam in recall scoring
+  (ISO-8601, naive read as UTC, stderr warning on garbage, wall clock when
+  absent); the characterization suite pins it to the fixture sentinel so
+  the frozen recall surface is time-invariant; hash re-captured with the
+  pinned clock; seam honored + byte-determinism test added.
+- Release-workflow hardening from the final-critic round: publish-step
+  idempotency is RELEASE existence (`gh release view`) rather than bare
+  tag existence, so a human-pushed bare tag heals on the next merge; both
+  actions are SHA-pinned (this workflow holds a contents:write token,
+  unlike ci.yml's documented read-only tag-pinning waiver).
+
 ## [0.10.0] — 2026-08-24
 
 ### Added

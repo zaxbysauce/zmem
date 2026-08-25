@@ -766,6 +766,37 @@ def _bump_telemetry(conn: sqlite3.Connection, ids: list[str], *, no_bump: bool) 
         )
     _commit(conn)
 
+def _now_epoch() -> float:
+    """The scoring clock — wall-clock now, pinnable for deterministic tests.
+
+    Composite scores embed continuously-decaying recency (``now −
+    ingestion_ts``), so a printed ``_score`` rounded to 4 decimals drifts
+    past its rounding boundary every few days — a latent time bomb for any
+    frozen/hash-based output surface (the characterization freeze flipped
+    exactly this way on 2026-08-25, a day-scale boundary crossing, not a
+    code change). ``ZMEM_TEST_NOW`` (ISO-8601; naive values read as UTC,
+    matching _normalize_as_of) pins the clock so such surfaces are
+    time-invariant. Absent or unparseable → the real wall clock, which is
+    the only path outside tests.
+    """
+    raw = os.environ.get("ZMEM_TEST_NOW", "")
+    if raw:
+        try:
+            dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError:
+            # A SET-but-garbage pin would silently reintroduce exactly the
+            # day-boundary drift the seam exists to eliminate, so say so on
+            # stderr (still never raise on the hot path).
+            print(f"[zmem] WARNING: ignoring unparseable ZMEM_TEST_NOW "
+                  f"{raw!r}; falling back to the wall clock", file=sys.stderr)
+            dt = None
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+    return time.time()
+
+
 def recall_memory(
     conn: sqlite3.Connection,
     *,
@@ -814,7 +845,7 @@ def recall_memory(
     mirroring ``export-pack`` (issue #18). Strict-by-default: with
     ``include_global=False`` (the default) behaviour is byte-identical to before.
     """
-    now_epoch = time.time()
+    now_epoch = _now_epoch()
     # Issue #58, 3.3: resolve the ``hybrid=None`` sentinel before passing
     # to the per-tier helper (which only accepts a concrete bool). When
     # embeddings are unavailable AND ``hybrid=True`` was explicitly
