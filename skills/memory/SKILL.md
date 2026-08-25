@@ -58,8 +58,10 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v9
+- schema compatibility against current v10
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
+- v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
+  `memory_entity`); inspect deeper with `store.py entity-list`
 - Claude/Codex native-memory conflicts via read-only config inspection
 - canonical namespace for the provided project
 - host surface presence (Claude plugin, ZCode plugin, memory skill; repo-local
@@ -72,7 +74,8 @@ surface change.
 ```
 python <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
                           [--include-global] [--global-limit 3] [--hybrid]
-                          [--no-hybrid] [--no-bump] [--as-of ISO-8601] [--json]
+                          [--no-hybrid] [--no-mmr] [--no-bump]
+                          [--as-of ISO-8601] [--json]
 ```
 Returns live (non-superseded) memories matching the query, filtered by confidence
 floor (>=0.25) and namespace — unless `--as-of ISO-8601` is given, in which case
@@ -113,6 +116,31 @@ then both lanes' rankings are fused with Reciprocal Rank Fusion (RRF, k=60).
 runtime (onnxruntime + tokenizers, model lazy-downloaded and
 checksum-verified) is optional and fails open: when it is unavailable,
 recall silently uses plain keyword ranking — never an error.
+
+**Entity matching is the THIRD RRF list and needs no model** (v10, issue #60
+5.3): at recall the query is run through the same deterministic entity
+extractor used on write, plus plain query tokens are matched against stored
+entity aliases. Memories linked to a matched entity join the fusion as a
+third ranked list (rank = number of matched entities, then recency). This is
+how the alias `rg` recalls `ripgrep`-linked memories even when BM25 terms
+miss — and it is live on model-absent stores by default. An unknown alias is
+simply an empty third list; the lexical (and, when available, vector) lanes
+fuse exactly as before.
+
+**MMR diversity is the DEFAULT** (v10, issue #60 5.5): after RRF fusion and
+composite scoring, the candidate set is re-ordered with Maximal Marginal
+Relevance before `--limit` is applied, so a cluster of near-paraphrase
+duplicates cannot crowd out a distinct fact. Similarity is embedding cosine
+when both rows have embeddings, else Jaccard on normalized content tokens —
+so MMR also works model-absent. `--no-mmr` returns pure composite-score
+order (four paraphrases instead of three + the distinct fact). The tradeoff
+knob is lambda: default 0.7, env `ZMEM_MMR_LAMBDA` (0.0 = maximize
+diversity, 1.0 = no diversity — identical ordering to `--no-mmr`).
+`--no-mmr` and `--no-hybrid` are independent flags and can be combined.
+
+Recall rows carry **entity cards**: `recall --json` rows include
+`entities: [{id, kind, name}]`, and the fenced hook render shows at most
+three entity NAMES per row (never ids). `get --id` shows the same links.
 
 `--no-bump` (opt-in) makes a recall **passive**: it records a surface event
 (`surfaced_count`/`last_surfaced`) instead of advancing `retrieval_count`/
@@ -443,6 +471,9 @@ python <store.py> export-jsonl [--out FILE] [--namespace NS] [--include-supersed
 Writes one memory row per line (no embeddings) for box-to-box sync via
 `ingest-jsonl`. Default: all namespaces, live rows only; `--namespace` scopes
 to one namespace, `--include-superseded` also exports tombstoned rows.
+Entity links are deliberately NOT carried in the JSONL (they are store-local
+derived data, like embeddings and content_norm): the receiving store rebuilds
+them by re-running the deterministic extractor on ingest — see below.
 
 ### ingest-jsonl — import Tier 3 sync JSONL
 ```
@@ -468,6 +499,44 @@ refuses rows whose `source_ref` looks like a secret (counted as
 `capture_refused` in the summary, NOT stored). `reviewed`/`manual` keep the
 original text with an advisory notice.
 
+Every ingested row ALSO runs the deterministic entity extractor (the same
+one `add` uses), so entity identity is rebuilt locally instead of carried
+(v10, issue #60): two stores ingesting the same rows derive the same
+entities, keyed by normalized alias, with no cross-store id collisions.
+
+### entity-list — inspect entity identity (v10, issue #60)
+```
+python <store.py> entity-list [--kind person|project|tool|preference|other] [--json]
+```
+Lists the entities the deterministic extractor minted: id, kind, canonical
+name, all normalized aliases, and how many memories link to each. `--kind`
+filters to one kind; `--json` emits `[{id, kind, name, aliases, links}]`.
+This is the inspection surface for humans and doctor — use it to see what
+the third RRF lane is actually matching.
+
+### entity-merge — reconcile duplicate entities (v10, issue #60)
+```
+python <store.py> entity-merge --from <entity-id> --to <entity-id> [--confirm]
+```
+Merges two entities: the `--from` entity's aliases and memory links move to
+`--to`, then `--from` is deleted. DRY RUN BY DEFAULT — without `--confirm`
+nothing is written and the plan (moves, alias/link collisions with the
+target, the deletion) is printed. With `--confirm` the write happens in one
+transaction; a target that already has an alias or link keeps its own
+(collisions are counted, never overwritten).
+
+Refusals (exit 2, nothing written): unknown id on either side, `--from` ==
+`--to`, or a kind mismatch — merging a `person` into a `tool` would silently
+re-classify history. Nothing in zmem AUTO-merges entities, ever (the issue's
+"ZMem will not auto-merge people" rule); person→person merges are allowed
+but only as this explicit manual command.
+
+Typical flow: `entity:Name` tags or backticked mentions created two
+entities for the same thing (e.g. `rg` and `ripgrep`); find both ids with
+`entity-list`, dry-run the merge, then apply with `--confirm`. Afterwards
+the alias `rg` resolves to the surviving entity and recall's third list
+returns all its linked memories.
+
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite
   file. The write-time filter is advisory only (regex heuristic), not a guarantee.
@@ -492,26 +561,65 @@ original text with an advisory notice.
   auto-normalized. If a `file:` ref cannot be opened, a stderr warning is emitted.
 
 ## How recall works
-FTS5 keyword match intersected with namespace filter and confidence floor, with
-source-staleness demotion. Results are re-ranked by a **composite score** that
-combines:
+Retrieval is a **three-signal pipeline**: FTS5/BM25 keyword match (always),
+vector KNN over stored embeddings (when the optional embedding runtime is
+available), and entity matching (v10 — always, no model needed): the query's
+identifiers and plain tokens are matched against stored entity aliases. The
+three lanes' rankings are fused with Reciprocal Rank Fusion (RRF, k=60,
+per-id additive: a memory appearing in several lanes accumulates each lane's
+contribution), then re-ranked by a **composite score** that combines:
 
-- **BM25 relevance** (55%) — the FTS5 keyword match score
+- **BM25 relevance** (55%) — the FTS5 keyword match score (vector-only rows
+  use cosine similarity; entity-only rows use the fraction of matched query
+  entities)
 - **Confidence** (20%) — grounded by signal tier (test/compile > reviewer/user > none)
 - **Recency** (15%) — exponential decay with a 90-day half-life
 - **Popularity** (10%) — retrieval frequency with diminishing returns (sqrt dampening)
 
-Confidence is still a hard floor (below 0.25 is dropped before scoring).
-Staleness demotion halves confidence, which feeds into the confidence component.
+Candidates are namespace-filtered (the tier's expanded alias set) and subject
+to the confidence floor (below 0.25 is dropped before scoring). Staleness
+demotion halves confidence, which feeds into the confidence component.
+
+**Entity matching (v10, issue #60 5.3)** is the third lane: the query runs
+through the same deterministic extractor used at write time, and plain query
+tokens are additionally matched against stored entity aliases. Memories
+linked to matched entities join RRF ranked by (number of matched entities,
+recency), with the same namespace filter and the same `--as-of` temporal
+predicate as the other lanes — like the vector lane, an entity match in a
+FOREIGN namespace never leaks into the querying tier (it is found by its own
+tier's run, e.g. the global tier under `--include-global`). Works
+model-absent by design; an unknown alias contributes nothing.
+
+**MMR diversity (v10, issue #60 5.5)**: after the composite sort, and before
+`--limit`, Maximal Marginal Relevance re-orders each tier's candidates —
+picking the best-scoring row first, then trading relevance against
+similarity-to-already-picked (lambda: 0.7 default, `ZMEM_MMR_LAMBDA` env,
+`--no-mmr` to disable, 1.0 == no diversity). Row-to-row similarity is
+embedding cosine when both rows have embeddings, else Jaccard on normalized
+content tokens — so near-paraphrase clusters stop crowding out distinct
+facts even on model-absent stores.
+
+**Entity cards (v10, issue #60 5.4)**: every recall row carries its linked
+entities — `entities: [{id, kind, name}]` in `recall --json`, at most three
+names per row in the fenced hook render. `entity-list` inspects the entity
+tables; `entity-merge` reconciles duplicates.
 
 **Hybrid recall is the default** when the embedding runtime is available
 (auto-enabled; `--no-hybrid` forces lexical-only): a vector/embedding lane
-runs on top of this keyword pipeline and the two lanes' rankings are fused
-with Reciprocal Rank Fusion (RRF, k=60), so a memory BM25 missed can still
+runs on top of this keyword pipeline and its ranking fuses with the lexical
+and entity lanes via the RRF above, so a memory BM25 missed can still
 surface via embedding similarity. It needs the optional
 onnxruntime/tokenizers runtime and embedding model; without them recall
-fails open to plain FTS5 keyword ranking (see the `recall` command section
-above for the full contract).
+fails open to plain keyword + entity ranking (see the `recall` command
+section above for the full contract).
+
+**Entity extraction at write time is deterministic** (no LLM): explicit
+`entity:Name` / `entity:<kind>:Name` tags, the `project:<suffix>` namespace
+suffix, `--tags` tokens (`kind:Name` or plain), backtick-quoted spans in
+content (kind `tool`), and CamelCase identifiers (2+ humps, kind `other`).
+Stopwords (`the`, `and`, `use`, …) and path/URL-shaped tokens are never
+entities; `person` entities exist only via an explicit `entity:person:`
+tag. The first kind seen for an alias wins; reconcile with `entity-merge`.
 
 The `rebuild-fts` subcommand rebuilds the FTS5 index from scratch (useful after
 bulk imports or if the index drifts):

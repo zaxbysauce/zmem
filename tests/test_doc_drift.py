@@ -174,6 +174,50 @@ class SkillDocDriftTest(unittest.TestCase):
                       "SKILL.md add --type must list decision/constraint as "
                       "shipped choices")
 
+    # -- issue #60, 5.7: the three-signal retrieval surface is documented ----
+
+    def _retrieval_section(self) -> str:
+        """The '## How recall works' section body (up to the next ## header).
+
+        Section-scoped on purpose: the issue's test requirement is that THE
+        RETRIEVAL SECTION mentions entity matching and MMR — whole-file
+        needles would stay green if the mentions drifted into an unrelated
+        section while the retrieval description went stale."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        start = text.find("## How recall works")
+        self.assertGreaterEqual(start, 0, "SKILL.md must have a '## How recall works' section")
+        end = text.find("\n## ", start + 1)
+        return text[start:] if end < 0 else text[start:end]
+
+    def test_retrieval_section_mentions_entity_matching_and_mmr(self):
+        """Issue #60, 5.7: the retrieval section must document the entity
+        lane (third RRF signal) and MMR diversity — the two v10 retrieval
+        behaviors — so an agent reading only SKILL.md operates them."""
+        section = self._retrieval_section()
+        self.assertIn("entity matching", section,
+                      "the retrieval section must mention entity matching "
+                      "(the third RRF signal, issue #60 5.3)")
+        self.assertIn("MMR", section,
+                      "the retrieval section must mention MMR diversity "
+                      "(issue #60 5.5)")
+
+    def test_entity_and_mmr_surface_flags_documented(self):
+        """An agent reading only SKILL.md can operate --no-mmr, entity-list,
+        and entity-merge (issue #60, 5.7), and the MMR env knob is named."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("--no-mmr", "ZMEM_MMR_LAMBDA",
+                       "entity-list", "entity-merge", "--confirm"):
+            self.assertIn(needle, text,
+                          f"SKILL.md must document {needle} (issue #60 surface)")
+
+    def test_entity_extraction_is_deterministic_and_llm_free(self):
+        """The extractor is deterministic by design and ships no LLM path —
+        the doc must say so (an operator must not wait on a model download
+        for entity identity to work)."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("deterministic", text)
+        self.assertIn("no LLM", text)
+
 
 class CloseoutDocDriftTest(unittest.TestCase):
     """Issue #58, 3.7: closeout must reflect that the vec0 KNN footgun

@@ -24,6 +24,7 @@ try:
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from correction_queue import SECRET_PATTERNS  # type: ignore # noqa: F401
+from storelib.entity import link_memory_entities, relink_memory
 from storelib.schema import CAPTURE_MODES, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, PROMPT_INJECTION_PATTERNS, SIGNAL_CONFIDENCE, _commit, _embeddings, _env_float, _normalize_content, _vec_knn_in_namespace, now_iso
 
 _degraded_embedding_warned = False
@@ -580,6 +581,15 @@ def rekey_namespace(
             f"WHERE superseded_at IS NULL AND namespace IN ({placeholders})",
             [to_namespace, *sources],
         )
+        # v10 (issue #60): namespace is an extraction input (project:<suffix>
+        # mints a project entity). Re-derive the moved rows' entity links from
+        # their NEW namespace in the same transaction so the entity lane never
+        # surfaces a rekeyed row under its dead old project identity.
+        for rid in [r[0] for r in conn.execute(
+            f"SELECT id FROM memory WHERE superseded_at IS NULL "
+            f"AND namespace=?", (to_namespace,)
+        ).fetchall()]:
+            relink_memory(conn, rid)
         if started_tx:
             _commit(conn)
     except Exception:
@@ -684,6 +694,10 @@ def add_memory(
                 "UPDATE memory SET taint=? WHERE id=?",
                 (worse_taint(ex_base, taint), existing["id"]),
             )
+            # v10 (issue #60, 5.2): the dedup keeper's tags were unioned by
+            # _merge_on_dedup — tags are an extraction input, so re-derive the
+            # keeper's entity links from its (unchanged content, merged tags).
+            relink_memory(conn, existing["id"])
             if started_tx:
                 _commit(conn)
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
@@ -726,6 +740,11 @@ def add_memory(
                 )
             except sqlite3.OperationalError:
                 pass  # vec0 table not available — embedding stored in memory table only
+        # v10 (issue #60, 5.2): deterministic entity extraction on every add.
+        # Same transaction as the INSERT, so a failed link rolls back the row.
+        link_memory_entities(
+            conn, mid, content=content, tags=tags, namespace=namespace,
+        )
         if started_tx:
             _commit(conn)
         print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"
@@ -1022,6 +1041,9 @@ def update_memory(
                 "UPDATE memory SET taint=? WHERE id=?",
                 (worse_taint(dup_base, incoming_taint), dup_id),
             )
+            # v10 (issue #60, 5.2): dedup fold unioned tags onto the target —
+            # re-derive its entity links (same as add's dedup branch).
+            relink_memory(conn, dup_id)
             if started_tx:
                 _commit(conn)
             print(f"[zmem] update: {mid} superseded; new content merged into existing "
@@ -1054,6 +1076,13 @@ def update_memory(
                 )
             except sqlite3.OperationalError:
                 pass  # vec0 table not available — embedding stored in memory table only
+        # v10 (issue #60, 5.2): the update's replacement row runs the same
+        # deterministic extractor as add. The tombstoned old row KEEPS its
+        # links — --as-of recall reaches it through the entity lane's
+        # temporal predicate, so history stays linked.
+        link_memory_entities(
+            conn, new_id, content=content_eff, tags=tags_eff, namespace=ns,
+        )
         if started_tx:
             _commit(conn)
         print(f"[zmem] updated memory {mid} -> {new_id} (ns={ns}, type={type_eff}, "

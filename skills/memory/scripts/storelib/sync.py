@@ -18,6 +18,7 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
+from storelib.entity import link_memory_entities, relink_memory
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
 from storelib.write import CapturePolicyRefusal, _GLOBAL_NEAR_MISS_STEMS, _apply_capture_policy, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory
@@ -632,6 +633,14 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                  superseded_at, supersede_reason,
                  ingestion_ts, merged_from, _normalize_content(content)),
             )
+            # v10 (issue #60, sync decision): entities are NOT carried in the
+            # JSONL (they are store-local derived data, like content_norm and
+            # embeddings); ingest REBUILDS them by running the same
+            # deterministic extractor as `add`. History rows link too —
+            # --as-of recall reaches them via the entity lane.
+            link_memory_entities(
+                conn, mid, content=content, tags=tags, namespace=namespace,
+            )
             if started_tx:
                 _commit(conn)
             return "added"
@@ -656,6 +665,9 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 "UPDATE memory SET taint=? WHERE id=?",
                 (worse_taint(ex_base, taint), existing["id"]),
             )
+            # v10 (issue #60): dedup merge unioned tags onto the local keeper
+            # — re-derive its entity links (same rule as add/update).
+            relink_memory(conn, existing["id"])
             if started_tx:
                 _commit(conn)
             return "deduped"
@@ -689,6 +701,12 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 )
             except sqlite3.OperationalError:
                 pass  # vec0 table not available -- embedding stored in memory table only
+        # v10 (issue #60, sync decision): rebuild entities on ingest by running
+        # the SAME deterministic extractor as `add` (entities are derived
+        # data; the JSONL carries none). Same transaction as the INSERT.
+        link_memory_entities(
+            conn, mid, content=content, tags=tags, namespace=namespace,
+        )
         # Record this newly-inserted row in the per-ingest dedup cache so a
         # later row in the SAME batch with identical normalized content is
         # detected as a duplicate without a namespace rescan (#36 M9).

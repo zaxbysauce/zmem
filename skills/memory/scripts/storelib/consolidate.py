@@ -18,6 +18,7 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
+from storelib.entity import relink_memory
 from storelib.schema import _embeddings, _env_float, _normalize_content, now_iso, worse_taint
 from storelib.sync import INGEST_MAX_CONTENT_CHARS
 from storelib.write import _merge_on_dedup, supersede_memory
@@ -281,6 +282,13 @@ def _absorb_into_keeper(
         conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (absorbed["id"],))
     except sqlite3.OperationalError:
         pass
+
+    # v10 (issue #60): the keeper's content/tags may have grown above, so its
+    # entity links are re-derived from the stored row. The ABSORBED row keeps
+    # its links untouched: it is history now, and --as-of recall reaches it
+    # through the entity lane's temporal predicate — same policy as
+    # update_memory's tombstoned row.
+    relink_memory(conn, keeper_id)
 
     return decision
 

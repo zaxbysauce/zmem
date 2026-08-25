@@ -1147,6 +1147,75 @@ def _check_v9_columns(resolved_store: Path) -> dict:
     )
 
 
+# v10 (issue #60, 5.1): the entity identity tables. Doctor probes presence +
+# row counts so a dead entity lane (tables present but permanently empty on a
+# store with memories — e.g. a migration whose backfill never ran) is one
+# command away from being noticed. The deeper inspection surface is
+# `store.py entity-list`.
+V10_ENTITY_TABLES = ("entity", "entity_alias", "memory_entity")
+
+
+def _check_entity_tables(resolved_store: Path) -> dict:
+    """Confirm the v10 entity tables exist and are not vacuously empty.
+
+    Read-only probe of sqlite_master + COUNT(*). Pass when all three tables
+    exist AND (the store has no memories OR at least one entity/link row — an
+    entity-free store is legitimate only when nothing was ever extracted,
+    e.g. a fresh store or one whose memories mention no eligible tokens).
+    Warn when the tables are missing (pre-v10; the next writable store.py run
+    migrates and backfills) or when memories exist but no entity was ever
+    derived (the extractor or its wiring went dark). Skip when the store is
+    absent/unreadable (already flagged by store-access). Never writes.
+    """
+    conn = _open_store_ro(resolved_store)
+    if conn is None:
+        return _check(
+            "entity-tables", "skip",
+            "Store not available; skipped entity tables check.",
+        )
+    try:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        missing = [t for t in V10_ENTITY_TABLES if t not in tables]
+        if missing:
+            return _check(
+                "entity-tables", "warn",
+                f"entity table(s) missing: {', '.join(missing)}; a writable "
+                f"store.py run will create them and backfill via migration "
+                f"(issue #60, 5.1).",
+                missing=missing, expected=list(V10_ENTITY_TABLES),
+            )
+        n_memory = conn.execute("SELECT count(*) FROM memory").fetchone()[0]
+        n_entities = conn.execute("SELECT count(*) FROM entity").fetchone()[0]
+        n_links = conn.execute("SELECT count(*) FROM memory_entity").fetchone()[0]
+    except Exception as exc:
+        return _check(
+            "entity-tables", "warn",
+            f"Could not inspect entity tables: {type(exc).__name__}: {exc}",
+        )
+    finally:
+        conn.close()
+    if n_memory > 0 and n_entities == 0 and n_links == 0:
+        return _check(
+            "entity-tables", "warn",
+            f"entity tables exist but are empty on a store with {n_memory} "
+            f"memory row(s) — the deterministic extractor should have derived "
+            f"at least namespace/tag entities on write (issue #60, 5.2). "
+            f"Re-run a writable store.py command to trigger the migration "
+            f"backfill, then inspect with `store.py entity-list`.",
+            entities=n_entities, links=n_links, memories=n_memory,
+        )
+    return _check(
+        "entity-tables", "pass",
+        f"entity identity tables present (entities={n_entities}, "
+        f"links={n_links}); inspect with `store.py entity-list`.",
+        entities=n_entities, links=n_links, memories=n_memory,
+    )
+
+
 # Tier-0 size guard thresholds (issue #49 C). core.md is injected into EVERY
 # session on EVERY hook host, so an overgrown file silently eats context
 # budget and dilutes instruction-following (~150-200 reliably-handled
@@ -1546,6 +1615,7 @@ def build_report(project: Path, repo_root: Path) -> dict:
     checks.append(access_check)
     checks.append(_check_schema(resolved_store, access_check))
     checks.append(_check_v9_columns(resolved_store))
+    checks.append(_check_entity_tables(resolved_store))
     checks.append(_check_claude_native_memory(Path.home()))
     checks.append(_check_session_retention(Path.home()))
     checks.extend(_check_codex_memory_and_trust(Path.home(), project, repo_root))

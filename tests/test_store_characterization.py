@@ -72,6 +72,17 @@ _RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 # the empty string; live rows now keep `''` per the live <=> empty-valid_until
 # invariant). `stats` and `list` are byte-identical to their pre-v9 freeze.
 #
+# "recall" was RE-CAPTURED AGAIN on 2026-08-24 for issue #60 (schema v10):
+# every recall row now carries the `entities` card list, and the pinned query
+# ("python insertion") legitimately fires the new third RRF lane + MMR
+# re-order on the fixture's tagged rows (the fixture builder adds
+# `python,language`-tagged rows, so alias `python` matches). Fixture
+# invariants re-checked before this freeze: live rows keep valid_until=''
+# (the PRR-Q invariant), and the fixture rows/timestamps are unchanged —
+# only the shipped recall surface changed. `stats`, `list`, and
+# `export_jsonl` are byte-identical to their pre-v10 freeze (entities are
+# deliberately NOT part of the export contract).
+#
 # NOTE on help surfaces: the argparse HelpFormatter renders wrapping, blank-line
 # placement, and indentation from a combination of terminal width and
 # Python-platform internals that we cannot fully normalize across Windows /
@@ -87,7 +98,9 @@ _RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 DATA_SHA = {
     "stats": "11ac804ebd82da80a80772814b5507f233d58e259b4c9c3498fa1311500630c8",
     "list": "c2e285928d3ee75154a12e4a61947d6793d3bc8f55edb0b3319e73ff4b75a598",
-    "recall": "f3f4a231f71ce481a733852e4a727572c7bba3e0a6b22734430c0b508792b716",
+    # RE-CAPTURED for v10 (issue #60): recall rows gained the `entities`
+    # card key (see freeze note above). stats/list/export_jsonl unchanged.
+    "recall": "c3719ff860497cd86da713217c1613e50fe33cae4adaf3d0118d1befaf448529",
     "export_jsonl": "8552767c0f9148e2b3c5d5d8759148837186386cdc78d309457d98ffa2d8ac73",
 }
 KNOWN_SUBCMDS = [
@@ -97,6 +110,8 @@ KNOWN_SUBCMDS = [
     "promote", "rekey-namespace", "backup", "restore", "export-pack",
     "export-jsonl", "ingest-jsonl", "failures", "corrections", "queue-list",
     "queue-clear", "mine-history", "sweep",
+    # v10 (issue #60): the entity identity inspection/reconciliation surface.
+    "entity-list", "entity-merge",
 ]
 
 # Subcommands whose argparse parser exposes ONLY the universal -h/--help

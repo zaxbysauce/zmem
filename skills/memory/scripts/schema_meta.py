@@ -23,7 +23,9 @@ from __future__ import annotations
 
 # Bumped by store.py's migration machinery; doctor.py reads it to decide
 # pass/warn/fail. Edit HERE and both consumers stay in sync.
-SUPPORTED_SCHEMA_VERSION = 9
+# v10 (issue #60): entity identity tables (entity / entity_alias /
+# memory_entity) — a live retrieval signal, not a dormant schema artifact.
+SUPPORTED_SCHEMA_VERSION = 10
 
 # The meta-table key under which the version is stored in the store.
 SCHEMA_VERSION_KEY = "schema_version"
@@ -54,6 +56,13 @@ ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
 # Numeric rank for worst-of propagation. A worse taint strictly dominates a
 # better one when two line items meet (update re-creation, consolidate absorb).
 TAINT_RANK = {"trusted_internal": 0, "untrusted_tool": 1, "untrusted_web": 2}
+
+# Entity `kind` enum (issue #60, 5.1). Deliberately small: five kinds cover
+# the deterministic extractor's output without an LLM. `person` is NEVER
+# auto-detected — it can only be created via an explicit `entity:person:Name`
+# tag, and no code path auto-merges person entities (entity-merge is manual,
+# --confirm-gated, and refuses kind mismatches).
+ENTITY_KINDS = ("person", "project", "tool", "preference", "other")
 
 # Signals that make a NEW write default to trusted_internal (human-authored /
 # closeout / grounded evidence). Any other signal (`none` — an agent's

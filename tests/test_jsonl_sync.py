@@ -1892,5 +1892,63 @@ class V9LineageSyncTest(_TwoStoreCase):
         self.assertEqual(stored[1], "2026-06-01T00:00:00Z")
 
 
+class EntityRebuildOnIngestTest(_TwoStoreCase):
+    """v10 (issue #60) sync decision, tested end to end: entity links are NOT
+    carried in the JSONL (they are store-local derived data like embeddings
+    and content_norm); ingest REBUILDS them by running the same deterministic
+    extractor as `add`. Two distinct stores ingesting the same rows derive
+    the same entities (same alias_norm set, same kinds), with no cross-store
+    id coupling and no silent link loss."""
+
+    def test_ingest_rebuilds_entities_and_export_carries_none(self):
+        self.a.add("project:ent-sync",
+                   "use `ripgrep` and entity:person:Kim here",
+                   tags="python")
+        # Full-file export (simplest true path): one row, live only.
+        r = self.a.run("export-jsonl")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 1)
+        exported = json.loads(lines[0])
+        # Positive assertion: the export row carries NO entity fields.
+        self.assertFalse(
+            any("entit" in k.lower() for k in exported),
+            f"export rows must not carry entity fields: {exported.keys()}")
+        path = os.path.join(self.a.tmp, "ent.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(r.stdout)
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+
+        def entities_of(store):
+            r2 = store.run("entity-list", "--json")
+            assert r2.returncode == 0, r2.stderr
+            return json.loads(r2.stdout)
+
+        a_ents, b_ents = entities_of(self.a), entities_of(self.b)
+        a_map = {(a, e["kind"]) for e in a_ents for a in e["aliases"]}
+        b_map = {(a, e["kind"]) for e in b_ents for a in e["aliases"]}
+        self.assertEqual(
+            a_map, b_map,
+            "the two stores must derive the same alias/kind entity set from "
+            "the same content (deterministic rebuild, no carried ids)")
+        # Store-local ids stay independent (no cross-store id coupling).
+        a_ids = {e["id"] for e in a_ents}
+        b_ids = {e["id"] for e in b_ents}
+        self.assertFalse(a_ids & b_ids)
+        # And the ingested memory is fully linked in store B.
+        links = self.b.query_all(
+            "SELECT e.canonical_name FROM memory_entity me "
+            "JOIN entity e ON e.id = me.entity_id WHERE me.memory_id=?",
+            (self.b.find_id("project:ent-sync",
+                            "use `ripgrep` and entity:person:Kim here"),))
+        names = {row[0] for row in links}
+        self.assertIn("ripgrep", names)
+        self.assertIn("Kim", names)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from storelib.backup import BACKUP_DEFAULT_RETENTION, CONSOLIDATE_LOCK_STALE_SECONDS, SENTINEL_SWEEP_DAYS_DEFAULT, SNAPSHOT_GLOB, _acquire_lock, _release_lock, cmd_backup, cmd_restore, cmd_sweep
 from storelib.consolidate import CONSOLIDATE_DEFAULT_THRESHOLD, consolidate
+from storelib.entity import ENTITY_KINDS, cmd_entity_list, cmd_entity_merge
 from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_queue_clear, cmd_queue_list
 from storelib.promote import promote_memory
 from storelib.recall import _reembed, get_memory, list_memory, recall_memory, recent_memory, stats
@@ -100,6 +101,15 @@ def main():
     p_recall.add_argument("--no-hybrid", action="store_true",
                           help="force lexical-only recall even when embeddings are available "
                                "(issue #58 3.3)")
+    p_recall.add_argument("--no-mmr", action="store_true",
+                          help="disable MMR diversity re-ranking for this recall "
+                               "(issue #60 5.5). By default recall re-orders the "
+                               "fused candidate set with Maximal Marginal Relevance "
+                               "so near-paraphrase duplicates do not crowd out "
+                               "distinct facts; --no-mmr returns pure composite-"
+                               "score order. Independent of --no-hybrid (the two "
+                               "lanes can be mixed freely). Lambda default 0.7, "
+                               "env ZMEM_MMR_LAMBDA.")
     p_recall.add_argument("--no-bump", action="store_true",
                           help="suppress the retrieval_count/last_retrieved write; record "
                                "surfaced_count/last_surfaced instead (passive recall, used "
@@ -505,6 +515,36 @@ def main():
     p_sweep.add_argument("--dry-run", action="store_true",
                          help="count what would be pruned without deleting anything")
 
+    # v10 (issue #60, 5.4): entity inspection surface — so humans and doctor
+    # can see what the deterministic extractor minted without raw SQL.
+    p_entity_list = sub.add_parser(
+        "entity-list",
+        help="list entities (kind, canonical name, aliases, link count)")
+    p_entity_list.add_argument("--kind", default=None, choices=list(ENTITY_KINDS),
+                               help="filter to one entity kind "
+                                    "(person/project/tool/preference/other)")
+    p_entity_list.add_argument("--json", action="store_true",
+                               help="emit [{id, kind, name, aliases, links}] "
+                                    "(default: human list)")
+
+    # v10 (issue #60, 5.6): manual entity reconciliation. DRY RUN by default —
+    # without --confirm nothing is written (the plan is printed instead).
+    p_entity_merge = sub.add_parser(
+        "entity-merge",
+        help="merge two entities: move aliases + memory links to the target, "
+             "delete the source (dry-run unless --confirm)")
+    p_entity_merge.add_argument("--from", dest="from_id", required=True,
+                                help="id of the entity to dissolve (its aliases "
+                                     "and links move to --to)")
+    p_entity_merge.add_argument("--to", dest="to_id", required=True,
+                                help="id of the entity that survives")
+    p_entity_merge.add_argument("--confirm", action="store_true",
+                                help="REQUIRED to write. Without it the merge is "
+                                     "a dry run that prints the plan. Refuses "
+                                     "kind mismatches (an entity's kind never "
+                                     "changes silently); person-to-person "
+                                     "merges are allowed but only ever manual.")
+
     args = ap.parse_args()
 
     # `failures` is store-independent (it reads a transcript JSONL or the ZCode
@@ -623,6 +663,9 @@ def main():
         or (args.cmd == "recent" and not args.no_bump)
         or (args.cmd == "search" and not args.no_bump)
         or (args.cmd == "rekey-namespace" and not args.dry_run and args.confirm)
+        # v10 (issue #60): entity-merge writes ONLY under --confirm; the
+        # dry-run default is read-only and must not take the writer lease.
+        or (args.cmd == "entity-merge" and args.confirm)
     ):
         writer_lease = _acquire_writer_lease(args.cmd)
 
@@ -713,7 +756,8 @@ def main():
             recall_memory(conn, query=args.query, namespace=args.namespace,
                           limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
                           no_bump=args.no_bump, include_global=args.include_global,
-                          global_limit=args.global_limit, as_of=args.as_of)
+                          global_limit=args.global_limit, as_of=args.as_of,
+                          no_mmr=args.no_mmr)
         elif args.cmd == "recent":
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
                           min_confidence=args.min_confidence, as_json=args.json,
@@ -902,6 +946,11 @@ def main():
                                   allow_tombstones=args.allow_tombstones,
                                   capture_mode=args.capture_mode)
             sys.exit(rc)
+        elif args.cmd == "entity-list":
+            sys.exit(cmd_entity_list(conn, kind=args.kind, as_json=args.json))
+        elif args.cmd == "entity-merge":
+            sys.exit(cmd_entity_merge(conn, from_id=args.from_id, to_id=args.to_id,
+                                      confirm=args.confirm))
     finally:
         _release_writer_lease(writer_lease)
         conn.close()
