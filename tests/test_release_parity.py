@@ -153,6 +153,18 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("contents: write", self.yml,
                       "creating the tag + Release needs contents: write")
 
+    def test_actions_are_sha_pinned(self):
+        """Unlike ci.yml's documented tag-pinning waiver (read-only token),
+        this workflow holds a contents:write token — a repointed major tag
+        must not execute with write scope. Both actions are SHA-pinned."""
+        import re
+        uses = re.findall(r"uses:\s*(\S+)", self.yml)
+        self.assertGreaterEqual(len(uses), 2)
+        for ref in uses:
+            self.assertRegex(
+                ref, r"@[0-9a-f]{40}",
+                f"action ref {ref!r} must be SHA-pinned (write token)")
+
     def test_runs_the_gate(self):
         self.assertIn("scripts/release_gate.py", self.yml)
 
@@ -165,8 +177,14 @@ class WorkflowContractTest(unittest.TestCase):
     def test_publishes_via_gh_release_create(self):
         self.assertIn("gh release create", self.yml)
 
-    def test_release_step_is_gated_on_should_release(self):
-        self.assertIn("steps.gate.outputs.should_release == 'true'", self.yml)
+    def test_idempotency_is_release_existence_not_tag_existence(self):
+        """Final-critic pin: a bare tag pushed without a Release (human
+        `git push --tag`) must heal on a later merge, not be skipped
+        forever — so the publish step checks `gh release view` first."""
+        self.assertIn("gh release view", self.yml)
+
+    def test_publish_step_runs_on_resolved_version(self):
+        self.assertIn("steps.gate.outputs.version != ''", self.yml)
 
 
 class GateIntegrationTest(unittest.TestCase):

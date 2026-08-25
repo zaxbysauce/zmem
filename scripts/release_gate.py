@@ -176,17 +176,18 @@ def main() -> int:
         return 1
 
     if tag_exists(version):
-        print(f"[release-gate] v{version} is already tagged — nothing to do "
-              f"(merges without a version bump never re-release).")
-        _github_output("should_release", "false")
-        _github_output("version", version)
-        return 0
+        print(f"[release-gate] v{version} is already tagged (merges without "
+              f"a version bump never re-release). The publish step's "
+              f"`gh release view` check remains the sole idempotency guard "
+              f"so a bare tag without a Release still heals.")
+    else:
+        print(f"[release-gate] v{version} is not tagged yet — the publish "
+              f"step will cut it if the Release is missing.")
 
     notes_path = Path(tempfile.gettempdir()) / f"zmem-release-notes-{version}.md"
     notes_path.write_text(notes, encoding="utf-8", newline="\n")
-    print(f"[release-gate] will cut v{version} "
+    print(f"[release-gate] resolved {version} "
           f"(notes: {len(notes.splitlines())} lines from CHANGELOG)")
-    _github_output("should_release", "true")
     _github_output("version", version)
     _github_output("notes_path", str(notes_path))
     _github_output("title", f"zmem {version}")

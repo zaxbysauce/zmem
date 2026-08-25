@@ -41,6 +41,20 @@ README.
   - README release/upgrade section updated: releases are cut automatically
     when a version bump merges to main; the host-side plugin refresh stays
     a deliberate user action (documented flow unchanged).
+- **Deterministic frozen surfaces** (flake caught by the full loop during
+  this work): the characterization recall hash flipped on a day boundary
+  with zero code change — composite `_score` embeds continuously-decaying
+  recency, so its 4-decimal rounding drifts every few days (latent since
+  the freeze's inception). New `ZMEM_TEST_NOW` seam in recall scoring
+  (ISO-8601, naive read as UTC, stderr warning on garbage, wall clock when
+  absent); the characterization suite pins it to the fixture sentinel so
+  the frozen recall surface is time-invariant; hash re-captured with the
+  pinned clock; seam honored + byte-determinism test added.
+- Release-workflow hardening from the final-critic round: publish-step
+  idempotency is RELEASE existence (`gh release view`) rather than bare
+  tag existence, so a human-pushed bare tag heals on the next merge; both
+  actions are SHA-pinned (this workflow holds a contents:write token,
+  unlike ci.yml's documented read-only tag-pinning waiver).
 
 ## [0.10.0] — 2026-08-24
 

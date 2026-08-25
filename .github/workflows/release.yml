@@ -5,12 +5,13 @@ name: Release
 # git tag (vX.Y.Z) and a GitHub Release". That step was manual and rotted:
 # v0.8.5/v0.8.6/v0.8.8 were never tagged; v0.9.0/v0.10.0 merged as manifest
 # bumps with no tag or Release, so release-tracking downstream clients never
-# saw them. Now: whenever a push to main carries a version the repo has
-# never tagged, the gate (scripts/release_gate.py) verifies manifest parity
-# + a matching CHANGELOG section, and this workflow cuts the tag AT THE MAIN
-# COMMIT that carries the version (never a PR-branch head — squash merges
-# orphan branch-head tags) and publishes the GitHub Release with the
-# CHANGELOG section as notes. Merges without a version bump are no-ops.
+# saw them. Now: whenever a push to main carries the version, the gate
+# (scripts/release_gate.py) verifies manifest parity + a matching CHANGELOG
+# section, and this workflow publishes the tag AT THE MAIN COMMIT that
+# carries the version (never a PR-branch head — squash merges orphan
+# branch-head tags) plus the GitHub Release with the CHANGELOG section as
+# notes. Idempotency is RELEASE existence (not bare tag existence), so even
+# a human-pushed bare tag without a release heals on the next merge.
 
 on:
   push:
@@ -24,40 +25,42 @@ permissions:
   contents: write
 
 # Serialize release runs: a second push landing mid-release must re-check
-# tag existence AFTER the first run finished, not race it. Never cancel an
-# in-flight release.
+# release existence AFTER the first run finished, not race it. Never cancel
+# an in-flight release.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   release:
-    name: cut release if version moved
+    name: publish release if missing
     runs-on: ubuntu-latest
     steps:
-      # fetch-depth 0 + tags: the gate must see existing tags to decide
-      # "already released" (idempotent skips after the first run).
+      # SHA-pinned (unlike ci.yml's tag-pinned read-only waiver): this
+      # workflow holds a contents:write token, so a repointed major tag must
+      # not be able to execute with write scope. Bump deliberately.
       - name: Checkout (full history + tags)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
 
-      - name: Release gate (manifest parity + CHANGELOG + tag check)
+      - name: Release gate (manifest parity + CHANGELOG alignment)
         id: gate
         shell: bash
         run: python scripts/release_gate.py
 
-      # --target is the triggering main commit (github.sha), NOT a branch
-      # head: in a squash-merge repo a tag pushed at the PR branch head is
-      # orphaned off first-parent history. gh creates the tag via the API
-      # at exactly this sha.
-      - name: Publish tag + GitHub Release
-        if: steps.gate.outputs.should_release == 'true'
+      # Idempotency is checked against the RELEASE (gh release view), not
+      # the bare tag: a tag without a release (e.g. a human `git push
+      # --tag`) heals here instead of being skipped forever. `gh release
+      # create` targets the triggering main commit (github.sha) — never a
+      # branch head — and attaches to the existing tag when one is present.
+      - name: Publish tag + GitHub Release (idempotent)
+        if: steps.gate.outputs.version != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,6 +70,10 @@ jobs:
           TARGET_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo "Release v${VERSION} already exists — nothing to publish."
+            exit 0
+          fi
           echo "Publishing v${VERSION} at ${TARGET_SHA}"
           gh release create "v${VERSION}" \
             --target "${TARGET_SHA}" \

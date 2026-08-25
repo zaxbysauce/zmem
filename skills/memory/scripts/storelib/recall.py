@@ -784,6 +784,11 @@ def _now_epoch() -> float:
         try:
             dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
         except ValueError:
+            # A SET-but-garbage pin would silently reintroduce exactly the
+            # day-boundary drift the seam exists to eliminate, so say so on
+            # stderr (still never raise on the hot path).
+            print(f"[zmem] WARNING: ignoring unparseable ZMEM_TEST_NOW "
+                  f"{raw!r}; falling back to the wall clock", file=sys.stderr)
             dt = None
         if dt is not None:
             if dt.tzinfo is None:
