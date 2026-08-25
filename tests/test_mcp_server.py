@@ -491,6 +491,28 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         self.assertEqual(result["count"], 50,
                          "limit=999 must be clamped to exactly the 50 hard max")
 
+    def test_search_never_expands_and_respects_hard_cap(self):
+        """v11 final-critic: MCP search aliases the CLI recall subcommand, so
+        without an explicit --link-hops 0 it would (a) diverge from the
+        documented "search never expands" contract and (b) append up to 2
+        link-expansion rows PAST the 50-row hard cap on a linked store. Seeds
+        55 mutually-linked rows so both failure modes would bind."""
+        ns = self._ns()
+        for i in range(55):
+            self._add_test_signal(
+                content=f"search clamp seed row shared tokens {i}",
+                namespace=ns)
+        result = self._call("search", query="search clamp seed shared tokens",
+                            namespace=ns, limit=999)
+        self.assertIsInstance(result, dict)
+        self.assertIn("results", result)
+        self.assertLessEqual(result["count"], 50,
+                             "hard cap must bound search output")
+        for item in result["results"]:
+            self.assertNotIn(
+                "link_relation", item,
+                "search never link-expands — expansion rows must not appear")
+
     def test_recent_empty_namespace_returns_empty_results(self):
         """An empty namespace returns a well-formed {results: [], count: 0}
         (the 'no-data' edge for recent — it has no required args, so this is

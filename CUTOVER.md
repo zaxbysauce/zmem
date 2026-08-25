@@ -29,10 +29,12 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 - local/non-OneDrive path safety
 - Python, SQLite FTS5, Node, and Windows shell prerequisites
 - best-effort read/write access to the target path
-- schema compatibility against current v10
+- schema compatibility against current v11
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity` — inspect deeper with `store.py entity-list`)
+- v11 link surface present (`memory_link` table + `memory.trust_score` in
+  range [0,1] — inspect deeper with `store.py links --id <uuid>`)
 - Claude and Codex native-memory conflicts
 - canonical namespace derivation for the target project
 - required host surfaces and optional Codex adapter files

@@ -579,7 +579,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             valid_until     TEXT NOT NULL DEFAULT '',
             update_of       TEXT NOT NULL DEFAULT '',
             taint           TEXT NOT NULL DEFAULT 'trusted_internal'
-                CHECK (taint IN ('trusted_internal','untrusted_tool','untrusted_web'))
+                CHECK (taint IN ('trusted_internal','untrusted_tool','untrusted_web')),
+            -- v11 (issue #61, 6.1): associative-memory trust score. Starts at
+            -- 1.0; a `contradicts` link event adjusts BOTH rows by -0.10 and a
+            -- `supports`/corroborating add by +0.05, clamped to [0.0, 1.0]
+            -- (storelib/links.py::adjust_trust). Deliberately independent of
+            -- `confidence`/`signal` (provenance inputs): trust_score is the
+            -- contradiction ledger, and linking never rewrites those columns.
+            trust_score     REAL NOT NULL DEFAULT 1.0
         );
         CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory(namespace);
         CREATE INDEX IF NOT EXISTS idx_memory_live ON memory(superseded_at) WHERE superseded_at IS NULL;
@@ -647,6 +654,29 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_memory_entity_entity
             ON memory_entity(entity_id);
+
+        -- v11 (issue #61, 6.1): associative links (A-MEM lite). Directed edge
+        -- table; symmetric relations (`related`/`contradicts`/`supports`) are
+        -- stored as TWO rows (one per direction) by storelib/links.py; the
+        -- typed Supermemory relations (`updates`/`extends`/`derives`) are
+        -- stored as the single directed row the operator authored. UNIQUE
+        -- makes every insert idempotent; CHECK (src_id != dst_id) enforces no
+        -- self-links at the schema level (add_link re-validates in Python).
+        -- `score` is the generating similarity (vec cosine or lexical
+        -- Jaccard) for auto edges, or the operator's --score for curated ones.
+        CREATE TABLE IF NOT EXISTS memory_link (
+            src_id     TEXT NOT NULL,
+            dst_id     TEXT NOT NULL,
+            relation   TEXT NOT NULL
+                CHECK (relation IN ('related','supports','contradicts',
+                                    'updates','extends','derives')),
+            score      REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL,
+            UNIQUE(src_id, dst_id, relation),
+            CHECK (src_id != dst_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_link_src ON memory_link(src_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_link_dst ON memory_link(dst_id);
         """
     )
     # executescript() does not accept parameter binding, so set created_at separately.
@@ -664,6 +694,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_memory_content_norm "
         "ON memory(namespace, content_norm) WHERE superseded_at IS NULL"
     )
+    # v11 (issue #61, 6.1): trust_score column probe — same trap/pattern as
+    # content_norm above. On a fresh store the CREATE TABLE already added it;
+    # on a legacy pre-v11 store init_db()'s CREATE TABLE is a no-op and the v11
+    # migrate block is the one that ALTERs it. Probe + add idempotently here so
+    # the column exists regardless of migration ordering (NOT NULL is legal in
+    # ALTER because the default is non-NULL; migrated rows read 1.0).
+    if "trust_score" not in cols:
+        conn.execute("ALTER TABLE memory ADD COLUMN trust_score REAL NOT NULL DEFAULT 1.0")
     # v9 (issue #59): temporal-history index. Created ONLY when the v9 columns
     # already exist — on a fresh store the CREATE TABLE above added them, but
     # on a legacy pre-v9 store init_db()'s CREATE TABLE is a no-op and the v9
@@ -1130,6 +1168,52 @@ def migrate(conn: sqlite3.Connection) -> None:
         from storelib.entity import backfill_entities
         backfill_entities(conn)
         conn.execute("UPDATE meta SET value='10' WHERE key='schema_version'")
+        conn.commit()
+
+    if ver < 11:
+        # v11 (issue #61): associative links + trust_score. Same idempotent
+        # pattern as v8/v9/v10: init_db() already creates the table/column on
+        # a fresh store (the executescript below is a no-op there); on a
+        # legacy pre-v11 store this block is the one that creates them. NO
+        # link backfill runs here — links accumulate from new writes, and the
+        # phase-7 `organize` command owns bulk backfill (issue #61 "Blocks").
+        # The one data change is the lossless merged_from normalization pass
+        # (issue #61, 6.6): "a,b,a" -> "a,b" (first-seen order, no id lost),
+        # so the de-duplicated-list invariant holds even for stores whose
+        # history predates the fix. Version bump AFTER the pass (v8 pattern):
+        # a crash mid-pass re-runs it; the helper is idempotent.
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS memory_link (
+                src_id     TEXT NOT NULL,
+                dst_id     TEXT NOT NULL,
+                relation   TEXT NOT NULL
+                    CHECK (relation IN ('related','supports','contradicts',
+                                        'updates','extends','derives')),
+                score      REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL,
+                UNIQUE(src_id, dst_id, relation),
+                CHECK (src_id != dst_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_link_src ON memory_link(src_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_link_dst ON memory_link(dst_id);
+        """)
+        v11_cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+        if "trust_score" not in v11_cols:
+            conn.execute(
+                "ALTER TABLE memory ADD COLUMN trust_score REAL NOT NULL DEFAULT 1.0"
+            )
+        from storelib.consolidate import _dedupe_merged_from
+        for r in conn.execute(
+            "SELECT rowid, merged_from FROM memory "
+            "WHERE merged_from IS NOT NULL AND merged_from != ''"
+        ).fetchall():
+            cleaned = _dedupe_merged_from(r["merged_from"])
+            if cleaned != r["merged_from"]:
+                conn.execute(
+                    "UPDATE memory SET merged_from=? WHERE rowid=?",
+                    (cleaned, r["rowid"]),
+                )
+        conn.execute("UPDATE meta SET value='11' WHERE key='schema_version'")
         conn.commit()
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to

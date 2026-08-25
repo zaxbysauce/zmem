@@ -21,6 +21,7 @@ from pathlib import Path
 from storelib.backup import BACKUP_DEFAULT_RETENTION, CONSOLIDATE_LOCK_STALE_SECONDS, SENTINEL_SWEEP_DAYS_DEFAULT, SNAPSHOT_GLOB, _acquire_lock, _release_lock, cmd_backup, cmd_restore, cmd_sweep
 from storelib.consolidate import CONSOLIDATE_DEFAULT_THRESHOLD, consolidate
 from storelib.entity import ENTITY_KINDS, cmd_entity_list, cmd_entity_merge
+from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
 from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_queue_clear, cmd_queue_list
 from storelib.promote import promote_memory
 from storelib.recall import _reembed, get_memory, list_memory, recall_memory, recent_memory, stats
@@ -130,6 +131,16 @@ def main():
     p_recall.add_argument("--global-limit", type=nonnegative_int, default=3,
                           help="max user:global rows when --include-global is set "
                                f"(default 3). No effect without --include-global.")
+    p_recall.add_argument("--link-hops", type=int, choices=[0, 1], default=1,
+                          help="v11 (issue #61, 6.3): walk related/supports links "
+                               "ONE hop from each recalled memory and append up to "
+                               "--link-budget neighbor rows (contradicts neighbors "
+                               "only if they survive the confidence floor, tagged "
+                               "[CONTESTED LINK]). Default 1; 0 disables expansion.")
+    p_recall.add_argument("--link-budget", type=nonnegative_int, default=2,
+                          help="max extra rows appended by 1-hop link expansion "
+                               "(default 2; 0 disables expansion — equivalent to "
+                               "--link-hops 0).")
 
     p_recent = sub.add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
@@ -545,6 +556,61 @@ def main():
                                      "changes silently); person-to-person "
                                      "merges are allowed but only ever manual.")
 
+    # v11 (issue #61, 6.5): associative-link inspection + curation. List mode
+    # mirrors the `get` not-found contract; --add is the CLI insertion path
+    # for the typed relations (updates/extends/derives) and curated supports.
+    p_links = sub.add_parser(
+        "links",
+        help="inspect a memory's associative links (or insert one with --add)",
+        description="List mode (default): `links --id UUID [--json]` prints "
+                    "every memory_link edge touching the memory, both "
+                    "directions. Missing id exits 1 with the same stderr line "
+                    "as `get`. Add mode: `links --add --id A --id B --relation "
+                    "R [--score S]` inserts a curated edge — symmetric "
+                    "relations (related/supports/contradicts) are stored both "
+                    "directions (supports carries the +0.05 trust event); "
+                    "typed relations (updates/extends/derives) keep their one "
+                    "authored direction. Refuses self-links and cross-"
+                    "namespace pairs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_links.add_argument("--id", required=True, action="append", dest="ids",
+                         metavar="UUID",
+                         help="memory id; once for list mode, twice (--id A "
+                              "--id B) with --add for src and dst")
+    p_links.add_argument("--json", action="store_true",
+                         help="emit [{src, dst, direction, other, relation, "
+                              "score, created_at}] (default: human list)")
+    p_links.add_argument("--add", action="store_true",
+                         help="insert a link instead of listing (requires "
+                              "exactly two --id values and --relation)")
+    p_links.add_argument("--relation", default=None, choices=list(LINK_RELATIONS),
+                         help="relation to insert (--add mode only)")
+    p_links.add_argument("--score", type=float, default=None,
+                         help="link score 0..1 (--add mode only; default "
+                              "ZMEM_LINK_THRESHOLD)")
+
+    p_contradict = sub.add_parser(
+        "contradict",
+        help="record that two memories contradict (contradicts pair + trust "
+             "-0.10 each)",
+        description="`contradict --id A --id B --reason ...` inserts a "
+                    "contradicts pair (both directions) and applies the "
+                    "-0.10 trust event to BOTH rows — without merging, "
+                    "deleting, or changing either row's content, confidence, "
+                    "or signal. --reason is REQUIRED (deliberate-use guard, "
+                    "the `invalidate` convention); the issue's v11 schema has "
+                    "no reason column, so it is validated and echoed but not "
+                    "persisted. Re-running the same contradict is an exact "
+                    "no-op (idempotent; no second trust delta). Missing ids "
+                    "exit 1 (the `get` contract).",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_contradict.add_argument("--id", required=True, action="append", dest="ids",
+                              metavar="UUID",
+                              help="the two contradicting memory ids (--id A "
+                                   "--id B)")
+    p_contradict.add_argument("--reason", required=True,
+                              help="why they contradict (REQUIRED)")
+
     args = ap.parse_args()
 
     # `failures` is store-independent (it reads a transcript JSONL or the ZCode
@@ -757,7 +823,8 @@ def main():
                           limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
                           no_bump=args.no_bump, include_global=args.include_global,
                           global_limit=args.global_limit, as_of=args.as_of,
-                          no_mmr=args.no_mmr)
+                          no_mmr=args.no_mmr,
+                          link_hops=args.link_hops, link_budget=args.link_budget)
         elif args.cmd == "recent":
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
                           min_confidence=args.min_confidence, as_json=args.json,
@@ -768,11 +835,13 @@ def main():
             # hybrid=False explicitly so the new default sentinel does
             # not silently flip search to vector-hybrid. Search output
             # stays byte-identical to pre-change.
+            # v11 (issue #61, 6.3): same reasoning for link expansion — it is
+            # a RECALL behavior; search keeps its byte-identical contract.
             recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
                           as_json=False, min_confidence=0.0,
                           include_global=args.include_global,
                           global_limit=args.global_limit, no_bump=args.no_bump,
-                          hybrid=False, as_of=args.as_of)
+                          hybrid=False, as_of=args.as_of, link_hops=0)
         elif args.cmd == "supersede":
             try:
                 ok = supersede_memory(conn, args.id, args.reason)
@@ -951,6 +1020,12 @@ def main():
         elif args.cmd == "entity-merge":
             sys.exit(cmd_entity_merge(conn, from_id=args.from_id, to_id=args.to_id,
                                       confirm=args.confirm))
+        elif args.cmd == "links":
+            sys.exit(cmd_links(conn, ids=args.ids, as_json=args.json,
+                               add=args.add, relation=args.relation,
+                               score=args.score))
+        elif args.cmd == "contradict":
+            sys.exit(cmd_contradict(conn, ids=args.ids, reason=args.reason))
     finally:
         _release_writer_lease(writer_lease)
         conn.close()

@@ -175,11 +175,34 @@ def cmd_export_jsonl(
     rows = conn.execute(
         f"""SELECT id, namespace, type, content, tags, source_ref, confidence, signal,
                    valid_from, valid_until, update_of, taint,
-                   ingestion_ts, superseded_at, supersede_reason, merged_from
+                   ingestion_ts, superseded_at, supersede_reason, merged_from,
+                   trust_score
             FROM memory {where}
             ORDER BY ingestion_ts, id""",
         params,
     ).fetchall()
+
+    # v11 (issue #61, 6.6/sync): outgoing link edges, grouped per src_id in one
+    # pass. Links ARE carried in the JSONL (unlike entities, they are not
+    # deterministically re-derivable per row — they depend on the neighbor set
+    # at write time and on curated contradicts/supports). Only OUTGOING edges
+    # are emitted: symmetric pairs are exported from BOTH endpoints' rows, so
+    # a directed re-insert on ingest restores the table exactly. Extra keys
+    # are backward-compatible: a pre-v11 validator reads fields via obj.get()
+    # and never rejects unknown keys, so an older client can still ingest this
+    # file (it just drops trust_score/links).
+    link_map: dict = {}
+    try:
+        for e in conn.execute(
+            "SELECT src_id, dst_id, relation, score, created_at FROM memory_link "
+            "ORDER BY src_id, relation, dst_id"
+        ).fetchall():
+            link_map.setdefault(e["src_id"], []).append({
+                "dst": e["dst_id"], "relation": e["relation"],
+                "score": e["score"], "created_at": e["created_at"],
+            })
+    except sqlite3.OperationalError:
+        pass  # memory_link absent (pre-v11 store never migrated) — export without links
 
     lines = []
     for r in rows:
@@ -203,6 +226,11 @@ def cmd_export_jsonl(
             "superseded_at": r["superseded_at"],
             "supersede_reason": r["supersede_reason"],
             "merged_from": r["merged_from"],
+            # v11 (issue #61): the contradiction-ledger score round-trips
+            # verbatim (it is event history, not derivable state), and so do
+            # the row's outgoing link edges.
+            "trust_score": r["trust_score"],
+            "links": link_map.get(r["id"], []),
         }
         line = json.dumps(obj, ensure_ascii=False)
         # json.dumps already escapes every codepoint < 0x20 (\n, \r, and any
@@ -470,6 +498,70 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     else:
         taint = raw_taint
 
+    # v11 (issue #61, sync): trust_score — optional float, finite, clamped to
+    # [0,1], default 1.0 (mirrors confidence handling: an unusable value falls
+    # back to the default rather than dropping the row — trust is a ranking
+    # input, not identity).
+    raw_trust = obj.get("trust_score")
+    if raw_trust is None:
+        trust_score = 1.0
+    else:
+        try:
+            trust_score = float(raw_trust)
+        except (TypeError, ValueError):
+            trust_score = 1.0
+        if not math.isfinite(trust_score):
+            trust_score = 1.0
+    trust_score = max(0.0, min(1.0, trust_score))
+
+    # v11 (issue #61, sync): outgoing link edges, optional list. Every entry
+    # is validated fail-closed (a malformed EDGE makes the ROW malformed —
+    # counted, not stored): dst must be UUID-shaped, relation must be a known
+    # enum value, score finite in [0,1], created_at a string. The list rides
+    # the validated dict under the reserved "_links" key (NOT a memory-table
+    # column) and is consumed by cmd_ingest_jsonl's post-row pass.
+    raw_links = obj.get("links")
+    if raw_links is None:
+        validated_links = []
+    elif not isinstance(raw_links, list):
+        raise ValueError(f"field 'links' must be a list or null, "
+                         f"got {type(raw_links).__name__}")
+    else:
+        from storelib.links import LINK_RELATIONS
+        validated_links = []
+        for i, entry in enumerate(raw_links):
+            if not isinstance(entry, dict):
+                raise ValueError(f"field 'links[{i}]' must be an object, "
+                                 f"got {type(entry).__name__}")
+            dst = entry.get("dst")
+            if not isinstance(dst, str) or not _INGEST_ID_RE.match(dst):
+                raise ValueError(f"field 'links[{i}].dst' must be a 36-char "
+                                 f"UUID-shaped string, got {dst!r}")
+            relation = entry.get("relation")
+            if not isinstance(relation, str) or relation not in LINK_RELATIONS:
+                raise ValueError(
+                    f"field 'links[{i}].relation' must be one of "
+                    f"{', '.join(LINK_RELATIONS)}, got {relation!r}"
+                )
+            raw_score = entry.get("score", 0.0)
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                raise ValueError(f"field 'links[{i}].score' must be a number, "
+                                 f"got {raw_score!r}")
+            if not math.isfinite(score):
+                raise ValueError(f"field 'links[{i}].score' must be finite, "
+                                 f"got {raw_score!r}")
+            created_at = entry.get("created_at", "")
+            if not isinstance(created_at, str):
+                raise ValueError(f"field 'links[{i}].created_at' must be a "
+                                 f"string, got {created_at!r}")
+            validated_links.append({
+                "dst": dst, "relation": relation,
+                "score": max(0.0, min(1.0, score)),
+                "created_at": created_at,
+            })
+
     if not ingestion_ts:
         ingestion_ts = now_iso()
     else:
@@ -498,6 +590,11 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
         "superseded_at": superseded_at,
         "supersede_reason": supersede_reason,
         "merged_from": merged_from,
+        # v11 (issue #61): carried through _ingest_row into the memory table;
+        # "_links" is a reserved carriage key consumed by cmd_ingest_jsonl
+        # (never a SQL column).
+        "trust_score": trust_score,
+        "_links": validated_links,
     }
 
 def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
@@ -539,6 +636,11 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
     superseded_at = obj["superseded_at"]
     supersede_reason = obj["supersede_reason"]
     merged_from = obj.get("merged_from")
+    # v11 (issue #61): the row's authored trust_score (validated/clamped
+    # upstream; 1.0 for a pre-v11 export). The "_links" carriage key is NOT
+    # read here — cmd_ingest_jsonl applies links in a post-row pass so an
+    # edge may reference an endpoint later in the file.
+    trust_score = obj.get("trust_score", 1.0)
 
     # Existing-local-row short-circuit FIRST (issue #35 refinement): an id
     # already present locally is NEVER content-overwritten by a sync import --
@@ -626,12 +728,14 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                     confidence, signal, valid_from, valid_until, update_of, taint,
                     superseded_at, supersede_reason,
                     ingestion_ts, retrieval_count, last_retrieved,
-                    embedding, embedding_model, embedded_at, merged_from, content_norm)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL,?,?)""",
+                    embedding, embedding_model, embedded_at, merged_from, content_norm,
+                    trust_score)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL,?,?,?)""",
                 (mid, namespace, type_, content, tags, source_ref, shash,
                  confidence, signal, valid_from, valid_until, update_of, taint,
                  superseded_at, supersede_reason,
-                 ingestion_ts, merged_from, _normalize_content(content)),
+                 ingestion_ts, merged_from, _normalize_content(content),
+                 trust_score),
             )
             # v10 (issue #60, sync decision): entities are NOT carried in the
             # JSONL (they are store-local derived data, like content_norm and
@@ -649,6 +753,27 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         # _apply_capture_policy (issue #35); no separate advisory scan here.
         existing, _sim, emb = _detect_duplicate(conn, content, namespace,
                                                  dedup_cache=dedup_cache)
+        # v11 (issue #61, 6.2 — PR-review R1): the SAME write-time polarity
+        # guard add_memory/update_memory apply. A remote row that contradicts
+        # its dedup hit ("always X" vs "never X") must NOT be folded into the
+        # keeper — the sync-restore contract restores ROWS, it does not get to
+        # silently absorb a refutation into the row it refutes. Fall through
+        # to the insert branch: the row lands as its own live row (still no
+        # auto link generation / trust delta on ingest — deterministic
+        # restore; a later `add`/`update`/`contradict` records the edge).
+        if existing:
+            from storelib.consolidate import _polarity_signature
+            ex_row = conn.execute(
+                "SELECT content FROM memory WHERE id=?", (existing["id"],)
+            ).fetchone()
+            if (ex_row is not None
+                    and _polarity_signature(ex_row["content"] or "")
+                    != _polarity_signature(content)):
+                print(f"[zmem] ingest-jsonl: dedup skipped for row {mid}: "
+                      f"polarity disagreement with {existing['id']}; stored "
+                      "as its own row (contradictions never merge)",
+                      file=sys.stderr)
+                existing = None
         if existing:
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
             # PR-review PRR-H (issue #59 review round): the surviving keeper
@@ -686,12 +811,12 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 confidence, signal, valid_from, valid_until, update_of, taint,
                 superseded_at, ingestion_ts,
                 retrieval_count, last_retrieved, embedding, embedding_model, embedded_at,
-                merged_from, content_norm)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?,?,?)""",
+                merged_from, content_norm, trust_score)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?,?,?,?)""",
             (mid, namespace, type_, content, tags, source_ref, shash,
              confidence, signal, valid_from, valid_until, update_of, taint,
              ingestion_ts, emb, emb_model, embedded_at,
-             merged_from, _normalize_content(content)),
+             merged_from, _normalize_content(content), trust_score),
         )
         if emb is not None:
             try:
@@ -756,9 +881,12 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
 
     added = tombstoned = tombstones_refused = deduped = skipped = malformed = 0
     capture_refused = 0
+    links_added = links_skipped = 0
     first_refused_id = None
     saw_line = False
     decode_error = None
+    # v11 (issue #61, sync): (src_id, validated_edges) per row carrying links.
+    pending_links: list = []
     try:
         # Stream the file line by line instead of reading it whole into
         # memory first -- a giant hostile file would otherwise exhaust RAM
@@ -911,6 +1039,15 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 deduped += 1
             else:
                 skipped += 1
+            # v11 (issue #61, sync): collect the row's validated outgoing
+            # edges for the post-row pass (an edge may reference an endpoint
+            # later in the file, so links can never be applied per-row).
+            # Collected on EVERY outcome — a deduped/skipped row's id never
+            # lands locally, and the post-pass existence check skips its
+            # edges (counted, reported) rather than failing the file.
+            row_links = obj.get("_links")
+            if row_links:
+                pending_links.append((obj["id"], row_links))
     except (UnicodeDecodeError, OSError) as e:
         # Invalid UTF-8 can now surface mid-iteration (streaming, not a single
         # up-front read_text()) -- that's the UnicodeDecodeError case. OSError
@@ -942,11 +1079,41 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
         # secret). NOT written. One summary note, not per-row, for the same
         # noise-suppression reason as tombstones_refused.
         print(f"[zmem] ingest-jsonl: refused {capture_refused} row(s) under the "
-              f"capture policy (secret-like source_ref in 'auto' mode); those rows "
-              f"are NOT stored. Re-ingest with --capture-mode reviewed/manual only "
+              f"capture policy (secret-like source_ref in 'auto' mode); those rows are "
+              f"NOT stored. Re-ingest with --capture-mode reviewed/manual only "
               f"if you have verified the source_ref is safe.", file=sys.stderr)
+
+    # v11 (issue #61, sync): apply collected link edges AFTER every row has
+    # landed (endpoints may appear anywhere in the file). Each edge is
+    # re-inserted as the SINGLE directed row it was exported as — symmetric
+    # pairs arrive as two rows (one per endpoint), so the table restores
+    # exactly, and created_at is preserved for byte-identical re-export. No
+    # trust deltas here, ever: the exported trust_score was restored verbatim
+    # with its row, and re-applying event history would double-count it
+    # (also what keeps re-ingest of the same file an exact no-op).
+    if pending_links:
+        from storelib.links import add_link
+        known = {r[0] for r in conn.execute("SELECT id FROM memory").fetchall()}
+        for src, entries in pending_links:
+            if src not in known:
+                links_skipped += len(entries)
+                continue
+            for e in entries:
+                if e["dst"] not in known:
+                    links_skipped += 1
+                    continue
+                try:
+                    if add_link(
+                        conn, src, e["dst"], e["relation"], e["score"],
+                        created_at=e["created_at"] or None,
+                    ):
+                        links_added += 1
+                except ValueError:
+                    links_skipped += 1
+        conn.commit()
 
     print(f"[zmem] ingest-jsonl: added={added} tombstoned={tombstoned} "
           f"tombstones_refused={tombstones_refused} capture_refused={capture_refused} "
-          f"deduped={deduped} skipped={skipped} malformed={malformed}")
+          f"deduped={deduped} skipped={skipped} malformed={malformed} "
+          f"links_added={links_added} links_skipped={links_skipped}")
     return 2 if decode_error is not None else 0

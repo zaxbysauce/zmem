@@ -108,7 +108,13 @@ DATA_SHA = {
     # (_run_env), making the surface time-invariant; stats/list/export_jsonl
     # are clock-independent and stay byte-identical to their prior freezes.
     "recall": "745a08e408bcf4dff0bb65a64e91cecfae97e35f60e22c7b951ac74daa0ebe39",
-    "export_jsonl": "8552767c0f9148e2b3c5d5d8759148837186386cdc78d309457d98ffa2d8ac73",
+    # v11 (issue #61): export-jsonl re-captured ONLY for the two new row keys
+    # (`trust_score`, `links`) — stripping exactly those keys from the new
+    # output reproduces the v10 freeze 8552767c… byte-for-byte (verified at
+    # re-capture time). recall/list/stats are UNCHANGED: the fixture builder
+    # disables auto-linking (ZMEM_LINK_THRESHOLD=1.01), so the frozen
+    # surfaces stay pre-v11-identical.
+    "export_jsonl": "2239fcd95efc4e2e6c86f8e742e4715814283a36db253d8bbeb0333907550399",
 }
 KNOWN_SUBCMDS = [
     "init", "add", "invalidate", "recall", "recent", "search", "supersede",
@@ -119,6 +125,8 @@ KNOWN_SUBCMDS = [
     "queue-clear", "mine-history", "sweep",
     # v10 (issue #60): the entity identity inspection/reconciliation surface.
     "entity-list", "entity-merge",
+    # v11 (issue #61): the associative-link inspection/curation surface.
+    "links", "contradict",
 ]
 
 # Subcommands whose argparse parser exposes ONLY the universal -h/--help

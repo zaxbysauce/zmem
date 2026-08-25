@@ -62,6 +62,12 @@ _ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "con
 _ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
 _DEFAULT_LIMIT = 5
 _HARD_LIMIT_MAX = 50
+# v11 (issue #61, 6.3): recall's default 1-hop link expansion appends up to
+# this many EXTRA neighbor rows beyond --limit. The tool's hard cap bounds the
+# TOTAL returned rows, so recall reserves this budget inside the clamp
+# (mains limit = clamp - reserve when the cap binds): a limit=999 recall
+# returns 48 query matches + 2 linked neighbors = 50 rows, never 52.
+_LINK_BUDGET_RESERVED = 2
 # Concurrency cap on simultaneous store.py subprocesses. Each tool call spawns a
 # fresh store.py; without a bound an authorized but chatty remote client could
 # exhaust the process table / FDs / memory. Default 8; override via env (#36 M6).
@@ -587,7 +593,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         q = (query or "").strip()
         if not q:
             return _error("query is required")
-        n = _clamp_limit(limit)
+        n = min(_clamp_limit(limit), _HARD_LIMIT_MAX - _LINK_BUDGET_RESERVED)
         args = [
             "recall",
             "--query", q[:_MAX_QUERY_CHARS],
@@ -716,6 +722,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "--include-global",
             "--global-limit", "3",
             "--no-hybrid",
+            # v11 (issue #61, 6.3; final-critic): search NEVER expands — the
+            # CLI search subcommand pins link_hops=0 for its byte-identical
+            # contract, and this tool aliases that subcommand, so without
+            # this flag the recall default (hops=1, budget=2) would both
+            # diverge from the documented contract and append up to 2 rows
+            # PAST _HARD_LIMIT_MAX on a linked store.
+            "--link-hops", "0",
             "--json",
         ] + _namespace_flag(namespace)
         return _parse_results(await _run_store_async(args))

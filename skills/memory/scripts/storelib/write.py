@@ -25,6 +25,7 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from correction_queue import SECRET_PATTERNS  # type: ignore # noqa: F401
 from storelib.entity import link_memory_entities, relink_memory
+from storelib.links import LINK_THRESHOLD, TRUST_DELTA_SUPPORTS, adjust_trust, generate_links_on_write
 from storelib.schema import CAPTURE_MODES, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, PROMPT_INJECTION_PATTERNS, SIGNAL_CONFIDENCE, _commit, _embeddings, _env_float, _normalize_content, _vec_knn_in_namespace, now_iso
 
 _degraded_embedding_warned = False
@@ -677,9 +678,41 @@ def add_memory(
         # dedup-on-write semantics to incoming rows without duplicating this logic.
         existing, dedup_sim, emb = _detect_duplicate(conn, content, namespace)
 
+        # v11 (issue #61, 6.2): similarity cannot distinguish "always X" from
+        # "never X" — the contested-cluster guard consolidate applies at
+        # cluster time (issue #49 A), applied here at WRITE time. When the
+        # dedup hit and the new content disagree on negation polarity, the
+        # rows contradict: do NOT merge (a merge would absorb a memory's own
+        # refutation into the row it contradicts, and _merge_on_dedup would
+        # bump retrieval_count on the keeper). Fall through to the insert
+        # path, where generate_links_on_write records the `contradicts` pair
+        # (sim >= dedup threshold 0.85 > link threshold 0.75) and applies the
+        # −0.10 trust event to BOTH rows.
+        if existing:
+            from storelib.consolidate import _polarity_signature
+            ex_row = conn.execute(
+                "SELECT content FROM memory WHERE id=?", (existing["id"],)
+            ).fetchone()
+            if (ex_row is not None
+                    and _polarity_signature(ex_row["content"] or "")
+                    != _polarity_signature(content)):
+                print(
+                    f"[zmem] dedup skipped: polarity disagreement with "
+                    f"{existing['id']} (similarity={dedup_sim:.3f}); rows stay "
+                    "separate and link as contradicts"
+                )
+                existing = None
+
         if existing:
             # Merge: upgrade confidence/signal if the new add is stronger.
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
+            # v11 (issue #61, 6.2): a polarity-AGREEING re-observation of the
+            # same memory is corroboration — +0.05 trust, clamped [0,1].
+            # Applied HERE (not inside _merge_on_dedup) because that helper is
+            # shared with consolidate's absorb path, and a consolidate merge
+            # is not a corroborating ADD; the ingest dedup path deliberately
+            # skips the delta too (it must stay idempotent under re-ingest).
+            adjust_trust(conn, existing["id"], TRUST_DELTA_SUPPORTS)
             # PR-review PRR-A (issue #59 review round): the dedup target also
             # absorbs the incoming taint — worst-of its own and the add's —
             # exactly like update_memory's dedup fold (S1). Without this, a
@@ -745,6 +778,19 @@ def add_memory(
         link_memory_entities(
             conn, mid, content=content, tags=tags, namespace=namespace,
         )
+        # v11 (issue #61, 6.2/6.4): automatic neighbor linking — the
+        # namespace-aware neighbors above the link threshold become
+        # `related` (or `contradicts` on polarity disagreement, with the
+        # −0.10 trust event), and their tags/entity links absorb the new
+        # row's (attribute evolution; content is never rewritten). Same
+        # transaction as the INSERT: a failed link pass rolls back the write.
+        link_report = generate_links_on_write(
+            conn, mid, content=content, namespace=namespace, tags=tags, emb=emb,
+        )
+        if link_report["related"] or link_report["contradicts"]:
+            print(f"[zmem] links: +{link_report['related']} related, "
+                  f"+{link_report['contradicts']} contradicts "
+                  f"(threshold={LINK_THRESHOLD})")
         if started_tx:
             _commit(conn)
         print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"
@@ -1027,9 +1073,30 @@ def update_memory(
         # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
         # cannot self-match; an unchanged-content update still creates history.
         existing, dedup_sim, emb = _detect_duplicate(conn, content_eff, ns)
+        # v11 (issue #61, 6.2): the same write-time polarity guard as add —
+        # a contradiction is NOT a duplicate. Disagree ⇒ skip the merge and
+        # insert the replacement row; generate_links_on_write below records
+        # the contradicts pair + trust event.
+        if existing:
+            from storelib.consolidate import _polarity_signature
+            ex_row = conn.execute(
+                "SELECT content FROM memory WHERE id=?", (existing["id"],)
+            ).fetchone()
+            if (ex_row is not None
+                    and _polarity_signature(ex_row["content"] or "")
+                    != _polarity_signature(content_eff)):
+                print(
+                    f"[zmem] update dedup skipped: polarity disagreement with "
+                    f"{existing['id']} (similarity={dedup_sim:.3f}); rows stay "
+                    "separate and link as contradicts"
+                )
+                existing = None
         if existing:
             dup_id = existing["id"]
             _merge_on_dedup(conn, dup_id, conf_eff, sig_eff, tags_eff)
+            # v11 (issue #61, 6.2): polarity-agreeing dedup fold on update is
+            # a corroborating re-observation — same +0.05 as add.
+            adjust_trust(conn, dup_id, TRUST_DELTA_SUPPORTS)
             # The dedup target absorbs the update's lineage: worst-of its own
             # taint and the incoming lineage (S1 — do NOT rely on the shared
             # taint-neutral _merge_on_dedup).
@@ -1083,6 +1150,17 @@ def update_memory(
         link_memory_entities(
             conn, new_id, content=content_eff, tags=tags_eff, namespace=ns,
         )
+        # v11 (issue #61, 6.2): the replacement row generates its neighbor
+        # links exactly like a fresh add (related/contradicts + tag
+        # evolution), inside the same transaction.
+        link_report = generate_links_on_write(
+            conn, new_id, content=content_eff, namespace=ns, tags=tags_eff,
+            emb=emb,
+        )
+        if link_report["related"] or link_report["contradicts"]:
+            print(f"[zmem] links: +{link_report['related']} related, "
+                  f"+{link_report['contradicts']} contradicts "
+                  f"(threshold={LINK_THRESHOLD})")
         if started_tx:
             _commit(conn)
         print(f"[zmem] updated memory {mid} -> {new_id} (ns={ns}, type={type_eff}, "

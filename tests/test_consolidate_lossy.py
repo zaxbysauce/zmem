@@ -918,5 +918,58 @@ class TaintWorstOfTest(unittest.TestCase):
         self.assertEqual(k["merged_from"], absorbed)
 
 
+class MergedFromDedupTest(unittest.TestCase):
+    """v11 (issue #61, 6.6): merged_from is a de-duplicated first-seen list.
+
+    The pre-v11 writer plain-appended; the shared normalizer
+    (_dedupe_merged_from) now guards the consolidate writer, sync ingest, and
+    the v11 migration.
+    """
+
+    def setUp(self):
+        self.mod, self.conn, self.tmp = _make_store()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _dedupe(self, value):
+        return self.mod._dedupe_merged_from(value)
+
+    def test_unit_first_seen_order_no_id_lost(self):
+        self.assertEqual(self._dedupe("a,b,a"), "a,b")
+        self.assertEqual(self._dedupe("a,b,a,b"), "a,b")
+        self.assertEqual(self._dedupe("b,a,a"), "b,a")
+        self.assertEqual(self._dedupe("a"), "a")
+
+    def test_unit_marker_preserved_on_first_occurrence(self):
+        # The :truncated marker rides the FIRST occurrence; a later bare
+        # repeat does not resurrect content appending.
+        self.assertEqual(self._dedupe("a:truncated,b,a"), "a:truncated,b")
+
+    def test_unit_empty_stays_empty(self):
+        self.assertEqual(self._dedupe(""), "")
+        self.assertEqual(self._dedupe(None), "")
+
+    def test_unit_idempotent(self):
+        once = self._dedupe("a,b,a")
+        self.assertEqual(self._dedupe(once), once)
+
+    def test_absorb_writer_dedupes_in_place(self):
+        """The actual writer: absorbing an id already present in merged_from
+        cannot duplicate it (the historical failure mode of the plain
+        append)."""
+        keeper = _add(self.mod, self.conn, KEEPER_BASE, 0.95, rc=50)
+        absorbed = _add(self.mod, self.conn, ABSORBED_EXTRA, 0.85, rc=1)
+        # Plant the absorbed id as if a pre-v11 run had already recorded it.
+        self.conn.execute(
+            "UPDATE memory SET merged_from=? WHERE id=?", (absorbed, keeper))
+        self.conn.commit()
+        self.mod.consolidate(self.conn, force=True)
+        row = self.conn.execute(
+            "SELECT merged_from FROM memory WHERE id=?", (keeper,)).fetchone()
+        ids = [x.strip() for x in (row["merged_from"] or "").split(",")]
+        self.assertEqual(ids.count(absorbed), 1,
+                         f"absorbed id must appear exactly once: {ids!r}")
+        self.assertIn(absorbed, ids)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

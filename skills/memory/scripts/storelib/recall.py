@@ -19,6 +19,7 @@ import glob
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.entity import entities_for_memory, entities_for_memories, entity_match_ids
+from storelib.links import expand_recall_links
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, now_iso
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from schema_meta import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
@@ -700,6 +701,12 @@ def _format_fenced_recall(rows: list[dict], header: str) -> str:
             _markers.append("[UNTRUSTED TOOL]")
         elif _taint == "untrusted_web":
             _markers.append("[UNTRUSTED WEB]")
+        # v11 (issue #61, 6.3): contradicts neighbors pulled in by 1-hop link
+        # expansion are surfaced as CONTESTED so the reader sees immediately
+        # that another memory refutes this one. Only expansion rows ever
+        # carry `contested_link`, so non-expansion output is unchanged.
+        if r.get("contested_link"):
+            _markers.append("[CONTESTED LINK]")
         inj_prefix = (" " + " ".join(_markers)) if _markers else ""
         lines.append(
             f"{inj_prefix}- [{r['id']}] [conf={r['confidence']}] [signal={r['signal']}] "
@@ -811,6 +818,8 @@ def recall_memory(
     global_limit: int = 3,
     as_of: str | None = None,
     no_mmr: bool = False,
+    link_hops: int = 1,
+    link_budget: int = 2,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -929,6 +938,27 @@ def recall_memory(
             if not r.get("prompt_injection_risk") and r.get("taint") != "untrusted_web"
         ]
 
+    # v11 (issue #61, 6.3): budgeted 1-hop link expansion — AFTER MMR and the
+    # no_bump filter (expansion candidates get the same injection/untrusted
+    # drop), BEFORE entity cards so cards cover expansion rows too. Walks
+    # related/supports one hop (contradicts gated by the confidence floor and
+    # tagged [CONTESTED LINK]), appends up to link_budget rows not already in
+    # the result set. link_hops=0 or link_budget=0 disables it. Expansion rows
+    # (and ONLY expansion rows) carry link_relation/link_of/link_score/
+    # contested_link, so a link-free store keeps byte-identical output.
+    # `search` passes link_hops=0 to keep its byte-identical contract.
+    #
+    # Telemetry: expansion rows are deliberately NOT bumped — popularity
+    # rewards query-MATCHED rows, and a supplementary neighbor surfaced only
+    # through its link must not outrank genuine matches in later recalls
+    # (pinned by test_mmr's distinct-fact acceptance, issue #60 5.5).
+    bump_ids = [r["id"] for r in results]
+    if link_hops >= 1 and link_budget >= 1 and results:
+        results = results + expand_recall_links(
+            conn, results, ns_list=ns_list, budget=link_budget, as_of=as_of,
+            min_confidence=min_confidence, no_bump=no_bump,
+        )
+
     # v10 (issue #60, 5.4): entity cards on every recall row (JSON gains
     # `entities: [{id, kind, name}]`; the fenced text render shows at most
     # THREE names per row, never ids). Attached AFTER the filters so dropped
@@ -939,9 +969,10 @@ def recall_memory(
         for r in results:
             r["entities"] = cards.get(r["id"], [])
 
-    if results:
-        ids = [r["id"] for r in results]
-        _bump_telemetry(conn, ids, no_bump=no_bump)
+    if bump_ids:
+        # v11 (issue #61, 6.3): bump ONLY the query-matched rows — expansion
+        # neighbors joined via `bump_ids` capture above, before expansion.
+        _bump_telemetry(conn, bump_ids, no_bump=no_bump)
 
     if as_json:
         print(json.dumps(results, indent=2))

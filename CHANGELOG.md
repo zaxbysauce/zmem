@@ -12,6 +12,68 @@ README.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-08-25
+
+### Added
+
+- **Schema v11 — associative links (A-MEM lite) + trust_score** (issue #61,
+  all six mandatory tasks, no stubs):
+  - New `memory_link(src_id, dst_id, relation, score, created_at,
+    UNIQUE(src_id, dst_id, relation))` edge table with a relation CHECK over
+    `related|supports|contradicts|updates|extends|derives` (directed, no
+    self-links) and `memory.trust_score REAL NOT NULL DEFAULT 1.0`. Lossless
+    v10→v11 migration (migrated rows read trust 1.0; existing `merged_from`
+    values normalized in place). New `storelib/links.py` owns the surface.
+  - **Automatic link generation on every `add`/`update`**: the namespace-aware
+    neighbors dedup already computed (embedding cosine, or Jaccard when the
+    model is absent — model-absent stores link too) above
+    `ZMEM_LINK_THRESHOLD` (default 0.75) become `related` edges, stored both
+    directions. When the consolidate polarity signatures disagree the pair
+    links as `contradicts` instead and the dedup MERGE IS SKIPPED — "always
+    X" no longer absorbs "never X" at write time. Deterministic; no LLM (no
+    `ZMEM_LINK_LLM` knob exists).
+  - **trust_score deltas**: one contradicts event = −0.10 to BOTH rows; a
+    `supports` link or a polarity-agreeing duplicate re-add (corroborating
+    add) = +0.05; clamped to [0.0, 1.0] so ten contradictions land at exactly
+    0.0. `confidence`/`signal` are never touched by linking. Sync ingest
+    restores trust verbatim and never re-applies deltas (re-ingest stays an
+    exact no-op).
+  - **Attribute evolution**: each linked neighbor unions the new row's tags
+    and re-derives its entity links. Content, confidence, signal, and
+    retrieval_count are never rewritten (no content-rewrite helper exists).
+  - **Budgeted 1-hop recall expansion** (`--link-hops 0|1` default 1,
+    `--link-budget N` default 2): after MMR, `related`/`supports` neighbors
+    are appended up to the budget; `contradicts` neighbors only if they
+    survive the confidence floor, tagged `[CONTESTED LINK]` (JSON:
+    `contested_link`). Namespace-contained, `--as-of`-respecting, never
+    double-counting; expansion rows never advance telemetry (popularity
+    stays a query-match signal). `search`/`recent` never expand.
+  - **Inspection/curation CLI**: `links --id UUID [--json]` (missing id
+    exits 1, the `get` contract) and `links --add --id A --id B --relation R
+    [--score S]` (the sanctioned insertion path for the typed relations);
+    `contradict --id A --id B --reason ...` (required reason, pair + trust
+    event, never merges/deletes/rewrites; the schema has no reason column so
+    the reason is validated + echoed, not persisted).
+  - **Sync round-trip**: `export-jsonl` now carries `trust_score` and each
+    row's outgoing `links` (created_at preserved); `ingest-jsonl` validates
+    both fail-closed and applies links in a post-row pass
+    (`links_added`/`links_skipped` in the summary). Extra keys are
+    backward-compatible — a pre-v11 client ingests a v11 export cleanly and
+    simply drops the new fields.
+  - **merged_from is a de-duplicated first-seen list** (issue #61 6.6): the
+    consolidate writer, sync ingest, and the v11 migration all normalize
+    through one shared helper; empty stays empty, no id is ever lost, and no
+    `memory_merge` table was added.
+  - Doctor gains the `link-tables` check (table + column + trust range);
+    `get --json` shows `trust_score`; SKILL.md/CUTOVER.md document everything
+    above.
+
+### Changed
+
+- Write-time dedup now applies the polarity guard before merging (a
+  contradicting near-duplicate inserts as its own row + `contradicts` links
+  instead of refreshing the existing entry).
+
 ## [0.10.1] — 2026-08-25
 
 ### Added

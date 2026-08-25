@@ -51,6 +51,13 @@ PIN_TS = "2026-02-03T04:05:06Z"
 BASE_ENV = {
     "ZMEM_MODEL_AUTODOWNLOAD": "0",
     "ZMEM_MODELS_DIR": "/nonexistent-zmem-models-dir",
+    # v11 (issue #61): auto link generation is disabled for the fixture
+    # (threshold above every possible similarity) so the characterization
+    # freezes capture the PRE-v11 recall/export surfaces byte-identically,
+    # and _pin_ids' id rewrite can never orphan memory_link edges. Link
+    # behavior is pinned by tests/test_memory_links.py instead. This also
+    # proves ZMEM_LINK_THRESHOLD is honored end-to-end.
+    "ZMEM_LINK_THRESHOLD": "1.01",
     # Force a deterministic child stdout encoding so help/text output hashes are
     # byte-stable across Windows (cp1252) and POSIX (utf-8) CI.
     "PYTHONIOENCODING": "utf-8",
@@ -81,7 +88,8 @@ def _pin_ids(store: str) -> None:
     builds. Rowids are insertion-order deterministic (same seed sequence), so
     remapping by rowid to a fixed uuid keeps every downstream hash stable.
     No other table references memory.id here (merged_from is NULLed; memory_vec
-    is empty in the model-absent fixture), so the ids are safe to rewrite.
+    is empty in the model-absent fixture; memory_link stays empty because
+    BASE_ENV disables auto-linking), so the ids are safe to rewrite.
     """
     conn = sqlite3.connect(store)
     try:
