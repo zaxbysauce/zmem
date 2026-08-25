@@ -367,6 +367,104 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("id", result["error"])
 
+    # -- issue #59, 4.5/4.7: taint + update + invalidate tools ------------
+
+    def _add_for(self, content, namespace, signal="test"):
+        result = self._call("add", type="fact", content=content,
+                            namespace=namespace, signal=signal)
+        self.assertEqual(result.get("result"), "stored", result)
+        return result
+
+    def test_add_accepts_valid_taint_override(self):
+        ns = self._ns()
+        result = self._call("add", type="fact",
+                            content="web fetched content for taint override",
+                            namespace=ns, signal="test", taint="untrusted_web")
+        self.assertEqual(result.get("result"), "stored", result)
+
+    def test_add_rejects_unknown_taint(self):
+        ns = self._ns()
+        result = self._call("add", type="fact",
+                            content="row with unknown taint",
+                            namespace=ns, signal="test", taint="banana")
+        self.assertIn("error", result)
+        self.assertIn("taint", result["error"])
+
+    def test_update_success_is_append_only_via_lineage(self):
+        ns = self._ns()
+        self._add_for("original lesson alpha to update via mcp", ns)
+        recalled = self._call("recall", query="original lesson alpha",
+                              namespace=ns, limit=5)
+        old_id = recalled["results"][0]["id"]
+
+        result = self._call("update", id=old_id,
+                            content="revised lesson beta via mcp",
+                            taint="untrusted_web")
+        self.assertEqual(result.get("result"), "updated", result)
+        self.assertIn("updated memory", result.get("raw", ""))
+
+        # The OLD row is gone from live recall; the NEW content is findable.
+        after = self._call("recall", query="revised lesson beta",
+                           namespace=ns, limit=5)
+        self.assertGreater(after["count"], 0, after)
+        new_ids = [x["id"] for x in after["results"]]
+        self.assertNotIn(old_id, new_ids,
+                         "the replaced row must be tombstoned, not live")
+
+    def test_update_refused_for_unknown_id(self):
+        ns = self._ns()
+        result = self._call("update",
+                            id="00000000-0000-0000-0000-000000000000",
+                            content="orphan content")
+        self.assertIn("error", result)
+        self.assertIn("no memory", result["error"])
+
+    def test_update_rejects_unknown_taint(self):
+        ns = self._ns()
+        self._add_for("update taint validation target", ns)
+        recalled = self._call("recall", query="update taint validation",
+                              namespace=ns, limit=5)
+        mid = recalled["results"][0]["id"]
+        result = self._call("update", id=mid, content="x", taint="banana")
+        self.assertIn("error", result)
+        self.assertIn("taint", result["error"])
+
+    def test_update_empty_content_returns_error(self):
+        result = self._call("update", id="anything", content="")
+        self.assertIn("error", result)
+        self.assertIn("content", result["error"])
+
+    def test_invalidate_success_removes_from_productive_recall(self):
+        ns = self._ns()
+        self._add_for("fact that becomes false and is invalidated", ns)
+        recalled = self._call("recall", query="fact that becomes false",
+                              namespace=ns, limit=5)
+        mid = recalled["results"][0]["id"]
+
+        result = self._call("invalidate", id=mid, reason="the API contract changed")
+        self.assertEqual(result.get("result"), "invalidated", result)
+        self.assertEqual(result.get("id"), mid)
+
+        after = self._call("recall", query="fact that becomes false",
+                           namespace=ns, limit=5)
+        self.assertNotIn(mid, [x["id"] for x in after["results"]],
+                         "invalidated row must be gone from live recall")
+
+    def test_invalidate_requires_reason(self):
+        result = self._call("invalidate", id="anything", reason="")
+        self.assertIn("error", result)
+        self.assertIn("reason", result["error"])
+
+    def test_recall_items_carry_v9_provenance_fields(self):
+        ns = self._ns()
+        self._add_for("provenance shape probe quokka", ns)
+        recalled = self._call("recall", query="provenance shape probe",
+                              namespace=ns, limit=5)
+        self.assertGreater(recalled["count"], 0, recalled)
+        item = recalled["results"][0]
+        for key in ("valid_from", "valid_until", "update_of", "taint"):
+            self.assertIn(key, item, f"recall item missing {key}")
+
     # -- recent -------------------------------------------------------------
 
     def test_recent_returns_results(self):
@@ -496,11 +594,11 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         in_flight = {"count": 0, "peak": 0}
         original_run_store = self.mcp_server._run_store
 
-        def counting_run_store(args):
+        def counting_run_store(args, input_text=None):
             in_flight["count"] += 1
             in_flight["peak"] = max(in_flight["peak"], in_flight["count"])
             try:
-                return original_run_store(args)
+                return original_run_store(args, input_text=input_text)
             finally:
                 in_flight["count"] -= 1
 
@@ -548,11 +646,11 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         # A blocking _run_store that waits on an event we control.
         release_event = {"go": False}
 
-        def blocking_run_store(args):
+        def blocking_run_store(args, input_text=None):
             while not release_event["go"]:
                 import time
                 time.sleep(0.01)
-            return original_run_store(args)
+            return original_run_store(args, input_text=input_text)
 
         self.mcp_server._run_store = blocking_run_store
         try:

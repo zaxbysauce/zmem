@@ -160,7 +160,8 @@ def _host():
 # enough that a stale local copy is safer than a hard failure here).
 _STORE_CONSTANTS = {
     "ALLOWED_SIGNALS": ("test", "compile", "lint", "reviewer", "user", "none"),
-    "ALLOWED_TYPES": ("fact", "lesson", "convention", "preference"),
+    "ALLOWED_TYPES": ("fact", "lesson", "convention", "preference", "decision", "constraint"),
+    "ALLOWED_TAINTS": ("trusted_internal", "untrusted_tool", "untrusted_web"),
     "MAX_CONTENT_CHARS": 65536,
 }
 
@@ -193,6 +194,7 @@ def _store_constants() -> Dict[str, Any]:
         return {
             "ALLOWED_SIGNALS": getattr(mod, "ALLOWED_SIGNALS", _STORE_CONSTANTS["ALLOWED_SIGNALS"]),
             "ALLOWED_TYPES": getattr(mod, "ALLOWED_TYPES", _STORE_CONSTANTS["ALLOWED_TYPES"]),
+            "ALLOWED_TAINTS": getattr(mod, "ALLOWED_TAINTS", _STORE_CONSTANTS["ALLOWED_TAINTS"]),
             "MAX_CONTENT_CHARS": getattr(mod, "MAX_CONTENT_CHARS", _STORE_CONSTANTS["MAX_CONTENT_CHARS"]),
         }
     except Exception as exc:
@@ -207,11 +209,38 @@ def _python_bin() -> str:
 
 # -- subprocess helper -------------------------------------------------------
 
-def _run_store(args: List[str]) -> Dict[str, Any]:
+# PR-review PRR-P (issue #59 review round): Windows CreateProcess argv caps
+# near 32k chars while the store's content cap is MAX_CONTENT_CHARS (65536).
+# Content longer than this threshold is piped via stdin (`--content -`)
+# instead of an argv element, so large-but-valid payloads never hit
+# WinError 206 on Windows-primary hosts.
+_ARGV_SAFE_CONTENT_CHARS = 30000
+
+
+def _sanitize_store_error(r: Dict[str, Any], limit: int = 200) -> str:
+    """PR-review PRR-M (issue #59 review round): classify + truncate a
+    store.py failure for return to a REMOTE client. Known refusals (the
+    ``[zmem] …`` stable-error lines) pass through verbatim — they ARE the
+    contract; anything else (unexpected tracebacks, argparse blobs, advisory
+    text) is collapsed and truncated so raw stderr never leaks wholesale."""
+    text = (r.get("stderr") or r.get("stdout") or "").strip()
+    if not text:
+        return "store command failed (no diagnostic)"
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    zmem = [ln for ln in lines if ln.startswith("[zmem]")]
+    chosen = " ".join(zmem if zmem else lines)
+    if len(chosen) > limit:
+        chosen = chosen[: limit - 3].rstrip() + "..."
+    return chosen
+
+
+def _run_store(args: List[str], input_text: str | None = None) -> Dict[str, Any]:
     """Run ``store.py <args>`` and return ``{ok, stdout, stderr, returncode}``.
 
     Always returns a dict (never raises) — memory must fail-open. The caller
-    decides whether a non-zero returncode is fatal.
+    decides whether a non-zero returncode is fatal. ``input_text`` (optional)
+    is piped to the child's stdin — used for oversize content (see
+    ``_ARGV_SAFE_CONTENT_CHARS``).
     """
     store_py = _resolve_store_py()
     if store_py is None:
@@ -225,6 +254,7 @@ def _run_store(args: List[str]) -> Dict[str, Any]:
     try:
         proc = subprocess.run(  # noqa: S603 — argv is constructed, not shell
             cmd,
+            input=input_text,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -301,6 +331,7 @@ _SEARCH_SCHEMA: Dict[str, Any] = {
 _SCHEMA_CONSTANTS = _store_constants()
 _ADD_TYPE_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_TYPES"])
 _ADD_SIGNAL_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_SIGNALS"])
+_ADD_TAINT_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_TAINTS"])
 
 _ADD_SCHEMA: Dict[str, Any] = {
     "name": "zmem_add",
@@ -336,6 +367,16 @@ _ADD_SCHEMA: Dict[str, Any] = {
                 "enum": _ADD_SIGNAL_ENUM,
                 "description": "How strongly grounded this memory is.",
             },
+            "taint": {
+                "type": "string",
+                "enum": _ADD_TAINT_ENUM,
+                "description": "Provenance/trust origin (issue #59, 4.7). "
+                               "Default is 'untrusted_tool': this agent's "
+                               "write is ungrounded self-opinion unless you "
+                               "claim more. Use 'untrusted_web' for content "
+                               "fetched from the web; 'trusted_internal' only "
+                               "when a human/test/closeout grounded it.",
+            },
             "source_ref": {
                 "type": "string",
                 "description": "Provenance (e.g. session:<id>).",
@@ -368,10 +409,90 @@ _SUPERSEDE_SCHEMA: Dict[str, Any] = {
     },
 }
 
+_UPDATE_SCHEMA: Dict[str, Any] = {
+    "name": "zmem_update",
+    "description": (
+        "Append-only update of a stored memory (issue #59, 4.2): replace its "
+        "content (and optionally metadata) with a NEW live row, tombstone the "
+        "old row (keeping full history), and link the new row back to the old "
+        "via update_of. Point-in-time recall (--as-of) before the update still "
+        "returns the OLD content; after returns the NEW. The id must be a LIVE "
+        "memory (use zmem_search to find one); an unknown or already-superseded "
+        "id is refused. Prefer this over add-then-supersede when revising a fact."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "id of the live memory to update.",
+            },
+            "content": {
+                "type": "string",
+                "description": "The new content (replaces the old row's content).",
+            },
+            "type": {
+                "type": "string",
+                "enum": _ADD_TYPE_ENUM,
+                "description": "Override the memory type (default: inherit).",
+            },
+            "tags": {
+                "type": "string",
+                "description": "Override comma-separated tags (default: inherit).",
+            },
+            "source_ref": {
+                "type": "string",
+                "description": "Override provenance (default: inherit).",
+            },
+            "signal": {
+                "type": "string",
+                "enum": _ADD_SIGNAL_ENUM,
+                "description": "Override grounding signal (default: inherit).",
+            },
+            "taint": {
+                "type": "string",
+                "enum": _ADD_TAINT_ENUM,
+                "description": "Provenance/trust origin override (issue #59, "
+                               "4.7). Default 'untrusted_tool'; the surviving "
+                               "row keeps the WORST of this and the replaced "
+                               "row's taint.",
+            },
+        },
+        "required": ["id", "content"],
+    },
+}
+
+_INVALIDATE_SCHEMA: Dict[str, Any] = {
+    "name": "zmem_invalidate",
+    "description": (
+        "Tombstone a memory BECAUSE THE FACT IS NO LONGER TRUE, with a REQUIRED "
+        "reason so the correction is auditable (issue #59, 4.3). Future recall "
+        "skips it (history preserved). Prefer this over zmem_supersede when the "
+        "old memory is wrong or obsolete — a contradiction correction; "
+        "zmem_supersede remains for general tombstones with no reason."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "id of the live memory to invalidate.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why the fact is no longer true (REQUIRED).",
+            },
+        },
+        "required": ["id", "reason"],
+    },
+}
+
 _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     _SEARCH_SCHEMA,
     _ADD_SCHEMA,
     _SUPERSEDE_SCHEMA,
+    _UPDATE_SCHEMA,
+    _INVALIDATE_SCHEMA,
 ]
 
 
@@ -534,6 +655,10 @@ class ZmemMemoryProvider(MemoryProvider):
             return self._tool_add(args)
         if tool_name == "zmem_supersede":
             return self._tool_supersede(args)
+        if tool_name == "zmem_update":
+            return self._tool_update(args)
+        if tool_name == "zmem_invalidate":
+            return self._tool_invalidate(args)
         return _tool_error(f"Unknown tool: {tool_name}")
 
     def _tool_search(self, args: Dict[str, Any]) -> str:
@@ -569,7 +694,7 @@ class ZmemMemoryProvider(MemoryProvider):
         # (unscoped already covers every namespace, so no --include-global).
         r = _run_store(cli_args)
         if not r["ok"]:
-            return _tool_error(f"Search failed: {r['stderr'] or r['stdout'][:200]}")
+            return _tool_error(f"Search failed: {_sanitize_store_error(r)}")
         stdout = (r["stdout"] or "").strip()
         if not stdout:
             return json.dumps({"results": [], "count": 0})
@@ -587,6 +712,13 @@ class ZmemMemoryProvider(MemoryProvider):
                 "confidence": it.get("confidence"),
                 "tags": it.get("tags"),
                 "source_ref": it.get("source_ref"),
+                # Lineage + provenance trust travel with the row so the agent
+                # can see whether a result is an update of another row or an
+                # untrusted-origin note (issue #59, 4.2/4.7).
+                "valid_from": it.get("valid_from"),
+                "valid_until": it.get("valid_until"),
+                "update_of": it.get("update_of"),
+                "taint": it.get("taint"),
             }
             for it in results
             if isinstance(it, dict)
@@ -624,24 +756,49 @@ class ZmemMemoryProvider(MemoryProvider):
             return _tool_error(
                 "signal must be one of: " + ", ".join(consts["ALLOWED_SIGNALS"])
             )
+        # Taint (issue #59, 4.7 / plan M5): the agent surface's default is
+        # EXPLICIT untrusted_tool — an agent's write is ungrounded self-opinion
+        # unless the caller claims more. An explicit taint (e.g. untrusted_web
+        # for a web fetch) overrides; validated at the boundary for a clean
+        # error message (mirrors the signal validation above, #37 L7).
+        taint = (args.get("taint") or "").strip()
+        if not taint:
+            taint = "untrusted_tool"
+        elif taint not in consts["ALLOWED_TAINTS"]:
+            return _tool_error(
+                "taint must be one of: " + ", ".join(consts["ALLOWED_TAINTS"])
+            )
         tags = (args.get("tags") or "").strip()
         source_ref = (args.get("source_ref") or "").strip()
         if not source_ref and self._session_id:
             source_ref = f"session:{self._session_id}"
+        # PR-review PRR-L (issue #59 review round): Hermes writes are agent
+        # surface traffic — pass --capture-mode auto so secret-like content is
+        # redacted exactly as the MCP add path does (#36 M4 parity).
         cli_args = [
             "add",
             "--namespace", ns,
             "--type", mtype,
             "--content", content,
             "--signal", signal,
+            "--taint", taint,
+            "--capture-mode", "auto",
         ]
         if tags:
             cli_args += ["--tags", tags]
         if source_ref:
             cli_args += ["--source-ref", source_ref]
-        r = _run_store(cli_args)
+        # PR-review PRR-P: pipe oversize content via stdin (`--content -`) so
+        # large-but-valid payloads never hit the Windows argv cap.
+        input_text = None
+        if len(content) > _ARGV_SAFE_CONTENT_CHARS:
+            cli_args[cli_args.index("--content") + 1] = "-"
+            input_text = content
+        r = _run_store(cli_args, input_text=input_text)
         if not r["ok"]:
-            return _tool_error(f"Add failed: {r['stderr'] or r['stdout'][:200]}")
+            # PR-review PRR-M: never echo raw store.py stderr to the remote
+            # client — pass a classified, truncated message instead.
+            return _tool_error(f"Add failed: {_sanitize_store_error(r)}")
         # store.py prints "[zmem] added memory <id> ..." to stdout on success.
         return json.dumps({"result": "stored", "raw": r["stdout"].strip()})
 
@@ -656,9 +813,100 @@ class ZmemMemoryProvider(MemoryProvider):
         r = _run_store(cli_args)
         if not r["ok"]:
             return _tool_error(
-                f"Supersede failed (id may not exist): {r['stderr'] or r['stdout'][:200]}"
+                f"Supersede failed (id may not exist): {_sanitize_store_error(r)}"
             )
         return json.dumps({"result": "superseded", "id": mid})
+
+    def _tool_update(self, args: Dict[str, Any]) -> str:
+        """Append-only knowledge update (issue #59, 4.2). See _UPDATE_SCHEMA.
+
+        Override params are validated at the boundary (clean error messages,
+        mirroring _tool_add's #37 L7 pattern) before they reach store.py. The
+        taint default/override rule matches _tool_add (plan M5): the agent
+        surface defaults to EXPLICIT untrusted_tool; the store widens it to
+        the worst-of with the replaced row's taint.
+        """
+        consts = _store_constants()
+        mid = (args.get("id") or "").strip()
+        content = (args.get("content") or "").strip()
+        if not mid:
+            return _tool_error("Missing required parameter: id")
+        if not content:
+            return _tool_error("Missing required parameter: content")
+        if len(content) > consts["MAX_CONTENT_CHARS"]:
+            return _tool_error(
+                f"content is {len(content)} chars, over the "
+                f"{consts['MAX_CONTENT_CHARS']} limit"
+            )
+        cli_args = ["update", "--id", mid, "--content", content]
+        mtype = (args.get("type") or "").strip()
+        if mtype:
+            if mtype not in consts["ALLOWED_TYPES"]:
+                return _tool_error(
+                    "type must be one of: " + ", ".join(consts["ALLOWED_TYPES"])
+                )
+            cli_args += ["--type", mtype]
+        tags = (args.get("tags") or "").strip()
+        if tags:
+            cli_args += ["--tags", tags]
+        source_ref = (args.get("source_ref") or "").strip()
+        if source_ref:
+            cli_args += ["--source-ref", source_ref]
+        signal = (args.get("signal") or "").strip()
+        if signal:
+            if signal not in consts["ALLOWED_SIGNALS"]:
+                return _tool_error(
+                    "signal must be one of: " + ", ".join(consts["ALLOWED_SIGNALS"])
+                )
+            cli_args += ["--signal", signal]
+        taint = (args.get("taint") or "").strip()
+        if not taint:
+            taint = "untrusted_tool"
+        elif taint not in consts["ALLOWED_TAINTS"]:
+            return _tool_error(
+                "taint must be one of: " + ", ".join(consts["ALLOWED_TAINTS"])
+            )
+        cli_args += ["--taint", taint]
+        # PR-review PRR-L: agent-surface update redacts secrets like MCP (#36
+        # M4 parity). PR-review PRR-P: oversize content is piped via stdin.
+        cli_args += ["--capture-mode", "auto"]
+        input_text = None
+        if len(content) > _ARGV_SAFE_CONTENT_CHARS:
+            cli_args[cli_args.index("--content") + 1] = "-"
+            input_text = content
+        r = _run_store(cli_args, input_text=input_text)
+        if not r["ok"]:
+            # store.py update exits 2 for refused ids (unknown / already-
+            # superseded) — explain WHY, sanitized (PR-review PRR-M), instead
+            # of leaking a raw argparse/stderr blob.
+            return _tool_error(
+                f"Update failed (id may not exist or is already superseded): "
+                f"{_sanitize_store_error(r)}"
+            )
+        return json.dumps({"result": "updated", "raw": r["stdout"].strip()})
+
+    def _tool_invalidate(self, args: Dict[str, Any]) -> str:
+        """Tombstone with a REQUIRED reason (issue #59, 4.3). See _INVALIDATE_SCHEMA."""
+        mid = (args.get("id") or "").strip()
+        reason = (args.get("reason") or "").strip()
+        if not mid:
+            return _tool_error("Missing required parameter: id")
+        if not reason:
+            return _tool_error(
+                "Missing required parameter: reason — invalidation records why "
+                "the fact is no longer true and REQUIRES a reason (issue #59, 4.3)"
+            )
+        r = _run_store(["invalidate", "--id", mid, "--reason", reason])
+        if not r["ok"]:
+            # PR-review PRR-M: sanitized diagnostic (never raw stderr). The
+            # PR-review PRR-B guard makes a second invalidate exit 2 with the
+            # stable "[zmem] … already superseded …" line, which passes
+            # through _sanitize_store_error verbatim.
+            return _tool_error(
+                f"Invalidate failed (id may not exist or is already "
+                f"superseded): {_sanitize_store_error(r)}"
+            )
+        return json.dumps({"result": "invalidated", "id": mid})
 
     # -- session / shutdown -------------------------------------------------
 

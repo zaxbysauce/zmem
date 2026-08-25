@@ -1,6 +1,6 @@
 {
   "name": "zmem",
-  "version": "0.8.9",
+  "version": "0.9.0",
   "description": "Multi-tier memory system for ZCode: always-on core memory, cross-session lessons with FTS5 recall, and reflection-on-failure. Local-first, zero cloud dependency.",
   "author": {
     "name": "Brett",

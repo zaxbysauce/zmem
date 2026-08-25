@@ -63,6 +63,15 @@ _RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 # Captured from the behavior-identical split (verified byte-identical to
 # pre-split `ddce432` store.py) on 2026-08-22.
 #
+# "recall" and "export_jsonl" were RE-CAPTURED on 2026-08-24 for issue #59
+# (schema v9) — twice: once when the shipped surfaces gained the v9 lineage
+# fields (recall --json result dicts and export-jsonl rows now carry
+# `valid_until` / `update_of` / `taint`, plan S3), and again after the
+# swarm-pr-review round fixed the fixture (PRR-Q: `_pin_timestamps` used to
+# stamp a past `valid_until` onto LIVE rows, whose "never expires" marker is
+# the empty string; live rows now keep `''` per the live <=> empty-valid_until
+# invariant). `stats` and `list` are byte-identical to their pre-v9 freeze.
+#
 # NOTE on help surfaces: the argparse HelpFormatter renders wrapping, blank-line
 # placement, and indentation from a combination of terminal width and
 # Python-platform internals that we cannot fully normalize across Windows /
@@ -78,11 +87,12 @@ _RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 DATA_SHA = {
     "stats": "11ac804ebd82da80a80772814b5507f233d58e259b4c9c3498fa1311500630c8",
     "list": "c2e285928d3ee75154a12e4a61947d6793d3bc8f55edb0b3319e73ff4b75a598",
-    "recall": "1cc69349449eeb6d3dfc2f7b9cd80823323d3df6bcb2563ebe2bf26ee72af2f8",
-    "export_jsonl": "24d7c3b13cecc31fa3a845ee5a181369627298410bc3d41ccf90c043e460ce65",
+    "recall": "f3f4a231f71ce481a733852e4a727572c7bba3e0a6b22734430c0b508792b716",
+    "export_jsonl": "8552767c0f9148e2b3c5d5d8759148837186386cdc78d309457d98ffa2d8ac73",
 }
 KNOWN_SUBCMDS = [
-    "init", "add", "recall", "recent", "search", "supersede", "get", "list",
+    "init", "add", "invalidate", "recall", "recent", "search", "supersede",
+    "update", "get", "list",
     "stats", "path", "session-cadence", "rebuild-fts", "reembed", "consolidate",
     "promote", "rekey-namespace", "backup", "restore", "export-pack",
     "export-jsonl", "ingest-jsonl", "failures", "corrections", "queue-list",

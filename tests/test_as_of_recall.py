@@ -159,6 +159,53 @@ class AsOfBehaviorTests(unittest.TestCase):
         self.assertIn("row T2", r.stdout)
         self.assertNotIn("row T3", r.stdout)
 
+    def test_search_cli_as_of_exclusive_boundary(self):
+        """Issue #59, 4.4: `search --as-of` is a SEPARATE dispatcher from
+        recall/recent (cli.py search pins ``hybrid=False``) and must apply the
+        exact same temporal contract: the valid_until END is EXCLUSIVE and the
+        ``superseded_at IS NULL`` filter is dropped under as-of. Pins it through
+        the real `search` subprocess using the FTS/keyword lane."""
+        import sqlite3
+        import subprocess
+        conn = sqlite3.connect(self.store_path)
+        try:
+            conn.execute(
+                "UPDATE memory SET superseded_at=?, valid_until=? WHERE id=?",
+                ("2026-02-10T00:00:00Z", "2026-02-10T00:00:00Z", "asof-row-1"))
+            conn.commit()
+        finally:
+            conn.close()
+
+        env = {**os.environ, "ZMEM_STORE": str(self.store_path),
+               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+
+        def search_at(as_of):
+            r = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "store.py"), "search",
+                 "--text", "row", "--namespace", "project:asof-test",
+                 "--no-bump", "--as-of", as_of],
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout
+
+        # Inside the validity window: row T2 returns DESPITE superseded_at being
+        # set (live filter dropped under as-of); T3 is not yet born.
+        out_inside = search_at("2026-02-05T00:00:00Z")
+        self.assertIn("row T2", out_inside,
+                      "search --as-of inside the window must surface the "
+                      "superseded row")
+        self.assertNotIn("row T3", out_inside)
+        # AT the exclusive end: row T2 no longer valid.
+        out_at = search_at("2026-02-10T00:00:00Z")
+        self.assertNotIn("row T2", out_at,
+                         "search --as-of == valid_until must EXCLUDE the row "
+                         "(exclusive end)")
+        # AFTER the end.
+        out_after = search_at("2026-02-11T00:00:00Z")
+        self.assertNotIn("row T2", out_after,
+                         "search --as-of after valid_until must exclude the row")
+
     def test_absent_as_of_returns_all_live(self):
         """Absent flag → no temporal predicate → all live rows."""
         from storelib import recall_memory, connect
@@ -198,6 +245,82 @@ class AsOfBehaviorTests(unittest.TestCase):
             f"as_of=2025-12-31 (before all valid_from) must return 0 "
             f"rows, got {len(results)}",
         )
+
+    def test_superseded_row_valid_inside_window_gone_at_or_after_end(self):
+        """Issue #59, 4.4: complete --as-of against valid_until. as_of must
+        drop the hard ``superseded_at IS NULL`` live filter (a historically
+        superseded row CAN be valid at an instant inside its window), and
+        must apply valid_until as the EXCLUSIVE end (a row is valid while
+        ``valid_until > as_of``, never at equality).
+
+        Fixture (PR-review PRR-V label fix): row T2 (asof-row-1,
+        valid_from 2026-02-01) is tagged as superseded with
+        valid_until == superseded_at == 2026-02-10. As a function of as_of:
+          - inside the window (02-05): T2 IS returned — proves the live
+            filter is dropped, not just ignored in a footnote;
+          - AT valid_until (02-10): T2 is NOT returned — the bound is
+            exclusive;
+          - after (02-11): T2 gone.
+        """
+        from storelib import connect, recent_memory
+        conn = connect()
+        try:
+            conn.execute(
+                "UPDATE memory SET superseded_at=?, valid_until=? WHERE id=?",
+                ("2026-02-10T00:00:00Z", "2026-02-10T00:00:00Z", "asof-row-1"))
+            conn.commit()
+
+            def ids_at(as_of):
+                rows = recent_memory(
+                    conn, namespace="project:asof-test", limit=10,
+                    as_json=True, no_bump=True, as_of=as_of,
+                )
+                return sorted(r["id"] for r in rows)
+
+            # Inside the validity window: T2 returns DESPITE superseded_at
+            # being set (the filter is dropped under as_of).
+            self.assertEqual(
+                ids_at("2026-02-05T00:00:00Z"),
+                ["asof-row-0", "asof-row-1"],
+                "as_of inside T2's window must return T2 (superseded filter "
+                "dropped under as_of); T3 is not yet born",
+            )
+            # At the EXCLUSIVE end: T2 is no longer valid.
+            self.assertEqual(
+                ids_at("2026-02-10T00:00:00Z"),
+                ["asof-row-0"],
+                "as_of == valid_until must NOT return the row (exclusive end)",
+            )
+            # After the end.
+            self.assertEqual(
+                ids_at("2026-02-11T00:00:00Z"),
+                ["asof-row-0"],
+                "as_of after valid_until must NOT return the row",
+            )
+        finally:
+            conn.close()
+
+
+class VecLaneAsOfFilterScanTest(unittest.TestCase):
+    """PR-review PRR-K (issue #59 review round), source-scan pin: under
+    ``--as-of`` the hybrid vec candidate pool must be temporal-filtered
+    BEFORE RRF fusion (and over-fetched to compensate), so future-dated live
+    rows cannot crowd valid candidates out of the fixed KNN window. CI is
+    model-absent, so the behavioral proof is impossible there — the ratchet
+    keeps the filter present in the shipped recall path."""
+
+    def test_recall_filters_vec_candidates_under_as_of(self):
+        src = (SCRIPTS_DIR / "storelib" / "recall.py").read_text(encoding="utf-8")
+        self.assertIn("if as_of and vec_ids:", src,
+                      "the hybrid path must temporal-filter vec candidates "
+                      "when as_of is set (PRR-K)")
+        self.assertIn("AND valid_from <= ? AND (valid_until = '' OR valid_until > ?)",
+                      src,
+                      "the vec-candidate filter must use the same half-open "
+                      "validity predicate as the FTS lane")
+        self.assertIn("if as_of else max(15, limit + 10)", src,
+                      "the vec KNN window must over-fetch under as_of to "
+                      "compensate for post-filtering (PRR-K)")
 
 
 class Iso8601ArgparseTests(unittest.TestCase):

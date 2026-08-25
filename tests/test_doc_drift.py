@@ -125,6 +125,55 @@ class SkillDocDriftTest(unittest.TestCase):
         self.assertIn("INJECT_FLOOR_GATE_NONE", text,
                       "SKILL.md must document INJECT_FLOOR_GATE_NONE")
 
+    # -- issue #59, 4.x: the append-only revision surface is documented -------
+
+    def test_update_and_invalidate_documented(self):
+        """SKILL.md must document the append-only `update` and the
+        reason-required `invalidate` commands (and the lineage/validity columns
+        they write) — a later doc edit cannot silently drop the v9 write path
+        while the code and tests still ship it (test_doc_drift ratchet).
+        PR-review PRR-T: the needles are the feature-specific CLI tokens, not
+        the bare English words 'update'/'invalidate' (which match generic
+        prose anywhere and kept the ratchet green even with the whole feature
+        section deleted)."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("update --id", "invalidate --id", "--reason",
+                       "update_of", "valid_until", "append-only"):
+            self.assertIn(needle, text,
+                          f"SKILL.md must document {needle} (issue #59 write path)")
+
+    def test_taint_provenance_documented(self):
+        """SKILL.md must document the taint ranks (there are exactly three, an
+        unknown is refused), the worst-of propagation rule, and that explicit
+        recall prefixes untrusted rows — otherwise operators cannot reason about
+        trust on any surface."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("taint", "trusted_internal", "untrusted_tool",
+                       "untrusted_web", "worst-of"):
+            self.assertIn(needle, text,
+                          f"SKILL.md must document the taint model ({needle})")
+        self.assertNotIn("four streams", text)  # sanity: no invented rank
+
+    def test_as_of_valid_until_exclusive_semantics_documented(self):
+        """The complete --as-of contract (valid_until EXCLUSIVE end, and the
+        superseded filter drop under as-of) must be documented so callers do
+        not re-discover the boundary as a bug."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("EXCLUSIVE", text,
+                      "SKILL.md must state valid_until is the EXCLUSIVE end")
+        self.assertIn("valid_until > as_of", text,
+                      "SKILL.md must state the as-of validity predicate")
+
+    def test_decision_constraint_documented_as_shipped_types(self):
+        """decision/constraint are FIRST-CLASS shipped types (issue #59);
+        SKILL.md must list them in the add --type usage as ordinary choices —
+        never demoted to a deferred/future note, or a reader would build
+        against a system that already ships them."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("decision|constraint", text,
+                      "SKILL.md add --type must list decision/constraint as "
+                      "shipped choices")
+
 
 class CloseoutDocDriftTest(unittest.TestCase):
     """Issue #58, 3.7: closeout must reflect that the vec0 KNN footgun

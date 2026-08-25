@@ -18,7 +18,7 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
-from storelib.schema import _embeddings, _env_float, _normalize_content, now_iso
+from storelib.schema import _embeddings, _env_float, _normalize_content, now_iso, worse_taint
 from storelib.sync import INGEST_MAX_CONTENT_CHARS
 from storelib.write import _merge_on_dedup, supersede_memory
 
@@ -220,8 +220,9 @@ def _absorb_into_keeper(
     # duplicate content and waste size-cap budget, the latter able to push a
     # later genuinely-unique absorb to :truncated and back into issue #19's
     # data-loss class).
-    cur = conn.execute("SELECT content FROM memory WHERE id=?", (keeper_id,)).fetchone()
+    cur = conn.execute("SELECT content, taint FROM memory WHERE id=?", (keeper_id,)).fetchone()
     keeper_content = cur["content"] if cur else (keeper["content"] or "")
+    keeper_taint = cur["taint"] if cur else "trusted_internal"
 
     decision = _absorb_decision(keeper_content, absorbed_content, absorbed["id"])
     will_append = decision["will_append"]
@@ -255,10 +256,26 @@ def _absorb_into_keeper(
     # with write-time dedup semantics; no content change here.
     _merge_on_dedup(conn, keeper_id, absorbed["confidence"], absorbed["signal"], absorbed["tags"])
 
+    # Worst-of taint propagation (issue #59, 4.7): consolidation folds the
+    # absorbed row INTO the keeper permanently, so the keeper's taint becomes
+    # the lineage's worst — a merged row must never DOWNGRADE a riskier member
+    # to a trusted one (that would let an untrusted tool's memory surface
+    # unfenced). This is the one place taint travels sideways; plain
+    # supersede/invalidate deliberately does NOT get this (that path has no
+    # incoming live row to hoist).
+    merged_taint = worse_taint(keeper_taint, absorbed["taint"])
+    if merged_taint != keeper_taint:
+        conn.execute("UPDATE memory SET taint=? WHERE id=?", (merged_taint, keeper_id))
+
     # Tombstone the absorbed row (kept for history; removed from live recall).
+    # valid_until closes the row's validity interval at the same instant as
+    # superseded_at, so a point-in-time --as-of (which drops the superseded
+    # filter) still sees this row as dead at every T >= the tombstone (issue
+    # #59, 4.4 as-of soundness).
+    tomb_at = now_iso()
     conn.execute(
-        "UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?",
-        (now_iso(), f"consolidated into {keeper_id}", absorbed["id"]),
+        "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? WHERE id=?",
+        (tomb_at, tomb_at, f"consolidated into {keeper_id}", absorbed["id"]),
     )
     try:
         conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (absorbed["id"],))
@@ -466,7 +483,7 @@ def consolidate(
         f"""WITH ranked AS (
                SELECT id, namespace, content, tags, confidence, signal,
                       retrieval_count, surfaced_count, embedding,
-                      embedding_model, ingestion_ts,
+                      embedding_model, ingestion_ts, taint,
                       ROW_NUMBER() OVER (
                           PARTITION BY namespace
                           ORDER BY confidence * (retrieval_count + surfaced_count) DESC,
@@ -476,7 +493,7 @@ def consolidate(
                WHERE superseded_at IS NULL {embed_clause} {ns_clause}
            )
            SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
-                  surfaced_count, embedding, embedding_model, ingestion_ts
+                  surfaced_count, embedding, embedding_model, ingestion_ts, taint
            FROM ranked
            WHERE rn <= ?
            ORDER BY confidence * (retrieval_count + surfaced_count) DESC, confidence DESC,
@@ -608,7 +625,7 @@ def consolidate(
                     # cross-project merge.
                     row = conn.execute(
                         "SELECT id, confidence, signal, tags, retrieval_count, "
-                        "surfaced_count, content "
+                        "surfaced_count, content, taint "
                         "FROM memory "
                         "WHERE id=? AND superseded_at IS NULL AND namespace=?",
                         (mid, seed["namespace"]),

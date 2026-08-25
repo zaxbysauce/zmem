@@ -28,7 +28,7 @@ store = None
 
 
 EXPECTED_EXPORTS = [
-    "ALLOWED_SIGNALS", "ALLOWED_TYPES", "BACKUP_DEFAULT_RETENTION", "BACKUP_LOCK_STALE_SECONDS", "CAPTURE_MODES", "CONFIDENCE_FLOOR",
+    "ALLOWED_SIGNALS", "ALLOWED_TAINTS", "ALLOWED_TYPES", "BACKUP_DEFAULT_RETENTION", "BACKUP_LOCK_STALE_SECONDS", "CAPTURE_MODES", "CONFIDENCE_FLOOR",
     "CONSOLIDATE_DEFAULT_THRESHOLD", "CONSOLIDATE_GROWTH_THRESHOLD", "CONSOLIDATE_LEXICAL_THRESHOLD", "CONSOLIDATE_LOCK_STALE_SECONDS", "CONSOLIDATE_MAX_ROWS_PER_NAMESPACE", "CONSOLIDATE_MIN_INTERVAL_DAYS",
     "CORE_MD_PATH", "CapturePolicyRefusal", "ContentTooLarge", "DEDUP_SIMILARITY_THRESHOLD", "EXPORT_PACK_DEFAULT_GLOBAL_LIMIT", "EXPORT_PACK_DEFAULT_MAX_BYTES",
     "EXPORT_PACK_DEFAULT_MIN_CONFIDENCE", "EXPORT_PACK_DEFAULT_PROJECT_LIMIT", "GLOBAL_NAMESPACE", "INGEST_MAX_CONTENT_CHARS", "INGEST_MAX_FUTURE_SKEW_SECONDS", "MAINTENANCE_LOCK_STALE_SECONDS",
@@ -36,10 +36,10 @@ EXPECTED_EXPORTS = [
     "PROMOTE_SIGNALS", "PROMOTE_USE_FLOOR", "PROMOTION_REVIEW_DIRNAME", "PROMPT_INJECTION_PATTERNS", "RECENCY_HALF_LIFE_DAYS", "SCHEMA_LOCK_POLL_SECONDS",
     "SCHEMA_LOCK_STALE_SECONDS", "SCHEMA_LOCK_WAIT_SECONDS", "SCHEMA_VERSION_KEY", "SECRET_PATTERNS", "SENTINEL_PREFIXES", "SENTINEL_SWEEP_DAYS_DEFAULT",
     "SIDECAR_SUFFIXES", "SIGNAL_CONFIDENCE", "SNAPSHOT_GLOB", "SNAPSHOT_PREFIX", "SNAPSHOT_SUFFIX", "STORE_PATH",
-    "SUPPORTED_SCHEMA_VERSION", "SnapshotError", "WRITER_LEASE_STALE_SECONDS", "W_BM25", "W_CONFIDENCE", "W_POPULARITY",
+    "SUPPORTED_SCHEMA_VERSION", "TAINT_RANK", "TAINT_TRUSTED_SIGNALS", "SnapshotError", "WRITER_LEASE_STALE_SECONDS", "W_BM25", "W_CONFIDENCE", "W_POPULARITY",
     "W_RECENCY", "_CONSOLIDATE_NEGATOR_RE", "_GLOBAL_NEAR_MISS_STEMS", "_INGEST_ID_RE", "_LEXICAL_STOPWORDS", "_NS_MIGRATION_CHECKOUTS",
     "_SAMPLE_EXTRACT_LIMIT", "_SIGNAL_RANK", "_absorb_decision", "_absorb_into_keeper", "_acquire_lock", "_acquire_writer_lease",
-    "_aggregate_errors", "_apply_capture_policy", "_backup_dir", "_backup_due", "_backup_interval_days", "_bump_telemetry",
+    "_aggregate_errors", "_apply_capture_policy", "_as_of_temporal_predicate", "_backup_dir", "_backup_due", "_backup_interval_days", "_bump_telemetry",
     "_check_secrets", "_classify_correction", "_classify_error_type", "_cleanup_stale_writer_leases", "_collapse_line_breaks", "_commit",
     "_degraded_embedding_warned", "_detect_duplicate", "_detect_patterns", "_discard_snapshot", "_embeddings", "_ensure_backup_dir",
     "_env_float", "_expand_namespace_aliases", "_extract_user_messages", "_failures_from_db", "_failures_from_transcript", "_fetch_by_ids",
@@ -55,12 +55,12 @@ EXPECTED_EXPORTS = [
     "_sanitize_exc_text", "_sanitize_pack_content", "_sanitize_tool_name", "_slugify_skill_name", "_snapshot_stamp", "_source_hash",
     "_strict_acquire_lock", "_sweep_candidate_dirs", "_synthesize_trigger_description", "_to_win_path", "_transcript_mtime_iso", "_unique_tokens",
     "_uses_count", "_validate_namespace", "_validate_sync_row", "_vec_knn_in_namespace", "_vector_knn", "_wait_for_maintenance_clear", "_warn_degraded_embeddings_once",
-    "_writer_dir", "_yaml_dquote", "add_memory", "apply_retention", "cmd_backup", "cmd_corrections",
+    "_writer_dir", "_yaml_dquote", "_default_taint_for_signal", "add_memory", "apply_retention", "cmd_backup", "cmd_corrections",
     "cmd_export_jsonl", "cmd_export_pack", "cmd_failures", "cmd_ingest_jsonl", "cmd_mine_history", "cmd_queue_clear",
     "cmd_queue_list", "cmd_restore", "cmd_sweep", "compute_score", "connect", "consolidate",
     "counts_agree", "create_snapshot", "get_memory", "init_db", "list_memory", "list_snapshots",
     "main", "migrate", "nonnegative_int", "now_iso", "promote_memory", "recall_memory",
-    "recent_memory", "rekey_namespace", "stats", "supersede_memory", "verify_snapshot",
+    "recent_memory", "rekey_namespace", "stats", "supersede_memory", "update_memory", "validate_taint", "verify_snapshot", "worse_taint",
 ]
 
 

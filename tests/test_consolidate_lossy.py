@@ -561,8 +561,8 @@ class MigrationTest(unittest.TestCase):
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
-        # migrate() walks to the CURRENT supported version (now 8 after #39 E4).
-        self.assertEqual(sv, "8")
+        # migrate() walks to the CURRENT supported version (now 9 after #59).
+        self.assertEqual(sv, "9")
         self.assertIn("merged_from", cols)
         self.assertIn("surfaced_count", cols)
         self.assertIn("last_surfaced", cols)
@@ -578,8 +578,8 @@ class MigrationTest(unittest.TestCase):
         mod.migrate(conn)  # third time
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        # Idempotent: re-migrate stays at the current version (now 8).
-        self.assertEqual(sv, "8")
+        # Idempotent: re-migrate stays at the current version (now 9).
+        self.assertEqual(sv, "9")
         conn.close()
 
     def test_v6_to_v7_populated_migration_preserves_rows(self):
@@ -603,12 +603,12 @@ class MigrationTest(unittest.TestCase):
                     "retrieval_count, superseded_at, ingestion_ts FROM memory "
                     "ORDER BY id")
         before = [tuple(r) for r in conn.execute(cols_sel)]
-        # Upgrade — migrate() walks to the CURRENT version (v8 after #39 E4),
+        # Upgrade — migrate() walks to the CURRENT version (v9 after #59),
         # passing through the v7 block (re-adding surfaced_count/last_surfaced).
         mod.migrate(conn)
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        self.assertEqual(sv, "8")
+        self.assertEqual(sv, "9")
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
         self.assertIn("surfaced_count", cols)
         self.assertIn("last_surfaced", cols)
@@ -853,6 +853,68 @@ class CosinePathTest(unittest.TestCase):
             "SELECT content, merged_from FROM memory WHERE id=?", (keeper,)).fetchone()
         self.assertIn("deterministic", row["content"])
         self.assertEqual(row["merged_from"], absorbed)
+
+
+class TaintWorstOfTest(unittest.TestCase):
+    """Issue #59, 4.7: consolidation folds the absorbed row's provenance into
+    the keeper as WORST-of-taint (a merged row must never downgrade a riskier
+    member to trusted), and the absorbed tombstone closes valid_until at the
+    supersede instant so a point-in-time --as-of never resurrects it."""
+
+    def setUp(self):
+        self.mod, self.conn, self.tmp = _make_store()
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.tmp, True)
+
+    def test_absorb_applies_worst_of_taint_to_keeper_and_closes_validity(self):
+        # Keeper is signal=test -> taint trusted_internal by write-layer default.
+        keeper = _add(self.mod, self.conn, KEEPER_BASE, 0.90, rc=50)
+        absorbed = _add(self.mod, self.conn, ABSORBED_EXTRA, 0.85, rc=1)
+        # The absorbed row's provenance is the WORST rank (web fetch).
+        self.conn.execute(
+            "UPDATE memory SET taint=? WHERE id=?", ("untrusted_web", absorbed))
+        self.conn.commit()
+
+        self.mod.consolidate(self.conn)
+
+        k = self.conn.execute(
+            "SELECT taint, superseded_at FROM memory WHERE id=?", (keeper,)).fetchone()
+        self.assertEqual(
+            k["taint"], "untrusted_web",
+            "keeper must inherit the WORST taint of the merged lineage (a "
+            "consolidate must never downgrade a riskier member to trusted)")
+        self.assertIsNone(k["superseded_at"], "keeper must stay live")
+
+        a = self.conn.execute(
+            "SELECT superseded_at, valid_until, supersede_reason, taint "
+            "FROM memory WHERE id=?", (absorbed,)).fetchone()
+        self.assertIsNotNone(a["superseded_at"])
+        self.assertEqual(
+            a["valid_until"], a["superseded_at"],
+            "absorbed tombstone must close valid_until at the supersede instant "
+            "so as-of never resurrects it")
+        self.assertIn("consolidated into", a["supersede_reason"])
+        self.assertEqual(a["taint"], "untrusted_web",
+                         "taint is preserved on the absorbed tombstone itself")
+
+    def test_keeper_already_worse_taint_is_unchanged(self):
+        # Keeper untrusted_web, absorbed trusted_internal: the merge is a
+        # NO-OP for taint (never DOWNGRADES, never gratuitously rewrites).
+        keeper = _add(self.mod, self.conn, KEEPER_BASE, 0.90, rc=50)
+        absorbed = _add(self.mod, self.conn, ABSORBED_EXTRA, 0.85, rc=1)
+        self.conn.execute(
+            "UPDATE memory SET taint=? WHERE id=?", ("untrusted_web", keeper))
+        self.conn.commit()
+
+        self.mod.consolidate(self.conn)
+
+        k = self.conn.execute(
+            "SELECT taint, merged_from FROM memory WHERE id=?", (keeper,)).fetchone()
+        self.assertEqual(k["taint"], "untrusted_web",
+                         "keeping a worse taint must be a no-op (no downgrade)")
+        self.assertEqual(k["merged_from"], absorbed)
 
 
 if __name__ == "__main__":

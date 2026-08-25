@@ -16,12 +16,15 @@ Run: python tests/test_namespace_schema.py
 
 from __future__ import annotations
 
+import sys
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HERMES_INIT = REPO_ROOT / "hermes-plugin" / "__init__.py"
 MCP_SERVER = REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py"
+SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 class NamespaceSchemaTest(unittest.TestCase):
@@ -152,6 +155,132 @@ class McpServerNamespaceDocsStayCorrectTest(unittest.TestCase):
             "user:global", before_all,
             "recall docstring must not present user:global as a path to "
             "searching all namespaces (reworded-lie guard)")
+
+
+class V9ToolSchemaPresenceTest(unittest.TestCase):
+    """Issue #59, 4.5/4.7: every agent write surface (Hermes provider + MCP
+    server) must expose the append-only update/invalidate contract and validate
+    taint against the SAME enum (schema_meta.ALLOWED_TAINTS via the shared
+    source-of-truth load) — never a per-surface literal that could drift, and
+    never a fourth taint rank.
+
+    This is a SOURCE-TEXT scan (no imports): the Hermes provider imports
+    Hermes-internal modules absent from stdlib-only CI. The behavioral proofs
+    live in test_mcp_server.py (MCP) and tests/test_update_invalidate.py (CLI);
+    this ratchet keeps the declared schemas honest in CI without the mcp package.
+    """
+
+    def setUp(self):
+        self.hermes_src = HERMES_INIT.read_text(encoding="utf-8")
+        self.mcp_src = MCP_SERVER.read_text(encoding="utf-8")
+
+    def _def_body(self, src: str, name: str) -> str:
+        start = src.index(f"def {name}(")
+        # The next hermetic unit at the same nesting after this def.
+        for marker in ("    @mcp.tool()", "    def _tool_", "def _tool_"):
+            nxt = src.find(marker, start + 1)
+            if nxt != -1:
+                return src[start:nxt]
+        return src[start:start + 3000]
+
+    def test_hermes_exposes_update_and_invalidate_tool_schemas(self):
+        self.assertIn("_UPDATE_SCHEMA", self.hermes_src)
+        self.assertIn('"name": "zmem_update"', self.hermes_src)
+        self.assertIn("_INVALIDATE_SCHEMA", self.hermes_src)
+        self.assertIn('"name": "zmem_invalidate"', self.hermes_src)
+
+    def test_hermes_update_and_invalidate_are_wired(self):
+        # Tool dispatcher must route zmem_update / zmem_invalidate to their
+        # implementations (no unwired schema). PR-review PRR-R: assert the
+        # DISPATCHER routing expression ONLY — a bare quoted-tool-name
+        # substring would also match the _UPDATE_SCHEMA literal five lines
+        # up, making this ratchet vacuous (it passed even with the dispatcher
+        # branch deleted).
+        for tool in ("zmem_update", "zmem_invalidate"):
+            self.assertTrue(
+                (f'tool_name == "{tool}"' in self.hermes_src)
+                or (f'tool == "{tool}"' in self.hermes_src),
+                f"{tool} not wired into the tool dispatcher (expected the "
+                f'dispatcher comparison `tool_name == "{tool}"`); a schema '
+                "literal alone is NOT wiring",
+            )
+
+    def test_hermes_update_schema_documents_append_only_lineage(self):
+        start = self.hermes_src.index("_UPDATE_SCHEMA")
+        block = self.hermes_src[start:start + 3000]
+        self.assertIn("update_of", block)
+        self.assertIn("--as-of", block)
+        self.assertIn("Append-only", block)
+
+    def test_hermes_tool_add_and_update_validate_taint_against_shared_enum(self):
+        for name in ("_tool_add", "_tool_update"):
+            block = self._def_body(self.hermes_src, name)
+            self.assertIn("untrusted_tool", block,
+                          f"{name} must default the agent write to untrusted_tool (M5)")
+            self.assertIn('consts["ALLOWED_TAINTS"]', block,
+                          f"{name} must validate against schema_meta (not a literal)")
+
+    def test_mcp_add_and_update_default_taint_and_validate_against_shared_enum(self):
+        for name in ("add", "update"):
+            block = self._def_body(self.mcp_src, name)
+            self.assertIn('taint: str = "untrusted_tool"', block,
+                          f"MCP {name} must default agent writes to untrusted_tool (M5)")
+            self.assertIn("_ALLOWED_TAINTS", block,
+                          f"MCP {name} must validate against the shared enum")
+
+    def test_mcp_exposes_update_and_invalidate_tools(self):
+        self.assertIn("async def update(", self.mcp_src)
+        self.assertIn("async def invalidate(", self.mcp_src)
+        self.assertIn('"result": "updated"', self.mcp_src)
+        self.assertIn('"result": "invalidated"', self.mcp_src)
+
+    def test_no_surface_invents_a_fourth_taint_rank(self):
+        """ALLOWED_TAINTS is exactly three ranks; no surface may quietly accept
+        a fourth. Word-boundary regex so the legitimate 'untrusted_web' does not
+        false-positive the invented-bare-'trusted_web' check."""
+        import re as _re
+        for src in (self.hermes_src, self.mcp_src):
+            self.assertIsNone(_re.search(r"\btrusted_web\b", src),
+                              "a bare 'trusted_web' rank was invented")
+            self.assertIsNone(_re.search(r"\buntrusted_human\b", src),
+                              "an 'untrusted_human' rank was invented")
+
+
+class AllowedEnumV9RatchetTest(unittest.TestCase):
+    """Issue #59: `decision`/`constraint` are FIRST-CLASS shipped types and the
+    taint enum is EXACTLY three ranks. Pin the enum CONTENT (word-exact, not
+    substring) so a silent enum shrinkage cannot slip by, and require every
+    write surface to load the shared enum rather than a re-typed literal."""
+
+    def setUp(self):
+        from schema_meta import ALLOWED_TYPES, ALLOWED_TAINTS
+        self.allowed_types = tuple(ALLOWED_TYPES)
+        self.allowed_taints = tuple(ALLOWED_TAINTS)
+
+    def test_shipped_type_set_is_exact(self):
+        self.assertEqual(
+            self.allowed_types,
+            ("fact", "lesson", "convention", "preference",
+             "decision", "constraint"),
+            "ALLOWED_TYPES must be exactly the v9 shipped set — dropping a "
+            "shipped type is a schema regression",
+        )
+
+    def test_taint_set_is_exactly_three_ranks(self):
+        self.assertEqual(
+            self.allowed_taints,
+            ("trusted_internal", "untrusted_tool", "untrusted_web"),
+            "ALLOWED_TAINTS must be exactly three ranks — there is deliberately "
+            "no fourth rank",
+        )
+
+    def test_cli_and_agent_surfaces_load_the_shared_enum(self):
+        cli_src = (SCRIPTS_DIR / "storelib" / "cli.py").read_text(encoding="utf-8")
+        self.assertIn("choices=list(ALLOWED_TYPES)", cli_src)
+        self.assertIn("choices=list(ALLOWED_TAINTS)", cli_src)
+        hermes_src = HERMES_INIT.read_text(encoding="utf-8")
+        self.assertIn('consts["ALLOWED_TYPES"]', hermes_src)
+        self.assertIn('consts["ALLOWED_TAINTS"]', hermes_src)
 
 
 if __name__ == "__main__":

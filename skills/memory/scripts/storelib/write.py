@@ -54,6 +54,11 @@ try:
         MAX_CONTENT_CHARS,
         ALLOWED_TYPES,
         ALLOWED_SIGNALS,
+        ALLOWED_TAINTS,
+        TAINT_RANK,
+        TAINT_TRUSTED_SIGNALS,
+        validate_taint,
+        worse_taint,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
@@ -63,6 +68,11 @@ except ImportError:
         MAX_CONTENT_CHARS,
         ALLOWED_TYPES,
         ALLOWED_SIGNALS,
+        ALLOWED_TAINTS,
+        TAINT_RANK,
+        TAINT_TRUSTED_SIGNALS,
+        validate_taint,
+        worse_taint,
     )
 
 # Host-agnostic correction-pattern engine (issue #46). Pure text library, no
@@ -579,6 +589,20 @@ def rekey_namespace(
     print(f"[zmem] rekey-namespace: rekeyed {count} row(s).")
     return count
 
+def _default_taint_for_signal(signal: str) -> str:
+    """Store-side default taint for a NEW row whose origin the caller did not
+    declare (issue #59, 4.7).
+
+    Grounded signals (test/compile/lint/reviewer/user) are trusted evidence
+    (human/closeout/test-grounded), so the row defaults to trusted_internal.
+    Any other signal (`none` — an agent's ungrounded self-opinion) is
+    untrusted_tool. One derivation shared by every surface, so a row's trust
+    never depends on which surface wrote it (the CLI derives here; the remote
+    agent surfaces — Hermes/MCP — pass an explicit --taint instead when they
+    want to declare a different origin, e.g. untrusted_web).
+    """
+    return "trusted_internal" if signal in TAINT_TRUSTED_SIGNALS else "untrusted_tool"
+
 def add_memory(
     conn: sqlite3.Connection,
     *,
@@ -591,6 +615,7 @@ def add_memory(
     signal: str = "none",
     valid_from: str = "",
     capture_mode: str = "manual",
+    taint: str | None = None,
 ) -> str:
     content, source_ref, tags, warns = _apply_capture_policy(
         content=content,
@@ -612,6 +637,15 @@ def add_memory(
 
     if confidence is None:
         confidence = SIGNAL_CONFIDENCE.get(signal, SIGNAL_CONFIDENCE["none"])
+
+    # Taint: caller-declared origin wins; otherwise derive from the signal
+    # (the single store-side derivation every surface shares). An unknown
+    # taint value is refused, never silently coerced (fail-closed across every
+    # write surface — issue #59, 4.7).
+    if taint is None:
+        taint = _default_taint_for_signal(signal)
+    else:
+        taint = validate_taint(taint)
 
     # Enforce the single content-size cap on the CLI/local add path too —
     # previously only ingest-jsonl rejected oversize content, so a >65k row
@@ -636,6 +670,20 @@ def add_memory(
         if existing:
             # Merge: upgrade confidence/signal if the new add is stronger.
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
+            # PR-review PRR-A (issue #59 review round): the dedup target also
+            # absorbs the incoming taint — worst-of its own and the add's —
+            # exactly like update_memory's dedup fold (S1). Without this, a
+            # re-observed untrusted duplicate leaves the keeper's trust
+            # silently overstated.
+            ex_row = conn.execute(
+                "SELECT taint FROM memory WHERE id=?", (existing["id"],)
+            ).fetchone()
+            ex_base = (ex_row["taint"] if ex_row and ex_row["taint"]
+                       else "trusted_internal")
+            conn.execute(
+                "UPDATE memory SET taint=? WHERE id=?",
+                (worse_taint(ex_base, taint), existing["id"]),
+            )
             if started_tx:
                 _commit(conn)
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
@@ -662,11 +710,12 @@ def add_memory(
                (id, namespace, type, content, tags, source_ref, source_hash,
                 confidence, signal, valid_from, superseded_at, ingestion_ts,
                 retrieval_count, last_retrieved, embedding, embedding_model, embedded_at,
-                content_norm)
-               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?,?,?,?,?)""",
+                content_norm, valid_until, update_of, taint)
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?,?,?,?,?,'', '', ?)""",
             (mid, namespace, type_, content, tags, source_ref, shash,
              confidence, signal, valid_from, ts, ts, emb, emb_model,
-             ts if emb is not None else None, _normalize_content(content)),
+             ts if emb is not None else None, _normalize_content(content),
+             taint),
         )
         # Insert into vec0 table if we have an embedding.
         if emb is not None:
@@ -765,24 +814,56 @@ def supersede_memory(
 ) -> bool:
     """Tombstone a memory (mark superseded_at). Does not delete — keeps history.
 
-    `at` overrides the superseded_at timestamp (default: now). ingest-jsonl
+    ``at`` overrides the superseded_at timestamp (default: now). ingest-jsonl
     uses this to apply a remote tombstone with the ORIGINATING store's
     superseded_at, not the local ingest time — otherwise two synced copies of
     the same tombstone would disagree on when it happened.
+
+    v9 (issue #59, 4.3/4.4): the tombstone ALSO writes ``valid_until`` (same
+    timestamp). Point-in-time as-of recall DROPS the ``superseded_at IS NULL``
+    filter (a historically-superseded row may have been valid at that instant),
+    so a tombstoned row with an empty valid_until would be "valid at every T"
+    and resurrect at as-of. ``valid_until`` is the row's real exclusivity end:
+    as-of T returns the row only while ``valid_until > T``. ``at`` is applied to
+    BOTH columns so a remote tombstone's validity interval matches the
+    originating store exactly.
+
+    PR-review PRR-B (issue #59 review round): an ALREADY-tombstoned row is
+    REFUSED, never re-tombstoned. Overwriting superseded_at/valid_until with a
+    newer now would MOVE the validity end forward (an as-of query in
+    (old_end, new_end] would resurrect a dead fact) and destroy the original
+    audit reason — a mutation of append-only history. Mirrors update_memory's
+    same-condition refusal. ingest-jsonl guards liveness itself before calling
+    (sync.py applies remote tombstones only to live local rows), so this guard
+    never blocks a legitimate sync.
     """
     started_tx = False
     try:
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
-        row = conn.execute("SELECT id FROM memory WHERE id=?", (mid,)).fetchone()
+        row = conn.execute(
+            "SELECT id, superseded_at FROM memory WHERE id=?", (mid,)
+        ).fetchone()
         if not row:
             print(f"[zmem] no memory with id {mid}", file=sys.stderr)
             if started_tx and conn.in_transaction:
                 conn.rollback()
             return False
-        conn.execute("UPDATE memory SET superseded_at=?, supersede_reason=? WHERE id=?",
-                     (at or now_iso(), reason, mid))
+        if row["superseded_at"] is not None:
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise ValueError(
+                f"[zmem] memory {mid} is already superseded (at "
+                f"{row['superseded_at']}); supersede/invalidate refused — "
+                "re-tombstoning would move valid_until forward and mutate "
+                "append-only history"
+            )
+        ts = at or now_iso()
+        conn.execute(
+            "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? WHERE id=?",
+            (ts, ts, reason, mid),
+        )
         # Also remove from the vec0 table to prevent orphaned vectors consuming KNN slots.
         try:
             conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
@@ -808,3 +889,177 @@ def supersede_memory(
         safe_note = note.encode("ascii", "replace").decode("ascii")
         print(f"[zmem] superseded {mid}{safe_note}")
     return True
+
+
+def update_memory(
+    conn: sqlite3.Connection,
+    *,
+    mid: str,
+    content: str,
+    namespace: str | None = None,
+    type_: str | None = None,
+    tags: str | None = None,
+    source_ref: str | None = None,
+    confidence: float | None = None,
+    signal: str | None = None,
+    taint: str | None = None,
+    capture_mode: str = "manual",
+) -> tuple[str, bool]:
+    """Append-only knowledge update (issue #59, 4.2): create a NEW live row
+    that replaces ``mid``, tombstone ``mid``, and link the new row back to it
+    via ``update_of``.
+
+    ``mid`` must exist and be LIVE — an unknown or already-superseded id is
+    refused (raises ValueError; CLI exit 2, nothing written). The old row is
+    NEVER content-mutated: ``superseded_at=now, valid_until=now,
+    supersede_reason='updated'``; the new row carries ``valid_from=now,
+    valid_until='', update_of=mid``. Namespace/type/tags/source_ref are copied
+    from the old row unless overridden; confidence/signal/taint are
+    caller-supplied or inherited.
+
+    Dedup runs against OTHER live rows — ``mid`` is already tombstoned by that
+    point, so it cannot self-match (an unchanged-content "update" still creates
+    history). If the new content matches a different live row, the update folds
+    into it (metadata merge + worst-of taint) and returns its id with
+    ``created_new=False``; append-only history still holds (the old row is
+    tombstoned) and ``update_of`` is then not written (there is no new row).
+
+    Returns ``(result_id, created_new)``. Raises ContentTooLarge for oversize
+    content (CLI exit 1, mirroring ``add``), CapturePolicyRefusal for a
+    capture-policy refusal, ValueError for unknown / already-superseded ids.
+    """
+    # Resolve the old row first — everything else refuses against it.
+    old = conn.execute("SELECT * FROM memory WHERE id=?", (mid,)).fetchone()
+    if old is None:
+        raise ValueError(f"[zmem] no memory with id {mid}; cannot update")
+    if old["superseded_at"] is not None:
+        raise ValueError(
+            f"[zmem] memory {mid} is already superseded (at "
+            f"{old['superseded_at']}); update refused — history is append-only "
+            "and this row is no longer live"
+        )
+
+    # Effective field values: caller-supplied wins, else inherit from `old`.
+    ns = namespace if namespace is not None else old["namespace"]
+    type_eff = type_ if type_ is not None else old["type"]
+    tags_eff = tags if tags is not None else old["tags"]
+    source_ref_eff = source_ref if source_ref is not None else old["source_ref"]
+    conf_eff = confidence if confidence is not None else old["confidence"]
+    sig_eff = signal if signal is not None else old["signal"]
+
+    # Capture policy applies to the effective values (new content + any
+    # inherited-or-overridden tags/source_ref) exactly as add_memory does —
+    # and, as in add_memory, BEFORE the size check (PR-review PRR-C): in auto
+    # mode redaction can shrink secret-laden oversized content under the cap,
+    # and update must not reject content the add path would accept.
+    content_eff, source_ref_eff, tags_eff, warns = _apply_capture_policy(
+        content=content,
+        source_ref=source_ref_eff,
+        tags=tags_eff,
+        capture_mode=capture_mode,
+    )
+    ns = _validate_namespace(conn, ns)
+    for w in warns:
+        prefix = "WARNING (advisory, write proceeded)"
+        if _normalize_capture_mode(capture_mode) == "auto":
+            prefix = "NOTICE (automatic capture sanitized)"
+        print(f"[zmem] {prefix}: {w}", file=sys.stderr)
+
+    # Single content-size cap, identical to add_memory (M8b / #36 M17) and
+    # applied to the POST-capture content: an oversize update must be refused
+    # at the CLI boundary like an oversize add, not silently stored (an
+    # oversized row would then fail tier-3 export).
+    if len(content_eff) > MAX_CONTENT_CHARS:
+        raise ContentTooLarge(
+            f"content is {len(content_eff)} chars, over the {MAX_CONTENT_CHARS} limit"
+        )
+
+    # Taint lineage (issue #59, 4.7): the new content's provenance is the WORST
+    # of the caller-declared-or-derived origin and the row it replaces.
+    # Effective base = explicit taint if given, else the shared signal
+    # derivation; a provided taint is validated (unknown refused). The incoming
+    # lineage taint is computed ONCE and applied to whichever row survives
+    # (the new row, or the dedup target) so trust never depends on the path.
+    effective_base = (
+        validate_taint(taint) if taint is not None
+        else _default_taint_for_signal(sig_eff)
+    )
+    incoming_taint = worse_taint(old["taint"] or "trusted_internal", effective_base)
+
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
+
+        # 1) Tombstone the old row (append-only history). valid_until=now so
+        # point-in-time as-of never resurrects it (see supersede_memory).
+        ts = now_iso()
+        conn.execute(
+            "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? "
+            "WHERE id=?",
+            (ts, ts, "updated", mid),
+        )
+        try:
+            conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
+        except sqlite3.OperationalError:
+            pass  # vec0 table not available
+
+        # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
+        # cannot self-match; an unchanged-content update still creates history.
+        existing, dedup_sim, emb = _detect_duplicate(conn, content_eff, ns)
+        if existing:
+            dup_id = existing["id"]
+            _merge_on_dedup(conn, dup_id, conf_eff, sig_eff, tags_eff)
+            # The dedup target absorbs the update's lineage: worst-of its own
+            # taint and the incoming lineage (S1 — do NOT rely on the shared
+            # taint-neutral _merge_on_dedup).
+            dup_row = conn.execute(
+                "SELECT taint FROM memory WHERE id=?", (dup_id,)
+            ).fetchone()
+            dup_base = dup_row["taint"] if dup_row and dup_row["taint"] else "trusted_internal"
+            conn.execute(
+                "UPDATE memory SET taint=? WHERE id=?",
+                (worse_taint(dup_base, incoming_taint), dup_id),
+            )
+            if started_tx:
+                _commit(conn)
+            print(f"[zmem] update: {mid} superseded; new content merged into existing "
+                  f"live memory {dup_id} (similarity={dedup_sim:.3f})")
+            return dup_id, False
+
+        # 3) No dedup hit — insert the NEW live row replacing `mid`.
+        new_id = str(uuid.uuid4())
+        shash = _source_hash(source_ref_eff)
+        emb_model = "minilm-onnx" if emb is not None else ""
+        if emb is None:
+            _warn_degraded_embeddings_once(content_eff)
+        conn.execute(
+            """INSERT INTO memory
+               (id, namespace, type, content, tags, source_ref, source_hash,
+                confidence, signal, valid_from, superseded_at, ingestion_ts,
+                retrieval_count, last_retrieved, embedding, embedding_model, embedded_at,
+                content_norm, valid_until, update_of, taint)
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?,?,?,?,?,'',?,?)""",
+            (new_id, ns, type_eff, content_eff, tags_eff, source_ref_eff, shash,
+             conf_eff, sig_eff, ts, ts, ts, emb, emb_model,
+             ts if emb is not None else None, _normalize_content(content_eff),
+             mid, incoming_taint),
+        )
+        if emb is not None:
+            try:
+                conn.execute(
+                    "INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
+                    [emb, new_id],
+                )
+            except sqlite3.OperationalError:
+                pass  # vec0 table not available — embedding stored in memory table only
+        if started_tx:
+            _commit(conn)
+        print(f"[zmem] updated memory {mid} -> {new_id} (ns={ns}, type={type_eff}, "
+              f"signal={sig_eff}, conf={conf_eff}, taint={incoming_taint})")
+        return new_id, True
+    except Exception:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        raise

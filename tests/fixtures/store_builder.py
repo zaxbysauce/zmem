@@ -142,10 +142,22 @@ def _pin_timestamps(store: str) -> None:
     and drop any telemetry that would embed a fresh 'now' on a later read."""
     conn = sqlite3.connect(store)
     try:
-        ts_cols = ["valid_from", "superseded_at", "ingestion_ts", "last_retrieved",
-                   "last_surfaced"]
+        ts_cols = ["valid_from", "superseded_at", "ingestion_ts",
+                   "last_retrieved", "last_surfaced"]
         for col in ts_cols:
             conn.execute(f"UPDATE memory SET {col}=? WHERE {col} IS NOT NULL", (PIN_TS,))
+        # PR-review PRR-Q (issue #59 review round): valid_until must be pinned
+        # ONLY where it is non-empty (tombstones). The column is NOT NULL
+        # DEFAULT '' — SQLite treats '' IS NOT NULL as TRUE — so the generic
+        # loop above would ALSO rewrite every live row's "never expires"
+        # marker to a past PIN_TS, giving live rows an empty
+        # [valid_from, valid_until) interval and violating the live <=> empty
+        # valid_until invariant the store enforces everywhere else.
+        conn.execute(
+            "UPDATE memory SET valid_until=? "
+            "WHERE valid_until IS NOT NULL AND valid_until != ''",
+            (PIN_TS,),
+        )
         conn.execute("UPDATE memory SET merged_from=NULL, retrieval_count=0, surfaced_count=0")
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES "

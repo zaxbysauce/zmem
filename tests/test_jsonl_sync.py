@@ -1624,5 +1624,273 @@ class CapturePolicyIngestTest(_TwoStoreCase):
             ("77777777-0000-0000-0000-000000000007",))[0])
 
 
+# ---------------------------------------------------------------------------
+# issue #59, 4.6: v9 lineage fields (valid_until / update_of / taint) in the
+# sync contract. Export must emit them; ingest must validate hostile values as
+# malformed (refused, never stored) and preserve well-formed values, including
+# the systematic v8->v9 migration defaults (tombstone valid_until inherits
+# superseded_at; an absent taint -> derived from the signal exactly like the
+# migration backfill — PR-review PRR-G).
+# ---------------------------------------------------------------------------
+class V9LineageSyncTest(_TwoStoreCase):
+    def _add_tainted(self, store: "Store", content: str, taint: str) -> str:
+        r = store.run("add", "--namespace", NS, "--type", "fact",
+                      "--content", content, "--signal", "test", "--taint", taint)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return store.find_id(NS, content)
+
+    def test_update_providence_and_lineage_propagate_to_receiving_store(self):
+        """The realistic two-phase sync: A ships the live original, then ships
+        the append-only update. B must end with the OLD row tombstoned (its
+        valid_until == superseded_at), the NEW live row linked via update_of,
+        and the untrusted_web taint preserved byte-for-byte the whole way."""
+        old = self._add_tainted(self.a, "original web-sourced lesson alpha",
+                                "untrusted_web")
+
+        export1 = os.path.join(self.a.tmp, "phase1.jsonl")
+        self.assertEqual(self.a.run("export-jsonl", "--out", export1).returncode, 0)
+        r = self.b.run("ingest-jsonl", "--in", export1)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+
+        up = self.a.run("update", "--id", old, "--content",
+                        "revised web-sourced lesson beta")
+        self.assertEqual(up.returncode, 0, up.stderr)
+        m = re.search(r"updated memory [0-9a-f-]+ -> ([0-9a-f-]{36})", up.stdout)
+        self.assertIsNotNone(m, up.stdout)
+        new_id = m.group(1)
+
+        export2 = os.path.join(self.a.tmp, "phase2.jsonl")
+        self.assertEqual(self.a.run(
+            "export-jsonl", "--out", export2, "--include-superseded").returncode, 0)
+        rows2 = self._read_jsonl(export2)
+        for row in rows2:
+            for key in ("valid_until", "update_of", "taint"):
+                self.assertIn(key, row, f"export dropped {key}")
+
+        r = self.b.run("ingest-jsonl", "--in", export2, "--allow-tombstones")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["tombstoned"], 1, r.stdout)
+        self.assertEqual(counts["added"], 1,
+                         "the updated (new) row is a brand-new id to B and must land as added")
+
+        old_b = self.b.query_one(
+            "SELECT valid_until, superseded_at, taint FROM memory WHERE id=?", (old,))
+        self.assertEqual(old_b[0], old_b[1],
+                         "tombstone validity end must equal supersede instant after sync")
+        self.assertEqual(old_b[2], "untrusted_web",
+                         "taint must survive the tombstone + sync unchanged")
+        new_b = self.b.query_one(
+            "SELECT taint, update_of, valid_until, superseded_at FROM memory WHERE id=?",
+            (new_id,))
+        self.assertEqual(new_b[0], "untrusted_web",
+                         "taint must survive the sync byte-for-byte")
+        self.assertEqual(new_b[1], old, "update_of lineage must survive export/ingest")
+        self.assertEqual(new_b[2], "", "new row is live (valid_until empty)")
+        self.assertIsNone(new_b[3])
+
+    def test_legacy_v8_row_without_v9_fields_ingests_with_migration_defaults(self):
+        row = _sync_row(id="aaaaaaaa-0000-0000-0000-00000000000a",
+                        content="an old v8-era synced row (no v9 fields)",
+                        superseded_at="2026-06-01T00:00:00Z", supersede_reason="stale")
+        for key in ("valid_until", "update_of", "taint"):
+            self.assertNotIn(key, row)
+        path = self._write_jsonl(self.b, "v8.jsonl", [row])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+        stored = self.b.query_one(
+            "SELECT valid_until, taint, update_of FROM memory WHERE id=?", (row["id"],))
+        self.assertEqual(stored[0], row["superseded_at"],
+                         "v8 tombstone valid_until must inherit superseded_at")
+        self.assertEqual(stored[1], "trusted_internal",
+                         "v8 row with a GROUNDED signal (test) defaults to "
+                         "trusted_internal via the shared signal derivation")
+        self.assertEqual(stored[2], "", "v8 row has no update_of lineage")
+
+    def test_legacy_v8_row_signal_none_ingests_as_untrusted_tool(self):
+        # PR-review PRR-G: the absent-taint default must be the SAME
+        # signal-based derivation the v8->v9 migration backfill applies
+        # (schema.py) — signal=none is an agent's ungrounded self-opinion and
+        # lands untrusted_tool, NOT the old hardcoded trusted_internal
+        # (which trust-escalated legacy rows relative to an in-place migration,
+        # with no recompute path).
+        row = _sync_row(id="aaaaaaaa-0000-0000-0000-0000000000aa",
+                        content="old v8 row with no signal grounding",
+                        signal="none")
+        for key in ("valid_until", "update_of", "taint"):
+            self.assertNotIn(key, row)
+        path = self._write_jsonl(self.b, "v8-none.jsonl", [row])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+        stored = self.b.query_one(
+            "SELECT taint FROM memory WHERE id=?", (row["id"],))[0]
+        self.assertEqual(stored, "untrusted_tool",
+                         "absent taint + signal=none must derive untrusted_tool "
+                         "(same as the migration backfill)")
+
+    def test_tombstone_valid_until_inherits_superseded_at_on_ingest(self):
+        row = _sync_row(id="aaaaaaaa-0000-0000-0000-00000000000b",
+                        content="tombstoned upstream with no valid_until",
+                        superseded_at="2026-06-01T00:00:00Z", supersede_reason="dead upstream")
+        path = self._write_jsonl(self.b, "inherit.jsonl", [row])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+        stored = self.b.query_one(
+            "SELECT valid_until FROM memory WHERE id=?", (row["id"],))[0]
+        self.assertEqual(stored, "2026-06-01T00:00:00Z")
+
+    def test_unknown_taint_is_malformed_and_not_stored(self):
+        path = self._write_jsonl(self.b, "badtaint.jsonl", [
+            _sync_row(id="aaaaaaaa-0000-0000-0000-00000000000c",
+                      content="taint sentinel", taint="banana")])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertEqual(counts["added"], 0)
+        self.assertIn("'taint'", r.stderr)
+
+    def test_non_string_taint_is_malformed(self):
+        path = self._write_jsonl(self.b, "numtaint.jsonl", [
+            _sync_row(id="aaaaaaaa-0000-0000-0000-00000000000d",
+                      content="numeric taint", taint=7)])  # type: ignore[arg-type]
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertEqual(counts["added"], 0)
+        # PR-review PRR-U: counts alone cannot catch a row that is COUNTED
+        # malformed but still written — assert the diagnostic and the
+        # absence-from-store like the sibling malformed tests do.
+        self.assertIn("'taint'", r.stderr)
+        self.assertIsNone(
+            self.b.query_one("SELECT id FROM memory WHERE content='numeric taint'"),
+            "a malformed-counted row must never be stored")
+
+    def test_bad_iso_valid_from_is_malformed(self):
+        path = self._write_jsonl(self.b, "badfrom.jsonl", [
+            _sync_row(id="aaaaaaaa-0000-0000-0000-00000000000e",
+                      content="bad valid_from", valid_from="not-a-date")])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertEqual(counts["added"], 0)
+        self.assertIn("'valid_from'", r.stderr)
+
+    def test_bad_iso_valid_until_is_malformed(self):
+        path = self._write_jsonl(self.b, "baduntil.jsonl", [
+            _sync_row(id="aaaaaaaa-0000-0000-0000-00000000000f",
+                      content="bad valid_until", superseded_at="2026-06-01T00:00:00Z",
+                      valid_until="not-a-date")])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertEqual(counts["added"], 0)
+        self.assertIn("'valid_until'", r.stderr)
+
+    def test_live_row_with_non_empty_valid_until_is_malformed(self):
+        path = self._write_jsonl(self.b, "liveuntil.jsonl", [
+            _sync_row(id="aaaaaaaa-0000-0000-0000-000000000010",
+                      content="live but claims a validity end",
+                      valid_until="2026-02-01T00:00:00Z")])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertEqual(counts["added"], 0)
+        self.assertIn("'valid_until'", r.stderr)
+
+    def test_bad_update_of_shape_is_malformed(self):
+        path = self._write_jsonl(self.b, "badupof.jsonl", [
+            _sync_row(id="aaaaaaaa-0000-0000-0000-000000000011",
+                      content="bad update_of", update_of="not-a-uuid")])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertEqual(counts["added"], 0)
+        self.assertIn("'update_of'", r.stderr)
+
+    def test_epoch_zero_timestamp_is_valid_not_malformed(self):
+        # PR-review PRR-E: 1970-01-01T00:00:00Z is a REAL ISO-8601 instant;
+        # the old _assert_valid_iso used _parse_iso_to_epoch == 0 as the
+        # failure sentinel, which collides with epoch zero and refused it.
+        row = _sync_row(id="aaaaaaaa-0000-0000-0000-000000000012",
+                        content="row born at the unix epoch",
+                        valid_from="1970-01-01T00:00:00Z",
+                        ingestion_ts="1970-01-01T00:00:00Z")
+        path = self._write_jsonl(self.b, "epoch.jsonl", [row])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+        stored = self.b.query_one(
+            "SELECT valid_from FROM memory WHERE id=?", (row["id"],))[0]
+        self.assertEqual(stored, "1970-01-01T00:00:00Z")
+
+    def test_tombstone_outliving_its_supersede_is_malformed(self):
+        # PR-review PRR-F: a tombstone whose valid_until is LATER than its
+        # superseded_at is incoherent (a row cannot outlive its own tombstone;
+        # this writer never produces it) and must be refused — counted
+        # malformed, never stored. An authored EARLIER end stays legitimate
+        # (pinned separately by test_tombstone_authored_valid_until_is_preserved).
+        path = self._write_jsonl(self.b, "outlive.jsonl", [
+            _sync_row(id="aaaaaaaa-0000-0000-0000-000000000013",
+                      content="tombstone that claims to outlive itself",
+                      superseded_at="2026-06-01T00:00:00Z",
+                      valid_until="2026-07-01T00:00:00Z")])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertEqual(counts["added"], 0)
+        self.assertIn("tombstone coherence", r.stderr)
+        self.assertIsNone(
+            self.b.query_one(
+                "SELECT id FROM memory WHERE content=?",
+                ("tombstone that claims to outlive itself",)),
+            "an outliving-tombstone row must never be stored")
+
+    def test_ingest_dedup_upgrades_keeper_to_worst_of_taint(self):
+        # PR-review PRR-H: a synced row that dedups against a live local
+        # keeper must upgrade the keeper's taint (worst-of) — a remote
+        # untrusted row folded into a local trusted keeper may not vanish
+        # without a trace of its trust level.
+        keeper = "shared content between local keeper and remote row"
+        r = self.b.run("add", "--namespace", NS, "--type", "fact",
+                       "--content", keeper, "--signal", "test",
+                       "--taint", "trusted_internal")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        path = self._write_jsonl(self.b, "deduptaint.jsonl", [
+            _sync_row(id="aaaaaaaa-0000-0000-0000-000000000014",
+                      content=keeper, taint="untrusted_web")])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["deduped"], 1, r.stdout)
+        stored = self.b.query_one(
+            "SELECT taint FROM memory WHERE content=?", (keeper,))[0]
+        self.assertEqual(stored, "untrusted_web",
+                         "ingest dedup must apply worst-of taint to the keeper")
+
+    def test_tombstone_authored_valid_until_is_preserved(self):
+        """A remote tombstone may carry a valid_until that is NOT the
+        supersede instant (factual validity ended before formal supersession).
+        This is legitimate and must be preserved as-authored, never rewritten."""
+        row = _sync_row(id="aaaaaaaa-0000-0000-0000-000000000012",
+                        content="remote tombstone with an authored valid_until",
+                        superseded_at="2026-06-01T00:00:00Z",
+                        valid_until="2026-05-15T00:00:00Z",
+                        supersede_reason="ended before formal supersede")
+        path = self._write_jsonl(self.b, "authored.jsonl", [row])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+        stored = self.b.query_one(
+            "SELECT valid_until, superseded_at FROM memory WHERE id=?", (row["id"],))
+        self.assertEqual(stored[0], "2026-05-15T00:00:00Z",
+                         "valid_until must be preserved as authored")
+        self.assertEqual(stored[1], "2026-06-01T00:00:00Z")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

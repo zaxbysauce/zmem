@@ -12,6 +12,84 @@ README.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-24
+
+### Added
+
+- **Schema v9: append-only knowledge lineage** (issue [#59], SOTA PR 4/10).
+  All seven mandatory tasks shipped, with no stubs and no unwired code:
+  - `store.py update` / `store.py invalidate` — schema-validated, append-only
+    history. `update` re-creates the row with `update_of` linkage, tombstones
+    the old row (`superseded_at` + `valid_until`), and inherits provenance
+    (folding into an existing live duplicate when one is found); `invalidate`
+    REQUIRES a reason and tombstones with the closed `valid_from`/`valid_until`
+    interval.
+  - `--as-of ISO-8601` on `recall`/`recent`/`search` now applies the FULL
+    temporal predicate via `_as_of_temporal_predicate`: `valid_from` is
+    INCLUSIVE, `valid_until` is EXCLUSIVE, and the hard `superseded_at IS
+    NULL` filter is dropped when as_of is set — a point-in-time read recovers
+    content that was valid at that instant. Lane bound: in hybrid mode such a
+    row is reachable only through the lexical (FTS5) lane; the vector lane
+    keeps its live-only pool (documented in SKILL.md).
+  - New `type` values `decision` and `constraint` (closed enum, word-exact
+    ratchet), accepted end to end by capture tooling.
+  - Taint provenance with a closed three-rank model
+    (`trusted_internal < untrusted_tool < untrusted_web`): worst-of lineage
+    through update re-creation and consolidate absorb; unknown taint refused;
+    `[UNTRUSTED TOOL]` / `[UNTRUSTED WEB]` markers on the explicit recall
+    text path; passive (`--no-bump`) surfaces omit `untrusted_web` exactly
+    like injection-risk rows.
+  - Hermes and MCP agent surfaces default new memories to `untrusted_tool`
+    and validate taint against the shared `schema_meta` enum.
+  - Wiring everywhere the feature has a surface: CLI, Hermes, MCP tools,
+    JSONL ingest/sync (authoring + validation), doctor checks, CUTOVER.md,
+    and SKILL.md.
+
+### Fixed
+
+- Swarm-pr-review round (run 20260824-pr70, all findings validated + challenged):
+  - **Append-only history is write-once**: a second `invalidate`/`supersede` on
+    an already-tombstoned row is refused (exit 2) instead of moving
+    `valid_until` forward and replacing the audit reason (PRR-B).
+  - **Worst-of taint now covers every merge**: a duplicate `add` or
+    `ingest-jsonl` row that folds into an existing keeper upgrades the keeper's
+    taint (worst-of), and a legacy v8 row with absent taint derives from its
+    signal exactly like the migration backfill (PRR-A/G/H).
+  - `update` applies the capture policy BEFORE the size cap (matching `add`),
+    so auto-redacted content the add path accepts is no longer rejected
+    (PRR-C); `invalidate --reason` must be non-empty (PRR-I).
+  - `ingest-jsonl` accepts a genuine `1970-01-01T00:00:00Z` timestamp (the
+    epoch-zero/parse-failure sentinel collision) and refuses a tombstone whose
+    `valid_until` is LATER than its `superseded_at` (a row cannot outlive its
+    own tombstone; an authored earlier end stays preserved) (PRR-E/F).
+  - Hybrid `--as-of` recall temporal-filters the vector candidate pool before
+    RRF fusion (with over-fetch), so future-dated rows cannot crowd valid
+    candidates out of the fixed KNN window (PRR-K).
+  - Hermes `zmem_add`/`zmem_update` pass `--capture-mode auto` (secret
+    redaction parity with MCP) and neither remote surface returns raw
+    subprocess stderr to clients any more (stable `[zmem]` refusal lines pass
+    through a sanitizer; anything else is truncated) (PRR-L/M).
+  - `--content -` reads content from stdin on `add`/`update`, and the
+    Hermes/MCP surfaces pipe oversize payloads through it — Windows argv caps
+    far below the 65536-char content limit (PRR-P).
+  - Test-fixture truth: the characterization builder no longer stamps a past
+    `valid_until` onto LIVE rows (their "never expires" marker is `''`), and
+    the frozen hashes/comments were re-captured truthfully (PRR-Q/X); vacuous
+    ratchets tightened (Hermes wiring, dedup-fold worst-of, doc-drift needles,
+    malformed-row absence checks) (PRR-R/S/T/U/V).
+
+- Replaced the earlier `valid_until` placeholder ("Phase 4") with the real
+  predicate; the `_recall_one_tier`/`_recent_one_tier`/`_fetch_by_ids`
+  docstrings no longer claim a placeholder exists.
+
+### Known issues
+
+- Historic content valid only *before* a supersede is not reachable via the
+  semantic vector lane in hybrid `--as-of` recall (the vector candidate pool
+  is live-only); re-run with `--no-hybrid` to include the lexical lane.
+
+[#59]: https://github.com/zaxbysauce/zmem/issues/59
+
 ## [0.8.9] — 2026-08-24
 
 ### Added

@@ -328,6 +328,158 @@ class GetExitContractTest(unittest.TestCase):
                              "must still be inspectable")
 
 
+class TaintAutoInjectSurfaceTest(unittest.TestCase):
+    """Issue #59, 4.7: the taint model must be visible and SAFE on the
+    auto-inject surface. A web-sourced row (untrusted_web) is omitted on the
+    passive --no-bump path exactly like an injection-risk row; an
+    untrusted_tool row is trusted enough to surface passively; and the
+    EXPLICIT recall text path PREFIXES both ranks so an agent/operator sees
+    the untrusted provenance without reading JSON. (Final critic blocker:
+    this is the regression pin the fix plan promised and the suite lacked.)"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-taint-surface-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store = os.path.join(self.tmp, "store.sqlite")
+        self.env = {**os.environ, "ZMEM_STORE": self.store,
+                    "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+
+    def _run(self, *args):
+        r = subprocess.run([PYTHON, str(STORE_PY), *args],
+                           env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def _seed(self, marker: str) -> dict:
+        """One row per taint rank, all grounded (conf 0.9, above the recall /
+        recent floors); contents unique to `marker`. Returns
+        ``{taint: id, "ns": ns}`` so a test holds direct references."""
+        ns = f"project:taint-surface-{marker}"
+        by_taint = {}
+        for taint, word in (("untrusted_web", "webey"),
+                            ("untrusted_tool", "tooly"),
+                            ("trusted_internal", "trusty")):
+            r = self._run("add", "--namespace", ns, "--type", "fact",
+                          "--content", f"{taint} {word} {marker} quokka",
+                          "--signal", "test", "--taint", taint)
+            mid = re.search(r"added memory ([0-9a-f-]{36})", r.stdout)
+            self.assertIsNotNone(mid, r.stdout)
+            by_taint[taint] = mid.group(1)
+        by_taint["ns"] = ns
+        return by_taint
+
+    def test_no_bump_recall_omits_untrusted_web_keeps_tool(self):
+        seeded = self._seed("alpha")
+        r = self._run("recall", "--query", "quokka", "--namespace", seeded["ns"],
+                      "--no-bump", "--json")
+        ids = {x["id"] for x in json.loads(r.stdout)}
+        self.assertNotIn(seeded["untrusted_web"], ids,
+                         "passive recall must OMIT untrusted_web (same path as "
+                         "injection-risk)")
+        self.assertIn(seeded["untrusted_tool"], ids,
+                      "passive recall must KEEP untrusted_tool: it is trusted "
+                      "enough to surface passively and gets flagged on the "
+                      "explicit path")
+        self.assertIn(seeded["trusted_internal"], ids)
+        # The payload still carries taint so a --json consumer can filter.
+        tool_item = next(x for x in json.loads(r.stdout)
+                         if x["id"] == seeded["untrusted_tool"])
+        self.assertEqual(tool_item["taint"], "untrusted_tool")
+
+    def test_no_bump_recent_omits_untrusted_web(self):
+        seeded = self._seed("bravo")
+        r = self._run("recent", "--namespace", seeded["ns"], "--no-bump", "--json")
+        ids = {x["id"] for x in json.loads(r.stdout)}
+        self.assertNotIn(seeded["untrusted_web"], ids,
+                         "passive recent must OMIT untrusted_web")
+        self.assertIn(seeded["untrusted_tool"], ids)
+        self.assertIn(seeded["trusted_internal"], ids)
+
+    def test_explicit_recall_keeps_all_and_prefixes_untrusted_taints(self):
+        seeded = self._seed("charlie")
+        r = self._run("recall", "--query", "quokka", "--namespace", seeded["ns"])
+        self.assertIn("[UNTRUSTED WEB]", r.stdout,
+                      "explicit recall text must prefix untrusted_web")
+        self.assertIn("[UNTRUSTED TOOL]", r.stdout,
+                      "explicit recall text must prefix untrusted_tool")
+        # Every rank still surfaces on the explicit path (a deliberate fetch —
+        # the operator sees the marker, not an omission).
+        self.assertIn("trusty", r.stdout)
+        self.assertIn("webey", r.stdout)
+        self.assertIn("tooly", r.stdout)
+
+    def test_explicit_json_includes_all_ranks_with_taint_field(self):
+        seeded = self._seed("delta")
+        r = self._run("recall", "--query", "quokka", "--namespace", seeded["ns"],
+                      "--json")
+        items = json.loads(r.stdout)
+        ids = {x["id"] for x in items}
+        self.assertIn(seeded["untrusted_web"], ids)
+        self.assertIn(seeded["untrusted_tool"], ids)
+        self.assertIn(seeded["trusted_internal"], ids)
+        taint_by_id = {x["id"]: x["taint"] for x in items}
+        for taint in ("untrusted_web", "untrusted_tool", "trusted_internal"):
+            self.assertEqual(taint_by_id[seeded[taint]], taint,
+                             f"explicit JSON must carry the real taint for {taint}")
+
+class AgentWriteSurfaceParityTest(unittest.TestCase):
+    """PR-review PRR-L/M/P/Y (issue #59 review round): the agent write
+    surfaces (Hermes + MCP add/update) must share ONE contract — secret
+    redaction (`--capture-mode auto`), sanitized (never raw-stderr) errors,
+    and a stdin fallback for content too large for Windows argv. Source-scan
+    ratchets so CI (which cannot import mcp/hermes internals) still guards
+    the parity."""
+
+    def _src(self, rel: str) -> str:
+        return (REPO_ROOT / rel).read_text(encoding="utf-8")
+
+    def test_agent_write_paths_pass_capture_mode_auto(self):
+        src = self._src("hermes-plugin/__init__.py")
+        for m in ("_tool_add", "_tool_update"):
+            start = src.find(f"def {m}")
+            self.assertGreater(start, 0, f"def {m} not found in hermes source")
+            window = src[start:start + 5000]
+            self.assertIn('"--capture-mode", "auto"', window,
+                          f"hermes {m} must pass --capture-mode auto so secrets "
+                          "are redacted like the MCP path (PRR-L)")
+        mcp = self._src("hermes-plugin/server/mcp_server.py")
+        self.assertGreaterEqual(mcp.count('"--capture-mode", "auto"'), 2,
+                                "MCP add AND update must keep --capture-mode auto")
+
+    def test_remote_error_paths_never_echo_raw_stderr(self):
+        for rel in ("hermes-plugin/server/mcp_server.py",
+                    "hermes-plugin/__init__.py"):
+            src = self._src(rel)
+            self.assertIn("_sanitize_store_error", src,
+                          f"{rel} must route remote error payloads through the "
+                          "sanitizer (PRR-M)")
+            self.assertNotIn('_error(r["stderr"]', src,
+                             f"{rel} must not return raw stderr to remote clients")
+            self.assertNotIn("r['stderr'] or r['stdout'][:200]", src,
+                             f"{rel} must not splice raw stderr into tool errors")
+        # The invalidate/supersede remote paths are covered by the file-wide
+        # checks above (critic nit): their failure payloads are built by the
+        # same sanitized call sites, so no separate unwired path exists.
+        mcp = self._src("hermes-plugin/server/mcp_server.py")
+        self.assertGreaterEqual(mcp.count("_sanitize_store_error(r)"), 4,
+                                "sanitize every remote failure site incl. "
+                                "supersede/invalidate/update")
+
+    def test_oversize_content_uses_stdin_not_argv(self):
+        for rel in ("hermes-plugin/__init__.py",
+                    "hermes-plugin/server/mcp_server.py"):
+            src = self._src(rel)
+            self.assertIn("_ARGV_SAFE_CONTENT_CHARS", src,
+                          f"{rel} must gate content-by-argv on the safe "
+                          "threshold and pipe larger content via stdin (PRR-P)")
+            self.assertIn('.index("--content")', src,
+                          f"{rel} must switch to the stdin content path for "
+                          "oversize payloads")
+        cli = self._src("skills/memory/scripts/storelib/cli.py")
+        self.assertIn('== "-"', cli,
+                      "the CLI must honor `--content -` as read-from-stdin")
+
+
 class ComputeScorePopularityBlendTest(unittest.TestCase):
     """compute_score popularity must blend surfaced + retrieval (defect-class fix)."""
 

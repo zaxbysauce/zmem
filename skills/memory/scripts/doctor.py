@@ -1100,6 +1100,53 @@ def _check_surfaces(repo_root: Path) -> dict:
     return _check("host-surfaces", status, summary, surfaces=details)
 
 
+# The three v9 (issue #59, 4.1) append-only lineage columns. A healthy store
+# post-migration carries all three; their ABSENCE means the store is pre-v9 and
+# waiting for a writable migration run (the schema-version check already flags
+# that case separately).
+V9_COLUMNS = ("valid_until", "update_of", "taint")
+
+
+def _check_v9_columns(resolved_store: Path) -> dict:
+    """Confirm the v9 append-only lineage columns exist (issue #59, 4.1).
+
+    Read-only probe of PRAGMA table_info(memory) for valid_until / update_of /
+    taint. Pass when all three are present; warn when the store is pre-v9
+    (migrate() adds them on the next WRITABLE store.py run, which is exactly
+    what the schema-version check already warns about); skip when the store is
+    absent/unreadable (already flagged by store-access). Never writes.
+    """
+    conn = _open_store_ro(resolved_store)
+    if conn is None:
+        return _check(
+            "v9-columns", "skip",
+            "Store not available; skipped v9 columns check.",
+        )
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+    except Exception as exc:
+        return _check(
+            "v9-columns", "warn",
+            f"Could not inspect memory table columns: {type(exc).__name__}: {exc}",
+        )
+    finally:
+        conn.close()
+    missing = [c for c in V9_COLUMNS if c not in cols]
+    if not missing:
+        return _check(
+            "v9-columns", "pass",
+            "memory table carries all v9 lineage columns "
+            "(valid_until, update_of, taint).",
+            columns=list(V9_COLUMNS),
+        )
+    return _check(
+        "v9-columns", "warn",
+        f"memory table is missing v9 column(s): {', '.join(missing)}; a writable "
+        f"store.py run will add them via migration (issue #59, 4.1).",
+        missing=missing, expected=list(V9_COLUMNS),
+    )
+
+
 # Tier-0 size guard thresholds (issue #49 C). core.md is injected into EVERY
 # session on EVERY hook host, so an overgrown file silently eats context
 # budget and dilutes instruction-following (~150-200 reliably-handled
@@ -1498,6 +1545,7 @@ def build_report(project: Path, repo_root: Path) -> dict:
     access_check = _check_store_access(resolved_store)
     checks.append(access_check)
     checks.append(_check_schema(resolved_store, access_check))
+    checks.append(_check_v9_columns(resolved_store))
     checks.append(_check_claude_native_memory(Path.home()))
     checks.append(_check_session_retention(Path.home()))
     checks.extend(_check_codex_memory_and_trust(Path.home(), project, repo_root))

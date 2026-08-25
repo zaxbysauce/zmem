@@ -19,8 +19,9 @@ import glob
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
-from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
-from storelib.write import CapturePolicyRefusal, _GLOBAL_NEAR_MISS_STEMS, _apply_capture_policy, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
+from storelib.write import CapturePolicyRefusal, _GLOBAL_NEAR_MISS_STEMS, _apply_capture_policy, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory
+from schema_meta import worse_taint  # noqa: F401
 
 EXPORT_PACK_DEFAULT_PROJECT_LIMIT = 50
 
@@ -172,7 +173,8 @@ def cmd_export_jsonl(
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(
         f"""SELECT id, namespace, type, content, tags, source_ref, confidence, signal,
-                   valid_from, ingestion_ts, superseded_at, supersede_reason, merged_from
+                   valid_from, valid_until, update_of, taint,
+                   ingestion_ts, superseded_at, supersede_reason, merged_from
             FROM memory {where}
             ORDER BY ingestion_ts, id""",
         params,
@@ -189,7 +191,13 @@ def cmd_export_jsonl(
             "source_ref": r["source_ref"],
             "confidence": r["confidence"],
             "signal": r["signal"],
+            # v9 (issue #59, 4.6): the append-only lineage + provenance trust
+            # columns round-trip with the row so a store rebuilt from its own
+            # export preserves update history and taint exactly.
             "valid_from": r["valid_from"],
+            "valid_until": r["valid_until"],
+            "update_of": r["update_of"],
+            "taint": r["taint"],
             "ingestion_ts": r["ingestion_ts"],
             "superseded_at": r["superseded_at"],
             "supersede_reason": r["supersede_reason"],
@@ -365,9 +373,101 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     source_ref = _opt_str("source_ref")
     supersede_reason = _opt_str("supersede_reason")
     valid_from = _opt_str("valid_from")
+    valid_until = _opt_str("valid_until")
+    update_of = _opt_str("update_of")
     ingestion_ts = _opt_str("ingestion_ts")
     superseded_at = _opt_str("superseded_at") or None
     merged_from = _opt_str("merged_from") or None
+
+    # v9 (issue #59, 4.6): strict ISO-8601 UTC validation for the temporal
+    # columns. Empty valid_until is legitimate ("never expires"); any
+    # NON-EMPTY valid_from/valid_until must parse the store's exact writer
+    # format (%Y-%m-%dT%H:%M:%SZ) or the row is counted malformed and NOT
+    # stored ("Bad timestamp counted, not stored"). This closes the hole
+    # where an unparsable timestamp was stored verbatim and silently defeated
+    # the lexicographic as-of predicate.
+    def _assert_valid_iso(value: str, field: str) -> None:
+        # PR-review PRR-E (issue #59 review round): validate by PARSING, not by
+        # comparing the epoch against 0 — _parse_iso_to_epoch returns 0.0 both
+        # for unparsable input AND for a genuine 1970-01-01T00:00:00Z, so the
+        # old epoch==0 sentinel wrongly refused the real epoch-zero timestamp.
+        if value:
+            try:
+                time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"field '{field}' is not a valid ISO-8601 UTC timestamp "
+                    f"(expected YYYY-MM-DDTHH:MM:SSZ), got {value!r}"
+                )
+
+    _assert_valid_iso(valid_from, "valid_from")
+    _assert_valid_iso(valid_until, "valid_until")
+
+    # lineage invariant (issue #59, 4.4/4.6): valid_until is the exclusive end
+    # of validity and is only EVER written at tombstone time, so a non-empty
+    # valid_until implies a tombstone and vice versa. Enforce both directions
+    # here so a remote file cannot resurrect a row or silently leave a
+    # tombstone with an open-ended validity interval:
+    #   - a TOMBSTONE (superseded_at set) with empty valid_until: inherit
+    #     superseded_at (point-in-time as-of drops the superseded filter, so
+    #     an empty valid_until would make the dead row valid at every T);
+    #   - a LIVE row (no superseded_at) with non-empty valid_until: malformed
+    #     (this writer only sets valid_until on tombstones; a live row carrying
+    #     one is internally contradictory and would surface by default forever
+    #     while being excluded at as-of=now).
+    if superseded_at:
+        if not valid_until:
+            valid_until = superseded_at
+        elif valid_until > superseded_at:
+            # PR-review PRR-F (issue #59 review round): an authored
+            # valid_until EARLIER than superseded_at is a legitimate,
+            # preserved-as-authored interval ("factual validity ended before
+            # the formal supersession" — pinned by
+            # test_tombstone_authored_valid_until_is_preserved). But a
+            # valid_until AFTER the death instant is incoherent with the
+            # tombstone (this writer never produces it): refuse, store
+            # nothing, count the row malformed.
+            raise ValueError(
+                f"tombstone coherence: 'valid_until' ({valid_until!r}) is "
+                f"later than 'superseded_at' ({superseded_at!r}); a row "
+                "cannot outlive its own tombstone (issue #59, 4.4)"
+            )
+    elif valid_until:
+        raise ValueError(
+            f"field 'valid_until' is set ({valid_until!r}) but the row is not "
+            "superseded; this store only writes valid_until at tombstone time "
+            "(issue #59, 4.4)"
+        )
+
+    # update_of references another row's id — enforce the same UUID-shape guard
+    # as `id` so a remote file cannot plant an arbitrary string into the
+    # append-only lineage chain (the comma-joined provenance columns already
+    # rely on UUID-only ids — consolidate.py invariant).
+    if update_of and not _INGEST_ID_RE.match(update_of):
+        raise ValueError(
+            f"field 'update_of' must be a 36-char UUID-shaped string, "
+            f"got {update_of!r}"
+        )
+
+    # taint: absent (legacy v8 export) → the SAME signal-based derivation the
+    # v8→v9 migration backfill applies (schema.py) and every write surface
+    # shares (_default_taint_for_signal) — a grounded signal (test/compile/
+    # lint/reviewer/user) defaults to trusted_internal, anything else to
+    # untrusted_tool. PR-review PRR-G: the previous hardcoded
+    # trusted_internal trust-escalated signal=none legacy rows relative to an
+    # in-place migration and had no recompute path. Present with an unknown
+    # value → malformed/refused ("Unknown taint value …", issue #59 4.7 —
+    # there is deliberately no fourth rank to coerce to).
+    raw_taint = obj.get("taint")
+    if raw_taint is None:
+        taint = _default_taint_for_signal(signal)
+    elif not isinstance(raw_taint, str) or raw_taint not in ALLOWED_TAINTS:
+        raise ValueError(
+            f"field 'taint' must be one of {', '.join(ALLOWED_TAINTS)}, "
+            f"got {raw_taint!r}"
+        )
+    else:
+        taint = raw_taint
 
     if not ingestion_ts:
         ingestion_ts = now_iso()
@@ -391,6 +491,9 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
         "confidence": confidence,
         "ingestion_ts": ingestion_ts,
         "valid_from": valid_from or ingestion_ts,
+        "valid_until": valid_until,
+        "update_of": update_of,
+        "taint": taint,
         "superseded_at": superseded_at,
         "supersede_reason": supersede_reason,
         "merged_from": merged_from,
@@ -429,6 +532,9 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
     confidence = obj["confidence"]
     ingestion_ts = obj["ingestion_ts"]
     valid_from = obj["valid_from"]
+    valid_until = obj["valid_until"]
+    update_of = obj["update_of"]
+    taint = obj["taint"]
     superseded_at = obj["superseded_at"]
     supersede_reason = obj["supersede_reason"]
     merged_from = obj.get("merged_from")
@@ -516,12 +622,14 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             conn.execute(
                 """INSERT INTO memory
                    (id, namespace, type, content, tags, source_ref, source_hash,
-                    confidence, signal, valid_from, superseded_at, supersede_reason,
+                    confidence, signal, valid_from, valid_until, update_of, taint,
+                    superseded_at, supersede_reason,
                     ingestion_ts, retrieval_count, last_retrieved,
                     embedding, embedding_model, embedded_at, merged_from, content_norm)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL,?,?)""",
                 (mid, namespace, type_, content, tags, source_ref, shash,
-                 confidence, signal, valid_from, superseded_at, supersede_reason,
+                 confidence, signal, valid_from, valid_until, update_of, taint,
+                 superseded_at, supersede_reason,
                  ingestion_ts, merged_from, _normalize_content(content)),
             )
             if started_tx:
@@ -534,6 +642,20 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                                                  dedup_cache=dedup_cache)
         if existing:
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
+            # PR-review PRR-H (issue #59 review round): the surviving keeper
+            # also absorbs the INCOMING row's taint — worst-of its own and the
+            # synced row's — mirroring add_memory/update_memory. A remote
+            # untrusted row folded into a local trusted keeper must upgrade
+            # the keeper, not vanish.
+            ex_row = conn.execute(
+                "SELECT taint FROM memory WHERE id=?", (existing["id"],)
+            ).fetchone()
+            ex_base = (ex_row["taint"] if ex_row and ex_row["taint"]
+                       else "trusted_internal")
+            conn.execute(
+                "UPDATE memory SET taint=? WHERE id=?",
+                (worse_taint(ex_base, taint), existing["id"]),
+            )
             if started_tx:
                 _commit(conn)
             return "deduped"
@@ -549,12 +671,14 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         conn.execute(
             """INSERT INTO memory
                (id, namespace, type, content, tags, source_ref, source_hash,
-                confidence, signal, valid_from, superseded_at, ingestion_ts,
+                confidence, signal, valid_from, valid_until, update_of, taint,
+                superseded_at, ingestion_ts,
                 retrieval_count, last_retrieved, embedding, embedding_model, embedded_at,
                 merged_from, content_norm)
-               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?,?,?)""",
             (mid, namespace, type_, content, tags, source_ref, shash,
-             confidence, signal, valid_from, ingestion_ts, emb, emb_model, embedded_at,
+             confidence, signal, valid_from, valid_until, update_of, taint,
+             ingestion_ts, emb, emb_model, embedded_at,
              merged_from, _normalize_content(content)),
         )
         if emb is not None:
