@@ -18,7 +18,8 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
-from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _format_recency, _parse_iso_to_epoch, now_iso
+from storelib.entity import entities_for_memory, entities_for_memories, entity_match_ids
+from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, now_iso
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from schema_meta import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
 
@@ -32,6 +33,14 @@ W_POPULARITY = 0.10
 # Recency half-life: a memory from RECENCY_HALF_LIFE_DAYS ago contributes half.
 
 RECENCY_HALF_LIFE_DAYS = 90
+
+# v10 (issue #60, 5.5): MMR diversity knob. Lambda trades relevance against
+# diversity: 1.0 = pure composite-score order (diversity off), 0.7 = default.
+# Env-overridable via ZMEM_MMR_LAMBDA; the recall CLI exposes --no-mmr for a
+# per-call opt-out. Registered in storelib._refresh_env_state so a reload
+# with a different env re-derives it (per-load env contract, issue #57).
+MMR_LAMBDA_DEFAULT = 0.7
+MMR_LAMBDA = _env_float("ZMEM_MMR_LAMBDA", MMR_LAMBDA_DEFAULT)
 
 
 
@@ -138,18 +147,150 @@ def _vec_knn_in_namespace(
     return _helper(conn, embedding, namespaces=namespaces, k=k,
                    overfetch=overfetch, k_cap=k_cap)
 
-def _rrf_fuse(bm25_ids: list[str], vec_ids: list[str], k: int = 60) -> list[str]:
+def _rrf_fuse(
+    bm25_ids: list[str],
+    vec_ids: list[str],
+    entity_ids: list[str] | None = None,
+    k: int = 60,
+) -> list[str]:
     """Reciprocal Rank Fusion: combine ranked lists by 1/(k+rank).
 
     Returns a fused list of memory_ids ordered by combined RRF score.
     k=60 is the industry-standard smoothing constant (Elasticsearch, Azure).
+
+    v10 (issue #60, 5.3): ``entity_ids`` is the optional THIRD ranked list —
+    memory_ids matched via the entity/alias lane. The fusion is per-id
+    ADDITIVE (a memory in several lists accumulates each list's
+    1/(k+rank) contribution) — do not "fix" that; it is the property that
+    makes cross-lane agreement float rows up.
     """
     scores: dict[str, float] = {}
     for rank, mid in enumerate(bm25_ids, 1):
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
     for rank, mid in enumerate(vec_ids, 1):
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+    for rank, mid in enumerate(entity_ids or [], 1):
+        scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
     return sorted(scores, key=scores.get, reverse=True)
+
+
+def _cosine_blob(a: bytes | None, b: bytes | None) -> float | None:
+    """Cosine similarity of two embedding BLOBs, or None when unusable.
+
+    Unpack format mirrors the writer exactly: embeddings.py packs with
+    ``struct.pack(f"{_MODEL_DIM}f", ...)`` (native float32), so this unpacks
+    with the same ``f"{n}f"`` format — a hard-coded endian prefix would
+    silently mis-read on a big-endian host and produce ~0 similarities.
+    Pure stdlib (no numpy): the model-absent CI matrix must not grow a numpy
+    dependency just for MMR, and the candidate pool is small (tens of rows).
+    """
+    if not a or not b or len(a) != len(b) or len(a) % 4:
+        return None
+    n = len(a) // 4
+    try:
+        va = struct.unpack(f"{n}f", a)
+        vb = struct.unpack(f"{n}f", b)
+    except struct.error:
+        return None
+    dot = na = nb = 0.0
+    for x, y in zip(va, vb):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return max(-1.0, min(1.0, dot / ((na * nb) ** 0.5)))
+
+
+def _jaccard_norm(cn_a: str | None, cn_b: str | None) -> float:
+    """Jaccard similarity of two content_norm token sets (model-absent path).
+
+    Empty token sets (blank content) are 0-similar, never an error.
+    """
+    sa = set((cn_a or "").split())
+    sb = set((cn_b or "").split())
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def _fetch_embeddings_for_ids(
+    conn: sqlite3.Connection, ids: list[str]
+) -> dict[str, bytes | None]:
+    """Embedding BLOBs for the MMR candidate set, keyed by memory id.
+
+    Fetched SEPARATELY from the lane SELECTs on purpose: the ``embedding``
+    column only exists after the v3 migration ALTERs the table, and the recall
+    lanes' SQL must keep working against any store the tests (or a partially
+    initialized box) can present — an unconditional column in the lane SELECT
+    would turn "no such column" into silently-empty FTS rows. Here the same
+    gap degrades MMR to the Jaccard path instead, which is exactly the
+    model-absent behavior. Never raises.
+    """
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
+    try:
+        rows = conn.execute(
+            f"SELECT id, embedding FROM memory WHERE id IN ({ph})", list(ids)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {r["id"]: r["embedding"] for r in rows}
+
+
+def _mmr_order(
+    scored: list[tuple[float, dict]],
+    limit: int,
+    lam: float,
+    norm_map: dict[str, str],
+    emb_map: dict[str, bytes | None],
+) -> list[tuple[float, dict]]:
+    """Maximal Marginal Relevance re-order of an already score-sorted tier
+    (issue #60, 5.5).
+
+    Greedy MMR over the WHOLE candidate pool, before the caller applies
+    ``--limit``: the first pick is the top-scored row; each next pick
+    maximizes ``lambda*relevance - (1-lambda)*max_similarity_to_selected``.
+    Relevance is the composite score normalized by the pool max so the trade-
+    off against similarity (0..1) is scale-free. At lambda=1.0 the selection
+    degenerates to pure score order — equal to no diversity, as the issue
+    requires.
+
+    Similarity between two rows: embedding cosine when BOTH have embeddings
+    (``emb_map``), else Jaccard on ``content_norm`` tokens (``norm_map``;
+    NULL content_norm — only possible on an un-migrated legacy store — falls
+    back to normalizing the row's content on the fly). Model-absent stores
+    have no embeddings at all, so the Jaccard path is the CI-verified default.
+    """
+    lam = min(max(lam, 0.0), 1.0)
+    if not scored or limit <= 0:
+        return []
+    max_score = scored[0][0]
+    denom = max_score if max_score > 0 else 1.0
+    rel = {item["id"]: score / denom for score, item in scored}
+
+    def _row_sim(a: dict, b: dict) -> float:
+        cos = _cosine_blob(emb_map.get(a["id"]), emb_map.get(b["id"]))
+        if cos is not None:
+            return max(0.0, cos)
+        cn_a = norm_map.get(a["id"]) or _normalize_content(a.get("content") or "")
+        cn_b = norm_map.get(b["id"]) or _normalize_content(b.get("content") or "")
+        return _jaccard_norm(cn_a, cn_b)
+
+    selected: list[tuple[float, dict]] = [scored[0]]
+    candidates = scored[1:]
+    while candidates and len(selected) < limit:
+        best_i = 0
+        best_val = None
+        for i, (_score, item) in enumerate(candidates):
+            diversity = max(_row_sim(item, sel) for _s, sel in selected)
+            val = lam * rel[item["id"]] - (1.0 - lam) * diversity
+            if best_val is None or val > best_val:
+                best_val = val
+                best_i = i
+        selected.append(candidates.pop(best_i))
+    return selected
 
 def _ns_migration_map(conn: sqlite3.Connection) -> dict:
     """The {old_namespace: new_namespace} map recorded by the v5 migration
@@ -217,6 +358,7 @@ def _fetch_by_ids(
                source_hash, confidence, signal, valid_from,
                ingestion_ts, retrieval_count, surfaced_count, last_retrieved,
                valid_until, update_of, taint,
+               content_norm,
                NULL AS fts_rank
         FROM memory
         WHERE id IN ({placeholders})
@@ -267,6 +409,7 @@ def _recall_one_tier(
     hybrid: bool,
     now_epoch: float,
     as_of: str | None = None,
+    mmr: bool = True,
 ) -> list[tuple[float, dict]]:
     """FTS5 + composite scoring for ONE namespace set (a single recall tier).
 
@@ -320,6 +463,7 @@ def _recall_one_tier(
                    m.source_hash, m.confidence, m.signal, m.valid_from,
                    m.ingestion_ts, m.retrieval_count, m.surfaced_count, m.last_retrieved,
                    m.valid_until, m.update_of, m.taint,
+                   m.content_norm,
                    rank AS fts_rank
             FROM memory_fts f
             JOIN memory m ON m.rowid = f.rowid
@@ -336,17 +480,23 @@ def _recall_one_tier(
         except sqlite3.OperationalError:
             rows = []
 
-    # --- Hybrid RRF fusion: if enabled and embeddings available, also query
-    # the vector store and fuse ranks via Reciprocal Rank Fusion (k=60). ---
+    # --- Hybrid + entity RRF fusion ---
     vec_sim_map: dict[str, float] = {}  # memory_id -> cosine similarity (for hybrid scoring)
     fts_rank_map: dict[str, float] = {}  # memory_id -> FTS5 rank (preserved across fusion)
+    # v10 (issue #60, 5.3): the entity/alias lane runs whenever there are
+    # query terms — a deterministic alias lookup that needs NO model, so the
+    # third RRF list is live by default on model-absent stores too. Unknown
+    # alias ⇒ empty list ⇒ the other lanes fuse exactly as before.
+    entity_ids: list[str] = []
+    entity_rel_map: dict[str, float] = {}  # memory_id -> matched/total entities
+    if terms:
+        entity_ids, entity_rel_map = entity_match_ids(
+            conn, query, ns_list=ns_list, as_of=as_of, limit=limit,
+        )
+    vec_ids: list[str] = []
     if hybrid and _embeddings and _embeddings.is_available() and terms:
         query_emb = _embeddings.embed_text(query)
         if query_emb is not None:
-            # Preserve FTS ranks before rows are replaced by _fetch_by_ids.
-            for r in rows:
-                if r["fts_rank"] is not None:
-                    fts_rank_map[r["id"]] = r["fts_rank"]
             # Get vec results WITH distances for the similarity map. Issue
             # #58 3.3: over-fetch is bounded at K=15 (max(15, limit+10)) so
             # each candidate list over-fetches to K=15 before RRF — matches
@@ -383,22 +533,30 @@ def _recall_one_tier(
                 vec_ids = [mid for mid in vec_ids if mid in keep_ids]
             for mid, dist in knn:
                 vec_sim_map[mid] = max(0.0, 1.0 - dist)
-            if vec_ids:
-                fts_ids = [r["id"] for r in rows]
-                fused_ids = _rrf_fuse(fts_ids, vec_ids, k=60)
-                # Re-fetch full rows for the fused set (may include IDs not in
-                # the FTS results — these are semantic matches BM25 missed).
-                # The namespace filter is this tier's own ns_list (the same set
-                # used for the FTS filter). vec KNN is namespace-agnostic, so a
-                # fused id that lives outside this tier is dropped here — that is
-                # correct: it is found by ITS OWN tier's run (recall_memory runs
-                # the global tier separately when --include-global is on). This
-                # keeps the per-tier-budget / hard-floor contract unconditional.
-                # (Final-critic F1.)
-                rows = _fetch_by_ids(conn, fused_ids, ns_list, floor, as_of=as_of)
+    if vec_ids or entity_ids:
+        # Fuse whenever ANY lane beyond FTS produced ids (v10: that includes
+        # the entity lane alone — the model-absent default). Preserve FTS
+        # ranks BEFORE rows are replaced by the re-fetch, then re-fetch the
+        # fused set. The namespace filter is this tier's own ns_list (the
+        # same set used for the FTS filter). Vec KNN / entity matching are
+        # namespace-agnostic, so a fused id that lives outside this tier is
+        # dropped here — that is correct: it is found by ITS OWN tier's run
+        # (recall_memory runs the global tier separately when
+        # --include-global is on). This keeps the per-tier-budget /
+        # hard-floor contract unconditional. (Final-critic F1.)
+        for r in rows:
+            if r["fts_rank"] is not None:
+                fts_rank_map[r["id"]] = r["fts_rank"]
+        fts_ids = [r["id"] for r in rows]
+        fused_ids = _rrf_fuse(fts_ids, vec_ids, entity_ids, k=60)
+        rows = _fetch_by_ids(conn, fused_ids, ns_list, floor, as_of=as_of)
 
     # Re-rank by composite score (relevance + confidence + recency + popularity).
     scored: list[tuple[float, dict]] = []
+    # v10 (issue #60, 5.5): per-candidate content_norm for MMR's Jaccard
+    # fallback, keyed by memory id. Stays OFF the output dicts (built
+    # key-by-key below) so it can never leak into JSON.
+    norm_map: dict[str, str] = {}
     for r in rows:
         conf = r["confidence"]
         stale_note = ""
@@ -416,7 +574,14 @@ def _recall_one_tier(
         if fts_r is None and r["id"] in fts_rank_map:
             fts_r = fts_rank_map[r["id"]]  # restore rank lost during fusion re-fetch
         vsim = vec_sim_map.get(r["id"]) if fts_r is None else None
+        # v10 (issue #60, 5.3): an ENTITY-only match carries neither an FTS
+        # rank nor a vec similarity — use the entity relevance proxy
+        # (matched query entities / total matched entities) so the row's
+        # composite score is comparable instead of relevance-less.
+        if fts_r is None and vsim is None:
+            vsim = entity_rel_map.get(r["id"])
         score = compute_score(row_fields, fts_r, now_epoch, vec_sim=vsim)
+        norm_map[r["id"]] = r["content_norm"] or ""
         scored.append((score, {
             "id": r["id"],
             "namespace": r["namespace"],
@@ -438,6 +603,18 @@ def _recall_one_tier(
 
     # Sort by composite score descending within this tier, take top `limit`.
     scored.sort(key=lambda x: x[0], reverse=True)
+    # v10 (issue #60, 5.5): MMR diversity on the candidate set BEFORE the
+    # limit, per tier. Ordering vs the other emit-time passes: MMR runs here
+    # (inside the tier, before merge/filters); classify_injection and the
+    # no_bump injection/untrusted_web filter run later in recall_memory on
+    # the post-limit set — the same rows-in/rows-out counts as before MMR
+    # existed, so filter semantics are unchanged. lambda=1.0 degenerates to
+    # the pure score order above (equal to --no-mmr).
+    if mmr and limit > 1 and len(scored) > 1:
+        emb_map = _fetch_embeddings_for_ids(
+            conn, [item["id"] for _score, item in scored]
+        )
+        scored = _mmr_order(scored, limit, MMR_LAMBDA, norm_map, emb_map)
     return scored[:limit]
 
 def _merge_tiers(
@@ -534,6 +711,16 @@ def _format_fenced_recall(rows: list[dict], header: str) -> str:
             lines.append(f"    source_ref: {r['source_ref']}")
         if r.get("tags"):
             lines.append(f"    tags: {r['tags']}")
+        # v10 (issue #60, 5.4): at most THREE entity NAMES per row (never
+        # ids) so the injected surface stays attribution-light. Rows without
+        # entities (e.g. every `recent` row) omit the line entirely.
+        _ents = r.get("entities") or []
+        if _ents:
+            lines.append(
+                "    entities: " + ", ".join(
+                    e.get("name", "?") for e in _ents[:3]
+                )
+            )
     lines.append(ZMEM_FENCE_CLOSE)
     return "\n".join(lines)
 
@@ -592,6 +779,7 @@ def recall_memory(
     include_global: bool = False,
     global_limit: int = 3,
     as_of: str | None = None,
+    no_mmr: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -667,7 +855,7 @@ def recall_memory(
     project_scored = _recall_one_tier(
         conn, query=query, ns_list=ns_list, limit=limit,
         min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-        as_of=as_of,
+        as_of=as_of, mmr=not no_mmr,
     )
 
     global_scored: list[tuple[float, dict]] = []
@@ -675,7 +863,7 @@ def recall_memory(
         global_scored = _recall_one_tier(
             conn, query=query, ns_list=global_ns_list, limit=global_limit,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-            as_of=as_of,
+            as_of=as_of, mmr=not no_mmr,
         )
 
     # Issue #58, 3.4: at emit time, re-classify each row for
@@ -709,6 +897,16 @@ def recall_memory(
             r for r in results
             if not r.get("prompt_injection_risk") and r.get("taint") != "untrusted_web"
         ]
+
+    # v10 (issue #60, 5.4): entity cards on every recall row (JSON gains
+    # `entities: [{id, kind, name}]`; the fenced text render shows at most
+    # THREE names per row, never ids). Attached AFTER the filters so dropped
+    # rows cost no lookups; `recent` rows never carry the key and the fence
+    # renderer omits the line for them.
+    if results:
+        cards = entities_for_memories(conn, [r["id"] for r in results])
+        for r in results:
+            r["entities"] = cards.get(r["id"], [])
 
     if results:
         ids = [r["id"] for r in results]
@@ -1000,6 +1198,9 @@ def get_memory(conn, mid) -> bool:
         return False
     d = {k: (f"<{len(v)}-byte blob>" if isinstance(v, bytes) else v)
          for k, v in dict(r).items()}
+    # v10 (issue #60): the memory's entity links ride along on the get
+    # surface — [{id, kind, name}] from memory_entity, canonical-name order.
+    d["entities"] = entities_for_memory(conn, mid)
     print(json.dumps(d, indent=2))
     return True
 

@@ -561,8 +561,9 @@ class MigrationTest(unittest.TestCase):
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
-        # migrate() walks to the CURRENT supported version (now 9 after #59).
-        self.assertEqual(sv, "9")
+        # migrate() walks to the CURRENT supported version (v10 after #60;
+        # asserted dynamically from the shipped constant).
+        self.assertEqual(sv, str(mod.SUPPORTED_SCHEMA_VERSION))
         self.assertIn("merged_from", cols)
         self.assertIn("surfaced_count", cols)
         self.assertIn("last_surfaced", cols)
@@ -578,8 +579,8 @@ class MigrationTest(unittest.TestCase):
         mod.migrate(conn)  # third time
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        # Idempotent: re-migrate stays at the current version (now 9).
-        self.assertEqual(sv, "9")
+        # Idempotent: re-migrate stays at the current version.
+        self.assertEqual(sv, str(mod.SUPPORTED_SCHEMA_VERSION))
         conn.close()
 
     def test_v6_to_v7_populated_migration_preserves_rows(self):
@@ -603,12 +604,12 @@ class MigrationTest(unittest.TestCase):
                     "retrieval_count, superseded_at, ingestion_ts FROM memory "
                     "ORDER BY id")
         before = [tuple(r) for r in conn.execute(cols_sel)]
-        # Upgrade — migrate() walks to the CURRENT version (v9 after #59),
+        # Upgrade — migrate() walks to the CURRENT version (v10 after #60),
         # passing through the v7 block (re-adding surfaced_count/last_surfaced).
         mod.migrate(conn)
         sv = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        self.assertEqual(sv, "9")
+        self.assertEqual(sv, str(mod.SUPPORTED_SCHEMA_VERSION))
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
         self.assertIn("surfaced_count", cols)
         self.assertIn("last_surfaced", cols)

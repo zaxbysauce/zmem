@@ -615,6 +615,38 @@ def init_db(conn: sqlite3.Connection) -> None:
             value TEXT NOT NULL
         );
         INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');
+
+        -- v10 (issue #60, 5.1): entity identity. entity_alias.alias_norm is
+        -- GLOBALLY unique — one alias resolves to exactly one entity, so a
+        -- paraphrase re-add links to the same entity ids. memory_entity rows
+        -- are derived data (see storelib/entity.py): re-derived in the same
+        -- transaction by every site that inserts a memory or changes its
+        -- content/tags/namespace. The UNIQUE constraints below double as the
+        -- lookup indexes; the two extra indexes cover the reverse direction
+        -- (entity_id → aliases / links) used by entity-list and recall.
+        CREATE TABLE IF NOT EXISTS entity (
+            id             TEXT PRIMARY KEY,
+            kind           TEXT NOT NULL
+                CHECK (kind IN ('person','project','tool','preference','other')),
+            canonical_name TEXT NOT NULL,
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS entity_alias (
+            entity_id  TEXT NOT NULL,
+            alias_norm TEXT NOT NULL,
+            UNIQUE(alias_norm)
+        );
+        CREATE INDEX IF NOT EXISTS idx_entity_alias_entity
+            ON entity_alias(entity_id);
+        CREATE TABLE IF NOT EXISTS memory_entity (
+            memory_id TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            role      TEXT NOT NULL DEFAULT 'mentions',
+            UNIQUE(memory_id, entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_entity_entity
+            ON memory_entity(entity_id);
         """
     )
     # executescript() does not accept parameter binding, so set created_at separately.
@@ -731,6 +763,27 @@ def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces) -> dict[str, str
                 "UPDATE memory SET namespace=? WHERE namespace=?",
                 (new_ns, old_ns),
             )
+            # v10 (issue #60): the namespace suffix is an entity-extraction
+            # input, so every moved row's links are re-derived from its NEW
+            # namespace in the same uncommitted batch. Covers both callers —
+            # the one-time v5 walk (whose rows the v10 backfill would also
+            # cover, but this keeps the invariant local) and the
+            # every-migrate() retry pass, which runs AFTER the v10 block and
+            # would otherwise strand stale links. GUARD: on a legacy pre-v10
+            # store walking the versions, this code runs BEFORE the v10 block
+            # creates the entity tables — skip then (the v10 backfill derives
+            # those rows' links with their final namespace). Local import:
+            # entity.py imports this module.
+            has_entities = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='memory_entity'"
+            ).fetchone()
+            if has_entities:
+                from storelib.entity import relink_memory
+                for rid in [r[0] for r in conn.execute(
+                    "SELECT id FROM memory WHERE namespace=?", (new_ns,)
+                ).fetchall()]:
+                    relink_memory(conn, rid)
     return mapping
 
 def _record_ns_migration(
@@ -1031,6 +1084,52 @@ def migrate(conn: sqlite3.Connection) -> None:
             "ON memory(namespace, valid_from, valid_until)"
         )
         conn.execute("UPDATE meta SET value='9' WHERE key='schema_version'")
+        conn.commit()
+
+    if ver < 10:
+        # v10 (issue #60): entity identity tables + backfill. Same idempotent
+        # pattern as v6/v7/v8/v9: init_db() already creates these tables on a
+        # fresh store (CREATE TABLE IF NOT EXISTS here is a no-op there); on a
+        # legacy pre-v10 store this block is the one that creates them. The
+        # backfill then re-runs the deterministic extractor over EVERY memory
+        # row — tombstoned rows included, because --as-of recall reaches
+        # historical rows through the entity lane's temporal predicate, so
+        # history must carry its links. Without the backfill every migrated
+        # store would have a permanently empty entity table and the third RRF
+        # lane would be dead on arrival — the exact "unused table" the issue
+        # forbids. Memory rows themselves are never touched (lossless).
+        # Version bump AFTER the backfill (v8 pattern): a crash mid-backfill
+        # re-runs it on next open, and INSERT OR IGNORE links make the re-run
+        # an exact no-op. The extractor import is local because entity.py
+        # imports this module (no import cycle at runtime).
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS entity (
+                id             TEXT PRIMARY KEY,
+                kind           TEXT NOT NULL
+                    CHECK (kind IN ('person','project','tool','preference','other')),
+                canonical_name TEXT NOT NULL,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entity_alias (
+                entity_id  TEXT NOT NULL,
+                alias_norm TEXT NOT NULL,
+                UNIQUE(alias_norm)
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_alias_entity
+                ON entity_alias(entity_id);
+            CREATE TABLE IF NOT EXISTS memory_entity (
+                memory_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                role      TEXT NOT NULL DEFAULT 'mentions',
+                UNIQUE(memory_id, entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_entity_entity
+                ON memory_entity(entity_id);
+        """)
+        from storelib.entity import backfill_entities
+        backfill_entities(conn)
+        conn.execute("UPDATE meta SET value='10' WHERE key='schema_version'")
         conn.commit()
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to

@@ -124,7 +124,9 @@ class ContentNormDedupTests(unittest.TestCase):
     def test_legacy_v7_store_is_migrated_with_backfill(self):
         """A real store regressed to v7 (content_norm NULLed, schema_version=7)
         is migrated back to the current version: all rows backfilled with correct
-        content_norm and schema_version bumped to the supported version (now 9)."""
+        content_norm and schema_version bumped to the supported version (v10 as
+        of issue #60; asserted dynamically from schema_meta so the next schema
+        bump does not need to touch this test)."""
         self._regress_to_v7(3)
         # Re-run any store.py command — migrate() runs as part of connect().
         r = self._run("stats")
@@ -135,7 +137,16 @@ class ContentNormDedupTests(unittest.TestCase):
             ver = c.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()[0]
-            self.assertEqual(ver, "9", "schema_version must bump to 9 after migrate")
+            import importlib.util
+            _meta_spec = importlib.util.spec_from_file_location(
+                "zmem_schema_meta", SCRIPTS_DIR / "schema_meta.py"
+            )
+            _meta = importlib.util.module_from_spec(_meta_spec)
+            _meta_spec.loader.exec_module(_meta)
+            self.assertEqual(
+                ver, str(_meta.SUPPORTED_SCHEMA_VERSION),
+                "schema_version must bump to the supported version after migrate",
+            )
             # Every row backfilled with the correct normalized form.
             for row in c.execute("SELECT content, content_norm FROM memory"):
                 self.assertIsNotNone(row["content_norm"],

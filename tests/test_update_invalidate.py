@@ -53,6 +53,9 @@ PYTHON = sys.executable
 # Only used by the in-process cap-boundary test (
 # test_update_oversize_content_exits_1); harmless to expose at import.
 sys.path.insert(0, str(SCRIPTS_DIR))
+# The shipped schema-version constant (dependency-free module on the inserted
+# path) so version ratchets assert the CURRENT version, not a hard-coded one.
+from schema_meta import SUPPORTED_SCHEMA_VERSION  # noqa: E402
 
 
 class Store:
@@ -660,7 +663,9 @@ class V9MigrationAndSupersedeTest(_StoreCase):
         try:
             ver = c.execute(
                 "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-            self.assertEqual(ver, "9", "migrate must land on the supported version")
+            self.assertEqual(
+                ver, str(SUPPORTED_SCHEMA_VERSION),
+                "migrate must land on the supported version")
             cols = {rr["name"] for rr in c.execute("PRAGMA table_info(memory)")}
             for col in ("valid_until", "update_of", "taint"):
                 self.assertIn(col, cols, f"migration did not re-add {col}")
@@ -693,7 +698,7 @@ class V9MigrationAndSupersedeTest(_StoreCase):
         try:
             ver = c.execute(
                 "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-            self.assertEqual(ver, "9")
+            self.assertEqual(ver, str(SUPPORTED_SCHEMA_VERSION))
         finally:
             c.close()
 

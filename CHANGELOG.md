@@ -12,6 +12,87 @@ README.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-24
+
+### Added
+
+- **Schema v10: entity identity, third RRF signal, MMR diversity** (issue
+  [#60], SOTA PR 5/10). All seven mandatory tasks shipped, with no stubs and
+  no unwired code:
+  - Three new tables — `entity(id, kind, canonical_name, created_at,
+    updated_at)` with kinds person/project/tool/preference/other,
+    `entity_alias(entity_id, alias_norm)` with a GLOBAL `UNIQUE(alias_norm)`,
+    and `memory_entity(memory_id, entity_id, role)` with
+    `UNIQUE(memory_id, entity_id)`. The v9→v10 migration is lossless for
+    memory rows and BACKFILLS entities for every existing row (tombstoned
+    rows included — `--as-of` recall reaches history through the entity
+    lane). New module `storelib/entity.py` is the single owner of the logic.
+  - **Deterministic entity extractor on write** (no LLM, no model download,
+    no `ZMEM_ENTITY_LLM` knob by design): explicit `entity:Name` /
+    `entity:<kind>:Name` tags, the `project:<suffix>` namespace suffix,
+    `--tags` tokens (`kind:Name` or plain), backtick-quoted spans in content
+    (kind `tool`), and CamelCase identifiers of 2+ humps (kind `other`).
+    Stopwords (`the`, `and`, `use`, …) and path/URL-shaped tokens never
+    become entities; `person` entities are only ever minted by an explicit
+    `entity:person:` tag. Alias normalization reuses the exact
+    `content_norm` function; a paraphrase re-add links to the SAME entity
+    ids (alias-first upsert, first-seen kind wins). Runs inside the write
+    transaction at every insert site (add, update, both ingest-jsonl paths)
+    and re-derives at every mutation site that changes content/tags/
+    namespace (dedup tag-union merges, consolidate absorb, both namespace
+    re-key paths).
+  - **Entity matching as the third RRF list** at recall: the query runs
+    through the same extractor, and plain query tokens are matched
+    read-only against stored aliases. Matched memories join
+    `_rrf_fuse` as a third ranked list (rank = number of matched entities,
+    then recency) under the same namespace filter and the same `--as-of`
+    temporal predicate as the other lanes. Model-absent by design — the
+    fusion block now runs whenever ANY non-FTS lane produced ids, so the
+    entity lane is live on stores without the embedding runtime. Unknown
+    alias = empty third list; RRF stays per-id additive. Entity-only
+    matches score with a relevance proxy (matched/total query entities).
+  - **Entity cards + `entity-list`**: recall `--json` rows gain
+    `entities: [{id, kind, name}]`; the fenced hook render shows at most
+    THREE names per row (never ids) — Hermes prefetch render matches; MCP
+    tools pass the JSON through. `get --id` shows the row's links.
+    `store.py entity-list [--kind] [--json]` is the documented inspection
+    surface for humans and doctor.
+  - **MMR diversity after RRF** (issue 5.5): each recall tier re-orders its
+    candidate set with Maximal Marginal Relevance before `--limit` — near
+    paraphrases stop crowding out distinct facts. Similarity: embedding
+    cosine when both rows have embeddings (pure-stdlib unpack mirroring the
+    writer's `struct.pack` format), else Jaccard on `content_norm` tokens.
+    Lambda default 0.7, env `ZMEM_MMR_LAMBDA` (1.0 == no diversity),
+    `--no-mmr` opt-out on `recall`; `search` inherits MMR through the
+    shared recall path.
+  - **`store.py entity-merge --from ID --to ID [--confirm]`**: manual
+    reconciliation of duplicate entities. Dry-run by default (plan printed,
+    nothing written); with `--confirm` aliases and memory links move to the
+    target in one transaction (collisions counted, never overwritten) and
+    the source entity is deleted. Refuses unknown ids, `--from == --to`,
+    and kind mismatches. Nothing auto-merges entities of any kind, ever.
+  - **JSONL sync decision** (documented + tested): entity links are NOT
+    carried in export-jsonl — they are store-local derived data like
+    embeddings and content_norm; `ingest-jsonl` REBUILDS them by running the
+    same deterministic extractor, so two stores ingesting the same rows
+    derive the same entities with no cross-store id collisions.
+  - Doctor gained an `entity-tables` check (presence + non-vacuous counts);
+    CUTOVER.md and SKILL.md updated (schema v10, three-signal retrieval
+    rewrite, entity-list/entity-merge sections).
+
+### Tests
+
+- New `tests/test_entity.py` (schema/UNIQUE constraints, migration backfill,
+  extractor acceptance + negatives, third-list recall incl. alias-after-merge
+  and `--as-of`, cards/fence caps, entity-list, entity-merge, mutation-site
+  re-derivation, two-store JSONL rebuild parity) and `tests/test_mmr.py`
+  (crowding acceptance, `--no-mmr`, lambda semantics, env parsing, Jaccard
+  model-absent path, known-bytes cosine). `test_jsonl_sync.py`,
+  `test_schema_version.py`, `test_doc_drift.py`, `test_storelib_exports.py`,
+  and `test_store_characterization.py` extended for the new surface.
+
+[#60]: https://github.com/zaxbysauce/zmem/issues/60
+
 ## [0.9.0] — 2026-08-24
 
 ### Added

@@ -619,10 +619,23 @@ class ZmemMemoryProvider(MemoryProvider):
             conf = item.get("confidence")
             sig = item.get("signal", "?")
             sref = (item.get("source_ref") or "").strip()
+            # v10 (issue #60, 5.4): entity cards — at most THREE names per
+            # row (never ids), mirroring storelib's fence render so both hook
+            # surfaces carry the same attribution. Rows without entities
+            # (older stores pre-migration, `recent` rows) omit the note.
+            ents = item.get("entities") or []
+            ent_note = ""
+            if isinstance(ents, list) and ents:
+                names = [
+                    e.get("name", "?") for e in ents[:3]
+                    if isinstance(e, dict)
+                ]
+                if names:
+                    ent_note = f" entities={','.join(names)}"
             tag = f"[{mtype}" + (f" conf={conf}" if conf is not None else "") + "] "
             entry = f"- {tag}{content}"
             lines.append(entry)
-            lines.append(f"  id={mid} signal={sig}" + (f" source_ref={sref}" if sref else ""))
+            lines.append(f"  id={mid} signal={sig}" + (f" source_ref={sref}" if sref else "") + ent_note)
         if not lines:
             return ""
         # PRR-027 fix (issue #58 3.5): prefetch inlines untrusted retrieved
