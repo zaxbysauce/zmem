@@ -16,11 +16,13 @@ workflow runs on every push to main:
      release violation, not a warning).
   3. Fail loudly if the CHANGELOG has no `## [X.Y.Z]` section matching the
      manifest version (no naked version bumps).
-  4. If tag `vX.Y.Z` already exists → already released; skip (idempotent).
-  5. Otherwise emit `should_release=true` plus the extracted CHANGELOG notes
-     so the workflow can cut the tag + GitHub Release at the MAIN commit
-     that carries the version (never a PR-branch head — squash merges orphan
-     branch-head tags).
+  4. Emit the resolved version, the release title, and the extracted
+     CHANGELOG notes so the workflow can publish the tag + GitHub Release
+     at the MAIN commit that carries the version (never a PR-branch head —
+     squash merges orphan branch-head tags). Tag existence is reported
+     informationally only; publish idempotency is RELEASE existence, checked
+     by the workflow's `gh release view` step (a bare tag without a release
+     heals on the next merge).
 
 Exit codes: 0 gate passed (release OR skip), 1 contract violation.
 Network-free: only `git ls-files` / `git rev-parse` against the local clone.
