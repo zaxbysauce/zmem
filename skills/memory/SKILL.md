@@ -585,8 +585,10 @@ through the same deterministic extractor used at write time, and plain query
 tokens are additionally matched against stored entity aliases. Memories
 linked to matched entities join RRF ranked by (number of matched entities,
 recency), with the same namespace filter and the same `--as-of` temporal
-predicate as the other lanes. Works model-absent by design; an unknown alias
-contributes nothing.
+predicate as the other lanes — like the vector lane, an entity match in a
+FOREIGN namespace never leaks into the querying tier (it is found by its own
+tier's run, e.g. the global tier under `--include-global`). Works
+model-absent by design; an unknown alias contributes nothing.
 
 **MMR diversity (v10, issue #60 5.5)**: after the composite sort, and before
 `--limit`, Maximal Marginal Relevance re-orders each tier's candidates —

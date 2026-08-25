@@ -247,6 +247,26 @@ class MmrUnitTests(unittest.TestCase):
         self.assertEqual(self.mod._mmr_order([], 4, 0.7, {}, {}), [])
         self.assertEqual(self.mod._mmr_order(scored, 0, 0.7, norms, {}), [])
 
+    def test_mmr_all_zero_scores_still_seeks_diversity(self):
+        """Reviewer-round pin: when every composite score is 0 (denominator
+        guard falls back to 1.0, all rel values tie at 0.0), the greedy pick
+        reduces to maximizing -diversity — which picks the MOST diverse row
+        next, not the least. Pinned so the degenerate boundary cannot invert
+        silently."""
+        scored = [
+            (0.0, {"id": "a", "content": "alpha beta gamma"}),
+            (0.0, {"id": "b", "content": "alpha beta gamma"}),
+            (0.0, {"id": "c", "content": "alpha beta gamma"}),
+            (0.0, {"id": "d", "content": "totally different tokens"}),
+        ]
+        norms = {i["id"]: i["content"] for _s, i in scored}
+        out = self.mod._mmr_order(scored, 4, 0.7, norms, {})
+        ids = [i["id"] for _s, i in out]
+        self.assertEqual(ids[0], "a", "first pick stays the list head on ties")
+        self.assertEqual(ids[1], "d",
+                         "the distinct row must be picked before the "
+                         "redundant cluster even when all scores are zero")
+
     def test_mmr_uses_embedding_cosine_when_available(self):
         scored, norms = self._scored()
         # p1 and p2 embeddings identical; d1 orthogonal to both. With lambda

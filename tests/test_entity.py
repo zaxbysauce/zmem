@@ -158,7 +158,7 @@ class ExtractorAcceptanceTest(_Store):
             names, {"ent"},
             "stopwords must never mint entities (only the namespace suffix)",
         )
-        self.add(r"see C:\Users\Brett and /e/ZCode and `C:\Users\Brett` and https://x.io/y")
+        self.add(r"see C:\Temp\dir and /e/ZCode and `C:\Temp\dir` and https://x.io/y")
         names = {e["name"] for e in self.entity_json()}
         self.assertEqual(
             names, {"ent"},

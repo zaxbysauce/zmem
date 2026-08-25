@@ -69,6 +69,9 @@ ENTITY_STOPWORDS = frozenset({
     "who", "how", "why", "all", "any", "some", "more", "most", "other",
     "new", "old", "own", "same", "very", "just", "also", "can", "will",
     "should", "would", "must", "may", "might", "shall", "has", "have", "had",
+    # The extractor's own keyword: a bare `entity` tag token (no :Name) is
+    # syntax, not an identity.
+    "entity",
 })
 
 # CamelCase identifier: a capital-led run of humps, each hump being one
@@ -100,7 +103,8 @@ def _eligible_name(name: str) -> bool:
 
     Path-shaped tokens, URLs, stopwords, and too-short/purely-numeric runs
     are refused from EVERY source. Path-shape takes precedence over the
-    backtick rule: `` `C:\\Users\\brett` `` is a quoted PATH, not a tool.
+    backtick rule: a backtick-quoted absolute path is a quoted PATH, not a
+    tool.
     """
     name = (name or "").strip()
     if not name or _PATHISH_RE.search(name):
@@ -512,7 +516,10 @@ def cmd_entity_merge(
     link_collisions = [m for m in from_links if m in to_link_set]
 
     if not confirm:
-        print("[zmem] entity-merge DRY RUN (no writes — pass --confirm to apply)")
+        # NOTE: runtime prints stay ASCII-only (unlike docstrings): stdout may
+        # be a legacy codepage console (cp1252/cp932), and an unencodable
+        # char here would crash the command after the work is done.
+        print("[zmem] entity-merge DRY RUN (no writes - pass --confirm to apply)")
         print(f"[zmem]   from: {from_id} kind={frm['kind']} name={frm['canonical_name']!r}")
         print(f"[zmem]   to:   {to_id} kind={to['kind']} name={to['canonical_name']!r}")
         print(f"[zmem]   aliases to move: {len(from_aliases) - len(alias_collisions)} "
