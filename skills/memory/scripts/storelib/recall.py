@@ -356,9 +356,31 @@ def _recall_one_tier(
             # cannot dominate same-namespace vec slots.
             knn = _vec_knn_in_namespace(
                 conn, query_emb,
-                namespaces=ns_list, k=max(15, limit + 10),
+                namespaces=ns_list,
+                # PR-review PRR-K (issue #59 review round): under --as-of the
+                # vec pool is post-filtered by the temporal predicate below
+                # (the helper itself is live-rows-only and cannot express the
+                # half-open validity interval), so over-fetch 2x to keep the
+                # surviving candidate count near the normal window — without
+                # this, future-dated live rows could crowd valid candidates
+                # out of the fixed KNN window.
+                k=(max(15, limit + 10) * 2) if as_of else max(15, limit + 10),
             )
             vec_ids = [mid for mid, _d in knn]
+            if as_of and vec_ids:
+                # Same predicate as _as_of_temporal_predicate, applied to the
+                # vec candidates BEFORE fusion so invalid-at-as_of rows cannot
+                # consume RRF slots (_fetch_by_ids would drop them later, but
+                # only after they crowded the window).
+                vph = ",".join("?" * len(vec_ids))
+                keep_ids = {
+                    r[0] for r in conn.execute(
+                        f"SELECT id FROM memory WHERE id IN ({vph}) "
+                        "AND valid_from <= ? AND (valid_until = '' OR valid_until > ?)",
+                        [*vec_ids, as_of, as_of],
+                    )
+                }
+                vec_ids = [mid for mid in vec_ids if mid in keep_ids]
             for mid, dist in knn:
                 vec_sim_map[mid] = max(0.0, 1.0 - dist)
             if vec_ids:

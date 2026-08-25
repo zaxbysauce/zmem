@@ -131,10 +131,14 @@ class SkillDocDriftTest(unittest.TestCase):
         """SKILL.md must document the append-only `update` and the
         reason-required `invalidate` commands (and the lineage/validity columns
         they write) — a later doc edit cannot silently drop the v9 write path
-        while the code and tests still ship it (test_doc_drift ratchet)."""
+        while the code and tests still ship it (test_doc_drift ratchet).
+        PR-review PRR-T: the needles are the feature-specific CLI tokens, not
+        the bare English words 'update'/'invalidate' (which match generic
+        prose anywhere and kept the ratchet green even with the whole feature
+        section deleted)."""
         text = SKILL_MD.read_text(encoding="utf-8")
-        for needle in ("update", "invalidate", "update_of", "valid_until",
-                       "append-only"):
+        for needle in ("update --id", "invalidate --id", "--reason",
+                       "update_of", "valid_until", "append-only"):
             self.assertIn(needle, text,
                           f"SKILL.md must document {needle} (issue #59 write path)")
 

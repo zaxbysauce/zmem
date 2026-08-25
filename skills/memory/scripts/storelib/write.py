@@ -670,6 +670,20 @@ def add_memory(
         if existing:
             # Merge: upgrade confidence/signal if the new add is stronger.
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
+            # PR-review PRR-A (issue #59 review round): the dedup target also
+            # absorbs the incoming taint — worst-of its own and the add's —
+            # exactly like update_memory's dedup fold (S1). Without this, a
+            # re-observed untrusted duplicate leaves the keeper's trust
+            # silently overstated.
+            ex_row = conn.execute(
+                "SELECT taint FROM memory WHERE id=?", (existing["id"],)
+            ).fetchone()
+            ex_base = (ex_row["taint"] if ex_row and ex_row["taint"]
+                       else "trusted_internal")
+            conn.execute(
+                "UPDATE memory SET taint=? WHERE id=?",
+                (worse_taint(ex_base, taint), existing["id"]),
+            )
             if started_tx:
                 _commit(conn)
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
@@ -813,18 +827,38 @@ def supersede_memory(
     as-of T returns the row only while ``valid_until > T``. ``at`` is applied to
     BOTH columns so a remote tombstone's validity interval matches the
     originating store exactly.
+
+    PR-review PRR-B (issue #59 review round): an ALREADY-tombstoned row is
+    REFUSED, never re-tombstoned. Overwriting superseded_at/valid_until with a
+    newer now would MOVE the validity end forward (an as-of query in
+    (old_end, new_end] would resurrect a dead fact) and destroy the original
+    audit reason — a mutation of append-only history. Mirrors update_memory's
+    same-condition refusal. ingest-jsonl guards liveness itself before calling
+    (sync.py applies remote tombstones only to live local rows), so this guard
+    never blocks a legitimate sync.
     """
     started_tx = False
     try:
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
-        row = conn.execute("SELECT id FROM memory WHERE id=?", (mid,)).fetchone()
+        row = conn.execute(
+            "SELECT id, superseded_at FROM memory WHERE id=?", (mid,)
+        ).fetchone()
         if not row:
             print(f"[zmem] no memory with id {mid}", file=sys.stderr)
             if started_tx and conn.in_transaction:
                 conn.rollback()
             return False
+        if row["superseded_at"] is not None:
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise ValueError(
+                f"[zmem] memory {mid} is already superseded (at "
+                f"{row['superseded_at']}); supersede/invalidate refused — "
+                "re-tombstoning would move valid_until forward and mutate "
+                "append-only history"
+            )
         ts = at or now_iso()
         conn.execute(
             "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? WHERE id=?",
@@ -913,16 +947,11 @@ def update_memory(
     conf_eff = confidence if confidence is not None else old["confidence"]
     sig_eff = signal if signal is not None else old["signal"]
 
-    # Single content-size cap, identical to add_memory (M8b / #36 M17): an
-    # oversize update must be refused at the CLI boundary like an oversize add,
-    # not silently stored (an oversized row would then fail tier-3 export).
-    if len(content) > MAX_CONTENT_CHARS:
-        raise ContentTooLarge(
-            f"content is {len(content)} chars, over the {MAX_CONTENT_CHARS} limit"
-        )
-
     # Capture policy applies to the effective values (new content + any
-    # inherited-or-overridden tags/source_ref) exactly as add_memory does.
+    # inherited-or-overridden tags/source_ref) exactly as add_memory does —
+    # and, as in add_memory, BEFORE the size check (PR-review PRR-C): in auto
+    # mode redaction can shrink secret-laden oversized content under the cap,
+    # and update must not reject content the add path would accept.
     content_eff, source_ref_eff, tags_eff, warns = _apply_capture_policy(
         content=content,
         source_ref=source_ref_eff,
@@ -935,6 +964,15 @@ def update_memory(
         if _normalize_capture_mode(capture_mode) == "auto":
             prefix = "NOTICE (automatic capture sanitized)"
         print(f"[zmem] {prefix}: {w}", file=sys.stderr)
+
+    # Single content-size cap, identical to add_memory (M8b / #36 M17) and
+    # applied to the POST-capture content: an oversize update must be refused
+    # at the CLI boundary like an oversize add, not silently stored (an
+    # oversized row would then fail tier-3 export).
+    if len(content_eff) > MAX_CONTENT_CHARS:
+        raise ContentTooLarge(
+            f"content is {len(content_eff)} chars, over the {MAX_CONTENT_CHARS} limit"
+        )
 
     # Taint lineage (issue #59, 4.7): the new content's provenance is the WORST
     # of the caller-declared-or-derived origin and the row it replaces.

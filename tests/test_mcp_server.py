@@ -594,11 +594,11 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         in_flight = {"count": 0, "peak": 0}
         original_run_store = self.mcp_server._run_store
 
-        def counting_run_store(args):
+        def counting_run_store(args, input_text=None):
             in_flight["count"] += 1
             in_flight["peak"] = max(in_flight["peak"], in_flight["count"])
             try:
-                return original_run_store(args)
+                return original_run_store(args, input_text=input_text)
             finally:
                 in_flight["count"] -= 1
 
@@ -646,11 +646,11 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         # A blocking _run_store that waits on an event we control.
         release_event = {"go": False}
 
-        def blocking_run_store(args):
+        def blocking_run_store(args, input_text=None):
             while not release_event["go"]:
                 import time
                 time.sleep(0.01)
-            return original_run_store(args)
+            return original_run_store(args, input_text=input_text)
 
         self.mcp_server._run_store = blocking_run_store
         try:

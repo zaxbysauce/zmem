@@ -59,8 +59,11 @@ TAINT_RANK = {"trusted_internal": 0, "untrusted_tool": 1, "untrusted_web": 2}
 # closeout / grounded evidence). Any other signal (`none` — an agent's
 # self-opinion) defaults the new row to untrusted_tool. This is the single
 # store-side derivation stored in storelib/write._default_taint_for_signal —
-# the CLI, Hermes, MCP, and ingest surfaces all share it (the remote surfaces
-# additionally pass an explicit--taint when the agent wants to mark a web fetch).
+# the CLI and ingest surfaces share it directly. The REMOTE agent surfaces
+# (Hermes/MCP) deliberately do NOT: plan M5 pins their default to an explicit
+# untrusted_tool (an agent write is ungrounded self-opinion unless the caller
+# claims more), and they pass an explicit --taint only when marking e.g. a
+# web fetch (PR-review PRR-N wording fix).
 TAINT_TRUSTED_SIGNALS = frozenset({"test", "compile", "lint", "reviewer", "user"})
 
 

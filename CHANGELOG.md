@@ -47,7 +47,38 @@ README.
 
 ### Fixed
 
-- Replaced the earlier `valid_until` placeholder (“Phase 4”) with the real
+- Swarm-pr-review round (run 20260824-pr70, all findings validated + challenged):
+  - **Append-only history is write-once**: a second `invalidate`/`supersede` on
+    an already-tombstoned row is refused (exit 2) instead of moving
+    `valid_until` forward and replacing the audit reason (PRR-B).
+  - **Worst-of taint now covers every merge**: a duplicate `add` or
+    `ingest-jsonl` row that folds into an existing keeper upgrades the keeper's
+    taint (worst-of), and a legacy v8 row with absent taint derives from its
+    signal exactly like the migration backfill (PRR-A/G/H).
+  - `update` applies the capture policy BEFORE the size cap (matching `add`),
+    so auto-redacted content the add path accepts is no longer rejected
+    (PRR-C); `invalidate --reason` must be non-empty (PRR-I).
+  - `ingest-jsonl` accepts a genuine `1970-01-01T00:00:00Z` timestamp (the
+    epoch-zero/parse-failure sentinel collision) and refuses a tombstone whose
+    `valid_until` is LATER than its `superseded_at` (a row cannot outlive its
+    own tombstone; an authored earlier end stays preserved) (PRR-E/F).
+  - Hybrid `--as-of` recall temporal-filters the vector candidate pool before
+    RRF fusion (with over-fetch), so future-dated rows cannot crowd valid
+    candidates out of the fixed KNN window (PRR-K).
+  - Hermes `zmem_add`/`zmem_update` pass `--capture-mode auto` (secret
+    redaction parity with MCP) and neither remote surface returns raw
+    subprocess stderr to clients any more (stable `[zmem]` refusal lines pass
+    through a sanitizer; anything else is truncated) (PRR-L/M).
+  - `--content -` reads content from stdin on `add`/`update`, and the
+    Hermes/MCP surfaces pipe oversize payloads through it — Windows argv caps
+    far below the 65536-char content limit (PRR-P).
+  - Test-fixture truth: the characterization builder no longer stamps a past
+    `valid_until` onto LIVE rows (their "never expires" marker is `''`), and
+    the frozen hashes/comments were re-captured truthfully (PRR-Q/X); vacuous
+    ratchets tightened (Hermes wiring, dedup-fold worst-of, doc-drift needles,
+    malformed-row absence checks) (PRR-R/S/T/U/V).
+
+- Replaced the earlier `valid_until` placeholder ("Phase 4") with the real
   predicate; the `_recall_one_tier`/`_recent_one_tier`/`_fetch_by_ids`
   docstrings no longer claim a placeholder exists.
 

@@ -209,11 +209,38 @@ def _python_bin() -> str:
 
 # -- subprocess helper -------------------------------------------------------
 
-def _run_store(args: List[str]) -> Dict[str, Any]:
+# PR-review PRR-P (issue #59 review round): Windows CreateProcess argv caps
+# near 32k chars while the store's content cap is MAX_CONTENT_CHARS (65536).
+# Content longer than this threshold is piped via stdin (`--content -`)
+# instead of an argv element, so large-but-valid payloads never hit
+# WinError 206 on Windows-primary hosts.
+_ARGV_SAFE_CONTENT_CHARS = 30000
+
+
+def _sanitize_store_error(r: Dict[str, Any], limit: int = 200) -> str:
+    """PR-review PRR-M (issue #59 review round): classify + truncate a
+    store.py failure for return to a REMOTE client. Known refusals (the
+    ``[zmem] …`` stable-error lines) pass through verbatim — they ARE the
+    contract; anything else (unexpected tracebacks, argparse blobs, advisory
+    text) is collapsed and truncated so raw stderr never leaks wholesale."""
+    text = (r.get("stderr") or r.get("stdout") or "").strip()
+    if not text:
+        return "store command failed (no diagnostic)"
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    zmem = [ln for ln in lines if ln.startswith("[zmem]")]
+    chosen = " ".join(zmem if zmem else lines)
+    if len(chosen) > limit:
+        chosen = chosen[: limit - 3].rstrip() + "..."
+    return chosen
+
+
+def _run_store(args: List[str], input_text: str | None = None) -> Dict[str, Any]:
     """Run ``store.py <args>`` and return ``{ok, stdout, stderr, returncode}``.
 
     Always returns a dict (never raises) — memory must fail-open. The caller
-    decides whether a non-zero returncode is fatal.
+    decides whether a non-zero returncode is fatal. ``input_text`` (optional)
+    is piped to the child's stdin — used for oversize content (see
+    ``_ARGV_SAFE_CONTENT_CHARS``).
     """
     store_py = _resolve_store_py()
     if store_py is None:
@@ -227,6 +254,7 @@ def _run_store(args: List[str]) -> Dict[str, Any]:
     try:
         proc = subprocess.run(  # noqa: S603 — argv is constructed, not shell
             cmd,
+            input=input_text,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -666,7 +694,7 @@ class ZmemMemoryProvider(MemoryProvider):
         # (unscoped already covers every namespace, so no --include-global).
         r = _run_store(cli_args)
         if not r["ok"]:
-            return _tool_error(f"Search failed: {r['stderr'] or r['stdout'][:200]}")
+            return _tool_error(f"Search failed: {_sanitize_store_error(r)}")
         stdout = (r["stdout"] or "").strip()
         if not stdout:
             return json.dumps({"results": [], "count": 0})
@@ -744,6 +772,9 @@ class ZmemMemoryProvider(MemoryProvider):
         source_ref = (args.get("source_ref") or "").strip()
         if not source_ref and self._session_id:
             source_ref = f"session:{self._session_id}"
+        # PR-review PRR-L (issue #59 review round): Hermes writes are agent
+        # surface traffic — pass --capture-mode auto so secret-like content is
+        # redacted exactly as the MCP add path does (#36 M4 parity).
         cli_args = [
             "add",
             "--namespace", ns,
@@ -751,14 +782,23 @@ class ZmemMemoryProvider(MemoryProvider):
             "--content", content,
             "--signal", signal,
             "--taint", taint,
+            "--capture-mode", "auto",
         ]
         if tags:
             cli_args += ["--tags", tags]
         if source_ref:
             cli_args += ["--source-ref", source_ref]
-        r = _run_store(cli_args)
+        # PR-review PRR-P: pipe oversize content via stdin (`--content -`) so
+        # large-but-valid payloads never hit the Windows argv cap.
+        input_text = None
+        if len(content) > _ARGV_SAFE_CONTENT_CHARS:
+            cli_args[cli_args.index("--content") + 1] = "-"
+            input_text = content
+        r = _run_store(cli_args, input_text=input_text)
         if not r["ok"]:
-            return _tool_error(f"Add failed: {r['stderr'] or r['stdout'][:200]}")
+            # PR-review PRR-M: never echo raw store.py stderr to the remote
+            # client — pass a classified, truncated message instead.
+            return _tool_error(f"Add failed: {_sanitize_store_error(r)}")
         # store.py prints "[zmem] added memory <id> ..." to stdout on success.
         return json.dumps({"result": "stored", "raw": r["stdout"].strip()})
 
@@ -773,7 +813,7 @@ class ZmemMemoryProvider(MemoryProvider):
         r = _run_store(cli_args)
         if not r["ok"]:
             return _tool_error(
-                f"Supersede failed (id may not exist): {r['stderr'] or r['stdout'][:200]}"
+                f"Supersede failed (id may not exist): {_sanitize_store_error(r)}"
             )
         return json.dumps({"result": "superseded", "id": mid})
 
@@ -827,13 +867,21 @@ class ZmemMemoryProvider(MemoryProvider):
                 "taint must be one of: " + ", ".join(consts["ALLOWED_TAINTS"])
             )
         cli_args += ["--taint", taint]
-        r = _run_store(cli_args)
+        # PR-review PRR-L: agent-surface update redacts secrets like MCP (#36
+        # M4 parity). PR-review PRR-P: oversize content is piped via stdin.
+        cli_args += ["--capture-mode", "auto"]
+        input_text = None
+        if len(content) > _ARGV_SAFE_CONTENT_CHARS:
+            cli_args[cli_args.index("--content") + 1] = "-"
+            input_text = content
+        r = _run_store(cli_args, input_text=input_text)
         if not r["ok"]:
             # store.py update exits 2 for refused ids (unknown / already-
-            # superseded) — explain WHY instead of leaking an argparse blob.
+            # superseded) — explain WHY, sanitized (PR-review PRR-M), instead
+            # of leaking a raw argparse/stderr blob.
             return _tool_error(
                 f"Update failed (id may not exist or is already superseded): "
-                f"{r['stderr'] or r['stdout'][:200]}"
+                f"{_sanitize_store_error(r)}"
             )
         return json.dumps({"result": "updated", "raw": r["stdout"].strip()})
 
@@ -850,8 +898,13 @@ class ZmemMemoryProvider(MemoryProvider):
             )
         r = _run_store(["invalidate", "--id", mid, "--reason", reason])
         if not r["ok"]:
+            # PR-review PRR-M: sanitized diagnostic (never raw stderr). The
+            # PR-review PRR-B guard makes a second invalidate exit 2 with the
+            # stable "[zmem] … already superseded …" line, which passes
+            # through _sanitize_store_error verbatim.
             return _tool_error(
-                f"Invalidate failed (id may not exist): {r['stderr'] or r['stdout'][:200]}"
+                f"Invalidate failed (id may not exist or is already "
+                f"superseded): {_sanitize_store_error(r)}"
             )
         return json.dumps({"result": "invalidated", "id": mid})
 

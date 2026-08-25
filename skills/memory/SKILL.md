@@ -169,7 +169,14 @@ python <store.py> invalidate --id <full-uuid> --reason "<why the fact is no long
 - **`invalidate`** is `supersede` with a REQUIRED `--reason` — the preferred way to
   record "this fact is no longer true" so the correction is auditable (issue #59,
   4.3). `supersede` remains for general tombstones (consolidated/pruned rows)
-  where a reason is optional.
+  where a reason is optional. The reason must be NON-EMPTY (whitespace-only is
+  refused, exit 2), and tombstones are write-once: a second `invalidate`/
+  `supersede` on an already-tombstoned row is refused (exit 2) — re-tombstoning
+  would move `valid_until` forward and falsify point-in-time history.
+- **Large content**: `--content -` (the literal dash) reads the content from
+  stdin on both `add` and `update`. Windows caps command-line argv far below the
+  65536-char content limit, so pipe near-limit payloads instead of passing them
+  as an argument (the Hermes/MCP surfaces do this automatically).
 
 ### Provenance trust (`--taint`) — v9 (issue #59, 4.7)
 Every memory carries a **taint** rank marking the trust of its ORIGIN:
@@ -190,7 +197,9 @@ The taint default depends on the surface:
   web fetch, or `trusted_internal` for a human-grounded note).
 Taint propagates **worst-of forward through lineage**: `update` re-creation and
 `consolidate` absorb both set the surviving row's taint to the worse of the two
-merged sources (a merged row never DOWNGRADES a riskier member). A tombstone
+merged sources (a merged row never DOWNGRADES a riskier member), and a
+duplicate `add` / `ingest-jsonl` row that folds into an existing keeper applies
+the same worst-of to the keeper. A tombstone
 (`supersede`/`invalidate`) preserves the row's taint — it creates no new row.
 
 Recall surfaces the taint so trust is visible, mirroring prompt-injection-risk:

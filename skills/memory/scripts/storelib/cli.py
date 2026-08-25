@@ -69,7 +69,10 @@ def main():
     p_add = sub.add_parser("add", help="add a memory")
     p_add.add_argument("--namespace", required=True)
     p_add.add_argument("--type", required=True, choices=list(ALLOWED_TYPES))
-    p_add.add_argument("--content", required=True)
+    p_add.add_argument("--content", required=True,
+                       help="the memory text; the literal '-' reads content from "
+                            "stdin (use for payloads near the content cap — "
+                            "Windows argv caps far below MAX_CONTENT_CHARS)")
     p_add.add_argument("--tags", default="")
     p_add.add_argument("--source-ref", default="")
     p_add.add_argument("--confidence", type=float, default=None)
@@ -194,7 +197,10 @@ def main():
                     "the update returns the OLD content; after returns the NEW.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p_upd.add_argument("--id", required=True, help="id of the live memory to update")
-    p_upd.add_argument("--content", required=True, help="the new content")
+    p_upd.add_argument("--content", required=True,
+                       help="the new content; the literal '-' reads content from "
+                            "stdin (use for payloads near the content cap — "
+                            "Windows argv caps far below MAX_CONTENT_CHARS)")
     p_upd.add_argument("--namespace", default=None)
     p_upd.add_argument("--type", default=None, choices=list(ALLOWED_TYPES))
     p_upd.add_argument("--tags", default=None)
@@ -583,6 +589,14 @@ def main():
         print(STORE_PATH)
         sys.exit(0)
 
+    # PR-review PRR-P (issue #59 review round): `--content -` reads the content
+    # from stdin. Windows argv caps near 32k chars while the content cap is
+    # MAX_CONTENT_CHARS (65536), so large-but-valid content cannot always be
+    # delivered as an argv element; the Hermes/MCP surfaces pipe oversize
+    # payloads through this path instead.
+    if getattr(args, "content", None) == "-":
+        args.content = sys.stdin.read()
+
     try:
         _wait_for_maintenance_clear(args.cmd)
         conn = connect()
@@ -643,7 +657,20 @@ def main():
             # required=True on the parser, so argparse refuses missing at rc 2
             # before we get here) — the preferred "this fact is no longer true"
             # command (issue #59, 4.3). Both tombstone with valid_until=now.
-            ok = supersede_memory(conn, args.id, args.reason)
+            # PR-review PRR-I: argparse checks PRESENCE, not content — an
+            # empty/whitespace reason is refused here so the audit trail can
+            # never be blank (MCP/Hermes already strip-refuse at the boundary).
+            if not args.reason.strip():
+                print("[zmem] invalidate --reason must be non-empty — the reason "
+                      "is the audit trail", file=sys.stderr)
+                sys.exit(2)
+            try:
+                ok = supersede_memory(conn, args.id, args.reason)
+            except ValueError as exc:
+                # PR-review PRR-B: already-tombstoned rows are refused (never
+                # re-tombstoned) — a stable exit-2 refusal, not a traceback.
+                print(str(exc), file=sys.stderr)
+                sys.exit(2)
             sys.exit(0 if ok else 1)
         elif args.cmd == "update":
             try:
@@ -703,7 +730,13 @@ def main():
                           global_limit=args.global_limit, no_bump=args.no_bump,
                           hybrid=False, as_of=args.as_of)
         elif args.cmd == "supersede":
-            ok = supersede_memory(conn, args.id, args.reason)
+            try:
+                ok = supersede_memory(conn, args.id, args.reason)
+            except ValueError as exc:
+                # PR-review PRR-B: already-tombstoned rows are refused (never
+                # re-tombstoned) — a stable exit-2 refusal, not a traceback.
+                print(str(exc), file=sys.stderr)
+                sys.exit(2)
             sys.exit(0 if ok else 1)
         elif args.cmd == "get":
             sys.exit(0 if get_memory(conn, args.id) else 1)

@@ -253,13 +253,14 @@ class AsOfBehaviorTests(unittest.TestCase):
         must apply valid_until as the EXCLUSIVE end (a row is valid while
         ``valid_until > as_of``, never at equality).
 
-        Fixture: row T1 (valid_from 2026-02-01) is tagged as superseded with
+        Fixture (PR-review PRR-V label fix): row T2 (asof-row-1,
+        valid_from 2026-02-01) is tagged as superseded with
         valid_until == superseded_at == 2026-02-10. As a function of as_of:
-          - inside the window (02-05): T1 IS returned — proves the live
+          - inside the window (02-05): T2 IS returned — proves the live
             filter is dropped, not just ignored in a footnote;
-          - AT valid_until (02-10): T1 is NOT returned — the bound is
+          - AT valid_until (02-10): T2 is NOT returned — the bound is
             exclusive;
-          - after (02-11): T1 gone.
+          - after (02-11): T2 gone.
         """
         from storelib import connect, recent_memory
         conn = connect()
@@ -276,15 +277,15 @@ class AsOfBehaviorTests(unittest.TestCase):
                 )
                 return sorted(r["id"] for r in rows)
 
-            # Inside the validity window: T1 returns DESPITE superseded_at
+            # Inside the validity window: T2 returns DESPITE superseded_at
             # being set (the filter is dropped under as_of).
             self.assertEqual(
                 ids_at("2026-02-05T00:00:00Z"),
                 ["asof-row-0", "asof-row-1"],
-                "as_of inside T1's window must return T1 (superseded filter "
-                "dropped under as_of); T2 is not yet born",
+                "as_of inside T2's window must return T2 (superseded filter "
+                "dropped under as_of); T3 is not yet born",
             )
-            # At the EXCLUSIVE end: T1 is no longer valid.
+            # At the EXCLUSIVE end: T2 is no longer valid.
             self.assertEqual(
                 ids_at("2026-02-10T00:00:00Z"),
                 ["asof-row-0"],
@@ -298,6 +299,28 @@ class AsOfBehaviorTests(unittest.TestCase):
             )
         finally:
             conn.close()
+
+
+class VecLaneAsOfFilterScanTest(unittest.TestCase):
+    """PR-review PRR-K (issue #59 review round), source-scan pin: under
+    ``--as-of`` the hybrid vec candidate pool must be temporal-filtered
+    BEFORE RRF fusion (and over-fetched to compensate), so future-dated live
+    rows cannot crowd valid candidates out of the fixed KNN window. CI is
+    model-absent, so the behavioral proof is impossible there — the ratchet
+    keeps the filter present in the shipped recall path."""
+
+    def test_recall_filters_vec_candidates_under_as_of(self):
+        src = (SCRIPTS_DIR / "storelib" / "recall.py").read_text(encoding="utf-8")
+        self.assertIn("if as_of and vec_ids:", src,
+                      "the hybrid path must temporal-filter vec candidates "
+                      "when as_of is set (PRR-K)")
+        self.assertIn("AND valid_from <= ? AND (valid_until = '' OR valid_until > ?)",
+                      src,
+                      "the vec-candidate filter must use the same half-open "
+                      "validity predicate as the FTS lane")
+        self.assertIn("if as_of else max(15, limit + 10)", src,
+                      "the vec KNN window must over-fetch under as_of to "
+                      "compensate for post-filtering (PRR-K)")
 
 
 class Iso8601ArgparseTests(unittest.TestCase):

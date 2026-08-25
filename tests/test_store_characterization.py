@@ -63,12 +63,14 @@ _RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 # Captured from the behavior-identical split (verified byte-identical to
 # pre-split `ddce432` store.py) on 2026-08-22.
 #
-# "recall" was RE-CAPTURED on 2026-08-24 for issue #59 (schema v9): the shipped
-# `recall --json` result dict now carries the v9 lineage fields `valid_until` /
-# `update_of` / `taint` (issue #59 4.4/4.6/4.7, plan S3; verified deterministic -
-# every timestamp the fixture seeds is pinned, and the hash reproduces across
-# runs). `stats`/`list`/`export_jsonl` are byte-identical to their pre-v9
-# freeze and unchanged.
+# "recall" and "export_jsonl" were RE-CAPTURED on 2026-08-24 for issue #59
+# (schema v9) — twice: once when the shipped surfaces gained the v9 lineage
+# fields (recall --json result dicts and export-jsonl rows now carry
+# `valid_until` / `update_of` / `taint`, plan S3), and again after the
+# swarm-pr-review round fixed the fixture (PRR-Q: `_pin_timestamps` used to
+# stamp a past `valid_until` onto LIVE rows, whose "never expires" marker is
+# the empty string; live rows now keep `''` per the live <=> empty-valid_until
+# invariant). `stats` and `list` are byte-identical to their pre-v9 freeze.
 #
 # NOTE on help surfaces: the argparse HelpFormatter renders wrapping, blank-line
 # placement, and indentation from a combination of terminal width and
@@ -85,8 +87,8 @@ _RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 DATA_SHA = {
     "stats": "11ac804ebd82da80a80772814b5507f233d58e259b4c9c3498fa1311500630c8",
     "list": "c2e285928d3ee75154a12e4a61947d6793d3bc8f55edb0b3319e73ff4b75a598",
-    "recall": "124e6e67610c9ccdfe783adba4867ed14b7e66065eba9bfa63489026ab75862f",
-    "export_jsonl": "5f29cf9006180b77ba39391f8338edd47abfc136c73be6a2f6a7f5ad8eb5ff35",
+    "recall": "f3f4a231f71ce481a733852e4a727572c7bba3e0a6b22734430c0b508792b716",
+    "export_jsonl": "8552767c0f9148e2b3c5d5d8759148837186386cdc78d309457d98ffa2d8ac73",
 }
 KNOWN_SUBCMDS = [
     "init", "add", "invalidate", "recall", "recent", "search", "supersede",

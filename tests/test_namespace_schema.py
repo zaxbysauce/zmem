@@ -191,13 +191,18 @@ class V9ToolSchemaPresenceTest(unittest.TestCase):
 
     def test_hermes_update_and_invalidate_are_wired(self):
         # Tool dispatcher must route zmem_update / zmem_invalidate to their
-        # implementations (no unwired schema).
+        # implementations (no unwired schema). PR-review PRR-R: assert the
+        # DISPATCHER routing expression ONLY — a bare quoted-tool-name
+        # substring would also match the _UPDATE_SCHEMA literal five lines
+        # up, making this ratchet vacuous (it passed even with the dispatcher
+        # branch deleted).
         for tool in ("zmem_update", "zmem_invalidate"):
             self.assertTrue(
                 (f'tool_name == "{tool}"' in self.hermes_src)
-                or (f'tool == "{tool}"' in self.hermes_src)
-                or (f'"{tool}"' in self.hermes_src),
-                f"{tool} not wired into the tool dispatcher",
+                or (f'tool == "{tool}"' in self.hermes_src),
+                f"{tool} not wired into the tool dispatcher (expected the "
+                f'dispatcher comparison `tool_name == "{tool}"`); a schema '
+                "literal alone is NOT wiring",
             )
 
     def test_hermes_update_schema_documents_append_only_lineage(self):

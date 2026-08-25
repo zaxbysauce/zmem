@@ -407,11 +407,15 @@ class UpdateTaintLineageTest(_StoreCase):
 # ---------------------------------------------------------------------------
 class UpdateDedupFoldTest(_StoreCase):
     def test_update_folds_into_existing_live_row_with_worst_of_taint(self):
+        # PR-review PRR-S: the survivor must start at the BEST rank and the
+        # update lineage at the WORST — seeding the survivor at untrusted_web
+        # made the worst-of assertion vacuous (worse-of is idempotent at the
+        # top rank; deleting the merge in write.py left it passing).
         ns = self.ns()
         future = self.store.add(ns, "identical destination content lives here",
-                                taint="untrusted_web")
+                                taint="trusted_internal")
         mid = self.store.add(ns, "row about to be revised into a duplicate",
-                             taint="trusted_internal")
+                             taint="untrusted_web")
 
         r = self.store.run("update", "--id", mid, "--content",
                            "identical destination content lives here")
@@ -427,9 +431,64 @@ class UpdateDedupFoldTest(_StoreCase):
         live = [x["id"] for x in self.store.recall("identical destination", ns)]
         self.assertEqual(live, [future], "update fold must not create a second row")
         # The surviving row's taint is the WORST of the two sources
-        # (trusted_internal vs untrusted_web -> untrusted_web).
+        # (trusted_internal survivor vs untrusted_web lineage -> untrusted_web).
         self.assertEqual(self.store.row(future)["taint"], "untrusted_web",
                          "dedup fold must apply worst-of taint to the survivor")
+
+
+# ---------------------------------------------------------------------------
+# PR-review PRR-A: the ADD dedup path must apply worst-of taint too — a
+# re-observed untrusted duplicate may not leave the keeper's trust overstated.
+# ---------------------------------------------------------------------------
+class AddDedupTaintTest(_StoreCase):
+    def test_add_dedup_upgrades_keeper_to_worst_of_taint(self):
+        ns = self.ns()
+        first = self.store.add(ns, "exact duplicate content for taint fold",
+                               taint="trusted_internal")
+        # A second add of the SAME content with a worse taint dedups into the
+        # first row; the keeper must absorb the untrusted lineage.
+        r = self.store.run("add", "--namespace", ns, "--type", "fact",
+                           "--content", "exact duplicate content for taint fold",
+                           "--signal", "test", "--taint", "untrusted_web")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("dedup", r.stdout, r.stdout)
+        self.assertEqual(self.store.row(first)["taint"], "untrusted_web",
+                         "add-dedup must apply worst-of taint to the keeper")
+
+
+# ---------------------------------------------------------------------------
+# PR-review PRR-P: `--content -` reads content from stdin, so large-but-valid
+# payloads can be delivered on Windows where argv caps far below the store cap.
+# ---------------------------------------------------------------------------
+class StdinContentTest(_StoreCase):
+    def _run_stdin(self, *args, text: str):
+        return subprocess.run(
+            [PYTHON, str(STORE_PY), *args],
+            env=self.store.env, capture_output=True, text=True,
+            input=text, timeout=60,
+        )
+
+    def test_add_content_dash_reads_stdin(self):
+        ns = self.ns()
+        r = self._run_stdin("add", "--namespace", ns, "--type", "fact",
+                            "--content", "-", "--signal", "test",
+                            text="memory body delivered over stdin")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("added memory", r.stdout)
+        self.assertEqual(len(self.store.recent(ns)), 1)
+        self.assertEqual(self.store.recent(ns)[0]["content"],
+                         "memory body delivered over stdin")
+
+    def test_update_content_dash_reads_stdin(self):
+        ns = self.ns()
+        mid = self.store.add(ns, "row to revise over stdin")
+        r = self._run_stdin("update", "--id", mid, "--content", "-",
+                            text="revised body delivered over stdin")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _, new_id = self.store._extract_update_pair(r.stdout)
+        self.assertEqual(self.store.row(new_id)["content"],
+                         "revised body delivered over stdin")
+        self.assertIsNotNone(self.store.row(mid)["superseded_at"])
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +536,51 @@ class InvalidateCommandTest(_StoreCase):
         r2 = self.store.run("update", "--id", mid, "--content", "should be refused")
         self.assertEqual(r2.returncode, 2, r2.stderr)
         self.assertIn("already superseded", r2.stderr)
+
+    def test_second_invalidate_refused_appends_no_new_history(self):
+        # PR-review PRR-B: re-tombstoning would MOVE valid_until forward (an
+        # as-of query in (old_end, new_end] would resurrect the dead fact) and
+        # replace the audit reason — a mutation of append-only history. The
+        # second invalidate must refuse (exit 2) and leave the original
+        # tombstone bytes untouched.
+        ns = self.ns()
+        mid = self.store.add(ns, "fact invalidated exactly once")
+        r1 = self.store.run("invalidate", "--id", mid, "--reason", "premise gone")
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        before = self.store.row(mid)
+        r2 = self.store.run("invalidate", "--id", mid, "--reason", "again later")
+        self.assertEqual(r2.returncode, 2, r2.stderr)
+        self.assertIn("already superseded", r2.stderr)
+        after = self.store.row(mid)
+        self.assertEqual(
+            (after["superseded_at"], after["valid_until"], after["supersede_reason"]),
+            (before["superseded_at"], before["valid_until"], before["supersede_reason"]),
+            "a refused second invalidate must not touch the tombstone")
+
+    def test_second_supersede_refused_history_immutable(self):
+        # PR-review PRR-B, plain-supersede surface: same guard as invalidate.
+        ns = self.ns()
+        mid = self.store.add(ns, "fact superseded exactly once")
+        r1 = self.store.run("supersede", "--id", mid, "--reason", "stale")
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        before = self.store.row(mid)["valid_until"]
+        r2 = self.store.run("supersede", "--id", mid, "--reason", "again")
+        self.assertEqual(r2.returncode, 2, r2.stderr)
+        self.assertIn("already superseded", r2.stderr)
+        self.assertEqual(self.store.row(mid)["valid_until"], before,
+                         "valid_until must not move on a refused re-supersede")
+
+    def test_invalidate_whitespace_reason_refused_exit_2(self):
+        # PR-review PRR-I: argparse required=True checks PRESENCE, not content —
+        # a whitespace-only reason must be refused so the audit trail can never
+        # be blank (MCP/Hermes already strip-refuse at their boundaries).
+        ns = self.ns()
+        mid = self.store.add(ns, "row with a blank reason attempt")
+        r = self.store.run("invalidate", "--id", mid, "--reason", "   ")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("non-empty", r.stderr)
+        self.assertIsNone(self.store.row(mid)["superseded_at"],
+                          "a blank-reason invalidate must write nothing")
 
 
 # ---------------------------------------------------------------------------

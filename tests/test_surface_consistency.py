@@ -422,6 +422,64 @@ class TaintAutoInjectSurfaceTest(unittest.TestCase):
             self.assertEqual(taint_by_id[seeded[taint]], taint,
                              f"explicit JSON must carry the real taint for {taint}")
 
+class AgentWriteSurfaceParityTest(unittest.TestCase):
+    """PR-review PRR-L/M/P/Y (issue #59 review round): the agent write
+    surfaces (Hermes + MCP add/update) must share ONE contract — secret
+    redaction (`--capture-mode auto`), sanitized (never raw-stderr) errors,
+    and a stdin fallback for content too large for Windows argv. Source-scan
+    ratchets so CI (which cannot import mcp/hermes internals) still guards
+    the parity."""
+
+    def _src(self, rel: str) -> str:
+        return (REPO_ROOT / rel).read_text(encoding="utf-8")
+
+    def test_agent_write_paths_pass_capture_mode_auto(self):
+        src = self._src("hermes-plugin/__init__.py")
+        for m in ("_tool_add", "_tool_update"):
+            start = src.find(f"def {m}")
+            self.assertGreater(start, 0, f"def {m} not found in hermes source")
+            window = src[start:start + 5000]
+            self.assertIn('"--capture-mode", "auto"', window,
+                          f"hermes {m} must pass --capture-mode auto so secrets "
+                          "are redacted like the MCP path (PRR-L)")
+        mcp = self._src("hermes-plugin/server/mcp_server.py")
+        self.assertGreaterEqual(mcp.count('"--capture-mode", "auto"'), 2,
+                                "MCP add AND update must keep --capture-mode auto")
+
+    def test_remote_error_paths_never_echo_raw_stderr(self):
+        for rel in ("hermes-plugin/server/mcp_server.py",
+                    "hermes-plugin/__init__.py"):
+            src = self._src(rel)
+            self.assertIn("_sanitize_store_error", src,
+                          f"{rel} must route remote error payloads through the "
+                          "sanitizer (PRR-M)")
+            self.assertNotIn('_error(r["stderr"]', src,
+                             f"{rel} must not return raw stderr to remote clients")
+            self.assertNotIn("r['stderr'] or r['stdout'][:200]", src,
+                             f"{rel} must not splice raw stderr into tool errors")
+        # The invalidate/supersede remote paths are covered by the file-wide
+        # checks above (critic nit): their failure payloads are built by the
+        # same sanitized call sites, so no separate unwired path exists.
+        mcp = self._src("hermes-plugin/server/mcp_server.py")
+        self.assertGreaterEqual(mcp.count("_sanitize_store_error(r)"), 4,
+                                "sanitize every remote failure site incl. "
+                                "supersede/invalidate/update")
+
+    def test_oversize_content_uses_stdin_not_argv(self):
+        for rel in ("hermes-plugin/__init__.py",
+                    "hermes-plugin/server/mcp_server.py"):
+            src = self._src(rel)
+            self.assertIn("_ARGV_SAFE_CONTENT_CHARS", src,
+                          f"{rel} must gate content-by-argv on the safe "
+                          "threshold and pipe larger content via stdin (PRR-P)")
+            self.assertIn('.index("--content")', src,
+                          f"{rel} must switch to the stdin content path for "
+                          "oversize payloads")
+        cli = self._src("skills/memory/scripts/storelib/cli.py")
+        self.assertIn('== "-"', cli,
+                      "the CLI must honor `--content -` as read-from-stdin")
+
+
 class ComputeScorePopularityBlendTest(unittest.TestCase):
     """compute_score popularity must blend surfaced + retrieval (defect-class fix)."""
 

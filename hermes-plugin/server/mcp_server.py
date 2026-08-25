@@ -286,13 +286,40 @@ def _compute_health() -> dict:
 
 
 
-def _run_store(args: list[str]) -> dict[str, Any]:
-    """Run ``store.py <args>``; returns {ok, stdout, stderr, returncode}."""
+# PR-review PRR-P (issue #59 review round): Windows CreateProcess argv caps
+# near 32k chars while the store content cap is 65536 — content past this
+# threshold is piped via stdin (`--content -`) instead of an argv element.
+_ARGV_SAFE_CONTENT_CHARS = 30000
+
+
+def _sanitize_store_error(r: dict[str, Any], limit: int = 200) -> str:
+    """PR-review PRR-M (issue #59 review round): classify + truncate a
+    store.py failure for return to a REMOTE client. The stable ``[zmem] …``
+    refusal lines ARE the contract and pass through verbatim; anything else
+    (tracebacks, argparse blobs) is collapsed + truncated so raw stderr never
+    leaks wholesale to the network client."""
+    text = (r.get("stderr") or r.get("stdout") or "").strip()
+    if not text:
+        return "store command failed (no diagnostic)"
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    zmem = [ln for ln in lines if ln.startswith("[zmem]")]
+    chosen = " ".join(zmem if zmem else lines)
+    if len(chosen) > limit:
+        chosen = chosen[: limit - 3].rstrip() + "..."
+    return chosen
+
+
+def _run_store(args: list[str], input_text: str | None = None) -> dict[str, Any]:
+    """Run ``store.py <args>``; returns {ok, stdout, stderr, returncode}.
+
+    ``input_text`` (optional) is piped to the child's stdin — used for
+    oversize content (see ``_ARGV_SAFE_CONTENT_CHARS``)."""
     store_py = _resolve_store_py()
     cmd = [sys.executable, str(store_py), *args]
     try:
         proc = subprocess.run(  # noqa: S603
             cmd,
+            input=input_text,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -353,7 +380,9 @@ def _get_executor() -> "ThreadPoolExecutor":
     return _store_executor
 
 
-async def _run_store_async(args: list[str]) -> dict[str, Any]:
+async def _run_store_async(
+    args: list[str], input_text: str | None = None
+) -> dict[str, Any]:
     """Async, concurrency-bounded wrapper around the sync ``_run_store``.
 
     FastMCP invokes tool functions directly in the event-loop thread, so a
@@ -394,7 +423,7 @@ async def _run_store_async(args: list[str]) -> dict[str, Any]:
     # done-callback fires when the worker thread returns), not the asyncio
     # wrapper (whose callback fires on cancellation, too early).
     executor = _get_executor()
-    cfut = executor.submit(_run_store, args)
+    cfut = executor.submit(_run_store, args, input_text=input_text)
 
     def _release_on_worker_done(_cfut, _loop=loop, _sem=sem):
         # Runs in the worker thread on completion — marshal release to the loop.
@@ -482,7 +511,7 @@ def _parse_results(r: dict[str, Any]) -> dict[str, Any]:
     non-JSON, and non-list shapes uniformly.
     """
     if not r["ok"]:
-        return _error(r["stderr"] or r["stdout"][:200])
+        return _error(_sanitize_store_error(r))
     stdout = (r["stdout"] or "").strip()
     if not stdout:
         return {"results": [], "count": 0}
@@ -640,13 +669,20 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args += ["--tags", str(tags)]
         if source_ref:
             args += ["--source-ref", str(source_ref)]
-        r = await _run_store_async(args)
+        # PR-review PRR-P: pipe oversize content via stdin (`--content -`) so
+        # large-but-valid payloads never hit the Windows argv cap.
+        input_text = None
+        if len(body) > _ARGV_SAFE_CONTENT_CHARS:
+            args[args.index("--content") + 1] = "-"
+            input_text = body
+        r = await _run_store_async(args, input_text=input_text)
         warnings = _parse_store_warnings(r.get("stderr", ""))
         if not r["ok"]:
             # returncode 2 == CapturePolicyRefusal (source_ref secret-like) or
-            # argparse/validation error. Surface the (redacted) message + any
-            # warnings parsed so far. Do NOT echo raw stderr verbatim.
-            msg = r.get("stderr") or r.get("stdout", "")[:200] or "add failed"
+            # argparse/validation error. Surface the (redacted, PR-review
+            # PRR-M-sanitized) message + any warnings parsed so far. Do NOT
+            # echo raw stderr verbatim.
+            msg = _sanitize_store_error(r)
             resp = _error(msg)
             if warnings:
                 resp["warnings"] = warnings
@@ -696,7 +732,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         r = await _run_store_async(args)
         if not r["ok"]:
             return _error(
-                r["stderr"] or r["stdout"][:200] or f"memory id {mid} not found"
+                _sanitize_store_error(r) or f"memory id {mid} not found"
             )
         return {"result": "superseded", "id": mid}
 
@@ -714,10 +750,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
 
         Replaces the content of a LIVE memory with a NEW row, tombstones the
         old row (full history preserved), and links the new row back via
-        update_of (lineage). Namespace/type/tags/source_ref/confidence/signal
-        inherit from the old row unless overridden. Point-in-time recall before
-        the update returns the OLD content; after returns the NEW. Refused
-        (nothing written) when the id is unknown or already superseded.
+        update_of (lineage). Type/tags/source_ref/signal inherit from the old
+        row unless overridden here; namespace and confidence inherit and are
+        NOT remotely overridable (use the CLI `update --namespace/--confidence`
+        for those). Point-in-time recall before the update returns the OLD
+        content; after returns the NEW. Refused (nothing written) when the id
+        is unknown or already superseded — and a second invalidate/supersede on
+        the same row is refused too (append-only history is never re-written).
         taint defaults to 'untrusted_tool' (plan M5); the surviving row keeps
         the WORST of this and the replaced row's taint (issue #59, 4.7).
         """
@@ -762,12 +801,19 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                     "signal must be one of: " + ", ".join(_ALLOWED_SIGNALS)
                 )
             args += ["--signal", s]
-        r = await _run_store_async(args)
+        # PR-review PRR-P: pipe oversize content via stdin (`--content -`) so
+        # large-but-valid payloads never hit the Windows argv cap.
+        input_text = None
+        if len(body) > _ARGV_SAFE_CONTENT_CHARS:
+            args[args.index("--content") + 1] = "-"
+            input_text = body
+        r = await _run_store_async(args, input_text=input_text)
         warnings = _parse_store_warnings(r.get("stderr", ""))
         if not r["ok"]:
             # returncode 2 == refused id (unknown / already superseded) or a
-            # validation error — explain instead of leaking raw stderr.
-            msg = r.get("stderr") or r.get("stdout", "")[:200] or \
+            # validation error — explain, sanitized (PR-review PRR-M), instead
+            # of leaking raw stderr.
+            msg = _sanitize_store_error(r) or \
                 f"memory id {mid} not found or already superseded"
             resp = _error(msg)
             if warnings:
@@ -797,8 +843,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             )
         r = await _run_store_async(["invalidate", "--id", mid, "--reason", why])
         if not r["ok"]:
+            # PR-review PRR-B: a second invalidate now exits 2 with the stable
+            # "[zmem] … already superseded …" line, which the sanitizer passes
+            # through verbatim; anything else is truncated, never raw stderr.
             return _error(
-                r["stderr"] or r["stdout"][:200] or f"memory id {mid} not found"
+                _sanitize_store_error(r) or f"memory id {mid} not found"
             )
         return {"result": "invalidated", "id": mid}
 

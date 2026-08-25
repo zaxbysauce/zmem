@@ -20,7 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
-from storelib.write import CapturePolicyRefusal, _GLOBAL_NEAR_MISS_STEMS, _apply_capture_policy, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory
+from storelib.write import CapturePolicyRefusal, _GLOBAL_NEAR_MISS_STEMS, _apply_capture_policy, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory
+from schema_meta import worse_taint  # noqa: F401
 
 EXPORT_PACK_DEFAULT_PROJECT_LIMIT = 50
 
@@ -386,11 +387,18 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     # where an unparsable timestamp was stored verbatim and silently defeated
     # the lexicographic as-of predicate.
     def _assert_valid_iso(value: str, field: str) -> None:
-        if value and _parse_iso_to_epoch(value) == 0:
-            raise ValueError(
-                f"field '{field}' is not a valid ISO-8601 UTC timestamp "
-                f"(expected YYYY-MM-DDTHH:MM:SSZ), got {value!r}"
-            )
+        # PR-review PRR-E (issue #59 review round): validate by PARSING, not by
+        # comparing the epoch against 0 — _parse_iso_to_epoch returns 0.0 both
+        # for unparsable input AND for a genuine 1970-01-01T00:00:00Z, so the
+        # old epoch==0 sentinel wrongly refused the real epoch-zero timestamp.
+        if value:
+            try:
+                time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"field '{field}' is not a valid ISO-8601 UTC timestamp "
+                    f"(expected YYYY-MM-DDTHH:MM:SSZ), got {value!r}"
+                )
 
     _assert_valid_iso(valid_from, "valid_from")
     _assert_valid_iso(valid_until, "valid_until")
@@ -410,6 +418,20 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     if superseded_at:
         if not valid_until:
             valid_until = superseded_at
+        elif valid_until > superseded_at:
+            # PR-review PRR-F (issue #59 review round): an authored
+            # valid_until EARLIER than superseded_at is a legitimate,
+            # preserved-as-authored interval ("factual validity ended before
+            # the formal supersession" — pinned by
+            # test_tombstone_authored_valid_until_is_preserved). But a
+            # valid_until AFTER the death instant is incoherent with the
+            # tombstone (this writer never produces it): refuse, store
+            # nothing, count the row malformed.
+            raise ValueError(
+                f"tombstone coherence: 'valid_until' ({valid_until!r}) is "
+                f"later than 'superseded_at' ({superseded_at!r}); a row "
+                "cannot outlive its own tombstone (issue #59, 4.4)"
+            )
     elif valid_until:
         raise ValueError(
             f"field 'valid_until' is set ({valid_until!r}) but the row is not "
@@ -427,13 +449,18 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
             f"got {update_of!r}"
         )
 
-    # taint: absent (legacy v8 export) → trusted_internal (the migration
-    # backfill gives pre-v9 rows the same value, so rebuilds agree); present
-    # with an unknown value → malformed/refused ("Unknown taint value …",
-    # issue #59 4.7 — there is deliberately no fourth rank to coerce to).
+    # taint: absent (legacy v8 export) → the SAME signal-based derivation the
+    # v8→v9 migration backfill applies (schema.py) and every write surface
+    # shares (_default_taint_for_signal) — a grounded signal (test/compile/
+    # lint/reviewer/user) defaults to trusted_internal, anything else to
+    # untrusted_tool. PR-review PRR-G: the previous hardcoded
+    # trusted_internal trust-escalated signal=none legacy rows relative to an
+    # in-place migration and had no recompute path. Present with an unknown
+    # value → malformed/refused ("Unknown taint value …", issue #59 4.7 —
+    # there is deliberately no fourth rank to coerce to).
     raw_taint = obj.get("taint")
     if raw_taint is None:
-        taint = "trusted_internal"
+        taint = _default_taint_for_signal(signal)
     elif not isinstance(raw_taint, str) or raw_taint not in ALLOWED_TAINTS:
         raise ValueError(
             f"field 'taint' must be one of {', '.join(ALLOWED_TAINTS)}, "
@@ -615,6 +642,20 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                                                  dedup_cache=dedup_cache)
         if existing:
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
+            # PR-review PRR-H (issue #59 review round): the surviving keeper
+            # also absorbs the INCOMING row's taint — worst-of its own and the
+            # synced row's — mirroring add_memory/update_memory. A remote
+            # untrusted row folded into a local trusted keeper must upgrade
+            # the keeper, not vanish.
+            ex_row = conn.execute(
+                "SELECT taint FROM memory WHERE id=?", (existing["id"],)
+            ).fetchone()
+            ex_base = (ex_row["taint"] if ex_row and ex_row["taint"]
+                       else "trusted_internal")
+            conn.execute(
+                "UPDATE memory SET taint=? WHERE id=?",
+                (worse_taint(ex_base, taint), existing["id"]),
+            )
             if started_tx:
                 _commit(conn)
             return "deduped"
