@@ -88,7 +88,11 @@ def read_version(rel_path: str) -> str | None:
         return None
     if path.suffix == ".yaml":
         m = _VERSION_RE.search(text)
-        return m.group(1) if m else None
+        if not m:
+            return None
+        # Tolerate quoted YAML scalars (`version: "0.10.1"`) so a formatting
+        # change cannot break parity with a confusing mismatch.
+        return m.group(1).strip("\"'")
     try:
         data = json.loads(text)
     except json.JSONDecodeError:

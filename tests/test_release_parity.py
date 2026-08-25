@@ -20,7 +20,6 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 GATE_PY = REPO_ROOT / "scripts" / "release_gate.py"
 WORKFLOW_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 CHANGELOG = REPO_ROOT / "CHANGELOG.md"
@@ -102,6 +101,26 @@ class ReleaseGateUnitTest(unittest.TestCase):
         self.assertNotIn("First release body.", body,
                          "body must stop at the next ## header")
         self.assertIsNone(gate.latest_changelog_section("no sections here"))
+
+    def test_body_terminates_at_any_h2_header_including_plain_ones(self):
+        """Reviewer-round pin (deliberate semantics): a section's body stops
+        at the NEXT `## ` header of ANY kind — including plain non-bracket
+        headers like the file's trailing '## Prior development versions'.
+        A bracket-only terminator would bleed that trailing prose into the
+        oldest release's notes, so the broad stop is the correct choice."""
+        text = (
+            "## [0.2.0] — 2026-01-02\n\nbody of newest\n\n"
+            "## Prior development versions (0.8.0 – 0.8.3)\n\nold prose\n"
+        )
+        version, body = gate.latest_changelog_section(text)
+        self.assertEqual(version, "0.2.0")
+        self.assertIn("body of newest", body)
+        self.assertNotIn("old prose", body,
+                         "plain ## headers terminate a section body")
+
+    def test_yaml_version_quoting_is_tolerated(self):
+        m = gate._VERSION_RE.search('name: x\nversion: "1.2.3"\n')
+        self.assertEqual(m.group(1).strip("\"'"), "1.2.3")
 
     def test_section_regex_ignores_unreleased(self):
         self.assertIsNone(gate.latest_changelog_section(
