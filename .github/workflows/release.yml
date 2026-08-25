@@ -1,0 +1,75 @@
+name: Release
+
+# Release automation — makes the repo's release contract self-enforcing.
+# The contract (README / CHANGELOG): "released versions are marked with a
+# git tag (vX.Y.Z) and a GitHub Release". That step was manual and rotted:
+# v0.8.5/v0.8.6/v0.8.8 were never tagged; v0.9.0/v0.10.0 merged as manifest
+# bumps with no tag or Release, so release-tracking downstream clients never
+# saw them. Now: whenever a push to main carries a version the repo has
+# never tagged, the gate (scripts/release_gate.py) verifies manifest parity
+# + a matching CHANGELOG section, and this workflow cuts the tag AT THE MAIN
+# COMMIT that carries the version (never a PR-branch head — squash merges
+# orphan branch-head tags) and publishes the GitHub Release with the
+# CHANGELOG section as notes. Merges without a version bump are no-ops.
+
+on:
+  push:
+    branches: ["main"]
+
+# Creating the tag + Release requires write on contents. This workflow runs
+# only on pushes to main (never pull_request_target), uses only the
+# ephemeral GITHUB_TOKEN (no stored secrets), and its only write is the
+# tag + release object — no branch or workflow modifications.
+permissions:
+  contents: write
+
+# Serialize release runs: a second push landing mid-release must re-check
+# tag existence AFTER the first run finished, not race it. Never cancel an
+# in-flight release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: cut release if version moved
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0 + tags: the gate must see existing tags to decide
+      # "already released" (idempotent skips after the first run).
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Release gate (manifest parity + CHANGELOG + tag check)
+        id: gate
+        shell: bash
+        run: python scripts/release_gate.py
+
+      # --target is the triggering main commit (github.sha), NOT a branch
+      # head: in a squash-merge repo a tag pushed at the PR branch head is
+      # orphaned off first-parent history. gh creates the tag via the API
+      # at exactly this sha.
+      - name: Publish tag + GitHub Release
+        if: steps.gate.outputs.should_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.gate.outputs.version }}
+          TITLE: ${{ steps.gate.outputs.title }}
+          NOTES: ${{ steps.gate.outputs.notes_path }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Publishing v${VERSION} at ${TARGET_SHA}"
+          gh release create "v${VERSION}" \
+            --target "${TARGET_SHA}" \
+            --title "${TITLE}" \
+            --notes-file "${NOTES}"
+          echo "Released. Verify: https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}"

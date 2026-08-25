@@ -1,6 +1,6 @@
 {
   "name": "zmem",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Multi-tier box-wide memory system for Claude Code: always-on core memory, cross-session lessons with FTS5/semantic recall, and reflection-on-failure. Shares its store with ZCode. Local-first, zero cloud dependency.",
   "author": {
     "name": "Brett",
