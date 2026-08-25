@@ -491,7 +491,7 @@ def cmd_entity_merge(
         return 2
     if frm["kind"] != to["kind"]:
         print(f"[zmem] entity-merge: refusing to merge kind '{frm['kind']}' "
-              f"into kind '{to['kind']}' — an entity's kind never changes "
+              f"into kind '{to['kind']}' - an entity's kind never changes "
               "silently", file=sys.stderr)
         return 2
 

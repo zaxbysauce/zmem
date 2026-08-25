@@ -88,8 +88,10 @@ README.
   re-derivation, two-store JSONL rebuild parity) and `tests/test_mmr.py`
   (crowding acceptance, `--no-mmr`, lambda semantics, env parsing, Jaccard
   model-absent path, known-bytes cosine). `test_jsonl_sync.py`,
-  `test_schema_version.py`, `test_doc_drift.py`, `test_storelib_exports.py`,
-  and `test_store_characterization.py` extended for the new surface.
+  `test_doc_drift.py`, `test_storelib_exports.py`, and
+  `test_store_characterization.py` extended for the new surface;
+  `test_schema_version.py` needed no edit (it reads the version constant
+  dynamically and the docs were bumped to v10).
 
 [#60]: https://github.com/zaxbysauce/zmem/issues/60
 
