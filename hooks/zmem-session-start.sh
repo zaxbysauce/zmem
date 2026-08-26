@@ -164,11 +164,13 @@ export ZMEM_DATA="${ZMEM_DATA:-$DATA_DIR}"
 export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 
 # Background sleep-time organization: fully detached, fire-and-forget. stdio is
-# redirected to /dev/null so it (a) can't pollute the launcher's piped stdout
-# buffer and (b) doesn't hold the launcher's read pipe open — the launcher gets
-# EOF the moment THIS script exits. No wait/kill loop: blocking up to 5s here is
-# exactly the ~5s session-start stall Phase 3 removes; organize has its own
-# internal growth-threshold + interval guard, so an orphaned run is safe.
+# redirected to the $BG_SINK maintenance log below (a best-effort log file that
+# falls back to /dev/null when the data dir is unwritable) so it (a) can't
+# pollute the launcher's piped stdout buffer and (b) doesn't hold the launcher's
+# read pipe open — the launcher gets EOF the moment THIS script exits. No
+# wait/kill loop: blocking up to 5s here is exactly the ~5s session-start stall
+# Phase 3 removes; organize shares consolidate's growth-threshold + interval
+# gate, so an orphaned run is safe.
 #
 # Auto-snapshot (P11) rides the exact same detachment discipline for the exact
 # same reasons: fully redirected stdio so nothing can leak into the

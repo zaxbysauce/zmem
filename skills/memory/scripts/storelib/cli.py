@@ -64,6 +64,21 @@ def _iso8601(value: str) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
 def main():
+    # Production-stream encoding hardening (issue #62 editorial round, Claude
+    # Code F-005): every ``print`` in store.py, including consolidate's
+    # contested-cluster previews and organize's NLI diagnostics, can carry
+    # non-ANSI memory content. Under a legacy/redirected stdout codec that
+    # would raise UnicodeEncodeError mid-run — and because consolidate commits
+    # its cadence-clock write BEFORE those crash points, one poisoned cluster
+    # would silently suppress the whole maintenance job for the gate window.
+    # Reconfigure ONCE at the single process entry so every site is covered;
+    # errors="replace" guarantees a run can never die on a cosmetic print.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # stream not reconfigurable (e.g. detached) — leave as-is
+
     ap = argparse.ArgumentParser(prog="store.py", description="ZMem semantic store")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

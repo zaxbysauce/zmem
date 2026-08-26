@@ -524,6 +524,11 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
         self.store = os.path.join(self.tmp, "store.sqlite")
         self.env = {**os.environ, "ZMEM_STORE": self.store,
                     "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        # cubic#76 / Claude Code round 4 (env isolation): a host-leaked
+        # ZMEM_UNRECALLED_DAYS would silently change every expectation here —
+        # including test_default_unrecalled_days_is_30's premise. Pop it so
+        # the suite is hermetic (pattern: test_session_cadence._base_env).
+        self.env.pop("ZMEM_UNRECALLED_DAYS", None)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -565,6 +570,59 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
             return row[0] if row else None
         finally:
             c.close()
+
+    def _add_old_row_iso(self, content, *, surfaced_count, last_surfaced_days,
+                         days_old=60):
+        """Seed a row whose timestamps are the REAL store format — ISO-8601
+        ``YYYY-MM-DDTHH:MM:SSZ`` from ``now_iso()`` — unlike ``_add_old_row``,
+        which writes SQLite's space-form ``datetime('now', ...)``. PRR-005:
+        the prune WHERE used to compare the TEXT columns against a space-form
+        cutoff, and 'T' (0x54) > ' ' (0x20) in byte order, so genuinely-stale
+        ISO rows silently NEVER qualified — the space-form seeds below were
+        structurally blind to the inversion."""
+        r = self._run("add", "--namespace", NS, "--type", "fact",
+                      "--content", content, "--signal", "none",
+                      "--confidence", "0.2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        def iso(days: float) -> str:
+            return time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
+
+        c = sqlite3.connect(self.store)
+        try:
+            c.execute(
+                "UPDATE memory SET retrieval_count=0, surfaced_count=?, "
+                "last_surfaced=?, ingestion_ts=? WHERE content LIKE ?",
+                (surfaced_count, iso(last_surfaced_days), iso(days_old),
+                 f"%{content}%"))
+            c.commit()
+        finally:
+            c.close()
+
+    def test_iso_form_timestamps_prune_correctly(self):
+        """PRR-005 regression: both boundary comparisons must be
+        format-agnostic (``julianday`` on both sides). A row last surfaced
+        60d ago in the store's real ISO form IS pruned; one surfaced 10d ago
+        IS NOT — under the old TEXT-vs-space-form comparison, the stale ISO
+        row's 'T' made it byte-GREATER than the cutoff so BOTH survived. The
+        two probes are deliberately lexically DISSIMILAR so consolidation
+        never merges them (a merged keeper would inherit one row's
+        last_surfaced and make the assertion nondeterministic)."""
+        stale = "ancient lighthouse sentinel sixty"
+        fresh = "modern harbor beacon ten"
+        self._add_old_row_iso(stale, surfaced_count=3, last_surfaced_days=60)
+        self._add_old_row_iso(fresh, surfaced_count=3, last_surfaced_days=10)
+        r = self._run("consolidate", "--prune")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(
+            self._superseded(stale),
+            f"60-day-old ISO-form last_surfaced must be pruned; "
+            f"out={r.stdout!r} {r.stderr!r}")
+        self.assertIsNone(
+            self._superseded(fresh),
+            f"10-day-old ISO-form last_surfaced must stay protected; "
+            f"out={r.stdout!r} {r.stderr!r}")
 
     def test_surfaced_beyond_unrecalled_days_is_pruned(self):
         """surfaced_count=3 with last_surfaced OLDER than ZMEM_UNRECALLED_DAYS:

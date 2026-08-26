@@ -937,19 +937,27 @@ class ZmemMemoryProvider(MemoryProvider):
         self._namespace = self._resolve_namespace(**kwargs)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Detached housekeeping — consolidate + backup if due.
+        """Detached housekeeping — organize + backup if due.
 
-        ``consolidate`` runs WITHOUT ``--dry-run``: store.py's own cadence gate
-        (meta-key ``last_consolidation``) + single-flight lock make the real
-        call cheap when not due, and ``--dry-run`` was an expensive no-op that
-        paid the full clustering scan without ever merging. Since issue #26 the
-        gate announces a skip (``[zmem] consolidate: skipped by cadence gate ...``) to
-        stdout; this caller discards that output, so the housekeeping run stays
-        silent as intended — the announcement is for the interactive closeout
-        user, not the background hook.
+        Session-end maintenance is the SAME act as SessionStart's sleep-time
+        job (issue #62, 7.7): ``organize``, not bare ``consolidate`` (claude
+        Code F-009 — this plugin was the one shipped surface still calling
+        consolidate after the 7.7 rewire, so Hermes users received none of
+        organize's deliverables while a Hermes session-end could arm the shared
+        cadence clock and starve the next SessionStart organize).
+
+        ``organize`` runs WITHOUT ``--dry-run``: it shares consolidate's single-
+        flight "consolidate" lock and the shared meta-key cadence gate, so on a
+        store that is not due it is a cheap announce-only no-op (the gate and
+        any skips are printed to stdout, which this caller discards — the
+        announcement is for the interactive closeout user, not the background
+        hook). organize's episode is BOUNDED (ZMEM_ORGANIZE_EPISODE_BOUND,
+        default 256), so its wall-clock is strictly lower than the full-store
+        ``consolidate`` it replaces — comfortably inside the plugin's
+        ``_STORE_TIMEOUT_S`` (20s) subprocess cap.
         """
         try:
-            _run_store(["consolidate"])
+            _run_store(["organize"])
             _run_store(["backup", "--if-due"])
         except Exception as exc:  # pragma: no cover — defensive
             logger.debug("zmem on_session_end housekeeping failed: %s", exc)

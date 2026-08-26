@@ -292,7 +292,7 @@ def _link_neighbors_vec(
 
 def generate_links_on_write(
     conn: sqlite3.Connection, mid: str, *, content: str, namespace: str,
-    tags: str, emb: bytes | None,
+    tags: str, emb: bytes | None, propagate_tags: bool = True,
 ) -> dict:
     """Generate + persist automatic links for a freshly-inserted row (6.2).
 
@@ -306,7 +306,15 @@ def generate_links_on_write(
 
     Attribute evolution (6.4): each linked neighbor unions the new row's tags
     into its own and re-derives its entity links. Content, confidence,
-    signal, and retrieval_count are never touched.
+    signal, and retrieval_count are never touched. ``propagate_tags`` (issue
+    #62 editorial round — Claude Code F-004) turns THIS off for writes whose
+    ``tags`` are structural markers rather than content tags: an
+    ``organize`` summary is tagged ``summary,topic``, and evolving that marker
+    onto user rows would poison them (organize's own topic scope is never keyed
+    on mutable tags, so the pollution would be cosmetic at best — but it is
+    still suppressed at the summary-write call site to keep user rows clean).
+    Link EDGES and polarity/trust events are unaffected; only the neighbor
+    tag-union + relink are skipped.
 
     Deterministic — no LLM (see module doc). Returns a small report for the
     caller's stdout note.
@@ -340,14 +348,16 @@ def generate_links_on_write(
             report[relation] += 1
         # Attribute evolution: tags (and, via relink, entity links) flow into
         # the neighbor. First-seen tags win; empty new tags are a no-op.
-        new_tags = (tags or "").strip()
-        if new_tags:
-            merged = _merge_tag_strings(row["tags"] or "", new_tags)
-            if merged != (row["tags"] or ""):
-                conn.execute(
-                    "UPDATE memory SET tags=? WHERE id=?", (merged, row["id"])
-                )
-                relink_memory(conn, row["id"])
+        # Suppressed for structural-marker writes (``propagate_tags=False``).
+        if propagate_tags:
+            new_tags = (tags or "").strip()
+            if new_tags:
+                merged = _merge_tag_strings(row["tags"] or "", new_tags)
+                if merged != (row["tags"] or ""):
+                    conn.execute(
+                        "UPDATE memory SET tags=? WHERE id=?", (merged, row["id"])
+                    )
+                    relink_memory(conn, row["id"])
     return report
 
 

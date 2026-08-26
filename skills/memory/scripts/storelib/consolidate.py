@@ -355,6 +355,7 @@ def _gather_neighbors(
     lexical_tokens: dict[str, set[str]],
     effective_threshold: float,
     absorbed: set[str],
+    restrict_ids: set[str] | None = None,
 ) -> tuple[list[tuple[sqlite3.Row, float]], bool]:
     """Return the qualifying neighbors of ``seed`` among ``rows``, plus whether the
     vec0 KNN hit its k cap with every returned row still above threshold.
@@ -382,6 +383,18 @@ def _gather_neighbors(
       while ``organize``'s related-graph deliberately includes every live
       working row — an unembedded row there simply joins a topic only via
       shared-entity grouping, never via a neighbor edge.
+
+    ``restrict_ids`` (issue #62, editorial round — Claude Code F-001): when
+    set, the vec0 KNN is a GLOBAL index scan whose result ids are then
+    filtered down to ``restrict_ids`` before the liveness re-fetch. This is
+    the OPT-IN escape hatch that lets ``organize`` bound the related-graph (and
+    ``consolidate`` under ``working_ids``) to exactly its native episode,
+    while a bare ``consolidate`` on the full store keeps the historical global
+    KNN behaviour byte-identical. The lexical branch iterates ``rows`` and is
+    therefore already bounded — the filter is a cosine-only concern. A
+    neighbor whose id is absent from ``restrict_ids`` can never be returned,
+    so a callers' union-find over ``rows`` can never see an out-of-episode id
+    from this function.
 
     Read-only (no writes, no commits).
     """
@@ -426,6 +439,10 @@ def _gather_neighbors(
             mid = r["memory_id"]
             if mid == seed["id"] or mid in absorbed:
                 continue
+            if restrict_ids is not None and mid not in restrict_ids:
+                # OUT-OF-EPISODE: the global index offered it, but the caller's
+                # episode does not include it — it is not a candidate neighbor.
+                continue
             sim = 1.0 - r["distance"]
             if sim >= effective_threshold:
                 row = conn.execute(
@@ -445,26 +462,104 @@ def _prune_unrecalled_days() -> int:
     """ZMEM_UNRECALLED_DAYS (issue #62, 7.6), default 30, read LAZILY at call
     time. Prune may additionally qualify a live row whose ``last_surfaced`` is
     older than this many days (see the prune block). Lazy read so tests can
-    vary it per invocation without reloading; absent/garbage/non-numeric -> 30."""
+    vary it per invocation without reloading; absent/garbage/non-numeric -> 30.
+    OverflowError is caught too (`int(float('inf'))` raises it — a deliberately
+    extreme env value must degrade to the default, not crash the prune pass)."""
     try:
         raw = os.environ.get("ZMEM_UNRECALLED_DAYS", "").strip()
         if not raw:
             return 30
         n = int(float(raw))
         return n if n >= 0 else 30
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 30
 
 
-def _nli_first_sentence(text: str | None, max_len: int = 2000) -> str:
+def _cadence_gate_skipped(
+    conn: sqlite3.Connection, *, force: bool, dry_run: bool, label: str,
+) -> bool:
+    """Shared 7d / 20%-growth cadence gate (issues #26 / #62) — ONE
+    implementation for both entry points to the same maintenance act.
+
+    ``consolidate()`` and ``organize()`` were carrying two byte-identical
+    copies of this predicate; that is exactly the drift class this module's
+    shared-neighbor extraction exists to prevent (Claude Code round 4
+    test-coverage list). ``label`` is the caller's singular noun for the
+    human message ('consolidate' / 'organize'); the meta keys, knobs,
+    thresholds, and both dry-run/real message frames are shared. The knob
+    values are this OWNING module's constants (refreshed together by
+    ``_refresh_env_state``), so both entry points always read the same
+    instance — the core of PRR-007: organize must never snapshot these by
+    value at its own import or the two entry points could drift.
+
+    Returns True when the run must skip (the gate is armed AND the store has
+    not grown enough). Callers set their own ``skipped_by_cadence_gate`` flag
+    and return early — the clock is left untouched so a skip never arms it.
+    """
+    last_consolidation = conn.execute(
+        "SELECT value FROM meta WHERE key='last_consolidation'"
+    ).fetchone()
+    if not last_consolidation or force:
+        return False
+    import calendar as _cal
+    last_ts = last_consolidation[0]
+    last_epoch = (
+        _cal.timegm(time.strptime(last_ts, "%Y-%m-%dT%H:%M:%SZ"))
+        if last_ts else 0
+    )
+    days_since = (time.time() - last_epoch) / 86400.0 if last_epoch > 0 else 999
+    live_count = conn.execute(
+        "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
+    ).fetchone()[0]
+    last_count = conn.execute(
+        "SELECT value FROM meta WHERE key='last_consolidation_count'"
+    ).fetchone()
+    last_live = int(last_count[0]) if last_count and last_count[0].isdigit() else 0
+    growth = (live_count - last_live) / max(last_live, 1)
+
+    # The knob values are the OWNING module's constants (refreshed by
+    # store-level _refresh_env_state), not direct env reads: both entry points
+    # read the SAME instance, so they can never diverge, and an env override
+    # set at process start (the supported surface) governs identically.
+    min_days = CONSOLIDATE_MIN_INTERVAL_DAYS
+    min_growth = CONSOLIDATE_GROWTH_THRESHOLD
+    if days_since >= min_days or growth >= min_growth:
+        return False
+    # Announce the skip (never silent — issue #26). dry_run and the real run
+    # share the gate so the two modes agree. Background callers
+    # (zmem-session-start.sh, hermes on_session_end) redirect stdout to
+    # /dev/null, so this stays silent there by design; the interactive
+    # closeout user reading stdout is who needs to see it.
+    if dry_run:
+        print(f"[zmem] {label}: dry-run: would skip by cadence gate "
+              f"({days_since:.1f}d since last run < "
+              f"{min_days:g}d min, {growth:.1%} growth < "
+              f"{min_growth:.1%} min; needs more "
+              f"time OR more growth; drop --dry-run and pass --force to "
+              f"run anyway)")
+    else:
+        print(f"[zmem] {label}: skipped by cadence gate "
+              f"({days_since:.1f}d since last run < "
+              f"{min_days:g}d min, {growth:.1%} growth < "
+              f"{min_growth:.1%} min; needs more "
+              f"time OR more growth)")
+    return True
+
+
+def _nli_first_sentence(text: str | None, max_len: int | None = 2000) -> str:
     """First whole sentence of ``text`` (bounded) sent to the NLI judge.
     Verbatim content is too noisy; the two-sentence contract (issue #62, 7.5)
-    is the first sentence of each side."""
+    is the first sentence of each side. ``max_len=None`` disables the bound so
+    a caller that must preserve the WHOLE first sentence verbatim (organize's
+    extractive bullets — PRR-010) is never truncated mid-sentence."""
     collapsed = re.sub(r"\s+", " ", (text or "").strip())
     if not collapsed:
         return ""
     parts = re.split(r"(?<=[.!?])\s+", collapsed)
-    return parts[0][:max_len] if parts else collapsed[:max_len]
+    first = parts[0] if parts else collapsed
+    if max_len is not None:
+        return first[:max_len]
+    return first
 
 
 def _nli_judge_pair(argv: list[str], a: str, b: str) -> str:
@@ -474,17 +569,25 @@ def _nli_judge_pair(argv: list[str], a: str, b: str) -> str:
     (the caller then falls back to polarity and does NOT merge). The exact
     stdin contract: two first-sentences, one newline-separated line each, plus
     a trailing newline. argv is a list passed straight to CreateProcess on
-    Windows (never ``shell=True``)."""
+    Windows (never ``shell=True``). The judge's stdin/stdout are decoded as
+    UTF-8 (7.5 negotiated content can be any script), and a failure is
+    surfaced to stderr as a distinguishable diagnostic instead of silently
+    swallowing the cause into "neutral" (Claude Code F-007/F-008)."""
     a_first = _nli_first_sentence(a)
     b_first = _nli_first_sentence(b)
     try:
         proc = subprocess.run(
-            argv, input=f"{a_first}\n{b_first}\n", text=True,
+            argv, input=f"{a_first}\n{b_first}\n",
             capture_output=True, timeout=5,
+            encoding="utf-8", errors="replace",
         )
-    except (subprocess.SubprocessError, OSError, ValueError):
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"[zmem] consolidate: NLI judge could not be invoked "
+              f"({argv!r}): {exc}; degrading to neutral", file=sys.stderr)
         return "neutral"
     if proc.returncode != 0:
+        print(f"[zmem] consolidate: NLI judge exited {proc.returncode} "
+              f"({argv!r}); degrading to neutral", file=sys.stderr)
         return "neutral"
     return proc.stdout.strip().lower()
 
@@ -500,23 +603,38 @@ def _nli_judge_all_entail(member_pols: list[tuple]) -> bool | None:
     ``neutral``/``contradiction``/crash/non-zero/garbage all mean park (fall
     back to polarity, never auto-merge). All-entailment semantics: one
     non-entailing flagged pair parks the whole cluster. Env var read lazily
-    each call."""
+    each call.
+
+    A "polarity-flagged pair" is ANY pair of members whose negation-polarity
+    signatures differ — not only the pair anchored on the keeper (PRR-004): a
+    non-keeper pair at opposite polarity is every bit as contradictory as one
+    touching the keeper, so all-entailment must hold across every differing
+    pair or the cluster parks. Pair order is deterministic (first-seen member
+    order). On Windows the argv template's backslashes are normalized to
+    forward slashes before the shlex split so ``python C:\path\judge.py``
+    survives the POSIX backslash-stripping (Claude Code F-007)."""
     cmd = os.environ.get("ZMEM_NLI_CMD", "").strip()
     if not cmd:
         return None
+    if os.name == "nt":
+        # subprocess never runs a shell here; backslashes in the template are
+        # WindowS path separators, never escape sequences. Forward slashes keep
+        # them intact through shlex.split's POSIX backslash handling while
+        # leaving quoted-token semantics (and spaces) untouched.
+        cmd = cmd.replace("\\", "/")
     try:
         argv = shlex.split(cmd)
     except ValueError:
         argv = []
     if not argv:
         return None
-    keeper_pol = member_pols[0][2]
-    keeper_text = member_pols[0][1]
-    flagged = [
-        (keeper_text, mcontent)
-        for _mid, mcontent, mpol in member_pols[1:]
-        if mpol != keeper_pol
-    ]
+    flagged = []
+    for i in range(len(member_pols)):
+        for j in range(i + 1, len(member_pols)):
+            if member_pols[i][2] != member_pols[j][2]:
+                # Deterministic order: earlier member index first.
+                a, b = member_pols[i][1], member_pols[j][1]
+                flagged.append((a, b))
     if not flagged:
         return False
     for a, b in flagged:
@@ -677,45 +795,19 @@ def consolidate(
     # `threshold == CONSOLIDATE_DEFAULT_THRESHOLD` but for an UNRELATED purpose
     # (picking the Jaccard default in lexical fallback mode); the two predicates
     # are fully decoupled — do not "clean up" one expecting the other to follow.
-    last_consolidation = conn.execute(
-        "SELECT value FROM meta WHERE key='last_consolidation'"
-    ).fetchone()
-    last_count = conn.execute(
-        "SELECT value FROM meta WHERE key='last_consolidation_count'"
-    ).fetchone()
-
-    if last_consolidation and not force:
-        import calendar as _cal
-        last_ts = last_consolidation[0]
-        last_epoch = _cal.timegm(time.strptime(last_ts, "%Y-%m-%dT%H:%M:%SZ")) if last_ts else 0
-        days_since = (time.time() - last_epoch) / 86400.0 if last_epoch > 0 else 999
-        live_count = conn.execute(
-            "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
-        ).fetchone()[0]
-        last_live = int(last_count[0]) if last_count and last_count[0].isdigit() else 0
-        growth = (live_count - last_live) / max(last_live, 1)
-
-        if days_since < CONSOLIDATE_MIN_INTERVAL_DAYS and growth < CONSOLIDATE_GROWTH_THRESHOLD:
-            # Announce the skip (never silent — issue #26). dry_run and the real
-            # run share the gate so the two modes agree. Background callers
-            # (zmem-session-start.sh, hermes on_session_end) redirect stdout to
-            # /dev/null, so this stays silent there by design; the interactive
-            # closeout user reading stdout is who needs to see it.
-            if dry_run:
-                print(f"[zmem] consolidate: dry-run: would skip by cadence gate "
-                      f"({days_since:.1f}d since last run < "
-                      f"{CONSOLIDATE_MIN_INTERVAL_DAYS:g}d min, {growth:.1%} growth < "
-                      f"{CONSOLIDATE_GROWTH_THRESHOLD:.1%} min; needs more "
-                      f"time OR more growth; drop --dry-run and pass --force to "
-                      f"run anyway)")
-            else:
-                print(f"[zmem] consolidate: skipped by cadence gate "
-                      f"({days_since:.1f}d since last run < "
-                      f"{CONSOLIDATE_MIN_INTERVAL_DAYS:g}d min, {growth:.1%} growth < "
-                      f"{CONSOLIDATE_GROWTH_THRESHOLD:.1%} min; needs more "
-                      f"time OR more growth)")
-            report["skipped_by_cadence_gate"] = True
-            return report  # gate declined — leave last_consolidation untouched
+    # Growth-based cadence gate (issue #26): skip if last consolidation was
+    # recent AND the store hasn't grown significantly since. The skip is always
+    # announced. dry_run models the same gate so the two modes agree; only
+    # `force` bypasses it. Shared with organize() via _cadence_gate_skipped: the
+    # two entry points to the same maintenance act must never drift (Claude
+    # Code round 4 coverage list). NOTE: the lexical-swap below
+    # (effective_threshold) ALSO keys off `threshold ==
+    # CONSOLIDATE_DEFAULT_THRESHOLD` but for an UNRELATED purpose (picking the
+    # Jaccard default in lexical fallback mode); the two predicates are fully
+    # decoupled — do not "clean up" one expecting the other to follow.
+    if _cadence_gate_skipped(conn, force=force, dry_run=dry_run, label="consolidate"):
+        report["skipped_by_cadence_gate"] = True
+        return report  # gate declined — leave last_consolidation untouched
 
     # Write the consolidation timestamp BEFORE the clustering loop, so a killed
     # run still creates backpressure on the next session. Count is start-of-run
@@ -837,6 +929,12 @@ def consolidate(
             lexical_tokens=lexical_tokens,
             effective_threshold=effective_threshold,
             absorbed=absorbed,
+            # Issue #62, 7.1 + editorial round (Claude Code F-001): when the
+            # episode is deliberately bounded to ``working_ids``, the vec0 KNN
+            # must not leak out-of-episode neighbors in — every neighbor must
+            # be a member of the bounded working set. Bare consolidate
+            # (working_ids=None) keeps the historical global-KNN behaviour.
+            restrict_ids=working_ids,
         )
         if knn_local:
             knn_truncated = True
@@ -932,6 +1030,7 @@ def consolidate(
             # that would be lost). Accumulate the keeper's grown content as we
             # go so successive absorbs see the keeper as the real merge would.
             dry_keeper_content = seed["content"] or ""
+            grew_preview = False
             for nb_row, nb_sim in neighbors:
                 dec = _absorb_decision(dry_keeper_content, nb_row["content"] or "", nb_row["id"])
                 print(f"    absorb [{nb_row['id'][:8]}] sim={nb_sim:.3f}: "
@@ -939,6 +1038,7 @@ def consolidate(
                       f"prod={nb_row['confidence'] * ((nb_row['retrieval_count'] or 0) + (nb_row['surfaced_count'] or 0)):.2f}")
                 print(f"        content: {nb_row['content']}")
                 if dec["reason"] == "unique":
+                    grew_preview = True  # mirror the real-run growth test
                     if dec["new_tokens"]:
                         print(f"        would APPEND (gains tokens: {dec['new_tokens']})")
                     else:
@@ -957,7 +1057,7 @@ def consolidate(
                     print("        already represented in keeper; nothing to append")
                 absorbed.add(nb_row["id"])  # track in dry-run too
             merged_count += len(neighbors)
-            if collect_run_ids:
+            if collect_run_ids and grew_preview:
                 consolidated_ids.append(seed["id"])
             if contested_override:
                 # Dry run: nothing merged — merged must be False (PRR-001).
@@ -980,10 +1080,18 @@ def consolidate(
         # Atomic commit per cluster.
         try:
             conn.execute("BEGIN")
+            keeper_grew = False
             for nb_row, nb_sim in neighbors:
                 # Preserve absorbed content + record provenance + merge metadata
                 # + supersede (issue #19). consolidate-ONLY helper.
-                _absorb_into_keeper(conn, seed, nb_row)
+                decision = _absorb_into_keeper(conn, seed, nb_row)
+                # Issue #62, 7.4 (c76 no-op-absorb blast radius): only a keeper
+                # whose content actually GREW this run is a valid compression
+                # candidate — a cluster that merged only already-represented /
+                # size-capped / empty content appended nothing, and organize
+                # must not truncate a keeper this run did not touch (which
+                # would also churn the summary member ids for nothing).
+                keeper_grew = keeper_grew or decision["will_append"]
                 absorbed.add(nb_row["id"])
             # Mark the keeper as consolidated.
             conn.execute(
@@ -992,7 +1100,7 @@ def consolidate(
             )
             conn.execute("COMMIT")
             merged_count += len(neighbors)
-            if collect_run_ids:
+            if collect_run_ids and keeper_grew:
                 consolidated_ids.append(seed["id"])
             if contested_override:
                 # Appended only after the successful COMMIT, and printed so a
@@ -1059,10 +1167,10 @@ def consolidate(
                  AND retrieval_count = 0
                  AND signal = 'none'
                  AND confidence < 0.35
-                 AND ingestion_ts < datetime('now', '-30 days')
+                 AND julianday(ingestion_ts) < julianday('now', '-{int(unrecalled_days)} days')
                  AND (surfaced_count = 0 OR (
                        last_surfaced IS NOT NULL AND
-                       last_surfaced < datetime('now', '-{int(unrecalled_days)} days')
+                       julianday(last_surfaced) < julianday('now', '-{int(unrecalled_days)} days')
                      ))
                {ns_clause}""",
             ns_params,

@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -39,10 +40,12 @@ PYTHON = sys.executable
 
 NS = "project:organize-62"
 
-# Force the lexical fallback deterministically (same rationale as
-# test_consolidate_lossy.py): organize's topic graph and consolidation must not
-# be hijacked by a host model cache.
-os.environ["ZMEM_MODELS_DIR"] = str(REPO_ROOT / "no-such-models")
+# NOTE (PRR-012 / Claude Code round 4): the module previously MUTATED
+# os.environ["ZMEM_MODELS_DIR"] at import scope, leaking into every sibling
+# test in a shared-process run. Removed: every subprocess test pins
+# ZMEM_MODELS_DIR explicitly in setUp below, and the in-process loaders patch
+# it inside _load_store_module, so the module-level mutation was redundant
+# process-global state.
 
 
 # --- in-process store loader (fold-guard unit tests) ---
@@ -81,6 +84,14 @@ class OrganizeIntegrationTest(unittest.TestCase):
         self.env = {**os.environ, "ZMEM_STORE": self.store,
                     "ZMEM_MODELS_DIR": os.path.join(self.tmp, "no-such-models"),
                     "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        # Hermetic organize knobs (Claude Code round 4 env-isolation gap): a
+        # host-leaked value would silently change episode/idle/compression
+        # expectations for ~11 dependent tests. Individual tests re-set the
+        # one knob they mean to exercise via env_extra.
+        for k in ("ZMEM_ORGANIZE_IDLE_HOURS", "ZMEM_ORGANIZE_EPISODE_BOUND",
+                  "ZMEM_KEEPER_COMPRESS_CHARS", "ZMEM_UNRECALLED_DAYS",
+                  "ZMEM_NLI_CMD"):
+            self.env.pop(k, None)
         r = self._run("init")
         self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -432,6 +443,69 @@ class OrganizeIntegrationTest(unittest.TestCase):
         after = Path(self.store).read_bytes()
         self.assertEqual(before, after, "dry run must write nothing")
 
+    def test_compression_then_rerun_updates_not_duplicates(self):
+        """F-002 regression (Claude Code round 4): compression is append-only —
+        update_memory REPLACES the keeper's id — so compression must run BEFORE
+        topic identity is keyed. Run 1 grows a keeper past a tiny compress cap
+        (compression fires, keeper id changes) and creates the topic summary
+        keyed on POST-compression ids; run 2, with no new growth, must find
+        that exact summary (update) instead of creating a duplicate and
+        orphaning the old one — the pre-fix behavior."""
+        long_a = ("Atlas staging holds the build green before every prod "
+                  "rollout inside the nightly maintenance window on the "
+                  "shared cluster.")
+        long_b = ("Atlas staging always holds the build green before every "
+                  "prod rollout inside the nightly maintenance window on the "
+                  "shared cluster.")
+        self._seed_raw(long_a, tags="entity:Atlas", order=1)
+        self._seed_raw(long_b, tags="entity:Atlas", order=2)
+        self._seed_raw("Atlas maintenance timeouts page the on-call engineer.",
+                       tags="entity:Atlas", order=3)
+        self._seed_raw("Atlas backup window opens on the first weekend monthly.",
+                       tags="entity:Atlas", order=4)
+        env = {"ZMEM_KEEPER_COMPRESS_CHARS": "80"}
+
+        first = self._run("organize", "--force", "--json", env_extra=env)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        rep1 = json.loads(first.stdout)
+        # The near-duplicate pair merged and the grown keeper was compressed.
+        self.assertGreaterEqual(rep1["consolidate"]["merged"], 1, rep1)
+        self.assertGreaterEqual(rep1["compressed"]["count"], 1, rep1)
+        # 3 live members remain (compressed keeper + 2 distinct) -> 1 summary,
+        # keyed on the POST-compression member set.
+        self.assertEqual(rep1["summaries"]["created"], 1, rep1)
+        c = self._conn()
+        try:
+            summ = c.execute(
+                "SELECT merged_from FROM memory WHERE tags='summary,topic' "
+                "AND superseded_at IS NULL").fetchone()
+            self.assertIsNotNone(summ)
+            live_keep = c.execute(
+                "SELECT id FROM memory WHERE superseded_at IS NULL "
+                "AND content LIKE 'Atlas staging%'").fetchone()
+            self.assertIsNotNone(live_keep)
+            self.assertIn(live_keep[0], summ[0],
+                          "the summary key must carry the POST-compression "
+                          "keeper id (compression ran before topic identity)")
+        finally:
+            c.close()
+
+        second = self._run("organize", "--force", "--json", env_extra=env)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        rep2 = json.loads(second.stdout)
+        self.assertEqual(rep2["summaries"]["created"], 0,
+                         f"run 2 must find the existing summary — a create "
+                         f"here is the F-002 duplicate-and-orphan failure: {rep2}")
+        self.assertEqual(rep2["summaries"]["updated"], 1, rep2)
+        c = self._conn()
+        try:
+            n = c.execute(
+                "SELECT count(*) FROM memory WHERE tags='summary,topic' "
+                "AND superseded_at IS NULL").fetchone()[0]
+        finally:
+            c.close()
+        self.assertEqual(n, 1, "exactly one live summary across both runs")
+
     # --- --dry-run writes nothing ---
     def test_dry_run_writes_nothing_and_reports_would_counts(self):
         for content in ("Nova disaster drills cover storage, compute, and the control plane.",
@@ -540,6 +614,28 @@ class OrganizeFoldGuardTest(unittest.TestCase):
         self.mod = mod
         self.conn = conn
         self.tmp = tmp
+        # Hermetic organize knobs for the in-process run (final-critic
+        # residual #5): organize reads them lazily at call time, so a
+        # host-leaked value would perturb the fixture. Popped for this test,
+        # restored after.
+        _pop_env = ("ZMEM_ORGANIZE_IDLE_HOURS", "ZMEM_ORGANIZE_EPISODE_BOUND",
+                    "ZMEM_KEEPER_COMPRESS_CHARS", "ZMEM_UNRECALLED_DAYS",
+                    "ZMEM_NLI_CMD")
+        _saved = {k: os.environ.pop(k) for k in _pop_env if k in os.environ}
+        self.addCleanup(os.environ.update, _saved)
+        # Force the lexical fallback for THIS in-process test, hermetically.
+        # embeddings._check_available() CACHES its result in the module global
+        # _model_available, and on a dev box with a real model in the resolved
+        # default models dir the ambient answer is True — the fixture below
+        # (3 dissimilar Rho rows, no embeddings in the store) is only valid in
+        # lexical mode (in cosine mode the summary bullets semantically dedup
+        # onto the member rows and the create legitimately FOLDS). Pin the
+        # cache directly instead of mutating process-global env (PRR-012).
+        emb_mod = importlib.import_module("embeddings")
+        self._saved_model_available = emb_mod._model_available
+        emb_mod._model_available = False
+        self.addCleanup(
+            setattr, emb_mod, "_model_available", self._saved_model_available)
         # `storelib.organize` PACKAGE attribute is clobbered by the re-exported
         # `organize()` function (same ambiguity as `storelib.consolidate`), so
         # reach the real module through sys.modules.
@@ -667,6 +763,168 @@ class SessionStartHookInvocationTest(unittest.TestCase):
                          f"consolidate must not be called inline at SessionStart "
                          f"(organize is the cadence op now, 7.7): "
                          f"{inline_consolidate!r}")
+
+
+class CosineOrganizeRestrictTest(unittest.TestCase):
+    """F-001 regression + the FIRST cosine-mode organize coverage.
+
+    The in-process client suite forces the lexical fallback at module scope, so
+    organize's cosine path had ZERO test coverage here — which is how F-001/
+    F-003/F-004 shipped undetected (Claude Code review). These tests stub
+    embeddings available and inject real vec0 rows, then assert the
+    related-graph is bounded to its native episode: an OUT-OF-EPISODE
+    near-duplicate in the global vec0 index must never be absorbed/merged into
+    the episode, and the union-find must never KeyError on an out-of-episode
+    neighbor id (the pre-fix crash).
+
+    Skipped when the bundled sqlite build lacks the vec0 table (mirrors
+    test_consolidate_contested.CosineContestedTest).
+    """
+
+    def setUp(self):
+        self.mod, self.conn, self.tmp = _make_store(prefix="zmem-organize-cos-")
+        # Hermetic organize knobs (final-critic residual #5): the per-test
+        # bound is re-set by _organize via patch.dict; anything else leaking
+        # from the host would perturb the geometry assertions.
+        _pop_env = ("ZMEM_ORGANIZE_IDLE_HOURS", "ZMEM_ORGANIZE_EPISODE_BOUND",
+                    "ZMEM_KEEPER_COMPRESS_CHARS", "ZMEM_UNRECALLED_DAYS",
+                    "ZMEM_NLI_CMD")
+        _saved = {k: os.environ.pop(k) for k in _pop_env if k in os.environ}
+        self.addCleanup(os.environ.update, _saved)
+        have_vec = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='memory_vec'"
+        ).fetchone()
+        if not have_vec:
+            self.skipTest("memory_vec (vec0) unavailable in this sqlite build")
+        # Cleanup runs LIFO: close the connection BEFORE the tmp dir is removed.
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, True))
+        self.addCleanup(self.conn.close)
+        # Reach the real submodules (the store shim cannot forward attr writes).
+        self.org_mod = importlib.import_module("storelib.organize")
+        self.cons_mod = importlib.import_module("storelib.consolidate")
+
+    def _vec(self, *values):
+        dim = 384
+        vals = list(values) + [0.0] * (dim - len(values))
+        return struct.pack(f"{dim}f", *vals)
+
+    def _add_embedded_raw(self, content, embedding, *, days_ago=0, namespace="project:cos-ep"):
+        """Insert a row DIRECTLY (no write-time dedup/enrichment) with an
+        embedding + vec0 entry, like _seed_raw but in cosine mode. ``days_ago``
+        back-dates ingestion_ts (ISO-Z form, the real store format) so the
+        episode bound can exclude it."""
+        mid = str(uuid.uuid4())
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days_ago * 86400))
+        c = self.conn
+        c.execute(
+            """INSERT INTO memory
+               (id, namespace, type, content, tags, source_ref, source_hash,
+                confidence, signal, valid_from, superseded_at, ingestion_ts,
+                retrieval_count, last_retrieved, embedding, embedding_model)
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,'test-stub')""",
+            (mid, namespace, "fact", content, "", "", "",
+             0.5, "none", ts, ts, embedding))
+        c.execute("INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
+                  (embedding, mid))
+        c.commit()
+        return mid
+
+    def _organize(self, bound=3):
+        stub = mock.Mock()
+        stub.is_available.return_value = True
+        buf = io.StringIO()
+        with mock.patch.object(self.org_mod, "_embeddings", stub), \
+             mock.patch.object(self.cons_mod, "_embeddings", stub), \
+             mock.patch.dict(os.environ, {"ZMEM_ORGANIZE_EPISODE_BOUND": str(bound)},
+                            clear=False):
+            with redirect_stdout(buf):
+                report = self.org_mod.organize(self.conn, force=True)
+        return report, buf.getvalue()
+
+    def test_cosine_episode_ignores_out_of_episode_near_duplicate(self):
+        """Regression for F-001: the out-of-episode near-duplicate (cos ~0.99
+        to member 1) must NOT be absorbed into the episode nor crash the
+        union-find, even though its vec0 row sits in the global index. The
+        episode is bounded to 3 (the 3 recent rows); the stale twin is
+        excluded and must stay live."""
+        # Three orthonormal rows (cos ~0 between them -> no consolidation) that
+        # share the project namespace entity, so a 3-member topic forms.
+        m1 = self._add_embedded_raw(
+            "Pulsar boot pins the kernel before any fleet upgrade.",
+            self._vec(1.0, 0.0, 0.0))
+        self._add_embedded_raw(
+            "Pulsar credentials rotate quarterly and never live in plaintext.",
+            self._vec(0.0, 1.0, 0.0))
+        self._add_embedded_raw(
+            "Pulsar backup window opens on the first weekend of every month.",
+            self._vec(0.0, 0.0, 1.0))
+        # The STALE TWIN: identical content to m1, ~0 otherwise, OLD ingestion
+        # -> falls outside the 3-row episode.
+        stale = self._add_embedded_raw(
+            "Pulsar boot pins the kernel before any fleet upgrade.",
+            self._vec(0.99, 0.01, 0.0), days_ago=30)
+
+        report, _out = self._organize(bound=3)
+
+        self.assertEqual(report["mode"], "cosine")
+        c_rep = report["consolidate"]
+        # No out-of-episode absorb: the episode's own rows are orthonormal, so
+        # consolidation must merge nothing (the stale twin is NOT an episode
+        # neighbor).
+        self.assertEqual(c_rep["merged"], 0, c_rep)
+        # The stale twin survives untouched (a pre-fix global-KNN leak would
+        # have tombstoned it into m1).
+        row = self.conn.execute(
+            "SELECT superseded_at FROM memory WHERE id=?", (stale,)).fetchone()
+        self.assertIsNone(row["superseded_at"],
+                          "out-of-episode near-duplicate must NOT be absorbed")
+        self.assertIsNone(
+            self.conn.execute("SELECT superseded_at FROM memory WHERE id=?",
+                              (m1,)).fetchone()["superseded_at"],
+            "episode keeper must stay live")
+        # 3-member project-entity topic formed and got a summary (mode-correct
+        # behavior, not a crash).
+        self.assertGreaterEqual(report["summaries"]["created"], 1, report)
+        self.assertLessEqual([len(t["members"]) for t in report["topics"]], [3], report)
+
+    def test_cosine_episode_rows_still_cluster_in_episode(self):
+        """Positive control: with the same episode geometry and NO stale twin,
+        the 3 live rows still form the shared project-entity topic and a
+        summary is created — the restrict filter must not have disabled normal
+        in-episode grouping."""
+        for i, content in enumerate((
+                "Quasar boot pins the kernel before any fleet upgrade.",
+                "Quasar credentials rotate quarterly and never live in plaintext.",
+                "Quasar backup window opens on the first weekend of every month.")):
+            vec = [0.0] * i + [1.0] + [0.0] * (2 - i)
+            self._add_embedded_raw(content, self._vec(*vec))
+        report, _out = self._organize(bound=3)
+        self.assertEqual(report["mode"], "cosine")
+        self.assertGreaterEqual(report["summaries"]["created"], 1, report)
+        self.assertEqual(report["consolidate"]["merged"], 0, report)
+
+
+class HermesSessionEndStickTest(unittest.TestCase):
+    """F-009 guard (final-critic residual #4): the Hermes plugin's session-end
+    housekeeping must dispatch `organize` — the same maintenance act as
+    SessionStart — never bare `consolidate` (which would arm the shared
+    cadence clock while giving Hermes users none of organize's deliverables).
+    Source-level stick test, mirroring SessionStartHookInvocationTest: no store
+    required, and it is the only guard that would catch a silent revert."""
+
+    HERMES = REPO_ROOT / "hermes-plugin" / "__init__.py"
+
+    def test_hermes_session_end_dispatches_organize(self):
+        src = self.HERMES.read_text(encoding="utf-8")
+        self.assertIn('_run_store(["organize"])', src,
+                      "hermes on_session_end must dispatch organize (issue #62 "
+                      "7.7 / F-009)")
+        # The retired bare-consolidate dispatch must be gone from the
+        # housekeeping block (a `consolidate` string elsewhere — docstrings,
+        # other commands — is fine; the exact dispatch list is not).
+        self.assertNotIn('_run_store(["consolidate"])', src,
+                         "hermes on_session_end must not dispatch bare "
+                         "consolidate anymore")
 
 
 if __name__ == "__main__":

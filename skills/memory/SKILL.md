@@ -400,57 +400,78 @@ deliverables: a topic hierarchy, hierarchical extractive summaries, and
 extractive compression of the rows consolidation just grew. Everything is
 deterministic and LLM-free by default; there is no `--threshold`/`--namespace`
 to keep the two maintenance entry points aligned (see the consolidate section:
-organize and consolidate SHARE the cadence meta keys and SHARE the
-single-flight "consolidate" lock, so they can never run back-to-back on the
-same store state).
+organize and consolidate SHARE one cadence gate implementation, one cadence
+clock, and one single-flight "consolidate" lock, so on a given store at most
+one maintenance run happens per cadence window — whether it was triggered
+from SessionStart, a manual CLI call, or the Hermes session-end hook).
 
 Pipeline (in order):
-1. **Shared cadence gate** — the SAME 7-day / 20%-growth gate as consolidate,
-   using consolidate's `last_consolidation` meta keys (two entry points, one
-   clock). `--force` is the only bypass. A gated run prints
-   `[zmem] organize: skipped by cadence gate (...)` and changes nothing;
-   `--dry-run` models the gate (`would skip by cadence gate`).
+1. **Shared cadence gate** — the SAME 7-day / 20%-growth gate as consolidate
+   (ONE shared implementation, `_cadence_gate_skipped`, so the two entry
+   points can never drift), using consolidate's `last_consolidation` meta keys
+   (two entry points, one clock). `--force` is the only bypass. A gated run
+   prints `[zmem] organize: skipped by cadence gate (...)` and changes
+   nothing; `--dry-run` models the gate (`would skip by cadence gate`).
 2. **Optional idle gate** — `ZMEM_ORGANIZE_IDLE_HOURS` (default 0 = off). When
    set, organize refuses to run unless the store has had no live-memory activity
    (max of ingestion_ts/last_retrieved/last_surfaced) for at least that many
    hours: sleep-time jobs should not churn a store that is mid-use. A skip prints
    `[zmem] organize: skipped by idle gate (...)`.
 3. **Working set / episode bound** — the N most recent live rows
-   (`ZMEM_ORGANIZE_EPISODE_BOUND`, default 256), box-wide. 0 disables real work.
+   (`ZMEM_ORGANIZE_EPISODE_BOUND`, default 256, clamped to the per-namespace
+   consolidation cap), box-wide. 0 disables real work. organize's own summary
+   rows are EXCLUDED from the episode — keyed on the structural
+   `source_ref` `organize:` prefix, never the (mutable) tags column, so
+   summaries are the pipeline's OUTPUT and never its input. The `organize:`
+   prefix is therefore RESERVED for summary rows: a manually-added row whose
+   `--source-ref` begins with `organize:` is excluded from episodes the same
+   way.
 4. **Entity backfill** — every working row missing `memory_entity` links gets
    them via the deterministic extractor (idempotent; rows with nothing
-extractable are counted as candidates but link nothing).
+   extractable are counted as candidates but link nothing).
 5. **Link backfill** — every working row missing `memory_link` edges gets them
    via the standard write-time linker (`related`/`contradicts` at
    `ZMEM_LINK_THRESHOLD`).
 6. **Episodic consolidation** — `consolidate` on EXACTLY the working set
    (keeper selection, absorb, contested guard + optional NLI judge, bounded by
-   the same per-namespace cap). See the consolidate section for semantics.
-7. **Topics** — a related-graph over the POST-ABSORB live working rows using
-   the SAME neighbor predicate at the same threshold consolidate would use;
-   leftover singletons are grouped by SHARED entity (A-MEM lite). Every live
-   NON-summary working row lands in exactly one topic. Topics of ≥3 members get
-   a **hierarchical extractive summary**: a REAL row (`type=fact`, tags exactly
-   `summary,topic`, `signal=none`, confidence 0.5, `source_ref=organize:<members>`,
+   the same per-namespace cap). The vector neighbor lookup is bounded to the
+   episode too — an out-of-episode near-duplicate in the global vec0 index is
+   never pulled in. See the consolidate section for semantics.
+7. **Compression** — the keepers consolidation actually GREW, when their
+   content exceeds `ZMEM_KEEPER_COMPRESS_CHARS` (default 4000; 0/negative
+   degrades to the default — it is a cap, not a switch), are compressed
+   deterministically: order-preserving UNIQUE sentences, dropping only from
+   the TAIL on whole-sentence boundaries (never mid-sentence; the pre-compress
+   text stays on the superseded history row and `merged_from` provenance is
+   carried to the replacement). Compression runs BEFORE topic identity is
+   recorded: compression replaces the keeper's id (append-only update), so
+   keying topics first would leave every later run with a different key and a
+   duplicate summary.
+8. **Topics + summaries** — a related-graph over the POST-COMPRESSION live
+   working rows using the SAME neighbor predicate at the same threshold
+   consolidate would use; leftover singletons are grouped by SHARED entity
+   (A-MEM lite). Every live NON-summary working row lands in exactly one
+   topic. Topics of ≥3 members get a **hierarchical extractive summary**: a
+   REAL row (`type=fact`, tags exactly `summary,topic`, `signal=none`,
+   confidence 0.5, `source_ref=organize:<members>`,
    `merged_from=<members>`), built from the first sentence of each member
-   (de-duplicated, capped). Members stay live; the summary is FTS/entity/search
-   recallable. Idempotent: a re-run finds the existing summary by
-   `tags/source_ref/merged_from` and UPDATES it (Phase 4 of the issue) instead
-   of duplicating. Summary rows are the pipeline's OUTPUT and never join a
-   topic as members (excluding them keeps the topic key stable run-over-run).
-   If the update/create would fold into a dedup target, organize logs and
-   skips rather than rewriting a stranger's row.
-8. **Compression** — the keepers consolidation grew,
-   when their content exceeds `ZMEM_KEEPER_COMPRESS_CHARS` (default 4000), are
-   compressed deterministically: order-preserving UNIQUE sentences, dropping
-   only from the TAIL on whole-sentence boundaries (never mid-sentence; the
-   pre-compress text stays on the superseded history row and `merged_from`
-   provenance is carried to the replacement).
+   (de-duplicated, capped, never truncated mid-sentence). Members stay live;
+   the summary is FTS/entity/search recallable. Idempotent: a re-run finds the
+   existing summary by its STRUCTURAL identity (`source_ref` + `merged_from` —
+   never the mutable tags column) and UPDATES it (Phase 4 of the issue)
+   instead of duplicating; when a topic's membership legitimately changed,
+   the stale overlapping summary is superseded (`reorganized into a changed
+   topic`) rather than left as a live orphan. Summary writes never propagate
+   the `summary,topic` marker onto neighboring user rows. If the
+   update/create would fold into a dedup target, organize logs and skips
+   rather than rewriting a stranger's row.
 9. **Unrecalled prune (pass-through)** — `--prune` enables the `consolidate
    --prune` rule, extended (issue #62, 7.6): a live row also qualifies when its
    `last_surfaced` is OLDER than `ZMEM_UNRECALLED_DAYS` (default 30) even with
    `surfaced_count > 0` — a surface event that has itself gone stale loses its
-   issue #21 protection. `signal != none` is never pruned; never automatic.
+   issue #21 protection (both boundary comparisons are made in a
+   format-agnostic way, so the store's ISO-8601 timestamps compare correctly
+   against the cutoff). `signal != none` is never pruned; never automatic.
 
 `--dry-run` writes NOTHING (no meta, no backfill, no summaries) and the `--json`
 report carries per-step would-be counts (`entity_backfill`, `link_backfill`,
@@ -461,9 +482,14 @@ sub-report).  A concurrent organize/consolidate loses cleanly (exit 0, a
 Optional local NLI judge (7.5): when `ZMEM_NLI_CMD` is set to an argv template
 (e.g. `ZMEM_NLI_CMD='python /path/to/your/local-judge.py'`), consolidate's
 contested branch consults it for mixed-polarity clusters; only an `entailment`
-verdict on EVERY polarity-flagged pair un-parks the merge, and any other
-verdict or failure parks it (never auto-merges). The judge receives the two
-first-sentences on stdin (one per line) and prints a verdict word. Unset =
+verdict on EVERY polarity-flagged pair — ANY two members whose negation
+polarity differs, not only pairs anchored on the keeper — un-parks the merge,
+and any other verdict or failure parks it (never auto-merges; a failure is
+reported on stderr as a distinguishable NLI diagnostic). The judge receives
+the two first-sentences on stdin (one per line, UTF-8) and prints a verdict
+word. On Windows, backslashes in the template are normalized to forward
+slashes before parsing (POSIX-style backslash stripping would otherwise
+mangle `C:\path\judge.py`; quote paths containing spaces). Unset =
 byte-identical behavior (no NLI); a deterministic regex polarity remains the
 fallback for a response you judge ambiguous.
 
