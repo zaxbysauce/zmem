@@ -382,7 +382,7 @@ def _check_embeddings() -> dict:
         and st.get("models_dir")
     ):
         try:
-            ck_ok = embeddings.verify_checksum(
+            ck_ok = embeddings.verify_checksum_cached(
                 Path(st["models_dir"]) / "minilm.onnx"
             )
         except Exception:

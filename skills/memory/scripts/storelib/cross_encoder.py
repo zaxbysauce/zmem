@@ -65,22 +65,45 @@ def cli_allowed(*, no_bump: bool, no_hybrid: bool) -> bool:
     return enabled() and not no_bump and not no_hybrid
 
 
+_SCORER_CACHE: dict = {}
+
+
 def _local_scorer():
-    """Build (and memoize) a pair-logit scorer from the configured local ONNX
-    model. Returns None — rather than raising — on every failure mode: env
-    unset, file missing/unreadable, missing onnxruntime/tokenizers, session
-    error. A negative probe is retried on later calls because the operator may
-    install the model between commands."""
+    """Build (and CACHE by resolved-path + mtime) a pair-logit scorer from the
+    configured local ONNX model.
+
+    Returns None — rather than raising — on every failure mode: env unset,
+    file missing/unreadable, missing onnxruntime/tokenizers, session error.
+    Negative results are NOT cached (the operator may install/replace the
+    model between commands); positive results are cached and invalidated by
+    file mtime changes.
+
+    SCORING-SHAPE HONESTY: there is no universally-pinned cross-encoder ONNX
+    contract we can assume generically — pair-tokenization order, input names,
+    and logit slicing vary per export. This loader makes a best-effort minimal
+    input guess and NEVER lets a shape mismatch escape (degrade contract); an
+    operator whose model scores oddly must supply a validated export. If you
+    need guaranteed fidelity, inject via ``set_scorer``.
+    """
     model_path = (os.environ.get(MODEL_PATH_ENV) or "").strip()
     if not model_path or not os.path.isfile(model_path):
         return None
     try:
+        mtime = os.stat(model_path).st_mtime
+    except OSError:
+        return None
+    cached = _SCORER_CACHE.get(model_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    def build():
         import numpy as np  # noqa: F401  (session inputs need it)
         import onnxruntime as ort
         from tokenizers import Tokenizer
-    except Exception:
-        return None
+        return ort, Tokenizer
+
     try:
+        ort, Tokenizer = build()
         sess = ort.InferenceSession(model_path)
         tok_dir = os.path.dirname(model_path)
         tok_file = os.path.join(tok_dir, "tokenizer.json")
@@ -114,6 +137,7 @@ def _local_scorer():
                 scores = logits[:, 0]
             return [float(s) for s in scores]
 
+        _SCORER_CACHE[model_path] = (mtime, score)
         return score
     except Exception:
         return None

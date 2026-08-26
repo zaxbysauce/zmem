@@ -178,6 +178,35 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+_deep_ck_cache: dict = {}
+
+
+def verify_checksum_cached(path: Path, expected: str | None = None):
+    """Deep hash of `path` with POSITIVE-result memoization keyed on
+    (mtime, size).
+
+    Doctor's diagnostic pass needs an authoritative pin verdict even when no
+    load has happened yet this process — but re-hashing a ~90 MB model on
+    every doctor invocation is wasted I/O for the healthy case. A VERIFIED
+    file whose (mtime,size) is unchanged skips the rehash; mismatches are
+    NEVER cached, so tampering stays instantly visible and repairing the file
+    flips back to verified once its stats change.
+    Returns True / False / None (file unreadable), like a three-state probe.
+    """
+    try:
+        stt = path.stat()
+        key = (str(path), stt.st_mtime_ns, stt.st_size)
+    except OSError:
+        return None
+    cached = _deep_ck_cache.get(key)
+    if cached is not None:
+        return cached
+    verdict = bool(verify_checksum(path, expected))
+    if verdict:
+        _deep_ck_cache[key] = True
+    return verdict
+
+
 def verify_checksum(path: Path, expected: str | None = None) -> bool:
     """True iff `path` exists and its sha256 matches `expected`. Never raises.
 

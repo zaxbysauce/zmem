@@ -337,7 +337,9 @@ Existing embeddings are preserved; no runtime means a graceful skip.
 `--all` rebuilds EVERY live memory's vector under the selected profile —
 the operator-grade converter when you switch profiles:
 - `--profile NAME` selects from the shipped registry (`minilm`, `fake`; see
-  "Embedding profiles" below). Default: active `ZMEM_EMBED_PROFILE` or `minilm`.
+  "Embedding profiles" below). Default: active `ZMEM_EMBED_PROFILE` or
+  `minilm`. Requires `--all` — `--profile` without it refuses with the exact
+  conversion command, never a silent no-op.
 - If the profile's dimension differs from what the store holds, `memory_vec`
   is recreated at the new dimension INSIDE one transaction — a crash mid-run
   rolls back to the pristine pre-run state, so a half-dim index is impossible.

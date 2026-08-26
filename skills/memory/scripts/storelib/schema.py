@@ -411,7 +411,33 @@ def assert_embedding_compatible(conn: sqlite3.Connection, *, allow_rebuild: bool
         prof_dim = _profiles.PROFILES[prof_name]["dim"]
     else:
         prof_dim = 384
-    live_dim = _live_embedding_dim(conn)
+    live_dim = None
+    ddl_unknown = False
+    try:
+        live_dim = _live_embedding_dim(conn)
+    except RuntimeError:
+        # Unparseable memory_vec DDL and zero committed blobs: nothing vector-
+        # shaped has been persisted yet, so unlike the corrupt-data case this
+        # is treated as "no committed dimension" (same posture as an empty
+        # store). Fail-closed would brick every guarded command behind an
+        # unrecoverable refusal; reembed --all remains the repair tool.
+        try:
+            any_blob = conn.execute(
+                "SELECT 1 FROM memory WHERE embedding IS NOT NULL LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            any_blob = None
+        if any_blob:
+            raise
+        ddl_unknown = True
+    if ddl_unknown:
+        import sys as _sys
+
+        print("[zmem] note: memory_vec DDL is unparseable and no embeddings "
+              "exist yet — treating the store as having no committed "
+              "dimension; reembed --all will rebuild the index.",
+              file=_sys.stderr)
+        return
     if live_dim is None or live_dim == prof_dim:
         return
     if allow_rebuild:

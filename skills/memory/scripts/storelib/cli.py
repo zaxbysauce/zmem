@@ -310,8 +310,9 @@ def main():
 
         _PROFILE_CHOICES = sorted(_P)
     p_reembed.add_argument("--profile", choices=_PROFILE_CHOICES, default=None,
-                           help="embedding profile to convert the store to "
-                                "(default: active ZMEM_EMBED_PROFILE or minilm)")
+                           help="with --all: embedding profile to convert "
+                                "the store to (default: active "
+                                "ZMEM_EMBED_PROFILE or minilm)")
     p_reembed.add_argument("--batch", type=nonnegative_int, default=64,
                            help="progress-report granularity in rows "
                                 "(stderr pacing only; does not affect "
@@ -789,8 +790,12 @@ def main():
     # `recent` deliberately guards NOTHING because SessionStart hooks depend
     # on it unconditionally, and it neither embeds nor touches memory_vec.
     # allow_rebuild exempts exactly the escape hatch: reembed --all.
+    # review round (issue #63): ingest-jsonl joins the guard set — its row
+    # loop embeds fresh vectors via _detect_duplicate and inserts into
+    # memory_vec, so an unmatched active profile could previously write
+    # wrong-dim blobs with the vec-row insert silently swallowed.
     if args.cmd in {"add", "update", "recall", "search", "consolidate",
-                    "organize"} or args.cmd == "reembed":
+                    "organize", "ingest-jsonl"} or args.cmd == "reembed":
         try:
             assert_embedding_compatible(
                 conn,
@@ -963,11 +968,21 @@ def main():
             conn.commit()
             print("[zmem] FTS5 index rebuilt")
         elif args.cmd == "reembed":
-            if args.all or args.profile or args.dry_run or args.batch != 64:
+            if args.profile and not args.all:
+                # Silent no-op would be crueler than refusal: --profile alone
+                # looks like a conversion but only ever took effect with
+                # --all. Say exactly what to type (review round, R2).
+                print("[zmem] --profile only takes effect with --all "
+                      "(use: reembed --all --profile <name> to convert)",
+                      file=sys.stderr)
+                sys.exit(2)
+            if args.all or args.dry_run:
                 sys.exit(reembed_embeddings(
                     conn, rebuild_all=args.all, profile=args.profile,
                     batch=args.batch, dry_run=args.dry_run))
-            _reembed(conn)  # legacy flagless form: byte-identical behavior
+            # legacy flagless/backfill form: byte-identical stdout contract;
+            # --batch passes through purely as stderr progress pacing.
+            sys.exit(reembed_embeddings(conn, batch=args.batch))
         elif args.cmd == "consolidate":
             # Single-flight: consolidate() writes, and the SessionStart hook fires a
             # detached one per session. Its meta-key cadence gate is a SOFT gate

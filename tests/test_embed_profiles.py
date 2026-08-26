@@ -219,13 +219,28 @@ class NoUnverifiedEscapeHatch(unittest.TestCase):
     """Repo-wide invariant: verification cannot be bypassed by env (#63 gate)."""
 
     def test_no_allow_unverified_anywhere(self):
+        """No code may READ an ALLOW_UNVERIFIED-style env var. Doc/test
+        mentions of the *absence* are fine; an actual environment fetch would
+        be the hatch (issue #63 gate)."""
         r = subprocess.run(
-            ["git", "grep", "-l", "-i", "-e", "ALLOW_UNVERIFIED",
+            ["git", "grep", "-n", "-i", "-e", "ALLOW_UNVERIFIED",
              "--", "*.py", "*.js", "*.sh"],
             capture_output=True, text=True, cwd=str(REPO_ROOT),
         )
-        hits = [ln for ln in r.stdout.splitlines() if ln.strip()]
-        self.assertEqual(hits, [], f"unverified-load hatch introduced: {hits}")
+        import re as _re
+
+        def is_hatch(ln):
+            low = ln.lower()
+            return ("getenv" in low and "allow_unverified" in low) or (
+                "environ" in low and "allow_unverified" in low)
+
+        hatch = [
+            ln for ln in r.stdout.splitlines()
+            if is_hatch(ln)
+            and "test_embed_profiles.py" not in ln  # this scanner's own text
+        ]
+        self.assertEqual(hatch, [],
+                         f"unverified-load hatch introduced: {hatch}")
 
 
 if __name__ == "__main__":

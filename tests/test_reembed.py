@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import subprocess
 import shutil
@@ -379,6 +380,70 @@ class BatchProgressPacing(ReembedBase):
         lines = [ln for ln in err.getvalue().splitlines()
                  if ln.startswith("[zmem] reembed:")]
         self.assertEqual(len(lines), 3, "ceil(7/3)=3 progress ticks")
+
+class ReviewRoundFixes(unittest.TestCase):
+    """Direct coverage for the independent-review round (issue #63)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-revfix-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store_path = Path(self.tmp) / "store.sqlite"
+
+    def test_profile_without_all_refuses_exit_2(self):
+        env = dict(os.environ)
+        env["ZMEM_STORE"] = str(self.store_path)
+        env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "reembed",
+             "--profile", "fake"],
+            capture_output=True, text=True, env=env, cwd=str(SCRIPTS),
+            timeout=60)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--profile only takes effect with --all",
+                      r.stderr + r.stdout)
+
+    def test_ingest_jsonl_guarded_by_dim_mismatch(self):
+        """fake-profile ingest on a 384-d store: exit 2, zero rows."""
+        import struct as _s
+        # build a legacy minilm-dim store first
+        os.environ["ZMEM_STORE"] = str(self.store_path)
+        os.environ.pop("ZMEM_EMBED_PROFILE", None)
+        sys.path.insert(0, str(SCRIPTS))
+        for m in list(sys.modules):
+            if m.startswith("storelib"):
+                del sys.modules[m]
+        from storelib.schema import connect as _c, _prepare_store as _p
+        conn = _c(); _p(conn)
+        conn.execute(
+            "INSERT INTO memory(id,namespace,type,content,confidence,signal,"
+            "valid_from,ingestion_ts,taint,embedding,embedding_model) VALUES"
+            "('old1','user:t','fact','legacy row',0.9,'test',"
+            "'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','trusted_internal',"
+            "?, 'minilm-onnx')",
+            (_s.pack("<384f", *([0.3] * 384)),))
+        conn.commit(); conn.close()
+
+        jsonl = Path(self.tmp) / "in.jsonl"
+        payload = {"id": "new1", "namespace": "user:t", "type": "fact",
+                   "content": "fresh imported row", "signal": "none",
+                   "ingestion_ts": "2026-02-02T00:00:00Z"}
+        jsonl.write_text(json.dumps(payload), encoding="utf-8")
+
+        env = dict(os.environ)
+        env["ZMEM_STORE"] = str(self.store_path)
+        env["ZMEM_EMBED_PROFILE"] = "fake"
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "ingest-jsonl",
+             "--from", str(jsonl)],
+            capture_output=True, text=True, env=env, cwd=str(SCRIPTS),
+            timeout=60)
+        self.assertEqual(
+            r.returncode, 2,
+            f"mismatched ingest must refuse; got rc={r.returncode} "
+            f"stderr={r.stderr[-300:]!r}")
+        cnt = sqlite3.connect(str(self.store_path)).execute(
+            "SELECT COUNT(*) FROM memory").fetchone()[0]
+        self.assertEqual(cnt, 1, "zero partial rows may land")
 
 
 class Refusals(unittest.TestCase):
