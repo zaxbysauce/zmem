@@ -97,14 +97,14 @@ def _local_scorer():
     if cached is not None and cached[0] == mtime:
         return cached[1]
 
-    def build():
-        import numpy as np  # noqa: F401  (session inputs need it)
+    # Imports live in THIS scope (not a nested builder) so the `score`
+    # closure below can see them: closure cells resolve per-frame, and an
+    # import hidden inside a helper would make every score() call raise
+    # NameError -> silent no-rerank forever (final-critic finding).
+    try:
+        import numpy as np  # noqa: F401  (array construction in score)
         import onnxruntime as ort
         from tokenizers import Tokenizer
-        return ort, Tokenizer
-
-    try:
-        ort, Tokenizer = build()
         sess = ort.InferenceSession(model_path)
         tok_dir = os.path.dirname(model_path)
         tok_file = os.path.join(tok_dir, "tokenizer.json")

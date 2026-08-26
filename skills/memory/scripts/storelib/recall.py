@@ -1284,6 +1284,8 @@ def _has_any_embedding(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         "SELECT 1 FROM memory WHERE superseded_at IS NULL AND embedding IS NOT NULL LIMIT 1"
     ).fetchone()
+    return bool(row)
+
 def _reembed(conn: sqlite3.Connection) -> None:
     """Flagless backfill — byte-compatible legacy entry point.
 

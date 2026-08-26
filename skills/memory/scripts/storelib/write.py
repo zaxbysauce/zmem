@@ -120,6 +120,19 @@ except ImportError:
     from correction_queue import SECRET_PATTERNS  # type: ignore # noqa: F401
 
 
+def _warn_fake_active_once() -> None:
+    """Issue #63 review round C4 / approved-plan D: operator-guard banner on
+    WRITE surfaces when ZMEM_EMBED_PROFILE=fake is active. The embeddings
+    module owns the once-per-process state; passive hook read paths stay
+    quiet because only writers call this."""
+    if _embeddings is not None:
+        try:
+            _embeddings.warn_fake_active()
+        except Exception:
+            pass
+
+
+
 
 class CapturePolicyRefusal(ValueError):
     """Automatic capture could not safely preserve the record contract."""
@@ -693,6 +706,7 @@ def add_memory(
         # match fallback. Semantic dedup catches paraphrases the exact-match miss.
         # Shared with ingest-jsonl (Tier 3 sync import), which must apply the same
         # dedup-on-write semantics to incoming rows without duplicating this logic.
+        _warn_fake_active_once()
         existing, dedup_sim, emb = _detect_duplicate(conn, content, namespace)
 
         # v11 (issue #61, 6.2): similarity cannot distinguish "always X" from
@@ -1090,6 +1104,7 @@ def update_memory(
 
         # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
         # cannot self-match; an unchanged-content update still creates history.
+        _warn_fake_active_once()
         existing, dedup_sim, emb = _detect_duplicate(conn, content_eff, ns)
         # v11 (issue #61, 6.2): the same write-time polarity guard as add —
         # a contradiction is NOT a duplicate. Disagree ⇒ skip the merge and

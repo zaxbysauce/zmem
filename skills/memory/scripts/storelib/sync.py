@@ -770,6 +770,14 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
 
         # Secret/injection handling is applied once above (for new rows) via
         # _apply_capture_policy (issue #35); no separate advisory scan here.
+        # Issue #63 review round: ingest is a WRITE surface; a forgotten
+        # fake-profile export must announce itself here too.
+        import embeddings as _emb_sync
+
+        try:
+            _emb_sync.warn_fake_active()
+        except Exception:
+            pass  # banner must never break ingest (mirror write.py guard)
         existing, _sim, emb = _detect_duplicate(conn, content, namespace,
                                                  dedup_cache=dedup_cache)
         # v11 (issue #61, 6.2 — PR-review R1): the SAME write-time polarity
