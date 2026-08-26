@@ -69,7 +69,8 @@ _SCORER_CACHE: dict = {}
 
 
 def _local_scorer():
-    """Build (and CACHE by resolved-path + mtime) a pair-logit scorer from the
+    """Build and cache a pair-logit scorer from the configured local ONNX
+    model (dict keyed by resolved path; value carries (mtime, score)).
     configured local ONNX model.
 
     Returns None — rather than raising — on every failure mode: env unset,

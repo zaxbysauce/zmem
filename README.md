@@ -615,6 +615,8 @@ lose semantic recall.
    Use `reembed --all [--profile NAME]` to convert the whole store to another
    profile/dimension atomically (see SKILL.md "reembed" and "Embedding
    profiles"); profiles are selected with `ZMEM_EMBED_PROFILE`.
+   `--profile` requires `--all`: without it the command refuses with exit 2
+   rather than silently doing nothing.
 
    Shipped profiles: `minilm` (Xenova/all-MiniLM-L6-v2 ONNX, 384-d,
    checksum-pinned) and `fake` (16-d deterministic placeholders for

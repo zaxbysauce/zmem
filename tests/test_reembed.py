@@ -388,11 +388,19 @@ class ReviewRoundFixes(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="zmem-revfix-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.store_path = Path(self.tmp) / "store.sqlite"
+        self._saved_autodl = os.environ.get("ZMEM_MODEL_AUTODOWNLOAD")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        self.addCleanup(self._restore_autodl)
+
+    def _restore_autodl(self):
+        if self._saved_autodl is None:
+            os.environ.pop("ZMEM_MODEL_AUTODOWNLOAD", None)
+        else:
+            os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = self._saved_autodl
 
     def test_profile_without_all_refuses_exit_2(self):
         env = dict(os.environ)
         env["ZMEM_STORE"] = str(self.store_path)
-        env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
         r = subprocess.run(
             [sys.executable, str(SCRIPTS / "store.py"), "reembed",
              "--profile", "fake"],
@@ -434,13 +442,17 @@ class ReviewRoundFixes(unittest.TestCase):
         env["ZMEM_EMBED_PROFILE"] = "fake"
         r = subprocess.run(
             [sys.executable, str(SCRIPTS / "store.py"), "ingest-jsonl",
-             "--from", str(jsonl)],
+             "--in", str(jsonl)],
             capture_output=True, text=True, env=env, cwd=str(SCRIPTS),
             timeout=60)
         self.assertEqual(
             r.returncode, 2,
             f"mismatched ingest must refuse; got rc={r.returncode} "
             f"stderr={r.stderr[-300:]!r}")
+        self.assertIn(
+            "expects", r.stderr,
+            "rc-2 must come from the embedding-compat GUARD message, not an "
+            "incidental validation path")
         cnt = sqlite3.connect(str(self.store_path)).execute(
             "SELECT COUNT(*) FROM memory").fetchone()[0]
         self.assertEqual(cnt, 1, "zero partial rows may land")

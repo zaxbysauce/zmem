@@ -431,12 +431,10 @@ def assert_embedding_compatible(conn: sqlite3.Connection, *, allow_rebuild: bool
             raise
         ddl_unknown = True
     if ddl_unknown:
-        import sys as _sys
-
         print("[zmem] note: memory_vec DDL is unparseable and no embeddings "
               "exist yet — treating the store as having no committed "
               "dimension; reembed --all will rebuild the index.",
-              file=_sys.stderr)
+              file=sys.stderr)
         return
     if live_dim is None or live_dim == prof_dim:
         return

@@ -1484,13 +1484,16 @@ def reembed_embeddings(
 
             set_meta(conn, "embedding_profile", target)
             conn.execute("COMMIT")
-        except Exception as exc:  # noqa: BLE001 — degrade path prints reason
+        except BaseException as exc:  # KeyboardInterrupt/SystemExit included
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
-            rc = 1
-            error_note = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, Exception):
+                rc = 1
+                error_note = f"{type(exc).__name__}: {exc}"
+            else:
+                raise
         finally:
             conn.isolation_level = old_iso
         if rc == 0:
