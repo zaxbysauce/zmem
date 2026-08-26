@@ -12,6 +12,8 @@ README.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-08-26
+
 ### Added
 
 - **Sleep-time organize + SessionStart wiring** (issue #62, schema-stable — no
