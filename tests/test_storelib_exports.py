@@ -59,7 +59,7 @@ EXPECTED_EXPORTS = [
     "cmd_entity_list", "cmd_entity_merge", "cmd_export_jsonl", "cmd_export_pack", "cmd_failures", "cmd_ingest_jsonl", "cmd_mine_history", "cmd_queue_clear",
     "cmd_queue_list", "cmd_restore", "cmd_sweep", "compute_score", "connect", "consolidate",
     "counts_agree", "create_snapshot", "entities_for_memory", "entities_for_memories", "entity_match_ids", "extract_entities", "get_memory", "init_db", "link_memory_entities", "list_memory", "list_snapshots",
-    "main", "migrate", "nonnegative_int", "now_iso", "promote_memory", "recall_memory",
+    "main", "migrate", "nonnegative_int", "now_iso", "organize", "promote_memory", "recall_memory",
     "recent_memory", "rekey_namespace", "relink_memory", "stats", "supersede_memory", "update_memory", "validate_taint", "verify_snapshot", "worse_taint",
 ]
 

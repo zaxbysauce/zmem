@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import struct
@@ -344,6 +345,305 @@ def _absorb_into_keeper(
 
     return decision
 
+
+def _gather_neighbors(
+    conn: sqlite3.Connection,
+    seed: sqlite3.Row,
+    rows: list[sqlite3.Row],
+    *,
+    use_lexical: bool,
+    lexical_tokens: dict[str, set[str]],
+    effective_threshold: float,
+    absorbed: set[str],
+    restrict_ids: set[str] | None = None,
+) -> tuple[list[tuple[sqlite3.Row, float]], bool]:
+    """Return the qualifying neighbors of ``seed`` among ``rows``, plus whether the
+    vec0 KNN hit its k cap with every returned row still above threshold.
+
+    This is the SINGLE source of the cluster/topic neighbor predicate shared by
+    the ``consolidate`` seed loop and the phase-7 ``organize`` related-graph
+    (issue #62, 7.2): both paths must decide "is this row related to seed at
+    this similarity threshold" identically, or organize's topics would drift
+    from what consolidate would cluster. Extracted VERBATIM from the former
+    inline loop — do not "clean up" either branch here without changing both
+    callers in the same edit.
+
+    Semantics preserved from the original loop:
+    - Namespace containment: a neighbor is ALWAYS scoped to the seed's own
+      namespace (the background no--namespace run must never merge across
+      projects).
+    - A row already claimed by an earlier cluster (``absorbed``) is skipped.
+    - vec0 path: escalate k until the qualifying set is provably complete;
+      cap k at ``min(max(len(rows), 10), 500)`` and set ``knn_truncated`` when
+      the cap binds with all rows still above threshold. Every candidate is
+      re-fetched with a liveness AND same-namespace check (vec0 is
+      namespace-blind; the seed loop's correctness depends on this re-fetch).
+    - An unembedded seed in cosine mode participates in NO edges (returns
+      empty): consolidate pre-filters unembedded rows out of its candidate set,
+      while ``organize``'s related-graph deliberately includes every live
+      working row — an unembedded row there simply joins a topic only via
+      shared-entity grouping, never via a neighbor edge.
+
+    ``restrict_ids`` (issue #62, editorial round — Claude Code F-001): when
+    set, the vec0 KNN is a GLOBAL index scan whose result ids are then
+    filtered down to ``restrict_ids`` before the liveness re-fetch. This is
+    the OPT-IN escape hatch that lets ``organize`` bound the related-graph (and
+    ``consolidate`` under ``working_ids``) to exactly its native episode,
+    while a bare ``consolidate`` on the full store keeps the historical global
+    KNN behaviour byte-identical. The lexical branch iterates ``rows`` and is
+    therefore already bounded — the filter is a cosine-only concern. A
+    neighbor whose id is absent from ``restrict_ids`` can never be returned,
+    so a callers' union-find over ``rows`` can never see an out-of-episode id
+    from this function.
+
+    Read-only (no writes, no commits).
+    """
+    neighbors: list[tuple[sqlite3.Row, float]] = []
+    knn_truncated = False
+
+    if use_lexical:
+        seed_tokens = lexical_tokens.get(seed["id"]) or set()
+        for row in rows:
+            if row["id"] == seed["id"] or row["id"] in absorbed:
+                continue
+            if row["namespace"] != seed["namespace"]:
+                continue  # namespace containment — see the note above
+            sim = _lexical_similarity(seed_tokens, lexical_tokens.get(row["id"]) or set())
+            if sim >= effective_threshold:
+                neighbors.append((row, sim))
+    else:
+        if seed["embedding"] is None:
+            return [], False
+        results = []
+        k = 10
+        k_cap = min(max(len(rows), 10), 500)
+        while True:
+            try:
+                results = conn.execute(
+                    "SELECT memory_id, distance FROM memory_vec "
+                    "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                    [seed["embedding"], k],
+                ).fetchall()
+            except sqlite3.OperationalError:
+                results = []
+                break
+            if len(results) < k:
+                break  # vec0 exhausted — this is every row it can offer
+            if any((1.0 - r["distance"]) < effective_threshold for r in results):
+                break  # saw the cutoff — the qualifying set is complete
+            if k >= k_cap:
+                knn_truncated = True
+                break
+            k = min(k * 5, k_cap)
+        for r in results:
+            mid = r["memory_id"]
+            if mid == seed["id"] or mid in absorbed:
+                continue
+            if restrict_ids is not None and mid not in restrict_ids:
+                # OUT-OF-EPISODE: the global index offered it, but the caller's
+                # episode does not include it — it is not a candidate neighbor.
+                continue
+            sim = 1.0 - r["distance"]
+            if sim >= effective_threshold:
+                row = conn.execute(
+                    "SELECT id, confidence, signal, tags, retrieval_count, "
+                    "surfaced_count, content, taint "
+                    "FROM memory "
+                    "WHERE id=? AND superseded_at IS NULL AND namespace=?",
+                    (mid, seed["namespace"]),
+                ).fetchone()
+                if row:
+                    neighbors.append((row, sim))
+
+    return neighbors, knn_truncated
+
+
+def _prune_unrecalled_days() -> int:
+    """ZMEM_UNRECALLED_DAYS (issue #62, 7.6), default 30, read LAZILY at call
+    time. Prune may additionally qualify a live row whose ``last_surfaced`` is
+    older than this many days (see the prune block). Lazy read so tests can
+    vary it per invocation without reloading; absent/garbage/non-numeric -> 30.
+    OverflowError is caught too (`int(float('inf'))` raises it — a deliberately
+    extreme env value must degrade to the default, not crash the prune pass)."""
+    try:
+        raw = os.environ.get("ZMEM_UNRECALLED_DAYS", "").strip()
+        if not raw:
+            return 30
+        n = int(float(raw))
+        return n if n >= 0 else 30
+    except (TypeError, ValueError, OverflowError):
+        return 30
+
+
+def _cadence_gate_skipped(
+    conn: sqlite3.Connection, *, force: bool, dry_run: bool, label: str,
+) -> bool:
+    """Shared 7d / 20%-growth cadence gate (issues #26 / #62) — ONE
+    implementation for both entry points to the same maintenance act.
+
+    ``consolidate()`` and ``organize()`` were carrying two byte-identical
+    copies of this predicate; that is exactly the drift class this module's
+    shared-neighbor extraction exists to prevent (Claude Code round 4
+    test-coverage list). ``label`` is the caller's singular noun for the
+    human message ('consolidate' / 'organize'); the meta keys, knobs,
+    thresholds, and both dry-run/real message frames are shared. The knob
+    values are this OWNING module's constants (refreshed together by
+    ``_refresh_env_state``), so both entry points always read the same
+    instance — the core of PRR-007: organize must never snapshot these by
+    value at its own import or the two entry points could drift.
+
+    Returns True when the run must skip (the gate is armed AND the store has
+    not grown enough). Callers set their own ``skipped_by_cadence_gate`` flag
+    and return early — the clock is left untouched so a skip never arms it.
+    """
+    last_consolidation = conn.execute(
+        "SELECT value FROM meta WHERE key='last_consolidation'"
+    ).fetchone()
+    if not last_consolidation or force:
+        return False
+    import calendar as _cal
+    last_ts = last_consolidation[0]
+    last_epoch = (
+        _cal.timegm(time.strptime(last_ts, "%Y-%m-%dT%H:%M:%SZ"))
+        if last_ts else 0
+    )
+    days_since = (time.time() - last_epoch) / 86400.0 if last_epoch > 0 else 999
+    live_count = conn.execute(
+        "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
+    ).fetchone()[0]
+    last_count = conn.execute(
+        "SELECT value FROM meta WHERE key='last_consolidation_count'"
+    ).fetchone()
+    last_live = int(last_count[0]) if last_count and last_count[0].isdigit() else 0
+    growth = (live_count - last_live) / max(last_live, 1)
+
+    # The knob values are the OWNING module's constants (refreshed by
+    # store-level _refresh_env_state), not direct env reads: both entry points
+    # read the SAME instance, so they can never diverge, and an env override
+    # set at process start (the supported surface) governs identically.
+    min_days = CONSOLIDATE_MIN_INTERVAL_DAYS
+    min_growth = CONSOLIDATE_GROWTH_THRESHOLD
+    if days_since >= min_days or growth >= min_growth:
+        return False
+    # Announce the skip (never silent — issue #26). dry_run and the real run
+    # share the gate so the two modes agree. Background callers
+    # (zmem-session-start.sh, hermes on_session_end) redirect stdout to
+    # /dev/null, so this stays silent there by design; the interactive
+    # closeout user reading stdout is who needs to see it.
+    if dry_run:
+        print(f"[zmem] {label}: dry-run: would skip by cadence gate "
+              f"({days_since:.1f}d since last run < "
+              f"{min_days:g}d min, {growth:.1%} growth < "
+              f"{min_growth:.1%} min; needs more "
+              f"time OR more growth; drop --dry-run and pass --force to "
+              f"run anyway)")
+    else:
+        print(f"[zmem] {label}: skipped by cadence gate "
+              f"({days_since:.1f}d since last run < "
+              f"{min_days:g}d min, {growth:.1%} growth < "
+              f"{min_growth:.1%} min; needs more "
+              f"time OR more growth)")
+    return True
+
+
+def _nli_first_sentence(text: str | None, max_len: int | None = 2000) -> str:
+    """First whole sentence of ``text`` (bounded) sent to the NLI judge.
+    Verbatim content is too noisy; the two-sentence contract (issue #62, 7.5)
+    is the first sentence of each side. ``max_len=None`` disables the bound so
+    a caller that must preserve the WHOLE first sentence verbatim (organize's
+    extractive bullets — PRR-010) is never truncated mid-sentence."""
+    collapsed = re.sub(r"\s+", " ", (text or "").strip())
+    if not collapsed:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", collapsed)
+    first = parts[0] if parts else collapsed
+    if max_len is not None:
+        return first[:max_len]
+    return first
+
+
+def _nli_judge_pair(argv: list[str], a: str, b: str) -> str:
+    """Run the LOCAL contradiction judge on two texts; return the normalized
+    verdict in {entailment, contradiction, neutral}. Any failure — non-zero
+    exit, timeout, OSError, or non-matching stdout — degrades to ``neutral``
+    (the caller then falls back to polarity and does NOT merge). The exact
+    stdin contract: two first-sentences, one newline-separated line each, plus
+    a trailing newline. argv is a list passed straight to CreateProcess on
+    Windows (never ``shell=True``). The judge's stdin/stdout are decoded as
+    UTF-8 (7.5 negotiated content can be any script), and a failure is
+    surfaced to stderr as a distinguishable diagnostic instead of silently
+    swallowing the cause into "neutral" (Claude Code F-007/F-008)."""
+    a_first = _nli_first_sentence(a)
+    b_first = _nli_first_sentence(b)
+    try:
+        proc = subprocess.run(
+            argv, input=f"{a_first}\n{b_first}\n",
+            capture_output=True, timeout=5,
+            encoding="utf-8", errors="replace",
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"[zmem] consolidate: NLI judge could not be invoked "
+              f"({argv!r}): {exc}; degrading to neutral", file=sys.stderr)
+        return "neutral"
+    if proc.returncode != 0:
+        print(f"[zmem] consolidate: NLI judge exited {proc.returncode} "
+              f"({argv!r}); degrading to neutral", file=sys.stderr)
+        return "neutral"
+    return proc.stdout.strip().lower()
+
+
+def _nli_judge_all_entail(member_pols: list[tuple]) -> bool | None:
+    """Issue #62, 7.5: does the optional local NLI judge resolve EVERY
+    polarity-FLAGGED pair (differing ``_polarity_signature``) in this cluster
+    as entailment?
+
+    Returns True (un-park -> merge), False (park), or None when ``ZMEM_NLI_CMD``
+    is unset — the caller then behaves BYTE-IDENTICALLY to the pre-judge code
+    path (no print, no subprocess import). Only ``entailment`` may un-park;
+    ``neutral``/``contradiction``/crash/non-zero/garbage all mean park (fall
+    back to polarity, never auto-merge). All-entailment semantics: one
+    non-entailing flagged pair parks the whole cluster. Env var read lazily
+    each call.
+
+    A "polarity-flagged pair" is ANY pair of members whose negation-polarity
+    signatures differ — not only the pair anchored on the keeper (PRR-004): a
+    non-keeper pair at opposite polarity is every bit as contradictory as one
+    touching the keeper, so all-entailment must hold across every differing
+    pair or the cluster parks. Pair order is deterministic (first-seen member
+    order). On Windows the argv template's backslashes are normalized to
+    forward slashes before the shlex split so ``python C:\path\judge.py``
+    survives the POSIX backslash-stripping (Claude Code F-007)."""
+    cmd = os.environ.get("ZMEM_NLI_CMD", "").strip()
+    if not cmd:
+        return None
+    if os.name == "nt":
+        # subprocess never runs a shell here; backslashes in the template are
+        # WindowS path separators, never escape sequences. Forward slashes keep
+        # them intact through shlex.split's POSIX backslash handling while
+        # leaving quoted-token semantics (and spaces) untouched.
+        cmd = cmd.replace("\\", "/")
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        argv = []
+    if not argv:
+        return None
+    flagged = []
+    for i in range(len(member_pols)):
+        for j in range(i + 1, len(member_pols)):
+            if member_pols[i][2] != member_pols[j][2]:
+                # Deterministic order: earlier member index first.
+                a, b = member_pols[i][1], member_pols[j][1]
+                flagged.append((a, b))
+    if not flagged:
+        return False
+    for a, b in flagged:
+        verdict = _nli_judge_pair(argv, a, b)
+        print(f"[zmem] consolidate: NLI judge: [{a[:40]!r} vs {b[:40]!r}] -> {verdict}")
+        if verdict != "entailment":
+            return False
+    return True
+
 def consolidate(
     conn: sqlite3.Connection,
     *,
@@ -353,6 +653,8 @@ def consolidate(
     namespace: str | None = None,
     force: bool = False,
     merge_contested: bool = False,
+    working_ids: set[str] | None = None,
+    collect_run_ids: bool = False,
 ) -> dict:
     """Merge near-duplicate memories via embedding similarity (or a lexical
     token-overlap fallback when embeddings are unavailable — Phase 10).
@@ -426,6 +728,30 @@ def consolidate(
     is the only intentional bypass. ``threshold`` no longer affects the gate (the
     previous behaviour where any non-default ``--threshold`` incidentally bypassed
     it was an undocumented side-channel and is removed).
+
+    ``working_ids`` (issue #62, 7.1): when set, the candidate set is narrowed to
+    exactly those live rows (still bounded by the per-namespace cap and ordered
+    by the documented keeper-priority key). This is how the phase-7 ``organize``
+    job bounds its episode to the N most recent live rows and then runs the SAME
+    cluster logic 1:1 on that bounded set. Default None keeps the historical
+    box-wide semantics byte-identical.
+
+    ``collect_run_ids`` (issue #62, 7.4): when True, ``report["consolidated_ids"]``
+    lists the id of every KEEPER in a cluster that actually merged (committed) —
+    or, in dry-run, that the preview marked would-APPEND — so ``organize`` can
+    compress exactly the keepers its absorb pass grew. Contested/parked clusters
+    are never listed (they did not merge). Additive-only; the key is absent when
+    False so every existing caller's report is unchanged.
+
+    ``ZMEM_NLI_CMD`` (issue #62, 7.5): when set to an argv template, the optional
+    LOCAL contradiction judge is consulted for mixed-polarity clusters before
+    they are parked contested; only a verdict of ``entailment`` on EVERY
+    polarity-flagged pair un-parks the cluster (merges it). Neutral /
+    contradiction / crash / non-zero exit / garbage stdout all fall back to
+    today's regex polarity (park, never auto-merge). Unset = byte-identical to
+    the pre-judge code path. ``ZMEM_UNRECALLED_DAYS`` (issue #62, 7.6): prune may
+    additionally qualify live rows whose ``last_surfaced`` is older than this
+    many days (see the prune block).
     """
     use_lexical = not (_embeddings and _embeddings.is_available())
     if use_lexical:
@@ -448,6 +774,16 @@ def consolidate(
         "truncated": False,
         "knn_truncated": False,
     }
+    consolidated_ids: list[str] = []
+
+    # Optional working-set narrowing (issue #62, 7.1): ``working_ids`` bounds
+    # the candidate rows to a native episode (organize passes the N most recent
+    # live rows). Sorted for a deterministic IN-list. Empty/None -> unchanged.
+    ids_clause = ""
+    ids_params: list[str] = []
+    if working_ids:
+        ids_params = sorted(working_ids)
+        ids_clause = f" AND id IN ({','.join('?' * len(ids_params))})"
 
     # Growth-based cadence gate (issue #26): skip if last consolidation was
     # recent AND the store hasn't grown significantly since. The skip is always
@@ -459,45 +795,19 @@ def consolidate(
     # `threshold == CONSOLIDATE_DEFAULT_THRESHOLD` but for an UNRELATED purpose
     # (picking the Jaccard default in lexical fallback mode); the two predicates
     # are fully decoupled — do not "clean up" one expecting the other to follow.
-    last_consolidation = conn.execute(
-        "SELECT value FROM meta WHERE key='last_consolidation'"
-    ).fetchone()
-    last_count = conn.execute(
-        "SELECT value FROM meta WHERE key='last_consolidation_count'"
-    ).fetchone()
-
-    if last_consolidation and not force:
-        import calendar as _cal
-        last_ts = last_consolidation[0]
-        last_epoch = _cal.timegm(time.strptime(last_ts, "%Y-%m-%dT%H:%M:%SZ")) if last_ts else 0
-        days_since = (time.time() - last_epoch) / 86400.0 if last_epoch > 0 else 999
-        live_count = conn.execute(
-            "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
-        ).fetchone()[0]
-        last_live = int(last_count[0]) if last_count and last_count[0].isdigit() else 0
-        growth = (live_count - last_live) / max(last_live, 1)
-
-        if days_since < CONSOLIDATE_MIN_INTERVAL_DAYS and growth < CONSOLIDATE_GROWTH_THRESHOLD:
-            # Announce the skip (never silent — issue #26). dry_run and the real
-            # run share the gate so the two modes agree. Background callers
-            # (zmem-session-start.sh, hermes on_session_end) redirect stdout to
-            # /dev/null, so this stays silent there by design; the interactive
-            # closeout user reading stdout is who needs to see it.
-            if dry_run:
-                print(f"[zmem] consolidate: dry-run: would skip by cadence gate "
-                      f"({days_since:.1f}d since last run < "
-                      f"{CONSOLIDATE_MIN_INTERVAL_DAYS:g}d min, {growth:.1%} growth < "
-                      f"{CONSOLIDATE_GROWTH_THRESHOLD:.1%} min; needs more "
-                      f"time OR more growth; drop --dry-run and pass --force to "
-                      f"run anyway)")
-            else:
-                print(f"[zmem] consolidate: skipped by cadence gate "
-                      f"({days_since:.1f}d since last run < "
-                      f"{CONSOLIDATE_MIN_INTERVAL_DAYS:g}d min, {growth:.1%} growth < "
-                      f"{CONSOLIDATE_GROWTH_THRESHOLD:.1%} min; needs more "
-                      f"time OR more growth)")
-            report["skipped_by_cadence_gate"] = True
-            return report  # gate declined — leave last_consolidation untouched
+    # Growth-based cadence gate (issue #26): skip if last consolidation was
+    # recent AND the store hasn't grown significantly since. The skip is always
+    # announced. dry_run models the same gate so the two modes agree; only
+    # `force` bypasses it. Shared with organize() via _cadence_gate_skipped: the
+    # two entry points to the same maintenance act must never drift (Claude
+    # Code round 4 coverage list). NOTE: the lexical-swap below
+    # (effective_threshold) ALSO keys off `threshold ==
+    # CONSOLIDATE_DEFAULT_THRESHOLD` but for an UNRELATED purpose (picking the
+    # Jaccard default in lexical fallback mode); the two predicates are fully
+    # decoupled — do not "clean up" one expecting the other to follow.
+    if _cadence_gate_skipped(conn, force=force, dry_run=dry_run, label="consolidate"):
+        report["skipped_by_cadence_gate"] = True
+        return report  # gate declined — leave last_consolidation untouched
 
     # Write the consolidation timestamp BEFORE the clustering loop, so a killed
     # run still creates backpressure on the next session. Count is start-of-run
@@ -531,8 +841,8 @@ def consolidate(
     embed_clause = "" if use_lexical else "AND embedding IS NOT NULL"
     total_eligible = conn.execute(
         f"""SELECT count(*) AS c FROM memory
-           WHERE superseded_at IS NULL {embed_clause} {ns_clause}""",
-        ns_params,
+           WHERE superseded_at IS NULL {embed_clause} {ns_clause}{ids_clause}""",
+        [*ns_params, *ids_params],
     ).fetchone()["c"]
     # The cap is PER NAMESPACE (the constant is CONSOLIDATE_MAX_ROWS_PER_NAMESPACE):
     # a window function ranks rows within each namespace by the priority ORDER BY,
@@ -550,7 +860,7 @@ def consolidate(
                                    confidence DESC, ingestion_ts ASC, id ASC
                       ) AS rn
                FROM memory
-               WHERE superseded_at IS NULL {embed_clause} {ns_clause}
+               WHERE superseded_at IS NULL {embed_clause} {ns_clause}{ids_clause}
            )
            SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
                   surfaced_count, embedding, embedding_model, ingestion_ts, taint
@@ -558,7 +868,7 @@ def consolidate(
            WHERE rn <= ?
            ORDER BY confidence * (retrieval_count + surfaced_count) DESC, confidence DESC,
                     ingestion_ts ASC, id ASC""",
-        [*ns_params, CONSOLIDATE_MAX_ROWS_PER_NAMESPACE],
+        [*ns_params, *ids_params, CONSOLIDATE_MAX_ROWS_PER_NAMESPACE],
     ).fetchall()
     truncated = total_eligible > len(rows)
     # Set True if any seed's vec0 KNN escalation hit the k cap with all-returned
@@ -609,89 +919,25 @@ def consolidate(
         if seed["id"] in absorbed or seed["id"] in contested_ids:
             continue
 
-        neighbors = []
-        if use_lexical:
-            # Jaccard token-overlap clustering: compare seed against every
-            # other not-yet-absorbed row. O(n^2) but consolidate runs on a
-            # bounded, infrequent cadence (see the growth-gate above) over a
-            # single user's live memory count, not a large corpus.
-            seed_tokens = lexical_tokens[seed["id"]]
-            for row in rows:
-                if row["id"] == seed["id"] or row["id"] in absorbed:
-                    continue
-                if row["namespace"] != seed["namespace"]:
-                    continue  # namespace containment — see the note above
-                sim = _lexical_similarity(seed_tokens, lexical_tokens[row["id"]])
-                if sim >= effective_threshold:
-                    neighbors.append((row, sim))
-        else:
-            # Query vec0 for nearest neighbors of this seed.
-            #
-            # vec0's KNN is NAMESPACE-BLIND: it returns the globally nearest k
-            # rows, and the namespace filter below then discards the ones
-            # belonging to other projects. With a fixed k that silently
-            # UNDER-merges — on a box-wide store holding several projects the
-            # global top-10 can be filled entirely by other namespaces while
-            # the seed's own duplicate sits at rank 11, so consolidation finds
-            # nothing and the duplicate survives forever. (Introduced when the
-            # namespace filter was added to stop cross-project merging; the
-            # filter is right, a fixed k alongside it is not.)
-            #
-            # Escalate k until the answer is provably complete. Rows come back
-            # ORDER BY distance (similarity descending), so the moment we see
-            # one below the threshold, no later row can qualify and the
-            # qualifying set is closed. Only when EVERY returned row is still
-            # above the threshold might more qualify — then widen and re-ask.
-            results = []
-            k = 10
-            # Cap k at the bounded candidate set size, never above 500: the
-            # vec0 KNN cost scales with k, and the input set is already bounded
-            # by CONSOLIDATE_MAX_ROWS_PER_NAMESPACE (#36 M8). If the cap binds
-            # while every returned row is still above threshold, the qualifying
-            # set MAY be incomplete (a same-namespace duplicate could sit beyond
-            # rank 500) — that is tracked in knn_truncated and reported in the
-            # summary rather than silently dropped (cubic-4).
-            k_cap = min(max(len(rows), 10), 500)
-            while True:
-                try:
-                    results = conn.execute(
-                        "SELECT memory_id, distance FROM memory_vec "
-                        "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                        [seed["embedding"], k],
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    results = []
-                    break
-                if len(results) < k:
-                    break  # vec0 exhausted — this is every row it can offer
-                if any((1.0 - r["distance"]) < effective_threshold for r in results):
-                    break  # saw the cutoff — the qualifying set is complete
-                if k >= k_cap:
-                    # Cap reached with all returned rows above threshold: the
-                    # qualifying set may be incomplete. Flag for the summary.
-                    knn_truncated = True
-                    break
-                k = min(k * 5, k_cap)
-            for r in results:
-                mid = r["memory_id"]
-                if mid == seed["id"] or mid in absorbed:
-                    continue
-                sim = 1.0 - r["distance"]
-                if sim >= effective_threshold:
-                    # Verify it's live AND in the seed's own namespace —
-                    # namespace containment, see the note above the loop. vec0
-                    # KNN is namespace-blind, so this is the only thing standing
-                    # between a background (no --namespace) run and a
-                    # cross-project merge.
-                    row = conn.execute(
-                        "SELECT id, confidence, signal, tags, retrieval_count, "
-                        "surfaced_count, content, taint "
-                        "FROM memory "
-                        "WHERE id=? AND superseded_at IS NULL AND namespace=?",
-                        (mid, seed["namespace"]),
-                    ).fetchone()
-                    if row:
-                        neighbors.append((row, sim))
+        # Gather this seed's qualifying neighbors via the SHARED predicate
+        # (issue #62, 7.2): consolidate's cluster loop and organize's
+        # related-graph must decide "related at this threshold" identically,
+        # so the neighbor logic lives in _gather_neighbors (single source).
+        neighbors, knn_local = _gather_neighbors(
+            conn, seed, rows,
+            use_lexical=use_lexical,
+            lexical_tokens=lexical_tokens,
+            effective_threshold=effective_threshold,
+            absorbed=absorbed,
+            # Issue #62, 7.1 + editorial round (Claude Code F-001): when the
+            # episode is deliberately bounded to ``working_ids``, the vec0 KNN
+            # must not leak out-of-episode neighbors in — every neighbor must
+            # be a member of the bounded working set. Bare consolidate
+            # (working_ids=None) keeps the historical global-KNN behaviour.
+            restrict_ids=working_ids,
+        )
+        if knn_local:
+            knn_truncated = True
 
         if not neighbors:
             continue
@@ -712,7 +958,19 @@ def consolidate(
         ]
         contested_override = False
         if len({pol for _, _, pol in member_pols}) > 1:
-            if merge_contested:
+            # Issue #62, 7.5: optional LOCAL contradiction judge. When
+            # ZMEM_NLI_CMD is set, a cluster whose mixed negation polarity is
+            # judged ENTAILMENT is a heuristic false positive and un-parks
+            # (merges). Unset -> _nli_judge_all_entail returns None and this
+            # branch is byte-identical to the pre-judge path; --merge-contested
+            # remains the explicit override and still wins over a park verdict.
+            _nli_unpark = _nli_judge_all_entail(member_pols)
+            if _nli_unpark:
+                print(f"[zmem] consolidate: NLI judge: entailment resolves the "
+                      f"contested cluster around [{seed['id'][:8]}] - merging "
+                      f"(contradiction judged false)")
+                contested_override = True
+            elif merge_contested:
                 # Explicit override for a confirmed heuristic false positive:
                 # merge like any other cluster. The report entry is appended
                 # only AFTER the outcome is known (dry run → merged: False —
@@ -772,6 +1030,7 @@ def consolidate(
             # that would be lost). Accumulate the keeper's grown content as we
             # go so successive absorbs see the keeper as the real merge would.
             dry_keeper_content = seed["content"] or ""
+            grew_preview = False
             for nb_row, nb_sim in neighbors:
                 dec = _absorb_decision(dry_keeper_content, nb_row["content"] or "", nb_row["id"])
                 print(f"    absorb [{nb_row['id'][:8]}] sim={nb_sim:.3f}: "
@@ -779,6 +1038,7 @@ def consolidate(
                       f"prod={nb_row['confidence'] * ((nb_row['retrieval_count'] or 0) + (nb_row['surfaced_count'] or 0)):.2f}")
                 print(f"        content: {nb_row['content']}")
                 if dec["reason"] == "unique":
+                    grew_preview = True  # mirror the real-run growth test
                     if dec["new_tokens"]:
                         print(f"        would APPEND (gains tokens: {dec['new_tokens']})")
                     else:
@@ -797,6 +1057,8 @@ def consolidate(
                     print("        already represented in keeper; nothing to append")
                 absorbed.add(nb_row["id"])  # track in dry-run too
             merged_count += len(neighbors)
+            if collect_run_ids and grew_preview:
+                consolidated_ids.append(seed["id"])
             if contested_override:
                 # Dry run: nothing merged — merged must be False (PRR-001).
                 # The print is the only override-preview trace; the report
@@ -818,10 +1080,18 @@ def consolidate(
         # Atomic commit per cluster.
         try:
             conn.execute("BEGIN")
+            keeper_grew = False
             for nb_row, nb_sim in neighbors:
                 # Preserve absorbed content + record provenance + merge metadata
                 # + supersede (issue #19). consolidate-ONLY helper.
-                _absorb_into_keeper(conn, seed, nb_row)
+                decision = _absorb_into_keeper(conn, seed, nb_row)
+                # Issue #62, 7.4 (c76 no-op-absorb blast radius): only a keeper
+                # whose content actually GREW this run is a valid compression
+                # candidate — a cluster that merged only already-represented /
+                # size-capped / empty content appended nothing, and organize
+                # must not truncate a keeper this run did not touch (which
+                # would also churn the summary member ids for nothing).
+                keeper_grew = keeper_grew or decision["will_append"]
                 absorbed.add(nb_row["id"])
             # Mark the keeper as consolidated.
             conn.execute(
@@ -830,6 +1100,8 @@ def consolidate(
             )
             conn.execute("COMMIT")
             merged_count += len(neighbors)
+            if collect_run_ids and keeper_grew:
+                consolidated_ids.append(seed["id"])
             if contested_override:
                 # Appended only after the successful COMMIT, and printed so a
                 # real-run override is never invisible in human output (the
@@ -881,14 +1153,25 @@ def consolidate(
     # retrieved. `surfaced_count = 0` is required so a hook-surfaced memory (issue #21)
     # is protected — `retrieval_count = 0` alone is NOT evidence of unused.
     if prune:
+        # Unrecalled-prune extension (issue #62, 7.6): a live row qualifies
+        # only when it was NEVER retrieved, is ungrounded + low-confidence +
+        # old by ingestion, AND either never surfaced at all OR was last
+        # surfaced longer than ZMEM_UNRECALLED_DAYS ago. Rows surfaced recently
+        # stay protected; a NULL last_surfaced (never surfaced) still qualifies
+        # via surfaced_count=0. `applied_count` does not exist in this schema
+        # (issue: skip the clause when missing). signal!=none is never pruned.
+        unrecalled_days = _prune_unrecalled_days()
         prune_rows = conn.execute(
             f"""SELECT id, content FROM memory
                WHERE superseded_at IS NULL
                  AND retrieval_count = 0
-                 AND surfaced_count = 0
                  AND signal = 'none'
                  AND confidence < 0.35
-                 AND ingestion_ts < datetime('now', '-30 days')
+                 AND julianday(ingestion_ts) < julianday('now', '-{int(unrecalled_days)} days')
+                 AND (surfaced_count = 0 OR (
+                       last_surfaced IS NOT NULL AND
+                       julianday(last_surfaced) < julianday('now', '-{int(unrecalled_days)} days')
+                     ))
                {ns_clause}""",
             ns_params,
         ).fetchall()
@@ -966,4 +1249,6 @@ def consolidate(
     report["pruned"] = pruned_count
     report["truncated"] = truncated
     report["knn_truncated"] = knn_truncated
+    if collect_run_ids:
+        report["consolidated_ids"] = consolidated_ids
     return report

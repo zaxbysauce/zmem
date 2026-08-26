@@ -3,8 +3,9 @@
 The session-start hook used to spawn three separate detached python
 interpreters (consolidate, backup --if-due, sweep). `session-cadence` batches
 them into one process. Each op must keep its EXACT standalone semantics:
-consolidate's cadence gate + single-flight lock, backup's --if-due gate, and
-sweep's store-independent file reaping.
+organize's shared cadence gate + single-flight lock (the sleep-time op is
+ORGANIZE since issue #62 7.7), backup's --if-due gate, and sweep's
+store-independent file reaping.
 
 Run: python tests/test_session_cadence.py
 """
@@ -24,7 +25,7 @@ STORE_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
 
 
 # Post-split (issue #57) `main()` dispatch calls cli's own by-value
-# `consolidate` import; patch that namespace, not the store shim.
+# `organize` import; patch that namespace, not the store shim.
 sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
 import importlib as _ii
 _cli_mod = _ii.import_module("storelib.cli")
@@ -39,6 +40,14 @@ def _base_env(tmp: str) -> dict:
     env.pop("ZMEM_BACKUP_INTERVAL_DAYS", None)
     env["ZMEM_MODELS_DIR"] = os.path.join(tmp, "no-such-models")
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+    # Hermetic organize/gate knobs (Claude Code round 4 env-isolation gap): a
+    # host-leaked value here would silently flip cadence-gate expectations —
+    # the two gate tests below REQUIRE the documented defaults.
+    for k in ("ZMEM_ORGANIZE_IDLE_HOURS", "ZMEM_ORGANIZE_EPISODE_BOUND",
+              "ZMEM_KEEPER_COMPRESS_CHARS", "ZMEM_UNRECALLED_DAYS",
+              "ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS",
+              "ZMEM_CONSOLIDATE_GROWTH_THRESHOLD"):
+        env.pop(k, None)
     return env
 
 
@@ -56,27 +65,35 @@ class SessionCadenceTests(unittest.TestCase):
         )
 
     def test_session_cadence_runs_all_three_ops(self):
-        """A fresh store: session-cadence runs consolidate, backup, sweep and
-        prints a one-line summary naming all three."""
+        """A fresh store: session-cadence runs organize, backup, sweep and
+        prints a one-line summary naming all three (the sleep-time op is
+        ORGANIZE since issue #62 7.7, not consolidate)."""
         r = self._run("init")
         self.assertEqual(r.returncode, 0, r.stderr)
         r = self._run("session-cadence", "--backup-retention", "7")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("[zmem] session-cadence:", r.stdout)
         # All three ops are named in the summary line.
-        self.assertIn("consolidate:", r.stdout)
+        self.assertIn("organize:", r.stdout)
         self.assertIn("backup:", r.stdout)
         self.assertIn("sweep:", r.stdout)
 
     def test_second_run_is_cadence_noop(self):
-        """Hard assertion (critic-required): running session-cadence twice in a
-        row, the second run respects the cadence gates — backup is 'not due' and
-        consolidate is skipped by its cadence gate. Proves batching did not
-        bypass the --if-due / consolidate-cadence gating."""
+        """Hard assertion (critic-required; cubic#76 + Claude Code round 4):
+        on a store WITH a live memory, run 1's organize does real work and its
+        step-6 consolidate writes the shared clock; run 2's organize must then
+        be GATED — "skipped by cadence gate", never the empty-episode no-op
+        fallback. (The retired empty-store variant short-circuited at the
+        empty-episode check before the gate was ever exercised — deleting the
+        entire gate block left it green, i.e. it proved nothing.)"""
         self._run("init")
+        r = self._run("add", "--namespace", "project:cadence-probe",
+                      "--type", "fact", "--content", "cadence gate probe row")
+        self.assertEqual(r.returncode, 0, r.stderr)
         first = self._run("session-cadence", "--backup-retention", "7")
         self.assertEqual(first.returncode, 0, first.stderr)
-        # The first run records last_backup (backup ran on a fresh store).
+        # The first run records last_backup (backup ran on a fresh store) and
+        # organize's internal consolidate wrote the shared cadence clock.
         self.assertIn("backup: snapshot", first.stdout + first.stderr)
 
         second = self._run("session-cadence", "--backup-retention", "7")
@@ -85,11 +102,32 @@ class SessionCadenceTests(unittest.TestCase):
         # backup --if-due must skip on the immediate second run.
         self.assertIn("not due", combined,
                       "second run's backup must be skipped by the --if-due gate")
-        # consolidate's cadence gate must also skip the immediate re-run.
-        self.assertTrue(
-            "skipped by cadence gate" in combined or "no embeddable memories" in combined,
-            f"second run's consolidate must be cadence-gated or empty. got: {combined}",
-        )
+        # organize's shared cadence gate must skip the immediate re-run — the
+        # clock run 1 armed is armed, days~0 < 7 and growth ~0 < 20%.
+        self.assertIn("skipped by cadence gate", combined,
+                      "second run's organize MUST hit the shared cadence gate "
+                      f"(run 1 armed the clock). got: {combined}")
+
+    def test_consolidate_arms_clock_gates_session_cadence_organize(self):
+        """REVERSE gate direction (Claude Code round 4 coverage asymmetry:
+        only organize→consolidate was ever tested, never consolidate→organize
+        — the same direction as the F-009 Hermes gap this round fixes). An
+        explicit ``consolidate --force`` writes the shared meta key; the next
+        session-cadence's organize must respect it: two entry points, one
+        clock."""
+        self._run("init")
+        r = self._run("add", "--namespace", "project:cadence-probe",
+                      "--type", "fact", "--content", "reverse gate probe row")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self._run("consolidate", "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rc = self._run("session-cadence", "--backup-retention", "7")
+        self.assertEqual(rc.returncode, 0, rc.stderr)
+        combined = rc.stdout + rc.stderr
+        self.assertIn("skipped by cadence gate", combined,
+                      f"a just-run consolidate must gate session-cadence's "
+                      f"organize (shared clock, one maintenance act); "
+                      f"got: {combined}")
 
     def test_backup_retention_flag_actually_prunes(self):
         """The --backup-retention flag reaches cmd_backup THROUGH session-cadence
@@ -123,9 +161,9 @@ class SessionCadenceTests(unittest.TestCase):
                              f"to <= 1 snapshot, got {len(snapshots)}: {snapshots}")
 
     def test_one_op_error_does_not_abort_others_inprocess(self):
-        """Inject a REAL error into consolidate, drive main() in-process (so the
+        """Inject a REAL error into organize, drive main() in-process (so the
         production dispatch, failure counter, and exit code are the code under
-        test — not a re-typed replica), and confirm: (a) consolidate reports
+        test — not a re-typed replica), and confirm: (a) organize reports
         'error' in the summary, (b) backup still runs, (c) the process exits
         nonzero (SystemExit code 1) per PRR-003/006."""
         import importlib.util
@@ -153,12 +191,12 @@ class SessionCadenceTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            # Monkeypatch consolidate to raise — simulating a real op failure.
-            original_consolidate = _cli_mod.consolidate
+            # Monkeypatch organize to raise — simulating a real op failure.
+            original_organize = _cli_mod.organize
 
             def _boom(*a, **kw):
-                raise RuntimeError("injected consolidate failure for test")
-            _cli_mod.consolidate = _boom
+                raise RuntimeError("injected organize failure for test")
+            _cli_mod.organize = _boom
 
             # Drive main() in-process via sys.argv so the REAL dispatch + failure
             # counter + sys.exit(1) path are exercised (PRR-003/006).
@@ -176,15 +214,15 @@ class SessionCadenceTests(unittest.TestCase):
                         exit_code = e.code
             finally:
                 sys.argv = orig_argv
-                _cli_mod.consolidate = original_consolidate
+                _cli_mod.organize = original_organize
 
             output = captured.getvalue()
-            # (a) consolidate error reported in the summary
-            self.assertIn("consolidate: error", output,
-                          f"consolidate error not reported in: {output!r}")
-            # (b) backup still ran despite the consolidate failure
+            # (a) organize error reported in the summary
+            self.assertIn("organize: error", output,
+                          f"organize error not reported in: {output!r}")
+            # (b) backup still ran despite the organize failure
             self.assertIn("backup:", output,
-                          f"backup did not run after consolidate error: {output!r}")
+                          f"backup did not run after organize error: {output!r}")
             # (c) the process exited nonzero (PRR-003: failures → sys.exit(1))
             self.assertEqual(exit_code, 1,
                              f"expected exit code 1 on op failure, got {exit_code}. "

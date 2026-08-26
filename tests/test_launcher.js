@@ -272,11 +272,11 @@ console.log("\n[1] End-to-end envelope translation (real session-start.sh, seede
         !!(obj && /canonical ZMEM_ env/.test(obj.additionalContext || "")));
 }
 
-console.log("\n[2] Payload survives stray consolidate-style stdout noise");
+console.log("\n[2] Payload survives stray organize-style stdout noise");
 
 {
     // Wrapper plugin root: runs the REAL session-start.sh (via ZMEM_ROOT=repo),
-    // then prints consolidate-style noise onto the SAME stdout stream after the
+    // then prints organize-style noise onto the SAME stdout stream after the
     // sentinel. host.py copied in so the launcher resolves the same namespace.
     const WROOT = path.join(TMP, "wrap");
     fs.mkdirSync(path.join(WROOT, "hooks"), { recursive: true });
@@ -531,7 +531,7 @@ console.log("\n[8] No ~5s session-start stall");
         ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
     }));
     const elapsed = Date.now() - t0;
-    ok("timing: session-start returns in < 4000ms (no consolidate wait stall)",
+    ok("timing: session-start returns in < 4000ms (no organize wait stall)",
         elapsed < 4000, elapsed + "ms");
 }
 

@@ -12,6 +12,50 @@ README.
 
 ## [Unreleased]
 
+### Added
+
+- **Sleep-time organize + SessionStart wiring** (issue #62, schema-stable — no
+  migration, older clients keep working):
+  - New `organize` subcommand — the session-cadence job that replaces the
+    `consolidate` call at SessionStart (the `consolidate` CLI remains for
+    manual runs; the Hermes session-end hook dispatches organize too, so all
+    three surfaces run the same maintenance act). Bounds an episode to the
+    most recent live non-summary rows
+    (`ZMEM_ORGANIZE_EPISODE_BOUND`, default 256), backfills missing
+    entity links and `memory_link` edges on working rows, runs consolidate's
+    EXACT cluster/absorb/contested machinery on that episode (sharing one
+    gate implementation, the `last_consolidation` cadence meta keys, and the
+    single-flight lock — organize and consolidate are two entry points to one
+    maintenance act, so on a given store at most one maintenance run happens
+    per cadence window), then adds sleep-time deliverables: deterministic
+    keeper compression (`ZMEM_KEEPER_COMPRESS_CHARS`, default 4000) applied
+    BEFORE topic identity is keyed, then a topic hierarchy over the
+    post-compression live rows via the shared neighbor predicate and
+    hierarchical extractive summaries (real `summary,topic` rows, confidence
+    0.5, member ids in `merged_from`, identified structurally by
+    `source_ref` + `merged_from` — never the mutable tags column — with an
+    idempotent Phase-4 update and stale-overlap supersession), an optional
+    idle gate (`ZMEM_ORGANIZE_IDLE_HOURS`, default 0) and unrecalled prune
+    pass-through (`--prune`). LLM-free by default;
+    `--dry-run`/`--json` report per-step would-be counts and `--dry-run`
+    writes nothing.
+  - Optional LOCAL NLI judge (`ZMEM_NLI_CMD`, issue #62 7.5): when set,
+    consolidate's mixed-polarity contested clusters consult it before
+    parking — only an `entailment` verdict on every polarity-flagged pair
+    (any two members whose negation polarity differs) un-parks; any other
+    verdict or failure parks (never auto-merges; a judge failure is a
+    distinguishable stderr diagnostic, and on Windows backslash paths in the
+    template are normalized before parsing). Unset = byte-identical
+    behavior.
+  - Unrecalled-prune extension (issue #62 7.6): `consolidate --prune` — and
+    therefore `organize --prune` — may additionally qualify a live row whose
+    `last_surfaced` is older than `ZMEM_UNRECALLED_DAYS` (default 30);
+    `signal != none` is never pruned.
+  - The replaced inline consolidate neighbor loop is now the shared
+    `_gather_neighbors` predicate used by BOTH the consolidate seed loop and
+    the organize related-graph — one decision, two call sites, behavior
+    identical (all pre-existing consolidate tests pass unchanged).
+
 ## [0.11.0] — 2026-08-25
 
 ### Added

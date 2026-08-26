@@ -82,10 +82,11 @@ def _make_store(prefix="zmem-contested49-"):
     return mod, conn, tmp
 
 
-def _add_raw(mod, conn, content, confidence, rc=0, signal="test"):
+def _add_raw(mod, conn, content, confidence, rc=0, signal="test", namespace=NS):
     """Insert a row DIRECTLY into memory, bypassing write-time dedup so
     near-identical rows coexist for consolidate's clustering (house pattern
-    from test_consolidate_lossy.py)."""
+    from test_consolidate_lossy.py). ``namespace`` defaults to this module's
+    NS; pass an explicit one to build isolated clusters."""
     import uuid
     mid = str(uuid.uuid4())
     ts = mod.now_iso()
@@ -95,7 +96,7 @@ def _add_raw(mod, conn, content, confidence, rc=0, signal="test"):
             confidence, signal, valid_from, superseded_at, ingestion_ts,
             retrieval_count, last_retrieved)
            VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?,NULL)""",
-        (mid, NS, "fact", content, "", "", "", confidence, signal, ts, ts, rc),
+        (mid, namespace, "fact", content, "", "", "", confidence, signal, ts, ts, rc),
     )
     conn.commit()
     return mid
@@ -593,6 +594,260 @@ class CosineContestedTest(unittest.TestCase):
         row = self.conn.execute(
             "SELECT merged_from FROM memory WHERE id=?", (d,)).fetchone()
         self.assertEqual(row["merged_from"], b)
+
+
+def _write_judge(tmp: Path, verdict: str) -> str:
+    """Write a fake local NLI judge that prints ``verdict`` and return a
+    ZMEM_NLI_CMD argv template that invokes it. ``verdict`` may contain
+    characters that are invalid in a Windows filename (e.g. '?'), so the
+    script basename is sanitized while the printed verdict stays verbatim.
+    The judge ignores its stdin (the two-sentence contract is truncated
+    first-sentences we do not need to exercise here) and always emits the same
+    verdict — enough to pin consolidate's all-entailment gate semantics."""
+    import re as _re
+    safe = _re.sub(r"[^A-Za-z0-9_]", "_", verdict)
+    script = tmp / f"nli_fake_{safe}.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.stdout.write({verdict!r} + '\\n')\n"
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+def _write_seq_judge(tmp: Path, name: str, verdicts: list[str]) -> str:
+    """A judge whose per-CALL verdict follows a scripted sequence (F-010).
+
+    Each judge invocation is a fresh process, so the call counter lives in a
+    STATE FILE next to the script; call N returns ``verdicts[N]`` (clamped to
+    the last). Call order is deterministic (consolidate is single-threaded and
+    the flagged-pair list is built in member order). Returns the argv template
+    exactly like ``_write_judge``."""
+    script = tmp / f"nli_seq_{name}.py"
+    state = tmp / f"nli_seq_{name}.count"
+    script.write_text(
+        "import sys\n"
+        f"STATE = r'{state}'\n"
+        f"VERDICTS = {verdicts!r}\n"
+        "n = 0\n"
+        "try:\n"
+        "    n = int(open(STATE).read())\n"
+        "except OSError:\n"
+        "    pass\n"
+        "try:\n"
+        "    open(STATE, 'w').write(str(n + 1))\n"
+        "except OSError:\n"
+        "    pass\n"
+        "for _ in sys.stdin:\n"
+        "    pass\n"
+        "sys.stdout.write(VERDICTS[min(n, len(VERDICTS) - 1)] + '\\n')\n"
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+def _seq_judge_calls(tmp: Path, name: str) -> int:
+    """How many times the seq judge above was invoked (for asserting the
+    flagged-PAIR COUNT, pinning the all-pairs semantics of PRR-004)."""
+    state = tmp / f"nli_seq_{name}.count"
+    try:
+        return int(state.read_text())
+    except OSError:
+        return 0
+
+
+class NliJudgeExtensionTest(unittest.TestCase):
+    """Issue #62, 7.5: the optional LOCAL NLI judge consulted for mixed-polarity
+    clusters BEFORE they park contested. ONLY an ``entailment`` verdict on
+    EVERY polarity-flagged pair un-parks (merges); neutral/contradiction/
+    crash/non-zero/garbage all fall back to parking. The env var is read
+    lazily, so each test mocks its own ZMEM_NLI_CMD."""
+
+    def setUp(self):
+        self.mod, self.conn, self.tmp = _make_store()
+        self.tmp_path = Path(self.tmp)
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.tmp, True)
+
+    def _run(self, judge_cmd=None, **kwargs):
+        env = {"ZMEM_NLI_CMD": judge_cmd} if judge_cmd else {}
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf):
+                report = self.mod.consolidate(self.conn, force=True, **kwargs)
+        return report, buf.getvalue()
+
+    def test_entailment_unparks_contested_cluster(self):
+        pos = _add_raw(self.mod, self.conn, POS, 0.9)
+        neg = _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = _write_judge(self.tmp_path, "entailment")
+        report, out = self._run(cmd)
+
+        # The judge resolved the flagged pair as entailment: the cluster MERGES
+        # instead of parking — one row tombstoned, the merged:true entry
+        # reported (transparently, so the merge is never silent).
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertTrue(report["contested_clusters"][0]["merged"])
+        live = _live_rows(self.conn, pos, neg)
+        self.assertEqual(sum(1 for v in live.values() if v is None), 1)
+        self.assertIn("NLI judge", out)
+
+    def test_entailment_dry_run_previews_merge(self):
+        """A dry run consults the judge too, so the preview matches the real
+        run (the judge is consulted BEFORE the dry_run split)."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = _write_judge(self.tmp_path, "entailment")
+        report, out = self._run(cmd, dry_run=True)
+        self.assertEqual(report["merged"], 1)  # would-be count, dry_run=True
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        # PRR-001: a dry run NEVER claims merged:true — the entry's merged
+        # stays False even when the judge un-parked the cluster.
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        self.assertIn("NLI judge", out)
+
+    def test_neutral_verdict_parks_cluster(self):
+        pos = _add_raw(self.mod, self.conn, POS, 0.9)
+        neg = _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = _write_judge(self.tmp_path, "neutral")
+        report, out = self._run(cmd)
+
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        self.assertIn("CONTESTED cluster", out)
+        self.assertIn("NOT merged (contested)", out)
+
+    def test_garbage_stdout_parks_cluster(self):
+        """A judge that prints garbage is treated exactly like neutral — an
+        unreadable verdict must never auto-merge."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = _write_judge(self.tmp_path, "maybe?")
+        report, out = self._run(cmd)
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+
+    def test_crash_parks_cluster(self):
+        """A judge argv that fails to launch (missing script => OSError) must
+        degrade to park, never to merge."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = f'"{sys.executable}" "{self.tmp_path / "does-not-exist.py"}"'
+        report, out = self._run(cmd)
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+
+    def test_nonzero_exit_parks_cluster(self):
+        """A judge that exits nonzero is treated as neutral (park)."""
+        script = self.tmp_path / "nli_exit1.py"
+        script.write_text("import sys; sys.exit(1)\n")
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = f'"{sys.executable}" "{script}"'
+        report, out = self._run(cmd)
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertIn("CONTESTED cluster", out)
+
+    def test_two_flagged_pairs_partial_entailment_parks(self):
+        """REAL multi-pair all-entailment semantics (F-010/PRR-003/PRR-004).
+
+        A 3-member mixed cluster (POS, NEG, rarely-MIX_C) has TWO
+        polarity-flagged pairs: POS↔NEG and NEG↔MIX_C ('rarely' carries no
+        negator, so MIX_C is positive polarity). A judge that answers
+        entailment for the FIRST pair and neutral for the SECOND must PARK the
+        whole cluster — all-entailment, not any-entailment. The retired test
+        this replaces seeded only ONE flagged pair (its judge also never
+        returned entailment), so all- and any-entailment were analytically
+        indistinguishable to the suite — mutation testing could not catch a
+        loop-logic regression. The call-count state file additionally pins
+        that BOTH pairs were actually judged."""
+        a = _add_raw(self.mod, self.conn, POS, 0.9)
+        b = _add_raw(self.mod, self.conn, NEG, 0.9)
+        c = _add_raw(self.mod, self.conn, MIX_C, 0.8)
+        cmd = _write_seq_judge(self.tmp_path, "partial", ["entailment", "neutral"])
+        report, out = self._run(cmd)
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        # BOTH flagged pairs were judged (the all-pairs fix, PRR-004): one
+        # entailment was not enough to stop judging the second.
+        self.assertEqual(_seq_judge_calls(self.tmp_path, "partial"), 2)
+        # The whole cluster parked: every member stays live.
+        for mid in (a, b, c):
+            self.assertIsNone(_live_rows(self.conn, mid)[mid])
+
+    def test_two_flagged_pairs_all_entailment_merges(self):
+        """The mirror of the partial case: when EVERY flagged pair (both of
+        them) is judged entailment, the cluster un-parks and merges — proving
+        the park above was the all-entailment gate refusing, not a broken
+        judge plumbing."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        _add_raw(self.mod, self.conn, MIX_C, 0.8)
+        cmd = _write_seq_judge(self.tmp_path, "allentail", ["entailment", "entailment"])
+        report, out = self._run(cmd)
+        self.assertEqual(_seq_judge_calls(self.tmp_path, "allentail"), 2)
+        self.assertEqual(report["merged"], 2, report)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertTrue(report["contested_clusters"][0]["merged"])
+
+
+class ConsolidatedIdsGrowthTest(unittest.TestCase):
+    """Issue #62, 7.4 + c76 (Claude Code round 4 coverage list):
+    ``report["consolidated_ids"]`` — organize's compression candidate list —
+    must contain ONLY keepers whose content this run actually GREW. A cluster
+    that merged purely already-represented content (a strict-substring
+    absorbed row) appended nothing, and compressing such a keeper would
+    truncate content consolidation never touched AND churn the summary member
+    ids for nothing (F-002 blast radius)."""
+
+    def setUp(self):
+        self.mod, self.conn, self.tmp = _make_store(prefix="zmem-consids-")
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.tmp, True)
+
+    def test_noop_absorb_is_not_scheduled_for_compression(self):
+        ns_noop = "project:consids-noop"
+        ns_grow = "project:consids-grow"
+        # No-op cluster (same namespace): the ABSORBED row is a strict
+        # substring of the keeper -> "already-represented", nothing appended.
+        keeper_noop = _add_raw(self.mod, self.conn,
+                               "always run migrations before deploy every time", 0.95)
+        _add_raw(self.mod, self.conn, "always run migrations before deploy", 0.85)
+        # Growth cluster (other namespace): the ABSORBED row carries a unique
+        # tail the keeper lacks -> appended, keeper grew.
+        keeper_grow = _add_raw(self.mod, self.conn,
+                               "orion deploy checks the rollout dashboard", 0.95)
+        _add_raw(self.mod, self.conn,
+                 "orion deploy checks the rollout dashboard hourly for trends", 0.85)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            report = self.mod.consolidate(self.conn, force=True,
+                                          collect_run_ids=True)
+
+        self.assertEqual(report["merged"], 2, report)
+        run_ids = report.get("consolidated_ids")
+        self.assertIsNotNone(run_ids, "collect_run_ids=True must populate the key")
+        self.assertIn(keeper_grow, run_ids,
+                      "a keeper that GREW must be scheduled for compression")
+        self.assertNotIn(keeper_noop, run_ids,
+                         "a no-op absorb (already-represented) must NOT be "
+                         "scheduled: this run did not grow that keeper")
+        # The no-op keeper's content is unchanged (nothing was appended).
+        row = self.conn.execute(
+            "SELECT content FROM memory WHERE id=?", (keeper_noop,)).fetchone()
+        self.assertEqual(row["content"],
+                         "always run migrations before deploy every time")
+        # The growth keeper's content DID grow (unique tail preserved).
+        grown = self.conn.execute(
+            "SELECT content FROM memory WHERE id=?", (keeper_grow,)).fetchone()
+        self.assertIn("hourly for trends", grown["content"])
 
 
 if __name__ == "__main__":

@@ -127,6 +127,10 @@ KNOWN_SUBCMDS = [
     "entity-list", "entity-merge",
     # v11 (issue #61): the associative-link inspection/curation surface.
     "links", "contradict",
+    # issue #62 (schema v11): the sleep-time organization job (keep the flag
+    # allowlist honest — organize exposes real flags, so it must NOT be dumped
+    # into FLAGLESS_SUBCMDS).
+    "organize",
 ]
 
 # Subcommands whose argparse parser exposes ONLY the universal -h/--help

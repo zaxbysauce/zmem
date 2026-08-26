@@ -637,6 +637,7 @@ def add_memory(
     valid_from: str = "",
     capture_mode: str = "manual",
     taint: str | None = None,
+    link_attr_propagate: bool = True,
 ) -> str:
     content, source_ref, tags, warns = _apply_capture_policy(
         content=content,
@@ -791,6 +792,7 @@ def add_memory(
         # transaction as the INSERT: a failed link pass rolls back the write.
         link_report = generate_links_on_write(
             conn, mid, content=content, namespace=namespace, tags=tags, emb=emb,
+            propagate_tags=link_attr_propagate,
         )
         if link_report["related"] or link_report["contradicts"]:
             print(f"[zmem] links: +{link_report['related']} related, "
@@ -974,6 +976,7 @@ def update_memory(
     signal: str | None = None,
     taint: str | None = None,
     capture_mode: str = "manual",
+    link_attr_propagate: bool = True,
 ) -> tuple[str, bool]:
     """Append-only knowledge update (issue #59, 4.2): create a NEW live row
     that replaces ``mid``, tombstone ``mid``, and link the new row back to it
@@ -1155,7 +1158,7 @@ def update_memory(
         # evolution), inside the same transaction.
         link_report = generate_links_on_write(
             conn, new_id, content=content_eff, namespace=ns, tags=tags_eff,
-            emb=emb,
+            emb=emb, propagate_tags=link_attr_propagate,
         )
         if link_report["related"] or link_report["contradicts"]:
             print(f"[zmem] links: +{link_report['related']} related, "
