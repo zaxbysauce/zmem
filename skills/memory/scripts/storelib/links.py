@@ -446,7 +446,7 @@ def expand_recall_links(
 def cmd_links(
     conn: sqlite3.Connection, *, ids: list[str], as_json: bool = False,
     add: bool = False, relation: str | None = None,
-    score: float | None = None,
+    score: float | None = None, reason: str = "",
 ) -> int:
     """The `store.py links` command backend (issue #61, 6.5).
 
@@ -458,9 +458,12 @@ def cmd_links(
     Add mode (``--add``): ``links --add --id A --id B --relation R [--score S]``
     inserts a curated edge — the CLI insertion path the issue sanctions for
     the typed relations (``updates``/``extends``/``derives``) and for
-    operator-curated ``supports`` (which carries the +0.05 trust event).
-    Symmetric relations insert both directions; typed relations insert the
-    one authored direction. Bad arity exits 2 (the argparse convention).
+    operator-curated ``supports``/``contradicts``. Symmetric relations insert
+    both directions; typed relations insert the one authored direction.
+    Trust-carrying relations (``contradicts``/``supports``) REQUIRE ``--reason``
+    — the same deliberate-use guard `contradict` enforces (PRR-001: without
+    it, --add was a reasonless trust-drain/inflation bypass). Bad arity or a
+    missing required reason exits 2 (the argparse convention).
     """
     if add:
         if len(ids) != 2:
@@ -471,6 +474,17 @@ def cmd_links(
             )
             return 2
         rel = validate_relation(relation or "related")
+        # PRR-001 (swarm PR review): the trust event is the one effect that
+        # outlives the command, so it carries contradict's deliberate-use
+        # guard. Typed + related relations record no trust and need no reason.
+        if rel in _TRUST_EVENT_DELTAS and not (reason or "").strip():
+            print(
+                f"[zmem] links --add --relation {rel} adjusts trust_score; "
+                "--reason is required (the `contradict` deliberate-use "
+                "convention)",
+                file=sys.stderr,
+            )
+            return 2
         src, dst = ids
         try:
             if rel in LINK_PAIR_RELATIONS:
@@ -500,6 +514,8 @@ def cmd_links(
             )
         print(f"[zmem] link {'inserted' if inserted else 'already present'}: "
               f"{src} -[{rel}]-> {dst}{trust_note}")
+        if rel in _TRUST_EVENT_DELTAS:
+            print(f"[zmem] reason (validated, not persisted): {reason.strip()}")
         return 0
     if len(ids) != 1:
         print(

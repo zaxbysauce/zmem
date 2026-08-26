@@ -521,7 +521,8 @@ row with the same id — off by default; use it only when the file is an
 export of a store you trust as authoritative for those ids.
 
 v11 (issue #61) notes: rows carry `trust_score` (restored verbatim, default
-1.0 for pre-v11 files) and outgoing `links` (validated fail-closed, applied
+1.0 for pre-v11 files; a PRESENT but non-numeric/non-finite value makes the
+row malformed — refused, counted, not stored) and outgoing `links` (validated fail-closed, applied
 after every row lands so an edge may reference a later row;
 `links_added`/`links_skipped` in the summary). Ingest deliberately applies
 NO trust deltas and NO auto link generation — it is deterministic state
@@ -584,7 +585,9 @@ returns all its linked memories.
 ### links — inspect (or curate) a memory's associative links (v11, issue #61)
 ```
 python <store.py> links --id <uuid> [--json]           # list every edge
-python <store.py> links --add --id <a> --id <b> \n    --relation <related|supports|contradicts|updates|extends|derives> [--score S]
+python <store.py> links --add --id <a> --id <b> \
+    --relation <related|supports|contradicts|updates|extends|derives> \
+    [--score S] [--reason "..."]
 ```
 List mode prints every `memory_link` edge touching the memory, both
 directions (`out` = the memory is the source; JSON rows carry
@@ -592,11 +595,14 @@ directions (`out` = the memory is the source; JSON rows carry
 exits 1 with the same stable stderr line as `get`.
 
 `--add` is the operator-curated insertion path for the typed relations
-(and for `supports`, which carries the +0.05 trust event). Symmetric
+(and for the trust-carrying `supports`/`contradicts`). Symmetric
 relations (`related`/`supports`/`contradicts`) insert BOTH directions;
 typed relations (`updates`/`extends`/`derives`) keep their one authored
 direction. Self-links and cross-namespace pairs are refused; re-adding an
 existing edge is an exact no-op (idempotent, no second trust delta).
+`--relation contradicts|supports` adjusts `trust_score`, so those inserts
+REQUIRE `--reason` — the same deliberate-use guard `contradict` enforces
+(validated and echoed, not persisted).
 
 Links are generated automatically on every `add`/`update` (see
 `ZMEM_LINK_THRESHOLD` below) — deterministic, no LLM (no `ZMEM_LINK_LLM`

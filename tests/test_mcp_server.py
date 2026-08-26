@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -502,6 +503,21 @@ class McpServerToolSurfaceTest(unittest.TestCase):
             self._add_test_signal(
                 content=f"search clamp seed row shared tokens {i}",
                 namespace=ns)
+        # PRR-003 (swarm PR review): the regression only bites if the seeded
+        # rows actually LINKED (pairwise Jaccard 1.0 on the 6 shared tokens) —
+        # assert the precondition so the no-expansion assertions below cannot
+        # pass vacuously on a store with zero edges.
+        conn = sqlite3.connect(self.store_path)
+        try:
+            n_links = conn.execute(
+                "SELECT count(*) FROM memory_link ml JOIN memory m "
+                "ON m.id = ml.src_id WHERE m.namespace = ?", (ns,)).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertGreater(
+            n_links, 0,
+            "precondition failed: seeded rows formed no links — the "
+            "no-expansion assertions below would be vacuous")
         result = self._call("search", query="search clamp seed shared tokens",
                             namespace=ns, limit=999)
         self.assertIsInstance(result, dict)

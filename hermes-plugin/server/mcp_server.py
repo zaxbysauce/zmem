@@ -63,10 +63,13 @@ _ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
 _DEFAULT_LIMIT = 5
 _HARD_LIMIT_MAX = 50
 # v11 (issue #61, 6.3): recall's default 1-hop link expansion appends up to
-# this many EXTRA neighbor rows beyond --limit. The tool's hard cap bounds the
-# TOTAL returned rows, so recall reserves this budget inside the clamp
-# (mains limit = clamp - reserve when the cap binds): a limit=999 recall
-# returns 48 query matches + 2 linked neighbors = 50 rows, never 52.
+# this many EXTRA neighbor rows beyond --limit. recall reserves this budget
+# inside the clamp so a capped call returns (cap - reserve) PROJECT-tier
+# query matches + up to `reserve` linked neighbors = at most _HARD_LIMIT_MAX
+# project-lane rows (48 + 2 = 50 for limit=999). NOTE (PRR-004): the
+# --include-global union adds up to 3 GLOBAL-tier rows on top of that — a
+# pre-existing over-cap worst case (50 + 3) that predates v11 on main and is
+# unchanged here; the clamp test's namespace has no global matches.
 _LINK_BUDGET_RESERVED = 2
 # Concurrency cap on simultaneous store.py subprocesses. Each tool call spawns a
 # fresh store.py; without a bound an authorized but chatty remote client could

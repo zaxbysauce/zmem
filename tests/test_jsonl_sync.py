@@ -2042,6 +2042,63 @@ class LinkTrustSyncTest(_TwoStoreCase):
         self.assertIsNone(self.b.query_one(
             "SELECT id FROM memory WHERE id=?", (row["id"],)))
 
+    def test_malformed_trust_score_rejected_not_silently_maxed(self):
+        """PRR-013: a PRESENT but garbage trust_score must make the row
+        malformed (refused, counted) — the old silent-1.0 fallback let an
+        untrusted row restore at FULL trust. Absent stays 1.0 (legacy
+        export); out-of-range numbers still clamp (recoverable shape)."""
+        base = {
+            "namespace": "project:trust-fmt", "type": "fact",
+            "content": "trust format probe row",
+        }
+        cases = ["not-a-number", True, float("nan"), float("inf")]
+        for i, bad in enumerate(cases):
+            row = {"id": f"70000000-0000-4000-8000-{i:012d}", **base}
+            row["trust_score"] = bad
+            path = os.path.join(self.a.tmp, f"badtrust{i}.jsonl")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            r = self.b.run("ingest-jsonl", "--in", path)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("malformed=1", r.stdout, f"case {bad!r}: {r.stdout}")
+            self.assertIsNone(self.b.query_one(
+                "SELECT id FROM memory WHERE id=?", (row["id"],)),
+                f"case {bad!r} must not be stored")
+        # Numeric STRING coerces (confidence's recoverable shape — the PR
+        # head accepted "0.5" and intra-PR regressions are not allowed).
+        row3 = {"id": "70000000-0000-4000-8000-00000000000b",
+                "trust_score": "0.5",
+                **{**base, "content": base["content"] + " v3"}}
+        path = os.path.join(self.a.tmp, "strtrust.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row3, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("malformed=0", r.stdout, r.stdout)
+        self.assertEqual(self.b.query_one(
+            "SELECT trust_score FROM memory WHERE id=?",
+            (row3["id"],))[0], 0.5)
+        # Absent key -> 1.0 (pre-v11 export shape); numeric out-of-range clamps.
+        row = {"id": "70000000-0000-4000-8000-000000000009", **base}
+        path = os.path.join(self.a.tmp, "oktrust.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.b.query_one(
+            "SELECT trust_score FROM memory WHERE id=?",
+            (row["id"],))[0], 1.0)
+        row2 = {"id": "70000000-0000-4000-8000-00000000000a",
+                "trust_score": 1.7, **{**base, "content": base["content"] + " v2"}}
+        path = os.path.join(self.a.tmp, "clamptrust.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row2, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.b.query_one(
+            "SELECT trust_score FROM memory WHERE id=?",
+            (row2["id"],))[0], 1.0, "out-of-range numeric still clamps")
+
     def test_missing_endpoint_links_skipped_and_counted(self):
         a = self.a.add("project:missing-ep",
                        "anchor row for a missing-endpoint link")

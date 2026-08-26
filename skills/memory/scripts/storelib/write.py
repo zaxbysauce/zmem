@@ -25,7 +25,17 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from correction_queue import SECRET_PATTERNS  # type: ignore # noqa: F401
 from storelib.entity import link_memory_entities, relink_memory
-from storelib.links import LINK_THRESHOLD, TRUST_DELTA_SUPPORTS, adjust_trust, generate_links_on_write
+from storelib.links import TRUST_DELTA_SUPPORTS, adjust_trust, generate_links_on_write
+
+
+def _link_threshold_now() -> float:
+    """Live link threshold for stdout notes (PRR-009): write.py's by-value
+    LINK_THRESHOLD import is a load-time snapshot that env refresh does not
+    update (only storelib.links.LINK_THRESHOLD is refreshed); read the owning
+    module at call time so the printed value matches the one generation
+    actually used."""
+    from storelib import links as _links_live
+    return _links_live.LINK_THRESHOLD
 from storelib.schema import CAPTURE_MODES, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, PROMPT_INJECTION_PATTERNS, SIGNAL_CONFIDENCE, _commit, _embeddings, _env_float, _normalize_content, _vec_knn_in_namespace, now_iso
 
 _degraded_embedding_warned = False
@@ -689,13 +699,8 @@ def add_memory(
         # (sim >= dedup threshold 0.85 > link threshold 0.75) and applies the
         # −0.10 trust event to BOTH rows.
         if existing:
-            from storelib.consolidate import _polarity_signature
-            ex_row = conn.execute(
-                "SELECT content FROM memory WHERE id=?", (existing["id"],)
-            ).fetchone()
-            if (ex_row is not None
-                    and _polarity_signature(ex_row["content"] or "")
-                    != _polarity_signature(content)):
+            from storelib.consolidate import dedup_polarity_conflict
+            if dedup_polarity_conflict(conn, existing["id"], content):
                 print(
                     f"[zmem] dedup skipped: polarity disagreement with "
                     f"{existing['id']} (similarity={dedup_sim:.3f}); rows stay "
@@ -790,7 +795,7 @@ def add_memory(
         if link_report["related"] or link_report["contradicts"]:
             print(f"[zmem] links: +{link_report['related']} related, "
                   f"+{link_report['contradicts']} contradicts "
-                  f"(threshold={LINK_THRESHOLD})")
+                  f"(threshold={_link_threshold_now()})")
         if started_tx:
             _commit(conn)
         print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"
@@ -1078,13 +1083,8 @@ def update_memory(
         # insert the replacement row; generate_links_on_write below records
         # the contradicts pair + trust event.
         if existing:
-            from storelib.consolidate import _polarity_signature
-            ex_row = conn.execute(
-                "SELECT content FROM memory WHERE id=?", (existing["id"],)
-            ).fetchone()
-            if (ex_row is not None
-                    and _polarity_signature(ex_row["content"] or "")
-                    != _polarity_signature(content_eff)):
+            from storelib.consolidate import dedup_polarity_conflict
+            if dedup_polarity_conflict(conn, existing["id"], content_eff):
                 print(
                     f"[zmem] update dedup skipped: polarity disagreement with "
                     f"{existing['id']} (similarity={dedup_sim:.3f}); rows stay "
@@ -1160,7 +1160,7 @@ def update_memory(
         if link_report["related"] or link_report["contradicts"]:
             print(f"[zmem] links: +{link_report['related']} related, "
                   f"+{link_report['contradicts']} contradicts "
-                  f"(threshold={LINK_THRESHOLD})")
+                  f"(threshold={_link_threshold_now()})")
         if started_tx:
             _commit(conn)
         print(f"[zmem] updated memory {mid} -> {new_id} (ns={ns}, type={type_eff}, "

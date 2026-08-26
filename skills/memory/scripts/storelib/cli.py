@@ -588,6 +588,12 @@ def main():
     p_links.add_argument("--score", type=float, default=None,
                          help="link score 0..1 (--add mode only; default "
                               "ZMEM_LINK_THRESHOLD)")
+    p_links.add_argument("--reason", default="",
+                         help="why the link is being recorded; REQUIRED for "
+                              "--relation contradicts|supports (they adjust "
+                              "trust_score — the `contradict` deliberate-use "
+                              "convention; validated and echoed, not "
+                              "persisted)")
 
     p_contradict = sub.add_parser(
         "contradict",
@@ -1023,7 +1029,7 @@ def main():
         elif args.cmd == "links":
             sys.exit(cmd_links(conn, ids=args.ids, as_json=args.json,
                                add=args.add, relation=args.relation,
-                               score=args.score))
+                               score=args.score, reason=args.reason))
         elif args.cmd == "contradict":
             sys.exit(cmd_contradict(conn, ids=args.ids, reason=args.reason))
     finally:

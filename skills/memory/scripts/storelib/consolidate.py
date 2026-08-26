@@ -97,6 +97,27 @@ def _polarity_signature(content: str | None) -> bool:
     text = re.sub(r'"[^"\n]*"', " ", text)    # double-quoted spans
     return bool(_CONSOLIDATE_NEGATOR_RE.search(text))
 
+def dedup_polarity_conflict(
+    conn: sqlite3.Connection, existing_id: str, content: str
+) -> bool:
+    """v11 (issue #61, 6.2): does `content` CONTRADICT the live row
+    `existing_id` by negation polarity?
+
+    The single source of the write-time polarity guard shared by
+    add_memory, update_memory, and ingest-jsonl's dedup path (PRR-010: the
+    three sites previously carried verbatim copies that could drift). A
+    missing row is NOT a conflict (callers keep their pre-guard behavior).
+    Callers import this function-locally: this module imports write/sync at
+    module top, so a top-level import from those modules would cycle.
+    """
+    row = conn.execute(
+        "SELECT content FROM memory WHERE id=?", (existing_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    return _polarity_signature(row["content"] or "") != _polarity_signature(content)
+
+
 def _normalize_text(text: str) -> str:
     """Normalize text for substring/overlap comparison: collapse runs of
     whitespace to a single space and strip+lowercase. Used by

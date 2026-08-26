@@ -498,20 +498,37 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     else:
         taint = raw_taint
 
-    # v11 (issue #61, sync): trust_score — optional float, finite, clamped to
-    # [0,1], default 1.0 (mirrors confidence handling: an unusable value falls
-    # back to the default rather than dropping the row — trust is a ranking
-    # input, not identity).
+    # v11 (issue #61, sync): trust_score — optional float, clamped to
+    # [0,1], absent/None defaults 1.0 (a pre-v11 export).
+    # PRR-013 (swarm PR review): the previous silent 1.0 fallback let an
+    # UNTRUSTED-taint row carrying garbage trust restore at FULL trust (the
+    # max) — inconsistent with taint's strictness one screen up. Absent/None
+    # still means 1.0 (a pre-v11 export — the normal legacy case); numeric
+    # STRINGS coerce exactly like confidence's recoverable shape (the PR head
+    # accepted "0.5" — no intra-PR regressions); any other non-numeric or
+    # non-finite value makes the row malformed (fail-closed, counted, not
+    # stored).
     raw_trust = obj.get("trust_score")
     if raw_trust is None:
         trust_score = 1.0
     else:
+        if isinstance(raw_trust, bool) or not isinstance(
+            raw_trust, (int, float, str)
+        ):
+            raise ValueError(
+                f"field 'trust_score' must be a number, got "
+                f"{type(raw_trust).__name__}"
+            )
         try:
             trust_score = float(raw_trust)
-        except (TypeError, ValueError):
-            trust_score = 1.0
+        except ValueError:
+            raise ValueError(
+                f"field 'trust_score' must be a number, got {raw_trust!r}"
+            )
         if not math.isfinite(trust_score):
-            trust_score = 1.0
+            raise ValueError(
+                f"field 'trust_score' must be finite, got {raw_trust!r}"
+            )
     trust_score = max(0.0, min(1.0, trust_score))
 
     # v11 (issue #61, sync): outgoing link edges, optional list. Every entry
@@ -762,13 +779,8 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         # auto link generation / trust delta on ingest — deterministic
         # restore; a later `add`/`update`/`contradict` records the edge).
         if existing:
-            from storelib.consolidate import _polarity_signature
-            ex_row = conn.execute(
-                "SELECT content FROM memory WHERE id=?", (existing["id"],)
-            ).fetchone()
-            if (ex_row is not None
-                    and _polarity_signature(ex_row["content"] or "")
-                    != _polarity_signature(content)):
+            from storelib.consolidate import dedup_polarity_conflict
+            if dedup_polarity_conflict(conn, existing["id"], content):
                 print(f"[zmem] ingest-jsonl: dedup skipped for row {mid}: "
                       f"polarity disagreement with {existing['id']}; stored "
                       "as its own row (contradictions never merge)",
@@ -1110,7 +1122,11 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                         links_added += 1
                 except ValueError:
                     links_skipped += 1
-        conn.commit()
+        # PRR-005 (swarm PR review): every other commit site in this file
+        # goes through _commit's busy_retry — a raw conn.commit() here let a
+        # transient SQLITE_BUSY raise past the summary line and drop the
+        # run's collected links.
+        _commit(conn)
 
     print(f"[zmem] ingest-jsonl: added={added} tombstoned={tombstoned} "
           f"tombstones_refused={tombstones_refused} capture_refused={capture_refused} "

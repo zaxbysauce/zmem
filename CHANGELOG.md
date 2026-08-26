@@ -50,7 +50,9 @@ README.
     stays a query-match signal). `search`/`recent` never expand.
   - **Inspection/curation CLI**: `links --id UUID [--json]` (missing id
     exits 1, the `get` contract) and `links --add --id A --id B --relation R
-    [--score S]` (the sanctioned insertion path for the typed relations);
+    [--score S] [--reason ...]` (the sanctioned insertion path for the typed
+    relations; `--relation contradicts|supports` adjusts trust and therefore
+    REQUIRES `--reason` — exit 2 without it, the `contradict` convention);
     `contradict --id A --id B --reason ...` (required reason, pair + trust
     event, never merges/deletes/rewrites; the schema has no reason column so
     the reason is validated + echoed, not persisted).

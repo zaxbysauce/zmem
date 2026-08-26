@@ -433,31 +433,47 @@ class RecallExpansionTest(_Store):
 
     def test_contested_neighbor_floor_and_tag(self):
         """A contradicts neighbor surfaces ONLY above the confidence floor,
-        tagged contested_link (JSON) / [CONTESTED LINK] (fenced text)."""
+        tagged contested_link (JSON) / [CONTESTED LINK] (fenced text).
+
+        PRR-002 (swarm PR review): the assertions are RANK-AGNOSTIC and
+        UNCONDITIONAL — execution showed the `never` row reliably wins the
+        main slot, so the original `if contested:` guards (keyed on the
+        other row) skipped on every run and pinned nothing."""
         a = self.add("the cache ttl setting should always be ten minutes "
                      "for the rate limiter service", tags="cache")
         b = self.add("the cache ttl setting should never be ten minutes "
                      "for the rate limiter service", tags="cache")
-        # Both a and b match the query; make ONLY the contradicted pair
-        # reachable via expansion by limiting to 1 result.
+        # Both a and b match the query; limiting to 1 leaves exactly one
+        # main and (if expansion works) its contradicted partner as the
+        # single extra — whichever way the ranking breaks.
         rows = self.recall(query="cache ttl rate limiter service", limit=1)
+        mains = [r for r in rows if "link_relation" not in r]
         extras = [r for r in rows if "link_relation" in r]
-        contested = [r for r in extras if r["id"] == b]
-        if contested:
-            self.assertTrue(contested[0]["contested_link"])
-            self.assertEqual(contested[0]["link_relation"], "contradicts")
-        # Fenced render tags the contested neighbor.
+        self.assertEqual(len(mains), 1, rows)
+        self.assertEqual(len(extras), 1, rows)
+        main, extra = mains[0], extras[0]
+        contested_id = b if main["id"] == a else a
+        self.assertEqual(extra["id"], contested_id,
+                         "the contradicted partner must be the expansion row")
+        self.assertTrue(extra["contested_link"],
+                        "contradicts expansion rows must carry "
+                        "contested_link=true")
+        self.assertEqual(extra["link_relation"], "contradicts")
+        self.assertEqual(extra["link_of"], main["id"])
+        # Fenced render tags the contested neighbor — unconditionally.
         r = self.run_store("recall", "--query", "cache ttl rate limiter",
                            "--namespace", "project:links", "--limit", "1")
-        if b in [row.get("id") for row in rows if "link_relation" in row]:
-            self.assertIn("[CONTESTED LINK]", r.stdout, r.stdout)
-        # Below the floor, the contradicts neighbor is dropped from expansion.
+        self.assertIn("[CONTESTED LINK]", r.stdout, r.stdout)
+        # Below the floor, the contradicts neighbor is dropped from expansion
+        # — whichever row was the contested extra. If the floor gate broke,
+        # it would resurface as the (now-main) partner's contested extra.
         conn = self.db()
-        conn.execute("UPDATE memory SET confidence=0.1 WHERE id=?", (b,))
+        conn.execute("UPDATE memory SET confidence=0.1 WHERE id=?",
+                     (contested_id,))
         conn.commit()
         rows = self.recall(query="cache ttl rate limiter service", limit=1)
         extras = [r for r in rows if "link_relation" in r]
-        self.assertNotIn(b, [r["id"] for r in extras],
+        self.assertNotIn(contested_id, [r["id"] for r in extras],
                          "contradicts neighbor below the confidence floor "
                          "must not expand")
 
@@ -545,14 +561,21 @@ class LinksCliTest(_Store):
     def test_links_add_supports_applies_trust_delta(self):
         a = self.add(_POS_A)
         b = self.add(_UNRELATED)
+        # PRR-001: supports adjusts trust, so --reason is REQUIRED.
         r = self.run_store("links", "--add", "--id", a, "--id", b,
                            "--relation", "supports")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--reason is required", r.stderr)
+        r = self.run_store("links", "--add", "--id", a, "--id", b,
+                           "--relation", "supports",
+                           "--reason", "both verified in CI logs")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertAlmostEqual(self.trust(a), 1.0)  # clamped from 1.05
         self.assertAlmostEqual(self.trust(b), 1.0)
         # A SECOND supports event between the same pair is idempotent.
         r = self.run_store("links", "--add", "--id", a, "--id", b,
-                           "--relation", "supports")
+                           "--relation", "supports",
+                           "--reason", "re-confirmed")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertAlmostEqual(self.trust(a), 1.0)
 
@@ -562,7 +585,7 @@ class LinksCliTest(_Store):
         self.run_store("contradict", "--id", a, "--id", b, "--reason", "x")
         self.assertAlmostEqual(self.trust(a), 0.9)
         self.run_store("links", "--add", "--id", a, "--id", b,
-                       "--relation", "supports")
+                       "--relation", "supports", "--reason", "corroborated")
         self.assertAlmostEqual(self.trust(a), 0.95)
 
     def test_links_add_typed_relations_are_directed_and_visible(self):
@@ -611,6 +634,18 @@ class LinksCliTest(_Store):
         # Bad arity refused with exit 2 (argparse convention).
         r = self.run_store("links", "--add", "--id", a, "--relation", "related")
         self.assertEqual(r.returncode, 2)
+        # PRR-001: contradicts/supports via --add without --reason refused.
+        r = self.run_store("links", "--add", "--id", a, "--id", b,
+                           "--relation", "contradicts")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--reason is required", r.stderr)
+        self.assertEqual(len(self.edges()), 0, "nothing written on refusal")
+        # With a reason it works (and carries the trust event).
+        r = self.run_store("links", "--add", "--id", a, "--id", b,
+                           "--relation", "contradicts",
+                           "--reason", "conflicting guidance observed")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertAlmostEqual(self.trust(a), 0.9)
         del b
 
     def test_links_single_id_more_than_one_refused(self):
