@@ -54,6 +54,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock  # noqa: F401  (patch.object used by the ingest guard test)
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1948,6 +1949,267 @@ class EntityRebuildOnIngestTest(_TwoStoreCase):
         self.assertIn("ripgrep", names)
         self.assertIn("Kim", names)
 
+
+# ---------------------------------------------------------------------------
+# v11 (issue #61): trust_score + link edges round-trip; extra keys stay
+# old-client-safe; ingest applies no trust deltas.
+# ---------------------------------------------------------------------------
+class LinkTrustSyncTest(_TwoStoreCase):
+    def _seed(self, store: Store):
+        a = store.add("project:link-sync",
+                      "the deploy pipeline always gates releases on the green suite")
+        b = store.add("project:link-sync",
+                      "the deploy pipeline never gates releases on the green suite")
+        r = store.run("contradict", "--id", a, "--id", b,
+                      "--reason", "opposite guidance")
+        assert r.returncode == 0, r.stderr
+        c = store.add("project:link-sync",
+                      "a pasta note entirely unrelated to deployment pipelines")
+        r = store.run("links", "--add", "--id", a, "--id", c,
+                      "--relation", "derives")
+        assert r.returncode == 0, r.stderr
+        return a, b, c
+
+    def test_trust_and_links_round_trip(self):
+        a, b, c = self._seed(self.a)
+        out_a = os.path.join(self.a.tmp, "a.jsonl")
+        r = self.a.run("export-jsonl", "--out", out_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.b.run("ingest-jsonl", "--in", out_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("links_added=3", r.stdout, r.stdout)
+
+        # trust restored verbatim (contradict event: 0.9 both endpoints)
+        for store, mid in ((self.a, a), (self.b, a), (self.a, b), (self.b, b)):
+            got = store.query_one(
+                "SELECT trust_score FROM memory WHERE id=?", (mid,))
+            self.assertAlmostEqual(got[0], 0.9)
+        # links restored as the exact directed rows (2 contradicts + 1 derives)
+        rels = sorted((e[0], e[1], e[2]) for e in self.b.query_all(
+            "SELECT src_id, dst_id, relation FROM memory_link"))
+        self.assertIn((a, b, "contradicts"), rels)
+        self.assertIn((b, a, "contradicts"), rels)
+        self.assertIn((a, c, "derives"), rels)
+        self.assertEqual(len(rels), 3, rels)
+
+        # re-export is byte-identical (created_at preserved): full parity
+        out_b = os.path.join(self.b.tmp, "b.jsonl")
+        self.b.run("export-jsonl", "--out", out_b)
+        self.assertEqual(
+            Path(out_a).read_text(encoding="utf-8"),
+            Path(out_b).read_text(encoding="utf-8"),
+            "two-store export parity")
+
+    def test_old_format_export_still_ingests(self):
+        """A pre-v11 shaped export (no trust_score/links keys) ingests
+        cleanly — trust defaults 1.0, no links, nothing malformed."""
+        a = self.a.add("project:old-fmt", "a legacy shaped row for old exports")
+        out = os.path.join(self.a.tmp, "old.jsonl")
+        self.a.run("export-jsonl", "--out", out)
+        rows = [json.loads(l) for l in
+                Path(out).read_text(encoding="utf-8").splitlines() if l.strip()]
+        stripped = []
+        for row in rows:
+            row = dict(row)
+            row.pop("trust_score", None)
+            row.pop("links", None)
+            stripped.append(row)
+        old_path = os.path.join(self.a.tmp, "old-shaped.jsonl")
+        with open(old_path, "w", encoding="utf-8", newline="\n") as f:
+            for row in stripped:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", old_path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("malformed=0", r.stdout, r.stdout)
+        self.assertEqual(self.b.query_one(
+            "SELECT trust_score FROM memory WHERE id=?", (a,))[0], 1.0)
+
+    def test_malformed_link_entry_fails_closed(self):
+        a = self.a.add("project:bad-link", "base row for a malformed link file")
+        row = {
+            "id": "20000000-0000-4000-8000-000000000001",
+            "namespace": "project:bad-link",
+            "type": "fact",
+            "content": "remote row with a poisoned link entry",
+            "links": [{"dst": a, "relation": "bogus", "score": 0.5}],
+        }
+        path = os.path.join(self.a.tmp, "bad.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)  # counted, run continues
+        self.assertIn("malformed=1", r.stdout, r.stdout)
+        self.assertIsNone(self.b.query_one(
+            "SELECT id FROM memory WHERE id=?", (row["id"],)))
+
+    def test_malformed_trust_score_rejected_not_silently_maxed(self):
+        """PRR-013: a PRESENT but garbage trust_score must make the row
+        malformed (refused, counted) — the old silent-1.0 fallback let an
+        untrusted row restore at FULL trust. Absent stays 1.0 (legacy
+        export); out-of-range numbers still clamp (recoverable shape)."""
+        base = {
+            "namespace": "project:trust-fmt", "type": "fact",
+            "content": "trust format probe row",
+        }
+        cases = ["not-a-number", True, float("nan"), float("inf")]
+        for i, bad in enumerate(cases):
+            row = {"id": f"70000000-0000-4000-8000-{i:012d}", **base}
+            row["trust_score"] = bad
+            path = os.path.join(self.a.tmp, f"badtrust{i}.jsonl")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            r = self.b.run("ingest-jsonl", "--in", path)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("malformed=1", r.stdout, f"case {bad!r}: {r.stdout}")
+            self.assertIsNone(self.b.query_one(
+                "SELECT id FROM memory WHERE id=?", (row["id"],)),
+                f"case {bad!r} must not be stored")
+        # Numeric STRING coerces (confidence's recoverable shape — the PR
+        # head accepted "0.5" and intra-PR regressions are not allowed).
+        row3 = {"id": "70000000-0000-4000-8000-00000000000b",
+                "trust_score": "0.5",
+                **{**base, "content": base["content"] + " v3"}}
+        path = os.path.join(self.a.tmp, "strtrust.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row3, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("malformed=0", r.stdout, r.stdout)
+        self.assertEqual(self.b.query_one(
+            "SELECT trust_score FROM memory WHERE id=?",
+            (row3["id"],))[0], 0.5)
+        # Absent key -> 1.0 (pre-v11 export shape); numeric out-of-range clamps.
+        row = {"id": "70000000-0000-4000-8000-000000000009", **base}
+        path = os.path.join(self.a.tmp, "oktrust.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.b.query_one(
+            "SELECT trust_score FROM memory WHERE id=?",
+            (row["id"],))[0], 1.0)
+        row2 = {"id": "70000000-0000-4000-8000-00000000000a",
+                "trust_score": 1.7, **{**base, "content": base["content"] + " v2"}}
+        path = os.path.join(self.a.tmp, "clamptrust.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row2, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.b.query_one(
+            "SELECT trust_score FROM memory WHERE id=?",
+            (row2["id"],))[0], 1.0, "out-of-range numeric still clamps")
+
+    def test_missing_endpoint_links_skipped_and_counted(self):
+        a = self.a.add("project:missing-ep",
+                       "anchor row for a missing-endpoint link")
+        del a
+        row = {
+            "id": "30000000-0000-4000-8000-000000000001",
+            "namespace": "project:missing-ep",
+            "type": "fact",
+            "content": "row linking to an id that is not in this file",
+            "links": [{"dst": "40000000-0000-4000-8000-000000000002",
+                       "relation": "related", "score": 0.9}],
+        }
+        path = os.path.join(self.a.tmp, "missing.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("links_added=0", r.stdout, r.stdout)
+        self.assertIn("links_skipped=1", r.stdout, r.stdout)
+
+    def test_ingest_never_applies_trust_deltas(self):
+        """Sync ingest is deterministic state restore: re-ingesting a file
+        can never move trust (no corroborating +0.05 on the skip/dedup
+        paths — that delta is an organic add/update-only signal)."""
+        keeper = self.a.add("project:ing-dedup",
+                            "the ingest dedup anchor row content")
+        out = os.path.join(self.a.tmp, "ing.jsonl")
+        self.a.run("export-jsonl", "--out", out)
+        # Hand-lower the keeper's trust so any +0.05 would be visible.
+        conn = sqlite3.connect(self.a.path)
+        conn.execute("UPDATE memory SET trust_score=0.5 WHERE id=?", (keeper,))
+        conn.commit()
+        conn.close()
+        for _ in range(3):
+            r = self.a.run("ingest-jsonl", "--in", out)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.a.query_one(
+            "SELECT trust_score FROM memory WHERE id=?", (keeper,))[0], 0.5,
+            "re-ingest must be an exact no-op for trust")
+
+    def test_ingest_dedup_polarity_guard_refuses_contradiction_merge(self):
+        """PR-review R1 (issue #61 6.2): a remote row that CONTRADICTS its
+        dedup hit must insert as its own row, never merge into the keeper —
+        the same write-time guard add/update apply. The semantic dedup path
+        needs embeddings, so this pins the guard directly against
+        _ingest_row with a stubbed _detect_duplicate installed on the OWNING
+        submodule (storelib.sync), per the module-__setattr__ lesson."""
+        tmp = tempfile.mkdtemp(prefix="zmem-ing-guard-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        env = {
+            "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+            "ZMEM_MODELS_DIR": os.path.join(tmp, "no-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "zmem_ingest_guard_store", str(STORE_PY))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        conn = mod.connect()
+        mod.init_db(conn)
+        mod.migrate(conn)
+        self.addCleanup(conn.close)
+        keeper = mod.add_memory(
+            conn, namespace="project:guard", type_="fact",
+            content="the gate always requires the green suite", signal="test")
+
+        row = mod._validate_sync_row({
+            "id": "60000000-0000-4000-8000-000000000001",
+            "namespace": "project:guard",
+            "type": "fact",
+            "content": "the gate never requires the green suite",
+            "signal": "test",
+        })
+        from storelib import sync as sync_mod
+        orig = sync_mod._detect_duplicate
+
+        def _stub(conn_, content, ns, dedup_cache=None):
+            hit = conn_.execute(
+                "SELECT id, content FROM memory WHERE id=?", (keeper,)
+            ).fetchone()
+            return hit, 0.99, None
+
+        with unittest.mock.patch.object(sync_mod, "_detect_duplicate", _stub):
+            outcome = sync_mod._ingest_row(conn, row, allow_tombstones=False)
+        self.assertEqual(outcome, "added",
+                         "a contradicting remote row must INSERT, not dedup-merge")
+        live = conn.execute(
+            "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
+        ).fetchone()[0]
+        self.assertEqual(live, 2, "both rows stay live")
+        rc = conn.execute(
+            "SELECT retrieval_count FROM memory WHERE id=?", (keeper,)
+        ).fetchone()[0]
+        self.assertEqual(rc, 0,
+                         "the keeper must not be touched by the refused merge")
+
+        # And the polarity-AGREEING path still dedup-merges (guard is narrow).
+        row2 = mod._validate_sync_row({
+            "id": "60000000-0000-4000-8000-000000000002",
+            "namespace": "project:guard",
+            "type": "fact",
+            "content": "the gate always requires the green suite rerun",
+            "signal": "test",
+        })
+        with unittest.mock.patch.object(sync_mod, "_detect_duplicate", _stub):
+            outcome2 = sync_mod._ingest_row(conn, row2, allow_tombstones=False)
+        self.assertEqual(
+            outcome2, "deduped",
+            "a polarity-AGREEING duplicate still merges on ingest")
 
 
 if __name__ == "__main__":

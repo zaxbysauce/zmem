@@ -442,6 +442,75 @@ class DoctorCliTest(unittest.TestCase):
         self.assertEqual(schema["status"], "fail", schema)
 
     # ------------------------------------------------------------------
+    # v11 (issue #61, 6.1): the link-tables check
+    # ------------------------------------------------------------------
+    def _make_v11_link_store(self, store_path: Path, *, with_link_table: bool,
+                             trust_values=(1.0,)) -> None:
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(store_path))
+        try:
+            conn.execute(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
+                (str(CURRENT_SCHEMA_VERSION),))
+            conn.execute(
+                "CREATE TABLE memory(id TEXT PRIMARY KEY, trust_score REAL "
+                "NOT NULL DEFAULT 1.0)")
+            for i, t in enumerate(trust_values):
+                conn.execute(
+                    "INSERT INTO memory(id, trust_score) VALUES (?, ?)",
+                    (f"row-{i}", t))
+            if with_link_table:
+                conn.execute(
+                    "CREATE TABLE memory_link(src_id TEXT, dst_id TEXT, "
+                    "relation TEXT, score REAL, created_at TEXT)")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_link_tables_check_passes_on_healthy_v11_store(self):
+        store_dir = self.home / ".zmem"
+        self._make_v11_link_store(store_dir / "store.sqlite",
+                                  with_link_table=True)
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project),
+        )
+        report = json.loads(result.stdout)
+        check = next(c for c in report["checks"] if c["id"] == "link-tables")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertIn("memory_link table present", check["summary"])
+
+    def test_link_tables_check_warns_when_table_missing(self):
+        store_dir = self.home / ".zmem"
+        self._make_v11_link_store(store_dir / "store.sqlite",
+                                  with_link_table=False)
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project),
+        )
+        report = json.loads(result.stdout)
+        check = next(c for c in report["checks"] if c["id"] == "link-tables")
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIn("memory_link table missing", check["summary"])
+
+    def test_link_tables_check_warns_on_out_of_range_trust(self):
+        """adjust_trust clamps in SQL, so an out-of-range value means a
+        hand-edited store — doctor warns (read-only, never repairs)."""
+        store_dir = self.home / ".zmem"
+        self._make_v11_link_store(store_dir / "store.sqlite",
+                                  with_link_table=True, trust_values=(1.0, 1.7))
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project),
+        )
+        report = json.loads(result.stdout)
+        check = next(c for c in report["checks"] if c["id"] == "link-tables")
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIn("outside [0.0, 1.0]", check["summary"])
+
+    # ------------------------------------------------------------------
     # E8 (#39): pending namespace-migration preview in doctor
     # ------------------------------------------------------------------
     def _make_store_with_rows(self, store_path: Path, rows: list[tuple[str, str]],

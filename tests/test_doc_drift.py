@@ -210,6 +210,38 @@ class SkillDocDriftTest(unittest.TestCase):
             self.assertIn(needle, text,
                           f"SKILL.md must document {needle} (issue #60 surface)")
 
+    # -- issue #61 (v11): the associative-link surface is documented ----------
+
+    def test_link_surface_flags_and_commands_documented(self):
+        """Issue #61, 6.3/6.5: an agent reading only SKILL.md can operate
+        --link-hops/--link-budget, links, and contradict, and the link env
+        knob is named."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("--link-hops", "--link-budget",
+                       "ZMEM_LINK_THRESHOLD", "contradict",
+                       "trust_score", "[CONTESTED LINK]"):
+            self.assertIn(needle, text,
+                          f"SKILL.md must document {needle} (issue #61 surface)")
+
+    def test_retrieval_section_mentions_link_expansion(self):
+        """Issue #61, 6.3: the retrieval section must document 1-hop link
+        expansion so an agent reading only SKILL.md can interpret the extra
+        recall rows and the [CONTESTED LINK] tag."""
+        section = self._retrieval_section()
+        self.assertIn("Link expansion", section,
+                      "the retrieval section must mention link expansion "
+                      "(issue #61 6.3)")
+        self.assertIn("[CONTESTED LINK]", section)
+
+    def test_linking_is_deterministic_and_llm_free(self):
+        """Link generation is deterministic by design and ships no LLM knob
+        (ZMEM_LINK_LLM deliberately does not exist) — the doc must say so."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("no LLM", text)
+        self.assertNotIn("ZMEM_LINK_LLM=", text,
+                         "SKILL.md must not document a ZMEM_LINK_LLM default "
+                         "as if the knob existed — it is not shipped")
+
     def test_entity_extraction_is_deterministic_and_llm_free(self):
         """The extractor is deterministic by design and ships no LLM path —
         the doc must say so (an operator must not wait on a model download

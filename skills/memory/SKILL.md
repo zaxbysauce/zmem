@@ -58,10 +58,12 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v10
+- schema compatibility against current v11
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity`); inspect deeper with `store.py entity-list`
+- v11 link surface present (`memory_link` table + `memory.trust_score` in
+  range [0,1]); inspect deeper with `store.py links --id <uuid>`
 - Claude/Codex native-memory conflicts via read-only config inspection
 - canonical namespace for the provided project
 - host surface presence (Claude plugin, ZCode plugin, memory skill; repo-local
@@ -73,6 +75,7 @@ surface change.
 ### recall — surface relevant memories (high-precision)
 ```
 python <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
+  [--link-hops 0|1] [--link-budget N]
                           [--include-global] [--global-limit 3] [--hybrid]
                           [--no-hybrid] [--no-mmr] [--no-bump]
                           [--as-of ISO-8601] [--json]
@@ -142,6 +145,20 @@ Recall rows carry **entity cards**: `recall --json` rows include
 `entities: [{id, kind, name}]`, and the fenced hook render shows at most
 three entity NAMES per row (never ids). `get --id` shows the same links.
 
+**1-hop link expansion is the DEFAULT** (v11, issue #61 6.3): after MMR,
+each recalled memory's `related`/`supports` links are walked one hop and
+up to `--link-budget` (default 2) extra neighbor rows are appended — a
+memory that never matched the query but is associative-neighbor of a
+match still surfaces. `contradicts` neighbors are included only when
+they survive the confidence floor and are tagged `[CONTESTED LINK]` in
+the fenced render (`contested_link: true` in JSON). Expansion rows carry
+`link_relation` / `link_of` / `link_score` / `contested_link` keys; rows
+that matched the query themselves never carry them, and expansion rows
+never advance telemetry (popularity rewards query matches, not link
+neighbors — so expansion cannot distort later rankings). `--link-hops 0`
+disables the walk; `--link-budget 0` is equivalent. `search` and `recent`
+never expand.
+
 `--no-bump` (opt-in) makes a recall **passive**: it records a surface event
 (`surfaced_count`/`last_surfaced`) instead of advancing `retrieval_count`/
 `last_retrieved`. The explicit-vs-passive split is the system contract: the
@@ -170,6 +187,19 @@ reachable via `search --text`, which applies no confidence floor, or
 `recent --min-confidence 0`) (#36 M3).
 Dedup-on-write: near-identical live content in the same namespace refreshes the
 existing entry instead of duplicating.
+Dedup has a polarity guard (v11, issue #61 6.2): a near-identical hit whose
+negation polarity DISAGREES ("always X" vs "never X") is NOT merged — both
+rows stay live, link as `contradicts`, and each loses 0.10 trust. A
+polarity-AGREEING duplicate re-add is corroboration: the existing entry
+refreshes as before AND gains +0.05 trust.
+Link generation on write (v11, issue #61 6.2): after every `add`/`update`,
+the same namespace-aware neighbors dedup already computed (embedding cosine
+when the model is present, else Jaccard token overlap — model-absent stores
+link too) above `ZMEM_LINK_THRESHOLD` (default 0.75) become `related` edges
+(stored both directions). Each linked neighbor also absorbs the new row's
+TAGS and re-derives its entity links (attribute evolution) — content,
+confidence, signal, and retrieval_count are never touched. Deterministic;
+no LLM (a `ZMEM_LINK_LLM` knob deliberately does not exist).
 Namespace validation: obvious misspellings of the global namespace (`global`,
 `userglobal`, `users:global`, …) are rejected at `add` time AND on `ingest-jsonl`
 sync import with a message naming the canonical `user:global` — such rows would
@@ -323,7 +353,10 @@ blend-aware for hook-surfaced memories (ties broken by confidence, then earliest
 ingestion) (issue #21). Absorbed rows are NOT lost on merge: a near-duplicate that is not
 fully subsumed by the keeper has its ENTIRE text appended to the keeper's content
 (live-recallable + FTS-indexed), and its id is recorded in the keeper's
-`merged_from` provenance column, so consolidated memory is non-lossy. Note this
+`merged_from` provenance column, so consolidated memory is non-lossy
+(v11, issue #61 6.6: the column is maintained as a DE-DUPLICATED,
+first-seen-order id list — the same absorbed id is never recorded twice,
+and the v11 migration normalized pre-existing duplicates losslessly). Note this
 is a whole-text append, not a unique-tail diff — a partially-overlapping row
 duplicates the span it already shares with the keeper (deliberate
 over-preservation, bounded by the size cap below). Reordered same-token phrasing
@@ -487,6 +520,18 @@ row inserted this run (default: keep each row's own incoming source_ref).
 row with the same id — off by default; use it only when the file is an
 export of a store you trust as authoritative for those ids.
 
+v11 (issue #61) notes: rows carry `trust_score` (restored verbatim, default
+1.0 for pre-v11 files; a PRESENT but non-numeric/non-finite value makes the
+row malformed — refused, counted, not stored) and outgoing `links` (validated fail-closed, applied
+after every row lands so an edge may reference a later row;
+`links_added`/`links_skipped` in the summary). Ingest deliberately applies
+NO trust deltas and NO auto link generation — it is deterministic state
+restore, so re-ingesting the same file is an exact no-op (the +0.05
+corroboration is an organic `add`/`update`-only signal). The dedup path DOES
+apply the write-time polarity guard: a remote row that contradicts its
+dedup hit inserts as its own live row instead of merging (contradictions
+never merge, on any surface).
+
 `--capture-mode` routes every inserted row through the same capture policy as
 `add` (a sync file is remote-authored data that can otherwise plant a poisoned
 memory surfacing verbatim into model context, or store secret-like text). The
@@ -536,6 +581,54 @@ entities for the same thing (e.g. `rg` and `ripgrep`); find both ids with
 `entity-list`, dry-run the merge, then apply with `--confirm`. Afterwards
 the alias `rg` resolves to the surviving entity and recall's third list
 returns all its linked memories.
+
+### links — inspect (or curate) a memory's associative links (v11, issue #61)
+```
+python <store.py> links --id <uuid> [--json]           # list every edge
+python <store.py> links --add --id <a> --id <b> \
+    --relation <related|supports|contradicts|updates|extends|derives> \
+    [--score S] [--reason "..."]
+```
+List mode prints every `memory_link` edge touching the memory, both
+directions (`out` = the memory is the source; JSON rows carry
+`{src, dst, direction, other, relation, score, created_at}`). A missing id
+exits 1 with the same stable stderr line as `get`.
+
+`--add` is the operator-curated insertion path for the typed relations
+(and for the trust-carrying `supports`/`contradicts`). Symmetric
+relations (`related`/`supports`/`contradicts`) insert BOTH directions;
+typed relations (`updates`/`extends`/`derives`) keep their one authored
+direction. Self-links and cross-namespace pairs are refused; re-adding an
+existing edge is an exact no-op (idempotent, no second trust delta).
+`--relation contradicts|supports` adjusts `trust_score`, so those inserts
+REQUIRE `--reason` — the same deliberate-use guard `contradict` enforces
+(validated and echoed, not persisted).
+
+Links are generated automatically on every `add`/`update` (see
+`ZMEM_LINK_THRESHOLD` below) — deterministic, no LLM (no `ZMEM_LINK_LLM`
+knob exists; link generation never calls a model).
+
+### contradict — record a contradiction (v11, issue #61)
+```
+python <store.py> contradict --id <a> --id <b> --reason "<why they conflict>"
+```
+Inserts a `contradicts` pair (both directions) and applies the trust event
+to BOTH rows: `trust_score` −0.10 each, clamped to [0.0, 1.0] (ten
+contradictions land a row at exactly 0.0, never below). Neither row is
+merged, deleted, or rewritten — content, confidence, and signal are
+untouched. `--reason` is REQUIRED (the `invalidate` deliberateness
+convention); the v11 schema has no reason column, so the reason is
+validated and echoed but deliberately not persisted. Re-running the same
+contradict is an exact no-op. A polarity-disagreeing `add` that lands in
+the dedup window does this automatically (see `add`).
+
+**trust_score semantics** (v11): every memory starts at 1.0. A
+`contradicts` event lowers BOTH rows by 0.10; a `supports` link or a
+polarity-agreeing duplicate re-add (corroborating add, CLI `add`/`update`
+only — sync ingest never re-applies deltas) raises the keeper by 0.05.
+Always clamped to [0.0, 1.0]; visible in `get --json`, `export-jsonl`,
+and `doctor`. `confidence`/`signal` are never changed by linking — they
+are provenance inputs; trust_score is the contradiction ledger.
 
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite
@@ -589,6 +682,16 @@ predicate as the other lanes — like the vector lane, an entity match in a
 FOREIGN namespace never leaks into the querying tier (it is found by its own
 tier's run, e.g. the global tier under `--include-global`). Works
 model-absent by design; an unknown alias contributes nothing.
+
+**Link expansion (v11, issue #61 6.3)**: after MMR and the passive-surface
+filters, each result's `related`/`supports` edges are walked ONE hop and up
+to `--link-budget` (default 2) neighbors are appended to the result set
+(never duplicating an already-present row, never crossing the tier's
+namespace set, and always respecting the `--as-of` predicate — a neighbor
+invalid at the requested instant does not surface). `contradicts`
+neighbors must additionally survive the confidence floor and are tagged
+`[CONTESTED LINK]`. Expansion is bounded (one indexed lookup per result
+row, budget-capped) — no PageRank or graph propagation of any kind.
 
 **MMR diversity (v10, issue #60 5.5)**: after the composite sort, and before
 `--limit`, Maximal Marginal Relevance re-orders each tier's candidates —

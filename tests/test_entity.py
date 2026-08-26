@@ -29,6 +29,13 @@ SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 STORE_PY = SCRIPTS_DIR / "store.py"
 PYTHON = sys.executable
 
+# Schema-version ratchets are DYNAMIC (v11, issue #61): the suite asserts the
+# store lands on schema_meta's current version instead of pinning a number
+# that goes stale on every bump (the pattern the v10 PR left behind for its
+# own two ratchets).
+sys.path.insert(0, str(SCRIPTS_DIR))
+from schema_meta import SUPPORTED_SCHEMA_VERSION  # noqa: E402
+
 
 def _base_env(store_path: str) -> dict:
     env = dict(os.environ)
@@ -94,7 +101,7 @@ class SchemaTest(_Store):
         ver = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()[0]
-        self.assertEqual(ver, "10")
+        self.assertEqual(ver, str(SUPPORTED_SCHEMA_VERSION))
         tables = {
             r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -496,7 +503,7 @@ class MigrationTest(_Store):
         ver = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()[0]
-        self.assertEqual(ver, "10")
+        self.assertEqual(ver, str(SUPPORTED_SCHEMA_VERSION))
         self.assertEqual(
             conn.execute("SELECT count(*) FROM memory").fetchone()[0], n_mem,
             "migration must preserve every memory row",

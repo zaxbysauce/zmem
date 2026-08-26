@@ -23,9 +23,12 @@ from __future__ import annotations
 
 # Bumped by store.py's migration machinery; doctor.py reads it to decide
 # pass/warn/fail. Edit HERE and both consumers stay in sync.
-# v10 (issue #60): entity identity tables (entity / entity_alias /
-# memory_entity) — a live retrieval signal, not a dormant schema artifact.
-SUPPORTED_SCHEMA_VERSION = 10
+# v11 (issue #61): associative links (A-MEM lite) — the `memory_link` edge
+# table + the `trust_score` column on `memory` (contradict −0.10 / corroborate
+# +0.05, clamped [0,1]). Links are generated on every add/update, walked one
+# hop at recall, inspectable via `links`/`contradict`, and round-tripped by
+# export/ingest — not a dormant schema artifact.
+SUPPORTED_SCHEMA_VERSION = 11
 
 # The meta-table key under which the version is stored in the store.
 SCHEMA_VERSION_KEY = "schema_version"

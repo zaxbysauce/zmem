@@ -97,6 +97,27 @@ def _polarity_signature(content: str | None) -> bool:
     text = re.sub(r'"[^"\n]*"', " ", text)    # double-quoted spans
     return bool(_CONSOLIDATE_NEGATOR_RE.search(text))
 
+def dedup_polarity_conflict(
+    conn: sqlite3.Connection, existing_id: str, content: str
+) -> bool:
+    """v11 (issue #61, 6.2): does `content` CONTRADICT the live row
+    `existing_id` by negation polarity?
+
+    The single source of the write-time polarity guard shared by
+    add_memory, update_memory, and ingest-jsonl's dedup path (PRR-010: the
+    three sites previously carried verbatim copies that could drift). A
+    missing row is NOT a conflict (callers keep their pre-guard behavior).
+    Callers import this function-locally: this module imports write/sync at
+    module top, so a top-level import from those modules would cycle.
+    """
+    row = conn.execute(
+        "SELECT content FROM memory WHERE id=?", (existing_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    return _polarity_signature(row["content"] or "") != _polarity_signature(content)
+
+
 def _normalize_text(text: str) -> str:
     """Normalize text for substring/overlap comparison: collapse runs of
     whitespace to a single space and strip+lowercase. Used by
@@ -181,6 +202,34 @@ def _absorb_decision(keeper_content: str, absorbed_content: str, absorbed_id: st
 
     return {"will_append": True, "reason": "unique", "new_tokens": new_tokens}
 
+def _dedupe_merged_from(value: str | None) -> str:
+    """Normalize a merged_from provenance string to a de-duplicated,
+    first-seen-order list (issue #61, 6.6).
+
+    Entries are comma-joined ids, optionally suffixed ``:truncated`` (the
+    size-cap marker). The same id can historically appear twice (the old
+    writer plain-appended with no dedup); this helper keeps each BASE id's
+    first occurrence — marker preserved as it first appeared — and drops
+    later repeats. No id is ever lost; empty/None stays empty. Idempotent by
+    construction, which is what lets the v11 migration run it over every row
+    and lets a crash mid-migration safely re-run it.
+    """
+    if not value:
+        return ""
+    seen: set[str] = set()
+    out: list[str] = []
+    for entry in (value or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        base = entry[:-len(":truncated")] if entry.endswith(":truncated") else entry
+        if base in seen:
+            continue
+        seen.add(base)
+        out.append(entry)
+    return ",".join(out)
+
+
 def _absorb_into_keeper(
     conn: sqlite3.Connection,
     keeper: sqlite3.Row,
@@ -250,7 +299,10 @@ def _absorb_into_keeper(
     id_entry = f"{absorbed['id']}{marker}"
     row = conn.execute("SELECT merged_from FROM memory WHERE id=?", (keeper_id,)).fetchone()
     existing = (row["merged_from"] if row and row["merged_from"] else "").strip()
-    merged_from = f"{existing},{id_entry}" if existing else id_entry
+    # v11 (issue #61, 6.6): the append is normalized through the shared
+    # de-duplicator, so merged_from can only ever be a first-seen-order list
+    # of UNIQUE ids (the pre-v11 writer plain-appended and could repeat one).
+    merged_from = _dedupe_merged_from(f"{existing},{id_entry}" if existing else id_entry)
     conn.execute("UPDATE memory SET merged_from=? WHERE id=?", (merged_from, keeper_id))
 
     # Metadata upgrade (confidence/signal/tags + retrieval_count bump). Shared

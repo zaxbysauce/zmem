@@ -1216,6 +1216,84 @@ def _check_entity_tables(resolved_store: Path) -> dict:
     )
 
 
+# v11 (issue #61, 6.1): the associative-link surface. Doctor probes the
+# memory_link table + the memory.trust_score column and sanity-reads the
+# trust range, so the link lane's health is one command away via
+# `store.py links`. An EMPTY link table is legitimate: links accumulate from
+# new writes only (the v11 migration deliberately runs no backfill — the
+# phase-7 `organize` command owns bulk backfill), so a just-migrated store
+# with zero edges is healthy.
+V11_LINK_TABLE = "memory_link"
+
+
+def _check_link_tables(resolved_store: Path) -> dict:
+    """Confirm the v11 link surface exists and trust_score is in range.
+
+    Read-only probe of sqlite_master + PRAGMA table_info(memory) + MIN/MAX.
+    Pass when memory_link exists, memory.trust_score exists, and every
+    trust_score is within [0.0, 1.0] (adjust_trust clamps in SQL, so an
+    out-of-range value means a hand-edited store). Warn when the table or
+    column is missing (pre-v11; the next writable store.py run migrates) or
+    the range drifted. Skip when the store is absent/unreadable (already
+    flagged by store-access). Never writes.
+    """
+    conn = _open_store_ro(resolved_store)
+    if conn is None:
+        return _check(
+            "link-tables", "skip",
+            "Store not available; skipped link tables check.",
+        )
+    try:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if V11_LINK_TABLE not in tables:
+            return _check(
+                "link-tables", "warn",
+                f"{V11_LINK_TABLE} table missing; a writable store.py run "
+                "will create it via migration (issue #61, 6.1).",
+                missing=[V11_LINK_TABLE], expected=[V11_LINK_TABLE],
+            )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+        if "trust_score" not in cols:
+            return _check(
+                "link-tables", "warn",
+                "memory.trust_score column missing; a writable store.py run "
+                "will add it via migration (issue #61, 6.1).",
+                missing=["trust_score"], expected=["trust_score"],
+            )
+        n_links = conn.execute(
+            f"SELECT count(*) FROM {V11_LINK_TABLE}"
+        ).fetchone()[0]
+        lo, hi = conn.execute(
+            "SELECT MIN(trust_score), MAX(trust_score) FROM memory"
+        ).fetchone()
+    except Exception as exc:
+        return _check(
+            "link-tables", "warn",
+            f"Could not inspect link tables: {type(exc).__name__}: {exc}",
+        )
+    finally:
+        conn.close()
+    if lo is not None and (lo < 0.0 or hi > 1.0):
+        return _check(
+            "link-tables", "warn",
+            f"trust_score range [{lo}, {hi}] outside [0.0, 1.0] — writes "
+            "clamp in SQL, so this store was hand-edited; inspect with "
+            "`store.py get --json`.",
+            trust_min=lo, trust_max=hi,
+        )
+    return _check(
+        "link-tables", "pass",
+        f"memory_link table present (edges={n_links}); trust_score in range "
+        f"[{lo if lo is not None else 'n/a'}, {hi if hi is not None else 'n/a'}]; "
+        "inspect with `store.py links --id <uuid>`.",
+        edges=n_links, trust_min=lo, trust_max=hi,
+    )
+
+
 # Tier-0 size guard thresholds (issue #49 C). core.md is injected into EVERY
 # session on EVERY hook host, so an overgrown file silently eats context
 # budget and dilutes instruction-following (~150-200 reliably-handled
@@ -1616,6 +1694,8 @@ def build_report(project: Path, repo_root: Path) -> dict:
     checks.append(_check_schema(resolved_store, access_check))
     checks.append(_check_v9_columns(resolved_store))
     checks.append(_check_entity_tables(resolved_store))
+    # v11 (issue #61, 6.1): link surface + trust range probe.
+    checks.append(_check_link_tables(resolved_store))
     checks.append(_check_claude_native_memory(Path.home()))
     checks.append(_check_session_retention(Path.home()))
     checks.extend(_check_codex_memory_and_trust(Path.home(), project, repo_root))
