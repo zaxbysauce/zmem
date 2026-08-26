@@ -3,8 +3,9 @@
 The session-start hook used to spawn three separate detached python
 interpreters (consolidate, backup --if-due, sweep). `session-cadence` batches
 them into one process. Each op must keep its EXACT standalone semantics:
-consolidate's cadence gate + single-flight lock, backup's --if-due gate, and
-sweep's store-independent file reaping.
+organize's shared cadence gate + single-flight lock (the sleep-time op is
+ORGANIZE since issue #62 7.7), backup's --if-due gate, and sweep's
+store-independent file reaping.
 
 Run: python tests/test_session_cadence.py
 """
@@ -24,7 +25,7 @@ STORE_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
 
 
 # Post-split (issue #57) `main()` dispatch calls cli's own by-value
-# `consolidate` import; patch that namespace, not the store shim.
+# `organize` import; patch that namespace, not the store shim.
 sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
 import importlib as _ii
 _cli_mod = _ii.import_module("storelib.cli")
@@ -63,8 +64,9 @@ class SessionCadenceTests(unittest.TestCase):
         r = self._run("session-cadence", "--backup-retention", "7")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("[zmem] session-cadence:", r.stdout)
-        # All three ops are named in the summary line.
-        self.assertIn("consolidate:", r.stdout)
+        # All three ops are named in the summary line. SessionStart's sleep-time
+        # op is ORGANIZE (issue #62 7.7); organize runs under the cadence gate.
+        self.assertIn("organize:", r.stdout)
         self.assertIn("backup:", r.stdout)
         self.assertIn("sweep:", r.stdout)
 
@@ -85,10 +87,15 @@ class SessionCadenceTests(unittest.TestCase):
         # backup --if-due must skip on the immediate second run.
         self.assertIn("not due", combined,
                       "second run's backup must be skipped by the --if-due gate")
-        # consolidate's cadence gate must also skip the immediate re-run.
+        # organize's cadence gate must also skip the immediate re-run — or, on a
+        # store with no rows to organize at all, report the empty-episode no-op
+        # (an empty episode is organize's honest analog of "no embeddable
+        # memories" for consolidate — nothing to merge AND nothing to summarize).
         self.assertTrue(
-            "skipped by cadence gate" in combined or "no embeddable memories" in combined,
-            f"second run's consolidate must be cadence-gated or empty. got: {combined}",
+            "skipped by cadence gate" in combined
+            or "no embeddable memories" in combined
+            or "no live memories to organize" in combined,
+            f"second run's organize must be cadence-gated or a no-op. got: {combined}",
         )
 
     def test_backup_retention_flag_actually_prunes(self):
@@ -123,9 +130,9 @@ class SessionCadenceTests(unittest.TestCase):
                              f"to <= 1 snapshot, got {len(snapshots)}: {snapshots}")
 
     def test_one_op_error_does_not_abort_others_inprocess(self):
-        """Inject a REAL error into consolidate, drive main() in-process (so the
+        """Inject a REAL error into organize, drive main() in-process (so the
         production dispatch, failure counter, and exit code are the code under
-        test — not a re-typed replica), and confirm: (a) consolidate reports
+        test — not a re-typed replica), and confirm: (a) organize reports
         'error' in the summary, (b) backup still runs, (c) the process exits
         nonzero (SystemExit code 1) per PRR-003/006."""
         import importlib.util
@@ -153,12 +160,12 @@ class SessionCadenceTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            # Monkeypatch consolidate to raise — simulating a real op failure.
-            original_consolidate = _cli_mod.consolidate
+            # Monkeypatch organize to raise — simulating a real op failure.
+            original_organize = _cli_mod.organize
 
             def _boom(*a, **kw):
-                raise RuntimeError("injected consolidate failure for test")
-            _cli_mod.consolidate = _boom
+                raise RuntimeError("injected organize failure for test")
+            _cli_mod.organize = _boom
 
             # Drive main() in-process via sys.argv so the REAL dispatch + failure
             # counter + sys.exit(1) path are exercised (PRR-003/006).
@@ -176,15 +183,15 @@ class SessionCadenceTests(unittest.TestCase):
                         exit_code = e.code
             finally:
                 sys.argv = orig_argv
-                _cli_mod.consolidate = original_consolidate
+                _cli_mod.organize = original_organize
 
             output = captured.getvalue()
-            # (a) consolidate error reported in the summary
-            self.assertIn("consolidate: error", output,
-                          f"consolidate error not reported in: {output!r}")
-            # (b) backup still ran despite the consolidate failure
+            # (a) organize error reported in the summary
+            self.assertIn("organize: error", output,
+                          f"organize error not reported in: {output!r}")
+            # (b) backup still ran despite the organize failure
             self.assertIn("backup:", output,
-                          f"backup did not run after consolidate error: {output!r}")
+                          f"backup did not run after organize error: {output!r}")
             # (c) the process exited nonzero (PRR-003: failures → sys.exit(1))
             self.assertEqual(exit_code, 1,
                              f"expected exit code 1 on op failure, got {exit_code}. "

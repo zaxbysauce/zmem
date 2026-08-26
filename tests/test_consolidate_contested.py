@@ -595,5 +595,142 @@ class CosineContestedTest(unittest.TestCase):
         self.assertEqual(row["merged_from"], b)
 
 
+def _write_judge(tmp: Path, verdict: str) -> str:
+    """Write a fake local NLI judge that prints ``verdict`` and return a
+    ZMEM_NLI_CMD argv template that invokes it. ``verdict`` may contain
+    characters that are invalid in a Windows filename (e.g. '?'), so the
+    script basename is sanitized while the printed verdict stays verbatim.
+    The judge ignores its stdin (the two-sentence contract is truncated
+    first-sentences we do not need to exercise here) and always emits the same
+    verdict — enough to pin consolidate's all-entailment gate semantics."""
+    import re as _re
+    safe = _re.sub(r"[^A-Za-z0-9_]", "_", verdict)
+    script = tmp / f"nli_fake_{safe}.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.stdout.write({verdict!r} + '\\n')\n"
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+class NliJudgeExtensionTest(unittest.TestCase):
+    """Issue #62, 7.5: the optional LOCAL NLI judge consulted for mixed-polarity
+    clusters BEFORE they park contested. ONLY an ``entailment`` verdict on
+    EVERY polarity-flagged pair un-parks (merges); neutral/contradiction/
+    crash/non-zero/garbage all fall back to parking. The env var is read
+    lazily, so each test mocks its own ZMEM_NLI_CMD."""
+
+    def setUp(self):
+        self.mod, self.conn, self.tmp = _make_store()
+        self.tmp_path = Path(self.tmp)
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.tmp, True)
+
+    def _run(self, judge_cmd=None, **kwargs):
+        env = {"ZMEM_NLI_CMD": judge_cmd} if judge_cmd else {}
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf):
+                report = self.mod.consolidate(self.conn, force=True, **kwargs)
+        return report, buf.getvalue()
+
+    def test_entailment_unparks_contested_cluster(self):
+        pos = _add_raw(self.mod, self.conn, POS, 0.9)
+        neg = _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = _write_judge(self.tmp_path, "entailment")
+        report, out = self._run(cmd)
+
+        # The judge resolved the flagged pair as entailment: the cluster MERGES
+        # instead of parking — one row tombstoned, the merged:true entry
+        # reported (transparently, so the merge is never silent).
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertTrue(report["contested_clusters"][0]["merged"])
+        live = _live_rows(self.conn, pos, neg)
+        self.assertEqual(sum(1 for v in live.values() if v is None), 1)
+        self.assertIn("NLI judge", out)
+
+    def test_entailment_dry_run_previews_merge(self):
+        """A dry run consults the judge too, so the preview matches the real
+        run (the judge is consulted BEFORE the dry_run split)."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = _write_judge(self.tmp_path, "entailment")
+        report, out = self._run(cmd, dry_run=True)
+        self.assertEqual(report["merged"], 1)  # would-be count, dry_run=True
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        # PRR-001: a dry run NEVER claims merged:true — the entry's merged
+        # stays False even when the judge un-parked the cluster.
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        self.assertIn("NLI judge", out)
+
+    def test_neutral_verdict_parks_cluster(self):
+        pos = _add_raw(self.mod, self.conn, POS, 0.9)
+        neg = _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = _write_judge(self.tmp_path, "neutral")
+        report, out = self._run(cmd)
+
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        self.assertIn("CONTESTED cluster", out)
+        self.assertIn("NOT merged (contested)", out)
+
+    def test_garbage_stdout_parks_cluster(self):
+        """A judge that prints garbage is treated exactly like neutral — an
+        unreadable verdict must never auto-merge."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = _write_judge(self.tmp_path, "maybe?")
+        report, out = self._run(cmd)
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+
+    def test_crash_parks_cluster(self):
+        """A judge argv that fails to launch (missing script => OSError) must
+        degrade to park, never to merge."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = f'"{sys.executable}" "{self.tmp_path / "does-not-exist.py"}"'
+        report, out = self._run(cmd)
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+
+    def test_nonzero_exit_parks_cluster(self):
+        """A judge that exits nonzero is treated as neutral (park)."""
+        script = self.tmp_path / "nli_exit1.py"
+        script.write_text("import sys; sys.exit(1)\n")
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        cmd = f'"{sys.executable}" "{script}"'
+        report, out = self._run(cmd)
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertIn("CONTESTED cluster", out)
+
+    def test_all_flagged_pairs_must_entail(self):
+        """All-entailment semantics: if ANY one flagged pair is not entailment,
+        the whole cluster parks even when other pairs entail."""
+        script = self.tmp_path / "nli_sometimes.py"
+        script.write_text(
+            "import sys\n"
+            "n = 0\n"
+            "for _ in sys.stdin: n += 1\n"
+            "sys.stdout.write('neutral\\n' if n >= 2 else 'entailment\\n')\n"
+        )
+        a = _add_raw(self.mod, self.conn, POS, 0.9)
+        b = _add_raw(self.mod, self.conn, NEG, 0.9)
+        c = _add_raw(self.mod, self.conn, "rarely run migrations before deploy", 0.8)
+        cmd = f'"{sys.executable}" "{script}"'
+        report, out = self._run(cmd)
+        self.assertEqual(report["merged"], 0)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertIsNone(_live_rows(self.conn, a)[a])
+        self.assertIsNone(_live_rows(self.conn, b)[b])
+        self.assertIsNone(_live_rows(self.conn, c)[c])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

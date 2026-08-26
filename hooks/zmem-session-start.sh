@@ -163,12 +163,12 @@ NUDGE_MARKER_PY="$(join_path "$DATA_DIR_PY" .native-nudge-shown)"
 export ZMEM_DATA="${ZMEM_DATA:-$DATA_DIR}"
 export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 
-# Background consolidation: fully detached, fire-and-forget. stdio is redirected
-# to /dev/null so it (a) can't pollute the launcher's piped stdout buffer and
-# (b) doesn't hold the launcher's read pipe open — the launcher gets EOF the
-# moment THIS script exits. No wait/kill loop: blocking up to 5s here is exactly
-# the ~5s session-start stall Phase 3 removes; consolidate has its own internal
-# growth-threshold + interval guard, so an orphaned run is safe.
+# Background sleep-time organization: fully detached, fire-and-forget. stdio is
+# redirected to /dev/null so it (a) can't pollute the launcher's piped stdout
+# buffer and (b) doesn't hold the launcher's read pipe open — the launcher gets
+# EOF the moment THIS script exits. No wait/kill loop: blocking up to 5s here is
+# exactly the ~5s session-start stall Phase 3 removes; organize has its own
+# internal growth-threshold + interval guard, so an orphaned run is safe.
 #
 # Auto-snapshot (P11) rides the exact same detachment discipline for the exact
 # same reasons: fully redirected stdio so nothing can leak into the
@@ -177,7 +177,7 @@ export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 # makes it a cheap no-op almost every session — it only snapshots once per
 # $ZMEM_BACKUP_INTERVAL_DAYS (default 1). Both commands take their own
 # single-flight lock, so several sessions starting at once produce one
-# consolidation and one snapshot, not N of each.
+# organization run and one snapshot, not N of each.
 #
 # `sweep` (issue #23) prunes the per-session cooldown markers the capture/
 # convention hooks leave behind, so they cannot accumulate unboundedly in the
@@ -188,7 +188,7 @@ export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 # starting at once are safe by construction; do not "harden" it with the
 # consolidate/backup single-flight unless a real race is demonstrated.
 if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
-  # Background maintenance log (#37 L22): consolidate/backup/sweep previously
+  # Background maintenance log (#37 L22): organize/backup/sweep previously
   # redirected to /dev/null, which hid cadence skips and errors completely —
   # an operator had no way to tell maintenance had silently stopped running.
   # Now the three detached jobs append to a log file under the data dir (shell
@@ -220,9 +220,11 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
     fi
   fi
   # Batch the three cadence ops into ONE detached python process (#39 E9):
-  # consolidate + backup --if-due + sweep. Each keeps its own cadence gate /
-  # single-flight lock inside session-cadence, so this is behavior-equivalent
-  # to the former three-line spawn but starts one interpreter instead of three.
+  # organize (issue #62 7.7 — SessionStart invokes `session-cadence`, whose
+  # sleep-time maintenance op is now ORGANIZE, not consolidate) + backup
+  # --if-due + sweep. Each keeps its own cadence gate / single-flight lock
+  # inside session-cadence, so this is behavior-equivalent to the former
+  # three-line spawn but starts one interpreter instead of three.
   "$PYTHON_BIN" "$STORE_PY_PY" session-cadence \
     --backup-retention "${ZMEM_BACKUP_RETENTION:-7}" >>"$BG_SINK" 2>&1 &
 fi

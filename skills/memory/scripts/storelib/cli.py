@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from storelib.backup import BACKUP_DEFAULT_RETENTION, CONSOLIDATE_LOCK_STALE_SECONDS, SENTINEL_SWEEP_DAYS_DEFAULT, SNAPSHOT_GLOB, _acquire_lock, _release_lock, cmd_backup, cmd_restore, cmd_sweep
 from storelib.consolidate import CONSOLIDATE_DEFAULT_THRESHOLD, consolidate
+from storelib.organize import organize
 from storelib.entity import ENTITY_KINDS, cmd_entity_list, cmd_entity_merge
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
 from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_queue_clear, cmd_queue_list
@@ -294,6 +295,25 @@ def main():
                                help="print a machine-readable run report (contested clusters "
                                     "included) as the ONLY stdout content; human output goes "
                                     "to stderr")
+
+    # Sleep-time organize (issue #62). NOT flagless: it deliberately exposes
+    # --prune/--dry-run/--force/--json (each wired to a real behavior below —
+    # there is no unwired flag; see the test's FLAGLESS_SUBCMDS allowlist).
+    p_organize = sub.add_parser(
+        "organize",
+        help="sleep-time organization: bounded-episode consolidation, entity/link "
+             "backfill, topic clustering, hierarchical extractive summaries, "
+             "compression (issue #62)")
+    p_organize.add_argument("--prune", action="store_true",
+                            help="also supersede low-value never-retrieved memories "
+                                 "(unrecalled prune extension, issue #62 7.6)")
+    p_organize.add_argument("--dry-run", action="store_true",
+                            help="show what would be organized without changing anything")
+    p_organize.add_argument("--force", action="store_true",
+                            help="bypass the shared cadence gate and run organize now")
+    p_organize.add_argument("--json", action="store_true",
+                            help="print a machine-readable run report as the ONLY stdout "
+                                 "content; human output goes to stderr")
 
     p_promote = sub.add_parser("promote", help="promote high-confidence lessons to SKILL.md files")
     p_promote.add_argument("--dry-run", action="store_true",
@@ -913,34 +933,81 @@ def main():
                 return
             if args.json:
                 print(json.dumps(c_report))
+        elif args.cmd == "organize":
+            # Single-flight on the SHARED "consolidate" lock + shared cadence
+            # gate (issue #62). organize IS the same maintenance act as
+            # consolidate (it runs consolidate on a bounded episode), so the two
+            # commands share one lock AND one meta-key gate: two entry points,
+            # one clock — SessionStart organizing and a manual consolidate can
+            # never both fire back-to-back on the same store state. --dry-run
+            # writes nothing and still never takes the single-flight lock
+            # (mirroring consolidate); only --force bypasses the cadence gate.
+            #
+            # --json: stdout must remain strictly json.loads-parseable (same
+            # discipline as consolidate, PRR-004): every human print from the
+            # lock path AND from organize() itself is routed to stderr, and the
+            # machine report — or a lock-busy error object — is printed to the
+            # RESTORED stdout after the redirect block exits.
+            o_token = None
+            lock_busy = False
+            o_report = None
+            o_redirect = (
+                contextlib.redirect_stdout(sys.stderr)
+                if args.json else contextlib.nullcontext()
+            )
+            with o_redirect:
+                if not args.dry_run:
+                    o_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+                    if o_token is None:
+                        print("[zmem] organize: another organize/consolidation is "
+                              "already running - skipped")
+                        lock_busy = True
+                if not lock_busy:
+                    try:
+                        o_report = organize(
+                            conn, dry_run=args.dry_run, force=args.force,
+                            prune=args.prune)
+                    finally:
+                        _release_lock("consolidate", o_token)
+            if lock_busy:
+                # conn is closed exactly once by main()'s outer finally — the
+                # explicit close here would be a harmless double-close.
+                if args.json:
+                    print('{"error": "organize lock busy"}')
+                return
+            if args.json:
+                print(json.dumps(o_report))
         elif args.cmd == "backup":
             rc = cmd_backup(conn, retention=args.retention, out_dir=args.out_dir,
                             if_due=args.if_due)
             sys.exit(rc)
         elif args.cmd == "session-cadence":
             # Batch the three session-start cadence ops into one process (#39 E9).
-            # Each op keeps its EXACT standalone semantics: consolidate takes its
-            # single-flight lock + cadence gate (force=False respects it), backup
-            # runs with --if-due (cheap no-op when not due), and sweep is the same
+            # Each op keeps its EXACT standalone semantics: organize takes its
+            # single-flight lock + shared cadence gate (force=False respects it —
+            # issue #62 7.7 wired SessionStart to organize, NOT consolidate; the
+            # consolidate CLI remains for manual/ad-hoc runs), backup runs with
+            # --if-due (cheap no-op when not due), and sweep is the same
             # store-independent file reaper. A failure in any one op is reported
             # but does not abort the others (cadence ops are independent).
             # sweep already ran BEFORE connect() (store-independence, PRR-004)
             # — fold its result into the summary here.
             steps: list[str] = []
             failures = 0
-            # 1) consolidate (cadence-gated via force=False, single-flighted)
-            c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
-            if c_token is None:
-                steps.append("consolidate: already running - skipped")
+            # 1) organize (shares consolidate's lock + meta-key cadence gate via
+            # force=False; single-flighted on the shared "consolidate" lock)
+            o_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+            if o_token is None:
+                steps.append("organize: already running - skipped")
             else:
                 try:
-                    consolidate(conn, force=False)
-                    steps.append("consolidate: ok")
+                    organize(conn, force=False)
+                    steps.append("organize: ok")
                 except Exception as exc:  # never let one cadence op abort the batch
-                    steps.append(f"consolidate: error - {type(exc).__name__}: {exc}")
+                    steps.append(f"organize: error - {type(exc).__name__}: {exc}")
                     failures += 1
                 finally:
-                    _release_lock("consolidate", c_token)
+                    _release_lock("consolidate", o_token)
             # 2) backup --if-due (cheap no-op almost every session)
             try:
                 rc_b = cmd_backup(conn, retention=args.backup_retention, if_due=True)

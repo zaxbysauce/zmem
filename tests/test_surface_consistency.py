@@ -507,5 +507,128 @@ class ComputeScorePopularityBlendTest(unittest.TestCase):
             msg="popularity counts total surface events regardless of which counter carried them")
 
 
+class UnrecalledPruneExtensionTest(unittest.TestCase):
+    """Issue #62, 7.6: the unrecalled-prune extension. ``consolidate --prune``
+    may additionally qualify a live row whose ``last_surfaced`` is older than
+    ZMEM_UNRECALLED_DAYS (default 30) — a surfaced-but-stale row loses its
+    issue #21 protection once the surface event itself has gone stale. A
+    recently-surfaced row stays protected; a never-surfaced row (NULL
+    last_surfaced, surfaced_count=0) still qualifies via the surgeed_count=0
+    branch; signal!=none is never pruned.
+
+    Uses the REAL store.py CLI (subprocess) exactly like the prune test above.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-unrecalled-")
+        self.store = os.path.join(self.tmp, "store.sqlite")
+        self.env = {**os.environ, "ZMEM_STORE": self.store,
+                    "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, *args):
+        return subprocess.run([PYTHON, str(STORE_PY), *args],
+                              env=self.env, capture_output=True, text=True, timeout=60)
+
+    def _add_old_row(self, content, *, surfaced_count, last_surfaced, days_old=60,
+                     signal="none", confidence="0.2", retrieval=0):
+        r = self._run("add", "--namespace", NS, "--type", "fact",
+                      "--content", content, "--signal", signal,
+                      "--confidence", confidence)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        c = sqlite3.connect(self.store)
+        try:
+            if last_surfaced is None:
+                c.execute(
+                    "UPDATE memory SET retrieval_count=?, surfaced_count=?, "
+                    "ingestion_ts=datetime('now', ?) WHERE content LIKE ?",
+                    (retrieval, surfaced_count, f"-{days_old} days", f"%{content}%"))
+            else:
+                c.execute(
+                    "UPDATE memory SET retrieval_count=?, surfaced_count=?, "
+                    "last_surfaced=datetime('now', ?), "
+                    "ingestion_ts=datetime('now', ?) WHERE content LIKE ?",
+                    (retrieval, surfaced_count, f"-{last_surfaced} days",
+                     f"-{days_old} days", f"%{content}%"))
+            c.commit()
+        finally:
+            c.close()
+
+    def _superseded(self, content):
+        c = sqlite3.connect(self.store)
+        try:
+            row = c.execute(
+                "SELECT superseded_at FROM memory WHERE content LIKE ?",
+                (f"%{content}%",)).fetchone()
+            return row[0] if row else None
+        finally:
+            c.close()
+
+    def test_surfaced_beyond_unrecalled_days_is_pruned(self):
+        """surfaced_count=3 with last_surfaced OLDER than ZMEM_UNRECALLED_DAYS:
+        the row's protection lapses and it IS pruned."""
+        stale = "surfaced long ago and now stale row eta"
+        self._add_old_row(stale, surfaced_count=3, last_surfaced=60)
+        self.env = {**self.env, "ZMEM_UNRECALLED_DAYS": "30"}
+        r = self._run("consolidate", "--prune")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(
+            self._superseded(stale),
+            f"stale-surfaced row must be pruned when last_surfaced > 30d; "
+            f"out={r.stdout!r} {r.stderr!r}")
+
+    def test_recently_surfaced_stays_protected(self):
+        """last_surfaced 10 days ago < ZMEM_UNRECALLED_DAYS=30: protected."""
+        fresh = "surfaced recently so protected row zeta"
+        self._add_old_row(fresh, surfaced_count=3, last_surfaced=10)
+        self.env = {**self.env, "ZMEM_UNRECALLED_DAYS": "30"}
+        r = self._run("consolidate", "--prune")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(
+            self._superseded(fresh),
+            f"recently-surfaced row must NOT be pruned (last_surfaced < 30d); "
+            f"out={r.stdout!r} {r.stderr!r}")
+
+    def test_default_unrecalled_days_is_30(self):
+        """With no ZMEM_UNRECALLED_DAYS, the default 30 applies: a row surfaced
+        29 days ago is protected, one surfaced 31 days ago is pruned."""
+        keep = "default 30 protects 29-day-surfaced row iota"
+        drop = "default 30 prunes 31-day-surfaced row kappa"
+        self._add_old_row(keep, surfaced_count=2, last_surfaced=29)
+        self._add_old_row(drop, surfaced_count=2, last_surfaced=31)
+        r = self._run("consolidate", "--prune")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(self._superseded(keep),
+                          f"29-day-surfaced row must survive the default-30 gate")
+        self.assertIsNotNone(self._superseded(drop),
+                             f"31-day-surfaced row must be pruned under default-30")
+
+    def test_never_surfaced_null_last_surfaced_still_prunable(self):
+        """NULL last_surfaced + surfaced_count=0 keeps qualifying (the existing
+        issue #21 branch) — the extension must not regress the base rule."""
+        inert = "never surfaced so plainly prunable row lambda"
+        self._add_old_row(inert, surfaced_count=0, last_surfaced=None)
+        self.env = {**self.env, "ZMEM_UNRECALLED_DAYS": "30"}
+        r = self._run("consolidate", "--prune")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self._superseded(inert),
+                             f"never-surfaced row must still be pruned")
+
+    def test_signal_not_none_never_pruned(self):
+        """signal!=none rows are never pruned even when every numeric gate
+        (old, unretrieved, low-confidence, stale-surfaced) would qualify them."""
+        kept = "belief signal old unretrieved row mu"
+        self._add_old_row(kept, surfaced_count=3, last_surfaced=60, signal="user")
+        self.env = {**self.env, "ZMEM_UNRECALLED_DAYS": "30"}
+        r = self._run("consolidate", "--prune")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(
+            self._superseded(kept),
+            f"signal!=none row must NEVER be pruned, regardless of staleness; "
+            f"out={r.stdout!r}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -334,11 +334,15 @@ python <store.py> consolidate [--threshold 0.80] [--prune] [--dry-run] [--namesp
 ```
 Clusters live memories by embedding cosine similarity (Jaccard token overlap when
 embeddings are unavailable), picks a keeper, merges metadata, and supersedes the
-rest with a persisted reason. Runs automatically on SessionStart once 7 days
-have elapsed since the last run OR the live store has grown >20% since then (an
-automatic run is skipped only when the last run was <7 days ago AND growth was
-<20%; both bounds are env-tunable via `ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS` /
-`ZMEM_CONSOLIDATE_GROWTH_THRESHOLD`). When the gate declines, the run prints a
+rest with a persisted reason. The automatic SessionStart cadence now invokes
+**`organize`** (issue #62, 7.7) — which runs consolidate's EXACT same cluster
+logic on a bounded episode — so the 7-day / 20%-growth gate below protects the
+schedule REGARDLESS of entry point: organize and consolidate share the same
+`last_consolidation` meta keys and the same single-flight lock. An automatic
+run is skipped only when the last run was <7 days ago AND growth was <20%; both
+bounds are env-tunable via `ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS` /
+`ZMEM_CONSOLIDATE_GROWTH_THRESHOLD`. The `consolidate` CLI remains available for
+explicit/manual scope runs. When the gate declines, the run prints a
 single `[zmem] consolidate: skipped by cadence gate (...)` line (never silent)
 and changes nothing. Use `--dry-run` to preview clusters and the exact merge
 decision per row without mutating the store — `--dry-run` models the cadence
@@ -373,11 +377,101 @@ tokens for this case.
 `--prune` also removes low-value NEVER-surfaced and never-retrieved memories
 (`retrieval_count = 0` AND `surfaced_count = 0`, low confidence, old, `signal = none`;
 opt-in, never automatic). A hook-surfaced memory is protected — `retrieval_count = 0`
-alone is not evidence of unused (issue #21).
+alone is not evidence of unused (issue #21). Unrecalled extension (issue #62,
+7.6): a live row whose `last_surfaced` is OLDER than `ZMEM_UNRECALLED_DAYS`
+(default 30) qualifies EVEN with `surfaced_count > 0` — a surface event that has
+itself gone stale loses its issue #21 protection; `NULL last_surfaced` keeps the
+`surfaced_count = 0` rule unchanged and `signal != none` is never pruned.
 
 Consolidation is **single-flighted**: concurrent runs (several sessions starting
 at once) take an advisory lockfile in the store dir, and the losers skip cleanly
 and exit 0 rather than clustering the same rows twice.
+
+### organize — sleep-time organization (SessionStart cadence job)
+```
+python <store.py> organize [--prune] [--dry-run] [--force] [--json]
+```
+The SessionStart sleep-time maintenance job (issue #62, 7.7): the
+`session-cadence` batch that the start hook launches detached runs ORGANIZE, not
+consolidate. It bounds an "episode" of work to the most recent live rows,
+backfills any enrichment those rows are missing, runs consolidate's identical
+cluster/absorb/contested machinery on exactly that set, then adds sleep-time
+deliverables: a topic hierarchy, hierarchical extractive summaries, and
+extractive compression of the rows consolidation just grew. Everything is
+deterministic and LLM-free by default; there is no `--threshold`/`--namespace`
+to keep the two maintenance entry points aligned (see the consolidate section:
+organize and consolidate SHARE the cadence meta keys and SHARE the
+single-flight "consolidate" lock, so they can never run back-to-back on the
+same store state).
+
+Pipeline (in order):
+1. **Shared cadence gate** — the SAME 7-day / 20%-growth gate as consolidate,
+   using consolidate's `last_consolidation` meta keys (two entry points, one
+   clock). `--force` is the only bypass. A gated run prints
+   `[zmem] organize: skipped by cadence gate (...)` and changes nothing;
+   `--dry-run` models the gate (`would skip by cadence gate`).
+2. **Optional idle gate** — `ZMEM_ORGANIZE_IDLE_HOURS` (default 0 = off). When
+   set, organize refuses to run unless the store has had no live-memory activity
+   (max of ingestion_ts/last_retrieved/last_surfaced) for at least that many
+   hours: sleep-time jobs should not churn a store that is mid-use. A skip prints
+   `[zmem] organize: skipped by idle gate (...)`.
+3. **Working set / episode bound** — the N most recent live rows
+   (`ZMEM_ORGANIZE_EPISODE_BOUND`, default 256), box-wide. 0 disables real work.
+4. **Entity backfill** — every working row missing `memory_entity` links gets
+   them via the deterministic extractor (idempotent; rows with nothing
+extractable are counted as candidates but link nothing).
+5. **Link backfill** — every working row missing `memory_link` edges gets them
+   via the standard write-time linker (`related`/`contradicts` at
+   `ZMEM_LINK_THRESHOLD`).
+6. **Episodic consolidation** — `consolidate` on EXACTLY the working set
+   (keeper selection, absorb, contested guard + optional NLI judge, bounded by
+   the same per-namespace cap). See the consolidate section for semantics.
+7. **Topics** — a related-graph over the POST-ABSORB live working rows using
+   the SAME neighbor predicate at the same threshold consolidate would use;
+   leftover singletons are grouped by SHARED entity (A-MEM lite). Every live
+   NON-summary working row lands in exactly one topic. Topics of ≥3 members get
+   a **hierarchical extractive summary**: a REAL row (`type=fact`, tags exactly
+   `summary,topic`, `signal=none`, confidence 0.5, `source_ref=organize:<members>`,
+   `merged_from=<members>`), built from the first sentence of each member
+   (de-duplicated, capped). Members stay live; the summary is FTS/entity/search
+   recallable. Idempotent: a re-run finds the existing summary by
+   `tags/source_ref/merged_from` and UPDATES it (Phase 4 of the issue) instead
+   of duplicating. Summary rows are the pipeline's OUTPUT and never join a
+   topic as members (excluding them keeps the topic key stable run-over-run).
+   If the update/create would fold into a dedup target, organize logs and
+   skips rather than rewriting a stranger's row.
+8. **Compression** — the keepers consolidation grew,
+   when their content exceeds `ZMEM_KEEPER_COMPRESS_CHARS` (default 4000), are
+   compressed deterministically: order-preserving UNIQUE sentences, dropping
+   only from the TAIL on whole-sentence boundaries (never mid-sentence; the
+   pre-compress text stays on the superseded history row and `merged_from`
+   provenance is carried to the replacement).
+9. **Unrecalled prune (pass-through)** — `--prune` enables the `consolidate
+   --prune` rule, extended (issue #62, 7.6): a live row also qualifies when its
+   `last_surfaced` is OLDER than `ZMEM_UNRECALLED_DAYS` (default 30) even with
+   `surfaced_count > 0` — a surface event that has itself gone stale loses its
+   issue #21 protection. `signal != none` is never pruned; never automatic.
+
+`--dry-run` writes NOTHING (no meta, no backfill, no summaries) and the `--json`
+report carries per-step would-be counts (`entity_backfill`, `link_backfill`,
+`topics`, `summaries`, `compressed`, `pruned`, `episode_ids`, `consolidate`
+sub-report).  A concurrent organize/consolidate loses cleanly (exit 0, a
+`- skipped` notice, or `{"error": "organize lock busy"}` under `--json`).
+
+Optional local NLI judge (7.5): when `ZMEM_NLI_CMD` is set to an argv template
+(e.g. `ZMEM_NLI_CMD='python /path/to/your/local-judge.py'`), consolidate's
+contested branch consults it for mixed-polarity clusters; only an `entailment`
+verdict on EVERY polarity-flagged pair un-parks the merge, and any other
+verdict or failure parks it (never auto-merges). The judge receives the two
+first-sentences on stdin (one per line) and prints a verdict word. Unset =
+byte-identical behavior (no NLI); a deterministic regex polarity remains the
+fallback for a response you judge ambiguous.
+
+Schema compatibility: organize NEVER changes the schema. All of its outputs use
+pre-existing columns (`merged_from`, `source_ref`, `tags`, `confidence`,
+`source_hash`), so a store stamped at an older schema version keeps opening
+normally in an older client until the new version is installed — verify a
+template store with `store.py organize --dry-run` before upgrading.
 
 ### rekey-namespace — remediate stranded namespace rows (admin)
 ```
