@@ -12,6 +12,35 @@ README.
 
 ## [Unreleased]
 
+### Added
+- **Embedding profiles registry** — `embed_profiles.py`: shipped `minilm`
+  (Xenova/all-MiniLM-L6-v2 ONNX, 384-d, checksum-pinned) and test-only `fake`
+  (deterministic 16-d placeholder vectors hashed from the content_norm form;
+  doctor warns loudly on any non-temporary store using it) selected via
+  `ZMEM_EMBED_PROFILE`; unknown profiles refuse exit-2 (issue #63, 8.2/8.5)
+
+- **`reembed --all`** — full store rebuild under a selected profile with
+  single-transaction dim conversion (crash-safe, idempotent, dry-run,
+  batch-paced stderr progress, telemetry/content untouched); flagless
+  backfill keeps its byte-identical legacy contract (issue #63, 8.3)
+
+- **Doctor `embeddings_health` + checksum note** — profile/dim vs store match,
+  rows with/without embeddings, shipped-profile inventory, deep checksum
+  verification with the Xenova-ONNX-vs-PyTorch note, fake-on-real-store and
+  zero-embedded-with-hybrid warnings, dedicated checksum-mismatch
+  recommendation (issue #63, 8.1/8.4)
+
+- **Optional cross-encoder rerank** — `ZMEM_CROSS_ENCODER=1` +
+  `ZMEM_CROSS_ENCODER_MODEL=<local .onnx>`; post-MMR rerank on explicit CLI
+  `recall` only, structurally unreachable from hooks/PreCompact/recent/
+  search aliases/--no-bump, silent degrade on missing model, injectable
+  test scorer via `storelib.cross_encoder.set_scorer` (issue #63, 8.6)
+
+### Tests
+- New standalone suites: `tests/test_embed_profiles.py`,
+  `tests/test_embedder_checksum.py`, `tests/test_reembed.py`,
+  `tests/test_cross_encoder.py`; extended `tests/test_doctor.py`
+
 ## [0.12.0] — 2026-08-26
 
 ### Added

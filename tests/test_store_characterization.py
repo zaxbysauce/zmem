@@ -139,7 +139,9 @@ KNOWN_SUBCMDS = [
 # NON-vacuous (a regression that drops a real flag must trip the test).
 # Adding a subcommand here without removing its real flags from the CLI is
 # the only way this allowlist grows, so it forces a conscious decision.
-FLAGLESS_SUBCMDS = frozenset({"init", "stats", "path", "rebuild-fts", "reembed"})
+# reembed left the flagless set (issue #63, 8.3): it now exposes
+# --all/--profile/--batch/--dry-run; its help surface is structurally pinned.
+FLAGLESS_SUBCMDS = frozenset({"init", "stats", "path", "rebuild-fts"})
 
 
 def _sha(text: str) -> str:

@@ -24,12 +24,14 @@ try:
     from schema_meta import (SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY,
         MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS, ALLOWED_TAINTS,
         TAINT_RANK, TAINT_TRUSTED_SIGNALS, validate_taint, worse_taint,
+        normalize_content,
         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from schema_meta import (SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY,
         MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS, ALLOWED_TAINTS,
         TAINT_RANK, TAINT_TRUSTED_SIGNALS, validate_taint, worse_taint,
+        normalize_content,
         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)  # type: ignore
 
 try:
@@ -49,6 +51,15 @@ except ImportError:
         import embeddings as _embeddings
     except ImportError:
         _embeddings = None
+
+try:
+    import embed_profiles as _profiles
+except ImportError:
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        import embed_profiles as _profiles
+    except ImportError:
+        _profiles = None
 
 def _env_float(name: str, default: float) -> float:
     """Read a float env var, falling back to `default` on absent/garbage input.
@@ -278,14 +289,141 @@ def connect() -> sqlite3.Connection:
         _load_vec(conn)
         # Ensure the vec0 table exists whenever vec loads (handles the case
         # where sqlite_vec was absent during the v3 migration but installed later).
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0("
-            "embedding float[384] distance_metric=cosine, memory_id TEXT"
-            ")"
-        )
+        # Dimension follows the ACTIVE embedding profile (issue #63, 8.2) so a
+        # fresh store created under ZMEM_EMBED_PROFILE=fake is born 16-dim; an
+        # EXISTING table is untouched (IF NOT EXISTS), and existing stores keep
+        # their committed dim regardless of env — a mismatched profile is
+        # refused at dispatch by assert_embedding_compatible, never silently
+        # coerced here.
+        conn.execute(_vec0_create_sql(_active_vec0_dim()))
     except Exception:
         pass
     return conn
+
+def _active_vec0_dim() -> int:
+    """Vector dimension used when creating a FRESH memory_vec table: the active
+    profile's dim. An invalid/unreadable registry or env value falls back to
+    the historical 384 fail-safe — connect() must never raise on env content;
+    a genuinely bad profile is refused later at dispatch."""
+    if _profiles is None:
+        return 384
+    try:
+        return _profiles.active_dim()
+    except Exception:
+        return 384
+
+
+def _vec0_create_sql(dim: int) -> str:
+    """Single source of the memory_vec DDL shape (both creation sites use this:
+    connect-time ensure + v3 migration). Keep distance_metric/second column in
+    lockstep with every KNN/dedup query against the table."""
+    return (
+        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0("
+        f"embedding float[{dim}] distance_metric=cosine, memory_id TEXT"
+        ")"
+    )
+
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    """Read one meta key (call-time read, NEVER cached). Returns None when the
+    row is absent."""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return row["value"] if row else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """Upsert one meta key. Old clients only ever address meta rows by exact
+    key (WHERE key=?), so extra keys written by newer clients are inert for
+    them — that property is why profile bookkeeping lives here instead of a
+    schema bump (issue #63 compat ledger)."""
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value)
+    )
+
+
+def _live_embedding_dim(conn: sqlite3.Connection) -> int | None:
+    """The vector dimension currently COMMITTED to the store.
+
+    Primary oracle: byte-length of a real `memory.embedding` blob (packed
+    float32 => len // 4 floats). Fallback for an empty-but-initialized store:
+    parse the declared float[N] out of the memory_vec DDL in sqlite_master.
+    Returns None when the store has no committed dimension yet (no embedded
+    rows AND no declared table) — any profile may then claim it freely.
+
+    A regex miss on the fallback (future sqlite-vec DDL syntax drift) returns
+    None as well ONLY when there are no blobs; if blobs exist they decided
+    already. This function never raises and never guesses.
+    """
+    try:
+        row = conn.execute(
+            "SELECT length(embedding)/4 FROM memory "
+            "WHERE embedding IS NOT NULL LIMIT 1"
+        ).fetchone()
+        if row and row[0]:
+            return int(row[0])
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_vec'"
+        ).fetchone()
+        if row and row[0]:
+            m = re.search(r"float\[(\d+)\]", row[0], re.IGNORECASE)
+            if m:
+                return int(m.group(1))
+            raise RuntimeError(_VEC_DIM_UNKNOWN_MSG)
+    except RuntimeError:
+        raise
+    except sqlite3.Error:
+        pass
+    return None
+
+
+_VEC_DIM_UNKNOWN_MSG = (
+    "[zmem] cannot determine the store's embedding dimension: memory_vec DDL "
+    "is not parseable and no embeddings exist yet. Refusing rather than "
+    "guessing. Re-run with ZMEM_EMBED_PROFILE unset after backing up."
+)
+
+
+def assert_embedding_compatible(conn: sqlite3.Connection, *, allow_rebuild: bool = False) -> None:
+    """Fail-closed dim gate (issue #63, 8.2): refuse any command whose success
+    depends on generating or querying vectors when the ACTIVE profile's dim
+    differs from the dimension already committed to the store.
+
+    Raises RuntimeError (cli turns into exit 2 with the remediation command)
+    instead of letting a wrong-dim INSERT blow up mid-write or a wrong-dim
+    query crash recall. `allow_rebuild=True` exempts reembed --all / --dry-run,
+    which are precisely the tools that RESOLVE a mismatch.
+    """
+    prof_name = "minilm"
+    if _profiles is not None:
+        try:
+            prof_name = _profiles.resolve_active_profile()
+        except Exception:
+            prof_name = ""  # unreachable via CLI; guard mirrors registry
+        if not prof_name:
+            raise RuntimeError(
+                "unknown ZMEM_EMBED_PROFILE value "
+                f"{(_profiles.get_env_raw() or '')!r} — valid profiles: "
+                f"{', '.join(sorted(_profiles.PROFILES))}"
+            )
+        prof_dim = _profiles.PROFILES[prof_name]["dim"]
+    else:
+        prof_dim = 384
+    live_dim = _live_embedding_dim(conn)
+    if live_dim is None or live_dim == prof_dim:
+        return
+    if allow_rebuild:
+        return
+    fix = f"store.py reembed --all --profile {prof_name}"
+    raise RuntimeError(
+        f"profile '{prof_name}' expects {prof_dim}-dim embeddings but the store "
+        f"holds {live_dim}-dim data — refusing to mix dimensions. Run "
+        f"`{fix}` to convert the store (this rebuilds every embedding), or "
+        f"unset ZMEM_EMBED_PROFILE to stay on the stored dimension."
+    )
+
 
 SCHEMA_LOCK_STALE_SECONDS = _env_float("ZMEM_SCHEMA_LOCK_STALE_SECONDS", 300.0)
 
@@ -949,11 +1087,11 @@ def migrate(conn: sqlite3.Connection) -> None:
         # the rest of the system continues to work (FTS5-only recall).
         try:
             _load_vec(conn)
-            conn.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0("
-                "embedding float[384] distance_metric=cosine, memory_id TEXT"
-                ")"
-            )
+            # Same dynamic-dim rule as connect(): a store BORN under an
+            # active non-default profile (e.g. CI fake stores migrating
+            # v2->v3) gets its own dim; operator stores mid-profile-switch
+            # are gated by assert_embedding_compatible at dispatch instead.
+            conn.execute(_vec0_create_sql(_active_vec0_dim()))
         except Exception:
             pass  # sqlite-vec not available — embeddings disabled
 
@@ -1228,18 +1366,13 @@ def _load_vec(conn: sqlite3.Connection) -> None:
     sqlite_vec.load(conn)
 
 def _normalize_content(s: str) -> str:
-    """Canonical content form for exact-match dedup (#39 E4).
-
-    Single source of truth: MUST be used at every dedup comparison AND every
-    content_norm write (add_memory INSERT, _ingest_row INSERT,
-    _absorb_into_keeper UPDATE, backfill) so the content_norm index never
-    diverges from the comparison semantics. Mirrors the former inline
-    ``re.sub(r"\\s+", " ", s.strip().lower())`` at the dedup call sites.
-    NOT a SQL GENERATED ALWAYS AS column — SQLite cannot replicate Python's
-    Unicode-aware ``.lower()`` + ``\\s+`` collapse, so a DB-generated column
-    would silently diverge and cause false-negative dedup misses.
+    """Alias of schema_meta.normalize_content — kept because every writer
+    and several tests import THIS name from this module. The implementation
+    moved to schema_meta (issue #63 critic round C5) so embed_profiles' fake
+    embedder hashes the identical canonical form without importing this
+    module.
     """
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
+    return normalize_content(s)
 
 def _parse_iso_to_epoch(ts: str) -> float:
     """Parse an ISO-8601 UTC timestamp to epoch seconds. Returns 0 on failure."""

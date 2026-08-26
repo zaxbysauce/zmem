@@ -10,6 +10,14 @@ file is missing (and cannot be lazy-downloaded — see `_try_download_model`),
 all functions return None and callers should degrade gracefully to FTS5-only
 recall / lexical-overlap clustering (see store.py `consolidate`).
 
+Embedding profiles (issue #63, 8.2/8.5): ZMEM_EMBED_PROFILE selects a row from
+``embed_profiles.PROFILES``. The default/unset profile (`minilm`) behaves
+exactly as before this module gained profile awareness. The `fake` profile
+returns deterministic 16-dim placeholder vectors with no dependencies, files,
+or network — for model-absent tests/CI only (doctor warns on real stores).
+Model facts (hf_id / dim / sha256) live in ``embed_profiles`` — this module
+no longer owns them.
+
 The model file itself (skills/memory/models/minilm.onnx, ~90MB) is NOT
 committed to git (Phase 10, PLAN.md §7-P10) — it's gitignored and either
 already present on disk from a prior install, lazy-downloaded on first use
@@ -28,10 +36,19 @@ import struct
 import sys
 from pathlib import Path
 
+# Profile registry (issue #63). Same directory, stdlib-only, no circular
+# imports. All model identity constants below are now sourced from it.
+import embed_profiles as _profiles
+
 # --- Lazy globals (populated on first use) ---
 _session = None
 _tokenizer = None
 _model_available: bool | None = None
+# Which profile's verdict `_model_available` reflects. Profile awareness means
+# the availability verdict is PER-PROFILE: without the key, an in-process env
+# switch (tests, long-lived Hermes server) would serve a stale minilm verdict
+# to fake or vice versa.
+_profile_cache_key: str | None = None
 # None = not yet checked; True = checksum verified at load; False = mismatch
 # (model present but rejected). availability_status() surfaces this so doctor
 # does not report a checksum-rejected model as healthy (cubic-2, #36 M15).
@@ -42,12 +59,12 @@ _model_checksum_ok: bool | None = None
 _model_load_failed: bool = False
 _MODEL_DIM = 384
 
-# sha256 of the minilm.onnx currently shipped/installed on the reference box
-# (computed from the on-disk file at Phase-10 implementation time). Any
-# downloaded replacement is verified against this before being trusted —
-# on mismatch we discard it and fail open to no-embeddings, never load an
-# unverified binary.
-_MODEL_SHA256 = "bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5"
+# sha256 of the Xenova ONNX export bundled/downloaded as minilm.onnx. Now a
+# RE-EXPORT of the registry value so `embed_profiles` stays the single source
+# of truth; kept as this module attribute because tests monkeypatch it here and
+# `verify_checksum` resolves its default at call time via this name (#36 M15;
+# issue #63 8.1 keeps that contract intact).
+_MODEL_SHA256 = _profiles.MINILM_SHA256
 
 # Default source for a lazy download when the model file is absent. This is
 # the widely-used Xenova ONNX export of all-MiniLM-L6-v2 (same architecture/
@@ -60,6 +77,44 @@ _MODEL_SHA256 = "bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c
 _DEFAULT_MODEL_URL = (
     "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
 )
+
+# Resolved fresh on every call so tests and long-lived servers observe env
+# changes without cache surprises. An unknown profile name returns "" here
+# (treated as unavailable); the CLI refuses it with exit 2 long before any
+# embed attempt, so this path is defense-in-depth, not primary validation.
+def current_profile_name(environ=None) -> str:
+    try:
+        return _profiles.resolve_active_profile(environ)
+    except _profiles.ProfileError:
+        return ""
+
+
+_fake_warned_once = False
+
+
+def warn_fake_active() -> None:
+    """One-time-per-process operator guard for the `fake` profile.
+
+    Called by WRITE surfaces (add/update/ingest) before they embed: hooks'
+    short-lived recall processes stay quiet on read paths, but any store that
+    starts accumulating fake vectors announces itself loudly on stderr — a
+    forgotten ZMEM_EMBED_PROFILE=fake export must never silently corrupt a
+    real store with placeholder vectors.
+    """
+    global _fake_warned_once
+    if _fake_warned_once or current_profile_name() != "fake":
+        return
+    _fake_warned_once = True
+    try:
+        print(
+            "[zmem] WARNING: ZMEM_EMBED_PROFILE=fake is active — writes will "
+            "store deterministic 16-dim PLACEHOLDER vectors, not semantic "
+            "embeddings. This profile is for model-absent tests/CI only; unset "
+            "the variable before real use.",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
 
 
 # The plugin's bundled models directory, relative to this script. Kept as a
@@ -254,10 +309,25 @@ def _check_available() -> bool:
     network call, to honor the project's local-first / zero-cloud-dependency
     promise. Download failure of any kind is silent and falls through to
     the no-embeddings path; it never raises.
+
+    Profile-aware (issue #63): the `fake` profile needs neither deps nor
+    files — it short-circuits to available. The cached verdict is keyed on
+    the active profile so an env switch is never masked by a stale bool.
     """
-    global _model_available
-    if _model_available is not None:
+    global _model_available, _profile_cache_key
+    prof = current_profile_name()
+    if _model_available is not None and _profile_cache_key == prof:
         return _model_available
+    _profile_cache_key = prof
+    if not prof:
+        # Unknown ZMEM_EMBED_PROFILE value. Unreachable via the CLI (it
+        # refuses at dispatch); degrade here so library callers can't be
+        # crashed by env content.
+        _model_available = False
+        return False
+    if prof == "fake":
+        _model_available = True
+        return True
     try:
         import onnxruntime  # noqa: F401
         from tokenizers import Tokenizer  # noqa: F401
@@ -279,6 +349,8 @@ def _ensure_loaded():
     global _session, _tokenizer, _model_available, _model_checksum_ok, _model_load_failed
     if _session is not None:
         return
+    if current_profile_name() == "fake":
+        return  # fake embeds never touch the session/tokenizer stack
     if not _check_available():
         return
     import onnxruntime as ort
@@ -337,13 +409,16 @@ def _ensure_loaded():
 
 
 def embed_text(text: str) -> bytes | None:
-    """Generate a 384-dim L2-normalized embedding for the given text.
+    """Generate an L2-normalized embedding blob for the given text.
 
-    Returns a packed float32 blob (1536 bytes) suitable for sqlite-vec, or
-    None if the embedding infrastructure is unavailable.
+    Dimensions follow the active profile: 384-d (1536 bytes) for `minilm`,
+    16-d (64 bytes) for `fake`. Returns a packed float32 blob suitable for
+    sqlite-vec, or None if the embedding infrastructure is unavailable.
     """
     if not text or not text.strip():
         return None
+    if current_profile_name() == "fake":
+        return _profiles.fake_embed(text)
     _ensure_loaded()
     if _session is None or _tokenizer is None:
         return None
@@ -402,7 +477,8 @@ def availability_status() -> dict:
                                         #   (AND the model passed checksum if loaded)
           "reason": str | None,         # 'ok' | 'imports_missing' |
                                         # 'model_file_missing' | 'tokenizer_missing' |
-                                        # 'model_checksum_mismatch' | None
+                                        # 'model_checksum_mismatch' |
+                                        # 'model_load_failed' | 'unknown_profile' | None
           "missing_imports": list[str], # subset of onnxruntime/tokenizers/numpy
           "models_dir": str,            # resolved models dir (ZMEM_MODELS_DIR or default)
           "interpreter": str,           # sys.executable — which Python is resolving deps
@@ -410,6 +486,13 @@ def availability_status() -> dict:
           "tokenizer_file": bool,       # tokenizer.json present?
           "checksum_ok": bool | None,   # None=not yet checked, True=verified,
                                         #   False=rejected at load (M15)
+          "load_failed": bool,          # load failure flag (distinct from mismatch)
+          "profile": str,               # active embedding profile name (''=invalid env)
+          "dim": int | None,            # that profile's vector dim (None if invalid)
+          "note": str,                  # only present on model_checksum_mismatch:
+                                        # names the Xenova-ONNX vs PyTorch-weights
+                                        # distinction so operators never "fix" a
+                                        # mismatch by disabling verification (#63 8.1)
         }
 
     Presence-only: checks importability + file existence. NEVER hashes the
@@ -441,42 +524,82 @@ def availability_status() -> dict:
     except (OSError, ValueError):
         tokenizer_file = False
 
+    # Resolve the profile WITHOUT crashing on an unknown value: the raw env
+    # string goes into the report so the operator sees exactly what they set.
+    try:
+        prof = _profiles.resolve_active_profile()
+    except _profiles.ProfileError:
+        prof = ""
+    if not prof:
+        return {
+            "available": False,
+            "reason": "unknown_profile",
+            "missing_imports": missing,
+            "models_dir": str(models_dir),
+            "interpreter": sys.executable or "",
+            "model_file": model_file,
+            "tokenizer_file": tokenizer_file,
+            "checksum_ok": None,
+            "load_failed": _model_load_failed,
+            "profile": (_profiles.get_env_raw() or "").strip().lower(),
+            "dim": None,
+        }
+
+    prof_entry = _profiles.PROFILES[prof]
+    base_note: dict = {"profile": prof, "dim": prof_entry["dim"]}
+
+    if prof == "fake":
+        # No deps/files needed for the hash embedder; probe results are
+        # informational only. Checked BEFORE the deps gate so a fake-profile
+        # CI box without onnxruntime still reads available=True — matching
+        # `_check_available` exactly.
+        return {**base_note, "available": True, "reason": "ok",
+                "missing_imports": [], "models_dir": str(models_dir),
+                "interpreter": sys.executable or "", "model_file": model_file,
+                "tokenizer_file": tokenizer_file, "checksum_ok": None,
+                "load_failed": _model_load_failed}
     if missing:
-        reason = "imports_missing"
-        available = False
-    elif not model_file:
-        reason = "model_file_missing"
-        available = False
-    elif not tokenizer_file:
-        reason = "tokenizer_missing"
-        available = False
-    elif _model_load_failed:
+        return {**base_note, "available": False, "reason": "imports_missing",
+                "missing_imports": missing, "models_dir": str(models_dir),
+                "interpreter": sys.executable or "", "model_file": model_file,
+                "tokenizer_file": tokenizer_file, "checksum_ok": None,
+                "load_failed": _model_load_failed}
+    if not model_file:
+        return {**base_note, "available": False, "reason": "model_file_missing",
+                "missing_imports": missing, "models_dir": str(models_dir),
+                "interpreter": sys.executable or "", "model_file": model_file,
+                "tokenizer_file": tokenizer_file, "checksum_ok": None,
+                "load_failed": _model_load_failed}
+    if not tokenizer_file:
+        return {**base_note, "available": False, "reason": "tokenizer_missing",
+                "missing_imports": missing, "models_dir": str(models_dir),
+                "interpreter": sys.executable or "", "model_file": model_file,
+                "tokenizer_file": tokenizer_file, "checksum_ok": None,
+                "load_failed": _model_load_failed}
+    if _model_load_failed:
         # Checksum PASSED but the model/tokenizer failed to load (corrupt
         # tokenizer.json, unparseable ONNX). Distinct from a checksum mismatch
         # so the diagnostic is accurate (cubic-2 final-critic).
-        reason = "model_load_failed"
-        available = False
-    elif _model_checksum_ok is False:
+        return {**base_note, "available": False, "reason": "model_load_failed",
+                "missing_imports": missing, "models_dir": str(models_dir),
+                "interpreter": sys.executable or "", "model_file": model_file,
+                "tokenizer_file": tokenizer_file, "checksum_ok": True,
+                "load_failed": _model_load_failed}
+    if _model_checksum_ok is False:
         # Files present, but the load path already REJECTED the model on a
         # checksum mismatch (M15). Report unavailable so doctor does not show a
         # checksum-rejected model as healthy (cubic-2). `_model_checksum_ok` is
         # None until the first load attempt; a short-lived CLI process that has
         # not yet embedded leaves it None (treated as 'ok' here — the checksum
         # gate fires on first embed).
-        reason = "model_checksum_mismatch"
-        available = False
-    else:
-        reason = "ok"
-        available = True
-
-    return {
-        "available": available,
-        "reason": reason,
-        "missing_imports": missing,
-        "models_dir": str(models_dir),
-        "interpreter": sys.executable or "",
-        "model_file": model_file,
-        "tokenizer_file": tokenizer_file,
-        "checksum_ok": _model_checksum_ok,
-        "load_failed": _model_load_failed,
-    }
+        return {**base_note, "available": False,
+                "reason": "model_checksum_mismatch", "note": prof_entry["notes"],
+                "missing_imports": missing, "models_dir": str(models_dir),
+                "interpreter": sys.executable or "", "model_file": model_file,
+                "tokenizer_file": tokenizer_file, "checksum_ok": False,
+                "load_failed": _model_load_failed}
+    return {**base_note, "available": True, "reason": "ok",
+            "missing_imports": missing, "models_dir": str(models_dir),
+            "interpreter": sys.executable or "", "model_file": model_file,
+            "tokenizer_file": tokenizer_file, "checksum_ok": _model_checksum_ok,
+            "load_failed": _model_load_failed}

@@ -20,9 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from storelib.entity import entities_for_memory, entities_for_memories, entity_match_ids
 from storelib.links import expand_recall_links
-from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, now_iso
+from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from schema_meta import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
+import embed_profiles as _profiles
+from storelib.cross_encoder import maybe_rerank as _cross_maybe_rerank
 
 W_BM25 = 0.55
 
@@ -820,6 +822,7 @@ def recall_memory(
     no_mmr: bool = False,
     link_hops: int = 1,
     link_budget: int = 2,
+    cross_rerank: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -952,6 +955,16 @@ def recall_memory(
     # rewards query-MATCHED rows, and a supplementary neighbor surfaced only
     # through its link must not outrank genuine matches in later recalls
     # (pinned by test_mmr's distinct-fact acceptance, issue #60 5.5).
+    # Issue #63, 8.6: optional cross-encoder rerank of the FINAL post-MMR,
+    # post-filter merged list — applied HERE so the reordered list also drives
+    # the telemetry capture below (bumped ids == presented ids). Enablement is
+    # decided exclusively at the CLI dispatch layer (see cli_allowed); every
+    # library caller and passive surface lands here with cross_rerank=False,
+    # which makes hook/PreCompact/prefetch invocations structurally incapable
+    # of reaching a scorer. The helper itself degrades to the input order on
+    # any scorer absence/error, so a missing model never fails a recall.
+    if cross_rerank:
+        results = _cross_maybe_rerank(query, results)
     bump_ids = [r["id"] for r in results]
     if link_hops >= 1 and link_budget >= 1 and results:
         results = results + expand_recall_links(
@@ -1271,43 +1284,262 @@ def _has_any_embedding(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         "SELECT 1 FROM memory WHERE superseded_at IS NULL AND embedding IS NOT NULL LIMIT 1"
     ).fetchone()
-    return row is not None
-
 def _reembed(conn: sqlite3.Connection) -> None:
-    """Backfill embeddings + vec0 entries for live memories missing them."""
-    if not _embeddings or not _embeddings.is_available():
-        print("[zmem] embeddings unavailable — install onnxruntime + tokenizers "
-              "and ensure the model file is present.", file=sys.stderr)
-        return
+    """Flagless backfill — byte-compatible legacy entry point.
 
-    # Phase 1: embed memories that have no embedding at all.
+    Keeps the historical contract verbatim (stdout summary line, graceful
+    degrade with exit 0 when the runtime is unavailable, INSERT-only repair of
+    missing vec entries). Scripts and hook cadences invoke this form, so their
+    outputs must not shift (issue #63 compat ledger).
+    """
+    reembed_embeddings(conn)
+
+
+def _declared_vec0_dim(conn: sqlite3.Connection) -> int | None:
+    """Dimension DECLARED by the existing memory_vec virtual table, parsed
+    from its stored CREATE statement. None means no table exists (sqlite-vec
+    never loaded for this store). An unparseable declaration raises: guessing
+    would corrupt the very index this command owns."""
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_vec'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    m = re.search(r"float\[(\d+)\]", row[0], re.IGNORECASE)
+    if not m:
+        raise RuntimeError(
+            "[zmem] memory_vec exists but its DDL is not parseable — refusing "
+            "to rebuild against an unknown dimension. Back up the store and "
+            "inspect sqlite_master manually."
+        )
+    return int(m.group(1))
+
+
+def _embed_for_profile(text: str, profile_name: str):
+    """Vector source for one profile. Real profiles route through the standard
+    embeddings module (checksum gate included); fake goes straight to the
+    registry's deterministic hash so no ONNX stack is ever touched."""
+    if profile_name == "fake":
+        return _profiles.fake_embed(text)
+    assert _embeddings is not None  # readiness checked by caller
+    return _embeddings.embed_text(text)
+
+
+def _row_needs_rebuild(conn: sqlite3.Connection, target_dim: int, marker: str) -> int:
+    """Count of live memories whose --all run would change something: missing
+    vector, wrong dimension, or written under a different profile marker.
+    Single SQL pass shared by --dry-run reporting."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM memory WHERE superseded_at IS NULL AND ("
+        "embedding IS NULL OR length(embedding)/4 <> ? "
+        "OR COALESCE(embedding_model,'') <> ?)",
+        (target_dim, marker),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def reembed_embeddings(
+    conn: sqlite3.Connection,
+    *,
+    rebuild_all: bool = False,
+    profile: str | None = None,
+    batch: int = 64,
+    dry_run: bool = False,
+) -> int:
+    """Backfill (default form) or full-rebuild (--all) semantic embeddings.
+
+    Default form reproduces legacy flagless behavior exactly: fill NULL
+    embeddings, repair missing memory_vec rows, degrade gracefully (rc 0)
+    without a runtime, never touch retrieval_count / surfaced_count /
+    content / content_norm.
+
+    --all form (issue #63, 8.3): rebuild EVERY live row's vector under the
+    selected profile, recreating memory_vec at the target dimension when it
+    changes. ATOMICITY CONTRACT — everything happens inside ONE explicit
+    transaction (BEGIN IMMEDIATE .. COMMIT): SQLite DDL is transactional, so
+    the DROP/re-CREATE of the virtual table rolls back together with every
+    blob update on any crash or embed failure. The issue's 'a crash mid-run
+    never leaves a half-dim index' guarantee therefore holds absolutely: the
+    post-commit state is ALWAYS uniform-dimension + complete-index +
+    meta('embedding_profile') recorded; anything pre-commit leaves the store
+    byte-identical to before. --batch paces PROGRESS REPORTING ONLY (stderr);
+    batches are display chunks inside the one transaction, not commits.
+
+    Idempotent: a second identical run recomputes identical blobs and reports
+    0 changed rows. --dry-run writes nothing anywhere and reports exactly what
+    --all would change.
+
+    Returns the process exit code (0 success/dry-run, 1 refused or failed,
+    2 bad profile env).
+    """
+    requested = (profile or "").strip() or None
+    try:
+        active = _profiles.resolve_active_profile()
+    except _profiles.ProfileError as exc:
+        print(f"[zmem] {exc}", file=sys.stderr)
+        return 2
+    target = requested or active
+    if requested and requested != active:
+        print(
+            f"[zmem] note: rebuilding as profile '{target}' while "
+            f"ZMEM_EMBED_PROFILE='{active}' — subsequent writes embed with "
+            f"the ACTIVE profile, so set ZMEM_EMBED_PROFILE={target} to keep "
+            "adding matching vectors.",
+            file=sys.stderr,
+        )
+    entry = _profiles.PROFILES[target]
+    target_dim = entry["dim"]
+    marker = _profiles.embedding_model_name(target)
+
+    def provider_ready(name: str) -> bool:
+        if name == "fake":
+            return True
+        return bool(_embeddings and _embeddings.is_available())
+
+    if dry_run:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM memory WHERE superseded_at IS NULL"
+        ).fetchone()[0]
+        would = _row_needs_rebuild(conn, target_dim, marker)
+        print(
+            f"[zmem] reembed --dry-run (profile '{target}', dim {target_dim}): "
+            f"{would} of {total} live memories would change"
+            + ("  — nothing was written" if would else "")
+        )
+        return 0
+
+    # Readiness: an EXPLICIT operator-commanded rebuild refuses loudly rather
+    # than silently degrading; only the legacy flagless path keeps fail-open
+    # semantics. Fake needs no runtime.
+    if rebuild_all and not provider_ready(target):
+        print(
+            f"[zmem] reembed --all requires the '{target}' embedding runtime "
+            "(onnxruntime + tokenizers + checksum-passing model files), which "
+            "is unavailable. Nothing was written.",
+            file=sys.stderr,
+        )
+        return 1
+
+    declared_dim = _declared_vec0_dim(conn)
+    vec_table_exists = declared_dim is not None
+    if declared_dim is not None and declared_dim <= 0:
+        # Unreachable with the stock helper (float[384]/[16]); guards future
+        # hand-edited DDL from zeroing the store.
+        print(f"[zmem] refusing nonsensical declared dim {declared_dim}",
+              file=sys.stderr)
+        return 1
+
+    if rebuild_all:
+        if target == "fake":
+            # Operator-facing guard rail (critic round C4): announce loudly at
+            # the moment a store starts becoming a fake-vector store.
+            _embeddings.warn_fake_active()
+        old_iso = conn.isolation_level
+        rc = 0
+        summary_done = 0
+        error_note = ""
+        conn.isolation_level = None  # manual transaction control (DDL-safe)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if vec_table_exists and declared_dim != target_dim:
+                conn.execute("DROP TABLE memory_vec")
+                conn.execute(_vec0_create_sql(target_dim))
+                vec_table_exists = True  # recreated at the target dimension
+            elif vec_table_exists:
+                conn.execute("DELETE FROM memory_vec")
+
+            live_rows = conn.execute(
+                "SELECT id, content FROM memory WHERE superseded_at IS NULL ORDER BY id"
+            ).fetchall()
+            total = len(live_rows)
+            for i, r in enumerate(live_rows):
+                emb = _embed_for_profile(r["content"] or "", target)
+                if emb is None:
+                    raise RuntimeError(
+                        f"the '{target}' embedder returned no vector for id "
+                        f"{r['id']} — aborting; nothing will be committed"
+                    )
+                conn.execute(
+                    "UPDATE memory SET embedding=?, embedding_model=?, "
+                    "embedded_at=? WHERE id=?",
+                    (emb, marker, now_iso(), r["id"]),
+                )
+                if vec_table_exists:
+                    conn.execute(
+                        "INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
+                        [emb, r["id"]],
+                    )
+                summary_done = i + 1
+                if batch > 0 and summary_done % batch == 0:
+                    print(f"[zmem] reembed: {summary_done}/{total}",
+                          file=sys.stderr)
+            if batch > 0 and total and summary_done % batch != 0:
+                # ceil-semantics: the final partial batch still reports, so
+                # progress tick count is exactly ceil(total/batch)
+                print(f"[zmem] reembed: {summary_done}/{total}",
+                      file=sys.stderr)
+
+            set_meta(conn, "embedding_profile", target)
+            conn.execute("COMMIT")
+        except Exception as exc:  # noqa: BLE001 — degrade path prints reason
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            rc = 1
+            error_note = f"{type(exc).__name__}: {exc}"
+        finally:
+            conn.isolation_level = old_iso
+        if rc == 0:
+            print(
+                f"[zmem] reembed --all complete: rebuilt {summary_done} memories "
+                f"(profile '{target}', dim {target_dim})"
+            )
+        else:
+            print(
+                f"[zmem] reembed failed ({error_note}). Rolled back — the "
+                "store is unchanged.",
+                file=sys.stderr,
+            )
+        return rc
+
+    # ---------------- Legacy flagless backfill ----------------
+    active_entry_dim = entry["dim"]  # same dim applies within the active profile
+    if not provider_ready(active):
+        print("[zmem] embeddings unavailable — install onnxruntime + tokenizers "
+              "and ensure the model file is present.")
+        return 0
+    if batch <= 0:
+        batch = 64
+    del active_entry_dim
+
     need_embed = conn.execute(
         "SELECT id, content FROM memory WHERE superseded_at IS NULL AND embedding IS NULL"
     ).fetchall()
 
-    # Phase 2: find memories with embeddings but missing from memory_vec.
-    # This happens when reembed ran before sqlite-vec was loaded on connect().
-    # NOTE: vec_ids is recomputed AFTER Phase 1 to avoid inserting duplicates
-    # for memories that Phase 1 just embedded.
     try:
         vec_ids = set(
-            r["memory_id"] for r in conn.execute("SELECT memory_id FROM memory_vec").fetchall()
+            r["memory_id"]
+            for r in conn.execute("SELECT memory_id FROM memory_vec").fetchall()
         )
     except sqlite3.OperationalError:
         vec_ids = set()  # vec0 table not available
 
     if not need_embed and not vec_ids and not _has_any_embedding(conn):
         print("[zmem] all live memories already have embeddings and vec0 entries")
-        return
+        return 0
 
     embed_count = 0
     for r in need_embed:
-        emb = _embeddings.embed_text(r["content"])
+        emb = _embed_for_profile(r["content"], active)
         if emb is None:
             continue
         conn.execute(
-            "UPDATE memory SET embedding=?, embedding_model='minilm-onnx', embedded_at=? WHERE id=?",
-            (emb, now_iso(), r["id"]),
+            "UPDATE memory SET embedding=?, embedding_model=?, embedded_at=? WHERE id=?",
+            (emb, marker, now_iso(), r["id"]),
         )
         vec_ids.add(r["id"])  # track unconditionally — we embedded it
         try:
@@ -1318,10 +1550,13 @@ def _reembed(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
         embed_count += 1
+        if batch > 0 and embed_count % batch == 0:
+            print(f"[zmem] reembed: {embed_count}/{len(need_embed)}",
+                  file=sys.stderr)
 
     # Phase 2: populate vec0 for memories that have embeddings but are missing
-    # from memory_vec (e.g. embedded before sqlite-vec was available on connect).
-    # vec_ids was updated during Phase 1 to include newly embedded memories.
+    # from memory_vec (e.g. embedded before sqlite-vec was available on
+    # connect).
     need_vec = conn.execute(
         "SELECT id, embedding FROM memory "
         "WHERE superseded_at IS NULL AND embedding IS NOT NULL"
@@ -1346,3 +1581,4 @@ def _reembed(conn: sqlite3.Connection) -> None:
     if vec_count:
         parts.append(f"populated vec0 for {vec_count}")
     print(f"[zmem] {' + '.join(parts)} memories")
+    return 0

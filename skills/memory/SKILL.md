@@ -138,6 +138,20 @@ when both rows have embeddings, else Jaccard on normalized content tokens —
 so MMR also works model-absent. `--no-mmr` returns pure composite-score
 order (four paraphrases instead of three + the distinct fact). The tradeoff
 knob is lambda: default 0.7, env `ZMEM_MMR_LAMBDA` (0.0 = maximize
+
+**Embedding profiles & rerank** (`ZMEM_EMBED_PROFILE`, `ZMEM_CROSS_ENCODER`,
+`ZMEM_CROSS_ENCODER_MODEL`): `ZMEM_EMBED_PROFILE` selects a row from the
+registry in `skills/memory/scripts/embed_profiles.py` — unknown values refuse
+with exit 2 before any store work, and a value whose dimension differs from
+the store's committed vectors refuses until `reembed --all` converts it.
+`ZMEM_CROSS_ENCODER=1` enables the optional cross-encoder rerank on explicit
+CLI `recall` invocations only (never hooks / `recent` / PreCompact /
+`search`-aliases / `--no-bump` runs), pointing `ZMEM_CROSS_ENCODER_MODEL` at a
+LOCAL pair-scoring `.onnx` plus sibling `tokenizer.json`. A missing or broken
+model degrades silently to un-reranked results — rerank can never fail a
+recall. No public cross-encoder hash ships because none was verifiable;
+there is likewise NO unverified-load escape hatch for the main model
+(`ZMEM_MODEL_ALLOW_UNVERIFIED` does not exist).
 diversity, 1.0 = no diversity — identical ordering to `--no-mmr`).
 `--no-mmr` and `--no-hybrid` are independent flags and can be combined.
 
@@ -311,12 +325,57 @@ runs are lexical-only and unaffected; a hybrid run that misses old content via
 the vec lane should be re-run with `--no-hybrid` to include the FTS lane.
 
 
-### reembed — backfill semantic embeddings
+### reembed — backfill or rebuild semantic embeddings
 ```
 python <store.py> reembed
+python <store.py> reembed --all [--profile NAME] [--batch N] [--dry-run]
 ```
-Backfills missing embeddings for live memories when the optional embedding
-runtime and model are available. Existing embeddings are preserved.
+Flagless form (unchanged contract): backfills embeddings for live memories that
+are MISSING them when the optional embedding runtime and model are available.
+Existing embeddings are preserved; no runtime means a graceful skip.
+
+`--all` rebuilds EVERY live memory's vector under the selected profile —
+the operator-grade converter when you switch profiles:
+- `--profile NAME` selects from the shipped registry (`minilm`, `fake`; see
+  "Embedding profiles" below). Default: active `ZMEM_EMBED_PROFILE` or `minilm`.
+- If the profile's dimension differs from what the store holds, `memory_vec`
+  is recreated at the new dimension INSIDE one transaction — a crash mid-run
+  rolls back to the pristine pre-run state, so a half-dim index is impossible.
+  Every command then re-verifies profile-vs-store dimension before it embeds
+  (mismatch = exit 2 with the exact remediation line).
+- Idempotent: a second identical run changes 0 rows. `retrieval_count`,
+  `content`, and every other column stay untouched — only embedding bytes,
+  their `embedding_model` marker, and `embedded_at` are rewritten, plus the
+  `embedding_profile` meta key recording the last completed conversion.
+- `--batch N` paces stderr progress lines ONLY (display chunks inside the
+  single transaction — batches are never separate commits). For very large
+  stores run during an idle window: the single transaction briefly grows the
+  WAL by roughly the size of all rebuilt vectors (~1.5 KB/row at 384-dim).
+- `--dry-run` reports how many of the live rows would change and writes
+  nothing (no writer lease, no meta write).
+
+Idempotency detail: change detection keys on
+`embedding IS NULL OR blob dim mismatch OR embedding_model marker differs`,
+so switching `--profile` back and forth always reports honestly instead of
+silently treating rows as current.
+
+### Embedding profiles — shipped registry (`embed_profiles.py`)
+
+| Profile | hf_id | dim | sha256 | Purpose |
+|---|---|---|---|---|
+| `minilm` | `Xenova/all-MiniLM-L6-v2` | 384 | `bbd7b466…46f0c5` (Xenova **ONNX export** blob) | Operator default; semantic recall/dedup |
+| `fake` | — | 16 | — (no files/network by design) | Model-absent tests/CI ONLY; deterministic placeholders; doctor warns on non-temporary stores |
+
+Notes:
+- The published pin covers the Xenova ONNX export (`onnx/model.onnx`), NOT the
+  sentence-transformers PyTorch weights — different builds of the same checkpoint
+  hash differently. `checksum_mismatch` therefore means "wrong build installed";
+  doctor prints this note verbatim. Verification has NO escape hatch:
+  `ZMEM_MODEL_ALLOW_UNVERIFIED` does not exist and never will.
+- A third ONNX profile was evaluated and deliberately OMITTED per the release
+  rule: no Qwen3/Nomic local ONNX artifact with a personally verified
+  hf_id+dim+sha256 could be pinned at authoring time. "A name with empty
+  sha256 is a stub" is forbidden — add one only with verified facts.
 
 ### promote — review and install a reusable skill
 ```
