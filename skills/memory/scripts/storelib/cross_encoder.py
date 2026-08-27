@@ -8,9 +8,9 @@ POLICY (load-bearing — do not weaken):
   prefetch pass --no-bump, so they are structurally excluded — they would need
   BOTH this module to be edited AND their flags changed to reach it.
 - The `search` subcommand never evaluates this module at all (its dispatch
-  omits the enablement parameter outright), and its Hermes/MCP aliases pin
-  --no-hybrid by byte-stable contract, so the recall-argv gate refuses those
-  too if they ever route differently.
+  omits the enablement parameter outright). Its Hermes/MCP aliases additionally
+  pin --no-hybrid by byte-stable contract, so they stay excluded even if a
+  future refactor routes them through the recall argv.
 - Degrade is silent and total: a missing model file, missing deps, or any
   scorer exception returns the input order UNCHANGED and never fails the
   recall that asked for it.

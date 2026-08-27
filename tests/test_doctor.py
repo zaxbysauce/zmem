@@ -994,6 +994,11 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
         self.assertEqual(d["live_memories"], 1)
         names = {p["name"] for p in d["shipped_profiles"]}
         self.assertEqual(names, {"minilm", "fake"})
+        # zax-L3/PRR-005: opt-in cross-encoder visibility must exist in the
+        # health payload even when unset (disabled + unconfigured defaults)
+        ce = d.get("cross_encoder") or {}
+        self.assertIn("enabled", ce)
+        self.assertEqual(ce.get("enabled"), False)
 
     def test_warning_decision_core_unit(self):
         sys.path.insert(0, str(self.scripts))

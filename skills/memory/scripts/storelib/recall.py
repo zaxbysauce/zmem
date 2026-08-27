@@ -1556,14 +1556,12 @@ def reembed_embeddings(
     # NOTE: an unparseable memory_vec DDL reaches the clean refusal above only
     # for --all/--dry-run forms; the flagless path degrades before touching
     # declared dims when no runtime exists (historical contract). Deliberate.
-    active_entry_dim = entry["dim"]  # same dim applies within the active profile
     if not provider_ready(active):
         print("[zmem] embeddings unavailable — install onnxruntime + tokenizers "
               "and ensure the model file is present.", file=sys.stderr)
         return 0
     if batch <= 0:
         batch = 64
-    del active_entry_dim
 
     need_embed = conn.execute(
         "SELECT id, content FROM memory WHERE superseded_at IS NULL AND embedding IS NULL"

@@ -353,7 +353,9 @@ def _check_available() -> bool:
     prof = current_profile_name()
     if _model_available is not None and _profile_cache_key == prof:
         return _model_available
-    _profile_cache_key = prof
+    # NOTE (PRR-011): _profile_cache_key is committed ONLY after every probe
+    # below succeeds — assigning it up-front could pin a stale verdict for
+    # this profile if a probe raises mid-way.
     if not prof:
         # Unknown ZMEM_EMBED_PROFILE value. Unreachable via the CLI (it
         # refuses at dispatch); degrade here so library callers can't be
@@ -361,6 +363,7 @@ def _check_available() -> bool:
         _model_available = False
         return False
     if prof == "fake":
+        _profile_cache_key = prof
         _model_available = True
         return True
     try:
@@ -368,6 +371,7 @@ def _check_available() -> bool:
         from tokenizers import Tokenizer  # noqa: F401
         import numpy  # noqa: F401
     except ImportError:
+        _profile_cache_key = prof
         _model_available = False
         return False
     models_dir = _resolve_models_dir()
@@ -375,6 +379,7 @@ def _check_available() -> bool:
     tok_path = models_dir / "tokenizer.json"
     if not model_path.is_file() and os.environ.get("ZMEM_MODEL_AUTODOWNLOAD", "0") == "1":
         _try_download_model(model_path)
+    _profile_cache_key = prof
     _model_available = model_path.is_file() and tok_path.is_file()
     return _model_available
 

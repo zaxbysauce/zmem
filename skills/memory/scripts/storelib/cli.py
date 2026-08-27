@@ -25,6 +25,9 @@ from storelib.entity import ENTITY_KINDS, cmd_entity_list, cmd_entity_merge
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
 from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_queue_clear, cmd_queue_list
 from storelib.promote import promote_memory
+# _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
+# this module's re-export surface for `storelib/__init__.py` and legacy
+# importers — removing it broke that chain.
 from storelib.recall import _reembed, get_memory, list_memory, recall_memory, recent_memory, stats
 from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import reembed_embeddings

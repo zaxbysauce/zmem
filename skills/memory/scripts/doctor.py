@@ -1899,6 +1899,30 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
         shipped = []
     details["shipped_profiles"] = shipped
 
+    # Issue #63 zax-review L3 / PRR-005 (restored after an isolation-revert
+    # dropped it once): surface the opt-in cross-encoder state. An
+    # enabled-but-missing model silently degrades to no rerank; that must be
+    # visible in the operator's primary diagnostic, not just doc prose.
+    try:
+        _truthy_ce = {"1", "true", "yes", "on"}
+        ce_enabled = os.environ.get(
+            "ZMEM_CROSS_ENCODER", "").strip().lower() in _truthy_ce
+        ce_model_cfg = (os.environ.get("ZMEM_CROSS_ENCODER_MODEL")
+                        or "").strip()
+        ce_model_present = bool(ce_model_cfg) and Path(ce_model_cfg).is_file()
+        ce_tok_present = False
+        if ce_model_cfg:
+            sibling = Path(ce_model_cfg).parent / "tokenizer.json"
+            ce_tok_present = sibling.is_file()
+        details["cross_encoder"] = {
+            "enabled": ce_enabled,
+            "model_path_configured": ce_model_cfg,
+            "model_file_present": ce_model_present,
+            "tokenizer_file_present": ce_tok_present if ce_model_cfg else None,
+        }
+    except Exception:
+        pass
+
 
     active = st.get("profile")
     warnings = _embedding_health_warnings(

@@ -122,13 +122,27 @@ class FakeLocalScorerExecutes(unittest.TestCase):
         )
 
         set_scorer(None)
-        self._patch_session_run(lambda _s, _i: [[20.0], [30.0]])
+        # Score DERIVES from the session inputs: under a query-only-regression
+        # both candidates would encode identically and this ordering breaks —
+        # giving model-absent CI a mutation guard for the pair contract.
+        self._patch_session_run(lambda _s, inputs: [
+            [float(sum(row))] for row in inputs["input_ids"]])
         try:
             fn = _local_scorer()
             self.assertIsNotNone(
                 fn, "with mocked deps present, scorer must build")
+            calls_seen = []
+            real_encode = None
+
+            class _Spy:
+                pass
+
             scores = fn("ignored by fixture", ["a text", "b text"])
             self.assertEqual(len(scores), 2)
+            # input-derived oracle: sums of ids [7,2,0]=9 and [7,3,0]=10
+            self.assertEqual(scores, [9.0, 10.0],
+                             "scores must derive from each candidate's own "
+                             "pair-encoded ids (query-only feeds break this)")
             rows = [{"id": "x", "content": "a text"},
                     {"id": "y", "content": "b text"}]
             out = maybe_rerank("anything", rows)
@@ -142,13 +156,9 @@ class FakeLocalScorerExecutes(unittest.TestCase):
         """Reviewer round: a build-ok/score-always-throws production scorer
         must be evicted from _SCORER_CACHE on first failure and rebuilt on
         the next call — regression-proof for the `fn is not _scorer_fn` gate."""
-        import importlib
-
         from storelib.cross_encoder import (
             _local_scorer, maybe_rerank, set_scorer, _SCORER_CACHE,
         )
-        ce_mod = importlib.import_module("storelib.cross_encoder")
-        del ce_mod
         set_scorer(None)
         self._patch_session_run(
             lambda _s, _i: (_ for _ in ()).throw(RuntimeError("always broken")))
