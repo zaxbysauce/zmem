@@ -379,9 +379,10 @@ def _check_available() -> bool:
     tok_path = models_dir / "tokenizer.json"
     if not model_path.is_file() and os.environ.get("ZMEM_MODEL_AUTODOWNLOAD", "0") == "1":
         _try_download_model(model_path)
+    ok = model_path.is_file() and tok_path.is_file()
     _profile_cache_key = prof
-    _model_available = model_path.is_file() and tok_path.is_file()
-    return _model_available
+    _model_available = ok
+    return ok
 
 
 def _ensure_loaded():
