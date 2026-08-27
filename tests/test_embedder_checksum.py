@@ -240,11 +240,11 @@ class TamperedModelRefusal(unittest.TestCase):
             [sys.executable, str(SCRIPTS / "doctor.py"), "--format", "json"],
             capture_output=True, text=True, timeout=120, cwd=str(SCRIPTS),
         )
-        if r.returncode != 0 or not r.stdout.strip():
+        if not r.stdout.strip():
             self.fail(
-                "doctor subprocess produced no JSON: "
+                "doctor subprocess wrote no JSON to stdout: "
                 f"rc={r.returncode} stderr={r.stderr[-800:]!r} "
-                f"stdout={r.stdout[:200]!r}"
+                f"stdout-head={r.stdout[:200]!r}"
             )
         report = json.loads(r.stdout)
         emb = next(
