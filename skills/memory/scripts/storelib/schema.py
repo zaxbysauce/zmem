@@ -24,14 +24,14 @@ try:
     from schema_meta import (SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY,
         MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS, ALLOWED_TAINTS,
         TAINT_RANK, TAINT_TRUSTED_SIGNALS, validate_taint, worse_taint,
-        normalize_content,
+        normalize_content, TRUST_VIOLATION_FLOOR_DROP,
         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from schema_meta import (SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION_KEY,
         MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS, ALLOWED_TAINTS,
         TAINT_RANK, TAINT_TRUSTED_SIGNALS, validate_taint, worse_taint,
-        normalize_content,
+        normalize_content, TRUST_VIOLATION_FLOOR_DROP,
         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)  # type: ignore
 
 try:
@@ -748,7 +748,19 @@ def init_db(conn: sqlite3.Connection) -> None:
             -- (storelib/links.py::adjust_trust). Deliberately independent of
             -- `confidence`/`signal` (provenance inputs): trust_score is the
             -- contradiction ledger, and linking never rewrites those columns.
-            trust_score     REAL NOT NULL DEFAULT 1.0
+            trust_score     REAL NOT NULL DEFAULT 1.0,
+            -- v12 (issue #64): Voyager-style usage-feedback counters. Written
+            -- ONLY by the explicit `store.py feedback --id --applied|--violated`
+            -- CLI (storelib/write.py::feedback_memory). Hooks, --no-bump
+            -- recall, PreCompact, and Hermes prefetch NEVER advance them
+            -- (retrieval_count/surfaced_count remain the passive telemetry);
+            -- ingest carries them verbatim and never applies their side
+            -- effects. Ladder: applied_count >= 3 with violated_count == 0
+            -- makes a lesson promote-eligible (storelib/promote.py); a
+            -- violated_count crossing to 2 applies a ONE-TIME
+            -- TRUST_VIOLATION_FLOOR_DROP to trust_score (signal untouched).
+            applied_count   INTEGER NOT NULL DEFAULT 0,
+            violated_count  INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_memory_namespace ON memory(namespace);
         CREATE INDEX IF NOT EXISTS idx_memory_live ON memory(superseded_at) WHERE superseded_at IS NULL;
@@ -864,6 +876,15 @@ def init_db(conn: sqlite3.Connection) -> None:
     # ALTER because the default is non-NULL; migrated rows read 1.0).
     if "trust_score" not in cols:
         conn.execute("ALTER TABLE memory ADD COLUMN trust_score REAL NOT NULL DEFAULT 1.0")
+    # v12 (issue #64): Voyager counter column probe — same trap/pattern as
+    # trust_score above. Fresh stores get both columns from the CREATE TABLE;
+    # a legacy pre-v12 store gets them from the v12 migrate block. Probe + add
+    # idempotently so the columns exist regardless of migration ordering
+    # (NOT NULL is legal in ALTER because the default is non-NULL).
+    if "applied_count" not in cols:
+        conn.execute("ALTER TABLE memory ADD COLUMN applied_count INTEGER NOT NULL DEFAULT 0")
+    if "violated_count" not in cols:
+        conn.execute("ALTER TABLE memory ADD COLUMN violated_count INTEGER NOT NULL DEFAULT 0")
     # v9 (issue #59): temporal-history index. Created ONLY when the v9 columns
     # already exist — on a fresh store the CREATE TABLE above added them, but
     # on a legacy pre-v9 store init_db()'s CREATE TABLE is a no-op and the v9
@@ -1376,6 +1397,26 @@ def migrate(conn: sqlite3.Connection) -> None:
                     (cleaned, r["rowid"]),
                 )
         conn.execute("UPDATE meta SET value='11' WHERE key='schema_version'")
+        conn.commit()
+
+    if ver < 12:
+        # v12 (issue #64): Voyager usage-feedback counters. Same idempotent
+        # pattern as v8/v9/v10/v11: init_db() already adds both columns on a
+        # fresh store (the CREATE TABLE carries them); on a legacy pre-v12
+        # store this block is the one that ALTERs them in. NO backfill beyond
+        # the DEFAULT 0 (spec: "Default 0 on migrate") and NO side effects —
+        # the trust floor drop is applied only by the live `feedback` CLI when
+        # a row's violated_count crosses to 2, never retroactively here.
+        v12_cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+        if "applied_count" not in v12_cols:
+            conn.execute(
+                "ALTER TABLE memory ADD COLUMN applied_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "violated_count" not in v12_cols:
+            conn.execute(
+                "ALTER TABLE memory ADD COLUMN violated_count INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute("UPDATE meta SET value='12' WHERE key='schema_version'")
         conn.commit()
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to

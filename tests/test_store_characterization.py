@@ -114,7 +114,16 @@ DATA_SHA = {
     # re-capture time). recall/list/stats are UNCHANGED: the fixture builder
     # disables auto-linking (ZMEM_LINK_THRESHOLD=1.01), so the frozen
     # surfaces stay pre-v11-identical.
-    "export_jsonl": "2239fcd95efc4e2e6c86f8e742e4715814283a36db253d8bbeb0333907550399",
+    # v12 (issue #64): re-captured ONLY for the two new row keys
+    # (`applied_count`, `violated_count`) — stripping exactly those keys from
+    # the new output reproduces the v11 freeze 2239fcd9… byte-for-byte
+    # (verified at re-capture time). The recall SELECT lists DID gain the two
+    # columns (recall.py _fetch_by_ids / _recall_one_tier), but the recall
+    # --json OUTPUT dict is a hand-built literal that does not emit them
+    # (only get --json's SELECT * does, by design) — so the recall hash is
+    # unchanged. list never selected the counters and stats never aggregated
+    # them, so their hashes are unchanged too.
+    "export_jsonl": "744a906c8ba2704763b996403178afb414d36cf46f2c5635797641735b66828a",
 }
 KNOWN_SUBCMDS = [
     "init", "add", "invalidate", "recall", "recent", "search", "supersede",
@@ -131,6 +140,8 @@ KNOWN_SUBCMDS = [
     # allowlist honest — organize exposes real flags, so it must NOT be dumped
     # into FLAGLESS_SUBCMDS).
     "organize",
+    # v12 (issue #64): explicit usage-feedback + dry-run weight tuning.
+    "feedback", "tune-weights",
 ]
 
 # Subcommands whose argparse parser exposes ONLY the universal -h/--help

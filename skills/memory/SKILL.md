@@ -58,7 +58,7 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v11
+- schema compatibility against current v12
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity`); inspect deeper with `store.py entity-list`
@@ -421,6 +421,79 @@ python <store.py> promote --id <uuid> --confirm --install-approved
 `--confirm` writes a review candidate; `--install-approved` is the additional
 explicit gate that installs the reviewed skill into Codex, Claude Code, and
 ZCode skill directories. Promotion is never an unattended hook action.
+
+The promote ladder (issue #64, schema v12) decides which lessons are
+candidates. A lesson is eligible only when its EXPLICIT usage feedback says it
+works and nothing says it doesn't:
+- `applied_count >= 3` AND `violated_count == 0` → eligible (see `feedback`).
+- Any `violated_count > 0` blocks eligibility; the 2nd violation has already
+  dropped the row's `trust_score` by `TRUST_VIOLATION_FLOOR_DROP` (0.15,
+  clamped at 0.0, applied exactly once at the violated_count 1→2 crossing).
+  `signal` is NEVER changed by feedback — trust_score is the usage ledger,
+  signal is provenance.
+- Passive exposure does NOT count: `retrieval_count`/`surfaced_count`
+  (hooks, `--no-bump` recall) are not eligibility inputs. Only the explicit
+  `feedback` CLI advances the counters, so nothing auto-promotes.
+- The other candidate bars are unchanged: `type=lesson`, grounded signal
+  (test/compile/lint), `confidence >= 0.85`, live row.
+`promote --dry-run` with no eligible rows is a no-op that prints
+`[zmem] no promotion candidates found` (exit 0).
+
+### feedback — record explicit usage feedback (Voyager counters)
+```
+python <store.py> feedback --id <uuid> --applied
+python <store.py> feedback --id <uuid> --violated
+```
+Increments exactly one of the row's `applied_count` / `violated_count`
+(schema v12) and prints a one-line JSON summary
+(`id`, `verdict`, both counters, `trust_score`, `trust_dropped`). This is the
+ONLY writer of those counters anywhere — hooks, `--no-bump` recall,
+PreCompact, and Hermes prefetch never advance them.
+Exit codes: 0 success; 1 target missing or not live (tombstoned rows refuse);
+2 usage error (both or neither of `--applied`/`--violated`, missing `--id`).
+
+### eval — offline recall-quality harness
+```
+python scripts/eval_runner.py --store <path> [--gold eval/gold.jsonl] [--k 5] [--fail-under X] [--json-out PATH]
+```
+Runs every gold item through the REAL recall pipeline and prints one JSON
+report: `hit_at_k`, `mrr`, `as_of_accuracy`, `injection_omit_rate` (+ per-bucket
+and per-item detail). `--store` is REQUIRED — the runner never resolves the
+default home store; point it at a throwaway path and it auto-builds the
+deterministic 50-row fixture corpus (the ids `eval/gold.jsonl` names) there.
+The gold set covers six buckets: as-of knowledge updates, injection omission,
+entity aliases, namespace isolation, contested/superseded guidance, and
+ordinary FTS hits. Exit 0 regardless of scores (quality is collected, never
+gating); `--fail-under` is optional and OFF in CI; 2 on operational errors
+(invalid gold set names the offending item).
+The run is model-absent by construction: the fake embedder
+(`ZMEM_EMBED_PROFILE=fake`) and a pinned clock (`ZMEM_TEST_NOW`) make ranking
+deterministic on any machine. Evaluation is passive (`no_bump`) and measures
+retrieval quality — link expansion and MMR presentation are excluded
+(`link_hops=0`, `no_mmr`).
+Public-corpus adapters convert on-disk corpora into gold JSONL and skip
+cleanly when the corpus is absent (CI downloads nothing):
+```
+python scripts/eval_adapters.py --adapter longmemeval --input <path> --out <path>
+python scripts/eval_adapters.py --adapter locomo --input <path> --out <path>
+```
+A missing `--input` prints `skipped: ...` and exits 0. Synthetic 3-row toy
+fixtures under `tests/fixtures/adapters/` prove both converters.
+
+### tune-weights — suggest recall scoring weights (dry-run only)
+```
+python <store.py> tune-weights --dry-run --gold eval/gold.jsonl [--k 5]
+```
+Evaluates the shipped composite weights (W_BM25/W_CONFIDENCE/W_RECENCY/
+W_POPULARITY) against a gold set, hill-climbs a small deterministic candidate
+set, and prints JSON with `current` and `suggested` weight vectors (always
+summing to 1.0) plus the metrics each achieves. It WRITES NOTHING — there is
+deliberately no `--apply`. Applying a suggestion is a MANUAL edit of the W_*
+constants at the top of `skills/memory/scripts/storelib/recall.py`, keeping
+the sum at 1.0. Uses the CURRENT store (env-resolved like every subcommand —
+in tests/CI that is a fixture store via `ZMEM_STORE`, never the operator
+store). Exit 0 even when the current weights already win; 2 on an invalid
+gold set or a missing `--dry-run`.
 
 ### consolidate — merge near-duplicate memories
 ```

@@ -250,6 +250,51 @@ class SkillDocDriftTest(unittest.TestCase):
         self.assertIn("deterministic", text)
         self.assertIn("no LLM", text)
 
+    # -- issue #64 (v12): feedback, the promote ladder, eval, tune-weights --
+
+    def test_feedback_command_documented(self):
+        """Issue #64, 9.4: an agent reading only SKILL.md can submit feedback
+        and knows the counters are CLI-only."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("### feedback", "--applied", "--violated",
+                       "applied_count", "violated_count",
+                       "trust_score", "0 success; 1 target missing",
+                       "Hermes prefetch never advance them"):
+            self.assertIn(needle, text,
+                          f"SKILL.md must document {needle} (issue #64 surface)")
+
+    def test_promote_ladder_documented(self):
+        """Issue #64, 9.4: the exact ladder thresholds must be documented and
+        the doc must state hooks never auto-promote."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("applied_count >= 3", "violated_count == 0",
+                       "TRUST_VIOLATION_FLOOR_DROP", "0.15",
+                       "nothing auto-promotes"):
+            self.assertIn(needle, text,
+                          f"SKILL.md must document {needle} (promote ladder)")
+
+    def test_eval_runner_documented(self):
+        """Issue #64, 9.1/9.2/9.3: an agent reading only SKILL.md can run the
+        eval runner against an isolated store and know the adapters skip
+        cleanly."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("scripts/eval_runner.py", "--store", "eval/gold.jsonl",
+                       "hit_at_k", "mrr", "as_of_accuracy",
+                       "injection_omit_rate", "eval_adapters.py",
+                       "skipped: ...", "ZMEM_EMBED_PROFILE=fake",
+                       "ZMEM_TEST_NOW"):
+            self.assertIn(needle, text,
+                          f"SKILL.md must document {needle} (eval surface)")
+
+    def test_tune_weights_documented(self):
+        """Issue #64, 9.6: the dry-run-only contract and the manual-edit
+        application path must be documented."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("tune-weights --dry-run", "summing to 1.0",
+                       "MANUAL edit", "no `--apply`"):
+            self.assertIn(needle, text,
+                          f"SKILL.md must document {needle} (tune-weights)")
+
 
 class CloseoutDocDriftTest(unittest.TestCase):
     """Issue #58, 3.7: closeout must reflect that the vec0 KNN footgun

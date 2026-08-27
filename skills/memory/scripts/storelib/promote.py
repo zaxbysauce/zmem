@@ -21,12 +21,16 @@ from pathlib import Path
 from storelib.schema import STORE_PATH, _resolve_skills_dirs
 
 PROMOTE_CONFIDENCE_FLOOR = 0.85
-# Issue #21: eligibility uses TOTAL surface events (retrieval_count + surfaced_count),
-# not retrieval_count alone. A grounded lesson surfaced many times only by the hook
-# path (retrieval_count=0) must remain promotable — it is clearly useful, just never
-# explicitly fetched.
-
-PROMOTE_USE_FLOOR = 3
+# Issue #64 (v12): eligibility is the Voyager feedback ladder, enforced here:
+# a lesson is promote-eligible only when its explicit usage feedback says it
+# WORKS (applied_count >= PROMOTE_APPLIED_FLOOR) and nothing says it doesn't
+# (violated_count == 0). retrieval_count/surfaced_count remain passive
+# telemetry and are deliberately NOT an eligibility input anymore — surfacing
+# a lesson often is exposure, not endorsement.
+PROMOTE_APPLIED_FLOOR = 3
+# The violated tier: TRUST_VIOLATION_FLOOR_DROP (schema_meta.py) was already
+# applied once by `feedback` when violated_count crossed to 2; promote simply
+# refuses rows in that state (violated_count = 0 required below).
 
 PROMOTE_SIGNALS = ("test", "compile", "lint")
 
@@ -113,12 +117,15 @@ def promote_memory(
 ) -> None:
     """Promote high-confidence lessons to reusable SKILL.md files.
 
-    Candidates: type=lesson, signal in (test/compile/lint), confidence>=0.85,
-    total surface events (retrieval_count + surfaced_count) > PROMOTE_USE_FLOOR,
-    not superseded. Does NOT supersede the source lesson — the lesson and the
-    skill coexist (the lesson costs ~200 bytes; if the skill description fails
-    to trigger, the lesson is still in recall). Ranking blends surfaced + retrieval
-    activity so hook-surfaced-only lessons (retrieval_count=0) stay promotable (issue #21).
+    Candidates (issue #64 ladder): type=lesson, signal in (test/compile/lint),
+    confidence>=0.85, applied_count >= PROMOTE_APPLIED_FLOOR (3) via explicit
+    `store.py feedback --applied`, violated_count == 0 (any violation blocks;
+    a violated_count crossing to 2 has already dropped the row's trust_score
+    by TRUST_VIOLATION_FLOOR_DROP), not superseded. Does NOT supersede the
+    source lesson — the lesson and the skill coexist (the lesson costs ~200
+    bytes; if the skill description fails to trigger, the lesson is still in
+    recall). Hooks never submit feedback, so promotion is always a human- or
+    agent-initiated CLI act — nothing auto-promotes.
 
     Human-in-the-loop: --dry-run shows candidates, the generated review-candidate
     path, and the eventual install targets. `--id <uuid> --confirm` writes only
@@ -131,16 +138,17 @@ def promote_memory(
     ns_params = [namespace] if namespace else []
     candidates = conn.execute(
         f"""SELECT id, namespace, type, content, tags, confidence, signal,
-                  retrieval_count, surfaced_count, valid_from
+                  applied_count, violated_count, valid_from
            FROM memory
            WHERE superseded_at IS NULL
              AND type = 'lesson'
              AND signal IN ('test', 'compile', 'lint')
              AND confidence >= ?
-             AND (retrieval_count + surfaced_count) > ?
+             AND applied_count >= ?
+             AND violated_count = 0
              {ns_clause}
-           ORDER BY (retrieval_count + surfaced_count) DESC, confidence DESC""",
-        [PROMOTE_CONFIDENCE_FLOOR, PROMOTE_USE_FLOOR] + ns_params,
+           ORDER BY applied_count DESC, confidence DESC""",
+        [PROMOTE_CONFIDENCE_FLOOR, PROMOTE_APPLIED_FLOOR] + ns_params,
     ).fetchall()
 
     if not candidates and not memory_id:
@@ -161,8 +169,8 @@ def promote_memory(
         for c in candidates:
             skill_name = _slugify_skill_name(c["tags"], c["id"])
             review_skill = review_root / f"{skill_name}-{c['id'][:8]}" / "SKILL.md"
-            print(f"\n  [{c['id'][:8]}] (rc={c['retrieval_count']}, sc={c['surfaced_count']}, "
-                  f"uses={c['retrieval_count'] + c['surfaced_count']}, "
+            print(f"\n  [{c['id'][:8]}] (applied={c['applied_count']}, "
+                  f"violated={c['violated_count']}, "
                   f"conf={c['confidence']}, signal={c['signal']})")
             print(f"    content: {c['content'][:80]}...")
             print(f"    tags: {c['tags']}")
@@ -230,8 +238,8 @@ Use when working with: {trigger_contexts}.
 {row['content']}
 
 ## Source
-- Promoted from zmem lesson `{row['id']}` (surfaced_count={row['surfaced_count']},
-  retrieval_count={row['retrieval_count']}, signal={row['signal']},
+- Promoted from zmem lesson `{row['id']}` (applied_count={row['applied_count']},
+  violated_count={row['violated_count']}, signal={row['signal']},
   confidence={row['confidence']})
 - Namespace: {row['namespace']}
 - Tags: {tags_str}

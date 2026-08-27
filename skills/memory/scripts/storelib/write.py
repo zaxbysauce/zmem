@@ -42,7 +42,7 @@ def _link_threshold_now() -> float:
     actually used."""
     from storelib import links as _links_live
     return _links_live.LINK_THRESHOLD
-from storelib.schema import CAPTURE_MODES, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, PROMPT_INJECTION_PATTERNS, SIGNAL_CONFIDENCE, _commit, _embeddings, _env_float, _normalize_content, _vec_knn_in_namespace, now_iso
+from storelib.schema import CAPTURE_MODES, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, PROMPT_INJECTION_PATTERNS, SIGNAL_CONFIDENCE, TRUST_VIOLATION_FLOOR_DROP, _commit, _embeddings, _env_float, _normalize_content, _vec_knn_in_namespace, now_iso
 
 _degraded_embedding_warned = False
 
@@ -1202,3 +1202,101 @@ def update_memory(
         if started_tx and conn.in_transaction:
             conn.rollback()
         raise
+
+
+class FeedbackTargetError(ValueError):
+    """Raised by feedback_memory when the --id does not resolve to a LIVE
+    memory row (unknown id, or an id already tombstoned by supersede/
+    invalidate). The CLI maps this to exit 1 — an operational refusal, not a
+    usage error."""
+
+
+# v12 (issue #64): the verdict -> counter column map. A fixed dict (not string
+# interpolation of user input) so the f-string column below is a closed set.
+_FEEDBACK_COLUMNS = {"applied": "applied_count", "violated": "violated_count"}
+
+
+def feedback_memory(conn: sqlite3.Connection, *, memory_id: str,
+                    verdict: str) -> dict:
+    """Record explicit usage feedback on one memory row (issue #64, 9.4).
+
+    The ONLY writer of memory.applied_count / violated_count anywhere in the
+    codebase — hooks, --no-bump recall, PreCompact, Hermes prefetch, and
+    ingest never advance them (retrieval_count/surfaced_count remain the
+    passive telemetry; source-scan ratcheted by tests/test_feedback_promote.py).
+
+    Semantics:
+    - The target must be a LIVE row (superseded_at IS NULL); tombstoned or
+      unknown ids raise FeedbackTargetError — feeding back on dead history is
+      meaningless and silence would report a refusal as success.
+    - The matched counter increments by exactly 1. Counters grow unbounded
+      (they are usage event history, not a bounded score).
+    - Violated tier: when violated_count CROSSES to 2 (i.e. the selected post-
+      increment value equals exactly 2), trust_score drops by the ONE-TIME
+      TRUST_VIOLATION_FLOOR_DROP (0.15), clamped at 0.0 like every trust
+      delta. Later violations do not re-drop; `signal` is NEVER changed
+      (feedback is a usage signal, not a provenance change). A manual-SQL jump
+      from 1 to 3 does not fire the drop — counters are CLI-driven by contract.
+    - Ingest restores counters verbatim and never re-applies the drop.
+
+    Transaction contract: feedback_memory opens its own transaction ONLY when
+    none is open (the CLI dispatch path — no caller may wrap it in an outer
+    transaction; when a caller's transaction is open the function executes in
+    it and never rolls the OUTER work back on error).
+
+    Returns {"id", "verdict", "applied_count", "violated_count",
+    "trust_score", "trust_dropped"} read back from the row after the write.
+    """
+    column = _FEEDBACK_COLUMNS.get(verdict)
+    if column is None:
+        raise ValueError("verdict must be 'applied' or 'violated'")
+
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
+        cur = conn.execute(
+            f"UPDATE memory SET {column} = {column} + 1 "
+            "WHERE id = ? AND superseded_at IS NULL",
+            (memory_id,),
+        )
+        if cur.rowcount == 0:
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise FeedbackTargetError(
+                f"no live memory with id {memory_id}"
+            )
+        row = conn.execute(
+            "SELECT applied_count, violated_count, trust_score "
+            "FROM memory WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        trust_dropped = False
+        if (verdict == "violated" and row["violated_count"] == 2
+                and TRUST_VIOLATION_FLOOR_DROP):
+            conn.execute(
+                "UPDATE memory SET trust_score = "
+                "ROUND(MAX(0.0, trust_score - ?), 10) WHERE id = ?",
+                (TRUST_VIOLATION_FLOOR_DROP, memory_id),
+            )
+            trust_dropped = True
+        if started_tx:
+            _commit(conn)
+    except Exception:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        raise
+    final = conn.execute(
+        "SELECT applied_count, violated_count, trust_score "
+        "FROM memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()
+    return {
+        "id": memory_id,
+        "verdict": verdict,
+        "applied_count": final["applied_count"],
+        "violated_count": final["violated_count"],
+        "trust_score": final["trust_score"],
+        "trust_dropped": trust_dropped,
+    }

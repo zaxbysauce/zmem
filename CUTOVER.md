@@ -29,7 +29,7 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 - local/non-OneDrive path safety
 - Python, SQLite FTS5, Node, and Windows shell prerequisites
 - best-effort read/write access to the target path
-- schema compatibility against current v11
+- schema compatibility against current v12
 - `embeddings_health` check: active profile vs stored vector dimension,
   rows with/without embeddings, shipped-profile inventory, and warnings
   when a non-temporary store runs `ZMEM_EMBED_PROFILE=fake` (issue #63)
