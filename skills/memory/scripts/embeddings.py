@@ -92,7 +92,7 @@ def current_profile_name(environ=None) -> str:
 _fake_warned_once = False
 
 
-def warn_fake_active() -> None:
+def warn_fake_active(profile_name: str | None = None) -> None:
     """One-time-per-process operator guard for the `fake` profile.
 
     Called by WRITE surfaces (add/update/ingest) before they embed: hooks'
@@ -100,9 +100,15 @@ def warn_fake_active() -> None:
     starts accumulating fake vectors announces itself loudly on stderr — a
     forgotten ZMEM_EMBED_PROFILE=fake export must never silently corrupt a
     real store with placeholder vectors.
+
+    `profile_name` lets EXPLICIT conversions (`reembed --all --profile fake`)
+    pass the profile actually being applied — the environment may still be
+    unset/minilm there, and keying the warning off env alone was the silent-
+    destruction hole from the zax review round B2.
     """
     global _fake_warned_once
-    if _fake_warned_once or current_profile_name() != "fake":
+    target = profile_name if profile_name is not None else current_profile_name()
+    if _fake_warned_once or target != "fake":
         return
     _fake_warned_once = True
     try:
@@ -394,7 +400,18 @@ def _ensure_loaded():
     # _MODEL_SHA256 is the trust root (a code constant, not attacker-writable).
     # On mismatch we fail OPEN to the degraded no-embeddings path rather than
     # executing an unverified model. (#36 M15.)
-    if not verify_checksum(model_path):
+    #
+    # TOCTOU closure (zax-review round): read the file ONCE and verify/load the
+    # same buffer — hashing a path and then re-opening it for the session left a
+    # swap-in window between the two operations.
+    try:
+        model_bytes = model_path.read_bytes()
+        actual_sha = hashlib.sha256(model_bytes).hexdigest()
+    except OSError:
+        _model_available = False
+        _model_checksum_ok = False
+        return
+    if actual_sha != _MODEL_SHA256:  # call-time attr: tests patch it
         _model_available = False
         _model_checksum_ok = False
         try:
@@ -414,7 +431,7 @@ def _ensure_loaded():
     # unguarded callers (add/hybrid-search hard-failing). This mirrors the
     # checksum-mismatch fail-open above (cubic-1/2, #36 M15 residual).
     try:
-        _session = ort.InferenceSession(str(model_path))
+        _session = ort.InferenceSession(model_bytes)
         _tokenizer = Tokenizer.from_file(str(models_dir / "tokenizer.json"))
         _tokenizer.enable_padding(length=128)
         _tokenizer.enable_truncation(max_length=128)

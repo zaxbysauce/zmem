@@ -339,7 +339,9 @@ the operator-grade converter when you switch profiles:
 - `--profile NAME` selects from the shipped registry (`minilm`, `fake`; see
   "Embedding profiles" below). Default: active `ZMEM_EMBED_PROFILE` or
   `minilm`. Requires `--all` — `--profile` without it refuses with the exact
-  conversion command, never a silent no-op.
+  conversion command, never a silent no-op. Converting committed non-fake
+  vectors TO `fake` additionally requires `--confirm` (the placeholders are
+  irreversible-in-practice without a working model later).
 - If the profile's dimension differs from what the store holds, `memory_vec`
   is recreated at the new dimension INSIDE one transaction — a crash mid-run
   rolls back to the pristine pre-run state, so a half-dim index is impossible.
@@ -378,6 +380,36 @@ Notes:
   rule: no Qwen3/Nomic local ONNX artifact with a personally verified
   hf_id+dim+sha256 could be pinned at authoring time. "A name with empty
   sha256 is a stub" is forbidden — add one only with verified facts.
+
+#### Compatibility ledger for profile conversion (read before switching)
+
+- **Older zmem releases on a converted store:** versions without this change
+  hardcode `float[384]` and do not know about `embedding_profile`. On a store
+  converted to another dimension they keep opening it, keep writing rows, and
+  silently lose/degrade vector recall (the vec lane's failures are swallowed
+  there). Conversion is per-machine deliberate maintenance — coordinate box
+  upgrades around it.
+- **Hook surfaces during mismatch:** while the active profile's dim differs
+  from committed data, every hook that recalls (`--no-bump`) receives an EMPTY
+  inject envelope; the refusal reason lands only on the child's stderr, which
+  hooks do not surface. This refuse-over-wrong-vectors posture is deliberate:
+  lexical-only degradation inside a wrong-dim store would surface misplaced
+  confidence rather than silence. Run `reembed --all` (or restore the prior
+  profile) to clear the state.
+- **`doctor` default-run behavior changed by design** in the same release:
+  the embeddings check now deep-verifies the model pin (mtime-keyed cached
+  hashing), so its JSON can newly report `checksum_ok:false` where older
+  versions stayed silently `null`.
+- **Concurrency during `reembed --all`:** the whole rebuild holds one SQLite
+  write transaction for its duration; concurrent writers wait (busy-timeout),
+  readers proceed on WAL snapshots. Schedule large conversions for idle
+  windows.
+
+**Cross-encoder trust note** (issue #63 review round): `ZMEM_CROSS_ENCODER_MODEL`
+loads an operator-supplied local ONNX file with NO checksum pin — none was
+publishable offline. Treat that path with the same caution as any executable;
+doctor's `embeddings_health.cross_encoder` block surfaces enabled/model-file
+state so a missing-model silent degrade is visible.
 
 ### promote — review and install a reusable skill
 ```

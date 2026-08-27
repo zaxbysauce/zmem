@@ -72,9 +72,10 @@ class _StubEmbeddings:
             "load_failed": False, "profile": "minilm", "dim": self._dim,
         }
 
-    def warn_fake_active(self):
+    def warn_fake_active(self, profile_name=None):
         # the production `embeddings` module owns this one-time banner; stubs
         # mirror the seam contract so profile=fake rebuild paths exercise it
+        # (profile_name arg added in zax-B2 round — target-keyed warnings)
         self.fake_warned = True
 
     def embed_text(self, text):
@@ -166,10 +167,11 @@ class ReembedBase(unittest.TestCase):
     def state_fingerprint(self):
         """Everything the rebuild contract promises to leave untouched."""
         rows = self._conn.execute(
-            "SELECT id, content, retrieval_count, surfaced_count FROM memory "
-            "ORDER BY id").fetchall()
+            "SELECT id, content, retrieval_count, surfaced_count, "
+            "embedding_model FROM memory ORDER BY id").fetchall()
         return [
-            (r["id"], r["content"], r["retrieval_count"], r["surfaced_count"])
+            (r["id"], r["content"], r["retrieval_count"],
+             r["surfaced_count"], r["embedding_model"])
             for r in rows
         ]
 
@@ -205,13 +207,17 @@ class LegacyFlaglessContract(ReembedBase):
         )
 
     def test_graceful_degrade_without_runtime(self):
+        """zax-N2: the degrade diagnostic lives on STDERR like every sibling
+        error path (pre-PR placement restored)."""
         stub = self.patch_stub(available=False)
         self.seed(1)
-        out = io.StringIO()
-        with redirect_stdout(out):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
             rc = self.R.reembed_embeddings(self._conn)
         self.assertEqual(rc, 0, "flagless degrade is exit-0, not refusal")
-        self.assertIn("embeddings unavailable", out.getvalue())
+        self.assertIn("embeddings unavailable", err.getvalue(),
+                      "diagnostic must be on stderr, not stdout")
+        self.assertNotIn("embeddings unavailable", out.getvalue())
         left = self._conn.execute(
             "SELECT COUNT(*) FROM memory WHERE embedding IS NOT NULL"
         ).fetchone()[0]
@@ -243,8 +249,12 @@ class AllRebuildSemantics(ReembedBase):
         return {r["id"]: bytes(r["embedding"]) for r in rows}
 
     def test_telemetry_and_content_untouched(self):
+        """Idempotent re-run must not drift telemetry/content/marker: the
+        fingerprint is captured AFTER a priming pass so marker '' -> 'minilm-
+        onnx' from the FIRST pin isn't conflated with rerun churn."""
         self.patch_stub(dim=384)
         self.seed(2)
+        self.assertEqual(self.run_reembed("--all")[0], 0)
         before = self.state_fingerprint()
         self.assertEqual(self.run_reembed("--all")[0], 0)
         self.assertEqual(self.state_fingerprint(), before)
@@ -285,7 +295,12 @@ class DimensionConversion(ReembedBase):
         self.assertEqual(self.run_reembed("--all")[0], 0)
         self.assertEqual(self.R._declared_vec0_dim(self._conn), 384)
 
-        rc, out, err = self.run_reembed("--all", "--profile", "fake")
+        # zax-B2: converting real vectors to placeholders requires --confirm
+        rc_no, _, err_no = self.run_reembed("--all", "--profile", "fake")
+        self.assertEqual(rc_no, 2, "unconfirmed fake conversion must refuse")
+        self.assertIn("--confirm", err_no)
+        rc, out, err = self.run_reembed(
+            "--all", "--profile", "fake", "--confirm")
         self.assertEqual(rc, 0)
         self.assertIn("profile 'fake', dim 16", out)
         self.assertEqual(self.R._declared_vec0_dim(self._conn), 16)
@@ -305,7 +320,7 @@ class DimensionConversion(ReembedBase):
             pass
 
         self.R._embeddings = FakeOnly(dim=384)  # KNN query source irrelevant
-        self.run_reembed("--all", "--profile", "fake")
+        self.run_reembed("--all", "--profile", "fake", "--confirm")
         q = ep.fake_embed("seed content 1 unique")
         knn = self.S._vec_knn_in_namespace(
             self._conn, q, namespaces=["user:t"], k=3, overfetch=8, k_cap=50)
@@ -381,6 +396,28 @@ class BatchProgressPacing(ReembedBase):
                  if ln.startswith("[zmem] reembed:")]
         self.assertEqual(len(lines), 3, "ceil(7/3)=3 progress ticks")
 
+    def test_progress_exact_divisible_boundary(self):
+        """PRR-020: N % batch == 0 yields exactly N/batch ticks — no phantom
+        final tick from the partial-batch branch."""
+        self.patch_stub(dim=384)
+        self.seed(6)
+        err = io.StringIO()
+        old = sys.argv
+        sys.argv = ["store.py", "reembed", "--all", "--batch", "3"]
+        buf_out = io.StringIO()
+        try:
+            with redirect_stdout(buf_out), redirect_stderr(err):
+                from storelib.cli import main as cli_main
+                try:
+                    cli_main()
+                except SystemExit:
+                    pass
+        finally:
+            sys.argv = old
+        lines = [ln for ln in err.getvalue().splitlines()
+                 if ln.startswith("[zmem] reembed:")]
+        self.assertEqual(len(lines), 2, "6/3 => exactly 2 ticks")
+
 class ReviewRoundFixes(unittest.TestCase):
     """Direct coverage for the independent-review round (issue #63)."""
 
@@ -453,9 +490,101 @@ class ReviewRoundFixes(unittest.TestCase):
             "expects", r.stderr,
             "rc-2 must come from the embedding-compat GUARD message, not an "
             "incidental validation path")
-        cnt = sqlite3.connect(str(self.store_path)).execute(
-            "SELECT COUNT(*) FROM memory").fetchone()[0]
+        self.assertIn("reembed --all", r.stderr,
+                      "refusal must carry its remediation command")
+        import struct as _s2
+        db_chk = sqlite3.connect(str(self.store_path))
+        cnt, blob_len = db_chk.execute(
+            "SELECT COUNT(*), length(embedding) FROM memory "
+            "WHERE id='old1'").fetchone()[0:2]
+        db_chk.close()
+        # zax/PRR-017: the EXISTING row's vector bytes are untouched as well
         self.assertEqual(cnt, 1, "zero partial rows may land")
+        self.assertEqual(blob_len, 384 * 4)
+        check_conn = sqlite3.connect(str(self.store_path)).execute(
+            "SELECT embedding FROM memory WHERE id='old1'").fetchone()[0]
+        self.assertEqual(check_conn,
+                         _s2.pack("<384f", *([0.3] * 384)),
+                         "guard refuses BEFORE any mutation of prior rows")
+
+
+class GuardSurfaceCoverage(unittest.TestCase):
+    """zax/PRR-003 + review round: the dim guard spans seven commands;
+    regression coverage must include more than `add`."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-guardcov-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store_path = str(Path(self.tmp) / "store.sqlite")
+        self._saved = {k: os.environ.get(k) for k in
+                       ("ZMEM_STORE", ep.PROFILE_ENV, "ZMEM_DATA",
+                        "ZMEM_MODEL_AUTODOWNLOAD")}
+        os.environ["ZMEM_STORE"] = self.store_path
+        os.environ.pop("ZMEM_DATA", None)
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ[ep.PROFILE_ENV] = "minilm"
+        import struct as _s
+        sys.path.insert(0, str(SCRIPTS))
+        for m in list(sys.modules):
+            if m.startswith("storelib"):
+                del sys.modules[m]
+        from storelib.schema import connect as _c, _prepare_store as _pp
+        conn = _c(); _pp(conn)
+        conn.execute(
+            "INSERT INTO memory(id,namespace,type,content,confidence,"
+            "signal,valid_from,ingestion_ts,taint,embedding,"
+            "embedding_model,retrieval_count) VALUES "
+            "('g1','user:t','fact','guard seed row',0.9,'test',"
+            "'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',"
+            "'trusted_internal',?, 'minilm-onnx', 3)",
+            (_s.pack("<384f", *([0.4] * 384)),))
+        conn.commit(); conn.close()
+        self._blob_ref = _s.pack("<384f", *([0.4] * 384))
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _post_state(self):
+        conn_chk = sqlite3.connect(self.store_path)
+        row = conn_chk.execute(
+            "SELECT COUNT(*), embedding FROM memory").fetchone()
+        cnt = row[0]
+        blob_ok = (row[1] == self._blob_ref)
+        conn_chk.close()
+        return cnt, blob_ok
+
+    def _mismatch_env(self):
+        """Child env flips ACTIVE profile against the committed 384-d store
+        (setUp pins minilm during seeding; probe uses fake => 16-d)."""
+        env = {**os.environ}
+        env[ep.PROFILE_ENV] = "fake"
+        return env
+
+    def test_update_refused_and_prior_row_untouched(self):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "update",
+             "--id", "g1", "--content", "should never land"],
+            capture_output=True, text=True,
+            env=self._mismatch_env(), cwd=str(SCRIPTS), timeout=60)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("reembed --all", r.stderr)
+        cnt, blob_ok = self._post_state()
+        self.assertEqual(cnt, 1)
+        self.assertTrue(blob_ok)
+
+    def test_recall_mismatch_refuses_with_hint(self):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "recall",
+             "--query", "anything"],
+            capture_output=True, text=True,
+            env=self._mismatch_env(), cwd=str(SCRIPTS), timeout=60)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("expects", r.stderr)
+        self.assertIn("reembed --all", r.stderr)
 
 
 class Refusals(unittest.TestCase):

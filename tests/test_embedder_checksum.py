@@ -42,6 +42,11 @@ def _sha(data: bytes) -> str:
 
 class ChecksumSemantics(unittest.TestCase):
     def setUp(self):
+        # module-global hygiene regardless of alphabetical neighbors (_N3)
+        embeddings._model_available = None
+        embeddings._model_checksum_ok = None
+        embeddings._model_load_failed = False
+
         self.tmp = Path(tempfile.mkdtemp(prefix="zmem-cksum-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
 

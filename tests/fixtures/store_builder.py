@@ -50,6 +50,8 @@ PIN_TS = "2026-02-03T04:05:06Z"
 # is stable before normalization.
 BASE_ENV = {
     "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        "ZMEM_EMBED_PROFILE": "minilm",
+        "ZMEM_CROSS_ENCODER": "",
     "ZMEM_MODELS_DIR": "/nonexistent-zmem-models-dir",
     # v11 (issue #61): auto link generation is disabled for the fixture
     # (threshold above every possible similarity) so the characterization

@@ -316,9 +316,14 @@ def main():
     p_reembed.add_argument("--batch", type=nonnegative_int, default=64,
                            help="progress-report granularity in rows "
                                 "(stderr pacing only; does not affect "
-                                "transaction atomicity)")
+                                "transaction atomicity; values < 1 reset "
+                                "to the default 64)")
     p_reembed.add_argument("--dry-run", action="store_true",
                            help="report what --all would change; writes nothing")
+    p_reembed.add_argument("--confirm", action="store_true",
+                           help="required by --all --profile fake when the "
+                                "store holds committed non-fake vectors "
+                                "(conversion overwrites them with placeholders)")
 
 
     p_consolidate = sub.add_parser("consolidate", help="merge near-duplicate memories")
@@ -979,7 +984,8 @@ def main():
             if args.all or args.dry_run:
                 sys.exit(reembed_embeddings(
                     conn, rebuild_all=args.all, profile=args.profile,
-                    batch=args.batch, dry_run=args.dry_run))
+                    batch=args.batch, dry_run=args.dry_run,
+                    confirm=args.confirm))
             # legacy flagless/backfill form: byte-identical stdout contract;
             # --batch passes through purely as stderr progress pacing.
             sys.exit(reembed_embeddings(conn, batch=args.batch))

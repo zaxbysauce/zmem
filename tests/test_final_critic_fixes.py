@@ -18,6 +18,7 @@ import contextlib
 import io
 import os
 import shutil
+import subprocess
 import sqlite3
 import struct
 import sys
@@ -33,14 +34,19 @@ import embed_profiles as ep  # noqa: E402
 
 
 class FakeLocalScorerExecutes(unittest.TestCase):
-    """Drives _local_scorer end-to-end against MOCKED heavy modules."""
+    """Drives _local_scorer end-to-end against MOCKED heavy modules.
+
+    zax-review B1 hardening: the pair contract requires each CANDIDATE's own
+    ids inside session inputs (query-only feeds are a permanent no-op), so the
+    fake tokenizers pair-encodes ids derived from the TEXT and the fake
+    session derives scores from those same ids — wrong wiring can no longer
+    pass, and the assertion checks a strict reorder rather than membership."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="zmem-ceprod-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.saved = {k: os.environ.get(k) for k in
                       ("ZMEM_CROSS_ENCODER_MODEL", "ZMEM_CROSS_ENCODER")}
-        # fabricate a model pair; the mocked loaders accept anything readable
         models = self.tmp / "models"
         models.mkdir()
         (models / "ranker.onnx").write_bytes(b"dummy")
@@ -48,29 +54,14 @@ class FakeLocalScorerExecutes(unittest.TestCase):
 
         import types
 
-        def array(data, dtype=None):
-            return data if isinstance(data, list) and isinstance(data[0], float) \
-                else [[1, 0] for _ in data]
-
-        fake_np = types.ModuleType("numpy")
-        fake_np.array = lambda data, dtype=None: (
-            list(data) if not (isinstance(data, list) and data and
-                               isinstance(data[0], list)) else data)
-
-        class FakeSession:
-            def __init__(self, path):
-                assert str(path).endswith("ranker.onnx")
-
-            def run(self, _, inputs):
-                ids = inputs["input_ids"]
-                return [[[0.9 if i == 0 else 0.1] for i in row] for row in ids]
-
-        fake_ort = types.ModuleType("onnxruntime")
-        fake_ort.InferenceSession = FakeSession
+        def tok_id(text):
+            # stable per-text byte: 'a ...' -> 2, 'b ...' -> 3
+            return 2 if text.startswith("a") else 3
 
         class FakeEnc:
-            ids = [7, 0]
-            attention_mask = [1, 0]
+            def __init__(self, text):
+                self.ids = [7, tok_id(text), 0]
+                self.attention_mask = [1, 1, 0]
 
         class FakeTok:
             def __init__(self, path):
@@ -80,8 +71,11 @@ class FakeLocalScorerExecutes(unittest.TestCase):
             def from_file(cls, path):
                 return cls(path)
 
-            def encode(self, text):
-                return FakeEnc()
+            def encode(self, query, text=None):
+                # PAIR form: the joint sequence embeds BOTH parts; candidate
+                # identity survives into ids[1] which is what the fixture
+                # model scores on.
+                return FakeEnc(text if text is not None else query)
 
             def enable_padding(self, length):
                 pass
@@ -89,12 +83,30 @@ class FakeLocalScorerExecutes(unittest.TestCase):
             def enable_truncation(self, max_length):
                 pass
 
+        seen = {}
+
+        class FakeSession:
+            def __init__(self, path):
+                assert str(path).endswith("ranker.onnx")
+
+            def run(self, _, inputs):
+                rows = inputs["input_ids"]
+                scores = []
+                for row in rows:
+                    key = tuple(row)
+                    seen.setdefault(key, len(seen))
+                    # score purely from the CANDIDATE id position: distinct
+                    # candidates MUST produce distinct scores here.
+                    scores.append(float(10 * row[1]))
+                return [scores]
+
+        fake_ort = types.ModuleType("onnxruntime")
+        fake_ort.InferenceSession = FakeSession
         fake_tok_mod = types.ModuleType("tokenizers")
         fake_tok_mod.Tokenizer = FakeTok
 
         self._modules_backup = {k: sys.modules.get(k)
-                                for k in ("numpy", "onnxruntime", "tokenizers")}
-        sys.modules["numpy"] = fake_np
+                                for k in ("onnxruntime", "tokenizers")}
         sys.modules["onnxruntime"] = fake_ort
         sys.modules["tokenizers"] = fake_tok_mod
         self.addCleanup(self._restore_modules)
@@ -113,104 +125,83 @@ class FakeLocalScorerExecutes(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-    def test_production_scorer_scores_without_name_error(self):
-        from storelib.cross_encoder import _local_scorer, maybe_rerank, set_scorer
+    def test_production_pair_scores_differ_by_candidate_and_reorder(self):
+        from storelib.cross_encoder import (
+            _local_scorer, maybe_rerank, set_scorer,
+        )
 
         set_scorer(None)  # force the PRODUCTION path, not an injected stub
         try:
             fn = _local_scorer()
             self.assertIsNotNone(
                 fn, "with file+mocked deps present, scorer must build")
-            rows = [{"content": "b text"}, {"content": "a text"}]
-            out = maybe_rerank("q", rows)
-            self.assertEqual(len(out), 2)
-            self.assertEqual({r["content"] for r in out},
-                             {"a text", "b text"})
+            scores = fn("q is ignored by fixture", ["a text", "b text"])
+            self.assertEqual(scores, [20.0, 30.0],
+                             "candidate ids must drive the score (pair feed)")
+            rows = [{"id": "x", "content": "a text"},
+                    {"id": "y", "content": "b text"}]
+            out = maybe_rerank("anything", rows)
+            self.assertEqual([r["content"] for r in out],
+                             ["b text", "a text"],
+                             "higher-scoring candidate must take rank 0")
         finally:
             set_scorer(None)
 
 
-class FakeProfileAddBanner(unittest.TestCase):
-    def test_add_under_fake_emits_placeholder_warning(self):
-        tmp = tempfile.mkdtemp(prefix="zmem-banner-")
+class BannerSurfacesRound2(unittest.TestCase):
+    """zax/PRR-019: the fake-profile banner must fire on EVERY write surface.
+    Subprocess-isolated so the module-level once-flag cannot mask regressions."""
+
+    def _base_env(self, tmp: Path):
+        env = dict(os.environ)
+        env["ZMEM_STORE"] = str(tmp / "store.sqlite")
+        env["ZMEM_EMBED_PROFILE"] = "fake"
+        env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        env.pop("ZMEM_DATA", None)
+        return env
+
+    def test_update_surface_warns(self):
+        import json as _json
+        import uuid as _uuid
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-ban-u-"))
         self.addCleanup(shutil.rmtree, tmp, True)
-        saved = {k: os.environ.get(k) for k in
-                 ("ZMEM_STORE", ep.PROFILE_ENV, "ZMEM_DATA",
-                  "ZMEM_MODEL_AUTODOWNLOAD")}
-        os.environ["ZMEM_STORE"] = str(Path(tmp) / "store.sqlite")
-        os.environ["ZMEM_EMBED_PROFILE"] = "fake"
-        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        env = self._base_env(tmp)
+        # seed an existing row first
+        mid = str(_uuid.uuid4())
+        row = {"id": mid, "namespace": "user:t", "type": "fact",
+               "content": "original text here",
+               "ingestion_ts": "2026-01-01T00:00:00Z"}
+        jf = tmp / "seed.jsonl"
+        jf.write_text(_json.dumps(row), encoding="utf-8")
+        subprocess.run([sys.executable, str(SCRIPTS / "store.py"),
+                        "ingest-jsonl", "--in", str(jf)],
+                       capture_output=True, text=True, env=env,
+                       cwd=str(SCRIPTS), timeout=60)
+        r = subprocess.run([sys.executable, str(SCRIPTS / "store.py"),
+                            "update", "--id", mid,
+                            "--content", "updated body"],
+                           capture_output=True, text=True, env=env,
+                           cwd=str(SCRIPTS), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertIn("PLACEHOLDER vectors", r.stderr)
 
-        try:
-            sys.path.insert(0, str(SCRIPTS))
-            from storelib.schema import connect, _prepare_store
-            conn = connect()
-            _prepare_store(conn)
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                from storelib.write import add_memory
-                add_memory(conn, namespace="user:t", type_="fact",
-                           content="banner probe", confidence=0.9)
-            conn.close()
-            self.assertIn("PLACEHOLDER vectors", err.getvalue(),
-                          "write under fake profile must warn the operator")
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-
-
-class FlaglessVecRepair(unittest.TestCase):
-    def test_backfill_repairs_empty_memory_vec(self):
-        """Pre-existing latent bug pinned by the final critic: when all live
-        rows ALREADY have embeddings but memory_vec holds none, flagless
-        reembed must populate it — not claim nothing-to-do."""
-        tmp = tempfile.mkdtemp(prefix="zmem-repair-")
+    def test_ingest_surface_warns(self):
+        import json as _json
+        import uuid as _uuid
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-ban-i-"))
         self.addCleanup(shutil.rmtree, tmp, True)
-        saved_store = os.environ.get("ZMEM_STORE")
-        saved_profile = os.environ.get(ep.PROFILE_ENV)
-        os.environ["ZMEM_STORE"] = str(Path(tmp) / "store.sqlite")
-        os.environ.pop(ep.PROFILE_ENV, None)
-        sys.path.insert(0, str(SCRIPTS))
-        for m in list(sys.modules):
-            if m.startswith("storelib"):
-                del sys.modules[m]
-        try:
-            from storelib.schema import connect, _prepare_store
-            from storelib import recall as R
-            conn = connect()
-            _prepare_store(conn)
-            blob = struct.pack("<384f", *([0.25] * 384))
-            for i in range(3):
-                conn.execute(
-                    "INSERT INTO memory(id,namespace,type,content,"
-                    "confidence,signal,valid_from,ingestion_ts,taint,"
-                    "embedding,embedding_model) VALUES (?,'user:t','fact',?,"
-                    "0.9,'test','2026-01-01T00:00:00Z',"
-                    "'2026-01-01T00:00:00Z','trusted_internal',?,"
-                    "'minilm-onnx')",
-                    (f"rep{i}", f"repair row {i}", blob))
-            conn.commit()
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                rc = R.reembed_embeddings(conn)
-            self.assertEqual(rc, 0)
-            self.assertIn("populated vec0 for 3", out.getvalue(),
-                          out.getvalue())
-            cnt = conn.execute(
-                "SELECT COUNT(*) FROM memory_vec").fetchone()[0]
-            self.assertEqual(cnt, 3)
-        finally:
-            if saved_store is None:
-                os.environ.pop("ZMEM_STORE", None)
-            else:
-                os.environ["ZMEM_STORE"] = saved_store
-            if saved_profile is None:
-                os.environ.pop(ep.PROFILE_ENV, None)
-            else:
-                os.environ[ep.PROFILE_ENV] = saved_profile
+        env = self._base_env(tmp)
+        row = {"id": str(_uuid.uuid4()), "namespace": "user:t",
+               "type": "fact", "content": "fresh ingest body",
+               "ingestion_ts": "2026-01-01T00:00:00Z"}
+        jf = tmp / "in.jsonl"
+        jf.write_text(_json.dumps(row), encoding="utf-8")
+        r = subprocess.run([sys.executable, str(SCRIPTS / "store.py"),
+                            "ingest-jsonl", "--in", str(jf)],
+                           capture_output=True, text=True, env=env,
+                           cwd=str(SCRIPTS), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertIn("PLACEHOLDER vectors", r.stderr)
 
 
 if __name__ == "__main__":

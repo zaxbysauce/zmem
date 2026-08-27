@@ -32,7 +32,22 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
-sys.path.insert(0, str(SCRIPTS))
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+# Shared seed contract (issue #63 zax-review round B1 fix): BOTH candidates
+# must be lexically retrievable by QUERY on a runner WITHOUT sqlite_vec —
+# the old "zzz unrelated filler" row was vector-lane-only and collapsed CI to
+# one result. Every consumer below imports these constants so wording can
+# never drift between seeder and assertions again.
+QUERY_TEXT = "candidate"
+SEED_A_MARKER = "primary"
+# A carries a duplicated query token so BM25's term-frequency component makes
+# it the DETERMINISTIC natural champion (C-theater lesson: rank ties make
+# reorder assertions meaningless); B is merely retrievable.
+SEED_A_CONTENT = f"{QUERY_TEXT} alpha {QUERY_TEXT} {SEED_A_MARKER} facts"
+SEED_B_MARKER = "bravo"
+SEED_B_CONTENT = f"{QUERY_TEXT} beta {SEED_B_MARKER} secondary tail"
 
 ENABLE = "ZMEM_CROSS_ENCODER"
 MODEL_ENV = "ZMEM_CROSS_ENCODER_MODEL"
@@ -105,9 +120,9 @@ def _seed_store(tmp: Path) -> Path:
     conn = connect()
     _prepare_store(conn)
     add_memory(conn, namespace="user:t", type_="fact",
-               content="aaa match query term alpha", confidence=0.9)
+               content=SEED_A_CONTENT, confidence=0.9)
     add_memory(conn, namespace="user:t", type_="fact",
-               content="zzz unrelated filler beta gamma", confidence=0.9)
+               content=SEED_B_CONTENT, confidence=0.9)
     conn.close()
     return saved_store, saved_profile_envs
 
@@ -134,18 +149,26 @@ class CliRerankBehavior(unittest.TestCase):
         os.environ.pop(ENABLE, None)
 
     def _drive(self, extra_args):
-        """Returns (ids, scorer_calls, json_text)."""
+        """Uninjected drive: natural order (no model file -> prod CE no-op).
+        Returns (ids, scorer_calls=0, json_text)."""
+        return self._drive_injected(None, extra_args=list(extra_args or []))
+
+    def _drive_injected(self, scorer, extra_args=None):
+        """Drive the real CLI dispatch with an optional injected scorer.
+        Returns (ids, scorer_call_count, json_text)."""
+        extra_args = list(extra_args or [])
         from storelib.cross_encoder import set_scorer
         calls = {"n": 0}
-
-        def inverted(query, texts):
-            calls["n"] += 1
-            return [1.0 if t.startswith("zzz") else 0.0 for t in texts]
-
-        set_scorer(inverted)
+        if scorer is None:
+            set_scorer(None)
+        else:
+            def wrapped(query, texts):
+                calls["n"] += 1
+                return scorer(query, texts)
+            set_scorer(wrapped)
         out, err = io.StringIO(), io.StringIO()
         old_argv = list(sys.argv)
-        sys.argv = ["store.py", "recall", "--query", "match query alpha",
+        sys.argv = ["store.py", "recall", "--query", QUERY_TEXT,
                     "--namespace", "user:t", "--json", *extra_args]
         try:
             with contextlib.redirect_stdout(out), \
@@ -162,14 +185,40 @@ class CliRerankBehavior(unittest.TestCase):
         rows = json.loads(out.getvalue())
         return [r["id"][:8] for r in rows], calls["n"], out.getvalue()
 
-    def test_explicit_recall_reranks_once(self):
-        ids_plain, n_plain, _ = self._drive([])
-        self.assertGreaterEqual(len(ids_plain), 2)
-        self.assertEqual(n_plain, 1, "scorer invoked exactly once")
-        # inverted preferences must actually move 'zzz' ahead of the lexical
-        # winner somewhere in the ordering unless identical already excluded
-        natural = [r for r in ids_plain]
-        del natural
+    def test_explicit_recall_reranks_reorders_and_calls_once(self):
+        """zax-review B1/P004: rerank must fire exactly once AND flip the
+        champion to whichever candidate the injected scorer prefers.
+
+        Engine-agnostic design: the first UNINJECTED drive fixes the natural
+        order (the production cross-encoder with no configured model is an
+        exact no-op), so no BM25/vector-weight assumption can make this flaky
+        on CI or locally."""
+        def marker_of_top(ids, json_text):
+            # _drive truncates ids to 8 chars for assertions; match that here
+            rows = {r["id"][:8]: r["content"] for r in json.loads(json_text)}
+            content = rows[ids[0]]
+            return (SEED_A_MARKER if f" {SEED_A_MARKER} " in
+                    f" {content} " else SEED_B_MARKER)
+
+        natural_ids, _, natural_json = self._drive([])
+        self.assertEqual(
+            len(natural_ids), 2,
+            "both seeds are lexical matches; vector lane must never be "
+            "required for coverage on sqlite_vec-absent runners")
+        natural_champ = marker_of_top(natural_ids, natural_json)
+        loser = (SEED_B_MARKER if natural_champ == SEED_A_MARKER
+                 else SEED_A_MARKER)
+        needle = (f"{QUERY_TEXT} beta"
+                  if loser == SEED_B_MARKER else f"{QUERY_TEXT} alpha")
+
+        ids_reranked, n_calls, rerank_json = self._drive_injected(
+            lambda q, texts: [1.0 if t.startswith(needle) else 0.0
+                              for t in texts])
+        self.assertEqual(n_calls, 1, "scorer invoked exactly once")
+        self.assertEqual(marker_of_top(ids_reranked, rerank_json), loser,
+                         "injected preference must become the champion")
+        self.assertEqual(set(natural_ids), set(ids_reranked),
+                         "same membership after rerank")
 
     def test_no_hybrid_never_invokes(self):
         _, n, _ = self._drive(["--no-hybrid"])
@@ -188,7 +237,7 @@ class CliRerankBehavior(unittest.TestCase):
         set_scorer(boom)
         out, err = io.StringIO(), io.StringIO()
         old = list(sys.argv)
-        sys.argv = ["store.py", "recall", "--query", "match query alpha",
+        sys.argv = ["store.py", "recall", "--query", QUERY_TEXT,
                     "--namespace", "user:t", "--json"]
         try:
             with contextlib.redirect_stdout(out), \
@@ -207,7 +256,7 @@ class CliRerankBehavior(unittest.TestCase):
         set_scorer(lambda q, t: [float(len(x)) for x in t])
         out, err = io.StringIO(), io.StringIO()
         old = list(sys.argv)
-        sys.argv = ["store.py", "recall", "--query", "match query alpha",
+        sys.argv = ["store.py", "recall", "--query", QUERY_TEXT,
                     "--namespace", "user:t", "--json"]
         try:
             with contextlib.redirect_stdout(out), \
@@ -280,16 +329,15 @@ class EndToEndHookCanary(unittest.TestCase):
             conn = connect()
             _prepare_store(conn)
             add_memory(conn, namespace="user:t", type_="fact",
-                       content="aaa match query term alpha", confidence=0.9)
+                       content=SEED_A_CONTENT, confidence=0.9)
             add_memory(conn, namespace="user:t", type_="fact",
-                       content="zzz unrelated filler beta gamma",
-                       confidence=0.9)
+                       content=SEED_B_CONTENT, confidence=0.9)
             conn.close()
 
             os.environ[ENABLE] = "1"
             canary = tmp / "canary.txt"     # nonexistent model path => no-op
             payload = json.dumps({
-                "session_id": "ce-canary", "prompt": "match query alpha",
+                "session_id": "ce-canary", "prompt": QUERY_TEXT,
                 "cwd": str(tmp),
             }).encode()
 
@@ -306,8 +354,8 @@ class EndToEndHookCanary(unittest.TestCase):
             self.assertFalse(canary.exists(),
                              "cross-encoder model/scorer ran under a hook")
             blob = r.stdout.decode("utf-8", errors="replace")
-            self.assertIn("zzz unrelated filler beta gamma", blob,
-                          "hook recall still surfaced real content")
+            self.assertIn(SEED_A_CONTENT.split()[2], blob,
+                          "hook recall still surfaced the lexical candidate")
         finally:
             for k, v in saved_env.items():
                 if v is None:

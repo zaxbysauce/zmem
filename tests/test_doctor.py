@@ -684,6 +684,10 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
             "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
             "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+            # issue #63 review round: the new embedding/CE knobs must not
+            # leak from a developer shell into doctor's sandbox (PRR-013)
+            "ZMEM_EMBED_PROFILE", "ZMEM_CROSS_ENCODER",
+            "ZMEM_CROSS_ENCODER_MODEL", "ZMEM_MODELS_DIR",
             "OneDrive", "OneDriveConsumer", "OneDriveCommercial",
         ):
             env.pop(key, None)
@@ -696,6 +700,11 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
             env=self._env(), capture_output=True, text=True, timeout=60,
         )
         self.assertNotIn("Traceback", result.stderr, result.stderr)
+        if not result.stdout.strip():
+            self.fail("doctor wrote no JSON on stdout "
+                      f"(rc={result.returncode}) stderr={result.stderr[-400:]!r} "
+                      "— a crash here previously masked itself as a confusing "
+                      "JSONDecodeError (PRR-014 courtesy note)")
         return result, json.loads(result.stdout)
 
     def _check(self, report, check_id):

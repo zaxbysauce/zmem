@@ -338,9 +338,11 @@ def _check_embeddings() -> dict:
     Degraded embeddings are a SUPPORTED state (FTS5 recall + lexical
     consolidate keep working), so unavailability is `warn`, not `fail` — it
     must not flip the report's top-level `ok` (which is `fail count == 0`).
-    Pure presence check via embeddings.availability_status(): no store access,
-    no network, no model load, no checksum hash — read-only and side-effect
-    free, per doctor's contract.
+    Presence probe via embeddings.availability_status(); since issue #63 8.1
+    doctor ALSO deep-verifies the model pin (cached-positive by file stats —
+    see embeddings.verify_checksum_cached) so a tampered minilm.onnx can never
+    masquerade as healthy merely because nothing loaded it yet this process.
+    No store writes, no network, no ONNX session load.
     """
     try:
         saved_path = sys.path[:]
@@ -1896,6 +1898,7 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
     except Exception:
         shipped = []
     details["shipped_profiles"] = shipped
+
 
     active = st.get("profile")
     warnings = _embedding_health_warnings(

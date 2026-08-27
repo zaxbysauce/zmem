@@ -7,9 +7,10 @@ POLICY (load-bearing — do not weaken):
   (UserPromptSubmit / SubagentStart / PreCompact / SessionStart) and the Hermes
   prefetch pass --no-bump, so they are structurally excluded — they would need
   BOTH this module to be edited AND their flags changed to reach it.
-- The `search` subcommand and its Hermes/MCP aliases pass --no-hybrid BY
-  CONTRACT (byte-stable lexical ordering, pinned twice in review rounds), so
-  cli_allowed refuses them too even when they arrive through the recall argv.
+- The `search` subcommand never evaluates this module at all (its dispatch
+  omits the enablement parameter outright), and its Hermes/MCP aliases pin
+  --no-hybrid by byte-stable contract, so the recall-argv gate refuses those
+  too if they ever route differently.
 - Degrade is silent and total: a missing model file, missing deps, or any
   scorer exception returns the input order UNCHANGED and never fails the
   recall that asked for it.
@@ -79,12 +80,14 @@ def _local_scorer():
     model between commands); positive results are cached and invalidated by
     file mtime changes.
 
-    SCORING-SHAPE HONESTY: there is no universally-pinned cross-encoder ONNX
-    contract we can assume generically — pair-tokenization order, input names,
-    and logit slicing vary per export. This loader makes a best-effort minimal
-    input guess and NEVER lets a shape mismatch escape (degrade contract); an
-    operator whose model scores oddly must supply a validated export. If you
-    need guaranteed fidelity, inject via ``set_scorer``.
+    SCORING-SHAPE CONTRACT: candidates are PAIR-encoded jointly with the query
+    (`tok.encode(query, candidate)`), so the session receives every candidate's
+    own ids — a query-only feed is the permanent-no-op bug class this round
+    closes. Input names are pinned to the two tensors virtually every
+    exported bert/reranker accepts (`input_ids`, `attention_mask`); a model
+    needing different names should be wrapped via ``set_scorer`` instead.
+    Degrade semantics are unchanged: any build/score failure returns the
+    input order untouched.
     """
     model_path = (os.environ.get(MODEL_PATH_ENV) or "").strip()
     if not model_path or not os.path.isfile(model_path):
@@ -101,8 +104,15 @@ def _local_scorer():
     # closure below can see them: closure cells resolve per-frame, and an
     # import hidden inside a helper would make every score() call raise
     # NameError -> silent no-rerank forever (final-critic finding).
+    #
+    # PAIR ENCODING CONTRACT (zax-review round B1): a cross-encoder scores the
+    # QUERY+CANDIDATE SEQUENCE JOINTLY. The candidate's ids MUST reach the
+    # session, or every row yields the identical query-only score vector and
+    # rerank is a permanent no-op behind the degrade swallow. We therefore use
+    # the tokenizers library's pair form tok.encode(query, t) exactly as
+    # MS-MARCO-class exporters expect. Inputs are plain python int lists —
+    # ORT converts them, and mocks/tests stay trivially inspectable.
     try:
-        import numpy as np  # noqa: F401  (array construction in score)
         import onnxruntime as ort
         from tokenizers import Tokenizer
         sess = ort.InferenceSession(model_path)
@@ -115,28 +125,21 @@ def _local_scorer():
         tok.enable_truncation(max_length=128)
 
         def score(query: str, texts: list[str]):
-            pairs_q: list = []
-            pairs_t: list = []
+            pair_ids: list[list[int]] = []
+            pair_mask: list[list[int]] = []
             for t in texts:
-                enc_q = tok.encode(query)
-                enc_t = tok.encode(t)
-                pairs_q.append(enc_q.ids)
-                pairs_t.append(enc_t.attention_mask)
-            q_ids = np.array(pairs_q, dtype=np.int64)
-            t_mask = np.array(pairs_t, dtype=np.int64)
-            q_mask = (q_ids != 0).astype(np.int64)
-            inputs = {"input_ids": q_ids, "attention_mask": q_mask}
-            out = sess.run(None, inputs)
+                enc = tok.encode(query, t)
+                pair_ids.append(list(enc.ids))
+                pair_mask.append(list(enc.attention_mask))
+            out = sess.run(None, {
+                "input_ids": pair_ids,
+                "attention_mask": pair_mask,
+            })
             logits = out[0]
-            # Binarize attention back onto the TEXT side using its own mask;
-            # generic pair models vary, so keep inputs minimal and tolerate
-            # extra optional inputs.
-            try:
-                masked = logits * t_mask[:, :, None] if logits.ndim == 3 else logits
-                scores = masked[:, 0]
-            except Exception:
-                scores = logits[:, 0]
-            return [float(s) for s in scores]
+            rows = logits.tolist() if hasattr(logits, "tolist") else logits
+            if rows and isinstance(rows[0], (list, tuple)):
+                return [float(r[0]) for r in rows]
+            return [float(r) for r in rows]
 
         _SCORER_CACHE[model_path] = (mtime, score)
         return score

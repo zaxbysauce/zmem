@@ -1297,6 +1297,9 @@ def _reembed(conn: sqlite3.Connection) -> None:
     reembed_embeddings(conn)
 
 
+_MAX_PLAUSIBLE_VEC_DIM = 4096
+
+
 def _declared_vec0_dim(conn: sqlite3.Connection) -> int | None:
     """Dimension DECLARED by the existing memory_vec virtual table, parsed
     from its stored CREATE statement. None means no table exists (sqlite-vec
@@ -1350,6 +1353,7 @@ def reembed_embeddings(
     profile: str | None = None,
     batch: int = 64,
     dry_run: bool = False,
+    confirm: bool = False,
 ) -> int:
     """Backfill (default form) or full-rebuild (--all) semantic embeddings.
 
@@ -1392,6 +1396,12 @@ def reembed_embeddings(
             "adding matching vectors.",
             file=sys.stderr,
         )
+    if requested and requested not in _profiles.PROFILES:
+        # Library callers bypass the CLI's argparse choices; refuse with the
+        # house convention instead of an opaque KeyError traceback (PRR-008).
+        msg = _profiles.ProfileError(f"unknown profile {requested!r}")
+        print(f"[zmem] {msg}", file=sys.stderr)
+        return 2
     entry = _profiles.PROFILES[target]
     target_dim = entry["dim"]
     marker = _profiles.embedding_model_name(target)
@@ -1425,20 +1435,51 @@ def reembed_embeddings(
         )
         return 1
 
-    declared_dim = _declared_vec0_dim(conn)
+    try:
+        declared_dim = _declared_vec0_dim(conn)
+    except RuntimeError as exc:
+        # Unparseable memory_vec DDL must surface as a clean [zmem] refusal —
+        # a raw traceback here would contradict the ddl_unknown guidance that
+        # points operators at exactly this command (zax round L1 / PRR-012).
+        print(str(exc), file=sys.stderr)
+        print("[zmem] repair or restore the store before running reembed.",
+              file=sys.stderr)
+        return 1
     vec_table_exists = declared_dim is not None
-    if declared_dim is not None and declared_dim <= 0:
-        # Unreachable with the stock helper (float[384]/[16]); guards future
-        # hand-edited DDL from zeroing the store.
-        print(f"[zmem] refusing nonsensical declared dim {declared_dim}",
+    if declared_dim is not None and (
+            declared_dim <= 0 or declared_dim > _MAX_PLAUSIBLE_VEC_DIM):
+        # Defensive cap over hostile/hand-edited DDL floats: parsed dims feed
+        # DDL strings only; nothing struct-packs from them. Cap keeps even the
+        # CREATE statement bounded (PRR-007 residual).
+        print(f"[zmem] refusing implausible declared dim {declared_dim}",
               file=sys.stderr)
         return 1
 
+    if rebuild_all and target == "fake":
+        # zax-review B2: converting real vectors to PLACEHOLDERS destroys the
+        # semantic index irreversibly-in-practice (regeneration needs a working
+        # model somewhere later). Two independent rails:
+        #   (a) loud warning keyed on the TARGET profile — env may be unset
+        #       during explicit conversions;
+        #   (b) hard --confirm gate whenever committed non-fake data exists,
+        #       because provider_ready(fake)=True means this runs model-less.
+        _embeddings.warn_fake_active(target)
+        has_real_vectors = bool(conn.execute(
+            "SELECT 1 FROM memory WHERE superseded_at IS NULL "
+            "AND embedding IS NOT NULL "
+            "AND COALESCE(embedding_model,'') <> ? LIMIT 1",
+            (_profiles.embedding_model_name("fake"),),
+        ).fetchone())
+        if has_real_vectors and not confirm:
+            print(
+                "[zmem] refusing: --profile fake would overwrite committed "
+                "non-fake embeddings with deterministic 16-dim placeholders "
+                "(regeneration needs a working model later). Re-run with "
+                "--confirm to proceed deliberately.",
+                file=sys.stderr,
+            )
+            return 2
     if rebuild_all:
-        if target == "fake":
-            # Operator-facing guard rail (critic round C4): announce loudly at
-            # the moment a store starts becoming a fake-vector store.
-            _embeddings.warn_fake_active()
         old_iso = conn.isolation_level
         rc = 0
         summary_done = 0
@@ -1515,7 +1556,7 @@ def reembed_embeddings(
     active_entry_dim = entry["dim"]  # same dim applies within the active profile
     if not provider_ready(active):
         print("[zmem] embeddings unavailable — install onnxruntime + tokenizers "
-              "and ensure the model file is present.")
+              "and ensure the model file is present.", file=sys.stderr)
         return 0
     if batch <= 0:
         batch = 64

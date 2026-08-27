@@ -227,6 +227,10 @@ class NoUnverifiedEscapeHatch(unittest.TestCase):
              "--", "*.py", "*.js", "*.sh"],
             capture_output=True, text=True, cwd=str(REPO_ROOT),
         )
+        self.assertEqual(r.returncode, 0,
+                         f"scan must actually run: rc={r.returncode} "
+                         f"stderr={r.stderr[:200]!r} (vacuous pass outside a "
+                         "git checkout would hide real hatches)")
         import re as _re
 
         def is_hatch(ln):
