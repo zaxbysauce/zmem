@@ -149,6 +149,10 @@ def _local_scorer():
         _SCORER_CACHE[model_path] = (mtime, score)
         return score
     except Exception:
+        # Opt-in operator diagnostics without weakening the degrade contract.
+        if os.environ.get("ZMEM_CE_DEBUG_TRACEBACK") == "1":
+            import traceback as _tb
+            _tb.print_exc()
         return None
 
 
