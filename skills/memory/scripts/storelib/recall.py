@@ -1553,6 +1553,9 @@ def reembed_embeddings(
         return rc
 
     # ---------------- Legacy flagless backfill ----------------
+    # NOTE: an unparseable memory_vec DDL reaches the clean refusal above only
+    # for --all/--dry-run forms; the flagless path degrades before touching
+    # declared dims when no runtime exists (historical contract). Deliberate.
     active_entry_dim = entry["dim"]  # same dim applies within the active profile
     if not provider_ready(active):
         print("[zmem] embeddings unavailable — install onnxruntime + tokenizers "

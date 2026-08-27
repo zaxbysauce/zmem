@@ -115,7 +115,12 @@ def _local_scorer():
     try:
         import onnxruntime as ort
         from tokenizers import Tokenizer
-        sess = ort.InferenceSession(model_path)
+        # TOCTOU parity with embeddings.py (zax-review follow-up): stat for
+        # cache freshness, then load ONE buffer for the session so a swap
+        # between freshness check and construction cannot take effect here.
+        with open(model_path, "rb") as fh:
+            model_bytes = fh.read()
+        sess = ort.InferenceSession(model_bytes)
         tok_dir = os.path.dirname(model_path)
         tok_file = os.path.join(tok_dir, "tokenizer.json")
         if not os.path.isfile(tok_file):
@@ -170,5 +175,11 @@ def maybe_rerank(query: str, rows: list):
         return [r for _s, _i, r in scored]
     except Exception:
         # Degrade unconditionally — issue 8.6: missing/broken model must not
-        # fail the recall that requested rerank.
+        # fail the recall that requested rerank. Additionally evict a
+        # PRODUCTION scorer entry that just threw: a build that succeeds but
+        # scores wrong-shaped models must not stay pinned forever (reviewer
+        # round: cache-pinning gap).
+        if fn is not _scorer_fn:
+            for key in [k for k, val in _SCORER_CACHE.items() if val[1] is fn]:
+                _SCORER_CACHE.pop(key, None)
         return rows

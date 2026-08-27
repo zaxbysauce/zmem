@@ -86,8 +86,10 @@ class FakeLocalScorerExecutes(unittest.TestCase):
         seen = {}
 
         class FakeSession:
-            def __init__(self, path):
-                assert str(path).endswith("ranker.onnx")
+            def __init__(self, model_bytes):
+                # production now passes the VERIFIED BYTES (TOCTOU parity),
+                # so this constructor receives content, not a path
+                assert isinstance(model_bytes, (bytes, bytearray))
 
             def run(self, _, inputs):
                 rows = inputs["input_ids"]
@@ -202,6 +204,65 @@ class BannerSurfacesRound2(unittest.TestCase):
                            cwd=str(SCRIPTS), timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr[-300:])
         self.assertIn("PLACEHOLDER vectors", r.stderr)
+
+
+@unittest.skipUnless(
+    __import__("importlib.util", fromlist=["util"]).find_spec("onnxruntime"),
+    "real-ONNX integration requires onnxruntime (CI runs model-absent; "
+    "dev boxes and any env with the runtime execute it)",
+)
+class RealFixtureOnnxIntegration(unittest.TestCase):
+    """zax-review B1 closure proof: deserialize the COMMITTED fixture bytes
+    through ort.InferenceSession (bytes form) via the production closure and
+    prove relevance discrimination + strict reorder. This is the unwired-
+    artifact guard the reviewer gate demanded."""
+
+    def test_real_onnx_fixture_discriminates_and_reorders(self):
+        import os
+
+        fixtures = REPO_ROOT / "tests" / "fixtures" / "cross_encoder"
+        onnx_path = fixtures / "mini_pair_scorer.onnx"
+        tok_path = fixtures / "tokenizer.json"
+        self.assertTrue(onnx_path.is_file(), onnx_path)
+        self.assertTrue(tok_path.is_file(), tok_path)
+
+        from storelib.cross_encoder import (
+            _local_scorer, maybe_rerank, set_scorer,
+        )
+
+        saved = {k: os.environ.get(k) for k in
+                 ("ZMEM_CROSS_ENCODER", "ZMEM_CROSS_ENCODER_MODEL")}
+        os.environ["ZMEM_CROSS_ENCODER"] = "1"
+        os.environ["ZMEM_CROSS_ENCODER_MODEL"] = str(onnx_path)
+        try:
+            set_scorer(None)  # production path only
+            fn = _local_scorer()
+            self.assertIsNotNone(fn)
+            relevant, irrelevant = "match prime keeper", "bravo xenon quill"
+            scores = fn("match alpha",
+                        [irrelevant, relevant])  # irrelevant FIRST
+            self.assertGreater(scores[1], scores[0] + 10.0,
+                               f"fixture must separate relevance: {scores}")
+
+            rows = [{"id": "i1", "content": irrelevant},
+                    {"id": "r1", "content": relevant}]
+            out = maybe_rerank("match alpha", rows)
+            self.assertEqual(out[0]["id"], "r1",
+                             "relevant candidate must be promoted to rank 0")
+            # tokenizer.json loaded from sibling dir: rebuild uses bytes; the
+            # tokenizers path stays file-based by design (same-dir artifact).
+            self.assertEqual(Path(str(tok_path)).is_file(), True)
+        finally:
+            set_scorer(None)
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 
 
 if __name__ == "__main__":

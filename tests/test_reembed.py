@@ -346,6 +346,8 @@ class DimensionConversion(ReembedBase):
 
         boom = _StubEmbeddings(dim=384, fail_after=1)  # fails on 2nd row
         self.assertFalse(getattr(boom, "fake_warned", False))
+        # target here is minilm: zax-B2 says the warning must stay keyed to
+        # the applied profile, so it must ALSO remain unset after the run.
         self.R._embeddings = boom
         rc, out, err = self.run_reembed("--all")
         self.assertEqual(rc, 1)
@@ -356,6 +358,8 @@ class DimensionConversion(ReembedBase):
             self.S.get_meta(self._conn, "embedding_profile"), "minilm",
             "rolled-back conversion must leave the PRIOR committed marker",
         )
+        self.assertFalse(getattr(boom, "fake_warned", False),
+                         "minilm-targeted conversion must never warn fake")
 
         # Health after rollback: fresh connection serves correct-dim KNN.
         self._conn.close()

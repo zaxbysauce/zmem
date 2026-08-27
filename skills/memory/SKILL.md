@@ -339,9 +339,10 @@ the operator-grade converter when you switch profiles:
 - `--profile NAME` selects from the shipped registry (`minilm`, `fake`; see
   "Embedding profiles" below). Default: active `ZMEM_EMBED_PROFILE` or
   `minilm`. Requires `--all` — `--profile` without it refuses with the exact
-  conversion command, never a silent no-op. Converting committed non-fake
-  vectors TO `fake` additionally requires `--confirm` (the placeholders are
-  irreversible-in-practice without a working model later).
+  conversion command, never a silent no-op. `--all --profile fake`
+  requires `--confirm` ONLY when the store already holds non-fake committed
+  vectors (the overwrite is irreversible-in-practice without a working model
+  later); fresh/empty stores convert freely.
 - If the profile's dimension differs from what the store holds, `memory_vec`
   is recreated at the new dimension INSIDE one transaction — a crash mid-run
   rolls back to the pristine pre-run state, so a half-dim index is impossible.
