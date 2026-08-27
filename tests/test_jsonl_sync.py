@@ -2212,5 +2212,147 @@ class LinkTrustSyncTest(_TwoStoreCase):
             "a polarity-AGREEING duplicate still merges on ingest")
 
 
+class VoyagerCounterSyncTest(_TwoStoreCase):
+    """v12 (issue #64): applied_count / violated_count round-trip verbatim,
+    default 0 on pre-v12 files, malformed values refused fail-closed, and
+    ingest NEVER re-applies the promote-ladder trust drop."""
+
+    def test_counters_round_trip(self):
+        a_id = self.a.add("project:voyager", "the voyager counter anchor row")
+        for _ in range(2):
+            r = self.a.run("feedback", "--id", a_id, "--applied")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.a.run("feedback", "--id", a_id, "--violated")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        out = os.path.join(self.a.tmp, "voy.jsonl")
+        r = self.a.run("export-jsonl", "--out", out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = self._read_jsonl(out)
+        row = next(x for x in rows if x["id"] == a_id)
+        self.assertEqual(row["applied_count"], 2)
+        self.assertEqual(row["violated_count"], 1)
+
+        r = self.b.run("ingest-jsonl", "--in", out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            self.b.query_one(
+                "SELECT applied_count, violated_count FROM memory WHERE id=?",
+                (a_id,)),
+            (2, 1),
+            "usage counters must round-trip verbatim")
+
+        # Re-export from B must carry the same counters (round-trip closure).
+        out_b = os.path.join(self.b.tmp, "voy_b.jsonl")
+        r = self.b.run("export-jsonl", "--out", out_b)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        row_b = next(x for x in self._read_jsonl(out_b) if x["id"] == a_id)
+        self.assertEqual((row_b["applied_count"], row_b["violated_count"]),
+                         (2, 1))
+
+    def test_pre_v12_export_line_ingests_with_zero_defaults(self):
+        a_id = self.a.add("project:voyager", "the pre-v12 compat anchor row")
+        out = os.path.join(self.a.tmp, "prev12.jsonl")
+        self.a.run("export-jsonl", "--out", out)
+        stripped = os.path.join(self.a.tmp, "prev12_stripped.jsonl")
+        with open(out, encoding="utf-8") as fh, \
+                open(stripped, "w", encoding="utf-8", newline="\n") as fo:
+            for line in fh:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                obj.pop("applied_count", None)
+                obj.pop("violated_count", None)
+                fo.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", stripped)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            self.b.query_one(
+                "SELECT applied_count, violated_count, trust_score FROM memory "
+                "WHERE id=?", (a_id,)),
+            (0, 0, 1.0),
+            "a v11-era file must ingest with counter defaults 0")
+
+    def test_malformed_counters_refused_fail_closed(self):
+        good = {
+            "id": "70000000-0000-4000-8000-000000000001",
+            "namespace": "project:voyager",
+            "type": "fact",
+            "content": "a hostile-counter sync row",
+            "signal": "test",
+        }
+        for field in ("applied_count", "violated_count"):
+            for bad in (-1, 2.5, True, "3"):
+                with self.subTest(field=field, value=bad):
+                    row = dict(good)
+                    row[field] = bad
+                    path = os.path.join(self.a.tmp, "bad_counter.jsonl")
+                    with open(path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(json.dumps(row) + "\n")
+                    r = self.b.run("ingest-jsonl", "--in", path)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertIn("malformed", r.stdout + r.stderr)
+                    n = self.b.query_one(
+                        "SELECT count(*) FROM memory WHERE id=?",
+                        (row["id"],))[0]
+                    self.assertEqual(n, 0,
+                                     f"{field}={bad!r} row must NOT be stored")
+
+    def test_dedup_keeps_keeper_counters_discards_incoming(self):
+        """Documented dedup semantics (issue #64): a dedup merge keeps the
+        KEEPER's own feedback history and discards the incoming row's
+        counters — a re-observation is exposure, not new usage evidence, so
+        it must never fabricate promote-ladder eligibility (and re-ingest
+        stays idempotent)."""
+        a_row = self.a.add("project:voyager", "the dedup counter anchor row")
+        for _ in range(2):
+            r = self.a.run("feedback", "--id", a_row, "--applied")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        b_row = self.b.add("project:voyager", "the dedup counter anchor row")
+        for _ in range(5):
+            r = self.b.run("feedback", "--id", b_row, "--applied")
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+        out = os.path.join(self.a.tmp, "dedup.jsonl")
+        self.a.run("export-jsonl", "--out", out)
+        r = self.b.run("ingest-jsonl", "--in", out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("deduped=1", r.stdout, r.stdout)
+        # The local keeper keeps ITS OWN counters (5 applied); the incoming
+        # row's (2 applied) are discarded, not merged or max-ed.
+        self.assertEqual(
+            self.b.query_one(
+                "SELECT applied_count, violated_count FROM memory WHERE id=?",
+                (b_row,)),
+            (5, 0))
+
+    def test_ingest_never_applies_violation_trust_drop(self):
+        """The v11 invariant extends to v12: the −0.15 violation drop is a
+        `feedback`-time event; ingest restores the counters verbatim without
+        re-running the ladder side effect."""
+        a_id = self.a.add("project:voyager", "the ingest-drop anchor row")
+        for _ in range(2):
+            r = self.a.run("feedback", "--id", a_id, "--violated")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        dropped = self.a.query_one(
+            "SELECT trust_score FROM memory WHERE id=?", (a_id,))[0]
+        self.assertAlmostEqual(dropped, 1.0 - 0.15, places=6)
+
+        out = os.path.join(self.a.tmp, "drop.jsonl")
+        self.a.run("export-jsonl", "--out", out)
+        # Reset B-side trust LOWER than the export carries: if ingest re-applied
+        # the drop (or clamped up), the value would change. It must arrive
+        # verbatim instead.
+        r = self.b.run("ingest-jsonl", "--in", out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        restored = self.b.query_one(
+            "SELECT trust_score, applied_count, violated_count FROM memory "
+            "WHERE id=?", (a_id,))
+        self.assertAlmostEqual(restored[0], 1.0 - 0.15, places=6,
+                               msg="trust must arrive verbatim (already dropped, not re-dropped)")
+        self.assertEqual(restored[1], 0)
+        self.assertEqual(restored[2], 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

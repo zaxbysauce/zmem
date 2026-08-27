@@ -511,6 +511,97 @@ class DoctorCliTest(unittest.TestCase):
         self.assertIn("outside [0.0, 1.0]", check["summary"])
 
     # ------------------------------------------------------------------
+    # v12 (issue #64): the voyager-counters check
+    # ------------------------------------------------------------------
+    def _make_v12_counter_store(self, store_path: Path,
+                                counters: list[tuple[int, int]]) -> None:
+        """Minimal v12-tagged store whose memory table carries ONLY the
+        columns the voyager-counters check reads."""
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(store_path))
+        try:
+            conn.execute(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
+                (str(CURRENT_SCHEMA_VERSION),))
+            conn.execute(
+                "CREATE TABLE memory(id TEXT PRIMARY KEY, "
+                "applied_count INTEGER NOT NULL DEFAULT 0, "
+                "violated_count INTEGER NOT NULL DEFAULT 0)")
+            for i, (applied, violated) in enumerate(counters):
+                conn.execute(
+                    "INSERT INTO memory(id, applied_count, violated_count) "
+                    "VALUES (?, ?, ?)", (f"row-{i}", applied, violated))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _voyager_check(self):
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project),
+        )
+        report = json.loads(result.stdout)
+        check = next(c for c in report["checks"]
+                     if c["id"] == "voyager-counters")
+        return result, check
+
+    def test_voyager_counters_pass_on_healthy_v12_store(self):
+        self._disable_native_memory()
+        store_dir = self.home / ".zmem"
+        self._make_v12_counter_store(store_dir / "store.sqlite",
+                                     counters=[(0, 0), (3, 1), (2, 0)])
+        result, check = self._voyager_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(check["status"], "pass", check)
+        self.assertEqual(check["details"]["applied_max"], 3, check)
+        self.assertEqual(check["details"]["violated_max"], 1, check)
+
+    def test_voyager_counters_warn_on_store_missing_columns_without_failing(self):
+        """A store whose memory table lacks the columns (the minimal shape the
+        next writable run creates/migrates) must WARN, never fail the
+        report — doctor recovers, it does not gate."""
+        self._disable_native_memory()
+        store_dir = self.home / ".zmem"
+        _make_store(store_dir / "store.sqlite",
+                    schema_version=CURRENT_SCHEMA_VERSION)
+        result, check = self._voyager_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIn("issue #64", check["summary"])
+
+    def test_voyager_counters_warn_on_negative_counter(self):
+        self._disable_native_memory()
+        store_dir = self.home / ".zmem"
+        self._make_v12_counter_store(store_dir / "store.sqlite",
+                                     counters=[(0, 0), (1, -2)])
+        result, check = self._voyager_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIn("negative", check["summary"])
+
+    def test_voyager_counters_warn_not_crash_on_non_integer_counter(self):
+        """SQLite dynamic typing allows TEXT in an INTEGER column via manual
+        SQL; the check must degrade to warn, never raise TypeError mid-run
+        (doctor never crashes on a hand-edited store)."""
+        self._disable_native_memory()
+        store_dir = self.home / ".zmem"
+        store = store_dir / "store.sqlite"
+        self._make_v12_counter_store(store, counters=[(0, 0)])
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.execute("INSERT INTO memory(id, applied_count, "
+                         "violated_count) VALUES ('row-x', 'many', 0)")
+            conn.commit()
+        finally:
+            conn.close()
+        result, check = self._voyager_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIn("non-integer", check["summary"])
+
+    # ------------------------------------------------------------------
     # E8 (#39): pending namespace-migration preview in doctor
     # ------------------------------------------------------------------
     def _make_store_with_rows(self, store_path: Path, rows: list[tuple[str, str]],

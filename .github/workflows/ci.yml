@@ -71,7 +71,32 @@ jobs:
             python "$f"
           done
 
+      # Issue #64, 9.5: offline eval against the fixture gold set, using the
+      # SAME command SKILL.md documents (scripts/eval_runner.py). Model-absent
+      # by construction (fake embedder, ZMEM_TEST_NOW-pinned). The report is
+      # collected as an artifact; the score never gates the build (no
+      # --fail-under) and nothing is downloaded.
+      - name: Run offline eval (model-absent, fake profile)
+        if: always()
+        shell: bash
+        env:
+          ZMEM_EMBED_PROFILE: fake
+        run: |
+          set -e
+          python scripts/eval_runner.py --store .eval-tmp/store.sqlite --gold eval/gold.jsonl --json-out .eval-tmp/eval-results.json
+
+      - name: Upload eval report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-${{ matrix.os }}
+          path: .eval-tmp/eval-results.json
+          if-no-files-found: warn
+
       - name: Run Node test suites
+        # always(): the eval step above can fail operationally (exit 2) — a
+        # JS-coverage blackout on one matrix leg must not be its side effect.
+        if: always()
         shell: bash
         run: |
           set -e

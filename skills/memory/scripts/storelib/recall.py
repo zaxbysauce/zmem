@@ -71,14 +71,30 @@ def _uses_count(row: sqlite3.Row | dict) -> int:
     return total
 
 def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: float,
-                  vec_sim: float | None = None) -> float:
+                  vec_sim: float | None = None,
+                  weights: dict | None = None) -> float:
     """Composite score: BM25 relevance + confidence boost + recency + popularity.
 
     fts_rank is the raw FTS5 rank value (lower = better match). For memories
     that came from the vector path only (no FTS match), fts_rank is None — in
     that case vec_sim (cosine similarity, 0..1) is used as the relevance proxy.
     All other factors come from the memory row itself.
+
+    ``weights`` (issue #64, 9.6): optional {"bm25", "confidence", "recency",
+    "popularity"} override evaluated INSTEAD of the W_* module constants.
+    The default (None) is byte-identical behavior for every existing caller;
+    the tuner passes explicit candidate dicts so it never has to mutate the
+    module globals another in-process consumer might be reading.
     """
+    if weights is None:
+        w_bm25, w_conf = W_BM25, W_CONFIDENCE
+        w_rec, w_pop = W_RECENCY, W_POPULARITY
+    else:
+        w_bm25 = float(weights.get("bm25", W_BM25))
+        w_conf = float(weights.get("confidence", W_CONFIDENCE))
+        w_rec = float(weights.get("recency", W_RECENCY))
+        w_pop = float(weights.get("popularity", W_POPULARITY))
+
     # Relevance component: BM25 if available, else vector similarity as proxy.
     if fts_rank is not None:
         ar = abs(fts_rank)
@@ -106,10 +122,10 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
     popularity = min(1.0, 0.15 * (rc ** 0.5))
 
     return (
-        W_BM25 * relevance
-        + W_CONFIDENCE * confidence
-        + W_RECENCY * recency
-        + W_POPULARITY * popularity
+        w_bm25 * relevance
+        + w_conf * confidence
+        + w_rec * recency
+        + w_pop * popularity
     )
 
 def _vector_knn(conn: sqlite3.Connection, embedding: bytes, k: int) -> list[str]:
@@ -361,7 +377,7 @@ def _fetch_by_ids(
                source_hash, confidence, signal, valid_from,
                ingestion_ts, retrieval_count, surfaced_count, last_retrieved,
                valid_until, update_of, taint,
-               content_norm,
+               content_norm, applied_count, violated_count,
                NULL AS fts_rank
         FROM memory
         WHERE id IN ({placeholders})
@@ -413,6 +429,7 @@ def _recall_one_tier(
     now_epoch: float,
     as_of: str | None = None,
     mmr: bool = True,
+    weights: dict | None = None,
 ) -> list[tuple[float, dict]]:
     """FTS5 + composite scoring for ONE namespace set (a single recall tier).
 
@@ -431,6 +448,10 @@ def _recall_one_tier(
     ``_as_of_temporal_predicate``. With as_of set, the hard
     ``superseded_at IS NULL`` live filter is DROPPED — a historically-
     superseded row that was valid at that instant may surface.
+
+    ``weights`` (issue #64, 9.6): optional compute_score weight override,
+    threaded from recall_memory for the tune-weights evaluator ONLY. Never a
+    CLI flag — the shipped ranking weights stay the W_* module constants.
     """
     terms = [t for t in re.split(r"\s+", query.strip()) if t]
     floor = min_confidence if min_confidence is not None else CONFIDENCE_FLOOR
@@ -466,7 +487,7 @@ def _recall_one_tier(
                    m.source_hash, m.confidence, m.signal, m.valid_from,
                    m.ingestion_ts, m.retrieval_count, m.surfaced_count, m.last_retrieved,
                    m.valid_until, m.update_of, m.taint,
-                   m.content_norm,
+                   m.content_norm, m.applied_count, m.violated_count,
                    rank AS fts_rank
             FROM memory_fts f
             JOIN memory m ON m.rowid = f.rowid
@@ -583,7 +604,8 @@ def _recall_one_tier(
         # composite score is comparable instead of relevance-less.
         if fts_r is None and vsim is None:
             vsim = entity_rel_map.get(r["id"])
-        score = compute_score(row_fields, fts_r, now_epoch, vec_sim=vsim)
+        score = compute_score(row_fields, fts_r, now_epoch, vec_sim=vsim,
+                              weights=weights)
         norm_map[r["id"]] = r["content_norm"] or ""
         scored.append((score, {
             "id": r["id"],
@@ -750,7 +772,8 @@ def _classify_injection(item: dict) -> bool:
         item.get("tags") or "",
     )
 
-def _bump_telemetry(conn: sqlite3.Connection, ids: list[str], *, no_bump: bool) -> None:
+def _bump_telemetry(conn: sqlite3.Connection, ids: list[str], *, no_bump: bool,
+                    disabled: bool = False) -> None:
     """Record recall/recent/search telemetry for the returned ids.
 
     Issue #21: the two counters are mutually exclusive PER EVENT. Explicit recall
@@ -759,7 +782,14 @@ def _bump_telemetry(conn: sqlite3.Connection, ids: list[str], *, no_bump: bool) 
     "was surfaced into context" signal that hook-driven recall previously failed to
     record (so promote/prune/ranking inherited a manual-only bias). Their sum is the
     non-double-counted "times surfaced" metric (see _uses_count).
+
+    ``disabled`` (issue #64): the offline eval harness records NEITHER counter
+    — evaluation must be a zero-write read (the fixture store stays
+    byte-identical and repeated runs are bit-identical), while still getting
+    the passive path's injection-omit filter semantics via no_bump=True.
     """
+    if disabled:
+        return
     placeholders = ",".join("?" * len(ids))
     if no_bump:
         conn.execute(
@@ -823,6 +853,8 @@ def recall_memory(
     link_hops: int = 1,
     link_budget: int = 2,
     cross_rerank: bool = False,
+    weights: dict | None = None,
+    no_telemetry: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -848,6 +880,18 @@ def recall_memory(
 
     Confidence is still a hard floor (high-precision-first principle): memories
     below CONFIDENCE_FLOOR (or min_confidence) are dropped before scoring.
+
+    ``weights`` (issue #64, 9.6): internal keyword for the tune-weights
+    evaluator — an optional {"bm25","confidence","recency","popularity"}
+    override passed through to compute_score instead of the W_* constants.
+    Deliberately NOT exposed as a CLI flag; the shipped ranking weights are
+    edited in code (SKILL.md §tune-weights), and module globals are never
+    mutated to try candidates.
+
+    ``no_telemetry`` (issue #64, 9.1): internal keyword for the eval harness —
+    records NEITHER counter (zero writes; the store stays byte-identical)
+    while ``no_bump=True`` still supplies the passive path's injection-omit
+    filter semantics. Pair the two for a read-only evaluation.
 
     When ``include_global`` is True and ``namespace`` is set to something other
     than ``GLOBAL_NAMESPACE`` ("user:global"), the result ALSO surfaces up to
@@ -898,7 +942,7 @@ def recall_memory(
     project_scored = _recall_one_tier(
         conn, query=query, ns_list=ns_list, limit=limit,
         min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-        as_of=as_of, mmr=not no_mmr,
+        as_of=as_of, mmr=not no_mmr, weights=weights,
     )
 
     global_scored: list[tuple[float, dict]] = []
@@ -906,7 +950,7 @@ def recall_memory(
         global_scored = _recall_one_tier(
             conn, query=query, ns_list=global_ns_list, limit=global_limit,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-            as_of=as_of, mmr=not no_mmr,
+            as_of=as_of, mmr=not no_mmr, weights=weights,
         )
 
     # Issue #58, 3.4: at emit time, re-classify each row for
@@ -985,7 +1029,9 @@ def recall_memory(
     if bump_ids:
         # v11 (issue #61, 6.3): bump ONLY the query-matched rows — expansion
         # neighbors joined via `bump_ids` capture above, before expansion.
-        _bump_telemetry(conn, bump_ids, no_bump=no_bump)
+        # v12 (issue #64): no_telemetry (the eval harness) records nothing.
+        _bump_telemetry(conn, bump_ids, no_bump=no_bump,
+                        disabled=no_telemetry)
 
     if as_json:
         print(json.dumps(results, indent=2))

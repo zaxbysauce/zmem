@@ -13,6 +13,59 @@ README.
 ## [Unreleased]
 
 ### Added
+- **Schema v12 — Voyager usage-feedback counters** (issue #64):
+  `memory.applied_count` / `memory.violated_count` (INTEGER NOT NULL
+  DEFAULT 0). Written ONLY by the new explicit `feedback` CLI — hooks,
+  `--no-bump` recall, PreCompact, and Hermes prefetch never advance them
+  (source-scan ratcheted). Round-tripped by export/ingest (absent → 0 on
+  pre-v12 files; malformed values refused fail-closed), included in
+  `get --json`/recall output, and probed by a new doctor `voyager-counters`
+  check
+
+- **`feedback` CLI + enforce promote ladder** (issue #64, 9.4):
+  `store.py feedback --id <uuid> --applied|--violated` (both flags refused
+  exit-2; missing/tombstoned id exit-1). Ladder enforced in `promote`:
+  eligible ⇔ `applied_count >= 3` AND `violated_count == 0` (replaces the
+  retrieval/surfaced usage floor — passive exposure is no longer an
+  eligibility input); a violated_count crossing to 2 applies a ONE-TIME
+  −0.15 `trust_score` drop (`TRUST_VIOLATION_FLOOR_DROP`, clamped at 0;
+  `signal` never auto-changed; never re-applied by ingest). `promote` with
+  no eligible rows stays a clear no-op
+
+- **Offline eval harness** (issue #64, 9.1/9.2/9.5): `scripts/eval_runner.py`
+  (the canonical command CI runs) over `eval/gold.jsonl` — 30 items across
+  six buckets (as-of updates, injection omission, entity aliases, namespace
+  isolation, contested guidance, ordinary FTS) naming ids minted by the new
+  deterministic 50-row fixture builder `tests/fixtures/eval_store.py`.
+  Reports hit@k / MRR / as-of accuracy / injection-omit rate as JSON;
+  `--store` REQUIRED (never touches the operator home store); auto-builds
+  the corpus at the given path; model-absent by construction (fake embedder,
+  pinned `ZMEM_TEST_NOW`); exit 0 regardless of scores, optional
+  `--fail-under` off in CI. New CI steps run it and upload the JSON report
+  as a workflow artifact (`if-no-files-found: warn`, score never gates)
+
+- **Public-corpus eval adapters** (issue #64, 9.3): `scripts/eval_adapters.py`
+  converts on-disk LongMemEval/LoCoMo-shaped corpora into gold JSONL;
+  a missing corpus prints `skipped: ...` and exits 0 (CI downloads nothing);
+  synthetic 3-row toy fixtures under `tests/fixtures/adapters/` prove the
+  converters with no copyrighted text
+
+- **`tune-weights --dry-run`** (issue #64, 9.6): evaluates the shipped
+  W_BM25/W_CONFIDENCE/W_RECENCY/W_POPULARITY against a gold set, hill-climbs
+  a deterministic candidate set (candidates passed through compute_score's
+  new internal `weights` parameter — module globals never mutated), and
+  prints suggested weights summing to 1.0. Writes nothing; no `--apply`
+  exists — applying is a documented manual edit (SKILL.md §tune-weights)
+
+### Tests
+- New standalone suites: `tests/test_feedback_promote.py`,
+  `tests/test_eval_runner.py`, `tests/test_tune_weights.py`
+- Updated: characterization (KNOWN_SUBCMDS + re-recorded data hashes for the
+  new counter fields), `test_jsonl_sync.py` (counter round-trip/legacy/
+  malformed), `test_doc_drift.py` (feedback/eval/tune-weights doc needles),
+  `test_promote.py` (ladder-based eligibility seeding),
+  `test_storelib_exports.py` (v12 exports)
+
 - **Embedding profiles registry** — `embed_profiles.py`: shipped `minilm`
   (Xenova/all-MiniLM-L6-v2 ONNX, 384-d, checksum-pinned) and test-only `fake`
   (deterministic 16-d placeholder vectors hashed from the content_norm form;

@@ -178,7 +178,7 @@ def cmd_export_jsonl(
         f"""SELECT id, namespace, type, content, tags, source_ref, confidence, signal,
                    valid_from, valid_until, update_of, taint,
                    ingestion_ts, superseded_at, supersede_reason, merged_from,
-                   trust_score
+                   trust_score, applied_count, violated_count
             FROM memory {where}
             ORDER BY ingestion_ts, id""",
         params,
@@ -232,6 +232,10 @@ def cmd_export_jsonl(
             # verbatim (it is event history, not derivable state), and so do
             # the row's outgoing link edges.
             "trust_score": r["trust_score"],
+            # v12 (issue #64): Voyager usage-feedback counters round-trip
+            # verbatim (usage event history, not derivable state).
+            "applied_count": r["applied_count"],
+            "violated_count": r["violated_count"],
             "links": link_map.get(r["id"], []),
         }
         line = json.dumps(obj, ensure_ascii=False)
@@ -533,6 +537,35 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
             )
     trust_score = max(0.0, min(1.0, trust_score))
 
+    # v12 (issue #64, sync): Voyager usage-feedback counters — optional
+    # non-negative integers, absent/None defaults 0 (a pre-v12 export). The
+    # counters are usage EVENT HISTORY, so they round-trip verbatim; the
+    # validator deliberately does NOT clamp them (they grow unbounded) and
+    # does NOT apply their promote-ladder side effect — ingest never mutates
+    # trust_score (the v11 invariant, now covering the counter drop too).
+    # Fail-closed on anything that is not a non-bool integer >= 0: a bool, a
+    # float with a fractional part, a numeric string (stricter than
+    # trust_score, because a coercible string still declares the wrong TYPE
+    # for a counter and counters feed a promote security decision), or a
+    # negative value makes the row malformed — counted, not stored.
+    validated_counters: dict[str, int] = {}
+    for counter in ("applied_count", "violated_count"):
+        raw_counter = obj.get(counter)
+        if raw_counter is None:
+            validated_counters[counter] = 0
+            continue
+        if isinstance(raw_counter, bool) or not isinstance(raw_counter, int):
+            raise ValueError(
+                f"field '{counter}' must be a non-negative integer, got "
+                f"{type(raw_counter).__name__}"
+            )
+        if raw_counter < 0:
+            raise ValueError(
+                f"field '{counter}' must be a non-negative integer, got "
+                f"{raw_counter!r}"
+            )
+        validated_counters[counter] = raw_counter
+
     # v11 (issue #61, sync): outgoing link edges, optional list. Every entry
     # is validated fail-closed (a malformed EDGE makes the ROW malformed —
     # counted, not stored): dst must be UUID-shaped, relation must be a known
@@ -613,6 +646,10 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
         # "_links" is a reserved carriage key consumed by cmd_ingest_jsonl
         # (never a SQL column).
         "trust_score": trust_score,
+        # v12 (issue #64): carried through _ingest_row verbatim (usage event
+        # history); the promote-ladder side effect is ingest's business NOT.
+        "applied_count": validated_counters["applied_count"],
+        "violated_count": validated_counters["violated_count"],
         "_links": validated_links,
     }
 
@@ -660,6 +697,12 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
     # read here — cmd_ingest_jsonl applies links in a post-row pass so an
     # edge may reference an endpoint later in the file.
     trust_score = obj.get("trust_score", 1.0)
+    # v12 (issue #64): the row's authored usage counters (validated upstream;
+    # 0 for a pre-v12 export). Carried verbatim into the INSERTs below — the
+    # promote-ladder trust drop is deliberately NOT re-applied here (ingest
+    # restores event history; it does not re-run the events).
+    applied_count = obj.get("applied_count", 0)
+    violated_count = obj.get("violated_count", 0)
 
     # Existing-local-row short-circuit FIRST (issue #35 refinement): an id
     # already present locally is NEVER content-overwritten by a sync import --
@@ -748,13 +791,13 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                     superseded_at, supersede_reason,
                     ingestion_ts, retrieval_count, last_retrieved,
                     embedding, embedding_model, embedded_at, merged_from, content_norm,
-                    trust_score)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL,?,?,?)""",
+                    trust_score, applied_count, violated_count)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,'',NULL,?,?,?,?,?)""",
                 (mid, namespace, type_, content, tags, source_ref, shash,
                  confidence, signal, valid_from, valid_until, update_of, taint,
                  superseded_at, supersede_reason,
                  ingestion_ts, merged_from, _normalize_content(content),
-                 trust_score),
+                 trust_score, applied_count, violated_count),
             )
             # v10 (issue #60, sync decision): entities are NOT carried in the
             # JSONL (they are store-local derived data, like content_norm and
@@ -837,12 +880,13 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 confidence, signal, valid_from, valid_until, update_of, taint,
                 superseded_at, ingestion_ts,
                 retrieval_count, last_retrieved, embedding, embedding_model, embedded_at,
-                merged_from, content_norm, trust_score)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?,?,?,?)""",
+                merged_from, content_norm, trust_score, applied_count, violated_count)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,?,?,?,?,?,?,?)""",
             (mid, namespace, type_, content, tags, source_ref, shash,
              confidence, signal, valid_from, valid_until, update_of, taint,
              ingestion_ts, emb, emb_model, embedded_at,
-             merged_from, _normalize_content(content), trust_score),
+             merged_from, _normalize_content(content), trust_score,
+             applied_count, violated_count),
         )
         if emb is not None:
             try:

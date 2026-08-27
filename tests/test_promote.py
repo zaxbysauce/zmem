@@ -63,21 +63,20 @@ class PromoteTestBase(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
 
-        # Promotion requires total surface events (retrieval_count + surfaced_count)
-        # > the floor (issue #21); add_memory always starts a fresh row at 0, so bump it
-        # directly — the store schema, not a CLI surface, is the fastest/most direct way
-        # to set up this fixture.
+        # Promotion eligibility is the v12 feedback ladder (issue #64):
+        # applied_count >= 3 AND violated_count == 0. Seed it through the REAL
+        # `feedback` CLI (not a direct SQL bump) so the ladder integration
+        # itself is exercised on every promote test.
         conn = sqlite3.connect(self.store)
         try:
             self.memory_id = conn.execute(
                 "SELECT id FROM memory WHERE superseded_at IS NULL"
             ).fetchone()[0]
-            conn.execute(
-                "UPDATE memory SET retrieval_count = 5 WHERE id = ?", (self.memory_id,)
-            )
-            conn.commit()
         finally:
             conn.close()
+        for _ in range(3):
+            r = self._run("feedback", "--id", self.memory_id, "--applied")
+            self.assertEqual(r.returncode, 0, r.stderr)
 
     def _run(self, *args):
         return subprocess.run(
@@ -110,52 +109,101 @@ class TestDryRun(PromoteTestBase):
         self.assertNotIn("EDIT THIS DESCRIPTION", r.stdout)
 
 
-class TestSurfacedEligibility(PromoteTestBase):
-    """Issue #21: promote ranking/eligibility must blend surfaced + retrieval activity.
+class TestFeedbackLadder(PromoteTestBase):
+    """Issue #64 (v12): eligibility keys on the EXPLICIT feedback ladder, not
+    passive surface telemetry.
 
-    A grounded lesson surfaced many times by the HOOK path (retrieval_count = 0) but
-    never explicitly fetched must be promotable — previously it was invisible because
-    eligibility keyed on retrieval_count alone.
+    - activity without feedback (any retrieval/surfaced counts, applied_count
+      = 0) is NOT eligible;
+    - any violation blocks;
+    - `--id --confirm` remains a human override that ignores the candidate bar
+      (its own live-row lookup) — it must keep working for a feedback-light
+      row.
     """
 
-    def _surface_only_lesson(self):
-        # Add a second, grounded lesson with retrieval_count = 0 but high surfaced_count
-        # (as if only hooks ever surfaced it), and an explicit --id reference.
+    def _add_second_lesson(self, content: str) -> str:
         r = self._run(
             "add", "--namespace", NS, "--type", "lesson",
-            "--content", "Always verify surfaced telemetry before pruning the shared store.",
+            "--content", content,
             "--tags", "surfaced, telemetry",
             "--signal", "test", "--confidence", "0.9",
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         conn = sqlite3.connect(self.store)
         try:
-            mid = conn.execute(
-                "SELECT id FROM memory WHERE content LIKE 'Always verify surfaced%'"
+            return conn.execute(
+                "SELECT id FROM memory WHERE content LIKE ?",
+                (content[:30] + "%",),
             ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_activity_without_feedback_is_not_eligible(self):
+        mid = self._add_second_lesson(
+            "Always verify surfaced telemetry before pruning the shared store.")
+        # Hook-style passive exposure only — retrieval_count/surfaced_count
+        # are NOT ladder inputs anymore (issue #64 replaced issue #21's bar).
+        conn = sqlite3.connect(self.store)
+        try:
             conn.execute(
-                "UPDATE memory SET retrieval_count = 0, surfaced_count = 5 WHERE id = ?",
-                (mid,))
+                "UPDATE memory SET retrieval_count = 0, surfaced_count = 5 "
+                "WHERE id = ?", (mid,))
             conn.commit()
         finally:
             conn.close()
-        return mid
-
-    def test_hook_surfaced_only_lesson_is_promotable(self):
-        mid = self._surface_only_lesson()
         r = self._run("promote", "--dry-run", "--namespace", NS)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn(mid[:8], r.stdout,
-                      "a hook-surfaced-only grounded lesson must be a promotion candidate")
+        self.assertNotIn(mid[:8], r.stdout,
+                         "passive exposure without feedback must NOT be a candidate")
+        self.assertIn(self.memory_id[:8], r.stdout,
+                      "the feedback-seeded lesson stays eligible")
 
-    def test_surfaced_only_id_confirm_writes_review_candidate(self):
-        mid = self._surface_only_lesson()
+    def test_any_violation_blocks_eligibility(self):
+        # 3 applied + 1 violated: applied floor met, violated_count != 0.
+        for _ in range(3):
+            r = self._run("feedback", "--id", self.memory_id, "--applied")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        r = self._run("feedback", "--id", self.memory_id, "--violated")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self._run("promote", "--dry-run", "--namespace", NS)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(self.memory_id[:8], r.stdout,
+                         "a violated lesson must not be a candidate")
+
+    def test_violation_threshold_drops_trust_once(self):
+        # The violated tier: the 2nd violation applies the ONE-TIME -0.15
+        # trust floor drop; later violations do not re-drop; signal untouched.
+        for _ in range(2):
+            r = self._run("feedback", "--id", self.memory_id, "--violated")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        conn = sqlite3.connect(self.store)
+        try:
+            row = conn.execute(
+                "SELECT trust_score, signal, violated_count FROM memory WHERE id=?",
+                (self.memory_id,)).fetchone()
+            self.assertEqual(row[2], 2)
+            self.assertAlmostEqual(row[0], 0.85, places=6)
+            self.assertEqual(row[1], "test")
+            r = self._run("feedback", "--id", self.memory_id, "--violated")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            row = conn.execute(
+                "SELECT trust_score, violated_count FROM memory WHERE id=?",
+                (self.memory_id,)).fetchone()
+            self.assertEqual(row[1], 3)
+            self.assertAlmostEqual(row[0], 0.85, places=6,
+                                   msg="the drop must apply exactly once")
+        finally:
+            conn.close()
+
+    def test_id_confirm_overrides_candidate_bar(self):
+        mid = self._add_second_lesson(
+            "Always verify surfaced telemetry before pruning the shared store.")
         r = self._run("promote", "--id", mid, "--confirm")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(len(self._review_files()), 1)
         text = self._review_files()[0].read_text(encoding="utf-8")
-        # The blended counters must be surfaced in the emitted Source block.
-        self.assertIn("surfaced", text)
+        # The v12 Source block carries the usage counters.
+        self.assertIn("applied_count", text)
         self.assertNotIn("EDIT THIS DESCRIPTION", text)
 
 

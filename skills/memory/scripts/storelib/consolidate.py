@@ -1158,8 +1158,11 @@ def consolidate(
         # old by ingestion, AND either never surfaced at all OR was last
         # surfaced longer than ZMEM_UNRECALLED_DAYS ago. Rows surfaced recently
         # stay protected; a NULL last_surfaced (never surfaced) still qualifies
-        # via surfaced_count=0. `applied_count` does not exist in this schema
-        # (issue: skip the clause when missing). signal!=none is never pruned.
+        # via surfaced_count=0. v12 (issue #64): the usage-feedback counters
+        # (applied_count/violated_count) are deliberately NOT prune inputs —
+        # the explicit `feedback` CLI owns them and the promote ladder reads
+        # them; feedback-aware pruning would need its own issue + tests.
+        # signal!=none is never pruned.
         unrecalled_days = _prune_unrecalled_days()
         prune_rows = conn.execute(
             f"""SELECT id, content FROM memory

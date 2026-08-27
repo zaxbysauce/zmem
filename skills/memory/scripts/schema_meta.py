@@ -47,7 +47,22 @@ def normalize_content(s: str) -> str:
 # +0.05, clamped [0,1]). Links are generated on every add/update, walked one
 # hop at recall, inspectable via `links`/`contradict`, and round-tripped by
 # export/ingest — not a dormant schema artifact.
-SUPPORTED_SCHEMA_VERSION = 11
+# v12 (issue #64): Voyager-style usage-feedback counters — `applied_count` and
+# `violated_count` on `memory` (both INTEGER NOT NULL DEFAULT 0). They are
+# written ONLY by the explicit `store.py feedback --id --applied|--violated`
+# CLI (storelib/write.py::feedback_memory); hooks, --no-bump recall, PreCompact,
+# and Hermes prefetch never touch them (source-scan ratcheted by
+# tests/test_feedback_promote.py). Ladder (SKILL.md, promote.py): applied>=3
+# with violated==0 -> promote-eligible; a violated_count crossing to 2 applies
+# a ONE-TIME TRUST_VIOLATION_FLOOR_DROP to trust_score (signal is never
+# auto-changed). Round-tripped by export/ingest; doctor checks them.
+SUPPORTED_SCHEMA_VERSION = 12
+
+# v12 (issue #64): one-time trust_score reduction applied when a row's
+# violated_count crosses to 2 (the promote ladder's "violated" tier). Clamped
+# at 0.0 like every trust delta; signal is deliberately untouched (feedback is
+# a usage signal, not a provenance change). Documented in SKILL.md §promote.
+TRUST_VIOLATION_FLOOR_DROP = 0.15
 
 # The meta-table key under which the version is stored in the store.
 SCHEMA_VERSION_KEY = "schema_version"

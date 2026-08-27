@@ -33,10 +33,10 @@ EXPECTED_EXPORTS = [
     "CORE_MD_PATH", "CapturePolicyRefusal", "ContentTooLarge", "DEDUP_SIMILARITY_THRESHOLD", "ENTITY_KINDS", "ENTITY_ROLE_DEFAULT", "ENTITY_STOPWORDS", "EXPORT_PACK_DEFAULT_GLOBAL_LIMIT", "EXPORT_PACK_DEFAULT_MAX_BYTES",
     "EXPORT_PACK_DEFAULT_MIN_CONFIDENCE", "EXPORT_PACK_DEFAULT_PROJECT_LIMIT", "GLOBAL_NAMESPACE", "INGEST_MAX_CONTENT_CHARS", "INGEST_MAX_FUTURE_SKEW_SECONDS", "MAINTENANCE_LOCK_STALE_SECONDS",
     "MAINTENANCE_POLL_SECONDS", "MAINTENANCE_WAIT_SECONDS", "MAX_CONTENT_CHARS", "MAX_LINE_CHARS", "MMR_LAMBDA", "MMR_LAMBDA_DEFAULT", "PRERESTORE_PREFIX", "PROMOTE_CONFIDENCE_FLOOR",
-    "PROMOTE_SIGNALS", "PROMOTE_USE_FLOOR", "PROMOTION_REVIEW_DIRNAME", "PROMPT_INJECTION_PATTERNS", "RECENCY_HALF_LIFE_DAYS", "SCHEMA_LOCK_POLL_SECONDS",
+    "PROMOTE_SIGNALS", "PROMOTE_APPLIED_FLOOR", "PROMOTION_REVIEW_DIRNAME", "PROMPT_INJECTION_PATTERNS", "RECENCY_HALF_LIFE_DAYS", "SCHEMA_LOCK_POLL_SECONDS",
     "SCHEMA_LOCK_STALE_SECONDS", "SCHEMA_LOCK_WAIT_SECONDS", "SCHEMA_VERSION_KEY", "SECRET_PATTERNS", "SENTINEL_PREFIXES", "SENTINEL_SWEEP_DAYS_DEFAULT",
     "SIDECAR_SUFFIXES", "SIGNAL_CONFIDENCE", "SNAPSHOT_GLOB", "SNAPSHOT_PREFIX", "SNAPSHOT_SUFFIX", "STORE_PATH",
-    "SUPPORTED_SCHEMA_VERSION", "TAINT_RANK", "TAINT_TRUSTED_SIGNALS", "SnapshotError", "WRITER_LEASE_STALE_SECONDS", "W_BM25", "W_CONFIDENCE", "W_POPULARITY",
+    "SUPPORTED_SCHEMA_VERSION", "TAINT_RANK", "TAINT_TRUSTED_SIGNALS", "SnapshotError", "TRUST_VIOLATION_FLOOR_DROP", "WRITER_LEASE_STALE_SECONDS", "W_BM25", "W_CONFIDENCE", "W_POPULARITY",
     "W_RECENCY", "_CONSOLIDATE_NEGATOR_RE", "_GLOBAL_NEAR_MISS_STEMS", "_INGEST_ID_RE", "_LEXICAL_STOPWORDS", "_NS_MIGRATION_CHECKOUTS",
     "_SAMPLE_EXTRACT_LIMIT", "_SIGNAL_RANK", "_absorb_decision", "_absorb_into_keeper", "_acquire_lock", "_acquire_writer_lease",
     "_aggregate_errors", "_apply_capture_policy", "_as_of_temporal_predicate", "_backup_dir", "_backup_due", "_backup_interval_days", "_bump_telemetry",
@@ -58,9 +58,9 @@ EXPECTED_EXPORTS = [
     "_writer_dir", "_yaml_dquote", "_default_taint_for_signal", "add_memory", "apply_retention", "backfill_entities", "cmd_backup", "cmd_corrections",
     "cmd_entity_list", "cmd_entity_merge", "cmd_export_jsonl", "cmd_export_pack", "cmd_failures", "cmd_ingest_jsonl", "cmd_mine_history", "cmd_queue_clear",
     "cmd_queue_list", "cmd_restore", "cmd_sweep", "compute_score", "connect", "consolidate",
-    "counts_agree", "create_snapshot", "entities_for_memory", "entities_for_memories", "entity_match_ids", "extract_entities", "get_memory", "init_db", "link_memory_entities", "list_memory", "list_snapshots",
-    "main", "migrate", "nonnegative_int", "now_iso", "organize", "promote_memory", "recall_memory",
-    "recent_memory", "rekey_namespace", "relink_memory", "stats", "supersede_memory", "update_memory", "validate_taint", "verify_snapshot", "worse_taint",
+    "counts_agree", "create_snapshot", "entities_for_memory", "entities_for_memories", "entity_match_ids", "evaluate_items", "extract_entities", "feedback_memory", "get_memory", "init_db", "link_memory_entities", "list_memory", "list_snapshots",
+    "load_gold", "main", "migrate", "nonnegative_int", "now_iso", "organize", "promote_memory", "recall_memory",
+    "recent_memory", "rekey_namespace", "relink_memory", "stats", "supersede_memory", "tune_weights", "update_memory", "validate_taint", "verify_snapshot", "worse_taint",
 ]
 
 

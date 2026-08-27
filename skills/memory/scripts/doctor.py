@@ -1343,6 +1343,96 @@ def _check_link_tables(resolved_store: Path) -> dict:
     )
 
 
+def _check_voyager_counters(resolved_store: Path) -> dict:
+    """Confirm the v12 usage-feedback counters exist and hold sane values
+    (issue #64).
+
+    Read-only probe of meta.schema_version + PRAGMA table_info(memory) +
+    MIN/MAX, same shape as _check_link_tables. Pass when both columns exist
+    and every applied_count/violated_count is a non-negative integer (the
+    writers only ever increment, so a negative value means a hand-edited
+    store). Warn when the columns are missing — on a pre-v12 store a writable
+    store.py run migrates them in, and the migration writes the ALTERs and
+    the version bump in ONE transaction, so a v12-tagged store cannot
+    actually lack the columns through any shipped code path (a fail branch
+    would be unreachable); warn (not fail) on negative or non-integer values,
+    for the same recoverability reasoning. Skip when the store is
+    absent/unreadable (already flagged by store-access). Never writes.
+    """
+    conn = _open_store_ro(resolved_store)
+    if conn is None:
+        return _check(
+            "voyager-counters", "skip",
+            "Store not available; skipped usage-counter check.",
+        )
+    try:
+        expected = ["applied_count", "violated_count"]
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        try:
+            store_version = int(row[0]) if row else 0
+        except (TypeError, ValueError):
+            store_version = 0
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
+        missing = [c for c in expected if c not in cols]
+        if missing:
+            # Missing structure is always recoverable (a writable store.py run
+            # creates the table / migrates the columns in), so doctor WARNS —
+            # the same severity _check_link_tables uses for a missing
+            # memory_link table. The migration writes the ALTERs and the
+            # version bump in one transaction, so a v12-tagged store with a
+            # real memory table cannot actually lack the columns through any
+            # shipped code path; no separate fail branch is needed.
+            return _check(
+                "voyager-counters", "warn",
+                "memory is missing the v12 usage counters "
+                f"({', '.join(missing)}); a writable store.py run will add "
+                "them via migration (issue #64).",
+                missing=missing, expected=expected, schema_version=store_version,
+            )
+        lo_applied, hi_applied, lo_violated, hi_violated = conn.execute(
+            "SELECT MIN(applied_count), MAX(applied_count), "
+            "MIN(violated_count), MAX(violated_count) FROM memory"
+        ).fetchone()
+    except Exception as exc:
+        return _check(
+            "voyager-counters", "warn",
+            f"Could not inspect usage counters: {type(exc).__name__}: {exc}",
+        )
+    finally:
+        conn.close()
+    # SQLite's dynamic typing lets a hand-edited INTEGER column hold TEXT:
+    # guard the comparison so a weird value degrades to the warn below
+    # instead of raising TypeError mid-report (doctor must never crash).
+    extremes = (lo_applied, hi_applied, lo_violated, hi_violated)
+    if any(v is not None and not isinstance(v, int) for v in extremes):
+        return _check(
+            "voyager-counters", "warn",
+            "non-integer usage counter value(s) — writes only ever store "
+            "integers, so this store was hand-edited; inspect with "
+            "`store.py get --json`.",
+            applied_min=lo_applied, applied_max=hi_applied,
+            violated_min=lo_violated, violated_max=hi_violated,
+        )
+    mins = (lo_applied, lo_violated)
+    if any(m is not None and m < 0 for m in mins):
+        return _check(
+            "voyager-counters", "warn",
+            f"negative usage counter value(s) (applied_min={lo_applied}, "
+            f"violated_min={lo_violated}) — writes only increment, so this "
+            "store was hand-edited; inspect with `store.py get --json`.",
+            applied_min=lo_applied, violated_min=lo_violated,
+        )
+    return _check(
+        "voyager-counters", "pass",
+        f"usage counters present and sane (applied_max={hi_applied}, "
+        f"violated_max={hi_violated}); written only by "
+        "`store.py feedback` — hooks never advance them.",
+        applied_max=hi_applied, violated_max=hi_violated,
+    )
+
+
 # Tier-0 size guard thresholds (issue #49 C). core.md is injected into EVERY
 # session on EVERY hook host, so an overgrown file silently eats context
 # budget and dilutes instruction-following (~150-200 reliably-handled
@@ -1976,6 +2066,8 @@ def build_report(project: Path, repo_root: Path) -> dict:
     checks.append(_check_entity_tables(resolved_store))
     # v11 (issue #61, 6.1): link surface + trust range probe.
     checks.append(_check_link_tables(resolved_store))
+    # v12 (issue #64): usage-feedback counters probe.
+    checks.append(_check_voyager_counters(resolved_store))
     checks.append(_check_claude_native_memory(Path.home()))
     checks.append(_check_session_retention(Path.home()))
     checks.extend(_check_codex_memory_and_trust(Path.home(), project, repo_root))

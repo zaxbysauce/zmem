@@ -33,7 +33,8 @@ from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import reembed_embeddings
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl
-from storelib.write import CapturePolicyRefusal, ContentTooLarge, add_memory, rekey_namespace, supersede_memory, update_memory
+from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory
+from storelib.tune import tune_weights
 
 def nonnegative_int(value: str) -> int:
     """argparse type= for flags fed straight into a SQL LIMIT: SQLite treats a
@@ -42,6 +43,16 @@ def nonnegative_int(value: str) -> int:
     n = int(value)
     if n < 0:
         raise argparse.ArgumentTypeError(f"must be a non-negative integer, got {value!r}")
+    return n
+
+
+def positive_int(value: str) -> int:
+    """argparse type= for top-k cuts: k must be >= 1 (k=0 would make
+    tune-weights evaluate an empty result set and report all-miss metrics as
+    a successful run)."""
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
     return n
 
 def _iso8601(value: str) -> str:
@@ -388,6 +399,46 @@ def main():
     p_promote.add_argument("--install-approved", action="store_true",
                            help="explicitly install the generated SKILL.md into the live "
                                 "skills dirs after writing the review candidate")
+
+    # v12 (issue #64, 9.4): explicit usage-feedback CLI. The ONLY writer of
+    # applied_count / violated_count anywhere in the codebase — hooks,
+    # --no-bump recall, PreCompact, and Hermes prefetch never touch them.
+    p_feedback = sub.add_parser(
+        "feedback",
+        help="record explicit usage feedback on one memory (Voyager counters; "
+             "feeds the promote ladder)")
+    p_feedback.add_argument("--id", required=True,
+                            help="UUID of the memory the feedback is about")
+    p_feedback_group = p_feedback.add_mutually_exclusive_group(required=True)
+    p_feedback_group.add_argument("--applied", action="store_true",
+                                  help="the memory helped: increments applied_count. "
+                                       "applied_count >= 3 with violated_count == 0 makes a "
+                                       "lesson promote-eligible (see `promote --dry-run`).")
+    p_feedback_group.add_argument("--violated", action="store_true",
+                                  help="the memory misled: increments violated_count. The "
+                                       "2nd violation applies a ONE-TIME -0.15 trust_score "
+                                       "drop (signal is never changed); any violation makes "
+                                       "the row promote-ineligible.")
+
+    # v12 (issue #64, 9.6): offline weight tuning. Dry-run ONLY — suggested
+    # W_* weights are computed in memory from the gold set; nothing is ever
+    # written. Applying weights is a documented manual edit of the W_* module
+    # constants in storelib/recall.py (SKILL.md §tune-weights).
+    p_tune = sub.add_parser(
+        "tune-weights",
+        help="suggest recall scoring weights from a gold set (dry-run only; "
+             "writes nothing)")
+    p_tune.add_argument("--dry-run", action="store_true",
+                        help="REQUIRED (the command is analysis-only): evaluate the "
+                             "current weights and a deterministic hill-climb over "
+                             "candidate weights against the gold set")
+    p_tune.add_argument("--gold", required=True,
+                        help="path to the gold JSONL (build one with "
+                             "scripts/eval_adapters.py, or use eval/gold.jsonl against "
+                             "a fixture-built store — never the operator home store)")
+    p_tune.add_argument("--k", type=positive_int, default=5,
+                        help="top-k cut for hit@k (default 5; applied to gold "
+                             "items that do not set their own 'k')")
 
     p_rekey = sub.add_parser(
         "rekey-namespace",
@@ -816,6 +867,9 @@ def main():
     writer_lease = None
     if (
         args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl"}
+        # v12 (issue #64, 9.4): feedback is a write surface — it takes the
+        # lease so it serializes against restore/backup like every writer.
+        or args.cmd == "feedback"
         # Issue #63, 8.3: reembed takes the writer lease ONLY when it can
         # write. --dry-run is read-only by contract and must never block on —
         # or be blocked as — a writer.
@@ -1173,6 +1227,31 @@ def main():
                                 install_approved=args.install_approved)
             if rc:
                 sys.exit(rc)
+        elif args.cmd == "feedback":
+            # v12 (issue #64, 9.4): FeedbackTargetError (unknown/tombstoned id)
+            # is an operational refusal -> exit 1, stable stderr message (the
+            # `get` convention). argparse's mutually-exclusive required group
+            # already refuses both/neither flags and a missing --id with exit 2.
+            try:
+                result = feedback_memory(conn, memory_id=args.id,
+                                         verdict="applied" if args.applied else "violated")
+            except FeedbackTargetError as exc:
+                print(f"[zmem] {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(json.dumps(result, ensure_ascii=False))
+        elif args.cmd == "tune-weights":
+            # v12 (issue #64, 9.6): dry-run only. A missing --dry-run is a
+            # usage refusal (exit 2) — it keeps the door visibly closed on an
+            # untested apply path; applying weights is a documented manual
+            # edit of storelib/recall.py's W_* constants (SKILL.md).
+            if not args.dry_run:
+                print("[zmem] tune-weights: only --dry-run is implemented; the "
+                      "evaluation is read-only. Applying suggested weights is "
+                      "a manual edit of the W_* constants in "
+                      "skills/memory/scripts/storelib/recall.py (see SKILL.md "
+                      "§tune-weights).", file=sys.stderr)
+                sys.exit(2)
+            sys.exit(tune_weights(conn, gold_path=args.gold, k=args.k))
         elif args.cmd == "export-pack":
             rc = cmd_export_pack(
                 conn, namespace=args.namespace, out=args.out,

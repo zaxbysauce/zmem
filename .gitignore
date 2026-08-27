@@ -41,3 +41,10 @@ skills/memory/models/*.part
 # never read by repo code, and its keys embed absolute home paths)
 graphify-out/
 .tmp-tests/
+
+# Offline eval scratch (issue #64): CI builds the eval corpus store + report
+# here; the report is uploaded as a workflow artifact, never committed.
+.eval-tmp/
+
+# Session scratch (isolated test stores / probe scripts) — never committed.
+/tmp/
