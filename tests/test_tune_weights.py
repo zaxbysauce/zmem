@@ -196,10 +196,13 @@ class TuneSourceAndGlobalsTest(unittest.TestCase):
 
         sys.path.insert(0, str(SCRIPTS_DIR))
         self.addClassCleanup(sys.path.remove, str(SCRIPTS_DIR))
-        os.environ["ZMEM_STORE"] = os.path.join(tmp, "import-only.sqlite")
-        os.environ["ZMEM_EMBED_PROFILE"] = "fake"
-        os.environ["ZMEM_TEST_NOW"] = EVAL_PIN_TS
-        self.addClassCleanup(os.environ.pop, "ZMEM_STORE", None)
+        # Every mutated env key gets a cleanup — a leak here would flip
+        # recall/embed behavior for any test running later in the process.
+        for key, val in (("ZMEM_STORE", os.path.join(tmp, "import-only.sqlite")),
+                         ("ZMEM_EMBED_PROFILE", "fake"),
+                         ("ZMEM_TEST_NOW", EVAL_PIN_TS)):
+            os.environ[key] = val
+            self.addCleanup(os.environ.pop, key, None)
         for mod in ("storelib", "storelib.schema", "storelib.recall",
                     "storelib.tune", "storelib.eval_gold"):
             sys.modules.pop(mod, None)
@@ -220,6 +223,36 @@ class TuneSourceAndGlobalsTest(unittest.TestCase):
         finally:
             for mod in ("storelib", "storelib.schema", "storelib.recall",
                         "storelib.tune", "storelib.eval_gold"):
+                sys.modules.pop(mod, None)
+
+    def test_compute_score_weights_override_is_honored(self):
+        """The `weights` parameter is the entire mechanism tune-weights uses
+        to evaluate candidates — pin that a non-default dict actually changes
+        the composite score at the compute_score unit level (PRR-029)."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        self.addClassCleanup(sys.path.remove, str(SCRIPTS_DIR))
+        os.environ["ZMEM_STORE"] = os.path.join(
+            tempfile.mkdtemp(prefix="zmem-tune-w-"), "import-only.sqlite")
+        self.addCleanup(os.environ.pop, "ZMEM_STORE", None)
+        for mod in ("storelib", "storelib.recall"):
+            sys.modules.pop(mod, None)
+        try:
+            import storelib.recall as recall_mod
+            row = {"confidence": 0.9, "retrieval_count": 0,
+                   "surfaced_count": 0, "ingestion_ts": "2026-01-01T00:00:00Z"}
+            now = 1788000000.0
+            default = recall_mod.compute_score(row, None, now, vec_sim=0.5)
+            pure_confidence = recall_mod.compute_score(
+                row, None, now, vec_sim=0.5,
+                weights={"bm25": 0.0, "confidence": 1.0,
+                         "recency": 0.0, "popularity": 0.0})
+            # confidence weight 1.0 => the score is exactly row confidence
+            # (0.9); the default path blends bm25+recency+popularity in, so a
+            # broken override (ignored dict) would return the blend instead.
+            self.assertAlmostEqual(pure_confidence, 0.9, places=6)
+            self.assertNotEqual(default, pure_confidence)
+        finally:
+            for mod in ("storelib", "storelib.recall"):
                 sys.modules.pop(mod, None)
 
 

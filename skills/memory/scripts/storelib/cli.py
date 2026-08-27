@@ -45,6 +45,16 @@ def nonnegative_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"must be a non-negative integer, got {value!r}")
     return n
 
+
+def positive_int(value: str) -> int:
+    """argparse type= for top-k cuts: k must be >= 1 (k=0 would make
+    tune-weights evaluate an empty result set and report all-miss metrics as
+    a successful run)."""
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+    return n
+
 def _iso8601(value: str) -> str:
     """argparse type= for --as-of (issue #58, 3.6): accept an ISO-8601
     timestamp, validate strictly (garbage → argparse error), and return the
@@ -426,8 +436,9 @@ def main():
                         help="path to the gold JSONL (build one with "
                              "scripts/eval_adapters.py, or use eval/gold.jsonl against "
                              "a fixture-built store — never the operator home store)")
-    p_tune.add_argument("--k", type=nonnegative_int, default=5,
-                        help="top-k cut for hit@k (default 5)")
+    p_tune.add_argument("--k", type=positive_int, default=5,
+                        help="top-k cut for hit@k (default 5; applied to gold "
+                             "items that do not set their own 'k')")
 
     p_rekey = sub.add_parser(
         "rekey-namespace",
@@ -1234,9 +1245,9 @@ def main():
             # untested apply path; applying weights is a documented manual
             # edit of storelib/recall.py's W_* constants (SKILL.md).
             if not args.dry_run:
-                print("[zmem] tune-weights: only --dry-run is implemented; it "
-                      "writes nothing. Applying suggested weights is a manual "
-                      "edit of the W_* constants in "
+                print("[zmem] tune-weights: only --dry-run is implemented; the "
+                      "evaluation is read-only. Applying suggested weights is "
+                      "a manual edit of the W_* constants in "
                       "skills/memory/scripts/storelib/recall.py (see SKILL.md "
                       "§tune-weights).", file=sys.stderr)
                 sys.exit(2)

@@ -881,7 +881,16 @@ def _find_semantic_duplicate(
 def _merge_on_dedup(
     conn: sqlite3.Connection, mid: str, new_confidence: float, new_signal: str, new_tags: str
 ) -> None:
-    """Merge a re-observed memory: upgrade confidence/signal/tags if stronger."""
+    """Merge a re-observed memory: upgrade confidence/signal/tags if stronger.
+
+    v12 (issue #64): the usage-feedback counters (applied_count/violated_count)
+    are deliberately NOT merged — the KEEPER keeps its own feedback history.
+    A re-observation is exposure of the same memory, not new usage evidence:
+    the observer never applied/violated anything, so importing the incoming
+    row's counters (or max-ing them) would fabricate ladder eligibility for
+    feedback that was never given. Same policy as the write-time dedup path:
+    counters move only through the explicit `feedback` CLI.
+    """
     row = conn.execute(
         "SELECT confidence, signal, tags FROM memory WHERE id=?", (mid,)
     ).fetchone()
@@ -1237,7 +1246,9 @@ def feedback_memory(conn: sqlite3.Connection, *, memory_id: str,
       delta. Later violations do not re-drop; `signal` is NEVER changed
       (feedback is a usage signal, not a provenance change). A manual-SQL jump
       from 1 to 3 does not fire the drop — counters are CLI-driven by contract.
-    - Ingest restores counters verbatim and never re-applies the drop.
+    - Ingest restores counters verbatim on the INSERT path (a dedup merge
+      keeps the KEEPER's own counters — see _merge_on_dedup) and never
+      re-applies the drop.
 
     Transaction contract: feedback_memory opens its own transaction ONLY when
     none is open (the CLI dispatch path — no caller may wrap it in an outer

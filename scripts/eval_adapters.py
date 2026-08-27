@@ -55,17 +55,22 @@ def convert_longmemeval(path: str, max_items: int | None) -> list[dict]:
             if not line:
                 continue
             obj = json.loads(line)
+            if not isinstance(obj, dict):
+                raise ValueError(
+                    f"{path}:{lineno}: longmemeval row must be a JSON object, "
+                    f"got {type(obj).__name__}")
             question = obj.get("question") or obj.get("query") or ""
             answer = obj.get("answer") or obj.get("expected_answer") or ""
             if not question or not answer:
                 raise ValueError(
                     f"{path}:{lineno}: longmemeval row needs "
                     "'question'+'answer' (or query/expected_answer)")
-            item_id = str(obj.get("question_id") or obj.get("id")
-                          or f"longmemeval-{lineno}")
-            items.append(_gold_item(f"longmemeval-{item_id}", question,
-                                    answer, _LONGMEMEVAL_NS))
-            if max_items and len(items) >= max_items:
+            # Single prefix, whatever the source provided: a corpus id that
+            # already carries "longmemeval-" must not get it twice.
+            raw_id = obj.get("question_id") or obj.get("id")
+            item_id = f"longmemeval-{raw_id}" if raw_id else f"longmemeval-{lineno}"
+            items.append(_gold_item(item_id, question, answer, _LONGMEMEVAL_NS))
+            if max_items is not None and len(items) >= max_items:
                 break
     return items
 
@@ -84,8 +89,20 @@ def convert_locomo(path: str, max_items: int | None) -> list[dict]:
         raise ValueError(f"{path}: locomo corpus must be a list of conversations")
     items = []
     for conv_i, conv in enumerate(data, start=1):
+        if not isinstance(conv, dict):
+            raise ValueError(
+                f"{path}: locomo conversation {conv_i} must be an object, "
+                f"got {type(conv).__name__}")
         turns = conv.get("conversation") or conv.get("turns") or []
+        if not isinstance(turns, list):
+            raise ValueError(
+                f"{path}: locomo conversation {conv_i} 'conversation' field "
+                f"must be a list, got {type(turns).__name__}")
         for turn_i, turn in enumerate(turns, start=1):
+            if not isinstance(turn, dict):
+                raise ValueError(
+                    f"{path}: locomo c{conv_i} turn {turn_i} must be an "
+                    f"object, got {type(turn).__name__}")
             speaker = turn.get("speaker") or turn.get("role") or "speaker"
             text = turn.get("text") or turn.get("content") or ""
             if not text:
@@ -96,7 +113,7 @@ def convert_locomo(path: str, max_items: int | None) -> list[dict]:
                 text,
                 _LOCOMO_NS,
             ))
-            if max_items and len(items) >= max_items:
+            if max_items is not None and len(items) >= max_items:
                 return items
     return items
 
@@ -120,8 +137,12 @@ def main() -> int:
     ap.add_argument("--out", required=True,
                     help="path of the converted gold JSONL to write")
     ap.add_argument("--max-items", type=int, default=None,
-                    help="optional cap on converted items")
+                    help="optional cap on converted items (must be >= 1 when "
+                         "given)")
     args = ap.parse_args()
+
+    if args.max_items is not None and args.max_items < 1:
+        ap.error(f"--max-items must be a positive integer, got {args.max_items}")
 
     src = Path(args.input)
     if not src.is_file():
@@ -130,9 +151,26 @@ def main() -> int:
 
     try:
         items = ADAPTERS[args.adapter](str(src), args.max_items)
-    except (ValueError, json.JSONDecodeError) as exc:
+    except (ValueError, json.JSONDecodeError, RecursionError) as exc:
+        # RecursionError (deeply-nested hostile JSON) and decode errors are
+        # operational conversion failures; RecursionError is a RuntimeError,
+        # not a ValueError, so it must be listed explicitly.
         print(f"[eval] adapter {args.adapter}: cannot convert {args.input}: "
               f"{exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        # The skip-if-missing contract covers unreadable corpora too: an
+        # on-disk path that cannot be opened (permissions, share violation)
+        # is the same operator situation as a corpus that was never fetched.
+        print(f"skipped: {args.adapter} corpus not readable at {args.input} "
+              f"({exc})")
+        return 0
+
+    if not items:
+        # An empty gold file would be reported as success here and then
+        # rejected by the runner's loader — refuse it at the source instead.
+        print(f"[eval] adapter {args.adapter}: {args.input} produced no "
+              f"convertible items", file=sys.stderr)
         return 2
 
     out = Path(args.out)

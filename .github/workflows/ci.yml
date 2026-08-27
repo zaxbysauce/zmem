@@ -94,6 +94,9 @@ jobs:
           if-no-files-found: warn
 
       - name: Run Node test suites
+        # always(): the eval step above can fail operationally (exit 2) — a
+        # JS-coverage blackout on one matrix leg must not be its side effect.
+        if: always()
         shell: bash
         run: |
           set -e

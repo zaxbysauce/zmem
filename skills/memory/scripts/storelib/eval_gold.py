@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 # The six issue-mandated fixture buckets + "adapter" (the output bucket of
@@ -45,7 +46,7 @@ class GoldItem:
     query: str
     namespace: str | None = None
     as_of: str | None = None
-    k: int = 5
+    k: int | None = None
     must_include_ids: list[str] = field(default_factory=list)
     must_exclude_ids: list[str] = field(default_factory=list)
     must_include_text: str | None = None
@@ -68,7 +69,11 @@ def load_gold(path: str) -> list[GoldItem]:
             continue  # blank lines are structural noise, not items
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
+            # RecursionError: a deeply-nested hostile row must fail closed
+            # with the item line, not escape as a traceback (it is a
+            # RuntimeError, not a ValueError, so it would bypass a plain
+            # JSONDecodeError handler).
             raise GoldError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
         if not isinstance(obj, dict):
             raise GoldError(f"{path}:{lineno}: gold item must be a JSON object")
@@ -106,10 +111,6 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
                         ("must_exclude_ids", exclude_ids)):
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise GoldError(f"field '{name}' must be a list of strings")
-    if include_ids is None:
-        include_ids = []
-    if exclude_ids is None:
-        exclude_ids = []
     overlap = sorted(set(include_ids) & set(exclude_ids))
     if overlap:
         raise GoldError(
@@ -126,11 +127,25 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
         raise GoldError("field 'namespace' must be a string")
     as_of = obj.get("as_of")
     if as_of is not None:
+        # Fail closed on unparseable timestamps: recall's _normalize_as_of
+        # returns unparseable strings UNCHANGED (degrade-don't-raise on the
+        # hot path), which here would silently mis-filter the eval. An
+        # unparseable as_of is a broken gold item, not degraded data.
         if not isinstance(as_of, str) or not as_of.strip():
             raise GoldError("field 'as_of' must be a non-empty ISO-8601 string")
-    k = obj.get("k", 5)
-    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
-        raise GoldError("field 'k' must be a positive integer")
+        try:
+            datetime.fromisoformat(as_of.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise GoldError(
+                f"field 'as_of' must be parseable ISO-8601, got {as_of!r}: {exc}"
+            ) from exc
+    # Per-item top-k cut; None = inherit the caller's k_default (the CLI
+    # --k). Deliberately NOT defaulted to 5 here — a hardcoded default would
+    # make the runner's/tuner's --k a silent no-op for every item that omits
+    # the field (PR-review PRR-009).
+    k = obj.get("k")
+    if k is not None and (isinstance(k, bool) or not isinstance(k, int) or k < 1):
+        raise GoldError("field 'k' must be a positive integer when present")
     return GoldItem(
         id=item_id,
         bucket=bucket,
@@ -175,7 +190,7 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
 
     per_item: list[dict] = []
     for item in items:
-        k = item.k or k_default
+        k = item.k if item.k is not None else k_default
         # recall_memory prints its CLI surface (fences or JSON) regardless of
         # as_json — the runner's stdout is reserved for the JSON report, so
         # the per-query prints are captured and discarded. no_bump supplies

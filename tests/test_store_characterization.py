@@ -396,6 +396,33 @@ class CharacterizationTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self._assert_sha("export-jsonl", _sha(_norm(r.stdout)), DATA_SHA["export_jsonl"])
 
+    def test_export_drift_is_exactly_the_v12_counter_keys(self):
+        """Encodes the v12 re-capture claim (previously comment-only): the
+        v12 export must differ from the v11 freeze by EXACTLY the two new
+        row keys. Stripping applied_count/violated_count from the live
+        export and re-serializing must reproduce the v11 freeze hash
+        byte-for-byte — any OTHER change to the export surface fails here
+        with a precise cause, not just a hash mismatch."""
+        r = _run_cli(self.env, "export-jsonl")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = r.stdout.replace("\r\n", "\n")
+        stripped = []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            obj = dict(json.loads(line))
+            obj.pop("applied_count", None)
+            obj.pop("violated_count", None)
+            stripped.append(json.dumps(obj, ensure_ascii=False))
+        stripped_hash = hashlib.sha256(
+            ("\n".join(stripped) + "\n").encode("utf-8")).hexdigest()
+        self.assertEqual(
+            stripped_hash,
+            "2239fcd95efc4e2e6c86f8e742e4715814283a36db253d8bbeb0333907550399",
+            "export-jsonl drifted beyond the two v12 counter keys: stripping "
+            "applied_count/violated_count no longer reproduces the v11 "
+            "freeze — update the freeze comment AND this assertion together")
+
 
 if __name__ == "__main__":
     if RECORD:

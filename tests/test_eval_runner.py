@@ -176,6 +176,13 @@ class TestRunnerRefusals(EvalRunnerTestBase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("fail-under", r.stderr)
 
+    def test_fail_under_pass_exits_0(self):
+        # Symmetric case: a reachable threshold that the corpus MEETS must
+        # stay exit 0 (guards against the breach branch firing on every run).
+        r = self._run("--store", self.store, "--gold", str(GOLD),
+                      "--fail-under", "0.99")
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+
 
 class TestGoldSetShape(unittest.TestCase):
     def test_committed_gold_is_valid_and_covers_six_buckets(self):

@@ -304,8 +304,11 @@ def _seed_asof_rows(store: str) -> None:
     guidance with no secret/injection shape."""
     sys.path.insert(0, str(SCRIPTS_DIR))
     import embed_profiles as _profiles  # noqa: E402
-    profile = _profiles.resolve_active_profile()
-    model_name = _profiles.embedding_model_name(profile)
+    # Hard-code the fake profile's model label: resolve_active_profile()
+    # would read the AMBIENT env, so a caller without ZMEM_EMBED_PROFILE
+    # exported could label fake 16-dim vectors as "minilm-onnx". The builder
+    # contract is fake everywhere (see BASE_ENV); this pins the label too.
+    model_name = _profiles.embedding_model_name("fake")
     rows = _asof_rows()
     conn = sqlite3.connect(store)
     # The vec0 virtual table only exists/accepts inserts with the sqlite-vec

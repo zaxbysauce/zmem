@@ -2298,6 +2298,34 @@ class VoyagerCounterSyncTest(_TwoStoreCase):
                     self.assertEqual(n, 0,
                                      f"{field}={bad!r} row must NOT be stored")
 
+    def test_dedup_keeps_keeper_counters_discards_incoming(self):
+        """Documented dedup semantics (issue #64): a dedup merge keeps the
+        KEEPER's own feedback history and discards the incoming row's
+        counters — a re-observation is exposure, not new usage evidence, so
+        it must never fabricate promote-ladder eligibility (and re-ingest
+        stays idempotent)."""
+        a_row = self.a.add("project:voyager", "the dedup counter anchor row")
+        for _ in range(2):
+            r = self.a.run("feedback", "--id", a_row, "--applied")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        b_row = self.b.add("project:voyager", "the dedup counter anchor row")
+        for _ in range(5):
+            r = self.b.run("feedback", "--id", b_row, "--applied")
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+        out = os.path.join(self.a.tmp, "dedup.jsonl")
+        self.a.run("export-jsonl", "--out", out)
+        r = self.b.run("ingest-jsonl", "--in", out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("deduped=1", r.stdout, r.stdout)
+        # The local keeper keeps ITS OWN counters (5 applied); the incoming
+        # row's (2 applied) are discarded, not merged or max-ed.
+        self.assertEqual(
+            self.b.query_one(
+                "SELECT applied_count, violated_count FROM memory WHERE id=?",
+                (b_row,)),
+            (5, 0))
+
     def test_ingest_never_applies_violation_trust_drop(self):
         """The v11 invariant extends to v12: the −0.15 violation drop is a
         `feedback`-time event; ingest restores the counters verbatim without

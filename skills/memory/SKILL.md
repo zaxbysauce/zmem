@@ -487,13 +487,15 @@ python <store.py> tune-weights --dry-run --gold eval/gold.jsonl [--k 5]
 Evaluates the shipped composite weights (W_BM25/W_CONFIDENCE/W_RECENCY/
 W_POPULARITY) against a gold set, hill-climbs a small deterministic candidate
 set, and prints JSON with `current` and `suggested` weight vectors (always
-summing to 1.0) plus the metrics each achieves. It WRITES NOTHING — there is
-deliberately no `--apply`. Applying a suggestion is a MANUAL edit of the W_*
+summing to 1.0) plus the metrics each achieves. The evaluation is read-only
+and it WRITES NOTHING — there is deliberately no `--apply` (the store must
+already be at the current schema: opening any store.py subcommand migrates
+it, as always). Applying a suggestion is a MANUAL edit of the W_*
 constants at the top of `skills/memory/scripts/storelib/recall.py`, keeping
 the sum at 1.0. Uses the CURRENT store (env-resolved like every subcommand —
 in tests/CI that is a fixture store via `ZMEM_STORE`, never the operator
 store). Exit 0 even when the current weights already win; 2 on an invalid
-gold set or a missing `--dry-run`.
+gold set, a missing `--dry-run`, or an evaluation failure.
 
 ### consolidate — merge near-duplicate memories
 ```

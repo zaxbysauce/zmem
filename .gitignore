@@ -47,4 +47,4 @@ graphify-out/
 .eval-tmp/
 
 # Session scratch (isolated test stores / probe scripts) — never committed.
-tmp/
+/tmp/

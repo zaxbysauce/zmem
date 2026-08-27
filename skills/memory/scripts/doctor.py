@@ -1351,12 +1351,13 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
     MIN/MAX, same shape as _check_link_tables. Pass when both columns exist
     and every applied_count/violated_count is a non-negative integer (the
     writers only ever increment, so a negative value means a hand-edited
-    store). Warn when the columns are missing on a pre-v12 store (a writable
-    store.py run migrates them in) and FAIL when schema_version is already 12
-    but a column is absent — that is a migration regression, not a legacy
-    store. Warn (not fail) on negative values: recall/export still work; the
-    promote ladder reads them. Skip when the store is absent/unreadable
-    (already flagged by store-access). Never writes.
+    store). Warn when the columns are missing — on a pre-v12 store a writable
+    store.py run migrates them in, and the migration writes the ALTERs and
+    the version bump in ONE transaction, so a v12-tagged store cannot
+    actually lack the columns through any shipped code path (a fail branch
+    would be unreachable); warn (not fail) on negative or non-integer values,
+    for the same recoverability reasoning. Skip when the store is
+    absent/unreadable (already flagged by store-access). Never writes.
     """
     conn = _open_store_ro(resolved_store)
     if conn is None:
@@ -1401,6 +1402,19 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
         )
     finally:
         conn.close()
+    # SQLite's dynamic typing lets a hand-edited INTEGER column hold TEXT:
+    # guard the comparison so a weird value degrades to the warn below
+    # instead of raising TypeError mid-report (doctor must never crash).
+    extremes = (lo_applied, hi_applied, lo_violated, hi_violated)
+    if any(v is not None and not isinstance(v, int) for v in extremes):
+        return _check(
+            "voyager-counters", "warn",
+            "non-integer usage counter value(s) — writes only ever store "
+            "integers, so this store was hand-edited; inspect with "
+            "`store.py get --json`.",
+            applied_min=lo_applied, applied_max=hi_applied,
+            violated_min=lo_violated, violated_max=hi_violated,
+        )
     mins = (lo_applied, lo_violated)
     if any(m is not None and m < 0 for m in mins):
         return _check(

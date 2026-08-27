@@ -142,6 +142,17 @@ class TestFeedbackCLI(FeedbackTestBase):
         r = self._run("feedback", "--id", self.memory_id, "--applied")
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("no live memory", r.stderr)
+        # Feedback on a dead row must be a full no-op: the tombstoned row's
+        # counters stay exactly as they were at supersede time (never
+        # silently incremented by a refused write).
+        conn = sqlite3.connect(self.store)
+        try:
+            row = conn.execute(
+                "SELECT applied_count, violated_count FROM memory WHERE id=?",
+                (self.memory_id,)).fetchone()
+            self.assertEqual((row[0], row[1]), (0, 0))
+        finally:
+            conn.close()
 
     def _assert_untouched(self):
         row = self._row()
@@ -245,6 +256,9 @@ class TestHookSourceScan(unittest.TestCase):
         surfaces += list((REPO_ROOT / "hooks").rglob("*.js"))
         surfaces += list((REPO_ROOT / "hooks").rglob("*.mjs"))
         surfaces += list((REPO_ROOT / "hooks").rglob("*.cjs"))
+        # Hook CONFIG files are executable surfaces too: a feedback dispatch
+        # can be wired entirely inside a JSON hook definition.
+        surfaces += list((REPO_ROOT / "hooks").rglob("*.json"))
         surfaces += [REPO_ROOT / "hermes-plugin" / "__init__.py"]
         surfaces += list((REPO_ROOT / "hermes-plugin" / "server").rglob("*.py"))
         offenders = []
@@ -263,6 +277,94 @@ class TestHookSourceScan(unittest.TestCase):
         self.assertEqual(offenders, [],
                          "passive surfaces must never touch the Voyager "
                          f"counters: {offenders}")
+
+
+class MigrationV12Test(unittest.TestCase):
+    """v11 -> v12 migration on a POPULATED store (issue #64).
+
+    Each schema bump carries a populated-legacy test (v8->v9 in
+    test_update_invalidate, v9->v10 in test_entity, v10->v11 in
+    test_memory_links). v12 is the simplest bump — two probe-guarded
+    ADD COLUMN DEFAULT 0, no backfill, no side effects — and this pins
+    exactly that: rows preserved, version bumped, counters read 0, and a
+    re-open is idempotent.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-v12mig-")
+        self.store = os.path.join(self.tmp, "store.sqlite")
+        self.env = {**os.environ, "ZMEM_STORE": self.store}
+        for k in ("ZMEM_DATA", "ZMEM_BACKUP_DIR"):
+            self.env.pop(k, None)
+        # Hand-plant a v11-era store: no counter columns, populated rows.
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.executescript("""
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES ('schema_version', '11');
+                CREATE TABLE memory(
+                    id TEXT PRIMARY KEY, namespace TEXT NOT NULL,
+                    type TEXT NOT NULL, content TEXT NOT NULL,
+                    superseded_at TEXT, ingestion_ts TEXT NOT NULL);
+                INSERT INTO memory(id, namespace, type, content,
+                                   superseded_at, ingestion_ts) VALUES
+                    ('aaaaaaaa-0000-4000-8000-000000000001',
+                     'project:mig', 'fact', 'v11 row one', NULL, '2026-01-01T00:00:00Z'),
+                    ('aaaaaaaa-0000-4000-8000-000000000002',
+                     'project:mig', 'fact', 'v11 row two', NULL, '2026-01-02T00:00:00Z');
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def tearDown(self):
+        try:
+            os.remove(self.store)
+        except OSError:
+            pass
+
+    def test_populated_v11_store_migrates_to_v12_losslessly(self):
+        # A writable subcommand is the migration trigger (the real flow).
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), "get", "--id",
+             "aaaaaaaa-0000-4000-8000-000000000001"],
+            env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        row = json.loads(r.stdout)
+        self.assertEqual(row["applied_count"], 0)
+        self.assertEqual(row["violated_count"], 0)
+        self.assertIn("v11 row one", row["content"])
+
+        conn = sqlite3.connect(self.store)
+        try:
+            ver = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+            n = conn.execute("SELECT count(*) FROM memory").fetchone()[0]
+            cols = {c[1] for c in conn.execute("PRAGMA table_info(memory)")}
+            mins = conn.execute(
+                "SELECT MIN(applied_count), MIN(violated_count), "
+                "MAX(applied_count) FROM memory").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(ver, "12")
+        self.assertEqual(n, 2, "no rows may be lost in migration")
+        self.assertIn("applied_count", cols)
+        self.assertIn("violated_count", cols)
+        self.assertEqual(mins, (0, 0, 0), "counters default to 0 on migrate")
+
+        # Second writable run is an idempotent no-op (version stays 12).
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), "get", "--id",
+             "aaaaaaaa-0000-4000-8000-000000000002"],
+            env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn = sqlite3.connect(self.store)
+        try:
+            ver = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(ver, "12")
 
 
 class TestFeedbackSync(FeedbackTestBase):

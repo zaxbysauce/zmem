@@ -4,9 +4,11 @@
 composite weights (W_BM25/W_CONFIDENCE/W_RECENCY/W_POPULARITY in
 storelib/recall.py) against a gold set, then runs a small deterministic
 hill-climb over candidate weight vectors that always sum to 1.0, and prints
-the suggestion as JSON on stdout. It WRITES NOTHING — not the store, not the
-weights (there is no --apply; applying weights is a documented manual edit of
-the W_* module constants, SKILL.md §tune-weights).
+the suggestion as JSON on stdout. The evaluation is read-only — no weights
+are written (there is no --apply; applying weights is a documented manual
+edit of the W_* module constants, SKILL.md §tune-weights). Opening the store
+runs the standard per-subcommand migration, so a pre-v12 store is migrated
+first like for every store.py command.
 
 Candidate weights are passed to evaluate_items/recall_memory's internal
 ``weights`` keyword (compute_score override) instead of mutating module
@@ -55,8 +57,9 @@ def _objective(metrics: dict) -> float:
 
 def tune_weights(conn: sqlite3.Connection, *, gold_path: str, k: int = 5) -> int:
     """CLI body for `tune-weights --dry-run`. Returns the process exit code:
-    0 on a completed analysis, 2 on an invalid gold set (operational refusal;
-    low scores are data, not failures — the run still exits 0 and reports)."""
+    0 on a completed analysis, 2 on an operational refusal or failure
+    (invalid gold set, unreadable/corrupt store, mid-eval error); low scores
+    are data, not failures — the run still exits 0 and reports."""
     try:
         items = load_gold(gold_path)
     except GoldError as exc:
@@ -68,39 +71,47 @@ def tune_weights(conn: sqlite3.Connection, *, gold_path: str, k: int = 5) -> int
                                     weights=_weights_dict(vec))
         return metrics
 
+    # Operational failures mid-evaluation (sqlite corruption, a locked or
+    # unreadable store, recall errors) must exit 2 with a message — never a
+    # traceback whose exit 1 is indistinguishable from a completed run to a
+    # caller parsing exit codes.
+    try:
+        current_vec = _CURRENT_WEIGHTS
+        current_metrics = score(current_vec)
+        best_vec = current_vec
+        best_metrics = current_metrics
+        best_obj = _objective(current_metrics)
+        candidates_evaluated = 1
 
-    current_vec = _CURRENT_WEIGHTS
-    current_metrics = score(current_vec)
-    best_vec = current_vec
-    best_metrics = current_metrics
-    best_obj = _objective(current_metrics)
-    candidates_evaluated = 1
-
-    for _pass in range(_MAX_PASSES):
-        improved = False
-        for i in range(len(_WEIGHT_KEYS)):
-            for j in range(len(_WEIGHT_KEYS)):
-                if i == j:
-                    continue
-                for size in _TRANSFER_SIZES:
-                    src = best_vec[i]
-                    dst = best_vec[j]
-                    if src - size < _WEIGHT_FLOOR:
+        for _pass in range(_MAX_PASSES):
+            improved = False
+            for i in range(len(_WEIGHT_KEYS)):
+                for j in range(len(_WEIGHT_KEYS)):
+                    if i == j:
                         continue
-                    candidate = list(best_vec)
-                    candidate[i] = round(src - size, 10)
-                    candidate[j] = round(dst + size, 10)
-                    cand_vec = tuple(candidate)
-                    cand_metrics = score(cand_vec)
-                    candidates_evaluated += 1
-                    cand_obj = _objective(cand_metrics)
-                    if cand_obj > best_obj + 1e-9:
-                        best_vec = cand_vec
-                        best_metrics = cand_metrics
-                        best_obj = cand_obj
-                        improved = True
-        if not improved:
-            break
+                    for size in _TRANSFER_SIZES:
+                        src = best_vec[i]
+                        dst = best_vec[j]
+                        if src - size < _WEIGHT_FLOOR:
+                            continue
+                        candidate = list(best_vec)
+                        candidate[i] = round(src - size, 10)
+                        candidate[j] = round(dst + size, 10)
+                        cand_vec = tuple(candidate)
+                        cand_metrics = score(cand_vec)
+                        candidates_evaluated += 1
+                        cand_obj = _objective(cand_metrics)
+                        if cand_obj > best_obj + 1e-9:
+                            best_vec = cand_vec
+                            best_metrics = cand_metrics
+                            best_obj = cand_obj
+                            improved = True
+            if not improved:
+                break
+    except Exception as exc:
+        print(f"[zmem] tune-weights: evaluation failed: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
 
     report = {
         "command": "tune-weights",
@@ -120,7 +131,10 @@ def tune_weights(conn: sqlite3.Connection, *, gold_path: str, k: int = 5) -> int
             "objective": round(best_obj, 6),
         },
         "candidates_evaluated": candidates_evaluated,
-        "note": ("dry-run; nothing written. Applying the suggested weights is "
+        "note": ("dry-run; nothing written. (The evaluation is read-only; "
+                 "opening the store runs the standard per-subcommand "
+                 "migration, so a pre-v12 store is migrated first like for "
+                 "every store.py command.) Applying the suggested weights is "
                  "a manual edit of the W_* constants in "
                  "skills/memory/scripts/storelib/recall.py — they must keep "
                  "summing to 1.0 (see SKILL.md tune-weights)."),

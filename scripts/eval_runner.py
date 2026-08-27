@@ -88,9 +88,16 @@ def main() -> int:
                          "built as the deterministic eval corpus at this path.")
     ap.add_argument("--gold", default=str(DEFAULT_GOLD),
                     help=f"gold JSONL path (default: {DEFAULT_GOLD})")
-    ap.add_argument("--k", type=int, default=5,
+    def _positive_int(value: str) -> int:
+        n = int(value)
+        if n < 1:
+            raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+        return n
+
+    ap.add_argument("--k", type=_positive_int, default=5,
                     help="default top-k cut for hit@k (default 5; a gold item "
-                         "may override with its own 'k')")
+                         "may override with its own 'k'; applied to items that "
+                         "do not set one)")
     ap.add_argument("--fail-under", type=float, default=None,
                     help="OPTIONAL: exit 1 when hit@k falls below this value. "
                          "Off by default and OFF in CI — the build never fails "
@@ -150,11 +157,22 @@ def main() -> int:
         ],
     }
     text = json.dumps(report, ensure_ascii=False, indent=2)
+    # Same line-terminator escaping sync.py's export applies: U+2028/2029/0085
+    # inside memory content are NOT escaped by json.dumps but DO terminate
+    # lines for splitlines()-based consumers of the artifact.
+    text = (text.replace("\u2028", "\\u2028")
+                .replace("\u2029", "\\u2029")
+                .replace("\u0085", "\\u0085"))
     print(text)
     if args.json_out:
-        out = Path(args.json_out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text + "\n", encoding="utf-8", newline="\n")
+        try:
+            out = Path(args.json_out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(text + "\n", encoding="utf-8", newline="\n")
+        except OSError as exc:
+            print(f"[eval] cannot write --json-out {args.json_out}: {exc}",
+                  file=sys.stderr)
+            return 2
 
     if args.fail_under is not None and metrics["hit_at_k"] < args.fail_under:
         print(f"[eval] FAIL: hit@{args.k}={metrics['hit_at_k']:.4f} below "
