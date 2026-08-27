@@ -18,6 +18,8 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
+
+import embed_profiles as _profiles
 from storelib.entity import link_memory_entities, relink_memory
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
@@ -768,6 +770,14 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
 
         # Secret/injection handling is applied once above (for new rows) via
         # _apply_capture_policy (issue #35); no separate advisory scan here.
+        # Issue #63 review round: ingest is a WRITE surface; a forgotten
+        # fake-profile export must announce itself here too.
+        import embeddings as _emb_sync
+
+        try:
+            _emb_sync.warn_fake_active()
+        except Exception:
+            pass  # banner must never break ingest (mirror write.py guard)
         existing, _sim, emb = _detect_duplicate(conn, content, namespace,
                                                  dedup_cache=dedup_cache)
         # v11 (issue #61, 6.2 — PR-review R1): the SAME write-time polarity
@@ -810,7 +820,11 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             return "deduped"
 
         shash = ""
-        emb_model = "minilm-onnx" if emb is not None else ""
+        emb_model = (
+            _profiles.embedding_model_name(_profiles.resolve_active_profile())
+            if emb is not None
+            else ""
+        )
         embedded_at = now_iso() if emb is not None else None
         # Primary warning site for the ingest live-row insert (moved out of
         # _detect_duplicate so a no-op duplicate add cannot consume the one-time

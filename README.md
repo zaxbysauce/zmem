@@ -612,6 +612,17 @@ lose semantic recall.
 
 **Backfill existing unembedded rows:** once the root cause is fixed, run
 `python <store.py> reembed` to embed live rows that are missing embeddings.
+   Use `reembed --all [--profile NAME]` to convert the whole store to another
+   profile/dimension atomically (see SKILL.md "reembed" and "Embedding
+   profiles"); profiles are selected with `ZMEM_EMBED_PROFILE`.
+   `--profile` requires `--all`: without it the command refuses with exit 2
+   rather than silently doing nothing.
+
+   Shipped profiles: `minilm` (Xenova/all-MiniLM-L6-v2 ONNX, 384-d,
+   checksum-pinned) and `fake` (16-d deterministic placeholders for
+   model-absent tests/CI only). The pin covers the Xenova ONNX export —
+   sentence-transformers PyTorch weights differ by design; verification has no
+   override or bypass.
 Backfilling before fixing the root cause only treats the backlog — new captures
 keep landing unembedded until embeddings are available in the capturing
 environment. When embeddings are unavailable, ZMem prints a one-time-per-process

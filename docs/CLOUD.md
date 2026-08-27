@@ -321,7 +321,9 @@ compromise of the store, and rebuild rather than "clean up" — see the
   land without one are FTS-only until they are embedded, so semantic recall
   and dedup silently under-perform on exactly the newest knowledge:
   ```bash
-  python <store.py> reembed
+  python <store.py> reembed   # backfill missing embeddings
+  # or convert the whole store to another profile:
+  #   reembed --all [--profile NAME] [--batch N] [--dry-run] [--confirm]
   ```
   Cheap and idempotent — it backfills only live rows that are missing an
   embedding. Put it at the end of your ingest cadence.

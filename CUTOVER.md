@@ -30,6 +30,9 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 - Python, SQLite FTS5, Node, and Windows shell prerequisites
 - best-effort read/write access to the target path
 - schema compatibility against current v11
+- `embeddings_health` check: active profile vs stored vector dimension,
+  rows with/without embeddings, shipped-profile inventory, and warnings
+  when a non-temporary store runs `ZMEM_EMBED_PROFILE=fake` (issue #63)
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity` — inspect deeper with `store.py entity-list`)

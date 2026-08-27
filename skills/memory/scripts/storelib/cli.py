@@ -25,8 +25,13 @@ from storelib.entity import ENTITY_KINDS, cmd_entity_list, cmd_entity_merge
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
 from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_queue_clear, cmd_queue_list
 from storelib.promote import promote_memory
+# _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
+# this module's re-export surface for `storelib/__init__.py` and legacy
+# importers — removing it broke that chain.
 from storelib.recall import _reembed, get_memory, list_memory, recall_memory, recent_memory, stats
-from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect
+from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
+from storelib.recall import reembed_embeddings
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl
 from storelib.write import CapturePolicyRefusal, ContentTooLarge, add_memory, rekey_namespace, supersede_memory, update_memory
 
@@ -289,7 +294,40 @@ def main():
 
     sub.add_parser("rebuild-fts", help="rebuild the FTS5 index from scratch")
 
-    sub.add_parser("reembed", help="backfill embeddings for live memories missing them")
+    # Issue #63, 8.3: reembed grew flags. Flagless remains the legacy backfill
+    # with byte-identical behavior; --all is the operator-grade rebuild.
+    p_reembed = sub.add_parser(
+        "reembed",
+        help="backfill missing embeddings (flagless), or rebuild every live "
+             "embedding under a profile (--all)",
+    )
+    p_reembed.add_argument("--all", action="store_true",
+                           help="rebuild EVERY live memory's embedding (not "
+                                "just missing ones); recreates memory_vec at "
+                                "the profile's dimension when it changes")
+    try:
+        import embed_profiles as _ep_mod
+        _PROFILE_CHOICES = sorted(_ep_mod.PROFILES)
+    except ImportError:  # pragma: no cover — repo always ships it
+        from embed_profiles import PROFILES as _P  # type: ignore
+
+        _PROFILE_CHOICES = sorted(_P)
+    p_reembed.add_argument("--profile", choices=_PROFILE_CHOICES, default=None,
+                           help="with --all: embedding profile to convert "
+                                "the store to (default: active "
+                                "ZMEM_EMBED_PROFILE or minilm)")
+    p_reembed.add_argument("--batch", type=nonnegative_int, default=64,
+                           help="progress-report granularity in rows "
+                                "(stderr pacing only; does not affect "
+                                "transaction atomicity; values < 1 reset "
+                                "to the default 64)")
+    p_reembed.add_argument("--dry-run", action="store_true",
+                           help="report what --all would change; writes nothing")
+    p_reembed.add_argument("--confirm", action="store_true",
+                           help="required by --all --profile fake when the "
+                                "store holds committed non-fake vectors "
+                                "(conversion overwrites them with placeholders)")
+
 
     p_consolidate = sub.add_parser("consolidate", help="merge near-duplicate memories")
     p_consolidate.add_argument("--threshold", type=float,
@@ -752,9 +790,36 @@ def main():
         print(f"[zmem] {e}", file=sys.stderr)
         sys.exit(2)
 
+    # Issue #63, 8.2: fail-closed embedding-profile gate. Applied ONLY to
+    # commands whose success depends on generating or querying vectors — a
+    # profile/store dimension mismatch must refuse with the remediation
+    # command instead of failing mid-write or crashing recall. Read-only and
+    # non-vector surfaces (get/list/recent/stats/export/...) stay untouched:
+    # `recent` deliberately guards NOTHING because SessionStart hooks depend
+    # on it unconditionally, and it neither embeds nor touches memory_vec.
+    # allow_rebuild exempts exactly the escape hatch: reembed --all.
+    # review round (issue #63): ingest-jsonl joins the guard set — its row
+    # loop embeds fresh vectors via _detect_duplicate and inserts into
+    # memory_vec, so an unmatched active profile could previously write
+    # wrong-dim blobs with the vec-row insert silently swallowed.
+    if args.cmd in {"add", "update", "recall", "search", "consolidate",
+                    "organize", "ingest-jsonl"} or args.cmd == "reembed":
+        try:
+            assert_embedding_compatible(
+                conn,
+                allow_rebuild=(args.cmd == "reembed" and (args.all or args.dry_run)),
+            )
+        except RuntimeError as e:
+            print(f"[zmem] {e}", file=sys.stderr)
+            sys.exit(2)
+
     writer_lease = None
     if (
-        args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "reembed", "ingest-jsonl"}
+        args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl"}
+        # Issue #63, 8.3: reembed takes the writer lease ONLY when it can
+        # write. --dry-run is read-only by contract and must never block on —
+        # or be blocked as — a writer.
+        or (args.cmd == "reembed" and not args.dry_run)
         # recall/recent/search DO write on the `--no-bump` path now that it records a
         # surface (issue #21), but they must NOT take a writer lease when passive:
         # the SubagentStart/UserPromptSubmit/prefetch hook fires at high fan-out, and
@@ -860,12 +925,20 @@ def main():
                 hybrid_arg = True
             else:
                 hybrid_arg = None
+            # Issue #63, 8.6: cross-encoder rerank is an explicit-recall-only,
+            # opt-in feature. The single decision point lives in
+            # cross_encoder.cli_allowed; --no-bump excludes every passive hook
+            # caller structurally, --no-hybrid keeps search's byte-stable
+            # contract out of scope even when aliased through this argv.
+            rerank_flag = _ce_cli_allowed(no_bump=args.no_bump,
+                                          no_hybrid=args.no_hybrid)
             recall_memory(conn, query=args.query, namespace=args.namespace,
                           limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
                           no_bump=args.no_bump, include_global=args.include_global,
                           global_limit=args.global_limit, as_of=args.as_of,
                           no_mmr=args.no_mmr,
-                          link_hops=args.link_hops, link_budget=args.link_budget)
+                          link_hops=args.link_hops, link_budget=args.link_budget,
+                          cross_rerank=rerank_flag)
         elif args.cmd == "recent":
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
                           min_confidence=args.min_confidence, as_json=args.json,
@@ -903,7 +976,22 @@ def main():
             conn.commit()
             print("[zmem] FTS5 index rebuilt")
         elif args.cmd == "reembed":
-            _reembed(conn)
+            if args.profile and not args.all:
+                # Silent no-op would be crueler than refusal: --profile alone
+                # looks like a conversion but only ever took effect with
+                # --all. Say exactly what to type (review round, R2).
+                print("[zmem] --profile only takes effect with --all "
+                      "(use: reembed --all --profile <name> to convert)",
+                      file=sys.stderr)
+                sys.exit(2)
+            if args.all or args.dry_run:
+                sys.exit(reembed_embeddings(
+                    conn, rebuild_all=args.all, profile=args.profile,
+                    batch=args.batch, dry_run=args.dry_run,
+                    confirm=args.confirm))
+            # legacy flagless/backfill form: byte-identical stdout contract;
+            # --batch passes through purely as stderr progress pacing.
+            sys.exit(reembed_embeddings(conn, batch=args.batch))
         elif args.cmd == "consolidate":
             # Single-flight: consolidate() writes, and the SessionStart hook fires a
             # detached one per session. Its meta-key cadence gate is a SOFT gate

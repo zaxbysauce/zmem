@@ -139,7 +139,9 @@ KNOWN_SUBCMDS = [
 # NON-vacuous (a regression that drops a real flag must trip the test).
 # Adding a subcommand here without removing its real flags from the CLI is
 # the only way this allowlist grows, so it forces a conscious decision.
-FLAGLESS_SUBCMDS = frozenset({"init", "stats", "path", "rebuild-fts", "reembed"})
+# reembed left the flagless set (issue #63, 8.3): it now exposes
+# --all/--profile/--batch/--dry-run; its help surface is structurally pinned.
+FLAGLESS_SUBCMDS = frozenset({"init", "stats", "path", "rebuild-fts"})
 
 
 def _sha(text: str) -> str:
@@ -197,7 +199,7 @@ def _norm_stats(text: str) -> str:
 
 def _run_env(tmp: str) -> dict:
     env = {**os.environ, **builder.BASE_ENV, "ZMEM_STORE": os.path.join(tmp, "store.sqlite")}
-    for k in ("ZMEM_DATA", "ZMEM_BACKUP_DIR", "ZMEM_BACKUP_INTERVAL_DAYS"):
+    for k in ("ZMEM_DATA", "ZMEM_BACKUP_DIR", "ZMEM_BACKUP_INTERVAL_DAYS", "ZMEM_EMBED_PROFILE", "ZMEM_CROSS_ENCODER", "ZMEM_CROSS_ENCODER_MODEL", "ZMEM_MODELS_DIR"):
         env.pop(k, None)
     # Pin the scoring clock to the fixture's timestamp sentinel. Composite
     # scores embed wall-clock recency, so a rounded `_score` drifts past its

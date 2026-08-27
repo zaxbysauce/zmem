@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import shutil
+import re
 import sqlite3
 import subprocess
 import sys
@@ -337,9 +338,11 @@ def _check_embeddings() -> dict:
     Degraded embeddings are a SUPPORTED state (FTS5 recall + lexical
     consolidate keep working), so unavailability is `warn`, not `fail` — it
     must not flip the report's top-level `ok` (which is `fail count == 0`).
-    Pure presence check via embeddings.availability_status(): no store access,
-    no network, no model load, no checksum hash — read-only and side-effect
-    free, per doctor's contract.
+    Presence probe via embeddings.availability_status(); since issue #63 8.1
+    doctor ALSO deep-verifies the model pin (cached-positive by file stats —
+    see embeddings.verify_checksum_cached) so a tampered minilm.onnx can never
+    masquerade as healthy merely because nothing loaded it yet this process.
+    No store writes, no network, no ONNX session load.
     """
     try:
         saved_path = sys.path[:]
@@ -368,6 +371,42 @@ def _check_embeddings() -> dict:
             error=f"{type(exc).__name__}: {exc}",
             interpreter=sys.executable,
         )
+    # Issue #63, 8.1: doctor OWNS the pin verdict. The module-level probe is
+    # presence-only by design ("never hashes"), but in a fresh doctor process
+    # nothing has ever attempted a LOAD, so `_model_checksum_ok` is still None
+    # and a tampered file would silently read as healthy/None forever — exactly
+    # the blind spot this PR closes. Hash it here (~one pass over the file,
+    # diagnostic command): verdict becomes authoritative in the JSON.
+    if (
+        st.get("available")
+        and st.get("profile") != "fake"
+        and not st.get("missing_imports")
+        and st.get("models_dir")
+    ):
+        try:
+            ck_ok = embeddings.verify_checksum_cached(
+                Path(st["models_dir"]) / "minilm.onnx"
+            )
+        except Exception:
+            ck_ok = None
+        if ck_ok is False:
+            note = ""
+            try:
+                import embed_profiles as _ep
+
+                note = _ep.PROFILES[_ep.DEFAULT_PROFILE]["notes"]
+            except Exception:
+                pass
+            st = {
+                **st,
+                "available": False,
+                "reason": "model_checksum_mismatch",
+                "checksum_ok": False,
+                **({"note": note} if note else {}),
+            }
+        elif ck_ok is True and st.get("checksum_ok") is None:
+            st = {**st, "checksum_ok": True}
+
     status = "pass" if st["available"] else "warn"
     if st["available"]:
         summary = "Embeddings available; semantic recall/dedup active."
@@ -376,6 +415,12 @@ def _check_embeddings() -> dict:
             f"Embeddings unavailable (reason={st['reason']}); semantic "
             "recall/dedup disabled — degraded FTS5/lexical mode is supported."
         )
+    # Issue #63, 8.1/8.4: surface the profile dimension and the checksum
+    # verdict with the Xenova-vs-sentence-transformers NOTE so an operator is
+    # never left reasoning that disabling verification is the fix.
+    profile = st.get("profile")
+    if profile == "fake":
+        summary += " (test profile: ZMEM_EMBED_PROFILE=fake — placeholder vectors)"
     return _check(
         "embeddings",
         status,
@@ -387,6 +432,10 @@ def _check_embeddings() -> dict:
         interpreter=st.get("interpreter"),
         model_file=st.get("model_file"),
         tokenizer_file=st.get("tokenizer_file"),
+        profile=profile,
+        dim=st.get("dim"),
+        checksum_ok=st.get("checksum_ok"),
+        **({"note": st["note"]} if st.get("note") else {}),
     )
 
 
@@ -1516,6 +1565,17 @@ def _recommendations(checks: list[dict]) -> list[str]:
                 "to backfill existing rows. Degraded FTS5/lexical operation is "
                 "supported meanwhile."
             )
+        elif reason == "model_checksum_mismatch":
+            # Issue #63, 8.1: name WHY a hash can differ from what the operator
+            # expected, so nobody 'fixes' verification by disabling it. There
+            # is deliberately NO unverified-load escape hatch.
+            note = details.get("note") or ""
+            notes.append(
+                "The installed minilm.onnx FAILED its checksum pin. " + note +
+                " Restore the correct Xenova ONNX export (or point "
+                "ZMEM_MODEL_URL at a source matching the pinned SHA-256 with "
+                "ZMEM_MODEL_AUTODOWNLOAD=1); the model stays refused until then."
+            )
         else:
             notes.append(
                 "Embeddings are disabled; semantic recall/dedup is off (degraded "
@@ -1681,6 +1741,226 @@ def _check_hybrid_default() -> dict:
     )
 
 
+def _store_path_is_temp(resolved_store: Path) -> bool:
+    """True when the resolved store lives under the system temp directory —
+    the ONLY place where running the test-only `fake` profile counts as sane.
+    Best-effort: any resolution error means 'not temp' (fail loud)."""
+    import tempfile as _tempfile
+
+    try:
+        return resolved_store.resolve().is_relative_to(
+            Path(_tempfile.gettempdir()).resolve())
+    except Exception:
+        return False
+
+
+def _embedding_health_warnings(
+    *,
+    active_profile,
+    embeddings_available: bool,
+    matches_store,  # bool | None
+    total_live,     # int | None
+    with_emb,       # int | None
+    store_is_temp: bool,
+) -> list:
+    """Pure decision core of _check_embeddings_health warnings (unit-tested
+    directly because the real conditions need a provisioned runtime that
+    model-absent CI cannot provide)."""
+    warnings: list = []
+    if active_profile == "fake" and not store_is_temp:
+        warnings.append(
+            "ZMEM_EMBED_PROFILE=fake is active on a NON-temporary store — "
+            "rows written now are deterministic placeholders, not "
+            "semantic vectors. Unset it for real use."
+        )
+    if (
+        embeddings_available
+        and active_profile != "fake"
+        and matches_store is not False
+        and total_live
+        and with_emb == 0
+    ):
+        warnings.append(
+            "hybrid recall default is ON but this store has ZERO embedded "
+            "rows — the vector lane has nothing to fuse. Run "
+            "`store.py reembed` to backfill once the model files are in place."
+        )
+    return warnings
+
+
+def _check_embeddings_health(resolved_store: Path) -> dict:
+    """Store-side embedding health (issue #63, 8.4).
+
+    One read-only aggregation over the resolved store: active profile vs the
+    dimension actually committed to the store, rows with/without embeddings,
+    shipped-profile inventory, and two operator-safety warnings:
+      - fake profile on anything NOT under the system temp dir (a forgotten
+        ZMEM_EMBED_PROFILE=fake export must be loud, wherever the store lives);
+      - hybrid default is available but zero live rows carry embeddings.
+    Advisory only: warn/info statuses, never `fail`.
+    """
+    import tempfile as _tempfile
+
+    try:
+        import embeddings  # type: ignore
+    except Exception as exc:
+        return _check(
+            "embeddings_health", "skip",
+            f"embeddings module unavailable ({type(exc).__name__})")
+
+    st = embeddings.availability_status()
+    details: dict = {
+        "active_profile": st.get("profile"),
+        "dim": st.get("dim"),
+        "checksum_ok": st.get("checksum_ok"),
+    }
+    if st.get("note"):
+        details["note"] = st["note"]
+
+    total_live = with_emb = without_emb = live_dim = declared_dim = None
+    meta_profile = None
+    store_ok = False
+    if resolved_store.exists():
+        try:
+            uri = resolved_store.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*), "
+                    "SUM(embedding IS NOT NULL), SUM(embedding IS NULL) "
+                    "FROM memory WHERE superseded_at IS NULL"
+                ).fetchone()
+                if row is not None:
+                    total_live = int(row[0] or 0)
+                    with_emb = int(row[1] or 0)
+                    without_emb = int(row[2] or 0)
+                row2 = conn.execute(
+                    "SELECT length(embedding)/4 FROM memory "
+                    "WHERE embedding IS NOT NULL LIMIT 1"
+                ).fetchone()
+                live_dim = int(row2[0]) if row2 and row2[0] else None
+                try:
+                    row3 = conn.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='table' "
+                        "AND name='memory_vec'"
+                    ).fetchone()
+                    if row3 and row3[0]:
+                        m = re.search(r"float\[(\d+)\]", row3[0],
+                                      re.IGNORECASE)
+                        declared_dim = int(m.group(1)) if m else None
+                except sqlite3.Error:
+                    pass
+                try:
+                    row4 = conn.execute(
+                        "SELECT value FROM meta WHERE key='embedding_profile'"
+                    ).fetchone()
+                    meta_profile = row4[0] if row4 else None
+                except sqlite3.Error:
+                    pass
+            finally:
+                conn.close()
+            store_ok = True
+        except sqlite3.Error:
+            store_ok = False
+
+    details.update(
+        store_read=store_ok,
+        live_memories=total_live,
+        rows_with_embedding=with_emb,
+        rows_without_embedding=without_emb,
+        stored_dim=live_dim,
+        declared_vec_dim=declared_dim,
+        last_rebuilt_profile=meta_profile,
+        matches_store=(
+            None
+            if live_dim is None or st.get("dim") is None
+            else st["dim"] == live_dim
+        ),
+    )
+
+    shipped = []
+    try:
+        import embed_profiles as ep
+
+        models_dir = Path(str(st.get("models_dir", "")))
+        for name, entry in sorted(ep.PROFILES.items()):
+            if name == "fake":
+                installed = True
+            else:
+                mf = entry.get("model_file", "")
+                installed = bool(mf) and (models_dir / mf).is_file()
+            shipped.append({
+                "name": name,
+                "hf_id": entry.get("hf_id", ""),
+                "dim": entry.get("dim"),
+                "installed": installed,
+            })
+    except Exception:
+        shipped = []
+    details["shipped_profiles"] = shipped
+
+    # Issue #63 zax-review L3 / PRR-005 (restored after an isolation-revert
+    # dropped it once): surface the opt-in cross-encoder state. An
+    # enabled-but-missing model silently degrades to no rerank; that must be
+    # visible in the operator's primary diagnostic, not just doc prose.
+    try:
+        _truthy_ce = {"1", "true", "yes", "on"}
+        ce_enabled = os.environ.get(
+            "ZMEM_CROSS_ENCODER", "").strip().lower() in _truthy_ce
+        ce_model_cfg = (os.environ.get("ZMEM_CROSS_ENCODER_MODEL")
+                        or "").strip()
+        ce_model_present = bool(ce_model_cfg) and Path(ce_model_cfg).is_file()
+        ce_tok_present = False
+        if ce_model_cfg:
+            sibling = Path(ce_model_cfg).parent / "tokenizer.json"
+            ce_tok_present = sibling.is_file()
+        details["cross_encoder"] = {
+            "enabled": ce_enabled,
+            "model_path_configured": ce_model_cfg,
+            "model_file_present": ce_model_present,
+            "tokenizer_file_present": ce_tok_present if ce_model_cfg else None,
+        }
+    except Exception:
+        pass
+
+
+    active = st.get("profile")
+    warnings = _embedding_health_warnings(
+        active_profile=active,
+        embeddings_available=bool(st.get("available")),
+        matches_store=details["matches_store"],
+        total_live=total_live,
+        with_emb=with_emb,
+        store_is_temp=_store_path_is_temp(resolved_store),
+    )
+    if details["matches_store"] is False:
+        status = "warn"
+        summary = (
+            f"profile '{active}' dim {st.get('dim')} does NOT match the "
+            f"store's committed {live_dim}-dim data; commands that embed are "
+            "refused until `reembed --all` converts the store."
+        )
+    elif warnings:
+        status = "warn"
+        summary = "; ".join(warnings)
+    elif not resolved_store.exists():
+        status = "info"
+        summary = "no store yet at the resolved path - nothing to report."
+    else:
+        status = "pass"
+        parts = [
+            f"profile '{active}'",
+            f"stored {live_dim}-dim" if live_dim
+            else "no committed vectors yet",
+            (f"{with_emb}/{total_live} rows embedded"
+             if total_live is not None else ""),
+        ]
+        summary = ", ".join(x for x in parts if x)
+        if active == "fake":
+            summary += " (test profile on a temporary store)"
+    return _check("embeddings_health", status, summary, **details)
+
+
 def build_report(project: Path, repo_root: Path) -> dict:
     resolved_store = host.resolve_store_path()
     checks: list[dict] = []
@@ -1704,6 +1984,8 @@ def build_report(project: Path, repo_root: Path) -> dict:
     checks.append(_check_surfaces(repo_root))
     checks.append(_check_tier0_size(project))
     checks.append(_check_embeddings())
+    # Issue #63, 8.4: store-side embedding health (profile/dim/coverage).
+    checks.append(_check_embeddings_health(resolved_store))
     # Issue #58, 3.7: hybrid-default (3.3) + vec-ns-overfetch (3.1).
     # PRR-031: scope the vec count to the resolved namespace when available.
     checks.append(_check_hybrid_default())

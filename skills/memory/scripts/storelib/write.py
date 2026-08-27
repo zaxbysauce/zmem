@@ -20,6 +20,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
+    import embed_profiles as _profiles
+except ImportError:
+    sys.path.insert(0, os.path.dirname(__file__))
+    import embed_profiles as _profiles  # type: ignore
+
+try:
     from correction_queue import SECRET_PATTERNS  # noqa: F401
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
@@ -112,6 +118,19 @@ try:
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from correction_queue import SECRET_PATTERNS  # type: ignore # noqa: F401
+
+
+def _warn_fake_active_once() -> None:
+    """Issue #63 review round C4 / approved-plan D: operator-guard banner on
+    WRITE surfaces when ZMEM_EMBED_PROFILE=fake is active. The embeddings
+    module owns the once-per-process state; passive hook read paths stay
+    quiet because only writers call this."""
+    if _embeddings is not None:
+        try:
+            _embeddings.warn_fake_active()
+        except Exception:
+            pass
+
 
 
 
@@ -687,6 +706,7 @@ def add_memory(
         # match fallback. Semantic dedup catches paraphrases the exact-match miss.
         # Shared with ingest-jsonl (Tier 3 sync import), which must apply the same
         # dedup-on-write semantics to incoming rows without duplicating this logic.
+        _warn_fake_active_once()
         existing, dedup_sim, emb = _detect_duplicate(conn, content, namespace)
 
         # v11 (issue #61, 6.2): similarity cannot distinguish "always X" from
@@ -750,7 +770,11 @@ def add_memory(
             valid_from = ts
 
         # Determine embedding model name for the embedding_model column.
-        emb_model = "minilm-onnx" if emb is not None else ""
+        # Issue #63 critic C2: marker derives from the ACTIVE profile so a
+        # converted store never accumulates mislabeled vectors.
+        emb_model = _profiles.embedding_model_name(
+            _profiles.resolve_active_profile()
+        ) if emb is not None else ""
         # This insert-site guard is the PRIMARY warning site (the warning was
         # moved out of _detect_duplicate, which runs before dedup resolution and
         # would consume the one-time flag on a no-op duplicate add). See
@@ -1080,6 +1104,7 @@ def update_memory(
 
         # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
         # cannot self-match; an unchanged-content update still creates history.
+        _warn_fake_active_once()
         existing, dedup_sim, emb = _detect_duplicate(conn, content_eff, ns)
         # v11 (issue #61, 6.2): the same write-time polarity guard as add —
         # a contradiction is NOT a duplicate. Disagree ⇒ skip the merge and
@@ -1123,7 +1148,11 @@ def update_memory(
         # 3) No dedup hit — insert the NEW live row replacing `mid`.
         new_id = str(uuid.uuid4())
         shash = _source_hash(source_ref_eff)
-        emb_model = "minilm-onnx" if emb is not None else ""
+        # Issue #63 critic C2: marker derives from the ACTIVE profile so a
+        # converted store never accumulates mislabeled vectors.
+        emb_model = _profiles.embedding_model_name(
+            _profiles.resolve_active_profile()
+        ) if emb is not None else ""
         if emb is None:
             _warn_degraded_embeddings_once(content_eff)
         conn.execute(

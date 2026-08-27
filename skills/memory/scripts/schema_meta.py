@@ -21,6 +21,25 @@ env-var parsing.
 
 from __future__ import annotations
 
+import re
+
+
+def normalize_content(s: str) -> str:
+    """Canonical content form for exact-match dedup (#39 E4).
+
+    Moved here (issue #63 review round) from ``storelib/schema._normalize_content``
+    so the write path, the content_norm backfills, AND the ``fake`` embedding
+    profile (``embed_profiles.fake_embed``, which hashes the canonical form of a
+    text without importing the writer stack) all share ONE implementation instead
+    of drifting copies of the same regex. Mirrors the former inline
+    ``re.sub(r"\\s+", " ", s.strip().lower())`` at the dedup call sites.
+    NOT a SQL GENERATED ALWAYS AS column — SQLite cannot replicate Python's
+    Unicode-aware ``.lower()`` + ``\\s+`` collapse, so a DB-generated column
+    would silently diverge and cause false-negative dedup misses.
+    """
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
 # Bumped by store.py's migration machinery; doctor.py reads it to decide
 # pass/warn/fail. Edit HERE and both consumers stay in sync.
 # v11 (issue #61): associative links (A-MEM lite) — the `memory_link` edge

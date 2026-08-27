@@ -684,6 +684,10 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
             "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
             "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+            # issue #63 review round: the new embedding/CE knobs must not
+            # leak from a developer shell into doctor's sandbox (PRR-013)
+            "ZMEM_EMBED_PROFILE", "ZMEM_CROSS_ENCODER",
+            "ZMEM_CROSS_ENCODER_MODEL", "ZMEM_MODELS_DIR",
             "OneDrive", "OneDriveConsumer", "OneDriveCommercial",
         ):
             env.pop(key, None)
@@ -696,6 +700,11 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
             env=self._env(), capture_output=True, text=True, timeout=60,
         )
         self.assertNotIn("Traceback", result.stderr, result.stderr)
+        if not result.stdout.strip():
+            self.fail("doctor wrote no JSON on stdout "
+                      f"(rc={result.returncode}) stderr={result.stderr[-400:]!r} "
+                      "— a crash here previously masked itself as a confusing "
+                      "JSONDecodeError (PRR-014 courtesy note)")
         return result, json.loads(result.stdout)
 
     def _check(self, report, check_id):
@@ -905,6 +914,120 @@ class PythonFloorTest(unittest.TestCase):
             self.skipTest("interpreter is below the 3.11 floor")
         check = doctor._check_python()
         self.assertEqual(check["status"], "pass", check)
+
+
+class EmbeddingsHealthCheckTest(unittest.TestCase):
+    """Issue #63, 8.1/8.4: the new embeddings/embeddings_health surfaces."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scripts = REPO_ROOT / "skills" / "memory" / "scripts"
+        sys.path.insert(0, str(cls.scripts))
+
+    def _report(self, env_extra):
+        import json as _json
+        import subprocess as _sub
+        tmp = tempfile.mkdtemp(prefix="zmem-doctor63-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        data = Path(tmp) / "data"
+        data.mkdir()
+        (data / "store.sqlite").write_bytes(b"")  # empty file: doctor skips
+        env = dict(os.environ)
+        env["ZMEM_DATA"] = str(data)
+        env.pop("ZMEM_EMBED_PROFILE", None)
+        env.update(env_extra)
+        r = _sub.run(
+            [sys.executable, str(self.scripts / "doctor.py"),
+             "--format", "json"],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(self.scripts), env=env,
+        )
+        rep = _json.loads(r.stdout) if r.stdout.strip() else {"checks": []}
+        return rep
+
+    def test_health_check_always_present(self):
+        rep = self._report({})
+        ids = [c["id"] for c in rep["checks"]]
+        self.assertIn("embeddings", ids)
+        self.assertIn("embeddings_health", ids)
+
+    def test_details_shape_on_minimal_fixture_store(self):
+        sys.path.insert(0, str(self.scripts))
+        import tempfile as _tf
+        import sqlite3 as _sq
+        store_dir = Path(_tf.mkdtemp(prefix="zmem-doctor63b-"))
+        self.addCleanup(shutil.rmtree, store_dir, True)
+        db = store_dir / "store.sqlite"
+        c = _sq.connect(db)
+        c.executescript(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "INSERT INTO meta VALUES('schema_version','11');"
+            "CREATE TABLE memory(id TEXT PRIMARY KEY, namespace TEXT,"
+            " type TEXT, content TEXT, tags TEXT DEFAULT '',"
+            " source_ref TEXT DEFAULT '', source_hash TEXT DEFAULT '',"
+            " confidence REAL DEFAULT 0.5, signal TEXT DEFAULT 'none',"
+            " valid_from TEXT, superseded_at TEXT,"
+            " supersede_reason TEXT DEFAULT '', consolidated_at TEXT,"
+            " merged_from TEXT, ingestion_ts TEXT,"
+            " retrieval_count INTEGER DEFAULT 0, last_retrieved TEXT,"
+            " embedding BLOB, embedding_model TEXT DEFAULT '',"
+            " embedded_at TEXT, content_norm TEXT DEFAULT '',"
+            " valid_until TEXT DEFAULT '', update_of TEXT,"
+            " taint TEXT DEFAULT '', trust_score REAL);"
+            "INSERT INTO memory(id,content,valid_from,ingestion_ts)"
+            " VALUES('r1','hello world','2026-01-01T00:00:00Z',"
+            "'2026-01-01T00:00:00Z');"
+        )
+        c.commit(); c.close()
+        env = {
+            "ZMEM_DATA": str(store_dir),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_MODELS_DIR": str(store_dir / "no-models"),
+        }
+        rep = self._report(env)
+        eh = next(c for c in rep["checks"]
+                  if c["id"] == "embeddings_health")
+        d = eh["details"]
+        for key in ("rows_with_embedding", "rows_without_embedding",
+                    "shipped_profiles", "active_profile", "matches_store"):
+            self.assertIn(key, d, key)
+        self.assertEqual(d["live_memories"], 1)
+        names = {p["name"] for p in d["shipped_profiles"]}
+        self.assertEqual(names, {"minilm", "fake"})
+        # zax-L3/PRR-005: opt-in cross-encoder visibility must exist in the
+        # health payload even when unset (disabled + unconfigured defaults)
+        ce = d.get("cross_encoder") or {}
+        self.assertIn("enabled", ce)
+        self.assertEqual(ce.get("enabled"), False)
+
+    def test_warning_decision_core_unit(self):
+        sys.path.insert(0, str(self.scripts))
+        import doctor
+
+        w = doctor._embedding_health_warnings(
+            active_profile="fake", embeddings_available=True,
+            matches_store=None, total_live=5, with_emb=5,
+            store_is_temp=False)
+        self.assertEqual(len(w), 1)
+        self.assertIn("NON-temporary", w[0])
+
+        w2 = doctor._embedding_health_warnings(
+            active_profile="minilm", embeddings_available=True,
+            matches_store=True, total_live=9, with_emb=0,
+            store_is_temp=True)
+        self.assertEqual(len(w2), 1)
+        self.assertIn("ZERO embedded", w2[0])
+
+        # fake inside a temp sandbox stays quiet; unavailable runtime mutes
+        # the zero-embedded advisory
+        self.assertEqual(doctor._embedding_health_warnings(
+            active_profile="fake", embeddings_available=True,
+            matches_store=None, total_live=5, with_emb=5,
+            store_is_temp=True), [])
+        self.assertEqual(doctor._embedding_health_warnings(
+            active_profile="minilm", embeddings_available=False,
+            matches_store=None, total_live=9, with_emb=0,
+            store_is_temp=True), [])
 
 
 if __name__ == "__main__":
