@@ -132,7 +132,8 @@ class Store:
             args += ["--as-of", as_of]
         r = self.run(*args)
         assert r.returncode == 0, r.stderr
-        return json.loads(r.stdout)
+        parsed = json.loads(r.stdout)
+        return parsed["results"] if isinstance(parsed, dict) else parsed
 
     def recent(self, namespace: str, *, as_of: str | None = None):
         args = ["recent", "--namespace", namespace, "--json"]
@@ -140,7 +141,8 @@ class Store:
             args += ["--as-of", as_of]
         r = self.run(*args)
         assert r.returncode == 0, r.stderr
-        return json.loads(r.stdout)
+        parsed = json.loads(r.stdout)
+        return parsed["results"] if isinstance(parsed, dict) else parsed
 
 
 class _StoreCase(unittest.TestCase):

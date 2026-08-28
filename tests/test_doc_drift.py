@@ -90,6 +90,41 @@ def _read(rel):
 
 class SkillDocDriftTest(unittest.TestCase):
 
+    # -- v13 (issue #65) -----------------------------------------------------
+
+    def test_v13_episode_cli_documented(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for cmd in ("episode-open", "episode-add", "episode-close",
+                    "episode-list"):
+            self.assertIn(cmd, text, f"SKILL.md must document `{cmd}` (10.7)")
+        self.assertIn("episode_memory", text)
+        self.assertIn("token_count", text)
+
+    def test_v13_session_tools_documented(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("session_start", text)
+        self.assertIn("session_end", text)
+        self.assertIn("NO-WRITE", text)
+        self.assertIn("retrieval_count", text)
+
+    def test_v13_scoped_tokens_documented(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("namespace_not_allowed", text)
+        self.assertIn("ZMEM_MCP_TOKEN_FILE", text)
+        self.assertIn("unscoped_token", text)
+
+    def test_v13_token_budget_documented(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("ZMEM_INJECT_TOKEN_BUDGET", text)
+        self.assertIn("tokens_used", text)
+        self.assertIn("tokens_budget", text)
+
+    def test_v13_read_envelope_documented(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn('"omitted"', text)
+        self.assertIn("injection_risk", text)
+        self.assertIn("kind", text)
+
     def test_no_future_optional_tier_claim(self):
         text = SKILL_MD.read_text(encoding="utf-8")
         self.assertNotIn(

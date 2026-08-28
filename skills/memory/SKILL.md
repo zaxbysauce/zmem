@@ -58,12 +58,15 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v12
+- schema compatibility against current v13
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity`); inspect deeper with `store.py entity-list`
 - v11 link surface present (`memory_link` table + `memory.trust_score` in
   range [0,1]); inspect deeper with `store.py links --id <uuid>`
+- v13 episode storage present with counts (`episode-tables` check) and the
+  MCP token scope advisory (`mcp-token` check: warns `unscoped_token: true`
+  on full-access operator tokens, never reports the token value)
 - Claude/Codex native-memory conflicts via read-only config inspection
 - canonical namespace for the provided project
 - host surface presence (Claude plugin, ZCode plugin, memory skill; repo-local
@@ -102,6 +105,19 @@ constants live in `schema_meta.py`.
 The three floors are intentional. Do not silently unify them. The
 selective-inject gate (3.8) is a hook-only filter; it does not change
 the Python recall path.
+
+#### Injection token budget (issue #65, 10.9)
+
+`ZMEM_INJECT_TOKEN_BUDGET` (default 1500, estimated at 4 chars/token — no
+tokenizer is bundled) caps the memories injected by the hooks
+(UserPromptSubmit / PreCompact / SubagentStart / SessionStart Tier 2) and by
+the `session_start` MCP/Hermes tools. When the budget is hit, bullet
+admission stops: lowest-score `signal=none` rows drop first, and
+`decision`/`constraint` rows are NEVER dropped (once only they remain,
+enforcement stops — they are kept even over budget). The hook bg-log line
+reports `tokens=<used>/<budget>`, and every read `--json` envelope reports
+`tokens_used`/`tokens_budget`. `ZMEM_CTX_BUDGET` (character cap) remains the
+hard outer truncation on the rendered block.
 
 `--include-global` (opt-in) ALSO surfaces up to `--global-limit` query-relevant
 rows from the `user:global` tier, merged project-first so a global row never
@@ -214,6 +230,10 @@ link too) above `ZMEM_LINK_THRESHOLD` (default 0.75) become `related` edges
 TAGS and re-derives its entity links (attribute evolution) — content,
 confidence, signal, and retrieval_count are never touched. Deterministic;
 no LLM (a `ZMEM_LINK_LLM` knob deliberately does not exist).
+`add --json` (v13) prints a structured write result — `{"id", "result":
+"stored"|"deduped", "warnings"}` — with warnings as structured objects
+(`{"type": "redacted", "count": N}` for automatic secret redactions); the
+MCP and Hermes add surfaces use it. Default output is unchanged.
 Namespace validation: obvious misspellings of the global namespace (`global`,
 `userglobal`, `users:global`, …) are rejected at `add` time AND on `ingest-jsonl`
 sync import with a message naming the canonical `user:global` — such rows would
@@ -292,7 +312,7 @@ python <store.py> recent [--namespace NS] [--limit 5] [--min-confidence 0.5]
                          [--json]
 python <store.py> search --text "<text>" [--namespace NS] [--limit 10]
                         [--include-global] [--global-limit 3] [--no-bump]
-                        [--as-of ISO-8601]
+                        [--as-of ISO-8601] [--json]
 python <store.py> supersede --id <full-uuid> [--reason "..."]
 python <store.py> invalidate --id <full-uuid> --reason "..."
 python <store.py> update --id <full-uuid> --content "<new content>" [overrides...]
@@ -300,6 +320,17 @@ python <store.py> list [--namespace NS] [--include-superseded]
 python <store.py> get --id <uuid>
 python <store.py> stats
 ```
+Read envelope (v13, issue #65 10.8): `recall`/`recent`/`search --json` print
+`{"results", "count", "omitted", "injection_risk", "tokens_used",
+"tokens_budget"}` instead of a bare list — `omitted` counts rows the
+`--no-bump` inject filter dropped (injection-risk + `untrusted_web`), so
+hosts stop guessing from stderr. Library callers still get the bare row list
+from the Python API.
+
+`update --json` mirrors `add --json` (`{"id", "result", "created_new",
+"warnings"}`). `get` (always JSON) includes the v13 `episodes` key — the
+episodes this memory belongs to (always a list, possibly empty).
+
 `recent`/`search` accept the same `--include-global`/`--global-limit` pair as
 `recall` (project-first global tier union). `recent` now ALSO honours v5
 migration aliases (so `recent --namespace <old pre-v5 key>` finds rows migrated
@@ -411,6 +442,86 @@ loads an operator-supplied local ONNX file with NO checksum pin — none was
 publishable offline. Treat that path with the same caution as any executable;
 doctor's `embeddings_health.cross_encoder` block surfaces enabled/model-file
 state so a missing-model silent degrade is visible.
+
+### episode-open / episode-add / episode-close / episode-list — session containers (v13, issue #65 10.7)
+
+```
+python <store.py> episode-open --namespace "project:<basename>" [--json]
+python <store.py> episode-add --episode <uuid> --memory <uuid> [--json]
+python <store.py> episode-close --episode <uuid> [--summary] [--json]
+python <store.py> episode-list [--namespace NS] [--json]
+```
+
+An **episode** groups the memories captured during one working session
+(schema v13: `episode` + `episode_memory` tables). It is a CONTAINER, not a
+memory type — `episode` is deliberately absent from `--type` values.
+
+- `episode-open` creates the row (`ended_at` empty until close) and prints
+  its id; this is the only creator — no empty-table seeding.
+- `episode-add` attaches a LIVE memory (`superseded_at IS NULL`; a
+  tombstoned id is refused exit-2) to an OPEN episode. Idempotent per pair;
+  memberships are append-only (a later supersede never removes one).
+- `episode-close` sets `ended_at`, computes `token_count` (the same
+  `row_token_cost` the injection budget uses, summed over LIVE members at
+  close), and with `--summary` writes one extractive first-sentence summary
+  row via the standard `add` path (capture-mode auto, so the shared
+  redaction helper runs) linked by `summary_memory_id`. A closed episode
+  cannot be re-closed or re-opened (append-only).
+- `episode-list` prints episodes newest-first with member counts
+  (`--json` for rows). `get --json` on a memory lists its episodes.
+
+Episodes round-trip through `export-jsonl`/`ingest-jsonl` via a `kind`
+discriminator (`"memory"` on memory rows; separate `episode` and
+`episode_memory` records). Legacy kind-less files still ingest as
+memory rows; an older client consuming a new export should filter to
+`kind == "memory"` lines. Doctor reports counts (`episode-tables`).
+
+### session_start / session_end — MCP + Hermes pairing tools (v13, issue #65 10.5)
+
+Both surfaces expose `session_start` / `session_end` (MCP tools) and
+`zmem_session_start` / `zmem_session_end` (Hermes tools) with the same
+contract:
+
+- **`session_start(namespace?, limit=3)`** — passive prefetch returning a
+  fenced, provenance-tagged context block (Phase 3 fence + selective-inject
+  rules, 0.5 recent floor). It runs `recent --no-bump`: `retrieval_count`
+  NEVER advances (only the surface event is recorded — pinned by
+  tests/test_session_tools.py), injection-risk and `untrusted_web` rows are
+  omitted, and `ZMEM_INJECT_TOKEN_BUDGET` is honored. The response reports
+  `ids`, `omitted`, `tokens_used`, `tokens_budget`. Namespace omitted
+  resolves to the surface's own default — `user:global` on MCP, the session
+  namespace on Hermes (a deliberate divergence: the Hermes provider is
+  session-scoped, the network server is not).
+- **`session_end(note?, namespace?)`** — default is a NO-WRITE
+  acknowledgement so clients can pair start/end freely; it NEVER organizes
+  or consolidates (run the explicit CLI for that). With a `note`, exactly
+  one row is written via the standard `add` path (`fact`, `signal none`,
+  `taint untrusted_tool`, capture-mode auto so redaction runs), defaulting
+  to the server/session namespace.
+
+### Scoped MCP tokens (v13, issue #65 10.2)
+
+`ZMEM_MCP_TOKEN` (env) is always an UNSCOPED operator token — full access to
+every namespace, exactly the pre-v13 behavior. To scope it, point
+`ZMEM_MCP_TOKEN_FILE` at a JSON object:
+
+```json
+{"token": "<secret>", "namespaces": ["project:zmem", "user:global"]}
+```
+
+Requests outside the allow-list fail closed with the stable
+`namespace_not_allowed` error. Note: `supersede`/`invalidate` are
+id-addressed and deliberately NOT namespace-confined (a scoped token
+holding an id may tombstone it) — namespace confinement applies to the
+namespace-bearing tools. Scoped tokens MUST pass an allowed namespace
+explicitly on every read — a namespace-less read spans the whole store and
+is denied — and the implicit `user:global` union on scoped reads is
+suppressed unless `user:global` is itself in the list. Malformed JSON, an
+empty `namespaces` list, or near-miss scopes like `"global"` are hard
+startup errors (exit 2). A bare (non-JSON) token file stays unscoped, as does
+a JSON object with `namespaces` absent or `null`.
+Doctor warns `unscoped_token: true` on operator tokens (issue #65, 10.10)
+and never prints the token value.
 
 ### promote — review and install a reusable skill
 ```
@@ -796,6 +907,14 @@ to one namespace, `--include-superseded` also exports tombstoned rows.
 Entity links are deliberately NOT carried in the JSONL (they are store-local
 derived data, like embeddings and content_norm): the receiving store rebuilds
 them by re-running the deterministic extractor on ingest — see below.
+
+v13 (issue #65, 10.7): every row carries a `kind` discriminator (`"memory"`);
+episodes round-trip as additional `"episode"` and `"episode_memory"`
+records when any exist (memberships are emitted only when both endpoints are
+in the exported set, so the file is self-consistent). `ingest-jsonl` treats
+a missing `kind` as `"memory"` (legacy files ingest unchanged) and applies
+records in dependency order (memory → episode → membership) regardless of
+file order; re-ingesting the same file is an exact no-op.
 
 ### ingest-jsonl — import Tier 3 sync JSONL
 ```

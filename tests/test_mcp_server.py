@@ -273,7 +273,10 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         result = self._add(content="prefer small reviewable commits",
                            type_="lesson", signal="user")
         self.assertEqual(result.get("result"), "stored")
-        self.assertIn("raw", result)
+        # v13 (issue #65, 10.8): --json structured write result — the id is a
+        # first-class field (no more raw stdout scraping).
+        self.assertIn("id", result)
+        self.assertRegex(result["id"], r"^[0-9a-f-]{36}$")
 
     def test_add_bad_type_returns_error(self):
         result = self._call("add", type="bogus", content="x", namespace=self._ns())
@@ -402,7 +405,10 @@ class McpServerToolSurfaceTest(unittest.TestCase):
                             content="revised lesson beta via mcp",
                             taint="untrusted_web")
         self.assertEqual(result.get("result"), "updated", result)
-        self.assertIn("updated memory", result.get("raw", ""))
+        # v13 (issue #65, 10.8): structured write result — the replacement row
+        # id + created_new flag (no more raw stdout scraping).
+        self.assertIn("id", result)
+        self.assertTrue(result.get("created_new"))
 
         # The OLD row is gone from live recall; the NEW content is findable.
         after = self._call("recall", query="revised lesson beta",
@@ -561,11 +567,19 @@ class McpServerToolSurfaceTest(unittest.TestCase):
             content="deploy token: ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
             namespace=ns, signal="test")
         self.assertEqual(result.get("result"), "stored", result)
-        # An advisory/notice warning about redaction must be surfaced.
+        # v13 (issue #65, 10.8): warnings are STRUCTURED objects — a redaction
+        # carries {"type": "redacted", "count": N, "message": ...}.
         warnings = result.get("warnings") or []
-        redaction_warnings = [w for w in warnings if "redact" in w.lower()]
+        redaction_warnings = [
+            w for w in warnings
+            if isinstance(w, dict) and w.get("type") == "redacted"
+        ]
         self.assertGreater(len(redaction_warnings), 0,
                            f"expected a redaction warning, got: {warnings}")
+        self.assertGreater(redaction_warnings[0].get("count", 0), 0)
+        # The warning never carries the secret itself.
+        self.assertNotIn("ghp_" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+                         str(warnings))
 
     def test_add_secret_source_ref_returns_structured_error(self):
         """When source_ref itself carries secret-like text, auto mode refuses
@@ -591,7 +605,9 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         self.assertEqual(result.get("result"), "stored", result)
         secret_warnings = [
             w for w in (result.get("warnings") or [])
-            if "secret" in w.lower() or "redacted" in w.lower()
+            if isinstance(w, dict) and w.get("type") in ("redacted", "advisory")
+            and ("secret" in str(w.get("message", "")).lower()
+                 or "redacted" in str(w.get("message", "")).lower())
         ]
         self.assertEqual(secret_warnings, [],
                          f"clean content should not produce secret warnings: {secret_warnings}")

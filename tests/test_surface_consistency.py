@@ -114,8 +114,26 @@ class AdapterScanTest(unittest.TestCase):
     def test_explicit_mcp_recall_omits_no_bump(self):
         text = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py").read_text(
             encoding="utf-8")
-        self.assertNotIn("--no-bump", text,
-                         "MCP recall/search are EXPLICIT and must NOT pass --no-bump")
+        # v13 (issue #65, 10.5): session_start is the D4 PASSIVE path and MUST
+        # pass --no-bump — the scan is scoped to the EXPLICIT tool bodies so
+        # the passive exception is pinned, not forbidden.
+        import ast as _ast
+        tree = _ast.parse(text)
+        bodies = {}
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.AsyncFunctionDef) and node.name in (
+                "recall", "search", "recent", "session_start", "session_end",
+            ):
+                bodies[node.name] = _ast.get_source_segment(text, node) or ""
+        for explicit in ("recall", "search", "recent"):
+            self.assertIn(explicit, bodies, f"tool {explicit} missing?")
+            self.assertNotIn(
+                "--no-bump", bodies[explicit],
+                f"MCP {explicit} is EXPLICIT and must NOT pass --no-bump")
+        self.assertIn(
+            "--no-bump", bodies.get("session_start", ""),
+            "MCP session_start is the D4 passive path and MUST pass --no-bump "
+            "(issue #65, 10.5)")
 
     def test_explicit_mcp_recall_docstring_documents_bump(self):
         # I2 (#38 / #56): the explicit-vs-passive bump rule is tested design,
@@ -372,7 +390,10 @@ class TaintAutoInjectSurfaceTest(unittest.TestCase):
         seeded = self._seed("alpha")
         r = self._run("recall", "--query", "quokka", "--namespace", seeded["ns"],
                       "--no-bump", "--json")
-        ids = {x["id"] for x in json.loads(r.stdout)}
+        _parsed = json.loads(r.stdout)
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        _rows = _parsed["results"] if isinstance(_parsed, dict) else _parsed
+        ids = {x["id"] for x in _rows}
         self.assertNotIn(seeded["untrusted_web"], ids,
                          "passive recall must OMIT untrusted_web (same path as "
                          "injection-risk)")
@@ -382,14 +403,16 @@ class TaintAutoInjectSurfaceTest(unittest.TestCase):
                       "explicit path")
         self.assertIn(seeded["trusted_internal"], ids)
         # The payload still carries taint so a --json consumer can filter.
-        tool_item = next(x for x in json.loads(r.stdout)
+        tool_item = next(x for x in _rows
                          if x["id"] == seeded["untrusted_tool"])
         self.assertEqual(tool_item["taint"], "untrusted_tool")
 
     def test_no_bump_recent_omits_untrusted_web(self):
         seeded = self._seed("bravo")
         r = self._run("recent", "--namespace", seeded["ns"], "--no-bump", "--json")
-        ids = {x["id"] for x in json.loads(r.stdout)}
+        _parsed = json.loads(r.stdout)
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        ids = {x["id"] for x in (_parsed["results"] if isinstance(_parsed, dict) else _parsed)}
         self.assertNotIn(seeded["untrusted_web"], ids,
                          "passive recent must OMIT untrusted_web")
         self.assertIn(seeded["untrusted_tool"], ids)
@@ -412,7 +435,9 @@ class TaintAutoInjectSurfaceTest(unittest.TestCase):
         seeded = self._seed("delta")
         r = self._run("recall", "--query", "quokka", "--namespace", seeded["ns"],
                       "--json")
-        items = json.loads(r.stdout)
+        _parsed = json.loads(r.stdout)
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        items = _parsed["results"] if isinstance(_parsed, dict) else _parsed
         ids = {x["id"] for x in items}
         self.assertIn(seeded["untrusted_web"], ids)
         self.assertIn(seeded["untrusted_tool"], ids)
@@ -432,6 +457,56 @@ class AgentWriteSurfaceParityTest(unittest.TestCase):
 
     def _src(self, rel: str) -> str:
         return (REPO_ROOT / rel).read_text(encoding="utf-8")
+
+    # -- v13 (issue #65): surface-completeness parity -----------------------
+
+    def test_session_tools_exist_on_both_surfaces(self):
+        """10.3/10.5: session_start/session_end, search, update, invalidate
+        are listed on BOTH the MCP server and the Hermes provider — one
+        contract, two surfaces (source-scan so CI guards it too)."""
+        mcp = self._src("hermes-plugin/server/mcp_server.py")
+        hermes = self._src("hermes-plugin/__init__.py")
+        for tool in ("session_start", "session_end", "update", "invalidate",
+                     "search", "recall", "recent", "add"):
+            self.assertIn(f"async def {tool}(", mcp, f"MCP missing tool {tool}")
+        for tool in ("zmem_session_start", "zmem_session_end", "zmem_update",
+                     "zmem_invalidate", "zmem_search"):
+            self.assertIn(f'"{tool}"', hermes, f"Hermes missing tool {tool}")
+        schemas = [f'"{t}"' in hermes for t in
+                   ("zmem_session_start", "zmem_session_end")]
+        self.assertTrue(all(schemas), "Hermes session tool schemas missing")
+
+    def test_hermes_search_never_expands_links(self):
+        """10.4 (plan-critic 13): Hermes zmem_search pins --link-hops 0 — the
+        CLI/MCP keyword-only, never-expanded search contract. A future refactor
+        dropping the flag would silently append linked neighbors past --limit."""
+        src = self._src("hermes-plugin/__init__.py")
+        start = src.find("def _tool_search")
+        window = src[start:start + 2500]
+        self.assertIn('"--link-hops", "0"', window,
+                      "hermes _tool_search must pin --link-hops 0 (parity "
+                      "with the CLI search subcommand and MCP search)")
+
+    def test_both_write_surfaces_use_structured_json_result(self):
+        """10.8: MCP and Hermes add/update consume the structured --json write
+        result so remote write warnings are structured data on both surfaces."""
+        mcp = self._src("hermes-plugin/server/mcp_server.py")
+        hermes = self._src("hermes-plugin/__init__.py")
+        self.assertIn('_write_response(r, ok_result="stored"', mcp)
+        self.assertIn('_write_response(r, ok_result="updated"', mcp)
+        self.assertIn('_structured_write_response(r, ok_result="stored")', hermes)
+        self.assertIn('_structured_write_response(r, ok_result="updated")', hermes)
+
+    def test_update_namespace_override_on_both_surfaces(self):
+        """10.3: the namespace override is exposed on BOTH remote update
+        surfaces (CLI already had --namespace)."""
+        mcp = self._src("hermes-plugin/server/mcp_server.py")
+        hermes = self._src("hermes-plugin/__init__.py")
+        mcp_start = mcp.find("async def update(")
+        # Window widened: the scoped-token F6 pin block grew the tool body.
+        self.assertIn('"--namespace", ns_override', mcp[mcp_start:mcp_start + 8000])
+        h_start = hermes.find("def _tool_update")
+        self.assertIn('"--namespace", ns_override', hermes[h_start:h_start + 4000])
 
     def test_agent_write_paths_pass_capture_mode_auto(self):
         src = self._src("hermes-plugin/__init__.py")

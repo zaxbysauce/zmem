@@ -156,7 +156,8 @@ Hermes reads/writes the same canonical store via a `MemoryProvider` adapter.
 Unlike ZCode/CC/Codex (which use the host adapter + bash hooks), Hermes has
 its own first-class memory-provider ABC and a shell-hook system, so the
 adapter is native Python: passive recall before each turn, explicit memory
-tools (`zmem_add` / `zmem_search` / `zmem_supersede`), Tier-0 `core.md`
+tools (`zmem_add` / `zmem_search` / `zmem_update` / `zmem_invalidate` /
+`zmem_supersede` / `zmem_session_start` / `zmem_session_end`), Tier-0 `core.md`
 injection, and an optional reflection loop.
 
 Hermes' plugin discovery scans `~/.hermes/plugins/memory/<name>/`, so install
@@ -316,6 +317,7 @@ Consolidate / recall / dedup tuning:
 | `ZMEM_CONSOLIDATE_LEXICAL_THRESHOLD` | Jaccard token-overlap threshold used in the no-embeddings lexical fallback. | `0.60` |
 | `ZMEM_DEDUP_THRESHOLD` | Cosine similarity above which an incoming memory is deduped against an existing one. | `0.85` |
 | `ZMEM_CTX_BUDGET` | Approx byte budget for the Tier-1 pack / context payload. Host-dependent when unset: `25000` (ZCode) vs `9000` (Claude Code / Codex). | `25000` / `9000` |
+| `ZMEM_INJECT_TOKEN_BUDGET` | Token budget (default 1500, 4 chars/token heuristic) for hook/session_start memory injection: bullet admission stops at the budget, `decision`/`constraint` rows are never dropped, lowest-score `signal=none` rows drop first (issue #65, 10.9). | `1500` |
 | `ZMEM_CONVENTION_INTERVAL` | Fire the convention nudge every N successful tool calls. | `10` |
 
 Capture:
@@ -337,7 +339,7 @@ MCP server:
 | Var | Purpose | Default |
 |-----|---------|---------|
 | `ZMEM_MCP_TOKEN` | Bearer token for the MCP server. **Required** to start the server. | — |
-| `ZMEM_MCP_TOKEN_FILE` | Path to a file containing the token (alternative to `ZMEM_MCP_TOKEN`). | — |
+| `ZMEM_MCP_TOKEN_FILE` | Path to a file containing the token (alternative to `ZMEM_MCP_TOKEN`). A bare text file is an UNSCOPED operator token (full access). A JSON file `{"token": "...", "namespaces": ["project:x", "user:global"]}` scopes the token: requests outside the allow-list fail closed with the stable `namespace_not_allowed` error, and scoped tokens must pass an allowed namespace explicitly on every read (issue #65, 10.2). Omitting `namespaces` — or setting it to `null` — means an UNSCOPED operator token (full access), exactly like a bare text file. | — |
 | `ZMEM_MCP_ALLOW_INSECURE_BIND` | Set to `1` to allow `0.0.0.0` / `::` (and IPv4-mapped) wildcard binds. | unset |
 | `ZMEM_MCP_MAX_CONCURRENT` | Cap on simultaneous `store.py` subprocesses the MCP server will run (overload protection). | `8` |
 | `ZMEM_MCP_QUEUE_TIMEOUT_S` | How long a queued tool call waits for a concurrency slot before returning an overload error. | `60` |

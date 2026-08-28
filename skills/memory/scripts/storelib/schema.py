@@ -851,6 +851,30 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_memory_link_src ON memory_link(src_id);
         CREATE INDEX IF NOT EXISTS idx_memory_link_dst ON memory_link(dst_id);
+
+        -- v13 (issue #65, 10.7): episodes — bounded session containers.
+        -- `episode` is a container, NOT a memory type (never in ALLOWED_TYPES).
+        -- ended_at/summary_memory_id follow the store's empty-TEXT idiom.
+        -- token_count = sum of row_token_cost(member) over LIVE members at
+        -- close time (storelib/episodes.py maintains it).
+        CREATE TABLE IF NOT EXISTS episode (
+            id                 TEXT PRIMARY KEY,
+            namespace          TEXT NOT NULL,
+            started_at         TEXT NOT NULL,
+            ended_at           TEXT NOT NULL DEFAULT '',
+            summary_memory_id  TEXT NOT NULL DEFAULT '',
+            token_count        INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_episode_ns
+            ON episode(namespace, started_at);
+        CREATE TABLE IF NOT EXISTS episode_memory (
+            episode_id  TEXT NOT NULL,
+            memory_id   TEXT NOT NULL,
+            added_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (episode_id, memory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_episode_memory_mem
+            ON episode_memory(memory_id);
         """
     )
     # executescript() does not accept parameter binding, so set created_at separately.
@@ -1417,6 +1441,41 @@ def migrate(conn: sqlite3.Connection) -> None:
                 "ALTER TABLE memory ADD COLUMN violated_count INTEGER NOT NULL DEFAULT 0"
             )
         conn.execute("UPDATE meta SET value='12' WHERE key='schema_version'")
+        conn.commit()
+
+    if ver < 13:
+        # v13 (issue #65, 10.7): episodes as real storage. Purely ADDITIVE —
+        # two new tables + one index, no `memory` column changes, no backfill,
+        # no data rewrite (safe on a large production store: worst case is two
+        # empty CREATE TABLE IF NOT EXISTS statements). init_db() creates the
+        # same tables on a fresh store; this block is the legacy-store path.
+        # `episode` is a CONTAINER, not a memory type — it is deliberately NOT
+        # in ALLOWED_TYPES (out-of-scope list, issue #65). ended_at and
+        # summary_memory_id use the store's empty-TEXT idiom (like valid_until)
+        # rather than NULL so predicates never need IS NULL/'' duals.
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS episode (
+                id                 TEXT PRIMARY KEY,
+                namespace          TEXT NOT NULL,
+                started_at         TEXT NOT NULL,
+                ended_at           TEXT NOT NULL DEFAULT '',
+                summary_memory_id  TEXT NOT NULL DEFAULT '',
+                token_count        INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_episode_ns
+                ON episode(namespace, started_at);
+            CREATE TABLE IF NOT EXISTS episode_memory (
+                episode_id  TEXT NOT NULL,
+                memory_id   TEXT NOT NULL,
+                added_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (episode_id, memory_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_episode_memory_mem
+                ON episode_memory(memory_id);
+            """
+        )
+        conn.execute("UPDATE meta SET value='13' WHERE key='schema_version'")
         conn.commit()
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to

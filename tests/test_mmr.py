@@ -69,6 +69,8 @@ class _Store(unittest.TestCase):
         )
         self.assertEqual(out.returncode, 0, out.stderr)
         rows = json.loads(out.stdout)
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        rows = rows["results"] if isinstance(rows, dict) else rows
         return [r["content"] for r in rows]
 
     def seed_crowded(self):
@@ -149,10 +151,12 @@ class MmrAcceptanceTest(_Store):
             "add", "--namespace", "project:mmr", "--type", "fact",
             "--content", "solo anchor content", "--signal", "test",
         )
-        rows = json.loads(self.run_store(
+        parsed = json.loads(self.run_store(
             "recall", "--query", "solo anchor", "--namespace", "project:mmr",
             "--json", "--limit", "1",
         ).stdout)
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        rows = parsed["results"] if isinstance(parsed, dict) else parsed
         self.assertEqual(len(rows), 1)
 
     def test_no_mmr_flag_documented(self):

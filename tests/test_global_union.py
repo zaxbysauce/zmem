@@ -88,12 +88,16 @@ class _StoreCase(unittest.TestCase):
     def recall_json(self, query: str, *extra: str) -> list[dict]:
         r = self.run_store("recall", "--query", query, "--no-bump", "--json", *extra)
         self.assertEqual(r.returncode, 0, r.stderr)
-        return json.loads(r.stdout) if r.stdout.strip() else []
+        parsed = json.loads(r.stdout) if r.stdout.strip() else []
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        return parsed["results"] if isinstance(parsed, dict) else parsed
 
     def recent_json(self, *extra: str) -> list[dict]:
         r = self.run_store("recent", "--no-bump", "--json", *extra)
         self.assertEqual(r.returncode, 0, r.stderr)
-        return json.loads(r.stdout) if r.stdout.strip() else []
+        parsed = json.loads(r.stdout) if r.stdout.strip() else []
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        return parsed["results"] if isinstance(parsed, dict) else parsed
 
 
 # --------------------------------------------------------------------------
@@ -452,7 +456,9 @@ class TestHybridRrfGlobalUnion(_StoreCase):
                            "--namespace", PROJECT_NS, "--include-global",
                            "--hybrid", "--no-bump", "--json", env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
-        results = json.loads(r.stdout) if r.stdout.strip() else []
+        parsed = json.loads(r.stdout) if r.stdout.strip() else []
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        results = parsed["results"] if isinstance(parsed, dict) else parsed
         # The global fox row (semantic match only) must surface via the union.
         self.assertTrue(
             any(r_["namespace"] == "user:global" for r_ in results),

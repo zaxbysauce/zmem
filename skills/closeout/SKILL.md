@@ -105,6 +105,19 @@ capture time. Render the warning to yourself, and write that item via
 `add --capture-mode auto` so any remaining secret-like text is redacted before
 it reaches the store (the default manual mode would keep the original wording).
 
+**Redaction operator feedback (issue #65, 10.6):** when an `add`/`update` in
+`--capture-mode auto` reports a redaction warning (the structured
+`{"type": "redacted", "count": N}` warning on `--json`, or the stderr NOTICE
+line), you MUST emit exactly one operator feedback line in your closeout
+summary, derived ONLY from the warning count — never from the captured value:
+
+```
+zmem: redacted <N> secret-like value(s) from the captured memory (value not shown).
+```
+
+The stored row shows `[REDACTED_SECRET]` markers where the values were; the raw
+value must never appear in your feedback, the store, or the transcript.
+
 After processing, clear the processed items from the queue (leave explicitly
 deferred items in place), and prune stale low-confidence candidates:
 

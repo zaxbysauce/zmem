@@ -40,6 +40,15 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STORE_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
+
+# schema_meta loaded standalone (constants-only, dependency-free) so the
+# migration assertions track the CURRENT supported version across bumps.
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location(
+    "zmem_schema_meta_v", REPO_ROOT / "skills" / "memory" / "scripts" / "schema_meta.py")
+_schema_meta = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_schema_meta)
+SUPPORTED_VERSION = str(_schema_meta.SUPPORTED_SCHEMA_VERSION)
 PYTHON = sys.executable
 NS = "project:feedback-test"
 TRUST_DROP = 0.15
@@ -346,13 +355,15 @@ class MigrationV12Test(unittest.TestCase):
                 "MAX(applied_count) FROM memory").fetchone()
         finally:
             conn.close()
-        self.assertEqual(ver, "12")
+        # v13 (issue #65): the walk continues past v12 to the current
+        # SUPPORTED_SCHEMA_VERSION (13 adds the additive episode tables).
+        self.assertEqual(ver, SUPPORTED_VERSION)
         self.assertEqual(n, 2, "no rows may be lost in migration")
         self.assertIn("applied_count", cols)
         self.assertIn("violated_count", cols)
         self.assertEqual(mins, (0, 0, 0), "counters default to 0 on migrate")
 
-        # Second writable run is an idempotent no-op (version stays 12).
+        # Second writable run is an idempotent no-op (version stays pinned).
         r = subprocess.run(
             [PYTHON, str(STORE_PY), "get", "--id",
              "aaaaaaaa-0000-4000-8000-000000000002"],
@@ -364,7 +375,7 @@ class MigrationV12Test(unittest.TestCase):
                 "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(ver, "12")
+        self.assertEqual(ver, SUPPORTED_VERSION)
 
 
 class TestFeedbackSync(FeedbackTestBase):

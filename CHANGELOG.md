@@ -12,6 +12,11 @@ README.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-08-27
+
+This release folds in the previously-Unreleased work from issues #63 and #64
+(below) alongside issue #65.
+
 ### Added
 - **Schema v12 — Voyager usage-feedback counters** (issue #64):
   `memory.applied_count` / `memory.violated_count` (INTEGER NOT NULL
@@ -93,6 +98,80 @@ README.
 - New standalone suites: `tests/test_embed_profiles.py`,
   `tests/test_embedder_checksum.py`, `tests/test_reembed.py`,
   `tests/test_cross_encoder.py`; extended `tests/test_doctor.py`
+
+**Issue #65 — host and MCP completeness**
+
+Added:
+- **Schema v13 — episode storage** (issue #65, 10.7): `episode(id, namespace,
+  started_at, ended_at, summary_memory_id, token_count)` +
+  `episode_memory(episode_id, memory_id, added_at)` containers. Purely
+  ADDITIVE migration (two CREATE TABLE IF NOT EXISTS; no `memory` column
+  changes). New CLI: `episode-open` / `episode-add` / `episode-close
+  [--summary]` / `episode-list [--json]`; `get --json` carries `episodes`
+  linkage; doctor `episode-tables` check reports counts; export/ingest
+  round-trip episodes via a `kind` discriminator (memory rows gain
+  `"kind": "memory"`; legacy kind-less files still ingest). `episode` is NOT
+  an ALLOWED_TYPES member — it is a container, not a memory type. Members
+  must be LIVE at attach; memberships are append-only; close is refused on a
+  closed episode; `token_count` sums the shared `row_token_cost` over LIVE
+  members at close
+
+- **MCP + Hermes session tools** (issue #65, 10.5 — D4 contract):
+  `session_start` (passive prefetch: `--no-bump` so `retrieval_count` never
+  advances, injection-risk/`untrusted_web` rows omitted, Phase 3 fence +
+  0.5 recent floor, token-budget honored) and `session_end` (default is a
+  NO-WRITE ack; an optional note writes exactly one row via the standard add
+  path with capture-mode auto) on BOTH surfaces (`session_start`/
+  `session_end` MCP tools, `zmem_session_start`/`zmem_session_end` Hermes
+  tools)
+
+- **Scoped MCP tokens** (issue #65, 10.2): `ZMEM_MCP_TOKEN_FILE` accepts a
+  JSON object `{"token", "namespaces": [...]}`; requests outside the
+  allow-list fail closed with the stable `namespace_not_allowed` error;
+  namespace-less reads are denied for scoped tokens; the implicit
+  user:global union is suppressed unless `user:global` is in the list. The
+  unscoped operator token (env var or bare file) remains full-access —
+  pre-v13 behavior unchanged. Malformed JSON / empty or invalid namespace
+  lists / near-miss `global` scopes are hard exit-2 config errors. New
+  doctor `mcp-token` check warns `unscoped_token: true` on operator tokens
+  and never reports the token value (issue #65, 10.10)
+
+- **Token budget** (issue #65, 10.9): `ZMEM_INJECT_TOKEN_BUDGET` (default
+  1500, 4-chars/token heuristic). Hooks (UserPromptSubmit, PreCompact,
+  SubagentStart, SessionStart Tier 2) and both session_start tools stop
+  adding bullets at the budget; `decision`/`constraint` rows are never
+  dropped; lowest-score `signal=none` rows drop first. The hook bg-log line
+  gains `tokens=<used>/<budget>`. Read `--json` envelopes report
+  `tokens_used`/`tokens_budget` (`storelib/inject.py` is the single
+  implementation)
+
+- **Read envelope + structured write warnings** (issue #65, 10.8):
+  `recall`/`recent`/`search --json` emit `{"results", "count", "omitted",
+  "injection_risk", "tokens_used", "tokens_budget"}` so hosts stop guessing
+  from stderr (`search` gains `--json`); `add`/`update` gain `--json`
+  printing `{"id", "result", "warnings"}` with structured
+  `{"type": "redacted", "count": N}` entries; MCP add/update and Hermes
+  add/update surface the structured warnings (Hermes previously dropped
+  them). One redaction helper (`storelib.write.redact_text`) serves CLI,
+  MCP, Hermes, mine-history, organize, and episode summary writes; a
+  redaction failure in auto mode refuses the write (fail-closed)
+
+- **Surface parity** (issues #65 10.1/10.3/10.4, closes #38 I1/I4/I5): MCP
+  `add` validates namespace shape fail-fast (CLI-identical rules); MCP
+  `update` + Hermes `zmem_update` gain the `namespace` override (parity
+  with `update --namespace`; guarded by the token scope); Hermes
+  `zmem_search` pins `--link-hops 0` (the CLI search contract) and unwraps
+  the read envelope; Hermes `prefetch` unwraps the envelope
+
+- **Closeout redaction feedback** (issue #65, 10.6): the closeout skill
+  requires one count-based operator line after a redaction —
+  `zmem: redacted <N> secret-like value(s) from the captured memory (value
+  not shown).` — derived from the warning count, never the value
+
+Tests (issue #65): new standalone suites `tests/test_mcp_auth.py`,
+`tests/test_session_tools.py`, `tests/test_redaction.py`,
+`tests/test_episodes.py`, `tests/test_token_budget.py`; extended
+`tests/test_mcp_server.py`, `tests/test_doctor.py`.
 
 ## [0.12.0] — 2026-08-26
 

@@ -22,6 +22,7 @@ from storelib.entity import entities_for_memory, entities_for_memories, entity_m
 from storelib.links import expand_recall_links
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
+from storelib.inject import estimate_tokens, inject_token_budget
 from schema_meta import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
 import embed_profiles as _profiles
 from storelib.cross_encoder import maybe_rerank as _cross_maybe_rerank
@@ -979,11 +980,17 @@ def recall_memory(
     # scripts inherit (they pass `--no-bump`; no hook script edit is
     # needed). `untrusted_tool` is NOT omitted — it is trusted enough
     # to surface passively, and is flagged on the explicit path instead.
+    # v13 (issue #65, 10.8): count the drops so the --json envelope can
+    # report `omitted` — hosts must not have to guess from stderr.
+    omitted = 0
     if no_bump:
-        results = [
-            r for r in results
-            if not r.get("prompt_injection_risk") and r.get("taint") != "untrusted_web"
-        ]
+        kept_rows = []
+        for r in results:
+            if not r.get("prompt_injection_risk") and r.get("taint") != "untrusted_web":
+                kept_rows.append(r)
+            else:
+                omitted += 1
+        results = kept_rows
 
     # v11 (issue #61, 6.3): budgeted 1-hop link expansion — AFTER MMR and the
     # no_bump filter (expansion candidates get the same injection/untrusted
@@ -1026,6 +1033,11 @@ def recall_memory(
         for r in results:
             r["entities"] = cards.get(r["id"], [])
 
+    # F13 (PR #81 round 2): count flagged rows AFTER link expansion —
+    # expand_recall_links sets prompt_injection_risk on expansion rows,
+    # and the pre-expansion count missed them (violating this function's
+    # own 'flagged rows are counted too' contract).
+    injection_risk_count = sum(1 for r in results if r.get("prompt_injection_risk"))
     if bump_ids:
         # v11 (issue #61, 6.3): bump ONLY the query-matched rows — expansion
         # neighbors joined via `bump_ids` capture above, before expansion.
@@ -1034,7 +1046,20 @@ def recall_memory(
                         disabled=no_telemetry)
 
     if as_json:
-        print(json.dumps(results, indent=2))
+        # v13 (issue #65, 10.8/10.9): reads emit an ENVELOPE, not a bare list,
+        # so hosts get structured omit/injection counts and token accounting
+        # without parsing stderr. In-repo consumers unwrap via
+        # storelib.inject.envelope_results (hooks body, Hermes, MCP); a bare
+        # list keeps working for every library caller (the return value below).
+        tokens_used = sum(estimate_tokens(r.get("content", "") or "") for r in results)
+        print(json.dumps({
+            "results": results,
+            "count": len(results),
+            "omitted": omitted,
+            "injection_risk": injection_risk_count,
+            "tokens_used": tokens_used,
+            "tokens_budget": inject_token_budget(),
+        }, indent=2))
     else:
         # Issue #58, 3.5: hook/text surface uses the fenced render
         # with full provenance (id, confidence, signal, ns, type,
@@ -1188,19 +1213,34 @@ def recent_memory(
     # (defense in depth) and drop on `--no-bump` paths. v9 (#59, 4.7): the
     # passive path also omits `untrusted_web` rows (same path as
     # injection-risk), symmetric with recall_memory — see that site.
+    # v13 (issue #65, 10.8): count the drops for the --json envelope.
     for r in project_rows:
         r["prompt_injection_risk"] = _classify_injection(r)
     results = project_rows
+    omitted = 0
     if no_bump:
-        results = [
-            r for r in results
-            if not r.get("prompt_injection_risk") and r.get("taint") != "untrusted_web"
-        ]
+        kept_rows = []
+        for r in results:
+            if not r.get("prompt_injection_risk") and r.get("taint") != "untrusted_web":
+                kept_rows.append(r)
+            else:
+                omitted += 1
+        results = kept_rows
+    injection_risk_count = sum(1 for r in results if r.get("prompt_injection_risk"))
     if results:
         ids = [r["id"] for r in results]
         _bump_telemetry(conn, ids, no_bump=no_bump)
     if as_json:
-        print(json.dumps(results, indent=2))
+        # v13 (issue #65, 10.8/10.9): read envelope, same shape as recall.
+        tokens_used = sum(estimate_tokens(r.get("content", "") or "") for r in results)
+        print(json.dumps({
+            "results": results,
+            "count": len(results),
+            "omitted": omitted,
+            "injection_risk": injection_risk_count,
+            "tokens_used": tokens_used,
+            "tokens_budget": inject_token_budget(),
+        }, indent=2))
     else:
         # Issue #58, 3.5: same fence + provenance as recall. Recent is
         # the high-confidence admin pull used by SessionStart /
@@ -1322,6 +1362,22 @@ def get_memory(conn, mid) -> bool:
     # v10 (issue #60): the memory's entity links ride along on the get
     # surface — [{id, kind, name}] from memory_entity, canonical-name order.
     d["entities"] = entities_for_memory(conn, mid)
+    # v13 (issue #65, 10.7): episode linkage rides along the same way — the
+    # episodes this memory belongs to (open AND closed; membership is
+    # append-only history), newest first. Always a list so consumers can rely
+    # on the key. Guarded so a pre-v13 store (tables absent until the next
+    # writable open migrates it) still answers get.
+    try:
+        d["episodes"] = [
+            dict(row) for row in conn.execute(
+                """SELECT e.id, e.ended_at, em.added_at
+                   FROM episode_memory em JOIN episode e ON e.id = em.episode_id
+                   WHERE em.memory_id=? ORDER BY em.added_at DESC, e.id""",
+                (mid,),
+            ).fetchall()
+        ]
+    except sqlite3.OperationalError:
+        d["episodes"] = []
     print(json.dumps(d, indent=2))
     return True
 
