@@ -65,6 +65,18 @@ def normalize_content(s: str) -> str:
 # discriminator); doctor reports counts (episode-tables check).
 SUPPORTED_SCHEMA_VERSION = 13
 
+# Forward-compat window (issue #65 follow-up): a client refuses a store whose
+# schema_version exceeds its SUPPORTED_SCHEMA_VERSION. For ADDITIVE-ONLY bumps
+# (new side tables/indexes, no `memory` column or constraint changes) an older
+# client's SQL is fully valid on the newer store, so refusing just bricks it
+# until it updates. A maintenance release of an older line may therefore raise
+# THIS constant (never SUPPORTED) to the additive version: memory read/write
+# keeps working and only the newer-only features are unavailable. Between
+# SUPPORTED and FORWARD_COMPAT the client prints a one-time stderr NOTICE and
+# proceeds; above FORWARD_COMPAT it still refuses (ZMEM_ALLOW_NEWER_SCHEMA=1
+# overrides, at the operator's own risk).
+FORWARD_COMPAT_SCHEMA_VERSION = 13
+
 # v12 (issue #64): one-time trust_score reduction applied when a row's
 # violated_count crosses to 2 (the promote ladder's "violated" tier). Clamped
 # at 0.0 like every trust delta; signal is deliberately untouched (feedback is

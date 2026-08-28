@@ -25,6 +25,7 @@ try:
         MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS, ALLOWED_TAINTS,
         TAINT_RANK, TAINT_TRUSTED_SIGNALS, validate_taint, worse_taint,
         normalize_content, TRUST_VIOLATION_FLOOR_DROP,
+        FORWARD_COMPAT_SCHEMA_VERSION,
         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
@@ -32,6 +33,7 @@ except ImportError:
         MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS, ALLOWED_TAINTS,
         TAINT_RANK, TAINT_TRUSTED_SIGNALS, validate_taint, worse_taint,
         normalize_content, TRUST_VIOLATION_FLOOR_DROP,
+        FORWARD_COMPAT_SCHEMA_VERSION,
         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)  # type: ignore
 
 try:
@@ -244,13 +246,62 @@ def _read_schema_version(path: Path) -> int | None:
             f"zmem: store {path} has a non-integer schema_version {row[0]!r}; "
             "refusing to modify it"
         )
-    if version > SUPPORTED_SCHEMA_VERSION:
-        raise RuntimeError(
-            f"zmem: store {path} uses schema_version {version}, newer than this "
-            f"client's supported version {SUPPORTED_SCHEMA_VERSION}; refusing "
-            "to modify it"
-        )
+    _schema_compat(version, path)
     return version
+
+def _schema_compat(store_version: int, path) -> str:
+    """Forward-compat gate for one store's schema_version (issue #65
+    follow-up). Returns one of:
+
+      "ok"     store <= SUPPORTED -- business as usual.
+      "compat" SUPPORTED < store <= FORWARD_COMPAT_SCHEMA_VERSION -- an
+               additive-only bump this client's SQL is valid on; proceed and
+               print a ONE-TIME stderr NOTICE so the operator knows to update.
+      "refuse" store > FORWARD_COMPAT -- genuinely ahead; refuse unless the
+               operator sets ZMEM_ALLOW_NEWER_SCHEMA=1 ("compat" with a loud
+               warning).
+
+    A module flag keeps the NOTICE once-per-process (hooks spawn one
+    process per event; migrate() would otherwise print per call). In a
+    long-lived process (the MCP server) the NOTICE/WARNING therefore
+    prints at most once for the server's lifetime, no matter how many
+    distinct stores it later touches.
+    """
+    if store_version <= SUPPORTED_SCHEMA_VERSION:
+        return "ok"
+    if store_version <= FORWARD_COMPAT_SCHEMA_VERSION:
+        if not _schema_compat._warned:
+            _schema_compat._warned = True
+            print(
+                f"[zmem] NOTICE: store schema v{store_version} is newer than "
+                f"this client's v{SUPPORTED_SCHEMA_VERSION}; memory read/write "
+                "continues (additive-only schema), but newer-only features are "
+                "unavailable until you update this plugin.",
+                file=sys.stderr,
+            )
+        return "compat"
+    if os.environ.get("ZMEM_ALLOW_NEWER_SCHEMA", "").strip() == "1":
+        if not _schema_compat._warned:
+            _schema_compat._warned = True
+            print(
+                f"[zmem] WARNING: ZMEM_ALLOW_NEWER_SCHEMA=1 -- operating on a "
+                f"store at schema v{store_version} ahead of this client's "
+                f"v{SUPPORTED_SCHEMA_VERSION}. Data written by newer clients "
+                "may be invisible here; remove the override once updated.",
+                file=sys.stderr,
+            )
+        return "compat"
+    raise RuntimeError(
+        f"zmem: store {path} uses schema_version {store_version}, newer than "
+        f"this client's supported version {SUPPORTED_SCHEMA_VERSION} "
+        f"(forward-compat ceiling {FORWARD_COMPAT_SCHEMA_VERSION}); refusing "
+        "to modify it. Update this plugin (>= the store's schema release), or "
+        "set ZMEM_ALLOW_NEWER_SCHEMA=1 to proceed at your own risk."
+    )
+
+
+_schema_compat._warned = False
+
 
 def _commit(conn: sqlite3.Connection) -> None:
     """conn.commit() with a bounded retry on 'database is locked' — belt and
@@ -1109,11 +1160,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     row = conn.execute("SELECT value FROM meta WHERE key=?",
                        (SCHEMA_VERSION_KEY,)).fetchone()
     ver = int(row[0]) if row else 1
-    if ver > SUPPORTED_SCHEMA_VERSION:
-        raise RuntimeError(
-            f"zmem: store schema_version {ver} is newer than this client's "
-            f"supported version {SUPPORTED_SCHEMA_VERSION}; refusing to modify it"
-        )
+    # Single source of refusal messaging: _schema_compat raises the
+    # actionable RuntimeError (update hint / env override) on refuse.
+    _schema_compat(ver, "store")
 
     if ver < 2:
         # v2: ranking-support indexes + FTS trigger fix (stop write amplification).

@@ -47,6 +47,13 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 
 Do not proceed on a failing doctor run until the blockers are understood.
 
+If a store has already migrated ahead of some installed clients
+(schema_version newer than a client's ceiling), those clients fail closed.
+For ADDITIVE-ONLY bumps a maintenance release of the older line may extend
+`FORWARD_COMPAT_SCHEMA_VERSION` so those clients keep storing memories until
+they update; `ZMEM_ALLOW_NEWER_SCHEMA=1` is the explicit manual override
+(issue #65 follow-up).
+
 Schema v13 (issue #65) is purely ADDITIVE: two new container tables
 (`episode`, `episode_memory`) and one index, created idempotently on the
 first writable command after upgrade — no `memory` column changes, no data

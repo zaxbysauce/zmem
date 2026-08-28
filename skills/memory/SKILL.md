@@ -106,6 +106,16 @@ The three floors are intentional. Do not silently unify them. The
 selective-inject gate (3.8) is a hook-only filter; it does not change
 the Python recall path.
 
+#### Schema forward-compatibility (issue #65 follow-up)
+
+A client refuses a store whose `schema_version` is above its ceiling.
+`FORWARD_COMPAT_SCHEMA_VERSION` (schema_meta) is that ceiling: a maintenance
+release of an older client line may raise it to an ADDITIVE-ONLY newer schema
+(new side tables, no `memory` changes), letting the older client keep storing
+and recalling memories — with a one-time stderr NOTICE — until it updates.
+Above the ceiling the refusal names the update, and
+`ZMEM_ALLOW_NEWER_SCHEMA=1` overrides at the operator's own risk.
+
 #### Injection token budget (issue #65, 10.9)
 
 `ZMEM_INJECT_TOKEN_BUDGET` (default 1500, estimated at 4 chars/token — no
