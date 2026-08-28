@@ -900,7 +900,12 @@ def main():
     # memory_vec, so an unmatched active profile could previously write
     # wrong-dim blobs with the vec-row insert silently swallowed.
     if args.cmd in {"add", "update", "recall", "search", "consolidate",
-                    "organize", "ingest-jsonl"} or args.cmd == "reembed":
+                    "organize", "ingest-jsonl"} or args.cmd == "reembed" \
+            or (args.cmd == "episode-close" and args.summary):
+        # PR-review F1 (PR #81 round 2): episode-close --summary embeds via
+        # add_memory — include it so a profile/dimension mismatch refuses
+        # upfront instead of silently writing wrong-dim vectors (the KNN
+        # and vec0 insert failures are both swallowed downstream).
         try:
             assert_embedding_compatible(
                 conn,
@@ -1420,6 +1425,16 @@ def main():
             except EpisodeError as exc:
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
+            except CapturePolicyRefusal as exc:
+                # PR-review F2 (PR #81 round 2): episode-open validates the
+                # namespace via write._validate_namespace, which raises
+                # CapturePolicyRefusal — surface the stable [zmem] refusal
+                # line like add/update do, never a traceback.
+                print(f"[zmem] {exc}", file=sys.stderr)
+                sys.exit(2)
+            except ContentTooLarge as exc:
+                print(f"[zmem] {exc}", file=sys.stderr)
+                sys.exit(1)
     finally:
         _release_writer_lease(writer_lease)
         conn.close()

@@ -408,7 +408,7 @@ class CharacterizationTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self._assert_sha("export-jsonl", _sha(_norm(r.stdout)), DATA_SHA["export_jsonl"])
 
-    def test_export_drift_is_exactly_the_v12_counter_keys(self):
+    def test_export_drift_is_exactly_the_v12_plus_v13_keys(self):
         """Encodes the v12 re-capture claim (previously comment-only): the
         v12 export must differ from the v11 freeze by EXACTLY the two new
         row keys. Stripping applied_count/violated_count from the live
@@ -436,9 +436,10 @@ class CharacterizationTests(unittest.TestCase):
         self.assertEqual(
             stripped_hash,
             "2239fcd95efc4e2e6c86f8e742e4715814283a36db253d8bbeb0333907550399",
-            "export-jsonl drifted beyond the two v12 counter keys: stripping "
-            "applied_count/violated_count no longer reproduces the v11 "
-            "freeze — update the freeze comment AND this assertion together")
+            "export-jsonl drifted beyond the v12 counter keys PLUS the v13 "
+            "kind key: stripping applied_count/violated_count/kind no longer "
+            "reproduces the v11 freeze — update the freeze comment AND this "
+            "assertion together (all three keys are stripped here)")
 
 
 if __name__ == "__main__":

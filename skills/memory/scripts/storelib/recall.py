@@ -991,9 +991,6 @@ def recall_memory(
             else:
                 omitted += 1
         results = kept_rows
-    # Rows flagged but still returned (explicit, non---no-bump paths) are
-    # counted too so every read surface can show the flag prevalence.
-    injection_risk_count = sum(1 for r in results if r.get("prompt_injection_risk"))
 
     # v11 (issue #61, 6.3): budgeted 1-hop link expansion — AFTER MMR and the
     # no_bump filter (expansion candidates get the same injection/untrusted
@@ -1036,6 +1033,11 @@ def recall_memory(
         for r in results:
             r["entities"] = cards.get(r["id"], [])
 
+    # F13 (PR #81 round 2): count flagged rows AFTER link expansion —
+    # expand_recall_links sets prompt_injection_risk on expansion rows,
+    # and the pre-expansion count missed them (violating this function's
+    # own 'flagged rows are counted too' contract).
+    injection_risk_count = sum(1 for r in results if r.get("prompt_injection_risk"))
     if bump_ids:
         # v11 (issue #61, 6.3): bump ONLY the query-matched rows — expansion
         # neighbors joined via `bump_ids` capture above, before expansion.

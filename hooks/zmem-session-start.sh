@@ -308,12 +308,17 @@ if store_py and os.path.isfile(store_py):
             stderr=subprocess.DEVNULL, timeout=8,
         ).decode("utf-8", "replace")
         rows = json.loads(out) if out.strip() else []
-        # v13 (issue #65, 10.8): unwrap the read envelope ({"results": ...});
-        # a bare list from a pre-v13 store.py still works.
-        if isinstance(rows, dict):
-            rows = rows.get("results", [])
-        if not isinstance(rows, list):
-            rows = []
+        # v13 (issue #65, 10.8): unwrap the read envelope via the SHARED
+        # shim (C38) — same helper the hooks body / Hermes / MCP use; the
+        # inline dict/list fallback covers a failed import (fail-open).
+        try:
+            import inject as _inj_mod
+            rows = _inj_mod.envelope_results(rows)
+        except Exception:
+            if isinstance(rows, dict):
+                rows = rows.get("results", [])
+            if not isinstance(rows, list):
+                rows = []
         if rows:
             # Issue #58, 3.5: wrap Tier 2 in the same non-executable
             # fence + provenance render that zmem-recall uses. The gate
@@ -357,9 +362,16 @@ if store_py and os.path.isfile(store_py):
                 # v13 (issue #65, 10.9): token-budget admission. Protected
                 # types (decision/constraint) are never dropped; lowest-score
                 # signal=none rows drop first. Fail-open on import failure.
+                _tok_used = None
+                _tok_budget = None
                 try:
                     import inject as _inj_mod
                     rows, _est, _dropped = _inj_mod.apply_token_budget(rows)
+                    _tok_budget = _inj_mod.inject_token_budget()
+                    # WD-003: content-sum estimate (the read-envelope
+                    # semantics) — the log line rides with the budget so
+                    # budget-driven silence is auditable here too.
+                    _tok_used = sum(_inj_mod.estimate_tokens(r.get("content", "") or "") for r in rows)
                 except Exception:
                     pass
                 # PRR-014 fix: record the injected|silent decision in the
@@ -373,12 +385,16 @@ if store_py and os.path.isfile(store_py):
                     _log_path = os.path.join(_log_dir, "zmem-bg.log")
                     if os.path.isdir(_log_dir):
                         with open(_log_path, "a", encoding="utf-8") as _lf:
+                            _tok = ""
+                            if _tok_used is not None:
+                                _tok = " tokens=%s/%s" % (_tok_used, _tok_budget if _tok_budget is not None else "-")
                             _lf.write(
-                                "[%d] zmem-hook status=%s ids=%s all=%s\n" % (
+                                "[%d] zmem-hook status=%s ids=%s all=%s%s\n" % (
                                     int(__import__("time").time()),
                                     "injected" if rows else "silent",
                                     [r.get("id") for r in rows],
                                     [r.get("id") for r in rows],
+                                    _tok,
                                 )
                             )
                 except Exception:

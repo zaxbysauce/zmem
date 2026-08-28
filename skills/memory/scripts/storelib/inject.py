@@ -74,6 +74,9 @@ def _row_priority(row: dict[str, Any], index: int) -> Tuple[float, int, int]:
         score = float(row.get("_score", row.get("confidence", 0)) or 0)
     except (TypeError, ValueError):
         score = 0.0
+    # NaN/inf sort keys compare unreliably — treat as no signal (RB-010).
+    if score != score or score in (float("inf"), float("-inf")):
+        score = 0.0
     none_last = 1 if (row.get("signal") or "none") == "none" else 0
     return (-score, none_last, index)
 

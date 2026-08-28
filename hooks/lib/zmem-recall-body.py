@@ -393,7 +393,13 @@ def main() -> int:
             status = "silent"
 
     if not selected:
-        _log_inject_decision(rows, selected, status)
+        # F18: when the budget caused the silence, still log the token
+        # fields so budget-silence is distinguishable from gate-silence.
+        if tokens_budget is not None:
+            _log_inject_decision(rows, selected, status,
+                                 tokens_used=0, tokens_budget=tokens_budget)
+        else:
+            _log_inject_decision(rows, selected, status)
         _emit_envelope("no durable memories met the inject bar.")
         return 0
 

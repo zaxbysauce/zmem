@@ -48,11 +48,13 @@ def _store_env(tmp: str):
 def _row_counts(store_path: str) -> dict:
     conn = sqlite3.connect(store_path)
     try:
+        # TC-001: pin the FULL passive contract — retrieval_count AND
+        # last_retrieved must never move on a passive surface.
         rows = conn.execute(
-            "SELECT id, retrieval_count, surfaced_count FROM memory "
-            "WHERE superseded_at IS NULL"
+            "SELECT id, retrieval_count, surfaced_count, last_retrieved "
+            "FROM memory WHERE superseded_at IS NULL"
         ).fetchall()
-        return {r[0]: (r[1], r[2]) for r in rows}
+        return {r[0]: (r[1], r[2], r[3]) for r in rows}
     finally:
         conn.close()
 
@@ -71,7 +73,7 @@ class McpSessionToolsTest(unittest.TestCase):
             os.environ[k] = v
         os.environ.pop("ZMEM_DATA", None)
         os.environ.pop("ZMEM_INJECT_TOKEN_BUDGET", None)
-        cls.store_path = os.environ.join(cls._tmp, "store.sqlite") if hasattr(os, "join2") else os.path.join(cls._tmp, "store.sqlite")
+        cls.store_path = os.path.join(cls._tmp, "store.sqlite")  # C40: dead branch removed
 
         import importlib.util
         spec = importlib.util.spec_from_file_location(
@@ -84,6 +86,8 @@ class McpSessionToolsTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
         for k, v in cls._saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -111,11 +115,14 @@ class McpSessionToolsTest(unittest.TestCase):
         result = self._call("session_start", namespace="project:session")
         self.assertEqual(result.get("result"), "session_started", result)
         after = _row_counts(self.store_path)
-        for mid, (retr_before, _surf_before) in before.items():
-            retr_after, _surf_after = after[mid]
+        for mid, (retr_before, _surf_before, _lr_before) in before.items():
+            retr_after, _surf_after, lr_after = after[mid]
             self.assertEqual(
                 retr_after, retr_before,
                 f"session_start must never bump retrieval_count ({mid})")
+            self.assertEqual(
+                lr_after, _lr_before,
+                f"session_start must never bump last_retrieved ({mid})")
 
     def test_session_start_omits_injection_risk_and_untrusted_web(self):
         # Own namespace: other tests' rows share ingestion timestamps at
@@ -133,6 +140,53 @@ class McpSessionToolsTest(unittest.TestCase):
         self.assertNotIn("ignore previous instructions", ctx)
         self.assertNotIn("web sourced session row", ctx)
         self.assertGreaterEqual(result.get("omitted", 0), 2)
+
+    def test_session_start_star_resolves_to_default(self):
+        # F7: namespace '*' must resolve to the server default (user:global)
+        # — never a literal match against a namespace named '*', which would
+        # silently return an empty context.
+        self._add("star default resolution probe row")  # default ns of _add
+        star = self._call("session_start", namespace="*")
+        omitted = self._call("session_start")  # resolves to user:global too
+        self.assertNotIn("error", star, star)
+        self.assertNotIn("error", omitted, omitted)
+        self.assertEqual(star.get("namespace"), "user:global", star)
+        self.assertEqual(star.get("ids"), omitted.get("ids"),
+                         "namespace='*' must resolve exactly like an "
+                         "omitted namespace (the server default)")
+
+    def test_session_end_dash_note_stored_verbatim(self):
+        # F8: a note of exactly '-' must be stored literally, not hit the
+        # CLI's stdin sentinel and become an empty row.
+        result = self._call("session_end", note="-",
+                            namespace="project:session-dash")
+        self.assertTrue(result.get("written"), result)
+        self.assertIn("id", result)
+        import subprocess
+        g = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "get", "--id",
+             result["id"]],
+            capture_output=True, text=True, timeout=120)
+        row = json.loads(g.stdout)
+        self.assertEqual(row["content"], "-",
+                         "the '-' note must be stored verbatim")
+
+    def test_session_start_reports_budget_dropped(self):
+        # F9: budget-dropped rows surface as budget_dropped (distinct from
+        # the store-side omitted count).
+        ns = "project:session-budgetdrop"
+        self._add("budget drop probe row with plenty of distinct words " * 6,
+                  namespace=ns)
+        os.environ["ZMEM_INJECT_TOKEN_BUDGET"] = "10"
+        try:
+            result = self._call("session_start", namespace=ns, limit=5)
+        finally:
+            os.environ.pop("ZMEM_INJECT_TOKEN_BUDGET", None)
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result.get("tokens_budget"), 10)
+        self.assertEqual(result.get("budget_dropped"), 1, result)
+        self.assertEqual(result.get("ids"), [])
+        self.assertIn("withheld", result.get("context", ""))
 
     def test_session_start_fences_and_reports_tokens(self):
         ns = "project:session-fence"
@@ -235,6 +289,8 @@ class HermesSessionToolsTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
         for k, v in cls._saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -257,10 +313,13 @@ class HermesSessionToolsTest(unittest.TestCase):
         self.assertEqual(d.get("result"), "session_started", d)
         self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", d.get("context", ""))
         after = _row_counts(self.store_path)
-        for mid, (retr_b, _s) in before.items():
+        for mid, (retr_b, _s, _lr) in before.items():
             self.assertEqual(after[mid][0], retr_b,
                              "Hermes session_start must not bump "
                              "retrieval_count")
+            self.assertEqual(after[mid][2], _lr,
+                             "Hermes session_start must not bump "
+                             "last_retrieved")
 
     def test_session_end_ack_and_note(self):
         ack = json.loads(self.provider.handle_tool_call("zmem_session_end", {}))

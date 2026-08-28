@@ -14,8 +14,8 @@ README.
 
 ## [0.13.0] — 2026-08-27
 
-Final-critic B2: this release folds in the previously-Unreleased
-work from issues #63 and #64 (below) alongside issue #65.
+This release folds in the previously-Unreleased work from issues #63 and #64
+(below) alongside issue #65.
 
 ### Added
 - **Schema v12 — Voyager usage-feedback counters** (issue #64):
@@ -99,9 +99,9 @@ work from issues #63 and #64 (below) alongside issue #65.
   `tests/test_embedder_checksum.py`, `tests/test_reembed.py`,
   `tests/test_cross_encoder.py`; extended `tests/test_doctor.py`
 
-### Issue #65 — host + MCP completeness
+**Issue #65 — host and MCP completeness**
 
-### Added
+Added:
 - **Schema v13 — episode storage** (issue #65, 10.7): `episode(id, namespace,
   started_at, ended_at, summary_memory_id, token_count)` +
   `episode_memory(episode_id, memory_id, added_at)` containers. Purely
@@ -168,11 +168,10 @@ work from issues #63 and #64 (below) alongside issue #65.
   `zmem: redacted <N> secret-like value(s) from the captured memory (value
   not shown).` — derived from the warning count, never the value
 
-### Tests
-- New standalone suites: `tests/test_mcp_auth.py`,
-  `tests/test_session_tools.py`, `tests/test_redaction.py`,
-  `tests/test_episodes.py`, `tests/test_token_budget.py`; extended
-  `tests/test_mcp_server.py`, `tests/test_doctor.py`
+Tests (issue #65): new standalone suites `tests/test_mcp_auth.py`,
+`tests/test_session_tools.py`, `tests/test_redaction.py`,
+`tests/test_episodes.py`, `tests/test_token_budget.py`; extended
+`tests/test_mcp_server.py`, `tests/test_doctor.py`.
 
 ## [0.12.0] — 2026-08-26
 

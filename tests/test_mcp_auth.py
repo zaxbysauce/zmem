@@ -34,9 +34,42 @@ except Exception:
 
 
 def _load_auth_module():
-    """Load hermes-plugin/server/auth.py standalone (stub-free: under
-    MCP_AVAILABLE the real mcp package provides the ABCs)."""
+    """Load hermes-plugin/server/auth.py standalone.
+
+    F19 (PR #81 round 2): the token-CONFIG parsing matrix must run on hosts
+    without the `mcp` package — that is exactly where a parsing regression
+    would otherwise never be caught. When `mcp` is absent, install a minimal
+    stub for `mcp.server.auth.provider` (the only import auth.py needs at
+    module scope) BEFORE exec; when present, the real package provides the
+    ABCs. StaticPrefixedTokenVerifier needs no stub either way.
+    """
     import importlib.util
+    import types
+
+    if "mcp.server.auth.provider" not in sys.modules and not MCP_AVAILABLE:
+        provider = types.ModuleType("mcp.server.auth.provider")
+
+        class AccessToken:  # attribute bag, matching the SDK shape we use
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class TokenVerifier:  # Protocol stand-in; parsing tests never use it
+            pass
+
+        provider.AccessToken = AccessToken
+        provider.TokenVerifier = TokenVerifier
+        mcp_mod = types.ModuleType("mcp")
+        server_mod = types.ModuleType("mcp.server")
+        auth_mod = types.ModuleType("mcp.server.auth")
+        auth_mod.provider = provider
+        server_mod.auth = auth_mod
+        mcp_mod.server = server_mod
+        sys.modules.update({
+            "mcp": mcp_mod,
+            "mcp.server": server_mod,
+            "mcp.server.auth": auth_mod,
+            "mcp.server.auth.provider": provider,
+        })
 
     spec = importlib.util.spec_from_file_location("zmem_auth_test", SERVER_DIR / "auth.py")
     mod = importlib.util.module_from_spec(spec)
@@ -45,9 +78,13 @@ def _load_auth_module():
     return mod
 
 
-@unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed")
 class TokenConfigParsingTest(unittest.TestCase):
-    """The C1 matrix: sniff rule, malformed configs, near-miss namespaces."""
+    """The C1 matrix: sniff rule, malformed configs, near-miss namespaces.
+
+    F19: deliberately NOT gated on MCP_AVAILABLE — these tests exercise the
+    parsing rules via the stub provider when the real package is absent,
+    so a security-parsing regression cannot hide behind a missing dep.
+    """
 
     def setUp(self):
         self.auth = _load_auth_module()
@@ -59,6 +96,9 @@ class TokenConfigParsingTest(unittest.TestCase):
         os.environ.pop("ZMEM_MCP_TOKEN_FILE", None)
 
     def tearDown(self):
+        # C23/ML-D-004: remove the per-test temp tree.
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -138,6 +178,16 @@ class TokenConfigParsingTest(unittest.TestCase):
             self.auth.load_token_config()
         self.assertEqual(cm.exception.code, 2)
 
+    def test_control_char_scope_is_rejected(self):
+        # F15: C0/DEL control chars in namespace scopes must fail at
+        # load (they cannot survive subprocess argv safely).
+        for bad in ("project:a\u0000", "project:\u007fx", "project:\u0001b"):
+            os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(
+                json.dumps({"token": "x", "namespaces": [bad]}))
+            with self.assertRaises(SystemExit) as cm:
+                self.auth.load_token_config()
+            self.assertEqual(cm.exception.code, 2, repr(bad))
+
     def test_scoped_config_denials(self):
         cfg = self.auth.TokenConfig(
             token="t", namespaces=frozenset({"project:mine"}))
@@ -181,6 +231,8 @@ class ScopedTokenToolSurfaceTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
         for k, v in cls._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)

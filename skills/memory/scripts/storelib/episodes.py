@@ -27,11 +27,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import uuid
 
 from storelib.inject import row_token_cost
 from storelib.promote import _first_sentence
-from storelib.schema import now_iso
+from storelib.schema import _commit, now_iso
 from storelib.write import _validate_namespace, add_memory
 
 # Structural identity of an episode summary row, mirroring organize's
@@ -57,11 +58,20 @@ def episode_open(conn: sqlite3.Connection, *, namespace: str) -> dict:
     ns = _validate_namespace(conn, namespace)
     eid = str(uuid.uuid4())
 
-    conn.execute(
-        "INSERT INTO episode (id, namespace, started_at) VALUES (?,?,?)",
-        (eid, ns, now_iso()),
-    )
-    conn.commit()
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
+        conn.execute(
+            "INSERT INTO episode (id, namespace, started_at) VALUES (?,?,?)",
+            (eid, ns, now_iso()),
+        )
+        _commit(conn)
+    except Exception:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        raise
     return episode_get(conn, eid)
 
 
@@ -105,16 +115,39 @@ def episode_add(conn: sqlite3.Connection, *, episode_id: str, memory_id: str) ->
             f"[zmem] episode-add: memory {memory_id} is tombstoned; cannot add "
             "to episode (attach the live replacement row instead)"
         )
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO episode_memory (episode_id, memory_id, added_at) "
-        "VALUES (?,?,?)",
-        # added_at written explicitly in the store's canonical now_iso()
-        # format — the column DEFAULT (datetime('now')) is only a guard for
-        # hand-SQL, and its "YYYY-MM-DD HH:MM:SS" shape would fail the JSONL
-        # ISO-8601 validator on round-trip.
-        (episode_id, memory_id, now_iso()),
-    )
-    conn.commit()
+    mem_ns_row = conn.execute(
+        "SELECT namespace FROM memory WHERE id=?", (memory_id,)
+    ).fetchone()
+    if mem_ns_row is not None and mem_ns_row["namespace"] != ep["namespace"]:
+        # PR-review A-02 (PR #81 round 2): cross-namespace attach is allowed
+        # but loud — episode-close --summary folds member content into a
+        # summary row under the EPISODE's namespace, so the operator must
+        # see when a member comes from elsewhere.
+        print(
+            f"[zmem] episode-add: warning: memory {memory_id} is from "
+            f"namespace {mem_ns_row['namespace']}, episode is "
+            f"{ep['namespace']}",
+            file=sys.stderr,
+        )
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO episode_memory (episode_id, memory_id, "
+            "added_at) VALUES (?,?,?)",
+            # added_at written explicitly in the store's canonical now_iso()
+            # format — the column DEFAULT (datetime('now')) is only a guard
+            # for hand-SQL, and its "YYYY-MM-DD HH:MM:SS" shape would fail
+            # the JSONL ISO-8601 validator on round-trip.
+            (episode_id, memory_id, now_iso()),
+        )
+        _commit(conn)
+    except Exception:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        raise
     return {
         "episode": episode_id,
         "memory": memory_id,
@@ -164,104 +197,121 @@ def episode_close(
             f"(at {ep['ended_at']}); history is append-only"
         )
 
-    # token_count = admission cost over LIVE members at close time (same
-    # row_token_cost the inject budget uses — one definition everywhere).
-    members = conn.execute(
-        """SELECT m.content FROM episode_memory em
-           JOIN memory m ON m.id = em.memory_id
-           WHERE em.episode_id=? AND m.superseded_at IS NULL
-           ORDER BY em.added_at, em.memory_id""",
-        (episode_id,),
-    ).fetchall()
-    token_count = sum(row_token_cost({"content": r["content"]}) for r in members)
+    # PR-review F4 (PR #81 round 2): close is ATOMIC — open one transaction
+    # so the summary row (add_memory joins the open transaction instead of
+    # committing its own) and the episode UPDATE land together or not at
+    # all; a crash can no longer orphan a summary row. _commit adds the
+    # busy_retry discipline every other writer uses (F3).
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
 
-    summary_memory_id = ""
-    if with_summary and members:
-        # LIVE member ids for the fold rule below (members were selected with
-        # superseded_at IS NULL above).
-        member_ids = {
-            r["memory_id"] for r in conn.execute(
-                "SELECT memory_id FROM episode_memory WHERE episode_id=?",
-                (episode_id,),
-            ).fetchall()
-        }
-        bullets = build_extractive_summary([r["content"] for r in members])
-        if bullets:
-            # Route through add_memory so the SHARED capture policy (secret
-            # redaction in auto mode, injection tagging) runs on this write
-            # path too (issue #65, 10.8). taint trusted_internal: the summary
-            # derives from store content, not untrusted input.
-            res = add_memory(
-                conn,
-                namespace=ep["namespace"],
-                type_="fact",
-                content=bullets,
-                tags=EPISODE_SUMMARY_TAGS,
-                source_ref=f"episode:{episode_id}",
-                signal="none",
-                taint="trusted_internal",
-                capture_mode="auto",
-                link_attr_propagate=False,
-            )
-            if res.warnings:
-                for w in res.warnings:
-                    print(f"[zmem] episode summary: {w['message']}")
-            if res.deduped and str(res) in member_ids:
-                # The summary quoted its member closely enough to dedup-fold
-                # INTO that member (a 1-2 member episode's bullets are mostly
-                # the members' own first sentences). The member already says
-                # what the summary would say: pin the summary link to it and
-                # NEVER touch its tags/merged_from (organize's no-clobber
-                # rule for structural markers).
-                summary_memory_id = str(res)
-                # Union (never replace) a discoverable marker tag so the
-                # operator can tell this row doubles as the episode summary
-                # — get/recall surface tags, not episode.summary_memory_id.
-                from storelib.write import _merge_tag_strings
-                row = conn.execute(
-                    "SELECT tags FROM memory WHERE id=?", (summary_memory_id,)
-                ).fetchone()
-                if row is not None:
-                    conn.execute(
-                        "UPDATE memory SET tags=? WHERE id=?",
-                        (_merge_tag_strings(row["tags"] or "", "episode-summary"),
-                         summary_memory_id),
+        # token_count = admission cost over LIVE members at close time (same
+        # row_token_cost the inject budget uses — one definition everywhere).
+        members = conn.execute(
+            """SELECT m.content FROM episode_memory em
+               JOIN memory m ON m.id = em.memory_id
+               WHERE em.episode_id=? AND m.superseded_at IS NULL
+               ORDER BY em.added_at, em.memory_id""",
+            (episode_id,),
+        ).fetchall()
+        token_count = sum(row_token_cost({"content": r["content"]}) for r in members)
+
+        summary_memory_id = ""
+        if with_summary and members:
+            # LIVE member ids for the fold rule below (members were selected
+            # with superseded_at IS NULL above).
+            member_ids = {
+                r["memory_id"] for r in conn.execute(
+                    "SELECT memory_id FROM episode_memory WHERE episode_id=?",
+                    (episode_id,),
+                ).fetchall()
+            }
+            bullets = build_extractive_summary([r["content"] for r in members])
+            if bullets:
+                # Route through add_memory so the SHARED capture policy (secret
+                # redaction in auto mode, injection tagging) runs on this write
+                # path too (issue #65, 10.8). taint trusted_internal: the summary
+                # derives from store content, not untrusted input.
+                res = add_memory(
+                    conn,
+                    namespace=ep["namespace"],
+                    type_="fact",
+                    content=bullets,
+                    tags=EPISODE_SUMMARY_TAGS,
+                    source_ref=f"episode:{episode_id}",
+                    signal="none",
+                    taint="trusted_internal",
+                    capture_mode="auto",
+                    link_attr_propagate=False,
+                )
+                if res.warnings:
+                    for w in res.warnings:
+                        print(f"[zmem] episode summary: {w['message']}",
+                              file=sys.stderr)
+                if res.deduped and str(res) in member_ids:
+                    # The summary quoted its member closely enough to dedup-fold
+                    # INTO that member (a 1-2 member episode's bullets are mostly
+                    # the members' own first sentences). The member already says
+                    # what the summary would say: pin the summary link to it and
+                    # NEVER touch its tags/merged_from (organize's no-clobber
+                    # rule for structural markers).
+                    summary_memory_id = str(res)
+                    # Union (never replace) a discoverable marker tag so the
+                    # operator can tell this row doubles as the episode summary
+                    # — get/recall surface tags, not episode.summary_memory_id.
+                    from storelib.write import _merge_tag_strings
+                    row = conn.execute(
+                        "SELECT tags FROM memory WHERE id=?", (summary_memory_id,)
+                    ).fetchone()
+                    if row is not None:
+                        conn.execute(
+                            "UPDATE memory SET tags=? WHERE id=?",
+                            (_merge_tag_strings(row["tags"] or "", "episode-summary"),
+                             summary_memory_id),
+                        )
+                    print(
+                        f"[zmem] episode summary: folded into member memory "
+                        f"{res}; linked as this episode's summary"
                     )
-                print(
-                    f"[zmem] episode summary: folded into member memory "
-                    f"{res}; linked as this episode's summary"
-                )
-            elif res.deduped:
-                # Folded into an existing NON-member row: do not pin another
-                # row's lineage to this episode (merged_from is the other
-                # summary's key — the organize 'summary update folded'
-                # convention).
-                print(
-                    f"[zmem] episode summary: deduped into existing memory "
-                    f"{res}; no summary row pinned to episode {episode_id}"
-                )
-            else:
-                summary_memory_id = str(res)
-                # Union (never replace) the structural marker so a
-                # capture-policy marker like auto-redacted survives, and
-                # record the lineage key like organize's summaries
-                # (final-critic A4).
-                from storelib.write import _merge_tag_strings
-                srow = conn.execute(
-                    "SELECT tags FROM memory WHERE id=?", (summary_memory_id,)
-                ).fetchone()
-                pinned_tags = _merge_tag_strings(
-                    srow["tags"] if srow else "", EPISODE_SUMMARY_TAGS)
-                conn.execute(
-                    "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
-                    (pinned_tags, episode_id, summary_memory_id),
-                )
-    conn.execute(
-        "UPDATE episode SET ended_at=?, token_count=?, summary_memory_id=? "
-        "WHERE id=?",
-        (now_iso(), token_count, summary_memory_id, episode_id),
-    )
-    conn.commit()
+                elif res.deduped:
+                    # Folded into an existing NON-member row: do not pin another
+                    # row's lineage to this episode (merged_from is the other
+                    # summary's key — the organize 'summary update folded'
+                    # convention).
+                    print(
+                        f"[zmem] episode summary: deduped into existing memory "
+                        f"{res}; no summary row pinned to episode {episode_id}"
+                    )
+                else:
+                    summary_memory_id = str(res)
+                    # Union (never replace) the structural marker so a
+                    # capture-policy marker like auto-redacted survives, and
+                    # record the lineage key like organize's summaries
+                    # (final-critic A4).
+                    from storelib.write import _merge_tag_strings
+                    srow = conn.execute(
+                        "SELECT tags FROM memory WHERE id=?", (summary_memory_id,)
+                    ).fetchone()
+                    pinned_tags = _merge_tag_strings(
+                        srow["tags"] if srow else "", EPISODE_SUMMARY_TAGS)
+                    conn.execute(
+                        "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
+                        (pinned_tags, episode_id, summary_memory_id),
+                    )
+
+        conn.execute(
+            "UPDATE episode SET ended_at=?, token_count=?, summary_memory_id=? "
+            "WHERE id=?",
+            (now_iso(), token_count, summary_memory_id, episode_id),
+        )
+        _commit(conn)
+    except Exception:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        raise
     return episode_get(conn, episode_id)
 
 

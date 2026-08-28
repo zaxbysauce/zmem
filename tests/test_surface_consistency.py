@@ -503,7 +503,8 @@ class AgentWriteSurfaceParityTest(unittest.TestCase):
         mcp = self._src("hermes-plugin/server/mcp_server.py")
         hermes = self._src("hermes-plugin/__init__.py")
         mcp_start = mcp.find("async def update(")
-        self.assertIn('"--namespace", ns_override', mcp[mcp_start:mcp_start + 4000])
+        # Window widened: the scoped-token F6 pin block grew the tool body.
+        self.assertIn('"--namespace", ns_override', mcp[mcp_start:mcp_start + 8000])
         h_start = hermes.find("def _tool_update")
         self.assertIn('"--namespace", ns_override', hermes[h_start:h_start + 4000])
 

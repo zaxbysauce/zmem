@@ -207,6 +207,18 @@ def cmd_export_jsonl(
         pass  # memory_link absent (pre-v11 store never migrated) — export without links
 
     lines = []
+
+    def _emit(obj: dict) -> None:
+        """Serialize one JSONL record with the unicode line-separator
+        escaping memory rows have always had (F11: episode and membership
+        records now get the same protection — a U+2028/29/0085 inside a
+        namespace would otherwise shatter the line on re-import)."""
+        line = json.dumps(obj, ensure_ascii=False)
+        line = (line.replace("\u2028", "\\u2028")
+                    .replace("\u2029", "\\u2029")
+                    .replace("\u0085", "\\u0085"))
+        lines.append(line)
+
     exported_ids: set[str] = set()
     for r in rows:
         exported_ids.add(r["id"])
@@ -245,19 +257,7 @@ def cmd_export_jsonl(
             "violated_count": r["violated_count"],
             "links": link_map.get(r["id"], []),
         }
-        line = json.dumps(obj, ensure_ascii=False)
-        # json.dumps already escapes every codepoint < 0x20 (\n, \r, and any
-        # other ASCII control char), but U+2028/U+2029/U+0085 are line
-        # terminators recognized by str.splitlines() (and some JS/JSONL
-        # consumers) yet are NOT escaped by json.dumps since they are >=
-        # 0x20. Left raw, one of these inside a content string would split
-        # a single JSON object across multiple physical lines, shattering
-        # the row for any reader that splits on line boundaries rather than
-        # a bare "\n". Escape them explicitly so one JSON object == one line.
-        line = (line.replace("\u2028", "\\u2028")
-                    .replace("\u2029", "\\u2029")
-                    .replace("\u0085", "\\u0085"))
-        lines.append(line)
+        _emit(obj)
 
     # v13 (issue #65, 10.7): episodes round-trip in the same stream. Only
     # memberships whose episode AND member memory are BOTH in the exported set
@@ -274,27 +274,33 @@ def cmd_export_jsonl(
         exported_eps: set[str] = set()
         for e in episodes:
             exported_eps.add(e["id"])
-            lines.append(json.dumps({
+            # F12: only keep summary_memory_id when the summary row itself is
+            # in the export — a superseded summary would land as a dangling
+            # reference on the importing store.
+            summary_ref = e["summary_memory_id"] or ""
+            if summary_ref and summary_ref not in exported_ids:
+                summary_ref = ""
+            _emit({
                 "kind": "episode",
                 "id": e["id"],
                 "namespace": e["namespace"],
                 "started_at": e["started_at"],
                 "ended_at": e["ended_at"] or "",
-                "summary_memory_id": e["summary_memory_id"] or "",
+                "summary_memory_id": summary_ref,
                 "token_count": e["token_count"],
-            }, ensure_ascii=False))
+            })
         if exported_eps:
             for m in conn.execute(
                 "SELECT episode_id, memory_id, added_at FROM episode_memory "
                 "ORDER BY episode_id, added_at, memory_id"
             ).fetchall():
                 if m["episode_id"] in exported_eps and m["memory_id"] in exported_ids:
-                    lines.append(json.dumps({
+                    _emit({
                         "kind": "episode_memory",
                         "episode_id": m["episode_id"],
                         "memory_id": m["memory_id"],
                         "added_at": m["added_at"],
-                    }, ensure_ascii=False))
+                    })
     except sqlite3.OperationalError:
         pass  # episode tables absent (pre-v13 store never migrated) — export without them
 
@@ -358,18 +364,30 @@ def _validate_episode_row(obj: dict, lineno: int) -> None:
     ns = str(_need("namespace"))
     if len(ns) > 512:
         raise ValueError("episode namespace over 512 chars")
+    # F10: validate by PARSING (time.strptime, like _validate_sync_row) —
+    # an epoch<=0 sentinel rejects legitimate epoch-adjacent timestamps.
+    import time as _time
     started = str(_need("started_at"))
-    if _parse_iso_to_epoch(started) <= 0:
+    try:
+        _time.strptime(started, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
         raise ValueError("episode started_at is not ISO-8601")
     ended = obj.get("ended_at", "") or ""
-    if ended and _parse_iso_to_epoch(str(ended)) <= 0:
-        raise ValueError("episode ended_at is not ISO-8601")
+    if ended:
+        try:
+            _time.strptime(str(ended), "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            raise ValueError("episode ended_at is not ISO-8601")
     summary = obj.get("summary_memory_id", "") or ""
     if summary and not _INGEST_ID_RE.match(str(summary)):
         raise ValueError("episode summary_memory_id is not UUID-shaped")
     tc = obj.get("token_count", 0)
-    if not isinstance(tc, int) or isinstance(tc, bool) or tc < 0:
-        raise ValueError("episode token_count must be a non-negative integer")
+    if (not isinstance(tc, int) or isinstance(tc, bool)
+            or tc < 0 or tc > 2**63 - 1):
+        # F14: values past sqlite's signed 64-bit max would raise
+        # OverflowError at INSERT — outside the malformed-line accounting.
+        raise ValueError("episode token_count must be a non-negative "
+                         "64-bit integer")
 
 
 def _validate_membership_row(obj: dict, lineno: int) -> None:
@@ -379,8 +397,12 @@ def _validate_membership_row(obj: dict, lineno: int) -> None:
         if not isinstance(v, str) or not _INGEST_ID_RE.match(v):
             raise ValueError(f"episode_memory {field} is missing or not UUID-shaped")
     added_at = obj.get("added_at", "") or ""
-    if added_at and _parse_iso_to_epoch(str(added_at)) <= 0:
-        raise ValueError("episode_memory added_at is not ISO-8601")
+    if added_at:
+        import time as _time
+        try:
+            _time.strptime(str(added_at), "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            raise ValueError("episode_memory added_at is not ISO-8601")
 
 
 
@@ -1319,7 +1341,6 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                      e["summary_memory_id"], e["token_count"]),
                 )
                 episodes_added += 1
-            _commit(conn)
             known_eps = {r[0] for r in conn.execute("SELECT id FROM episode")}
             known_mem = {r[0] for r in conn.execute("SELECT id FROM memory")}
             for lineno, m in pending_memberships:
@@ -1336,6 +1357,13 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     "(episode_id, memory_id, added_at) VALUES (?,?,?)",
                     (m["episode_id"], m["memory_id"], m["added_at"]),
                 )
+            # F12 (ingest side): never keep a summary_memory_id that does not
+            # resolve locally, regardless of what the file said.
+            conn.execute(
+                "UPDATE episode SET summary_memory_id='' "
+                "WHERE summary_memory_id!='' AND summary_memory_id NOT IN "
+                "(SELECT id FROM memory)"
+            )
             _commit(conn)
         except sqlite3.OperationalError as e:
             # episode tables absent (pre-v13 store never migrated): every

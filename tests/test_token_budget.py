@@ -143,11 +143,16 @@ class ReadEnvelopeReportingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.mkdtemp(prefix="zmem-budget-cli-")
-        cls._saved = {k: os.environ.get(k) for k in ("ZMEM_STORE", "ZMEM_DATA")}
+        # C26: save AND clear the budget knob — the subprocess inherits
+        # this env and the test asserts the documented default 1500.
+        cls._saved = {k: os.environ.get(k) for k in (
+            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_INJECT_TOKEN_BUDGET",
+            "ZMEM_MODEL_AUTODOWNLOAD")}
         cls.store = os.path.join(cls._tmp, "store.sqlite")
         os.environ["ZMEM_STORE"] = cls.store
         os.environ["ZMEM_DATA"] = cls._tmp
         os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ.pop("ZMEM_INJECT_TOKEN_BUDGET", None)
         cls._run(["init"])
         cls._run(["add", "--namespace", "project:budget", "--type", "fact",
                   "--content", "token budget envelope check row",
@@ -155,6 +160,8 @@ class ReadEnvelopeReportingTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
         for k, v in cls._saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -216,6 +223,8 @@ class HookBodyBudgetTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
         for k, v in cls._saved.items():
             if v is None:
                 os.environ.pop(k, None)

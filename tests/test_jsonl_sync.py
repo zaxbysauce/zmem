@@ -956,8 +956,11 @@ class IngestValidationTest(_TwoStoreCase):
         r = self.b.run("recall", "--query", "widgets", "--namespace", NS, "--json")
         self.assertEqual(r.returncode, 0,
                          f"recall must not crash on an ingested row: {r.stderr}")
-        self.assertEqual(len((lambda p: p["results"] if isinstance(p, dict) else p)(json.loads(r.stdout))), 3
-            if not isinstance(json.loads(r.stdout), dict) else len(json.loads(r.stdout)["results"]))
+        # C01/E4: parse ONCE, unwrap, and actually assert the count (the
+        # previous line compared the same extracted list to itself).
+        parsed = json.loads(r.stdout)
+        results = parsed["results"] if isinstance(parsed, dict) else parsed
+        self.assertEqual(len(results), 3)
 
         r = self.b.run("export-pack", "--namespace", NS, "--min-confidence", "0.0")
         self.assertEqual(r.returncode, 0,

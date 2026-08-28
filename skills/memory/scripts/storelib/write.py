@@ -227,8 +227,12 @@ def _apply_capture_policy(
 
     Returns structured warnings (issue #65, 10.8): each is a dict with
     ``type`` ("advisory" | "redacted"), ``message`` (the same human text the
-    stderr lines have always printed), and for redactions a ``count``. The
-    message NEVER includes secret material — only pattern labels and counts.
+    stderr lines have always printed), and for redactions a ``count``.
+    Secret-material guarantee: 'redacted' messages carry ONLY counts;
+    'advisory' messages carry the pattern label plus AT MOST the first 20
+    characters of the matched text (C03/B-01: state the real contract).
+    Remote surfaces force capture-mode auto, so only count-only messages
+    ever cross a network boundary.
     """
     mode = _normalize_capture_mode(capture_mode)
     secret_hits = _check_secrets(content, source_ref, tags)

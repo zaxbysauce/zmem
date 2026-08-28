@@ -74,6 +74,8 @@ class WritePathRedactionTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
         for k, v in cls._saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -109,6 +111,12 @@ class WritePathRedactionTest(unittest.TestCase):
         warnings = out.get("warnings") or []
         advisories = [w for w in warnings if w.get("type") == "advisory"]
         self.assertGreaterEqual(len(advisories), 1, warnings)
+        # TC-012: pin the documented advisory contract — pattern label
+        # plus at most a 20-char prefix, never the full secret.
+        self.assertTrue(advisories[0]["message"].startswith(
+            "possible secret-like text matched pattern"),
+            advisories[0]["message"])
+        self.assertNotIn(SECRET, advisories[0]["message"])
         # Manual mode keeps the original wording by contract (the operator
         # explicitly chose reviewed capture), but the WARNING text itself
         # never contains more than a 20-char prefix of the match.
@@ -162,6 +170,8 @@ class ReadEnvelopeOmitCountsTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
         for k, v in cls._saved.items():
             if v is None:
                 os.environ.pop(k, None)

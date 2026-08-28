@@ -931,7 +931,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # PR-review PRR-P: pipe oversize content via stdin (`--content -`) so
         # large-but-valid payloads never hit the Windows argv cap.
         input_text = None
-        if len(body) > _ARGV_SAFE_CONTENT_CHARS:
+        if len(body) > _ARGV_SAFE_CONTENT_CHARS or body == "-":
+            # F8: a literal '-' content would hit the CLI's stdin
+            # sentinel and be silently replaced by empty stdin — pipe it
+            # like oversize content so it is stored verbatim.
             args[args.index("--content") + 1] = "-"
             input_text = body
         r = await _run_store_async(args, input_text=input_text)
@@ -1016,7 +1019,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         optional override that re-keys the replacement row to another
         namespace (issue #65, 10.3 — parity with the CLI ``update
         --namespace``; a scoped token must be allowed for the TARGET
-        namespace). Point-in-time recall before the update returns the OLD
+        namespace; for scoped tokens without an override the tool reads the
+        target's namespace first and PINS it on the update call, so a
+        concurrent rekey between the two subprocesses cannot land the
+        replacement row outside the token's allow-list). Point-in-time recall before the update returns the OLD
         content; after returns the NEW. Refused (nothing written) when the id
         is unknown or already superseded — and a second invalidate/supersede on
         the same row is refused too (append-only history is never re-written).
@@ -1035,6 +1041,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 f"content is {len(body)} chars, over the {_MAX_CONTENT_CHARS} limit"
             )
         ns_override = (str(namespace or "")).strip()
+        ns_pin = None
         if ns_override:
             if not _valid_mcp_namespace(ns_override):
                 return _error(
@@ -1064,6 +1071,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             denied = _guard_namespace(target_ns)
             if denied:
                 return denied
+            # F6: PIN the verified namespace on the update itself. The
+            # get/update pair is two subprocesses (no cross-process lease),
+            # so a concurrent writer could rekey the row in between;
+            # passing --namespace <verified> (below, once args exist)
+            # means the replacement row lands in the namespace we
+            # checked, never in a foreign one.
+            ns_pin = target_ns
         t = (taint or "untrusted_tool").strip()
         if t not in _ALLOWED_TAINTS:
             return _error(
@@ -1081,6 +1095,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ]
         if ns_override:
             args += ["--namespace", ns_override]
+        elif ns_pin:
+            args += ["--namespace", ns_pin]
         if type:
             mt = str(type).strip()
             if mt not in _ALLOWED_TYPES:
@@ -1102,7 +1118,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # PR-review PRR-P: pipe oversize content via stdin (`--content -`) so
         # large-but-valid payloads never hit the Windows argv cap.
         input_text = None
-        if len(body) > _ARGV_SAFE_CONTENT_CHARS:
+        if len(body) > _ARGV_SAFE_CONTENT_CHARS or body == "-":
+            # F8: see add — pipe literal '-' via stdin.
             args[args.index("--content") + 1] = "-"
             input_text = body
         r = await _run_store_async(args, input_text=input_text)
@@ -1180,6 +1197,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         scoped token must be allowed for it (or pass its own namespace).
         """
         resolved_ns = (namespace or "").strip() or "user:global"
+        if resolved_ns == "*":
+            # F7: recent requires a CONCRETE namespace — '*' would be a
+            # literal match against a namespace named '*' (empty result).
+            # Resolve it to the server default like an omitted param.
+            resolved_ns = "user:global"
         denied = _guard_namespace(resolved_ns)
         if denied:
             return denied
@@ -1211,8 +1233,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         omitted = parsed.get("omitted", 0) if isinstance(parsed, dict) else 0
         # Token budget (10.9): admission control on rows BEFORE the fence.
         tokens_budget = None
+        budget_dropped = 0
         if _inject is not None:
-            rows, _est, _dropped = _inject.apply_token_budget(rows)
+            rows, _est, budget_dropped = _inject.apply_token_budget(rows)
             tokens_budget = _inject.inject_token_budget()
         renderer = _fence_renderer() or _local_fenced_recall
         header = (
@@ -1222,6 +1245,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         )
         if rows:
             context = renderer(rows, header)
+        elif budget_dropped:
+            # F9/C14: rows existed but the token budget dropped them all
+            # — say so instead of implying the store had nothing.
+            context = (
+                "session memories withheld: the injection token budget "
+                "(ZMEM_INJECT_TOKEN_BUDGET) dropped every candidate row."
+            )
         else:
             context = "no durable memories met the session inject bar."
         tokens_used = None
@@ -1234,6 +1264,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "namespace": resolved_ns,
             "ids": [row.get("id") for row in rows],
             "omitted": omitted,
+            "budget_dropped": budget_dropped,
             "context": context,
             "tokens_used": tokens_used,
             "tokens_budget": tokens_budget,
@@ -1263,6 +1294,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 f"note is {len(body)} chars, over the {_MAX_CONTENT_CHARS} limit"
             )
         resolved_ns = (namespace or "").strip() or "user:global"
+        if resolved_ns == "*":
+            resolved_ns = "user:global"
         if not _valid_mcp_namespace(resolved_ns):
             return _error(
                 "namespace must be project:<name>, user:<name>, or the "
@@ -1283,7 +1316,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "--json",
         ]
         input_text = None
-        if len(body) > _ARGV_SAFE_CONTENT_CHARS:
+        if len(body) > _ARGV_SAFE_CONTENT_CHARS or body == "-":
+            # F8: a note of exactly '-' would hit the CLI stdin sentinel
+            # and store an empty note — pipe it via stdin.
             args[args.index("--content") + 1] = "-"
             input_text = body
         r = await _run_store_async(args, input_text=input_text)

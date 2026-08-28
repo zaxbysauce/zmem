@@ -60,7 +60,10 @@ class ContentNormDedupTests(unittest.TestCase):
     def _run(self, *args):
         return subprocess.run(
             [PYTHON, str(STORE_PY), *args],
-            env=self.env, capture_output=True, text=True, timeout=60,
+            # CI S1: windows runners can exceed 60s per add under load
+            # (row 199/600 timed out on a 7m runner while the same commit
+            # passed elsewhere) — 180s keeps the suite deterministic.
+            env=self.env, capture_output=True, text=True, timeout=180,
         )
 
     def _connect(self):

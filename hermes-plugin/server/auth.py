@@ -111,6 +111,10 @@ def _valid_scope_namespace(ns: object) -> bool:
         return False  # a scope of '*' is the unscoped case — not expressible
     if _NS_NEAR_MISS_RE.match(v):
         return False
+    # F15: reject C0 control chars and DEL — Python's \s does not cover
+    # all of them, and they cannot survive a subprocess argv safely.
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+        return False
     return bool(_NS_SHAPE_RE.match(v))
 
 

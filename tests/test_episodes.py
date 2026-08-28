@@ -54,6 +54,9 @@ class EpisodeIsolationTest(unittest.TestCase):
         os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 
     def tearDown(self):
+        # C23: remove the per-test temp tree (was leaked before).
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
         for k, v in self._saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -137,6 +140,28 @@ class EpisodeIsolationTest(unittest.TestCase):
         r = _run(["stats"])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self._schema_version(), "13")
+
+    def test_episode_add_cross_namespace_warns_but_attaches(self):
+        # A-02 (review round 2): cross-namespace attach is allowed but
+        # loud — the operator sees the namespace mismatch on stderr.
+        self._init()
+        other = self._add("other-namespace member. one sentence.",
+                          namespace="project:other")
+        r = _run(["episode-open", "--namespace", "project:eps", "--json"])
+        eid = json.loads(r.stdout)["id"]
+        r = _run(["episode-add", "--episode", eid, "--memory", other])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("warning: memory", r.stderr)
+        self.assertIn("project:other", r.stderr)
+
+    def test_episode_open_near_miss_namespace_is_stable_refusal(self):
+        # F2 (review round 2): episode-open's CapturePolicyRefusal must
+        # surface as the stable exit-2 [zmem] line, never a traceback.
+        self._init()
+        r = _run(["episode-open", "--namespace", "global"])
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("[zmem]", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
 
     def test_episode_not_in_allowed_types(self):
         self.assertNotIn("episode", ALLOWED_TYPES)
@@ -315,8 +340,10 @@ class EpisodeIsolationTest(unittest.TestCase):
         export = os.path.join(self._tmp, "export.jsonl")
         r = _run(["export-jsonl", "--out", export])
         self.assertEqual(r.returncode, 0, r.stderr)
+        # C24/C25: read via a closed handle (open() leaked before).
+        export_text = Path(export).read_text(encoding="utf-8")
         kinds = [json.loads(line).get("kind")
-                 for line in open(export, encoding="utf-8") if line.strip()]
+                 for line in export_text.splitlines() if line.strip()]
         self.assertIn("memory", kinds)
         self.assertIn("episode", kinds)
         self.assertIn("episode_memory", kinds)

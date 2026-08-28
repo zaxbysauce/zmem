@@ -873,6 +873,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             added_at    TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (episode_id, memory_id)
         );
+        CREATE INDEX IF NOT EXISTS idx_episode_memory_mem
+            ON episode_memory(memory_id);
         """
     )
     # executescript() does not accept parameter binding, so set created_at separately.
@@ -1469,6 +1471,8 @@ def migrate(conn: sqlite3.Connection) -> None:
                 added_at    TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (episode_id, memory_id)
             );
+            CREATE INDEX IF NOT EXISTS idx_episode_memory_mem
+                ON episode_memory(memory_id);
             """
         )
         conn.execute("UPDATE meta SET value='13' WHERE key='schema_version'")

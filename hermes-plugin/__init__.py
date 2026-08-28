@@ -991,7 +991,9 @@ class ZmemMemoryProvider(MemoryProvider):
         # PR-review PRR-P: pipe oversize content via stdin (`--content -`) so
         # large-but-valid payloads never hit the Windows argv cap.
         input_text = None
-        if len(content) > _ARGV_SAFE_CONTENT_CHARS:
+        if len(content) > _ARGV_SAFE_CONTENT_CHARS or content == "-":
+            # F8: pipe literal '-' via stdin so it is stored verbatim
+            # instead of hitting the CLI stdin sentinel.
             cli_args[cli_args.index("--content") + 1] = "-"
             input_text = content
         r = _run_store(cli_args, input_text=input_text)
@@ -1074,7 +1076,8 @@ class ZmemMemoryProvider(MemoryProvider):
         # v13 (issue #65, 10.8): --json for the structured write result.
         cli_args += ["--capture-mode", "auto", "--json"]
         input_text = None
-        if len(content) > _ARGV_SAFE_CONTENT_CHARS:
+        if len(content) > _ARGV_SAFE_CONTENT_CHARS or content == "-":
+            # F8: see _tool_add — pipe literal '-' via stdin.
             cli_args[cli_args.index("--content") + 1] = "-"
             input_text = content
         r = _run_store(cli_args, input_text=input_text)
@@ -1115,6 +1118,8 @@ class ZmemMemoryProvider(MemoryProvider):
         (decision/constraint protected), rendered through storelib's fence.
         """
         ns = (args.get("namespace") or self._namespace).strip() or "user:global"
+        if ns == "*":
+            ns = self._namespace
         try:
             limit = max(1, min(int(args.get("limit") or 3), 50))
         except (TypeError, ValueError):
@@ -1148,8 +1153,9 @@ class ZmemMemoryProvider(MemoryProvider):
             return _tool_error("Session prefetch returned non-JSON")
         rows = _envelope_results(parsed)
         omitted = parsed.get("omitted", 0) if isinstance(parsed, dict) else 0
+        budget_dropped = 0
         if _INJECT is not None:
-            rows, _est, _dropped = _INJECT.apply_token_budget(rows)
+            rows, _est, budget_dropped = _INJECT.apply_token_budget(rows)
             tokens_budget = _INJECT.inject_token_budget()
         else:
             tokens_budget = None
@@ -1161,6 +1167,12 @@ class ZmemMemoryProvider(MemoryProvider):
         )
         if rows:
             context = renderer(rows, header)
+        elif budget_dropped:
+            # F9/C14: the budget dropped every candidate — say so.
+            context = (
+                "session memories withheld: the injection token budget "
+                "(ZMEM_INJECT_TOKEN_BUDGET) dropped every candidate row."
+            )
         else:
             context = "no durable memories met the session inject bar."
         tokens_used = None
@@ -1171,6 +1183,7 @@ class ZmemMemoryProvider(MemoryProvider):
             "namespace": ns,
             "ids": [row.get("id") for row in rows],
             "omitted": omitted,
+            "budget_dropped": budget_dropped,
             "context": context,
             "tokens_used": tokens_used,
             "tokens_budget": tokens_budget,
@@ -1193,6 +1206,8 @@ class ZmemMemoryProvider(MemoryProvider):
                 f"{consts['MAX_CONTENT_CHARS']} limit"
             )
         ns = (args.get("namespace") or self._namespace).strip() or "user:global"
+        if ns == "*":
+            ns = self._namespace
         cli_args = [
             "add",
             "--namespace", ns,
@@ -1205,7 +1220,8 @@ class ZmemMemoryProvider(MemoryProvider):
             "--json",
         ]
         input_text = None
-        if len(note) > _ARGV_SAFE_CONTENT_CHARS:
+        if len(note) > _ARGV_SAFE_CONTENT_CHARS or note == "-":
+            # F8: pipe literal '-' via stdin (CLI stdin sentinel).
             cli_args[cli_args.index("--content") + 1] = "-"
             input_text = note
         r = _run_store(cli_args, input_text=input_text)

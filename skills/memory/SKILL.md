@@ -518,7 +518,8 @@ explicitly on every read — a namespace-less read spans the whole store and
 is denied — and the implicit `user:global` union on scoped reads is
 suppressed unless `user:global` is itself in the list. Malformed JSON, an
 empty `namespaces` list, or near-miss scopes like `"global"` are hard
-startup errors (exit 2). A bare (non-JSON) token file stays unscoped.
+startup errors (exit 2). A bare (non-JSON) token file stays unscoped, as does
+a JSON object with `namespaces` absent or `null`.
 Doctor warns `unscoped_token: true` on operator tokens (issue #65, 10.10)
 and never prints the token value.
 

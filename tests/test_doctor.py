@@ -962,11 +962,19 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
     """
 
     def _run_json(self, env):
-        return subprocess.run(
+        result = subprocess.run(
             [PYTHON, str(DOCTOR_PY), "--format", "json",
              "--repo-root", str(self.repo), "--project", str(self.project)],
             env=env, capture_output=True, text=True, timeout=60,
         )
+        # C39: same PRR-014 guard as _run_doctor — a doctor crash must
+        # surface as its traceback here, not as a confusing
+        # JSONDecodeError on empty stdout in the caller.
+        self.assertNotIn("Traceback", result.stderr, result.stderr)
+        self.assertTrue(result.stdout.strip(),
+                        f"doctor wrote no JSON (rc={result.returncode}) "
+                        f"stderr={result.stderr[-400:]!r}")
+        return result
 
     @staticmethod
     def _check(report, check_id):

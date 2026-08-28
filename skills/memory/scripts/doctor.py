@@ -823,6 +823,15 @@ def _check_mcp_token() -> dict:
             f"ZMEM_MCP_TOKEN_FILE ({tok_file}) is configured but unreadable: {exc}",
             unscoped_token=None,
         )
+    if not raw.strip():
+        # F16: auth._parse_token_file hard-fails an empty file (exit 2);
+        # doctor must not report a usable configuration.
+        return _check(
+            "mcp-token", "fail",
+            f"ZMEM_MCP_TOKEN_FILE ({tok_file}) is empty -- the MCP server "
+            "will refuse to start (exit 2).",
+            unscoped_token=None,
+        )
     if not raw.lstrip().startswith("{"):
         return _check(
             "mcp-token", "warn",
@@ -842,6 +851,17 @@ def _check_mcp_token() -> dict:
             "ZMEM_MCP_TOKEN_FILE starts with '{' but is not valid JSON -- "
             "the MCP server will refuse to start (exit 2). Fix the file or "
             "remove the leading '{' if it is meant to be a bare token.",
+            unscoped_token=None,
+        )
+    # F16b: validate the token field exactly like auth.py -- a JSON file
+    # with a missing/non-string/empty token refuses to start (exit 2),
+    # so doctor must never report warn/pass for it.
+    tok_value = obj.get("token") if isinstance(obj, dict) else None
+    if not isinstance(tok_value, str) or not tok_value.strip():
+        return _check(
+            "mcp-token", "fail",
+            "ZMEM_MCP_TOKEN_FILE JSON must carry a non-empty string 'token' "
+            "-- the MCP server will refuse to start (exit 2) as configured.",
             unscoped_token=None,
         )
     scopes = obj.get("namespaces") if isinstance(obj, dict) else None
@@ -926,12 +946,28 @@ def _check_episode_tables(resolved_store: Path) -> dict:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        for table in ("episode", "episode_memory"):
+        required = {
+            "episode": {"id", "namespace", "started_at", "ended_at",
+                        "summary_memory_id", "token_count"},
+            "episode_memory": {"episode_id", "memory_id", "added_at"},
+        }
+        for table, cols in required.items():
             if table not in names:
                 return _check(
                     "episode-tables", "warn",
                     f"Table '{table}' is missing -- run any writable store.py "
                     "command once to complete the v13 migration.",
+                    store=_display_path(resolved_store),
+                )
+            # F17: structure check, not just existence -- a partially
+            # created table must not report ready.
+            actual = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if not cols.issubset(actual):
+                return _check(
+                    "episode-tables", "warn",
+                    f"Table '{table}' is missing expected columns "
+                    f"{sorted(cols - actual)} -- re-run a writable store.py "
+                    "command to complete the v13 migration.",
                     store=_display_path(resolved_store),
                 )
         open_n = conn.execute(
@@ -949,7 +985,9 @@ def _check_episode_tables(resolved_store: Path) -> dict:
             episodes_closed=closed_n,
             memberships=members_n,
         )
-    except sqlite3.OperationalError as exc:
+    except sqlite3.Error as exc:
+        # B-07: DatabaseError (corrupt/non-database file) is not an
+        # OperationalError subclass -- doctor is fail-open, never a crash.
         return _check(
             "episode-tables", "warn",
             f"Episode tables unreadable: {exc}",
