@@ -12,6 +12,23 @@ README.
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-08-28
+
+### Added
+- **Schema forward-compat window** (issue #65 follow-up): an older client no
+  longer hard-refuses a store whose schema is newer but ADDITIVE-ONLY.
+  `schema_meta.FORWARD_COMPAT_SCHEMA_VERSION` (default: same as
+  `SUPPORTED_SCHEMA_VERSION`) defines the ceiling; between the two the client
+  proceeds for memory read/write with a one-time stderr NOTICE (newer-only
+  features unavailable). Above the ceiling it still refuses, now with an
+  actionable message, and `ZMEM_ALLOW_NEWER_SCHEMA=1` overrides at the
+  operator's own risk. Motivation: a shared store that migrated ahead of some
+  installed clients must not brick those clients' memory writes until they
+  update. Pinned by `tests/test_schema_forward_compat.py` (includes the
+  older-client-stores-on-newer-store scenario); the fail-closed
+  newer-version contract is unchanged by default in 0.13.1
+  (`test_store_hardening.py`).
+
 ## [0.13.0] — 2026-08-27
 
 This release folds in the previously-Unreleased work from issues #63 and #64

@@ -9,7 +9,7 @@
       "name": "zmem",
       "source": ".",
       "description": "Box-wide multi-tier memory for Claude Code, sharing a store with ZCode.",
-      "version": "0.13.0"
+      "version": "0.13.1"
     }
   ]
 }

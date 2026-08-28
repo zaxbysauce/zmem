@@ -38,7 +38,8 @@ except ImportError:
 # module store.py uses) so doctor and store can never disagree. A stale local
 # copy here once made every healthy v7 store FAIL doctor's schema gate (#36 M11).
 try:
-    from schema_meta import SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION
+    from schema_meta import (SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION,
+                         FORWARD_COMPAT_SCHEMA_VERSION as COMPAT_CEILING)
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from schema_meta import SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION  # type: ignore # noqa: E501
@@ -650,13 +651,31 @@ def _check_schema(store_path: Path, access_check: dict) -> dict:
             expected=CURRENT_SCHEMA_VERSION,
             actual=version,
         )
-    if version > CURRENT_SCHEMA_VERSION:
+    if CURRENT_SCHEMA_VERSION < version <= COMPAT_CEILING:
+        # Forward-compat window (issue #65 follow-up): an additive-only
+        # newer store. The writer proceeds for memory read/write with a
+        # NOTICE; doctor grades it warn (recoverable by updating), not fail.
+        return _check(
+            "schema-version",
+            "warn",
+            f"Store schema is v{version}, within this checkout's forward-compat "
+            f"window (ceiling v{COMPAT_CEILING}): memory read/write works, but "
+            "newer-only features are unavailable until you update this plugin.",
+            expected=CURRENT_SCHEMA_VERSION,
+            actual=version,
+            compat_ceiling=COMPAT_CEILING,
+        )
+    if version > COMPAT_CEILING:
         return _check(
             "schema-version",
             "fail",
-            f"Store schema is v{version}, newer than this checkout's expected v{CURRENT_SCHEMA_VERSION}.",
+            f"Store schema is v{version}, newer than this checkout's ceiling "
+            f"v{COMPAT_CEILING} (expected v{CURRENT_SCHEMA_VERSION}); update "
+            "this plugin, or set ZMEM_ALLOW_NEWER_SCHEMA=1 in the client at "
+            "your own risk.",
             expected=CURRENT_SCHEMA_VERSION,
             actual=version,
+            compat_ceiling=COMPAT_CEILING,
         )
     if writable:
         return _check(

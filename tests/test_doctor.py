@@ -417,8 +417,11 @@ class DoctorCliTest(unittest.TestCase):
         self.assertEqual(schema["status"], "warn", schema)
 
     def test_future_schema_version_fails_doctor(self):
-        """A store NEWER than the checkout's expected version must FAIL — the
-        checkout is too old to safely read it."""
+        """A store NEWER than the forward-compat ceiling must FAIL — the
+        checkout cannot safely operate on it (update, or the explicit
+        ZMEM_ALLOW_NEWER_SCHEMA override). The band BETWEEN the checkout's
+        supported version and the ceiling is covered by the in-process
+        doctor grading tests in tests/test_schema_forward_compat.py."""
         store_dir = self.home / ".zmem"
         _make_store(store_dir / "store.sqlite",
                     schema_version=CURRENT_SCHEMA_VERSION + 1)
