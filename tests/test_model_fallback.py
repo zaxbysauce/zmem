@@ -620,7 +620,9 @@ class ModelAbsentEndToEndTests(unittest.TestCase):
             self.env,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
-        results = json.loads(r.stdout)
+        parsed = json.loads(r.stdout)
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        results = parsed["results"] if isinstance(parsed, dict) else parsed
         self.assertTrue(len(results) >= 1, f"expected FTS5 recall hit, got: {r.stdout}")
         self.assertIn("tb=short", results[0]["content"])
         # Sanity: added row was never embedded (no model to embed with).

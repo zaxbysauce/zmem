@@ -144,6 +144,36 @@ class ContentTooLarge(ValueError):
     UnicodeEncodeError (a ValueError subclass), changing stdio-encoding failure
     behavior (#36 M17)."""
 
+def redact_text(text: str) -> tuple[str, int]:
+    """THE single secret-redaction helper (issue #65, 10.8).
+
+    Every write path that must sanitize text — CLI/MCP/Hermes ``add``/``update``
+    (via ``_apply_capture_policy``), ``mine-history`` sample/message redaction,
+    and episode/organize summary writes (they route through ``add_memory``) —
+    calls THIS function, never a private copy. Returns ``(redacted, count)``.
+    """
+    return _redact_secret_like_text(text)
+
+
+class WriteResult(str):
+    """Structured write outcome (issue #65, 10.8): the new/kept memory id (as a
+    plain ``str`` subclass so every existing caller that treats the return as an
+    id string keeps working) plus the capture-policy warnings as structured
+    objects — ``{"type": "redacted", "count": N, "message": ...}`` for automatic
+    redactions and ``{"type": "advisory", "message": ...}`` for advisory hits.
+    ``deduped`` marks the add-path fold into an existing row."""
+
+    warnings: list
+    deduped: bool
+
+    def __new__(cls, memory_id: str, *, warnings: list | None = None,
+                deduped: bool = False) -> "WriteResult":
+        obj = super().__new__(cls, memory_id)
+        obj.warnings = list(warnings or [])
+        obj.deduped = deduped
+        return obj
+
+
 def _check_secrets(content: str, source_ref: str, tags: str = "") -> list[str]:
     """Advisory only. Returns list of warnings. Never blocks. Scans both content
     source_ref, and tags (a token in metadata would otherwise slip through)."""
@@ -192,10 +222,16 @@ def _apply_capture_policy(
     source_ref: str,
     tags: str,
     capture_mode: str,
-) -> tuple[str, str, str, list[str]]:
-    """Apply capture-time redaction/labeling while preserving provenance."""
+) -> tuple[str, str, str, list[dict]]:
+    """Apply capture-time redaction/labeling while preserving provenance.
+
+    Returns structured warnings (issue #65, 10.8): each is a dict with
+    ``type`` ("advisory" | "redacted"), ``message`` (the same human text the
+    stderr lines have always printed), and for redactions a ``count``. The
+    message NEVER includes secret material — only pattern labels and counts.
+    """
     mode = _normalize_capture_mode(capture_mode)
-    warnings = _check_secrets(content, source_ref, tags)
+    secret_hits = _check_secrets(content, source_ref, tags)
     out_content = content
     out_source_ref = source_ref
     out_tags = tags
@@ -206,7 +242,7 @@ def _apply_capture_policy(
             "text; review it manually so provenance and staleness tracking are "
             "not silently destroyed"
         )
-    if mode == "auto" and warnings:
+    if mode == "auto" and secret_hits:
         out_content, content_redactions = _redact_secret_like_text(content)
         out_tags, tag_redactions = _redact_secret_like_text(tags)
         total = content_redactions + tag_redactions
@@ -215,11 +251,19 @@ def _apply_capture_policy(
                 "zmem: refusing automatic capture with likely secrets that could "
                 "not be safely redacted"
             )
-        warnings = [
-            f"automatic capture redacted {total} secret-like value(s); review the "
-            "stored memory before trusting it"
-        ]
+        warnings = [{
+            "type": "redacted",
+            "count": total,
+            "message": (
+                f"automatic capture redacted {total} secret-like value(s); review "
+                "the stored memory before trusting it"
+            ),
+        }]
         out_tags = _merge_tag_strings(out_tags, "auto-redacted")
+    else:
+        warnings = [
+            {"type": "advisory", "message": w} for w in secret_hits
+        ]
     # Scan content, source_ref, AND tags for injection risk: tags are free-form
     # text that is FTS-indexed and surfaced verbatim into model context via
     # recall, so injection text confined to tags must also be tagged. (Symmetric
@@ -657,7 +701,7 @@ def add_memory(
     capture_mode: str = "manual",
     taint: str | None = None,
     link_attr_propagate: bool = True,
-) -> str:
+) -> WriteResult:
     content, source_ref, tags, warns = _apply_capture_policy(
         content=content,
         source_ref=source_ref,
@@ -674,7 +718,7 @@ def add_memory(
         prefix = "WARNING (advisory, write proceeded)"
         if _normalize_capture_mode(capture_mode) == "auto":
             prefix = "NOTICE (automatic capture sanitized)"
-        print(f"[zmem] {prefix}: {w}", file=sys.stderr)
+        print(f"[zmem] {prefix}: {w['message']}", file=sys.stderr)
 
     if confidence is None:
         confidence = SIGNAL_CONFIDENCE.get(signal, SIGNAL_CONFIDENCE["none"])
@@ -761,7 +805,7 @@ def add_memory(
                 _commit(conn)
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
                   f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
-            return existing["id"]
+            return WriteResult(existing["id"], warnings=warns, deduped=True)
 
         mid = str(uuid.uuid4())
         shash = _source_hash(source_ref)
@@ -826,7 +870,7 @@ def add_memory(
             _commit(conn)
         print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"
               f"{', embedded' if emb is not None else ''})")
-        return mid
+        return WriteResult(mid, warnings=warns)
     except Exception:
         if started_tx and conn.in_transaction:
             conn.rollback()
@@ -1010,7 +1054,7 @@ def update_memory(
     taint: str | None = None,
     capture_mode: str = "manual",
     link_attr_propagate: bool = True,
-) -> tuple[str, bool]:
+) -> tuple[WriteResult, bool]:
     """Append-only knowledge update (issue #59, 4.2): create a NEW live row
     that replaces ``mid``, tombstone ``mid``, and link the new row back to it
     via ``update_of``.
@@ -1069,7 +1113,7 @@ def update_memory(
         prefix = "WARNING (advisory, write proceeded)"
         if _normalize_capture_mode(capture_mode) == "auto":
             prefix = "NOTICE (automatic capture sanitized)"
-        print(f"[zmem] {prefix}: {w}", file=sys.stderr)
+        print(f"[zmem] {prefix}: {w['message']}", file=sys.stderr)
 
     # Single content-size cap, identical to add_memory (M8b / #36 M17) and
     # applied to the POST-capture content: an oversize update must be refused
@@ -1152,7 +1196,7 @@ def update_memory(
                 _commit(conn)
             print(f"[zmem] update: {mid} superseded; new content merged into existing "
                   f"live memory {dup_id} (similarity={dedup_sim:.3f})")
-            return dup_id, False
+            return WriteResult(dup_id, warnings=warns), False
 
         # 3) No dedup hit — insert the NEW live row replacing `mid`.
         new_id = str(uuid.uuid4())
@@ -1206,7 +1250,7 @@ def update_memory(
             _commit(conn)
         print(f"[zmem] updated memory {mid} -> {new_id} (ns={ns}, type={type_eff}, "
               f"signal={sig_eff}, conf={conf_eff}, taint={incoming_taint})")
-        return new_id, True
+        return WriteResult(new_id, warnings=warns), True
     except Exception:
         if started_tx and conn.in_transaction:
             conn.rollback()

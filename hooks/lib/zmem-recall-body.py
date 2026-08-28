@@ -172,7 +172,8 @@ def _selective_inject_filter(rows, floor: float, gate_none_floor: float,
 _BG_LOG_DEFAULT_MAX_BYTES = 262144
 
 
-def _log_inject_decision(rows, selected, status: str) -> None:
+def _log_inject_decision(rows, selected, status: str,
+                         tokens_used=None, tokens_budget=None) -> None:
     """Append the injected|silent decision to the existing bg log.
 
     PRR-016 fix: read the CANONICAL ``ZMEM_DATA`` env (what every hook
@@ -199,13 +200,21 @@ def _log_inject_decision(rows, selected, status: str) -> None:
             pass
         ids_all = [r.get("id") for r in rows]
         ids_sel = [r.get("id") for r in selected]
+        # v13 (issue #65, 10.9): tokens kept/budget ride on the same line so
+        # budget behavior is auditable in the existing bg log.
+        tok = ""
+        if tokens_used is not None:
+            tok = " tokens={used}/{budget}".format(
+                used=tokens_used, budget=tokens_budget if tokens_budget is not None else "-"
+            )
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
-                "[{ts}] zmem-hook status={status} ids={ids_sel} all={ids_all}\n".format(
+                "[{ts}] zmem-hook status={status} ids={ids_sel} all={ids_all}{tok}\n".format(
                     ts=int(time.time()),
                     status=status,
                     ids_sel=ids_sel,
                     ids_all=ids_all,
+                    tok=tok,
                 )
             )
     except OSError:
@@ -239,6 +248,28 @@ def _format_fence(rows, header: str, store_py: str = "") -> str:
         sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
     from storelib import _format_fenced_recall
     return _format_fenced_recall(rows, header)
+
+
+def _inject_helpers(store_py: str):
+    """Load storelib/inject.py (budget + envelope helpers, issue #65 10.9/10.8).
+
+    Same path derivation as _format_fence (store.py's scripts dir). Returns
+    (apply_token_budget, inject_token_budget, estimate_tokens, envelope_results)
+    or None on import failure — callers fall back to no-budget/no-unwrap
+    legacy behavior (fail-open hook discipline).
+    """
+    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
+    if not scripts_dir:
+        return None
+    saved = sys.path[:]
+    try:
+        sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
+        import inject as _inject_mod
+        return _inject_mod
+    except Exception:
+        return None
+    finally:
+        sys.path[:] = saved
 
 
 def _emit_envelope(ctx: str) -> None:
@@ -281,6 +312,8 @@ def main() -> int:
     # PRR-017 fix: floors + grounded set come from schema_meta (single
     # source of truth) with literal fallbacks for a partially-deployed tree.
     floor, gate_none_floor, grounded_signals = _gate_constants(store_py)
+    # issue #65, 10.9: budget helpers (None when storelib is not importable).
+    _inj = None
 
     try:
         if mode == "precompact" or mode == "recent":
@@ -330,6 +363,16 @@ def main() -> int:
                 timeout=10,
             ).decode("utf-8", "replace")
         rows = json.loads(out) if out.strip() else []
+        # v13 (issue #65, 10.8): unwrap the read envelope ({"results": ...});
+        # a bare list from a pre-v13 store.py still works.
+        _inj = _inject_helpers(store_py)
+        if _inj is not None:
+            rows = _inj.envelope_results(rows)
+        else:
+            if isinstance(rows, dict):
+                rows = rows.get("results", [])
+            if not isinstance(rows, list):
+                rows = []
     except Exception:
         rows = []
 
@@ -337,9 +380,20 @@ def main() -> int:
         rows, floor=floor, gate_none_floor=gate_none_floor,
         grounded_signals=grounded_signals,
     )
-    _log_inject_decision(rows, selected, status)
+    # v13 (issue #65, 10.9): token-budget admission BEFORE the fence. Protected
+    # types (decision/constraint) are never dropped; lowest-score signal=none
+    # rows drop first. ZMEM_CTX_BUDGET char truncation below stays as the hard
+    # outer stop (the token estimate does not include every fence byte).
+    tokens_budget = None
+    tokens_used = None
+    if selected and _inj is not None:
+        selected, _est, _dropped = _inj.apply_token_budget(selected)
+        tokens_budget = _inj.inject_token_budget()
+        if not selected:
+            status = "silent"
 
     if not selected:
+        _log_inject_decision(rows, selected, status)
         _emit_envelope("no durable memories met the inject bar.")
         return 0
 
@@ -358,6 +412,12 @@ def main() -> int:
         closer = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
         body_budget = max(0, budget - len(closer) - 1)
         ctx = ctx[:body_budget].rstrip() + "\n" + closer + "\n[recall truncated]"
+    # tokens_used is measured on the FINAL emitted context (post budget,
+    # post char-truncation) - the honest number (issue #65, 10.9).
+    if _inj is not None:
+        tokens_used = _inj.estimate_tokens(ctx)
+    _log_inject_decision(rows, selected, status,
+                         tokens_used=tokens_used, tokens_budget=tokens_budget)
     _emit_envelope(ctx)
     return 0
 

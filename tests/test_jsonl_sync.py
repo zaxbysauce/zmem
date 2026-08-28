@@ -361,7 +361,9 @@ class TombstonePropagationTest(_TwoStoreCase):
         # Dead in recall too.
         r = self.b.run("recall", "--query", "superseded upstream", "--namespace", NS, "--json")
         self.assertEqual(r.returncode, 0, r.stderr)
-        results = json.loads(r.stdout)
+        parsed = json.loads(r.stdout)
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        results = parsed["results"] if isinstance(parsed, dict) else parsed
         self.assertNotIn(mid, [x["id"] for x in results])
 
 
@@ -610,7 +612,9 @@ class NewTombstonedIdTest(_TwoStoreCase):
         self.assertEqual(db_row[1], "stale on origin")
 
         r = self.b.run("recall", "--query", "pre-tombstoned", "--namespace", NS, "--json")
-        results = json.loads(r.stdout)
+        parsed = json.loads(r.stdout)
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        results = parsed["results"] if isinstance(parsed, dict) else parsed
         self.assertNotIn(row["id"], [x["id"] for x in results])
 
         r = self.b.run("list", "--namespace", NS)
@@ -636,7 +640,9 @@ class NoEmbeddingFtsRecallTest(_TwoStoreCase):
 
         r = self.b.run("recall", "--query", "xylophone quokka", "--namespace", NS, "--json")
         self.assertEqual(r.returncode, 0, r.stderr)
-        results = json.loads(r.stdout)
+        parsed = json.loads(r.stdout)
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        results = parsed["results"] if isinstance(parsed, dict) else parsed
         self.assertIn(mid, [x["id"] for x in results], "FTS recall must still find the synced row")
 
 
@@ -950,7 +956,8 @@ class IngestValidationTest(_TwoStoreCase):
         r = self.b.run("recall", "--query", "widgets", "--namespace", NS, "--json")
         self.assertEqual(r.returncode, 0,
                          f"recall must not crash on an ingested row: {r.stderr}")
-        self.assertEqual(len(json.loads(r.stdout)), 3)
+        self.assertEqual(len((lambda p: p["results"] if isinstance(p, dict) else p)(json.loads(r.stdout))), 3
+            if not isinstance(json.loads(r.stdout), dict) else len(json.loads(r.stdout)["results"]))
 
         r = self.b.run("export-pack", "--namespace", NS, "--min-confidence", "0.0")
         self.assertEqual(r.returncode, 0,
@@ -1281,7 +1288,9 @@ class TombstoneAuthorityTest(_TwoStoreCase):
         # And still recallable -- the refusal is real, not cosmetic.
         r = self.b.run("recall", "--query", "outbox wants dead",
                        "--namespace", NS, "--json")
-        self.assertIn(self.LIVE_ID, [x["id"] for x in json.loads(r.stdout)])
+        self.assertIn(self.LIVE_ID, [x["id"] for x in (
+            json.loads(r.stdout)["results"]  # v13 envelope
+            if isinstance(json.loads(r.stdout), dict) else json.loads(r.stdout))])
 
     def test_same_file_with_the_flag_applies_the_tombstone(self):
         kill_path = self._seed_live()

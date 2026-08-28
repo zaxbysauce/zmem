@@ -56,7 +56,14 @@ def normalize_content(s: str) -> str:
 # with violated==0 -> promote-eligible; a violated_count crossing to 2 applies
 # a ONE-TIME TRUST_VIOLATION_FLOOR_DROP to trust_score (signal is never
 # auto-changed). Round-tripped by export/ingest; doctor checks them.
-SUPPORTED_SCHEMA_VERSION = 12
+# v13 (issue #65, 10.7): episodes as real storage — the `episode` container
+# table (id, namespace, started_at, ended_at, summary_memory_id, token_count)
+# plus the `episode_memory` membership table (composite PK). CLI: episode-open /
+# episode-add / episode-close [--summary] / episode-list. Purely ADDITIVE to
+# `memory` (no column changes). `episode` is NOT a member of ALLOWED_TYPES —
+# it is a container, not a memory type. Round-tripped by export/ingest (kind
+# discriminator); doctor reports counts (episode-tables check).
+SUPPORTED_SCHEMA_VERSION = 13
 
 # v12 (issue #64): one-time trust_score reduction applied when a row's
 # violated_count crosses to 2 (the promote ladder's "violated" tier). Clamped
@@ -76,6 +83,12 @@ MAX_CONTENT_CHARS = 65536
 # Memory `type` enum. All write surfaces validate against this tuple.
 # v9 (#59): `decision` and `constraint` are first-class shipped types.
 ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint")
+
+# Types the token-budget admission policy PROTECTS from dropping (issue #65,
+# 10.9): decision/constraint rows are never dropped to stay under
+# ZMEM_INJECT_TOKEN_BUDGET — they are the store's commitments, not trivia.
+# Read by storelib/inject.py (soft import) so the policy has one source.
+PROTECTED_INJECT_TYPES = ("decision", "constraint")
 
 # Memory `signal` enum. All write surfaces validate against this tuple. Ordered
 # roughly by trustworthiness (test/compile/lint > reviewer/user > none).

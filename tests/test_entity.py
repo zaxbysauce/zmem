@@ -91,7 +91,9 @@ class _Store(unittest.TestCase):
             "recall", "--query", query, "--namespace", ns,
             "--json", "--limit", "10", "--no-hybrid", *extra,
         ).stdout
-        return json.loads(out)
+        parsed = json.loads(out)
+        # v13 (issue #65, 10.8): recall --json emits the read envelope.
+        return parsed["results"] if isinstance(parsed, dict) else parsed
 
 
 class SchemaTest(_Store):

@@ -109,7 +109,9 @@ class _Store(unittest.TestCase):
             args += ["--limit", str(limit)]
         r = self.run_store(*args, *extra)
         self.assertEqual(r.returncode, 0, r.stderr)
-        return json.loads(r.stdout)
+        parsed = json.loads(r.stdout)
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        return parsed["results"] if isinstance(parsed, dict) else parsed
 
 
 # Two contents with token overlap far above 0.75 Jaccard (link threshold) but

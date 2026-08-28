@@ -214,7 +214,9 @@ class ModelPresentAutoFuse(_Base):
                 cli_main()
         finally:
             sys.argv = saved_argv
-        results = json.loads(buf.getvalue())
+        parsed = json.loads(buf.getvalue())
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        results = parsed["results"] if isinstance(parsed, dict) else parsed
         ids = {r["id"] for r in results}
         self.assertNotIn(
             "vec-row", ids,
@@ -234,7 +236,8 @@ class ModelPresentAutoFuse(_Base):
                 cli_main()
         finally:
             sys.argv = saved_argv
-        results2 = json.loads(buf2.getvalue())
+        parsed2 = json.loads(buf2.getvalue())
+        results2 = parsed2["results"] if isinstance(parsed2, dict) else parsed2
         self.assertIn(
             "vec-row", {r["id"] for r in results2},
             "control: --hybrid alone must fuse the vec-only candidate",

@@ -954,6 +954,125 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         self.assertNotIn("fail", statuses)
 
 
+class V13DoctorChecksTest(DoctorIssue49ChecksTest):
+    """v13 (issue #65, 10.7/10.10): episode-tables + mcp-token checks.
+
+    Inherits the Issue49 fixture (temp HOME/config, read-only doctor); only
+    the two new checks' statuses are asserted.
+    """
+
+    def _run_json(self, env):
+        return subprocess.run(
+            [PYTHON, str(DOCTOR_PY), "--format", "json",
+             "--repo-root", str(self.repo), "--project", str(self.project)],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+
+    @staticmethod
+    def _check(report, check_id):
+        return next(c for c in report["checks"] if c["id"] == check_id)
+
+    def test_mcp_token_unconfigured_is_skip(self):
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "skip", check)
+
+    def test_mcp_token_env_is_unscoped_warn(self):
+        env = self._env()
+        env["ZMEM_MCP_TOKEN"] = "doctor-test-secret"
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIs(check["details"]["unscoped_token"], True, check)
+        # The token value never appears anywhere in the report.
+        self.assertNotIn("doctor-test-secret", json.dumps(report))
+
+    def test_mcp_token_scoped_json_is_pass(self):
+        tok = self.tmp / "scoped-token.json"
+        _write_text(tok, json.dumps(
+            {"token": "doctor-scoped-secret",
+             "namespaces": ["project:zmem"]}))
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env["ZMEM_MCP_TOKEN_FILE"] = str(tok)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertIs(check["details"]["unscoped_token"], False, check)
+        self.assertEqual(check["details"]["namespaces"], 1, check)
+        self.assertIs(check["details"]["reads_require_namespace"], True, check)
+        self.assertNotIn("doctor-scoped-secret", json.dumps(report))
+
+    def test_mcp_token_malformed_json_is_fail(self):
+        tok = self.tmp / "bad-token.json"
+        _write_text(tok, '{"token": "x", ')
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env["ZMEM_MCP_TOKEN_FILE"] = str(tok)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "fail", check)
+
+    def test_mcp_token_json_without_namespaces_is_unscoped_warn(self):
+        # auth.py treats absent/null 'namespaces' as a VALID unscoped
+        # operator token (final-critic B1): doctor must WARN, not fail.
+        tok = self.tmp / "unscoped-token.json"
+        _write_text(tok, json.dumps({"token": "json-unscoped-secret"}))
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env["ZMEM_MCP_TOKEN_FILE"] = str(tok)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIs(check["details"]["unscoped_token"], True, check)
+        self.assertNotIn("json-unscoped-secret", json.dumps(report))
+
+    def test_mcp_token_json_null_namespaces_is_unscoped_warn(self):
+        tok = self.tmp / "null-ns-token.json"
+        _write_text(tok, json.dumps(
+            {"token": "null-ns-secret", "namespaces": None}))
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env["ZMEM_MCP_TOKEN_FILE"] = str(tok)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIs(check["details"]["unscoped_token"], True, check)
+
+    def test_episode_tables_absent_store_is_skip(self):
+        env = self._env()
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "episode-tables")
+        self.assertEqual(check["status"], "skip", check)
+
+    def test_episode_tables_current_store_is_pass(self):
+        store = self.home / ".zmem" / "store.sqlite"
+        _make_store(store, schema_version=CURRENT_SCHEMA_VERSION)
+        # _make_store builds only the meta table; add the v13 tables so the
+        # fixture matches a real current store.
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.executescript(
+                "CREATE TABLE episode (id TEXT PRIMARY KEY, namespace TEXT NOT NULL,"
+                " started_at TEXT NOT NULL, ended_at TEXT NOT NULL DEFAULT '',"
+                " summary_memory_id TEXT NOT NULL DEFAULT '',"
+                " token_count INTEGER NOT NULL DEFAULT 0);"
+                "CREATE TABLE episode_memory (episode_id TEXT NOT NULL,"
+                " memory_id TEXT NOT NULL, added_at TEXT NOT NULL DEFAULT '',"
+                " PRIMARY KEY (episode_id, memory_id));")
+            conn.commit()
+        finally:
+            conn.close()
+        env = self._env()
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "episode-tables")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertEqual(check["details"]["memberships"], 0, check)
+
+
 class DoctorUnitFailOpenTest(unittest.TestCase):
     """Import-level fail-open tests that cannot be driven through the CLI
     subprocess (PR feedback PRR-027)."""

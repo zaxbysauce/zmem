@@ -33,7 +33,7 @@ except ImportError:
     from corrections import aggregate_errors as _aggregate_errors  # type: ignore
     from corrections import SAMPLE_EXTRACT_LIMIT as _SAMPLE_EXTRACT_LIMIT  # type: ignore
 from storelib.schema import _host
-from storelib.write import _normalize_capture_mode, _redact_secret_like_text
+from storelib.write import _normalize_capture_mode, redact_text
 
 def _collapse_line_breaks(text) -> str:
     """Collapse every CR/LF (and Unicode line separator) in `text` to a
@@ -447,7 +447,7 @@ def cmd_corrections(*, transcript: str) -> int:
             # fence-integrity/output-safety step that runs in BOTH modes — a
             # "verbatim" manual-mode message is line-break-free and capped at
             # 200 chars, only the secret redaction is omitted.
-            redacted, redactions = _redact_secret_like_text(classified["message"])
+            redacted, redactions = redact_text(classified["message"])
             if redactions:
                 classified["secret_warning"] = True
                 if mode == "auto":
@@ -498,7 +498,7 @@ def _mine_corrections_from_transcript(transcript, project_folder: str) -> list:
         if not classified:
             continue
         classified["message"] = _sanitize_correction_message(text)
-        redacted, redactions = _redact_secret_like_text(classified["message"])
+        redacted, redactions = redact_text(classified["message"])
         if redactions:
             classified["secret_warning"] = True
             if mode == "auto":
@@ -521,7 +521,7 @@ def _redact_error_pattern_samples(error_patterns) -> None:
         flagged = False
         out = []
         for s in e.get("sample_errors") or []:
-            redacted, n = _redact_secret_like_text(str(s))
+            redacted, n = redact_text(str(s))
             if n:
                 flagged = True
             out.append(redacted if (n and mode == "auto") else str(s))

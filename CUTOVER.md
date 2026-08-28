@@ -29,7 +29,7 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 - local/non-OneDrive path safety
 - Python, SQLite FTS5, Node, and Windows shell prerequisites
 - best-effort read/write access to the target path
-- schema compatibility against current v12
+- schema compatibility against current v13
 - `embeddings_health` check: active profile vs stored vector dimension,
   rows with/without embeddings, shipped-profile inventory, and warnings
   when a non-temporary store runs `ZMEM_EMBED_PROFILE=fake` (issue #63)
@@ -38,11 +38,22 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
   `memory_entity` — inspect deeper with `store.py entity-list`)
 - v11 link surface present (`memory_link` table + `memory.trust_score` in
   range [0,1] — inspect deeper with `store.py links --id <uuid>`)
+- v13 episode storage present with counts, and the MCP token scope advisory
+  (`mcp-token`: warns `unscoped_token: true` on full-access operator tokens,
+  never reports the token value) (issue #65)
 - Claude and Codex native-memory conflicts
 - canonical namespace derivation for the target project
 - required host surfaces and optional Codex adapter files
 
 Do not proceed on a failing doctor run until the blockers are understood.
+
+Schema v13 (issue #65) is purely ADDITIVE: two new container tables
+(`episode`, `episode_memory`) and one index, created idempotently on the
+first writable command after upgrade — no `memory` column changes, no data
+rewrite, safe on large production stores. Older-schema clients keep working
+against an un-migrated store until they pull this version; a pre-v13 client
+that opens an already-migrated v13 store refuses it (the standard
+newer-schema guard), so do not roll back after the first v13 write.
 
 ## 3. Disable native memory explicitly
 

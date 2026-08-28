@@ -182,7 +182,9 @@ class CliRerankBehavior(unittest.TestCase):
             sys.argv = old_argv
             from storelib.cross_encoder import set_scorer as reset
             reset(None)
-        rows = json.loads(out.getvalue())
+        parsed = json.loads(out.getvalue())
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        rows = parsed["results"] if isinstance(parsed, dict) else parsed
         return [r["id"][:8] for r in rows], calls["n"], out.getvalue()
 
     def test_explicit_recall_reranks_reorders_and_calls_once(self):
@@ -195,7 +197,10 @@ class CliRerankBehavior(unittest.TestCase):
         on CI or locally."""
         def marker_of_top(ids, json_text):
             # _drive truncates ids to 8 chars for assertions; match that here
-            rows = {r["id"][:8]: r["content"] for r in json.loads(json_text)}
+            parsed = json.loads(json_text)
+            # v13 (issue #65, 10.8): read --json emits the envelope.
+            _rows = parsed["results"] if isinstance(parsed, dict) else parsed
+            rows = {r["id"][:8]: r["content"] for r in _rows}
             content = rows[ids[0]]
             return (SEED_A_MARKER if f" {SEED_A_MARKER} " in
                     f" {content} " else SEED_B_MARKER)
@@ -247,7 +252,9 @@ class CliRerankBehavior(unittest.TestCase):
         finally:
             sys.argv = old
             set_scorer(None)
-        rows = json.loads(out.getvalue())
+        parsed = json.loads(out.getvalue())
+        # v13 (issue #65, 10.8): read --json emits the envelope.
+        rows = parsed["results"] if isinstance(parsed, dict) else parsed
         self.assertGreaterEqual(len(rows), 2)
         self.assertNotIn("_ce", rows[0])
 

@@ -121,6 +121,11 @@ def main():
     p_add.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
                        help="manual/reviewed keep the original text with warnings; "
                             "auto redacts likely secrets by default before writing")
+    p_add.add_argument("--json", action="store_true",
+                       help="print a structured write result (id, result, warnings) "
+                            "as JSON on stdout instead of the human lines "
+                            "(issue #65, 10.8 — consumed by the MCP/Hermes add "
+                            "surfaces; stderr advisory lines are unchanged)")
 
     p_recall = sub.add_parser("recall", help="recall relevant memories")
     p_recall.add_argument("--query", required=True)
@@ -216,6 +221,10 @@ def main():
                           help="temporal predicate (issue #59, 4.4): only return "
                                "rows VALID at as_of (valid_from <= as_of AND "
                                "(valid_until empty OR valid_until > as_of)).")
+    p_search.add_argument("--json", action="store_true",
+                          help="print the result envelope {results, count, omitted, "
+                               "injection_risk, tokens_used, tokens_budget} (issue "
+                               "#65, 10.8) — plain output is unchanged")
 
     p_sup = sub.add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
@@ -266,6 +275,11 @@ def main():
     p_upd.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
                        help="same capture policy as `add` (manual/reviewed keep text "
                             "with warnings; auto redacts secrets)")
+    p_upd.add_argument("--json", action="store_true",
+                       help="print a structured write result (id, result, created_new, "
+                            "warnings) as JSON on stdout instead of the human lines "
+                            "(issue #65, 10.8 — consumed by the MCP/Hermes update "
+                            "surfaces; stderr advisory lines are unchanged)")
 
     p_get = sub.add_parser(
         "get",
@@ -741,6 +755,38 @@ def main():
     p_contradict.add_argument("--reason", required=True,
                               help="why they contradict (REQUIRED)")
 
+    # v13 (issue #65, 10.7): episode container commands. episode-list is
+    # read-only; the other three take the writer lease (see the lease block).
+    p_ep_open = sub.add_parser(
+        "episode-open", help="open a new episode (session container)")
+    p_ep_open.add_argument("--namespace", required=True)
+    p_ep_open.add_argument("--json", action="store_true",
+                           help="print the created episode row as JSON")
+
+    p_ep_add = sub.add_parser(
+        "episode-add", help="attach a LIVE memory to an open episode")
+    p_ep_add.add_argument("--episode", required=True, help="episode id")
+    p_ep_add.add_argument("--memory", required=True, help="memory id (must be live)")
+    p_ep_add.add_argument("--json", action="store_true",
+                          help="print the membership result as JSON")
+
+    p_ep_close = sub.add_parser(
+        "episode-close",
+        help="close an open episode (append-only; computes token_count)")
+    p_ep_close.add_argument("--episode", required=True, help="episode id")
+    p_ep_close.add_argument("--summary", action="store_true",
+                            help="attach an extractive summary row built from "
+                                 "the episode's LIVE members (written via add "
+                                 "with capture-mode auto)")
+    p_ep_close.add_argument("--json", action="store_true",
+                            help="print the closed episode row as JSON")
+
+    p_ep_list = sub.add_parser(
+        "episode-list", help="list episodes (newest first)")
+    p_ep_list.add_argument("--namespace", default=None)
+    p_ep_list.add_argument("--json", action="store_true",
+                           help="print episodes as JSON")
+
     args = ap.parse_args()
 
     # `failures` is store-independent (it reads a transcript JSONL or the ZCode
@@ -892,6 +938,9 @@ def main():
         # v10 (issue #60): entity-merge writes ONLY under --confirm; the
         # dry-run default is read-only and must not take the writer lease.
         or (args.cmd == "entity-merge" and args.confirm)
+        # v13 (issue #65, 10.7): episode-open/add/close write; episode-list
+        # is read-only and never takes the lease.
+        or args.cmd in {"episode-open", "episode-add", "episode-close"}
     ):
         writer_lease = _acquire_writer_lease(args.cmd)
 
@@ -900,18 +949,38 @@ def main():
             print(f"[zmem] store ready at {STORE_PATH}")
         elif args.cmd == "add":
             try:
-                add_memory(
-                    conn,
-                    namespace=args.namespace,
-                    type_=args.type,
-                    content=args.content,
-                    tags=args.tags,
-                    source_ref=args.source_ref,
-                    confidence=args.confidence,
-                    signal=args.signal,
-                    taint=args.taint,
-                    capture_mode=args.capture_mode,
-                )
+                # Under --json the human progress lines ([zmem] added …,
+                # dedup/links notices) go to STDERR so stdout is pure JSON —
+                # the MCP/Hermes surfaces parse it directly (issue #65, 10.8).
+                if args.json:
+                    sys.stdout, _human_out = sys.stderr, sys.stdout
+                else:
+                    _human_out = None
+                try:
+                    res = add_memory(
+                        conn,
+                        namespace=args.namespace,
+                        type_=args.type,
+                        content=args.content,
+                        tags=args.tags,
+                        source_ref=args.source_ref,
+                        confidence=args.confidence,
+                        signal=args.signal,
+                        taint=args.taint,
+                        capture_mode=args.capture_mode,
+                    )
+                finally:
+                    if _human_out is not None:
+                        sys.stdout = _human_out
+                if args.json:
+                    # Structured write result (issue #65, 10.8): consumed by the
+                    # MCP/Hermes add surfaces so remote write warnings (e.g. a
+                    # redaction) are structured data, not stderr text.
+                    print(json.dumps({
+                        "id": str(res),
+                        "result": "deduped" if res.deduped else "stored",
+                        "warnings": res.warnings,
+                    }))
             except CapturePolicyRefusal as exc:
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(2)
@@ -943,19 +1012,35 @@ def main():
             sys.exit(0 if ok else 1)
         elif args.cmd == "update":
             try:
-                update_memory(
-                    conn,
-                    mid=args.id,
-                    content=args.content,
-                    namespace=args.namespace,
-                    type_=args.type,
-                    tags=args.tags,
-                    source_ref=args.source_ref,
-                    confidence=args.confidence,
-                    signal=args.signal,
-                    taint=args.taint,
-                    capture_mode=args.capture_mode,
-                )
+                # Same stdout discipline as add --json (issue #65, 10.8).
+                if args.json:
+                    sys.stdout, _human_out = sys.stderr, sys.stdout
+                else:
+                    _human_out = None
+                try:
+                    res, created_new = update_memory(
+                        conn,
+                        mid=args.id,
+                        content=args.content,
+                        namespace=args.namespace,
+                        type_=args.type,
+                        tags=args.tags,
+                        source_ref=args.source_ref,
+                        confidence=args.confidence,
+                        signal=args.signal,
+                        taint=args.taint,
+                        capture_mode=args.capture_mode,
+                    )
+                finally:
+                    if _human_out is not None:
+                        sys.stdout = _human_out
+                if args.json:
+                    print(json.dumps({
+                        "id": str(res),
+                        "result": "updated",
+                        "created_new": created_new,
+                        "warnings": res.warnings,
+                    }))
             except CapturePolicyRefusal as exc:
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(2)
@@ -1005,8 +1090,9 @@ def main():
             # stays byte-identical to pre-change.
             # v11 (issue #61, 6.3): same reasoning for link expansion — it is
             # a RECALL behavior; search keeps its byte-identical contract.
+            # v13 (issue #65, 10.8): --json emits the read envelope.
             recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
-                          as_json=False, min_confidence=0.0,
+                          as_json=args.json, min_confidence=0.0,
                           include_global=args.include_global,
                           global_limit=args.global_limit, no_bump=args.no_bump,
                           hybrid=False, as_of=args.as_of, link_hops=0)
@@ -1281,6 +1367,59 @@ def main():
                                score=args.score, reason=args.reason))
         elif args.cmd == "contradict":
             sys.exit(cmd_contradict(conn, ids=args.ids, reason=args.reason))
+        elif args.cmd in {"episode-open", "episode-add", "episode-close",
+                          "episode-list"}:
+            # v13 (issue #65, 10.7). Refusals are stable exit-2 [zmem] lines
+            # (the supersede/invalidate convention), never tracebacks.
+            from storelib.episodes import (
+                EpisodeError, episode_add, episode_close, episode_list, episode_open,
+            )
+            try:
+                if args.cmd == "episode-list":
+                    # episode_list prints its own output (JSON or human rows).
+                    episode_list(conn, namespace=args.namespace, as_json=args.json)
+                else:
+                    # Same stdout discipline as add/update --json: the summary
+                    # write inside episode-close prints human lines; keep
+                    # stdout pure JSON under --json.
+                    if args.json:
+                        sys.stdout, _human_out = sys.stderr, sys.stdout
+                    else:
+                        _human_out = None
+                    try:
+                        if args.cmd == "episode-open":
+                            row = episode_open(conn, namespace=args.namespace)
+                        elif args.cmd == "episode-add":
+                            res = episode_add(conn, episode_id=args.episode,
+                                              memory_id=args.memory)
+                        else:
+                            row = episode_close(conn, episode_id=args.episode,
+                                                with_summary=args.summary)
+                    finally:
+                        if _human_out is not None:
+                            sys.stdout = _human_out
+                    if args.cmd == "episode-open":
+                        print(json.dumps(row, indent=2) if args.json else
+                              f"[zmem] episode opened: {row['id']} "
+                              f"(ns={row['namespace']} started={row['started_at']})")
+                    elif args.cmd == "episode-add":
+                        if args.json:
+                            print(json.dumps(res))
+                        else:
+                            state = ("attached" if res["added"]
+                                     else "already attached")
+                            print(f"[zmem] episode-add: memory {args.memory} "
+                                  f"{state} to episode {args.episode}")
+                    else:
+                        print(json.dumps(row, indent=2) if args.json else
+                              f"[zmem] episode closed: {row['id']} "
+                              f"(members={row['member_count']} "
+                              f"tokens={row['token_count']}"
+                              + (f" summary={row['summary_memory_id']}"
+                                 if row["summary_memory_id"] else "") + ")")
+            except EpisodeError as exc:
+                print(str(exc), file=sys.stderr)
+                sys.exit(2)
     finally:
         _release_writer_lease(writer_lease)
         conn.close()

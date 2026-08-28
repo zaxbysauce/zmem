@@ -129,7 +129,9 @@ class McpServerNamespaceDocsStayCorrectTest(unittest.TestCase):
         # Isolate the recall function definition + its docstring window.
         self.assertIn("def recall(", self.src)
         recall_start = self.src.index("def recall(")
-        recall_block = self.src[recall_start:recall_start + 1200]
+        # v13 (issue #65): the docstring grew (scoped-token notes); keep the
+        # window generous so the closing triple-quote stays inside it.
+        recall_block = self.src[recall_start:recall_start + 2400]
         # The docstring is the first triple-quoted span after the def.
         self.assertIn('"""', recall_block)
         ds_start = recall_block.index('"""')
@@ -231,7 +233,10 @@ class V9ToolSchemaPresenceTest(unittest.TestCase):
     def test_mcp_exposes_update_and_invalidate_tools(self):
         self.assertIn("async def update(", self.mcp_src)
         self.assertIn("async def invalidate(", self.mcp_src)
-        self.assertIn('"result": "updated"', self.mcp_src)
+        # v13 (issue #65, 10.8): update's result string is built by
+        # _write_response(ok_result="updated") from the structured --json
+        # output; invalidate still writes its literal result dict.
+        self.assertIn('ok_result="updated"', self.mcp_src)
         self.assertIn('"result": "invalidated"', self.mcp_src)
 
     def test_no_surface_invents_a_fourth_taint_rank(self):

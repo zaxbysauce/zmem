@@ -308,6 +308,12 @@ if store_py and os.path.isfile(store_py):
             stderr=subprocess.DEVNULL, timeout=8,
         ).decode("utf-8", "replace")
         rows = json.loads(out) if out.strip() else []
+        # v13 (issue #65, 10.8): unwrap the read envelope ({"results": ...});
+        # a bare list from a pre-v13 store.py still works.
+        if isinstance(rows, dict):
+            rows = rows.get("results", [])
+        if not isinstance(rows, list):
+            rows = []
         if rows:
             # Issue #58, 3.5: wrap Tier 2 in the same non-executable
             # fence + provenance render that zmem-recall uses. The gate
@@ -348,6 +354,14 @@ if store_py and os.path.isfile(store_py):
                     elif _sig in _grounded and _conf >= _floor_prompt:
                         _selected.append(r)
                 rows = _selected
+                # v13 (issue #65, 10.9): token-budget admission. Protected
+                # types (decision/constraint) are never dropped; lowest-score
+                # signal=none rows drop first. Fail-open on import failure.
+                try:
+                    import inject as _inj_mod
+                    rows, _est, _dropped = _inj_mod.apply_token_budget(rows)
+                except Exception:
+                    pass
                 # PRR-014 fix: record the injected|silent decision in the
                 # SAME bg log the other hook surfaces use (recall /
                 # precompact / subagent-recall via the shared body).

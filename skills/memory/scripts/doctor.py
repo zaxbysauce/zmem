@@ -779,6 +779,185 @@ def _parse_ns_migration_map() -> dict[str, str]:
     return out
 
 
+def _check_mcp_token() -> dict:
+    """MCP token scope check (issue #65, 10.2/10.10).
+
+    Reads ZMEM_MCP_TOKEN / ZMEM_MCP_TOKEN_FILE DIRECTLY (never imports the
+    server's auth module -- load_expected_token exits the process when no
+    token is configured, which would kill doctor). Same sniff rule as the
+    server: env is always an UNSCOPED operator token; a file whose first
+    non-whitespace char is ``{`` must be a JSON object ``{"token", "namespaces"}``.
+    The token VALUE is never reported -- only its scope shape.
+
+      skip  no token configured (MCP server not in use on this box)
+      warn  token configured but UNSCOPED (full store access; the pre-v13
+            default) -- details carry unscoped_token: true
+      pass  scoped token -- details carry unscoped_token: false and the
+            namespace count (plus reads_require_namespace guidance)
+    """
+    env_tok = os.environ.get("ZMEM_MCP_TOKEN", "").strip()
+    if env_tok:
+        return _check(
+            "mcp-token", "warn",
+            "ZMEM_MCP_TOKEN is an UNSCOPED operator token (full access to "
+            "every namespace). Fine for the single-operator box; to scope it, "
+            "move the token into a ZMEM_MCP_TOKEN_FILE JSON object with a "
+            "namespaces allow-list (issue #65, 10.2).",
+            source="ZMEM_MCP_TOKEN",
+            unscoped_token=True,
+            namespaces=None,
+        )
+    tok_file = os.environ.get("ZMEM_MCP_TOKEN_FILE", "").strip()
+    if not tok_file:
+        return _check(
+            "mcp-token", "skip",
+            "No MCP token configured (ZMEM_MCP_TOKEN / ZMEM_MCP_TOKEN_FILE "
+            "unset) -- the MCP server is not in use on this box.",
+        )
+    path = Path(tok_file).expanduser()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return _check(
+            "mcp-token", "fail",
+            f"ZMEM_MCP_TOKEN_FILE ({tok_file}) is configured but unreadable: {exc}",
+            unscoped_token=None,
+        )
+    if not raw.lstrip().startswith("{"):
+        return _check(
+            "mcp-token", "warn",
+            "ZMEM_MCP_TOKEN_FILE holds a bare token: an UNSCOPED operator "
+            "token (full access to every namespace). Fine for the "
+            "single-operator box; scope it by switching the file to a JSON "
+            "object with a namespaces allow-list (issue #65, 10.2).",
+            source=f"ZMEM_MCP_TOKEN_FILE ({tok_file})",
+            unscoped_token=True,
+            namespaces=None,
+        )
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return _check(
+            "mcp-token", "fail",
+            "ZMEM_MCP_TOKEN_FILE starts with '{' but is not valid JSON -- "
+            "the MCP server will refuse to start (exit 2). Fix the file or "
+            "remove the leading '{' if it is meant to be a bare token.",
+            unscoped_token=None,
+        )
+    scopes = obj.get("namespaces") if isinstance(obj, dict) else None
+    if scopes is None:
+        # absent OR null = a VALID unscoped operator token (auth.py's sniff
+        # rule) — warn like every other full-access token, never fail.
+        return _check(
+            "mcp-token", "warn",
+            "ZMEM_MCP_TOKEN_FILE JSON omits 'namespaces': an UNSCOPED "
+            "operator token (full access to every namespace). Fine for the "
+            "single-operator box; scope it by adding a namespaces allow-list "
+            "(issue #65, 10.2).",
+            source=f"ZMEM_MCP_TOKEN_FILE ({tok_file})",
+            unscoped_token=True,
+            namespaces=None,
+        )
+    if not isinstance(scopes, list) or not scopes:
+        return _check(
+            "mcp-token", "fail",
+            "ZMEM_MCP_TOKEN_FILE 'namespaces' is present but not a non-empty "
+            "list -- the MCP server will refuse to start (exit 2) as "
+            "configured.",
+            unscoped_token=None,
+        )
+    # Reviewer round: mirror auth._valid_scope_namespace (without importing
+    # the server module) so doctor never reports "pass" for a token file the
+    # server itself will refuse (near-miss globals, bad shapes).
+    import re as _re
+    _shape = _re.compile(r"^(user:global|project:[^\s:][^:]*|user:[^\s:][^:]*)$")
+    _near_miss = _re.compile(
+        r"^(global|userglobal|users:global|user\.global|global:user|user-global)$",
+        _re.IGNORECASE,
+    )
+    for ns in scopes:
+        if not isinstance(ns, str) or not _shape.match(ns.strip()) or _near_miss.match(ns.strip()):
+            return _check(
+                "mcp-token", "fail",
+                f"ZMEM_MCP_TOKEN_FILE 'namespaces' entry {ns!r} is not a "
+                "valid namespace shape (expected project:<name>, "
+                "user:<name>, or user:global) -- the MCP server will refuse "
+                "to start (exit 2) on this file.",
+                unscoped_token=None,
+            )
+    return _check(
+        "mcp-token", "pass",
+        f"Scoped MCP token: allow-list of {len(scopes)} namespace(s). "
+        "Scoped tokens must pass an allowed namespace explicitly on every "
+        "read (namespace-less reads span the whole store and are denied).",
+        source=f"ZMEM_MCP_TOKEN_FILE ({tok_file})",
+        unscoped_token=False,
+        namespaces=len(scopes),
+        reads_require_namespace=True,
+    )
+
+
+def _check_episode_tables(resolved_store: Path) -> dict:
+    """Episode storage check (issue #65, 10.7): structure + counts, read-only.
+
+      skip   no store yet (first writable run will create it at v13)
+      pass   both tables present with the expected columns; details carry
+             open/closed episode and membership counts (0 on a fresh store)
+      warn   store exists but the tables are missing (a v13 store should not
+             be able to get here -- migrate creates them idempotently)
+    """
+    if not resolved_store.exists():
+        return _check(
+            "episode-tables", "skip",
+            "No store yet; the first writable run will create the v13 "
+            "episode tables.",
+        )
+    uri = resolved_store.resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except Exception:
+        return _check(
+            "episode-tables", "skip",
+            "Store unreadable read-only; episode counts unavailable.",
+        )
+    try:
+        names = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        for table in ("episode", "episode_memory"):
+            if table not in names:
+                return _check(
+                    "episode-tables", "warn",
+                    f"Table '{table}' is missing -- run any writable store.py "
+                    "command once to complete the v13 migration.",
+                    store=_display_path(resolved_store),
+                )
+        open_n = conn.execute(
+            "SELECT count(*) FROM episode WHERE ended_at=''"
+        ).fetchone()[0]
+        closed_n = conn.execute(
+            "SELECT count(*) FROM episode WHERE ended_at<>''"
+        ).fetchone()[0]
+        members_n = conn.execute("SELECT count(*) FROM episode_memory").fetchone()[0]
+        return _check(
+            "episode-tables", "pass",
+            f"Episode storage ready: {open_n} open, {closed_n} closed, "
+            f"{members_n} membership(s).",
+            episodes_open=open_n,
+            episodes_closed=closed_n,
+            memberships=members_n,
+        )
+    except sqlite3.OperationalError as exc:
+        return _check(
+            "episode-tables", "warn",
+            f"Episode tables unreadable: {exc}",
+        )
+    finally:
+        conn.close()
+
+
 def _check_ns_migration(resolved_store: Path) -> dict:
     """Read-only preview of pending namespace migrations (#39 E8).
 
@@ -1616,6 +1795,11 @@ def _recommendations(checks: list[dict]) -> list[str]:
         notes.append(
             "After installing any Codex hook surface, trust the project and reapprove hooks so the new path is explicit and reviewable."
         )
+    tok = by_id.get("mcp-token", {})
+    if tok.get("status") == "warn" and tok.get("details", {}).get("unscoped_token"):
+        notes.append(
+            "Scope the MCP token: put it in a ZMEM_MCP_TOKEN_FILE JSON object with a namespaces allow-list; scoped tokens must pass an allowed namespace on every read (issue #65, 10.2)."
+        )
     if by_id.get("schema-version", {}).get("status") == "warn":
         notes.append(
             f"Run the first writable zmem command only after the shared store path is correct; that first run may need to initialize or migrate schema v{CURRENT_SCHEMA_VERSION}."
@@ -2092,6 +2276,9 @@ def build_report(project: Path, repo_root: Path) -> dict:
     # Pending namespace-migration preview (#39 E8) — read-only dry-run of the
     # self-heal retry, so stranded namespaces are visible before they're fixed.
     checks.append(_check_ns_migration(resolved_store))
+    # v13 (issue #65, 10.7/10.10): episode storage + MCP token scope.
+    checks.append(_check_episode_tables(resolved_store))
+    checks.append(_check_mcp_token())
 
     # "info" is a supported non-ok-flipping status (hybrid-default's
     # embeddings-unavailable branch: lexical fallback works — PRR-001R fix;

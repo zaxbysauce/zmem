@@ -107,7 +107,10 @@ DATA_SHA = {
     # regression). The suite now pins ZMEM_TEST_NOW to the fixture sentinel
     # (_run_env), making the surface time-invariant; stats/list/export_jsonl
     # are clock-independent and stay byte-identical to their prior freezes.
-    "recall": "745a08e408bcf4dff0bb65a64e91cecfae97e35f60e22c7b951ac74daa0ebe39",
+        # v13 (issue #65, 10.8): recall --json re-captured for the read
+    # ENVELOPE ({"results", "count", "omitted", "injection_risk",
+    # "tokens_used", "tokens_budget"}); the rows inside are unchanged.
+    "recall": "a572b9484683f043e594dbef0c8cc643e27b99bf1f2820e48c97e3ee8a5a784a",
     # v11 (issue #61): export-jsonl re-captured ONLY for the two new row keys
     # (`trust_score`, `links`) — stripping exactly those keys from the new
     # output reproduces the v10 freeze 8552767c… byte-for-byte (verified at
@@ -123,7 +126,11 @@ DATA_SHA = {
     # (only get --json's SELECT * does, by design) — so the recall hash is
     # unchanged. list never selected the counters and stats never aggregated
     # them, so their hashes are unchanged too.
-    "export_jsonl": "744a906c8ba2704763b996403178afb414d36cf46f2c5635797641735b66828a",
+        # v13 (issue #65, 10.7): re-captured for the `kind` discriminator on
+    # memory rows (the fixture store has no episodes, so no episode
+    # records are emitted) — stripping exactly `kind` reproduces the
+    # v12 freeze 744a906c… byte-for-byte (pinned by the drift test).
+    "export_jsonl": "5bf14171020ec6df3d0b708f0e32460fafd14f6df28674caccb0bfd4362747f5",
 }
 KNOWN_SUBCMDS = [
     "init", "add", "invalidate", "recall", "recent", "search", "supersede",
@@ -383,9 +390,14 @@ class CharacterizationTests(unittest.TestCase):
         out_pin = run_fresh(builder.PIN_TS)
         out_day_later = run_fresh("2026-02-04T04:05:06Z")
         out_pin_again = run_fresh(builder.PIN_TS)
+        def _first_score(out: str) -> float:
+            parsed = json.loads(out)
+            # v13 (issue #65, 10.8): read --json emits the envelope.
+            rows = parsed["results"] if isinstance(parsed, dict) else parsed
+            return rows[0]["_score"]
+
         self.assertNotEqual(
-            json.loads(out_pin)[0]["_score"],
-            json.loads(out_day_later)[0]["_score"],
+            _first_score(out_pin), _first_score(out_day_later),
             "ZMEM_TEST_NOW must control the scoring clock (recency decay)")
         self.assertEqual(
             out_pin, out_pin_again,
@@ -413,6 +425,11 @@ class CharacterizationTests(unittest.TestCase):
             obj = dict(json.loads(line))
             obj.pop("applied_count", None)
             obj.pop("violated_count", None)
+            # v13 (issue #65, 10.7): every memory row gained the `kind`
+            # discriminator ("memory"; the fixture store has no episodes,
+            # so no episode records are emitted). Strip it to prove the
+            # drift beyond the v12 keys is EXACTLY the v13 key.
+            obj.pop("kind", None)
             stripped.append(json.dumps(obj, ensure_ascii=False))
         stripped_hash = hashlib.sha256(
             ("\n".join(stripped) + "\n").encode("utf-8")).hexdigest()

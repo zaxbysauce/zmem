@@ -207,8 +207,15 @@ def cmd_export_jsonl(
         pass  # memory_link absent (pre-v11 store never migrated) — export without links
 
     lines = []
+    exported_ids: set[str] = set()
     for r in rows:
+        exported_ids.add(r["id"])
         obj = {
+            # v13 (issue #65, 10.7): kind discriminator. Legacy readers ignore
+            # unknown keys (the v11 links precedent), so an older client can
+            # still ingest this file; episode lines (below) are new kinds an
+            # older client should filter.
+            "kind": "memory",
             "id": r["id"],
             "namespace": r["namespace"],
             "type": r["type"],
@@ -251,6 +258,46 @@ def cmd_export_jsonl(
                     .replace("\u2029", "\\u2029")
                     .replace("\u0085", "\\u0085"))
         lines.append(line)
+
+    # v13 (issue #65, 10.7): episodes round-trip in the same stream. Only
+    # memberships whose episode AND member memory are BOTH in the exported set
+    # are emitted, so the file is self-consistent (a live-only export carries
+    # live memberships; --include-superseded carries all of them) and a
+    # consumer never needs dangling-reference tolerance.
+    try:
+        ep_where = "WHERE namespace=?" if namespace else ""
+        ep_params: list = [namespace] if namespace else []
+        episodes = conn.execute(
+            f"SELECT * FROM episode {ep_where} ORDER BY started_at, id",
+            ep_params,
+        ).fetchall()
+        exported_eps: set[str] = set()
+        for e in episodes:
+            exported_eps.add(e["id"])
+            lines.append(json.dumps({
+                "kind": "episode",
+                "id": e["id"],
+                "namespace": e["namespace"],
+                "started_at": e["started_at"],
+                "ended_at": e["ended_at"] or "",
+                "summary_memory_id": e["summary_memory_id"] or "",
+                "token_count": e["token_count"],
+            }, ensure_ascii=False))
+        if exported_eps:
+            for m in conn.execute(
+                "SELECT episode_id, memory_id, added_at FROM episode_memory "
+                "ORDER BY episode_id, added_at, memory_id"
+            ).fetchall():
+                if m["episode_id"] in exported_eps and m["memory_id"] in exported_ids:
+                    lines.append(json.dumps({
+                        "kind": "episode_memory",
+                        "episode_id": m["episode_id"],
+                        "memory_id": m["memory_id"],
+                        "added_at": m["added_at"],
+                    }, ensure_ascii=False))
+    except sqlite3.OperationalError:
+        pass  # episode tables absent (pre-v13 store never migrated) — export without them
+
     text = "".join(line + "\n" for line in lines)
 
     if out:
@@ -290,6 +337,50 @@ INGEST_MAX_FUTURE_SKEW_SECONDS = 86400
 # use per line.
 
 MAX_LINE_CHARS = 1_048_576
+
+
+def _validate_episode_row(obj: dict, lineno: int) -> None:
+    """Validate a ``kind: "episode"`` JSONL record (issue #65, 10.7).
+
+    Same shape guards as memory rows: UUID-shaped ids, non-empty namespace,
+    ISO-8601 timestamps (started_at required; ended_at may be empty for an
+    open episode), and non-negative integer token_count. Raises ValueError
+    with a message safe to print (never echoes raw field content).
+    """
+    def _need(field: str) -> object:
+        v = obj.get(field)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            raise ValueError(f"episode record missing required field {field!r}")
+        return v
+
+    if not _INGEST_ID_RE.match(str(_need("id"))):
+        raise ValueError("episode id is not UUID-shaped")
+    ns = str(_need("namespace"))
+    if len(ns) > 512:
+        raise ValueError("episode namespace over 512 chars")
+    started = str(_need("started_at"))
+    if _parse_iso_to_epoch(started) <= 0:
+        raise ValueError("episode started_at is not ISO-8601")
+    ended = obj.get("ended_at", "") or ""
+    if ended and _parse_iso_to_epoch(str(ended)) <= 0:
+        raise ValueError("episode ended_at is not ISO-8601")
+    summary = obj.get("summary_memory_id", "") or ""
+    if summary and not _INGEST_ID_RE.match(str(summary)):
+        raise ValueError("episode summary_memory_id is not UUID-shaped")
+    tc = obj.get("token_count", 0)
+    if not isinstance(tc, int) or isinstance(tc, bool) or tc < 0:
+        raise ValueError("episode token_count must be a non-negative integer")
+
+
+def _validate_membership_row(obj: dict, lineno: int) -> None:
+    """Validate a ``kind: "episode_memory"`` JSONL record (issue #65, 10.7)."""
+    for field in ("episode_id", "memory_id"):
+        v = obj.get(field)
+        if not isinstance(v, str) or not _INGEST_ID_RE.match(v):
+            raise ValueError(f"episode_memory {field} is missing or not UUID-shaped")
+    added_at = obj.get("added_at", "") or ""
+    if added_at and _parse_iso_to_epoch(str(added_at)) <= 0:
+        raise ValueError("episode_memory added_at is not ISO-8601")
 
 
 
@@ -774,7 +865,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             print(f"[zmem] ingest-jsonl: refused row {mid}: {exc}", file=sys.stderr)
             return "capture_refused"
         for w in cap_warns:
-            print(f"[zmem] ingest-jsonl: capture policy: {w}", file=sys.stderr)
+            print(f"[zmem] ingest-jsonl: capture policy: {w['message']}", file=sys.stderr)
 
         if superseded_at:
             # New locally, but already tombstoned upstream: insert as history so
@@ -957,6 +1048,13 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     decode_error = None
     # v11 (issue #61, sync): (src_id, validated_edges) per row carrying links.
     pending_links: list = []
+    # v13 (issue #65, 10.7): episode records are applied AFTER every memory
+    # row lands (dependency order: memory -> episode -> membership), never in
+    # file order — a membership may precede its episode line in a
+    # third-party file. Memberships referencing a missing local episode or
+    # memory are counted malformed with a line number, never applied.
+    pending_episodes: list = []
+    pending_memberships: list = []
     try:
         # Stream the file line by line instead of reading it whole into
         # memory first -- a giant hostile file would otherwise exhaust RAM
@@ -1055,6 +1153,20 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 obj = json.loads(line)
                 if not isinstance(obj, dict):
                     raise ValueError("line is not a JSON object")
+                # v13 (issue #65, 10.7): kind discriminator. Absent kind (or
+                # "memory") is the legacy row path; episode records validate
+                # separately and apply in the post-pass.
+                _kind = obj.get("kind", "memory")
+                if _kind == "episode":
+                    _validate_episode_row(obj, lineno)
+                    pending_episodes.append((lineno, obj))
+                    continue
+                if _kind == "episode_memory":
+                    _validate_membership_row(obj, lineno)
+                    pending_memberships.append((lineno, obj))
+                    continue
+                if _kind != "memory":
+                    raise ValueError(f"unknown kind {_kind!r}")
                 obj = _validate_sync_row(obj, lineno)
             except Exception as e:
                 # Broad on purpose: a per-line parse guard must never let hostile
@@ -1186,8 +1298,57 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
         # run's collected links.
         _commit(conn)
 
+    # v13 (issue #65, 10.7): apply episode records in dependency order AFTER
+    # every memory row has landed. Episodes are skip-if-exists by id (the
+    # memory-row idempotency primitive); memberships INSERT OR IGNORE on the
+    # composite PK so re-ingesting the same file is an exact no-op.
+    episodes_added = episodes_skipped = episode_malformed = 0
+    if pending_episodes or pending_memberships:
+        try:
+            for lineno, e in pending_episodes:
+                exists = conn.execute(
+                    "SELECT 1 FROM episode WHERE id=?", (e["id"],)
+                ).fetchone()
+                if exists:
+                    episodes_skipped += 1
+                    continue
+                conn.execute(
+                    "INSERT INTO episode (id, namespace, started_at, ended_at, "
+                    "summary_memory_id, token_count) VALUES (?,?,?,?,?,?)",
+                    (e["id"], e["namespace"], e["started_at"], e["ended_at"],
+                     e["summary_memory_id"], e["token_count"]),
+                )
+                episodes_added += 1
+            _commit(conn)
+            known_eps = {r[0] for r in conn.execute("SELECT id FROM episode")}
+            known_mem = {r[0] for r in conn.execute("SELECT id FROM memory")}
+            for lineno, m in pending_memberships:
+                if m["episode_id"] not in known_eps or m["memory_id"] not in known_mem:
+                    print(f"[zmem] ingest-jsonl: malformed line {lineno}: "
+                          "episode_memory references an episode or memory "
+                          "not present locally (or earlier in this file); "
+                          "membership not applied", file=sys.stderr)
+                    episode_malformed += 1
+                    malformed += 1
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO episode_memory "
+                    "(episode_id, memory_id, added_at) VALUES (?,?,?)",
+                    (m["episode_id"], m["memory_id"], m["added_at"]),
+                )
+            _commit(conn)
+        except sqlite3.OperationalError as e:
+            # episode tables absent (pre-v13 store never migrated): every
+            # episode record in the file is counted malformed, reported once.
+            print(f"[zmem] ingest-jsonl: episode records skipped — episode "
+                  f"tables unavailable ({_sanitize_error_text(str(e))}); "
+                  "re-ingest after a writable open migrates this store to v13",
+                  file=sys.stderr)
+            malformed += len(pending_episodes) + len(pending_memberships)
+
     print(f"[zmem] ingest-jsonl: added={added} tombstoned={tombstoned} "
           f"tombstones_refused={tombstones_refused} capture_refused={capture_refused} "
           f"deduped={deduped} skipped={skipped} malformed={malformed} "
-          f"links_added={links_added} links_skipped={links_skipped}")
+          f"links_added={links_added} links_skipped={links_skipped} "
+          f"episodes_added={episodes_added} episodes_skipped={episodes_skipped}")
     return 2 if decode_error is not None else 0
