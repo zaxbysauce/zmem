@@ -1,22 +1,23 @@
 """Tests for the offline eval runner and public-corpus adapters
-(issue #64, 9.1/9.2/9.3).
+(issue #64, 9.1/9.2/9.3; issue #82 eval honesty).
 
 Covers:
   - End-to-end: the runner auto-builds its deterministic fixture corpus at the
-    given --store path, runs the committed eval/gold.jsonl (30 items, six
-    buckets), and exits 0 with a full JSON report on stdout. On the fixture
-    corpus the metrics are deterministic 1.0 (hit@k, MRR, as-of accuracy,
-    injection-omit) — this is the empirical proof the gold set is sound.
+    given --store path, runs the committed eval/gold.jsonl, and exits 0 with a
+    full JSON report on stdout. The original six issue-#64 buckets (30 items,
+    5 each) stay deterministic 1.0; the issue-#82 honesty buckets (retraction,
+    polarity, change-intent, >=3 items each) are pinned with their actual
+    deterministic hit rates.
   - Byte-stability: two consecutive runs produce byte-identical JSON.
-  - Passivity: a run leaves the store byte-identical (no_bump eval must not
-    even bump surfaced_count).
-  - Operational refusals: missing --store -> exit 2; invalid gold (unknown
-    bucket, empty query, assertion-less item, id overlap) -> exit 2 naming
-    the item; --fail-under breach -> exit 1.
-  - Gold-set shape: every committed item passes load_gold validation and
-    covers all six issue-mandated buckets (>=5 items each).
-  - Adapters: toy fixtures convert and validate through load_gold; a missing
-    corpus prints "skipped" and exits 0; an unknown adapter exits 2.
+  - Passivity: a run leaves the store byte-identical — including the
+    issue-#82 EXPLICIT items (no_bump=False + no_telemetry=True is a
+    zero-write combination; pinned at unit level below).
+  - Operational refusals: missing --store -> exit 2; invalid gold -> exit 2
+    naming the item; --fail-under breach -> exit 1.
+  - Gold-set shape: every committed item passes load_gold validation; the
+    original six buckets keep >=5 items, the #82 buckets >=3; ids 1-50 are
+    the frozen contract and no original item references a 51+ id.
+  - Adapters: toy fixtures convert and validate through load_gold.
 
 Run: python tests/test_eval_runner.py   (no pytest — repo convention)
 """
@@ -38,6 +39,21 @@ ADAPTERS = REPO_ROOT / "scripts" / "eval_adapters.py"
 GOLD = REPO_ROOT / "eval" / "gold.jsonl"
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
 PYTHON = sys.executable
+
+# ---------------------------------------------------------------------------
+# Module-level ZMEM_STORE pin: this file's in-process tests import storelib
+# mid-run, and storelib freezes STORE_PATH at FIRST import. Without this pin
+# that first import resolves (and could, on schema skew, auto-migrate) the
+# operator's real home store. Subprocess tests are env-pinned per run and the
+# runner overrides ZMEM_STORE itself; the frozen path here only serves the
+# in-process TestExplicitPassivity class, which builds its fixture AT it.
+# ---------------------------------------------------------------------------
+INPROC_STORE = os.path.join(
+    tempfile.mkdtemp(prefix="zmem-eval-inproc-"), "inproc.sqlite")
+os.environ["ZMEM_STORE"] = INPROC_STORE
+os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
+os.environ["ZMEM_MODELS_DIR"] = "/nonexistent-zmem-models-dir"
+os.environ["ZMEM_EMBED_PROFILE"] = "fake"
 
 
 class EvalRunnerTestBase(unittest.TestCase):
@@ -79,22 +95,61 @@ class TestRunnerEndToEnd(EvalRunnerTestBase):
         for key in ("hit_at_k", "mrr", "as_of_accuracy", "injection_omit_rate"):
             self.assertIn(key, self.report["metrics"])
 
-    def test_gold_set_has_all_six_buckets_with_metrics_1(self):
-        # The fixture corpus is designed so every bucket's assertion holds —
-        # a miss here means either the corpus or the recall pipeline drifted.
-        self.assertEqual(len(self.report["per_item"]), 30)
-        buckets = {b["bucket"] for b in self.report["per_item"]}
-        self.assertEqual(buckets, {"as-of", "injection", "namespace",
-                                   "contested", "entity-alias", "fts"})
-        for bucket, agg in self.report["per_bucket"].items():
+    def test_gold_set_covers_original_buckets_with_metrics_1(self):
+        # The original issue-#64 gold (ids 1-50, five items per bucket) is a
+        # frozen contract: every bucket's assertion must keep holding at 1.0.
+        items = [it for it in self.report["per_item"]
+                 if it["bucket"] in {"as-of", "injection", "namespace",
+                                     "contested", "entity-alias", "fts"}]
+        self.assertEqual(len(items), 30)
+        for bucket in {"as-of", "injection", "namespace", "contested",
+                       "entity-alias", "fts"}:
+            agg = self.report["per_bucket"][bucket]
             self.assertEqual(agg["items"], 5, bucket)
             self.assertEqual(agg["hits"], 5, bucket)
             self.assertEqual(agg["excluded_surfaced"], 0, bucket)
+
+    def test_gold_set_has_issue_82_buckets(self):
+        # Issue #82 honesty buckets: >=3 items each, all deterministic.
+        buckets = set(self.report["per_bucket"].keys())
+        self.assertEqual(
+            buckets,
+            {"as-of", "injection", "namespace", "contested", "entity-alias",
+             "fts", "retraction", "polarity", "change-intent"})
+        self.assertEqual(len(self.report["per_item"]), 42)
+        for bucket in ("retraction", "polarity", "change-intent"):
+            agg = self.report["per_bucket"][bucket]
+            self.assertGreaterEqual(agg["items"], 3, bucket)
+            self.assertEqual(agg["hits"], agg["items"], bucket)
+            self.assertEqual(agg["excluded_surfaced"], 0, bucket)
+
+    def test_explicit_items_flow_through_and_stay_flagged(self):
+        explicit = {it["id"]: it for it in self.report["per_item"]
+                    if it["explicit"]}
+        self.assertEqual(
+            set(explicit.keys()),
+            {"ci-explicit-1", "ci-explicit-2", "ci-explicit-3"})
+        self.assertTrue(all(it["hit"] for it in explicit.values()),
+                        "explicit change-intent items must surface the live "
+                        "head AND the [PREVIOUSLY] predecessor (unfold ran)")
+        # The passive twins must have kept the predecessor OUT (hooks never
+        # unfold) while still surfacing the live head.
+        passive = {it["id"]: it for it in self.report["per_item"]
+                   if it["id"].startswith("ci-passive")}
+        self.assertEqual(len(passive), 3)
+        for it in passive.values():
+            self.assertTrue(it["hit"])
+            self.assertEqual(it["excluded_ids_surfaced"], [],
+                             "a passive twin must never see the predecessor")
+
+    def test_metrics_1_with_pinned_mrr(self):
         self.assertAlmostEqual(self.report["metrics"]["hit_at_k"], 1.0)
-        self.assertAlmostEqual(self.report["metrics"]["mrr"], 1.0)
+        # MRR counts only items with an include-assertion; the two
+        # exclude-only retraction items legitimately contribute 0 (40 of 42).
+        self.assertAlmostEqual(self.report["metrics"]["mrr"], 40 / 42)
         self.assertAlmostEqual(self.report["metrics"]["as_of_accuracy"], 1.0)
         self.assertAlmostEqual(self.report["metrics"]["injection_omit_rate"], 1.0)
-        self.assertEqual(self.report["metrics"]["as_of_items"], 5)
+        self.assertEqual(self.report["metrics"]["as_of_items"], 6)
         self.assertEqual(self.report["metrics"]["injection_items"], 5)
 
     def test_runs_are_byte_stable(self):
@@ -185,7 +240,7 @@ class TestRunnerRefusals(EvalRunnerTestBase):
 
 
 class TestGoldSetShape(unittest.TestCase):
-    def test_committed_gold_is_valid_and_covers_six_buckets(self):
+    def test_committed_gold_is_valid_and_covers_buckets(self):
         scripts = str(REPO_ROOT / "skills" / "memory" / "scripts")
         fixtures = str(FIXTURES)
         sys.path.insert(0, scripts)
@@ -195,13 +250,15 @@ class TestGoldSetShape(unittest.TestCase):
         from storelib.eval_gold import load_gold  # local import (path above)
         import eval_store
         items = load_gold(str(GOLD))
-        self.assertGreaterEqual(len(items), 30)
+        self.assertGreaterEqual(len(items), 42)
         counts: dict[str, int] = {}
         for it in items:
             counts[it.bucket] = counts.get(it.bucket, 0) + 1
         for bucket in ("as-of", "injection", "entity-alias", "namespace",
                        "contested", "fts"):
             self.assertGreaterEqual(counts.get(bucket, 0), 5, bucket)
+        for bucket in ("retraction", "polarity", "change-intent"):
+            self.assertGreaterEqual(counts.get(bucket, 0), 3, bucket)
         # Every fixture id the gold names must be one the builder mints.
         named: set[str] = set()
         for it in items:
@@ -209,6 +266,89 @@ class TestGoldSetShape(unittest.TestCase):
             named.update(it.must_exclude_ids)
         self.assertLessEqual(named, set(eval_store.EVAL_IDS["all"]),
                              "gold names an id the fixture builder never mints")
+        # The original 30-item contract is frozen: no pre-#82 item may have
+        # been renumbered onto a 51+ id.
+        original = [it for it in items if it.bucket in
+                    {"as-of", "injection", "entity-alias", "namespace",
+                     "contested", "fts"}]
+        self.assertEqual(len(original), 30)
+        for it in original:
+            for mid in it.must_include_ids + it.must_exclude_ids:
+                self.assertLessEqual(int(mid.rsplit("-", 1)[1]), 50,
+                                     f"{it.id} references a post-#82 id: {mid}")
+        # Explicit flags live only on the change-intent bucket's explicit items.
+        for it in items:
+            if it.explicit:
+                self.assertEqual(it.bucket, "change-intent")
+
+
+class TestExplicitPassivity(unittest.TestCase):
+    """The issue-#82 explicit eval seam (no_bump=False + no_telemetry=True +
+    link_hops=1/link_budget=0) is a combination no other caller uses: prove it
+    is a zero-write read at the evaluate_items level, not just byte-stable
+    output at the runner level."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Build the fixture AT the module-frozen INPROC store so the
+        # in-process connect() (frozen STORE_PATH) reads the corpus the
+        # subprocess seed wrote.
+        r = subprocess.run(
+            [PYTHON, str(FIXTURES / "eval_store.py"), INPROC_STORE],
+            env={**os.environ, "PYTHONUTF8": "1"},
+            capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            raise AssertionError(r.stderr[-2000:])
+        sys.path.insert(0, str(FIXTURES))
+        cls.addClassCleanup(sys.path.remove, str(FIXTURES))
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        cls.addClassCleanup(sys.path.remove,
+                            str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        from eval_store import EVAL_PIN_TS
+        os.environ["ZMEM_TEST_NOW"] = EVAL_PIN_TS
+
+    def test_explicit_items_are_zero_write(self):
+        import sqlite3
+        from eval_store import EVAL_IDS
+        from storelib.eval_gold import GoldItem, evaluate_items
+        from storelib.schema import connect as storelib_connect
+
+        def counters():
+            conn = sqlite3.connect(INPROC_STORE)
+            try:
+                return conn.execute(
+                    "SELECT retrieval_count, surfaced_count FROM memory "
+                    "WHERE id IN (?, ?)", (EVAL_IDS["change_head"][62],
+                                           EVAL_IDS["change_pred"][59]),
+                ).fetchall()
+            finally:
+                conn.close()
+
+        before_bytes = Path(INPROC_STORE).read_bytes()
+        before_counts = counters()
+        items = [
+            GoldItem(id="x-explicit-1", bucket="change-intent",
+                     query="what changed about the lint gate",
+                     namespace="project:eval-change", explicit=True,
+                     must_include_ids=[EVAL_IDS["change_head"][62],
+                                       EVAL_IDS["change_pred"][59]]),
+            GoldItem(id="x-passive-1", bucket="change-intent",
+                     query="what changed about the lint gate",
+                     namespace="project:eval-change",
+                     must_include_ids=[EVAL_IDS["change_head"][62]],
+                     must_exclude_ids=[EVAL_IDS["change_pred"][59]]),
+        ]
+        conn = storelib_connect()
+        try:
+            per_item, metrics = evaluate_items(conn, items)
+        finally:
+            conn.close()
+        self.assertEqual([it["hit"] for it in per_item], [True, True])
+        self.assertAlmostEqual(metrics["hit_at_k"], 1.0)
+        self.assertEqual(counters(), before_counts,
+                         "explicit eval items must not advance either counter")
+        self.assertEqual(Path(INPROC_STORE).read_bytes(), before_bytes,
+                         "explicit eval items must be byte-passive")
 
 
 class TestAdapters(unittest.TestCase):

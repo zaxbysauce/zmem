@@ -822,6 +822,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         (omitted / injection_risk / tokens_*) from store.py. Scoped tokens
         must pass an allowed namespace explicitly; the implicit user:global
         union is suppressed unless user:global is in the token's allow-list.
+
+        Issue #82: change-intent queries ("what changed about X") may append
+        budgeted [PREVIOUSLY] predecessor rows — JSON keys unfold_of /
+        unfold_hop — after the query-matched results; does not apply to
+        session_start / prefetch (those are passive and never unfold).
         """
         q = (query or "").strip()
         if not q:

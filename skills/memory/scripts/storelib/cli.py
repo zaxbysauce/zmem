@@ -28,7 +28,7 @@ from storelib.promote import promote_memory
 # _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
 # this module's re-export surface for `storelib/__init__.py` and legacy
 # importers — removing it broke that chain.
-from storelib.recall import _reembed, get_memory, list_memory, recall_memory, recent_memory, stats
+from storelib.recall import _reembed, explain_recall, get_memory, list_memory, recall_memory, recent_memory, stats
 from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import reembed_embeddings
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect
@@ -178,6 +178,24 @@ def main():
                           help="max extra rows appended by 1-hop link expansion "
                                "(default 2; 0 disables expansion — equivalent to "
                                "--link-hops 0).")
+    p_recall.add_argument("--explain", action="store_true",
+                          help="issue #82: read-only retrieval debugger. Runs the real "
+                               "pipeline (zero writes) and prints one blameline per "
+                               "verdict explaining why a row did or did not surface. "
+                               "Combine with --target to debug a specific row, and "
+                               "--json for the machine-readable envelope. Never bumps, "
+                               "never unfolds.")
+    p_recall.add_argument("--target", default=None,
+                          help="with --explain: the row to explain — a memory id "
+                               "(full or unambiguous prefix) or a content fragment "
+                               "(case-insensitive substring, then token overlap). "
+                               "Multiple matches get one verdict per id.")
+    p_recall.add_argument("--no-unfold", action="store_true",
+                          help="issue #82: disable the change-intent lineage unfold "
+                               "(explicit recall only: change-intent queries like "
+                               "'what changed about X' otherwise append budgeted "
+                               "[PREVIOUSLY] update_of predecessors). Passive "
+                               "surfaces never unfold regardless (--no-bump).")
 
     p_recent = sub.add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
@@ -1076,13 +1094,28 @@ def main():
             # contract out of scope even when aliased through this argv.
             rerank_flag = _ce_cli_allowed(no_bump=args.no_bump,
                                           no_hybrid=args.no_hybrid)
-            recall_memory(conn, query=args.query, namespace=args.namespace,
-                          limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
-                          no_bump=args.no_bump, include_global=args.include_global,
-                          global_limit=args.global_limit, as_of=args.as_of,
-                          no_mmr=args.no_mmr,
-                          link_hops=args.link_hops, link_budget=args.link_budget,
-                          cross_rerank=rerank_flag)
+            # Issue #82: --explain dispatches to the read-only retrieval
+            # debugger (zero writes, never unfolds, fail-open). It is a flag,
+            # not a subcommand, so KNOWN_SUBCMDS stays byte-identical.
+            if getattr(args, "explain", False):
+                explain_recall(conn, query=args.query, target=args.target,
+                               namespace=args.namespace, limit=args.limit,
+                               as_json=args.json, hybrid=hybrid_arg,
+                               no_bump=args.no_bump,
+                               include_global=args.include_global,
+                               global_limit=args.global_limit, as_of=args.as_of,
+                               no_mmr=args.no_mmr,
+                               link_hops=args.link_hops,
+                               link_budget=args.link_budget)
+            else:
+                recall_memory(conn, query=args.query, namespace=args.namespace,
+                              limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
+                              no_bump=args.no_bump, include_global=args.include_global,
+                              global_limit=args.global_limit, as_of=args.as_of,
+                              no_mmr=args.no_mmr,
+                              link_hops=args.link_hops, link_budget=args.link_budget,
+                              cross_rerank=rerank_flag,
+                              no_unfold=args.no_unfold)
         elif args.cmd == "recent":
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
                           min_confidence=args.min_confidence, as_json=args.json,

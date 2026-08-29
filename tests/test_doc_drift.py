@@ -507,5 +507,52 @@ class TrackedFileHygieneTest(unittest.TestCase):
         self.assertIsNone(FLOOR_CLAIM_RE.search("3.8-era " + _PY + " floor"))
 
 
+class Issue82DocDriftTest(unittest.TestCase):
+    """Issue #82 documentation pins: the retrieval debugger, the unfold
+    contract, the honesty buckets, the self-corpus script, and the audited
+    claims surface."""
+
+    def test_claims_audit_exists_with_needles(self):
+        path = REPO_ROOT / "docs" / "CLAIMS-AUDIT.md"
+        self.assertTrue(path.is_file(),
+                        "docs/CLAIMS-AUDIT.md must exist (issue #82)")
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("aspirational", text,
+                      "the audit must mark non-claims explicitly")
+        self.assertIn("eval_runner.py", text,
+                      "the audit must map eval claims to the runner")
+        self.assertIn("never `add` rows",
+                      text,
+                      "the audit must carry the QUALIFIED hooks-write claim")
+
+    def test_skill_md_documents_explain_and_unfold(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("--explain", "--target", "--no-unfold",
+                       "EXPLAIN_REASONS", "vec_lane_miss",
+                       "omitted_injection", "explain_unavailable",
+                       "[PREVIOUSLY]", "unfold_of", "unfold_hop",
+                       "ZMEM_UNFOLD_TOP_K", "ZMEM_UNFOLD_MAX_HOPS",
+                       "ZMEM_UNFOLD_BUDGET", "change-intent"):
+            self.assertIn(needle, text, f"SKILL.md missing {needle!r}")
+
+    def test_skill_md_documents_honesty_buckets_and_self_corpus(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("retraction", "polarity", "explicit",
+                       "eval_self_corpus.py", "store.py backup"):
+            self.assertIn(needle, text, f"SKILL.md missing {needle!r}")
+
+    def test_skill_md_qualifies_hooks_write_claim(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        # The overstated absolute is gone...
+        self.assertNotIn(
+            "hooks never write the store",
+            text.replace("\n", " "),
+            "the absolute 'hooks never write the store' phrasing must stay "
+            "qualified (session-cadence maintenance legitimately writes)")
+        # ...and the accurate claim + its one sanctioned exception are stated.
+        self.assertIn("never `add` rows", text)
+        self.assertIn("session-cadence", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

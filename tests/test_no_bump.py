@@ -133,6 +133,24 @@ class NoBumpTest(unittest.TestCase):
         self.assertEqual(self._sc(), 2)
         self.assertEqual(self._rc(), 0)
 
+    # issue #82: the change-intent unfold's [PREVIOUSLY] extras are neighbors
+    # that did not match the query — they must never enter the telemetry bump
+    # set (pinned end-to-end here and via the library seam in
+    # tests/test_chain_unfold.py).
+    def test_unfold_extras_never_increment_retrieval_count(self):
+        r = self._run("recall", "--query", "what changed about the linter",
+                      "--namespace", NS, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # No lineage exists in this fixture, so no extras are appended; the
+        # matched row still bumps exactly once (explicit path).
+        self.assertEqual(self._rc(), 1)
+        r = self._run("recall", "--query", "what changed about the linter",
+                      "--namespace", NS, "--no-bump", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # the passive path must record a surface, never a retrieval
+        self.assertEqual(self._rc(), 1)
+        self.assertEqual(self._sc(), 1)
+
     # --- mixed: no-bump reads never advance the count a later bump starts from
     def test_no_bump_then_bump(self):
         self._run("recall", "--query", "linter", "--namespace", NS, "--no-bump", "--json")

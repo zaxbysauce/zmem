@@ -171,6 +171,17 @@ PROMPT_INJECTION_PATTERNS = [
     re.compile(r"(?i)\b(system prompt|developer message|tool call|function call)\b"),
     re.compile(r"(?i)</?(system|assistant|developer|tool)>"),
     re.compile(r"```"),
+    # Issue #82: high-precision instruction-to-the-model extras. Same
+    # fail-closed emit-time reclassify contract (_classify_injection runs on
+    # EVERY recall regardless of store age — no migration, no schema change).
+    # Additive only, and precision-first: ordinary coding lessons ("update the
+    # lockfile", "record the decision in the ADR") must never match — pinned
+    # by tests/test_injection_recall.py.
+    re.compile(r"(?i)\byou are now (?:an?|the)\b"),        # role hijack
+    re.compile(r"(?i)\bdo(?: not|n't) mention this\b"),    # concealment
+    # instruction override incl. paraphrases ("ignore all previous rules")
+    re.compile(r"(?i)\bignore (?:all )?(?:previous|prior) (?:instructions|guidelines|rules)\b"),
+    re.compile(r"(?i)\bupdate (?:your|the) (?:knowledge base|memory store)\b"),
 ]
 
 

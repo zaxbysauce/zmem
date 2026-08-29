@@ -11,7 +11,12 @@ A gold item is one JSON object per line:
      "k": 5,                      optional per-item top-k cut
      "must_include_ids": [...],   optional
      "must_exclude_ids": [...],   optional
-     "must_include_text": "..."}  optional
+     "must_include_text": "...",  optional
+     "explicit": true}            optional (issue #82: run the item on the
+                                  explicit path — no_bump=False, so the
+                                  change-intent unfold can fire — while
+                                  staying zero-write via no_telemetry=True.
+                                  Default items stay on the passive path.)
 
 Validation is fail-closed (GoldError): an invalid gold file must refuse the
 run with a named item id, never silently degrade the metrics. Keep this module
@@ -29,9 +34,12 @@ from typing import Any
 
 # The six issue-mandated fixture buckets + "adapter" (the output bucket of
 # scripts/eval_adapters.py, whose items assert must_include_text because the
-# target corpus mints ids at import time).
+# target corpus mints ids at import time) + the three issue-#82 honesty
+# buckets. Documented exception to the ">= 5 items per bucket" rule: the
+# three #82 buckets carry >= 3 items each (tests/test_eval_runner.py pins
+# the split: original six >= 5, new three >= 3).
 BUCKETS = ("as-of", "injection", "entity-alias", "namespace", "contested",
-           "fts", "adapter")
+           "fts", "adapter", "retraction", "polarity", "change-intent")
 
 
 class GoldError(ValueError):
@@ -50,6 +58,7 @@ class GoldItem:
     must_include_ids: list[str] = field(default_factory=list)
     must_exclude_ids: list[str] = field(default_factory=list)
     must_include_text: str | None = None
+    explicit: bool = False
 
 
 def load_gold(path: str) -> list[GoldItem]:
@@ -146,6 +155,12 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
     k = obj.get("k")
     if k is not None and (isinstance(k, bool) or not isinstance(k, int) or k < 1):
         raise GoldError("field 'k' must be a positive integer when present")
+    # Issue #82: optional explicit-path flag. Any truthy JSON value is
+    # accepted as True; non-bool truthy values are refused (a gold file with
+    # "explicit": "yes" is broken data, not a style choice).
+    explicit = obj.get("explicit", False)
+    if not isinstance(explicit, bool):
+        raise GoldError("field 'explicit' must be a boolean when present")
     return GoldItem(
         id=item_id,
         bucket=bucket,
@@ -156,6 +171,7 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
         must_include_ids=list(include_ids),
         must_exclude_ids=list(exclude_ids),
         must_include_text=include_text,
+        explicit=explicit,
     )
 
 
@@ -179,6 +195,15 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
       excluding it (plus the pinned clock) makes per-item ranking fully
       deterministic across platforms and dates.
 
+    Issue #82 explicit items: an item with ``explicit=True`` runs on the
+    explicit path — ``no_bump=False`` so the change-intent unfold can fire —
+    while keeping ``no_telemetry=True`` so the run stays zero-write
+    (``_bump_telemetry`` short-circuits on the disabled seam regardless of
+    ``no_bump``). ``link_hops=1`` satisfies the unfold gate's search-shape
+    exclusion while ``link_budget=0`` keeps link expansion itself OFF, so the
+    only extra rows an explicit item can surface are the `[PREVIOUSLY]`
+    lineage extras under measurement.
+
     Returns (per_item list, aggregate metrics dict). Never raises on low
     scores — a bad SCORE is data; only operational failures raise.
     """
@@ -196,16 +221,18 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
         # the per-query prints are captured and discarded. no_bump supplies
         # the passive (hook-path) injection-omit filter semantics; the eval
         # seam no_telemetry suppresses even the passive surfaced_count write,
-        # so evaluation is a true zero-write read.
+        # so evaluation is a true zero-write read. Issue #82: explicit=True
+        # flips ONLY the no_bump/link seam (see the contract comment above).
         with contextlib.redirect_stdout(io.StringIO()) as captured:
             results = recall_memory(
                 conn,
                 query=item.query,
                 namespace=item.namespace,
                 limit=k,
-                no_bump=True,
+                no_bump=not item.explicit,
                 no_telemetry=True,
-                link_hops=0,
+                link_hops=1 if item.explicit else 0,
+                link_budget=0 if item.explicit else 2,
                 include_global=False,
                 no_mmr=True,
                 as_of=item.as_of,
@@ -239,6 +266,7 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
             "query": item.query,
             "as_of": _normalize_as_of(item.as_of) if item.as_of else None,
             "k": k,
+            "explicit": item.explicit,
             "hit": hit,
             "text_hit": text_hit,
             "first_hit_rank": first_hit_rank,

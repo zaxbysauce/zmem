@@ -366,6 +366,39 @@ class CharacterizationTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self._assert_sha("recall --json", _sha(_norm(r.stdout)), DATA_SHA["recall"])
 
+    def test_recall_help_exposes_issue82_flags(self):
+        # Issue #82: the recall subcommand grows --explain/--target/--no-unfold
+        # as FLAGS (never a new subcommand — KNOWN_SUBCMDS above stays frozen).
+        r = _run_cli({}, "recall", "--help")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for flag in ("--explain", "--target", "--no-unfold"):
+            self.assertIn(flag, r.stdout,
+                          f"recall --help must expose {flag} (issue #82)")
+
+    def test_recent_and_search_help_omit_issue82_flags(self):
+        # recent/search are unchanged surfaces: --no-unfold is a recall-only
+        # operator opt-out, and --explain/--target are recall diagnostics.
+        for cmd in ("recent", "search"):
+            r = _run_cli({}, cmd, "--help")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            for flag in ("--no-unfold", "--explain", "--target"):
+                self.assertNotIn(flag, r.stdout,
+                                 f"{cmd} --help must not expose {flag}")
+
+    def test_known_subcmds_frozen_against_issue82(self):
+        # --explain is a recall FLAG, not a subcommand: the subcommand list
+        # must be byte-identical to the pre-#82 surface.
+        self.assertEqual(
+            KNOWN_SUBCMDS,
+            ["init", "add", "invalidate", "recall", "recent", "search",
+             "supersede", "update", "get", "list",
+             "stats", "path", "session-cadence", "rebuild-fts", "reembed",
+             "consolidate", "promote", "rekey-namespace", "backup", "restore",
+             "export-pack", "export-jsonl", "ingest-jsonl", "failures",
+             "corrections", "queue-list", "queue-clear", "mine-history",
+             "sweep", "entity-list", "entity-merge", "links", "contradict",
+             "organize", "feedback", "tune-weights"])
+
     def test_recall_clock_seam_is_honored_and_deterministic(self):
         """ZMEM_TEST_NOW pins the scoring clock (see _run_env). Two pins of
         the seam contract: (1) HONORED — a different pinned clock changes

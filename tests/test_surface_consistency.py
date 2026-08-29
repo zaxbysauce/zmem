@@ -161,6 +161,65 @@ class AdapterScanTest(unittest.TestCase):
         self.assertIn("passive", doc,
                       "the docstring must contrast explicit recall with the passive surfaces")
 
+    def test_passive_surfaces_omit_issue82_flags(self):
+        """Issue #82: passive surfaces must never pass --explain/--no-unfold.
+        They are explicit-operator diagnostics; the passive path is already
+        structurally excluded from both (no_telemetry / the no_bump gate), and
+        their argv must stay byte-identical."""
+        body_text = (REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py").read_text(
+            encoding="utf-8")
+        for rel in sorted(self.PASSIVE):
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            combined = text + "\n" + body_text
+            self.assertNotIn("--no-unfold", combined,
+                             f"{rel} must not pass --no-unfold")
+            self.assertNotIn("--explain", combined,
+                             f"{rel} must not pass --explain")
+        prefetch = self._method_body(
+            (REPO_ROOT / "hermes-plugin" / "__init__.py").read_text(
+                encoding="utf-8"),
+            "prefetch")
+        self.assertNotIn("--no-unfold", prefetch)
+        self.assertNotIn("--explain", prefetch)
+
+    def test_no_unfold_flag_is_cli_recall_only(self):
+        """Issue #82: --no-unfold exists ONLY on the CLI recall parser. No
+        hook, Hermes, or MCP surface may pass it (the no_bump gate already
+        excludes passive paths; search-shaped surfaces stay unfold-free via
+        their link_hops=0 contract)."""
+        cli_text = (SCRIPTS_DIR / "storelib" / "cli.py").read_text(
+            encoding="utf-8")
+        self.assertIn('"--no-unfold"', cli_text)
+        surfaces = list((REPO_ROOT / "hooks").rglob("*.py"))
+        surfaces += list((REPO_ROOT / "hooks").rglob("*.sh"))
+        surfaces += [REPO_ROOT / "hermes-plugin" / "__init__.py"]
+        surfaces += list((REPO_ROOT / "hermes-plugin" / "server").rglob("*.py"))
+        offenders = [str(p) for p in surfaces
+                     if "--no-unfold" in p.read_text(encoding="utf-8",
+                                                     errors="replace")]
+        self.assertEqual(offenders, [],
+                         f"--no-unfold leaked onto non-CLI surfaces: {offenders}")
+
+    def test_mcp_recall_docstring_documents_unfold(self):
+        """Issue #82: explicit MCP recall inherits the change-intent unfold
+        for free; the docstring must say so (and scope the exclusion)."""
+        source = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py").read_text(
+            encoding="utf-8")
+        tree = ast.parse(source)
+        doc = None
+        for node in ast.walk(tree):
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "recall"):
+                doc = ast.get_docstring(node)
+                break
+        self.assertIsNotNone(doc)
+        self.assertIn("[PREVIOUSLY]", doc,
+                      "the docstring must document the predecessor rows")
+        self.assertIn("unfold_of", doc,
+                      "the docstring must name the JSON keys (MCP sees JSON)")
+        self.assertIn("session_start", doc,
+                      "the docstring must scope the exclusion to session_start/prefetch")
+
     def test_readonly_invariant_docstring_lists_all_hooks(self):
         # The passive-recall read-only contract (the recall_memory DOCSTRING) must
         # name ALL THREE automatic hook sources — UserPromptSubmit, SubagentStart,
