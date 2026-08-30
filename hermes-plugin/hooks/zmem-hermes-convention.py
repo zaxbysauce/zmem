@@ -161,6 +161,56 @@ def _session_id(payload: dict) -> str:
     return sid or "unknown"
 
 
+def _op_descriptor(payload: dict, extra: dict) -> str:
+    """Best-effort operation descriptor for the query-context ring
+    (issue #88 / #85 direction 2). post_tool_call payload fields beyond
+    session_id / extra.status are gateway-defined (the emitter lives in the
+    Hermes gateway's model_tools, not in this repo), so probe the plausible
+    shapes defensively. append_ops_ring does the allowlisting — only the
+    allowlisted tokens ever reach disk (spec B)."""
+    for source in (extra, payload):
+        for key in ("command", "cmd"):
+            v = source.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        ti = source.get("tool_input")
+        if isinstance(ti, dict):
+            for key in ("command", "file_path", "notebook_path", "path"):
+                v = ti.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    return ""
+
+
+def _append_query_context(store_path: Path, session: str,
+                          payload: dict, extra: dict) -> None:
+    """Record this tool event on the per-session ops ring (#85 spec B:
+    prior-turn operation context for the prefetch query). The ring is the
+    SAME one the coding hosts' convention-capture writes; the Hermes
+    provider's prefetch() composes it into the next turn's query.
+    Fail-open: ring health never affects this hook."""
+    try:
+        desc = _op_descriptor(payload, extra)
+        if not desc:
+            return
+        _rel = Path("skills") / "memory" / "scripts"
+        candidates = [
+            Path(__file__).resolve().parents[2] / _rel,
+            Path(os.environ.get("ZMEM_HOME", "")).expanduser() / _rel,
+        ]
+        scripts_dir = next((c for c in candidates if (c / "host.py").is_file()),
+                           None)
+        if scripts_dir is None:
+            return
+        sys.path.insert(0, str(scripts_dir / "storelib"))
+        import ops_tokens  # noqa: E402  (stdlib-only, like this hook)
+        ops_tokens.append_ops_ring(str(store_path.parent), session,
+                                   str(extra.get("tool") or payload.get(
+                                       "tool_name") or ""), desc)
+    except Exception:
+        pass
+
+
 def _emit_empty() -> None:
     """Always silent — post_tool_call results are discarded by Hermes."""
     print("{}")
@@ -169,6 +219,18 @@ def _emit_empty() -> None:
 def main() -> int:
     payload = _read_payload()
     session = _session_id(payload)
+    extra = payload.get("extra") or {}
+    if not isinstance(extra, dict):
+        extra = {}
+
+    # Issue #88 / #85 direction 2: record this tool event on the query-
+    # context ring BEFORE the store connect — the ring only needs the store
+    # PATH (its sibling ops/ dir), so a missing/unwritable store must not
+    # lose the verb. Fail-open either way.
+    try:
+        _append_query_context(_resolve_store_path(), session, payload, extra)
+    except Exception:
+        pass
 
     conn = _connect()
     if conn is None:
@@ -176,9 +238,6 @@ def main() -> int:
         return 0
 
     try:
-        extra = payload.get("extra") or {}
-        if not isinstance(extra, dict):
-            extra = {}
         status = (extra.get("status") or "").strip().lower()
 
         if status == "error":

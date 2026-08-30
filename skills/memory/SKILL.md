@@ -184,6 +184,24 @@ variants (`no durable memories retrieved for this session.` and
 when the passive injection-risk filter dropped rows. The closed set lives in
 `schema_meta.py` (`INJECT_SILENT_REASONS`).
 
+#### Query context (prior-turn operation tokens) — issue #88 / #85 direction 2
+
+Decision-point prompts are prose with zero lexical overlap with the
+operation-adjacent lessons that matter; the retrieval signal lives in the
+tool commands the session is executing. The PostToolUse hooks
+(convention-capture on the coding hosts, `post_tool_call` on Hermes) append
+each Edit/Write/Bash event to a per-session ring at
+`<data>/ops/<session>.log`, storing ONLY the tool name plus allowlisted
+tokens (git subcommand chains, test-runner verbs, edited-path basenames) —
+never a raw command dump, stdout, or secrets; argument values that are bare
+words are dropped. The UserPromptSubmit body and the Hermes `prefetch`
+compose that ring into the query, with the ops tail occupying a fixed
+reserved slice INSIDE the 500-char cap (never appended past it). `ZMEM_QUERY_CONTEXT=0`
+is the kill switch. `zmem-bg.log` lines carry `ops=N` when tokens augmented
+the query. Explicit surfaces (`recall --query`, `search`) are unchanged.
+Limitation (deliberate, see #88): this helps LATER turns only — the first
+tool call of a turn still runs before any operation context exists.
+
 #### Schema forward-compatibility (issue #65 follow-up)
 
 A client refuses a store whose `schema_version` is above its ceiling.

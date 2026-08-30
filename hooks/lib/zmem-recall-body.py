@@ -237,7 +237,8 @@ _BG_LOG_DEFAULT_MAX_BYTES = 262144
 
 
 def _log_inject_decision(rows, selected, status: str, reason: str,
-                         omitted=0, tokens_used=None, tokens_budget=None) -> None:
+                         omitted=0, tokens_used=None, tokens_budget=None,
+                         ops_count=0) -> None:
     """Append the injected|silent decision to the existing bg log.
 
     Issue #87 / #85 direction 1: every line carries ``reason=`` (closed set
@@ -283,10 +284,16 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
             tok = " tokens={used}/{budget}".format(
                 used=tokens_used, budget=tokens_budget if tokens_budget is not None else "-"
             )
+        # Issue #88 / #85 direction 2: when operation tokens augmented the
+        # query, say how many — an invisible query lane cannot be debugged
+        # (the #85 lesson). Additive; appended at line end.
+        ops = ""
+        if ops_count and ops_count > 0:
+            ops = " ops={0}".format(int(ops_count))
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
-                "ids={ids_sel} all={ids_all}{tok}\n".format(
+                "ids={ids_sel} all={ids_all}{tok}{ops}\n".format(
                     ts=int(time.time()),
                     status=status,
                     reason=reason,
@@ -294,6 +301,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     ids_sel=ids_sel,
                     ids_all=ids_all,
                     tok=tok,
+                    ops=ops,
                 )
             )
     except OSError:
@@ -355,6 +363,60 @@ def _emit_envelope(ctx: str) -> None:
     print(json.dumps({"additionalContext": ctx}))
 
 
+def _ops_helpers(store_py: str):
+    """Load storelib/ops_tokens.py (issue #88 / #85 direction 2 —
+    operation-token derivation for the inject query). Same path derivation
+    as _inject_helpers; returns None on import failure and the caller
+    degrades to the prose-only query (fail-open)."""
+    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
+    if not scripts_dir:
+        return None
+    saved = sys.path[:]
+    try:
+        sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
+        import ops_tokens as _ops_mod
+        return _ops_mod
+    except Exception:
+        return None
+    finally:
+        sys.path[:] = saved
+
+
+def _data_dir() -> str:
+    """Resolve the data dir the same way _log_inject_decision does (the
+    ring must live beside the store the hook is reading)."""
+    data_dir = os.environ.get("ZMEM_DATA", "")
+    if not data_dir:
+        store = os.environ.get("ZMEM_STORE", "")
+        data_dir = os.path.dirname(store) if store else ""
+    if not data_dir:
+        data_dir = os.path.join(os.path.expanduser("~"), ".zmem")
+    return data_dir
+
+
+def _ops_query_tokens(store_py: str, session_id: str, _ops_cache={}):
+    """Derive operation tokens for this session's recent tool events
+    (issue #88 / #85 direction 2). ZMEM_QUERY_CONTEXT=0 disables (kill
+    switch, spec B). Fail-open: any error or missing ring degrades to []
+    (prose-only query, byte-identical to the pre-#88 behavior)."""
+    if not session_id:
+        return []
+    if "mod" in _ops_cache:
+        ops_mod = _ops_cache["mod"]
+    else:
+        ops_mod = _ops_helpers(store_py)
+        _ops_cache["mod"] = ops_mod
+    if ops_mod is None:
+        return []
+    try:
+        if not ops_mod.query_context_enabled():
+            return []
+        events = ops_mod.read_ops_ring(_data_dir(), session_id)
+        return ops_mod.derive_ops_tokens(*events)
+    except Exception:
+        return []
+
+
 def main() -> int:
     if len(sys.argv) < 4:
         return 0
@@ -396,6 +458,7 @@ def main() -> int:
     # issue #87: envelope omitted count (passive injection-risk drops) and the
     # closed reason set, resolved once for the classification below.
     omitted = 0
+    ops_tokens = []
     silent_reasons, injected_reason = _reason_constants(store_py)
 
     try:
@@ -424,17 +487,33 @@ def main() -> int:
             # stdin (plain text) is used verbatim for manual invocation.
             raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
             prompt = ""
+            session_id = ""
             try:
                 obj = json.loads(raw_stdin)
-                prompt = obj.get("prompt", "") if isinstance(obj, dict) else ""
+                if isinstance(obj, dict):
+                    prompt = obj.get("prompt", "")
+                    _sid = obj.get("session_id", "")
+                    session_id = _sid if isinstance(_sid, str) else ""
             except (ValueError, TypeError):
                 prompt = raw_stdin
             if not prompt or len(prompt.strip()) < 5:
                 return 0
+            # Issue #88 / #85 direction 2: decision-point prompts are prose
+            # with zero lexical overlap with the operation-adjacent lessons
+            # that matter; append this session's recent tool-operation tokens
+            # (from the PostToolUse ring) to the query. Fail-open: no ring /
+            # opt-out / derivation error ⇒ prose-only query, byte-identical
+            # to the pre-#88 behavior (compose is the identity then).
+            _ops_mod = _ops_helpers(store_py)
+            ops_tokens = _ops_query_tokens(store_py, session_id)
+            if _ops_mod is not None and ops_tokens:
+                query = _ops_mod.compose_inject_query(prompt, " ".join(ops_tokens))
+            else:
+                query = prompt[:500]
             out = subprocess.check_output(
                 [
                     sys.executable, store_py, "recall",
-                    "--query", prompt[:500],
+                    "--query", query,
                     "--namespace", ns,
                     "--limit", "5",
                     "--include-global",
@@ -512,6 +591,7 @@ def main() -> int:
             omitted=omitted,
             tokens_used=0 if budget_emptied else None,
             tokens_budget=tokens_budget if budget_emptied else None,
+            ops_count=len(ops_tokens),
         )
         _emit_envelope(ctx)
         return 0
@@ -537,7 +617,8 @@ def main() -> int:
         tokens_used = _inj.estimate_tokens(ctx)
     _log_inject_decision(rows, selected, status, injected_reason,
                          omitted=omitted,
-                         tokens_used=tokens_used, tokens_budget=tokens_budget)
+                         tokens_used=tokens_used, tokens_budget=tokens_budget,
+                         ops_count=len(ops_tokens))
     _emit_envelope(ctx)
     return 0
 

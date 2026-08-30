@@ -12,6 +12,19 @@ README.
 
 ## [Unreleased]
 
+### Added
+- **Query context: prior-turn operation tokens on the passive inject query**
+  (issue #88, #85 direction 2): the PostToolUse hooks record each
+  Edit/Write/Bash event to a per-session ring (`<data>/ops/<session>.log`)
+  storing only tool name + allowlisted tokens (git subcommand chains,
+  test-runner verbs, edited-path basenames — never raw commands or
+  secrets); the UserPromptSubmit body and the Hermes `prefetch` compose
+  that ring into the query with the ops slice reserved INSIDE the 500-char
+  cap. `ZMEM_QUERY_CONTEXT=0` kill switch; `ops=N` on the `zmem-bg.log`
+  line; `store.py sweep` collects stale rings; decision-point gold bucket
+  (fixture rowids 65–70) asserts the #85-shaped prompts retrieve the
+  hazard lessons WITH ops context and miss without it.
+
 ### Fixed
 - **Hook/Hermes silent inject no longer blames the bar when the pool was
   empty** (issue #85, direction 1 per #87): the UserPromptSubmit / PreCompact /

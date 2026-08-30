@@ -83,16 +83,31 @@ try:
     name = name if isinstance(name, str) else ''
     ti = obj.get('tool_input')
     cmd = ti.get('command') if isinstance(ti, dict) else None
+    # Issue #88 / #85 direction 2: the operation descriptor (Bash command or
+    # edited file path) rides line 3 as a JSON dict so multiline commands
+    # cannot break the line-split below (json.dumps escapes newlines).
+    desc = ''
+    if isinstance(ti, dict):
+        if isinstance(cmd, str) and cmd:
+            desc = cmd
+        else:
+            fp = ti.get('file_path') or ti.get('notebook_path') or ti.get('path') or ''
+            if isinstance(fp, str):
+                desc = fp
     print(name)
     print(int(name == 'Bash' and isinstance(cmd, str)
               and 'git commit' in cmd and '--amend' not in cmd))
+    print(json.dumps({'tool': name, 'op': desc}))
 except Exception:
     print('')
     print(0)
+    print(json.dumps({'tool': '', 'op': ''}))
 " 2>/dev/null)"
 TOOL_META="${TOOL_META//$'\r'/}"
 TOOL_NAME="${TOOL_META%%$'\n'*}"
-IS_COMMIT="${TOOL_META#*$'\n'}"
+TOOL_META_REST="${TOOL_META#*$'\n'}"
+IS_COMMIT="${TOOL_META_REST%%$'\n'*}"
+OP_EVENT_JSON="${TOOL_META_REST#*$'\n'}"
 
 case "$TOOL_NAME" in
   Edit|Write|MultiEdit|NotebookEdit|Bash) ;;
@@ -246,6 +261,23 @@ ns_hint = sys.argv[5]
 is_commit = sys.argv[6]
 commit_marker = sys.argv[7]
 
+# Issue #88 / #85 direction 2: append this tool event to the per-session
+# ops ring BEFORE anything else — the ring must grow on every call,
+# independent of the marker cooldowns and the cadence counter below. The
+# ring feeds the UserPromptSubmit inject query (storelib/ops_tokens is the
+# single source for the ring format). Best-effort: ring health never
+# affects this hook'"'"'s nudge behavior.
+try:
+    _op_event = json.loads(sys.argv[8]) if len(sys.argv) > 8 else {}
+    if isinstance(_op_event, dict) and _op_event.get("op"):
+        sys.path.insert(0, os.path.join(os.path.dirname(store_py_hint), "storelib"))
+        import ops_tokens as _ot
+        _ot.append_ops_ring(data_dir, session_id,
+                            str(_op_event.get("tool", "")),
+                            str(_op_event.get("op", "")))
+except Exception:
+    pass
+
 # Turn counter in the meta table — atomic increment via UPDATE. Runs FIRST
 # (issue #49 B) so a commit-firing Bash call still counts toward the cadence
 # interval. The counter now counts every convention-tool call of the session;
@@ -339,7 +371,7 @@ msg = (
     "(This prompt fires at most once per session.)"
 ) % (store_py_arg, namespace_arg, source_ref_arg)
 print(json.dumps({"additionalContext": msg}))
-' "$SESSION_ID" "$DATA_DIR_PY" "$MARKER" "$STORE_PY_PY" "$NS_HINT" "$IS_COMMIT" "$COMMIT_MARKER" 2>/dev/null || echo '{}')"
+' "$SESSION_ID" "$DATA_DIR_PY" "$MARKER" "$STORE_PY_PY" "$NS_HINT" "$IS_COMMIT" "$COMMIT_MARKER" "$OP_EVENT_JSON" 2>/dev/null || echo '{}')"
 
 if [ -z "$CTX_JSON" ]; then
   CTX_JSON='{}'
