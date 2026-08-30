@@ -330,7 +330,8 @@ class HermesReflectDeliveryTest(unittest.TestCase):
 
             db = os.path.join(tmp, "store.sqlite")
             conn = sqlite3.connect(db)
-            meta_before = set(conn.execute("SELECT key FROM meta").fetchall())
+            meta_before = conn.execute(
+                "SELECT key, value FROM meta ORDER BY key").fetchall()
             conn.close()
 
             first = self._run_reflect(tmp)
@@ -351,7 +352,8 @@ class HermesReflectDeliveryTest(unittest.TestCase):
             marker = Path(tmp, "ops", "s-reflect.delivered")
             self.assertTrue(marker.is_file())
             conn = sqlite3.connect(db)
-            meta_after = set(conn.execute("SELECT key FROM meta").fetchall())
+            meta_after = conn.execute(
+                "SELECT key, value FROM meta ORDER BY key").fetchall()
             conn.close()
             self.assertEqual(meta_before, meta_after,
                              "query-context delivery must not write the "
