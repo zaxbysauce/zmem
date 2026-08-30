@@ -222,6 +222,36 @@ def _ring_path(data_dir: str, session_id: str) -> str:
     return os.path.join(data_dir, "ops", safe + ".log")
 
 
+def ring_last_ts(data_dir: str, session_id: str) -> float:
+    """Newest event timestamp in the session's ring (0.0 when the ring is
+    absent or unreadable). Lets a delivery surface (e.g. the Hermes
+    pre_llm_call reflect hook) skip work until fresh verbs exist."""
+    if not data_dir or not session_id:
+        return 0.0
+    path = _ring_path(data_dir, session_id)
+    last = 0.0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    try:
+                        ts = float(obj.get("ts", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if ts > last:
+                        last = ts
+    except OSError:
+        return 0.0
+    return last
+
+
 def read_ops_ring(data_dir: str, session_id: str, max_events: int = 8) -> List[str]:
     """Read the newest ``max_events`` operation descriptors from the
     per-session ring at ``<data_dir>/ops/<session>.log``.

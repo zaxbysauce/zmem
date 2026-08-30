@@ -149,6 +149,22 @@ Three outcomes, and they lead to different actions:
 *surface* on `surfaced_count`, not a retrieval — issue #21). `--hybrid` blends vector
 and keyword matching so you find near-misses phrased differently from your query.
 
+### Decision-point checkpoints (required, #85 direction E)
+
+Recall is not only a closeout step. When ANY workflow this skill feeds is
+about to run a hazardous git operation, run the matching explicit recall
+FIRST and treat a hit as blocking review (see the memory skill's
+"Decision-point checkpoints" section for the full contract):
+
+- before `git stash pop` (stash-consume) — `recall --query "git stash pop
+  foreign stash conflict"`
+- before `git reset --soft` (squash assembly) — `recall --query "git reset
+  soft origin main stale tree"`
+- before `git push` — `recall --query "git push stale tree fetch rebase
+  verify"`
+- before editing a file named by a stored citation/ratchet lesson —
+  `recall --query "<path basename> ratchet citation re-pin"`
+
 ## Step 2 — Capture, with a hard bar
 
 A lesson earns a row only if **all** of these hold:

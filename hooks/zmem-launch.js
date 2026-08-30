@@ -63,6 +63,7 @@ const { homedir } = require("os");
 const TRANSLATED_HOOKS = new Set([
     "session-start",
     "recall",
+    "pretool-recall",
     "reflect",
     "capture-failure",
     "subagent-recall",
@@ -89,6 +90,7 @@ const TRANSLATED_HOOKS = new Set([
 const NEEDS_NAMESPACE = new Set([
     "session-start",
     "recall",
+    "pretool-recall",
     "subagent-recall",
     "reflect",
     "capture-failure",
@@ -103,6 +105,7 @@ const EVENT_MAP = {
     "session-start": "SessionStart",
     "recall": "UserPromptSubmit",
     "subagent-recall": "SubagentStart",
+    "pretool-recall": "PreToolUse",
     "reflect": "Stop",
     "subagent-reflect": "SubagentStop",
     "capture-failure": "PostToolUseFailure",
