@@ -198,6 +198,23 @@ INJECT_FLOOR_PROMPT_ENV = "ZMEM_INJECT_FLOOR_PROMPT"
 INJECT_FLOOR_RECENT_ENV = "ZMEM_INJECT_FLOOR_RECENT"
 INJECT_FLOOR_GATE_NONE_ENV = "ZMEM_INJECT_FLOOR_GATE_NONE"
 
+# Closed reason set for silent inject decisions (issue #87 / #85 direction 1).
+# When a passive surface (--no-bump) injects nothing, it names WHICH gate fired
+# instead of always blaming "the inject bar":
+#   empty-pool  — retrieval returned zero candidate rows (query construction /
+#                 corpus coverage; the #85 field failure mode)
+#   omitted     — rows existed but every one was dropped by the passive
+#                 injection-risk/untrusted_web filter (envelope omitted > 0)
+#   below-bar   — rows reached the hook selective-inject gate and none passed
+#   budget-drop — the gate passed rows but the inject token budget emptied
+# The hook body, Hermes session_start, and the MCP twin import this tuple as
+# the single source (PRR-017 discipline). Do not invent extra reasons.
+INJECT_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop")
+
+# Success-line reason (not a silent reason): logged alongside status=injected
+# so every zmem-hook log line carries a reason= field.
+INJECT_REASON_INJECTED = "injected"
+
 # Vec0 KNN over-fetch factor (issue #58, 3.1). Default 8; the recall path
 # over-fetches by this factor before namespace-filtering so a foreign
 # namespace cannot dominate same-namespace slots. Consolidate uses its

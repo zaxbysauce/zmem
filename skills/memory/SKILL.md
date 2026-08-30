@@ -167,6 +167,17 @@ The three floors are intentional. Do not silently unify them. The
 selective-inject gate (3.8) is a hook-only filter; it does not change
 the Python recall path.
 
+When a passive inject surfaces nothing, it names WHICH gate fired (issue #87 /
+#85 direction 1): `no durable memories retrieved for this prompt.` means the
+candidate pool itself was empty (query construction / corpus coverage), while
+`no durable memories met the inject bar.` means rows reached the
+selective-inject gate and none passed, and a token-budget wipe says so in its
+own words. `zmem-bg.log` carries the same cut per decision line: every
+`zmem-hook` line has `reason=` (`reason=empty-pool`, `reason=omitted`,
+`reason=below-bar`, `reason=budget-drop`, `reason=injected`), plus `omitted=N`
+when the passive injection-risk filter dropped rows. The closed set lives in
+`schema_meta.py` (`INJECT_SILENT_REASONS`).
+
 #### Schema forward-compatibility (issue #65 follow-up)
 
 A client refuses a store whose `schema_version` is above its ceiling.

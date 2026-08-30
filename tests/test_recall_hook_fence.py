@@ -269,6 +269,20 @@ class SelectiveInjectGateTests(unittest.TestCase):
                       "inject decision must log to zmem-bg.log (existing "
                       "bg log, I5 critic-fix)")
 
+    def test_gate_log_line_carries_reason(self):
+        # Issue #87 / #85 direction 1: every zmem-hook line must carry
+        # reason= so empty-pool silent decisions are distinguishable from
+        # below-bar ones without log forensics.
+        src = inspect.getsource(self.body._log_inject_decision)
+        self.assertIn("reason={reason}", src,
+                      "_log_inject_decision must write reason= on the "
+                      "zmem-hook line (issue #87)")
+        # The below-bar one-liner stays byte-identical for the one case it
+        # was true (operator greps keep working).
+        body_text = (REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py").read_text(
+            encoding="utf-8")
+        self.assertIn("no durable memories met the inject bar.", body_text)
+
 
 class PreCompactHookTests(unittest.TestCase):
     """Issue #58, 3.9: PreCompact registered in claude.json only, sources

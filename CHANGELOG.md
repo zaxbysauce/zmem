@@ -12,6 +12,18 @@ README.
 
 ## [Unreleased]
 
+### Fixed
+- **Hook/Hermes silent inject no longer blames the bar when the pool was
+  empty** (issue #85, direction 1 per #87): the UserPromptSubmit / PreCompact /
+  SubagentStart hook body, the Hermes `session_start` tool, and its MCP twin
+  now name WHICH gate fired — `no durable memories retrieved for this
+  prompt.` (empty pool / passive-filter omit), the byte-identical
+  `no durable memories met the inject bar.` (gate rejection), or the
+  token-budget sentence. `zmem-bg.log` lines carry `reason=` (closed
+  `INJECT_SILENT_REASONS` set in schema_meta) and `omitted=N` when the
+  passive injection-risk filter dropped rows. No ranking, floor, budget, or
+  omit membership change; no schema change.
+
 ### Added
 - **`recall --explain`** (issue #82): read-only retrieval debugger with
   `--target` (id/prefix/fragment) and a machine-readable `--json` envelope;
