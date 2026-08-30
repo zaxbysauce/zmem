@@ -252,6 +252,52 @@ class ConventionCaptureRingTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_corrupt_stdin_fails_open_no_ring_write(self):
+        # Review round 1: a corrupt payload must degrade to the silent
+        # envelope with NO ring write. ("Ring on every convention-tool
+        # event" holds whenever PYTHON_BIN resolves — the happy-path tests
+        # above prove that path; this pins the corrupt-input fail-open.)
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-capbad-")
+        try:
+            bash = shutil.which("bash")
+            if not bash:
+                self.skipTest("no bash on PATH")
+            env = _clean_env(
+                tmp, ZMEM_ROOT=str(REPO_ROOT), ZMEM_SESSION="sess-cap",
+                ZMEM_CONVENTION_INTERVAL="10")
+            r = subprocess.run(
+                [bash, str(REPO_ROOT / "hooks" / "zmem-convention-capture.sh")],
+                input="not json at all {{{",
+                capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("<<<ZMEM_JSON>>>", r.stdout)
+            self.assertFalse(Path(tmp, "ops", "sess-cap.log").exists(),
+                             "no ring line may be written for a corrupt event")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_unmatched_tool_name_writes_no_ring_line(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-capskip-")
+        try:
+            bash = shutil.which("bash")
+            if not bash:
+                self.skipTest("no bash on PATH")
+            env = _clean_env(
+                tmp, ZMEM_ROOT=str(REPO_ROOT), ZMEM_SESSION="sess-cap",
+                ZMEM_CONVENTION_INTERVAL="10")
+            event = json.dumps({"tool_name": "Read",
+                                "tool_input": {"file_path": "x.ts"},
+                                "session_id": "sess-cap"})
+            r = subprocess.run(
+                [bash, str(REPO_ROOT / "hooks" / "zmem-convention-capture.sh")],
+                input=event, capture_output=True, text=True, env=env,
+                timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(Path(tmp, "ops", "sess-cap.log").exists(),
+                             "the case gate must skip non-convention tools")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_edit_event_appends_path_basename(self):
         tmp = tempfile.mkdtemp(prefix="zmem-ops-cap-")
         try:
@@ -394,6 +440,18 @@ class HermesPrefetchComposeTest(unittest.TestCase):
             self.assertIn("prefetchcanary", out)
             out_nosid = provider.prefetch("keep finalizing this work")
             self.assertNotIn("prefetchcanary", out_nosid)
+
+            # Review round 1: a checkout where ops_tokens cannot be
+            # imported (copy install without skills/, #36 M10) must
+            # degrade to the prose-only query — no crash, no composition.
+            saved_mod = mod._OPS_TOKENS
+            mod._OPS_TOKENS = None
+            try:
+                out_none = provider.prefetch("keep finalizing this work",
+                                             session_id="sess-pf")
+            finally:
+                mod._OPS_TOKENS = saved_mod
+            self.assertNotIn("prefetchcanary", out_none)
         finally:
             for k, v in saved.items():
                 if v is None:
@@ -466,6 +524,44 @@ class EvalGoldComposeTest(unittest.TestCase):
             self.assertEqual(
                 ops_tokens.compose_inject_query(item.query, item.ops),
                 item.query.strip()[:500])
+
+    def test_runner_path_composes_legacy_identically_and_ops_via_shared_fn(self):
+        """Runner-level pin (review round 1): the identity must hold on the
+        path evaluate_items ACTUALLY takes — the runner bypasses compose for
+        ops-less items and calls the shared compose for ops items. Record
+        the queries it hands to recall_memory and compare both."""
+        import sqlite3
+
+        import storelib.recall as recall_mod
+        from storelib.eval_gold import GoldItem, evaluate_items
+        recorded = []
+        real = recall_mod.recall_memory
+
+        def recorder(conn, *, query, **kw):
+            recorded.append(query)
+            return []
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            recall_mod.recall_memory = recorder
+            legacy = GoldItem(id="lg-1", bucket="fts",
+                              query="  padded legacy query  ",
+                              must_include_ids=["x"])
+            ops_item = GoldItem(id="dp-1", bucket="decision-point",
+                                query="drive the loop", ops="git stash pop",
+                                must_include_ids=["y"])
+            evaluate_items(conn, [legacy, ops_item])
+        finally:
+            recall_mod.recall_memory = real
+        self.assertEqual(len(recorded), 2)
+        # Legacy: the runner passes the raw gold query untouched — the
+        # byte-identical pre-#88 behavior (no compose call at all).
+        self.assertEqual(recorded[0], legacy.query)
+        # Ops item: the EXACT string the shared composer produces — the
+        # eval measures the hook's real query, not a fork.
+        self.assertEqual(
+            recorded[1],
+            ops_tokens.compose_inject_query(ops_item.query, ops_item.ops))
 
 
 class SweepOpsRingTest(unittest.TestCase):

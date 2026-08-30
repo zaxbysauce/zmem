@@ -130,6 +130,21 @@ class TestRunnerEndToEnd(EvalRunnerTestBase):
         dec = self.report["per_bucket"]["decision-point"]
         self.assertEqual(dec["items"], 6)
         self.assertEqual(dec["hits"], 6)
+        # Review round 1: pin each item's first_hit_rank explicitly so a
+        # fixture-content drift cannot silently move a rank while hit@k
+        # still passes (the MRR pin below would then fail opaquely).
+        expected_ranks = {
+            "decision-stash-65": 1,
+            "decision-reset-66": 2,
+            "decision-ratchet-67": 1,
+            "decision-queue-68": 1,
+            "decision-push-69": 1,
+            "decision-worktree-70": 1,
+        }
+        for it in self.report["per_item"]:
+            if it["id"] in expected_ranks:
+                self.assertEqual(it["first_hit_rank"],
+                                 expected_ranks[it["id"]], it["id"])
 
     def test_explicit_items_flow_through_and_stay_flagged(self):
         explicit = {it["id"]: it for it in self.report["per_item"]
