@@ -540,7 +540,19 @@ def main() -> int:
             # TOOL INPUT ITSELF — the command or file path about to run.
             # This is the only event that sees `git stash pop` before it
             # executes (the exact #85 failure shape). Non-operation events
-            # derive to nothing and stay silent (fail-open, exit 0).
+            # derive to nothing and stay silent (fail-open, exit 0). The
+            # kill switch is GLOBAL (review round 1): ZMEM_QUERY_CONTEXT=0
+            # silences every query-context lane, this one included — an
+            # operator flipping it expects silence, and this lane costs a
+            # subprocess per matched tool call.
+            _ops_mod = _ops_helpers(store_py)
+            if _ops_mod is None:
+                return 0
+            try:
+                if not _ops_mod.query_context_enabled():
+                    return 0
+            except Exception:
+                pass  # degrade to enabled — the switch itself must not crash
             tool_desc = ""
             if isinstance(stdin_obj, dict):
                 ti = stdin_obj.get("tool_input")
@@ -550,12 +562,10 @@ def main() -> int:
                                  or "")
                     if not isinstance(tool_desc, str):
                         tool_desc = ""
-            _ops_mod = _ops_helpers(store_py)
-            if _ops_mod is not None:
-                try:
-                    ops_tokens = _ops_mod.derive_ops_tokens(str(tool_desc))
-                except Exception:
-                    ops_tokens = []
+            try:
+                ops_tokens = _ops_mod.derive_ops_tokens(str(tool_desc))
+            except Exception:
+                ops_tokens = []
             if not ops_tokens:
                 return 0
             query = " ".join(ops_tokens)
@@ -739,8 +749,14 @@ def main() -> int:
         ctx = ctx[:body_budget].rstrip() + "\n" + closer + "\n[recall truncated]"
     if pending_ctx and ctx:
         # Issue #90 / #85 C: prepend the parked pre-tool fence (same turn's
-        # operation context) to this prompt's recall.
+        # operation context) to this prompt's recall — then re-apply the
+        # char budget to the COMBINED block (review round 1): the budget is
+        # the outer stop for the emitted context, not per-recall.
         ctx = pending_ctx + "\n\n" + ctx
+        if budget > 0 and len(ctx) > budget:
+            closer = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
+            body_budget = max(0, budget - len(closer) - 1)
+            ctx = ctx[:body_budget].rstrip() + "\n" + closer + "\n[recall truncated]"
     # tokens_used is measured on the FINAL emitted context (post budget,
     # post char-truncation) - the honest number (issue #65, 10.9).
     if _inj is not None:

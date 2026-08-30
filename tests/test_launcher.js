@@ -710,6 +710,10 @@ console.log("\n[11] Phase 8 PERF: ZMEM_NAMESPACE resolved only for NEEDS_NAMESPA
     const expectedConsumers = [
         "session-start", "recall", "subagent-recall", "reflect",
         "capture-failure", "subagent-reflect", "convention-capture",
+        // issue #90 / #85 C: the pre-tool hook queries the SAME canonical
+        // namespace as every recall surface — skipping resolution would
+        // silently default it to user:global.
+        "pretool-recall",
     ];
     for (const h of expectedConsumers) {
         ok(`NEEDS_NAMESPACE includes ${h}`, launch.NEEDS_NAMESPACE.has(h));

@@ -139,6 +139,18 @@ class PreToolModeTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(_ctx(out), "")
 
+    def test_kill_switch_silences_the_pretool_lane_too(self):
+        # Review round 1: ZMEM_QUERY_CONTEXT=0 is a GLOBAL kill switch — an
+        # operator flipping it expects silence everywhere, and this lane
+        # costs a subprocess per matched tool call.
+        out, rc = _run_body(
+            self._tmp, "pretool",
+            {"tool_name": "Bash", "tool_input": {"command": "git stash pop"},
+             "session_id": "s3"},
+            ns="project:pretool", ZMEM_QUERY_CONTEXT="0")
+        self.assertEqual(rc, 0)
+        self.assertEqual(_ctx(out), "")
+
     def test_missing_store_fails_open(self):
         tmp2 = tempfile.mkdtemp(prefix="zmem-pretool-nostore-")
         try:

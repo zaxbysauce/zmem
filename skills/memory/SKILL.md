@@ -216,9 +216,14 @@ PreToolUse hook (`zmem-pretool-recall.sh`, matcher
 tool input ITSELF — the command or file path about to run — and injects
 matching hazard lessons before the tool executes. It NEVER denies (a
 surfaced hazard is information, not grounds to block a legitimate command)
-and stays fully silent when nothing qualified. Hermes delivers the
-equivalent on `pre_llm_call` (after the fact of the producing call). Codex
-has no pre-tool context injection (documented gap).
+and stays fully silent when nothing qualified. `ZMEM_QUERY_CONTEXT=0`
+silences every query-context lane, this one included. The Claude pending
+sidecar requires the host event's `session_id` (without it the direct emit
+is the only delivery). Hermes delivers the equivalent on `pre_llm_call`
+(after the fact of the producing call), best-effort per ring timestamp: a
+transient store failure after the at-most-once marker skips that
+timestamp's delivery; newer verbs still deliver. Codex has no pre-tool
+context injection (documented gap).
 
 Inject surface parity (host facts, not aspirations): Claude Code registers
 SubagentStart (task-text recall when the event carries the delegated
