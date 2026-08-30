@@ -81,7 +81,9 @@ python <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
   [--link-hops 0|1] [--link-budget N]
                           [--include-global] [--global-limit 3] [--hybrid]
                           [--no-hybrid] [--no-mmr] [--no-bump]
-                          [--as-of ISO-8601] [--json]
+                          [--as-of ISO-8601] [--no-unfold] [--json]
+python <store.py> recall --query "<query>" --explain [--target ID|FRAGMENT]
+                          [--json]
 ```
 Returns live (non-superseded) memories matching the query, filtered by confidence
 floor (>=0.25) and namespace — unless `--as-of ISO-8601` is given, in which case
@@ -89,6 +91,65 @@ it is a point-in-time read that returns rows **valid at that instant** (a row
 superseded after that instant may be included; a row created after it is not;
 see the `--as-of` notes below). Prefer `--namespace project:<basename>` to scope to
 the current project; use `user:global` for cross-project.
+
+#### Retrieval debugger: `--explain` / `--target` (issue #82)
+
+`recall --explain` re-runs the REAL pipeline (same lanes, same floors, same
+merge) and prints one blameline per verdict explaining why a row did or did
+not surface. It is an operator diagnostic in the same spirit as `doctor.py`:
+ZERO writes (the telemetry path is never reached — stricter than
+`no_telemetry`), it never unfolds, it never fails a recall (a thrown tracer
+degrades to the `explain_unavailable` verdict and the results still print).
+`--target` takes a memory id (full or unambiguous prefix) or a content
+fragment (case-insensitive substring, then token overlap >= 0.7); multiple
+matches produce one verdict per id, never a guess. With `--json` the read
+envelope gains an `explain` object: `query`, `target`, the effective
+settings (`namespace`, `limit`, `include_global`, `global_limit`, `no_mmr`,
+`no_bump`, `as_of`, `hybrid`), and `verdicts[]` with
+`id`/`reason`/`rank`/`score`/`detail`.
+
+Verdict reasons are a CLOSED set (`EXPLAIN_REASONS` in `storelib/recall.py`):
+
+| reason | meaning |
+|---|---|
+| `found` | in the presented result set at `rank` (1-based) |
+| `below_limit` | retrieved and scored but beyond `--limit` |
+| `below_floor` | the row's confidence is below the effective floor (the recall `min_confidence` parameter, default `CONFIDENCE_FLOOR`) |
+| `omitted_injection` | would have ranked; dropped because `no_bump` and prompt-injection risk |
+| `omitted_untrusted_web` | would have ranked; dropped because `no_bump` and `taint=untrusted_web` |
+| `namespace` | lives outside the query's expanded namespace set (and `--include-global` did not admit it) |
+| `superseded` | live-only recall and `superseded_at` is set (`detail.successor_id` names the live replacement when one exists) |
+| `not_valid_at_as_of` | `--as-of` set and the validity interval does not contain it |
+| `vec_lane_miss` | `--as-of` + hybrid: the row was valid then, but the vec KNN pool is live-rows-only (the SKILL.md as-of caveat — this is why history-on-hooks is not "just pass `--as-of`") |
+| `not_in_pool` | not in the FTS, vec, or entity candidate pool at over-fetch depth |
+| `not_in_db` | no row matched `--target` (`detail.neighbors` lists up to 5 nearest live rows by token overlap) |
+| `explain_unavailable` | the tracer threw; results still returned (fail-open) |
+
+#### Change-intent lineage unfold — explicit recall only (issue #82)
+
+Already-stored lineage (`update_of` from `update`) becomes visible on the
+EXPLICIT path: when the query reads as change-intent ("what changed about X",
+"why did we switch to Y", "we used to Z") AND the presented results contain a
+live head of a tombstoned predecessor, recall appends the predecessor chain as
+budgeted extra rows tagged `[PREVIOUSLY]` (JSON keys `unfold_of` +
+`unfold_hop`, 1 = immediate predecessor). Extras never count against
+`--limit`, never enter the telemetry bump set (popularity rewards query
+matches, not neighbors), never cross namespaces, and are never silently
+dropped for taint — the explicit surface prefixes `[INJECTION RISK]` /
+`[UNTRUSTED WEB]` like any other row.
+
+It runs ONLY when all of these hold: not `--no-bump` (hooks, PreCompact,
+Hermes prefetch, and eval defaults never unfold), not `--no-unfold`, the
+query matches the compiled change-intent regexes (deterministic, no LLM), and
+`link_hops >= 1` (the same contract that keeps `search` — CLI, MCP, and
+Hermes `_tool_search` — byte-identical; MCP `recall` unfolds for free).
+`--explain` describes lineage in verdict detail but never injects rows.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `ZMEM_UNFOLD_TOP_K` | `3` | max presented hits to walk backward from (clamped 1-10) |
+| `ZMEM_UNFOLD_MAX_HOPS` | `3` | max `update_of` hops per chain (clamped 1-10) |
+| `ZMEM_UNFOLD_BUDGET` | `4` | hard cap on total `[PREVIOUSLY]` extras per recall (clamped 1-20) |
 
 #### Confidence floors (issue #58, 3.8)
 
@@ -581,10 +642,19 @@ Runs every gold item through the REAL recall pipeline and prints one JSON
 report: `hit_at_k`, `mrr`, `as_of_accuracy`, `injection_omit_rate` (+ per-bucket
 and per-item detail). `--store` is REQUIRED — the runner never resolves the
 default home store; point it at a throwaway path and it auto-builds the
-deterministic 50-row fixture corpus (the ids `eval/gold.jsonl` names) there.
-The gold set covers six buckets: as-of knowledge updates, injection omission,
-entity aliases, namespace isolation, contested/superseded guidance, and
-ordinary FTS hits. Exit 0 regardless of scores (quality is collected, never
+deterministic 64-row fixture corpus (the ids `eval/gold.jsonl` names) there.
+The gold set covers the six issue-#64 buckets (as-of knowledge updates,
+injection omission, entity aliases, namespace isolation, contested/superseded
+guidance, ordinary FTS hits; >= 5 items each) plus the issue-#82 honesty
+buckets (>= 3 items each): `retraction` (an `invalidate --reason`-ed fact must
+vanish at current time yet surface under `--as-of` before the tombstone),
+`polarity` (two LIVE contradicting rows — both sides surface), and
+`change-intent` (explicit-path lineage unfold). An optional `"explicit": true`
+gold flag runs an item on the explicit path (`no_bump=false`, still zero-write
+via `no_telemetry`) so the change-intent unfold is measured; passive twins on
+the same rows pin that hooks never unfold. The original 30 ids (rowids 1-50)
+are the frozen #64 contract; #82 appends rowids 51-64.
+Exit 0 regardless of scores (quality is collected, never
 gating); `--fail-under` is optional and OFF in CI; 2 on operational errors
 (invalid gold set names the offending item).
 The run is model-absent by construction: the fake embedder
@@ -592,6 +662,19 @@ The run is model-absent by construction: the fake embedder
 deterministic on any machine. Evaluation is passive (`no_bump`) and measures
 retrieval quality — link expansion and MMR presentation are excluded
 (`link_hops=0`, `no_mmr`).
+Self-corpus probe — measure recall against YOUR corpus (issue #82):
+```
+python scripts/eval_self_corpus.py --store <store-copy> [--k 5,20] [--limit 100] [--json-out PATH]
+```
+`--store` is REQUIRED and the runner REFUSES the host default store path
+(exit 2 with a remediation: take a `store.py backup` snapshot and probe the
+copy) and refuses nonexistent paths before creating anything. Probes are
+templated deterministically from the store's own live rows (first sentence /
+distinctive tokens / entity aliases — domain-agnostic, no LLM). Every probe
+is fully passive (`no_telemetry`, `no_bump`, `link_hops=0`, `no_mmr`; the
+unfold structurally cannot fire) so the probed store stays byte-identical.
+The report may embed operator content — `--json-out` is the only write and
+reports are gitignored; never commit one.
 Public-corpus adapters convert on-disk corpora into gold JSONL and skip
 cleanly when the corpus is absent (CI downloads nothing):
 ```
@@ -883,8 +966,10 @@ The `capture-correction` hook (UserPromptSubmit, Claude Code / ZCode / Codex)
 queues mid-session user corrections ("no, use X", "remember: ...") into a
 namespace-scoped sidecar file (`<store-data-dir>/queue/<ns>.json`, default
 `~/.zmem/queue/<ns>.json`; follows the store's `ZMEM_STORE`/`ZMEM_DATA` override
-chain, not a fixed path) — hooks never write the
-store. `queue-list` shows the pending candidates for review (emit them into the
+chain, not a fixed path) — these recall/capture hooks never `add` rows and
+write nothing else to the store themselves (the one sanctioned exception is
+the DETACHED SessionStart `session-cadence` maintenance task, which runs
+organize/backup/sweep on its own lease). `queue-list` shows the pending candidates for review (emit them into the
 store via `add --signal user` only if they clear the closeout rubric);
 `queue-clear` removes processed ids (`--id`), empties the queue (`--all`), or
 prunes stale low-confidence items (`--drop-stale`) — exactly one selector is
@@ -955,7 +1040,14 @@ never merge, on any surface).
 memory surfacing verbatim into model context, or store secret-like text). The
 default resolves like `add` (`ZMEM_CAPTURE_MODE` env or `manual`): verbatim
 content with prompt-injection-risk tagging (a row matching an injection
-pattern is tagged `prompt-injection-risk` so it can be reviewed, in ALL modes).
+pattern is tagged `prompt-injection-risk` so it can be reviewed, in ALL modes;
+issue #82 widened the pattern set with four high-precision
+instruction-to-the-model shapes — role hijack ("you are now the ..."),
+concealment ("do not mention this"), instruction-override paraphrases
+("ignore all previous rules/guidelines"), and store-mutation imperatives
+("update your knowledge base / the memory store") — precision-first, so
+ordinary coding lessons like "update the lockfile" never tag; the read path
+re-classifies EVERY row at emit time regardless of store age).
 Use `--capture-mode auto` when ingesting an untrusted/remote sync file: it
 additionally redacts secret-like content/tags (tagged `auto-redacted`) and
 refuses rows whose `source_ref` looks like a secret (counted as

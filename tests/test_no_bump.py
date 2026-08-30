@@ -18,6 +18,7 @@ Run: python tests/test_no_bump.py   (no pytest required — repo convention)
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -132,6 +133,53 @@ class NoBumpTest(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self._sc(), 2)
         self.assertEqual(self._rc(), 0)
+
+    # issue #82: the change-intent unfold's [PREVIOUSLY] extras are neighbors
+    # that did not match the query — they must never enter the telemetry bump
+    # set. This end-to-end variant builds REAL lineage (add → update) so the
+    # extras genuinely form; the library-seam pin lives in
+    # tests/test_chain_unfold.py::test_extras_never_bump_retrieval_count.
+    def test_unfold_extras_never_increment_retrieval_count(self):
+        # Build lineage through the real update path: the matched head gains
+        # a tombstoned predecessor that the change-intent query will unfold.
+        r = self._run("update", "--id", self._row_id(superseded=False),
+                      "--content", "always run the linter with the strict rule set")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        head = self._row_id(superseded=False)
+        pred = self._row_id(superseded=True)
+        r = self._run("recall", "--query", "what changed about the linter",
+                      "--namespace", NS, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        doc = json.loads(r.stdout)
+        extras = [x for x in doc["results"] if x.get("unfold_hop")]
+        self.assertEqual([x["id"] for x in extras], [pred],
+                         "precondition: the unfold must actually append the "
+                         "predecessor, or this test proves nothing")
+        conn = sqlite3.connect(self.store)
+        try:
+            head_rc = conn.execute(
+                "SELECT retrieval_count FROM memory WHERE id=?", (head,)
+            ).fetchone()[0]
+            pred_rc = conn.execute(
+                "SELECT retrieval_count FROM memory WHERE id=?", (pred,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(head_rc, 1, "the query-matched head bumps once")
+        self.assertEqual(pred_rc, 0,
+                         "the [PREVIOUSLY] extra must never be bumped")
+
+    def _row_id(self, superseded: bool) -> str:
+        conn = sqlite3.connect(self.store)
+        try:
+            rows = conn.execute(
+                "SELECT id FROM memory WHERE superseded_at IS "
+                + ("NOT NULL" if superseded else "NULL")
+            ).fetchall()
+            self.assertEqual(len(rows), 1)
+            return rows[0][0]
+        finally:
+            conn.close()
 
     # --- mixed: no-bump reads never advance the count a later bump starts from
     def test_no_bump_then_bump(self):

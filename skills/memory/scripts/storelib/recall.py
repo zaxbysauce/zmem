@@ -46,6 +46,70 @@ RECENCY_HALF_LIFE_DAYS = 90
 MMR_LAMBDA_DEFAULT = 0.7
 MMR_LAMBDA = _env_float("ZMEM_MMR_LAMBDA", MMR_LAMBDA_DEFAULT)
 
+# Issue #82: closed vocabulary for `recall --explain` verdicts. One source of
+# truth; tests import this tuple and pin every value against a fixture row.
+EXPLAIN_REASONS = (
+    "found", "below_limit", "below_floor", "omitted_injection",
+    "omitted_untrusted_web", "namespace", "superseded", "not_valid_at_as_of",
+    "vec_lane_miss", "not_in_pool", "not_in_db", "explain_unavailable",
+)
+
+# Issue #82: change-intent trigger for the explicit-recall lineage unfold.
+# Deterministic regexes (no LLM). The false-positive bar is a merge blocker:
+# ordinary hook-shaped coding prompts ("use pytest", "fix the failing test")
+# must never match — pinned by tests/test_chain_unfold.py with >=8 positives
+# and >=8 negatives. Hooks can never unfold anyway (`no_bump` gate), but the
+# regex is shared with eval gold items and must stay precise.
+_CHANGE_INTENT_RES = (
+    re.compile(r"(?i)\bwhat (?:has )?changed\b"),
+    re.compile(r"(?i)\bwhat did we (?:change|switch|replace)\b"),
+    re.compile(r"(?i)\bwhy did we (?:switch|change|replace|stop using|leave|drop)\b"),
+    re.compile(r"(?i)\bwe used to\b"),
+    re.compile(r"(?i)\bused to be\b"),
+    re.compile(r"(?i)\bpreviously\b"),
+    re.compile(r"(?i)\bbefore we\b"),
+    re.compile(r"(?i)\bold vs\.? new\b"),
+    re.compile(r"(?i)\bsuperseded\b"),
+    re.compile(r"(?i)\breplaced by\b"),
+)
+
+
+def _is_change_intent_query(query: str) -> bool:
+    return any(p.search(query or "") for p in _CHANGE_INTENT_RES)
+
+
+# Issue #82: unfold budget knobs. Read at CALL time (not import) so a test can
+# vary them via os.environ inside one process, mirroring the ZMEM_TEST_NOW
+# seam. Out-of-range values clamp; garbage warns and falls back to the
+# default (same discipline as _now_epoch).
+UNFOLD_TOP_K_DEFAULT = 3
+UNFOLD_MAX_HOPS_DEFAULT = 3
+UNFOLD_BUDGET_DEFAULT = 4
+
+
+def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        val = int(raw.strip())
+    except ValueError:
+        print(f"[zmem] WARNING: {name}={raw!r} is not an integer — "
+              f"using default {default}", file=sys.stderr)
+        return default
+    return max(lo, min(hi, val))
+
+
+def _unfold_enabled(*, no_bump: bool, no_unfold: bool, link_hops: int) -> bool:
+    """Issue #82 unfold gate. Explicit recall only: every passive surface
+    (hooks, PreCompact, Hermes prefetch, eval-default) passes `--no-bump` and
+    never unfolds; search-shaped surfaces (CLI `search`, MCP `search`, Hermes
+    `_tool_search`) pin `link_hops=0` as part of their never-expanded contract
+    and therefore never unfold either — the issue's "search stays no-unfold
+    (already link_hops=0)". CLI `recall` and MCP `recall` (default link_hops=1,
+    no --no-bump) are the unfold surfaces."""
+    return (not no_bump) and (not no_unfold) and link_hops >= 1
+
 
 
 def _uses_count(row: sqlite3.Row | dict) -> int:
@@ -393,6 +457,140 @@ def _fetch_by_ids(
     return [row_map[mid] for mid in ids if mid in row_map]
 
 
+def _fetch_lineage_rows(
+    conn: sqlite3.Connection, ids: list[str], ns_list: list[str] | None = None
+) -> list[sqlite3.Row]:
+    """Any-state fetch by exact id for lineage walking (issue #82).
+
+    Same projection as ``_fetch_by_ids`` but with NO confidence floor and NO
+    live/as-of filter: a superseded predecessor is the whole point of the
+    change-intent unfold. This is a lineage read, not candidate-retrieval SQL —
+    the rows never feed ranking; they are only appended as ``[PREVIOUSLY]``
+    extras after ``bump_ids`` has been captured.
+    """
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    ns_clause = ""
+    params: list = list(ids)
+    if ns_list:
+        ns_placeholders = ",".join("?" * len(ns_list))
+        ns_clause = f"AND namespace IN ({ns_placeholders})"
+        params.extend(ns_list)
+    sql = f"""
+        SELECT id, namespace, type, content, tags, source_ref,
+               confidence, signal, valid_from, valid_until,
+               update_of, taint
+        FROM memory
+        WHERE id IN ({placeholders})
+          {ns_clause}
+    """
+    return conn.execute(sql, params).fetchall()
+
+
+def _successor_id(conn: sqlite3.Connection, mid: str) -> str | None:
+    """Live row whose ``update_of`` is ``mid`` (issue #82), if any — the row
+    that replaced it in the append-only lineage. Used by the explain
+    ``superseded`` verdict; never a ranking input."""
+    row = conn.execute(
+        "SELECT id FROM memory WHERE update_of = ? AND superseded_at IS NULL "
+        "ORDER BY ingestion_ts LIMIT 1",
+        (mid,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def _lineage_row_dict(r: sqlite3.Row) -> dict:
+    """Result-shaped dict for a lineage row — the render/serialize-relevant
+    subset of the key set the recall lanes build in _recall_one_tier, so a
+    [PREVIOUSLY] extra renders and serializes exactly like a query-matched
+    row plus its unfold keys (the pipeline-only fields — scores, norms,
+    counters — are intentionally absent; extras never feed ranking)."""
+    return {
+        "id": r["id"],
+        "namespace": r["namespace"],
+        "type": r["type"],
+        "content": r["content"],
+        "tags": r["tags"],
+        "confidence": round(r["confidence"], 3),
+        "signal": r["signal"],
+        "source_ref": r["source_ref"],
+        "valid_from": r["valid_from"],
+        "valid_until": r["valid_until"],
+        "update_of": r["update_of"],
+        "taint": r["taint"],
+        "stale": False,
+        "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
+        "_stale_note": "",
+        "_score": 0.0,
+    }
+
+
+def unfold_change_history(
+    conn: sqlite3.Connection,
+    results: list[dict],
+    *,
+    top_k: int | None = None,
+    max_hops: int | None = None,
+    budget: int | None = None,
+) -> list[dict]:
+    """Walk `update_of` backward from presented change-intent hits (issue #82).
+
+    For up to ZMEM_UNFOLD_TOP_K (default 3) presented live rows that either
+    carry a non-empty ``update_of`` or are the live head of a tombstoned
+    predecessor, append up to ZMEM_UNFOLD_MAX_HOPS (default 3) predecessor
+    rows, hard-capped at ZMEM_UNFOLD_BUDGET (default 4) extras total. Extras
+    carry ``unfold_of`` (the live head id) and ``unfold_hop`` (1 = immediate
+    predecessor), are namespace-scoped (a hop crossing namespace stops the
+    walk), and are never deduped into the presented set. Injection-risk /
+    untrusted predecessors are NOT dropped — the operator asked what changed;
+    rendering prefixes them like any other explicit row.
+
+    Pure: no writes, no prints. Returns [] on any internal error — the unfold
+    is a presentation extra and must never fail an explicit recall.
+    """
+    try:
+        if top_k is None:
+            top_k = _env_int("ZMEM_UNFOLD_TOP_K", UNFOLD_TOP_K_DEFAULT, lo=1, hi=10)
+        if max_hops is None:
+            max_hops = _env_int("ZMEM_UNFOLD_MAX_HOPS", UNFOLD_MAX_HOPS_DEFAULT, lo=1, hi=10)
+        if budget is None:
+            budget = _env_int("ZMEM_UNFOLD_BUDGET", UNFOLD_BUDGET_DEFAULT, lo=1, hi=20)
+        heads = [r for r in results if not r.get("unfold_hop")][:top_k]
+        if not heads:
+            return []
+        extras: list[dict] = []
+        seen = {r["id"] for r in results}
+        for head in heads:
+            # In the update-path model every chain head carries a non-empty
+            # update_of (the tombstoned row it replaced), so the backward walk
+            # is fully determined by the presented row itself.
+            nxt = head.get("update_of") or None
+            if not nxt:
+                continue
+            hop = 0
+            while nxt and hop < max_hops and len(extras) < budget:
+                if nxt in seen:
+                    break
+                rows = _fetch_lineage_rows(conn, [nxt], ns_list=[head["namespace"]])
+                if not rows:
+                    break
+                row = _lineage_row_dict(rows[0])
+                # Namespace isolation: a lineage walk never crosses namespaces.
+                if row["namespace"] != head["namespace"]:
+                    break
+                row["unfold_of"] = head["id"]
+                row["unfold_hop"] = hop + 1
+                row["prompt_injection_risk"] = _classify_injection(row)
+                extras.append(row)
+                seen.add(nxt)
+                hop += 1
+                nxt = row["update_of"] or None
+        return extras
+    except Exception:
+        return []
+
+
 def _normalize_as_of(as_of: str | None) -> str | None:
     """Normalize an --as-of timestamp to the canonical Z-suffixed UTC form
     the store compares against (PRR-022 fix, issue #58 3.6).
@@ -720,6 +918,12 @@ def _format_fenced_recall(rows: list[dict], header: str) -> str:
         # render.)
         _taint = r.get("taint")
         _markers: list[str] = []
+        # Issue #82: lineage extras pulled in by the change-intent unfold are
+        # marked PREVIOUSLY first so the reader sees the row is history, not a
+        # query match. Only unfold extras ever carry `unfold_hop`, so
+        # non-unfold output is unchanged (characterization-safe).
+        if r.get("unfold_hop"):
+            _markers.append("[PREVIOUSLY]")
         if r.get("prompt_injection_risk"):
             _markers.append("[INJECTION RISK]")
         if _taint == "untrusted_tool":
@@ -856,6 +1060,7 @@ def recall_memory(
     cross_rerank: bool = False,
     weights: dict | None = None,
     no_telemetry: bool = False,
+    no_unfold: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -901,6 +1106,14 @@ def recall_memory(
     project-first-then-global (a global row never crowds out a project row),
     mirroring ``export-pack`` (issue #18). Strict-by-default: with
     ``include_global=False`` (the default) behaviour is byte-identical to before.
+
+    Issue #82: on the EXPLICIT path only (``no_bump=False``), a change-intent
+    query ("what changed", "why did we switch", "we used to") appends budgeted
+    ``update_of`` predecessor rows tagged ``[PREVIOUSLY]`` (keys
+    ``unfold_of``/``unfold_hop``; never counted against ``limit``, never
+    bumped). ``no_unfold=True`` disables it; every passive surface is excluded
+    structurally by the ``no_bump`` gate and search-shaped surfaces by their
+    ``link_hops=0`` contract (see ``_unfold_enabled``).
     """
     now_epoch = _now_epoch()
     # Issue #58, 3.3: resolve the ``hybrid=None`` sentinel before passing
@@ -1023,6 +1236,16 @@ def recall_memory(
             min_confidence=min_confidence, no_bump=no_bump,
         )
 
+    # Issue #82: change-intent lineage unfold — EXPLICIT recall only. Runs
+    # AFTER the bump_ids capture (extras are neighbors that did not match the
+    # query, so popularity must not reward them — same law as link expansion)
+    # and BEFORE entity cards so extras get cards too. The gate
+    # (`_unfold_enabled`) structurally excludes every passive surface
+    # (--no-bump) and every search-shaped surface (link_hops=0).
+    if (_unfold_enabled(no_bump=no_bump, no_unfold=no_unfold, link_hops=link_hops)
+            and _is_change_intent_query(query) and results):
+        results = results + unfold_change_history(conn, results)
+
     # v10 (issue #60, 5.4): entity cards on every recall row (JSON gains
     # `entities: [{id, kind, name}]`; the fenced text render shows at most
     # THREE names per row, never ids). Attached AFTER the filters so dropped
@@ -1075,6 +1298,490 @@ def recall_memory(
                     f"Consider if they apply; ignore if not."
                 ),
             ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Issue #82: `recall --explain` — the read-only retrieval debugger.
+# ---------------------------------------------------------------------------
+
+def _explain_target_row(conn: sqlite3.Connection, mid: str) -> sqlite3.Row | None:
+    """Single-row any-state fetch with the extra columns the verdict gates
+    need (superseded_at, embedding, content_norm). Lineage read, never a
+    ranking input."""
+    return conn.execute(
+        """SELECT id, namespace, type, content, tags, source_ref, source_hash,
+                  confidence, signal, valid_from, valid_until, update_of,
+                  taint, superseded_at, content_norm, embedding
+           FROM memory WHERE id = ?""",
+        (mid,),
+    ).fetchone()
+
+
+def _explain_scope_ns(conn: sqlite3.Connection, namespace: str | None,
+                      include_global: bool) -> tuple[list[str] | None, list[str] | None]:
+    """The (project, global) namespace match sets explain shares with
+    recall_memory's orchestration."""
+    ns_list = _expand_namespace_aliases(conn, namespace)
+    do_global = bool(include_global and namespace
+                     and namespace != GLOBAL_NAMESPACE)
+    global_ns_list = (_expand_namespace_aliases(conn, GLOBAL_NAMESPACE)
+                      if do_global else None)
+    return ns_list, global_ns_list
+
+
+def _explain_valid_at(row: sqlite3.Row, as_of: str) -> bool:
+    """Half-open [valid_from, valid_until) containment (valid_from INCLUSIVE,
+    valid_until EXCLUSIVE — same contract as _as_of_temporal_predicate)."""
+    vf = row["valid_from"] or ""
+    vu = row["valid_until"] or ""
+    return (not vf or vf <= as_of) and (not vu or vu > as_of)
+
+
+def _explain_token_set(text: str) -> set[str]:
+    return {t for t in re.split(r"\s+", (text or "").lower()) if t}
+
+
+def _explain_jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+_EXPLAIN_TARGET_COLUMNS = """id, namespace, type, content, tags, source_ref,
+                   source_hash, confidence, signal, valid_from,
+                   valid_until, update_of, taint, superseded_at,
+                   content_norm, embedding"""
+
+
+def _resolve_explain_targets(
+    conn: sqlite3.Connection,
+    target: str,
+    scope: list[str] | None,
+) -> tuple[list[sqlite3.Row], bool]:
+    """Resolve a --target value (UUID full/unambiguous prefix, or content
+    fragment) against live + tombstoned rows in the requested namespace scope.
+
+    Returns (rows, is_fragment). Multiple matches are returned as-is — the
+    caller emits one verdict per id, never a guess. UUID-shaped targets
+    resolve against the WHOLE store (the operator named an id; if it lives
+    outside the query's namespace the verdict must be able to say
+    ``namespace``, not ``not_in_db``). A non-uuid target tries
+    case-insensitive substring first, then token-Jaccard >= 0.7, scoped to
+    live + tombstoned rows in the requested namespace.
+    """
+    target = (target or "").strip()
+    if not target:
+        return [], False
+    looks_uuid = re.fullmatch(r"[0-9a-fA-F-]{4,36}", target) is not None
+    if looks_uuid:
+        rows = conn.execute(
+            f"""SELECT {_EXPLAIN_TARGET_COLUMNS}
+                FROM memory
+                WHERE id LIKE ? || '%'
+                ORDER BY id""",
+            [target.lower()],
+        ).fetchall()
+        return rows, False
+    scope_clause = ""
+    params: list = []
+    if scope:
+        ph = ",".join("?" * len(scope))
+        scope_clause = f"AND namespace IN ({ph})"
+        params = list(scope)
+    # Fragment pass 1: case-insensitive substring.
+    like = "%" + target.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%"
+    rows = conn.execute(
+        f"""SELECT {_EXPLAIN_TARGET_COLUMNS}
+            FROM memory
+            WHERE content LIKE ? ESCAPE '\\' {scope_clause}
+            ORDER BY id""",
+        [like, *params],
+    ).fetchall()
+    if rows:
+        return rows, True
+    # Fragment pass 2: token-Jaccard >= 0.7 against every row in scope.
+    frag_tokens = _explain_token_set(target)
+    if not frag_tokens:
+        return [], True
+    all_rows = conn.execute(
+        f"""SELECT {_EXPLAIN_TARGET_COLUMNS}
+            FROM memory WHERE 1=1 {scope_clause}""",
+        list(params),
+    ).fetchall()
+    matched = [
+        r for r in all_rows
+        if _explain_jaccard(
+            frag_tokens,
+            _explain_token_set(r["content_norm"] or r["content"]),
+        ) >= 0.7
+    ]
+    return matched, True
+
+
+def _explain_nearest_neighbors(
+    conn: sqlite3.Connection,
+    token_text: str,
+    scope: list[str] | None,
+    k: int = 5,
+) -> list[dict]:
+    """Up to k nearest LIVE rows by token overlap for the not_in_db verdict
+    (ids + first 80 chars — the same attribution-light content slice the
+    fenced render already exposes; no new content surface)."""
+    tokens = _explain_token_set(token_text)
+    scope_clause = ""
+    params: list = []
+    if scope:
+        ph = ",".join("?" * len(scope))
+        scope_clause = f"AND namespace IN ({ph})"
+        params = list(scope)
+    rows = conn.execute(
+        f"""SELECT id, content, content_norm, taint, tags FROM memory
+            WHERE superseded_at IS NULL {scope_clause}""",
+        params,
+    ).fetchall()
+    scored = []
+    for r in rows:
+        sim = _explain_jaccard(
+            tokens, _explain_token_set(r["content_norm"] or r["content"]))
+        if sim > 0.0:
+            scored.append((sim, r["id"], r["content"], r["taint"], r["tags"]))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    # PRR-005: neighbors carry the row's trust surface explicitly — the same
+    # rows the fenced render would mark, so a not_in_db verdict never shows
+    # untrusted content bare.
+    return [
+        {"id": mid, "content": (content or "")[:80], "token_overlap": round(sim, 3),
+         "taint": taint, "prompt_injection_risk": _has_injection_risk_tag(tags)}
+        for sim, mid, content, taint, tags in scored[:k]
+    ]
+
+
+def _explain_run_pipeline(
+    conn: sqlite3.Connection, *, query: str, ns_list: list[str] | None,
+    global_ns_list: list[str] | None, limit: int, global_limit: int,
+    min_confidence: float | None, hybrid: bool, now_epoch: float,
+    as_of: str | None, no_mmr: bool, weights: dict | None,
+) -> tuple[list[dict], list[tuple[float, dict]], list[tuple[float, dict]]]:
+    """Run the SAME orchestration recall_memory runs (same helpers, same
+    order, same real `limit`) and return (presented_pre_omit, project_deep,
+    global_deep). The deep pool runs the same tiers at over-fetch depth so
+    'scored but beyond --limit' rows are observable; the presented list comes
+    from the real-limit run, so it is identical to a plain recall's presented
+    set by construction. NEVER bumps, NEVER unfolds, NEVER prints."""
+    project_scored = _recall_one_tier(
+        conn, query=query, ns_list=ns_list, limit=limit,
+        min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+        as_of=as_of, mmr=not no_mmr, weights=weights,
+    )
+    global_scored: list[tuple[float, dict]] = []
+    if global_ns_list:
+        global_scored = _recall_one_tier(
+            conn, query=query, ns_list=global_ns_list, limit=global_limit,
+            min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+            as_of=as_of, mmr=not no_mmr, weights=weights,
+        )
+    for _s, item in project_scored:
+        item["prompt_injection_risk"] = _classify_injection(item)
+    for _s, item in global_scored:
+        item["prompt_injection_risk"] = _classify_injection(item)
+    if global_ns_list:
+        presented = _merge_tiers(project_scored, global_scored, limit, global_limit)
+    else:
+        presented = [item for _score, item in project_scored[:limit]]
+    project_deep = _recall_one_tier(
+        conn, query=query, ns_list=ns_list, limit=max(limit * 3, limit + 5),
+        min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+        as_of=as_of, mmr=not no_mmr, weights=weights,
+    )
+    global_deep: list[tuple[float, dict]] = []
+    if global_ns_list:
+        global_deep = _recall_one_tier(
+            conn, query=query, ns_list=global_ns_list,
+            limit=max(global_limit * 3, global_limit + 5),
+            min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+            as_of=as_of, mmr=not no_mmr, weights=weights,
+        )
+    return presented, project_deep, global_deep
+
+
+def _explain_verdict_for_target(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row, *,
+    as_of: str | None, hybrid: bool,
+    ns_list: list[str] | None, global_ns_list: list[str] | None,
+    include_global: bool, min_confidence: float | None,
+    presented: list[dict], omitted: list[tuple[dict, str]],
+    project_deep: list[tuple[float, dict]],
+    global_deep: list[tuple[float, dict]],
+) -> dict:
+    """First-match-wins gate analysis for one --target row (issue #82).
+
+    Order: namespace -> not_valid_at_as_of -> superseded -> below_floor ->
+    found -> omitted_* -> below_limit -> vec_lane_miss -> not_in_pool.
+    A row dropped by the confidence floor never reaches the scored pool (the
+    floor is applied inside the lane SQL), so below_floor is a pre-check on
+    the target row itself — that is the only way the reason can ever fire.
+    """
+    mid = row["id"]
+    in_project = ns_list is None or row["namespace"] in ns_list
+    in_global = bool(global_ns_list) and row["namespace"] in global_ns_list
+    if not in_project and not in_global:
+        return {"id": mid, "reason": "namespace", "rank": None, "score": None,
+                "detail": {"row_namespace": row["namespace"],
+                           "include_global": include_global}}
+    if as_of and not _explain_valid_at(row, as_of):
+        return {"id": mid, "reason": "not_valid_at_as_of", "rank": None,
+                "score": None,
+                "detail": {"valid_from": row["valid_from"],
+                           "valid_until": row["valid_until"], "as_of": as_of}}
+    if not as_of and row["superseded_at"]:
+        return {"id": mid, "reason": "superseded", "rank": None, "score": None,
+                "detail": {"superseded_at": row["superseded_at"],
+                           "successor_id": _successor_id(conn, mid)}}
+    floor = min_confidence if min_confidence is not None else CONFIDENCE_FLOOR
+    if (row["confidence"] or 0.0) < floor:
+        return {"id": mid, "reason": "below_floor", "rank": None, "score": None,
+                "detail": {"confidence": row["confidence"], "floor": floor}}
+    for rank, r in enumerate(presented, start=1):
+        if r["id"] == mid:
+            return {"id": mid, "reason": "found", "rank": rank,
+                    "score": r.get("_score"), "detail": {}}
+    for r, why in omitted:
+        if r["id"] == mid:
+            return {"id": mid, "reason": why, "rank": None,
+                    "score": r.get("_score"), "detail": {}}
+    deep = project_deep + global_deep
+    for rank, (score, r) in enumerate(deep, start=1):
+        if r["id"] == mid:
+            return {"id": mid, "reason": "below_limit", "rank": rank,
+                    "score": round(score, 4),
+                    "detail": {"pool_size": len(deep)}}
+    if (as_of and hybrid and row["superseded_at"]
+            and _explain_valid_at(row, as_of) and row["embedding"]):
+        return {"id": mid, "reason": "vec_lane_miss", "rank": None,
+                "score": None,
+                "detail": {"why": "vec KNN candidate pool is live-rows-only "
+                                  "(_vec_knn_in_namespace); the row was valid "
+                                  "at as_of but no lane that sees history "
+                                  "matched it lexically"}}
+    return {"id": mid, "reason": "not_in_pool", "rank": None, "score": None,
+            "detail": {"pool_size": len(deep), "hybrid": hybrid}}
+
+
+def _explain_omit_filter(
+    results: list[dict],
+) -> tuple[list[dict], list[tuple[dict, str]]]:
+    """The no_bump omit filter (same condition as recall_memory's) instrumented
+    to report WHICH rows dropped and WHY. Behavior-identical keep/drop split:
+    a row flagged injection-risk AND untrusted_web reports omitted_injection
+    (the render's marker order)."""
+    kept: list[dict] = []
+    dropped: list[tuple[dict, str]] = []
+    for r in results:
+        if r.get("prompt_injection_risk"):
+            dropped.append((r, "omitted_injection"))
+        elif r.get("taint") == "untrusted_web":
+            dropped.append((r, "omitted_untrusted_web"))
+        else:
+            kept.append(r)
+    return kept, dropped
+
+
+def _format_explain_blameline(v: dict) -> str:
+    bits = [f"[explain] {v.get('id') or '-'} {v.get('reason')}"]
+    if v.get("rank") is not None:
+        bits.append(f"rank={v['rank']}")
+    if v.get("score") is not None:
+        bits.append(f"score={v['score']}")
+    detail = v.get("detail") or {}
+    extras = []
+    if detail.get("successor_id"):
+        extras.append(f"successor={detail['successor_id']}")
+    if detail.get("row_namespace"):
+        extras.append(f"ns={detail['row_namespace']}")
+    if detail.get("neighbors"):
+        extras.append("nearest: " + "; ".join(
+            (("[UNTRUSTED WEB] " if n.get("taint") == "untrusted_web" else "")
+             + ("[INJECTION RISK] " if n.get("prompt_injection_risk") else "")
+             + f"{n['id']} {n['content'][:40]!r}")
+            for n in detail["neighbors"]))
+    if extras:
+        bits.append("(" + ", ".join(extras) + ")")
+    return " ".join(bits)
+
+
+def explain_recall(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    target: str | None = None,
+    namespace: str | None = None,
+    limit: int = 5,
+    as_json: bool = False,
+    min_confidence: float | None = None,
+    hybrid: bool | None = None,
+    no_bump: bool = False,
+    include_global: bool = False,
+    global_limit: int = 3,
+    as_of: str | None = None,
+    no_mmr: bool = False,
+    link_hops: int = 1,
+    link_budget: int = 2,
+    weights: dict | None = None,
+    cross_rerank: bool = False,
+) -> list[dict]:
+    """Read-only retrieval debugger behind `recall --explain` (issue #82).
+
+    Re-runs the recall pipeline with the SAME helpers in the SAME order, then
+    emits one closed-set verdict (``EXPLAIN_REASONS``) per ``--target`` row —
+    or per pipeline-observed row when no target was given. ZERO WRITES by
+    construction: the telemetry write path is never reached at all (stricter
+    than ``no_telemetry``), and the change-intent unfold never runs — the
+    debugger must not observe its own mutation (lineage shows up only as
+    ``superseded`` verdict detail). Fail-open: a thrown tracer yields a single
+    ``explain_unavailable`` verdict and the recall results still print.
+
+    The ``link_hops``/``link_budget`` kwargs are accepted for CLI
+    parameter-passing symmetry but deliberately unused: explain never expands
+    links and never unfolds. ``cross_rerank`` (PR-review PRR-001) keeps the
+    debugger faithful when the cross-encoder is CLI-enabled: the presented
+    list is re-ranked exactly like recall_memory's (the helper fails open to
+    input order), so `found`/rank verdicts match what a real recall presents.
+    Deep-pool ranks stay pre-rerank (the pool measures retrieval, not the
+    rerank presentation).
+    """
+    now_epoch = _now_epoch()
+    if hybrid is None:
+        hybrid = bool(_embeddings and _embeddings.is_available())
+    as_of = _normalize_as_of(as_of)
+    ns_list, global_ns_list = _explain_scope_ns(conn, namespace, include_global)
+    scope: list[str] | None = None
+    if ns_list is not None:
+        scope = list(ns_list) + [n for n in (global_ns_list or [])
+                                 if n not in ns_list]
+
+    target_rows: list[sqlite3.Row] = []
+    is_fragment = False
+    if target:
+        try:
+            target_rows, is_fragment = _resolve_explain_targets(
+                conn, target, scope)
+        except Exception:
+            target_rows, is_fragment = [], True
+
+    verdicts: list[dict] = []
+    presented: list[dict] = []
+    omitted: list[tuple[dict, str]] = []
+    project_deep: list[tuple[float, dict]] = []
+    global_deep: list[tuple[float, dict]] = []
+    pipeline_error = False
+    try:
+        presented, project_deep, global_deep = _explain_run_pipeline(
+            conn, query=query, ns_list=ns_list, global_ns_list=global_ns_list,
+            limit=limit, global_limit=global_limit,
+            min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+            as_of=as_of, no_mmr=no_mmr, weights=weights,
+        )
+        if no_bump:
+            presented, omitted = _explain_omit_filter(presented)
+        # PRR-001: mirror recall_memory's post-filter rerank stage so the
+        # presented ranks the verdicts cite match a real recall when the
+        # cross-encoder is CLI-enabled (the helper fails open to input order).
+        if cross_rerank and presented:
+            presented = _cross_maybe_rerank(query, presented)
+    except Exception:
+        pipeline_error = True
+
+    try:
+        if pipeline_error:
+            raise RuntimeError("pipeline failed")
+        if target and not target_rows:
+            # A missed UUID has no semantic content, so rank neighbors against
+            # the QUERY; a missed fragment keeps its own tokens.
+            neighbors = _explain_nearest_neighbors(
+                conn, query if not is_fragment else target, scope)
+            verdicts = [{"id": None, "reason": "not_in_db", "rank": None,
+                         "score": None,
+                         "detail": {"target": target, "neighbors": neighbors}}]
+        elif target_rows:
+            verdicts = [
+                _explain_verdict_for_target(
+                    conn, row, as_of=as_of, hybrid=hybrid, ns_list=ns_list,
+                    global_ns_list=global_ns_list, include_global=include_global,
+                    min_confidence=min_confidence, presented=presented,
+                    omitted=omitted, project_deep=project_deep,
+                    global_deep=global_deep,
+                )
+                for row in target_rows
+            ]
+        else:
+            # No target: report what the pipeline itself observed.
+            for rank, r in enumerate(presented, start=1):
+                verdicts.append({"id": r["id"], "reason": "found",
+                                 "rank": rank, "score": r.get("_score"),
+                                 "detail": {}})
+            for r, why in omitted:
+                verdicts.append({"id": r["id"], "reason": why, "rank": None,
+                                 "score": r.get("_score"), "detail": {}})
+            deep = project_deep + global_deep
+            presented_ids = {r["id"] for r in presented}
+            omitted_ids = {r["id"] for r, _why in omitted}
+            for rank, (score, r) in enumerate(deep, start=1):
+                if r["id"] in presented_ids or r["id"] in omitted_ids:
+                    continue
+                verdicts.append({"id": r["id"], "reason": "below_limit",
+                                 "rank": rank, "score": round(score, 4),
+                                 "detail": {"pool_size": len(deep)}})
+    except Exception:
+        verdicts = [{"id": (target_rows[0]["id"] if target_rows else target),
+                     "reason": "explain_unavailable", "rank": None,
+                     "score": None, "detail": {}}]
+
+    results = presented
+    explain_obj = {
+        "query": query,
+        "target": target,
+        # The effective settings that materially shape the verdicts: a
+        # below_limit/namespace verdict is only interpretable next to the
+        # limit/scope that produced it.
+        "namespace": namespace,
+        "limit": limit,
+        "include_global": include_global,
+        "global_limit": global_limit,
+        "no_mmr": no_mmr,
+        "no_bump": no_bump,
+        "as_of": as_of,
+        "hybrid": hybrid,
+        "verdicts": verdicts,
+    }
+    if as_json:
+        tokens_used = sum(estimate_tokens(r.get("content", "") or "")
+                          for r in results)
+        injection_risk_count = sum(
+            1 for r in results if r.get("prompt_injection_risk"))
+        print(json.dumps({
+            "results": results,
+            "count": len(results),
+            "omitted": len(omitted),
+            "injection_risk": injection_risk_count,
+            "tokens_used": tokens_used,
+            "tokens_budget": inject_token_budget(),
+            "explain": explain_obj,
+        }, indent=2))
+    else:
+        if not results:
+            print("[zmem] no matching memories found.")
+        else:
+            print(_format_fenced_recall(
+                results,
+                header=(
+                    f"Relevant memories (namespace {namespace or 'unscoped'}). "
+                    f"Consider if they apply; ignore if not."
+                ),
+            ))
+        for v in verdicts:
+            print(_format_explain_blameline(v))
     return results
 
 def _recent_one_tier(

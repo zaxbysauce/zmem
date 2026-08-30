@@ -15,15 +15,21 @@ Isolation + determinism contract:
 * ``--store`` is REQUIRED. The runner never resolves the default home store —
   an operator store cannot be evaluated (or migrated) by accident.
 * A missing store is built at the exact --store path by
-  ``tests/fixtures/eval_store.py`` (deterministic 50-row corpus whose ids are
-  the ones eval/gold.jsonl names) — the builder prints a notice on stderr.
+  ``tests/fixtures/eval_store.py`` (a deterministic 64-row corpus — the
+  original 50 rows of the #64 contract plus the #82 retraction/polarity/
+  change-intent rows 51-64 — whose ids are the ones eval/gold.jsonl names).
+  The builder prints a notice on stderr.
 * The FAKE embedder (ZMEM_EMBED_PROFILE=fake) and ZMEM_MODEL_AUTODOWNLOAD=0
   are forced BEFORE storelib is imported: the run is model-absent by
   construction, no downloads, byte-identical ranking on any machine.
 * ZMEM_TEST_NOW is pinned to the corpus sentinel so recency decay is fixed;
-  evaluation calls recall with no_bump=True (counters untouched — the store
-  stays byte-identical), link_hops=0 and no_mmr=True (measures retrieval
-  quality, not link expansion or MMR presentation; see SKILL.md).
+  evaluation calls recall with no_telemetry=True on EVERY item (counters
+  untouched — the store stays byte-identical). Default items are passive
+  (no_bump=True, link_hops=0, no_mmr=True: retrieval quality, not link
+  expansion or MMR presentation). An item with ``"explicit": true`` (issue
+  #82) runs the explicit path — no_bump=False with link_hops=1/link_budget=0
+  so the change-intent unfold fires while link expansion stays off — and is
+  STILL zero-write via the no_telemetry seam (see SKILL.md).
 
 Exit codes: 0 on a completed run REGARDLESS of scores (CI collects metrics,
 it does not gate on quality), 1 on a --fail-under breach, 2 on operational
@@ -58,6 +64,9 @@ def _bootstrap_env(store: str) -> None:
     os.environ["ZMEM_EMBED_PROFILE"] = "fake"
     os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
     os.environ.setdefault("ZMEM_MODELS_DIR", "/nonexistent-zmem-models-dir")
+    # Issue #82: pin UTF-8 text I/O on Windows consoles (cp1252 would crash
+    # mid-report on non-ASCII fixture content); a no-op on UTF-8 hosts.
+    os.environ.setdefault("PYTHONUTF8", "1")
     sys.path.insert(0, str(FIXTURES_DIR))
     from eval_store import EVAL_PIN_TS  # noqa: E402  (fixtures dir on path)
     os.environ["ZMEM_TEST_NOW"] = EVAL_PIN_TS
@@ -106,12 +115,22 @@ def main() -> int:
                     help="also write the JSON report to this path (CI uploads "
                          "it as a workflow artifact)")
     args = ap.parse_args()
+    # PRR-024 adjacent (cubic P2): `os.environ` alone doesn't switch the
+    # ALREADY-CREATED console streams on a cp1252 Windows host, and
+    # setdefault must honor an explicit PYTHONUTF8=0 — so reconfigure the
+    # report streams directly (no-op on UTF-8 hosts).
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
 
     _bootstrap_env(args.store)
     _ensure_store(args.store)
 
     sys.path.insert(0, str(SCRIPTS_DIR))
-    from storelib.eval_gold import GoldError, evaluate_items, load_gold  # noqa: E402
+    from storelib.eval_gold import (  # noqa: E402
+        PER_ITEM_REPORT_KEYS, GoldError, evaluate_items, load_gold)
     from storelib.schema import connect  # noqa: E402
 
     try:
@@ -149,10 +168,7 @@ def main() -> int:
         "metrics": metrics,
         "per_bucket": per_bucket,
         "per_item": [
-            {key: it[key] for key in (
-                "id", "bucket", "query", "as_of", "k", "hit", "text_hit",
-                "first_hit_rank", "excluded_ids_surfaced", "injection_omitted",
-                "ranked_ids", "ok")}
+            {key: it[key] for key in PER_ITEM_REPORT_KEYS}
             for it in per_item
         ],
     }

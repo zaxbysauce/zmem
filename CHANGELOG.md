@@ -12,6 +12,40 @@ README.
 
 ## [Unreleased]
 
+### Added
+- **`recall --explain`** (issue #82): read-only retrieval debugger with
+  `--target` (id/prefix/fragment) and a machine-readable `--json` envelope;
+  zero writes, closed `EXPLAIN_REASONS` set, fail-open on tracer errors.
+- **Change-intent lineage unfold** (issue #82): explicit recall on
+  change-intent queries appends budgeted `[PREVIOUSLY]` `update_of`
+  predecessors (`ZMEM_UNFOLD_TOP_K`/`_MAX_HOPS`/`_BUDGET`, `--no-unfold`
+  opt-out). Hooks, `--no-bump`, and search-shaped surfaces never unfold;
+  extras are never popularity-bumped.
+- **`scripts/eval_self_corpus.py`** (issue #82): self-corpus recall probe —
+  `--store` required, host-default store refused with a backup remediation,
+  fully passive.
+- **`docs/CLAIMS-AUDIT.md`** (issue #82): every public README claim mapped to
+  a path + symbol, a committed eval artifact, or an explicit aspirational row;
+  the "hooks never write the store" wording is qualified to the accurate
+  "hooks never `add` rows" claim.
+- Four high-precision prompt-injection patterns (role hijack, concealment,
+  instruction-override paraphrases, store-mutation imperatives) — picked up at
+  emit time by every existing store, no migration.
+
+### Tests
+- `tests/test_explain_recall.py`: every explain reason, zero-write and
+  fail-open contracts, source-scan ratchets.
+- `tests/test_chain_unfold.py`: change-intent regex positive/negative bar,
+  explicit-only unfold, budget/hop caps, telemetry exclusion, namespace
+  isolation.
+- `tests/test_eval_self_corpus.py`: refusals (missing/`--store`, home path,
+  nonexistent path) and byte-passivity.
+- Eval honesty: `retraction`/`polarity`/`change-intent` gold buckets with
+  `explicit`-flag items (fixture rowids 51-64; ids 1-50 frozen), passivity
+  proof for the explicit eval seam, bucket/coverage assertions updated.
+- Surface/characterization/doc-drift guards for the new flags, the qualified
+  hooks-write wording, and the frozen `KNOWN_SUBCMDS` list.
+
 ## [0.13.1] — 2026-08-28
 
 ### Added

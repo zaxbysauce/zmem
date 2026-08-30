@@ -5,7 +5,7 @@ exactly those ids, deterministically, in a store that lives wherever the
 caller says — never the operator's home store (scripts/eval_runner.py passes
 an explicit --store path; CI uses a workspace-relative path).
 
-Layout: 50 rows across 7 namespaces, one fixed id per rowid:
+Layout: 64 rows across 10 namespaces, one fixed id per rowid:
     e0000000-0000-4000-8000-{rowid:012d}
 
   rowids  1-10  as-of chains   (5 topics x old/new; historical windows)
@@ -14,6 +14,12 @@ Layout: 50 rows across 7 namespaces, one fixed id per rowid:
   rowids 31-40  contested      (5 x winner + contradicted-then-superseded loser)
   rowids 41-45  entity aliases (5 tagged rows, query via alias lane)
   rowids 46-50  ordinary FTS   (5 distinctive-token rows)
+  rowids 51-52  retraction     (issue #82: invalidated facts, pinned windows)
+  rowids 53-58  polarity       (issue #82: 3 x live contradict pairs, NO tombstone)
+  rowids 59-61  change preds   (issue #82: tombstoned by the real update path)
+  rowids 62-64  change heads   (issue #82: live successors with update_of)
+
+Ids 1-50 are the frozen contract of the issue #64 gold set; 51+ extend it.
 
 Determinism contract (mirrors store_builder.py, with the FAKE embedder):
 * every CLI write goes through the real `store.py` subprocess under BASE_ENV
@@ -55,6 +61,9 @@ NS_ALPHA = "project:eval-ns-alpha"
 NS_BETA = "project:eval-ns-beta"
 NS_CON = "project:eval-contested"
 NS_FTS = "project:eval-fts"
+NS_RETRACT = "project:eval-retract"
+NS_POLAR = "project:eval-polarity"
+NS_CHANGE = "project:eval-change"
 
 BASE_ENV = {
     "ZMEM_MODEL_AUTODOWNLOAD": "0",
@@ -230,6 +239,54 @@ FTS_ROWS = (
 )
 
 
+# --------------------------------------------------------- issue #82 buckets
+
+# Retraction: live facts the build invalidates via the REAL `invalidate
+# --reason` path (the mechanism the bucket celebrates), then re-pins to
+# historical windows so the as_of-before items are deterministic. Pinned
+# windows lie strictly before EVAL_PIN_TS.
+RETRACT_ROWS = (
+    # (rowid, content, window [valid_from, valid_until), reason)
+    (51, "deploy policy: production deploys require the blue-green swap window",
+     ("2026-03-01T00:00:00Z", "2026-03-15T00:00:00Z"),
+     "superseded by the canary rollout policy"),
+    (52, "backup policy: nightly backups mirror the primary database volume",
+     ("2026-04-01T00:00:00Z", "2026-04-15T00:00:00Z"),
+     "mirror backups replaced by incremental journal shipping"),
+)
+
+# Polarity: three live contradict pairs, deliberately NOT tombstoned — both
+# sides must surface so the reader sees the disagreement (that is the bucket's
+# contract; the contested bucket already covers contradict-then-supersede).
+# Confidence starts at 0.9 so the -0.10 contradicts trust events can never
+# push a member below CONFIDENCE_FLOOR (asserted in _verify).
+POLARITY_ROWS = (
+    (53, "release builds always sign with the release signing key"),
+    (54, "release builds never sign with the release signing key"),
+    (55, "the staging cache is always warmed before the traffic shift"),
+    (56, "the staging cache is never warmed before the traffic shift"),
+    (57, "the incident channel is always paged on a sev-one"),
+    (58, "the incident channel is never paged on a sev-one"),
+)
+POLARITY_PAIRS = ((53, 54), (55, 56), (57, 58))
+
+# Change-intent: three update_of chains. The predecessor is added via the CLI
+# then updated via the REAL `update` path (tombstone + live successor with
+# update_of), and the successor's id is pinned to the reserved head rowid.
+# Predecessors are seeded at positions 59-61 (so _pin_ids mints eval_id 59-61
+# for them); the update-created successors are remapped to 62-64.
+CHANGE_CHAIN_PREDS = (59, 60, 61)
+CHANGE_CHAIN_HEADS = (62, 63, 64)
+CHANGE_CHAINS = (
+    ("lint gate runs biome with the default rule set",
+     "lint gate runs biome with the strict recommended rule set"),
+    ("CI runner cache warmup takes the raw tarball route",
+     "CI runner cache warmup takes the zstd chunk route"),
+    ("release notes are drafted by the changelog script alone",
+     "release notes are drafted by the changelog script plus a human pass"),
+)
+
+
 # ------------------------------------------------------------------- EVAL_IDS
 
 def _build_eval_ids() -> dict:
@@ -238,7 +295,8 @@ def _build_eval_ids() -> dict:
     ids = {"asof_old": {}, "asof_new": {}, "injection_clean": {},
            "injection_row": {}, "ns_alpha": {}, "ns_beta": {},
            "contested_winner": {}, "contested_loser": {},
-           "entity": {}, "fts": {}}
+           "entity": {}, "fts": {}, "retraction": {}, "polarity": {},
+           "change_pred": {}, "change_head": {}}
     for i in range(5):
         ids["asof_old"][ASOF_TOPICS[i]] = eval_id(2 * i + 1)
         ids["asof_new"][ASOF_TOPICS[i]] = eval_id(2 * i + 2)
@@ -250,7 +308,14 @@ def _build_eval_ids() -> dict:
         ids["contested_loser"][CONTESTED_TOPICS[i][0]] = eval_id(30 + 2 * i + 2)
         ids["entity"][ENTITY_ROWS[i][2]] = eval_id(40 + i + 1)
         ids["fts"][FTS_ROWS[i][0].split()[0]] = eval_id(45 + i + 1)
-    ids["all"] = [eval_id(n) for n in range(1, 51)]
+    for rowid, content, _window, _reason in RETRACT_ROWS:
+        ids["retraction"][content.split(":")[0]] = eval_id(rowid)
+    for rowid, content in POLARITY_ROWS:
+        ids["polarity"][content] = eval_id(rowid)
+    for pred_rowid, head_rowid in zip(CHANGE_CHAIN_PREDS, CHANGE_CHAIN_HEADS):
+        ids["change_pred"][pred_rowid] = eval_id(pred_rowid)
+        ids["change_head"][head_rowid] = eval_id(head_rowid)
+    ids["all"] = [eval_id(n) for n in range(1, 65)]
     return ids
 
 
@@ -280,9 +345,20 @@ def build_eval_store(dest: str) -> str:
         _add(dest, NS_ENT, "fact", "test", content, tags)
     for content, _query in FTS_ROWS:
         _add(dest, NS_FTS, "fact", "test", content, "eval,fts")
+    # Issue #82 buckets: retraction + polarity + change-chain predecessors,
+    # all via the real CLI add path (fake-profile embeddings included).
+    for rowid, content, _window, _reason in RETRACT_ROWS:
+        _add(dest, NS_RETRACT, "fact", "test", content, "eval,retract")
+    for _rowid, content in POLARITY_ROWS:
+        _add(dest, NS_POLAR, "fact", "test", content, "eval,polarity")
+    for old_content, _new in CHANGE_CHAINS:
+        _add(dest, NS_CHANGE, "fact", "test", old_content, "eval,change")
 
     _pin_ids(dest)
     _contested_pairs(dest)
+    _polarity_pairs(dest)
+    _invalidate_retractions(dest)
+    _change_chains(dest)
     _verify(dest)
     return str(dest_path)
 
@@ -363,9 +439,13 @@ def _pin_ids(store: str) -> None:
     conn = sqlite3.connect(store)
     try:
         rows = conn.execute("SELECT id, rowid FROM memory ORDER BY rowid").fetchall()
-        if len(rows) != 50:
+        # 50 original rows + 2 retraction + 6 polarity + 3 change-chain
+        # predecessors = 61 at pin time. The 3 chain successors do not exist
+        # yet — _change_chains creates them (and pins their ids) after this.
+        if len(rows) != 61:
             raise AssertionError(
-                f"eval corpus expected 50 seeded rows, found {len(rows)}")
+                f"eval corpus expected 61 seeded rows at pin time, "
+                f"found {len(rows)}")
         for rowid, (old_id, _rowid) in enumerate(rows, start=1):
             new_id = eval_id(rowid)
             conn.execute("UPDATE memory SET id=? WHERE id=?", (new_id, old_id))
@@ -397,6 +477,82 @@ def _contested_pairs(store: str) -> None:
             raise RuntimeError(f"eval supersede failed rc={r.returncode}\n{r.stderr}")
 
 
+def _remap_id(conn: sqlite3.Connection, old_id: str, new_id: str) -> None:
+    """Rewrite one memory id to its fixed value, remapping the derived tables
+    the CLI writes (same contract as _pin_ids)."""
+    conn.execute("UPDATE memory SET id=? WHERE id=?", (new_id, old_id))
+    conn.execute("UPDATE memory_entity SET memory_id=? WHERE memory_id=?",
+                 (new_id, old_id))
+    try:
+        conn.execute("UPDATE memory_vec SET memory_id=? WHERE memory_id=?",
+                     (new_id, old_id))
+    except sqlite3.OperationalError:
+        pass  # vec0 unavailable — recall degrades to lexical deterministically
+
+
+def _polarity_pairs(store: str) -> None:
+    """Issue #82: contradict each polarity pair BOTH directions but never
+    supersede — both disagreeing sides stay live so recall surfaces the
+    disagreement itself (that is the bucket's contract; the contested bucket
+    covers contradict-then-supersede)."""
+    for a, b in POLARITY_PAIRS:
+        r = _run(store, "contradict", "--id", eval_id(a), "--id", eval_id(b),
+                 "--reason", "eval corpus: polarity pair disagrees")
+        if r.returncode != 0:
+            raise RuntimeError(f"eval contradict failed rc={r.returncode}\n{r.stderr}")
+
+
+def _invalidate_retractions(store: str) -> None:
+    """Issue #82: retract each live retraction fact via the REAL `invalidate
+    --reason` path (that mechanism is what the bucket measures), then pin the
+    tombstone's temporal columns to the row's historical window so the
+    as_of-before gold items are deterministic on any machine. The
+    supersede_reason written by the real CLI call is preserved."""
+    for rowid, _content, window, reason in RETRACT_ROWS:
+        mid = eval_id(rowid)
+        r = _run(store, "invalidate", "--id", mid, "--reason", reason)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"eval invalidate failed rc={r.returncode} for {mid}\n{r.stderr}")
+        conn = sqlite3.connect(store)
+        try:
+            conn.execute(
+                "UPDATE memory SET valid_from=?, valid_until=?, superseded_at=? "
+                "WHERE id=?",
+                (window[0], window[1], window[1], mid),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _change_chains(store: str) -> None:
+    """Issue #82: build each update_of chain via the REAL `update` path
+    (tombstones the predecessor, writes the live successor with update_of),
+    then pin the successor's id to its reserved head rowid so the gold set
+    can name it deterministically."""
+    for (pred_rowid, head_rowid) in zip(CHANGE_CHAIN_PREDS, CHANGE_CHAIN_HEADS):
+        pred = eval_id(pred_rowid)
+        _old_content, new_content = CHANGE_CHAINS[CHANGE_CHAIN_PREDS.index(pred_rowid)]
+        r = _run(store, "update", "--id", pred, "--content", new_content)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"eval update failed rc={r.returncode} for {pred}\n{r.stderr}")
+        conn = sqlite3.connect(store)
+        try:
+            row = conn.execute(
+                "SELECT id FROM memory WHERE update_of=? AND superseded_at IS NULL",
+                (pred,),
+            ).fetchone()
+            if not row:
+                raise AssertionError(
+                    f"eval corpus: no live successor of {pred} after update")
+            _remap_id(conn, row[0], eval_id(head_rowid))
+            conn.commit()
+        finally:
+            conn.close()
+
+
 def _verify(store: str) -> None:
     conn = sqlite3.connect(store)
     try:
@@ -410,20 +566,87 @@ def _verify(store: str) -> None:
         n_inj_tags = conn.execute(
             "SELECT count(*) FROM memory WHERE tags LIKE '%prompt-injection-risk%'"
         ).fetchone()[0]
+        # Issue #82 buckets.
+        n_retracted = conn.execute(
+            "SELECT count(*) FROM memory WHERE namespace=? AND superseded_at IS NOT NULL",
+            (NS_RETRACT,)).fetchone()[0]
+        n_retract_reasons = conn.execute(
+            "SELECT count(*) FROM memory WHERE namespace=? AND "
+            "supersede_reason IS NOT NULL AND supersede_reason != ''",
+            (NS_RETRACT,)).fetchone()[0]
+        n_chains = conn.execute(
+            "SELECT count(*) FROM memory WHERE namespace=? AND update_of != '' "
+            "AND superseded_at IS NULL",
+            (NS_CHANGE,)).fetchone()[0]
+        n_tombstoned_preds = conn.execute(
+            "SELECT count(*) FROM memory WHERE namespace=? AND update_of = '' "
+            "AND superseded_at IS NOT NULL",
+            (NS_CHANGE,)).fetchone()[0]
     finally:
         conn.close()
-    if n_total != 50:
-        raise AssertionError(f"eval corpus: expected 50 rows, got {n_total}")
-    if n_live != 40:  # 5 as-of old rows + 5 contested losers are tombstoned
-        raise AssertionError(f"eval corpus: expected 40 live rows, got {n_live}")
+    if n_total != 64:
+        raise AssertionError(f"eval corpus: expected 64 rows, got {n_total}")
+    # 5 as-of old + 5 contested losers + 2 retracted + 3 change predecessors
+    # are tombstoned; 64 - 15 = 49 live.
+    if n_live != 49:
+        raise AssertionError(f"eval corpus: expected 49 live rows, got {n_live}")
     if n_ent == 0:
         raise AssertionError("eval corpus: no entity links were derived")
-    if n_contradicts != 10:  # contradict inserts BOTH directions per pair
+    if n_contradicts != 16:  # 10 contested + 6 polarity (both directions x3)
         raise AssertionError(
-            f"eval corpus: expected 10 contradicts edges, got {n_contradicts}")
+            f"eval corpus: expected 16 contradicts edges, got {n_contradicts}")
     if n_inj_tags != 5:
         raise AssertionError(
             f"eval corpus: expected 5 injection-tagged rows, got {n_inj_tags}")
+    if n_retracted != len(RETRACT_ROWS):
+        raise AssertionError(
+            f"eval corpus: expected {len(RETRACT_ROWS)} retracted rows, "
+            f"got {n_retracted}")
+    if n_retract_reasons != len(RETRACT_ROWS):
+        raise AssertionError(
+            "eval corpus: retracted rows must carry the invalidate --reason "
+            f"audit trail, got {n_retract_reasons}")
+    if n_chains != len(CHANGE_CHAINS):
+        raise AssertionError(
+            f"eval corpus: expected {len(CHANGE_CHAINS)} live chain heads, "
+            f"got {n_chains}")
+    if n_tombstoned_preds != len(CHANGE_CHAINS):
+        raise AssertionError(
+            f"eval corpus: expected {len(CHANGE_CHAINS)} tombstoned chain "
+            f"predecessors, got {n_tombstoned_preds}")
+    # Polarity members must stay above the confidence floor after the
+    # contradict trust events — below it they could never surface and the
+    # bucket would assert the impossible.
+    _check_polarity_above_floor(store)
+
+
+def _check_polarity_above_floor(store: str) -> None:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    from storelib.schema import CONFIDENCE_FLOOR  # noqa: E402
+    conn = sqlite3.connect(store)
+    conn.row_factory = sqlite3.Row
+    try:
+        for a, b in POLARITY_PAIRS:
+            for rowid in (a, b):
+                row = conn.execute(
+                    "SELECT confidence, superseded_at FROM memory WHERE id=?",
+                    (eval_id(rowid),),
+                ).fetchone()
+                if row is None:
+                    raise AssertionError(
+                        f"eval corpus: polarity row {eval_id(rowid)} missing")
+                if row["superseded_at"]:
+                    raise AssertionError(
+                        f"eval corpus: polarity row {eval_id(rowid)} must stay "
+                        "live (no tombstone) — the bucket asserts both "
+                        "disagreeing sides surface")
+                if (row["confidence"] or 0.0) < CONFIDENCE_FLOOR:
+                    raise AssertionError(
+                        f"eval corpus: polarity row {eval_id(rowid)} confidence "
+                        f"{row['confidence']} fell below CONFIDENCE_FLOOR after "
+                        "the contradicts trust events")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

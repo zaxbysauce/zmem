@@ -56,6 +56,23 @@ in deterministic verification) > `reviewer/user` (medium) > `none` (low, below t
 retrieval floor by default). This follows the finding that intrinsic self-correction
 (lessons from the agent's own opinion, ungrounded) degrades accuracy.
 
+### Retrieval debugger, lineage unfold, and honest eval (issue #82)
+
+- `recall --explain [--target ID|fragment] [--json]` re-runs the real pipeline
+  with ZERO writes and explains every verdict — found, below_limit, below_floor,
+  omitted_injection, omitted_untrusted_web, namespace, superseded,
+  not_valid_at_as_of, vec_lane_miss, not_in_pool, not_in_db — using zmem's own
+  gates as first-class reasons.
+- On explicit recall only, a change-intent query ("what changed about X") can
+  append the tombstoned predecessors of a hit as budgeted `[PREVIOUSLY]` rows
+  (never counted against the limit, never popularity-bumped). Hooks and other
+  passive surfaces never unfold; `--no-unfold` opts out.
+- The offline eval covers retraction, polarity, and change-intent buckets
+  alongside the original six, and `scripts/eval_self_corpus.py` measures recall
+  against a snapshot of your own corpus (home store refused by design).
+- Every public capability claim is audited in `docs/CLAIMS-AUDIT.md`; scores
+  never gate CI.
+
 ## Requirements
 
 - ZCode and/or Claude Code (the plugin registers hooks + a skill via each
