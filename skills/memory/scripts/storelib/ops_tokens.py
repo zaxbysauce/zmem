@@ -189,8 +189,10 @@ def query_context_enabled() -> bool:
     return os.environ.get(_QUERY_CONTEXT_ENV, "1").strip() != "0"
 
 
-def _ring_path(data_dir: str, session_id: str) -> str:    # Session ids are host-generated (UUID-ish), but sanitize anyway — the
-    # ring filename must never escape the ops dir.
+def _ring_path(data_dir: str, session_id: str) -> str:
+    """Session ids are host-generated (UUID-ish), but sanitize anyway — the
+    ring filename must never escape the ops dir.
+    """
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:128] or "session"
     return os.path.join(data_dir, "ops", safe + ".log")
 
