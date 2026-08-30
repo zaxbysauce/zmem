@@ -311,6 +311,54 @@ class HermesReflectDeliveryTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_same_second_event_still_delivers_and_no_meta_write(self):
+        """Final-critic findings: (1) a second event appended in the SAME
+        second (ring ts are int(time.time())) must still deliver — a
+        ts-only comparison suppressed it forever; (2) the delivery path
+        persists ONLY under the ops/ sidecar namespace — the store's meta
+        table must not grow."""
+        import sqlite3
+
+        tmp = tempfile.mkdtemp(prefix="zmem-reflect-ss-")
+        try:
+            _seed(_clean_env(tmp), "user:global", LESSON)
+            ring = Path(tmp, "ops", "s-reflect.log")
+            ring.parent.mkdir(parents=True)
+            same_second = json.dumps({"ts": 200, "tool": "Bash",
+                                      "ops": "git stash pop"}) + "\n"
+            ring.write_text(same_second, encoding="utf-8")
+
+            db = os.path.join(tmp, "store.sqlite")
+            conn = sqlite3.connect(db)
+            meta_before = set(conn.execute("SELECT key FROM meta").fetchall())
+            conn.close()
+
+            first = self._run_reflect(tmp)
+            self.assertIn("pretoolcanary", first)
+            # Same ring → silent (cursor (200,1) already delivered).
+            self.assertEqual(self._run_reflect(tmp), "{}")
+            # SECOND event in the SAME second: cursor (200,2) > (200,1)
+            # must deliver — the count half of the cursor exists for this.
+            with open(ring, "a", encoding="utf-8") as f:
+                f.write(same_second)
+            third = self._run_reflect(tmp)
+            self.assertIn("pretoolcanary", third,
+                          "same-second event must not be suppressed")
+
+            # Sidecar marker exists; the store's meta table did not grow
+            # from the delivery path (the nudge-flag keys predate this PR
+            # and no nudge fired in this fixture).
+            marker = Path(tmp, "ops", "s-reflect.delivered")
+            self.assertTrue(marker.is_file())
+            conn = sqlite3.connect(db)
+            meta_after = set(conn.execute("SELECT key FROM meta").fetchall())
+            conn.close()
+            self.assertEqual(meta_before, meta_after,
+                             "query-context delivery must not write the "
+                             "store's meta table (sidecar-only persistence)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class RegistrationAndContractTest(unittest.TestCase):
     """Where PreToolUse is registered (probed hosts) and where it is a

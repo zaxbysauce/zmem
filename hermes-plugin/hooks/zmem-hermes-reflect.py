@@ -44,8 +44,11 @@ _PENDING_FAILURE_KEY = "hermes_pending_failure_{session}"
 # the convention hook would suppress every failure after the first delivered).
 _FAILURE_CAPTURED_KEY = "hermes_failure_captured_{session}"
 _REFLECT_PROMPTED_KEY = "hermes_reflect_prompted_{session}"
-# Issue #90 / #85 C: last ops-ring ts already delivered as recall context.
-_QUERY_CONTEXT_KEY = "hermes_query_context_delivered_{session}"
+# Issue #90 / #85 C: the query-context delivery marker lives in the ops/
+# SIDECAR namespace (<data>/ops/<session>.delivered via ops_tokens), NOT in
+# the store's meta table — the read-path delivery surfaces keep all their
+# persistence in sidecars (final-critic finding; the nudge flags above are
+# the established meta-table pattern and predate this).
 
 
 def _resolve_store_path() -> Path:
@@ -202,8 +205,12 @@ def _query_context_delivery(conn: sqlite3.Connection, session: str,
     verbs — stated in issue #90's matrix; attach to a consumed pre-tool hook
     if Hermes grows one.
 
-    At-most-once per ring timestamp (the marker is written before the
-    subprocess). Kill switch ZMEM_QUERY_CONTEXT=0. Returns "" on silence.
+    At-most-once per ring CURSOR ``(ts, parsed-event-count)`` — the count
+    catches a second event appended in the same second (final-critic
+    finding); the marker sidecar is written before the subprocess so a
+    crash cannot re-deliver. Kill switch ZMEM_QUERY_CONTEXT=0. Returns ""
+    on silence. Persists ONLY under the ops/ sidecar namespace (never the
+    store's meta table).
     """
     try:
         if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
@@ -221,28 +228,19 @@ def _query_context_delivery(conn: sqlite3.Connection, session: str,
         import ops_tokens  # noqa: E402  (stdlib-only, like this hook)
 
         data_dir = str(store_path.parent)
-        last_ts = ops_tokens.ring_last_ts(data_dir, session)
-        if last_ts <= 0:
+        cursor = ops_tokens.ring_cursor(data_dir, session)
+        if cursor <= (0.0, 0):
             return ""
-        delivered_key = _QUERY_CONTEXT_KEY.format(session=session)
-        prev = _meta_get(conn, delivered_key)
-        try:
-            prev_ts = float(prev) if prev else 0.0
-        except (TypeError, ValueError):
-            prev_ts = 0.0
-        if last_ts <= prev_ts:
+        if cursor <= ops_tokens.read_delivered_cursor(data_dir, session):
             return ""
         events = ops_tokens.read_ops_ring(data_dir, session)
         query = " ".join(ops_tokens.derive_ops_tokens(*events))
         if not query:
             return ""
-        # At-most-once: mark before the subprocess so a crash cannot re-deliver.
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (delivered_key, str(last_ts)),
-        )
-        conn.commit()
+        # At-most-once: mark before the subprocess so a crash cannot
+        # re-deliver (a transient recall failure after the mark skips that
+        # cursor's delivery — documented best-effort).
+        ops_tokens.write_delivered_cursor(data_dir, session, cursor)
 
         r = subprocess.run(
             [sys.executable, str(scripts_dir / "store.py"), "recall",

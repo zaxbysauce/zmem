@@ -502,10 +502,13 @@ def cmd_sweep(marker_dir: str | None = None,
                 except OSError:
                     continue
             removed += 1
-        # Issue #88 / #85 direction 2: the per-session query-context rings
-        # (<data>/ops/<session>.log) are session-scoped sidecars — same
-        # max-age policy as the sentinels so finished sessions' rings cannot
-        # accumulate. Same strict-< mtime rule keeps the live session's ring.
+        # Issue #88 / #85 direction 2 + #90: the per-session query-context
+        # sidecars under <data>/ops/ (rings .log, delivery markers
+        # .delivered, pre-tool pending fences .pending) are session-scoped —
+        # same max-age policy as the sentinels so finished sessions' files
+        # cannot accumulate. Same strict-< mtime rule keeps the live
+        # session's files (including an undelivered .pending, which only
+        # survives as long as its session does).
         ops_dir = d / "ops"
         if ops_dir.is_dir():
             try:
@@ -513,7 +516,7 @@ def cmd_sweep(marker_dir: str | None = None,
             except OSError:
                 ring_names = []
             for rname in ring_names:
-                if not rname.endswith(".log"):
+                if not rname.endswith((".log", ".delivered", ".pending")):
                     continue
                 rp = ops_dir / rname
                 try:

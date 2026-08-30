@@ -222,14 +222,24 @@ def _ring_path(data_dir: str, session_id: str) -> str:
     return os.path.join(data_dir, "ops", safe + ".log")
 
 
-def ring_last_ts(data_dir: str, session_id: str) -> float:
-    """Newest event timestamp in the session's ring (0.0 when the ring is
-    absent or unreadable). Lets a delivery surface (e.g. the Hermes
-    pre_llm_call reflect hook) skip work until fresh verbs exist."""
+def ring_cursor(data_dir: str, session_id: str) -> tuple:
+    """Delivery cursor for the session's ring: ``(last_ts, event_count)``
+    where event_count counts PARSED event lines. Consumed by the Hermes
+    pre_llm_call reflect hook's at-most-once delivery marker (issue #90).
+
+    The count matters because ring timestamps are second-granularity
+    (``int(time.time())``): a second event appended in the SAME second after
+    a delivery has an equal ts, and a ts-only comparison would suppress it
+    forever (final-critic finding). Cursor comparison is lexicographic on
+    ``(ts, count)`` — ts first so a ring TRIM (which lowers the count) still
+    delivers on newer verbs; count second so same-second growth delivers.
+    Returns (0.0, 0) when the ring is absent or unreadable.
+    """
     if not data_dir or not session_id:
-        return 0.0
+        return (0.0, 0)
     path = _ring_path(data_dir, session_id)
     last = 0.0
+    count = 0
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -245,11 +255,44 @@ def ring_last_ts(data_dir: str, session_id: str) -> float:
                         ts = float(obj.get("ts", 0) or 0)
                     except (TypeError, ValueError):
                         continue
+                    count += 1
                     if ts > last:
                         last = ts
     except OSError:
-        return 0.0
-    return last
+        return (0.0, 0)
+    return (last, count)
+
+
+def _marker_path(data_dir: str, session_id: str, suffix: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:128] or "session"
+    return os.path.join(data_dir, "ops", safe + suffix)
+
+
+def read_delivered_cursor(data_dir: str, session_id: str) -> tuple:
+    """Read the delivery marker ``<data>/ops/<session>.delivered`` — the
+    last ``(ts, count)`` cursor a delivery surface already handled. Sidecar
+    by design (final-critic finding): the #85 direction-C surfaces keep ALL
+    their persistence under the ops/ sidecar namespace and never grow the
+    store's meta table from a read path. (0.0, 0) when absent/unreadable."""
+    try:
+        with open(_marker_path(data_dir, session_id, ".delivered"),
+                  "r", encoding="utf-8", errors="replace") as f:
+            parts = f.read().split()
+        return (float(parts[0]), int(parts[1]))
+    except (OSError, ValueError, IndexError):
+        return (0.0, 0)
+
+
+def write_delivered_cursor(data_dir: str, session_id: str, cursor: tuple) -> None:
+    """Persist a delivery cursor marker (best-effort; never raises)."""
+    try:
+        os.makedirs(os.path.dirname(
+            _marker_path(data_dir, session_id, ".delivered")), exist_ok=True)
+        with open(_marker_path(data_dir, session_id, ".delivered"), "w",
+                  encoding="utf-8") as f:
+            f.write("{0} {1}".format(float(cursor[0]), int(cursor[1])))
+    except OSError:
+        pass
 
 
 def read_ops_ring(data_dir: str, session_id: str, max_events: int = 8) -> List[str]:

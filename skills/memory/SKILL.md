@@ -220,9 +220,11 @@ and stays fully silent when nothing qualified. `ZMEM_QUERY_CONTEXT=0`
 silences every query-context lane, this one included. The Claude pending
 sidecar requires the host event's `session_id` (without it the direct emit
 is the only delivery). Hermes delivers the equivalent on `pre_llm_call`
-(after the fact of the producing call), best-effort per ring timestamp: a
-transient store failure after the at-most-once marker skips that
-timestamp's delivery; newer verbs still deliver. Codex has no pre-tool
+(after the fact of the producing call), best-effort per ring CURSOR
+`(ts, event-count)` — same-second events still deliver; a transient store
+failure after the at-most-once marker skips that cursor's delivery. All
+query-context persistence (rings, delivery markers, pending fences) lives
+under `<data>/ops/` sidecars and never grows the store's tables. Codex has no pre-tool
 context injection (documented gap).
 
 Inject surface parity (host facts, not aspirations): Claude Code registers
