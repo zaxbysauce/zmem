@@ -196,7 +196,15 @@ def main() -> int:
         return out
     ap.add_argument("--k", type=_k_values, default=[5, 20],
                     help="comma-separated top-k cut points (default 5,20)")
-    ap.add_argument("--limit", type=int, default=100,
+    def _positive_int(value: str) -> int:
+        n = int(value)
+        if n < 1:
+            raise argparse.ArgumentTypeError(
+                f"must be a positive integer, got {value!r}")
+        return n
+    # PRR-004: SQLite treats a negative LIMIT as unlimited — a typo'd
+    # `--limit -1` must be refused, not silently sample the whole store.
+    ap.add_argument("--limit", type=_positive_int, default=100,
                     help="max live rows to sample (default 100)")
     ap.add_argument("--json-out", default=None,
                     help="also write the JSON report to this path. The report "
@@ -204,6 +212,14 @@ def main() -> int:
                          f"({DEFAULT_JSON_OUT_NAME}) is gitignored; never "
                          "commit a report.")
     args = ap.parse_args()
+    # Same rationale as eval_runner: reconfigure the ALREADY-CREATED console
+    # streams so a cp1252 Windows console cannot abort the report on
+    # non-ASCII probe content.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
 
     if _refuse_home(args.store):
         print(f"[self-corpus] REFUSED: {args.store} resolves to the host "

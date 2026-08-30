@@ -954,7 +954,11 @@ def main():
         # START during an active restore; the residual mid-flight window is fail-open
         # (lost surface telemetry on POSIX, clean restore refusal on Windows), never
         # corruption. See issue #21 implementation-review closure.
-        or (args.cmd == "recall" and not args.no_bump)
+        # Issue #82 (PR-review PRR-002): --explain is a zero-write read-only
+        # debugger — it must never hold the writer lease (which would make a
+        # concurrent restore/backup refuse against a diagnostic read).
+        or (args.cmd == "recall" and not args.no_bump
+            and not getattr(args, "explain", False))
         or (args.cmd == "recent" and not args.no_bump)
         or (args.cmd == "search" and not args.no_bump)
         or (args.cmd == "rekey-namespace" and not args.dry_run and args.confirm)
@@ -1106,7 +1110,8 @@ def main():
                                global_limit=args.global_limit, as_of=args.as_of,
                                no_mmr=args.no_mmr,
                                link_hops=args.link_hops,
-                               link_budget=args.link_budget)
+                               link_budget=args.link_budget,
+                               cross_rerank=rerank_flag)
             else:
                 recall_memory(conn, query=args.query, namespace=args.namespace,
                               limit=args.limit, as_json=args.json, hybrid=hybrid_arg,

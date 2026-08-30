@@ -155,9 +155,9 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
     k = obj.get("k")
     if k is not None and (isinstance(k, bool) or not isinstance(k, int) or k < 1):
         raise GoldError("field 'k' must be a positive integer when present")
-    # Issue #82: optional explicit-path flag. Any truthy JSON value is
-    # accepted as True; non-bool truthy values are refused (a gold file with
-    # "explicit": "yes" is broken data, not a style choice).
+    # Issue #82: optional explicit-path flag. Only JSON booleans are valid;
+    # non-bool values are refused (a gold file with "explicit": "yes" is
+    # broken data, not a style choice).
     explicit = obj.get("explicit", False)
     if not isinstance(explicit, bool):
         raise GoldError("field 'explicit' must be a boolean when present")
@@ -253,6 +253,12 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
                     break
 
         hit = all(rid in ranked_ids for rid in item.must_include_ids)
+        # Issue #82 (PR-review PRR-024): `hit` is vacuously True for
+        # exclude-only items (empty must_include_ids) — the REAL assertion
+        # for such items is `excluded_hit`/`excluded_ids_surfaced` below, and
+        # the per-bucket `excluded_surfaced` counter in the runner report.
+        # hit_at_k therefore counts exclude-only items as hits by design;
+        # do not read a retraction regression off hit@k alone.
         text_hit = bool(item.must_include_text) and item.must_include_text in top_content
         excluded_hit = [rid for rid in item.must_exclude_ids if rid in ranked_ids]
         # The injection-omit behavior under measurement is the HOOK path's:
@@ -293,6 +299,17 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
     metrics["as_of_items"] = len(as_of_items)
     metrics["injection_items"] = len(injection_items)
     return per_item, metrics
+
+
+# PRR-009: the reportable per-item key contract, shared by evaluate_items
+# (which builds the dicts) and eval_runner.py (which projects the report
+# subset). A single constant makes key drift an import-time-visible edit in
+# ONE place instead of a runtime KeyError in the runner.
+PER_ITEM_REPORT_KEYS = (
+    "id", "bucket", "query", "as_of", "k", "explicit", "hit", "text_hit",
+    "first_hit_rank", "excluded_ids_surfaced", "injection_omitted",
+    "ranked_ids", "ok",
+)
 
 
 def _share(population: list[dict], predicate) -> float:

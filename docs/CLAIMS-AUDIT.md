@@ -8,7 +8,7 @@ claims; zmem publishes only what its own harness measures on its own fixture.
 
 | Claim (README / docs surface) | Evidence (path + symbol) | Status |
 |---|---|---|
-| Hybrid FTS5 + vector + entity recall, RRF-fused, composite re-ranked | `skills/memory/scripts/storelib/recall.py` `recall_memory` / `_recall_one_tier` / `_rrf_fuse`; pinned by `tests/test_mmr.py`, `tests/test_hybrid.py` | shipped |
+| Hybrid FTS5 + vector + entity recall, RRF-fused, composite re-ranked | `skills/memory/scripts/storelib/recall.py` `recall_memory` / `_recall_one_tier` / `_rrf_fuse`; pinned by `tests/test_mmr.py`, `tests/test_hybrid_default.py` | shipped |
 | Keyword recall with a confidence floor, high-precision-first | `storelib/schema.py` `CONFIDENCE_FLOOR`, `storelib/recall.py` `_recall_one_tier` (floor in lane SQL); `tests/test_injection_recall.py` | shipped |
 | `--as-of` point-in-time recall; `update`/`supersede`/`invalidate` are append-only (tombstone + lineage) | `storelib/recall.py` `_as_of_temporal_predicate` usage; `storelib/write.py` `update_memory`/`supersede_memory`; `tests/test_as_of_recall.py`, `tests/test_update_invalidate.py` | shipped |
 | Offline eval harness, 42-item gold, deterministic (fake embedder + pinned clock), scores do NOT gate CI | `scripts/eval_runner.py` (`--store` required, `--fail-under` default None), `storelib/eval_gold.py` `BUCKETS`/`evaluate_items`, `eval/gold.jsonl`, `.github/workflows/ci.yml` (no `--fail-under`) | shipped |

@@ -5,7 +5,7 @@ exactly those ids, deterministically, in a store that lives wherever the
 caller says — never the operator's home store (scripts/eval_runner.py passes
 an explicit --store path; CI uses a workspace-relative path).
 
-Layout: 62 rows across 10 namespaces, one fixed id per rowid:
+Layout: 64 rows across 10 namespaces, one fixed id per rowid:
     e0000000-0000-4000-8000-{rowid:012d}
 
   rowids  1-10  as-of chains   (5 topics x old/new; historical windows)
@@ -255,7 +255,7 @@ RETRACT_ROWS = (
      "mirror backups replaced by incremental journal shipping"),
 )
 
-# Polarity: two live contradict pairs, deliberately NOT tombstoned — both
+# Polarity: three live contradict pairs, deliberately NOT tombstoned — both
 # sides must surface so the reader sees the disagreement (that is the bucket's
 # contract; the contested bucket already covers contradict-then-supersede).
 # Confidence starts at 0.9 so the -0.10 contradicts trust events can never

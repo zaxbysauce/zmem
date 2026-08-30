@@ -114,6 +114,12 @@ class ExplainFixtureBase(unittest.TestCase):
                  "the migration window opens after the freeze lifts",
                  0.9,
                  {"valid_from": "2027-01-01T00:00:00Z"}),
+                ("hist-row",
+                 "the quarterly archive rotation moved to the glacier tier",
+                 0.9,
+                 {"valid_from": "2026-01-01T00:00:00Z",
+                  "valid_until": "2026-05-01T00:00:00Z",
+                  "superseded_at": "2026-05-01T00:00:00Z"}),
             ]
             for mid, content, conf, extra in rows:
                 real_id = str(uuid.uuid4())
@@ -229,6 +235,43 @@ class ExplainReasonCoverageTests(ExplainFixtureBase):
         for v in verdicts["below_limit"]:
             self.assertGreater(v["rank"], 1)
             self.assertIsNotNone(v["score"])
+
+    def test_vec_lane_miss_reachable_under_hybrid_as_of(self):
+        # PRR-007: exercise the vec_lane_miss verdict for real. The target is
+        # a superseded row that was valid at as_of, carries an embedding
+        # (fake profile blob), and shares NO lexical tokens with the query —
+        # under forced hybrid the live-only vec pool could never see it.
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import embed_profiles
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.execute(
+                "UPDATE memory SET embedding=? WHERE id=?",
+                (embed_profiles.fake_embed("quarterly archive rotation glacier"),
+                 self.ids["hist-row"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        doc = self._explain_json(
+            "--query", "zz topological quartet",
+            "--namespace", NS, "--hybrid",
+            "--as-of", "2026-03-01T00:00:00Z",
+            "--target", self.ids["hist-row"])
+        v = doc["explain"]["verdicts"][0]
+        self.assertEqual(v["reason"], "vec_lane_miss")
+        self.assertTrue(v["detail"]["why"])
+
+    def test_not_in_pool_reachable(self):
+        # PRR-007: a live, in-namespace, above-floor row that shares no
+        # tokens with the query lands in no candidate pool -> not_in_pool.
+        doc = self._explain_json(
+            "--query", "xylophone quartet rehearsal",
+            "--namespace", NS,
+            "--target", self.ids["future-row"])
+        v = doc["explain"]["verdicts"][0]
+        self.assertEqual(v["reason"], "not_in_pool")
+        self.assertIn("pool_size", v["detail"])
 
     def test_below_floor(self):
         doc = self._explain_json("--query", "legacy backup script", "--namespace", NS,

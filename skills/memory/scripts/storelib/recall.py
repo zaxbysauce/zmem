@@ -479,11 +479,8 @@ def _fetch_lineage_rows(
         params.extend(ns_list)
     sql = f"""
         SELECT id, namespace, type, content, tags, source_ref,
-               source_hash, confidence, signal, valid_from,
-               ingestion_ts, retrieval_count, surfaced_count, last_retrieved,
-               valid_until, update_of, taint,
-               content_norm, applied_count, violated_count,
-               NULL AS fts_rank
+               confidence, signal, valid_from, valid_until,
+               update_of, taint
         FROM memory
         WHERE id IN ({placeholders})
           {ns_clause}
@@ -504,9 +501,11 @@ def _successor_id(conn: sqlite3.Connection, mid: str) -> str | None:
 
 
 def _lineage_row_dict(r: sqlite3.Row) -> dict:
-    """Result-shaped dict for a lineage row — the same key set the recall
-    lanes build in _recall_one_tier, so a [PREVIOUSLY] extra renders and
-    serializes exactly like a query-matched row plus its unfold keys."""
+    """Result-shaped dict for a lineage row — the render/serialize-relevant
+    subset of the key set the recall lanes build in _recall_one_tier, so a
+    [PREVIOUSLY] extra renders and serializes exactly like a query-matched
+    row plus its unfold keys (the pipeline-only fields — scores, norms,
+    counters — are intentionally absent; extras never feed ranking)."""
     return {
         "id": r["id"],
         "namespace": r["namespace"],
@@ -1437,7 +1436,7 @@ def _explain_nearest_neighbors(
         scope_clause = f"AND namespace IN ({ph})"
         params = list(scope)
     rows = conn.execute(
-        f"""SELECT id, content, content_norm FROM memory
+        f"""SELECT id, content, content_norm, taint, tags FROM memory
             WHERE superseded_at IS NULL {scope_clause}""",
         params,
     ).fetchall()
@@ -1446,11 +1445,15 @@ def _explain_nearest_neighbors(
         sim = _explain_jaccard(
             tokens, _explain_token_set(r["content_norm"] or r["content"]))
         if sim > 0.0:
-            scored.append((sim, r["id"], r["content"]))
+            scored.append((sim, r["id"], r["content"], r["taint"], r["tags"]))
     scored.sort(key=lambda x: (-x[0], x[1]))
+    # PRR-005: neighbors carry the row's trust surface explicitly — the same
+    # rows the fenced render would mark, so a not_in_db verdict never shows
+    # untrusted content bare.
     return [
-        {"id": mid, "content": (content or "")[:80], "token_overlap": round(sim, 3)}
-        for sim, mid, content in scored[:k]
+        {"id": mid, "content": (content or "")[:80], "token_overlap": round(sim, 3),
+         "taint": taint, "prompt_injection_risk": _has_injection_risk_tag(tags)}
+        for sim, mid, content, taint, tags in scored[:k]
     ]
 
 
@@ -1599,7 +1602,10 @@ def _format_explain_blameline(v: dict) -> str:
         extras.append(f"ns={detail['row_namespace']}")
     if detail.get("neighbors"):
         extras.append("nearest: " + "; ".join(
-            f"{n['id']} {n['content'][:40]!r}" for n in detail["neighbors"]))
+            (("[UNTRUSTED WEB] " if n.get("taint") == "untrusted_web" else "")
+             + ("[INJECTION RISK] " if n.get("prompt_injection_risk") else "")
+             + f"{n['id']} {n['content'][:40]!r}")
+            for n in detail["neighbors"]))
     if extras:
         bits.append("(" + ", ".join(extras) + ")")
     return " ".join(bits)
@@ -1623,6 +1629,7 @@ def explain_recall(
     link_hops: int = 1,
     link_budget: int = 2,
     weights: dict | None = None,
+    cross_rerank: bool = False,
 ) -> list[dict]:
     """Read-only retrieval debugger behind `recall --explain` (issue #82).
 
@@ -1637,7 +1644,12 @@ def explain_recall(
 
     The ``link_hops``/``link_budget`` kwargs are accepted for CLI
     parameter-passing symmetry but deliberately unused: explain never expands
-    links and never unfolds.
+    links and never unfolds. ``cross_rerank`` (PR-review PRR-001) keeps the
+    debugger faithful when the cross-encoder is CLI-enabled: the presented
+    list is re-ranked exactly like recall_memory's (the helper fails open to
+    input order), so `found`/rank verdicts match what a real recall presents.
+    Deep-pool ranks stay pre-rerank (the pool measures retrieval, not the
+    rerank presentation).
     """
     now_epoch = _now_epoch()
     if hybrid is None:
@@ -1673,6 +1685,11 @@ def explain_recall(
         )
         if no_bump:
             presented, omitted = _explain_omit_filter(presented)
+        # PRR-001: mirror recall_memory's post-filter rerank stage so the
+        # presented ranks the verdicts cite match a real recall when the
+        # cross-encoder is CLI-enabled (the helper fails open to input order).
+        if cross_rerank and presented:
+            presented = _cross_maybe_rerank(query, presented)
     except Exception:
         pipeline_error = True
 

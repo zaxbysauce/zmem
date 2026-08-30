@@ -115,12 +115,22 @@ def main() -> int:
                     help="also write the JSON report to this path (CI uploads "
                          "it as a workflow artifact)")
     args = ap.parse_args()
+    # PRR-024 adjacent (cubic P2): `os.environ` alone doesn't switch the
+    # ALREADY-CREATED console streams on a cp1252 Windows host, and
+    # setdefault must honor an explicit PYTHONUTF8=0 — so reconfigure the
+    # report streams directly (no-op on UTF-8 hosts).
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass
 
     _bootstrap_env(args.store)
     _ensure_store(args.store)
 
     sys.path.insert(0, str(SCRIPTS_DIR))
-    from storelib.eval_gold import GoldError, evaluate_items, load_gold  # noqa: E402
+    from storelib.eval_gold import (  # noqa: E402
+        PER_ITEM_REPORT_KEYS, GoldError, evaluate_items, load_gold)
     from storelib.schema import connect  # noqa: E402
 
     try:
@@ -158,10 +168,7 @@ def main() -> int:
         "metrics": metrics,
         "per_bucket": per_bucket,
         "per_item": [
-            {key: it[key] for key in (
-                "id", "bucket", "query", "as_of", "k", "explicit", "hit",
-                "text_hit", "first_hit_rank", "excluded_ids_surfaced",
-                "injection_omitted", "ranked_ids", "ok")}
+            {key: it[key] for key in PER_ITEM_REPORT_KEYS}
             for it in per_item
         ],
     }

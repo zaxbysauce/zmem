@@ -170,7 +170,15 @@ class AdapterScanTest(unittest.TestCase):
             encoding="utf-8")
         for rel in sorted(self.PASSIVE):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            combined = text + "\n" + body_text
+            # Mirror test_passive_hooks_carry_no_bump: only the hooks that
+            # SOURCE the shared body get it appended — session-start inlines
+            # its own store.py invocation and must not inherit shared-body
+            # text it never executes (PR-review PRR-022/cubic).
+            if rel in ("hooks/zmem-recall.sh", "hooks/zmem-precompact.sh",
+                       "hooks/zmem-subagent-recall.sh"):
+                combined = text + "\n" + body_text
+            else:
+                combined = text
             self.assertNotIn("--no-unfold", combined,
                              f"{rel} must not pass --no-unfold")
             self.assertNotIn("--explain", combined,

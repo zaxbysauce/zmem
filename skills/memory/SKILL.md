@@ -114,7 +114,7 @@ Verdict reasons are a CLOSED set (`EXPLAIN_REASONS` in `storelib/recall.py`):
 |---|---|
 | `found` | in the presented result set at `rank` (1-based) |
 | `below_limit` | retrieved and scored but beyond `--limit` |
-| `below_floor` | the row's confidence is below the effective floor (`--` min_confidence / `CONFIDENCE_FLOOR`) |
+| `below_floor` | the row's confidence is below the effective floor (the recall `min_confidence` parameter, default `CONFIDENCE_FLOOR`) |
 | `omitted_injection` | would have ranked; dropped because `no_bump` and prompt-injection risk |
 | `omitted_untrusted_web` | would have ranked; dropped because `no_bump` and `taint=untrusted_web` |
 | `namespace` | lives outside the query's expanded namespace set (and `--include-global` did not admit it) |

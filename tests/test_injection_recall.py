@@ -221,12 +221,11 @@ class InjectionFilterBehaviorTests(unittest.TestCase):
         )
 
 
-
 class Issue82PatternTests(unittest.TestCase):
     """Issue #82: the four added high-precision instruction-to-the-model
-    patterns. Pure regex-level pins plus one behavior round-trip through
-    _classify_injection — no store needed (the emit-time scanner is the
-    consumer, and its wiring is pinned by InjectionFilterSourceTests)."""
+    patterns. Pure regex-level pins through `_has_prompt_injection_risk` (the
+    scanner `_classify_injection` delegates to at emit time) — no store
+    needed; the emit-time wiring is pinned by InjectionFilterSourceTests."""
 
     @classmethod
     def setUpClass(cls):

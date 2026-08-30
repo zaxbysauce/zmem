@@ -142,7 +142,9 @@ class UnfoldFixtureBase(unittest.TestCase):
         # live successor written with update_of.
         conn = sqlite3.connect(self.store)
         try:
-            self.pred_id = conn.execute("SELECT id FROM memory").fetchone()[0]
+            self.pred_id = conn.execute(
+                "SELECT id FROM memory WHERE content LIKE 'lint gate%'"
+            ).fetchone()[0]
         finally:
             conn.close()
         r = subprocess.run(
@@ -408,6 +410,61 @@ class UnfoldSafetyTests(UnfoldFixtureBase):
         self.assertIn("[UNTRUSTED WEB]", prev_block,
                       "the operator asked what changed; taint is prefixed, "
                       "never silently dropped")
+
+    def test_unfold_fail_open_swallows_internal_errors(self):
+        # PRR-008: the unfold's fail-open contract — a lineage-read failure
+        # must degrade to "no extras", never fail the explicit recall (the
+        # analogous explain fail-open is pinned in test_explain_recall.py).
+        # Runs against the module-pinned INPROC store with a hand-seeded
+        # chain head so the unfold gate actually fires.
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), "init"],
+            env=_pin_env(INPROC_STORE), capture_output=True, text=True,
+            timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from storelib.schema import connect
+        conn = connect()
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO memory
+                   (id, namespace, type, content, tags, source_ref,
+                    source_hash, confidence, signal, valid_from,
+                    valid_until, update_of, taint, superseded_at,
+                    ingestion_ts)
+                   VALUES ('unfold-failopen-head', ?, 'fact',
+                           'foldout checklist gates the release train',
+                           'eval', '', '', 0.9, 'test',
+                           '2026-01-01T00:00:00Z', '', 'dead-lineage-id',
+                           'trusted_internal', NULL,
+                           '2026-01-01T00:00:00Z')""",
+                (NS,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        from storelib import recall as recall_mod
+        conn = connect()
+        original = recall_mod._fetch_lineage_rows
+
+        def _boom(*a, **k):
+            raise RuntimeError("lineage read exploded")
+
+        recall_mod._fetch_lineage_rows = _boom
+        try:
+            rows = recall_mod.recall_memory(
+                conn, query="what changed about the foldout checklist",
+                namespace=NS, no_bump=False, no_telemetry=True,
+                link_hops=1, link_budget=0, no_mmr=True)
+        finally:
+            recall_mod._fetch_lineage_rows = original
+            conn.close()
+        self.assertIsInstance(rows, list)
+        self.assertIn("unfold-failopen-head", [r["id"] for r in rows],
+                      "the recall itself must survive the lineage failure")
+        self.assertFalse(any(r.get("unfold_hop") for r in rows),
+                         "a lineage-read failure must yield no extras, "
+                         "not a failed recall")
 
     def test_source_scan_no_unfold_on_passive_surfaces(self):
         """Passive argv must never carry --no-unfold: the no_bump gate already

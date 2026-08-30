@@ -386,18 +386,13 @@ class CharacterizationTests(unittest.TestCase):
                                  f"{cmd} --help must not expose {flag}")
 
     def test_known_subcmds_frozen_against_issue82(self):
-        # --explain is a recall FLAG, not a subcommand: the subcommand list
-        # must be byte-identical to the pre-#82 surface.
-        self.assertEqual(
-            KNOWN_SUBCMDS,
-            ["init", "add", "invalidate", "recall", "recent", "search",
-             "supersede", "update", "get", "list",
-             "stats", "path", "session-cadence", "rebuild-fts", "reembed",
-             "consolidate", "promote", "rekey-namespace", "backup", "restore",
-             "export-pack", "export-jsonl", "ingest-jsonl", "failures",
-             "corrections", "queue-list", "queue-clear", "mine-history",
-             "sweep", "entity-list", "entity-merge", "links", "contradict",
-             "organize", "feedback", "tune-weights"])
+        # --explain is a recall FLAG, not a subcommand: no issue-#82-shaped
+        # subcommand may join the surface, and the count pins the pre-#82
+        # surface without duplicating the live list verbatim (a verbatim copy
+        # would be self-referential -- cubic review round 1).
+        self.assertEqual(len(KNOWN_SUBCMDS), 36)
+        for banned in ("explain", "why-not", "unfold"):
+            self.assertNotIn(banned, KNOWN_SUBCMDS)
 
     def test_recall_clock_seam_is_honored_and_deterministic(self):
         """ZMEM_TEST_NOW pins the scoring clock (see _run_env). Two pins of
