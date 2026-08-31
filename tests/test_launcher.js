@@ -750,8 +750,8 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("subagent-recall task-text: ratchet lesson retrieved via the delegated prompt",
             /P90_RATCHET/.test(ac), ac.slice(0, 300));
-        ok("subagent-recall task-text: newer filler rows displaced (fallback lane would miss)",
-            !/P90_FILLER0/.test(ac) || /P90_RATCHET/.test(ac.split("P90_FILLER0")[0]), ac.slice(0, 400));
+        ok("subagent-recall task-text: recent-fallback displaced (no filler rows surfaced)",
+            !/P90_FILLER/.test(ac), ac.slice(0, 400));
     }
 
     // (iv) the consumed sidecar delivers on the next user prompt and clears.
