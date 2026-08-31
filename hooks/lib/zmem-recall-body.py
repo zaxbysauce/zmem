@@ -28,13 +28,25 @@ The body:
   5. Emits ``{"additionalContext": <ctx>}`` on stdout (the .sh wrappers
      wrap it in the <<<ZMEM_JSON>>>…<<<END>>> sentinel and neutralize
      sentinel/fence tokens as transport defense).
-  6. If nothing passes the gate, emits the silent one-liner
-     "no durable memories met the inject bar." as additionalContext.
+  6. If nothing is injected, names WHICH gate fired (issue #87 / #85
+     direction 1) instead of always blaming the bar:
+       - retrieval empty (or rows dropped by the passive injection-risk
+         filter) → "no durable memories retrieved for this prompt."
+       - rows reached the selective-inject gate and none passed →
+         "no durable memories met the inject bar." (byte-identical to the
+         pre-#87 one-liner so existing greps keep working)
+       - the gate passed rows but the token budget emptied the set →
+         "memories withheld: the injection token budget
+         (ZMEM_INJECT_TOKEN_BUDGET) dropped every candidate row."
   7. Fail-open: any error path emits nothing (the wrapper's ``|| echo '{}'``
-     handles it) and exits 0.
+     handles it) and exits 0; a reason-classification error degrades to the
+     retrieved-empty one-liner (never the bar) and still exits 0.
 
 The selective-inject decision is logged to ``$DATA_DIR/zmem-bg.log``
-(I5 critic-fix: existing log file, not a new one).
+(I5 critic-fix: existing log file, not a new one). Since issue #87 every
+line carries ``reason=`` (from schema_meta's INJECT_SILENT_REASONS tuple,
+plus ``injected`` on the success line) and ``omitted=N`` when the passive
+injection-risk filter dropped rows.
 """
 
 from __future__ import annotations
@@ -55,6 +67,21 @@ _FALLBACK_GROUNDED_SIGNALS = {"test", "compile", "lint", "reviewer", "user"}
 _FALLBACK_FLOOR_PROMPT = 0.25
 _FALLBACK_FLOOR_GATE_NONE = 0.4
 _FALLBACK_FLOOR_RECENT = 0.5
+# Issue #87 / #85 direction 1: import-failure fallbacks mirroring
+# schema_meta.INJECT_SILENT_REASONS / INJECT_REASON_INJECTED (a
+# partially-deployed tree still classifies with the documented set).
+_FALLBACK_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop")
+_FALLBACK_REASON_INJECTED = "injected"
+
+# User-visible silent one-liners (issue #87 / #85 direction 1). The below-bar
+# string is byte-identical to the pre-#87 single one-liner on purpose —
+# operator greps and muscle memory keep working for the one case it was true.
+_SILENT_CTX_RETRIEVED_EMPTY = "no durable memories retrieved for this prompt."
+_SILENT_CTX_BELOW_BAR = "no durable memories met the inject bar."
+_SILENT_CTX_BUDGET_DROP = (
+    "memories withheld: the injection token budget "
+    "(ZMEM_INJECT_TOKEN_BUDGET) dropped every candidate row."
+)
 
 _schema_meta = None
 
@@ -132,6 +159,43 @@ def _recent_floor(store_py: str) -> float:
     return _floor("ZMEM_INJECT_FLOOR_RECENT", _FALLBACK_FLOOR_RECENT)
 
 
+def _reason_constants(store_py: str):
+    """Resolve (silent_reasons, injected_reason) from schema_meta (the
+    single source of truth, PRR-017), with literal fallbacks for a
+    partially-deployed tree (same discipline as _gate_constants)."""
+    sm = _load_schema_meta(store_py)
+    if sm is not None:
+        return (
+            tuple(getattr(sm, "INJECT_SILENT_REASONS", _FALLBACK_SILENT_REASONS)),
+            getattr(sm, "INJECT_REASON_INJECTED", _FALLBACK_REASON_INJECTED),
+        )
+    return (_FALLBACK_SILENT_REASONS, _FALLBACK_REASON_INJECTED)
+
+
+def _classify_silent_reason(rows, omitted=0, budget_emptied=False,
+                            allowed=_FALLBACK_SILENT_REASONS):
+    """Name WHY a silent inject is silent (issue #87 / #85 direction 1).
+
+    Called only when nothing will be injected. Order matters and matches the
+    #87 spec: budget-drop wins over below-bar (a budget wipe of a gate-passed
+    set is a budget fact, not a gate fact); empty rows with omitted==0 is
+    empty-pool even if the prompt was long — do not guess. ``allowed`` is the
+    closed set from schema_meta; a drift/unknown value degrades to empty-pool
+    rather than inventing a reason.
+    """
+    if budget_emptied:
+        reason = "budget-drop"
+    elif rows:
+        reason = "below-bar"
+    elif omitted > 0:
+        reason = "omitted"
+    else:
+        reason = "empty-pool"
+    if reason not in allowed:
+        return "empty-pool"
+    return reason
+
+
 def _selective_inject_filter(rows, floor: float, gate_none_floor: float,
                              grounded_signals=None):
     """Apply the hook selective-inject gate (issue #58, 3.8).
@@ -172,9 +236,18 @@ def _selective_inject_filter(rows, floor: float, gate_none_floor: float,
 _BG_LOG_DEFAULT_MAX_BYTES = 262144
 
 
-def _log_inject_decision(rows, selected, status: str,
-                         tokens_used=None, tokens_budget=None) -> None:
+def _log_inject_decision(rows, selected, status: str, reason: str,
+                         omitted=0, tokens_used=None, tokens_budget=None) -> None:
     """Append the injected|silent decision to the existing bg log.
+
+    Issue #87 / #85 direction 1: every line carries ``reason=`` (closed set
+    from schema_meta plus ``injected``), and ``omitted=N`` when the passive
+    injection-risk filter dropped rows — so an operator can tell an
+    empty-pool silent (query construction problem) from a below-bar silent
+    (scoring problem) from a budget-drop without log forensics. Field order:
+    ``status``, ``reason``, optional ``omitted=N``, ``ids``, ``all``,
+    optional ``tokens=used/budget`` (the ``tokens=\\d+/\\d+`` shape pinned by
+    tests/test_token_budget.py is unchanged).
 
     PRR-016 fix: read the CANONICAL ``ZMEM_DATA`` env (what every hook
     wrapper and the launcher export); the previous ``ZMEM_DATA_DIR`` read
@@ -202,6 +275,9 @@ def _log_inject_decision(rows, selected, status: str,
         ids_sel = [r.get("id") for r in selected]
         # v13 (issue #65, 10.9): tokens kept/budget ride on the same line so
         # budget behavior is auditable in the existing bg log.
+        om = ""
+        if omitted and omitted > 0:
+            om = " omitted={0}".format(int(omitted))
         tok = ""
         if tokens_used is not None:
             tok = " tokens={used}/{budget}".format(
@@ -209,9 +285,12 @@ def _log_inject_decision(rows, selected, status: str,
             )
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
-                "[{ts}] zmem-hook status={status} ids={ids_sel} all={ids_all}{tok}\n".format(
+                "[{ts}] zmem-hook status={status} reason={reason}{om} "
+                "ids={ids_sel} all={ids_all}{tok}\n".format(
                     ts=int(time.time()),
                     status=status,
+                    reason=reason,
+                    om=om,
                     ids_sel=ids_sel,
                     ids_all=ids_all,
                     tok=tok,
@@ -314,6 +393,10 @@ def main() -> int:
     floor, gate_none_floor, grounded_signals = _gate_constants(store_py)
     # issue #65, 10.9: budget helpers (None when storelib is not importable).
     _inj = None
+    # issue #87: envelope omitted count (passive injection-risk drops) and the
+    # closed reason set, resolved once for the classification below.
+    omitted = 0
+    silent_reasons, injected_reason = _reason_constants(store_py)
 
     try:
         if mode == "precompact" or mode == "recent":
@@ -364,7 +447,15 @@ def main() -> int:
             ).decode("utf-8", "replace")
         rows = json.loads(out) if out.strip() else []
         # v13 (issue #65, 10.8): unwrap the read envelope ({"results": ...});
-        # a bare list from a pre-v13 store.py still works.
+        # a bare list from a pre-v13 store.py still works. Issue #87: read the
+        # envelope's omitted count BEFORE the unwrap discards it — it counts
+        # rows the passive --no-bump filter dropped (injection-risk /
+        # untrusted_web), the difference between "omitted" and "empty-pool".
+        if isinstance(rows, dict):
+            try:
+                omitted = int(rows.get("omitted", 0) or 0)
+            except (TypeError, ValueError):
+                omitted = 0
         _inj = _inject_helpers(store_py)
         if _inj is not None:
             rows = _inj.envelope_results(rows)
@@ -375,6 +466,7 @@ def main() -> int:
                 rows = []
     except Exception:
         rows = []
+        omitted = 0
 
     selected, status = _selective_inject_filter(
         rows, floor=floor, gate_none_floor=gate_none_floor,
@@ -386,21 +478,42 @@ def main() -> int:
     # outer stop (the token estimate does not include every fence byte).
     tokens_budget = None
     tokens_used = None
+    budget_emptied = False
     if selected and _inj is not None:
         selected, _est, _dropped = _inj.apply_token_budget(selected)
         tokens_budget = _inj.inject_token_budget()
         if not selected:
             status = "silent"
+            budget_emptied = True
 
     if not selected:
-        # F18: when the budget caused the silence, still log the token
-        # fields so budget-silence is distinguishable from gate-silence.
-        if tokens_budget is not None:
-            _log_inject_decision(rows, selected, status,
-                                 tokens_used=0, tokens_budget=tokens_budget)
+        # Issue #87 / #85 direction 1: name WHY the inject is silent instead
+        # of always blaming the bar. Fail-open on classification errors —
+        # degrade to the retrieved-empty one-liner (never the bar: blaming the
+        # bar for an empty pool is the exact misattribution #85 hit), still
+        # exit 0. F18 survives: a budget wipe still logs the token fields.
+        try:
+            reason = _classify_silent_reason(
+                rows, omitted=omitted, budget_emptied=budget_emptied,
+                allowed=silent_reasons,
+            )
+        except Exception:
+            reason = "empty-pool"
+        if reason == "below-bar":
+            ctx = _SILENT_CTX_BELOW_BAR
+        elif reason == "budget-drop":
+            ctx = _SILENT_CTX_BUDGET_DROP
         else:
-            _log_inject_decision(rows, selected, status)
-        _emit_envelope("no durable memories met the inject bar.")
+            # empty-pool and omitted share the string: do not teach the model
+            # that omitted injection-risk rows existed (#87 spec).
+            ctx = _SILENT_CTX_RETRIEVED_EMPTY
+        _log_inject_decision(
+            rows, selected, status, reason,
+            omitted=omitted,
+            tokens_used=0 if budget_emptied else None,
+            tokens_budget=tokens_budget if budget_emptied else None,
+        )
+        _emit_envelope(ctx)
         return 0
 
     header = (
@@ -422,7 +535,8 @@ def main() -> int:
     # post char-truncation) - the honest number (issue #65, 10.9).
     if _inj is not None:
         tokens_used = _inj.estimate_tokens(ctx)
-    _log_inject_decision(rows, selected, status,
+    _log_inject_decision(rows, selected, status, injected_reason,
+                         omitted=omitted,
                          tokens_used=tokens_used, tokens_budget=tokens_budget)
     _emit_envelope(ctx)
     return 0

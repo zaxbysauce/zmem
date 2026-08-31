@@ -554,5 +554,33 @@ class Issue82DocDriftTest(unittest.TestCase):
         self.assertIn("session-cadence", text)
 
 
+class Issue87DocDriftTest(unittest.TestCase):
+    """Issue #87 / #85 direction 1: the silent-inject reason split must be
+    documented with exact literals so operators can diagnose an empty pool
+    vs a below-bar rejection vs a budget wipe from the message alone."""
+
+    def test_skill_md_documents_silent_reasons(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in ("reason=empty-pool", "reason=omitted",
+                       "reason=below-bar", "reason=budget-drop",
+                       "reason=injected", "INJECT_SILENT_REASONS",
+                       "no durable memories retrieved for this prompt.",
+                       "no durable memories met the inject bar.",
+                       # Review PRR-89-007d: pin the session variant and the
+                       # budget sentences too — they are byte-exact contract
+                       # strings on the Hermes/MCP/hook surfaces.
+                       "no durable memories retrieved for this session.",
+                       "memories withheld: the injection token budget "
+                       "(ZMEM_INJECT_TOKEN_BUDGET)",
+                       "session memories withheld:"):
+            self.assertIn(needle, text, f"SKILL.md missing {needle!r}")
+
+    def test_skill_md_documents_bg_log_reason_field(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("zmem-bg.log", text)
+        self.assertIn("reason=", text,
+                      "SKILL.md must say zmem-bg.log carries reason=")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
