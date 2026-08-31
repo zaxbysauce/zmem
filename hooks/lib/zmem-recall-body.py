@@ -5,7 +5,11 @@ Consumers (all invoke this file AS A SCRIPT — the hyphenated filename
 cannot be imported):
   - zmem-recall.sh        (UserPromptSubmit)         mode "user_prompt"
   - zmem-precompact.sh    (PreCompact, Claude only)  mode "precompact"
-  - zmem-subagent-recall.sh (SubagentStart)          mode "recent"
+  - zmem-subagent-recall.sh (SubagentStart)          mode "subagent"
+    (task-text recall when the host event carries the delegated prompt,
+    recent pull otherwise; "recent" remains accepted for back-compat)
+  - zmem-pretool-recall.sh (PreToolUse, ZCode+Claude) mode "pretool"
+    (issue #90 / #85 C: query derived from the tool input itself)
 
 argv contract (see main()):
   argv[1] = absolute path to store.py (must exist or exit 0)
@@ -363,6 +367,52 @@ def _emit_envelope(ctx: str) -> None:
     print(json.dumps({"additionalContext": ctx}))
 
 
+def _pending_ops_path(session_id: str):
+    """Path of the pending-inject sidecar for a session (issue #90 / #85 C).
+
+    A pre-tool fence parked for hosts that may ignore pre-tool
+    additionalContext (Claude: documented since 2.1.9 but honored only on
+    newer builds) is consumed (and cleared) by the next user_prompt run —
+    guaranteed delivery even if the field is ignored. None without a
+    session id.
+    """
+    if not session_id:
+        return None
+    import re as _re
+    safe = _re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:128]
+    if not safe:
+        return None
+    return os.path.join(_data_dir(), "ops", safe + ".pending")
+
+
+def _write_pending(session_id: str, ctx: str) -> None:
+    path = _pending_ops_path(session_id)
+    if not path or not ctx:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(ctx)
+    except OSError:
+        pass  # fail-open: delivery degrades to the pre-tool emit alone
+
+
+def _consume_pending(session_id: str) -> str:
+    path = _pending_ops_path(session_id)
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            ctx = f.read()
+    except OSError:
+        return ""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return ctx if ctx.strip() else ""
+
+
 def _ops_helpers(store_py: str):
     """Load storelib/ops_tokens.py (issue #88 / #85 direction 2 —
     operation-token derivation for the inject query). Same path derivation
@@ -463,12 +513,113 @@ def main() -> int:
     # closed reason set, resolved once for the classification below.
     omitted = 0
     ops_tokens = []
+    session_id = ""
+    pending_ctx = ""
     silent_reasons, injected_reason = _reason_constants(store_py)
 
+    # Query selection per mode. `use_recent_pull` selects the query-less
+    # recent lane; otherwise `query` drives the recall lane.
+    use_recent_pull = False
+    query = None
+
     try:
+        raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
+        try:
+            stdin_obj = json.loads(raw_stdin)
+        except (ValueError, TypeError):
+            stdin_obj = None
+        if isinstance(stdin_obj, dict):
+            _sid = stdin_obj.get("session_id", "")
+            session_id = _sid if isinstance(_sid, str) else ""
+
         if mode == "precompact" or mode == "recent":
             # PreCompact and subagent-recall: re-inject the
             # high-confidence recent payload. No prompt text.
+            use_recent_pull = True
+        elif mode == "pretool":
+            # PreToolUse (issue #90 / #85 C): the query is derived from the
+            # TOOL INPUT ITSELF — the command or file path about to run.
+            # This is the only event that sees `git stash pop` before it
+            # executes (the exact #85 failure shape). Non-operation events
+            # derive to nothing and stay silent (fail-open, exit 0). The
+            # kill switch is GLOBAL (review round 1): ZMEM_QUERY_CONTEXT=0
+            # silences every query-context lane, this one included — an
+            # operator flipping it expects silence, and this lane costs a
+            # subprocess per matched tool call.
+            _ops_mod = _ops_helpers(store_py)
+            if _ops_mod is None:
+                return 0
+            try:
+                if not _ops_mod.query_context_enabled():
+                    return 0
+            except Exception:
+                pass  # degrade to enabled — the switch itself must not crash
+            tool_desc = ""
+            if isinstance(stdin_obj, dict):
+                ti = stdin_obj.get("tool_input")
+                if isinstance(ti, dict):
+                    tool_desc = (ti.get("command") or ti.get("file_path")
+                                 or ti.get("notebook_path") or ti.get("path")
+                                 or "")
+                    if not isinstance(tool_desc, str):
+                        tool_desc = ""
+            try:
+                ops_tokens = _ops_mod.derive_ops_tokens(str(tool_desc))
+            except Exception:
+                ops_tokens = []
+            if not ops_tokens:
+                return 0
+            query = " ".join(ops_tokens)
+        elif mode == "subagent":
+            # SubagentStart (issue #90 / #85 D): prefer the delegated task
+            # text when the host event carries it (prompt/task/description),
+            # so a "fix CI" subagent queries the ratchet lessons instead of
+            # whatever recently landed; fall back to the recent pull when it
+            # does not (the payload historically has no task text).
+            task = ""
+            if isinstance(stdin_obj, dict):
+                for field in ("prompt", "task", "description"):
+                    _v = stdin_obj.get(field, "")
+                    if isinstance(_v, str) and len(_v.strip()) >= 5:
+                        task = _v
+                        break
+            if task:
+                query = task[:500]
+            else:
+                use_recent_pull = True
+        else:
+            # UserPromptSubmit: the prompt text is the QUERY.
+            # PRR-003 fix: stdin carries the host's JSON EVENT
+            # ({"prompt": ..., "session_id": ..., "cwd": ...}); parse out
+            # the prompt field (the pre-#58 wrapper contract). Non-JSON
+            # stdin (plain text) is used verbatim for manual invocation.
+            if isinstance(stdin_obj, dict):
+                prompt = stdin_obj.get("prompt", "")
+                if not isinstance(prompt, str):
+                    prompt = ""
+            else:
+                prompt = raw_stdin
+            if not prompt or len(prompt.strip()) < 5:
+                return 0
+            # Issue #90 / #85 C: first consume any pending pre-tool fence
+            # parked for a host that may not honor additionalContext
+            # pre-tool (Claude) — deliver it even if this prompt's own
+            # recall is silent, then clear the sidecar.
+            pending_ctx = _consume_pending(session_id)
+            # Issue #88 / #85 direction 2: decision-point prompts are prose
+            # with zero lexical overlap with the operation-adjacent lessons
+            # that matter; append this session's recent tool-operation tokens
+            # (from the PostToolUse ring) to the query. Fail-open: no ring /
+            # opt-out / derivation error ⇒ prose-only query, byte-identical
+            # to the pre-#88 behavior (compose is the identity then).
+            _ops_mod = _ops_helpers(store_py)
+            ops_tokens = _ops_query_tokens(store_py, session_id)
+            if _ops_mod is not None and ops_tokens:
+                query = _ops_mod.compose_inject_query(prompt, " ".join(ops_tokens))
+            else:
+                query = prompt[:500]
+
+        if use_recent_pull:
             out = subprocess.check_output(
                 [
                     sys.executable, store_py, "recent",
@@ -484,36 +635,6 @@ def main() -> int:
                 timeout=8,
             ).decode("utf-8", "replace")
         else:
-            # UserPromptSubmit: the prompt text is the QUERY.
-            # PRR-003 fix: stdin carries the host's JSON EVENT
-            # ({"prompt": ..., "session_id": ..., "cwd": ...}); parse out
-            # the prompt field (the pre-#58 wrapper contract). Non-JSON
-            # stdin (plain text) is used verbatim for manual invocation.
-            raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
-            prompt = ""
-            session_id = ""
-            try:
-                obj = json.loads(raw_stdin)
-                if isinstance(obj, dict):
-                    prompt = obj.get("prompt", "")
-                    _sid = obj.get("session_id", "")
-                    session_id = _sid if isinstance(_sid, str) else ""
-            except (ValueError, TypeError):
-                prompt = raw_stdin
-            if not prompt or len(prompt.strip()) < 5:
-                return 0
-            # Issue #88 / #85 direction 2: decision-point prompts are prose
-            # with zero lexical overlap with the operation-adjacent lessons
-            # that matter; append this session's recent tool-operation tokens
-            # (from the PostToolUse ring) to the query. Fail-open: no ring /
-            # opt-out / derivation error ⇒ prose-only query, byte-identical
-            # to the pre-#88 behavior (compose is the identity then).
-            _ops_mod = _ops_helpers(store_py)
-            ops_tokens = _ops_query_tokens(store_py, session_id)
-            if _ops_mod is not None and ops_tokens:
-                query = _ops_mod.compose_inject_query(prompt, " ".join(ops_tokens))
-            else:
-                query = prompt[:500]
             out = subprocess.check_output(
                 [
                     sys.executable, store_py, "recall",
@@ -597,6 +718,18 @@ def main() -> int:
             tokens_budget=tokens_budget if budget_emptied else None,
             ops_count=len(ops_tokens),
         )
+        if mode == "pretool":
+            # Issue #90 / #85 C: a per-tool-call one-liner would inject noise
+            # on every unmatched operation — PreToolUse stays fully silent
+            # when nothing qualified (the log line above carries the reason).
+            # A parked pending fence is still delivered by the NEXT
+            # user_prompt run, so nothing is lost.
+            return 0
+        if pending_ctx:
+            # Issue #90 / #85 C: deliver the parked pre-tool fence even when
+            # this prompt's own recall is silent — it was never seen.
+            _emit_envelope(pending_ctx)
+            return 0
         _emit_envelope(ctx)
         return 0
 
@@ -615,6 +748,16 @@ def main() -> int:
         closer = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
         body_budget = max(0, budget - len(closer) - 1)
         ctx = ctx[:body_budget].rstrip() + "\n" + closer + "\n[recall truncated]"
+    if pending_ctx and ctx:
+        # Issue #90 / #85 C: prepend the parked pre-tool fence (same turn's
+        # operation context) to this prompt's recall — then re-apply the
+        # char budget to the COMBINED block (review round 1): the budget is
+        # the outer stop for the emitted context, not per-recall.
+        ctx = pending_ctx + "\n\n" + ctx
+        if budget > 0 and len(ctx) > budget:
+            closer = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
+            body_budget = max(0, budget - len(closer) - 1)
+            ctx = ctx[:body_budget].rstrip() + "\n" + closer + "\n[recall truncated]"
     # tokens_used is measured on the FINAL emitted context (post budget,
     # post char-truncation) - the honest number (issue #65, 10.9).
     if _inj is not None:
@@ -623,6 +766,14 @@ def main() -> int:
                          omitted=omitted,
                          tokens_used=tokens_used, tokens_budget=tokens_budget,
                          ops_count=len(ops_tokens))
+    if mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude":
+        # Issue #90 / #85 C: older Claude builds ignore pre-tool
+        # additionalContext (documented since 2.1.9) — park the
+        # fence so the next user_prompt run is REQUIRED to deliver it even
+        # if the pre-tool emit was ignored. ZCode additionalContext is
+        # documented honored, so no sidecar there; worst case on Claude is
+        # one duplicate delivery, never a lost one.
+        _write_pending(session_id, ctx)
     _emit_envelope(ctx)
     return 0
 

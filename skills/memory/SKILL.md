@@ -207,6 +207,63 @@ the query. Explicit surfaces (`recall --query`, `search`) are unchanged.
 Limitation (deliberate, see #88): this helps LATER turns only — the first
 tool call of a turn still runs before any operation context exists.
 
+#### Pre-tool inject — issue #90 / #85 direction C
+
+On hosts whose pre-tool contract was probed and confirmed (ZCode: documented;
+Claude: emitted plus a pending sidecar the next prompt must deliver), a
+PreToolUse hook (`zmem-pretool-recall.sh`, matcher
+`Edit|Write|MultiEdit|NotebookEdit|Bash`) derives the recall query from the
+tool input ITSELF — the command or file path about to run — and injects
+matching hazard lessons before the tool executes. Pre-tool
+`additionalContext` is documented on Claude Code (since 2.1.9 it lands
+alongside the tool result; pausing is `permissionDecision`-driven only) —
+the pending sidecar covers older hosts that ignore the field, and requires
+the host event's `session_id` (without it the direct emit is the only
+delivery). The hook NEVER denies (a surfaced hazard is information, not
+grounds to block a legitimate command) and stays fully silent when nothing
+qualified. `ZMEM_QUERY_CONTEXT=0` silences every query-context lane, this
+one included. Hermes delivers the equivalent on `pre_llm_call` (after the
+fact of the producing call), best-effort per ring CURSOR
+`(ts, event-count)` — same-second events still deliver; a transient store
+failure after the at-most-once marker skips that cursor's delivery. Hermes
+delivery currently queries the `user:global` namespace only (the Hermes
+hook events carry no namespace); project-scoped operation context delivers
+on the coding-host PreToolUse surface. All query-context persistence
+(rings, delivery markers, pending fences) lives under `<data>/ops/`
+sidecars and never grows the store's tables. Codex has no pre-tool
+context injection (documented gap).
+
+Inject surface parity (host facts, not aspirations): Claude Code registers
+SubagentStart (task-text recall when the event carries the delegated
+prompt) and PreCompact; Codex registers SubagentStart/SubagentStop but has
+no PreCompact and no pre-tool context injection. **ZCode supports exactly
+seven hook events — SessionStart, UserPromptSubmit, PreToolUse,
+PermissionRequest, PostToolUse, PostToolUseFailure, Stop — so SubagentStart
+and PreCompact are host gaps on ZCode** (an unsupported event name would be
+dead config under the host's strict schema, so they are documented here
+instead of registered). If ZCode grows either event, wire
+`zmem-subagent-recall.sh` / `zmem-precompact.sh` immediately.
+
+#### Decision-point checkpoints (REQUIRED skill contract) — #85 direction E
+
+When an agent is about to run one of the named hazardous operations, the
+skill/workflow driving it MUST first run an explicit recall and treat any
+hit as blocking review (read the lesson before proceeding; do not skip it
+because the task feels urgent):
+
+- before `git stash pop` / any stash-consume — `recall --query "git stash
+  pop foreign stash conflict"` (a blind pop can apply a foreign stash)
+- before `git reset --soft` (squash assembly) — `recall --query "git reset
+  soft origin main stale tree"` (a fetch may have moved the base)
+- before `git push` — `recall --query "git push stale tree fetch rebase
+  verify"` (verify the tree against the fetched base first)
+- before editing any file named by a stored citation/ratchet lesson —
+  `recall --query "<path basename> ratchet citation re-pin"` (cited-file
+  edits have local gate batteries)
+
+These checkpoints complement the pre-tool hook; they are not a substitute
+for it (an agent improvising a raw command is exactly who the hook covers).
+
 #### Schema forward-compatibility (issue #65 follow-up)
 
 A client refuses a store whose `schema_version` is above its ceiling.

@@ -13,6 +13,36 @@ README.
 ## [Unreleased]
 
 ### Added
+- **Pre-tool inject** (issue #90, #85 direction C — host-probed): new
+  `hooks/zmem-pretool-recall.sh` + shared-body `pretool` mode derive the
+  recall query from the TOOL INPUT itself (the command/file path about to
+  run — the only moment that sees `git stash pop` before it executes).
+  Registered on ZCode and Claude (`PreToolUse`, matcher
+  `Edit|Write|MultiEdit|NotebookEdit|Bash`); never denies; fully silent when
+  nothing qualified. Claude additionally parks the fence in a pending
+  sidecar the next UserPromptSubmit run must deliver — the sidecar covers
+  older hosts that ignore pre-tool `additionalContext` (documented and
+  supported since Claude Code 2.1.9, where it lands alongside the tool
+  result; pausing is `permissionDecision`-driven only — worst case one
+  duplicate, never a lost delivery). Codex stays unregistered
+  (rejects `hookSpecificOutput.additionalContext`, openai/codex#19385) —
+  documented gap.
+- **SubagentStart task-text recall** (issue #90, #85 direction D): the
+  shared body's new `subagent` mode prefers the delegated task text
+  (prompt/task/description) over the query-less recent pull when the host
+  event carries it; falls back otherwise. ZCode has no SubagentStart /
+  PreCompact events (exactly seven supported events — documented gap, not
+  inert registrations).
+- **Hermes `pre_llm_call` operation-context delivery** (issue #90, #85 C):
+  the reflect hook delivers ring-tail recall as context when the session's
+  query-context ring grew since the last delivery (at-most-once per ring
+  timestamp; `ZMEM_QUERY_CONTEXT=0` kill switch). Hermes has no pre-tool
+  event, so this lands after the producing call — stated.
+- **Decision-point checkpoint skill contract** (issue #90, #85 direction E):
+  the memory and closeout skills REQUIRE an explicit `recall --query` before
+  stash-consume / `git reset --soft` / push / cited-file edits, with a hit
+  treated as blocking review; pinned by doc-drift-style tests. No
+  `store.py checkpoint` subcommand.
 - **Query context: prior-turn operation tokens on the passive inject query**
   (issue #88, #85 direction 2): the PostToolUse hooks record each
   Edit/Write/Bash event to a byte-capped per-session ring
@@ -28,21 +58,6 @@ README.
   (fixture rowids 65–70) asserts the #85-shaped prompts retrieve the
   hazard lessons WITH ops context and miss without it.
 
-### Fixed
-- **Hook/Hermes silent inject no longer blames the bar when the pool was
-  empty** (issue #85, direction 1 per #87): the UserPromptSubmit / PreCompact /
-  SubagentStart hook body, the Hermes `session_start` tool, and its MCP twin
-  now name WHICH gate fired. The hook body's retrieved-empty one-liner is
-  `no durable memories retrieved for this prompt.`; the Hermes/MCP session
-  variant is `no durable memories retrieved for this session.` (both cover
-  empty pool / passive-filter omit); gate rejection keeps the byte-identical
-  `no durable memories met the inject bar.`; a token-budget wipe says so in
-  its own words. `zmem-bg.log` lines carry `reason=` (closed
-  `INJECT_SILENT_REASONS` set in schema_meta) and `omitted=N` when the
-  passive injection-risk filter dropped rows. No ranking, floor, budget, or
-  omit membership change; no schema change.
-
-### Added
 - **`recall --explain`** (issue #82): read-only retrieval debugger with
   `--target` (id/prefix/fragment) and a machine-readable `--json` envelope;
   zero writes, closed `EXPLAIN_REASONS` set, fail-open on tracer errors.
@@ -61,6 +76,20 @@ README.
 - Four high-precision prompt-injection patterns (role hijack, concealment,
   instruction-override paraphrases, store-mutation imperatives) — picked up at
   emit time by every existing store, no migration.
+
+### Fixed
+- **Hook/Hermes silent inject no longer blames the bar when the pool was
+  empty** (issue #85, direction 1 per #87): the UserPromptSubmit / PreCompact /
+  SubagentStart hook body, the Hermes `session_start` tool, and its MCP twin
+  now name WHICH gate fired. The hook body's retrieved-empty one-liner is
+  `no durable memories retrieved for this prompt.`; the Hermes/MCP session
+  variant is `no durable memories retrieved for this session.` (both cover
+  empty pool / passive-filter omit); gate rejection keeps the byte-identical
+  `no durable memories met the inject bar.`; a token-budget wipe says so in
+  its own words. `zmem-bg.log` lines carry `reason=` (closed
+  `INJECT_SILENT_REASONS` set in schema_meta) and `omitted=N` when the
+  passive injection-risk filter dropped rows. No ranking, floor, budget, or
+  omit membership change; no schema change.
 
 ### Tests
 - `tests/test_explain_recall.py`: every explain reason, zero-write and

@@ -10,11 +10,14 @@
 # session would. This is the "recall into subagents" half of box-wide memory
 # (PLAN.md §5).
 #
-# WHY `recent`, not `recall`: SubagentStart carries NO task/prompt text (payload
-# keys: session_id, transcript_path, cwd, prompt_id, agent_id, agent_type,
-# hook_event_name — Phase 7 empirical dump), so there is no query to FTS on. The
-# spec primary behavior is "scoped to the namespace (+ user:global)", which is
-# exactly the query-less recent pull session-start already uses for Tier 2.
+# WHY `recent`, not `recall`: SubagentStart carried NO task/prompt text when
+# this hook was written (payload keys: session_id, transcript_path, cwd,
+# prompt_id, agent_id, agent_type, hook_event_name — Phase 7 empirical dump).
+# Issue #90 / #85 D: hosts that DO include the delegated prompt in the event
+# now get task-text recall (mode "subagent" probes prompt/task/description
+# and falls back to this same query-less recent pull when none is present),
+# so a "fix CI" subagent queries the ratchet lessons instead of whatever
+# recently landed.
 # (agent_type is passed through to the shared body, which renders it in
 # the header — preserving the pre-#58 header contract.)
 #
@@ -141,7 +144,9 @@ BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 # The body lives in hooks/lib/zmem-recall-body.py and is invoked as a
 # subprocess exactly like zmem-recall.sh and zmem-precompact.sh do —
 # the file is HYPHENATED, so it cannot be `import`ed; every consumer
-# runs it as a script (final-critic round 2 fix). Mode "recent" emits
+# runs it as a script (final-critic round 2 fix). Mode "subagent" (issue
+# #90 / #85 D) prefers the delegated task text when the host event carries
+# it and otherwise falls back to the query-less recent pull; it emits
 # the full {"additionalContext": ...} envelope with the fenced,
 # provenance-tagged render and the selective-inject gate applied.
 # Limits 5/3 preserve this hook's pre-existing pull width (up to 5
@@ -155,7 +160,7 @@ fi
 if [ -n "${RECALL_BODY_MISSING:-}" ]; then
   CTX_JSON='{}'
 else
-  CTX_JSON="$("$PYTHON_BIN" "$RECALL_BODY" "$STORE_PY_PY" "$NS" "$BUDGET" "recent" "5" "3" "$AGENT_TYPE" 2>/dev/null || echo '{}')"
+  CTX_JSON="$(printf '%s' "$INPUT" | "$PYTHON_BIN" "$RECALL_BODY" "$STORE_PY_PY" "$NS" "$BUDGET" "subagent" "5" "3" "$AGENT_TYPE" 2>/dev/null || echo '{}')"
 fi
 
 if [ -z "$CTX_JSON" ]; then

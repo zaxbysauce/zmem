@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -43,6 +44,11 @@ _PENDING_FAILURE_KEY = "hermes_pending_failure_{session}"
 # the convention hook would suppress every failure after the first delivered).
 _FAILURE_CAPTURED_KEY = "hermes_failure_captured_{session}"
 _REFLECT_PROMPTED_KEY = "hermes_reflect_prompted_{session}"
+# Issue #90 / #85 C: the query-context delivery marker lives in the ops/
+# SIDECAR namespace (<data>/ops/<session>.delivered via ops_tokens), NOT in
+# the store's meta table — the read-path delivery surfaces keep all their
+# persistence in sidecars (final-critic finding; the nudge flags above are
+# the established meta-table pattern and predate this).
 
 
 def _resolve_store_path() -> Path:
@@ -187,10 +193,92 @@ def _reflect_nudge(session: str, count: int) -> str:
     )
 
 
+def _query_context_delivery(conn: sqlite3.Connection, session: str,
+                            store_path: Path) -> str:
+    """Issue #90 / #85 C: deliver operation-context recall on pre_llm_call.
+
+    Hermes has no pre-tool event (post_tool_call is observational — its
+    results are discarded), so the closest prevention point is here: when the
+    session's query-context ring (#88) grew since the last delivery, run
+    recall on the ring tail and inject the fenced results before the next
+    model call. This still misses the tool invocation that produced the
+    verbs — stated in issue #90's matrix; attach to a consumed pre-tool hook
+    if Hermes grows one.
+
+    At-most-once per ring CURSOR ``(ts, parsed-event-count)`` — the count
+    catches a second event appended in the same second (final-critic
+    finding); the marker sidecar is written before the subprocess so a
+    crash cannot re-deliver. Kill switch ZMEM_QUERY_CONTEXT=0. Returns ""
+    on silence. Persists ONLY under the ops/ sidecar namespace (never the
+    store's meta table).
+    """
+    try:
+        if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
+            return ""
+        _rel = Path("skills") / "memory" / "scripts"
+        candidates = [
+            Path(__file__).resolve().parents[2] / _rel,
+            Path(os.environ.get("ZMEM_HOME", "")).expanduser() / _rel,
+        ]
+        scripts_dir = next((c for c in candidates if (c / "host.py").is_file()),
+                           None)
+        if scripts_dir is None:
+            return ""
+        sys.path.insert(0, str(scripts_dir / "storelib"))
+        import ops_tokens  # noqa: E402  (stdlib-only, like this hook)
+
+        data_dir = str(store_path.parent)
+        cursor = ops_tokens.ring_cursor(data_dir, session)
+        if cursor <= (0.0, 0):
+            return ""
+        if cursor <= ops_tokens.read_delivered_cursor(data_dir, session):
+            return ""
+        events = ops_tokens.read_ops_ring(data_dir, session)
+        query = " ".join(ops_tokens.derive_ops_tokens(*events))
+        if not query:
+            return ""
+        # At-most-once: mark before the subprocess so a crash cannot
+        # re-deliver (a transient recall failure after the mark skips that
+        # cursor's delivery — documented best-effort).
+        ops_tokens.write_delivered_cursor(data_dir, session, cursor)
+
+        r = subprocess.run(
+            [sys.executable, str(scripts_dir / "store.py"), "recall",
+             "--query", query[:500],
+             "--namespace", os.environ.get("ZMEM_NAMESPACE") or "user:global",
+             "--limit", "5", "--include-global", "--global-limit", "3",
+             "--no-bump", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        stdout = (r.stdout or "").strip()
+        if not stdout:
+            return ""
+        parsed = json.loads(stdout)
+        rows = parsed.get("results", []) if isinstance(parsed, dict) else parsed
+        if not isinstance(rows, list) or not rows:
+            return ""
+        try:
+            from storelib.inject import apply_token_budget  # noqa: E402
+            rows, _est, _dropped = apply_token_budget(rows)
+        except Exception:
+            pass
+        if not rows:
+            return ""
+        from storelib.recall import _format_fenced_recall  # noqa: E402
+        header = (
+            "Relevant memories (zmem pre_llm_call operation context, session "
+            f"{session}). Consider if they apply; ignore if not."
+        )
+        return _format_fenced_recall(rows, header)
+    except Exception:
+        return ""
+
+
 def main() -> int:
     payload = _read_payload()
     session = _session_id(payload)
 
+    store_path = _resolve_store_path()
     conn = _connect()
     if conn is None:
         _emit_empty()
@@ -203,10 +291,18 @@ def main() -> int:
             _emit_context(_failure_nudge(session))
             _meta_clear(conn, fail_key)
             # Also clear the one-shot captured marker so a subsequent failure
-            # in the same session can re-arm a nudge. Without this, the
+            # in this session can re-arm a nudge. Without this, the
             # convention hook's _FAILURE_CAPTURED_KEY would suppress every
             # failure after the first delivered one.
             _meta_clear(conn, _FAILURE_CAPTURED_KEY.format(session=session))
+            return 0
+
+        # Priority 1.5 (issue #90 / #85 C): operation-context recall on fresh
+        # ring verbs. Independent at-most-once marker, so it never starves or
+        # duplicates the nudges below.
+        ctx = _query_context_delivery(conn, session, store_path)
+        if ctx:
+            _emit_context(ctx)
             return 0
 
         # Priority 2: pending convention nudge.
