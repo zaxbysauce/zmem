@@ -193,11 +193,16 @@ tool commands the session is executing. The PostToolUse hooks
 each Edit/Write/Bash event to a per-session ring at
 `<data>/ops/<session>.log`, storing ONLY the tool name plus allowlisted
 tokens (git subcommand chains, test-runner verbs, edited-path basenames) —
-never a raw command dump, stdout, or secrets; argument values that are bare
-words are dropped. The UserPromptSubmit body and the Hermes `prefetch`
+never a raw command dump, stdout, or argument values that are bare words;
+secret-shaped tokens (common credential prefixes like `ghp_`/`sk-`/`xox?-`)
+are dropped as well. The ring is byte-capped: past 64 KB it is trimmed to
+the newest 64 lines. The UserPromptSubmit body and the Hermes `prefetch`
 compose that ring into the query, with the ops tail occupying a fixed
-reserved slice INSIDE the 500-char cap (never appended past it). `ZMEM_QUERY_CONTEXT=0`
-is the kill switch. `zmem-bg.log` lines carry `ops=N` when tokens augmented
+reserved slice INSIDE the 500-char cap (never appended past it; the
+separator shares the slice, so no token is severed).
+`ZMEM_QUERY_CONTEXT=0` is the lane kill switch — it stops BOTH composition
+and ring collection (an operator disabling the lane expects no sidecar
+writes). `zmem-bg.log` lines carry `ops=N` when tokens augmented
 the query. Explicit surfaces (`recall --query`, `search`) are unchanged.
 Limitation (deliberate, see #88): this helps LATER turns only — the first
 tool call of a turn still runs before any operation context exists.

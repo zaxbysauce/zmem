@@ -290,6 +290,9 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
             "id": item.id,
             "bucket": item.bucket,
             "query": item.query,
+            # Review PRR-91-006: for ops items the recall ran on the COMPOSED
+            # query — record it so report rows reflect what was executed.
+            "ops_query": query if item.ops else None,
             "as_of": _normalize_as_of(item.as_of) if item.as_of else None,
             "k": k,
             "explicit": item.explicit,
@@ -326,9 +329,9 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
 # subset). A single constant makes key drift an import-time-visible edit in
 # ONE place instead of a runtime KeyError in the runner.
 PER_ITEM_REPORT_KEYS = (
-    "id", "bucket", "query", "as_of", "k", "explicit", "hit", "text_hit",
-    "first_hit_rank", "excluded_ids_surfaced", "injection_omitted",
-    "ranked_ids", "ok",
+    "id", "bucket", "query", "ops_query", "as_of", "k", "explicit", "hit",
+    "text_hit", "first_hit_rank", "excluded_ids_surfaced",
+    "injection_omitted", "ranked_ids", "ok",
 )
 
 

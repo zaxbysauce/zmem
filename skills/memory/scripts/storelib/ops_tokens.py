@@ -36,6 +36,16 @@ from typing import List
 # A token must be entirely allowlisted characters to be emitted.
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9._/+-]+$")
 
+# Secret-SHAPED tokens (review PRR-91-002): common credential prefixes are
+# dropped before the file-shaped gate so a literal token pasted into a
+# command never lands on disk or in a query. Shape check, not a redaction
+# guarantee — operators must still not paste secrets into commands.
+_SECRET_SHAPE_RE = re.compile(
+    r"^(?:gh[pousr]_|github_pat_|sk-ant|sk-proj|sk-|xox[baprs]-|AKIA|"
+    r"glpat-|shpat_|dop_v1_|npm_|pypi-)",
+    re.IGNORECASE,
+)
+
 # Command verbs whose SUBCOMMANDS carry the retrieval signal (a bare "git" or
 # "bun" token matches nothing useful; "git stash pop" is the lesson-shaped
 # phrase). Ordered longest-first is irrelevant here — we walk the command's
@@ -124,11 +134,16 @@ def derive_ops_tokens(*events: str) -> List[str]:
             # (a dot/dash/underscore/slash — paths, test files, refs like
             # origin/main). A bare word argument ('hunter2', 'main') is an
             # argument VALUE and never reaches the ring (spec B: allowlisted
-            # argv tokens only, no secrets).
+            # argv tokens only, no secrets). Secret-SHAPED tokens (common
+            # credential prefixes — review PRR-91-002) are dropped even when
+            # file-shaped: a literal `ghp_…` pasted into a command must not
+            # land on disk or in a query.
             _push(head)
             for i, w in enumerate(words[1:5]):
                 t = _clean_token(w)
                 if not t or t.startswith("-"):
+                    continue
+                if _SECRET_SHAPE_RE.match(t):
                     continue
                 if i == 0 or t in _HAZARDOUS_SUBS or any(
                         c in t for c in "./_-"):
@@ -140,13 +155,18 @@ def derive_ops_tokens(*events: str) -> List[str]:
             last = words[-1] if words else ""
             base = last.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
             t = _clean_token(base)
-            if t and ("." in t or "-" in t or "_" in t):
-                _push(t)
+            if t and not _SECRET_SHAPE_RE.match(t):
+                if "." in t or "-" in t or "_" in t:
+                    _push(t)
 
-    # Bound the total tail size.
+    # Bound the total tail size. A single token longer than the reserved
+    # slice can never fit whole (review PRR-91-014) — drop it rather than
+    # sever it mid-word downstream.
     tail: List[str] = []
     used = 0
     for tok in out:
+        if len(tok) > _RESERVED_TAIL_CHARS:
+            continue
         if used + len(tok) + 1 > _MAX_TAIL_CHARS:
             break
         tail.append(tok)
@@ -160,6 +180,10 @@ def compose_inject_query(prompt: str, ops: str) -> str:
     (never appended after it — #85 spec B: concatenating then capping keeps
     the prose and throws away the operation verbs on long prompts).
 
+    The separator shares the reserved budget (prose ≤ 349 + " " + tail ≤ 150
+    = 500 exactly, review PRR-91-003), and derive_ops_tokens never returns a
+    token longer than the slice — so no token is ever severed mid-word.
+
     BYTE-EXACT IDENTITY CONTRACT: when ``ops`` is empty (or yields no
     tokens) the result is exactly ``prompt.strip()[:500]`` — this is what
     keeps every legacy gold item's query, and therefore the committed eval
@@ -171,9 +195,10 @@ def compose_inject_query(prompt: str, ops: str) -> str:
         return base
     tail = " ".join(tokens)
     if len(tail) > _RESERVED_TAIL_CHARS:
-        # Cut at the last complete token so a verb is never severed mid-word.
+        # Cut at the last complete token (tokens are each ≤ the slice, so a
+        # space boundary always exists within the cut for multi-token tails).
         tail = tail[:_RESERVED_TAIL_CHARS].rsplit(" ", 1)[0]
-    prose_budget = max(0, _PROMPT_KEEP_CHARS - _RESERVED_TAIL_CHARS)
+    prose_budget = max(0, _PROMPT_KEEP_CHARS - _RESERVED_TAIL_CHARS - 1)
     prose = base[:prose_budget].rstrip()
     return (prose + " " + tail).strip()[:_PROMPT_KEEP_CHARS]
 

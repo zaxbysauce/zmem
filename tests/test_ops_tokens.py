@@ -92,6 +92,25 @@ class DeriveTokensTest(unittest.TestCase):
         self.assertEqual(ops_tokens.derive_ops_tokens("   "), [])
         self.assertEqual(ops_tokens.derive_ops_tokens("plainword"), [])
 
+    def test_secret_shaped_tokens_dropped(self):
+        # Review PRR-91-002: credential-prefix tokens never reach the ring.
+        self.assertEqual(
+            ops_tokens.derive_ops_tokens("git clone ghp_AbCdEf123456"),
+            ["git", "clone"])
+        self.assertEqual(
+            ops_tokens.derive_ops_tokens("git push xoxb-123456"),
+            ["git", "push"])
+        self.assertEqual(
+            ops_tokens.derive_ops_tokens("bun test sk-ant-api03-xxxx"),
+            ["bun", "test"])
+
+    def test_single_oversized_token_dropped_not_severed(self):
+        # Review PRR-91-014: a token longer than the reserved slice cannot
+        # fit whole — it is dropped, never severed mid-word downstream.
+        long_tok = "a" * 200 + ".test.ts"
+        self.assertEqual(ops_tokens.derive_ops_tokens("bun test " + long_tok),
+                         ["bun", "test"])
+
     def test_caps_and_dedup(self):
         toks = ops_tokens.derive_ops_tokens(*(["git push origin HEAD"] * 30))
         self.assertLessEqual(len(toks), 12)
@@ -126,8 +145,30 @@ class ComposeQueryTest(unittest.TestCase):
         self.assertTrue(composed.endswith("git stash pop"))
         self.assertLessEqual(len(composed), 500)
 
+    def test_boundary_prose_349_tail_150_exact(self):
+        # Review PRR-91-003: the separator shares the reserved budget, and
+        # multi-token tails are cut at a space boundary, never mid-token.
+        prose = "x" * 400
+        tail = ("git stash pop " * 20).strip()
+        composed = ops_tokens.compose_inject_query(prose, tail)
+        self.assertLessEqual(len(composed), 500)
+        self.assertIn(" ", composed[349:])
+
+    def test_single_token_at_slice_cap_not_severed(self):
+        tok = "b" * 147 + ".ts"  # 150 chars, file-shaped so derivation keeps it
+        composed = ops_tokens.compose_inject_query("x" * 349, tok)
+        self.assertEqual(composed, "x" * 349 + " " + tok)
+        self.assertEqual(len(composed), 500)
+
     def test_kill_switch_env(self):
-        self.assertTrue(ops_tokens.query_context_enabled())
+        # Review PRR-91-010: isolate from ambient env — a host exporting
+        # ZMEM_QUERY_CONTEXT=0 must not fail the enabled-by-default assert.
+        saved = os.environ.pop("ZMEM_QUERY_CONTEXT", None)
+        try:
+            self.assertTrue(ops_tokens.query_context_enabled())
+        finally:
+            if saved is not None:
+                os.environ["ZMEM_QUERY_CONTEXT"] = saved
         saved = os.environ.get("ZMEM_QUERY_CONTEXT")
         try:
             os.environ["ZMEM_QUERY_CONTEXT"] = "0"
@@ -316,6 +357,44 @@ class ConventionCaptureRingTest(unittest.TestCase):
 class HermesConventionRingTest(unittest.TestCase):
     """The Hermes post_tool_call hook records the verb on the same ring."""
 
+    def test_post_tool_call_precedence_and_fallback(self):
+        # Review PRR-91-012: extra.command wins over payload.tool_input;
+        # payload.tool_input.command is the fallback when extra has none.
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-hermes-prec-")
+        env = _clean_env(tmp, ZMEM_HOME=str(REPO_ROOT))
+        try:
+            ring = Path(tmp, "ops", "s-prec.log")
+            payload = json.dumps({
+                "session_id": "s-prec",
+                "tool_input": {"command": "git stash pop"},
+                "extra": {"status": "ok", "tool": "Bash",
+                          "command": "bun test ratchet.test.ts"},
+            })
+            subprocess.run(
+                [sys.executable,
+                 str(REPO_ROOT / "hermes-plugin" / "hooks" /
+                     "zmem-hermes-convention.py")],
+                input=payload, capture_output=True, text=True, env=env,
+                timeout=60)
+            obj = json.loads(ring.read_text(encoding="utf-8").strip())
+            self.assertEqual(obj["ops"], "bun test ratchet.test.ts")
+            ring.unlink()
+            payload2 = json.dumps({
+                "session_id": "s-prec",
+                "tool_input": {"command": "git stash pop"},
+                "extra": {"status": "ok"},
+            })
+            subprocess.run(
+                [sys.executable,
+                 str(REPO_ROOT / "hermes-plugin" / "hooks" /
+                     "zmem-hermes-convention.py")],
+                input=payload2, capture_output=True, text=True, env=env,
+                timeout=60)
+            obj2 = json.loads(ring.read_text(encoding="utf-8").strip())
+            self.assertEqual(obj2["ops"], "git stash pop")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_post_tool_call_records_descriptor(self):
         tmp = tempfile.mkdtemp(prefix="zmem-ops-hermes-")
         env = _clean_env(tmp, ZMEM_HOME=str(REPO_ROOT))
@@ -393,6 +472,72 @@ class HookBodyComposeTest(unittest.TestCase):
                                  ZMEM_QUERY_CONTEXT="0")
             ctx = json.loads(out.strip())["additionalContext"]
             self.assertEqual(ctx, "no durable memories retrieved for this prompt.")
+
+            # Review PRR-91-013: ring present + recall returns nothing → the
+            # SILENT line still carries ops=N.
+            ring2 = Path(tmp, "ops", "sess-empty2.log")
+            ring2.write_text(
+                json.dumps({"ts": 2, "tool": "Bash",
+                            "ops": "kubectl rollout undo"}),
+                encoding="utf-8")
+            out = self._run_body(tmp, "keep finalizing this unrelated zebra",
+                                 "sess-empty2")
+            ctx = json.loads(out.strip())["additionalContext"]
+            self.assertNotIn("ringcanary", ctx)
+            line = [l for l in log.read_text(encoding="utf-8").splitlines()
+                    if "zmem-hook" in l][-1]
+            self.assertIn("status=silent", line)
+            self.assertRegex(line, r"ops=\d+")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class DataDirPrecedenceTest(unittest.TestCase):
+    """Review PRR-91-001: the ring reader (hook body) must resolve the data
+    dir ZMEM_STORE-first, matching the convention-capture writer — otherwise
+    split-env deployments silently no-op the lane."""
+
+    def test_reader_finds_ring_written_under_zmem_store_dir(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-precedence-")
+        try:
+            store_dir = Path(tmp, "store-loc")
+            data_dir = Path(tmp, "data-loc")
+            store_dir.mkdir()
+            data_dir.mkdir()
+            env = _clean_env(tmp)
+            env["ZMEM_STORE"] = str(store_dir / "store.sqlite")
+            env["ZMEM_DATA"] = str(data_dir)
+            _seed(env, "project:prec", HookBodyComposeTest.LESSON)
+            # Writer (convention-capture resolves ZMEM_STORE-first) writes
+            # under store-loc/ops — NOT under data-loc/ops.
+            bash = shutil.which("bash")
+            if not bash:
+                self.skipTest("no bash on PATH")
+            cenv = dict(env)
+            cenv.update({"ZMEM_ROOT": str(REPO_ROOT), "ZMEM_SESSION": "sess-p",
+                         "ZMEM_CONVENTION_INTERVAL": "10"})
+            event = json.dumps({"tool_name": "Bash",
+                                "tool_input": {"command": "git stash pop"},
+                                "session_id": "sess-p"})
+            subprocess.run(
+                [bash, str(REPO_ROOT / "hooks" / "zmem-convention-capture.sh")],
+                input=event, capture_output=True, text=True, env=cenv,
+                timeout=60)
+            self.assertTrue((store_dir / "ops" / "sess-p.log").is_file(),
+                            "writer must resolve ZMEM_STORE-first")
+            self.assertFalse((data_dir / "ops").exists())
+            # Reader (hook body) must find the ring under the SAME dir.
+            r = subprocess.run(
+                [sys.executable, str(BODY), str(SCRIPTS / "store.py"),
+                 "project:prec", "25000", "user_prompt"],
+                input=json.dumps({"prompt": "keep finalizing this work",
+                                  "session_id": "sess-p"}),
+                capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            ctx = json.loads(r.stdout.strip())["additionalContext"]
+            self.assertIn("ringcanary", ctx,
+                          "reader must resolve the ring from the "
+                          "ZMEM_STORE-parent dir like the writer")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -440,6 +585,16 @@ class HermesPrefetchComposeTest(unittest.TestCase):
             self.assertIn("prefetchcanary", out)
             out_nosid = provider.prefetch("keep finalizing this work")
             self.assertNotIn("prefetchcanary", out_nosid)
+
+            # Review PRR-91-009: the kill switch must silence the Hermes
+            # prefetch composition too.
+            os.environ["ZMEM_QUERY_CONTEXT"] = "0"
+            try:
+                out_ks = provider.prefetch("keep finalizing this work",
+                                           session_id="sess-pf")
+            finally:
+                os.environ.pop("ZMEM_QUERY_CONTEXT", None)
+            self.assertNotIn("prefetchcanary", out_ks)
 
             # Review round 1: a checkout where ops_tokens cannot be
             # imported (copy install without skills/, #36 M10) must

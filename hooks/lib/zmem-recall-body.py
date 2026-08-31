@@ -383,12 +383,16 @@ def _ops_helpers(store_py: str):
 
 
 def _data_dir() -> str:
-    """Resolve the data dir the same way _log_inject_decision does (the
-    ring must live beside the store the hook is reading)."""
+    """Resolve the data dir for the ops ring (and the bg log) with the SAME
+    precedence the bash writers use (host.resolve_store_path: ZMEM_STORE
+    first) — review PRR-91-001: the ring writer (convention-capture.sh)
+    resolves ZMEM_STORE-first, so a ZMEM_DATA-first reader here would look
+    in a different ops/ dir whenever both env vars are set to different
+    locations, silently no-op'ing the whole lane."""
+    store = os.environ.get("ZMEM_STORE", "")
+    if store:
+        return os.path.dirname(store)
     data_dir = os.environ.get("ZMEM_DATA", "")
-    if not data_dir:
-        store = os.environ.get("ZMEM_STORE", "")
-        data_dir = os.path.dirname(store) if store else ""
     if not data_dir:
         data_dir = os.path.join(os.path.expanduser("~"), ".zmem")
     return data_dir

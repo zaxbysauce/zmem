@@ -190,6 +190,9 @@ def _append_query_context(store_path: Path, session: str,
     provider's prefetch() composes it into the next turn's query.
     Fail-open: ring health never affects this hook."""
     try:
+        # Review PRR-91-004: the kill switch gates COLLECTION too.
+        if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
+            return
         desc = _op_descriptor(payload, extra)
         if not desc:
             return

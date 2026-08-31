@@ -268,13 +268,16 @@ commit_marker = sys.argv[7]
 # single source for the ring format). Best-effort: ring health never
 # affects this hook'"'"'s nudge behavior.
 try:
-    _op_event = json.loads(sys.argv[8]) if len(sys.argv) > 8 else {}
-    if isinstance(_op_event, dict) and _op_event.get("op"):
-        sys.path.insert(0, os.path.join(os.path.dirname(store_py_hint), "storelib"))
-        import ops_tokens as _ot
-        _ot.append_ops_ring(data_dir, session_id,
-                            str(_op_event.get("tool", "")),
-                            str(_op_event.get("op", "")))
+    # Review PRR-91-004: the kill switch gates COLLECTION too — an operator
+    # disabling the query-context lane expects no sidecar writes at all.
+    if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() != "0":
+        _op_event = json.loads(sys.argv[8]) if len(sys.argv) > 8 else {}
+        if isinstance(_op_event, dict) and _op_event.get("op"):
+            sys.path.insert(0, os.path.join(os.path.dirname(store_py_hint), "storelib"))
+            import ops_tokens as _ot
+            _ot.append_ops_ring(data_dir, session_id,
+                                str(_op_event.get("tool", "")),
+                                str(_op_event.get("op", "")))
 except Exception:
     pass
 

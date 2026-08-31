@@ -141,10 +141,20 @@ class TestRunnerEndToEnd(EvalRunnerTestBase):
             "decision-push-69": 1,
             "decision-worktree-70": 1,
         }
+        # Review PRR-91-008: EVERY decision item must be pinned — a renamed
+        # or added item without a pin must fail loudly here, not bypass.
+        actual_dec = {i["id"] for i in self.report["per_item"]
+                      if i["bucket"] == "decision-point"}
+        self.assertEqual(actual_dec, set(expected_ranks),
+                         "decision-point gold ids drifted from the rank pins")
         for it in self.report["per_item"]:
             if it["id"] in expected_ranks:
                 self.assertEqual(it["first_hit_rank"],
                                  expected_ranks[it["id"]], it["id"])
+                # Review PRR-91-006: ops items must report the composed query.
+                if it["bucket"] == "decision-point":
+                    self.assertIsNotNone(it.get("ops_query"), it["id"])
+                    self.assertNotEqual(it["ops_query"], it["query"], it["id"])
 
     def test_explicit_items_flow_through_and_stay_flagged(self):
         explicit = {it["id"]: it for it in self.report["per_item"]

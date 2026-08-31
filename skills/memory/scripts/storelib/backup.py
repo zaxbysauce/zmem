@@ -529,7 +529,8 @@ def cmd_sweep(marker_dir: str | None = None,
                 removed += 1
     if removed:
         verb = "would prune" if dry_run else "pruned"
-        print(f"[zmem] sweep: {verb} {removed} stale session sentinel(s)")
+        print(f"[zmem] sweep: {verb} {removed} stale session "
+              "sentinel(s)/sidecar(s)")
     return 0
 
 def _integrity_check_readonly(path: Path) -> str:
