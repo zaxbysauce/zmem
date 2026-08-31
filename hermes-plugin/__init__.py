@@ -243,6 +243,34 @@ def _load_inject():
 _INJECT = _load_inject()
 
 
+def _load_ops_tokens():
+    """Best-effort load of storelib/ops_tokens.py (issue #88 / #85
+    direction 2 — prior-turn operation context for the prefetch query).
+    Dependency-free like inject.py; same checkout resolution. Returns None
+    on any failure; callers degrade to the prose-only query (fail-open)."""
+    try:
+        import importlib.util
+        home = _resolve_zmem_home()
+        if home is None:
+            return None
+        path = home / "skills" / "memory" / "scripts" / "storelib" / "ops_tokens.py"
+        if not path.is_file():
+            return None
+        spec = importlib.util.spec_from_file_location("zmem_hermes_ops_tokens", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["zmem_hermes_ops_tokens"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as exc:
+        logger.debug("zmem: ops_tokens load failed (%s); prose-only query", exc)
+        return None
+
+
+_OPS_TOKENS = _load_ops_tokens()
+
+
 def _envelope_results(parsed: Any) -> List[Dict[str, Any]]:
     """Normalize a parsed recall/recent/search --json payload to a row list.
 
@@ -753,6 +781,22 @@ class ZmemMemoryProvider(MemoryProvider):
         if not query or not query.strip():
             return ""
         q = query.strip()[:_MAX_QUERY_CHARS]
+        # Issue #88 / #85 direction 2: compose with this session's recent
+        # tool-operation tokens (the PostToolUse/post_tool_call ring) — the
+        # ops tail occupies a reserved slice INSIDE the 500-char cap, never
+        # appended after it. Fail-open: kill switch (ZMEM_QUERY_CONTEXT=0),
+        # missing ring, or import failure keeps the prose-only query
+        # byte-identical (compose is the identity without ops material).
+        if session_id and _OPS_TOKENS is not None:
+            try:
+                if _OPS_TOKENS.query_context_enabled():
+                    _events = _OPS_TOKENS.read_ops_ring(
+                        str(_resolve_store_data_dir()), session_id)
+                    if _events:
+                        q = _OPS_TOKENS.compose_inject_query(
+                            query, " ".join(_events))
+            except Exception as exc:
+                logger.debug("zmem: query-context compose failed (%s)", exc)
         # Mirror the Claude Code UserPromptSubmit hook: union the user:global
         # tier into a project-scoped prefetch so cross-project lessons surface
         # (issue #18). When self._namespace IS user:global (the Hermes default),

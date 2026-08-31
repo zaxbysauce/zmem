@@ -111,17 +111,50 @@ class TestRunnerEndToEnd(EvalRunnerTestBase):
 
     def test_gold_set_has_issue_82_buckets(self):
         # Issue #82 honesty buckets: >=3 items each, all deterministic.
+        # Issue #88 adds the decision-point bucket (6 items, ops-composed).
         buckets = set(self.report["per_bucket"].keys())
         self.assertEqual(
             buckets,
             {"as-of", "injection", "namespace", "contested", "entity-alias",
-             "fts", "retraction", "polarity", "change-intent"})
-        self.assertEqual(len(self.report["per_item"]), 42)
+             "fts", "retraction", "polarity", "change-intent",
+             "decision-point"})
+        self.assertEqual(len(self.report["per_item"]), 48)
         for bucket in ("retraction", "polarity", "change-intent"):
             agg = self.report["per_bucket"][bucket]
             self.assertGreaterEqual(agg["items"], 3, bucket)
             self.assertEqual(agg["hits"], agg["items"], bucket)
             self.assertEqual(agg["excluded_surfaced"], 0, bucket)
+        # Decision-point items: all hit WITH ops composed (ranks pinned by
+        # the deterministic fixture; the prose-only MISS direction is pinned
+        # in tests/test_ops_tokens.py against the same fixture).
+        dec = self.report["per_bucket"]["decision-point"]
+        self.assertEqual(dec["items"], 6)
+        self.assertEqual(dec["hits"], 6)
+        # Review round 1: pin each item's first_hit_rank explicitly so a
+        # fixture-content drift cannot silently move a rank while hit@k
+        # still passes (the MRR pin below would then fail opaquely).
+        expected_ranks = {
+            "decision-stash-65": 1,
+            "decision-reset-66": 2,
+            "decision-ratchet-67": 1,
+            "decision-queue-68": 1,
+            "decision-push-69": 1,
+            "decision-worktree-70": 1,
+        }
+        # Review PRR-91-008: EVERY decision item must be pinned — a renamed
+        # or added item without a pin must fail loudly here, not bypass.
+        actual_dec = {i["id"] for i in self.report["per_item"]
+                      if i["bucket"] == "decision-point"}
+        self.assertEqual(actual_dec, set(expected_ranks),
+                         "decision-point gold ids drifted from the rank pins")
+        for it in self.report["per_item"]:
+            if it["id"] in expected_ranks:
+                self.assertEqual(it["first_hit_rank"],
+                                 expected_ranks[it["id"]], it["id"])
+                # Review PRR-91-006: ops items must report the composed query.
+                if it["bucket"] == "decision-point":
+                    self.assertIsNotNone(it.get("ops_query"), it["id"])
+                    self.assertNotEqual(it["ops_query"], it["query"], it["id"])
 
     def test_explicit_items_flow_through_and_stay_flagged(self):
         explicit = {it["id"]: it for it in self.report["per_item"]
@@ -145,8 +178,10 @@ class TestRunnerEndToEnd(EvalRunnerTestBase):
     def test_metrics_1_with_pinned_mrr(self):
         self.assertAlmostEqual(self.report["metrics"]["hit_at_k"], 1.0)
         # MRR counts only items with an include-assertion; the two
-        # exclude-only retraction items legitimately contribute 0 (40 of 42).
-        self.assertAlmostEqual(self.report["metrics"]["mrr"], 40 / 42)
+        # exclude-only retraction items legitimately contribute 0 (40 of 42
+        # pre-#88). Issue #88 adds six decision-point items with deterministic
+        # ranks 1,2,1,1,1,1 → rr sum 5.5 → (40 + 5.5) / 48.
+        self.assertAlmostEqual(self.report["metrics"]["mrr"], 45.5 / 48)
         self.assertAlmostEqual(self.report["metrics"]["as_of_accuracy"], 1.0)
         self.assertAlmostEqual(self.report["metrics"]["injection_omit_rate"], 1.0)
         self.assertEqual(self.report["metrics"]["as_of_items"], 6)

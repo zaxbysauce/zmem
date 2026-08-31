@@ -5,7 +5,7 @@ exactly those ids, deterministically, in a store that lives wherever the
 caller says — never the operator's home store (scripts/eval_runner.py passes
 an explicit --store path; CI uses a workspace-relative path).
 
-Layout: 64 rows across 10 namespaces, one fixed id per rowid:
+Layout: 70 rows across 11 namespaces, one fixed id per rowid:
     e0000000-0000-4000-8000-{rowid:012d}
 
   rowids  1-10  as-of chains   (5 topics x old/new; historical windows)
@@ -18,6 +18,8 @@ Layout: 64 rows across 10 namespaces, one fixed id per rowid:
   rowids 53-58  polarity       (issue #82: 3 x live contradict pairs, NO tombstone)
   rowids 59-61  change preds   (issue #82: tombstoned by the real update path)
   rowids 62-64  change heads   (issue #82: live successors with update_of)
+  rowids 65-70  decision-point (issue #88: operation-adjacent hazard lessons,
+                                queried by prose + tool-command ops context)
 
 Ids 1-50 are the frozen contract of the issue #64 gold set; 51+ extend it.
 
@@ -64,6 +66,7 @@ NS_FTS = "project:eval-fts"
 NS_RETRACT = "project:eval-retract"
 NS_POLAR = "project:eval-polarity"
 NS_CHANGE = "project:eval-change"
+NS_DECISION = "project:eval-decision"
 
 BASE_ENV = {
     "ZMEM_MODEL_AUTODOWNLOAD": "0",
@@ -286,6 +289,45 @@ CHANGE_CHAINS = (
      "release notes are drafted by the changelog script plus a human pass"),
 )
 
+# Decision-point (issue #88 / #85 direction 4): operation-adjacent hazard
+# lessons whose retrieval signal lives in the TOOL COMMAND, not the prose
+# prompt — the exact #85 field failure shape. Each row names its incident
+# family with a distinctive zq-token; the gold items query them with
+# decision-point PROSE (zero lexical overlap with the target) plus an
+# "ops" field carrying the command in flight. Contents deliberately embed
+# the ops tokens (git stash pop / bun test <file> / git worktree ...) so
+# the composed query matches; the prose alone does not.
+DECISION_ROWS = (
+    (65, "zqstash hazard: a later blind git stash pop can apply a foreign "
+         "pre-existing stash and raise UU conflicts; always verify git "
+         "stash list before any consuming command",
+     "git stash pop"),
+    # Contents are deliberately free of the prose queries' tokens (the
+    # gold items' prose-alone queries must MISS so the items actually
+    # measure the ops lane; tests/test_ops_tokens.py enforces this against
+    # the built fixture).
+    (66, "zqreset hazard: building a squash commit via git reset soft "
+         "against origin main after a fetch silently reverts main progress; "
+         "combine with current main, re-run gates before pushing",
+     "git reset --soft origin/main"),
+    (67, "zqratchet hazard: editing any file cited by writer classification "
+         "registry requires running bun test atomic-write-ratchet.test.ts "
+         "locally first or CI fails with registry citation rot",
+     "bun test atomic-write-ratchet.test.ts"),
+    (68, "zqqueue hazard: a gh pr merge through merge queue shifts "
+         "citations, renumbers registry rows; re-pin citations, read "
+         "over-cap hits as merge lag rather than regression",
+     "gh pr merge --auto 2431"),
+    (69, "zqpush hazard: git push right after a fetch can carry a stale "
+         "tree to origin; verify diffs against fetched base before "
+         "pushing",
+     "git push --force-with-lease origin HEAD"),
+    (70, "zqworktree hazard: a git worktree session beside a pre-existing "
+         "check leaks rows across stores; isolate suite execution per "
+         "worktree",
+     "git worktree add ../check main"),
+)
+
 
 # ------------------------------------------------------------------- EVAL_IDS
 
@@ -296,7 +338,7 @@ def _build_eval_ids() -> dict:
            "injection_row": {}, "ns_alpha": {}, "ns_beta": {},
            "contested_winner": {}, "contested_loser": {},
            "entity": {}, "fts": {}, "retraction": {}, "polarity": {},
-           "change_pred": {}, "change_head": {}}
+           "change_pred": {}, "change_head": {}, "decision": {}}
     for i in range(5):
         ids["asof_old"][ASOF_TOPICS[i]] = eval_id(2 * i + 1)
         ids["asof_new"][ASOF_TOPICS[i]] = eval_id(2 * i + 2)
@@ -315,7 +357,9 @@ def _build_eval_ids() -> dict:
     for pred_rowid, head_rowid in zip(CHANGE_CHAIN_PREDS, CHANGE_CHAIN_HEADS):
         ids["change_pred"][pred_rowid] = eval_id(pred_rowid)
         ids["change_head"][head_rowid] = eval_id(head_rowid)
-    ids["all"] = [eval_id(n) for n in range(1, 65)]
+    for rowid, content, _ops in DECISION_ROWS:
+        ids["decision"][content.split()[0]] = eval_id(rowid)
+    ids["all"] = [eval_id(n) for n in range(1, 71)]
     return ids
 
 
@@ -359,6 +403,12 @@ def build_eval_store(dest: str) -> str:
     _polarity_pairs(dest)
     _invalidate_retractions(dest)
     _change_chains(dest)
+    # Issue #88 / #85 direction 4: decision-point bucket, seeded AFTER the
+    # change chains so CLI rowids continue at 65 (heads 62-64 stay pinned)
+    # and remapped to their fixed ids the same way.
+    for _rowid, content, _ops in DECISION_ROWS:
+        _add(dest, NS_DECISION, "lesson", "test", content, "eval,decision")
+    _pin_decision_rows(dest)
     _verify(dest)
     return str(dest_path)
 
@@ -553,6 +603,30 @@ def _change_chains(store: str) -> None:
             conn.close()
 
 
+def _pin_decision_rows(store: str) -> None:
+    """Issue #88: remap the decision-bucket rows (seeded last, CLI rowids
+    65-70) to their fixed eval ids, remapping the derived tables the CLI
+    wrote (same contract as _pin_ids/_remap_id)."""
+    conn = sqlite3.connect(store)
+    try:
+        rows = conn.execute(
+            "SELECT id, rowid FROM memory WHERE namespace=? ORDER BY rowid",
+            (NS_DECISION,)).fetchall()
+        if len(rows) != len(DECISION_ROWS):
+            raise AssertionError(
+                f"eval corpus: expected {len(DECISION_ROWS)} decision rows, "
+                f"found {len(rows)}")
+        for (old_id, rowid), (want_rowid, _c, _o) in zip(rows, DECISION_ROWS):
+            if rowid != want_rowid:
+                raise AssertionError(
+                    f"eval corpus: decision row landed at rowid {rowid}, "
+                    f"expected {want_rowid} (seed order drifted)")
+            _remap_id(conn, old_id, eval_id(want_rowid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _verify(store: str) -> None:
     conn = sqlite3.connect(store)
     try:
@@ -582,14 +656,22 @@ def _verify(store: str) -> None:
             "SELECT count(*) FROM memory WHERE namespace=? AND update_of = '' "
             "AND superseded_at IS NOT NULL",
             (NS_CHANGE,)).fetchone()[0]
+        n_decision = conn.execute(
+            "SELECT count(*) FROM memory WHERE namespace=? AND "
+            "superseded_at IS NULL",
+            (NS_DECISION,)).fetchone()[0]
     finally:
         conn.close()
-    if n_total != 64:
-        raise AssertionError(f"eval corpus: expected 64 rows, got {n_total}")
+    if n_total != 70:
+        raise AssertionError(f"eval corpus: expected 70 rows, got {n_total}")
     # 5 as-of old + 5 contested losers + 2 retracted + 3 change predecessors
-    # are tombstoned; 64 - 15 = 49 live.
-    if n_live != 49:
-        raise AssertionError(f"eval corpus: expected 49 live rows, got {n_live}")
+    # are tombstoned; 70 - 15 = 55 live.
+    if n_live != 55:
+        raise AssertionError(f"eval corpus: expected 55 live rows, got {n_live}")
+    if n_decision != len(DECISION_ROWS):
+        raise AssertionError(
+            f"eval corpus: expected {len(DECISION_ROWS)} live decision rows, "
+            f"got {n_decision}")
     if n_ent == 0:
         raise AssertionError("eval corpus: no entity links were derived")
     if n_contradicts != 16:  # 10 contested + 6 polarity (both directions x3)

@@ -39,7 +39,8 @@ from typing import Any
 # three #82 buckets carry >= 3 items each (tests/test_eval_runner.py pins
 # the split: original six >= 5, new three >= 3).
 BUCKETS = ("as-of", "injection", "entity-alias", "namespace", "contested",
-           "fts", "adapter", "retraction", "polarity", "change-intent")
+           "fts", "adapter", "retraction", "polarity", "change-intent",
+           "decision-point")
 
 
 class GoldError(ValueError):
@@ -59,6 +60,12 @@ class GoldItem:
     must_exclude_ids: list[str] = field(default_factory=list)
     must_include_text: str | None = None
     explicit: bool = False
+    # Issue #88 / #85 direction 4: prior-turn tool-operation context for
+    # decision-point items. When present, the runner composes the query via
+    # the SAME compose_inject_query the UserPromptSubmit hook uses (reserved
+    # slice inside the 500-char cap) — the eval measures the hook's real
+    # query, not a forked one. Items without ops run byte-identical to today.
+    ops: str = ""
 
 
 def load_gold(path: str) -> list[GoldItem]:
@@ -161,6 +168,10 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
     explicit = obj.get("explicit", False)
     if not isinstance(explicit, bool):
         raise GoldError("field 'explicit' must be a boolean when present")
+    # Issue #88 / #85 direction 4: optional prior-turn operation context.
+    ops = obj.get("ops", "")
+    if not isinstance(ops, str):
+        raise GoldError("field 'ops' must be a string when present")
     return GoldItem(
         id=item_id,
         bucket=bucket,
@@ -172,6 +183,7 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
         must_exclude_ids=list(exclude_ids),
         must_include_text=include_text,
         explicit=explicit,
+        ops=ops,
     )
 
 
@@ -211,11 +223,19 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
     # recall stack (mirrors doctor.py's lazy-import discipline).
     import io
     import contextlib
+    from storelib.ops_tokens import compose_inject_query
     from storelib.recall import _normalize_as_of, recall_memory
 
     per_item: list[dict] = []
     for item in items:
         k = item.k if item.k is not None else k_default
+        # Issue #88 / #85 direction 4: decision-point items carry their
+        # prior-turn operation context; compose through the SAME function the
+        # UserPromptSubmit hook uses so the eval measures the real query.
+        # Without ops the composition is the byte-exact identity (pinned by
+        # tests), so every legacy item's query — and score — is unchanged.
+        query = compose_inject_query(item.query, item.ops) if item.ops \
+            else item.query
         # recall_memory prints its CLI surface (fences or JSON) regardless of
         # as_json — the runner's stdout is reserved for the JSON report, so
         # the per-query prints are captured and discarded. no_bump supplies
@@ -226,7 +246,7 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
         with contextlib.redirect_stdout(io.StringIO()) as captured:
             results = recall_memory(
                 conn,
-                query=item.query,
+                query=query,
                 namespace=item.namespace,
                 limit=k,
                 no_bump=not item.explicit,
@@ -270,6 +290,9 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
             "id": item.id,
             "bucket": item.bucket,
             "query": item.query,
+            # Review PRR-91-006: for ops items the recall ran on the COMPOSED
+            # query — record it so report rows reflect what was executed.
+            "ops_query": query if item.ops else None,
             "as_of": _normalize_as_of(item.as_of) if item.as_of else None,
             "k": k,
             "explicit": item.explicit,
@@ -306,9 +329,9 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
 # subset). A single constant makes key drift an import-time-visible edit in
 # ONE place instead of a runtime KeyError in the runner.
 PER_ITEM_REPORT_KEYS = (
-    "id", "bucket", "query", "as_of", "k", "explicit", "hit", "text_hit",
-    "first_hit_rank", "excluded_ids_surfaced", "injection_omitted",
-    "ranked_ids", "ok",
+    "id", "bucket", "query", "ops_query", "as_of", "k", "explicit", "hit",
+    "text_hit", "first_hit_rank", "excluded_ids_surfaced",
+    "injection_omitted", "ranked_ids", "ok",
 )
 
 

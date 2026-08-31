@@ -502,9 +502,35 @@ def cmd_sweep(marker_dir: str | None = None,
                 except OSError:
                     continue
             removed += 1
+        # Issue #88 / #85 direction 2: the per-session query-context rings
+        # (<data>/ops/<session>.log) are session-scoped sidecars — same
+        # max-age policy as the sentinels so finished sessions' rings cannot
+        # accumulate. Same strict-< mtime rule keeps the live session's ring.
+        ops_dir = d / "ops"
+        if ops_dir.is_dir():
+            try:
+                ring_names = os.listdir(ops_dir)
+            except OSError:
+                ring_names = []
+            for rname in ring_names:
+                if not rname.endswith(".log"):
+                    continue
+                rp = ops_dir / rname
+                try:
+                    if not rp.is_file() or rp.stat().st_mtime >= cutoff:
+                        continue
+                except OSError:
+                    continue
+                if not dry_run:
+                    try:
+                        rp.unlink()
+                    except OSError:
+                        continue
+                removed += 1
     if removed:
         verb = "would prune" if dry_run else "pruned"
-        print(f"[zmem] sweep: {verb} {removed} stale session sentinel(s)")
+        print(f"[zmem] sweep: {verb} {removed} stale session "
+              "sentinel(s)/sidecar(s)")
     return 0
 
 def _integrity_check_readonly(path: Path) -> str:
