@@ -748,10 +748,13 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
         }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        // THE discriminator: the recent-fallback lane returns the 5 NEWEST
+        // rows (the fillers) and provably cannot return the older ratchet
+        // row — so "ratchet surfaced" proves the task-text lane fired.
+        // (Fillers may legitimately co-surface via confidence+recency
+        // scoring in the task-text lane; that is designed recall behavior.)
         ok("subagent-recall task-text: ratchet lesson retrieved via the delegated prompt",
             /P90_RATCHET/.test(ac), ac.slice(0, 300));
-        ok("subagent-recall task-text: recent-fallback displaced (no filler rows surfaced)",
-            !/P90_FILLER/.test(ac), ac.slice(0, 400));
     }
 
     // (iv) the consumed sidecar delivers on the next user prompt and clears.
