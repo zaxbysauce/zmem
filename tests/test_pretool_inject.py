@@ -7,9 +7,10 @@ Proves:
   before it runs) and injects matching hazard lessons — fully silent when
   nothing qualified (no per-tool-call one-liner noise), fail-open, NEVER a
   permissionDecision;
-- the pending-inject sidecar for hosts whose pre-tool additionalContext
-  contract is unverified (Claude): parked pre-tool, delivered by the NEXT
-  user_prompt run even when that prompt's own recall is silent, then cleared;
+- the pending-inject sidecar for hosts that may ignore pre-tool
+  additionalContext (Claude: documented since 2.1.9, older builds ignore
+  it): parked pre-tool, delivered by the NEXT user_prompt run even when
+  that prompt's own recall is silent, then cleared;
 - "subagent" mode prefers the delegated task text over the recent pull when
   the host event carries it, and falls back otherwise;
 - the Hermes reflect hook delivers operation-context recall on pre_llm_call
@@ -406,6 +407,18 @@ class RegistrationAndContractTest(unittest.TestCase):
         self.assertIn('"pretool-recall"', translated)
         needs_ns = src.split("const NEEDS_NAMESPACE")[1].split("]);")[0]
         self.assertIn('"pretool-recall"', needs_ns)
+
+    def test_subagent_wrapper_pipes_stdin_to_body(self):
+        # Review PRR-92-A regression ratchet: the subagent body reads the
+        # event from STDIN (task-text lane) — the wrapper MUST pipe $INPUT
+        # to it. This exact gap shipped once: the wrapper drained stdin and
+        # invoked the body with argv only, silently disabling task-text
+        # recall while every body-level test stayed green.
+        wrapper = (REPO_ROOT / "hooks" / "zmem-subagent-recall.sh")             .read_text(encoding="utf-8")
+        self.assertIn(
+            "printf '%s' \"$INPUT\" | \"$PYTHON_BIN\" \"$RECALL_BODY\"",
+            wrapper,
+            "zmem-subagent-recall.sh must pipe the event to the body")
 
     def test_wrapper_wires_mode_pretool(self):
         wrapper = (REPO_ROOT / "hooks" / "zmem-pretool-recall.sh") \

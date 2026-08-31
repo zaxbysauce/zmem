@@ -370,10 +370,11 @@ def _emit_envelope(ctx: str) -> None:
 def _pending_ops_path(session_id: str):
     """Path of the pending-inject sidecar for a session (issue #90 / #85 C).
 
-    A pre-tool fence written when the host may not honor additionalContext
-    pre-tool (Claude: unverified in the official docs) is parked here and
-    consumed (and cleared) by the next user_prompt run — guaranteed delivery
-    even if the field is ignored. None without a session id.
+    A pre-tool fence parked for hosts that may ignore pre-tool
+    additionalContext (Claude: documented since 2.1.9 but honored only on
+    newer builds) is consumed (and cleared) by the next user_prompt run —
+    guaranteed delivery even if the field is ignored. None without a
+    session id.
     """
     if not session_id:
         return None
@@ -766,8 +767,8 @@ def main() -> int:
                          tokens_used=tokens_used, tokens_budget=tokens_budget,
                          ops_count=len(ops_tokens))
     if mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude":
-        # Issue #90 / #85 C: Claude's PreToolUse contract honoring of
-        # additionalContext is unverified in the official docs — park the
+        # Issue #90 / #85 C: older Claude builds ignore pre-tool
+        # additionalContext (documented since 2.1.9) — park the
         # fence so the next user_prompt run is REQUIRED to deliver it even
         # if the pre-tool emit was ignored. ZCode additionalContext is
         # documented honored, so no sidecar there; worst case on Claude is

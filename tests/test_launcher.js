@@ -730,13 +730,24 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
     // prompt must query it (this e2e fails against the pre-fix wrapper,
     // which never piped stdin to the body).
     {
-        // Discriminator: fill the recent window with NEWER unrelated rows so
-        // the recent-fallback lane (limit 5) can no longer return the ratchet
-        // row — only a task-TEXT query can. This is what makes the e2e fail
-        // against the pre-fix wrapper (which never piped stdin to the body).
-        for (let i = 0; i < 6; i++) {
-            seed(D90, NS90, "fact",
-                "P90_FILLER" + i + " unrelated recent row token fill" + i + ".", 0.9);
+        // Discriminator: fill the recent window with NEWER rows so the
+        // recent-fallback lane (limit 5) cannot return the older ratchet
+        // row — only a task-TEXT query can. Each filler uses DISTINCT
+        // vocabulary: store.py's semantic dedup-on-write (vec cosine
+        // >= 0.85) collapses near-identical fillers onto one row, which
+        // would leave both lanes returning everything and make this e2e
+        // vacuous (final-critic round: the first filler set deduped to one
+        // row and the assertion passed against the broken wrapper too).
+        const fillers = [
+            "P90_FILLER0 alpine quaternary graphite omnivore.",
+            "P90_FILLER1 modular scaffolding perpendicular jade.",
+            "P90_FILLER2 kaleidoscope whispering fjord lantern.",
+            "P90_FILLER3 turquoise bevel quadrant marzipan.",
+            "P90_FILLER4 obsidian prairie zephyr covariance.",
+            "P90_FILLER5 amber tessellation verdant hickory.",
+        ];
+        for (const f of fillers) {
+            seed(D90, NS90, "fact", f, 0.9);
         }
         const taskPayload = JSON.stringify({
             session_id: "p90-sub", cwd: PROJ, agent_type: "coder",
