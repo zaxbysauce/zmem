@@ -156,14 +156,14 @@ about to run a hazardous git operation, run the matching explicit recall
 FIRST and treat a hit as blocking review (see the memory skill's
 "Decision-point checkpoints" section for the full contract):
 
-- before `git stash pop` (stash-consume) — `recall --query "git stash pop
-  foreign stash conflict"`
-- before `git reset --soft` (squash assembly) — `recall --query "git reset
-  soft origin main stale tree"`
-- before `git push` — `recall --query "git push stale tree fetch rebase
-  verify"`
+- before `git stash pop` (stash-consume) —
+  `python "$S" recall --query "git stash pop foreign stash conflict"`
+- before `git reset --soft` (squash assembly) —
+  `python "$S" recall --query "git reset soft origin main stale tree"`
+- before `git push` —
+  `python "$S" recall --query "git push stale tree fetch rebase verify"`
 - before editing a file named by a stored citation/ratchet lesson —
-  `recall --query "<path basename> ratchet citation re-pin"`
+  `python "$S" recall --query "<path basename> ratchet citation re-pin"`
 
 ## Step 2 — Capture, with a hard bar
 

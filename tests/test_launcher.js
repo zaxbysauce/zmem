@@ -669,6 +669,108 @@ console.log("\n[9] Phase 7: subagent-recall (SubagentStart) + subagent-reflect (
     }
 }
 
+
+console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
+
+{
+    // Wrapper-level proof for both new stdin-dependent lanes (review
+    // PRR-92-A/T7): the launcher translates the envelope AND the wrapper
+    // actually pipes the event to the body.
+    const D90 = path.join(TMP, "p90data");
+    fs.mkdirSync(D90, { recursive: true });
+    const NS90 = resolveNs(PROJ);
+    seed(D90, NS90, "lesson",
+        "P90_STASH hazard: a later blind git stash pop can apply a foreign "
+        + "pre-existing stash; verify git stash list before any consuming command.", 0.9);
+    seed(D90, NS90, "lesson",
+        "P90_RATCHET hazard: editing any file cited by the writer "
+        + "classification registry requires running the ratchet battery locally.", 0.9);
+
+    // (i) pretool-recall / claude: PreToolUse envelope + hazard fence, and
+    // the pending sidecar is parked for the next user prompt.
+    {
+        const prePayload = JSON.stringify({
+            session_id: "p90-sess", cwd: PROJ,
+            tool_name: "Bash", tool_input: { command: "git stash pop" },
+            hook_event_name: "PreToolUse",
+        });
+        const r = runLauncher("pretool-recall", prePayload, envWith({
+            ZMEM_DATA: D90, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+            ZMEM_HOST: "claude",
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("pretool-recall/claude: valid JSON", obj !== null, r.stdout.slice(0, 200));
+        eq("pretool-recall/claude: hookEventName == PreToolUse",
+            obj && obj.hookSpecificOutput && obj.hookSpecificOutput.hookEventName, "PreToolUse");
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("pretool-recall: stash hazard lesson injected", /P90_STASH/.test(ac), ac.slice(0, 300));
+        ok("pretool-recall: no permissionDecision emitted", !/permissionDecision/.test(r.stdout));
+        ok("pretool-recall/claude: pending sidecar parked",
+            fs.existsSync(path.join(D90, "ops", "p90-sess.pending")));
+    }
+
+    // (ii) pretool-recall / zcode: bare additionalContext, NO sidecar.
+    {
+        const prePayload = JSON.stringify({
+            session_id: "p90-sess-z", cwd: PROJ,
+            tool_name: "Bash", tool_input: { command: "git stash pop" },
+        });
+        const r = runLauncher("pretool-recall", prePayload, envWith({
+            ZMEM_DATA: D90, ZCODE_PLUGIN_ROOT: REPO, ZCODE_PROJECT_DIR: PROJ,
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        ok("pretool-recall/zcode: bare envelope carries additionalContext",
+            obj && typeof obj.additionalContext === "string" && /P90_STASH/.test(obj.additionalContext),
+            r.stdout.slice(0, 200));
+        ok("pretool-recall/zcode: no pending sidecar",
+            !fs.existsSync(path.join(D90, "ops", "p90-sess-z.pending")));
+    }
+
+    // (iii) subagent-recall task-text lane: an event CARRYING a delegated
+    // prompt must query it (this e2e fails against the pre-fix wrapper,
+    // which never piped stdin to the body).
+    {
+        // Discriminator: fill the recent window with NEWER unrelated rows so
+        // the recent-fallback lane (limit 5) can no longer return the ratchet
+        // row — only a task-TEXT query can. This is what makes the e2e fail
+        // against the pre-fix wrapper (which never piped stdin to the body).
+        for (let i = 0; i < 6; i++) {
+            seed(D90, NS90, "fact",
+                "P90_FILLER" + i + " unrelated recent row token fill" + i + ".", 0.9);
+        }
+        const taskPayload = JSON.stringify({
+            session_id: "p90-sub", cwd: PROJ, agent_type: "coder",
+            prompt: "fix the registry ratchet citations before pushing",
+            hook_event_name: "SubagentStart",
+        });
+        const r = runLauncher("subagent-recall", taskPayload, envWith({
+            ZMEM_DATA: D90, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("subagent-recall task-text: ratchet lesson retrieved via the delegated prompt",
+            /P90_RATCHET/.test(ac), ac.slice(0, 300));
+        ok("subagent-recall task-text: newer filler rows displaced (fallback lane would miss)",
+            !/P90_FILLER0/.test(ac) || /P90_RATCHET/.test(ac.split("P90_FILLER0")[0]), ac.slice(0, 400));
+    }
+
+    // (iv) the consumed sidecar delivers on the next user prompt and clears.
+    {
+        const r = runLauncher("recall", JSON.stringify({
+            prompt: "carry on with unrelated zebra work", session_id: "p90-sess",
+            cwd: PROJ,
+        }), envWith({
+            ZMEM_DATA: D90, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+            ZMEM_HOST: "claude",
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("pending sidecar delivered on the next user prompt", /P90_STASH/.test(ac), ac.slice(0, 300));
+        ok("pending sidecar cleared after delivery",
+            !fs.existsSync(path.join(D90, "ops", "p90-sess.pending")));
+    }
+}
+
 console.log("\n[10] Phase 7 unit: buildCanonicalEnv exports agent transcript + id");
 
 {

@@ -231,8 +231,10 @@ def ring_cursor(data_dir: str, session_id: str) -> tuple:
     (``int(time.time())``): a second event appended in the SAME second after
     a delivery has an equal ts, and a ts-only comparison would suppress it
     forever (final-critic finding). Cursor comparison is lexicographic on
-    ``(ts, count)`` — ts first so a ring TRIM (which lowers the count) still
-    delivers on newer verbs; count second so same-second growth delivers.
+    ``(ts, count)``: a strictly newer ts always delivers (including after a
+    trim lowered the count); the count breaks ties ONLY within the same
+    second — a same-second event appended after a trim that dropped the
+    count to/below the delivered cursor stays suppressed (accepted corner).
     Returns (0.0, 0) when the ring is absent or unreadable.
     """
     if not data_dir or not session_id:

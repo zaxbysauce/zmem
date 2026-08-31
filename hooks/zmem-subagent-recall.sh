@@ -160,7 +160,7 @@ fi
 if [ -n "${RECALL_BODY_MISSING:-}" ]; then
   CTX_JSON='{}'
 else
-  CTX_JSON="$("$PYTHON_BIN" "$RECALL_BODY" "$STORE_PY_PY" "$NS" "$BUDGET" "subagent" "5" "3" "$AGENT_TYPE" 2>/dev/null || echo '{}')"
+  CTX_JSON="$(printf '%s' "$INPUT" | "$PYTHON_BIN" "$RECALL_BODY" "$STORE_PY_PY" "$NS" "$BUDGET" "subagent" "5" "3" "$AGENT_TYPE" 2>/dev/null || echo '{}')"
 fi
 
 if [ -z "$CTX_JSON" ]; then

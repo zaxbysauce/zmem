@@ -214,17 +214,23 @@ Claude: emitted plus a pending sidecar the next prompt must deliver), a
 PreToolUse hook (`zmem-pretool-recall.sh`, matcher
 `Edit|Write|MultiEdit|NotebookEdit|Bash`) derives the recall query from the
 tool input ITSELF — the command or file path about to run — and injects
-matching hazard lessons before the tool executes. It NEVER denies (a
-surfaced hazard is information, not grounds to block a legitimate command)
-and stays fully silent when nothing qualified. `ZMEM_QUERY_CONTEXT=0`
-silences every query-context lane, this one included. The Claude pending
-sidecar requires the host event's `session_id` (without it the direct emit
-is the only delivery). Hermes delivers the equivalent on `pre_llm_call`
-(after the fact of the producing call), best-effort per ring CURSOR
+matching hazard lessons before the tool executes. Pre-tool
+`additionalContext` is documented on Claude Code (since 2.1.9 it lands
+alongside the tool result; pausing is `permissionDecision`-driven only) —
+the pending sidecar covers older hosts that ignore the field, and requires
+the host event's `session_id` (without it the direct emit is the only
+delivery). The hook NEVER denies (a surfaced hazard is information, not
+grounds to block a legitimate command) and stays fully silent when nothing
+qualified. `ZMEM_QUERY_CONTEXT=0` silences every query-context lane, this
+one included. Hermes delivers the equivalent on `pre_llm_call` (after the
+fact of the producing call), best-effort per ring CURSOR
 `(ts, event-count)` — same-second events still deliver; a transient store
-failure after the at-most-once marker skips that cursor's delivery. All
-query-context persistence (rings, delivery markers, pending fences) lives
-under `<data>/ops/` sidecars and never grows the store's tables. Codex has no pre-tool
+failure after the at-most-once marker skips that cursor's delivery. Hermes
+delivery currently queries the `user:global` namespace only (the Hermes
+hook events carry no namespace); project-scoped operation context delivers
+on the coding-host PreToolUse surface. All query-context persistence
+(rings, delivery markers, pending fences) lives under `<data>/ops/`
+sidecars and never grows the store's tables. Codex has no pre-tool
 context injection (documented gap).
 
 Inject surface parity (host facts, not aspirations): Claude Code registers

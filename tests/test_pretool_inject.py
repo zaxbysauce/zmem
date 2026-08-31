@@ -139,6 +139,21 @@ class PreToolModeTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(_ctx(out), "")
 
+    def test_unset_host_does_not_park(self):
+        # Review PRR-92-T1/T10: the park gate is ZMEM_HOST=="claude" exactly;
+        # an unset host must not write a sidecar (asserted so a regression to
+        # park-on-any-host fails loudly here).
+        out, rc = _run_body(
+            self._tmp, "pretool",
+            {"tool_name": "Bash", "tool_input": {"command": "git stash pop"},
+             "session_id": "s-unset"},
+            ns="project:pretool")
+        self.assertEqual(rc, 0)
+        self.assertIn("pretoolcanary", _ctx(out))  # direct emit still happens
+        self.assertFalse(
+            Path(self._tmp, "ops", "s-unset.pending").exists(),
+            "unset ZMEM_HOST must not park a sidecar")
+
     def test_kill_switch_silences_the_pretool_lane_too(self):
         # Review round 1: ZMEM_QUERY_CONTEXT=0 is a GLOBAL kill switch — an
         # operator flipping it expects silence everywhere, and this lane

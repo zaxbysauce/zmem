@@ -14,9 +14,11 @@
 #
 # Contract (per the #85 C spec, host-probed):
 #   - ZCode: additionalContext is documented honored pre-tool → direct emit.
-#   - Claude: additionalContext pre-tool is UNVERIFIED in the official docs →
-#     the body also parks the fence in a pending sidecar the next
-#     UserPromptSubmit run must deliver (worst case one duplicate, never lost).
+#   - Claude: additionalContext pre-tool is documented (CC >= 2.1.9 injects
+#     it alongside the tool result; pausing is driven by the permission
+#     decision field only) → direct emit, PLUS a pending sidecar the next UserPromptSubmit
+#     run must deliver — the sidecar covers older hosts that ignore the
+#     field (worst case one duplicate, never lost).
 #   - Codex: NOT registered — the host rejects hookSpecificOutput.additionalContext
 #     (openai/codex#19385); documented gap in issue #90's matrix.
 #   - NEVER denies: surfacing a hazard is information for the model, not
@@ -107,8 +109,8 @@ BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 # Same single source of truth as recall/precompact/subagent-recall: mode
 # "pretool" derives the query from the tool input in the body, applies the
 # identical gate/budget/fence/#87 silent-reason contract, and decides there
-# whether to park a pending sidecar for hosts with an unverified pre-tool
-# additionalContext contract.
+# whether to park a pending sidecar (older hosts that ignore pre-tool
+# additionalContext).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECALL_BODY="$SCRIPT_DIR/lib/zmem-recall-body.py"
 if [ ! -f "$RECALL_BODY" ]; then
