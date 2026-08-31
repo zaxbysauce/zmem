@@ -317,6 +317,30 @@ class ConventionCaptureRingTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_kill_switch_stops_convention_capture_collection(self):
+        # Review PRR-91-004 follow-up: the kill switch gates the WRITER —
+        # a valid Bash event with ZMEM_QUERY_CONTEXT=0 writes no ring line.
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-capks-")
+        try:
+            bash = shutil.which("bash")
+            if not bash:
+                self.skipTest("no bash on PATH")
+            env = _clean_env(
+                tmp, ZMEM_ROOT=str(REPO_ROOT), ZMEM_SESSION="sess-cap",
+                ZMEM_CONVENTION_INTERVAL="10", ZMEM_QUERY_CONTEXT="0")
+            event = json.dumps({"tool_name": "Bash",
+                                "tool_input": {"command": "git stash pop"},
+                                "session_id": "sess-cap"})
+            r = subprocess.run(
+                [bash, str(REPO_ROOT / "hooks" / "zmem-convention-capture.sh")],
+                input=event, capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("<<<ZMEM_JSON>>>", r.stdout)
+            self.assertFalse(Path(tmp, "ops", "sess-cap.log").exists(),
+                             "kill switch must stop ring collection")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_unmatched_tool_name_writes_no_ring_line(self):
         tmp = tempfile.mkdtemp(prefix="zmem-ops-capskip-")
         try:
@@ -356,6 +380,31 @@ class ConventionCaptureRingTest(unittest.TestCase):
 
 class HermesConventionRingTest(unittest.TestCase):
     """The Hermes post_tool_call hook records the verb on the same ring."""
+
+    def test_post_tool_call_kill_switch_stops_collection(self):
+        # Review PRR-91-004 follow-up: the Hermes post_tool_call writer
+        # honors the kill switch — no ring line, hook still silent-ok.
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-hermes-ks-")
+        env = _clean_env(tmp, ZMEM_HOME=str(REPO_ROOT),
+                         ZMEM_QUERY_CONTEXT="0")
+        try:
+            payload = json.dumps({
+                "session_id": "s-ks",
+                "extra": {"status": "ok", "tool": "Bash",
+                          "command": "git stash pop"},
+            })
+            r = subprocess.run(
+                [sys.executable,
+                 str(REPO_ROOT / "hermes-plugin" / "hooks" /
+                     "zmem-hermes-convention.py")],
+                input=payload, capture_output=True, text=True, env=env,
+                timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "{}")
+            self.assertFalse(Path(tmp, "ops", "s-ks.log").exists(),
+                             "kill switch must stop Hermes ring collection")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_post_tool_call_precedence_and_fallback(self):
         # Review PRR-91-012: extra.command wins over payload.tool_input;
