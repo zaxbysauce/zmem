@@ -1122,6 +1122,10 @@ class ZmemMemoryProvider(MemoryProvider):
         retrieval_count), injection-risk/untrusted_web omitted by that same
         store-side filter, token budget applied BEFORE the fence
         (decision/constraint protected), rendered through storelib's fence.
+        Issue #87 / #85 direction 1: a silent prefetch names WHY — the JSON
+        result carries ``reason`` (empty-pool / omitted / budget-drop /
+        injected) and the context says retrieved-empty (session variant)
+        instead of blaming the inject bar for an empty pool.
         """
         ns = (args.get("namespace") or self._namespace).strip() or "user:global"
         if ns == "*":

@@ -536,6 +536,7 @@ def main() -> int:
     if _inj is not None:
         tokens_used = _inj.estimate_tokens(ctx)
     _log_inject_decision(rows, selected, status, injected_reason,
+                         omitted=omitted,
                          tokens_used=tokens_used, tokens_budget=tokens_budget)
     _emit_envelope(ctx)
     return 0

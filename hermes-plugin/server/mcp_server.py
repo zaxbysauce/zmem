@@ -1197,6 +1197,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
     ) -> dict[str, Any]:
         """Passive session prefetch (issue #65, 10.5 — the D4 contract).
 
+        Issue #87 / #85 direction 1: a silent prefetch names WHY — the result
+        carries ``reason`` (empty-pool / omitted / budget-drop / injected)
+        and the context says retrieved-empty (session variant) instead of
+        blaming the session inject bar for an empty pool.
+
         Returns a fenced, provenance-tagged context block of the namespace's
         recent high-confidence memories for the START of a session:
         - NEVER bumps retrieval_count (--no-bump; only a surface event is

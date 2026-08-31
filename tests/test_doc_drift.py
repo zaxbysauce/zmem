@@ -565,7 +565,14 @@ class Issue87DocDriftTest(unittest.TestCase):
                        "reason=below-bar", "reason=budget-drop",
                        "reason=injected", "INJECT_SILENT_REASONS",
                        "no durable memories retrieved for this prompt.",
-                       "no durable memories met the inject bar."):
+                       "no durable memories met the inject bar.",
+                       # Review PRR-89-007d: pin the session variant and the
+                       # budget sentences too — they are byte-exact contract
+                       # strings on the Hermes/MCP/hook surfaces.
+                       "no durable memories retrieved for this session.",
+                       "memories withheld: the injection token budget "
+                       "(ZMEM_INJECT_TOKEN_BUDGET)",
+                       "session memories withheld:"):
             self.assertIn(needle, text, f"SKILL.md missing {needle!r}")
 
     def test_skill_md_documents_bg_log_reason_field(self):

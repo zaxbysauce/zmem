@@ -214,6 +214,21 @@ class HookBodyReasonTest(unittest.TestCase):
         self.assertIn("status=injected reason=injected", line)
         self.assertRegex(line, r"tokens=\d+/\d+")
 
+    def test_2b_injected_with_omitted_logs_omitted(self):
+        # Review PRR-89-001: the INJECTED log line must carry omitted=N when
+        # the passive filter dropped rows alongside the injected one.
+        _seed(self.env, self.ns_omitted,
+              "riskcanary clean grounded companion row about instructions")
+        _remove_log(self._tmp)
+        out = self._run_body(
+            "user_prompt", self.ns_omitted,
+            "riskcanary instructions knowledge base")
+        ctx = self._ctx(out)
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        line = _read_last_hook_line(self._tmp)
+        self.assertIn("status=injected reason=injected", line)
+        self.assertIn("omitted=3", line)
+
     def test_11_recent_mode_below_bar(self):
         # The spec's tail note: precompact/recent modes have no prompt query,
         # but rows that clear the store-side recent floor can still fail the
@@ -226,6 +241,59 @@ class HookBodyReasonTest(unittest.TestCase):
         self.assertEqual(self._ctx(out), S_BELOW_BAR)
         line = _read_last_hook_line(self._tmp)
         self.assertIn("status=silent reason=below-bar", line)
+
+    def test_11b_precompact_mode_below_bar(self):
+        # Review PRR-89-007b: precompact shares the recent-pull lane; the
+        # silent-reason contract must hold there too (spec names all modes).
+        _remove_log(self._tmp)
+        env = dict(self.env)
+        env["ZMEM_INJECT_FLOOR_RECENT"] = "0.25"
+        out = self._run_body("precompact", self.ns_recent, "ignored prompt",
+                             env=env)
+        self.assertEqual(self._ctx(out), S_BELOW_BAR)
+        line = _read_last_hook_line(self._tmp)
+        self.assertIn("status=silent reason=below-bar", line)
+
+
+class ClassifierUnitTests(unittest.TestCase):
+    """Direct unit pins for _classify_silent_reason (review PRR-89-007a/007c):
+    the spec's precedence order and the closed-set drift fallback."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "zmem_recall_body_unit", BODY)
+        cls.body = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.body)
+
+    def test_order_budget_drop_beats_below_bar_and_omitted(self):
+        self.assertEqual(
+            self.body._classify_silent_reason(
+                [{"id": "x"}], omitted=3, budget_emptied=True),
+            "budget-drop")
+
+    def test_order_below_bar_beats_omitted(self):
+        # rows non-empty AND omitted>0: the gate rejection is the reason the
+        # inject is silent; omitted is context, not the cause.
+        self.assertEqual(
+            self.body._classify_silent_reason([{"id": "x"}], omitted=3),
+            "below-bar")
+
+    def test_order_omitted_beats_empty_pool(self):
+        self.assertEqual(self.body._classify_silent_reason([], omitted=2),
+                         "omitted")
+
+    def test_drift_fallback_degrades_to_empty_pool(self):
+        # A drifted/partially-deployed INJECT_SILENT_REASONS tuple must
+        # degrade to empty-pool, never invent an unknown reason.
+        self.assertEqual(
+            self.body._classify_silent_reason(
+                [{"id": "x"}], allowed=("empty-pool",)),
+            "empty-pool")
+        self.assertEqual(
+            self.body._classify_silent_reason([], omitted=2, allowed=()),
+            "empty-pool")
 
 
 class HookBodyBareListEnvelopeTest(unittest.TestCase):

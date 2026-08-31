@@ -169,10 +169,16 @@ the Python recall path.
 
 When a passive inject surfaces nothing, it names WHICH gate fired (issue #87 /
 #85 direction 1): `no durable memories retrieved for this prompt.` means the
-candidate pool itself was empty (query construction / corpus coverage), while
+candidate pool was empty OR every retrieved row was dropped by the passive
+injection-risk filter — the one-liner is shared by design (the model is never
+taught that omitted rows existed); the `zmem-bg.log` line distinguishes them.
 `no durable memories met the inject bar.` means rows reached the
-selective-inject gate and none passed, and a token-budget wipe says so in its
-own words. `zmem-bg.log` carries the same cut per decision line: every
+selective-inject gate and none passed. A token-budget wipe says so in its own
+words (`memories withheld: the injection token budget (ZMEM_INJECT_TOKEN_BUDGET)
+dropped every candidate row.`). Hermes/MCP `session_start` use the session
+variants (`no durable memories retrieved for this session.` and
+`session memories withheld: ...`).
+`zmem-bg.log` carries the same cut per decision line: every
 `zmem-hook` line has `reason=` (`reason=empty-pool`, `reason=omitted`,
 `reason=below-bar`, `reason=budget-drop`, `reason=injected`), plus `omitted=N`
 when the passive injection-risk filter dropped rows. The closed set lives in
