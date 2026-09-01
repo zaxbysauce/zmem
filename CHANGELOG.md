@@ -60,10 +60,13 @@ README.
 - **Ops-lane dir resolution tail parity** (issue #88 follow-up): the hook
   body's single resolver now walks the ring writer's four explicit-env cases
   in the same order (`ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA >
-  ZCODE_PLUGIN_DATA` before the `~/.zmem` fallback; `expanduser` on the
-  plugin-data branches as host.py does — the `ZMEM_*` branches stay verbatim
-  to match the writer, which now routes tilde-valued plugin-data vars
-  through `expanduser` too), and the `zmem-bg.log` write goes through that
+  ZCODE_PLUGIN_DATA` before the `~/.zmem` fallback), and `expanduser`
+  applies on EVERY side of the lane — host.py expanded all four
+  explicit-env values all along, the shared bash helper
+  (`hooks/lib/zmem-tilde-expand.sh`, sourced by both writer hooks) routes
+  any tilde-resolved data dir through `expanduser`, and the reader does the
+  same — so a tilde-valued var resolves identically everywhere instead of
+  splitting writer from reader. The `zmem-bg.log` write goes through that
   resolver — a non-launcher environment that only sets a plugin-data var no
   longer silently no-ops the ops lane (the log co-locates with the ring it
   describes). The session-start hook's own resolution (core.md, markers,

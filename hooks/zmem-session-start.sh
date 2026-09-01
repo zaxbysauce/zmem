@@ -29,6 +29,13 @@
 
 set -u
 
+# Shared tilde expansion for the DATA_DIR resolvers (one implementation for
+# every bash resolver of the lane — zmem-convention-capture.sh sources it
+# too; zmem_tilde_expand mutates DATA_DIR / DATA_DIR_IS_NATIVE). Sourced
+# before DATA_DIR is resolved so zmem_tilde_expand is defined at the call
+# site.
+. "$(dirname "$0")/lib/zmem-tilde-expand.sh"
+
 # --- Cross-platform setup ---
 IS_WINDOWS=0
 if [[ "$(uname -s 2>/dev/null)" == MINGW* ]] || [[ "$(uname -s 2>/dev/null)" == CYGWIN* ]] || [[ "$(uname -s 2>/dev/null)" == MSYS* ]]; then
@@ -118,26 +125,17 @@ elif [ -n "${ZCODE_PLUGIN_DATA:-}" ]; then
   DATA_DIR="$ZCODE_PLUGIN_DATA"
 fi
 # Tilde-valued dirs (degenerate operator input — hosts send absolute paths):
-# expand here exactly like convention-capture.sh does, so core.md, markers,
-# the bg log, and the ZMEM_DATA exported to children all land under the same
-# expanded directory the python readers (host.py, _data_dir) use — otherwise
-# this hook splits from the ops lane for tilde-valued plugin-data vars.
-# python's output is native to the interpreter that consumes it.
-DATA_DIR_NATIVE=0
-case "$DATA_DIR" in
-  "~"*)
-    if [ -n "$PYTHON_BIN" ]; then
-      _SS_EXPANDED="$("$PYTHON_BIN" -c 'import os, sys; sys.stdout.write(os.path.expanduser(sys.argv[1]))' "$DATA_DIR" 2>/dev/null)"
-      if [ -n "$_SS_EXPANDED" ]; then
-        DATA_DIR="$_SS_EXPANDED"
-        DATA_DIR_NATIVE=1
-      fi
-    fi
-    ;;
-esac
+# expand here exactly like convention-capture.sh does — the SHARED helper
+# (sourced at the top of this script; one implementation for every bash
+# resolver) — so core.md, markers, the bg log, and the ZMEM_DATA exported to
+# children all land under the same expanded directory the python readers
+# (host.py, _data_dir) use. python's output is native to the interpreter
+# that consumes it.
+DATA_DIR_IS_NATIVE=0
+zmem_tilde_expand
 
 if [ -n "$DATA_DIR" ]; then
-  if [ "$DATA_DIR_NATIVE" -eq 1 ]; then
+  if [ "$DATA_DIR_IS_NATIVE" -eq 1 ]; then
     DATA_DIR_PY="$DATA_DIR"
   else
     DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
@@ -422,18 +420,20 @@ if store_py and os.path.isfile(store_py):
                 # precompact / subagent-recall via the shared body).
                 try:
                     # PRR-101 review: mirror the shared body _data_dir()
-                    # chain exactly (ZMEM_STORE > ZMEM_DATA >
-                    # CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem,
-                    # expanduser on the host-supplied plugin-data values) —
-                    # otherwise a plugin-data-only environment splits the
-                    # bg log across two files: this block fell to ~/.zmem
-                    # while the body block moved to the plugin-data dir.
+                    # chain and normalization exactly (ZMEM_STORE >
+                    # ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
+                    # ~/.zmem; expanduser on EVERY branch — the outer bash
+                    # re-exports ZMEM_DATA verbatim, so a tilde-valued
+                    # ZMEM_DATA/ZMEM_STORE arrives here unexpanded and this
+                    # block must expand it too, or the isdir gate silently
+                    # drops the decision line).
                     _log_dir = ""
                     _ss_store = os.environ.get("ZMEM_STORE", "")
                     if _ss_store:
-                        _log_dir = os.path.dirname(_ss_store)
+                        _log_dir = os.path.expanduser(os.path.dirname(_ss_store))
                     if not _log_dir:
-                        _log_dir = os.environ.get("ZMEM_DATA", "")
+                        _log_dir = os.path.expanduser(
+                            os.environ.get("ZMEM_DATA", ""))
                     if not _log_dir:
                         for _pd_var in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
                             _pd_val = os.environ.get(_pd_var, "")

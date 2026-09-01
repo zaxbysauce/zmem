@@ -46,6 +46,12 @@ if [[ "$(uname -s 2>/dev/null)" == MINGW* ]] || [[ "$(uname -s 2>/dev/null)" == 
   IS_WINDOWS=1
 fi
 
+# Shared tilde expansion for the DATA_DIR resolvers (one implementation for
+# every bash resolver of the lane — zmem-session-start.sh sources it too).
+# Sourced before DATA_DIR is resolved so zmem_tilde_expand is defined at the
+# call site.
+. "$(dirname "$0")/lib/zmem-tilde-expand.sh"
+
 PYTHON_BIN=""
 if [ "$IS_WINDOWS" -eq 1 ]; then
   if python --version >/dev/null 2>&1; then PYTHON_BIN="python"
@@ -215,21 +221,12 @@ fi
 
 # Tilde-valued dirs (degenerate operator input — hosts send absolute paths)
 # must expand the same way on both sides of the lane: the python readers
-# (host.py, recall-body._data_dir) os.path.expanduser these values, so the
-# writer expands too or the ring lands in a literal '~' directory and the
-# lane silently no-ops. python's output is native to the interpreter that
-# consumes it, so mark it native (skips to_py_path below).
-case "$DATA_DIR" in
-  "~"*)
-    if [ -n "$PYTHON_BIN" ]; then
-      _EXPANDED="$("$PYTHON_BIN" -c 'import os, sys; sys.stdout.write(os.path.expanduser(sys.argv[1]))' "$DATA_DIR" 2>/dev/null)"
-      if [ -n "$_EXPANDED" ]; then
-        DATA_DIR="$_EXPANDED"
-        DATA_DIR_IS_NATIVE=1
-      fi
-    fi
-    ;;
-esac
+# (host.py, recall-body._data_dir) os.path.expanduser every branch, so the
+# writer expands the resolved DATA_DIR too via the SHARED helper (sourced at
+# the top of this script — one implementation for every bash resolver). On
+# success DATA_DIR_IS_NATIVE=1 (python output is native) and to_py_path is
+# skipped below.
+zmem_tilde_expand
 
 if [ "$DATA_DIR_IS_NATIVE" -eq 1 ]; then
   DATA_DIR_PY="$DATA_DIR"

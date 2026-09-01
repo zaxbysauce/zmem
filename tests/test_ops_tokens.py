@@ -562,8 +562,10 @@ class DataDirPrecedenceTest(unittest.TestCase):
         env.pop("ZMEM_DATA", None)
         # Keep even the pre-fix home fallback inside the sandbox: a failing
         # reader must probe <sandbox-home>/.zmem, never the operator's.
+        # exist_ok: tests may call this helper twice on one tmp (two
+        # sub-scenarios sharing a sandbox).
         home = Path(tmp, "sandbox-home")
-        home.mkdir()
+        home.mkdir(exist_ok=True)
         env["HOME"] = str(home)
         env["USERPROFILE"] = str(home)
         return env
@@ -716,6 +718,76 @@ class DataDirPrecedenceTest(unittest.TestCase):
                           "tilde path")
             line = self._last_hook_line(pd_dir)
             self.assertIn("status=injected", line)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_tilde_zmem_data_and_store_agree_across_lane(self):
+        # Cubic round-2 (CLM-2): the bash writers expand a tilde-resolved
+        # DATA_DIR from ANY chain branch, so the reader must expand
+        # ZMEM_DATA / ZMEM_STORE too — otherwise a tilde-valued operator
+        # override splits writer from reader (writer at the expanded home
+        # path, reader still probing the literal '~' path).
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-tilde-zdata-")
+        try:
+            env = self._plugin_data_env(tmp)
+            env["ZMEM_DATA"] = "~/pd-zd"
+            zd_dir = Path(env["HOME"]) / "pd-zd"
+            zd_dir.mkdir(parents=True)
+            _seed(env, "project:prec-tilde-zd", HookBodyComposeTest.LESSON)
+            self._run_writer(env, "sess-zd", cwd=tmp)
+            self.assertTrue((zd_dir / "ops" / "sess-zd.log").is_file(),
+                            "writer must expand a tilde-valued ZMEM_DATA")
+            self.assertFalse((Path(tmp) / "~").exists())
+            ctx = self._run_reader(env, "project:prec-tilde-zd", "sess-zd",
+                                   cwd=tmp)
+            self.assertIn("ringcanary", ctx,
+                          "reader must expand tilde ZMEM_DATA like the "
+                          "writer")
+            self._last_hook_line(zd_dir)
+
+            # Session-start's inline Tier-2 block must expand too: the outer
+            # bash re-exports ZMEM_DATA verbatim, so an unexpanded block
+            # would fail its own isdir gate and silently drop the decision
+            # line (reviewer round-3 finding). Pin the namespace the hook's
+            # recent-pull queries (ambient ZMEM_PROJECT-family vars are not
+            # stripped by _STRIP_ENV) so rows exist and the decision line is
+            # actually emitted.
+            env.update({"ZMEM_ROOT": str(REPO_ROOT), "ZMEM_SESSION": "sess-zd",
+                        "ZMEM_HOST": "zcode", "ZMEM_CTX_BUDGET": "25000",
+                        "ZMEM_NAMESPACE": "project:prec-tilde-zd"})
+            bash = shutil.which("bash")
+            if not bash:
+                self.skipTest("no bash on PATH")
+            r = subprocess.run(
+                [bash, str(REPO_ROOT / "hooks" / "zmem-session-start.sh")],
+                input=json.dumps({"session_id": "sess-zd"}),
+                capture_output=True, text=True, env=env, timeout=180, cwd=tmp)
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            # session-start's decision line is the one WITHOUT reason= (the
+            # body's line carries it) — assert THAT line landed in the
+            # expanded dir rather than being silently dropped by the block's
+            # isdir gate.
+            ss_lines = [ln for ln in (zd_dir / "zmem-bg.log").read_text(
+                encoding="utf-8").splitlines()
+                if "zmem-hook" in ln and "reason=" not in ln]
+            self.assertTrue(
+                ss_lines,
+                "session-start's own Tier-2 decision line must land in the "
+                "expanded tilde dir, not be silently dropped")
+
+            env = self._plugin_data_env(tmp)
+            env["ZMEM_STORE"] = "~/pz/store.sqlite"
+            pz_dir = Path(env["HOME"]) / "pz"
+            pz_dir.mkdir(parents=True)
+            _seed(env, "project:prec-tilde-zs", HookBodyComposeTest.LESSON)
+            self._run_writer(env, "sess-zs", cwd=tmp)
+            self.assertTrue((pz_dir / "ops" / "sess-zs.log").is_file(),
+                            "writer must expand a tilde-valued ZMEM_STORE")
+            ctx = self._run_reader(env, "project:prec-tilde-zs", "sess-zs",
+                                   cwd=tmp)
+            self.assertIn("ringcanary", ctx,
+                          "reader must expand tilde ZMEM_STORE like the "
+                          "writer")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

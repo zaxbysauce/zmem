@@ -438,18 +438,19 @@ def _data_dir() -> str:
     ORDER as the bash writer's four explicit-env cases (and
     host.resolve_store_path), so a non-launcher environment that only sets a
     plugin-data var still finds the ring instead of silently no-op'ing the
-    lane. Normalization: expanduser applies to the plugin-data branches only
-    (mirroring host.py); ZMEM_STORE/ZMEM_DATA pass through verbatim to match
-    the bash writer, which expands no branch — except that the
-    convention-capture writer now routes tilde-valued plugin-data vars
-    through expanduser too, so both sides of the ring lane agree on those as
-    well (session-start's bash chain does not, but its python blocks expand). host.py's deeper legacy tail
-    (~/.zcode/memory, plugin scan) stays approximated by ~/.zmem, as before.
-    Launcher-spawned hooks are unaffected: zmem-launch.js always exports
-    ZMEM_DATA."""
+    lane. Normalization: expanduser applies to EVERY branch — host.py
+    expands all four explicit-env values and both bash writers route any
+    tilde-resolved DATA_DIR through expanduser (shared helper
+    hooks/lib/zmem-tilde-expand.sh), so a tilde-valued var resolves to the
+    same directory on every side of the lane (a tilde ZMEM_DATA or
+    ZMEM_STORE previously split reader from writer — cubic round-2 finding).
+    For non-tilde values expanduser is a no-op, so launcher deployments are
+    unchanged. host.py's deeper legacy tail (~/.zcode/memory, plugin scan)
+    stays approximated by ~/.zmem, as before. Launcher-spawned hooks are
+    unaffected: zmem-launch.js always exports ZMEM_DATA."""
     store = os.environ.get("ZMEM_STORE", "")
     if store:
-        return os.path.dirname(store)
+        return os.path.expanduser(os.path.dirname(store))
     data_dir = os.environ.get("ZMEM_DATA", "")
     if not data_dir:
         claude_data = os.environ.get("CLAUDE_PLUGIN_DATA", "")
@@ -459,7 +460,7 @@ def _data_dir() -> str:
         if zcode_data:
             return os.path.expanduser(zcode_data)
         data_dir = os.path.join(os.path.expanduser("~"), ".zmem")
-    return data_dir
+    return os.path.expanduser(data_dir)
 
 
 def _ops_query_tokens(store_py: str, session_id: str, _ops_cache={}):
