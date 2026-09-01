@@ -57,6 +57,25 @@ README.
   line; `store.py sweep` collects stale rings; decision-point gold bucket
   (fixture rowids 65–70) asserts the #85-shaped prompts retrieve the
   hazard lessons WITH ops context and miss without it.
+- **Ops-lane dir resolution tail parity** (issue #88 follow-up): the hook
+  body's single resolver now walks the ring writer's four explicit-env cases
+  in the same order (`ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA >
+  ZCODE_PLUGIN_DATA` before the `~/.zmem` fallback), and `expanduser`
+  applies on EVERY side of the lane — host.py expanded all four
+  explicit-env values all along, the shared bash helper
+  (`hooks/lib/zmem-tilde-expand.sh`, sourced by both writer hooks) routes
+  any tilde-resolved data dir through `expanduser`, and the reader does the
+  same — so a tilde-valued var resolves identically everywhere instead of
+  splitting writer from reader. The `zmem-bg.log` write goes through that
+  resolver — a non-launcher environment that only sets a plugin-data var no
+  longer silently no-ops the ops lane (the log co-locates with the ring it
+  describes). The session-start hook's own resolution (core.md, markers,
+  its bg-log writers) follows the same chain, so every diagnostic and
+  Tier-0 artifact co-locates in those environments as well. Launcher
+  deployments are unaffected (the launcher always exports `ZMEM_DATA`).
+  Test suites strip the plugin-data vars like `test_sweep` and pin the
+  plugin-data precedence both directions; the decision-point eval hit-rank
+  pin tightened to the issue's rank 1–2 bar.
 
 - **`recall --explain`** (issue #82): read-only retrieval debugger with
   `--target` (id/prefix/fragment) and a machine-readable `--json` envelope;

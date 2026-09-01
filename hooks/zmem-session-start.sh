@@ -29,6 +29,13 @@
 
 set -u
 
+# Shared tilde expansion for the DATA_DIR resolvers (one implementation for
+# every bash resolver of the lane — zmem-convention-capture.sh sources it
+# too; zmem_tilde_expand mutates DATA_DIR / DATA_DIR_IS_NATIVE). Sourced
+# before DATA_DIR is resolved so zmem_tilde_expand is defined at the call
+# site.
+. "$(dirname "$0")/lib/zmem-tilde-expand.sh"
+
 # --- Cross-platform setup ---
 IS_WINDOWS=0
 if [[ "$(uname -s 2>/dev/null)" == MINGW* ]] || [[ "$(uname -s 2>/dev/null)" == CYGWIN* ]] || [[ "$(uname -s 2>/dev/null)" == MSYS* ]]; then
@@ -92,13 +99,47 @@ join_path() {
 # Canonical env is exported by the host adapter (zmem-launch.js). Prefer it;
 # fall back to the legacy ZCODE_* vars for manual/back-compat installs.
 PLUGIN_ROOT="${ZMEM_ROOT:-${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}"
-DATA_DIR="${ZMEM_DATA:-${ZCODE_PLUGIN_DATA:-}}"
 PROJECT="${ZMEM_PROJECT:-${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}"
 
-# Resolve the data dir: canonical ZMEM_DATA / plugin data dir if set, else the
-# box-neutral ~/.zmem default (the cutover target), else legacy ~/.zcode/memory.
+# Resolve the data dir with the SAME chain the shared hook body's _data_dir()
+# uses (PRR-101 review: every artifact this hook writes — core.md, markers,
+# the bg log — must co-locate with the store and the ops ring in every
+# environment, including non-launcher plugin-data-only ones):
+#   ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem
+# (expanduser on the plugin-data values happens python-side via host.py /
+# _data_dir(); this bash chain keeps the values verbatim like the writer).
+DATA_DIR=""
+if [ -n "${ZMEM_STORE:-}" ]; then
+  # Normalize Windows separators before dirname (MSYS/Git Bash coreutils
+  # treats `\` as a separator; WSL's does not — see convention-capture.sh).
+  if [ "$IS_WINDOWS" -eq 1 ]; then
+    DATA_DIR="$(dirname "$(printf '%s' "$ZMEM_STORE" | tr '\134' '/')")"
+  else
+    DATA_DIR="$(dirname "$ZMEM_STORE")"
+  fi
+elif [ -n "${ZMEM_DATA:-}" ]; then
+  DATA_DIR="$ZMEM_DATA"
+elif [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+  DATA_DIR="$CLAUDE_PLUGIN_DATA"
+elif [ -n "${ZCODE_PLUGIN_DATA:-}" ]; then
+  DATA_DIR="$ZCODE_PLUGIN_DATA"
+fi
+# Tilde-valued dirs (degenerate operator input — hosts send absolute paths):
+# expand here exactly like convention-capture.sh does — the SHARED helper
+# (sourced at the top of this script; one implementation for every bash
+# resolver) — so core.md, markers, the bg log, and the ZMEM_DATA exported to
+# children all land under the same expanded directory the python readers
+# (host.py, _data_dir) use. python's output is native to the interpreter
+# that consumes it.
+DATA_DIR_IS_NATIVE=0
+zmem_tilde_expand
+
 if [ -n "$DATA_DIR" ]; then
-  DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
+  if [ "$DATA_DIR_IS_NATIVE" -eq 1 ]; then
+    DATA_DIR_PY="$DATA_DIR"
+  else
+    DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
+  fi
   mkdir -p "$DATA_DIR" 2>/dev/null || true
 else
   DATA_DIR="$HOME/.zmem"
@@ -227,7 +268,25 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   # --if-due + sweep. Each keeps its own cadence gate / single-flight lock
   # inside session-cadence, so this is behavior-equivalent to the former
   # three-line spawn but starts one interpreter instead of three.
-  "$PYTHON_BIN" "$STORE_PY_PY" session-cadence \
+  #
+  # The 15s startup delay is a RACE GUARD, not cosmetic (PRR-101 CI
+  # evidence): the Tier-2 recall below reads the SAME store, and this
+  # worker — fired fire-and-forget — organizes/backs up/consolidates it
+  # concurrently. On slow runners the worker grabbed the database while the
+  # recent read was in flight, and the fail-open handling silently dropped
+  # the whole Tier-2 block (inject AND its bg-log decision line) on roughly
+  # every other CI run. Deferring the start gives the bounded recall a
+  # guaranteed head start; maintenance is background housekeeping, so the
+  # shift is invisible.
+  # NOTE: the wrapper must exec store.py THROUGH the interpreter
+  # ([sys.executable] + argv) — a bare subprocess.call(argv) would exec the
+  # .py file directly, which fails with ENOEXEC/WinError 193 everywhere
+  # (store.py has no shebang) and, being fire-and-forget with output in
+  # BG_SINK, would silently kill maintenance on every box (reviewer gate
+  # caught this pre-merge; CI was green because no test inspected the
+  # worker's output — the test below now does).
+  "$PYTHON_BIN" -c 'import time, subprocess, sys; time.sleep(15); sys.exit(subprocess.call([sys.executable] + sys.argv[1:]))' \
+    "$STORE_PY_PY" session-cadence \
     --backup-retention "${ZMEM_BACKUP_RETENTION:-7}" >>"$BG_SINK" 2>&1 &
 fi
 
@@ -303,10 +362,37 @@ if store_py and os.path.isfile(store_py):
             _recent_floor = float(_rf_raw) if _rf_raw else 0.5
         except ValueError:
             _recent_floor = 0.5
-        out = subprocess.check_output(
-            [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", str(_recent_floor), "--include-global", "--global-limit", "2", "--no-bump", "--json"],
-            stderr=subprocess.DEVNULL, timeout=8,
-        ).decode("utf-8", "replace")
+        # The detached session-cadence worker (dispatched above, same store)
+        # can hold the database while this read fires: on slow runners a
+        # first recent attempt fails transiently (SQLITE_BUSY -> non-zero
+        # exit), silently skipping the whole Tier-2 block below — inject AND
+        # its bg-log decision line (seen on CI windows runners). Retry
+        # briefly; still bounded and still fail-open on final failure.
+        out = ""
+        for _recent_attempt in range(3):
+            try:
+                out = subprocess.check_output(
+                    [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", str(_recent_floor), "--include-global", "--global-limit", "2", "--no-bump", "--json"],
+                    # 30s: a cold store.py spawn (full storelib import,
+                    # first-touch AV scanning on CI windows runners) can
+                    # exceed a tight timeout.
+                    stderr=subprocess.DEVNULL, timeout=30,
+                ).decode("utf-8", "replace")
+                break
+            except subprocess.TimeoutExpired:
+                # A 30s HANG is pathological (wedged process) — do not
+                # triple the stall by retrying; degrade to empty. This also
+                # bounds the whole block at ~30s so no caller subprocess
+                # timeout can be blown by the retry loop.
+                out = ""
+                break
+            except Exception:
+                # Fast failure (the observed CI mode: SQLITE_BUSY exit while
+                # the detached cadence worker held the store) — brief
+                # backoff, then retry.
+                out = ""
+                if _recent_attempt < 2:
+                    __import__("time").sleep(1.5)
         rows = json.loads(out) if out.strip() else []
         # v13 (issue #65, 10.8): unwrap the read envelope via the SHARED
         # shim (C38) — same helper the hooks body / Hermes / MCP use; the
@@ -378,10 +464,29 @@ if store_py and os.path.isfile(store_py):
                 # SAME bg log the other hook surfaces use (recall /
                 # precompact / subagent-recall via the shared body).
                 try:
-                    _log_dir = os.environ.get("ZMEM_DATA", "") or (
-                        os.path.dirname(os.environ.get("ZMEM_STORE", ""))
-                        if os.environ.get("ZMEM_STORE") else ""
-                    ) or os.path.join(os.path.expanduser("~"), ".zmem")
+                    # PRR-101 review: mirror the shared body _data_dir()
+                    # chain and normalization exactly (ZMEM_STORE >
+                    # ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
+                    # ~/.zmem; expanduser on EVERY branch — the outer bash
+                    # re-exports ZMEM_DATA verbatim, so a tilde-valued
+                    # ZMEM_DATA/ZMEM_STORE arrives here unexpanded and this
+                    # block must expand it too, or the isdir gate silently
+                    # drops the decision line).
+                    _log_dir = ""
+                    _ss_store = os.environ.get("ZMEM_STORE", "")
+                    if _ss_store:
+                        _log_dir = os.path.expanduser(os.path.dirname(_ss_store))
+                    if not _log_dir:
+                        _log_dir = os.path.expanduser(
+                            os.environ.get("ZMEM_DATA", ""))
+                    if not _log_dir:
+                        for _pd_var in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+                            _pd_val = os.environ.get(_pd_var, "")
+                            if _pd_val:
+                                _log_dir = os.path.expanduser(_pd_val)
+                                break
+                    if not _log_dir:
+                        _log_dir = os.path.join(os.path.expanduser("~"), ".zmem")
                     _log_path = os.path.join(_log_dir, "zmem-bg.log")
                     if os.path.isdir(_log_dir):
                         with open(_log_path, "a", encoding="utf-8") as _lf:

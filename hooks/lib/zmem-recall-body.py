@@ -46,11 +46,11 @@ The body:
      handles it) and exits 0; a reason-classification error degrades to the
      retrieved-empty one-liner (never the bar) and still exits 0.
 
-The selective-inject decision is logged to ``$DATA_DIR/zmem-bg.log``
-(I5 critic-fix: existing log file, not a new one). Since issue #87 every
-line carries ``reason=`` (from schema_meta's INJECT_SILENT_REASONS tuple,
-plus ``injected`` on the success line) and ``omitted=N`` when the passive
-injection-risk filter dropped rows.
+The selective-inject decision is logged to ``<data dir>/zmem-bg.log`` (the
+dir resolved by ``_data_dir()``; I5 critic-fix: existing log file, not a new
+one). Since issue #87 every line carries ``reason=`` (from schema_meta's
+INJECT_SILENT_REASONS tuple, plus ``injected`` on the success line) and
+``omitted=N`` when the passive injection-risk filter dropped rows.
 """
 
 from __future__ import annotations
@@ -254,19 +254,14 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
     optional ``tokens=used/budget`` (the ``tokens=\\d+/\\d+`` shape pinned by
     tests/test_token_budget.py is unchanged).
 
-    PRR-016 fix: read the CANONICAL ``ZMEM_DATA`` env (what every hook
-    wrapper and the launcher export); the previous ``ZMEM_DATA_DIR`` read
-    never matched, so the log always landed in ~/.zmem even on
-    store-overridden deployments. ``ZMEM_STORE``'s parent is the secondary
-    resolution (host.resolve_store_path gives ZMEM_STORE top precedence).
+    PRR-016 fix: the log used to read a stale ``ZMEM_DATA_DIR`` var and so
+    always landed in ~/.zmem even on store-overridden deployments; it now
+    reads the live env. Superseded again by ring-reader parity (PRR-91-001
+    follow-up): the resolution goes through ``_data_dir()`` so the log lands
+    next to the ops ring it describes — ZMEM_STORE-first like the ring read
+    path, with the same plugin-data steps for non-launcher environments.
     """
-    data_dir = os.environ.get("ZMEM_DATA", "")
-    if not data_dir:
-        store = os.environ.get("ZMEM_STORE", "")
-        data_dir = os.path.dirname(store) if store else ""
-    if not data_dir:
-        data_dir = os.path.join(os.path.expanduser("~"), ".zmem")
-    log_path = os.path.join(data_dir, "zmem-bg.log")
+    log_path = os.path.join(_data_dir(), "zmem-bg.log")
     try:
         # PRR-023: bounded growth — truncate to empty when over the cap so
         # per-event appends cannot grow the log without limit.
@@ -433,19 +428,39 @@ def _ops_helpers(store_py: str):
 
 
 def _data_dir() -> str:
-    """Resolve the data dir for the ops ring (and the bg log) with the SAME
-    precedence the bash writers use (host.resolve_store_path: ZMEM_STORE
-    first) — review PRR-91-001: the ring writer (convention-capture.sh)
-    resolves ZMEM_STORE-first, so a ZMEM_DATA-first reader here would look
-    in a different ops/ dir whenever both env vars are set to different
-    locations, silently no-op'ing the whole lane."""
+    """Resolve the data dir for the ops ring and the bg log — the single
+    resolver for every passive-lane read/write in this body.
+
+    Chain: ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
+    ~/.zmem. ZMEM_STORE-first matches the ring writer (convention-capture.sh)
+    so a split ZMEM_STORE/ZMEM_DATA deployment cannot split reader from
+    writer (review PRR-91-001); the plugin-data steps give the chain the same
+    ORDER as the bash writer's four explicit-env cases (and
+    host.resolve_store_path), so a non-launcher environment that only sets a
+    plugin-data var still finds the ring instead of silently no-op'ing the
+    lane. Normalization: expanduser applies to EVERY branch — host.py
+    expands all four explicit-env values and both bash writers route any
+    tilde-resolved DATA_DIR through expanduser (shared helper
+    hooks/lib/zmem-tilde-expand.sh), so a tilde-valued var resolves to the
+    same directory on every side of the lane (a tilde ZMEM_DATA or
+    ZMEM_STORE previously split reader from writer — cubic round-2 finding).
+    For non-tilde values expanduser is a no-op, so launcher deployments are
+    unchanged. host.py's deeper legacy tail (~/.zcode/memory, plugin scan)
+    stays approximated by ~/.zmem, as before. Launcher-spawned hooks are
+    unaffected: zmem-launch.js always exports ZMEM_DATA."""
     store = os.environ.get("ZMEM_STORE", "")
     if store:
-        return os.path.dirname(store)
+        return os.path.expanduser(os.path.dirname(store))
     data_dir = os.environ.get("ZMEM_DATA", "")
     if not data_dir:
+        claude_data = os.environ.get("CLAUDE_PLUGIN_DATA", "")
+        if claude_data:
+            return os.path.expanduser(claude_data)
+        zcode_data = os.environ.get("ZCODE_PLUGIN_DATA", "")
+        if zcode_data:
+            return os.path.expanduser(zcode_data)
         data_dir = os.path.join(os.path.expanduser("~"), ".zmem")
-    return data_dir
+    return os.path.expanduser(data_dir)
 
 
 def _ops_query_tokens(store_py: str, session_id: str, _ops_cache={}):
