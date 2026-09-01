@@ -344,15 +344,28 @@ if store_py and os.path.isfile(store_py):
             _recent_floor = float(_rf_raw) if _rf_raw else 0.5
         except ValueError:
             _recent_floor = 0.5
-        out = subprocess.check_output(
-            [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", str(_recent_floor), "--include-global", "--global-limit", "2", "--no-bump", "--json"],
-            # 30s: a cold store.py spawn (full storelib import, first-touch
-            # AV scanning on CI windows runners) can exceed a tight timeout,
-            # and a TimeoutExpired here silently skips the whole Tier-2
-            # block below — inject AND its bg-log decision line. Still
-            # bounded, still fail-open.
-            stderr=subprocess.DEVNULL, timeout=30,
-        ).decode("utf-8", "replace")
+        # The detached session-cadence worker (dispatched above, same store)
+        # can hold the database while this read fires: on slow runners a
+        # first recent attempt fails transiently (SQLITE_BUSY -> non-zero
+        # exit), silently skipping the whole Tier-2 block below — inject AND
+        # its bg-log decision line (seen on CI windows runners). Retry
+        # briefly; still bounded and still fail-open on final failure.
+        out = ""
+        for _recent_attempt in range(3):
+            try:
+                out = subprocess.check_output(
+                    [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", str(_recent_floor), "--include-global", "--global-limit", "2", "--no-bump", "--json"],
+                    # 30s per attempt: a cold store.py spawn (full storelib
+                    # import, first-touch AV scanning on CI windows runners)
+                    # can exceed a tight timeout.
+                    stderr=subprocess.DEVNULL, timeout=30,
+                ).decode("utf-8", "replace")
+                break
+            except Exception:
+                if _recent_attempt == 2:
+                    out = ""
+                else:
+                    __import__("time").sleep(1.5)
         rows = json.loads(out) if out.strip() else []
         # v13 (issue #65, 10.8): unwrap the read envelope via the SHARED
         # shim (C38) — same helper the hooks body / Hermes / MCP use; the
