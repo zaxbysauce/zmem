@@ -278,7 +278,14 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   # every other CI run. Deferring the start gives the bounded recall a
   # guaranteed head start; maintenance is background housekeeping, so the
   # shift is invisible.
-  "$PYTHON_BIN" -c 'import time, subprocess, sys; time.sleep(15); sys.exit(subprocess.call(sys.argv[1:]))' \
+  # NOTE: the wrapper must exec store.py THROUGH the interpreter
+  # ([sys.executable] + argv) — a bare subprocess.call(argv) would exec the
+  # .py file directly, which fails with ENOEXEC/WinError 193 everywhere
+  # (store.py has no shebang) and, being fire-and-forget with output in
+  # BG_SINK, would silently kill maintenance on every box (reviewer gate
+  # caught this pre-merge; CI was green because no test inspected the
+  # worker's output — the test below now does).
+  "$PYTHON_BIN" -c 'import time, subprocess, sys; time.sleep(15); sys.exit(subprocess.call([sys.executable] + sys.argv[1:]))' \
     "$STORE_PY_PY" session-cadence \
     --backup-retention "${ZMEM_BACKUP_RETENTION:-7}" >>"$BG_SINK" 2>&1 &
 fi
@@ -366,16 +373,25 @@ if store_py and os.path.isfile(store_py):
             try:
                 out = subprocess.check_output(
                     [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", str(_recent_floor), "--include-global", "--global-limit", "2", "--no-bump", "--json"],
-                    # 30s per attempt: a cold store.py spawn (full storelib
-                    # import, first-touch AV scanning on CI windows runners)
-                    # can exceed a tight timeout.
+                    # 30s: a cold store.py spawn (full storelib import,
+                    # first-touch AV scanning on CI windows runners) can
+                    # exceed a tight timeout.
                     stderr=subprocess.DEVNULL, timeout=30,
                 ).decode("utf-8", "replace")
                 break
+            except subprocess.TimeoutExpired:
+                # A 30s HANG is pathological (wedged process) — do not
+                # triple the stall by retrying; degrade to empty. This also
+                # bounds the whole block at ~30s so no caller subprocess
+                # timeout can be blown by the retry loop.
+                out = ""
+                break
             except Exception:
-                if _recent_attempt == 2:
-                    out = ""
-                else:
+                # Fast failure (the observed CI mode: SQLITE_BUSY exit while
+                # the detached cadence worker held the store) — brief
+                # backoff, then retry.
+                out = ""
+                if _recent_attempt < 2:
                     __import__("time").sleep(1.5)
         rows = json.loads(out) if out.strip() else []
         # v13 (issue #65, 10.8): unwrap the read envelope via the SHARED

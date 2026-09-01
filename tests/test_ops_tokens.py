@@ -828,6 +828,28 @@ class DataDirPrecedenceTest(unittest.TestCase):
             self.assertFalse(
                 (Path(env["HOME"]) / ".zmem" / "zmem-bg.log").exists(),
                 "the bg log must not split off to the home fallback")
+            # End-to-end worker proof (reviewer gate finding): the detached
+            # cadence worker starts through a python wrapper after a 15s
+            # race-guard delay — assert its output ACTUALLY lands in this bg
+            # log. A wrapper that fails to exec store.py through the
+            # interpreter (ENOEXEC/WinError 193, no shebang) is fire-and-
+            # forget with its traceback in BG_SINK, so nothing else would
+            # ever notice it (CI was green with exactly that bug).
+            import time as _t
+            deadline = _t.time() + 60
+            cadence_line = ""
+            while _t.time() < deadline:
+                text = log.read_text(encoding="utf-8")
+                hits = [ln for ln in text.splitlines()
+                        if "session-cadence:" in ln]
+                if hits:
+                    cadence_line = hits[-1]
+                    break
+                _t.sleep(2)
+            self.assertTrue(
+                cadence_line and "sweep: ok" in cadence_line,
+                "the deferred session-cadence worker must actually run and "
+                f"log here; tail was: {log.read_text(encoding='utf-8')[-400:]!r}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
