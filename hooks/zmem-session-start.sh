@@ -92,13 +92,56 @@ join_path() {
 # Canonical env is exported by the host adapter (zmem-launch.js). Prefer it;
 # fall back to the legacy ZCODE_* vars for manual/back-compat installs.
 PLUGIN_ROOT="${ZMEM_ROOT:-${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}"
-DATA_DIR="${ZMEM_DATA:-${ZCODE_PLUGIN_DATA:-}}"
 PROJECT="${ZMEM_PROJECT:-${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}"
 
-# Resolve the data dir: canonical ZMEM_DATA / plugin data dir if set, else the
-# box-neutral ~/.zmem default (the cutover target), else legacy ~/.zcode/memory.
+# Resolve the data dir with the SAME chain the shared hook body's _data_dir()
+# uses (PRR-101 review: every artifact this hook writes — core.md, markers,
+# the bg log — must co-locate with the store and the ops ring in every
+# environment, including non-launcher plugin-data-only ones):
+#   ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem
+# (expanduser on the plugin-data values happens python-side via host.py /
+# _data_dir(); this bash chain keeps the values verbatim like the writer).
+DATA_DIR=""
+if [ -n "${ZMEM_STORE:-}" ]; then
+  # Normalize Windows separators before dirname (MSYS/Git Bash coreutils
+  # treats `\` as a separator; WSL's does not — see convention-capture.sh).
+  if [ "$IS_WINDOWS" -eq 1 ]; then
+    DATA_DIR="$(dirname "$(printf '%s' "$ZMEM_STORE" | tr '\134' '/')")"
+  else
+    DATA_DIR="$(dirname "$ZMEM_STORE")"
+  fi
+elif [ -n "${ZMEM_DATA:-}" ]; then
+  DATA_DIR="$ZMEM_DATA"
+elif [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+  DATA_DIR="$CLAUDE_PLUGIN_DATA"
+elif [ -n "${ZCODE_PLUGIN_DATA:-}" ]; then
+  DATA_DIR="$ZCODE_PLUGIN_DATA"
+fi
+# Tilde-valued dirs (degenerate operator input — hosts send absolute paths):
+# expand here exactly like convention-capture.sh does, so core.md, markers,
+# the bg log, and the ZMEM_DATA exported to children all land under the same
+# expanded directory the python readers (host.py, _data_dir) use — otherwise
+# this hook splits from the ops lane for tilde-valued plugin-data vars.
+# python's output is native to the interpreter that consumes it.
+DATA_DIR_NATIVE=0
+case "$DATA_DIR" in
+  "~"*)
+    if [ -n "$PYTHON_BIN" ]; then
+      _SS_EXPANDED="$("$PYTHON_BIN" -c 'import os, sys; sys.stdout.write(os.path.expanduser(sys.argv[1]))' "$DATA_DIR" 2>/dev/null)"
+      if [ -n "$_SS_EXPANDED" ]; then
+        DATA_DIR="$_SS_EXPANDED"
+        DATA_DIR_NATIVE=1
+      fi
+    fi
+    ;;
+esac
+
 if [ -n "$DATA_DIR" ]; then
-  DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
+  if [ "$DATA_DIR_NATIVE" -eq 1 ]; then
+    DATA_DIR_PY="$DATA_DIR"
+  else
+    DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
+  fi
   mkdir -p "$DATA_DIR" 2>/dev/null || true
 else
   DATA_DIR="$HOME/.zmem"
@@ -378,10 +421,27 @@ if store_py and os.path.isfile(store_py):
                 # SAME bg log the other hook surfaces use (recall /
                 # precompact / subagent-recall via the shared body).
                 try:
-                    _log_dir = os.environ.get("ZMEM_DATA", "") or (
-                        os.path.dirname(os.environ.get("ZMEM_STORE", ""))
-                        if os.environ.get("ZMEM_STORE") else ""
-                    ) or os.path.join(os.path.expanduser("~"), ".zmem")
+                    # PRR-101 review: mirror the shared body _data_dir()
+                    # chain exactly (ZMEM_STORE > ZMEM_DATA >
+                    # CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem,
+                    # expanduser on the host-supplied plugin-data values) —
+                    # otherwise a plugin-data-only environment splits the
+                    # bg log across two files: this block fell to ~/.zmem
+                    # while the body block moved to the plugin-data dir.
+                    _log_dir = ""
+                    _ss_store = os.environ.get("ZMEM_STORE", "")
+                    if _ss_store:
+                        _log_dir = os.path.dirname(_ss_store)
+                    if not _log_dir:
+                        _log_dir = os.environ.get("ZMEM_DATA", "")
+                    if not _log_dir:
+                        for _pd_var in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+                            _pd_val = os.environ.get(_pd_var, "")
+                            if _pd_val:
+                                _log_dir = os.path.expanduser(_pd_val)
+                                break
+                    if not _log_dir:
+                        _log_dir = os.path.join(os.path.expanduser("~"), ".zmem")
                     _log_path = os.path.join(_log_dir, "zmem-bg.log")
                     if os.path.isdir(_log_dir):
                         with open(_log_path, "a", encoding="utf-8") as _lf:

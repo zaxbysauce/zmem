@@ -213,6 +213,24 @@ if [ -z "$DATA_DIR" ]; then
   DATA_DIR="$HOME/.zmem"
 fi
 
+# Tilde-valued dirs (degenerate operator input — hosts send absolute paths)
+# must expand the same way on both sides of the lane: the python readers
+# (host.py, recall-body._data_dir) os.path.expanduser these values, so the
+# writer expands too or the ring lands in a literal '~' directory and the
+# lane silently no-ops. python's output is native to the interpreter that
+# consumes it, so mark it native (skips to_py_path below).
+case "$DATA_DIR" in
+  "~"*)
+    if [ -n "$PYTHON_BIN" ]; then
+      _EXPANDED="$("$PYTHON_BIN" -c 'import os, sys; sys.stdout.write(os.path.expanduser(sys.argv[1]))' "$DATA_DIR" 2>/dev/null)"
+      if [ -n "$_EXPANDED" ]; then
+        DATA_DIR="$_EXPANDED"
+        DATA_DIR_IS_NATIVE=1
+      fi
+    fi
+    ;;
+esac
+
 if [ "$DATA_DIR_IS_NATIVE" -eq 1 ]; then
   DATA_DIR_PY="$DATA_DIR"
 else

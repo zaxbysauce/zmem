@@ -58,16 +58,21 @@ README.
   (fixture rowids 65–70) asserts the #85-shaped prompts retrieve the
   hazard lessons WITH ops context and miss without it.
 - **Ops-lane dir resolution tail parity** (issue #88 follow-up): the hook
-  body's single resolver now walks the SAME four explicit-env cases the ring
-  writer resolves (`ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA >
-  ZCODE_PLUGIN_DATA` before the `~/.zmem` fallback), and the `zmem-bg.log`
-  write goes through that resolver too — a non-launcher environment that
-  only sets a plugin-data var no longer silently no-ops the ops lane (the
-  log co-locates with the ring it describes). Launcher deployments are
-  unaffected (the launcher always exports `ZMEM_DATA`). Test suites strip
-  the plugin-data vars like `test_sweep` and pin the plugin-data precedence
-  both directions; the decision-point eval hit-rank pin tightened to the
-  issue's rank 1–2 bar.
+  body's single resolver now walks the ring writer's four explicit-env cases
+  in the same order (`ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA >
+  ZCODE_PLUGIN_DATA` before the `~/.zmem` fallback; `expanduser` on the
+  plugin-data branches as host.py does — the `ZMEM_*` branches stay verbatim
+  to match the writer, which now routes tilde-valued plugin-data vars
+  through `expanduser` too), and the `zmem-bg.log` write goes through that
+  resolver — a non-launcher environment that only sets a plugin-data var no
+  longer silently no-ops the ops lane (the log co-locates with the ring it
+  describes). The session-start hook's own resolution (core.md, markers,
+  its bg-log writers) follows the same chain, so every diagnostic and
+  Tier-0 artifact co-locates in those environments as well. Launcher
+  deployments are unaffected (the launcher always exports `ZMEM_DATA`).
+  Test suites strip the plugin-data vars like `test_sweep` and pin the
+  plugin-data precedence both directions; the decision-point eval hit-rank
+  pin tightened to the issue's rank 1–2 bar.
 
 - **`recall --explain`** (issue #82): read-only retrieval debugger with
   `--target` (id/prefix/fragment) and a machine-readable `--json` envelope;

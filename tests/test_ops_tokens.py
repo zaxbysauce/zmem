@@ -568,7 +568,7 @@ class DataDirPrecedenceTest(unittest.TestCase):
         env["USERPROFILE"] = str(home)
         return env
 
-    def _run_writer(self, env: dict, session_id: str) -> None:
+    def _run_writer(self, env: dict, session_id: str, cwd: str = None) -> None:
         bash = shutil.which("bash")
         if not bash:
             self.skipTest("no bash on PATH")
@@ -581,15 +581,16 @@ class DataDirPrecedenceTest(unittest.TestCase):
         subprocess.run(
             [bash, str(REPO_ROOT / "hooks" / "zmem-convention-capture.sh")],
             input=event, capture_output=True, text=True, env=cenv,
-            timeout=60)
+            timeout=60, cwd=cwd)
 
-    def _run_reader(self, env: dict, ns: str, session_id: str) -> str:
+    def _run_reader(self, env: dict, ns: str, session_id: str,
+                    cwd: str = None) -> str:
         r = subprocess.run(
             [sys.executable, str(BODY), str(SCRIPTS / "store.py"),
              ns, "25000", "user_prompt"],
             input=json.dumps({"prompt": "keep finalizing this work",
                               "session_id": session_id}),
-            capture_output=True, text=True, env=env, timeout=120)
+            capture_output=True, text=True, env=env, timeout=120, cwd=cwd)
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip())["additionalContext"]
 
@@ -659,6 +660,139 @@ class DataDirPrecedenceTest(unittest.TestCase):
             line = self._last_hook_line(claude_loc)
             self.assertIn("status=injected", line)
             self.assertRegex(line, r"ops=3(?:\s|$)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_zmem_data_wins_over_plugin_data(self):
+        # Precedence pin (PRR-101-008): ZMEM_DATA is the explicit operator
+        # override — when set alongside a plugin-data var it must win for
+        # BOTH the writer and the reader (the reader-side half of this
+        # ordering had no coverage before).
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-zdata-")
+        try:
+            data_loc = Path(tmp, "data-loc")
+            zcode_loc = Path(tmp, "zcode-loc")
+            data_loc.mkdir()
+            zcode_loc.mkdir()
+            env = _clean_env(tmp)
+            env.pop("ZMEM_STORE", None)
+            env["ZMEM_DATA"] = str(data_loc)
+            env["ZCODE_PLUGIN_DATA"] = str(zcode_loc)
+            _seed(env, "project:prec-zdata", HookBodyComposeTest.LESSON)
+            self._run_writer(env, "sess-z")
+            self.assertTrue((data_loc / "ops" / "sess-z.log").is_file(),
+                            "writer must prefer ZMEM_DATA over plugin-data")
+            self.assertFalse((zcode_loc / "ops").exists())
+            ctx = self._run_reader(env, "project:prec-zdata", "sess-z")
+            self.assertIn("ringcanary", ctx,
+                          "reader must prefer ZMEM_DATA over plugin-data too")
+            self._last_hook_line(data_loc)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_writer_expands_tilde_plugin_data_like_reader(self):
+        # Cubic CLM-1 (PRR-101-001): bash copies a tilde-valued plugin-data
+        # var verbatim while python expands it — the writer must expand too,
+        # or the ring lands in a literal '~' directory and the lane silently
+        # no-ops. The sandboxed HOME pins BOTH sides to the same expansion.
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-tilde-")
+        try:
+            env = self._plugin_data_env(tmp)
+            env["ZCODE_PLUGIN_DATA"] = "~/pd-t"
+            pd_dir = Path(env["HOME"]) / "pd-t"
+            pd_dir.mkdir(parents=True)
+            _seed(env, "project:prec-tilde", HookBodyComposeTest.LESSON)
+            self._run_writer(env, "sess-t", cwd=tmp)
+            self.assertTrue((pd_dir / "ops" / "sess-t.log").is_file(),
+                            "writer must expand a tilde-valued plugin-data "
+                            "var like the python readers do")
+            self.assertFalse((Path(tmp) / "~").exists(),
+                             "a literal '~' directory must never be created "
+                             "in the process cwd")
+            ctx = self._run_reader(env, "project:prec-tilde", "sess-t",
+                                   cwd=tmp)
+            self.assertIn("ringcanary", ctx,
+                          "reader must find the ring under the expanded "
+                          "tilde path")
+            line = self._last_hook_line(pd_dir)
+            self.assertIn("status=injected", line)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_session_start_bg_log_lands_in_plugin_data_dir(self):
+        # V1 (PRR-101-002): session-start's own bg-log writers (the bash
+        # BG_SINK block and the inline Tier-2 decision block) must resolve
+        # the SAME chain as the body — in a plugin-data-only environment the
+        # whole diagnostic log lands in ONE file instead of splitting across
+        # the plugin-data dir and ~/.zmem. CLAUDE-only is the catcher env:
+        # the pre-fix bash chain covered ZCODE but omitted CLAUDE entirely,
+        # so a ZCODE-only env would mask the split.
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-ssstart-")
+        try:
+            plugdata = Path(tmp, "plugdata")
+            plugdata.mkdir()
+            env = self._plugin_data_env(tmp)
+            env["CLAUDE_PLUGIN_DATA"] = str(plugdata)
+            env.update({"ZMEM_ROOT": str(REPO_ROOT), "ZMEM_SESSION": "sess-ss",
+                        "ZMEM_HOST": "zcode", "ZMEM_CTX_BUDGET": "25000"})
+            # The Tier-2 decision line is only written when the recent-pull
+            # returns rows — seed one into the global namespace the hook
+            # queries (the store resolves via the plugin-data chain too).
+            _seed(env, "user:global", HookBodyComposeTest.LESSON)
+            bash = shutil.which("bash")
+            if not bash:
+                self.skipTest("no bash on PATH")
+            r = subprocess.run(
+                [bash, str(REPO_ROOT / "hooks" / "zmem-session-start.sh")],
+                input=json.dumps({"session_id": "sess-ss"}),
+                capture_output=True, text=True, env=env, timeout=180, cwd=tmp)
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            log = plugdata / "zmem-bg.log"
+            self.assertTrue(
+                log.is_file(),
+                "session-start must write the bg log into the plugin-data "
+                "dir like the shared body does")
+            self.assertIn("zmem-hook", log.read_text(encoding="utf-8"))
+            self.assertFalse(
+                (Path(env["HOME"]) / ".zmem" / "zmem-bg.log").exists(),
+                "the bg log must not split off to the home fallback")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_session_start_expands_tilde_plugin_data(self):
+        # Final-critic finding on the fix round: session-start's bash chain
+        # must expand a tilde-valued plugin-data var exactly like the
+        # convention-capture writer, or its core.md/markers/bg log land in a
+        # literal '~' directory while the ring lane uses the expanded one.
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-sstilde-")
+        try:
+            env = self._plugin_data_env(tmp)
+            env["CLAUDE_PLUGIN_DATA"] = "~/pd-ss"
+            pd_dir = Path(env["HOME"]) / "pd-ss"
+            pd_dir.mkdir(parents=True)
+            env.update({"ZMEM_ROOT": str(REPO_ROOT), "ZMEM_SESSION": "sess-st",
+                        "ZMEM_HOST": "zcode", "ZMEM_CTX_BUDGET": "25000"})
+            _seed(env, "user:global", HookBodyComposeTest.LESSON)
+            bash = shutil.which("bash")
+            if not bash:
+                self.skipTest("no bash on PATH")
+            r = subprocess.run(
+                [bash, str(REPO_ROOT / "hooks" / "zmem-session-start.sh")],
+                input=json.dumps({"session_id": "sess-st"}),
+                capture_output=True, text=True, env=env, timeout=180, cwd=tmp)
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            self.assertFalse((Path(tmp) / "~").exists(),
+                             "a literal '~' directory must never be created "
+                             "in the process cwd")
+            log = pd_dir / "zmem-bg.log"
+            self.assertTrue(
+                log.is_file(),
+                "session-start must expand a tilde-valued plugin-data var "
+                "like the ring writer does")
+            self.assertIn("zmem-hook", log.read_text(encoding="utf-8"))
+            self.assertFalse(
+                (Path(env["HOME"]) / ".zmem" / "zmem-bg.log").exists(),
+                "no session-start artifact may split off to ~/.zmem")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

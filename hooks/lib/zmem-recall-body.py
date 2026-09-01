@@ -46,11 +46,11 @@ The body:
      handles it) and exits 0; a reason-classification error degrades to the
      retrieved-empty one-liner (never the bar) and still exits 0.
 
-The selective-inject decision is logged to ``$DATA_DIR/zmem-bg.log``
-(I5 critic-fix: existing log file, not a new one). Since issue #87 every
-line carries ``reason=`` (from schema_meta's INJECT_SILENT_REASONS tuple,
-plus ``injected`` on the success line) and ``omitted=N`` when the passive
-injection-risk filter dropped rows.
+The selective-inject decision is logged to ``<data dir>/zmem-bg.log`` (the
+dir resolved by ``_data_dir()``; I5 critic-fix: existing log file, not a new
+one). Since issue #87 every line carries ``reason=`` (from schema_meta's
+INJECT_SILENT_REASONS tuple, plus ``injected`` on the success line) and
+``omitted=N`` when the passive injection-risk filter dropped rows.
 """
 
 from __future__ import annotations
@@ -434,13 +434,19 @@ def _data_dir() -> str:
     Chain: ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
     ~/.zmem. ZMEM_STORE-first matches the ring writer (convention-capture.sh)
     so a split ZMEM_STORE/ZMEM_DATA deployment cannot split reader from
-    writer (review PRR-91-001); the plugin-data steps match the same four
-    explicit-env cases the bash writer resolves without a subprocess (and
+    writer (review PRR-91-001); the plugin-data steps give the chain the same
+    ORDER as the bash writer's four explicit-env cases (and
     host.resolve_store_path), so a non-launcher environment that only sets a
     plugin-data var still finds the ring instead of silently no-op'ing the
-    lane. host.py's deeper legacy tail (~/.zcode/memory, plugin scan) stays
-    approximated by ~/.zmem, as before. Launcher-spawned hooks are unaffected:
-    zmem-launch.js always exports ZMEM_DATA."""
+    lane. Normalization: expanduser applies to the plugin-data branches only
+    (mirroring host.py); ZMEM_STORE/ZMEM_DATA pass through verbatim to match
+    the bash writer, which expands no branch — except that the
+    convention-capture writer now routes tilde-valued plugin-data vars
+    through expanduser too, so both sides of the ring lane agree on those as
+    well (session-start's bash chain does not, but its python blocks expand). host.py's deeper legacy tail
+    (~/.zcode/memory, plugin scan) stays approximated by ~/.zmem, as before.
+    Launcher-spawned hooks are unaffected: zmem-launch.js always exports
+    ZMEM_DATA."""
     store = os.environ.get("ZMEM_STORE", "")
     if store:
         return os.path.dirname(store)
