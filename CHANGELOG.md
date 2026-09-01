@@ -57,6 +57,17 @@ README.
   line; `store.py sweep` collects stale rings; decision-point gold bucket
   (fixture rowids 65–70) asserts the #85-shaped prompts retrieve the
   hazard lessons WITH ops context and miss without it.
+- **Ops-lane dir resolution tail parity** (issue #88 follow-up): the hook
+  body's single resolver now walks the SAME four explicit-env cases the ring
+  writer resolves (`ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA >
+  ZCODE_PLUGIN_DATA` before the `~/.zmem` fallback), and the `zmem-bg.log`
+  write goes through that resolver too — a non-launcher environment that
+  only sets a plugin-data var no longer silently no-ops the ops lane (the
+  log co-locates with the ring it describes). Launcher deployments are
+  unaffected (the launcher always exports `ZMEM_DATA`). Test suites strip
+  the plugin-data vars like `test_sweep` and pin the plugin-data precedence
+  both directions; the decision-point eval hit-rank pin tightened to the
+  issue's rank 1–2 bar.
 
 - **`recall --explain`** (issue #82): read-only retrieval debugger with
   `--target` (id/prefix/fragment) and a machine-readable `--json` envelope;

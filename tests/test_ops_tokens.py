@@ -42,6 +42,11 @@ _STRIP_ENV = (
     "ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_NAMESPACE",
     "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT_TOKEN_BUDGET",
     "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR", "ZMEM_CONVENTION_INTERVAL",
+    # Hook dir-resolution chains consult the plugin-data vars (host.py:42-66,
+    # convention-capture.sh:166-190); strip them like test_sweep's
+    # DATA_DIR_ENV_VARS so a dev box's ambient values can never receive
+    # subprocess writes. Tests that need them set them explicitly via extra.
+    "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
 )
 
 
@@ -544,7 +549,118 @@ class HookBodyComposeTest(unittest.TestCase):
 class DataDirPrecedenceTest(unittest.TestCase):
     """Review PRR-91-001: the ring reader (hook body) must resolve the data
     dir ZMEM_STORE-first, matching the convention-capture writer — otherwise
-    split-env deployments silently no-op the lane."""
+    split-env deployments silently no-op the lane. The plugin-data cases
+    below extend the same writer/reader-parity contract to the rest of the
+    writer's chain (CLAUDE_PLUGIN_DATA / ZCODE_PLUGIN_DATA): a non-launcher
+    environment that only sets a plugin-data var must still find the ring."""
+
+    def _plugin_data_env(self, tmp: str) -> dict:
+        # _clean_env seeds ZMEM_STORE/ZMEM_DATA; the plugin-data branch of
+        # the chain is only reachable when BOTH are absent, so pop them.
+        env = _clean_env(tmp)
+        env.pop("ZMEM_STORE", None)
+        env.pop("ZMEM_DATA", None)
+        # Keep even the pre-fix home fallback inside the sandbox: a failing
+        # reader must probe <sandbox-home>/.zmem, never the operator's.
+        home = Path(tmp, "sandbox-home")
+        home.mkdir()
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)
+        return env
+
+    def _run_writer(self, env: dict, session_id: str) -> None:
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("no bash on PATH")
+        cenv = dict(env)
+        cenv.update({"ZMEM_ROOT": str(REPO_ROOT), "ZMEM_SESSION": session_id,
+                     "ZMEM_CONVENTION_INTERVAL": "10"})
+        event = json.dumps({"tool_name": "Bash",
+                            "tool_input": {"command": "git stash pop"},
+                            "session_id": session_id})
+        subprocess.run(
+            [bash, str(REPO_ROOT / "hooks" / "zmem-convention-capture.sh")],
+            input=event, capture_output=True, text=True, env=cenv,
+            timeout=60)
+
+    def _run_reader(self, env: dict, ns: str, session_id: str) -> str:
+        r = subprocess.run(
+            [sys.executable, str(BODY), str(SCRIPTS / "store.py"),
+             ns, "25000", "user_prompt"],
+            input=json.dumps({"prompt": "keep finalizing this work",
+                              "session_id": session_id}),
+            capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip())["additionalContext"]
+
+    def _last_hook_line(self, data_dir: Path) -> str:
+        log = data_dir / "zmem-bg.log"
+        self.assertTrue(log.is_file(),
+                        "bg log must co-locate with the ring's data dir")
+        lines = [l for l in log.read_text(encoding="utf-8").splitlines()
+                 if "zmem-hook" in l]
+        self.assertTrue(lines, "no zmem-hook line in the bg log")
+        return lines[-1]
+
+    def test_reader_finds_ring_written_under_plugin_data_var(self):
+        # THE W1 regression catcher: with ZMEM_STORE/ZMEM_DATA absent and
+        # only ZCODE_PLUGIN_DATA set, the writer lands the ring under the
+        # plugin-data dir and the reader must compose from the SAME dir.
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-plugdata-")
+        try:
+            plugdata = Path(tmp, "plugdata")
+            plugdata.mkdir()
+            env = self._plugin_data_env(tmp)
+            env["ZCODE_PLUGIN_DATA"] = str(plugdata)
+            _seed(env, "project:prec-plug", HookBodyComposeTest.LESSON)
+            self._run_writer(env, "sess-q")
+            self.assertTrue((plugdata / "ops" / "sess-q.log").is_file(),
+                            "writer must resolve the plugin-data dir")
+            self.assertFalse((Path(tmp) / "ops").exists(),
+                             "writer must not write under the stripped "
+                             "_clean_env data dir")
+            self.assertFalse(
+                (Path(env["HOME"]) / ".zmem" / "ops").exists(),
+                "writer must not fall through to the home fallback")
+            ctx = self._run_reader(env, "project:prec-plug", "sess-q")
+            self.assertIn("ringcanary", ctx,
+                          "reader must resolve the ring from the "
+                          "plugin-data dir like the writer")
+            line = self._last_hook_line(plugdata)
+            self.assertIn("status=injected", line)
+            # Exact token count: one `git stash pop` event derives exactly
+            # three allowlisted tokens, so the composed tokens provably came
+            # from THIS ring (the sandbox has no other ring to probe).
+            self.assertRegex(line, r"ops=3(?:\s|$)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_claude_plugin_data_precedes_zcode(self):
+        # Precedence pin (control): with both plugin-data vars set, writer
+        # and reader must agree on the CLAUDE dir and never touch the ZCODE
+        # one (host.resolve_store_path checks CLAUDE first).
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-plugorder-")
+        try:
+            claude_loc = Path(tmp, "claude-loc")
+            zcode_loc = Path(tmp, "zcode-loc")
+            claude_loc.mkdir()
+            zcode_loc.mkdir()
+            env = self._plugin_data_env(tmp)
+            env["CLAUDE_PLUGIN_DATA"] = str(claude_loc)
+            env["ZCODE_PLUGIN_DATA"] = str(zcode_loc)
+            _seed(env, "project:prec-order", HookBodyComposeTest.LESSON)
+            self._run_writer(env, "sess-o")
+            self.assertTrue((claude_loc / "ops" / "sess-o.log").is_file(),
+                            "writer must prefer CLAUDE_PLUGIN_DATA")
+            self.assertFalse((zcode_loc / "ops").exists())
+            ctx = self._run_reader(env, "project:prec-order", "sess-o")
+            self.assertIn("ringcanary", ctx,
+                          "reader must prefer CLAUDE_PLUGIN_DATA too")
+            line = self._last_hook_line(claude_loc)
+            self.assertIn("status=injected", line)
+            self.assertRegex(line, r"ops=3(?:\s|$)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_reader_finds_ring_written_under_zmem_store_dir(self):
         tmp = tempfile.mkdtemp(prefix="zmem-ops-precedence-")
@@ -695,7 +811,9 @@ class EvalGoldComposeTest(unittest.TestCase):
         self.assertEqual(len(dec), 6, "six decision-point gold items")
         for item_id, i in dec.items():
             self.assertTrue(i.get("hit"), f"{item_id} must hit with ops")
-            self.assertLessEqual(i.get("first_hit_rank", 99), 5)
+            # Issue #88's acceptance bar: the ops lane puts each decision
+            # item at rank 1-2 (exact ranks pinned in test_eval_runner).
+            self.assertLessEqual(i.get("first_hit_rank", 99), 2)
 
     def test_decision_items_miss_prose_only(self):
         import contextlib

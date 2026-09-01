@@ -254,19 +254,14 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
     optional ``tokens=used/budget`` (the ``tokens=\\d+/\\d+`` shape pinned by
     tests/test_token_budget.py is unchanged).
 
-    PRR-016 fix: read the CANONICAL ``ZMEM_DATA`` env (what every hook
-    wrapper and the launcher export); the previous ``ZMEM_DATA_DIR`` read
-    never matched, so the log always landed in ~/.zmem even on
-    store-overridden deployments. ``ZMEM_STORE``'s parent is the secondary
-    resolution (host.resolve_store_path gives ZMEM_STORE top precedence).
+    PRR-016 fix: the log used to read a stale ``ZMEM_DATA_DIR`` var and so
+    always landed in ~/.zmem even on store-overridden deployments; it now
+    reads the live env. Superseded again by ring-reader parity (PRR-91-001
+    follow-up): the resolution goes through ``_data_dir()`` so the log lands
+    next to the ops ring it describes — ZMEM_STORE-first like the ring read
+    path, with the same plugin-data steps for non-launcher environments.
     """
-    data_dir = os.environ.get("ZMEM_DATA", "")
-    if not data_dir:
-        store = os.environ.get("ZMEM_STORE", "")
-        data_dir = os.path.dirname(store) if store else ""
-    if not data_dir:
-        data_dir = os.path.join(os.path.expanduser("~"), ".zmem")
-    log_path = os.path.join(data_dir, "zmem-bg.log")
+    log_path = os.path.join(_data_dir(), "zmem-bg.log")
     try:
         # PRR-023: bounded growth — truncate to empty when over the cap so
         # per-event appends cannot grow the log without limit.
@@ -433,17 +428,30 @@ def _ops_helpers(store_py: str):
 
 
 def _data_dir() -> str:
-    """Resolve the data dir for the ops ring (and the bg log) with the SAME
-    precedence the bash writers use (host.resolve_store_path: ZMEM_STORE
-    first) — review PRR-91-001: the ring writer (convention-capture.sh)
-    resolves ZMEM_STORE-first, so a ZMEM_DATA-first reader here would look
-    in a different ops/ dir whenever both env vars are set to different
-    locations, silently no-op'ing the whole lane."""
+    """Resolve the data dir for the ops ring and the bg log — the single
+    resolver for every passive-lane read/write in this body.
+
+    Chain: ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
+    ~/.zmem. ZMEM_STORE-first matches the ring writer (convention-capture.sh)
+    so a split ZMEM_STORE/ZMEM_DATA deployment cannot split reader from
+    writer (review PRR-91-001); the plugin-data steps match the same four
+    explicit-env cases the bash writer resolves without a subprocess (and
+    host.resolve_store_path), so a non-launcher environment that only sets a
+    plugin-data var still finds the ring instead of silently no-op'ing the
+    lane. host.py's deeper legacy tail (~/.zcode/memory, plugin scan) stays
+    approximated by ~/.zmem, as before. Launcher-spawned hooks are unaffected:
+    zmem-launch.js always exports ZMEM_DATA."""
     store = os.environ.get("ZMEM_STORE", "")
     if store:
         return os.path.dirname(store)
     data_dir = os.environ.get("ZMEM_DATA", "")
     if not data_dir:
+        claude_data = os.environ.get("CLAUDE_PLUGIN_DATA", "")
+        if claude_data:
+            return os.path.expanduser(claude_data)
+        zcode_data = os.environ.get("ZCODE_PLUGIN_DATA", "")
+        if zcode_data:
+            return os.path.expanduser(zcode_data)
         data_dir = os.path.join(os.path.expanduser("~"), ".zmem")
     return data_dir
 
