@@ -268,7 +268,18 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   # --if-due + sweep. Each keeps its own cadence gate / single-flight lock
   # inside session-cadence, so this is behavior-equivalent to the former
   # three-line spawn but starts one interpreter instead of three.
-  "$PYTHON_BIN" "$STORE_PY_PY" session-cadence \
+  #
+  # The 15s startup delay is a RACE GUARD, not cosmetic (PRR-101 CI
+  # evidence): the Tier-2 recall below reads the SAME store, and this
+  # worker — fired fire-and-forget — organizes/backs up/consolidates it
+  # concurrently. On slow runners the worker grabbed the database while the
+  # recent read was in flight, and the fail-open handling silently dropped
+  # the whole Tier-2 block (inject AND its bg-log decision line) on roughly
+  # every other CI run. Deferring the start gives the bounded recall a
+  # guaranteed head start; maintenance is background housekeeping, so the
+  # shift is invisible.
+  "$PYTHON_BIN" -c 'import time, subprocess, sys; time.sleep(15); sys.exit(subprocess.call(sys.argv[1:]))' \
+    "$STORE_PY_PY" session-cadence \
     --backup-retention "${ZMEM_BACKUP_RETENTION:-7}" >>"$BG_SINK" 2>&1 &
 fi
 
