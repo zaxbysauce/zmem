@@ -346,7 +346,12 @@ if store_py and os.path.isfile(store_py):
             _recent_floor = 0.5
         out = subprocess.check_output(
             [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", str(_recent_floor), "--include-global", "--global-limit", "2", "--no-bump", "--json"],
-            stderr=subprocess.DEVNULL, timeout=8,
+            # 30s: a cold store.py spawn (full storelib import, first-touch
+            # AV scanning on CI windows runners) can exceed a tight timeout,
+            # and a TimeoutExpired here silently skips the whole Tier-2
+            # block below — inject AND its bg-log decision line. Still
+            # bounded, still fail-open.
+            stderr=subprocess.DEVNULL, timeout=30,
         ).decode("utf-8", "replace")
         rows = json.loads(out) if out.strip() else []
         # v13 (issue #65, 10.8): unwrap the read envelope via the SHARED
