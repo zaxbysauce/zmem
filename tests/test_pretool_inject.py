@@ -416,11 +416,33 @@ class RegistrationAndContractTest(unittest.TestCase):
         # shipped a full hooks system (openai/codex#19385 resolved).
         # The shipped surface map must state the CURRENT truth — Codex
         # wiring deferred to #95 — so it cannot silently re-stale.
+        # PRR-005 (PR #103 review): the pin is a CEILING, not just a
+        # floor — each factual claim that makes the paragraph true is
+        # ratcheted, so a future edit cannot keep the #95 phrase while
+        # restoring stale capability claims around it. Needles are
+        # newline-safe: each is contiguous within ONE physical line of
+        # SKILL.md (assertIn does not match across wrapped lines).
         memory_skill = (REPO_ROOT / "skills" / "memory" / "SKILL.md") \
             .read_text(encoding="utf-8")
         self.assertIn("wiring is tracked in #95", memory_skill,
                       "SKILL.md's parity section must name #95 as the "
                       "Codex pre-tool wiring owner")
+        self.assertIn(
+            "(`PreToolUse` accepts `hookSpecificOutput.additionalContext`",
+            memory_skill,
+            "SKILL.md must state the envelope contract (PreToolUse accepts "
+            "hookSpecificOutput.additionalContext)")
+        self.assertIn(
+            "`PreCompact`/`SubagentStart` exist; openai/codex#19385 was",
+            memory_skill,
+            "SKILL.md must state upstream ships PreCompact/SubagentStart "
+            "and cite the resolved rejection issue")
+        self.assertIn(
+            "resolved; Codex hooks reference: "
+            "https://learn.chatgpt.com/docs/hooks",
+            memory_skill,
+            "SKILL.md must cite the resolution and the current Codex "
+            "hooks reference URL")
 
     def test_launcher_knows_the_verb(self):
         src = (REPO_ROOT / "hooks" / "zmem-launch.js").read_text(encoding="utf-8")

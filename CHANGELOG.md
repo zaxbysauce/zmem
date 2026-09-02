@@ -115,8 +115,8 @@ README.
   shared body's new `subagent` mode prefers the delegated task text
   (prompt/task/description) over the query-less recent pull when the host
   event carries it; falls back otherwise. ZCode has no SubagentStart /
-  PreCompact events (exactly seven supported events — documented gap, not
-  inert registrations).
+  PreCompact events (exactly seven supported events — a host-implemented
+  gap, not a probe artifact that could expire; not inert registrations).
 - **Hermes `pre_llm_call` operation-context delivery** (issue #90, #85 C):
   the reflect hook delivers ring-tail recall as context when the session's
   query-context ring grew since the last delivery (at-most-once per ring
