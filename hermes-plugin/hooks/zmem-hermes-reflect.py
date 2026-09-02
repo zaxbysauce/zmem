@@ -208,7 +208,7 @@ def _capture_correction(user_message: str, session: str, store_path: Path) -> No
             corrections.detect_patterns(text)
         if not item_type:
             return
-        ns = os.environ.get("ZMEM_NAMESPACE") or "user:global"
+        ns = _resolve_hook_namespace()
         item = cq.make_item(
             message=text, type_=item_type, patterns=patterns,
             confidence=confidence, sentiment=sentiment, decay_days=decay_days,
@@ -361,7 +361,7 @@ def _query_context_delivery(conn: sqlite3.Connection, session: str,
         r = subprocess.run(
             [sys.executable, str(scripts_dir / "store.py"), "recall",
              "--query", query[:500],
-             "--namespace", os.environ.get("ZMEM_NAMESPACE") or "user:global",
+             "--namespace", _resolve_hook_namespace(),
              "--limit", "5", "--include-global", "--global-limit", "3",
              "--no-bump", "--json"],
             capture_output=True, text=True, timeout=10,
@@ -388,6 +388,32 @@ def _query_context_delivery(conn: sqlite3.Connection, session: str,
         return _format_fenced_recall(rows, header)
     except Exception:
         return ""
+
+
+def _resolve_hook_namespace() -> str:
+    """PRR-016: ONE namespace chain for everything this hook does with a
+    namespace — remote prefetch, query-context recall, and correction
+    capture. Order: ``ZMEM_MCP_NAMESPACE`` → ``ZMEM_NAMESPACE`` →
+    ``user:global``. Before this, correction capture skipped
+    ``ZMEM_MCP_NAMESPACE``, so a ``ZMEM_MCP_NAMESPACE=project:foo`` box
+    prefetched project:foo but queued corrections in user:global — related
+    data split across namespaces."""
+    return (os.environ.get("ZMEM_MCP_NAMESPACE", "")
+            or os.environ.get("ZMEM_NAMESPACE", "")
+            or "user:global")
+
+
+def _clamp_timeout(raw: str) -> float:
+    """PRR-019: parse + clamp ZMEM_MCP_TIMEOUT (seconds). Garbage → the 8s
+    default; anything outside [1, 30] is clamped (the hook's own shell-side
+    timeout is 15s, so >15 would never be honored anyway)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return 8.0
+    try:
+        return max(1.0, min(30.0, float(raw)))
+    except ValueError:
+        return 8.0
 
 
 def _remote_enabled() -> bool:
@@ -420,15 +446,8 @@ def _remote_context() -> str:
     client = hook_dir.parent / "server" / "mcp_client.py"
     if not client.is_file():
         return ""
-    timeout_s = 8.0
-    raw = os.environ.get("ZMEM_MCP_TIMEOUT", "").strip()
-    if raw:
-        try:
-            timeout_s = max(1.0, min(30.0, float(raw)))
-        except ValueError:
-            pass
-    ns = (os.environ.get("ZMEM_MCP_NAMESPACE", "")
-          or os.environ.get("ZMEM_NAMESPACE", "")).strip()
+    timeout_s = _clamp_timeout(os.environ.get("ZMEM_MCP_TIMEOUT", ""))
+    ns = _resolve_hook_namespace()
     cmd = [sys.executable, str(client), "--url", url, "call", "session_start"]
     if ns:
         cmd += ["--namespace", ns]

@@ -134,6 +134,29 @@ class CredentialShapeStillRefusedTest(unittest.TestCase):
         with self.assertRaises(CapturePolicyRefusal):
             self._refused("session:config api_key=supersecretvalue123")
 
+    def test_allowlisted_ref_with_github_fine_grained_pat_refuses(self):
+        # PRR-001: github_pat_ is a distinct shape from ghp_/gho_/… and was
+        # stored verbatim on an allowlisted ref before the fix.
+        with self.assertRaises(CapturePolicyRefusal):
+            self._refused("db:tokens:github_pat_" + "A1b2C3d4E5" * 4)
+
+    def test_allowlisted_ref_with_slack_token_refuses(self):
+        with self.assertRaises(CapturePolicyRefusal):
+            self._refused("db:slack:xoxb-" + "a1B2c3D4e5F6" * 2)
+
+    def test_allowlisted_ref_with_anthropic_token_refuses(self):
+        with self.assertRaises(CapturePolicyRefusal):
+            self._refused("db:anthropic:sk-ant-" + "A1b2C3d4E5f6" * 3)
+
+    def test_allowlisted_ref_with_google_key_refuses(self):
+        # Real Google API keys are 39 chars total: AIza + 35.
+        with self.assertRaises(CapturePolicyRefusal):
+            self._refused("db:gcp:AIza" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r")
+
+    def test_allowlisted_ref_with_jwt_refuses(self):
+        with self.assertRaises(CapturePolicyRefusal):
+            self._refused("db:jwt:eyJ" + "A1b2C3d4" * 8 + ".eyJ" + "x9Y8z7W6" * 4)
+
     def test_reviewed_mode_never_refuses(self):
         # Manual/reviewed semantics unchanged: advisory only.
         _, warnings = self._refused("db:tokens:ghp_" + "a" * 36, mode="reviewed")

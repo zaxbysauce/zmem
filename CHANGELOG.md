@@ -53,12 +53,21 @@ README.
   guard (`dedup_polarity_conflict`) intentionally KEEPS the #61 contract —
   any polarity flip stays a conflict (own row + `contradicts` link), which
   the eval corpus's discrimination pairs depend on; only the consolidate
-  cluster decision is refined.
+  cluster decision is refined. PR-review hardening (PRR-009): the
+  negation-target discriminator runs in EVERY band — an always/never flip
+  over ≥6 shared predicate tokens parks (never silently merges); the
+  documented trade is that positive restatements of a negated rule whose
+  shared verb sits right after the negator park too (pre-refinement
+  behavior) instead of merging.
 - **doctor second-stores check + `promote-store`** (issue #71 E): doctor
   FAILS when a leftover second store (`~/.zcode/memory`, legacy plugin dirs)
   holds live rows missing from the canonical store; `promote-store --from`
   merges one in (source ids preserved — idempotent; newer source schemas
-  refused).
+  refused). PR-review round: the merge also carries v11 associative links
+  and v13 episode containers/memberships (column-intersected, INSERT OR
+  IGNORE), preserves merged_from/trust_score/applied_count/violated_count
+  from v11+ sources, runs under the writer lease, and exits non-zero when
+  any row is malformed or fails to apply.
 - **mine-history Codex + Hermes adapters** (issue #71 I): `--source codex`
   parses a curated Codex MEMORY.md (User preferences / Reusable knowledge /
   Failures and how to do differently; `raw_memories.md` refused outright) and

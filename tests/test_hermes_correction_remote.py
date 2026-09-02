@@ -36,6 +36,7 @@ import tempfile
 import time
 import unittest
 import urllib.request
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -163,6 +164,56 @@ class HermesCorrectionCaptureTest(unittest.TestCase):
         self.assertEqual(_queue_items(self.tmp), [])
 
 
+class HookHelperUnitTest(unittest.TestCase):
+    """PRR-019 + PRR-016: the hook's timeout clamp and namespace chain, as
+    pure functions (import via importlib — the hook file is stdlib-only and
+    import-safe outside Hermes)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "zmem_hermes_reflect_hook", REFLECT)
+        cls.hook = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.hook)
+
+    def test_clamp_timeout_defaults_and_garbage(self):
+        self.assertEqual(self.hook._clamp_timeout(""), 8.0)
+        self.assertEqual(self.hook._clamp_timeout("   "), 8.0)
+        self.assertEqual(self.hook._clamp_timeout("not-a-number"), 8.0)
+
+    def test_clamp_timeout_bounds(self):
+        self.assertEqual(self.hook._clamp_timeout("0.2"), 1.0,
+                         "below-floor values clamp UP to 1s")
+        self.assertEqual(self.hook._clamp_timeout("999"), 30.0,
+                         "above-ceiling values clamp DOWN to 30s")
+        self.assertEqual(self.hook._clamp_timeout("12"), 12.0)
+
+    def test_namespace_chain_mcp_namespace_wins(self):
+        with mock.patch.dict(os.environ, {"ZMEM_MCP_NAMESPACE": "project:cfg",
+                                          "ZMEM_NAMESPACE": "user:z"},
+                             clear=False):
+            self.assertEqual(self.hook._resolve_hook_namespace(),
+                             "project:cfg")
+
+    def test_namespace_chain_fallbacks(self):
+        with mock.patch.dict(os.environ, {"ZMEM_NAMESPACE": "user:z"},
+                             clear=False):
+            os.environ.pop("ZMEM_MCP_NAMESPACE", None)
+            self.assertEqual(self.hook._resolve_hook_namespace(), "user:z")
+        env_backup = {k: os.environ.get(k) for k in
+                      ("ZMEM_MCP_NAMESPACE", "ZMEM_NAMESPACE")}
+        for k in env_backup:
+            os.environ.pop(k, None)
+        try:
+            self.assertEqual(self.hook._resolve_hook_namespace(),
+                             "user:global")
+        finally:
+            for k, v in env_backup.items():
+                if v is not None:
+                    os.environ[k] = v
+
+
 @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed")
 class HermesRemotePrefetchTest(unittest.TestCase):
     """Issue #71 A: passive prefetch over the real MCP server."""
@@ -170,6 +221,11 @@ class HermesRemotePrefetchTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="zmem-hermes-remote-")
+        # PRR-022: register cleanup BEFORE anything can fail — unittest skips
+        # tearDownClass when setUpClass raises, which would leak the spawned
+        # server process and the temp dir.
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        cls.addClassCleanup(cls._kill_server)
         cls.env = _clean_env(cls.tmp, ZMEM_HOME=str(REPO_ROOT))
         # Seed one canonical row so prefetch has something to surface.
         subprocess.run(
@@ -179,17 +235,31 @@ class HermesRemotePrefetchTest(unittest.TestCase):
              "--signal", "test", "--confidence", "0.9"],
             capture_output=True, text=True, env=cls.env, check=True,
             timeout=120)
-        # Ephemeral port + spawn the real server.
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            cls.port = s.getsockname()[1]
-        cls.server_env = {**cls.env, "ZMEM_MCP_TOKEN": "remote-test-token"}
-        cls.server = subprocess.Popen(
-            [sys.executable, str(MCP_SERVER), "--host", "127.0.0.1",
-             "--port", str(cls.port)],
-            env=cls.server_env, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
+        # Ephemeral port + spawn the real server. PRR-022: hold the bound
+        # socket OPEN until immediately before Popen — closing it earlier
+        # leaves a window where another process can steal the port.
+        holder = socket.socket()
+        try:
+            holder.bind(("127.0.0.1", 0))
+            cls.port = holder.getsockname()[1]
+            cls.server_env = {**cls.env, "ZMEM_MCP_TOKEN": "remote-test-token"}
+            cls.server = subprocess.Popen(
+                [sys.executable, str(MCP_SERVER), "--host", "127.0.0.1",
+                 "--port", str(cls.port)],
+                env=cls.server_env, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        finally:
+            holder.close()
         cls._wait_health()
+
+    @classmethod
+    def _kill_server(cls):
+        if getattr(cls, "server", None) is not None:
+            cls.server.terminate()
+            try:
+                cls.server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                cls.server.kill()
 
     @classmethod
     def _wait_health(cls, timeout=30.0):
@@ -208,12 +278,10 @@ class HermesRemotePrefetchTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.server.terminate()
-        try:
-            cls.server.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            cls.server.kill()
-        shutil.rmtree(cls.tmp, ignore_errors=True)
+        # PRR-022: process/tmp cleanup lives in addClassCleanup hooks
+        # (registered before any failure point) — tearDownClass is skipped
+        # entirely when setUpClass raises. Nothing to do here.
+        pass
 
     def _remote_env(self, **extra: str) -> dict:
         # Remote Hermes box: NO local store file (ZMEM_STORE points nowhere);

@@ -692,6 +692,10 @@ def _mine_hermes_candidates(sessions_dir: str) -> list[dict]:
                 "message": text,
                 "type": item_type,
                 "patterns": patterns,
+                # PRR-013: keep the detector's per-pattern calibration
+                # instead of hard-coding confidence/decay at queue time.
+                "confidence": confidence,
+                "decay_days": decay,
                 "source": "hermes-session:" + path.name,
                 "dedup_key": hashlib.sha1(
                     (item_type + "\x00" + text)
@@ -757,8 +761,13 @@ def cmd_mine_history_adapters(*, source: str, transcript_dir: str,
         try:
             item = _cq.make_item(
                 message=c["message"], type_=c["type"],
-                patterns=c.get("patterns", ""), confidence=0.7,
-                sentiment="correction", decay_days=90, session="",
+                patterns=c.get("patterns", ""),
+                # PRR-013: pass the detector's own calibration through
+                # (hermes candidates carry it; codex candidates fall back
+                # to the documented 0.7/90 defaults).
+                confidence=c.get("confidence", 0.7),
+                sentiment="correction",
+                decay_days=c.get("decay_days", 90), session="",
                 namespace=namespace,
                 host="codex" if source == "codex" else "hermes",
             )
@@ -978,10 +987,23 @@ def cmd_queue_clear(*, namespace: str, ids, clear_all: bool, drop_stale: bool) -
 # Anything the source lacks is simply absent -> the validator's documented
 # default applies (e.g. pre-v11 sources have no taint -> "" -> validator
 # normalizes). Never invents values the validator would not accept.
+# PRR-014: merged_from / trust_score / applied_count / violated_count are in
+# the projection so a v11+ source keeps its dedup lineage, trust, and
+# usage-feedback history instead of being silently reset to validator
+# defaults; sources that predate those columns simply omit them.
 _PROMOTE_COLUMNS = (
     "id", "namespace", "type", "content", "tags", "source_ref", "confidence",
     "signal", "ingestion_ts", "valid_from", "valid_until", "update_of",
     "taint", "superseded_at", "supersede_reason",
+    "merged_from", "trust_score", "applied_count", "violated_count",
+)
+
+# PRR-015: associated (non-derivable) tables promoted alongside memory rows —
+# associative links (v11) and episode containers/memberships (v13).
+_ASSOCIATED_TABLES = (
+    ("memory_link", "id"),
+    ("episode", "id"),
+    ("episode_memory", "id"),
 )
 
 
@@ -1043,8 +1065,41 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
         cols = [c for c in _PROMOTE_COLUMNS if c in src_cols]
         rows = sconn.execute(
             f"SELECT {', '.join(cols)} FROM memory").fetchall()
+        # PRR-015: capture the source's ASSOCIATED-table shapes and pre-read
+        # their rows while the read-only source connection is open. Bounded:
+        # links/episode memberships are small relative to memory rows.
+        sconn_cols_cache: dict[str, list[str]] = {}
+        assoc_rows: dict[str, list[tuple]] = {}
+        for table, _pk in _ASSOCIATED_TABLES:
+            try:
+                tcols = [r["name"] for r in
+                         sconn.execute(f"PRAGMA table_info({table})")]
+            except sqlite3.Error:
+                tcols = []
+            if not tcols:
+                continue
+            sconn_cols_cache[table] = tcols
+            assoc_rows[table] = sconn.execute(
+                f"SELECT {', '.join(tcols)} FROM {table}").fetchall()
     finally:
         sconn.close()
+
+    # Destination table columns (for the associated-table intersection).
+    dst_tables: dict[str, list[str]] = {}
+    for table, _pk in _ASSOCIATED_TABLES:
+        try:
+            dst_tables[table] = [r["name"] for r in
+                                 conn.execute(f"PRAGMA table_info({table})")]
+        except sqlite3.Error:
+            dst_tables[table] = []
+
+    def sconn_read(table: str, common: list[str]) -> list[tuple]:
+        """Project the pre-read associated rows onto the destination's common
+        column order (PRR-015)."""
+        out = []
+        for srow in assoc_rows.get(table, []):
+            out.append(tuple(srow[c] for c in common))
+        return out
 
     # Lazy import avoids a module-level cycle (sync imports write; mine is
     # imported by cli alongside both).
@@ -1094,10 +1149,53 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
             continue
         tallies[outcome] = tallies.get(outcome, 0) + 1
 
+    # PRR-015: memory rows alone are an incomplete merge — v11+ associative
+    # links and v13 episode containers/memberships are NOT derivable from the
+    # rows. Promote them too when BOTH stores carry the table, with a column
+    # intersection and INSERT OR IGNORE on the primary key so re-runs stay
+    # idempotent. Tables absent on either side are skipped with a count.
+    assoc_skipped: list[str] = []
+    for table, pk in _ASSOCIATED_TABLES:
+        src_has = bool(sconn_cols_cache.get(table))
+        dst_has = bool(dst_tables.get(table))
+        if not (src_has and dst_has):
+            if src_has and not dst_has:
+                assoc_skipped.append(table)
+            continue
+        src_tcols = sconn_cols_cache[table]
+        dst_tcols = set(dst_tables[table])
+        common = [c for c in src_tcols if c in dst_tcols]
+        if not common:
+            assoc_skipped.append(table)
+            continue
+        srows = sconn_read(table, common)
+        col_list = ", ".join(common)
+        placeholders = ", ".join("?" * len(common))
+        for srow in srows:
+            try:
+                conn.execute(
+                    f"INSERT OR IGNORE INTO {table} ({col_list}) "
+                    f"VALUES ({placeholders})",
+                    tuple(srow),
+                )
+                tallies[f"{table}"] = tallies.get(f"{table}", 0) + 1
+            except sqlite3.Error as exc:
+                print(f"[zmem] promote-store: {table} row skipped "
+                      f"({type(exc).__name__}: {exc})")
+                tallies[f"{table}_failed"] = \
+                    tallies.get(f"{table}_failed", 0) + 1
+
     summary = ", ".join(f"{k}={v}" for k, v in sorted(tallies.items())) or "no rows"
     verb = "dry-run" if dry_run else "promoted"
     print(f"[zmem] promote-store ({verb}) from {src}: {summary}"
           + (f"; malformed={malformed}" if malformed else "")
           + (f"; defaulted fields: "
-             f"{', '.join(sorted(k) for k in defaulted)}" if defaulted else ""))
+             f"{', '.join(sorted(k) for k in defaulted)}" if defaulted else "")
+          + (f"; tables skipped (absent on destination): "
+             f"{', '.join(assoc_skipped)}" if assoc_skipped else ""))
+    # PRR-012: a partial merge must not look complete — malformed source rows
+    # or per-row write failures make the command exit non-zero (the summary
+    # above already names the counts; dry-run stays informational).
+    if not dry_run and (malformed or tallies.get("failed")):
+        return 1
     return 0

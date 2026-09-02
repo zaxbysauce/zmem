@@ -67,6 +67,10 @@ os.environ["ZMEM_DATA"] = _TMP_IMPORT_STORE
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP_IMPORT_STORE, "no-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 os.environ.setdefault("ZMEM_NLI_CMD", "")
+# PRR-023: an ambient fake embed profile flips consolidate's lexical
+# fallback to the cosine path and the fixtures stop clustering — strip it
+# (the subprocess env inherits this process's os.environ).
+os.environ.pop("ZMEM_EMBED_PROFILE", None)
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import shutil  # noqa: E402
@@ -123,17 +127,43 @@ class NegationRelationUnitTest(unittest.TestCase):
         self.assertEqual(
             _negation_relation(R1A, R1B), "restatement")
 
-    def test_r2_preference_prefix_pair_is_restatement(self):
+    def test_r2_direct_negation_of_shared_verb_parks(self):
+        # PRR-009 fix: R2's negator ("do not RESTART …") targets a verb the
+        # other row shares, so tokens cannot separate it from a true flip
+        # ("never restart …"). It parks (contradiction) — the pre-#71-G
+        # behavior for this shape. Merging it safely needs semantics, not
+        # tokens; parking never loses a contradiction.
         self.assertEqual(
-            _negation_relation(R2A, R2B), "restatement")
+            _negation_relation(R2A, R2B), "contradiction")
 
-    def test_r3_issue_constraint_restated_is_restatement(self):
+    def test_r3_direct_negation_of_shared_verb_parks(self):
+        # PRR-009 fix, same trade as R2: "must not REPLACE …" vs "replacing …
+        # requires …" parks. Conservative outcome: no merge, no data loss.
         self.assertEqual(
-            _negation_relation(R3A, R3B), "restatement")
+            _negation_relation(R3A, R3B), "contradiction")
 
     def test_d1_historical_vs_current_parks(self):
-        self.assertEqual(
-            _negation_relation(D1A, D1B), "divergent")
+        # Outcome contract: the historical-vs-current pair NEVER merges.
+        # The label is band-dependent (D1's negator "no longer" precedes the
+        # shared word "production", so the PRR-009 fix labels it
+        # contradiction; either parked label satisfies the invariant).
+        self.assertIn(
+            _negation_relation(D1A, D1B), ("contradiction", "divergent"))
+        self.assertNotEqual(
+            _negation_relation(D1A, D1B), "restatement",
+            "historical-vs-current facts must never classify as a mergeable "
+            "restatement")
+
+    def test_prr009_always_never_pair_is_contradiction(self):
+        """PRR-009 regression (the reviewer's mechanically-proven pair):
+        'always rotate …' vs 'never rotate …' (j≈0.889, one-token symmetric
+        difference) previously classified as restatement and MERGED a true
+        contradiction. The negation-target discriminator must run in every
+        band: 'never' directly precedes the shared verb 'rotate' →
+        contradiction (park)."""
+        a = "always rotate the api deploy key before every fleet push"
+        b = "never rotate the api deploy key before every fleet push"
+        self.assertEqual(_negation_relation(a, b), "contradiction")
 
     def test_d2_different_subject_decoy_parks(self):
         # High lexical overlap, different subject: the containment/jaccard
@@ -231,13 +261,41 @@ class RestatementMergesTest(_ClusterStoreCase):
         conn.close()
         self.assertEqual(live, 2, "true contradiction must keep both rows")
 
-    def test_divergent_pair_parks_and_never_merges(self):
-        self.seed(D1A)
-        self.seed(D1B)
+    def test_prr009_always_never_pair_never_merges_e2e(self):
+        """PRR-009 e2e regression: the reviewer's proven pair ("always rotate
+        …" / "never rotate …", lexical Jaccard 0.8 — it CLUSTERS) previously
+        classified as restatement and merged a true contradiction. It must
+        park (contested), with both rows live."""
+        self.seed("always rotate the api deploy key before every fleet push")
+        self.seed("never rotate the api deploy key before every fleet push")
         self.conn.commit()
         self.conn.close()
         r = self.run_consolidate("--force")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("CONTESTED", r.stdout, r.stdout + r.stderr)
+        self.assertNotIn("restatement", r.stdout)
+        conn = sqlite3.connect(self.env["ZMEM_STORE"])
+        live = conn.execute(
+            "SELECT COUNT(*) FROM memory WHERE superseded_at IS NULL"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(live, 2,
+                         "an always/never flip must never silently merge")
+
+    def test_divergent_pair_parks_and_never_merges(self):
+        # PRR-005: the fixture must actually CLUSTER (lexical Jaccard >= the
+        # 0.60 fallback threshold) so this test exercises the real decision
+        # path instead of passing vacuously on a pair that never formed a
+        # cluster. D1NEW: _lexical_tokens inter=6/union=9 → J=0.667 >= 0.60;
+        # relation is direct-negation ("no longer" precedes the shared word
+        # "serves") → contradiction (parks).
+        self.seed("eugr no longer serves production traffic on the tower cluster today")
+        self.seed("grok serves production traffic on the tower cluster today")
+        self.conn.commit()
+        self.conn.close()
+        r = self.run_consolidate("--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("CONTESTED", r.stdout, r.stdout + r.stderr)
         conn = sqlite3.connect(self.env["ZMEM_STORE"])
         live = conn.execute(
             "SELECT COUNT(*) FROM memory WHERE superseded_at IS NULL"
@@ -264,41 +322,39 @@ class WriteTimeGuardTest(unittest.TestCase):
         self.addCleanup(self.conn.close)
 
     def _insert(self, content):
+        mid = f"cafebabe-0000-4000-8000-{abs(hash(content)) % 10**12:012d}"
         self.conn.execute(
             "INSERT INTO memory (id, namespace, type, content, tags, source_ref, "
             "confidence, signal, ingestion_ts, taint) VALUES "
             "(?, 'user:global', 'lesson', ?, '[]', 'session:w', 0.9, 'none', "
             "'2026-09-01T00:00:00+00:00', 'trusted_internal')",
-            (f"cafebabe-0000-4000-8000-{abs(hash(content)) % 10**12:012d}",
-             content))
+            (mid, content))
         self.conn.commit()
-
-    def _existing_id(self):
-        return self.conn.execute(
-            "SELECT id FROM memory LIMIT 1").fetchone()[0]
+        # PRR-006: return the id of the row JUST inserted and pass it
+        # explicitly to dedup_polarity_conflict — no LIMIT-1 arbitrary-row
+        # pick on the shared frozen store.
+        return mid
 
     def test_contradiction_is_conflict(self):
-        self._insert(C1A)
+        mid = self._insert(C1A)
         self.assertTrue(
-            dedup_polarity_conflict(
-                self.conn, self._existing_id(), C1B))
+            dedup_polarity_conflict(self.conn, mid, C1B))
 
     def test_restatement_is_still_a_write_conflict(self):
         # #61 contract preserved at write time: a restated-constraint add
         # still lands as a conflict (contradicts link / own row) — the #71 G
         # relaxation lives in consolidate() only, so the eval corpus's
         # discrimination pairs keep coexisting.
-        self._insert(R1A)
+        mid = self._insert(R1A)
         self.assertTrue(
-            dedup_polarity_conflict(
-                self.conn, self._existing_id(), R1B),
+            dedup_polarity_conflict(self.conn, mid, R1B),
             "write-time guard keeps the #61 polarity-flip contract")
 
     def test_same_polarity_is_not_conflict(self):
-        self._insert("deploy the fleet gateway on a tuesday morning")
+        mid = self._insert("deploy the fleet gateway on a tuesday morning")
         self.assertFalse(
             dedup_polarity_conflict(
-                self.conn, self._existing_id(),
+                self.conn, mid,
                 "deploy the fleet gateway on a tuesday morning again"))
 
 

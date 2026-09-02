@@ -149,6 +149,60 @@ class PromoteStoreTest(_StoreCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("not found", r.stdout + r.stderr)
 
+    def test_promote_refuses_newer_source_schema(self):
+        # COV-008: a source whose meta.schema_version is NEWER than the
+        # destination's must be refused (no trust demotion).
+        src_dir = os.path.join(self.tmp, "future-store")
+        os.makedirs(src_dir, exist_ok=True)
+        src = os.path.join(src_dir, "store.sqlite")
+        src_env = _clean_env(src_dir)
+        self.assertEqual(_run(src_env, "stats").returncode, 0)
+        conn = sqlite3.connect(src)
+        try:
+            conn.execute("UPDATE meta SET value='99' "
+                         "WHERE key='schema_version'")
+            conn.commit()
+        finally:
+            conn.close()
+        r = _run(self.env, "promote-store", "--from", src)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("refusing", r.stdout + r.stderr)
+        self.assertIn("newer", r.stdout + r.stderr)
+
+    def test_promote_malformed_row_exits_nonzero(self):
+        # PRR-012: a row the validator rejects must make the command exit
+        # non-zero — a partial merge must not look complete.
+        src_dir = os.path.join(self.tmp, "bad-store")
+        os.makedirs(src_dir, exist_ok=True)
+        src_env = _clean_env(src_dir)
+        self.assertEqual(_run(src_env, "stats").returncode, 0)
+        jl = os.path.join(src_dir, "bad.jsonl")
+        with open(jl, "w", encoding="utf-8") as f:
+            # Non-UUID id -> rejected as malformed by _validate_sync_row.
+            f.write(json.dumps({
+                "id": "not-a-uuid", "namespace": "user:global",
+                "type": "fact", "content": "badid row",
+                "signal": "none", "confidence": 0.5}) + "\n")
+        r = _run(src_env, "ingest-jsonl", "--in", jl, "--capture-mode",
+                 "auto")
+        # The bad row never enters the SOURCE via the normal path either;
+        # seed it directly so promote-store sees it.
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn = sqlite3.connect(os.path.join(src_dir, "store.sqlite"))
+        try:
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, ingestion_ts) VALUES "
+                "('bad-id', 'user:global', 'fact', 'badid row', '', '', "
+                "0.5, 'none', '2026-09-01')")
+            conn.commit()
+        finally:
+            conn.close()
+        r2 = _run(self.env, "promote-store", "--from",
+                  os.path.join(src_dir, "store.sqlite"))
+        self.assertEqual(r2.returncode, 1, r2.stdout + r2.stderr)
+        self.assertIn("malformed=1", r2.stdout)
+
 
 class DoctorSecondStoresTest(_StoreCase):
     def _check(self, candidates):
@@ -181,6 +235,32 @@ class DoctorSecondStoresTest(_StoreCase):
     def test_absent_candidate_skips(self):
         check = self._check([Path(os.path.join(self.tmp, "ghost.sqlite"))])
         self.assertEqual(check["status"], "skip")
+
+    def test_contained_second_store_warns(self):
+        # COV-009: a leftover store whose rows ALL exist canonically is a
+        # stale copy — warn (promotable/retirable), never fail.
+        second = os.path.join(self.tmp, "contained.sqlite")
+        env2 = _clean_env(os.path.join(self.tmp, "contained-dir"))
+        os.makedirs(env2["ZMEM_DATA"], exist_ok=True)
+        env2["ZMEM_STORE"] = second
+        self.assertEqual(_run(env2, "stats").returncode, 0)
+        # Seed the SAME content canonically first, then in the second store
+        # via ingest with a fixed id so both sides hold the identical row.
+        fixed_id = "abababab-1111-4111-8111-111111111111"
+        row = {"id": fixed_id, "namespace": "user:global", "type": "fact",
+               "content": "contained second-store shared row",
+               "signal": "test", "confidence": 0.8, "source_ref": "db:c:1"}
+        jl = os.path.join(self.tmp, "contained.jsonl")
+        with open(jl, "w", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        self.assertEqual(_run(self.env, "ingest-jsonl", "--in", jl,
+                              "--capture-mode", "auto").returncode, 0)
+        self.assertEqual(_run(env2, "ingest-jsonl", "--in", jl,
+                              "--capture-mode", "auto").returncode, 0)
+        check = self._check([Path(second)])
+        self.assertEqual(check["status"], "warn", check["summary"])
+        self.assertEqual(check["details"]["second_stores"][0]
+                         ["missing_in_canonical"], 0)
 
 
 CODEX_MEMORY = """# Codex memory

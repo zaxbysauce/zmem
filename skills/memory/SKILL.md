@@ -232,8 +232,10 @@ one included. Hermes delivers the equivalent on `pre_llm_call` (after the
 fact of the producing call), best-effort per ring CURSOR
 `(ts, event-count)` — same-second events still deliver; a transient store
 failure after the at-most-once marker skips that cursor's delivery. Hermes
-delivery currently queries the `user:global` namespace only (the Hermes
-hook events carry no namespace); project-scoped operation context delivers
+delivery's namespace follows the hook chain `ZMEM_MCP_NAMESPACE` →
+`ZMEM_NAMESPACE` → `user:global` (issue #71 review: one chain for prefetch,
+recall, and correction capture — Hermes hook events themselves carry no
+namespace); project-scoped operation context delivers
 on the coding-host PreToolUse surface. All query-context persistence
 (rings, delivery markers, pending fences) lives under `<data>/ops/`
 sidecars and never grows the store's tables. Codex has no pre-tool

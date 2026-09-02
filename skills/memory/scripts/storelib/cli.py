@@ -1078,6 +1078,10 @@ def main():
         # v13 (issue #65, 10.7): episode-open/add/close write; episode-list
         # is read-only and never takes the lease.
         or args.cmd in {"episode-open", "episode-add", "episode-close"}
+        # Issue #71 E (PR-review PRR-003): promote-store writes via
+        # _ingest_row, so a real run serializes against restore/backup like
+        # every other writer; --dry-run is read-only and never takes it.
+        or (args.cmd == "promote-store" and not args.dry_run)
     ):
         writer_lease = _acquire_writer_lease(args.cmd)
 

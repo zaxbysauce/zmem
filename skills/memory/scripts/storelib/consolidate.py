@@ -190,7 +190,21 @@ def _negation_relation(content_a: str, content_b: str) -> str:
     """Classify a mixed-polarity pair: 'contradiction' | 'restatement' |
     'divergent'. Callers: consolidate's cluster branch (all differing pairs
     must be restatements to un-park a merge) and dedup_polarity_conflict
-    (only contradictions mint `contradicts` links)."""
+    (only contradictions mint `contradicts` links).
+
+    PR-review PRR-009: the negation-target discriminator runs on the
+    mid-band TOO, not only at j>=CONTEST_CONTRADICTION_JACCARD. Without
+    this, "always rotate the api deploy key before every fleet push" vs
+    "never rotate …" (j≈0.889 — the negator word itself is stripped, so the
+    stripped predicates differ by one token) classifies as restatement and a
+    TRUE contradiction silently merges. Conservative rule: when the negator
+    directly precedes a predicate word the OTHER row shares, the pair parks
+    (contradiction) at ANY overlap level; only a negation carrying its OWN
+    verb ("do not SKIP a rotate …") can un-park a merge. Known limit
+    (documented trade, not a bug): a negated rule restated positively
+    ("must not replace X without approval" vs "replacing X requires
+    approval") shares the verb, so it parks too — the pre-#71-G behavior for
+    that shape; merging it safely needs semantics tokens cannot provide."""
     ta = _predicate_tokens(content_a)
     tb = _predicate_tokens(content_b)
     if not ta or not tb:
@@ -200,13 +214,14 @@ def _negation_relation(content_a: str, content_b: str) -> str:
     j = len(inter) / len(union)
     negated = content_a if _polarity_signature(content_a) else content_b
     other = tb if negated is content_a else ta
-    if j >= CONTEST_CONTRADICTION_JACCARD and \
-            _negation_targets_shared_predicate(negated, other):
-        return "contradiction"
+    direct = _negation_targets_shared_predicate(negated, other)
     if j >= CONTEST_CONTRADICTION_JACCARD:
-        # Near-identical predicates, but the negation carries its own verb
-        # (absent from the other side): agreement restated with negation.
-        return "restatement"
+        return "contradiction" if direct else "restatement"
+    if direct:
+        # Shared-predicate negation below the high band: indistinguishable
+        # from a true flip by tokens — park (never merge). This is the
+        # pre-#71-G outcome for that shape.
+        return "contradiction"
     if len(inter) >= CONTEST_RESTATEMENT_MIN_INTERSECTION and \
             j >= CONTEST_RESTATEMENT_MIN_JACCARD:
         return "restatement"
@@ -1107,7 +1122,13 @@ def consolidate(
                 print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] "
                       f"polarity differs but every pair is a same-predicate "
                       f"restatement (issue #71 G); {verb}")
-                report["uncontested_restatements"] += 1
+                # PRR-004: in a REAL run the counter increments only AFTER the
+                # cluster COMMITs (post-commit block below) — a rollback must
+                # never leave a phantom merge count. In dry-run there is no
+                # commit, so the counterfactual is counted here (the report
+                # qualifies it with dry_run).
+                if dry_run:
+                    report["uncontested_restatements"] += 1
                 contested_override = True
                 restatement_override = True
             else:
@@ -1259,17 +1280,23 @@ def consolidate(
             merged_count += len(neighbors)
             if collect_run_ids and keeper_grew:
                 consolidated_ids.append(seed["id"])
-            if contested_override:
+            if contested_override and restatement_override:
+                # PRR-004/PRR-002: a restatement merge is NOT a contested
+                # cluster — it gets its own truthful print here (post-COMMIT)
+                # and the counter increment; it never enters
+                # contested_clusters, which stays reserved for actually
+                # contested (parked or overridden) clusters.
+                report["uncontested_restatements"] += 1
+                print(f"[zmem] consolidate: merged restatement cluster around "
+                      f"[{seed['id'][:8]}] (same-predicate restatement, "
+                      f"issue #71 G; {len(neighbors) + 1} members)")
+            elif contested_override:
                 # Appended only after the successful COMMIT, and printed so a
                 # real-run override is never invisible in human output (the
                 # JSON report was previously the sole — and lying — audit
-                # trail; PRR-001). Restatement merges (#71 G) are labeled as
-                # such — they were never contested, just polarity-flagged.
-                override_verb = ("same-predicate restatement (#71 G)"
-                                 if restatement_override
-                                 else "--merge-contested override")
+                # trail; PRR-001).
                 print(f"[zmem] consolidate: merged CONTESTED cluster around "
-                      f"[{seed['id'][:8]}] ({override_verb}; "
+                      f"[{seed['id'][:8]}] (--merge-contested override; "
                       f"{len(neighbors) + 1} members)")
                 report["contested_clusters"].append({
                     "keeper": seed["id"],

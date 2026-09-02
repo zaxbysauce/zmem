@@ -136,7 +136,8 @@ KNOWN_SUBCMDS = [
     "init", "add", "invalidate", "recall", "recent", "search", "supersede",
     "update", "get", "list",
     "stats", "path", "session-cadence", "rebuild-fts", "reembed", "consolidate",
-    "promote", "rekey-namespace", "backup", "restore", "export-pack",
+    "promote", "promote-store", "rekey-namespace", "backup", "restore",
+    "export-pack",
     "export-jsonl", "ingest-jsonl", "failures", "corrections", "queue-list",
     "queue-clear", "mine-history", "sweep",
     # v10 (issue #60): the entity identity inspection/reconciliation surface.
@@ -394,7 +395,8 @@ class CharacterizationTests(unittest.TestCase):
         # subcommand may join the surface, and the count pins the pre-#82
         # surface without duplicating the live list verbatim (a verbatim copy
         # would be self-referential -- cubic review round 1).
-        self.assertEqual(len(KNOWN_SUBCMDS), 36)
+        # 36 -> 37: promote-store joined the surface (issue #71 E).
+        self.assertEqual(len(KNOWN_SUBCMDS), 37)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 

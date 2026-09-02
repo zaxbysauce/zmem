@@ -135,11 +135,8 @@ class AutoNearMissRekeyTest(unittest.TestCase):
         subprocess.run([PYTHON, str(STORE_PY), "stats"],
                        capture_output=True, text=True, env=self.env,
                        check=True)
-        linked = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM memory_entity").fetchone()["n"]
-        self.assertGreaterEqual(linked, 0)  # table exists post-migrate
-        # The row must have been seen by relink_memory: its entity links (if
-        # any were mintable) point at memory ids that live under user:global.
+        # PRR-027: the relink pass must not orphan memory_entity rows — every
+        # link's memory_id must reference a live memory row.
         orphans = self.conn.execute(
             "SELECT COUNT(*) AS n FROM memory_entity WHERE memory_id NOT IN "
             "(SELECT id FROM memory)").fetchone()["n"]
