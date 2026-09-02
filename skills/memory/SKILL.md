@@ -238,13 +238,21 @@ recall, and correction capture — Hermes hook events themselves carry no
 namespace); project-scoped operation context delivers
 on the coding-host PreToolUse surface. All query-context persistence
 (rings, delivery markers, pending fences) lives under `<data>/ops/`
-sidecars and never grows the store's tables. Codex has no pre-tool
-context injection (documented gap).
+sidecars and never grows the store's tables. Codex pre-tool injection is
+deliberately unwired: upstream Codex has since shipped a full hooks system
+(`PreToolUse` accepts `hookSpecificOutput.additionalContext` — model-visible,
+non-blocking — and `PreCompact`/`SubagentStart` exist; openai/codex#19385 was
+resolved; Codex hooks reference: https://learn.chatgpt.com/docs/hooks), so
+the old "host rejects pre-tool context" claim is retired;
+wiring is tracked in #95 (verification-first) behind the miss-rate
+baseline (#94).
 
 Inject surface parity (host facts, not aspirations): Claude Code registers
 SubagentStart (task-text recall when the event carries the delegated
-prompt) and PreCompact; Codex registers SubagentStart/SubagentStop but has
-no PreCompact and no pre-tool context injection. **ZCode supports exactly
+prompt) and PreCompact; Codex registers SubagentStart/SubagentStop, and
+upstream now also ships PreToolUse/PreCompact context injection — but zmem
+wires those only in #95 (verification-first), so they stay unregistered
+until then. **ZCode supports exactly
 seven hook events — SessionStart, UserPromptSubmit, PreToolUse,
 PermissionRequest, PostToolUse, PostToolUseFailure, Stop — so SubagentStart
 and PreCompact are host gaps on ZCode** (an unsupported event name would be
