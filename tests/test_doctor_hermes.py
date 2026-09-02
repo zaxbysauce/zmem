@@ -56,6 +56,35 @@ class HermesPluginCheckTest(unittest.TestCase):
         check = doctor._check_hermes_plugin(REPO_ROOT)
         self.assertEqual(check["status"], "pass", check["summary"])
 
+    def test_mcp_absent_degrades_to_pass_with_note(self):
+        """CI environment (stdlib-only, no mcp package): the missing lib must
+        NOT fail the surface check on a non-remote box — only the importability
+        probe degrades to 'unverified'. (This exact case failed ubuntu CI on
+        the first push.)"""
+        from unittest import mock
+        import importlib.util
+        with mock.patch.object(importlib.util, "find_spec",
+                               return_value=None):
+            check = doctor._check_hermes_plugin(REPO_ROOT)
+        self.assertEqual(check["status"], "pass", check["summary"])
+        self.assertEqual(check["details"].get("mcp_server_importable"),
+                         "unverified")
+
+    def test_remote_mode_mcp_absent_still_fails(self):
+        """Remote mode keeps the hard requirement: with ZMEM_MCP_URL set and
+        no mcp package, prefetch can never work — that must fail."""
+        from unittest import mock
+        import importlib.util
+        os.environ["ZMEM_MCP_URL"] = "http://127.0.0.1:8765/mcp"
+        os.environ.setdefault("ZMEM_MCP_TOKEN", "x")
+        with mock.patch.object(importlib.util, "find_spec",
+                               return_value=None), \
+             mock.patch.object(doctor.Path, "home",
+                               return_value=Path(self._home)):
+            check = doctor._check_hermes_plugin(REPO_ROOT)
+        self.assertEqual(check["status"], "fail")
+        self.assertIn("mcp", check["summary"])
+
     def test_stub_manifest_fails(self):
         with mock.patch.object(doctor, "_parse_simple_yaml",
                                return_value={"name": "zmem"}):

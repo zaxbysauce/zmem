@@ -1646,11 +1646,14 @@ def _check_hermes_plugin(repo_root: Path) -> dict:
                 spec.loader.exec_module(mod)
                 details["mcp_server_importable"] = True
             else:
+                # CI/dev boxes are stdlib-only by convention: a missing mcp
+                # lib here is NOT a surface problem (only the importability
+                # probe degrades to unverified). It IS a problem in remote
+                # mode, handled in the remote branch below (CI fix: this
+                # branch previously failed every stdlib-only run).
                 details["mcp_server_importable"] = "unverified"
-                problems.append("the 'mcp' package is not installed here, so "
-                                "server importability could not be verified "
-                                "(pip install -r hermes-plugin/server/"
-                                "requirements.txt)")
+                details["mcp_server_import_note"] = (
+                    "not verified: the 'mcp' package is not installed here")
         except Exception as exc:
             details["mcp_server_importable"] = False
             problems.append(f"server/mcp_server.py failed to import "
