@@ -114,10 +114,10 @@ except ImportError:
 # write-time redaction (so they can never drift). Stdlib-only, resolved like
 # `corrections`.
 try:
-    from correction_queue import SECRET_PATTERNS  # noqa: F401
+    from correction_queue import SECRET_CREDENTIAL_PATTERNS, SECRET_PATTERNS  # noqa: F401
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
-    from correction_queue import SECRET_PATTERNS  # type: ignore # noqa: F401
+    from correction_queue import SECRET_CREDENTIAL_PATTERNS, SECRET_PATTERNS  # type: ignore # noqa: F401
 
 
 def _warn_fake_active_once() -> None:
@@ -216,6 +216,68 @@ def _has_prompt_injection_risk(*values: str) -> bool:
     combined = " ".join(v for v in values if v)
     return any(p.search(combined) for p in PROMPT_INJECTION_PATTERNS)
 
+
+# Issue #71 F: structured provenance schemes whose source_refs legitimately
+# carry hash-shaped text (a db row id, a hindsight run id, a session uuid, a
+# content hash in a filename). In capture-mode auto these skip the GENERIC
+# hex/base64 secret patterns — which otherwise refuse valid rows — while the
+# CREDENTIAL patterns (key=value, PEM headers, gh*_ tokens, AKIA keys) still
+# refuse, so an actual credential never rides in on an allowlisted scheme.
+_ALLOWED_SOURCE_SCHEMES = ("db:", "hindsight:", "session:", "zmem-queue:", "file:")
+
+# `file:` additionally refuses absolute remainders AND parent-traversal
+# segments (`../`, `..\` — PRR-008: a relative ref is otherwise accepted, and
+# _source_hash reads CWD-relative bytes, so `file:../secrets` would hash
+# files outside the project). Relative paths within the project and
+# well-known stems (codex-MEMORY.md, MEMORY.md, …) are the sanctioned shapes.
+_FILE_REF_ABSOLUTE_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]|~)")
+_FILE_REF_TRAVERSAL_RE = re.compile(r"(?:^|[\\/])\.\.(?:[\\/]|$)")
+
+
+def _file_ref_absolute(source_ref: str) -> bool:
+    """True for ``file:`` refs that must never auto-store: absolute
+    remainders (drive letter, leading slash, UNC prefix, ``~``) or any
+    parent-traversal segment. A plain absolute path matches no legacy secret
+    pattern, so the legacy scan-and-refuse path alone would silently let it
+    through."""
+    ref = source_ref or ""
+    if not ref.startswith("file:"):
+        return False
+    remainder = ref[len("file:"):]
+    if _FILE_REF_ABSOLUTE_RE.match(remainder):
+        return True
+    return bool(_FILE_REF_TRAVERSAL_RE.search(remainder))
+
+
+def _source_ref_allowlisted(source_ref: str) -> tuple[bool, str | None]:
+    """(allowlisted, scheme) for the issue #71 F provenance schemes.
+
+    Strict prefix match on the whole source_ref. ``file:`` refs are
+    allowlisted only when the remainder is RELATIVE and traversal-free
+    (no drive letter, no leading slash/UNC, no ``~``, no ``..`` segment);
+    anything else falls through to the refusal rules in
+    ``_apply_capture_policy``.
+    """
+    ref = source_ref or ""
+    for scheme in _ALLOWED_SOURCE_SCHEMES:
+        if ref.startswith(scheme):
+            if scheme == "file:" and _file_ref_absolute(ref):
+                return False, None
+            return True, scheme
+    return False, None
+
+
+def _check_credential_shapes(source_ref: str) -> list[str]:
+    """Credential-shape scan for allowlisted source_refs (defense in depth):
+    only the EXPLICIT credential patterns, never the generic hex/base64 ones
+    that hash-shaped provenance legitimately trips."""
+    hits = []
+    for pat in SECRET_CREDENTIAL_PATTERNS:
+        m = pat.search(source_ref or "")
+        if m:
+            hits.append(f"possible secret-like text matched pattern {pat.pattern[:40]!r}...")
+    return hits
+
 def _apply_capture_policy(
     *,
     content: str,
@@ -235,17 +297,61 @@ def _apply_capture_policy(
     ever cross a network boundary.
     """
     mode = _normalize_capture_mode(capture_mode)
-    secret_hits = _check_secrets(content, source_ref, tags)
+    allowlisted, allow_scheme = _source_ref_allowlisted(source_ref)
+    # Issue #71 F: the REDACTION scan covers what gets rewritten (content +
+    # tags). For an allowlisted source_ref the hash-like shapes are legitimate
+    # provenance, so the ref is excluded from the redaction/advisory scan;
+    # credential shapes are still refused below.
+    secret_hits = _check_secrets(content, "" if allowlisted else source_ref, tags)
+    if allowlisted and mode != "auto":
+        # Reviewed/manual keep the original advisory contract: credential
+        # shapes in an allowlisted ref stay reviewer-visible (generic
+        # hash-like shapes stay silent — that is the allowlist's point).
+        secret_hits = secret_hits + _check_credential_shapes(source_ref)
     out_content = content
     out_source_ref = source_ref
     out_tags = tags
     source_warnings = _check_secrets("", source_ref)
-    if mode == "auto" and source_warnings:
-        raise CapturePolicyRefusal(
-            "refusing automatic capture because source_ref contains secret-like "
-            "text; review it manually so provenance and staleness tracking are "
-            "not silently destroyed"
-        )
+    allowlist_warning: dict | None = None
+    if mode == "auto":
+        if allowlisted:
+            if _check_credential_shapes(source_ref):
+                raise CapturePolicyRefusal(
+                    "refusing automatic capture because source_ref contains secret-like "
+                    "text; review it manually so provenance and staleness tracking are "
+                    "not silently destroyed"
+                )
+            allowlist_warning = {
+                "type": "source_ref_allowlisted",
+                "scheme": allow_scheme,
+                "message": (
+                    f"source_ref uses allowlisted provenance scheme "
+                    f"{allow_scheme!r}; hash-like shapes in it are not treated "
+                    "as secrets (content scanning unchanged)"
+                ),
+            }
+        elif _check_credential_shapes(source_ref):
+            # Credential shape on a NON-allowlisted ref: legacy refusal (same
+            # message; the credential is the more specific danger, checked
+            # before the file-absolute shape rule below).
+            raise CapturePolicyRefusal(
+                "refusing automatic capture because source_ref contains secret-like "
+                "text; review it manually so provenance and staleness tracking are "
+                "not silently destroyed"
+            )
+        elif _file_ref_absolute(source_ref):
+            raise CapturePolicyRefusal(
+                "refusing automatic capture: file: source_ref is an absolute "
+                "path; use a relative path or a well-known stem "
+                "(e.g. file:codex-MEMORY.md) so provenance never carries a "
+                "home-absolute location"
+            )
+        elif source_warnings:
+            raise CapturePolicyRefusal(
+                "refusing automatic capture because source_ref contains secret-like "
+                "text; review it manually so provenance and staleness tracking are "
+                "not silently destroyed"
+            )
     if mode == "auto" and secret_hits:
         out_content, content_redactions = _redact_secret_like_text(content)
         out_tags, tag_redactions = _redact_secret_like_text(tags)
@@ -274,6 +380,8 @@ def _apply_capture_policy(
     # with _check_secrets, which already scans all three for secrets.)
     if _has_prompt_injection_risk(out_content, out_source_ref, out_tags):
         out_tags = _merge_tag_strings(out_tags, "prompt-injection-risk")
+    if allowlist_warning is not None:
+        warnings.append(allowlist_warning)
     return out_content, out_source_ref, out_tags, warnings
 
 def _to_win_path(p: str) -> str:
@@ -546,8 +654,9 @@ def _validate_namespace(conn: sqlite3.Connection, namespace: str) -> str:
             msg += (
                 f" ({stranded} existing live row(s) are already stranded under "
                 f"a global-near-miss namespace and are unreachable from the "
-                "automatic hooks — rekey them with `rekey-namespace "
-                "--near-miss-global --confirm`.)"
+                "automatic hooks — they are rekeyed automatically the next time "
+                "any current client opens the store (issue #71 C), or rekey them "
+                "right now with `rekey-namespace --near-miss-global --confirm`.)"
             )
         raise CapturePolicyRefusal(msg)
     return trimmed

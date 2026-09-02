@@ -590,6 +590,204 @@ def _queue_mined(report, host: str, as_json: bool = False) -> int:
         print(summary)
     return 2 if failed else 0
 
+# ---------------------------------------------------------------------------
+# Issue #71 I: Codex + Hermes mine-history adapters. Review-queue candidates
+# ONLY — candidates land in the #47 sidecar queue via the same
+# dedup_key-idempotent append the Claude adapter uses; closeout stays the
+# write authority. NEVER raw_memories.md; never full transcripts.
+# ---------------------------------------------------------------------------
+
+_CODEX_SECTIONS = {
+    "user preferences": "preference",
+    "reusable knowledge": "lesson",
+    "failures and how to do differently": "lesson",
+}
+
+
+def _mine_codex_candidates(memory_path: str) -> list[dict]:
+    """Parse Codex MEMORY.md sections into review candidates.
+
+    Reads ONLY the curated sections (User preferences / Reusable knowledge /
+    Failures and how to do differently) — bullets become candidates with a
+    stable dedup_key (sha1 of section+text). raw_memories.md is REFUSED
+    outright (the issue's park list: bulk-ingesting raw model memory is the
+    noise antipattern)."""
+    p = Path(memory_path).expanduser()
+    if p.name.lower() == "raw_memories.md":
+        raise ValueError(
+            "raw_memories.md is never mined (issue #71 I: noise "
+            "antipattern); point --transcript-dir at a curated MEMORY.md")
+    if not p.is_file():
+        raise FileNotFoundError(str(p))
+    text = p.read_text(encoding="utf-8", errors="replace")
+    candidates: list[dict] = []
+    section_type: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            header = stripped.lstrip("#").strip().lower()
+            section_type = _CODEX_SECTIONS.get(header)
+            continue
+        if section_type and stripped.startswith(("-", "*")):
+            message = stripped.lstrip("-*").strip()
+            if len(message) >= 5:
+                candidates.append({
+                    "message": message,
+                    "type": section_type,
+                    "source": "codex-MEMORY.md",
+                    "dedup_key": hashlib.sha1(
+                        (section_type + "\x00" + message)
+                        .encode("utf-8", "replace")).hexdigest(),
+                })
+    return candidates
+
+
+_HERMES_MAX_SESSION_FILES = 50
+_HERMES_MAX_FILE_BYTES = 8 * 1024 * 1024
+
+
+def _mine_hermes_candidates(sessions_dir: str) -> list[dict]:
+    """Mine user turns from Hermes session JSONL transcripts into review
+    candidates (corrections + explicit preferences via the SAME
+    corrections.detect_patterns rules the live hook uses). Read-only;
+    bounded (newest _HERMES_MAX_SESSION_FILES files, per-file byte cap); an
+    unparseable line is skipped — session JSONL shape is upstream-owned."""
+    import corrections as _corr
+    root = Path(sessions_dir).expanduser()
+    if not root.is_dir():
+        raise FileNotFoundError(str(root))
+    files = sorted(
+        (p for p in root.rglob("*.jsonl") if p.is_file()
+         and p.stat().st_size <= _HERMES_MAX_FILE_BYTES),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+    candidates: list[dict] = []
+    for path in files[:_HERMES_MAX_SESSION_FILES]:
+        try:
+            lines = path.read_text(encoding="utf-8",
+                                   errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            role = str(obj.get("role") or obj.get("type") or "")
+            content = obj.get("content") or obj.get("text") or obj.get("message")
+            if role not in ("user", "human") or not isinstance(content, str):
+                continue
+            text = content.strip()
+            if len(text) < 5 or not _corr.should_include_message(text):
+                continue
+            item_type, patterns, confidence, sentiment, decay = \
+                _corr.detect_patterns(text)
+            if not item_type:
+                continue
+            candidates.append({
+                "message": text,
+                "type": item_type,
+                "patterns": patterns,
+                # PRR-013: keep the detector's per-pattern calibration
+                # instead of hard-coding confidence/decay at queue time.
+                "confidence": confidence,
+                "decay_days": decay,
+                "source": "hermes-session:" + path.name,
+                "dedup_key": hashlib.sha1(
+                    (item_type + "\x00" + text)
+                    .encode("utf-8", "replace")).hexdigest(),
+            })
+    return candidates
+
+
+def cmd_mine_history_adapters(*, source: str, transcript_dir: str,
+                              queue: bool, as_json: bool, limit=None) -> int:
+    """Dispatch for `mine-history --source codex|hermes` (issue #71 I).
+
+    Same contract as the Claude lane: read-only on inputs, candidates are
+    REVIEWED before any store write, --queue appends to the #47 sidecar with
+    dedup_key idempotency, never auto-writes the store."""
+    try:
+        if source == "codex":
+            root = transcript_dir or os.environ.get("ZMEM_CODEX_MEMORY") \
+                or str(Path.home() / ".codex" / "MEMORY.md")
+            candidates = _mine_codex_candidates(root)
+        else:
+            root = transcript_dir or os.environ.get("ZMEM_HERMES_SESSIONS") \
+                or str(Path.home() / ".hermes" / "sessions")
+            candidates = _mine_hermes_candidates(root)
+    except FileNotFoundError as exc:
+        print("[zmem] mine-history: no %s input found at %s (set "
+              "--transcript-dir or the source's env knob)"
+              % (source, exc), file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print("[zmem] mine-history: %s" % exc, file=sys.stderr)
+        return 1
+    if limit is not None:
+        candidates = candidates[:limit]
+    if as_json:
+        print(json.dumps({"source": source, "candidates": candidates,
+                          "count": len(candidates)}))
+    else:
+        print("[zmem] mine-history: %d candidate(s) from %s"
+              % (len(candidates), source))
+        for c in candidates:
+            print("  %s [%s]: %s" % (c["type"], c["source"],
+                                     c["message"][:100]))
+    if not queue:
+        return 0
+    try:
+        import correction_queue as _cq
+        namespace = _host.resolve_namespace(os.getcwd()) if _host \
+            else "user:global"
+    except Exception as exc:
+        print("[zmem] mine-history: --queue failed (queue unavailable): %s"
+              % _sanitize_exc_text(str(exc)), file=sys.stderr)
+        return 2
+    try:
+        existing = {it.get("dedup_key") for it in _cq.load_queue(namespace)
+                    if isinstance(it, dict) and it.get("dedup_key")}
+    except Exception:
+        existing = set()
+    added = failed = 0
+    for c in candidates:
+        if c["dedup_key"] in existing:
+            continue
+        try:
+            item = _cq.make_item(
+                message=c["message"], type_=c["type"],
+                patterns=c.get("patterns", ""),
+                # PRR-013: pass the detector's own calibration through
+                # (hermes candidates carry it; codex candidates fall back
+                # to the documented 0.7/90 defaults).
+                confidence=c.get("confidence", 0.7),
+                sentiment="correction",
+                decay_days=c.get("decay_days", 90), session="",
+                namespace=namespace,
+                host="codex" if source == "codex" else "hermes",
+            )
+            item["dedup_key"] = c["dedup_key"]
+            item["source"] = "history-mine"
+            if _cq.append_queue(namespace, item):
+                added += 1
+                existing.add(c["dedup_key"])
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+    summary = ("[zmem] mine-history: queued %d candidate(s) to %s "
+               "(source=%s); %d already present"
+               % (added, namespace, source, len(candidates) - added - failed))
+    if failed:
+        summary += "; %d write(s) FAILED" % failed
+    print(summary, file=sys.stderr if as_json else sys.stdout)
+    return 2 if failed else 0
+
 def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int,
                      limit, queue: bool, as_json: bool) -> int:
     """Mine user corrections, tool rejections, and repeated tool-error patterns
@@ -778,3 +976,250 @@ def cmd_queue_clear(*, namespace: str, ids, clear_all: bool, drop_stale: bool) -
     except Exception:
         print("[zmem] queue-clear: failed (queue untouched)")
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #71 E: promote-store — one-shot merge of a leftover second store into
+# the canonical one. Optional companion to doctor's `second-stores` check.
+# ---------------------------------------------------------------------------
+
+# Columns promoted from the source store, in _validate_sync_row's vocabulary.
+# Anything the source lacks is simply absent -> the validator's documented
+# default applies (e.g. pre-v11 sources have no taint -> "" -> validator
+# normalizes). Never invents values the validator would not accept.
+# PRR-014: merged_from / trust_score / applied_count / violated_count are in
+# the projection so a v11+ source keeps its dedup lineage, trust, and
+# usage-feedback history instead of being silently reset to validator
+# defaults; sources that predate those columns simply omit them.
+_PROMOTE_COLUMNS = (
+    "id", "namespace", "type", "content", "tags", "source_ref", "confidence",
+    "signal", "ingestion_ts", "valid_from", "valid_until", "update_of",
+    "taint", "superseded_at", "supersede_reason",
+    "merged_from", "trust_score", "applied_count", "violated_count",
+)
+
+# PRR-015: associated (non-derivable) tables promoted alongside memory rows —
+# associative links (v11) and episode containers/memberships (v13). Each
+# entry carries its NATURAL key columns: memory_link has no id (its uniqueness
+# is the (src_id, dst_id, relation) triple); episode_memory's PK is the
+# (episode_id, memory_id) pair; episode has a plain id PK.
+_ASSOCIATED_TABLES = (
+    ("memory_link", ("src_id", "dst_id", "relation")),
+    ("episode", ("id",)),
+    ("episode_memory", ("episode_id", "memory_id")),
+)
+
+
+def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
+                      dry_run: bool = False) -> int:
+    """Merge every row of another zmem store into THIS (canonical) one.
+
+    Read-only on the source (opened mode=ro; it may even be an old schema —
+    the column intersection below skips columns it does not have, and a
+    NEWER source schema is refused outright: promoting v14 rows into a v13
+    store would demote trust/lineage the destination cannot represent).
+    Source ids are PRESERVED, so re-running is a no-op (_ingest_row's
+    existing-local-row short-circuit makes the whole command idempotent —
+    the issue's 'capture-mode auto, idempotent IDs' requirement).
+
+    Rows are marshaled through the EXISTING _validate_sync_row contract owner
+    (the same gate ingest-jsonl applies to remote data) and applied via
+    _ingest_row with capture-mode 'manual': store-originated rows are
+    curated by definition, so content stays verbatim while the advisory
+    secret scan still reports anything suspicious. No vec rows are invented
+    here — the destination's normal reembed/embeddings lane owns vectors
+    (same as ingest-jsonl).
+
+    --dry-run reports the per-outcome tallies and the aggregate defaulting
+    counts without writing.
+    """
+    src = Path(from_path).expanduser()
+    if not src.is_file():
+        print(f"[zmem] promote-store: source store not found: {src}")
+        return 1
+
+    # Schema negotiation: refuse a NEWER source (no trust demotion).
+    def _read_version(path: Path) -> int:
+        try:
+            c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                row = c.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()
+                return int(row[0]) if row else 1
+            finally:
+                c.close()
+        except (sqlite3.Error, ValueError):
+            return 1
+
+    src_ver = _read_version(src)
+    dst_row = conn.execute(
+        "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    dst_ver = int(dst_row[0]) if dst_row else 1
+    if src_ver > dst_ver:
+        print(f"[zmem] promote-store: refusing: source schema v{src_ver} is "
+              f"newer than this store's v{dst_ver}; upgrade this client first")
+        return 1
+
+    sconn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    sconn.row_factory = sqlite3.Row
+    try:
+        src_cols = {r["name"] for r in sconn.execute("PRAGMA table_info(memory)")}
+        cols = [c for c in _PROMOTE_COLUMNS if c in src_cols]
+        rows = sconn.execute(
+            f"SELECT {', '.join(cols)} FROM memory").fetchall()
+        # PRR-015: capture the source's ASSOCIATED-table shapes and pre-read
+        # their rows while the read-only source connection is open. Bounded:
+        # links/episode memberships are small relative to memory rows.
+        sconn_cols_cache: dict[str, list[str]] = {}
+        assoc_rows: dict[str, list[tuple]] = {}
+        for table, _pk in _ASSOCIATED_TABLES:
+            try:
+                tcols = [r["name"] for r in
+                         sconn.execute(f"PRAGMA table_info({table})")]
+            except sqlite3.Error:
+                tcols = []
+            if not tcols:
+                continue
+            sconn_cols_cache[table] = tcols
+            assoc_rows[table] = sconn.execute(
+                f"SELECT {', '.join(tcols)} FROM {table}").fetchall()
+    finally:
+        sconn.close()
+
+    # Destination table columns (for the associated-table intersection).
+    dst_tables: dict[str, list[str]] = {}
+    for table, _pk in _ASSOCIATED_TABLES:
+        try:
+            dst_tables[table] = [r["name"] for r in
+                                 conn.execute(f"PRAGMA table_info({table})")]
+        except sqlite3.Error:
+            dst_tables[table] = []
+
+    def sconn_read(table: str, common: list[str]) -> list[tuple]:
+        """Project the pre-read associated rows onto the destination's common
+        column order (PRR-015)."""
+        out = []
+        for srow in assoc_rows.get(table, []):
+            out.append(tuple(srow[c] for c in common))
+        return out
+
+    # Lazy import avoids a module-level cycle (sync imports write; mine is
+    # imported by cli alongside both).
+    from storelib.sync import _ingest_row, _validate_sync_row
+
+    tallies: dict[str, int] = {}
+    defaulted: dict[str, int] = {}
+    malformed = 0
+    # Review-minor fix: project the existing-id short-circuit in dry-run too
+    # (the destination's live id set), so the dry-run summary accounts for
+    # EVERY source row: would_promote + would_skip + malformed == total.
+    dry_skip_ids: set[str] = set()
+    if dry_run:
+        try:
+            dry_skip_ids = {
+                r[0] for r in conn.execute("SELECT id FROM memory")}
+        except sqlite3.Error:
+            dry_skip_ids = set()
+    for row in rows:
+        obj = {c: row[c] for c in cols if row[c] is not None}
+        try:
+            validated = _validate_sync_row(obj)
+        except ValueError as exc:
+            malformed += 1
+            if dry_run:
+                print(f"[zmem] promote-store: would skip one malformed row "
+                      f"({exc})")
+            continue
+        # Track which optional fields the VALIDATOR defaulted (absent from
+        # the source), so --dry-run can summarize the shape change honestly.
+        for key in ("taint", "valid_until", "update_of", "supersede_reason"):
+            if key not in obj and validated.get(key):
+                defaulted[key] = defaulted.get(key, 0) + 1
+        if dry_run:
+            if validated["id"] in dry_skip_ids:
+                tallies["would_skip"] = tallies.get("would_skip", 0) + 1
+            else:
+                tallies["would_promote"] = tallies.get("would_promote", 0) + 1
+            continue
+        try:
+            outcome = _ingest_row(conn, validated, allow_tombstones=True,
+                                  capture_mode="manual")
+        except Exception as exc:
+            print(f"[zmem] promote-store: row {validated.get('id', '?')[:8]} "
+                  f"failed ({type(exc).__name__}: {exc}); skipped")
+            tallies["failed"] = tallies.get("failed", 0) + 1
+            continue
+        tallies[outcome] = tallies.get(outcome, 0) + 1
+
+    # PRR-015: memory rows alone are an incomplete merge — v11+ associative
+    # links and v13 episode containers/memberships are NOT derivable from the
+    # rows. Promote them too when BOTH stores carry the table, with a column
+    # intersection and INSERT OR IGNORE on the primary key so re-runs stay
+    # idempotent. Tables absent on either side are skipped with a count.
+    assoc_skipped: list[str] = []
+    for table, pk in _ASSOCIATED_TABLES:
+        src_has = bool(sconn_cols_cache.get(table))
+        dst_has = bool(dst_tables.get(table))
+        if not (src_has and dst_has):
+            if src_has and not dst_has:
+                assoc_skipped.append(table)
+            continue
+        src_tcols = sconn_cols_cache[table]
+        dst_tcols = set(dst_tables[table])
+        common = [c for c in src_tcols if c in dst_tcols]
+        if not common:
+            assoc_skipped.append(table)
+            continue
+        srows = sconn_read(table, common)
+        col_list = ", ".join(common)
+        placeholders = ", ".join("?" * len(common))
+        pk_idxs = [common.index(c) for c in pk if c in common]
+        for srow in srows:
+            if dry_run:
+                # Dry-run purity (reviewer gate on the PRR-015 fix):
+                # --dry-run must never write. Report would-insert counts
+                # against the destination's existing rows instead.
+                exists = conn.execute(
+                    f"SELECT 1 FROM {table} WHERE "
+                    + " AND ".join(f"{c}=?" for c in pk if c in common),
+                    tuple(srow[i] for i in pk_idxs),
+                ).fetchone()
+                key = table if exists is None else f"{table}_would_skip"
+                tallies[key] = tallies.get(key, 0) + 1
+                continue
+            try:
+                conn.execute(
+                    f"INSERT OR IGNORE INTO {table} ({col_list}) "
+                    f"VALUES ({placeholders})",
+                    tuple(srow),
+                )
+                # The assoc INSERTs run on the CLI connection OUTSIDE
+                # _ingest_row's per-row commit — without an explicit commit
+                # they roll back at process exit (caught by the
+                # carries-associated-tables regression test).
+                from storelib.schema import _commit
+                _commit(conn)
+                tallies[f"{table}"] = tallies.get(f"{table}", 0) + 1
+            except sqlite3.Error as exc:
+                print(f"[zmem] promote-store: {table} row skipped "
+                      f"({type(exc).__name__}: {exc})")
+                tallies[f"{table}_failed"] = \
+                    tallies.get(f"{table}_failed", 0) + 1
+
+    summary = ", ".join(f"{k}={v}" for k, v in sorted(tallies.items())) or "no rows"
+    verb = "dry-run" if dry_run else "promoted"
+    print(f"[zmem] promote-store ({verb}) from {src}: {summary}"
+          + (f"; malformed={malformed}" if malformed else "")
+          + (f"; defaulted fields: "
+             f"{', '.join(sorted(k) for k in defaulted)}" if defaulted else "")
+          + (f"; tables skipped (absent on destination): "
+             f"{', '.join(assoc_skipped)}" if assoc_skipped else ""))
+    # PRR-012: a partial merge must not look complete — malformed source rows
+    # or per-row write failures make the command exit non-zero (the summary
+    # above already names the counts; dry-run stays informational).
+    # Reviewer follow-up: associated-table write failures count too.
+    if not dry_run and (malformed or tallies.get("failed")
+                        or any(k.endswith("_failed") for k in tallies)):
+        return 1
+    return 0

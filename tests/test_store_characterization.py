@@ -136,7 +136,8 @@ KNOWN_SUBCMDS = [
     "init", "add", "invalidate", "recall", "recent", "search", "supersede",
     "update", "get", "list",
     "stats", "path", "session-cadence", "rebuild-fts", "reembed", "consolidate",
-    "promote", "rekey-namespace", "backup", "restore", "export-pack",
+    "promote", "promote-store", "rekey-namespace", "backup", "restore",
+    "export-pack",
     "export-jsonl", "ingest-jsonl", "failures", "corrections", "queue-list",
     "queue-clear", "mine-history", "sweep",
     # v10 (issue #60): the entity identity inspection/reconciliation surface.
@@ -159,7 +160,11 @@ KNOWN_SUBCMDS = [
 # the only way this allowlist grows, so it forces a conscious decision.
 # reembed left the flagless set (issue #63, 8.3): it now exposes
 # --all/--profile/--batch/--dry-run; its help surface is structurally pinned.
-FLAGLESS_SUBCMDS = frozenset({"init", "stats", "path", "rebuild-fts"})
+# Issue #71 C: --no-auto-rekey (a shared parent parser) is on EVERY
+# subcommand by design, so NO subcommand is flagless anymore — init/stats/
+# path/rebuild-fts left the set the same way reembed did (conscious freeze
+# update, not a weakening: their surfaces still hash-freeze WITH the flag).
+FLAGLESS_SUBCMDS = frozenset()
 
 
 def _sha(text: str) -> str:
@@ -390,7 +395,8 @@ class CharacterizationTests(unittest.TestCase):
         # subcommand may join the surface, and the count pins the pre-#82
         # surface without duplicating the live list verbatim (a verbatim copy
         # would be self-referential -- cubic review round 1).
-        self.assertEqual(len(KNOWN_SUBCMDS), 36)
+        # 36 -> 37: promote-store joined the surface (issue #71 E).
+        self.assertEqual(len(KNOWN_SUBCMDS), 37)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 

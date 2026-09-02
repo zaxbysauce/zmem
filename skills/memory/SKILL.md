@@ -206,6 +206,12 @@ writes). `zmem-bg.log` lines carry `ops=N` when tokens augmented
 the query. Explicit surfaces (`recall --query`, `search`) are unchanged.
 Limitation (deliberate, see #88): this helps LATER turns only — the first
 tool call of a turn still runs before any operation context exists.
+Cost note (#93 B4): credential-prefix-shaped tokens (`sk-`, `npm_`, `AKIA`,
+…) are dropped from the ops query EVEN when they are legitimate filenames —
+fail-safe direction (signal loss, never a leak); rename a real path that
+collides. The eval composer ignores `ZMEM_QUERY_CONTEXT` by design (#93 B6):
+evals must stay deterministic and immune to ambient env, so the kill switch
+does not change their queries.
 
 #### Pre-tool inject — issue #90 / #85 direction C
 
@@ -226,8 +232,10 @@ one included. Hermes delivers the equivalent on `pre_llm_call` (after the
 fact of the producing call), best-effort per ring CURSOR
 `(ts, event-count)` — same-second events still deliver; a transient store
 failure after the at-most-once marker skips that cursor's delivery. Hermes
-delivery currently queries the `user:global` namespace only (the Hermes
-hook events carry no namespace); project-scoped operation context delivers
+delivery's namespace follows the hook chain `ZMEM_MCP_NAMESPACE` →
+`ZMEM_NAMESPACE` → `user:global` (issue #71 review: one chain for prefetch,
+recall, and correction capture — Hermes hook events themselves carry no
+namespace); project-scoped operation context delivers
 on the coding-host PreToolUse surface. All query-context persistence
 (rings, delivery markers, pending fences) lives under `<data>/ops/`
 sidecars and never grows the store's tables. Codex has no pre-tool
@@ -983,6 +991,25 @@ namespace. `--to` may not itself be a near-miss. `--confirm` is required to
 write (without it, or with `--dry-run`, the command only previews). Superseded
 rows are left untouched (history preserved).
 
+Since issue #71 C this remediation also runs AUTOMATICALLY: every
+store-opening command rekeys global-near-miss rows to `user:global` before
+dispatching (silent on healthy stores; `ZMEM_AUTO_REKEY=0` or
+`--no-auto-rekey` opts out). The explicit command remains for previews and
+for kill-switch deployments. Namespace contract: fleet facts live in
+`user:global`; project facts in `project:<canonical-git-remote>`; MCP `add`
+without a namespace uses `ZMEM_MCP_DEFAULT_NS` when the operator set it,
+else `user:global` — a bare `global` is never invented.
+
+### promote-store — merge a leftover second store (admin, issue #71 E)
+```
+python <store.py> promote-store --from <path-to-store.sqlite> [--dry-run]
+```
+One-shot merge of a leftover second store (e.g. `~/.zcode/memory/store.sqlite`)
+into the canonical one. Read-only on the source; source ids are PRESERVED so
+re-runs are no-ops; a NEWER source schema is refused. doctor's
+`second-stores` check fails when any live row exists outside the canonical
+store and recommends this command.
+
 ### backup — verified snapshot with retention
 ```
 python <store.py> backup [--retention 7] [--out-dir DIR] [--if-due]
@@ -1150,6 +1177,15 @@ additionally redacts secret-like content/tags (tagged `auto-redacted`) and
 refuses rows whose `source_ref` looks like a secret (counted as
 `capture_refused` in the summary, NOT stored). `reviewed`/`manual` keep the
 original text with an advisory notice.
+
+Issue #71 F: in `auto` mode, `source_ref`s with a structured provenance
+scheme — `db:`, `hindsight:`, `session:`, `zmem-queue:`, and `file:` with a
+RELATIVE path (or a well-known stem like `codex-MEMORY.md`) — skip the
+generic hash-shape refusal (a 32-hex db row id is legitimate provenance).
+Credential shapes (key=value pairs, PEM headers, `gh*_`/AKIA tokens) still
+refuse on allowlisted refs, `file:` absolute remainders still refuse, and
+content/tags scanning is unchanged. The write result carries a structured
+`source_ref_allowlisted` warning so the relaxation is visible.
 
 Every ingested row ALSO runs the deterministic entity extractor (the same
 one `add` uses), so entity identity is rebuilt locally instead of carried

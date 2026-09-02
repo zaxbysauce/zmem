@@ -8,21 +8,34 @@ records pending-nudge flags in zmem's ``meta`` table; THIS hook fires on
 into the user message) and delivers them.
 
 Priority (first match wins, each is one-shot per session):
+  0. correction capture (issue #71 D) — runs BEFORE delivery in every mode:
+     the user turn is classified by the same ``corrections.detect_patterns``
+     rules the other hosts use and queued to the correction SIDECAR (never
+     the store; closeout stays the write authority)
   1. pending failure nudge → emit failure-capture context, clear flag
-  2. pending convention nudge → emit convention-capture context, clear flag
-  3. generic reflect: if convention counter > 0 and no lesson captured yet,
+  1.5 pending convention nudge (after the ops-ring delivery, see below)
+  2. generic reflect: if convention counter > 0 and no lesson captured yet,
      emit a reflect nudge (once per session)
+  (+) ops-ring query-context delivery (issue #90 / #85 C) between 1 and 2
+
+REMOTE MODE (issue #71 A): when ``ZMEM_MCP_URL`` is set, the box has no local
+store (``_connect()`` finds no file) and the passive prefetch comes from the
+LAN zmem MCP server via ``server/mcp_client.py`` (the ``session_start`` tool —
+``--no-bump``, fenced, token-budgeted). Fail-open: a missing ``mcp`` lib, a
+bad token, a refused connection, or a timeout means no injection and the turn
+proceeds.
 
 Works on ALL surfaces (CLI, TUI, Telegram, Discord, Slack) because
 ``pre_llm_call`` context is injected into the user message regardless of
 platform — unlike ``pre_verify`` which Hermes gates on file mutations.
 
 Emits raw JSON on stdout: ``{"context": "..."}`` to inject, ``{}`` silent.
-Stdlib only.
+Stdlib only (the ``mcp`` dependency lives in the mcp_client subprocess).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -115,9 +128,113 @@ def _read_payload() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _extract_user_message(payload: dict) -> str:
+    """Issue #71 D: pull the current user turn from a pre_llm_call payload.
+
+    Documented upstream shape is a top-level ``user_message`` (plugin-hook
+    catalog), but the shell-hook serializer has a known defect (upstream
+    #83281) nesting it under ``extra``; fall back to the last user entry of
+    ``conversation_history``, then the generic prompt-ish keys. Returns ""
+    when nothing usable is present (caller bails)."""
+    for container in (payload, payload.get("extra") if isinstance(payload.get("extra"), dict) else {}):
+        v = container.get("user_message")
+        if isinstance(v, str) and v.strip():
+            return v
+    history = payload.get("conversation_history")
+    if isinstance(history, list):
+        for msg in reversed(history):
+            if isinstance(msg, dict) and msg.get("role") in ("user", "human"):
+                v = msg.get("content")
+                if isinstance(v, str) and v.strip():
+                    return v
+    for key in ("prompt", "input", "text"):
+        v = payload.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
+def _capture_correction(user_message: str, session: str, store_path: Path) -> None:
+    """Issue #71 D: capture user corrections into the correction SIDECAR queue
+    (parity with zmem-capture-correction.sh on Claude/ZCode/Codex).
+
+    Hermes has no user-message hook; ``pre_llm_call`` is the closest real
+    event and its payload carries the user turn. The classification rules are
+    NOT duplicated here — the same ``corrections.detect_patterns`` /
+    ``should_include_message`` the bash hook uses decide what qualifies, and
+    ``correction_queue.make_item``/``append_queue`` write the same
+    schema-versioned queue the closeout skill reviews (the closeout stays the
+    sole store write authority; this hook NEVER touches the store).
+
+    Same <5-char bail and fail-open contract as every other host. Per-session
+    dedup via the ops sidecar (``<data>/ops/<session>.corr`` last-hash
+    marker) so repeated pre_llm_call fires for the same turn append once.
+    Kill switch: ZMEM_HERMES_CORRECTIONS=0. Default ON for parity with the
+    other hosts' capture hooks."""
+    if os.environ.get("ZMEM_HERMES_CORRECTIONS", "1").strip() == "0":
+        return
+    text = (user_message or "").strip()
+    if len(text) < 5:
+        return
+    data_dir = store_path.parent
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    marker = data_dir / "ops" / f"{session}.corr"
+    if marker.is_file():
+        try:
+            if marker.read_text(encoding="utf-8").strip() == digest:
+                return
+        except OSError:
+            pass
+    _rel = Path("skills") / "memory" / "scripts"
+    candidates = [
+        Path(__file__).resolve().parents[2] / _rel,            # in-tree / symlink
+        Path(os.environ.get("ZMEM_HOME", "")).expanduser() / _rel,  # copy install
+    ]
+    scripts_dir = next(
+        (c for c in candidates if (c / "correction_queue.py").is_file()), None)
+    if scripts_dir is None:
+        return
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    try:
+        import corrections  # noqa: E402
+        import correction_queue as cq  # noqa: E402
+    except Exception:
+        return
+    try:
+        if not corrections.should_include_message(text):
+            return
+        item_type, patterns, confidence, sentiment, decay_days = \
+            corrections.detect_patterns(text)
+        if not item_type:
+            return
+        ns = _resolve_hook_namespace()
+        item = cq.make_item(
+            message=text, type_=item_type, patterns=patterns,
+            confidence=confidence, sentiment=sentiment, decay_days=decay_days,
+            session=session, namespace=ns, host="hermes",
+        )
+        ok = cq.append_queue(ns, item)
+    except Exception:
+        return
+    if ok:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(digest, encoding="utf-8")
+        except OSError:
+            pass
+
+
 def _session_id(payload: dict) -> str:
+    """Sanitized session id (final-critic finding): the id lands in sidecar
+    FILE NAMES (``ops/<session>.corr``, ring names) — a crafted
+    ``../``-bearing session id must not escape the ops dir. Keep the common
+    id shapes (alnum, dash, underscore, dot), collapse everything else."""
+    import re as _re
     sid = (payload.get("session_id") or "").strip()
-    return sid or "unknown"
+    sid = _re.sub(r"[^A-Za-z0-9._-]", "_", sid)
+    sid = sid.replace("..", "_")
+    return sid[:128] or "unknown"
 
 
 def _emit_context(text: str) -> None:
@@ -224,6 +341,12 @@ def _query_context_delivery(conn: sqlite3.Connection, session: str,
                            None)
         if scripts_dir is None:
             return ""
+        # #93 C4: scripts_dir ITSELF on sys.path (not just storelib/) — the
+        # `from storelib.inject import ...` below is a PACKAGE import that
+        # needs the parent dir, removing the implicit dependency on
+        # _resolve_store_path having inserted it earlier.
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
         sys.path.insert(0, str(scripts_dir / "storelib"))
         import ops_tokens  # noqa: E402  (stdlib-only, like this hook)
 
@@ -245,7 +368,7 @@ def _query_context_delivery(conn: sqlite3.Connection, session: str,
         r = subprocess.run(
             [sys.executable, str(scripts_dir / "store.py"), "recall",
              "--query", query[:500],
-             "--namespace", os.environ.get("ZMEM_NAMESPACE") or "user:global",
+             "--namespace", _resolve_hook_namespace(),
              "--limit", "5", "--include-global", "--global-limit", "3",
              "--no-bump", "--json"],
             capture_output=True, text=True, timeout=10,
@@ -274,11 +397,110 @@ def _query_context_delivery(conn: sqlite3.Connection, session: str,
         return ""
 
 
+def _resolve_hook_namespace() -> str:
+    """PRR-016: ONE namespace chain for everything this hook does with a
+    namespace — remote prefetch, query-context recall, and correction
+    capture. Order: ``ZMEM_MCP_NAMESPACE`` → ``ZMEM_NAMESPACE`` →
+    ``user:global``. Before this, correction capture skipped
+    ``ZMEM_MCP_NAMESPACE``, so a ``ZMEM_MCP_NAMESPACE=project:foo`` box
+    prefetched project:foo but queued corrections in user:global — related
+    data split across namespaces."""
+    return (os.environ.get("ZMEM_MCP_NAMESPACE", "")
+            or os.environ.get("ZMEM_NAMESPACE", "")
+            or "user:global")
+
+
+def _clamp_timeout(raw: str) -> float:
+    """PRR-019: parse + clamp ZMEM_MCP_TIMEOUT (seconds). Garbage → the 8s
+    default; anything outside [1, 30] is clamped (the hook's own shell-side
+    timeout is 15s, so >15 would never be honored anyway)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return 8.0
+    try:
+        return max(1.0, min(30.0, float(raw)))
+    except ValueError:
+        return 8.0
+
+
+def _remote_enabled() -> bool:
+    """Issue #71 A: remote mode is opt-in via ZMEM_MCP_URL — the store lives
+    across the LAN and context comes from the MCP server, not a local
+    store.py."""
+    return bool(os.environ.get("ZMEM_MCP_URL", "").strip())
+
+
+def _remote_context() -> str:
+    """Issue #71 A: fetch the passive session_start prefetch over MCP.
+
+    Runs ``hermes-plugin/server/mcp_client.py`` as a SUBPROCESS so the ``mcp``
+    client library and its event loop stay out of this (sync, per-turn) hook
+    process; the timeout here is the wedge-proof backstop. The tool is the
+    server's ``session_start`` — passive ``--no-bump``, fenced, token-budgeted
+    — so retrieval_count is never bumped by a prefetch. Fail-open: ANY
+    failure (missing mcp lib, bad token, refused connection, timeout, empty
+    response) returns "" and the turn proceeds without injection.
+
+    Namespace (final-critic fix): comes ONLY from configuration —
+    ``ZMEM_MCP_NAMESPACE``, then ``ZMEM_NAMESPACE``; empty → the server's
+    default (``user:global``). NEVER the session id: pre-critic code passed
+    the session here, so scoped tokens rejected the request and the prefetch
+    queried an accidental empty namespace."""
+    url = os.environ.get("ZMEM_MCP_URL", "").strip()
+    if not url:
+        return ""
+    hook_dir = Path(__file__).resolve().parent
+    client = hook_dir.parent / "server" / "mcp_client.py"
+    if not client.is_file():
+        return ""
+    timeout_s = _clamp_timeout(os.environ.get("ZMEM_MCP_TIMEOUT", ""))
+    ns = _resolve_hook_namespace()
+    cmd = [sys.executable, str(client), "--url", url, "call", "session_start"]
+    if ns:
+        cmd += ["--namespace", ns]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout_s, encoding="utf-8",
+                           errors="replace")
+    except subprocess.TimeoutExpired:
+        return ""
+    except OSError:
+        return ""
+    if r.returncode != 0:
+        # One quiet stderr line keeps failures diagnosable without spamming
+        # the transcript (the hook itself stays silent on stdout).
+        sys.stderr.write(f"zmem-reflect: remote prefetch unavailable: "
+                         f"{(r.stderr or '').strip()[:200]}\n")
+        return ""
+    return (r.stdout or "").strip()
+
+
 def main() -> int:
     payload = _read_payload()
     session = _session_id(payload)
 
     store_path = _resolve_store_path()
+
+    # Issue #71 D: correction capture runs BEFORE any delivery return and in
+    # BOTH modes — it writes only the local sidecar queue, never the store.
+    try:
+        _capture_correction(_extract_user_message(payload), session, store_path)
+    except Exception:
+        pass
+
+    # Issue #71 A: REMOTE mode branches FIRST (final-critic fix): when
+    # ZMEM_MCP_URL is set the box's prefetch comes from the LAN MCP server
+    # regardless of whether a stale/accidental local store file exists — a
+    # leftover local file must never silently downgrade the box to local
+    # delivery. Correction capture (above) already ran and stays local.
+    if _remote_enabled():
+        ctx = _remote_context()
+        if ctx:
+            _emit_context(ctx)
+            return 0
+        _emit_empty()
+        return 0
+
     conn = _connect()
     if conn is None:
         _emit_empty()

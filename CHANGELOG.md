@@ -13,6 +13,79 @@ README.
 ## [Unreleased]
 
 ### Added
+- **Hermes remote passive prefetch** (issue #71 A): with `ZMEM_MCP_URL` (+ token)
+  set on a remote Hermes box, the `pre_llm_call` reflect hook runs the new
+  `hermes-plugin/server/mcp_client.py` subprocess and fetches the MCP server's
+  `session_start` tool — the passive `--no-bump`, fenced, token-budgeted
+  prefetch — so a fleet Hermes with Hindsight still enabled gets zmem context
+  before each turn. No second protocol (same MCP surface); fail-open on a
+  missing `mcp` lib, bad token, refused connection, or timeout
+  (`ZMEM_MCP_TIMEOUT`, default 8s). README's "planned v2" stub is retired.
+- **Hermes correction-capture parity** (issue #71 D): the reflect hook now
+  classifies the user turn with the same `corrections.detect_patterns` rules
+  the Claude/ZCode/Codex capture hook uses and appends to the same
+  schema-versioned sidecar queue (`host: "hermes"`); closeout remains the sole
+  store write authority. `<5`-char bail, fail-open, per-session dedup;
+  `ZMEM_HERMES_CORRECTIONS=0` kill switch.
+- **Hermes plugin manifest + doctor check** (issue #71 B): `plugin.yaml` is a
+  real memory-provider manifest (hooks = the MemoryProvider ABC hooks the
+  provider implements); doctor grows the `hermes-plugin` surface check
+  (manifest parity, register() entry point, hook scripts, guarded MCP-server
+  importability, remote-mode token/mcp requirements).
+- **Automatic near-miss namespace rekey** (issue #71 C): every store-opening
+  command rekeys rows stranded under a global near-miss namespace to
+  `user:global` (silent on healthy stores; `ZMEM_AUTO_REKEY=0` or
+  `--no-auto-rekey` opts out). MCP `add` honors the opt-in
+  `ZMEM_MCP_DEFAULT_NS` configured default. Namespace contract documented
+  (`user:global` fleet facts; `project:<canonical-git-remote>` projects).
+- **Capture-mode provenance allowlist** (issue #71 F): `auto` no longer
+  refuses `db:`/`hindsight:`/`session:`/`zmem-queue:`/`file:<relative>`
+  source_refs for hash-like shapes; credential shapes still refuse (PEM,
+  key=value, `gh*_`/AKIA), `file:` absolute remainders refuse, content
+  scanning unchanged, and a structured `source_ref_allowlisted` warning is
+  surfaced.
+- **Consolidation polarity refinement** (issue #71 G): mixed negation
+  polarity no longer auto-parks a CONSOLIDATE cluster — pairs classified as
+  same-predicate RESTATEMENTS merge (the field report's preference-vs-lesson
+  and restated-constraint false positives), true contradictions
+  ("is live" / "is not live") still park, and divergent pairs (historical vs
+  current facts, different subjects) park conservatively. The WRITE-time
+  guard (`dedup_polarity_conflict`) intentionally KEEPS the #61 contract —
+  any polarity flip stays a conflict (own row + `contradicts` link), which
+  the eval corpus's discrimination pairs depend on; only the consolidate
+  cluster decision is refined. PR-review hardening (PRR-009): the
+  negation-target discriminator runs in EVERY band — an always/never flip
+  over ≥6 shared predicate tokens parks (never silently merges); the
+  documented trade is that positive restatements of a negated rule whose
+  shared verb sits right after the negator park too (pre-refinement
+  behavior) instead of merging.
+- **doctor second-stores check + `promote-store`** (issue #71 E): doctor
+  FAILS when a leftover second store (`~/.zcode/memory`, legacy plugin dirs)
+  holds live rows missing from the canonical store; `promote-store --from`
+  merges one in (source ids preserved — idempotent; newer source schemas
+  refused). PR-review round: the merge also carries v11 associative links
+  and v13 episode containers/memberships (column-intersected, INSERT OR
+  IGNORE), preserves merged_from/trust_score/applied_count/violated_count
+  from v11+ sources, runs under the writer lease, and exits non-zero when
+  any row is malformed or fails to apply.
+- **mine-history Codex + Hermes adapters** (issue #71 I): `--source codex`
+  parses a curated Codex MEMORY.md (User preferences / Reusable knowledge /
+  Failures and how to do differently; `raw_memories.md` refused outright) and
+  `--source hermes` mines Hermes session JSONL user turns — review-queue
+  candidates only, dedup-key idempotent, never auto-writes.
+- **#93 follow-up sweep** (A1/A2/A3/B3–B8/C4): eval-runner env leaks
+  restored/stripped; ONNX fixture test skips loudly with versions; backup
+  sweep re-stats before unlink (TOCTOU); recall-body dir-less `ZMEM_STORE`
+  guard + honest bullet-7 docstring; secret-shape false-positive cost and
+  eval `ZMEM_QUERY_CONTEXT` neutrality documented.
+
+### Fixed
+- **Consolidate commit race**: the per-cluster COMMIT now uses the shared
+  busy_retry-backed `_commit` like every writer path (issue #55 §7 follow-up;
+  rollback stays the atomic backstop).
+- **MCP server docstring** listed 5 tools; now lists all nine.
+
+### Added (earlier in this train)
 - **Pre-tool inject** (issue #90, #85 direction C — host-probed): new
   `hooks/zmem-pretool-recall.sh` + shared-body `pretool` mode derive the
   recall query from the TOOL INPUT itself (the command/file path about to
@@ -23,7 +96,7 @@ README.
   sidecar the next UserPromptSubmit run must deliver — the sidecar covers
   older hosts that ignore pre-tool `additionalContext` (documented and
   supported since Claude Code 2.1.9, where it lands alongside the tool
-  result; pausing is `permissionDecision`-driven only — worst case one
+  result; pausing is permission-decision-driven only — worst case one
   duplicate, never a lost delivery). Codex stays unregistered
   (rejects `hookSpecificOutput.additionalContext`, openai/codex#19385) —
   documented gap.

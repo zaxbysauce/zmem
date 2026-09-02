@@ -195,6 +195,35 @@ running hooks, not the WSL `bash.exe` shim.
 - If a sync repo or broker is compromised, treat that as a memory-store content
   compromise, not a minor metadata issue.
 
+## 10. Hermes hosts (local and remote) — dual mode by default (issue #71)
+
+Hermes cutover is **dual-mode**: Hindsight stays the conversational extractor
+(`memory.provider: hindsight`) and zmem runs BESIDE it as the shared,
+high-precision store — MCP tools plus the `pre_llm_call` passive prefetch
+hook. `memory.provider: zmem` is the **local-only exclusive path**: it
+displaces Hindsight and is documented as such in the README (single-provider
+rule: builtin + one external provider).
+
+- Local Hermes: symlink/junction (or copy + `ZMEM_HOME`) the adapter into the
+  Hermes plugin dir and wire the shell hooks — see README "Hermes Agent —
+  local".
+- Remote Hermes: point it at the store host's MCP server (`mcp_servers.zmem`
+  in the remote `config.yaml`), then add the `pre_llm_call` hook +
+  `ZMEM_MCP_URL`/`ZMEM_MCP_TOKEN` for the passive `--no-bump` prefetch
+  (issue #71 A). `pip install -r hermes-plugin/server/requirements.txt` on
+  the remote box — without the `mcp` lib, prefetch fails open (no injection,
+  nothing surfaced to the agent). Verify with `hermes mcp test zmem`.
+- Gateway note: a running Hermes gateway loads MCP servers at startup — if
+  you change the config, restart the gateway once (Hermes runtime behavior,
+  not zmem's).
+- Leftover second store: doctor's `second-stores` check FAILS when any live
+  row exists outside the canonical store; merge it once with
+  `store.py promote-store --from <path>` (idempotent — source ids are kept)
+  and retire the old file.
+- Near-miss namespaces (`global`, `userglobal`, …): rows stranded by pre-guard
+  writes are rekeyed to `user:global` automatically the next time any current
+  client opens the store (issue #71 C; `ZMEM_AUTO_REKEY=0` opts out).
+
 ## Historical notes
 
 Any personal workstation paths, branch names, and one-time remediation commands

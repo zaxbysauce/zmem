@@ -1385,6 +1385,312 @@ def _check_surfaces(repo_root: Path) -> dict:
     return _check("host-surfaces", status, summary, surfaces=details)
 
 
+# Issue #71 B: the MemoryProvider ABC hooks the zmem provider actually
+# implements (diffed against hermes-plugin/__init__.py). The manifest's
+# `hooks:` list must be a subset of these — Hermes' plugin doctor reports
+# declared-vs-registered drift, so an invented name here is exactly the
+# "3-line stub" class of bug this check exists to catch.
+_HERMES_PROVIDER_HOOKS = {
+    "prefetch", "queue_prefetch", "sync_turn",
+    "on_session_end", "on_pre_compress", "on_memory_write",
+}
+
+
+def _parse_simple_yaml(path: Path) -> dict:
+    """Minimal manifest reader for plugin.yaml: top-level `key: value` scalars
+    plus one flat `key:` list block (`hooks:`/`tags:`). Prefer real YAML when
+    the package is importable; the fallback keeps the check working on
+    stdlib-only boxes instead of failing the whole surface check."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(text)
+        if isinstance(data, dict):
+            return data
+    except ImportError:
+        pass
+    except Exception:
+        return {}
+    out: dict = {}
+    current_list: str | None = None
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indented = raw_line[:1] in (" ", "\t") or raw_line.startswith("- ")
+        stripped = raw_line.strip()
+        if indented and current_list and stripped.startswith("- "):
+            out[current_list].append(stripped[2:].strip())
+            continue
+        if ":" in stripped and not indented:
+            key, _, value = stripped.partition(":")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if value:
+                out[key] = value
+                current_list = None
+            else:
+                out[key] = []
+                current_list = key
+    return out
+
+
+def _check_second_stores(resolved_store: Path,
+                         extra_candidates: list[Path] | None = None) -> dict:
+    """Issue #71 E: detect leftover second stores on the known host paths and
+    FAIL when any live row is missing from the canonical store (the cutover
+    blocker from the field report: `.zcode/memory/store.sqlite` kept 349 live
+    rows after the canonical cutover).
+
+    Candidates are the SAME alternates host.py's resolution chain knows:
+    `~/.zcode/memory/store.sqlite` (legacy manual install) and
+    `~/.zcode/cli/plugins/data/*zmem*/store.sqlite` (pre-box-wide plugin
+    dirs), plus env-pointed plugin-data stores that are not the canonical
+    path. Read-only (`mode=ro`): a candidate store is opened, its live-row
+    count taken, and its id set diffed against the canonical store — a fail
+    here means the cutover would strand memory. A fully-contained second
+    store is a `warn` (stale copy; `promote-store --from` retires it)."""
+    canonical = Path(resolved_store)
+    candidates: list[Path] = [
+        Path.home() / ".zcode" / "memory" / "store.sqlite",
+    ]
+    try:
+        data_dir = Path.home() / ".zcode" / "cli" / "plugins" / "data"
+        candidates.extend(
+            p for p in data_dir.glob("*zmem*/store.sqlite") if p.is_file())
+    except OSError:
+        pass
+    for var in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+        raw = os.environ.get(var, "").strip()
+        if raw:
+            p = Path(raw)
+            candidates.append(
+                p / "store.sqlite" if p.suffix != ".sqlite" else p)
+    # Injectable candidates (tests / future host probes); real paths only.
+    candidates.extend(extra_candidates or [])
+    seen: set[str] = set()
+    extra: list[Path] = []
+    for p in candidates:
+        key = str(p.resolve()).lower() if p.exists() else str(p).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if p.exists() and p.resolve() != canonical.resolve():
+                extra.append(p)
+        except OSError:
+            continue
+    details: dict = {"canonical": _display_path(canonical), "second_stores": []}
+    if not extra:
+        return _check("second-stores", "skip",
+                      "No leftover second store on the known host paths.",
+                      **details)
+
+    canonical_ids: set[str] | None = None
+    if canonical.exists():
+        try:
+            conn = sqlite3.connect(f"file:{canonical}?mode=ro", uri=True)
+            try:
+                canonical_ids = {
+                    r[0] for r in conn.execute(
+                        "SELECT id FROM memory WHERE superseded_at IS NULL")}
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            canonical_ids = None
+
+    results: list[dict] = []
+    worst = "skip"
+    unique_total = 0
+    for p in extra:
+        entry: dict = {"path": _display_path(p)}
+        live = 0
+        ids: set[str] = set()
+        try:
+            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT id FROM memory WHERE superseded_at IS NULL"
+                ).fetchall()
+                live = len(rows)
+                ids = {r[0] for r in rows}
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+            entry["status"] = "warn"
+            results.append(entry)
+            if worst == "skip":
+                worst = "warn"
+            continue
+        entry["live_rows"] = live
+        if canonical_ids is None:
+            entry["missing_in_canonical"] = "unknown (canonical store unreadable)"
+            entry["status"] = "warn" if live else "skip"
+        else:
+            missing = len(ids - canonical_ids)
+            entry["missing_in_canonical"] = missing
+            unique_total += missing
+            entry["status"] = "fail" if missing else ("warn" if live else "skip")
+        results.append(entry)
+
+    statuses = {e["status"] for e in results}
+    worst = ("fail" if "fail" in statuses
+             else "warn" if "warn" in statuses else "skip")
+
+    details["second_stores"] = results
+    if worst == "fail":
+        return _check(
+            "second-stores", "fail",
+            f"{unique_total} live row(s) exist OUTSIDE the canonical store "
+            f"({_display_path(canonical)}) — cutover would strand them. Run "
+            "`promote-store --from <path>` to merge them in, then retire the "
+            "second store; also disable the old host's native memory (see "
+            "the claude-native-memory / codex-native-memory checks).",
+            **details)
+    if worst == "warn":
+        return _check(
+            "second-stores", "warn",
+            "A leftover second store exists but every live row is already in "
+            "the canonical store; retire it when convenient.",
+            **details)
+    return _check("second-stores", "skip",
+                  "Second-store candidates found but none are readable/live.",
+                  **details)
+
+
+def _check_hermes_plugin(repo_root: Path) -> dict:
+    """Issue #71 B: Hermes plugin surface check (the issue's `hermes_plugin`
+    doctor check, analogous to the OpenCode check in #66).
+
+    Validates, in the repo checkout:
+    - hermes-plugin/plugin.yaml parses and carries name/version/description,
+      with `hooks:` limited to the ABC hooks the provider really implements;
+    - hermes-plugin/__init__.py exists and declares register();
+    - the three shell-hook scripts exist;
+    - hermes-plugin/server/mcp_server.py exists and is IMPORTABLE (guarded:
+      degrade to file-exists + warn when the `mcp` package is missing, since
+      CI/dev boxes need not install it);
+    - hermes-plugin/server/mcp_client.py exists (the #71 A remote prefetch
+      transport).
+
+    When ZMEM_MCP_URL is set (a remote-mode box): a token source must be
+    present and the mcp lib must import — otherwise every prefetch fails
+    open silently, which the operator needs to know. When there is no Hermes
+    usage at all (no ~/.hermes, no ZMEM_MCP_URL), the check is `skip`.
+    Never fails a doctor run on a box that does not use Hermes."""
+    import os
+    hermes_home = Path.home() / ".hermes"
+    remote_url = os.environ.get("ZMEM_MCP_URL", "").strip()
+    if not hermes_home.exists() and not remote_url:
+        return _check("hermes-plugin", "skip",
+                      "Hermes not in use on this box (no ~/.hermes, "
+                      "ZMEM_MCP_URL unset).")
+
+    hp = repo_root / "hermes-plugin"
+    problems: list[str] = []
+    details: dict = {"plugin_dir": str(hp)}
+
+    # Manifest parity.
+    manifest = hp / "plugin.yaml"
+    parsed = {}
+    if not manifest.is_file():
+        problems.append("plugin.yaml missing")
+    else:
+        parsed = _parse_simple_yaml(manifest) or {}
+        if not parsed:
+            problems.append("plugin.yaml unparseable")
+        if parsed:
+            missing_keys = [k for k in ("name", "version", "description")
+                            if not parsed.get(k)]
+            if missing_keys:
+                problems.append(
+                    "plugin.yaml missing " + ", ".join(missing_keys))
+            hooks = parsed.get("hooks") or []
+            unknown = [h for h in hooks if h not in _HERMES_PROVIDER_HOOKS]
+            if unknown:
+                problems.append(
+                    "plugin.yaml declares hooks the provider does not "
+                    "implement: " + ", ".join(sorted(unknown)))
+            details["manifest_hooks"] = list(hooks)
+
+    # Provider + hook scripts.
+    provider_init = hp / "__init__.py"
+    if not provider_init.is_file():
+        problems.append("__init__.py missing")
+    elif "def register(" not in provider_init.read_text(encoding="utf-8",
+                                                        errors="replace"):
+        problems.append("__init__.py has no register(ctx) entry point")
+    hook_names = ["zmem-hermes-convention.py", "zmem-hermes-reflect.py",
+                  "zmem-hermes-verify.py"]
+    missing_hooks = [h for h in hook_names if not (hp / "hooks" / h).is_file()]
+    if missing_hooks:
+        problems.append("hook scripts missing: " + ", ".join(missing_hooks))
+    details["hook_scripts"] = hook_names
+
+    # MCP server importable (guarded) + client present.
+    server = hp / "server" / "mcp_server.py"
+    client = hp / "server" / "mcp_client.py"
+    details["mcp_server"] = str(server)
+    details["mcp_client"] = str(client)
+    if not server.is_file():
+        problems.append("server/mcp_server.py missing")
+    else:
+        try:
+            import importlib.util as _ilu
+            if _ilu.find_spec("mcp") is not None:
+                spec = _ilu.spec_from_file_location(
+                    "zmem_doctor_mcp_probe", server)
+                mod = _ilu.module_from_spec(spec)
+                # Import guarded + transient: mcp_server.py's argparse only
+                # runs under __main__; module import defines the FastMCP app.
+                spec.loader.exec_module(mod)
+                details["mcp_server_importable"] = True
+            else:
+                # CI/dev boxes are stdlib-only by convention: a missing mcp
+                # lib here is NOT a surface problem (only the importability
+                # probe degrades to unverified). It IS a problem in remote
+                # mode, handled in the remote branch below (CI fix: this
+                # branch previously failed every stdlib-only run).
+                details["mcp_server_importable"] = "unverified"
+                details["mcp_server_import_note"] = (
+                    "not verified: the 'mcp' package is not installed here")
+        except Exception as exc:
+            details["mcp_server_importable"] = False
+            problems.append(f"server/mcp_server.py failed to import "
+                            f"({type(exc).__name__}: {exc})")
+    if not client.is_file():
+        problems.append("server/mcp_client.py missing")
+
+    # Remote-mode box: fail when prefetch cannot work at all.
+    if remote_url:
+        details["remote_mode"] = {"ZMEM_MCP_URL": remote_url}
+        has_token = bool(os.environ.get("ZMEM_MCP_TOKEN", "").strip()
+                         or os.environ.get("ZMEM_MCP_TOKEN_FILE", "").strip())
+        details["remote_mode"]["token_present"] = has_token
+        if not has_token:
+            problems.append("ZMEM_MCP_URL is set but no token source "
+                            "(ZMEM_MCP_TOKEN / ZMEM_MCP_TOKEN_FILE) — every "
+                            "prefetch would fail open")
+        try:
+            import importlib.util as _ilu
+            if _ilu.find_spec("mcp") is None:
+                problems.append("ZMEM_MCP_URL is set but the 'mcp' package is "
+                                "not installed — prefetch fails open on this "
+                                "box (pip install -r hermes-plugin/server/"
+                                "requirements.txt)")
+        except Exception:
+            pass
+
+    if problems:
+        return _check("hermes-plugin", "fail",
+                      "Hermes plugin surface problems: " + "; ".join(problems),
+                      **details)
+    return _check("hermes-plugin", "pass",
+                  "Hermes plugin surface is complete (manifest, provider, "
+                  "hook scripts, MCP server + client).",
+                  **details)
+
+
 # The three v9 (issue #59, 4.1) append-only lineage columns. A healthy store
 # post-migration carries all three; their ABSENCE means the store is pre-v9 and
 # waiting for a writable migration run (the schema-version check already flags
@@ -2297,6 +2603,8 @@ def build_report(project: Path, repo_root: Path) -> dict:
     checks: list[dict] = []
     checks.append(_check_store_resolution(repo_root, resolved_store))
     checks.append(_check_local_path(resolved_store))
+    # Issue #71 E: leftover second stores with live rows not in canonical.
+    checks.append(_check_second_stores(resolved_store))
     checks.append(_check_python())
     checks.append(_check_sqlite_fts5())
     checks.extend(_check_node_and_bash())
@@ -2315,6 +2623,9 @@ def build_report(project: Path, repo_root: Path) -> dict:
     namespace_check = _check_namespace(project)
     checks.append(namespace_check)
     checks.append(_check_surfaces(repo_root))
+    # Issue #71 B: Hermes plugin surface — manifest parity, provider/hooks
+    # files, MCP server importability, and remote-mode config when set.
+    checks.append(_check_hermes_plugin(repo_root))
     checks.append(_check_tier0_size(project))
     checks.append(_check_embeddings())
     # Issue #63, 8.4: store-side embedding health (profile/dim/coverage).

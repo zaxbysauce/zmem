@@ -391,6 +391,11 @@ class TestNamespaceValidation(_StoreCase):
         (any variant sharing a stem), not just the exact spelling typed. Seed a
         stranded row under one variant, then try to write a DIFFERENT variant —
         the count must be non-zero."""
+        # Runs under ZMEM_AUTO_REKEY=0: with issue #71 C's auto-remediation
+        # (default on), the store open for the refused add heals the stranded
+        # rows BEFORE the write guard counts them, so the count clause is only
+        # reachable in the kill-switch world this test pins.
+        self.env["ZMEM_AUTO_REKEY"] = "0"
         # Seed a stranded row directly under a near-miss namespace (bypassing
         # the now-active write-time check by inserting straight into the DB).
         conn = sqlite3.connect(self.store)
@@ -470,6 +475,15 @@ class TestHybridRrfGlobalUnion(_StoreCase):
 # --------------------------------------------------------------------------
 
 class TestRekeyNamespace(_StoreCase):
+    """Pins the MANUAL rekey-namespace machinery (F3, PRR-001/002/013). Runs
+    under ZMEM_AUTO_REKEY=0: issue #71 C's auto-remediation (default on,
+    covered by tests/test_auto_rekey.py) heals stranded rows on every store
+    open, which would otherwise consume these fixtures before the operator
+    command under test runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.env["ZMEM_AUTO_REKEY"] = "0"
 
     def _seed_stranded(self, ns: str, mid: str):
         conn = sqlite3.connect(self.store)

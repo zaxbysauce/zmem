@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import os
 import sqlite3
 import sys
@@ -317,35 +318,37 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         # search delegates to recall, so the shape must be identical.
         self.assertEqual(set(search_result.keys()), set(recall_result.keys()))
 
-    def test_search_equivalent_to_recall_on_same_args(self):
-        # I13 (#38 / #56): MCP `search` is a pure alias of `recall`; the alias
-        # relationship needs an equivalence test, not just a shape test.
-        # `_score` is excluded from the comparison on purpose: both tools are
-        # EXPLICIT reads and bump retrieval_count by design (issue #21), and
-        # compute_score's popularity component consumes that counter — so the
-        # second call's per-row _score legitimately differs. Every other
-        # field, and the result order, must match exactly.
-        ns = self._ns()
-        self._add_test_signal(content="equivalence probe quokka zephyr", namespace=ns)
-        search_result = self._call("search", query="quokka", namespace=ns, limit=5)
-        recall_result = self._call("recall", query="quokka", namespace=ns, limit=5)
-        # Non-vacuity guard: equality over two empty result sets would pass
-        # even if search stopped delegating.
-        self.assertGreater(search_result.get("count", 0), 0,
-                           search_result)
-        self.assertEqual(search_result.get("count"), recall_result.get("count"))
+    def test_search_is_keyword_only_not_hybrid_alias(self):
+        """Issue #71 cleanup + PR-review PRR-007: search pins `--no-hybrid` +
+        `--link-hops 0` (keyword-only, no link expansion) — NEVER a hybrid
+        recall alias. Runtime pin: spy on the store subprocess argv via the
+        same seam the concurrency tests use, so a dead literal or conditional
+        argv construction still fails the test (a source-inspection assert
+        cannot)."""
+        captured = {}
 
-        def strip_scores(res):
-            stripped = []
-            for item in res["results"]:
-                item = dict(item)
-                self.assertIn("_score", item,
-                              "recall payload must carry _score (shape pin)")
-                item.pop("_score")
-                stripped.append(item)
-            return stripped
+        async def _spy(argv, **kwargs):
+            captured["argv"] = list(argv)
+            return {"ok": True, "returncode": 0, "stdout": '{"results": [], "count": 0}',
+                    "stderr": ""}
 
-        self.assertEqual(strip_scores(search_result), strip_scores(recall_result))
+        self.mcp_server._MAX_CONCURRENT_STORE = 1
+        self.mcp_server._store_semaphore = None
+        original = self.mcp_server._run_store_async
+        self.mcp_server._run_store_async = _spy
+        try:
+            self._call("search", query="nonexistent-probe-zz",
+                       namespace=self._ns(), limit=5)
+        finally:
+            self.mcp_server._run_store_async = original
+            self.mcp_server._store_semaphore = None
+        argv = captured.get("argv", [])
+        self.assertTrue(argv, "search must invoke the store subprocess")
+        self.assertIn("--no-hybrid", argv,
+                      "search must pin --no-hybrid (keyword-only contract)")
+        self.assertIn("--link-hops", argv)
+        self.assertEqual(argv[argv.index("--link-hops") + 1], "0",
+                         "search must pin --link-hops 0 (no link expansion)")
 
     def test_search_empty_query_returns_error(self):
         result = self._call("search", query="", namespace=self._ns(), limit=5)
@@ -751,6 +754,114 @@ class McpServerToolSurfaceTest(unittest.TestCase):
             self.mcp_server._run_store = original_run_store
             self.mcp_server._MAX_CONCURRENT_STORE = original
             self.mcp_server._store_semaphore = None
+
+
+@unittest.skipUnless(MCP_AVAILABLE,
+                     "mcp package not installed (MCP server tests need it)")
+class McpDefaultNamespaceTest(unittest.TestCase):
+    """Issue #71 C: ZMEM_MCP_DEFAULT_NS — the opt-in configured default
+    namespace for MCP writes. Unset → the historical user:global default
+    (#65 10.1). A near-miss env value refuses with a structured error naming
+    the env var. An explicit client namespace always wins."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="zmem-mcp-defns-")
+        cls.store_path = os.path.join(cls.tmp, "store.sqlite")
+        cls._saved_env = {
+            k: os.environ.get(k) for k in (
+                "ZMEM_HOME", "ZMEM_STORE", "ZMEM_MCP_TOKEN",
+                "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR", "ZMEM_DATA",
+                "ZMEM_MCP_DEFAULT_NS",
+            )
+        }
+        os.environ["ZMEM_HOME"] = str(REPO_ROOT)
+        os.environ["ZMEM_STORE"] = cls.store_path
+        os.environ["ZMEM_MCP_TOKEN"] = "test-token-for-suite"
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(cls.tmp, "no-such-models")
+        os.environ.pop("ZMEM_DATA", None)
+        os.environ.pop("ZMEM_MCP_DEFAULT_NS", None)
+        import mcp_server  # noqa: E402 — imported lazily after env is set
+        cls.mcp_server = mcp_server
+        cls.server = mcp_server.build_server(host="127.0.0.1", port=0, use_tls=False)
+        # Initialize the schema: the near-miss-env test runs FIRST
+        # (alphabetical method order) and its refused add never reaches
+        # store.py, so the namespace probe would hit a table-less store.
+        import subprocess
+        env = {**os.environ,
+               "ZMEM_MODELS_DIR": os.environ["ZMEM_MODELS_DIR"],
+               "ZMEM_MODEL_AUTODOWNLOAD": "0",
+               "PYTHONUTF8": "1"}
+        subprocess.run(
+            [sys.executable, str(REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"),
+             "stats"],
+            capture_output=True, text=True, check=True, env=env)
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        for k, v in cls._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _call(self, name: str, **args):
+        return asyncio.run(
+            self.server._tool_manager.call_tool(name, args, context=None))
+
+    def _namespaces_with(self, marker: str) -> set[str]:
+        conn = sqlite3.connect(self.store_path)
+        try:
+            rows = conn.execute(
+                "SELECT namespace FROM memory WHERE content LIKE ?",
+                (f"%{marker}%",)).fetchall()
+            return {r[0] for r in rows}
+        finally:
+            conn.close()
+
+    def test_add_omitted_namespace_defaults_to_user_global(self):
+        os.environ.pop("ZMEM_MCP_DEFAULT_NS", None)
+        marker = "defns-unset-default"
+        res = self._call("add", type="fact", content=marker)
+        self.assertNotIn("error", res, res)
+        self.assertEqual(self._namespaces_with(marker), {"user:global"})
+
+    def test_add_omitted_namespace_uses_env_default(self):
+        os.environ["ZMEM_MCP_DEFAULT_NS"] = "project:github.com/zaxbysauce/zmem"
+        marker = "defns-env-project"
+        try:
+            res = self._call("add", type="fact", content=marker)
+            self.assertNotIn("error", res, res)
+            self.assertEqual(self._namespaces_with(marker),
+                             {"project:github.com/zaxbysauce/zmem"})
+        finally:
+            os.environ.pop("ZMEM_MCP_DEFAULT_NS", None)
+
+    def test_add_env_default_near_miss_refuses_with_env_name(self):
+        os.environ["ZMEM_MCP_DEFAULT_NS"] = "global"
+        marker = "defns-env-nearmiss"
+        try:
+            res = self._call("add", type="fact", content=marker)
+            self.assertIn("error", res, res)
+            self.assertIn("ZMEM_MCP_DEFAULT_NS", str(res["error"]))
+            self.assertEqual(self._namespaces_with(marker), set())
+        finally:
+            os.environ.pop("ZMEM_MCP_DEFAULT_NS", None)
+
+    def test_add_explicit_namespace_beats_env_default(self):
+        os.environ["ZMEM_MCP_DEFAULT_NS"] = "project:from-env"
+        marker = "defns-explicit-wins"
+        try:
+            res = self._call("add", type="fact", content=marker,
+                             namespace="user:test-explicit")
+            self.assertNotIn("error", res, res)
+            self.assertEqual(self._namespaces_with(marker),
+                             {"user:test-explicit"})
+        finally:
+            os.environ.pop("ZMEM_MCP_DEFAULT_NS", None)
 
 
 if __name__ == "__main__":

@@ -287,9 +287,61 @@ No zmem checkout or plugin install needed on the remote box.
 > [nssm](https://nssm.cc/); set `ZMEM_MCP_TOKEN` and `ZMEM_HOME` as system env
 > vars.
 >
-> **Limitation:** the remote Hermes gets explicit `mcp__zmem__*` tools (the
-> model calls them when it needs a memory), not automatic passive recall
-> before each turn. That's a planned v2.
+> **Limitation (shipped):** the remote Hermes gets explicit `mcp__zmem__*`
+> tools AND the passive prefetch — with Hindsight still enabled as
+> `memory.provider`, the `pre_llm_call` shell hook (issue #71 A) fetches a
+> `--no-bump` `session_start` prefetch over MCP before the model sees the
+> turn. Kill the MCP server or the token and the turn proceeds without
+> injection (fail-open).
+
+**Remote passive prefetch (issue #71 A)** — on the remote Hermes box:
+
+1. Install the `mcp` client library (REQUIRED — without it prefetch fails
+   open silently): `pip install -r hermes-plugin/server/requirements.txt`
+   (same file the store host uses for the server).
+2. Copy the hook and EVERYTHING it resolves at runtime. Two supported
+   layouts:
+   - **Preferred:** copy the full checkout subset — `hermes-plugin/`
+     (including `server/mcp_client.py`, which the prefetch subprocess
+     invokes) and `skills/memory/scripts/` in full (the query-context lane
+     additionally imports `ops_tokens` + `storelib`, and correction capture
+     imports `corrections`). Keep the relative layout
+     (`hermes-plugin/hooks/` next to `skills/memory/scripts/`).
+   - **Minimal:** copy only `hermes-plugin/hooks/` +
+     `hermes-plugin/server/mcp_client.py` +
+     `skills/memory/scripts/{host.py,correction_queue.py,corrections.py}` —
+     passive prefetch and correction capture work; the local query-context
+     recall lane silently degrades to no-op (fail-open) without
+     `ops_tokens`/`storelib`.
+   Copy installs that break the relative layout must set `ZMEM_HOME`.
+3. Wire the hook in `~/.hermes/config.yaml` (same `hooks:` block as the
+   local install above — the `pre_llm_call` entry is the prefetcher) and set
+   the remote env:
+   ```ini
+   ZMEM_MCP_URL=http://192.168.1.X:8765/mcp
+   ZMEM_MCP_TOKEN=<the-same-secret>
+   # optional: ZMEM_MCP_NAMESPACE=project:github.com/owner/repo  (else the
+   # server default user:global), ZMEM_MCP_TIMEOUT=8
+   ```
+   **Scoped-token deployments MUST set `ZMEM_MCP_NAMESPACE`** (issue #71
+   review): the server rejects a namespace the token is not scoped for, and
+   an unset namespace resolves to `user:global` — name a namespace the token
+   allows or every prefetch fails open.
+4. `hermes mcp test zmem` must still discover the tools; if a running
+   gateway must be restarted to load a config change, that is a Hermes
+   runtime behavior — one restart, documented here. Caveat: upstream
+   `pre_llm_call` is documented to fire in CLI and Gateway modes, but
+   gateway-mode firing is being verified upstream (zmem issue #96); zmem's
+   local delivery rides the same event, so a gateway-mode gap would affect
+   both equally.
+
+Remote corrections (issue #71 D): the same hook also captures user
+corrections ("No, use X") into the remote box's own sidecar queue
+(`~/.zmem/queue/` on that box) for review by the closeout skill there —
+hooks never write the store over MCP. Corrections use the same namespace
+chain as the prefetch (`ZMEM_MCP_NAMESPACE` → `ZMEM_NAMESPACE` →
+`user:global`). `ZMEM_HERMES_CORRECTIONS=0` disables.
+
 
 #### Hermes adapter env vars
 
@@ -356,6 +408,14 @@ MCP server:
 | Var | Purpose | Default |
 |-----|---------|---------|
 | `ZMEM_MCP_TOKEN` | Bearer token for the MCP server. **Required** to start the server. | — |
+| `ZMEM_MCP_URL` | Remote mode (issue #71 A): point the Hermes `pre_llm_call` hook at the LAN MCP server; the passive prefetch rides `session_start` (`--no-bump`). Unset = local-store mode. | — |
+| `ZMEM_MCP_TIMEOUT` | Prefetch subprocess timeout in seconds (the hook itself allows 15). | `8` |
+| `ZMEM_MCP_NAMESPACE` | Namespace for the remote prefetch, correction capture, and query-context recall when `ZMEM_NAMESPACE` is unset (empty → server default `user:global`). **Required for scoped-token deployments** — name a namespace the token allows. | — |
+| `ZMEM_MCP_DEFAULT_NS` | Opt-in configured default namespace for MCP `add` when the client omits it (issue #71 C; `user:global` otherwise — never a near-miss form like `global`). | — |
+| `ZMEM_AUTO_REKEY` | `0` disables the automatic near-miss namespace rekey on store open (issue #71 C; `--no-auto-rekey` per invocation). | `1` |
+| `ZMEM_HERMES_CORRECTIONS` | `0` disables Hermes correction capture on `pre_llm_call` (issue #71 D; default ON for parity with the other hosts). | `1` |
+| `ZMEM_CODEX_MEMORY` | Codex MEMORY.md path for `mine-history --source codex` (issue #71 I). | `~/.codex/MEMORY.md` |
+| `ZMEM_HERMES_SESSIONS` | Hermes session-JSONL root for `mine-history --source hermes` (issue #71 I). | `~/.hermes/sessions` |
 | `ZMEM_MCP_TOKEN_FILE` | Path to a file containing the token (alternative to `ZMEM_MCP_TOKEN`). A bare text file is an UNSCOPED operator token (full access). A JSON file `{"token": "...", "namespaces": ["project:x", "user:global"]}` scopes the token: requests outside the allow-list fail closed with the stable `namespace_not_allowed` error, and scoped tokens must pass an allowed namespace explicitly on every read (issue #65, 10.2). Omitting `namespaces` — or setting it to `null` — means an UNSCOPED operator token (full access), exactly like a bare text file. | — |
 | `ZMEM_MCP_ALLOW_INSECURE_BIND` | Set to `1` to allow `0.0.0.0` / `::` (and IPv4-mapped) wildcard binds. | unset |
 | `ZMEM_MCP_MAX_CONCURRENT` | Cap on simultaneous `store.py` subprocesses the MCP server will run (overload protection). | `8` |
