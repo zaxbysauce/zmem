@@ -47,6 +47,11 @@ _STRIP_ENV = (
     # DATA_DIR_ENV_VARS so a dev box's ambient values can never receive
     # subprocess writes. Tests that need them set them explicitly via extra.
     "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+    # #93 A1: eval-runner pollution vars (test_eval_runner sets both at module
+    # import; a single-process multi-file runner must not inherit them) plus
+    # the #71 C auto-rekey switch (a stray value must never redirect the
+    # remediation against an unintended store).
+    "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW", "ZMEM_AUTO_REKEY",
 )
 
 

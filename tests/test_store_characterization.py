@@ -159,7 +159,11 @@ KNOWN_SUBCMDS = [
 # the only way this allowlist grows, so it forces a conscious decision.
 # reembed left the flagless set (issue #63, 8.3): it now exposes
 # --all/--profile/--batch/--dry-run; its help surface is structurally pinned.
-FLAGLESS_SUBCMDS = frozenset({"init", "stats", "path", "rebuild-fts"})
+# Issue #71 C: --no-auto-rekey (a shared parent parser) is on EVERY
+# subcommand by design, so NO subcommand is flagless anymore — init/stats/
+# path/rebuild-fts left the set the same way reembed did (conscious freeze
+# update, not a weakening: their surfaces still hash-freeze WITH the flag).
+FLAGLESS_SUBCMDS = frozenset()
 
 
 def _sha(text: str) -> str:

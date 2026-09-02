@@ -50,14 +50,26 @@ from typing import Dict, List, Optional
 # Mirrors what store.py's `add`/`corrections` capture path enforces. The queue
 # holds plaintext corrections like the store does, so it gets the same advisory
 # scan, not a new one.
-SECRET_PATTERNS = [
+#
+# Issue #71 F splits the list into two named groups (same compiled objects,
+# same effective scanning as the original flat list):
+# - CREDENTIAL patterns are explicit credential shapes (a key=value pair, a
+#   PEM header, a GitHub/AWS token). These are treated as secrets even inside
+#   an allowlisted provenance source_ref.
+# - GENERIC patterns are hash/base64-shaped text that legitimately occurs in
+#   structured provenance (a db row id, a file hash, a session uuid). store.py
+#   skips these for allowlisted source_ref schemes (never for content/tags).
+SECRET_CREDENTIAL_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd|private[_-]?key)\s*[:=]\s*\S{8,}"),
     re.compile(r"-----BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY-----"),
-    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
-    re.compile(r"\b[0-9a-fA-F]{32,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 ]
+SECRET_GENERIC_PATTERNS = [
+    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+    re.compile(r"\b[0-9a-fA-F]{32,}\b"),
+]
+SECRET_PATTERNS = SECRET_CREDENTIAL_PATTERNS + SECRET_GENERIC_PATTERNS
 
 # Capture modes: "auto" redacts before writing; "manual"/"reviewed" keep the
 # original wording and set secret_warning so a reviewer sees it. Matches the

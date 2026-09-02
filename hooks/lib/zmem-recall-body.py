@@ -42,9 +42,13 @@ The body:
        - the gate passed rows but the token budget emptied the set →
          "memories withheld: the injection token budget
          (ZMEM_INJECT_TOKEN_BUDGET) dropped every candidate row."
-  7. Fail-open: any error path emits nothing (the wrapper's ``|| echo '{}'``
-     handles it) and exits 0; a reason-classification error degrades to the
-     retrieved-empty one-liner (never the bar) and still exits 0.
+  7. Fail-open: an unhandled ``main()`` crash emits nothing (the wrapper's
+     ``|| echo '{}'`` handles it) and exits 0; a recall-subprocess failure
+     sets ``rows=[]`` and STILL emits the retrieved-empty envelope (with its
+     reason classification, per bullet 6); a reason-classification error
+     degrades to the retrieved-empty one-liner (never the bar). Every path
+     exits 0. (#93 B7: split/reworded — the old text claimed only the
+     wrapper-handled case existed.)
 
 The selective-inject decision is logged to ``<data dir>/zmem-bg.log`` (the
 dir resolved by ``_data_dir()``; I5 critic-fix: existing log file, not a new
@@ -450,7 +454,12 @@ def _data_dir() -> str:
     unaffected: zmem-launch.js always exports ZMEM_DATA."""
     store = os.environ.get("ZMEM_STORE", "")
     if store:
-        return os.path.expanduser(os.path.dirname(store))
+        # #93 B3: a dir-less ZMEM_STORE (bare filename) must fall through to
+        # the rest of the chain, not early-return dirname("")==="" (which
+        # silently mis-writes every sidecar relative to CWD).
+        store_dir = os.path.dirname(store)
+        if store_dir:
+            return os.path.expanduser(store_dir)
     data_dir = os.environ.get("ZMEM_DATA", "")
     if not data_dir:
         claude_data = os.environ.get("CLAUDE_PLUGIN_DATA", "")

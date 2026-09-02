@@ -40,6 +40,11 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9._/+-]+$")
 # dropped before the file-shaped gate so a literal token pasted into a
 # command never lands on disk or in a query. Shape check, not a redaction
 # guarantee — operators must still not paste secrets into commands.
+# KNOWN FALSE-POSITIVE COST (#93 B4): any token starting one of these
+# prefixes is dropped EVEN WHEN IT IS A LEGITIMATE FILENAME or config var
+# (a file literally named `sk-something.ts`, `npm_config_registry`, …) —
+# fail-safe by design (recall-signal loss, never a leak); rename if a real
+# path collides.
 _SECRET_SHAPE_RE = re.compile(
     r"^(?:gh[pousr]_|github_pat_|sk-ant|sk-proj|sk-|xox[baprs]-|AKIA|"
     r"glpat-|shpat_|dop_v1_|npm_|pypi-)",

@@ -53,7 +53,25 @@ INPROC_STORE = os.path.join(
 os.environ["ZMEM_STORE"] = INPROC_STORE
 os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
 os.environ["ZMEM_MODELS_DIR"] = "/nonexistent-zmem-models-dir"
+# #93 A1: remember the AMBIENT values so tearDownModule can restore them —
+# a single-process multi-file runner (pytest tests/, importing two modules in
+# one interpreter) must not inherit the fake embedder or the pinned clock.
+_EVAL_ENV_OVERRIDES = {
+    key: os.environ.get(key)
+    for key in ("ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW", "ZMEM_STORE",
+                "ZMEM_MODELS_DIR")
+}
 os.environ["ZMEM_EMBED_PROFILE"] = "fake"
+
+
+def tearDownModule():
+    """#93 A1: restore the env vars this module overrode at import."""
+    import os as _os
+    for key, value in _EVAL_ENV_OVERRIDES.items():
+        if value is None:
+            _os.environ.pop(key, None)
+        else:
+            _os.environ[key] = value
 
 
 class EvalRunnerTestBase(unittest.TestCase):

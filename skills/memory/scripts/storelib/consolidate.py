@@ -20,7 +20,7 @@ import glob
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.entity import relink_memory
-from storelib.schema import _embeddings, _env_float, _normalize_content, now_iso, worse_taint
+from storelib.schema import _commit, _embeddings, _env_float, _normalize_content, now_iso, worse_taint
 from storelib.sync import INGEST_MAX_CONTENT_CHARS
 from storelib.write import _merge_on_dedup, supersede_memory
 
@@ -93,10 +93,126 @@ def _polarity_signature(content: str | None) -> bool:
     refinement — a quoted error message like ``"module not found"`` inside
     otherwise-positive guidance must not flip the polarity). Curly apostrophes
     are normalized so ``don’t`` matches like ``don't``."""
+    text = _strip_quoted_spans(content)
+    return bool(_CONSOLIDATE_NEGATOR_RE.search(text))
+
+
+def _strip_quoted_spans(content: str | None) -> str:
+    """Shared pre-tokenization: normalize curly apostrophes and blank out code
+    spans / double-quoted strings, so negation detection and predicate
+    extraction see the same text (#71 G — one stripping step, two consumers)."""
     text = (content or "").replace("\u2019", "'")
     text = re.sub(r"`[^`]*`", " ", text)      # code spans
     text = re.sub(r'"[^"\n]*"', " ", text)    # double-quoted spans
-    return bool(_CONSOLIDATE_NEGATOR_RE.search(text))
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Issue #71 G: same-predicate negation relation. Polarity PRESENCE alone
+# contests "do not skip a rotate of X every 90 days" against "rotate X every
+# 90 days" — the same constraint restated — and mints false `contradicts`
+# links at write time. The relation classifies a mixed-polarity pair:
+#   contradiction — negator-stripped predicates are near-identical AND the
+#                   negation targets the shared predicate ("is not live");
+#   restatement   — the same constraint with the negation carried by a
+#                   DIFFERENT verb ("do not SKIP ...") or with enough shared
+#                   predicate content that the pair agrees (preference-vs-
+#                   lesson phrasings); these MERGE;
+#   divergent     — everything else (historical-vs-current facts, different
+#                   subjects): park, exactly like today's contested path —
+#                   the conservative outcome never merges.
+# ---------------------------------------------------------------------------
+
+CONTEST_CONTRADICTION_JACCARD = 0.95
+CONTEST_RESTATEMENT_MIN_JACCARD = 0.55
+CONTEST_RESTATEMENT_MIN_INTERSECTION = 6
+
+_PREFERENCE_PREFIX_RE = re.compile(
+    r"^\s*(?:operator\s+preference|preference|note)\s*:\s*", re.IGNORECASE)
+
+
+def _light_stem(word: str) -> str:
+    """Minimal suffix folding so `rotating`/`rotate` and `requires`/`require`
+    compare equal. Deliberately crude and identical for both sides of a
+    comparison — precision comes from the thresholds, not the stemmer."""
+    w = word
+    if len(w) > 4 and w.endswith("ing"):
+        w = w[:-3]
+    elif len(w) > 4 and w.endswith("ed"):
+        w = w[:-2]
+    elif len(w) > 3 and w.endswith("es"):
+        w = w[:-2]
+    elif len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        w = w[:-1]
+    if len(w) > 3 and w.endswith("e"):
+        w = w[:-1]
+    return w
+
+
+def _predicate_tokens(content: str | None) -> frozenset:
+    """Negator-stripped, prefix-stripped, light-stemmed content tokens — the
+    "predicate" a row asserts. Compared only between rows that ALREADY differ
+    in polarity, so stripping the negator is lossless for the shared
+    predicate and exposes where the negation actually sits."""
+    text = _strip_quoted_spans(content)
+    text = _PREFERENCE_PREFIX_RE.sub(" ", text, count=1)
+    text = _CONSOLIDATE_NEGATOR_RE.sub(" ", text)
+    text = text.replace("without", " ")
+    out = set()
+    for w in re.findall(r"[a-z0-9]+", text.lower()):
+        if len(w) < 3 or w in _LEXICAL_STOPWORDS:
+            continue
+        s = _light_stem(w)
+        if len(s) >= 3:
+            out.add(s)
+    return frozenset(out)
+
+
+def _negation_targets_shared_predicate(negated_content: str,
+                                       other_tokens: frozenset) -> bool:
+    """True when any negator in ``negated_content`` directly precedes a content
+    word that also appears in ``other_tokens`` — i.e. the negation attaches to
+    the SHARED predicate ("the gateway is NOT live") rather than introducing
+    its own verb ("do not SKIP a rotate ..."). Looks at the first content word
+    within three tokens after each negator; quoted spans and stopwords are
+    already blanked by _strip_quoted_spans/_LEXICAL_STOPWORDS."""
+    text = _strip_quoted_spans(negated_content)
+    for m in _CONSOLIDATE_NEGATOR_RE.finditer(text):
+        window = re.findall(r"[a-z0-9]+", text[m.end():m.end() + 24])
+        for raw in window[:3]:
+            if len(raw) < 3 or raw in _LEXICAL_STOPWORDS:
+                continue
+            return _light_stem(raw) in other_tokens
+    return False
+
+
+def _negation_relation(content_a: str, content_b: str) -> str:
+    """Classify a mixed-polarity pair: 'contradiction' | 'restatement' |
+    'divergent'. Callers: consolidate's cluster branch (all differing pairs
+    must be restatements to un-park a merge) and dedup_polarity_conflict
+    (only contradictions mint `contradicts` links)."""
+    ta = _predicate_tokens(content_a)
+    tb = _predicate_tokens(content_b)
+    if not ta or not tb:
+        return "divergent"
+    inter = ta & tb
+    union = ta | tb
+    j = len(inter) / len(union)
+    negated = content_a if _polarity_signature(content_a) else content_b
+    other = tb if negated is content_a else ta
+    if j >= CONTEST_CONTRADICTION_JACCARD and \
+            _negation_targets_shared_predicate(negated, other):
+        return "contradiction"
+    if j >= CONTEST_CONTRADICTION_JACCARD:
+        # Near-identical predicates, but the negation carries its own verb
+        # (absent from the other side): agreement restated with negation.
+        return "restatement"
+    if len(inter) >= CONTEST_RESTATEMENT_MIN_INTERSECTION and \
+            j >= CONTEST_RESTATEMENT_MIN_JACCARD:
+        return "restatement"
+    return "divergent"
+
+
 
 def dedup_polarity_conflict(
     conn: sqlite3.Connection, existing_id: str, content: str
@@ -116,6 +232,13 @@ def dedup_polarity_conflict(
     ).fetchone()
     if row is None:
         return False
+    # Issue #71 G (scope note): the three-band relation refines the
+    # CONSOLIDATE cluster decision only. The WRITE-time guard keeps the
+    # original polarity-flip contract from #61 — an incoming restatement of a
+    # negated row stays a conflict (own live row + contradicts link, so a
+    # reviewer can supersede), which is the conservative information-preserving
+    # choice at write time; the eval corpus (tests/fixtures/eval_store.py)
+    # depends on exactly these rows coexisting.
     return _polarity_signature(row["content"] or "") != _polarity_signature(content)
 
 
@@ -771,6 +894,10 @@ def consolidate(
         "merged": 0,
         "pruned": 0,
         "contested_clusters": [],
+        # Issue #71 G: clusters whose mixed polarity resolved to all-
+        # restatement pairs — merged, not parked (the false-positive shape
+        # from the field report).
+        "uncontested_restatements": 0,
         "truncated": False,
         "knn_truncated": False,
     }
@@ -957,56 +1084,82 @@ def consolidate(
             for nb, _sim in neighbors
         ]
         contested_override = False
+        restatement_override = False
         if len({pol for _, _, pol in member_pols}) > 1:
-            # Issue #62, 7.5: optional LOCAL contradiction judge. When
-            # ZMEM_NLI_CMD is set, a cluster whose mixed negation polarity is
-            # judged ENTAILMENT is a heuristic false positive and un-parks
-            # (merges). Unset -> _nli_judge_all_entail returns None and this
-            # branch is byte-identical to the pre-judge path; --merge-contested
-            # remains the explicit override and still wins over a park verdict.
-            _nli_unpark = _nli_judge_all_entail(member_pols)
-            if _nli_unpark:
-                print(f"[zmem] consolidate: NLI judge: entailment resolves the "
-                      f"contested cluster around [{seed['id'][:8]}] - merging "
-                      f"(contradiction judged false)")
+            # Issue #71 G: classify every differing pair before contesting.
+            # A cluster whose mixed polarity is ENTIRELY restatements (same
+            # constraint, negation carried by a different verb / preference
+            # phrasing) is the field report's false-positive shape and merges
+            # like any other cluster. ANY contradiction or divergent pair
+            # keeps the conservative path below — divergent pairs park (the
+            # historical-vs-current shape), contradictions are real conflicts.
+            # Restatement resolution is deterministic and deliberately SKIPS
+            # the NLI judge (judge adjudicates genuine contradictions only).
+            pair_relations = [
+                _negation_relation(member_pols[i][1], member_pols[j][1])
+                for i in range(len(member_pols))
+                for j in range(i + 1, len(member_pols))
+                if member_pols[i][2] != member_pols[j][2]
+            ]
+            if pair_relations and all(r == "restatement" for r in pair_relations):
+                verb = "would merge (uncontested restatement)" if dry_run \
+                    else "merged (uncontested restatement)"
+                print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] "
+                      f"polarity differs but every pair is a same-predicate "
+                      f"restatement (issue #71 G); {verb}")
+                report["uncontested_restatements"] += 1
                 contested_override = True
-            elif merge_contested:
-                # Explicit override for a confirmed heuristic false positive:
-                # merge like any other cluster. The report entry is appended
-                # only AFTER the outcome is known (dry run → merged: False —
-                # nothing happened; COMMIT → merged: True; ROLLBACK → merged:
-                # False), so the machine report can never claim a merge that
-                # did not happen (PR feedback PRR-001: a premature merged:
-                # True lied in --dry-run --merge-contested and after a
-                # mid-merge rollback, and suppressed the contested summary
-                # line via contested_excluded).
-                contested_override = True
+                restatement_override = True
             else:
-                verb = "would NOT merge (contested)" if dry_run else "NOT merged (contested)"
-                print(f"[zmem] consolidate: CONTESTED cluster around [{seed['id'][:8]}] — "
-                      f"negation polarity differs; {verb}:")
-                for mid, mcontent, mpol in member_pols:
-                    print(f"    [{mid[:8]}] {'neg' if mpol else 'pos'}: "
-                          f"{(mcontent or '')[:60]}")
-                print("    one side likely needs `supersede --id <full-uuid> --reason ...` "
-                      "(Step 3 of closeout), not merging; pass --merge-contested only for a "
-                      "confirmed heuristic false positive")
-                report["contested_clusters"].append({
-                    "keeper": seed["id"],
-                    "namespace": seed["namespace"],
-                    "merged": False,
-                    "members": [
-                        {"id": mid, "polarity": "neg" if pol else "pos",
-                         "content_preview": (mcontent or "")[:60]}
-                        for mid, mcontent, pol in member_pols
-                    ],
-                })
-                # Park members for this run: no re-seeding (which would only
-                # re-report the same contested cluster from the mirror side),
-                # but NOT absorbed — they stay live and neighbor-eligible for
-                # later clusters that form around a fresh seed.
-                contested_ids.update(mid for mid, _, _ in member_pols)
-                continue
+                # Issue #62, 7.5: optional LOCAL contradiction judge. When
+                # ZMEM_NLI_CMD is set, a cluster whose mixed negation polarity is
+                # judged ENTAILMENT is a heuristic false positive and un-parks
+                # (merges). Unset -> _nli_judge_all_entail returns None and this
+                # branch is byte-identical to the pre-judge path; --merge-contested
+                # remains the explicit override and still wins over a park verdict.
+                _nli_unpark = _nli_judge_all_entail(member_pols)
+                if _nli_unpark:
+                    print(f"[zmem] consolidate: NLI judge: entailment resolves the "
+                          f"contested cluster around [{seed['id'][:8]}] - merging "
+                          f"(contradiction judged false)")
+                    contested_override = True
+                elif merge_contested:
+                    # Explicit override for a confirmed heuristic false positive:
+                    # merge like any other cluster. The report entry is appended
+                    # only AFTER the outcome is known (dry run → merged: False —
+                    # nothing happened; COMMIT → merged: True; ROLLBACK → merged:
+                    # False), so the machine report can never claim a merge that
+                    # did not happen (PR feedback PRR-001: a premature merged:
+                    # True lied in --dry-run --merge-contested and after a
+                    # mid-merge rollback, and suppressed the contested summary
+                    # line via contested_excluded).
+                    contested_override = True
+                else:
+                    verb = "would NOT merge (contested)" if dry_run else "NOT merged (contested)"
+                    print(f"[zmem] consolidate: CONTESTED cluster around [{seed['id'][:8]}] — "
+                          f"negation polarity differs; {verb}:")
+                    for mid, mcontent, mpol in member_pols:
+                        print(f"    [{mid[:8]}] {'neg' if mpol else 'pos'}: "
+                              f"{(mcontent or '')[:60]}")
+                    print("    one side likely needs `supersede --id <full-uuid> --reason ...` "
+                          "(Step 3 of closeout), not merging; pass --merge-contested only for a "
+                          "confirmed heuristic false positive")
+                    report["contested_clusters"].append({
+                        "keeper": seed["id"],
+                        "namespace": seed["namespace"],
+                        "merged": False,
+                        "members": [
+                            {"id": mid, "polarity": "neg" if pol else "pos",
+                             "content_preview": (mcontent or "")[:60]}
+                            for mid, mcontent, pol in member_pols
+                        ],
+                    })
+                    # Park members for this run: no re-seeding (which would only
+                    # re-report the same contested cluster from the mirror side),
+                    # but NOT absorbed — they stay live and neighbor-eligible for
+                    # later clusters that form around a fresh seed.
+                    contested_ids.update(mid for mid, _, _ in member_pols)
+                    continue
 
         # The seed is the keeper. With the rows query ordered by
         # (confidence * (retrieval_count + surfaced_count) DESC, confidence DESC,
@@ -1098,7 +1251,11 @@ def consolidate(
                 "UPDATE memory SET consolidated_at=? WHERE id=?",
                 (now_iso(), seed["id"]),
             )
-            conn.execute("COMMIT")
+            # Issue #71 (consolidate-while-MCP-live row): use the shared
+            # busy_retry-backed commit like every writer path — a live MCP
+            # writer must not turn this cluster's COMMIT into an immediate
+            # rollback; the ROLLBACK path below stays the atomic backstop.
+            _commit(conn)
             merged_count += len(neighbors)
             if collect_run_ids and keeper_grew:
                 consolidated_ids.append(seed["id"])
@@ -1106,9 +1263,13 @@ def consolidate(
                 # Appended only after the successful COMMIT, and printed so a
                 # real-run override is never invisible in human output (the
                 # JSON report was previously the sole — and lying — audit
-                # trail; PRR-001).
+                # trail; PRR-001). Restatement merges (#71 G) are labeled as
+                # such — they were never contested, just polarity-flagged.
+                override_verb = ("same-predicate restatement (#71 G)"
+                                 if restatement_override
+                                 else "--merge-contested override")
                 print(f"[zmem] consolidate: merged CONTESTED cluster around "
-                      f"[{seed['id'][:8]}] (--merge-contested override; "
+                      f"[{seed['id'][:8]}] ({override_verb}; "
                       f"{len(neighbors) + 1} members)")
                 report["contested_clusters"].append({
                     "keeper": seed["id"],
@@ -1219,6 +1380,15 @@ def consolidate(
         # completeness gap is visible (cubic-4, #36 M8 residual).
         parts.append("knn_truncated: KNN cap reached; some pairs may be unexamined")
     contested_excluded = sum(1 for c in report["contested_clusters"] if not c["merged"])
+    if report["uncontested_restatements"]:
+        # Mode-aware verb (#44 discipline: dry-run summaries never say
+        # "merged" — counterfactual counts qualify with "would").
+        restatement_verb = "would merge" if dry_run else "merged"
+        parts.append(
+            f"uncontested {report['uncontested_restatements']} restatement "
+            f"cluster(s) ({restatement_verb} — same-predicate restatements, "
+            f"issue #71 G)"
+        )
     if contested_excluded:
         # Never silent (issue #49): a contested exclusion that only appeared in
         # the per-cluster block above could be missed when skimming the tail of

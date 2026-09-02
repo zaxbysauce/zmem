@@ -3,10 +3,12 @@
 Runs on the store-host box (the machine with ``~/.zmem/store.sqlite`` and the
 zmem checkout). A Hermes agent on a *different* LAN box connects to this server
 over HTTP (StreamableHTTP) with a Bearer token and gets ``recall`` / ``add`` /
-``search`` / ``supersede`` / ``recent`` tools — the same surface the local
-memory provider exposes, but over the network. One store, one schema, shared
-across all four agents (ZCode, Claude Code, Codex, local Hermes) plus any
-remote MCP client.
+``search`` / ``supersede`` / ``update`` / ``invalidate`` / ``recent`` /
+``session_start`` / ``session_end`` tools — the same surface the local memory
+provider exposes, but over the network. One store, one schema, shared across
+all four agents (ZCode, Claude Code, Codex, local Hermes) plus any remote MCP
+client. Remote passive prefetch rides the same server via the Hermes
+``pre_llm_call`` hook + ``mcp_client.py`` (issue #71 A).
 
 Each tool subprocesses ``store.py`` (same code path as the local memory
 provider — never imports store.py in-process, so the server inherits zmem's
@@ -862,7 +864,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
     async def add(
         type: str,
         content: str,
-        namespace: str = "user:global",
+        namespace: Optional[str] = None,
         tags: Optional[str] = None,
         signal: str = "none",
         source_ref: Optional[str] = None,
@@ -876,7 +878,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         'untrusted_tool' (this agent's write is ungrounded self-opinion unless
         you claim more); use 'untrusted_web' for web-fetched content and
         'trusted_internal' only when a human/test/closeout grounded it (issue
-        #59, 4.7 / plan M5).
+        #59, 4.7 / plan M5). Omit namespace to use the server's configured
+        default: ZMEM_MCP_DEFAULT_NS when the operator set it, else
+        'user:global' (issue #71 C).
         """
         mtype = (type or "").strip()
         body = (content or "").strip()
@@ -900,12 +904,22 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return _error(
                 "signal must be one of: " + ", ".join(_ALLOWED_SIGNALS)
             )
-        # v13 (issue #65, 10.1): fail-fast namespace shape validation — the
-        # same rules the CLI applies (near-miss globals like `global` are
-        # refused; project:*/user:*/user:global pass). The subprocess would
-        # refuse too; this gives a clean structured error instead of a
-        # sanitized stderr blob.
+        # Issue #71 C: the configured single-tenant default namespace. Opt-in
+        # via ZMEM_MCP_DEFAULT_NS; unset → the historical user:global default
+        # (#65 10.1: "the configured default namespace", never a bare
+        # 'global'). The value is validated by the SAME _valid_mcp_namespace
+        # rule as client-supplied values — a near-miss env value refuses here
+        # with a message naming the env var instead of reaching the store.
+        default_ns = (os.environ.get("ZMEM_MCP_DEFAULT_NS") or "").strip()
         ns = (str(namespace or "")).strip()
+        if not ns:
+            ns = default_ns or "user:global"
+            if not _valid_mcp_namespace(ns):
+                return _error(
+                    f"ZMEM_MCP_DEFAULT_NS={ns!r} is not a valid namespace; "
+                    "set it to 'user:global' or 'project:<name>' (near-miss "
+                    "forms like 'global' are refused)"
+                )
         if not _valid_mcp_namespace(ns):
             return _error(
                 "namespace must be project:<name>, user:<name>, or the "

@@ -494,6 +494,11 @@ def cmd_sweep(marker_dir: str | None = None,
                 # concurrency proof.
                 if p.stat().st_mtime >= cutoff:
                     continue
+                # #93 A3: close the stat→unlink TOCTOU — a hook appending in
+                # the window above would lose that event. Re-stat immediately
+                # before the unlink and keep the file when it moved forward.
+                if p.stat().st_mtime >= cutoff:
+                    continue
             except OSError:
                 continue  # best-effort: unreadable/racy entry, skip
             if not dry_run:
@@ -521,6 +526,9 @@ def cmd_sweep(marker_dir: str | None = None,
                 rp = ops_dir / rname
                 try:
                     if not rp.is_file() or rp.stat().st_mtime >= cutoff:
+                        continue
+                    # #93 A3: same re-stat backstop for the ops sidecars.
+                    if rp.stat().st_mtime >= cutoff:
                         continue
                 except OSError:
                     continue

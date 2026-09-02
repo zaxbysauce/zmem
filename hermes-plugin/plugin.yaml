@@ -1,3 +1,13 @@
 name: zmem
 version: 0.13.1
-description: "ZMem — local-first cross-session memory shared with ZCode, Claude Code, and Codex via a single ~/.zmem/store.sqlite. Passive recall, explicit memory tools, and Tier-0 core.md injection. Pair with the bundled shell hooks for the reflection loop."
+description: "ZMem — shared cross-session memory for the whole fleet via one canonical store. MemoryProvider with passive no-bump prefetch + explicit memory tools, plus reflection shell hooks. Dual-mode by design: keep Hindsight as memory.provider and run zmem beside it (MCP + prefetch hook); memory.provider: zmem is the local-only exclusive path that displaces Hindsight. Issue #71 A/B."
+hooks:
+  - prefetch
+  - queue_prefetch
+  - sync_turn
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
+tags:
+  - memory
+  - fleet

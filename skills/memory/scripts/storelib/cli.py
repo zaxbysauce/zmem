@@ -23,7 +23,7 @@ from storelib.consolidate import CONSOLIDATE_DEFAULT_THRESHOLD, consolidate
 from storelib.organize import organize
 from storelib.entity import ENTITY_KINDS, cmd_entity_list, cmd_entity_merge
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
-from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_queue_clear, cmd_queue_list
+from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_queue_clear, cmd_queue_list, cmd_promote_store
 from storelib.promote import promote_memory
 # _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
 # this module's re-export surface for `storelib/__init__.py` and legacy
@@ -33,8 +33,64 @@ from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import reembed_embeddings
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl
-from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory
+from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory
 from storelib.tune import tune_weights
+
+def _auto_near_miss_rekey(conn: sqlite3.Connection, force_off: bool = False) -> None:
+    """Issue #71 C: run the existing near-miss remediation automatically on
+    store open. Rows stranded under a global-near-miss namespace (``global``,
+    ``userglobal``, ``users:global``, …) are unreachable from every automatic
+    hook; the issue requires the ALREADY-EXISTING guarded remediation
+    (``rekey_namespace(near_miss_global=True)`` — PRR-001 canonical exclusion,
+    PRR-002/013 destination validation, entity relink, BEGIN IMMEDIATE) to run
+    without an operator flag.
+
+    Deliberately narrow: only global-near-miss stems are rekeyed. Project
+    namespace splits (``project:foo`` vs ``project:github.com/o/foo``) are a
+    per-row operator decision (#97) and are never touched here.
+
+    Behavior contract:
+    - Healthy store cost: one indexed SELECT DISTINCT, zero writes, zero output.
+    - When stranded rows exist, ``rekey_namespace``'s own prints are rerouted
+      to stderr so ``--json`` stdout stays parseable, plus one summary line.
+    - Fail-open: any error prints a skip line and never fails the command.
+    - Kill switches: ``--no-auto-rekey`` (any subcommand) or
+      ``ZMEM_AUTO_REKEY=0``.
+
+    Concurrency: the SELECT-then-UPDATE window between two concurrent opens is
+    benign — both compute the same source set, the UPDATE is idempotent, and
+    ``BEGIN IMMEDIATE`` + busy_timeout + the ``_commit`` retry inside
+    ``rekey_namespace`` serialize the write. No writer lease is taken: this
+    runs on read commands too, and read commands must not serialize behind a
+    lease (issue #21 hot-path contract).
+    """
+    if force_off:
+        return
+    if os.environ.get("ZMEM_AUTO_REKEY", "1").strip() == "0":
+        return
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT namespace FROM memory WHERE superseded_at IS NULL"
+        ).fetchall()
+        stranded = [
+            r["namespace"] for r in rows
+            if r["namespace"] != GLOBAL_NAMESPACE
+            and _global_near_miss_key(r["namespace"]) in _GLOBAL_NEAR_MISS_STEMS
+        ]
+        if not stranded:
+            return
+        with contextlib.redirect_stdout(sys.stderr):
+            rekeyed = rekey_namespace(conn, near_miss_global=True)
+        print(
+            f"[zmem] auto-rekeyed {rekeyed} stranded row(s) from "
+            f"{', '.join(repr(s) for s in stranded)} -> {GLOBAL_NAMESPACE!r} "
+            "(issue #71 C; ZMEM_AUTO_REKEY=0 or --no-auto-rekey disables)",
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        print(f"[zmem] near-miss auto-remediation skipped: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
 
 def nonnegative_int(value: str) -> int:
     """argparse type= for flags fed straight into a SQL LIMIT: SQLite treats a
@@ -96,11 +152,24 @@ def main():
             pass  # stream not reconfigurable (e.g. detached) — leave as-is
 
     ap = argparse.ArgumentParser(prog="store.py", description="ZMem semantic store")
+    # Issue #71 C: the automatic near-miss rekey (see _auto_near_miss_rekey)
+    # runs on every store-opening command, so its opt-out must exist on every
+    # subcommand — shared via a parent parser rather than 40 copies.
+    _auto_rekey_parent = argparse.ArgumentParser(add_help=False)
+    _auto_rekey_parent.add_argument(
+        "--no-auto-rekey", action="store_true",
+        help="disable the automatic near-miss namespace rekey for this "
+             "invocation (same as ZMEM_AUTO_REKEY=0)")
+
+    def _add_parser(name: str, **kwargs):
+        kwargs.setdefault("parents", [_auto_rekey_parent])
+        return sub.add_parser(name, **kwargs)
+
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("init", help="create the store if absent (idempotent)")
+    _add_parser("init", help="create the store if absent (idempotent)")
 
-    p_add = sub.add_parser("add", help="add a memory")
+    p_add = _add_parser("add", help="add a memory")
     p_add.add_argument("--namespace", required=True)
     p_add.add_argument("--type", required=True, choices=list(ALLOWED_TYPES))
     p_add.add_argument("--content", required=True,
@@ -127,7 +196,7 @@ def main():
                             "(issue #65, 10.8 — consumed by the MCP/Hermes add "
                             "surfaces; stderr advisory lines are unchanged)")
 
-    p_recall = sub.add_parser("recall", help="recall relevant memories")
+    p_recall = _add_parser("recall", help="recall relevant memories")
     p_recall.add_argument("--query", required=True)
     p_recall.add_argument("--namespace", default=None)
     p_recall.add_argument("--limit", type=nonnegative_int, default=5)
@@ -197,7 +266,7 @@ def main():
                                "[PREVIOUSLY] update_of predecessors). Passive "
                                "surfaces never unfold regardless (--no-bump).")
 
-    p_recent = sub.add_parser("recent", help="most recent live memories (no FTS, admin pull)")
+    p_recent = _add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
     p_recent.add_argument("--limit", type=nonnegative_int, default=5)
     p_recent.add_argument("--min-confidence", type=float, default=0.5)
@@ -218,7 +287,7 @@ def main():
                                "rows VALID at as_of (valid_from <= as_of AND "
                                "(valid_until empty OR valid_until > as_of)).")
 
-    p_search = sub.add_parser("search", help="keyword search (no confidence floor)")
+    p_search = _add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
     p_search.add_argument("--namespace", default=None)
     p_search.add_argument("--limit", type=nonnegative_int, default=10)
@@ -244,11 +313,11 @@ def main():
                                "injection_risk, tokens_used, tokens_budget} (issue "
                                "#65, 10.8) — plain output is unchanged")
 
-    p_sup = sub.add_parser("supersede", help="tombstone a memory")
+    p_sup = _add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
     p_sup.add_argument("--reason", default="")
 
-    p_inv = sub.add_parser(
+    p_inv = _add_parser(
         "invalidate",
         help="tombstone a memory because the fact is no longer true "
              "(supersede with a REQUIRED reason — issue #59, 4.3)",
@@ -262,7 +331,7 @@ def main():
     p_inv.add_argument("--reason", required=True,
                        help="why the fact is no longer true (REQUIRED)")
 
-    p_upd = sub.add_parser(
+    p_upd = _add_parser(
         "update",
         help="append-only knowledge update: replace a memory, keeping history "
              "(issue #59, 4.2)",
@@ -299,7 +368,7 @@ def main():
                             "(issue #65, 10.8 — consumed by the MCP/Hermes update "
                             "surfaces; stderr advisory lines are unchanged)")
 
-    p_get = sub.add_parser(
+    p_get = _add_parser(
         "get",
         help="show a memory by id",
         description="Show one memory row as JSON (binary columns render as a "
@@ -311,23 +380,23 @@ def main():
     p_get.add_argument("--id", required=True,
                        help="id of the memory to show")
 
-    p_list = sub.add_parser("list", help="list memories")
+    p_list = _add_parser("list", help="list memories")
     p_list.add_argument("--namespace", default=None)
     p_list.add_argument("--limit", type=nonnegative_int, default=50)
     p_list.add_argument("--include-superseded", action="store_true")
 
-    sub.add_parser("stats", help="store statistics")
+    _add_parser("stats", help="store statistics")
 
     # Print only the resolved store path (the 6-level ZMEM_STORE > ZMEM_DATA >
     # CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem > legacy chain). Lets
     # scripts/tooling query the path without parsing `stats` output (#39 E5).
-    sub.add_parser("path", help="print the resolved store path")
+    _add_parser("path", help="print the resolved store path")
 
     # Run the three session-start cadence ops (consolidate, backup --if-due,
     # sweep) in ONE process instead of three detached python invocations
     # (#39 E9). Each op keeps its own cadence gate / single-flight lock / exit
     # semantics — this entrypoint only sequences them.
-    p_session_cadence = sub.add_parser(
+    p_session_cadence = _add_parser(
         "session-cadence",
         help="run consolidate + backup --if-due + sweep in one process "
              "(session-start cadence batch)")
@@ -335,11 +404,11 @@ def main():
                                    default=BACKUP_DEFAULT_RETENTION,
                                    help=f"backup retention in days (default {BACKUP_DEFAULT_RETENTION})")
 
-    sub.add_parser("rebuild-fts", help="rebuild the FTS5 index from scratch")
+    _add_parser("rebuild-fts", help="rebuild the FTS5 index from scratch")
 
     # Issue #63, 8.3: reembed grew flags. Flagless remains the legacy backfill
     # with byte-identical behavior; --all is the operator-grade rebuild.
-    p_reembed = sub.add_parser(
+    p_reembed = _add_parser(
         "reembed",
         help="backfill missing embeddings (flagless), or rebuild every live "
              "embedding under a profile (--all)",
@@ -372,7 +441,7 @@ def main():
                                 "(conversion overwrites them with placeholders)")
 
 
-    p_consolidate = sub.add_parser("consolidate", help="merge near-duplicate memories")
+    p_consolidate = _add_parser("consolidate", help="merge near-duplicate memories")
     p_consolidate.add_argument("--threshold", type=float,
                                default=CONSOLIDATE_DEFAULT_THRESHOLD)
     p_consolidate.add_argument("--prune", action="store_true",
@@ -395,7 +464,7 @@ def main():
     # Sleep-time organize (issue #62). NOT flagless: it deliberately exposes
     # --prune/--dry-run/--force/--json (each wired to a real behavior below —
     # there is no unwired flag; see the test's FLAGLESS_SUBCMDS allowlist).
-    p_organize = sub.add_parser(
+    p_organize = _add_parser(
         "organize",
         help="sleep-time organization: bounded-episode consolidation, entity/link "
              "backfill, topic clustering, hierarchical extractive summaries, "
@@ -411,7 +480,19 @@ def main():
                             help="print a machine-readable run report as the ONLY stdout "
                                  "content; human output goes to stderr")
 
-    p_promote = sub.add_parser("promote", help="promote high-confidence lessons to SKILL.md files")
+    p_promote = _add_parser("promote", help="promote high-confidence lessons to SKILL.md files")
+    # Issue #71 E: merge a leftover second store into this (canonical) one.
+    p_promote_store = _add_parser(
+        "promote-store",
+        help="merge every row of another zmem store into this one "
+             "(idempotent; doctor's second-stores check recommends this)")
+    p_promote_store.add_argument("--from", dest="from_path", required=True,
+                                 help="path to the source store.sqlite "
+                                      "(opened read-only; newer source "
+                                      "schemas are refused)")
+    p_promote_store.add_argument("--dry-run", action="store_true",
+                                 help="report would-promote tallies and "
+                                      "defaulted fields without writing")
     p_promote.add_argument("--dry-run", action="store_true",
                            help="show promotion candidates without creating skills")
     p_promote.add_argument("--id", default=None,
@@ -435,7 +516,7 @@ def main():
     # v12 (issue #64, 9.4): explicit usage-feedback CLI. The ONLY writer of
     # applied_count / violated_count anywhere in the codebase — hooks,
     # --no-bump recall, PreCompact, and Hermes prefetch never touch them.
-    p_feedback = sub.add_parser(
+    p_feedback = _add_parser(
         "feedback",
         help="record explicit usage feedback on one memory (Voyager counters; "
              "feeds the promote ladder)")
@@ -456,7 +537,7 @@ def main():
     # W_* weights are computed in memory from the gold set; nothing is ever
     # written. Applying weights is a documented manual edit of the W_* module
     # constants in storelib/recall.py (SKILL.md §tune-weights).
-    p_tune = sub.add_parser(
+    p_tune = _add_parser(
         "tune-weights",
         help="suggest recall scoring weights from a gold set (dry-run only; "
              "writes nothing)")
@@ -472,7 +553,7 @@ def main():
                         help="top-k cut for hit@k (default 5; applied to gold "
                              "items that do not set their own 'k')")
 
-    p_rekey = sub.add_parser(
+    p_rekey = _add_parser(
         "rekey-namespace",
         help="admin: rewrite the namespace of live rows (remediate stranded "
              "global-near-miss rows so they surface again)")
@@ -493,7 +574,7 @@ def main():
                          help="REQUIRED to actually write. rekey-namespace without "
                               "--confirm (and without --dry-run) refuses with exit 2.")
 
-    p_backup = sub.add_parser(
+    p_backup = _add_parser(
         "backup", help="take a verified, retention-rotated snapshot of the store")
     p_backup.add_argument("--retention", type=int, default=BACKUP_DEFAULT_RETENTION,
                           help=f"keep the newest N '{SNAPSHOT_GLOB}' snapshots and delete "
@@ -509,7 +590,7 @@ def main():
                                "SessionStart hook so the automatic trigger is cheap. "
                                "Without this flag the backup always runs.")
 
-    p_restore = sub.add_parser(
+    p_restore = _add_parser(
         "restore", help="restore the store from a snapshot (verifies first, "
                         "backs up the current store first)")
     p_restore.add_argument("--from", dest="from_path", required=True,
@@ -520,7 +601,7 @@ def main():
                            help="where to put the pre-restore backup (default: same as "
                                 "`backup`)")
 
-    p_export_pack = sub.add_parser(
+    p_export_pack = _add_parser(
         "export-pack",
         help="render a Tier 1 markdown memory pack for a namespace (project + user:global)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -559,7 +640,7 @@ def main():
                                     "trailing omitted-count note, rendered whenever rows "
                                     f"were omitted) can push the output past it (default {EXPORT_PACK_DEFAULT_MAX_BYTES})")
 
-    p_export_jsonl = sub.add_parser(
+    p_export_jsonl = _add_parser(
         "export-jsonl",
         help="export Tier 3 sync JSONL (one memory row per line, no embeddings)")
     p_export_jsonl.add_argument("--out", default=None,
@@ -569,7 +650,7 @@ def main():
     p_export_jsonl.add_argument("--include-superseded", action="store_true",
                                 help="also export tombstoned rows (default: live rows only)")
 
-    p_ingest_jsonl = sub.add_parser(
+    p_ingest_jsonl = _add_parser(
         "ingest-jsonl",
         help="import Tier 3 sync JSONL written by export-jsonl")
     p_ingest_jsonl.add_argument("--in", dest="in_path", required=True,
@@ -599,7 +680,7 @@ def main():
                                      "content with injection-risk tagging. Use 'auto' when "
                                      "ingesting an untrusted/remote sync file.")
 
-    p_fail = sub.add_parser(
+    p_fail = _add_parser(
         "failures",
         help="detect failed tool calls for a session (transcript JSONL or db.sqlite)")
     p_fail.add_argument("--session", default="",
@@ -609,7 +690,7 @@ def main():
     p_fail.add_argument("--db", default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
                         help="ZCode episodic db.sqlite path (default ~/.zcode/cli/db/db.sqlite)")
 
-    p_corr = sub.add_parser(
+    p_corr = _add_parser(
         "corrections",
         help="mine user corrections from a Claude Code transcript JSONL (read-only)")
     p_corr.add_argument("--transcript", default="",
@@ -617,7 +698,7 @@ def main():
     p_corr.add_argument("--json", action="store_true",
                        help="emit JSON (default output is already JSON; kept for parity)")
 
-    p_queue_list = sub.add_parser(
+    p_queue_list = _add_parser(
         "queue-list",
         help="list live-capture correction candidates for a namespace "
              "(read-only sidecar, store-independent)")
@@ -627,7 +708,7 @@ def main():
                               help="emit {\"count\": N, \"items\": [...]} "
                                    "(default: human list)")
 
-    p_queue_clear = sub.add_parser(
+    p_queue_clear = _add_parser(
         "queue-clear",
         help="clear processed/deferred live-capture correction candidates "
              "(sidecar, store-independent)")
@@ -644,7 +725,7 @@ def main():
     _qc_grp.add_argument("--drop-stale", action="store_true",
                          help="remove stale items with confidence < 0.6")
 
-    p_mine = sub.add_parser(
+    p_mine = _add_parser(
         "mine-history",
         help="mine corrections/rejections/error-patterns from HISTORICAL Claude Code "
              "transcripts (read-only; CC-transcript host surface only)")
@@ -665,10 +746,19 @@ def main():
                              "(source=history-mine; resolves the store namespace "
                              "from the current project's git origin, so it may "
                              "spawn one short `git` subprocess)")
+    p_mine.add_argument("--source", choices=["claude", "codex", "hermes"],
+                        default="claude",
+                        help="input surface (issue #71 I): claude = Claude Code "
+                             "transcripts (default, full report); codex = a "
+                             "curated Codex MEMORY.md (ZMEM_CODEX_MEMORY or "
+                             "~/.codex/MEMORY.md; raw_memories.md is refused); "
+                             "hermes = Hermes session JSONL under "
+                             "ZMEM_HERMES_SESSIONS or ~/.hermes/sessions. "
+                             "codex/hermes emit review-queue candidates only.")
     p_mine.add_argument("--json", action="store_true",
                         help="emit the full merged candidate report as JSON")
 
-    p_sweep = sub.add_parser(
+    p_sweep = _add_parser(
         "sweep",
         help="remove stale per-session cooldown sentinel files (issue #23)")
     p_sweep.add_argument("--marker-dir", default=None,
@@ -684,7 +774,7 @@ def main():
 
     # v10 (issue #60, 5.4): entity inspection surface — so humans and doctor
     # can see what the deterministic extractor minted without raw SQL.
-    p_entity_list = sub.add_parser(
+    p_entity_list = _add_parser(
         "entity-list",
         help="list entities (kind, canonical name, aliases, link count)")
     p_entity_list.add_argument("--kind", default=None, choices=list(ENTITY_KINDS),
@@ -696,7 +786,7 @@ def main():
 
     # v10 (issue #60, 5.6): manual entity reconciliation. DRY RUN by default —
     # without --confirm nothing is written (the plan is printed instead).
-    p_entity_merge = sub.add_parser(
+    p_entity_merge = _add_parser(
         "entity-merge",
         help="merge two entities: move aliases + memory links to the target, "
              "delete the source (dry-run unless --confirm)")
@@ -715,7 +805,7 @@ def main():
     # v11 (issue #61, 6.5): associative-link inspection + curation. List mode
     # mirrors the `get` not-found contract; --add is the CLI insertion path
     # for the typed relations (updates/extends/derives) and curated supports.
-    p_links = sub.add_parser(
+    p_links = _add_parser(
         "links",
         help="inspect a memory's associative links (or insert one with --add)",
         description="List mode (default): `links --id UUID [--json]` prints "
@@ -751,7 +841,7 @@ def main():
                               "convention; validated and echoed, not "
                               "persisted)")
 
-    p_contradict = sub.add_parser(
+    p_contradict = _add_parser(
         "contradict",
         help="record that two memories contradict (contradicts pair + trust "
              "-0.10 each)",
@@ -775,20 +865,20 @@ def main():
 
     # v13 (issue #65, 10.7): episode container commands. episode-list is
     # read-only; the other three take the writer lease (see the lease block).
-    p_ep_open = sub.add_parser(
+    p_ep_open = _add_parser(
         "episode-open", help="open a new episode (session container)")
     p_ep_open.add_argument("--namespace", required=True)
     p_ep_open.add_argument("--json", action="store_true",
                            help="print the created episode row as JSON")
 
-    p_ep_add = sub.add_parser(
+    p_ep_add = _add_parser(
         "episode-add", help="attach a LIVE memory to an open episode")
     p_ep_add.add_argument("--episode", required=True, help="episode id")
     p_ep_add.add_argument("--memory", required=True, help="memory id (must be live)")
     p_ep_add.add_argument("--json", action="store_true",
                           help="print the membership result as JSON")
 
-    p_ep_close = sub.add_parser(
+    p_ep_close = _add_parser(
         "episode-close",
         help="close an open episode (append-only; computes token_count)")
     p_ep_close.add_argument("--episode", required=True, help="episode id")
@@ -799,7 +889,7 @@ def main():
     p_ep_close.add_argument("--json", action="store_true",
                             help="print the closed episode row as JSON")
 
-    p_ep_list = sub.add_parser(
+    p_ep_list = _add_parser(
         "episode-list", help="list episodes (newest first)")
     p_ep_list.add_argument("--namespace", default=None)
     p_ep_list.add_argument("--json", action="store_true",
@@ -836,8 +926,17 @@ def main():
     # write surface is the #47 sidecar queue under --queue), so like
     # `failures`/`corrections`/`queue-list`/`sweep` it dispatches BEFORE
     # connect()/migrate() — a bad/locked/missing store can never break cold-start
-    # mining. Host input surface is Claude-Code-transcript-only by design.
+    # mining. Host input surface: Claude Code transcripts (default) plus the
+    # issue #71 I Codex/Hermes adapters (queue candidates only).
     if args.cmd == "mine-history":
+        if getattr(args, "source", "claude") != "claude":
+            sys.exit(cmd_mine_history_adapters(
+                source=args.source,
+                transcript_dir=args.transcript_dir or "",
+                queue=args.queue,
+                as_json=args.json,
+                limit=args.limit,
+            ))
         sys.exit(cmd_mine_history(
             transcript_dir=args.transcript_dir or None,
             all_projects=args.all_projects,
@@ -904,6 +1003,17 @@ def main():
     except RuntimeError as e:
         print(f"[zmem] {e}", file=sys.stderr)
         sys.exit(2)
+
+    # Issue #71 C: after the store is open and migrated, remediate any rows
+    # stranded under a global-near-miss namespace so they become reachable
+    # again. Fail-open, silent on healthy stores (see _auto_near_miss_rekey).
+    # `rekey-namespace` is EXEMPT for its WHOLE surface (both --near-miss-global
+    # and single-namespace --from/--to forms): the operator is explicitly doing
+    # remediation work, and the auto pass running first would consume the rows
+    # their command targets — turning --dry-run into an empty preview and
+    # --confirm into "no matching live rows found".
+    if args.cmd != "rekey-namespace":
+        _auto_near_miss_rekey(conn, force_off=getattr(args, "no_auto_rekey", False))
 
     # Issue #63, 8.2: fail-closed embedding-profile gate. Applied ONLY to
     # commands whose success depends on generating or querying vectors — a
@@ -1317,6 +1427,11 @@ def main():
             # CLI/metrics consumers only.
             if failures:
                 sys.exit(1)
+        elif args.cmd == "promote-store":
+            # Issue #71 E: one-shot merge of a leftover second store. Idempotent
+            # (source ids preserved), read-only on the source.
+            sys.exit(cmd_promote_store(conn, from_path=args.from_path,
+                                       dry_run=args.dry_run))
         elif args.cmd == "rekey-namespace":
             # --confirm (or --dry-run) is a REAL gate: this rewrites the
             # namespace column of live rows. Without either flag it refuses.
