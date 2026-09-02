@@ -21,7 +21,7 @@
 #     field (worst case one duplicate, never lost).
 #   - Codex: NOT registered YET — upstream has since shipped a full hooks
 #     system (PreToolUse accepts hookSpecificOutput.additionalContext;
-#     PreCompact exists — openai/codex#19385 was resolved; Codex hooks
+#     PreCompact and SubagentStart exist — openai/codex#19385 was resolved; Codex hooks
 #     reference: https://learn.chatgpt.com/docs/hooks), so the old gap
 #     claim is retired; wiring lands in #95 (verification-first: live
 #     tool_name dump before matchers).
