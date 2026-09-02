@@ -84,6 +84,16 @@ README.
   busy_retry-backed `_commit` like every writer path (issue #55 §7 follow-up;
   rollback stays the atomic backstop).
 - **MCP server docstring** listed 5 tools; now lists all nine.
+- **Stale Codex host-capability claims retired** (issue #90 closure):
+  upstream Codex shipped a full hooks system — `PreToolUse` accepts
+  `hookSpecificOutput.additionalContext` (model-visible, non-blocking;
+  openai/codex#19385 was resolved by openai/codex#20692) and
+  `PreCompact`/`SubagentStart` exist (Codex hooks reference:
+  https://learn.chatgpt.com/docs/hooks). SKILL.md's inject-parity section,
+  the pretool wrapper's header comment, and the registration test's
+  rationale no longer claim the host rejects pre-tool context. No
+  registration change: Codex stays unregistered until #95 wires it
+  (verification-first, behind the miss-rate baseline #94).
 
 ### Added (earlier in this train)
 - **Pre-tool inject** (issue #90, #85 direction C — host-probed): new
@@ -97,9 +107,10 @@ README.
   older hosts that ignore pre-tool `additionalContext` (documented and
   supported since Claude Code 2.1.9, where it lands alongside the tool
   result; pausing is permission-decision-driven only — worst case one
-  duplicate, never a lost delivery). Codex stays unregistered
-  (rejects `hookSpecificOutput.additionalContext`, openai/codex#19385) —
-  documented gap.
+  duplicate, never a lost delivery). Codex stays unregistered (at ship
+  time upstream rejected `hookSpecificOutput.additionalContext`,
+  openai/codex#19385 — since superseded: upstream shipped a full hooks
+  system and the wiring is tracked in #95).
 - **SubagentStart task-text recall** (issue #90, #85 direction D): the
   shared body's new `subagent` mode prefers the delegated task text
   (prompt/task/description) over the query-less recent pull when the host

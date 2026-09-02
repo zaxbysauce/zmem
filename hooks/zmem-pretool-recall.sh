@@ -19,8 +19,12 @@
 #     decision field only) → direct emit, PLUS a pending sidecar the next UserPromptSubmit
 #     run must deliver — the sidecar covers older hosts that ignore the
 #     field (worst case one duplicate, never lost).
-#   - Codex: NOT registered — the host rejects hookSpecificOutput.additionalContext
-#     (openai/codex#19385); documented gap in issue #90's matrix.
+#   - Codex: NOT registered YET — upstream has since shipped a full hooks
+#     system (PreToolUse accepts hookSpecificOutput.additionalContext;
+#     PreCompact exists — openai/codex#19385 was resolved; Codex hooks
+#     reference: https://learn.chatgpt.com/docs/hooks), so the old gap
+#     claim is retired; wiring lands in #95 (verification-first: live
+#     tool_name dump before matchers).
 #   - NEVER denies: surfacing a hazard is information for the model, not
 #     grounds to block a legitimate command. No permission decision is emitted.
 #

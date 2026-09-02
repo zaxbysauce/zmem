@@ -17,8 +17,10 @@ Proves:
   at most once per ring timestamp, with the ZMEM_QUERY_CONTEXT kill switch;
 - E: the shipped skill files carry the decision-point checkpoint contract
   (named hazardous verbs), and the host maps register PreToolUse where the
-  contract was probed (ZCode + Claude) and NOT where it is a documented gap
-  (Codex).
+  contract was probed (ZCode + Claude) and NOT on Codex, whose PreToolUse
+  wiring is deliberately deferred to issue #95 (upstream shipped a full
+  hooks system after our 2026-08-30 probe — openai/codex#19385 was
+  resolved; flip the Codex assertions inside #95's PR, never before).
 
 All stores are throwaway temp stores. Runs standalone:
 python tests/test_pretool_inject.py
@@ -383,8 +385,9 @@ class HermesReflectDeliveryTest(unittest.TestCase):
 
 
 class RegistrationAndContractTest(unittest.TestCase):
-    """Where PreToolUse is registered (probed hosts) and where it is a
-    documented gap (Codex); the E skill-contract text; launcher verbs."""
+    """Where PreToolUse is registered (probed hosts) and where wiring is
+    deliberately deferred (Codex → issue #95); the E skill-contract text;
+    launcher verbs."""
 
     def test_pretool_registered_on_zcode_and_claude_only(self):
         for name in ("hooks.zcode.json", "hooks.claude.json"):
@@ -400,9 +403,24 @@ class RegistrationAndContractTest(unittest.TestCase):
             (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8"))
         self.assertNotIn(
             "PreToolUse", codex["hooks"],
-            "Codex rejects hookSpecificOutput.additionalContext "
-            "(openai/codex#19385) — a registration would be inert; the gap "
-            "is documented in issue #90's matrix")
+            "Codex PreToolUse wiring is deliberately deferred to issue #95 "
+            "(upstream has since shipped a full hooks system — PreToolUse "
+            "accepts hookSpecificOutput.additionalContext; "
+            "openai/codex#19385 was resolved — so a registration would NOT "
+            "be inert; flip this assertion inside #95's PR together with "
+            "the registration, never before)")
+
+    def test_memory_skill_names_issue_95_as_codex_wiring_owner(self):
+        # The 2026-08-30 probe's Codex row ("host rejects
+        # hookSpecificOutput.additionalContext") expired when upstream
+        # shipped a full hooks system (openai/codex#19385 resolved).
+        # The shipped surface map must state the CURRENT truth — Codex
+        # wiring deferred to #95 — so it cannot silently re-stale.
+        memory_skill = (REPO_ROOT / "skills" / "memory" / "SKILL.md") \
+            .read_text(encoding="utf-8")
+        self.assertIn("wiring is tracked in #95", memory_skill,
+                      "SKILL.md's parity section must name #95 as the "
+                      "Codex pre-tool wiring owner")
 
     def test_launcher_knows_the_verb(self):
         src = (REPO_ROOT / "hooks" / "zmem-launch.js").read_text(encoding="utf-8")
