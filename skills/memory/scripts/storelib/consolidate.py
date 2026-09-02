@@ -1233,7 +1233,13 @@ def consolidate(
             merged_count += len(neighbors)
             if collect_run_ids and grew_preview:
                 consolidated_ids.append(seed["id"])
-            if contested_override:
+            if contested_override and restatement_override:
+                # PRR-004 critic follow-up: a dry-run restatement cluster is
+                # counted at classification (counterfactual, qualified by
+                # dry_run) and must NOT also appear as a contested cluster —
+                # the same self-contradictory report the real-run path fixed.
+                pass
+            elif contested_override:
                 # Dry run: nothing merged — merged must be False (PRR-001).
                 # The print is the only override-preview trace; the report
                 # carries dry_run: true as the machine-side qualifier.

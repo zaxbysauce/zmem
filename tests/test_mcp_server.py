@@ -319,29 +319,36 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         self.assertEqual(set(search_result.keys()), set(recall_result.keys()))
 
     def test_search_is_keyword_only_not_hybrid_alias(self):
-        """Issue #71 cleanup: the OLD name/assertion here
-        (`test_search_equivalent_to_recall_on_same_args`) claimed search is a
-        pure alias of recall — true only in model-absent environments where
-        hybrid degrades to lexical. The real contract (issue #58 3.3 I1,
-        PRR-007; issue #71's I13 correction): search pins `--no-hybrid` +
-        `--link-hops 0`, i.e. keyword-only with no link expansion, BY
-        DESIGN — it must never silently flip to hybrid when embeddings are
-        available. Pin the argv contract the same way
-        test_surface_consistency pins the other surfaces."""
-        src = inspect.getsource(self.mcp_server)
-        search_block = src[src.index("async def search"):]
-        search_block = search_block[:search_block.index("@mcp.tool",
-                                                        len("async def search"))]
-        self.assertIn('"--no-hybrid"', search_block,
-                      "MCP search must pin --no-hybrid (keyword-only "
-                      "contract), never delegate to hybrid recall")
-        self.assertIn('"--no-hybrid"', search_block,
-                      "MCP search must pin --no-hybrid (keyword-only "
-                      "contract), never delegate to hybrid recall")
-        self.assertIn('"--link-hops", "0"', search_block,
-                      "MCP search must pin --link-hops 0 (no link expansion)")
-        # The docstring must state the difference, not claim alias equality.
-        self.assertIn("keyword", search_block.lower())
+        """Issue #71 cleanup + PR-review PRR-007: search pins `--no-hybrid` +
+        `--link-hops 0` (keyword-only, no link expansion) — NEVER a hybrid
+        recall alias. Runtime pin: spy on the store subprocess argv via the
+        same seam the concurrency tests use, so a dead literal or conditional
+        argv construction still fails the test (a source-inspection assert
+        cannot)."""
+        captured = {}
+
+        async def _spy(argv, **kwargs):
+            captured["argv"] = list(argv)
+            return {"ok": True, "returncode": 0, "stdout": '{"results": [], "count": 0}',
+                    "stderr": ""}
+
+        self.mcp_server._MAX_CONCURRENT_STORE = 1
+        self.mcp_server._store_semaphore = None
+        original = self.mcp_server._run_store_async
+        self.mcp_server._run_store_async = _spy
+        try:
+            self._call("search", query="nonexistent-probe-zz",
+                       namespace=self._ns(), limit=5)
+        finally:
+            self.mcp_server._run_store_async = original
+            self.mcp_server._store_semaphore = None
+        argv = captured.get("argv", [])
+        self.assertTrue(argv, "search must invoke the store subprocess")
+        self.assertIn("--no-hybrid", argv,
+                      "search must pin --no-hybrid (keyword-only contract)")
+        self.assertIn("--link-hops", argv)
+        self.assertEqual(argv[argv.index("--link-hops") + 1], "0",
+                         "search must pin --link-hops 0 (no link expansion)")
 
     def test_search_empty_query_returns_error(self):
         result = self._call("search", query="", namespace=self._ns(), limit=5)

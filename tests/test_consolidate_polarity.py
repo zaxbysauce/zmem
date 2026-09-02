@@ -25,10 +25,14 @@ pair lands in its band):
   R1 "rotate mcp bearer token every ninety days" vs
      "Operator preference: do not SKIP a rotate ..." (issue repro) -> restatement
   R2 "Restarting the fleet gateway requires operator approval" vs
-     "Operator preference: do not restart ... without approval"    -> restatement
+     "Operator preference: do not restart ... without approval"  -> contradiction
+     (PRR-009 trade: direct negation of the shared verb parks — the
+     conservative pre-#71-G outcome; tokens cannot separate it from a
+     true flip)
   R3 "Must not replace ChatGPTN on :8000 without operator approval
       before cutover" vs "Replacing ChatGPTN ... requires operator
-      approval before cutover begins" (issue's constraint restated) -> restatement
+      approval before cutover begins" (issue's constraint restated) -> contradiction
+      (same PRR-009 trade as R2)
   D1 "EUGR is no longer the production model" vs
      "DeepSeek-V4-Flash-0731 is the production model"              -> divergent
   D2 "rotate the mcp bearer token every ninety days" vs
@@ -245,6 +249,30 @@ class RestatementMergesTest(_ClusterStoreCase):
         ).fetchone()[0]
         conn.close()
         self.assertEqual(live, 1, "restatement pair must collapse to one row")
+
+    def test_dry_run_restatement_never_double_reports(self):
+        """Reviewer-gate pin for the dry-run split (PRR-004 critic follow-up):
+        a --dry-run over an R1 pair counts the counterfactual in
+        `uncontested_restatements` and must NOT also emit the contested
+        preview ("would merge CONTESTED cluster") nor append the cluster to
+        `contested_clusters`. Reverting the dry-run `pass` to the shared
+        contested-preview path makes BOTH assertions fail."""
+        self.seed(R1A)
+        self.seed(R1B)
+        self.conn.commit()
+        self.conn.close()
+        r = self.run_consolidate("--force", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("uncontested", r.stdout)
+        self.assertNotIn("CONTESTED", r.stdout,
+                         "a restatement cluster is not contested; the dry-run "
+                         "preview must not emit the contested block")
+        conn = sqlite3.connect(self.env["ZMEM_STORE"])
+        live = conn.execute(
+            "SELECT COUNT(*) FROM memory WHERE superseded_at IS NULL"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(live, 2, "dry-run merges nothing")
 
     def test_contradiction_pair_still_contested(self):
         self.seed(C1A)

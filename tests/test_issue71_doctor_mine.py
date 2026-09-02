@@ -132,16 +132,101 @@ class PromoteStoreTest(_StoreCase):
                          "promoteunique row stranded in the second store")
 
     def test_promote_dry_run_writes_nothing(self):
-        src, unique_id, _shared = self._make_source_store("second-dry")
+        # PRR-015 reviewer gate: the source carries a memory_link row too, so
+        # the associated-table promotion path is exercised — a dry-run must
+        # not write memory rows OR assoc rows.
+        src_dir = os.path.join(self.tmp, "second-dry")
+        os.makedirs(src_dir, exist_ok=True)
+        src = os.path.join(src_dir, "store.sqlite")
+        src_env = _clean_env(src_dir)
+        self.assertEqual(_run(src_env, "stats").returncode, 0)
+        row_id = str(uuid.uuid4())
+        rows = [
+            {"id": row_id, "namespace": "user:global", "type": "lesson",
+             "content": "dryrun assoc unique row", "signal": "test",
+             "confidence": 0.8, "source_ref": "db:d:1"},
+        ]
+        jl = os.path.join(src_dir, "seed.jsonl")
+        with open(jl, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        self.assertEqual(_run(src_env, "ingest-jsonl", "--in", jl,
+                              "--capture-mode", "auto").returncode, 0)
+        # Seed one memory_link row in the source (schema: src_id/dst_id/
+        # relation/score/created_at, UNIQUE triple, src != dst).
+        sconn = sqlite3.connect(src)
+        try:
+            sconn.execute(
+                "INSERT OR IGNORE INTO memory_link (src_id, dst_id, "
+                "relation, score, created_at) VALUES (?, ?, ?, ?, ?)",
+                (row_id, "ffff0000-0000-4000-8000-000000000002",
+                 "related", 0.5, "2026-09-01"))
+            sconn.commit()
+        finally:
+            sconn.close()
+
         r = _run(self.env, "promote-store", "--from", src, "--dry-run")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("would_promote=2", r.stdout)
+        self.assertIn("would_promote=1", r.stdout)
+        self.assertIn("memory_link=1", r.stdout)
         conn = sqlite3.connect(self.env["ZMEM_STORE"])
         try:
-            n = conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+            n_mem = conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+            n_link = conn.execute(
+                "SELECT COUNT(*) FROM memory_link").fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(n, 0, "dry-run must not write")
+        self.assertEqual(n_mem, 0, "dry-run must not write memory rows")
+        self.assertEqual(n_link, 0, "dry-run must not write assoc rows")
+
+    def test_promote_carries_associated_tables(self):
+        # PRR-015: links + episode containers/memberships are promoted with
+        # INSERT OR IGNORE idempotency when both stores carry the tables.
+        src_dir = os.path.join(self.tmp, "assoc-store")
+        os.makedirs(src_dir, exist_ok=True)
+        src = os.path.join(src_dir, "store.sqlite")
+        src_env = _clean_env(src_dir)
+        self.assertEqual(_run(src_env, "stats").returncode, 0)
+        row_id = str(uuid.uuid4())
+        jl = os.path.join(src_dir, "seed.jsonl")
+        with open(jl, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "id": row_id, "namespace": "user:global", "type": "fact",
+                "content": "assoc unique row", "signal": "test",
+                "confidence": 0.8, "source_ref": "db:a:1"}) + "\n")
+        self.assertEqual(_run(src_env, "ingest-jsonl", "--in", jl,
+                              "--capture-mode", "auto").returncode, 0)
+        sconn = sqlite3.connect(src)
+        try:
+            # Second row so the link's CHECK (src_id != dst_id) passes.
+            sconn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, ingestion_ts) VALUES "
+                "(?, 'user:global', 'fact', 'assoc second row', '', 'db:a:2', "
+                "0.8, 'test', '2026-09-01')",
+                ("ffff0000-0000-4000-8000-000000000002",))
+            sconn.execute(
+                "INSERT OR IGNORE INTO memory_link (src_id, dst_id, "
+                "relation, score, created_at) VALUES (?, ?, ?, ?, ?)",
+                (row_id, "ffff0000-0000-4000-8000-000000000002",
+                 "related", 0.5, "2026-09-01"))
+            sconn.commit()
+        finally:
+            sconn.close()
+
+        r = _run(self.env, "promote-store", "--from", src)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("memory_link=1", r.stdout)
+        # Re-run: assoc rows are INSERT OR IGNORE-idempotent too.
+        r2 = _run(self.env, "promote-store", "--from", src)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        conn = sqlite3.connect(self.env["ZMEM_STORE"])
+        try:
+            n_link = conn.execute(
+                "SELECT COUNT(*) FROM memory_link").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n_link, 1, "re-run must not duplicate assoc rows")
 
     def test_promote_missing_source_fails_clean(self):
         r = _run(self.env, "promote-store", "--from",

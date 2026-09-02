@@ -370,6 +370,27 @@ class HermesRemotePrefetchTest(unittest.TestCase):
                       "prefetch must come from the MCP server")
         self.assertNotIn("stalelocal", out,
                          "a stale local store must not take over delivery")
+        # Final-critic: the MCP ENVELOPE must not be injected raw — the
+        # client extracts the context field (the hook's own {"context": ...}
+        # wrapper is expected; the server's envelope markers are not).
+        self.assertNotIn("session_started", out)
+        self.assertNotIn('"tokens_used"', out)
+
+    def test_session_id_sanitized_for_sidecar_paths(self):
+        """Final-critic: a crafted session id must not escape the ops dir in
+        sidecar file names."""
+        hostile = "../../evil"
+        env = self._remote_env()
+        out, rc = _run_reflect(env, {"session_id": hostile,
+                                     "user_message": CORRECTION})
+        self.assertEqual(rc, 0)
+        ops_dir = Path(env["ZMEM_DATA"], "ops")
+        names = [p.name for p in ops_dir.iterdir()] if ops_dir.is_dir() else []
+        for n in names:
+            self.assertNotIn("..", n, f"sidecar name must not traverse: {n}")
+        escaped = [str(p) for p in Path(self.tmp).rglob("evil*")]
+        self.assertEqual(escaped, [],
+                         "no sidecar file may land outside the data dir")
 
     def test_remote_namespace_env_reaches_the_query(self):
         """Final-critic critical #1: ZMEM_MCP_NAMESPACE (not the session id)

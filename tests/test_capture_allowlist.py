@@ -236,5 +236,35 @@ class IngestEndToEndContractTest(unittest.TestCase):
         self.assertTrue(_row_stored(tmp, ref))
 
 
+class FileTraversalRefusedTest(unittest.TestCase):
+    """PRR-008: `file:../` parent-traversal refs are refused — a relative
+    ref is otherwise allowlisted, and _source_hash reads CWD-relative
+    bytes, so traversal would hash files outside the project."""
+
+    def _refused(self, source_ref):
+        _apply_capture_policy(content="probe", source_ref=source_ref,
+                              tags="", capture_mode="auto")
+
+    def test_posix_traversal_refuses(self):
+        with self.assertRaises(CapturePolicyRefusal):
+            self._refused("file:../secrets.txt")
+
+    def test_nested_traversal_refuses(self):
+        with self.assertRaises(CapturePolicyRefusal):
+            self._refused("file:docs/../../etc/passwd")
+
+    def test_backslash_traversal_refuses(self):
+        with self.assertRaises(CapturePolicyRefusal):
+            self._refused("file:..\secrets.txt")
+
+    def test_inner_stays_allowed(self):
+        # A directory merely NAMED with dots is not traversal.
+        _, _, _, warnings = _apply_capture_policy(
+            content="probe", tags="", source_ref="file:docs/v1.2/notes.md",
+            capture_mode="auto")
+        self.assertTrue(any(w["type"] == "source_ref_allowlisted"
+                            for w in warnings))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

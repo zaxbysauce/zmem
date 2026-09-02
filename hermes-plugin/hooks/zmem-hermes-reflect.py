@@ -226,8 +226,15 @@ def _capture_correction(user_message: str, session: str, store_path: Path) -> No
 
 
 def _session_id(payload: dict) -> str:
+    """Sanitized session id (final-critic finding): the id lands in sidecar
+    FILE NAMES (``ops/<session>.corr``, ring names) — a crafted
+    ``../``-bearing session id must not escape the ops dir. Keep the common
+    id shapes (alnum, dash, underscore, dot), collapse everything else."""
+    import re as _re
     sid = (payload.get("session_id") or "").strip()
-    return sid or "unknown"
+    sid = _re.sub(r"[^A-Za-z0-9._-]", "_", sid)
+    sid = sid.replace("..", "_")
+    return sid[:128] or "unknown"
 
 
 def _emit_context(text: str) -> None:

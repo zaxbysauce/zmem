@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -38,7 +39,24 @@ def _resolve_token(args: argparse.Namespace) -> str:
     if token_file:
         p = Path(token_file).expanduser()
         if p.is_file():
-            return p.read_text(encoding="utf-8").strip()
+            raw = p.read_text(encoding="utf-8")
+            # Same sniff rule as server auth.py: a file starting with '{' is
+            # the JSON form {"token": ..., "namespaces": [...]} — take the
+            # token field (the server enforces the namespaces); anything else
+            # is a bare token file.
+            if raw.lstrip().startswith("{"):
+                try:
+                    obj = json.loads(raw)
+                    tok = obj.get("token") if isinstance(obj, dict) else None
+                    if isinstance(tok, str) and tok.strip():
+                        return tok.strip()
+                except ValueError:
+                    pass
+                print(f"mcp_client: token file {p} starts with '{{' but is "
+                      "not a valid {'token': ...} JSON object",
+                      file=sys.stderr)
+                return ""
+            return raw.strip()
     env_token = os.environ.get("ZMEM_MCP_TOKEN", "")
     return env_token.strip()
 
@@ -52,12 +70,34 @@ async def _call(url: str, token: str, tool: str, arguments: dict) -> str:
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool, arguments)
+    if getattr(result, "isError", False):
+        errs = " | ".join(
+            getattr(b, "text", "") for b in (result.content or [])
+            if getattr(b, "text", None)
+        ).strip()
+        raise RuntimeError(f"tool returned isError=True: {errs[:200]}")
     parts = []
     for block in (result.content or []):
         text = getattr(block, "text", None)
         if isinstance(text, str) and text.strip():
             parts.append(text)
-    return "\n".join(parts)
+    joined = "\n".join(parts)
+    # PRR (final-critic): FastMCP serializes the server's dict return into a
+    # JSON text block — the hook must inject the ENVELOPE'S context field,
+    # not the whole envelope. Fall back to the raw text for non-dict tools.
+    stripped = joined.strip()
+    if stripped.startswith("{"):
+        try:
+            obj = json.loads(stripped)
+        except ValueError:
+            return joined
+        if isinstance(obj, dict):
+            if obj.get("error"):
+                raise RuntimeError(str(obj["error"])[:200])
+            ctx = obj.get("context")
+            if isinstance(ctx, str):
+                return ctx
+    return joined
 
 
 def main() -> int:
@@ -96,6 +136,15 @@ def main() -> int:
             return 3
         except Exception as exc:
             print(f"mcp_client: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        except BaseException as exc:
+            # PRR-010 disposition: anyio cancellation surfaces a
+            # BaseExceptionGroup (a BaseException subclass) that the generic
+            # handler above cannot catch. This is still a subprocess whose
+            # only job is to die cleanly — map it to the same rc-1 fail-open
+            # signal instead of a raw traceback.
+            print(f"mcp_client: {type(exc).__name__} during MCP call; "
+                  "treating as failure", file=sys.stderr)
             return 1
         if not text.strip():
             print("mcp_client: empty tool response", file=sys.stderr)

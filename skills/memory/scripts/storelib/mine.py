@@ -999,11 +999,14 @@ _PROMOTE_COLUMNS = (
 )
 
 # PRR-015: associated (non-derivable) tables promoted alongside memory rows —
-# associative links (v11) and episode containers/memberships (v13).
+# associative links (v11) and episode containers/memberships (v13). Each
+# entry carries its NATURAL key columns: memory_link has no id (its uniqueness
+# is the (src_id, dst_id, relation) triple); episode_memory's PK is the
+# (episode_id, memory_id) pair; episode has a plain id PK.
 _ASSOCIATED_TABLES = (
-    ("memory_link", "id"),
-    ("episode", "id"),
-    ("episode_memory", "id"),
+    ("memory_link", ("src_id", "dst_id", "relation")),
+    ("episode", ("id",)),
+    ("episode_memory", ("episode_id", "memory_id")),
 )
 
 
@@ -1171,13 +1174,32 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
         srows = sconn_read(table, common)
         col_list = ", ".join(common)
         placeholders = ", ".join("?" * len(common))
+        pk_idxs = [common.index(c) for c in pk if c in common]
         for srow in srows:
+            if dry_run:
+                # Dry-run purity (reviewer gate on the PRR-015 fix):
+                # --dry-run must never write. Report would-insert counts
+                # against the destination's existing rows instead.
+                exists = conn.execute(
+                    f"SELECT 1 FROM {table} WHERE "
+                    + " AND ".join(f"{c}=?" for c in pk if c in common),
+                    tuple(srow[i] for i in pk_idxs),
+                ).fetchone()
+                key = table if exists is None else f"{table}_would_skip"
+                tallies[key] = tallies.get(key, 0) + 1
+                continue
             try:
                 conn.execute(
                     f"INSERT OR IGNORE INTO {table} ({col_list}) "
                     f"VALUES ({placeholders})",
                     tuple(srow),
                 )
+                # The assoc INSERTs run on the CLI connection OUTSIDE
+                # _ingest_row's per-row commit — without an explicit commit
+                # they roll back at process exit (caught by the
+                # carries-associated-tables regression test).
+                from storelib.schema import _commit
+                _commit(conn)
                 tallies[f"{table}"] = tallies.get(f"{table}", 0) + 1
             except sqlite3.Error as exc:
                 print(f"[zmem] promote-store: {table} row skipped "
@@ -1196,6 +1218,8 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
     # PRR-012: a partial merge must not look complete — malformed source rows
     # or per-row write failures make the command exit non-zero (the summary
     # above already names the counts; dry-run stays informational).
-    if not dry_run and (malformed or tallies.get("failed")):
+    # Reviewer follow-up: associated-table write failures count too.
+    if not dry_run and (malformed or tallies.get("failed")
+                        or any(k.endswith("_failed") for k in tallies)):
         return 1
     return 0

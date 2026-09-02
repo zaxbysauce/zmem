@@ -225,38 +225,44 @@ def _has_prompt_injection_risk(*values: str) -> bool:
 # refuse, so an actual credential never rides in on an allowlisted scheme.
 _ALLOWED_SOURCE_SCHEMES = ("db:", "hindsight:", "session:", "zmem-queue:", "file:")
 
-# `file:` additionally refuses absolute remainders: the issue's example of a
-# BAD allowlist hit is `file:C:\Users\<user>\secrets.txt` — a home-absolute
-# path is exactly where private material lives. Relative paths and well-known
-# stems (codex-MEMORY.md, MEMORY.md, …) are the sanctioned shapes.
+# `file:` additionally refuses absolute remainders AND parent-traversal
+# segments (`../`, `..\` — PRR-008: a relative ref is otherwise accepted, and
+# _source_hash reads CWD-relative bytes, so `file:../secrets` would hash
+# files outside the project). Relative paths within the project and
+# well-known stems (codex-MEMORY.md, MEMORY.md, …) are the sanctioned shapes.
 _FILE_REF_ABSOLUTE_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]|~)")
+_FILE_REF_TRAVERSAL_RE = re.compile(r"(?:^|[\\/])\.\.(?:[\\/]|$)")
 
 
 def _file_ref_absolute(source_ref: str) -> bool:
-    """True for ``file:`` refs with an absolute remainder (drive letter,
-    leading slash, UNC prefix, or ``~``). These are refused outright in auto
-    mode — a plain absolute path matches no legacy secret pattern, so the
-    legacy scan-and-refuse path alone would silently let it through."""
+    """True for ``file:`` refs that must never auto-store: absolute
+    remainders (drive letter, leading slash, UNC prefix, ``~``) or any
+    parent-traversal segment. A plain absolute path matches no legacy secret
+    pattern, so the legacy scan-and-refuse path alone would silently let it
+    through."""
     ref = source_ref or ""
     if not ref.startswith("file:"):
         return False
-    return bool(_FILE_REF_ABSOLUTE_RE.match(ref[len("file:"):]))
+    remainder = ref[len("file:"):]
+    if _FILE_REF_ABSOLUTE_RE.match(remainder):
+        return True
+    return bool(_FILE_REF_TRAVERSAL_RE.search(remainder))
+
 
 def _source_ref_allowlisted(source_ref: str) -> tuple[bool, str | None]:
     """(allowlisted, scheme) for the issue #71 F provenance schemes.
 
     Strict prefix match on the whole source_ref. ``file:`` refs are
-    allowlisted only when the remainder is RELATIVE (no drive letter, no
-    leading slash/UNC, no ``~``); absolute file refs are refused outright in
-    auto mode (see ``_file_ref_absolute``).
+    allowlisted only when the remainder is RELATIVE and traversal-free
+    (no drive letter, no leading slash/UNC, no ``~``, no ``..`` segment);
+    anything else falls through to the refusal rules in
+    ``_apply_capture_policy``.
     """
     ref = source_ref or ""
     for scheme in _ALLOWED_SOURCE_SCHEMES:
         if ref.startswith(scheme):
-            if scheme == "file:":
-                remainder = ref[len(scheme):]
-                if _FILE_REF_ABSOLUTE_RE.match(remainder):
-                    return False, None
+            if scheme == "file:" and _file_ref_absolute(ref):
+                return False, None
             return True, scheme
     return False, None
 
