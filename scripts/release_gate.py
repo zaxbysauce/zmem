@@ -80,7 +80,11 @@ _VERSION_RE = re.compile(r"^version:\s*(\S+)\s*$", re.MULTILINE)
 # The drift gate's escape marker (issue #106). Chosen over a path-filter
 # allowlist: docs/CI-only merges would need an evolving allowlist, while the
 # marker is an explicit operator choice in the merge subject and works at any
-# checkout depth.
+# checkout depth. Threat-model note: on this repo main history is squash
+# merges whose subjects are PR-title-derived, so the marker text is technically
+# contributor-influenced — but the gate runs POST-merge on push to main only,
+# so a marker can at most delay a release, never bypass a code-integrity or
+# security boundary.
 SKIP_RELEASE_MARKER = "[skip release]"
 
 
@@ -237,6 +241,16 @@ def head_bumps_version(repo_root: Path) -> bool:
     for rel in manifests:
         cur = _version_at(repo_root, "HEAD", rel)
         prev = _version_at(repo_root, "HEAD~1", rel)
+        # Fail closed on a transient git/read error: a manifest whose HEAD
+        # version cannot be read proves nothing, so a git hiccup must not
+        # flip the drift gate to PASS (a None here is never evidence of a
+        # bump). prev is None with a READABLE cur is the manifest-ADDED-at-
+        # HEAD case (a real bump; a renamed manifest path is deliberately
+        # treated the same — narrow trigger, policed by review). A partial
+        # multi-manifest bump DOES satisfy this step; full parity is policed
+        # by the default mode (and by the parity test earlier in ci.yml).
+        if cur is None:
+            return False
         if prev is None or cur != prev:
             return True
     return False

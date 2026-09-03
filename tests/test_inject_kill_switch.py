@@ -272,6 +272,20 @@ class KillSwitchSessionStartTest(unittest.TestCase):
         self.assertIn(DISABLED_LINE, lines[0])
         self.assertIn("sid=sess-ss", lines[0])
 
+    def test_disabled_whitespace_variants_still_disable(self):
+        # The inline-python parser is ".strip() == '0'" — whitespace-tolerated
+        # on both sides; pin the session-start twin of the recall-body
+        # literal-0 test so a future parser drift on THIS surface is caught.
+        for value in (" 0", "0 "):
+            lines_before = len(_hook_lines(self._tmp))
+            r = self._run(ZMEM_INJECT=value)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", r.stdout)
+            self.assertNotIn("additionalContext", r.stdout)
+            lines = _hook_lines(self._tmp)
+            self.assertEqual(len(lines), lines_before + 1, lines)
+            self.assertIn(DISABLED_LINE, lines[-1])
+
     def test_control_injects_tier0_and_recall(self):
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -283,35 +297,67 @@ class KillSwitchSessionStartTest(unittest.TestCase):
 class KillSwitchHermesReflectTest(unittest.TestCase):
     """The Hermes reflect hook: delivery silenced, capture still writes."""
 
+    def _run(self, tmp: str, payload: dict, **extra_env: str):
+        env = _clean_env(
+            tmp, ZMEM_HOME=str(REPO_ROOT), ZMEM_HERMES_CORRECTIONS="1",
+            **extra_env)
+        return subprocess.run(
+            [sys.executable, str(HERMES_REFLECT)],
+            input=json.dumps(payload), capture_output=True, text=True,
+            env=env, timeout=120, cwd=tmp,
+        )
+
     def test_capture_still_writes_and_delivery_silenced(self):
         tmp = tempfile.mkdtemp(prefix="zmem-killsw-hr-")
         try:
             correction = ("No, use bun not npm for this project installs "
                           "from now on")
-            env = _clean_env(
-                tmp, ZMEM_HOME=str(REPO_ROOT), ZMEM_INJECT="0",
-                ZMEM_HERMES_CORRECTIONS="1")
-            r = subprocess.run(
-                [sys.executable, str(HERMES_REFLECT)],
-                input=json.dumps({"session_id": "sess-hr",
-                                  "user_message": correction}),
-                capture_output=True, text=True, env=env,
-                timeout=120, cwd=tmp,
-            )
+            r = self._run(
+                tmp, {"session_id": "sess-hr", "user_message": correction},
+                ZMEM_INJECT="0")
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), "{}",
                              "delivery is silenced (empty envelope)")
             self.assertIn(DISABLED_LINE, r.stderr,
                           "the stderr marker line carries the reason")
-            # correction_queue.queue_path_for encodes namespaces (':' ->
-            # '_c'); the hook's default namespace is user:global.
-            queue = Path(tmp, "queue", "user_cglobal.json")
+            # Derive the queue path from the encoder itself (single source of
+            # truth for the ':' -> '_c' scheme), not a hardcoded filename.
+            sys.path.insert(0, str(SCRIPTS))
+            try:
+                import correction_queue
+            finally:
+                sys.path.pop(0)
+            queue = correction_queue.queue_path_for(
+                "user:global", Path(tmp) / "queue")
             self.assertTrue(queue.is_file(),
                             "capture ran BEFORE the switch: the sidecar "
                             f"queue must still be written ({queue})")
             items = json.loads(queue.read_text(encoding="utf-8"))
             self.assertEqual(len(items), 1)
             self.assertIn("bun", items[0]["message"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_remote_mode_disabled_skips_lan_call(self):
+        # PRR-005: the disabled gate must precede the _remote_enabled()
+        # branch — with ZMEM_MCP_URL set the hook would otherwise attempt a
+        # LAN session_start call. The discriminator: a disabled run's stderr
+        # carries the reason=disabled marker and NOT the
+        # "remote prefetch unavailable" line the remote path emits on
+        # connection failure (the URL points at a closed port on purpose).
+        tmp = tempfile.mkdtemp(prefix="zmem-killsw-hr-remote-")
+        try:
+            r = self._run(
+                tmp, {"session_id": "sess-remote",
+                      "user_message": "harmless prompt text"},
+                ZMEM_INJECT="0", ZMEM_MCP_URL="http://127.0.0.1:1/mcp")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "{}")
+            self.assertIn(DISABLED_LINE, r.stderr,
+                          "the kill-switch gate fired, not the remote path")
+            self.assertNotIn("remote prefetch unavailable", r.stderr,
+                             "the LAN call must never be attempted under "
+                             "the switch")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -339,7 +385,7 @@ class KillSwitchHermesProviderTest(unittest.TestCase):
         sys.modules.setdefault("agent.memory_provider", mp)
         cls._saved = {k: os.environ.get(k) for k in (
             "ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_INJECT",
-            "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
+            "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR", "ZMEM_MCP_TOKEN",
         )}
         os.environ["ZMEM_HOME"] = str(REPO_ROOT)
         os.environ["ZMEM_STORE"] = os.path.join(cls._tmp, "store.sqlite")
@@ -373,13 +419,21 @@ class KillSwitchHermesProviderTest(unittest.TestCase):
     def test_prefetch_enabled_control_finds_the_seeded_row(self):
         # No switch → the normal recall path runs against the isolated
         # seeded store and RETURNS the row (contrast to the disabled twin,
-        # which returns "" before any subprocess). Asserting non-empty
-        # proves the switch is not silently always-on.
+        # which returns "" before any subprocess). Asserting the content
+        # (not just non-empty) proves the switch is not silently always-on
+        # and the recall actually surfaced the seeded row.
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ZMEM_INJECT", None)
             out = self.provider.prefetch("git stash pop conflicts")
-            self.assertNotEqual(
-                out, "", "enabled prefetch must recall the seeded row")
+            self.assertIn("killswitchcanary", out,
+                          "enabled prefetch must recall the seeded row")
+
+    def test_prefetch_whitespace_zero_still_disables(self):
+        # Near-miss drift pin (X6/PRR-004 follow-up): the provider's own
+        # predicate is whitespace-tolerated literal-"0" — pin it here so a
+        # divergence from the other five sites is caught behaviorally.
+        with mock.patch.dict(os.environ, {"ZMEM_INJECT": " 0"}):
+            self.assertEqual(self.provider.prefetch("anything"), "")
 
     def test_session_start_tool_returns_disabled_envelope(self):
         with mock.patch.dict(os.environ, {"ZMEM_INJECT": "0"}):
@@ -412,7 +466,7 @@ class KillSwitchMcpSessionStartTest(unittest.TestCase):
         cls._tmp = tempfile.mkdtemp(prefix="zmem-killsw-mcp-")
         cls._saved = {k: os.environ.get(k) for k in (
             "ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_INJECT",
-            "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
+            "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR", "ZMEM_MCP_TOKEN",
         )}
         os.environ["ZMEM_HOME"] = str(REPO_ROOT)
         os.environ["ZMEM_STORE"] = os.path.join(cls._tmp, "store.sqlite")
@@ -506,6 +560,13 @@ class KillSwitchDoctorTest(unittest.TestCase):
         self.assertIn("DISABLED", check["summary"])
         self.assertIn("capture", check["summary"],
                       "the warn line says capture still writes")
+
+    def test_warn_when_whitespace_zero(self):
+        # Near-miss drift pin: doctor parses with the same literal-"0"
+        # whitespace-tolerated rule as every kill-switch caller.
+        with mock.patch.dict(os.environ, {"ZMEM_INJECT": "0 "}, clear=True):
+            check = self.doctor._check_inject_switch()
+        self.assertEqual(check["status"], "warn")
 
 
 if __name__ == "__main__":

@@ -46,7 +46,8 @@ MCP_SERVER = REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py"
 MCP_AVAILABLE = importlib.util.find_spec("mcp") is not None
 
 STRIP = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_NAMESPACE",
-         "ZMEM_HOST", "ZMEM_QUERY_CONTEXT", "ZMEM_HERMES_CORRECTIONS",
+         "ZMEM_HOST", "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT",
+         "ZMEM_HERMES_CORRECTIONS",
          "ZMEM_MCP_URL", "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE",
          "ZMEM_MCP_NAMESPACE", "ZMEM_MCP_TIMEOUT",
          "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",

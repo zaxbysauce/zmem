@@ -680,13 +680,17 @@ rollback is a re-pin, not a download:
   (`git checkout v0.14.0`).
 
 **Verifying a rollback (or a refresh).** The `zmem-bg.log` decision lines are
-the discriminator: a host running current code writes `reason=` on every
-recall-body line, while a host stuck on a pre-#87 tree writes session-start
-lines without `reason=` at all (the field proof in #106). So: trigger a
-prompt, then `tail ~/.zmem/zmem-bg.log` — `reason=` present means the new
-tree is live; `status=`-only lines mean the host is still serving the old
-tree. `doctor` corroborates (version surfaces + `inject-switch` state). The
-per-host injection canary that automates this check is tracked in #108.
+the discriminator — but read the RECALL-BODY line, not a session-start line:
+trigger a prompt, then check the line that prompt just appended. On current
+code every recall-body line carries `reason=`; a host stuck on a pre-#87 tree
+writes `status=`-only recall lines. Do **not** use session-start lines for
+this check: they carry no `reason=` on ANY version (old or current — the only
+exception being the `reason=disabled` kill-switch line), so a
+`status=`-only session-start line proves nothing either way (that writer
+shape is where the #106 field proof originated, which is why the recall-body
+line is the reliable discriminator). `doctor` corroborates (version surfaces
++ `inject-switch` state). The per-host injection canary that automates this
+check is tracked in #108.
 
 ### Embeddings (semantic recall / dedup)
 

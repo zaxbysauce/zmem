@@ -253,11 +253,16 @@ class UnreleasedDriftSyntheticRepoTest(unittest.TestCase):
         repo = tmp / "synthetic"
         repo.mkdir(parents=True)
         def git(*args: str):
-            subprocess.run(
+            r = subprocess.run(
                 ["git", "-c", "user.email=t@example.com", "-c",
                  "user.name=T", *args],
                 cwd=str(repo), capture_output=True, text=True, timeout=60,
             )
+            # PRR-010: a silently-failed fixture git call must surface as a
+            # fixture error, not as a confusing gate assertion downstream.
+            self.assertEqual(
+                r.returncode, 0,
+                f"fixture git {' '.join(args)} failed:\n{r.stderr}")
         git("init", "-q")
         (repo / ".claude-plugin").mkdir()
         (repo / ".claude-plugin" / "plugin.json").write_text(
@@ -276,13 +281,15 @@ class UnreleasedDriftSyntheticRepoTest(unittest.TestCase):
             (repo / ".claude-plugin" / "plugin.json").write_text(
                 json.dumps({"name": "zmem", "version": version}),
                 encoding="utf-8")
-        subprocess.run(
-            ["git", "-c", "user.email=t@example.com", "-c", "user.name=T",
-             "add", "-A"], cwd=str(repo), capture_output=True, timeout=60)
-        subprocess.run(
-            ["git", "-c", "user.email=t@example.com", "-c", "user.name=T",
-             "commit", "-qm", subject],
-            cwd=str(repo), capture_output=True, timeout=60)
+        for args in (["add", "-A"], ["commit", "-qm", subject]):
+            r = subprocess.run(
+                ["git", "-c", "user.email=t@example.com", "-c", "user.name=T",
+                 *args],
+                cwd=str(repo), capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(
+                r.returncode, 0,
+                f"fixture git {' '.join(args)} failed:\n{r.stderr}")
 
     def _run_gate(self, repo: Path) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -374,15 +381,61 @@ class UnreleasedDriftSyntheticRepoTest(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout)
             self.assertIn("no unreleased drift", r.stdout)
 
-    def test_live_repo_passes_drift_mode(self):
+    def test_drift_negative_paths(self):
+        # PRR-006: the two failure paths the original sweep never exercised —
+        # (a) CHANGELOG.md unreadable/absent -> error exit 1;
+        # (b) --repo-root on a non-git directory carrying drift content ->
+        # head_bumps_version finds no git history, treats it as NO bump
+        # (strict), no marker -> exit 1. An empty-Unreleased non-git dir
+        # passes at the history-free step (rc 0, no git needed).
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="zmem-drift-neg-") as td:
+            root = Path(td)
+            r = self._run_gate(root)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("::error::", r.stdout)
+            self.assertIn("unreadable", r.stdout)
+
+            nogit = root / "nogit"
+            nogit.mkdir()
+            (nogit / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## [Unreleased]\n\n- drift content (#1)\n",
+                encoding="utf-8")
+            r = self._run_gate(nogit)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("::error::unreleased drift", r.stdout)
+
+            (nogit / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] — x\n\nb\n",
+                encoding="utf-8")
+            r = self._run_gate(nogit)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("no unreleased drift", r.stdout)
+
+    def test_live_repo_drift_mode_reports_a_sane_verdict(self):
+        # X10: this runs in the every-PR CI loop, where the live repo MAY
+        # legitimately carry unreleased content (any feature PR mid-flight).
+        # The smoke value is "the mode runs and reports one of its two
+        # documented verdicts" — NOT a pinned rc (that would break every
+        # PR that accumulates [Unreleased] entries before its bump PR).
+        # The default mode's no-drift-text contract is still pinned.
         r = subprocess.run(
             [PYTHON, str(GATE_PY), "--check-unreleased-drift"],
             capture_output=True, text=True, timeout=120, cwd=str(REPO_ROOT),
         )
-        self.assertEqual(r.returncode, 0,
-                         f"live repo has unreleased drift:\n{r.stdout}")
+        self.assertIn(r.returncode, (0, 1),
+                      f"drift mode crashed on the live repo:\n{r.stdout}")
+        self.assertTrue(
+            ("no unreleased drift" in r.stdout)
+            or ("::error::unreleased drift" in r.stdout),
+            f"neither documented verdict emitted:\n{r.stdout}")
         # The default mode never gained drift output (release.yml contract).
-        self.assertIn("no unreleased drift", r.stdout)
+        d = subprocess.run(
+            [PYTHON, str(GATE_PY)], capture_output=True, text=True,
+            timeout=120, cwd=str(REPO_ROOT),
+        )
+        self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
+        self.assertNotIn("unreleased drift", d.stdout)
 
 
 class CiWorkflowContractTest(unittest.TestCase):
@@ -409,6 +462,12 @@ class CiWorkflowContractTest(unittest.TestCase):
             "github.event_name == 'push' && github.ref == 'refs/heads/main'",
             step.group(0),
             "the drift gate must run only on pushes to main")
+        # PRR-003: a red earlier step must not mute the drift check on a
+        # main push — the condition must include !cancelled() (or always()).
+        self.assertRegex(
+            step.group(0), r"if:.*(!cancelled\(\)|always\(\))",
+            "the drift gate is skipped whenever any earlier step fails — "
+            "add !cancelled() to the condition")
 
 
 if __name__ == "__main__":

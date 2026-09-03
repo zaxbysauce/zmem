@@ -83,8 +83,10 @@ jobs:
       # step: it polices the merge-to-main state, where HEAD~1 is the prior
       # main tip (a PR checkout's HEAD~1 is branch history, meaningless for
       # the bump comparison). Escape: "[skip release]" in the merge subject.
+      # !cancelled(): the gate must run even when an earlier step failed —
+      # a red build must not also mute the drift check on a main push.
       - name: Release drift gate (main pushes only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         shell: bash
         run: python scripts/release_gate.py --check-unreleased-drift
 

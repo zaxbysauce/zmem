@@ -572,15 +572,16 @@ def main() -> int:
     except IndexError:
         agent_label = ""
 
-    if not store_py or not os.path.isfile(store_py):
-        return 0
-
     # Issue #110 (P0-5): ZMEM_INJECT=0 is the passive-injection kill switch.
-    # It gates the whole body BEFORE the stdin try block and every store
-    # subprocess, so no exception path can bypass it. The decision line still
-    # lands in the bg log (guarded stdin session_id first, env chain second —
+    # It gates the whole body BEFORE the store.py existence check, the stdin
+    # try block, and every store subprocess, so no exception path can bypass
+    # it — and the decision line lands even on a broken install where
+    # store.py is missing (exactly when the operator most needs the audit
+    # trail; _log_inject_decision needs only the env-resolved data dir, and
+    # _reason_disabled falls back to its literal when schema_meta is
+    # unreachable). Session id: guarded stdin read first, env chain second —
     # sid=unknown when the host supplied none, the same fallback the other
-    # decision lines use), and the empty envelope is `{}`: the wrapper
+    # decision lines use. The empty envelope is `{}`: the wrapper
     # crash-fallback shape whose missing additionalContext the launcher
     # already treats as a clean no-injection no-op. Parked pre-tool sidecars
     # are left untouched — the next enabled run consumes them, so nothing is
@@ -603,6 +604,9 @@ def main() -> int:
             [], [], "silent", _reason_disabled(store_py),
             session_id=_sid)
         print("{}")
+        return 0
+
+    if not store_py or not os.path.isfile(store_py):
         return 0
 
     # PRR-017 fix: floors + grounded set come from schema_meta (single
