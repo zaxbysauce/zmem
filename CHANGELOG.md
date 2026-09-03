@@ -33,21 +33,25 @@ that Phase-2 ranking changes on live stores require (#110).
   byte-identical to before; new tests cover the drift parser, a synthetic
   repo reproducing the #106 history, and the ci.yml wiring.
 - **Passive-injection kill switch (issue #110, P0-5)**:
-  `ZMEM_INJECT=0` silences every passive-injection surface at once — the
-  shared recall body (all modes), the SessionStart hook (Tier 2 AND Tier 0 —
-  it emits its empty `{}` envelope), the Hermes provider (`prefetch`, the
-  `zmem_session_start` tool twin, and the system-prompt `core.md` block),
-  the Hermes reflect hook's delivery paths, and MCP `session_start`. Each
-  silenced surface emits its empty envelope and logs
+  `ZMEM_INJECT=0` silences every passive recall-injection surface at once —
+  the shared recall body (all modes), the SessionStart hook (Tier 2 AND
+  Tier 0 — it emits its empty `{}` envelope), the Hermes provider
+  (`prefetch`, the `zmem_session_start` tool twin, and the system-prompt
+  `core.md` block), the Hermes reflect hook's delivery paths, and MCP
+  `session_start`. Each silenced surface emits its empty envelope and logs
   `status=silent reason=disabled` (a NEW `INJECT_REASON_DISABLED` constant,
   deliberately kept OUT of `INJECT_SILENT_REASONS` so classifier semantics
   are untouched). Only the literal `0` disables — the
   `ZMEM_QUERY_CONTEXT` convention. Capture paths (correction capture,
   failure capture, ops ring, convention counters, session-cadence
-  maintenance) never consult the switch; parked pre-tool fences and armed
-  nudge markers survive it and deliver on the first enabled run. MCP /
-  Hermes `session_start` keep their exact 9-key envelope shape with
-  `reason=disabled`, `context=""`.
+  maintenance) never consult the switch, and the capture-side prompt hooks
+  (Stop/SubagentStop reflect, convention nudges, capture prompts) stay
+  active by design — they prompt capture, they do not inject recalled
+  memory; the Hermes reflect hook is the documented divergence (a #110-
+  named gated surface whose delivery carries recalled query-context).
+  Parked pre-tool fences and armed nudge markers survive the switch and
+  deliver on the first enabled run. MCP / Hermes `session_start` keep their
+  exact 9-key envelope shape with `reason=disabled`, `context=""`.
 - **doctor `inject-switch` line (issue #110)**: reports whether passive
   injection is disabled (WARN) so a confused operator sees the cause
   immediately.

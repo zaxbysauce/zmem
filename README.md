@@ -632,15 +632,16 @@ committed snapshot up to a full sync-repo read/write loop: see
 
 ### Disabling passive injection & rolling a host back (issue #110)
 
-**Kill switch.** `ZMEM_INJECT=0` turns off EVERY passive-injection surface at
-once: the recall hooks (UserPromptSubmit, PreToolUse, SubagentStart,
-PreCompact), the SessionStart hook (Tier 2 recall **and Tier 0** — under the
-switch SessionStart emits its empty `{}` envelope, so `core.md`/`AGENTS.md`
-are not injected either), the Hermes provider (`prefetch`, the
-`zmem_session_start` tool, and the system-prompt `core.md` block), the Hermes
-reflect hook's delivery, and MCP `session_start`. Each silenced surface emits
-its empty envelope and logs `status=silent reason=disabled`
-(`zmem-bg.log` for the hook surfaces; the Hermes/MCP loggers for theirs).
+**Kill switch.** `ZMEM_INJECT=0` turns off every passive recall-injection
+surface at once: the recall hooks (UserPromptSubmit, PreToolUse,
+SubagentStart, PreCompact), the SessionStart hook (Tier 2 recall **and Tier
+0** — under the switch SessionStart emits its empty `{}` envelope, so
+`core.md`/`AGENTS.md` are not injected either), the Hermes provider
+(`prefetch`, the `zmem_session_start` tool, and the system-prompt `core.md`
+block), the Hermes reflect hook's delivery, and MCP `session_start`. Each
+silenced surface emits its empty envelope and logs
+`status=silent reason=disabled` (`zmem-bg.log` for the hook surfaces; the
+Hermes/MCP loggers for theirs).
 Only the literal `0` disables — `ZMEM_INJECT=false`/`no`/empty leave injection
 ON (the `ZMEM_QUERY_CONTEXT` convention; `ZMEM_QUERY_CONTEXT` remains the
 narrower ops-lane switch). Beware near-miss spellings: `0.0`, `00`, `False`
@@ -650,10 +651,18 @@ the live state) after setting the variable.
 
 **What keeps running under the switch.** Every capture path: correction
 capture, failure capture, the PostToolUse ops ring, convention counters, and
-the SessionStart maintenance dispatch (session-cadence). Parked pre-tool
-fences and armed nudge markers stay on disk and deliver on the first enabled
-run — nothing is lost. `doctor` shows the state on its `inject-switch` line
-(WARN when disabled), so a confused operator sees the reason immediately.
+the SessionStart maintenance dispatch (session-cadence). The capture-side
+PROMPT hooks also stay active by design — `zmem-reflect.sh` (Stop
+reflection), `zmem-subagent-reflect.sh`, `zmem-convention-capture.sh`, and
+the capture-failure/correction prompts — because they prompt the agent to
+CAPTURE a lesson rather than inject recalled memory (issue #110 scopes the
+switch to recall surfaces and states "capture paths are unaffected"). The
+one documented divergence: the Hermes reflect hook (named in #110 as a gated
+surface) silences its delivery nudges under the switch, since recalled
+query-context rides the same delivery path there. Parked pre-tool fences and
+armed nudge markers stay on disk and deliver on the first enabled run —
+nothing is lost. `doctor` shows the state on its `inject-switch` line (WARN
+when disabled), so a confused operator sees the reason immediately.
 
 **Rolling a host back to a previous version.** Plugin caches pin a version
 directory and never overwrite older ones (see [Upgrade](#upgrade)), so a
