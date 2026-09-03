@@ -581,6 +581,29 @@ class Issue87DocDriftTest(unittest.TestCase):
         self.assertIn("reason=", text,
                       "SKILL.md must say zmem-bg.log carries reason=")
 
+    def test_skill_md_documents_sid_field_and_miss_rate(self):
+        """Issue #94 doc pins. PRESENCE needles only, each verified to sit
+        on ONE physical line of SKILL.md (a needle spanning a wrap can
+        never match — see the PR #104 lesson)."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for needle in (
+                # the sid= field doc (bg-log section)
+                "sid=<sanitized session id>",
+                "sid=unknown",
+                "`status`, `reason`, `omitted=`, `ids=`, `all=`, `tokens=`, `ops=`, `sid=`",
+                # the miss-rate report block (doctor section)
+                "--miss-rate",
+                "capture-gap",
+                "REFUSES to run without an explicit `--store`",
+                "host-default store even when given explicitly",
+                "snapshot the store and re-run with `--store`",
+                # the surfaced side must count BOTH injection shapes —
+                # filtering on reason=injected alone silently drops every
+                # session-start line (the degenerate-1.0 baseline finding)
+                "the session-start writer's `status=injected` lines",
+        ):
+            self.assertIn(needle, text, f"SKILL.md missing {needle!r}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

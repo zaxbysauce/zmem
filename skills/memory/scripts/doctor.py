@@ -2598,8 +2598,153 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
     return _check("embeddings_health", status, summary, **details)
 
 
-def build_report(project: Path, repo_root: Path) -> dict:
-    resolved_store = host.resolve_store_path()
+def _same_file(left, right) -> bool:
+    """Case-robust same-file comparison (Windows paths compare equal across
+    case/separator variance). Prefers true inode identity when both paths
+    exist (a hard-link alias of the host-default store must not slip past
+    the miss-rate guard — swarm-review PRR-006), falling back to
+    realpath comparison for absent paths."""
+    try:
+        lp, rp = Path(left), Path(right)
+        if lp.exists() and rp.exists():
+            return lp.samefile(rp)
+    except (TypeError, ValueError, OSError):
+        pass
+    try:
+        return (os.path.normcase(os.path.realpath(str(left)))
+                == os.path.normcase(os.path.realpath(str(right))))
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def _nonnegative_int(value: str) -> int:
+    """argparse type rejecting negative ints (swarm-review PRR-001: a
+    negative miss window inverts the interval and silently misclassifies)."""
+    try:
+        iv = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value!r}")
+    if iv < 0:
+        raise argparse.ArgumentTypeError(
+            f"must be >= 0 (got {value})")
+    return iv
+
+
+def _positive_int(value: str) -> int:
+    """argparse type with a floor of 1 (swarm-review PRR-015: --miss-limit
+    0 silently coerced to 1)."""
+    try:
+        iv = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value!r}")
+    if iv < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be >= 1 (got {value})")
+    return iv
+
+
+def _check_miss_rate(resolved_store: "str | Path", opts: dict,
+                     store_explicit: bool = False) -> dict:
+    """Issue #94: the miss-rate join (failures × store recall × bg-log
+    injections), opt-in via --miss-rate.
+
+    Guard first, twice (broad-review M1): (1) the join REQUIRES an explicit
+    ``--store`` — env-resolved stores are never sufficient, because an
+    ambient ZMEM_STORE/ZMEM_DATA (a documented deployment mode) would
+    otherwise silently point the join at the live store while the
+    clean-env host-default comparison looks the other way; (2) even an
+    explicit ``--store`` is REFUSED when it resolves to the host-default
+    store (scripts/eval_self_corpus.py pattern) — the operator takes a
+    snapshot and points --store at the copy. Either refusal is loud
+    (status fail) and the join is NOT executed.
+    """
+    try:
+        from storelib import miss_rate
+    except Exception:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from storelib import miss_rate  # type: ignore
+        except Exception as exc:
+            return _check("miss-rate", "fail",
+                          f"join library import failed: {exc}")
+    remediation = (
+        "snapshot the store into a temp dir — copy store.sqlite AND any "
+        "store.sqlite-wal/-shm beside it (plus zmem-bg.log and the ops/ "
+        "ring dir when present) — then re-run with --store <snapshot "
+        "path>. exit 1 from --miss-rate most often means exactly this: "
+        "snapshot the store and re-run with --store.")
+    if not store_explicit:
+        return _check(
+            "miss-rate", "fail",
+            "REFUSED: --miss-rate requires an explicit --store — the join "
+            "reads session data, so it must be pointed at a snapshot copy, "
+            "never an env-resolved (possibly live) store",
+            remediation=remediation,
+            resolved_store=_display_path(resolved_store),
+        )
+    try:
+        host_default = miss_rate.host_default_store()
+    except Exception as exc:
+        return _check("miss-rate", "fail",
+                      f"host-default store resolution failed: {exc}")
+    if _same_file(resolved_store, host_default):
+        return _check(
+            "miss-rate", "fail",
+            "REFUSED: the --store path resolves to the host-default store "
+            "— the miss-rate join reads session data and must be pointed "
+            "at a snapshot copy, never the live store",
+            remediation=remediation,
+            resolved_store=_display_path(resolved_store),
+            host_default=_display_path(host_default),
+        )
+    try:
+        report = miss_rate.run_miss_report(
+            store_path=resolved_store,
+            db_path=opts.get("db"),
+            transcripts=opts.get("transcripts") or (),
+            bg_log_path=opts.get("bg_log"),
+            window_before_s=opts.get("window_before_s", 1800),
+            window_after_s=opts.get("window_after_s", 300),
+            limit=opts.get("limit", 200),
+            verbose=bool(opts.get("verbose")),
+        )
+    except Exception as exc:
+        return _check("miss-rate", "fail",
+                      f"join failed: {type(exc).__name__}: {exc}")
+    if report.get("error"):
+        return _check("miss-rate", "fail",
+                      f"join failed: {report['error']}")
+    counts = report["counts"]
+    status = "pass"
+    if report.get("db_error"):
+        # PRR-002: a broken failure substrate must not read as a clean run.
+        status = "warn"
+    elif not report.get("failures_examined"):
+        status = "warn"
+    elif not report.get("bg_log_decision_lines"):
+        status = "warn"
+    elif (counts["missed"] == 0 and counts["surfaced_sid"] == 0
+            and counts["surfaced_legacy"] == 0):
+        # PRR-007 / cubic #6: the operator asked for a rate and the run has
+        # no denominator (every failure capture-gap/no-query) — that is not
+        # a clean pass. The human render prints only the summary line, so
+        # the status must carry what the JSON caveat says.
+        status = "warn"
+    summary = (
+        f"{report['failures_examined']} failures — "
+        f"missed {counts['missed']}, "
+        f"surfaced (sid) {counts['surfaced_sid']}, "
+        f"surfaced (legacy) {counts['surfaced_legacy']}, "
+        f"capture-gap {counts['capture_gap']}, "
+        f"no-query {counts['no_query']}"
+    )
+    return _check("miss-rate", status, summary, report=report)
+
+
+def build_report(project: Path, repo_root: Path,
+                 store_override=None, miss_rate_opts=None) -> dict:
+    resolved_store = (Path(store_override).expanduser()
+                      if store_override else host.resolve_store_path())
     checks: list[dict] = []
     checks.append(_check_store_resolution(repo_root, resolved_store))
     checks.append(_check_local_path(resolved_store))
@@ -2647,6 +2792,13 @@ def build_report(project: Path, repo_root: Path) -> dict:
     # v13 (issue #65, 10.7/10.10): episode storage + MCP token scope.
     checks.append(_check_episode_tables(resolved_store))
     checks.append(_check_mcp_token())
+    # Issue #94: the miss-rate join — OPT-IN only (--miss-rate). Without the
+    # flag doctor's behavior is byte-identical to pre-#94. The check refuses
+    # any invocation without an explicit --store, and the host-default store
+    # even when given explicitly (see _check_miss_rate).
+    if miss_rate_opts is not None:
+        checks.append(_check_miss_rate(resolved_store, miss_rate_opts,
+                                       store_explicit=bool(store_override)))
 
     # "info" is a supported non-ok-flipping status (hybrid-default's
     # embeddings-unavailable branch: lexical fallback works — PRR-001R fix;
@@ -2684,9 +2836,79 @@ def main(argv: list[str] | None = None) -> int:
         default="human",
         help="output format",
     )
+    ap.add_argument(
+        "--store",
+        default=None,
+        help="explicit store path — repoints the WHOLE report at this store "
+             "(e.g. a snapshot copy; every check reads it instead of the "
+             "env-resolved store)",
+    )
+    ap.add_argument(
+        "--miss-rate",
+        action="store_true",
+        help="issue #94: add the miss-rate check (failures × store recall × "
+             "bg-log injections). Read-only; REFUSES the host-default store "
+             "— take a snapshot and pass --store <snapshot path>",
+    )
+    ap.add_argument(
+        "--miss-db",
+        default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
+        help="ZCode episodic db for the failure side of the miss-rate join "
+             "(read-only; same default as store.py failures)",
+    )
+    ap.add_argument(
+        "--miss-transcripts",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="transcript JSONL glob(s) for the failure side (repeatable; "
+             "expanded in-process, read-only)",
+    )
+    ap.add_argument(
+        "--miss-bg-log",
+        default=None,
+        help="explicit zmem-bg.log path (default: <dir of --store>/"
+             "zmem-bg.log, co-located like the writers)",
+    )
+    ap.add_argument(
+        "--miss-window-before", type=_nonnegative_int, default=1800,
+        help="seconds before a failure in which an injection counts as "
+             "surfaced (default 1800; must be >= 0)",
+    )
+    ap.add_argument(
+        "--miss-window-after", type=_nonnegative_int, default=300,
+        help="seconds after a failure in which an injection counts as "
+             "surfaced (default 300; must be >= 0)",
+    )
+    ap.add_argument(
+        "--miss-limit", type=_positive_int, default=200,
+        help="max failures to examine, newest first (default 200; must be "
+             ">= 1)",
+    )
+    ap.add_argument(
+        "--miss-verbose",
+        action="store_true",
+        help="include a short content preview per top missed memory id "
+             "(default: ids and namespaces only)",
+    )
     args = ap.parse_args(argv)
 
-    report = build_report(Path(args.project).expanduser(), Path(args.repo_root).expanduser())
+    miss_rate_opts = None
+    if args.miss_rate:
+        miss_rate_opts = {
+            "db": args.miss_db,
+            "transcripts": args.miss_transcripts,
+            "bg_log": args.miss_bg_log,
+            "window_before_s": args.miss_window_before,
+            "window_after_s": args.miss_window_after,
+            "limit": args.miss_limit,
+            "verbose": args.miss_verbose,
+        }
+
+    report = build_report(Path(args.project).expanduser(),
+                          Path(args.repo_root).expanduser(),
+                          store_override=args.store,
+                          miss_rate_opts=miss_rate_opts)
     human = _render_human(report)
     payload = json.dumps(report, indent=2, sort_keys=True)
 

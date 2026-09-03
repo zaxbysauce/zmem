@@ -59,6 +59,9 @@ _STRIP_ENV = (
     "ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_INJECT_FLOOR_RECENT",
     "ZMEM_INJECT_FLOOR_PROMPT", "ZMEM_INJECT_FLOOR_GATE_NONE",
     "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
+    # #93 A1 residue: eval-runner pollution vars — a single-process
+    # multi-file runner must not leak the fake embedder or pinned clock in.
+    "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW", "ZMEM_AUTO_REKEY",
 )
 
 

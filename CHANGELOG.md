@@ -12,7 +12,38 @@ README.
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-09-03
+
+This release moves the accumulated `[Unreleased]` train downstream: the
+Hermes-first plugin surface and remote prefetch (#102/#71), the pre-tool
+inject + subagent task-text recall + Hermes `pre_llm_call` delivery (#92),
+the ops-ring query-context lane it depends on, and the miss-rate measurement
+(#94). The installed plugin caches pick all of it up on the next pull.
+
 ### Added
+- **Miss-rate measurement (issue #94, P0-1)**: the number the proactive-memory
+  epic gates on — "a failure occurred, a matching memory existed, nothing
+  surfaced" — is now measurable. Two parts: (1) every `zmem-bg.log` decision
+  line (both writers — the shared hook body and the session-start hook) ends
+  with `sid=<sanitized session id>` (`[^A-Za-z0-9._-]` → `_`, cap 128,
+  `sid=unknown` when the host sent none), so a mined failure can be bound to
+  the injection decisions of its own session; (2) `doctor --miss-rate
+  --store <snapshot>` joins mined tool failures (ZCode episodic db — with
+  the failed command recovered from the db's `part` table — and/or
+  transcript JSONL globs) against a read-only snapshot of the store
+  (telemetry-disabled recall, `link_hops=0`) and the bg log's injected
+  lines, classifying missed / surfaced (sid) / surfaced (legacy) /
+  capture-gap / no-query with first-class coverage metrics
+  (`query_source`, `sid_coverage_pct`, `no_query_pct`). New `doctor
+  --store` flag repoints the whole report at a snapshot store. The join
+  REQUIRES an explicit `--store` (an ambient ZMEM_STORE/ZMEM_DATA can
+  never point it at the live store) and refuses the host-default store
+  even when given explicitly; the snapshot recipe covers `store.sqlite`
+  plus any `-wal`/`-shm`, `zmem-bg.log`, and the `ops/` ring dir. It
+  never writes (mode=ro
+  everywhere; CLI `--no-bump` alone still bumps, the join disables
+  telemetry entirely), and never creates or migrates a store. No schema
+  bump; no ranking or floor changes — this measures, it does not tune.
 - **Hermes remote passive prefetch** (issue #71 A): with `ZMEM_MCP_URL` (+ token)
   set on a remote Hermes box, the `pre_llm_call` reflect hook runs the new
   `hermes-plugin/server/mcp_client.py` subprocess and fetches the MCP server's
@@ -80,6 +111,26 @@ README.
   eval `ZMEM_QUERY_CONTEXT` neutrality documented.
 
 ### Fixed
+- **Miss-rate report hardening** (post-review sweep on #94): the transcript
+  failure miner reads BOTH `session_id` and `sessionId` record keys (the
+  dominant real Claude Code shape is camelCase-only — sid attribution was
+  dead on that lane) and classifies exactly like `store.py failures`
+  (sibling `toolUseResult` "Error…" strings count; user rejections stay
+  excluded). `--miss-window-before/after` reject negative values (an
+  inverted window silently classified everything missed), `--miss-limit`
+  rejects values below 1, a present-but-unreadable episodic db is a loud
+  caveat + warn (never a silent zero), a failed store recall is excluded
+  with a caveat (never counted as capture-gap), an all-capture-gap run
+  says its denominator is null, the refusal guard now also catches
+  hard-link aliases of the host-default store, and writer A falls back to
+  the session env chain when the event JSON omits `session_id` (both
+  decision-line writers attribute to the same session on every path).
+- **Test isolation (#93 A1 residue)**: `tests/test_inject_silent_reason.py`
+  and `tests/test_pretool_inject.py` now strip `ZMEM_EMBED_PROFILE` /
+  `ZMEM_TEST_NOW` / `ZMEM_AUTO_REKEY` from child envs like
+  `tests/test_ops_tokens.py` already did — a single-process multi-file
+  runner (pytest) can no longer inherit the eval runner's fake embedder or
+  pinned clock across files.
 - **Consolidate commit race**: the per-cluster COMMIT now uses the shared
   busy_retry-backed `_commit` like every writer path (issue #55 §7 follow-up;
   rollback stays the atomic backstop).

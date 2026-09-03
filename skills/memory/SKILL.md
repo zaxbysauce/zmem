@@ -75,6 +75,49 @@ store or host config. Checks:
 Use it before first install, before cutover, and after any store-path or hook
 surface change.
 
+#### doctor `--miss-rate` — the miss-rate join (issue #94)
+
+```
+python <doctor.py> --miss-rate --store <snapshot-store.sqlite> [--miss-db PATH]
+                   [--miss-transcripts GLOB ...] [--miss-bg-log PATH]
+                   [--miss-window-before 1800] [--miss-window-after 300]
+                   [--miss-limit 200] [--miss-verbose] [--format json]
+```
+Opt-in check that measures the miss rate — "a failure occurred in a session,
+a matching memory existed in the store, and nothing surfaced at that moment".
+It joins mined tool failures (ZCode episodic db via `--miss-db`, transcript
+JSONL globs via `--miss-transcripts`) against a snapshot of the store
+(recall with telemetry fully disabled, `link_hops=0`) and the bg log's
+injection decision lines — BOTH shapes: writer A's `reason=injected` and
+the session-start writer's `status=injected` lines (that writer has never
+carried `reason=`). Definitions (pinned):
+- `missed` — failure + floor-passing store match + no injection of a matched
+  row in the window ⇒ counts toward the miss rate.
+- `capture-gap` — failure + NO store match (write-side problem, counted
+  separately).
+- `surfaced (sid)` — an injected line whose `sid=` proves it is this
+  session's decision carries a matched row id.
+- `surfaced (legacy)` — same evidence on a pre-#94 sid-less line or a
+  `sid=unknown` line (window+overlap attribution only;
+  `miss_rate_strict_sid` excludes it).
+- `no-query` — nothing derivable for the failure (no recovered operation and
+  no ops ring): unmeasurable, excluded from every rate. On boxes where the
+  ops-ring lane is not yet deployed this bucket can dominate until rings
+  accumulate.
+
+REFUSES to run without an explicit `--store`, and refuses the
+host-default store even when given explicitly — the join reads session
+data, so snapshot first: copy `store.sqlite` AND any
+`store.sqlite-wal`/`-shm` beside it into a temp dir (plus `zmem-bg.log`
+and the `ops/` ring dir when present), then pass that path. exit 1 from
+`--miss-rate` most often means exactly that:
+snapshot the store and re-run with `--store`; exit 1 from
+other checks means a real diagnostic failed.
+Read-only everywhere: the
+store/db open `mode=ro`, the report never writes, and a missing/old store is
+an error (never created, never migrated). Memory content stays out of the
+default output (ids/namespaces only; `--miss-verbose` adds a short preview).
+
 ### recall — surface relevant memories (high-precision)
 ```
 python <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
@@ -182,7 +225,12 @@ variants (`no durable memories retrieved for this session.` and
 `zmem-hook` line has `reason=` (`reason=empty-pool`, `reason=omitted`,
 `reason=below-bar`, `reason=budget-drop`, `reason=injected`), plus `omitted=N`
 when the passive injection-risk filter dropped rows. The closed set lives in
-`schema_meta.py` (`INJECT_SILENT_REASONS`).
+`schema_meta.py` (`INJECT_SILENT_REASONS`). Since issue #94 every line also
+ends with `sid=<sanitized session id>` (`[^A-Za-z0-9._-]` → `_`, cap 128;
+`sid=unknown` when the host sent none) — the session key doctor's
+`--miss-rate` join binds failures to injections with. Field order:
+`status`, `reason`, `omitted=`, `ids=`, `all=`, `tokens=`, `ops=`, `sid=`
+(last, always present).
 
 #### Query context (prior-turn operation tokens) — issue #88 / #85 direction 2
 
