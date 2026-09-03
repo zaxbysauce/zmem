@@ -572,7 +572,11 @@ class Issue87DocDriftTest(unittest.TestCase):
                        "no durable memories retrieved for this session.",
                        "memories withheld: the injection token budget "
                        "(ZMEM_INJECT_TOKEN_BUDGET)",
-                       "session memories withheld:"):
+                       "session memories withheld:",
+                       # Issue #110 (P0-5): the kill-switch doc must name the
+                       # switch and its log marker (presence needles only).
+                       "ZMEM_INJECT=0",
+                       "reason=disabled"):
             self.assertIn(needle, text, f"SKILL.md missing {needle!r}")
 
     def test_skill_md_documents_bg_log_reason_field(self):

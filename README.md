@@ -630,6 +630,52 @@ committed snapshot up to a full sync-repo read/write loop: see
 - Review skill promotion before writing it. `promote --confirm` writes into the
   host skill surfaces and should stay a reviewed step, not an automatic one.
 
+### Disabling passive injection & rolling a host back (issue #110)
+
+**Kill switch.** `ZMEM_INJECT=0` turns off EVERY passive-injection surface at
+once: the recall hooks (UserPromptSubmit, PreToolUse, SubagentStart,
+PreCompact), the SessionStart hook (Tier 2 recall **and Tier 0** — under the
+switch SessionStart emits its empty `{}` envelope, so `core.md`/`AGENTS.md`
+are not injected either), the Hermes provider (`prefetch`, the
+`zmem_session_start` tool, and the system-prompt `core.md` block), the Hermes
+reflect hook's delivery, and MCP `session_start`. Each silenced surface emits
+its empty envelope and logs `status=silent reason=disabled`
+(`zmem-bg.log` for the hook surfaces; the Hermes/MCP loggers for theirs).
+Only the literal `0` disables — `ZMEM_INJECT=false`/`no`/empty leave injection
+ON (the `ZMEM_QUERY_CONTEXT` convention; `ZMEM_QUERY_CONTEXT` remains the
+narrower ops-lane switch).
+
+**What keeps running under the switch.** Every capture path: correction
+capture, failure capture, the PostToolUse ops ring, convention counters, and
+the SessionStart maintenance dispatch (session-cadence). Parked pre-tool
+fences and armed nudge markers stay on disk and deliver on the first enabled
+run — nothing is lost. `doctor` shows the state on its `inject-switch` line
+(WARN when disabled), so a confused operator sees the reason immediately.
+
+**Rolling a host back to a previous version.** Plugin caches pin a version
+directory and never overwrite older ones (see [Upgrade](#upgrade)), so a
+rollback is a re-pin, not a download:
+
+- **Claude Code**: point the installed plugin back at the previous cache dir
+  (`~/.claude/plugins/cache/zmem/zmem/<old-version>/`, recorded with its
+  `gitCommitSha` in `~/.claude/plugins/installed_plugins.json`) or reinstall
+  from the release git tag, then restart the session.
+- **ZCode**: same shape under `~/.zcode/cli/plugins/cache/<marketplace>/zmem/
+  <old-version>/` (+ the `installed_plugins.json` next to it); or reinstall
+  from the git tag.
+- **Codex** (shared-store/broker mode): there is no plugin cache — the
+  checkout IS the install, so pin it by checking out the release tag
+  (`git checkout v0.14.0`).
+
+**Verifying a rollback (or a refresh).** The `zmem-bg.log` decision lines are
+the discriminator: a host running current code writes `reason=` on every
+recall-body line, while a host stuck on a pre-#87 tree writes session-start
+lines without `reason=` at all (the field proof in #106). So: trigger a
+prompt, then `tail ~/.zmem/zmem-bg.log` — `reason=` present means the new
+tree is live; `status=`-only lines mean the host is still serving the old
+tree. `doctor` corroborates (version surfaces + `inject-switch` state). The
+per-host injection canary that automates this check is tracked in #108.
+
 ### Embeddings (semantic recall / dedup)
 
 ZMem's semantic features — semantic dedup-on-write, hybrid vector recall, and

@@ -261,6 +261,25 @@ collides. The eval composer ignores `ZMEM_QUERY_CONTEXT` by design (#93 B6):
 evals must stay deterministic and immune to ambient env, so the kill switch
 does not change their queries.
 
+#### Passive-injection kill switch (ZMEM_INJECT=0) — issue #110 / P0-5
+
+`ZMEM_INJECT=0` disables EVERY passive-injection surface: the shared recall
+body (all modes — user_prompt, pretool, subagent, precompact/recent), the
+SessionStart hook (Tier 2 recall AND Tier 0 — under the switch SessionStart
+emits its empty `{}` envelope), the Hermes provider (`prefetch`, the
+`zmem_session_start` tool twin, and the system-prompt `core.md` block), the
+Hermes reflect hook's delivery paths, and MCP `session_start`. Each silenced
+surface emits its empty envelope and logs `status=silent reason=disabled`
+(`reason=disabled` is written only by this switch, never by silent-reason
+classification — it lives beside `injected` as `INJECT_REASON_DISABLED`, not
+in `INJECT_SILENT_REASONS`). Only the literal `0` (whitespace-tolerated)
+disables — the `ZMEM_QUERY_CONTEXT` convention; `false`/`no`/empty leave
+injection enabled. Capture paths never consult the switch: correction
+capture, the ops ring, convention counters, failure capture, and
+session-cadence maintenance keep writing. Parked pre-tool fences and armed
+nudge markers are left in place and deliver on the first enabled run.
+`doctor` shows the state (`inject-switch` line, WARN when disabled).
+
 #### Pre-tool inject — issue #90 / #85 direction C
 
 On hosts whose pre-tool contract was probed and confirmed (ZCode: documented;

@@ -49,6 +49,12 @@ The body:
      degrades to the retrieved-empty one-liner (never the bar). Every path
      exits 0. (#93 B7: split/reworded — the old text claimed only the
      wrapper-handled case existed.)
+  8. Issue #110 (P0-5): ``ZMEM_INJECT=0`` is the passive-injection kill
+     switch — before any stdin parsing or store subprocess the body logs
+     ``status=silent reason=disabled`` and emits ``{}`` (the empty envelope;
+     the launcher treats a payload without additionalContext as a no-op).
+     Only the literal ``0`` disables, matching the ZMEM_QUERY_CONTEXT
+     convention. Capture paths never consult the switch.
 
 The selective-inject decision is logged to ``<data dir>/zmem-bg.log`` (the
 dir resolved by ``_data_dir()``; I5 critic-fix: existing log file, not a new
@@ -83,6 +89,9 @@ _FALLBACK_FLOOR_RECENT = 0.5
 # partially-deployed tree still classifies with the documented set).
 _FALLBACK_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop")
 _FALLBACK_REASON_INJECTED = "injected"
+# Issue #110 (P0-5): mirror of schema_meta.INJECT_REASON_DISABLED for the
+# passive-injection kill switch below.
+_FALLBACK_REASON_DISABLED = "disabled"
 
 # User-visible silent one-liners (issue #87 / #85 direction 1). The below-bar
 # string is byte-identical to the pre-#87 single one-liner on purpose —
@@ -181,6 +190,24 @@ def _reason_constants(store_py: str):
             getattr(sm, "INJECT_REASON_INJECTED", _FALLBACK_REASON_INJECTED),
         )
     return (_FALLBACK_SILENT_REASONS, _FALLBACK_REASON_INJECTED)
+
+
+def _reason_disabled(store_py: str) -> str:
+    """Issue #110 (P0-5): the kill-switch reason, single-sourced from
+    schema_meta.INJECT_REASON_DISABLED with the literal fallback for a
+    partially-deployed tree (same discipline as _reason_constants)."""
+    sm = _load_schema_meta(store_py)
+    if sm is not None:
+        return getattr(sm, "INJECT_REASON_DISABLED", _FALLBACK_REASON_DISABLED)
+    return _FALLBACK_REASON_DISABLED
+
+
+def _inject_disabled() -> bool:
+    """Issue #110 (P0-5): ZMEM_INJECT=0 is the passive-injection kill
+    switch. Only the literal ``0`` (whitespace-tolerated) disables — the
+    same convention as ZMEM_QUERY_CONTEXT, so ``false``/``no``/empty keep
+    injection ENABLED. Capture paths never consult this switch."""
+    return os.environ.get("ZMEM_INJECT", "1").strip() == "0"
 
 
 def _classify_silent_reason(rows, omitted=0, budget_emptied=False,
@@ -546,6 +573,36 @@ def main() -> int:
         agent_label = ""
 
     if not store_py or not os.path.isfile(store_py):
+        return 0
+
+    # Issue #110 (P0-5): ZMEM_INJECT=0 is the passive-injection kill switch.
+    # It gates the whole body BEFORE the stdin try block and every store
+    # subprocess, so no exception path can bypass it. The decision line still
+    # lands in the bg log (guarded stdin session_id first, env chain second —
+    # sid=unknown when the host supplied none, the same fallback the other
+    # decision lines use), and the empty envelope is `{}`: the wrapper
+    # crash-fallback shape whose missing additionalContext the launcher
+    # already treats as a clean no-injection no-op. Parked pre-tool sidecars
+    # are left untouched — the next enabled run consumes them, so nothing is
+    # lost. Capture paths never consult this switch.
+    if _inject_disabled():
+        _sid = ""
+        try:
+            if not sys.stdin.isatty():
+                _obj = json.loads(sys.stdin.read() or "{}")
+                if isinstance(_obj, dict):
+                    _v = _obj.get("session_id", "")
+                    _sid = _v if isinstance(_v, str) else ""
+        except Exception:
+            _sid = ""
+        if not _sid:
+            _sid = (os.environ.get("ZMEM_SESSION", "")
+                    or os.environ.get("CLAUDE_SESSION_ID", "")
+                    or os.environ.get("ZCODE_SESSION_ID", ""))
+        _log_inject_decision(
+            [], [], "silent", _reason_disabled(store_py),
+            session_id=_sid)
+        print("{}")
         return 0
 
     # PRR-017 fix: floors + grounded set come from schema_meta (single

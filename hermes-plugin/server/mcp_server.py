@@ -73,6 +73,16 @@ _ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
 # from schema_meta (same source as the hook body and the Hermes twin).
 _INJECT_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop")
 _INJECT_REASON_INJECTED = "injected"
+# Issue #110 (P0-5): kill-switch reason, written only by the ZMEM_INJECT=0
+# short-circuit (never by classification).
+_INJECT_REASON_DISABLED = "disabled"
+
+
+def _inject_disabled() -> bool:
+    """Issue #110 (P0-5): ZMEM_INJECT=0 disables passive injection on this
+    surface (session_start). Only the literal ``0`` (whitespace-tolerated)
+    disables — the ZMEM_QUERY_CONTEXT kill-switch convention."""
+    return os.environ.get("ZMEM_INJECT", "1").strip() == "0"
 _DEFAULT_LIMIT = 5
 # v13 (issue #65, 10.5): the SessionStart hook contract recent floor is
 # env-tunable (ZMEM_INJECT_FLOOR_RECENT) — the session_start tools read the
@@ -164,6 +174,7 @@ def _load_store_constants() -> None:
     """
     global _MAX_CONTENT_CHARS, _ALLOWED_SIGNALS, _ALLOWED_TYPES, _ALLOWED_TAINTS
     global _INJECT_SILENT_REASONS, _INJECT_REASON_INJECTED
+    global _INJECT_REASON_DISABLED
     try:
         import importlib.util
         # Resolve schema_meta with the SAME precedence _resolve_zmem_home() uses
@@ -206,6 +217,9 @@ def _load_store_constants() -> None:
             _INJECT_SILENT_REASONS = tuple(reasons)
         _INJECT_REASON_INJECTED = getattr(
             mod, "INJECT_REASON_INJECTED", _INJECT_REASON_INJECTED
+        )
+        _INJECT_REASON_DISABLED = getattr(
+            mod, "INJECT_REASON_DISABLED", _INJECT_REASON_DISABLED
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("schema_meta constants load failed (%s); using defaults", exc)
@@ -1237,6 +1251,25 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # literal match against a namespace named '*' (empty result).
             # Resolve it to the server default like an omitted param.
             resolved_ns = "user:global"
+        # Issue #110 (P0-5): passive-injection kill switch — BEFORE the
+        # namespace guard (the switch is global, not per-namespace) and
+        # before any store subprocess. Same 9-key envelope as the enabled
+        # path; the reason/context values distinguish it. Twin of
+        # hermes-plugin/__init__.py _tool_session_start (do not fork).
+        if _inject_disabled():
+            logger.info(
+                "session_start: status=silent reason=disabled (ZMEM_INJECT=0)")
+            return {
+                "result": "session_started",
+                "namespace": resolved_ns,
+                "ids": [],
+                "omitted": 0,
+                "budget_dropped": 0,
+                "reason": _INJECT_REASON_DISABLED,
+                "context": "",
+                "tokens_used": None,
+                "tokens_budget": None,
+            }
         denied = _guard_namespace(resolved_ns)
         if denied:
             return denied

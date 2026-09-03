@@ -53,7 +53,7 @@ TASK_LESSON = ("taskcanary: merge-queue citation shifts renumber registry "
 
 _STRIP_ENV = (
     "ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_NAMESPACE", "ZMEM_HOST",
-    "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT_TOKEN_BUDGET",
+    "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET",
     "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR", "ZMEM_CONVENTION_INTERVAL",
     "ZMEM_SESSION", "CLAUDE_SESSION_ID", "ZCODE_SESSION_ID",
     # Hook dir-resolution chains consult the plugin-data vars (host.py:42-66);

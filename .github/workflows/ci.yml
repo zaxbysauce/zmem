@@ -42,6 +42,12 @@ jobs:
       # marginal gain here; revisit if secrets or pull_request_target are added.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Depth 2 (not the default 1) so the release drift gate below can
+          # compare HEAD's manifest versions against HEAD~1 (issue #106).
+          # release.yml keeps its own fetch-depth: 0 — this change is
+          # ci.yml-only.
+          fetch-depth: 2
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -70,6 +76,17 @@ jobs:
             echo "=== $f ==="
             python "$f"
           done
+
+      # Issue #106 (P0-1, durable half): fail a merge to main that leaves
+      # content under ## [Unreleased] without a version bump at HEAD — the
+      # exact 8-merge static-0.13.1 stall (PRs #86–#104). PR runs skip the
+      # step: it polices the merge-to-main state, where HEAD~1 is the prior
+      # main tip (a PR checkout's HEAD~1 is branch history, meaningless for
+      # the bump comparison). Escape: "[skip release]" in the merge subject.
+      - name: Release drift gate (main pushes only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: python scripts/release_gate.py --check-unreleased-drift
 
       # Issue #64, 9.5: offline eval against the fixture gold set, using the
       # SAME command SKILL.md documents (scripts/eval_runner.py). Model-absent

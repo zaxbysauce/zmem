@@ -12,6 +12,58 @@ README.
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-09-03
+
+Two P0 safety mechanisms from the proactive-memory epic (#100): the release
+gate that makes the 0.13.1 eight-merge stall structurally impossible to
+repeat (#106), and the passive-injection kill switch + documented rollback
+that Phase-2 ranking changes on live stores require (#110).
+
+### Added
+- **Release drift gate (issue #106, P0-1 durable half)**: a new
+  `--check-unreleased-drift` mode in `scripts/release_gate.py`, wired into
+  `.github/workflows/ci.yml` for pushes to main only — a merge that leaves
+  content under `## [Unreleased]` while its HEAD carries no version bump now
+  FAILS the build (the exact history that left PRs #86–#104 unserved at
+  static 0.13.1 while every installed cache stayed behind). Escape:
+  `[skip release]` in the merge subject (chosen over a path-filter
+  allowlist — explicit operator choice, works at any checkout depth; ci.yml
+  checkout gains `fetch-depth: 2` for the HEAD~1 bump comparison, and
+  release.yml is untouched). The default gate mode's behavior and stdout are
+  byte-identical to before; new tests cover the drift parser, a synthetic
+  repo reproducing the #106 history, and the ci.yml wiring.
+- **Passive-injection kill switch (issue #110, P0-5)**:
+  `ZMEM_INJECT=0` silences every passive-injection surface at once — the
+  shared recall body (all modes), the SessionStart hook (Tier 2 AND Tier 0 —
+  it emits its empty `{}` envelope), the Hermes provider (`prefetch`, the
+  `zmem_session_start` tool twin, and the system-prompt `core.md` block),
+  the Hermes reflect hook's delivery paths, and MCP `session_start`. Each
+  silenced surface emits its empty envelope and logs
+  `status=silent reason=disabled` (a NEW `INJECT_REASON_DISABLED` constant,
+  deliberately kept OUT of `INJECT_SILENT_REASONS` so classifier semantics
+  are untouched). Only the literal `0` disables — the
+  `ZMEM_QUERY_CONTEXT` convention. Capture paths (correction capture,
+  failure capture, ops ring, convention counters, session-cadence
+  maintenance) never consult the switch; parked pre-tool fences and armed
+  nudge markers survive it and deliver on the first enabled run. MCP /
+  Hermes `session_start` keep their exact 9-key envelope shape with
+  `reason=disabled`, `context=""`.
+- **doctor `inject-switch` line (issue #110)**: reports whether passive
+  injection is disabled (WARN) so a confused operator sees the cause
+  immediately.
+- **README "Disabling passive injection & rolling a host back" (issue
+  #110)**: what the switch silences, what keeps running, per-host rollback
+  (Claude Code / ZCode version-pinned cache dirs + `installed_plugins.json`;
+  Codex checkout-at-a-tag), and rollback/refresh verification via the
+  `zmem-bg.log` `reason=` discriminator (the #106 field proof; the automated
+  per-host canary stays with #108).
+
+### Compatibility
+- No store schema change (`SUPPORTED_SCHEMA_VERSION` stays 13): older
+  installed clients are unaffected. The new `reason=disabled` bg-log lines
+  are append-only text whose `reason=` value existing parsers (e.g. the
+  miss-rate join) already treat as free-form.
+
 ## [0.14.0] — 2026-09-03
 
 This release moves the accumulated `[Unreleased]` train downstream: the

@@ -340,6 +340,30 @@ try:
 except IndexError:
     session_id = ""
 
+# issue #110 (P0-5): ZMEM_INJECT=0 is the passive-injection kill switch.
+# Tier 0 (core.md / AGENTS.md), Tier 2 recall, the store-path nudge, the
+# promotion nudge, the correction-count nudge and the native-memory nudge
+# are ALL passive context: log the disabled decision and emit the empty
+# envelope, skipping every part. The maintenance the bash layer dispatched
+# above (session-cadence) and the core.md seeding are capture-side and keep
+# running. Only the literal 0 disables (ZMEM_QUERY_CONTEXT convention).
+# data_dir (argv 6) is the bash-resolved, tilde-expanded data dir — the
+# same directory the Tier-2 decision line below writes to.
+if os.environ.get("ZMEM_INJECT", "1").strip() == "0":
+    try:
+        if data_dir and os.path.isdir(data_dir):
+            _safe_sid = re.sub(
+                r"[^A-Za-z0-9._-]", "_",
+                (session_id or ""))[:128] or "unknown"
+            with open(os.path.join(data_dir, "zmem-bg.log"), "a", encoding="utf-8") as _lf:
+                _lf.write(
+                    "[%d] zmem-hook status=silent reason=disabled ids=[] all=[] sid=%s\n" % (
+                        int(__import__("time").time()), _safe_sid))
+    except Exception:
+        pass  # fail-open: the audit log never blocks session start
+    print("{}")
+    sys.exit(0)
+
 parts = []
 
 # Tier 0: core.md (user-level). errors="replace" so one bad byte does not nuke

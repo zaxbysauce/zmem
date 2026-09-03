@@ -215,6 +215,13 @@ INJECT_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop")
 # so every zmem-hook log line carries a reason= field.
 INJECT_REASON_INJECTED = "injected"
 
+# Kill-switch reason (issue #110 / P0-5), also not a silent reason: written
+# ONLY by the ZMEM_INJECT=0 short-circuit on a passive surface, never by
+# silent-reason classification — it names an operator choice, not a
+# retrieval/gate/budget fact. Deliberately kept OUT of
+# INJECT_SILENT_REASONS so the classifier's closed set stays untouched.
+INJECT_REASON_DISABLED = "disabled"
+
 # Vec0 KNN over-fetch factor (issue #58, 3.1). Default 8; the recall path
 # over-fetches by this factor before namespace-filtering so a foreign
 # namespace cannot dominate same-namespace slots. Consolidate uses its
