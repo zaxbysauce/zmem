@@ -167,6 +167,9 @@ _STORE_CONSTANTS = {
     # session_start twin classifies with the SAME tuple the hook body uses).
     "INJECT_SILENT_REASONS": ("empty-pool", "omitted", "below-bar", "budget-drop"),
     "INJECT_REASON_INJECTED": "injected",
+    # issue #110 (P0-5): kill-switch reason, written only by the
+    # ZMEM_INJECT=0 short-circuit (never by classification).
+    "INJECT_REASON_DISABLED": "disabled",
 }
 
 
@@ -202,6 +205,7 @@ def _store_constants() -> Dict[str, Any]:
             "MAX_CONTENT_CHARS": getattr(mod, "MAX_CONTENT_CHARS", _STORE_CONSTANTS["MAX_CONTENT_CHARS"]),
             "INJECT_SILENT_REASONS": tuple(getattr(mod, "INJECT_SILENT_REASONS", _STORE_CONSTANTS["INJECT_SILENT_REASONS"])),
             "INJECT_REASON_INJECTED": getattr(mod, "INJECT_REASON_INJECTED", _STORE_CONSTANTS["INJECT_REASON_INJECTED"]),
+            "INJECT_REASON_DISABLED": getattr(mod, "INJECT_REASON_DISABLED", _STORE_CONSTANTS["INJECT_REASON_DISABLED"]),
         }
     except Exception as exc:
         logger.debug("zmem: schema_meta constants load failed (%s); using defaults", exc)
@@ -211,6 +215,15 @@ def _store_constants() -> Dict[str, Any]:
 def _python_bin() -> str:
     """Python interpreter for store.py subprocess. Prefer the current one."""
     return sys.executable or "python"
+
+
+def _inject_disabled() -> bool:
+    """Issue #110 (P0-5): ZMEM_INJECT=0 disables every passive-injection
+    surface of this provider (prefetch, the session_start tool twin, and the
+    system-prompt Tier-0 block). Capture paths never consult it. Only the
+    literal ``0`` (whitespace-tolerated) disables — the ZMEM_QUERY_CONTEXT
+    kill-switch convention; ``false``/``no``/empty keep injection enabled."""
+    return os.environ.get("ZMEM_INJECT", "1").strip() == "0"
 
 
 def _load_inject():
@@ -761,6 +774,15 @@ class ZmemMemoryProvider(MemoryProvider):
 
     def system_prompt_block(self) -> str:
         """Inject Tier-0 ``core.md`` (stable rules) into the system prompt."""
+        # Issue #110 (P0-5): the kill switch silences ALL passive context on
+        # every surface — the bash SessionStart hook likewise suppresses its
+        # Tier 0 under ZMEM_INJECT=0 — so the Hermes system-prompt Tier 0
+        # goes quiet too (documented in README "Operations notes").
+        if _inject_disabled():
+            logger.info(
+                "zmem system prompt tier0: status=silent "
+                "reason=disabled (ZMEM_INJECT=0)")
+            return ""
         try:
             core = _resolve_core_md()
             if core.is_file():
@@ -778,6 +800,12 @@ class ZmemMemoryProvider(MemoryProvider):
         with a bounded join (``memory_manager.py``), so the subprocess cost is
         amortized — no need for queue_prefetch complexity here.
         """
+        # Issue #110 (P0-5): passive-injection kill switch — no store
+        # subprocess, empty delivery, one log line carrying the marker.
+        if _inject_disabled():
+            logger.info(
+                "zmem prefetch: status=silent reason=disabled (ZMEM_INJECT=0)")
+            return ""
         if not query or not query.strip():
             return ""
         q = query.strip()[:_MAX_QUERY_CHARS]
@@ -1174,6 +1202,24 @@ class ZmemMemoryProvider(MemoryProvider):
         ns = (args.get("namespace") or self._namespace).strip() or "user:global"
         if ns == "*":
             ns = self._namespace
+        # Issue #110 (P0-5): passive-injection kill switch — same 9-key
+        # envelope as the enabled path (clients parse the shape), with the
+        # distinguishing reason/context values. No store subprocess runs.
+        if _inject_disabled():
+            logger.info(
+                "zmem session_start: status=silent "
+                "reason=disabled (ZMEM_INJECT=0)")
+            return json.dumps({
+                "result": "session_started",
+                "namespace": ns,
+                "ids": [],
+                "omitted": 0,
+                "budget_dropped": 0,
+                "reason": _store_constants()["INJECT_REASON_DISABLED"],
+                "context": "",
+                "tokens_used": None,
+                "tokens_budget": None,
+            })
         try:
             limit = max(1, min(int(args.get("limit") or 3), 50))
         except (TypeError, ValueError):

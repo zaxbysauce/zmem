@@ -66,6 +66,7 @@ class McpSessionToolsTest(unittest.TestCase):
         cls._tmp = tempfile.mkdtemp(prefix="zmem-session-mcp-")
         cls._saved = {k: os.environ.get(k) for k in (
             "ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MCP_TOKEN",
+            "ZMEM_INJECT",
             "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
             "ZMEM_INJECT_TOKEN_BUDGET",
         )}
@@ -73,6 +74,7 @@ class McpSessionToolsTest(unittest.TestCase):
             os.environ[k] = v
         os.environ.pop("ZMEM_DATA", None)
         os.environ.pop("ZMEM_INJECT_TOKEN_BUDGET", None)
+        os.environ.pop("ZMEM_INJECT", None)
         cls.store_path = os.path.join(cls._tmp, "store.sqlite")  # C40: dead branch removed
 
         import importlib.util

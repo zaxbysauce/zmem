@@ -1159,6 +1159,31 @@ def _check_operational_health(resolved_store: Path) -> list[dict]:
     return checks
 
 
+def _check_inject_switch() -> dict:
+    """Issue #110 (P0-5): surface the ZMEM_INJECT kill-switch state so a
+    confused operator sees immediately why nothing is being injected.
+
+    Same parsing as every kill-switch caller (only the literal ``0``
+    disables — the ZMEM_QUERY_CONTEXT convention). Read-only; no store
+    access. WARN, not fail: a deliberately flipped switch is an operator
+    choice, not an installation defect.
+    """
+    disabled = os.environ.get("ZMEM_INJECT", "1").strip() == "0"
+    if disabled:
+        return _check(
+            "inject-switch", "warn",
+            "passive injection DISABLED (ZMEM_INJECT=0) — the recall hooks, "
+            "SessionStart (incl. Tier 0), Hermes prefetch/reflect "
+            "session_start and MCP session_start emit nothing and log "
+            "status=silent reason=disabled; capture paths still write",
+            env="ZMEM_INJECT=0",
+        )
+    return _check(
+        "inject-switch", "pass",
+        "passive injection enabled (ZMEM_INJECT unset or not 0)",
+    )
+
+
 def _check_claude_native_memory(home: Path) -> dict:
     inspected: list[dict] = []
     if _bool_env("CLAUDE_CODE_DISABLE_AUTO_MEMORY"):
@@ -2158,6 +2183,10 @@ def _recommendations(checks: list[dict]) -> list[str]:
         notes.append(
             "After installing any Codex hook surface, trust the project and reapprove hooks so the new path is explicit and reviewable."
         )
+    if by_id.get("inject-switch", {}).get("status") == "warn":
+        notes.append(
+            "Passive injection is disabled box-wide (ZMEM_INJECT=0). Unset the variable (or set it to 1) to re-enable recall injection; capture kept writing the whole time (issue #110)."
+        )
     tok = by_id.get("mcp-token", {})
     if tok.get("status") == "warn" and tok.get("details", {}).get("unscoped_token"):
         notes.append(
@@ -2763,6 +2792,8 @@ def build_report(project: Path, repo_root: Path,
     # v12 (issue #64): usage-feedback counters probe.
     checks.append(_check_voyager_counters(resolved_store))
     checks.append(_check_claude_native_memory(Path.home()))
+    # Issue #110 (P0-5): inject-switch state — env-derived, no store access.
+    checks.append(_check_inject_switch())
     checks.append(_check_session_retention(Path.home()))
     checks.extend(_check_codex_memory_and_trust(Path.home(), project, repo_root))
     namespace_check = _check_namespace(project)

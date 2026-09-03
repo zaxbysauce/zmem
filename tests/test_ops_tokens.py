@@ -40,7 +40,7 @@ import ops_tokens  # noqa: E402
 
 _STRIP_ENV = (
     "ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_NAMESPACE",
-    "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT_TOKEN_BUDGET",
+    "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET",
     "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR", "ZMEM_CONVENTION_INTERVAL",
     # Hook dir-resolution chains consult the plugin-data vars (host.py:42-66,
     # convention-capture.sh:166-190); strip them like test_sweep's

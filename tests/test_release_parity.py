@@ -203,6 +203,271 @@ class GateIntegrationTest(unittest.TestCase):
         )
         self.assertIn("[release-gate]", r.stdout,
                       "the gate must state its decision human-readably")
+        # The default mode's stdout is the Release workflow's input surface
+        # (GITHUB_OUTPUT + human lines); drift-mode text must never bleed in.
+        self.assertNotIn("unreleased drift", r.stdout)
+
+
+class UnreleasedDriftUnitTest(unittest.TestCase):
+    """Issue #106: pure-function coverage of the drift-mode CHANGELOG
+    parsing (unreleased_body / unreleased_has_content)."""
+
+    def _text(self, unreleased_body: str) -> str:
+        return (
+            "# Changelog\n\n## [Unreleased]\n\n" + unreleased_body +
+            "\n\n## [0.2.0] — 2026-01-02\n\nReleased body.\n"
+        )
+
+    def test_absent_section_is_empty(self):
+        self.assertEqual(gate.unreleased_body("## [0.2.0] — 2026-01-02\n\nbody\n"), "")
+        self.assertFalse(gate.unreleased_has_content(
+            "## [0.2.0] — 2026-01-02\n\nbody\n"))
+
+    def test_empty_and_whitespace_only_sections_have_no_content(self):
+        for body in ("", "   \n\n\t\n"):
+            text = self._text(body)
+            self.assertTrue(gate.unreleased_body(text) != "" or body == "",
+                            "section body extraction ran")
+            self.assertFalse(
+                gate.unreleased_has_content(text),
+                f"blank-only Unreleased body {body!r} must not count as drift")
+
+    def test_content_counts_as_drift(self):
+        text = self._text("- a merged change (#86)\n- another (#89)")
+        self.assertTrue(gate.unreleased_has_content(text))
+        self.assertIn("(#86)", gate.unreleased_body(text))
+
+    def test_body_stops_at_next_h2(self):
+        text = self._text("- unreleased item\n\n## Notable other section\nshared prose")
+        self.assertNotIn("shared prose", gate.unreleased_body(text))
+
+
+class UnreleasedDriftSyntheticRepoTest(unittest.TestCase):
+    """Issue #106 acceptance: on a synthetic repo reproducing the exact
+    history that produced the issue (content added under ## [Unreleased]
+    while the manifest version stays static), --check-unreleased-drift
+    MUST fail; the bump, the [skip release] marker, and an empty Unreleased
+    must each pass. Case names cite the check step they exercise."""
+
+    def _make_repo(self, tmp: Path) -> Path:
+        repo = tmp / "synthetic"
+        repo.mkdir(parents=True)
+        def git(*args: str):
+            r = subprocess.run(
+                ["git", "-c", "user.email=t@example.com", "-c",
+                 "user.name=T", *args],
+                cwd=str(repo), capture_output=True, text=True, timeout=60,
+            )
+            # PRR-010: a silently-failed fixture git call must surface as a
+            # fixture error, not as a confusing gate assertion downstream.
+            self.assertEqual(
+                r.returncode, 0,
+                f"fixture git {' '.join(args)} failed:\n{r.stderr}")
+        git("init", "-q")
+        (repo / ".claude-plugin").mkdir()
+        (repo / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "zmem", "version": "0.13.1"}), encoding="utf-8")
+        (repo / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n## [0.13.1] — 2026-08-28\n\n"
+            "Prior release.\n", encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-qm", "chore: cut 0.13.1 (#84)")
+        return repo
+
+    def _merge(self, repo: Path, *, changelog: str, version: str | None,
+               subject: str) -> None:
+        (repo / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
+        if version is not None:
+            (repo / ".claude-plugin" / "plugin.json").write_text(
+                json.dumps({"name": "zmem", "version": version}),
+                encoding="utf-8")
+        for args in (["add", "-A"], ["commit", "-qm", subject]):
+            r = subprocess.run(
+                ["git", "-c", "user.email=t@example.com", "-c", "user.name=T",
+                 *args],
+                cwd=str(repo), capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(
+                r.returncode, 0,
+                f"fixture git {' '.join(args)} failed:\n{r.stderr}")
+
+    def _run_gate(self, repo: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [PYTHON, str(GATE_PY), "--check-unreleased-drift",
+             "--repo-root", str(repo)],
+            capture_output=True, text=True, timeout=120, cwd=str(REPO_ROOT),
+        )
+
+    def test_step5_drift_fails_on_the_exact_issue_history(self):
+        # The #106 history: 8 merges appended under [Unreleased] while every
+        # manifest sat static at 0.13.1 — no bump, no marker, content present.
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="zmem-drift-") as td:
+            repo = self._make_repo(Path(td))
+            self._merge(
+                repo,
+                changelog=(
+                    "# Changelog\n\n## [Unreleased]\n\n"
+                    "- merged feature (#86)\n- merged fix (#89)\n\n"
+                    "## [0.13.1] — 2026-08-28\n\nPrior release.\n"),
+                version=None,
+                subject="feat(memory): something user-facing (#86)")
+            r = self._run_gate(repo)
+            self.assertEqual(r.returncode, 1,
+                             f"drift must fail the #106 history:\n{r.stdout}")
+            self.assertIn("::error::", r.stdout)
+
+    def test_step2_conventional_bump_promotes_and_passes(self):
+        # The repo-convention bump: content PROMOTED out of [Unreleased] into
+        # the new dated section — Unreleased is empty, so the gate passes at
+        # the history-free step 2 (the common clean path).
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="zmem-drift-") as td:
+            repo = self._make_repo(Path(td))
+            self._merge(
+                repo,
+                changelog=(
+                    "# Changelog\n\n## [Unreleased]\n\n"
+                    "## [0.14.0] — 2026-09-03\n\n- merged feature (#86)\n\n"
+                    "## [0.13.1] — 2026-08-28\n\nPrior release.\n"),
+                version="0.14.0",
+                subject="feat(memory): something user-facing; release 0.14.0 (#87)")
+            r = self._run_gate(repo)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("no unreleased drift", r.stdout)
+
+    def test_step4_bump_with_leftover_unreleased_passes(self):
+        # HEAD carries a version bump even though [Unreleased] still holds
+        # content (leftover, per the issue wording "HEAD does not carry a
+        # version bump" — a bump makes it pass regardless).
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="zmem-drift-") as td:
+            repo = self._make_repo(Path(td))
+            self._merge(
+                repo,
+                changelog=(
+                    "# Changelog\n\n## [Unreleased]\n\n"
+                    "- leftover follow-up work (#88)\n\n"
+                    "## [0.14.0] — 2026-09-03\n\n- merged feature (#86)\n\n"
+                    "## [0.13.1] — 2026-08-28\n\nPrior release.\n"),
+                version="0.14.0",
+                subject="feat(memory): something user-facing; release 0.14.0 (#87)")
+            r = self._run_gate(repo)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("version bump", r.stdout)
+
+    def test_step3_skip_release_marker_passes_without_bump(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="zmem-drift-") as td:
+            repo = self._make_repo(Path(td))
+            self._merge(
+                repo,
+                changelog=(
+                    "# Changelog\n\n## [Unreleased]\n\n"
+                    "- docs correction (#103)\n\n"
+                    "## [0.13.1] — 2026-08-28\n\nPrior release.\n"),
+                version=None,
+                subject="docs(memory): a docs-only change [skip release] (#103)")
+            r = self._run_gate(repo)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("[skip release]", r.stdout)
+
+    def test_step2_empty_unreleased_passes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="zmem-drift-") as td:
+            repo = self._make_repo(Path(td))
+            # No second merge at all — [Unreleased] still empty at HEAD.
+            r = self._run_gate(repo)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("no unreleased drift", r.stdout)
+
+    def test_drift_negative_paths(self):
+        # PRR-006: the two failure paths the original sweep never exercised —
+        # (a) CHANGELOG.md unreadable/absent -> error exit 1;
+        # (b) --repo-root on a non-git directory carrying drift content ->
+        # head_bumps_version finds no git history, treats it as NO bump
+        # (strict), no marker -> exit 1. An empty-Unreleased non-git dir
+        # passes at the history-free step (rc 0, no git needed).
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="zmem-drift-neg-") as td:
+            root = Path(td)
+            r = self._run_gate(root)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("::error::", r.stdout)
+            self.assertIn("unreadable", r.stdout)
+
+            nogit = root / "nogit"
+            nogit.mkdir()
+            (nogit / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## [Unreleased]\n\n- drift content (#1)\n",
+                encoding="utf-8")
+            r = self._run_gate(nogit)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("::error::unreleased drift", r.stdout)
+
+            (nogit / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] — x\n\nb\n",
+                encoding="utf-8")
+            r = self._run_gate(nogit)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("no unreleased drift", r.stdout)
+
+    def test_live_repo_drift_mode_reports_a_sane_verdict(self):
+        # X10: this runs in the every-PR CI loop, where the live repo MAY
+        # legitimately carry unreleased content (any feature PR mid-flight).
+        # The smoke value is "the mode runs and reports one of its two
+        # documented verdicts" — NOT a pinned rc (that would break every
+        # PR that accumulates [Unreleased] entries before its bump PR).
+        # The default mode's no-drift-text contract is still pinned.
+        r = subprocess.run(
+            [PYTHON, str(GATE_PY), "--check-unreleased-drift"],
+            capture_output=True, text=True, timeout=120, cwd=str(REPO_ROOT),
+        )
+        self.assertIn(r.returncode, (0, 1),
+                      f"drift mode crashed on the live repo:\n{r.stdout}")
+        self.assertTrue(
+            ("no unreleased drift" in r.stdout)
+            or ("::error::unreleased drift" in r.stdout),
+            f"neither documented verdict emitted:\n{r.stdout}")
+        # The default mode never gained drift output (release.yml contract).
+        d = subprocess.run(
+            [PYTHON, str(GATE_PY)], capture_output=True, text=True,
+            timeout=120, cwd=str(REPO_ROOT),
+        )
+        self.assertEqual(d.returncode, 0, d.stdout + d.stderr)
+        self.assertNotIn("unreleased drift", d.stdout)
+
+
+class CiWorkflowContractTest(unittest.TestCase):
+    """Issue #106: the drift gate must stay wired into ci.yml for main
+    pushes only — deleting the step (or letting it run on PRs, where
+    HEAD~1 is branch history) is exactly the regression class this pins."""
+
+    def setUp(self):
+        self.yml = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8")
+
+    def test_checkout_depth_covers_head_parent(self):
+        self.assertIn("fetch-depth: 2", self.yml,
+                      "the bump comparison needs HEAD~1 on push events")
+
+    def test_drift_step_runs_the_gate_on_main_pushes_only(self):
+        import re
+        step = re.search(
+            r"- name: Release drift gate.*?run: python scripts/"
+            r"release_gate\.py --check-unreleased-drift",
+            self.yml, re.DOTALL)
+        self.assertIsNotNone(step, "ci.yml lost the drift-gate step")
+        self.assertIn(
+            "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+            step.group(0),
+            "the drift gate must run only on pushes to main")
+        # PRR-003: a red earlier step must not mute the drift check on a
+        # main push — the condition must include !cancelled() (or always()).
+        self.assertRegex(
+            step.group(0), r"if:.*(!cancelled\(\)|always\(\))",
+            "the drift gate is skipped whenever any earlier step fails — "
+            "add !cancelled() to the condition")
 
 
 if __name__ == "__main__":

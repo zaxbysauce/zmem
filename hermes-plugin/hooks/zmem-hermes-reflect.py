@@ -488,6 +488,17 @@ def main() -> int:
     except Exception:
         pass
 
+    # Issue #110 (P0-5): passive-injection kill switch. Correction capture
+    # above already ran (capture never consults the switch); every DELIVERY
+    # path below — remote prefetch, failure/convention/reflect nudges,
+    # query-context — is silenced. Pending nudge markers stay armed: they
+    # fire on the first enabled run instead of being lost.
+    if os.environ.get("ZMEM_INJECT", "1").strip() == "0":
+        sys.stderr.write(
+            "zmem-reflect: status=silent reason=disabled (ZMEM_INJECT=0)\n")
+        _emit_empty()
+        return 0
+
     # Issue #71 A: REMOTE mode branches FIRST (final-critic fix): when
     # ZMEM_MCP_URL is set the box's prefetch comes from the LAN MCP server
     # regardless of whether a stale/accidental local store file exists — a

@@ -377,6 +377,7 @@ class HookBehaviorSmokeTests(unittest.TestCase):
             "ZMEM_STORE": str(cls.store),
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
             "ZMEM_DATA": cls.tmp,
+            "ZMEM_INJECT": "1",
             "ZMEM_NAMESPACE": "project:smoke",
             "ZMEM_INJECT_FLOOR_RECENT": "0.5",
         }

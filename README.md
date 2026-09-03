@@ -630,6 +630,68 @@ committed snapshot up to a full sync-repo read/write loop: see
 - Review skill promotion before writing it. `promote --confirm` writes into the
   host skill surfaces and should stay a reviewed step, not an automatic one.
 
+### Disabling passive injection & rolling a host back (issue #110)
+
+**Kill switch.** `ZMEM_INJECT=0` turns off every passive recall-injection
+surface at once: the recall hooks (UserPromptSubmit, PreToolUse,
+SubagentStart, PreCompact), the SessionStart hook (Tier 2 recall **and Tier
+0** — under the switch SessionStart emits its empty `{}` envelope, so
+`core.md`/`AGENTS.md` are not injected either), the Hermes provider
+(`prefetch`, the `zmem_session_start` tool, and the system-prompt `core.md`
+block), the Hermes reflect hook's delivery, and MCP `session_start`. Each
+silenced surface emits its empty envelope and logs
+`status=silent reason=disabled` (`zmem-bg.log` for the hook surfaces; the
+Hermes/MCP loggers for theirs).
+Only the literal `0` disables — `ZMEM_INJECT=false`/`no`/empty leave injection
+ON (the `ZMEM_QUERY_CONTEXT` convention; `ZMEM_QUERY_CONTEXT` remains the
+narrower ops-lane switch). Beware near-miss spellings: `0.0`, `00`, `False`
+(case-sensitive), `off` do NOT disable — a typo'd value fails silently toward
+injection staying ON, so verify with `doctor` (its `inject-switch` line shows
+the live state) after setting the variable.
+
+**What keeps running under the switch.** Every capture path: correction
+capture, failure capture, the PostToolUse ops ring, convention counters, and
+the SessionStart maintenance dispatch (session-cadence). The capture-side
+PROMPT hooks also stay active by design — `zmem-reflect.sh` (Stop
+reflection), `zmem-subagent-reflect.sh`, `zmem-convention-capture.sh`, and
+the capture-failure/correction prompts — because they prompt the agent to
+CAPTURE a lesson rather than inject recalled memory (issue #110 scopes the
+switch to recall surfaces and states "capture paths are unaffected"). The
+one documented divergence: the Hermes reflect hook (named in #110 as a gated
+surface) silences its delivery nudges under the switch, since recalled
+query-context rides the same delivery path there. Parked pre-tool fences and
+armed nudge markers stay on disk and deliver on the first enabled run —
+nothing is lost. `doctor` shows the state on its `inject-switch` line (WARN
+when disabled), so a confused operator sees the reason immediately.
+
+**Rolling a host back to a previous version.** Plugin caches pin a version
+directory and never overwrite older ones (see [Upgrade](#upgrade)), so a
+rollback is a re-pin, not a download:
+
+- **Claude Code**: point the installed plugin back at the previous cache dir
+  (`~/.claude/plugins/cache/zmem/zmem/<old-version>/`, recorded with its
+  `gitCommitSha` in `~/.claude/plugins/installed_plugins.json`) or reinstall
+  from the release git tag, then restart the session.
+- **ZCode**: same shape under `~/.zcode/cli/plugins/cache/<marketplace>/zmem/
+  <old-version>/` (+ the `installed_plugins.json` next to it); or reinstall
+  from the git tag.
+- **Codex** (shared-store/broker mode): there is no plugin cache — the
+  checkout IS the install, so pin it by checking out the release tag
+  (`git checkout v0.14.0`).
+
+**Verifying a rollback (or a refresh).** The `zmem-bg.log` decision lines are
+the discriminator — but read the RECALL-BODY line, not a session-start line:
+trigger a prompt, then check the line that prompt just appended. On current
+code every recall-body line carries `reason=`; a host stuck on a pre-#87 tree
+writes `status=`-only recall lines. Do **not** use session-start lines for
+this check: they carry no `reason=` on ANY version (old or current — the only
+exception being the `reason=disabled` kill-switch line), so a
+`status=`-only session-start line proves nothing either way (that writer
+shape is where the #106 field proof originated, which is why the recall-body
+line is the reliable discriminator). `doctor` corroborates (version surfaces
++ `inject-switch` state). The per-host injection canary that automates this
+check is tracked in #108.
+
 ### Embeddings (semantic recall / dedup)
 
 ZMem's semantic features — semantic dedup-on-write, hybrid vector recall, and

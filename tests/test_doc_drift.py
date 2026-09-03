@@ -572,7 +572,16 @@ class Issue87DocDriftTest(unittest.TestCase):
                        "no durable memories retrieved for this session.",
                        "memories withheld: the injection token budget "
                        "(ZMEM_INJECT_TOKEN_BUDGET)",
-                       "session memories withheld:"):
+                       "session memories withheld:",
+                       # Issue #110 (P0-5): the kill-switch doc must name the
+                       # switch and its log marker (presence needles only),
+                       # and the FINAL critic round pinned the QUALIFIED
+                       # scope claim — recall surfaces, not capture prompts
+                       # (single-line needles; see the PR #104 wrap lesson).
+                       "ZMEM_INJECT=0",
+                       "reason=disabled",
+                       "passive recall-injection surface",
+                       "they prompt capture, they do not inject recalled"):
             self.assertIn(needle, text, f"SKILL.md missing {needle!r}")
 
     def test_skill_md_documents_bg_log_reason_field(self):
