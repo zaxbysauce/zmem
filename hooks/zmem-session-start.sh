@@ -194,6 +194,11 @@ fi
 # autoMemoryEnabled:false. Fires at most once, guarded by a marker file in
 # ZMEM_DATA — never touches settings.json, read-only.
 HOST="${ZMEM_HOST:-zcode}"
+# Session id for the bg-log decision line (issue #94): the env chain the
+# other capture hooks use (launcher exports ZMEM_SESSION; the legacy vars
+# cover manual/back-compat invocation). Empty when no host supplied it —
+# the python block logs sid=unknown then.
+SESSION_ID="${ZMEM_SESSION:-${CLAUDE_SESSION_ID:-${ZCODE_SESSION_ID:-}}}"
 SETTINGS_DIR_PY="$(join_path "$(to_py_path "$HOME")" .claude)"
 NUDGE_MARKER_PY="$(join_path "$DATA_DIR_PY" .native-nudge-shown)"
 
@@ -305,7 +310,7 @@ BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 
 # Build the additionalContext payload using python for guaranteed-valid JSON.
 CTX_JSON="$("$PYTHON_BIN" -c '
-import json, os, sys, subprocess
+import json, os, re, sys, subprocess
 
 core = sys.argv[1]
 agents = sys.argv[2]
@@ -330,6 +335,10 @@ try:
     nudge_marker = sys.argv[11]
 except IndexError:
     nudge_marker = ""
+try:
+    session_id = sys.argv[12]
+except IndexError:
+    session_id = ""
 
 parts = []
 
@@ -493,13 +502,23 @@ if store_py and os.path.isfile(store_py):
                             _tok = ""
                             if _tok_used is not None:
                                 _tok = " tokens=%s/%s" % (_tok_used, _tok_budget if _tok_budget is not None else "-")
+                            # Issue #94: always carry the sanitized session
+                            # id at line end (same rule as the shared body
+                            # _log_inject_decision and the ring paths) so a
+                            # mined failure can be bound to the injection
+                            # decisions of this session. "unknown" when the
+                            # host supplied no session id.
+                            _safe_sid = re.sub(
+                                r"[^A-Za-z0-9._-]", "_",
+                                (session_id or ""))[:128] or "unknown"
                             _lf.write(
-                                "[%d] zmem-hook status=%s ids=%s all=%s%s\n" % (
+                                "[%d] zmem-hook status=%s ids=%s all=%s%s sid=%s\n" % (
                                     int(__import__("time").time()),
                                     "injected" if rows else "silent",
                                     [r.get("id") for r in rows],
                                     [r.get("id") for r in rows],
                                     _tok,
+                                    _safe_sid,
                                 )
                             )
                 except Exception:
@@ -649,7 +668,7 @@ if budget > 0 and len(ctx) > budget:
     else:
         ctx = _cut + "\n[recall truncated]"
 print(json.dumps({"additionalContext": ctx}) if ctx else "{}")
-' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" 2>/dev/null || echo '{}')"
+' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" "$SESSION_ID" 2>/dev/null || echo '{}')"
 
 # Neutralize any sentinel token a MEMORY'S OWN CONTENT happens to contain
 # before wrapping. The launcher locates the payload by scanning stdout for the

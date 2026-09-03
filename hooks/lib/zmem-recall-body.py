@@ -54,7 +54,10 @@ The selective-inject decision is logged to ``<data dir>/zmem-bg.log`` (the
 dir resolved by ``_data_dir()``; I5 critic-fix: existing log file, not a new
 one). Since issue #87 every line carries ``reason=`` (from schema_meta's
 INJECT_SILENT_REASONS tuple, plus ``injected`` on the success line) and
-``omitted=N`` when the passive injection-risk filter dropped rows.
+``omitted=N`` when the passive injection-risk filter dropped rows. Since
+issue #94 every line also carries ``sid=<sanitized session id>`` (the
+stdin event's ``session_id``; ``sid=unknown`` when the host sent none) —
+the session key the miss-rate report joins failures against.
 """
 
 from __future__ import annotations
@@ -246,7 +249,7 @@ _BG_LOG_DEFAULT_MAX_BYTES = 262144
 
 def _log_inject_decision(rows, selected, status: str, reason: str,
                          omitted=0, tokens_used=None, tokens_budget=None,
-                         ops_count=0) -> None:
+                         ops_count=0, session_id: str = "") -> None:
     """Append the injected|silent decision to the existing bg log.
 
     Issue #87 / #85 direction 1: every line carries ``reason=`` (closed set
@@ -256,7 +259,15 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
     (scoring problem) from a budget-drop without log forensics. Field order:
     ``status``, ``reason``, optional ``omitted=N``, ``ids``, ``all``,
     optional ``tokens=used/budget`` (the ``tokens=\\d+/\\d+`` shape pinned by
-    tests/test_token_budget.py is unchanged).
+    tests/test_token_budget.py is unchanged), optional ``ops=N``, then
+    ALWAYS ``sid=<sanitized session id>`` at line end (issue #94: the
+    session key the miss-rate join binds failures to injections with).
+    Sanitization is the canonical ops-lane rule
+    (``[^A-Za-z0-9._-]`` → ``_``, cap 128) so a hostile session id cannot
+    forge log structure; an absent session id logs ``sid=unknown`` — the
+    "unknown" fallback is deliberately distinct from ``_ring_path``'s
+    filename fallback ("session") because this is a log label, not a path
+    component.
 
     PRR-016 fix: the log used to read a stale ``ZMEM_DATA_DIR`` var and so
     always landed in ~/.zmem even on store-overridden deployments; it now
@@ -293,10 +304,18 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
         ops = ""
         if ops_count and ops_count > 0:
             ops = " ops={0}".format(int(ops_count))
+        # Issue #94: always carry the sanitized session id at line end so a
+        # mined failure can be bound to the injection decisions of its own
+        # session (the miss-rate join key). Same sanitize rule as
+        # _pending_ops_path / ops_tokens._ring_path.
+        import re as _re_sid
+        safe_sid = _re_sid.sub(
+            r"[^A-Za-z0-9._-]", "_", (session_id or ""))[:128] or "unknown"
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
-                "ids={ids_sel} all={ids_all}{tok}{ops}\n".format(
+                "ids={ids_sel} all={ids_all}{tok}{ops} "
+                "sid={safe_sid}\n".format(
                     ts=int(time.time()),
                     status=status,
                     reason=reason,
@@ -305,6 +324,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     ids_all=ids_all,
                     tok=tok,
                     ops=ops,
+                    safe_sid=safe_sid,
                 )
             )
     except OSError:
@@ -555,6 +575,15 @@ def main() -> int:
         if isinstance(stdin_obj, dict):
             _sid = stdin_obj.get("session_id", "")
             session_id = _sid if isinstance(_sid, str) else ""
+        # Issue #94 (bot round): a host that omits session_id from the
+        # event JSON but launches through the adapter still carries it in
+        # the env — the SAME chain the session-start writer uses, so both
+        # decision-line writers attribute to the same session on every
+        # path (manual/back-compat invocations included).
+        if not session_id:
+            session_id = (os.environ.get("ZMEM_SESSION", "")
+                          or os.environ.get("CLAUDE_SESSION_ID", "")
+                          or os.environ.get("ZCODE_SESSION_ID", ""))
 
         if mode == "precompact" or mode == "recent":
             # PreCompact and subagent-recall: re-inject the
@@ -741,6 +770,7 @@ def main() -> int:
             tokens_used=0 if budget_emptied else None,
             tokens_budget=tokens_budget if budget_emptied else None,
             ops_count=len(ops_tokens),
+            session_id=session_id,
         )
         if mode == "pretool":
             # Issue #90 / #85 C: a per-tool-call one-liner would inject noise
@@ -789,7 +819,8 @@ def main() -> int:
     _log_inject_decision(rows, selected, status, injected_reason,
                          omitted=omitted,
                          tokens_used=tokens_used, tokens_budget=tokens_budget,
-                         ops_count=len(ops_tokens))
+                         ops_count=len(ops_tokens),
+                         session_id=session_id)
     if mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude":
         # Issue #90 / #85 C: older Claude builds ignore pre-tool
         # additionalContext (documented since 2.1.9) — park the

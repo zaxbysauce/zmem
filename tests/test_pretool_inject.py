@@ -60,6 +60,9 @@ _STRIP_ENV = (
     # strip them like test_sweep's DATA_DIR_ENV_VARS so ambient dev-box values
     # can never receive subprocess writes.
     "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+    # #93 A1 residue: eval-runner pollution vars — a single-process
+    # multi-file runner must not leak the fake embedder or pinned clock in.
+    "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW", "ZMEM_AUTO_REKEY",
 )
 
 
