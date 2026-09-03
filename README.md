@@ -643,7 +643,10 @@ its empty envelope and logs `status=silent reason=disabled`
 (`zmem-bg.log` for the hook surfaces; the Hermes/MCP loggers for theirs).
 Only the literal `0` disables — `ZMEM_INJECT=false`/`no`/empty leave injection
 ON (the `ZMEM_QUERY_CONTEXT` convention; `ZMEM_QUERY_CONTEXT` remains the
-narrower ops-lane switch).
+narrower ops-lane switch). Beware near-miss spellings: `0.0`, `00`, `False`
+(case-sensitive), `off` do NOT disable — a typo'd value fails silently toward
+injection staying ON, so verify with `doctor` (its `inject-switch` line shows
+the live state) after setting the variable.
 
 **What keeps running under the switch.** Every capture path: correction
 capture, failure capture, the PostToolUse ops ring, convention counters, and

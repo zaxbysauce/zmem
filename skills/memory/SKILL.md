@@ -279,6 +279,8 @@ capture, the ops ring, convention counters, failure capture, and
 session-cadence maintenance keep writing. Parked pre-tool fences and armed
 nudge markers are left in place and deliver on the first enabled run.
 `doctor` shows the state (`inject-switch` line, WARN when disabled).
+Near-miss spellings (`0.0`, `00`, `False`, `off`) do NOT disable — the
+parser matches the exact literal `0`; verify with `doctor` after setting.
 
 #### Pre-tool inject — issue #90 / #85 direction C
 

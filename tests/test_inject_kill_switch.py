@@ -171,8 +171,10 @@ class KillSwitchBodyTest(unittest.TestCase):
 
     def test_literal_zero_only_convention(self):
         # Only the literal 0 disables (the ZMEM_QUERY_CONTEXT convention):
-        # empty and false-y spellings leave injection ENABLED.
-        for value in ("", "false", "no", "1"):
+        # empty, false-y, and NEAR-MISS spellings (0.0 / 00 / False / off)
+        # all leave injection ENABLED — pinned so the documented footgun
+        # stays a documented fact, not a silent behavior change.
+        for value in ("", "false", "no", "1", "0.0", "00", "False", "off"):
             shutil.rmtree(self._tmp, ignore_errors=True)
             os.makedirs(self._tmp, exist_ok=True)
             _seed(_clean_env(self._tmp), self.ns,
@@ -320,6 +322,13 @@ class KillSwitchHermesProviderTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp(prefix="zmem-killsw-prov-")
+        # Pin the provider to an ISOLATED seeded store: the enabled-path
+        # control below runs a real recall subprocess, and an unpinned
+        # store resolution could reach the host-default store.
+        _seed(_clean_env(cls._tmp), "user:global",
+              "killswitchcanary: git stash pop conflicts need stash drop "
+              "after resolve, verified by test")
         agent = types.ModuleType("agent")
         mp = types.ModuleType("agent.memory_provider")
         class MemoryProvider:  # noqa: D401 - minimal ABC stub
@@ -328,12 +337,14 @@ class KillSwitchHermesProviderTest(unittest.TestCase):
         agent.memory_provider = mp
         sys.modules.setdefault("agent", agent)
         sys.modules.setdefault("agent.memory_provider", mp)
-        saved_env = {
-            k: os.environ.get(k)
-            for k in ("ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_INJECT")
-        }
+        cls._saved = {k: os.environ.get(k) for k in (
+            "ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_INJECT",
+            "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
+        )}
         os.environ["ZMEM_HOME"] = str(REPO_ROOT)
-        os.environ.pop("ZMEM_STORE", None)
+        os.environ["ZMEM_STORE"] = os.path.join(cls._tmp, "store.sqlite")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(cls._tmp, "no-models")
         os.environ.pop("ZMEM_DATA", None)
         os.environ.pop("ZMEM_INJECT", None)
         try:
@@ -342,30 +353,33 @@ class KillSwitchHermesProviderTest(unittest.TestCase):
             cls.mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(cls.mod)
         finally:
-            for k, v in saved_env.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
+            pass  # env restored in tearDownClass (provider holds no import)
         cls.provider = cls.mod.ZmemMemoryProvider()
         cls.provider.initialize("sess-killsw")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+        for k, v in cls._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def test_prefetch_returns_empty_string(self):
         with mock.patch.dict(os.environ, {"ZMEM_INJECT": "0"}):
             self.assertEqual(self.provider.prefetch("anything"), "")
 
-    def test_prefetch_enabled_control(self):
-        # No switch → the method runs its normal path (a store subprocess
-        # against ZMEM_HOME's store.py; an empty result is fine — the pin
-        # is that it is NOT the short-circuit, proven by the disabled twin
-        # returning before any subprocess could fail here).
+    def test_prefetch_enabled_control_finds_the_seeded_row(self):
+        # No switch → the normal recall path runs against the isolated
+        # seeded store and RETURNS the row (contrast to the disabled twin,
+        # which returns "" before any subprocess). Asserting non-empty
+        # proves the switch is not silently always-on.
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ZMEM_INJECT", None)
-            try:
-                out = self.provider.prefetch("git stash pop conflicts")
-                self.assertIsInstance(out, str)
-            finally:
-                pass
+            out = self.provider.prefetch("git stash pop conflicts")
+            self.assertNotEqual(
+                out, "", "enabled prefetch must recall the seeded row")
 
     def test_session_start_tool_returns_disabled_envelope(self):
         with mock.patch.dict(os.environ, {"ZMEM_INJECT": "0"}):
