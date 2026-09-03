@@ -340,11 +340,11 @@ class KillSwitchHermesReflectTest(unittest.TestCase):
 
     def test_remote_mode_disabled_skips_lan_call(self):
         # PRR-005: the disabled gate must precede the _remote_enabled()
-        # branch — with ZMEM_MCP_URL set the hook would otherwise attempt a
-        # LAN session_start call. The discriminator: a disabled run's stderr
-        # carries the reason=disabled marker and NOT the
-        # "remote prefetch unavailable" line the remote path emits on
-        # connection failure (the URL points at a closed port on purpose).
+        # branch. ZMEM_MCP_URL points at a closed port: if the gate ever
+        # moved below the remote branch, the remote path would dial it, fail,
+        # and add its own "remote prefetch unavailable" stderr line. The
+        # pin: the disabled marker is the ONLY stderr output — a reordered
+        # gate cannot satisfy it.
         tmp = tempfile.mkdtemp(prefix="zmem-killsw-hr-remote-")
         try:
             r = self._run(
@@ -353,11 +353,10 @@ class KillSwitchHermesReflectTest(unittest.TestCase):
                 ZMEM_INJECT="0", ZMEM_MCP_URL="http://127.0.0.1:1/mcp")
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), "{}")
-            self.assertIn(DISABLED_LINE, r.stderr,
-                          "the kill-switch gate fired, not the remote path")
-            self.assertNotIn("remote prefetch unavailable", r.stderr,
-                             "the LAN call must never be attempted under "
-                             "the switch")
+            stderr_lines = [ln for ln in r.stderr.splitlines() if ln.strip()]
+            self.assertEqual(
+                len(stderr_lines), 1, r.stderr)
+            self.assertIn(DISABLED_LINE, stderr_lines[0])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
