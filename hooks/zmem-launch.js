@@ -466,16 +466,24 @@ function extractPayload(raw) {
 }
 
 // Wrap additionalContext content into the host-appropriate envelope shape.
-function makeEnvelope(host, hookName, content) {
+// systemMessage (issue #107) is the OPERATOR channel: a served-tree drift
+// notice shown to the user, never injected into model context. It rides
+// top-level next to the additionalContext envelope for every host (hosts that
+// do not render it ignore the extra key harmlessly).
+function makeEnvelope(host, hookName, content, systemMessage) {
+    const envelope = {};
     if (host === "claude" || host === "codex") {
-        return {
-            hookSpecificOutput: {
-                hookEventName: hookEventNameFor(host, hookName),
-                additionalContext: content,
-            },
+        envelope.hookSpecificOutput = {
+            hookEventName: hookEventNameFor(host, hookName),
+            additionalContext: content,
         };
+    } else {
+        envelope.additionalContext = content;
     }
-    return { additionalContext: content };
+    if (typeof systemMessage === "string" && systemMessage) {
+        envelope.systemMessage = systemMessage;
+    }
+    return envelope;
 }
 
 // Encoded size of an envelope in UTF-8 BYTES. `String.prototype.length` counts
@@ -533,12 +541,26 @@ function fitEnvelope(host, hookName, content, budget) {
 
 // Translate the buffered child stdout into the final envelope for a
 // sentinel-emitting hook. Never throws — returns {} on any failure.
+// Issue #107: the operator-facing systemMessage is read BEFORE the
+// empty-content early-return — a kill-switch session emits no
+// additionalContext, but its served-tree drift notice must still reach the
+// user. systemMessage is never part of fitEnvelope's content trimming (it is
+// a fixed operator string, never model context).
 function translate(raw, host, hookName, budget) {
     const payload = extractPayload(raw);
     if (payload === null) return {}; // missing/invalid sentinel → fail open
     const content = payload.additionalContext;
-    if (content === undefined || content === null || content === "") return {};
-    return fitEnvelope(host, hookName, String(content), budget);
+    const sysMsg =
+        typeof payload.systemMessage === "string" && payload.systemMessage.trim()
+            ? payload.systemMessage
+            : null;
+    const hasContent = !(content === undefined || content === null || content === "");
+    if (!hasContent && !sysMsg) return {};
+    const envelope = hasContent
+        ? fitEnvelope(host, hookName, String(content), budget)
+        : makeEnvelope(host, hookName, "");
+    if (sysMsg) envelope.systemMessage = sysMsg;
+    return envelope;
 }
 
 // Resolve and VALIDATE the context budget (issue #39 E3). A negative value is

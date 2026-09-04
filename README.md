@@ -469,6 +469,43 @@ Notes:
 - To pin a specific version, install from a checked-out git tag rather than the
   rolling `main` branch.
 
+#### Detecting served-code drift and forcing a refresh (issue #107)
+
+A version string cannot tell you which code is actually running: a partially
+refreshed plugin cache can serve different bytes under the same `version`. Since
+0.17.0 every release ships `release-manifest.json` — a sha-256 content hash of
+the runtime surface (`hooks/**`, `skills/memory/scripts/**`, `skills/**/SKILL.md`,
+`hermes-plugin/**`), committed at the repo root and attached to the GitHub
+Release. zmem compares the served tree against it in two places:
+
+- **`doctor`** — the `served-drift` check reports `matched` (pass), `drifted`
+  (warn, with the first 10 differing paths and both digests), or `unknown`/skip
+  when the tree has no manifest (pre-0.17.0 caches, dev checkouts).
+- **Session start** — on the first hook decision of a session, a drifted tree
+  appends one line to `zmem-bg.log`
+  (`zmem-drift served=<sha8> release=<sha8> files=<n>`) and shows the OPERATOR a
+  `systemMessage` notice (never model context; it fires even with
+  `ZMEM_INJECT=0`). Detection is log-only and never blocks a hook, and runs at
+  most once per session id — hosts that supply no session id share one
+  `.drift-checked-unknown` marker, so such boxes log at most one drift line
+  total until the marker is cleared.
+
+To force a refresh per host when doctor reports drift:
+
+1. **ZCode / Claude Code / Codex**: re-run the install/discovery flow from the
+   top of this README (or your marketplace update) and restart the session;
+   then confirm the active cache path changed.
+2. **Manual cache mirror** (robocopy/rsync flows): re-mirror the release tag's
+   tree into the cache dir — a partial mirror is exactly what drift detects.
+3. Verify: `python <plugin-root>/skills/memory/scripts/doctor.py` shows
+   `served-drift ... pass (matched)`, and no new `zmem-drift` line appears in
+   `zmem-bg.log` on the next session start.
+
+Release maintainers: regenerate the manifest with
+`python scripts/release_gate.py --emit-manifest` and commit it with the release;
+the Release workflow runs `--verify-manifest` and refuses to publish a release
+whose manifest does not describe its own tree.
+
 ## Project-level memory
 
 On ZCode, ZMem injects `<repo>/AGENTS.md` if present — this is project-level

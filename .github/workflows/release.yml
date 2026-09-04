@@ -74,9 +74,17 @@ jobs:
             echo "Release v${VERSION} already exists — nothing to publish."
             exit 0
           fi
+          # Issue #107: a release ships a content manifest of its runtime
+          # surface. Under set -euo pipefail a stale (or missing) manifest
+          # fails this step BEFORE the release is created — the release can
+          # never ship code its manifest cannot identify. Placement after the
+          # release-exists early exit keeps non-release pushes (manifest
+          # intentionally stale under [Unreleased]) away from this check.
+          python scripts/release_gate.py --verify-manifest
           echo "Publishing v${VERSION} at ${TARGET_SHA}"
           gh release create "v${VERSION}" \
             --target "${TARGET_SHA}" \
             --title "${TITLE}" \
-            --notes-file "${NOTES}"
+            --notes-file "${NOTES}" \
+            release-manifest.json
           echo "Released. Verify: https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}"

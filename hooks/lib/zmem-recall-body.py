@@ -220,6 +220,46 @@ def _classify_silent_reason(rows, omitted=0, budget_emptied=False,
 _BG_LOG_DEFAULT_MAX_BYTES = 262144
 
 
+def _maybe_log_drift(session_id: str) -> None:
+    """Issue #107: run the served-tree drift check once per session id.
+
+    The session-start hook runs the same drift.py ``log-once`` first; this
+    choke point covers hosts/wirings where session-start never fired, using
+    the SAME per-session marker so the zmem-drift bg-log line is written at
+    most once per session regardless of which writer wins. Fail-open and
+    bounded: the marker is one stat after the first call, and the drift
+    subprocess gets a 5s timeout (hashing the runtime surface is
+    milliseconds-scale; 5s is pathological headroom only, well under this
+    hook own subprocess budget). The drift.py path is derived from THIS
+    file own tree (parents[2]) — never from env — so a partial refresh can
+    never spawn a drift checker from a different tree.
+    """
+    try:
+        data_dir = _data_dir()
+        import re as _re_drift
+        safe_sid = _re_drift.sub(
+            r"[^A-Za-z0-9._-]", "_", (session_id or ""))[:128] or "unknown"
+        marker = os.path.join(
+            data_dir, ".drift-checked-{0}".format(safe_sid))
+        if os.path.isfile(marker):
+            return
+        drift_py = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))),
+            "skills", "memory", "scripts", "drift.py")
+        if not os.path.isfile(drift_py):
+            # Pre-0.17 served tree: drift logging is simply absent.
+            return
+        subprocess.run(
+            [sys.executable, drift_py, "log-once",
+             "--data-dir", data_dir, "--sid", session_id or ""],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        pass  # fail-open: drift reporting never blocks a decision
+
+
 def _log_inject_decision(rows, selected, status: str, reason: str,
                          omitted=0, tokens_used=None, tokens_budget=None,
                          ops_count=0, session_id: str = "",
@@ -251,6 +291,10 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
     path, with the same plugin-data steps for non-launcher environments.
     """
     log_path = os.path.join(_data_dir(), "zmem-bg.log")
+    # Issue #107: the first decision of a session also fires the (marker
+    # guarded, once-per-session) served-tree drift check — the session-start
+    # hook normally wins the race; this covers wirings where it never ran.
+    _maybe_log_drift(session_id)
     try:
         # PRR-023: bounded growth — truncate to empty when over the cap so
         # per-event appends cannot grow the log without limit.

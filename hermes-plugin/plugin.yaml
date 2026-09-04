@@ -1,5 +1,5 @@
 name: zmem
-version: 0.16.0
+version: 0.17.0
 description: "ZMem — shared cross-session memory for the whole fleet via one canonical store. MemoryProvider with passive no-bump prefetch + explicit memory tools, plus reflection shell hooks. Dual-mode by design: keep Hindsight as memory.provider and run zmem beside it (MCP + prefetch hook); memory.provider: zmem is the local-only exclusive path that displaces Hindsight. Issue #71 A/B."
 hooks:
   - prefetch

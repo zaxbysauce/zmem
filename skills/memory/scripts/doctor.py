@@ -33,6 +33,14 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     import host  # type: ignore
 
+# Issue #107: served-code drift detection (content-hash manifest). drift.py is
+# stdlib-only and side-effect-free at import (no store access).
+try:
+    import drift
+except ImportError:
+    sys.path.insert(0, os.path.dirname(__file__))
+    import drift  # type: ignore
+
 
 # Single source of truth: import the schema version from schema_meta (the same
 # module store.py uses) so doctor and store can never disagree. A stale local
@@ -1410,6 +1418,63 @@ def _check_surfaces(repo_root: Path) -> dict:
     return _check("host-surfaces", status, summary, surfaces=details)
 
 
+def _check_served_drift(repo_root: Path) -> dict:
+    """Issue #107 (Workstream A PR 2): served tree vs release-manifest.json.
+
+    Version strings cannot identify served code (three materially different
+    trees can share one manifest version); this check recomputes the content
+    hashes of the runtime surface over the tree doctor itself lives in — the
+    same tree the launcher resolves — and compares against the committed
+    release manifest.
+
+    Severity is DELIBERATELY warn, never fail: the issue scopes drift to
+    report-only, and "fail" would flip doctor's exit code and break the
+    never-fails-the-hook-path contract (acceptance criterion 2). skip never
+    counts as fail, so a tree without a manifest (pre-0.17.0 served trees,
+    dev checkouts) also keeps exit 0.
+    """
+    try:
+        result = drift.evaluate(repo_root)
+    except Exception:
+        return _check(
+            "served-drift", "skip",
+            "Served-tree drift check could not run (unexpected error).")
+    status = result.get("status")
+    if status == "drifted":
+        n = result.get("differing_count", 0)
+        differing = result.get("differing", [])
+        preview = ", ".join(differing[:10])
+        return _check(
+            "served-drift", "warn",
+            f"Served tree DRIFTED from release {result.get('version') or '?'} "
+            f"— {n} runtime file(s) differ (served {result.get('served')} vs "
+            f"release {result.get('release')}); first differing: {preview}.",
+            version=result.get("version"),
+            served=result.get("served"),
+            release=result.get("release"),
+            files_compared=result.get("files_compared"),
+            differing_count=n,
+            differing=differing,
+        )
+    if status == "matched":
+        return _check(
+            "served-drift", "pass",
+            f"Served tree matches release manifest "
+            f"({result.get('files_compared')} files, digest "
+            f"{result.get('served')}).",
+            version=result.get("version"),
+            served=result.get("served"),
+            release=result.get("release"),
+            files_compared=result.get("files_compared"),
+        )
+    return _check(
+        "served-drift", "skip",
+        "No release-manifest.json in this tree — cannot compare served code "
+        "to a release (pre-0.17.0 served tree, or a checkout without one).",
+        served=result.get("served"),
+    )
+
+
 # Issue #71 B: the MemoryProvider ABC hooks the zmem provider actually
 # implements (diffed against hermes-plugin/__init__.py). The manifest's
 # `hooks:` list must be a subset of these — Hermes' plugin doctor reports
@@ -2187,6 +2252,14 @@ def _recommendations(checks: list[dict]) -> list[str]:
         notes.append(
             "Passive injection is disabled box-wide (ZMEM_INJECT=0). Unset the variable (or set it to 1) to re-enable recall injection; capture kept writing the whole time (issue #110)."
         )
+    if by_id.get("served-drift", {}).get("status") == "warn":
+        notes.append(
+            "The served zmem tree differs from its release manifest: force a "
+            "refresh of this host's plugin cache (re-run the install/discovery "
+            "flow per README Upgrade, or re-mirror the release tag into the "
+            "cache dir), then re-run doctor to confirm served-drift passes "
+            "(issue #107)."
+        )
     tok = by_id.get("mcp-token", {})
     if tok.get("status") == "warn" and tok.get("details", {}).get("unscoped_token"):
         notes.append(
@@ -2799,6 +2872,9 @@ def build_report(project: Path, repo_root: Path,
     namespace_check = _check_namespace(project)
     checks.append(namespace_check)
     checks.append(_check_surfaces(repo_root))
+    # Issue #107 (Workstream A PR 2): served tree vs release manifest —
+    # content-hash identity (warn/skip only; see _check_served_drift).
+    checks.append(_check_served_drift(repo_root))
     # Issue #71 B: Hermes plugin surface — manifest parity, provider/hooks
     # files, MCP server importability, and remote-mode config when set.
     checks.append(_check_hermes_plugin(repo_root))
