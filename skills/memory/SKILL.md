@@ -452,11 +452,23 @@ never expand.
 (`surfaced_count`/`last_surfaced`) instead of advancing `retrieval_count`/
 `last_retrieved`. The explicit-vs-passive split is the system contract: the
 three automatic hooks and the Hermes provider prefetch are passive surfaces
-(they pass `--no-bump` — a background injection is not a usefulness signal);
-explicit recall — this CLI without `--no-bump`, the MCP `recall`/`search`
-tools, and the Hermes `MemoryProvider` search tool — intentionally bumps
-`retrieval_count`, because an explicit read IS evidence the memory was useful
-(issue #21).
+(a background injection is not a usefulness signal); explicit recall — this
+CLI without `--no-bump`, the MCP `recall`/`search` tools, and the Hermes
+`MemoryProvider` search tool — intentionally bumps `retrieval_count`, because
+an explicit read IS evidence the memory was useful (issue #21).
+
+Issue #114 sharpened that contract in two ways. First, the automatic hooks and
+SessionStart now pass `--for-injection` (with `--no-bump`): the selective
+inject gate and the token budget run INSIDE that one store call, the returned
+rows are exactly the rendered set, and `surfaced_count` advances only for
+rendered QUERY-MATCHED rows (link neighbors render but never count; unfold
+is explicit-recall-only and never runs on this lane) —
+one subprocess, one decision, no second ack process. Second, ranking
+popularity now reads `retrieval_count` ONLY: passive surfaces are still
+recorded (promote/prune/consolidate consume them) but they no longer feed the
+composite score, so passive pulls cannot inflate their own ranking (the
+live-store shape `surfaced_count=371, retrieval_count=0` was this loop). The
+weight itself is unchanged; #124 will repoint it at applied/violated counters.
 
 ### add — capture a memory
 ```

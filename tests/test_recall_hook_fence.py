@@ -1,10 +1,12 @@
 """Issue #58, 3.5: hook recall text is wrapped in a non-executable fence
 plus a one-line disclaimer. Each bullet carries id / confidence / source_ref.
 
-3.8 also lives here: the selective-inject gate in
-``hooks/lib/zmem-recall-body.py`` drops low-signal rows and emits the
-silent one-liner when nothing qualifies. The decision is appended to
-``zmem-bg.log``.
+3.8 also lives here: the selective-inject gate drops low-signal rows and
+emits the silent one-liner when nothing qualifies; the decision is appended
+to ``zmem-bg.log``. Issue #114 moved the gate store-side into
+``storelib.inject.selective_inject_filter`` (the hook-local twin was
+deleted; the hook body consumes the envelope and keeps only the log
+writer).
 
 3.9 also lives here (lightly): PreCompact sources the same body via
 ``hooks/zmem-precompact.sh`` so the fence / gate / log contract is
@@ -182,21 +184,25 @@ class HookScriptNeutralizationTests(unittest.TestCase):
 
 
 class SelectiveInjectGateTests(unittest.TestCase):
-    """The selective-inject gate in ``hooks/lib/zmem-recall-body.py``
-    drops low-confidence noise and emits the silent one-liner when
-    nothing qualifies. Decision is logged to ``zmem-bg.log`` (I5)."""
+    """The selective-inject gate drops low-confidence noise and emits the
+    silent one-liner when nothing qualifies. Decision is logged to
+    ``zmem-bg.log`` (I5). Issue #114 moved the gate store-side into
+    ``storelib.inject.selective_inject_filter`` (the hook-local twin was
+    deleted), so these semantics are pinned against the LIVE
+    implementation now."""
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        body_path = REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py"
-        spec = importlib.util.spec_from_file_location("zmem_recall_body", body_path)
-        cls.body = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.body)  # type: ignore[union-attr]
+        import sys
+        scripts = REPO_ROOT / "skills" / "memory" / "scripts"
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        from storelib import inject as _inject
+        cls.body = _inject
 
     def test_gate_drops_signal_none_below_gate_none_floor(self):
         rows = [{"id": "low-none", "confidence": 0.30, "signal": "none"}]
-        selected, status = self.body._selective_inject_filter(
+        selected, status = self.body.selective_inject_filter(
             rows, floor=0.25, gate_none_floor=0.4,
         )
         self.assertEqual(status, "silent")
@@ -204,7 +210,7 @@ class SelectiveInjectGateTests(unittest.TestCase):
 
     def test_gate_keeps_signal_none_above_gate_none_floor(self):
         rows = [{"id": "hi-none", "confidence": 0.50, "signal": "none"}]
-        selected, status = self.body._selective_inject_filter(
+        selected, status = self.body.selective_inject_filter(
             rows, floor=0.25, gate_none_floor=0.4,
         )
         self.assertEqual(status, "injected")
@@ -219,7 +225,7 @@ class SelectiveInjectGateTests(unittest.TestCase):
             {"id": "low-test", "confidence": 0.30, "signal": "test"},
             {"id": "hi-test", "confidence": 0.90, "signal": "test"},
         ]
-        selected, status = self.body._selective_inject_filter(
+        selected, status = self.body.selective_inject_filter(
             rows, floor=0.25, gate_none_floor=0.4,
         )
         ids = [r["id"] for r in selected]
@@ -234,7 +240,7 @@ class SelectiveInjectGateTests(unittest.TestCase):
     def test_gate_keeps_compile_signal_at_prompt_floor(self):
         """compile-signal at exactly 0.25 must ride (boundary case)."""
         rows = [{"id": "compile-25", "confidence": 0.25, "signal": "compile"}]
-        selected, status = self.body._selective_inject_filter(
+        selected, status = self.body.selective_inject_filter(
             rows, floor=0.25, gate_none_floor=0.4,
         )
         self.assertEqual(status, "injected")
@@ -244,7 +250,7 @@ class SelectiveInjectGateTests(unittest.TestCase):
         """test-signal below the prompt floor (0.25) must drop — the
         floor is a hard floor for high-signal too."""
         rows = [{"id": "test-20", "confidence": 0.20, "signal": "test"}]
-        selected, status = self.body._selective_inject_filter(
+        selected, status = self.body.selective_inject_filter(
             rows, floor=0.25, gate_none_floor=0.4,
         )
         self.assertEqual(status, "silent")
@@ -256,15 +262,26 @@ class SelectiveInjectGateTests(unittest.TestCase):
         floor. The first gate draft dropped `user`, silently killing
         the pre-existing sentinel round-trip canary."""
         rows = [{"id": "user-90", "confidence": 0.9, "signal": "user"}]
-        selected, status = self.body._selective_inject_filter(
+        selected, status = self.body.selective_inject_filter(
             rows, floor=0.25, gate_none_floor=0.4,
         )
         self.assertEqual(status, "injected")
         self.assertEqual([r["id"] for r in selected], ["user-90"])
 
+    def _body_log_source(self) -> str:
+        # The log WRITER still lives in the hook body (only the gate moved
+        # store-side, issue #114) — inspect it there.
+        import importlib.util
+        body_path = REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py"
+        spec = importlib.util.spec_from_file_location(
+            "zmem_recall_body_for_log", body_path)
+        body = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(body)  # type: ignore[union-attr]
+        return inspect.getsource(body._log_inject_decision)
+
     def test_gate_logs_to_bg_log_path(self):
         # _log_inject_decision writes to $DATA_DIR/zmem-bg.log (I5).
-        src = inspect.getsource(self.body._log_inject_decision)
+        src = self._body_log_source()
         self.assertIn("zmem-bg.log", src,
                       "inject decision must log to zmem-bg.log (existing "
                       "bg log, I5 critic-fix)")
@@ -273,7 +290,7 @@ class SelectiveInjectGateTests(unittest.TestCase):
         # Issue #87 / #85 direction 1: every zmem-hook line must carry
         # reason= so empty-pool silent decisions are distinguishable from
         # below-bar ones without log forensics.
-        src = inspect.getsource(self.body._log_inject_decision)
+        src = self._body_log_source()
         self.assertIn("reason={reason}", src,
                       "_log_inject_decision must write reason= on the "
                       "zmem-hook line (issue #87)")

@@ -763,18 +763,23 @@ class DataDirPrecedenceTest(unittest.TestCase):
             bash = shutil.which("bash")
             if not bash:
                 self.skipTest("no bash on PATH")
+            _bg = zd_dir / "zmem-bg.log"
+            _before = (_bg.read_text(encoding="utf-8").splitlines()
+                       if _bg.is_file() else [])
             r = subprocess.run(
                 [bash, str(REPO_ROOT / "hooks" / "zmem-session-start.sh")],
                 input=json.dumps({"session_id": "sess-zd"}),
                 capture_output=True, text=True, env=env, timeout=180, cwd=tmp)
             self.assertEqual(r.returncode, 0, r.stderr[-800:])
-            # session-start's decision line is the one WITHOUT reason= (the
-            # body's line carries it) — assert THAT line landed in the
-            # expanded dir rather than being silently dropped by the block's
-            # isdir gate.
-            ss_lines = [ln for ln in (zd_dir / "zmem-bg.log").read_text(
-                encoding="utf-8").splitlines()
-                if "zmem-hook" in ln and "reason=" not in ln]
+            # Issue #114: session-start decision lines carry reason= now, so
+            # the writer is told apart by POSITION (lines appended after the
+            # run) rather than by the old reason=-absence shape. What matters
+            # here is only that the Tier-2 line LANDED in the expanded tilde
+            # dir instead of being silently dropped by the isdir gate.
+            _after = (_bg.read_text(encoding="utf-8").splitlines()
+                      if _bg.is_file() else [])
+            ss_lines = [ln for ln in _after[len(_before):]
+                        if "zmem-hook" in ln]
             self.assertTrue(
                 ss_lines,
                 "session-start's own Tier-2 decision line must land in the "

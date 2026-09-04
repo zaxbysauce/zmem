@@ -283,8 +283,14 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         return r
 
     def _ss_line(self) -> str:
-        """The session-start decision line: the one WITHOUT reason=."""
-        lines = [ln for ln in _hook_lines(self._tmp) if "reason=" not in ln]
+        """The session-start decision line.
+
+        Pre-#114 the session-start writer was the one bg-log writer WITHOUT
+        reason= (writer B); issue #114 aligned it to the shared-body format,
+        so it now carries reason= and the PRE-gATE candidate set in all=.
+        Only session-start writes decision lines in these fixtures, so the
+        last decision line is the session-start one."""
+        lines = _hook_lines(self._tmp)
         self.assertTrue(lines,
                         "session-start decision line missing (check the "
                         "inline python ran; stderr above)")
@@ -298,6 +304,11 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         self.assertRegex(line, r" sid=\S+$")
         self.assertEqual(line.count(" sid="), 1)
         self.assertNotIn("<", line)
+        # Issue #114 review (PRR-014): the aligned session-start line must
+        # carry the full shared-body field set, not just sid/status.
+        self.assertRegex(line, r" status=injected reason=injected ")
+        self.assertIn(" all=[", line)
+        self.assertRegex(line, r" ids=\[[^\]]*\] ")
 
     def test_session_start_without_session_logs_sid_unknown(self):
         r = self._run_session_start({})
@@ -330,6 +341,8 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         self.assertIn("status=silent", line)
         self.assertIn(" sid=sess-quiet", line)
         self.assertRegex(line, r" sid=\S+$")
+        # PRR-014: silent lines carry the envelope reason (budget-drop here)
+        self.assertIn(" reason=", line)
 
 
 if __name__ == "__main__":
