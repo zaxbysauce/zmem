@@ -486,9 +486,13 @@ Release. zmem compares the served tree against it in two places:
   (`zmem-drift served=<sha8> release=<sha8> files=<n>`) and shows the OPERATOR a
   `systemMessage` notice (never model context; it fires even with
   `ZMEM_INJECT=0`). Detection is log-only and never blocks a hook, and runs at
-  most once per session id — hosts that supply no session id share one
-  `.drift-checked-unknown` marker, so such boxes log at most one drift line
-  total until the marker is cleared.
+  most once per session id — each session id gets its own
+  `.drift-checked-<key>` marker file in the data dir (the key appends a short
+  hash of the full session id so distinct sessions can never collide), and
+  hosts that supply no session id share one marker, so such boxes log at most
+  one drift line total until the marker is cleared. Markers are reaped by the
+  session sweep after the standard sentinel TTL (7 days,
+  `ZMEM_SENTINEL_SWEEP_DAYS`), like the capture/convention prompt markers.
 
 To force a refresh per host when doctor reports drift:
 
@@ -504,7 +508,10 @@ To force a refresh per host when doctor reports drift:
 Release maintainers: regenerate the manifest with
 `python scripts/release_gate.py --emit-manifest` and commit it with the release;
 the Release workflow runs `--verify-manifest` and refuses to publish a release
-whose manifest does not describe its own tree.
+whose manifest does not describe its own tree. Run
+`python scripts/release_gate.py --verify-manifest` locally as the pre-push
+check on any release-prep branch (a manual `gh release create` bypasses the
+workflow's verify, so verify before you push).
 
 ## Project-level memory
 

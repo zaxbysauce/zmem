@@ -276,7 +276,7 @@ class DriftCliTest(unittest.TestCase):
         lines = _drift_lines(self.data)
         self.assertEqual(len(lines), 1)
         self.assertRegex(lines[0], DRIFT_LINE_RE)
-        marker = self.data / ".drift-checked-sess-a"
+        marker = drift._marker_path(self.data, "sess-a")
         self.assertTrue(marker.is_file())
 
     def test_log_once_at_most_once_per_session(self):
@@ -303,7 +303,7 @@ class DriftCliTest(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(json.loads(second.stdout)["status"], "already")
         self.assertEqual(_drift_lines(self.data), [])
-        self.assertTrue((self.data / ".drift-checked-sess-a").is_file())
+        self.assertTrue(drift._marker_path(self.data, "sess-a").is_file())
 
     def test_log_once_missing_manifest_never_blocks(self):
         """AC2: no manifest -> unknown, exit 0, no line, marker still set."""
@@ -326,8 +326,98 @@ class DriftCliTest(unittest.TestCase):
         r = _run_log_once(self.root, self.data, hostile)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(
-            (self.data / f".drift-checked-{_sanitize(hostile)}").is_file())
+            drift._marker_path(self.data, hostile).is_file())
         self.assertEqual(len(_drift_lines(self.data)), 1)
+
+    def test_marker_names_collision_free_for_prefix_sharing_sids(self):
+        """CS-1: two distinct sids sharing 200 sanitized chars must NOT
+        collide on one marker — each logs its own drift line."""
+        _write_manifest(self.root)
+        (self.root / "hooks/zmem-recall.sh").write_bytes(b"#!/bin/sh\n")
+        long_a = "sess-" + "a" * 200
+        long_b = "sess-" + "a" * 197 + "bcd"
+        self.assertNotEqual(drift._marker_path(self.data, long_a),
+                            drift._marker_path(self.data, long_b))
+        for sid in (long_a, long_b):
+            r = _run_log_once(self.root, self.data, sid)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(json.loads(r.stdout)["status"], "drifted")
+        self.assertEqual(len(_drift_lines(self.data)), 2)
+
+    def test_manifest_non_string_hash_values_degrade_to_unknown(self):
+        """CS-3/M1-1: a corrupt manifest (non-string hash values) must be
+        treated as unreadable (unknown), never as whole-tree drift."""
+        (self.root / "release-manifest.json").write_text(
+            json.dumps({"version": "9.9.9",
+                        "files": {"hooks/zmem-recall.sh": 12345}}),
+            encoding="utf-8")
+        self.assertEqual(drift.evaluate(self.root)["status"], "unknown")
+        (self.root / "release-manifest.json").write_text(
+            json.dumps({"version": "9.9.9",
+                        "files": {"hooks/zmem-recall.sh": {"a": 1}}}),
+            encoding="utf-8")
+        self.assertEqual(drift.evaluate(self.root)["status"], "unknown")
+
+    def test_no_subcommand_keeps_stdout_pure(self):
+        """CS-5: a mis-invoked drift.py must never put non-JSON on stdout
+        (session-start captures stdout as DRIFT_JSON and parses it)."""
+        r = _run_cli()
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stdout, "")
+        self.assertTrue(r.stderr.strip())
+
+    def test_marker_path_as_directory_recovers(self):
+        """M2-4: a stray DIRECTORY at the marker path must not suppress the
+        session's drift line forever — it is removed and detection proceeds."""
+        _write_manifest(self.root)
+        (self.root / "hooks/zmem-recall.sh").write_bytes(b"#!/bin/sh\n")
+        marker = drift._marker_path(self.data, "sess-a")
+        marker.mkdir(parents=True)
+        r = _run_log_once(self.root, self.data, "sess-a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        payload = json.loads(r.stdout)
+        self.assertEqual(payload["status"], "drifted")
+        self.assertTrue(payload["logged"])
+        self.assertEqual(len(_drift_lines(self.data)), 1)
+        self.assertTrue(marker.is_file())
+
+    def test_failed_log_append_releases_marker_for_retry(self):
+        """CS-2: if the bg-log append fails after the marker was created, the
+        marker is released so a later call retries instead of leaving a
+        marker with no drift line."""
+        _write_manifest(self.root)
+        (self.root / "hooks/zmem-recall.sh").write_bytes(b"#!/bin/sh\n")
+        marker = drift._marker_path(self.data, "sess-a")
+        # RO dir: marker create succeeds (file in RO dir? no) — instead point
+        # --data-dir at a dir where zmem-bg.log cannot be appended: make the
+        # log path a DIRECTORY, so open(..., "a") raises OSError.
+        (self.data / "zmem-bg.log").mkdir()
+        r = _run_log_once(self.root, self.data, "sess-a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        payload = json.loads(r.stdout)
+        self.assertEqual(payload["status"], "drifted")
+        self.assertFalse(payload["logged"])
+        self.assertFalse(marker.exists(),
+                         "marker must be released when the log write fails")
+        # Retry with the blocker removed: the line is written then.
+        (self.data / "zmem-bg.log").rmdir()
+        r2 = _run_log_once(self.root, self.data, "sess-a")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertTrue(json.loads(r2.stdout)["logged"])
+        self.assertEqual(len(_drift_lines(self.data)), 1)
+
+    def test_hostile_version_sanitized_in_system_message(self):
+        """ST-1: newlines/ANSI escapes in a hostile manifest version must not
+        reach the operator systemMessage (display-forgery class)."""
+        hostile_version = "9.9.9\nFAKE LOG LINE\x1b[31mRED"
+        _write_manifest(self.root, version=hostile_version)
+        (self.root / "hooks/zmem-recall.sh").write_bytes(b"#!/bin/sh\n")
+        r = _run_log_once(self.root, self.data, "sess-a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        msg = json.loads(r.stdout)["system_message"]
+        self.assertNotIn("\n", msg)
+        self.assertNotIn("\x1b", msg)
+        self.assertIn("?", msg)
 
     def test_system_message_survives_hostile_manifest_version(self):
         """The systemMessage is generated inside drift.py from manifest fields;
@@ -500,6 +590,94 @@ class SessionStartDriftE2ETest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-800:])
         self.assertEqual(_drift_lines(self.data), [])
         self.assertNotIn("systemMessage", self._sentinel_payload(r.stdout))
+
+
+class RecallBodyGlueTest(unittest.TestCase):
+    """TF-2: the recall-body fallback glue (_maybe_log_drift) — marker
+    honored without spawning, argv correctness, fail-open on spawn error.
+
+    The module is loaded via importlib spec_from_file_location (the hyphenated
+    filename cannot be imported; module level is constants + defs + a
+    __main__ guard, so this is import-safe)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "zmem_recall_body_drift_glue",
+            str(REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py"))
+        cls.body = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.body)
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-drift107-glue-"))
+        self.data = self.tmp / "data"
+        self.data.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_marker_honored_without_spawn(self):
+        import unittest.mock
+        marker = drift._marker_path(self.data, "sess-a")
+        marker.write_text("checked\n", encoding="utf-8")
+        with unittest.mock.patch.object(
+                self.body.subprocess, "run",
+                side_effect=AssertionError("must not spawn")):
+            self.body._maybe_log_drift("sess-a")
+
+    def test_spawn_argv_and_env(self):
+        import unittest.mock
+        seen = {}
+        def fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            seen["timeout"] = kwargs.get("timeout")
+            class _R:
+                returncode = 0
+            return _R()
+        with unittest.mock.patch.object(self.body.subprocess, "run",
+                                        side_effect=fake_run):
+            with unittest.mock.patch.dict(
+                    os.environ, {"ZMEM_DATA": str(self.data),
+                                 "ZMEM_STORE": str(self.data / "s.sqlite")}):
+                self.body._maybe_log_drift("sess-glue")
+        argv = seen["argv"]
+        self.assertEqual(argv[1], str(DRIFT_PY))
+        self.assertEqual(argv[2:4], ["log-once", "--data-dir"])
+        self.assertEqual(argv[4], str(self.data))
+        self.assertEqual(argv[5:7], ["--sid", "sess-glue"])
+        self.assertEqual(seen["timeout"], 5)
+
+    def test_spawn_failure_swallowed(self):
+        import unittest.mock
+        marker = drift._marker_path(self.data, "sess-a")
+        with unittest.mock.patch.object(
+                self.body.subprocess, "run",
+                side_effect=OSError("boom")):
+            with unittest.mock.patch.dict(
+                    os.environ, {"ZMEM_DATA": str(self.data)}):
+                # Must not raise.
+                self.body._maybe_log_drift("sess-a")
+        self.assertFalse(marker.exists())
+
+
+class SweepPrefixPinTest(unittest.TestCase):
+    """RP-3: the session sweep must reap drift markers (unbounded-growth
+    guard). Pinned via a subprocess so the storelib import never resolves a
+    store from this test process's env."""
+
+    def test_drift_markers_in_sweep_prefixes(self):
+        code = (
+            "import sys; sys.path.insert(0, %r); "
+            "from storelib.backup import SENTINEL_PREFIXES; "
+            "assert '.drift-checked-' in SENTINEL_PREFIXES, SENTINEL_PREFIXES"
+        ) % str(SCRIPTS)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM")}
+        env["ZMEM_STORE"] = str(Path(tempfile.mkdtemp()) / "s.sqlite")
+        r = subprocess.run([PYTHON, "-c", code], env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 if __name__ == "__main__":

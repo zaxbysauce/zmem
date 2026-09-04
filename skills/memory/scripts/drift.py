@@ -84,6 +84,15 @@ def _sanitize_sid(sid: str) -> str:
     return _SID_SAFE_RE.sub("_", (sid or ""))[:128] or "unknown"
 
 
+def _marker_key(sid: str) -> str:
+    """Collision-proof marker key: readable truncated prefix + short hash of
+    the FULL sanitized sid (hashing the truncated form would still collide
+    for sids sharing their first 128 sanitized characters)."""
+    full = _SID_SAFE_RE.sub("_", (sid or "")) or "unknown"
+    digest = hashlib.sha256(full.encode("utf-8")).hexdigest()
+    return f"{full[:128]}-{digest[:8]}"
+
+
 def _is_surface(rel: str) -> bool:
     """True when a POSIX relpath belongs to the runtime surface."""
     parts = rel.split("/")
@@ -149,6 +158,11 @@ def load_manifest(root: Path):
     files = data.get("files")
     if not isinstance(files, dict):
         return None
+    # Schema gate: hash values must be strings. A hand-edited/corrupt manifest
+    # with non-string values would otherwise compare unequal to every served
+    # hash and report whole-tree drift (wrong remediation path).
+    if not all(isinstance(v, str) for v in files.values()):
+        return None
     return data
 
 
@@ -192,7 +206,10 @@ def evaluate(root: Path) -> dict:
 
 
 def _operator_message(result: dict) -> str:
-    version = result.get("version") or "unknown"
+    # Display hardening: the manifest is data, not trusted text — collapse any
+    # non-printable byte (newlines, ANSI escapes) so a hostile version string
+    # cannot forge log-like lines in the operator's systemMessage render.
+    version = re.sub(r"[^\x20-\x7e]", "?", str(result.get("version") or "unknown"))
     return (
         "zmem: served code drifted from release {v} - {n} runtime file(s) "
         "differ (served {s} vs release {r}). Run zmem doctor "
@@ -206,7 +223,7 @@ def _operator_message(result: dict) -> str:
 
 
 def _marker_path(data_dir: Path, sid: str) -> Path:
-    return Path(data_dir) / f".drift-checked-{_sanitize_sid(sid)}"
+    return Path(data_dir) / f".drift-checked-{_marker_key(sid)}"
 
 
 def _bg_log_max_bytes() -> int:
@@ -249,12 +266,24 @@ def log_once(root: Path, data_dir: Path, sid: str) -> dict:
     The exclusive marker is created FIRST (the .native-nudge-shown race
     pattern): only the process that wins the create evaluates, so concurrent
     first decisions of one session produce at most one line (issue #107
-    acceptance criterion 3). When the marker cannot be created the function
-    reports error and does NOT log — a wedged marker dir must not turn the
-    per-session line into a per-call line."""
+    acceptance criterion 3). A wedged marker path (a DIRECTORY at the marker
+    path) is removed best-effort so one stray directory cannot suppress the
+    session's drift line forever; if removal fails the function reports error
+    and does NOT log. Failure-recovery contract: if the evaluate or the
+    bg-log append fails AFTER the marker was created, the marker is removed
+    so a later call retries, instead of leaving a permanent marker with no
+    drift line."""
     marker = _marker_path(data_dir, sid)
     if os.path.isfile(marker):
         return {"status": "already", "logged": False}
+    if os.path.isdir(marker):
+        # Stray directory at the marker path (manual intervention, a partial
+        # makedirs): remove so detection is not silently suppressed.
+        import shutil
+        try:
+            shutil.rmtree(marker)
+        except OSError:
+            return {"status": "error", "logged": False}
     try:
         os.makedirs(marker.parent, exist_ok=True)
         fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -264,12 +293,29 @@ def log_once(root: Path, data_dir: Path, sid: str) -> dict:
             os.close(fd)
     except OSError:
         return {"status": "error", "logged": False}
-    result = evaluate(root)
+
+    def _release_marker():
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+
+    try:
+        result = evaluate(root)
+    except Exception:
+        # Marker must not survive a failed evaluation, or the session's drift
+        # line is permanently suppressed (crash-window contract).
+        _release_marker()
+        return {"status": "error", "logged": False}
     payload = dict(result)
     payload["logged"] = False
     if result["status"] == "drifted":
         payload["logged"] = _append_bg_line(data_dir, result)
         payload["system_message"] = _operator_message(result)
+        if not payload["logged"]:
+            # Log write failed: release the marker so a later call retries
+            # instead of leaving a marker with no corresponding line.
+            _release_marker()
     return payload
 
 
@@ -301,8 +347,12 @@ def main(argv=None) -> int:
         print(json.dumps(log_once(Path(args.root), Path(args.data_dir),
                                   args.sid)))
         return 0
-    ap.print_help()
-    return 0
+    # Stdout-purity contract: session-start captures this script's stdout as
+    # DRIFT_JSON and json.loads parses it. Help text goes to STDERR with a
+    # non-zero exit so a mis-invoked drift.py can never put non-JSON on
+    # stdout (a silent operator-notice suppressor).
+    ap.print_help(file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

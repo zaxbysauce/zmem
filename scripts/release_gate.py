@@ -321,8 +321,12 @@ def _discover_manifests_disk(repo_root: Path) -> list[str]:
         dirnames[:] = [d for d in dirnames
                        if d not in (".git", "node_modules", "__pycache__")]
         for name in filenames:
-            rel = Path(dirpath).joinpath(name).relative_to(
-                repo_root).as_posix()
+            full = os.path.join(dirpath, name)
+            # Never read through symlinks: a planted file-symlink could point
+            # outside the repo and be ingested as a manifest.
+            if os.path.islink(full):
+                continue
+            rel = Path(full).relative_to(repo_root).as_posix()
             if MANIFEST_RE.search(rel):
                 out.append(rel)
     return sorted(out)

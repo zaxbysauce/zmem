@@ -228,19 +228,30 @@ def _maybe_log_drift(session_id: str) -> None:
     the SAME per-session marker so the zmem-drift bg-log line is written at
     most once per session regardless of which writer wins. Fail-open and
     bounded: the marker is one stat after the first call, and the drift
-    subprocess gets a 5s timeout (hashing the runtime surface is
-    milliseconds-scale; 5s is pathological headroom only, well under this
-    hook own subprocess budget). The drift.py path is derived from THIS
-    file own tree (parents[2]) — never from env — so a partial refresh can
-    never spawn a drift checker from a different tree.
-    """
+    subprocess gets a 5s timeout — on timeout subprocess.run kills the child;
+    because drift.py creates the marker BEFORE evaluating, even a killed run
+    leaves the marker, so the realistic worst case is one skipped drift check
+    per session (pre-0.17 behavior), not a re-spawn per decision. The drift
+    subprocess costs ~200ms (surface walk + hashing) once per session; that
+    is accepted, documented latency, not a per-decision cost. The drift.py
+    path is derived from THIS file own tree (parents[2]) — never from env —
+    so a partial refresh can never spawn a drift checker from a different
+    tree. The marker name MUST mirror drift.py _marker_path exactly (readable
+    sanitized prefix + sha8 of the full sanitized sid); drift.py owns the
+    authoritative create, this guard is only a fast-path stat."""
     try:
         data_dir = _data_dir()
+        import hashlib as _hashlib
         import re as _re_drift
-        safe_sid = _re_drift.sub(
-            r"[^A-Za-z0-9._-]", "_", (session_id or ""))[:128] or "unknown"
-        marker = os.path.join(
-            data_dir, ".drift-checked-{0}".format(safe_sid))
+        # Mirror drift.py _marker_key EXACTLY: readable truncated prefix +
+        # sha8 of the FULL sanitized sid (hashing the truncated form would
+        # collide for sids sharing their first 128 sanitized chars).
+        safe_full = _re_drift.sub(
+            r"[^A-Za-z0-9._-]", "_", (session_id or "")) or "unknown"
+        marker_key = "{0}-{1}".format(
+            safe_full[:128],
+            _hashlib.sha256(safe_full.encode("utf-8")).hexdigest()[:8])
+        marker = os.path.join(data_dir, ".drift-checked-{0}".format(marker_key))
         if os.path.isfile(marker):
             return
         drift_py = os.path.join(
