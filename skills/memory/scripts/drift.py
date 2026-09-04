@@ -80,10 +80,6 @@ _SID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 _BG_LOG_DEFAULT_MAX_BYTES = 262144
 
 
-def _sanitize_sid(sid: str) -> str:
-    return _SID_SAFE_RE.sub("_", (sid or ""))[:128] or "unknown"
-
-
 def _marker_key(sid: str) -> str:
     """Collision-proof marker key: readable truncated prefix + short hash of
     the FULL sanitized sid (hashing the truncated form would still collide

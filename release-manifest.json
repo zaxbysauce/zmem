@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "5e6f42b9a05ddf84c7a0ab82c878092c4b0b151b7549c9adf2026e52ba9a5aa3",
+  "digest": "98ded51d83a556ac3f391f579996a1bff13cbc9fccff34badc968e9b8d044bf2",
   "files": {
     "hermes-plugin/__init__.py": "39ad2617be05846d35aa6eef2bd63ba513ce14fafe0816f381efe836a804f036",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -36,7 +36,7 @@
     "skills/memory/scripts/correction_queue.py": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
     "skills/memory/scripts/doctor.py": "889dd5b7da2dd8a7aa2a657a97d02b4130bf5dd6d5ea7e21c17e08ac59a48ef3",
-    "skills/memory/scripts/drift.py": "8f7d96f61060fe69d8a3a85019e56f8a7fdb0e93252abe63ad83c43f4e33a4bf",
+    "skills/memory/scripts/drift.py": "aa1dd3aca609772130573e72dc3566d41dfb884a5795c3bb22e7f713fe11b665",
     "skills/memory/scripts/embed_profiles.py": "0666878e7c4924bf8798fed0641bbdaf36b33edad1c7f7d16ecf5e984e06899c",
     "skills/memory/scripts/embeddings.py": "5828b0a26701315f730ba383bc4545bffe9f64859ec7426161dde65acfa6cd0a",
     "skills/memory/scripts/history_mining.py": "654ed03ab1a1d3a505f37d2a0840a1f286ad946b4c3559336fa944d749509881",
