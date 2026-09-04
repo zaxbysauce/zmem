@@ -662,8 +662,9 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         bg_log_path = os.path.join(data_dir, "zmem-bg.log")
     lines = parse_bg_log(bg_log_path)
     # An injection line is EITHER writer A's explicit reason=injected OR
-    # writer B's shape (the session-start writer has never carried reason=;
-    # its injections are marked status=injected with no reason field).
+    # writer B's legacy shape (status=injected with no reason field — the
+    # session-start writer's pre-#114 form; it now emits reason= too, but
+    # logs from mixed-version deployments keep both shapes readable).
     # Baseline-run finding: filtering on reason=injected alone silently
     # dropped every session-start injection and inflated the miss rate.
     injected = [ln for ln in lines

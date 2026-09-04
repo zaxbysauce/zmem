@@ -46,7 +46,8 @@ owns (#133).
 - **hooks** (issue #114): the recall body and the SessionStart Tier-2 lane
   pass `--for-injection` and stop gate/budget-ing locally — the store already
   did it, in the same process that writes the telemetry. The bg-log decision
-  line format is unchanged; `all=` is now pinned to the PRE-gate candidate
+  line format is unchanged for the recall-body writer; the session-start
+  writer gains `reason=` (and logs silent pulls); `all=` is now pinned to the PRE-gate candidate
   set everywhere (the session-start writer previously logged the post-gate
   rows — aligned to the convention the #94/#105 miss-rate join matches
   against); session-start lines now carry `reason=` and are written whenever
