@@ -75,8 +75,11 @@ class ForInjectionBase(unittest.TestCase):
                   "--content", "keep the flange calibrated before every launch",
                   "--tags", "flange", "--signal", "test",
                   "--confidence", "0.9", "--json")
+        # The dropped row deliberately shares the token "flange" with the
+        # rendered row: pool membership must not depend on embeddings
+        # (model-absent CI legs), only the gate decides its fate.
         self._run("add", "--namespace", NS, "--type", "lesson",
-                  "--content", "vibes only opinion note about nothing much",
+                  "--content", "flange vibes only opinion note about nothing much",
                   "--tags", "vibes", "--signal", "none",
                   "--confidence", "0.3", "--json")
 
