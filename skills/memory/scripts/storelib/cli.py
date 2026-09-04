@@ -227,7 +227,8 @@ def main():
                                "selective inject gate and token budget INSIDE this call, "
                                "return only the rendered rows, and record exactly one "
                                "surfaced_count event per rendered QUERY-MATCHED row "
-                               "(link/unfold neighbors render but are never counted). "
+                               "(link neighbors render but are never counted; "
+                               "unfold is explicit-recall-only and never runs here). "
                                "Implies --no-bump; the --json envelope gains reason and "
                                "candidate_ids (pre-gate ids) for the hook decision log.")
     p_recall.add_argument("--as-of", type=_iso8601, default=None,
@@ -1225,12 +1226,28 @@ def main():
             # cross_encoder.cli_allowed; --no-bump excludes every passive hook
             # caller structurally, --no-hybrid keeps search's byte-stable
             # contract out of scope even when aliased through this argv.
-            rerank_flag = _ce_cli_allowed(no_bump=args.no_bump,
-                                          no_hybrid=args.no_hybrid)
+            # Issue #114 review (PRR-002): the injection lane is passive
+            # even without an explicit --no-bump (recall_memory forces
+            # no_bump for it), so it must be structurally incapable of
+            # reaching the cross-encoder scorer like every other passive
+            # surface.
+            rerank_flag = (_ce_cli_allowed(no_bump=args.no_bump,
+                                           no_hybrid=args.no_hybrid)
+                           and not args.for_injection)
             # Issue #82: --explain dispatches to the read-only retrieval
             # debugger (zero writes, never unfolds, fail-open). It is a flag,
             # not a subcommand, so KNOWN_SUBCMDS stays byte-identical.
             if getattr(args, "explain", False):
+                if args.for_injection:
+                    # Issue #114 review (PRR-003): explain is the read-only
+                    # debugger and has no injection-lane mode; reject the
+                    # combination loudly instead of silently ignoring the
+                    # flag.
+                    print("[zmem] --for-injection is not supported with "
+                          "--explain: explain never applies the inject gate "
+                          "or budget. Re-run without one of the flags.",
+                          file=sys.stderr)
+                    sys.exit(2)
                 explain_recall(conn, query=args.query, target=args.target,
                                namespace=args.namespace, limit=args.limit,
                                as_json=args.json, hybrid=hybrid_arg,

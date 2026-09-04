@@ -1091,8 +1091,9 @@ def recall_memory(
     the rendered set, and the surfaced_count/last_surfaced write covers only those
     rendered rows that were also QUERY-MATCHED (the pre-expansion bump set — same law
     as always: popularity rewards matches, not link neighbors). Implies no_bump
-    semantics; the envelope gains ``reason`` and ``candidate_ids`` (pre-gate ids) so
-    hook-side bg-log ``all=`` keeps its miss-rate-join meaning. ``no_telemetry``
+    semantics; the envelope gains ``reason`` and ``candidate_ids`` (pre-gate ids,
+    captured after link expansion — mirroring the hook's historical ``all=``
+    set) so hook-side bg-log ``all=`` keeps its miss-rate-join meaning. ``no_telemetry``
     suppresses the write but NOT the filters, so the eval harness can exercise this
     lane as a zero-write read.
 
@@ -1260,7 +1261,10 @@ def recall_memory(
     # which makes hook/PreCompact/prefetch invocations structurally incapable
     # of reaching a scorer. The helper itself degrades to the input order on
     # any scorer absence/error, so a missing model never fails a recall.
-    if cross_rerank:
+    if cross_rerank and not for_injection:
+        # Issue #114 review (PRR-002): belt-and-suspenders — a library
+        # caller passing cross_rerank=True with for_injection=True still
+        # cannot reach the scorer on the passive injection lane.
         results = _cross_maybe_rerank(query, results)
     bump_ids = [r["id"] for r in results]
     if link_hops >= 1 and link_budget >= 1 and results:
@@ -1301,10 +1305,10 @@ def recall_memory(
     # Placement (plan-critic pinned): AFTER link expansion and unfold (so
     # expansion rows are eligible for gate-drop and consume budget exactly
     # as they did under the hook's post-return budget) and BEFORE telemetry.
-    candidate_rows = results
-    candidate_ids = [r["id"] for r in candidate_rows]
     inj_reason = None
     if for_injection:
+        candidate_rows = results
+        candidate_ids = [r["id"] for r in candidate_rows]
         selected_rows, _gate_status = selective_inject_filter(results)
         budget_emptied = False
         if selected_rows:
@@ -1321,7 +1325,8 @@ def recall_memory(
     if for_injection:
         # Issue #114: surfaced telemetry covers ONLY the rendered rows that
         # were also QUERY-MATCHED — the pre-expansion bump set (same law as
-        # ever: link/unfold neighbors render but never feed the counters).
+        # ever: link neighbors render but never feed the counters;
+        # unfold is explicit-recall-only and structurally never runs here).
         # v12 (issue #64): no_telemetry (the eval harness) records nothing,
         # but the filters above still ran.
         matched = set(bump_ids)
@@ -2033,10 +2038,10 @@ def recent_memory(
     # surfaced telemetry only for the rendered rows. recent has no expansion
     # or unfold, so every candidate is query-legitimate; the write set is
     # simply the gate+budget survivors.
-    candidate_rows = results
-    candidate_ids = [r["id"] for r in candidate_rows]
     inj_reason = None
     if for_injection:
+        candidate_rows = results
+        candidate_ids = [r["id"] for r in candidate_rows]
         selected_rows, _gate_status = selective_inject_filter(results)
         budget_emptied = False
         if selected_rows:

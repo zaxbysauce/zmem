@@ -206,6 +206,11 @@ def selective_inject_filter(
             conf = float(r.get("confidence", 0) or 0)
         except (TypeError, ValueError):
             conf = 0.0
+        # Review round (PRR-009): NaN/inf confidence must fail the gate like
+        # _row_priority normalizes them — inf would otherwise compare >= any
+        # floor. Same normalization as inject._row_priority.
+        if conf != conf or conf in (float("inf"), float("-inf")):
+            conf = 0.0
         sig = (r.get("signal") or "none").lower()
         if sig == "none":
             if conf >= gate_none_floor:

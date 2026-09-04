@@ -461,7 +461,8 @@ Issue #114 sharpened that contract in two ways. First, the automatic hooks and
 SessionStart now pass `--for-injection` (with `--no-bump`): the selective
 inject gate and the token budget run INSIDE that one store call, the returned
 rows are exactly the rendered set, and `surfaced_count` advances only for
-rendered QUERY-MATCHED rows (link/unfold neighbors render but never count) —
+rendered QUERY-MATCHED rows (link neighbors render but never count; unfold
+is explicit-recall-only and never runs on this lane) —
 one subprocess, one decision, no second ack process. Second, ranking
 popularity now reads `retrieval_count` ONLY: passive surfaces are still
 recorded (promote/prune/consolidate consume them) but they no longer feed the

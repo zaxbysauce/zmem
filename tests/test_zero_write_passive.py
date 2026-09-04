@@ -167,6 +167,57 @@ class AcceptanceRecallTest(ForInjectionBase):
                          "exactly one surface event per decision, two decisions")
         self.assertTrue(all(counts[p][1] == 0 for p in dropped))
 
+    def test_link_neighbor_rendered_but_never_counted(self):
+        # PRR-013 (review round): the PR's load-bearing telemetry law, pinned
+        # end-to-end — a link-expansion neighbor RENDERS on the injection
+        # lane but must never gain surfaced_count (popularity rewards
+        # query-matched rows, not link neighbors).
+        counts = self._counts()
+        rendered = next(p for p in counts if self._signal_of(p) == "test")
+        r = self._run("add", "--namespace", NS, "--type", "lesson",
+                      "--content", "unrelated zebra migration patterns note",
+                      "--tags", "zebra", "--signal", "test",
+                      "--confidence", "0.9", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn = sqlite3.connect(self.store)
+        try:
+            rendered_full = conn.execute(
+                "SELECT id FROM memory WHERE id LIKE ?",
+                (rendered + "%",)).fetchone()[0]
+            neighbor_full = conn.execute(
+                "SELECT id FROM memory WHERE content LIKE 'unrelated zebra%'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        neighbor = neighbor_full[:8]
+        r = self._run("links", "--add", "--id", rendered_full,
+                      "--id", neighbor_full,
+                      "--relation", "related", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # --no-hybrid: the zebra row shares no token with the query, so in
+        # lexical mode the link is the ONLY way it can render (with
+        # embeddings available the vector lane would surface it as a direct
+        # match, making the pin vacuous locally while CI stays lexical).
+        r = self._run("recall", "--query", "flange calibrated launch",
+                      "--namespace", NS, "--limit", "5", "--no-hybrid",
+                      "--no-bump", "--for-injection", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        doc = json.loads(r.stdout)
+        ids = [x["id"][:8] for x in doc["results"]]
+        self.assertIn(neighbor, ids,
+                      "precondition: the neighbor must render via the link "
+                      "expansion, or this test proves nothing")
+        self.assertTrue(any(x.get("link_relation") for x in doc["results"]
+                            if x["id"][:8] == neighbor),
+                        "neighbor must arrive as a link row, not a direct "
+                        "match, for this pin to be meaningful")
+        after = self._counts()
+        self.assertGreaterEqual(after[rendered][1], 1,
+                                "the query-matched row is counted")
+        self.assertEqual(after[neighbor][1], 0,
+                         "the link neighbor rendered but must never be "
+                         "surfaced-counted (issue #114 review PRR-013)")
+
     def test_budget_dropped_rows_unchanged_and_reason_budget_drop(self):
         # A budget no normal row can fit under (fence overhead alone is 12) —
         # gate passes, admission wipes the set: the #87 budget-drop shape.
@@ -320,26 +371,39 @@ class ZeroWriteTest(ForInjectionBase):
 
     def test_for_injection_with_no_telemetry_is_zero_write(self):
         before = Path(self.store).read_bytes()
+        # PRR-012 (review round): save/restore the process env and storelib
+        # state — never leak the fixture store path to whatever runs after
+        # this test in the same process.
+        saved_store = os.environ.get("ZMEM_STORE")
         os.environ["ZMEM_STORE"] = self.store
         storelib._refresh_env_state()
-        import io
-        import contextlib
-        conn = sqlite3.connect(
-            "file:" + self.store.replace(os.sep, "/") + "?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row  # storelib readers index by column name
         try:
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                rows = storelib.recall_memory(
-                    conn, query="flange calibrated launch", namespace=NS,
-                    limit=5, as_json=False, no_bump=True, for_injection=True,
-                    no_telemetry=True)
-            self.assertEqual(len(rows), 1, "filters ran; the gate still applies")
+            import io
+            import contextlib
+            conn = sqlite3.connect(
+                "file:" + self.store.replace(os.sep, "/") + "?mode=ro",
+                uri=True)
+            conn.row_factory = sqlite3.Row  # storelib readers index by name
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rows = storelib.recall_memory(
+                        conn, query="flange calibrated launch", namespace=NS,
+                        limit=5, as_json=False, no_bump=True,
+                        for_injection=True, no_telemetry=True)
+                self.assertEqual(len(rows), 1,
+                                 "filters ran; the gate still applies")
+            finally:
+                conn.close()
+            self.assertEqual(Path(self.store).read_bytes(), before,
+                             "no_telemetry must suppress the surfaced write "
+                             "while the gate/budget filters still run")
         finally:
-            conn.close()
-        self.assertEqual(Path(self.store).read_bytes(), before,
-                         "no_telemetry must suppress the surfaced write while "
-                         "the gate/budget filters still run")
+            if saved_store is None:
+                os.environ.pop("ZMEM_STORE", None)
+            else:
+                os.environ["ZMEM_STORE"] = saved_store
+            storelib._refresh_env_state()
 
 
 class PopularityInputTest(unittest.TestCase):

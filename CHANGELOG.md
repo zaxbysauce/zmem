@@ -19,6 +19,28 @@ recall can no longer write ranking popularity for rows that never reached the
 model (#114), plus the miss-rate kill-switch discrimination the P2 onboarding
 owns (#133).
 
+### Added
+
+- **memory** (issue #114, P2-3): new `--for-injection` flag on `recall` and
+  `recent` — the passive INJECTION lane. The selective inject gate and the
+  token budget now run INSIDE the single store subprocess (after MMR, rerank,
+  entity cards, link expansion and unfold; before telemetry); the returned
+  rows are exactly the rendered set; `surfaced_count` advances only for
+  rendered QUERY-MATCHED rows (link neighbors render but never count; unfold
+  is explicit-recall-only and never runs here); `retrieval_count` is never
+  written on this lane. No second ack process (one store.py start ~1.5 s
+  against a 15 s hook timeout, #121). Under the flag only, the `--json`
+  envelope gains `reason` (the #87 closed set, or `injected`) and
+  `candidate_ids` (pre-gate ids, captured after expansion — the bg-log
+  `all=` pre-image), so plain-path output stays byte-identical.
+  `recent_memory` also gains the `no_telemetry` seam for symmetry with
+  `recall_memory`.
+- **tests** (issue #114): new `tests/test_zero_write_passive.py` pins the
+  #114 acceptance criteria (gate/budget-dropped rows untouched; rendered
+  rows counted exactly once per decision; five pinned-clock recalls with
+  stable scores; `--explain`/eval zero-write; the flag/telemetry truth
+  table; link neighbors rendered but never counted).
+
 ### Changed
 
 - **memory** (issue #114, P2-3): ranking popularity now reads
@@ -32,17 +54,6 @@ owns (#133).
   `scripts/eval_runner.py --gold eval/gold.jsonl`, before vs after):
   hit_at_k 1.0 → 1.0, mrr 0.947917 → 0.947917, as_of_accuracy 1.0 → 1.0,
   injection_omit_rate 1.0 → 1.0, per-item diffs none.
-- **memory** (issue #114, P2-3): new `--for-injection` flag on `recall` and
-  `recent` — the passive injection lane. The selective inject gate and the
-  token budget now run INSIDE the single store subprocess (after MMR, rerank,
-  entity cards, link expansion and unfold; before telemetry); the returned
-  rows are exactly the rendered set; `surfaced_count` advances only for
-  rendered QUERY-MATCHED rows (link/unfold neighbors render but never count);
-  the `--json` envelope gains `reason` (the #87 closed set, or `injected`)
-  and `candidate_ids` (pre-gate ids, the bg-log `all=` pre-image) under the
-  flag only, so plain-path output stays byte-identical. `recent_memory` also
-  gains the `no_telemetry` seam for symmetry with `recall_memory`. No second
-  ack process (one store.py start ~1.5 s against a 15 s hook timeout, #121).
 - **hooks** (issue #114): the recall body and the SessionStart Tier-2 lane
   pass `--for-injection` and stop gate/budget-ing locally — the store already
   did it, in the same process that writes the telemetry. The bg-log decision
@@ -57,6 +68,14 @@ owns (#133).
   bg-log lines (the ZMEM_INJECT=0 kill-switch marker) into a distinct
   `counts.disabled` bucket, excluded from the numerator AND denominator with
   a caveat — a disabled window now reads as "switch off", not 100% miss.
+- **memory** (review round on this PR): `--explain --for-injection` is
+  rejected loudly instead of silently ignoring the flag; the cross-encoder
+  rerank gate treats the injection lane as passive (a passive surface can
+  never reach the scorer); the hook body prints a stderr diagnostic when the
+  store subprocess fails (mixed-version deployments are diagnosable, still
+  fail-closed); `doctor --miss-rate` disabled-window attribution is
+  session-correlated like injected attribution, and the gate/budget
+  select_inject_filter normalizes NaN/inf confidence.
 - **tests** (issue #133): near-miss whitespace pins (`"0 "`/`" 0"`, plus
   enabled near-misses) for the two kill-switch sites that only had
   literal-"0" coverage (the Hermes reflect hook and MCP `session_start`),
@@ -66,6 +85,9 @@ owns (#133).
   rows counted exactly once per decision; five pinned-clock recalls with
   stable scores; `--explain`/eval zero-write; the flag/telemetry truth
   table).
+
+### Compatibility
+
 - Schema unchanged at v13 — `surfaced_count`/`last_surfaced` columns are
   retained, nothing dropped; older released clients keep working against
   the shared store until they pull this version.

@@ -13,9 +13,9 @@ This module covers:
     all adapters so a future adapter cannot silently introduce a fourth rule.
   - `consolidate --prune` protection: a memory that has been SURFACED but never explicitly
     retrieved must NOT be pruned by the never-used rule.
-  - `compute_score` popularity blends surfaced + retrieval (a surfaced-only row scores
-    above an inert row; equivalent surface totals score equal regardless of which counter
-    carried the events).
+  - `compute_score` popularity reads `retrieval_count` ONLY (issue #114: a
+    surfaced-only row scores exactly like an inert row no matter how many
+    passive surface events it has; explicit retrieval still outranks).
 
 Run: python tests/test_surface_consistency.py   (no pytest required — repo convention)
 """

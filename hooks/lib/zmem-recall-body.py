@@ -21,12 +21,19 @@ argv contract (see main()):
             subagent-recall passes 5/3 to preserve its pull width)
 
 The body:
-  1. Calls ``python store.py recall|recent ...`` with --no-bump, --json,
-     and the per-mode query/limit set. Hooks never write the store.
-  2. Reads the JSON dict list from stdout.
-  3. Applies the selective-inject gate (signals test|compile|lint|reviewer
-     above the prompt floor; signal=none above the gate-none floor;
-     everything else omitted).
+  1. Calls ``python store.py recall|recent ...`` with --no-bump,
+     --for-injection (issue #114: the selective-inject gate and the token
+     budget run INSIDE the store subprocess), --json, and the per-mode
+     query/limit set. Hooks never write the store. A store subprocess that
+     predates --for-injection (mixed-version deployment) fails here and the
+     hook degrades fail-closed to a silent decision line — never ungated
+     injection.
+  2. Reads the JSON envelope from stdout (the rows are already the
+     gate+budget survivors; the envelope carries the decision reason and
+     the pre-gate candidate ids for the bg-log all= field).
+  3. Derives the decision status/reason from the envelope (the closed-set
+     classifier below remains only as a fail-open fallback for stores that
+     do not stamp a reason).
   4. Renders the rows through ``storelib._format_fenced_recall`` into a
      fenced, provenance-tagged block.
   5. Emits ``{"additionalContext": <ctx>}`` on stdout (the .sh wrappers
@@ -258,7 +265,9 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
             # Issue #114: on the --for-injection lane the hook receives only
             # the RENDERED rows; the pre-gate candidate ids ride the envelope
             # (candidate_ids) so this field keeps its miss-rate-join meaning
-            # ("what the recall would have matched") unchanged.
+            # ("what the recall would have matched") unchanged. The fallback
+            # below (rows themselves) is post-gate and only reachable for
+            # legacy bare-list stores that predate candidate_ids.
             ids_all = list(all_ids)
         ids_sel = [r.get("id") for r in selected]
         # v13 (issue #65, 10.9): tokens kept/budget ride on the same line so
@@ -743,11 +752,25 @@ def main() -> int:
                 rows = rows.get("results", [])
             if not isinstance(rows, list):
                 rows = []
-    except Exception:
+    except Exception as _store_exc:
         rows = []
         omitted = 0
         envelope_reason = None
         envelope_candidates = None
+        # Issue #114 review (PRR-005): a store failure (timeout, crash, or an
+        # older store.py that predates --for-injection) must not masquerade
+        # as a silent empty pool with no trace. Still fail closed (inject
+        # nothing) — but say why on stderr so the launcher debug log carries
+        # the cause and mixed-version deployments are diagnosable.
+        # Only the exception TYPE + a caller-safe detail: str() of a
+        # CalledProcessError embeds the full argv, which would leak query
+        # terms into the launcher debug log.
+        _detail = getattr(_store_exc, "returncode", None)
+        _suffix = ("returncode=" + str(_detail)) if _detail is not None else ""
+        print("[zmem] store recall failed ("
+              + type(_store_exc).__name__
+              + (": " + _suffix if _suffix else "")
+              + "); injecting nothing this event", file=sys.stderr)
 
     # Issue #114 (P2-3): the store subprocess ran the injection lane
     # (--for-injection) — the selective gate and the token budget were applied

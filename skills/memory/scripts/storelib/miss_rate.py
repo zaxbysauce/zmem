@@ -800,12 +800,23 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         elif any(matched & set(ln["ids"]) for ln in cand_legacy):
             counts["surfaced_legacy"] += 1
             legacy_attributions += 1
-        elif disabled_lines and any(
-                lo <= ln["ts"] <= hi for ln in disabled_lines):
-            # Issue #133: the switch was OFF around this failure — the hook
-            # logged reason=disabled and injected nothing by design. Not a
-            # miss: excluded from the numerator AND the denominator so a
-            # disabled window reads as "switch off", never 100% miss.
+        elif (f_sid_real and any(
+                lo <= ln["ts"] <= hi
+                and (ln.get("sid") == f_sid
+                     or ln.get("sid") in (None, "unknown"))
+                for ln in disabled_lines)):
+            # Issue #133: the switch was OFF for THIS SESSION around this
+            # failure — the hook logged reason=disabled and injected nothing
+            # by design. Not a miss: excluded from the numerator AND the
+            # denominator so a disabled window reads as "switch off", never
+            # 100% miss. Review round (PRR-004): sid-correlated like the
+            # injected branches — another NAMED session's kill-switch window
+            # must not absorb this session's genuine miss (ZMEM_INJECT is
+            # per-process env, so concurrent sessions can differ). Sid-less
+            # disabled lines (hosts that never supplied a session id, pre-#94
+            # logs) weakly match any failure, mirroring the
+            # surfaced-sid/surfaced-legacy split above — a sid-less disabled
+            # line is still proof the switch was off for whatever ran.
             counts["disabled"] += 1
         else:
             counts["missed"] += 1
@@ -855,7 +866,8 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
             "error) — excluded from every rate, never counted as "
             "capture-gap")
     if (failures and counts["missed"] == 0 and counts["surfaced_sid"] == 0
-            and counts["surfaced_legacy"] == 0):
+            and counts["surfaced_legacy"] == 0
+            and counts["disabled"] == 0):
         caveats.append(
             "no miss-rate denominator: every examined failure landed in "
             "capture-gap or no-query — the rate fields are null by "

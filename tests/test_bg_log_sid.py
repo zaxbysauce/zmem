@@ -304,6 +304,11 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         self.assertRegex(line, r" sid=\S+$")
         self.assertEqual(line.count(" sid="), 1)
         self.assertNotIn("<", line)
+        # Issue #114 review (PRR-014): the aligned session-start line must
+        # carry the full shared-body field set, not just sid/status.
+        self.assertRegex(line, r" status=injected reason=injected ")
+        self.assertIn(" all=[", line)
+        self.assertRegex(line, r" ids=\[[^\]]*\] ")
 
     def test_session_start_without_session_logs_sid_unknown(self):
         r = self._run_session_start({})
@@ -336,6 +341,8 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         self.assertIn("status=silent", line)
         self.assertIn(" sid=sess-quiet", line)
         self.assertRegex(line, r" sid=\S+$")
+        # PRR-014: silent lines carry the envelope reason (budget-drop here)
+        self.assertIn(" reason=", line)
 
 
 if __name__ == "__main__":

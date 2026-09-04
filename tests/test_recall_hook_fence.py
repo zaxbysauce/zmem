@@ -1,10 +1,12 @@
 """Issue #58, 3.5: hook recall text is wrapped in a non-executable fence
 plus a one-line disclaimer. Each bullet carries id / confidence / source_ref.
 
-3.8 also lives here: the selective-inject gate in
-``hooks/lib/zmem-recall-body.py`` drops low-signal rows and emits the
-silent one-liner when nothing qualifies. The decision is appended to
-``zmem-bg.log``.
+3.8 also lives here: the selective-inject gate drops low-signal rows and
+emits the silent one-liner when nothing qualifies; the decision is appended
+to ``zmem-bg.log``. Issue #114 moved the gate store-side into
+``storelib.inject.selective_inject_filter`` (the hook-local twin was
+deleted; the hook body consumes the envelope and keeps only the log
+writer).
 
 3.9 also lives here (lightly): PreCompact sources the same body via
 ``hooks/zmem-precompact.sh`` so the fence / gate / log contract is
