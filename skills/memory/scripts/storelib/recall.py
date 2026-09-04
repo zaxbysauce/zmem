@@ -2056,7 +2056,11 @@ def recent_memory(
                             disabled=no_telemetry)
     elif results:
         ids = [r["id"] for r in results]
-        _bump_telemetry(conn, ids, no_bump=no_bump)
+        # The no_telemetry seam applies to BOTH branches (review round:
+        # symmetry promised in the docstring must hold on the plain path
+        # too, or a future zero-write caller would silently mutate).
+        _bump_telemetry(conn, ids, no_bump=no_bump,
+                        disabled=no_telemetry)
     if as_json:
         # v13 (issue #65, 10.8/10.9): read envelope, same shape as recall.
         tokens_used = sum(estimate_tokens(r.get("content", "") or "") for r in results)

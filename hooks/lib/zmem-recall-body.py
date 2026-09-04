@@ -80,7 +80,6 @@ import time
 # _load_schema_meta(). The literals below are ONLY the import-failure
 # fallback so a partially-deployed tree still runs with the documented
 # defaults rather than crashing the hook (fail-open).
-_FALLBACK_GROUNDED_SIGNALS = {"test", "compile", "lint", "reviewer", "user"}
 _FALLBACK_FLOOR_PROMPT = 0.25
 _FALLBACK_FLOOR_GATE_NONE = 0.4
 _FALLBACK_FLOOR_RECENT = 0.5
@@ -143,32 +142,6 @@ def _floor(name: str, default: float) -> float:
     return value
 
 
-def _gate_constants(store_py: str):
-    """Resolve (floor, gate_none_floor, grounded_signals) from schema_meta
-    when importable, else the documented literal defaults."""
-    sm = _load_schema_meta(store_py)
-    if sm is not None:
-        # getattr fallbacks: a partially-updated deployment (older
-        # schema_meta without a constant) degrades to the literal default
-        # instead of crashing the hook (fail-open).
-        return (
-            _floor(
-                getattr(sm, "INJECT_FLOOR_PROMPT_ENV", "ZMEM_INJECT_FLOOR_PROMPT"),
-                getattr(sm, "INJECT_FLOOR_PROMPT_DEFAULT", _FALLBACK_FLOOR_PROMPT),
-            ),
-            _floor(
-                getattr(sm, "INJECT_FLOOR_GATE_NONE_ENV", "ZMEM_INJECT_FLOOR_GATE_NONE"),
-                getattr(sm, "INJECT_FLOOR_GATE_NONE_DEFAULT", _FALLBACK_FLOOR_GATE_NONE),
-            ),
-            set(getattr(sm, "INJECT_GROUNDED_SIGNALS", _FALLBACK_GROUNDED_SIGNALS)),
-        )
-    return (
-        _floor("ZMEM_INJECT_FLOOR_PROMPT", _FALLBACK_FLOOR_PROMPT),
-        _floor("ZMEM_INJECT_FLOOR_GATE_NONE", _FALLBACK_FLOOR_GATE_NONE),
-        set(_FALLBACK_GROUNDED_SIGNALS),
-    )
-
-
 def _recent_floor(store_py: str) -> float:
     sm = _load_schema_meta(store_py)
     if sm is not None:
@@ -182,7 +155,7 @@ def _recent_floor(store_py: str) -> float:
 def _reason_constants(store_py: str):
     """Resolve (silent_reasons, injected_reason) from schema_meta (the
     single source of truth, PRR-017), with literal fallbacks for a
-    partially-deployed tree (same discipline as _gate_constants)."""
+    partially-deployed tree."""
     sm = _load_schema_meta(store_py)
     if sm is not None:
         return (
@@ -232,40 +205,6 @@ def _classify_silent_reason(rows, omitted=0, budget_emptied=False,
     if reason not in allowed:
         return "empty-pool"
     return reason
-
-
-def _selective_inject_filter(rows, floor: float, gate_none_floor: float,
-                             grounded_signals=None):
-    """Apply the hook selective-inject gate (issue #58, 3.8).
-
-    Issue spec: tighten ONLY ``signal=none`` (the agent's self-opinion)
-    to ``gate_none_floor`` (default 0.4). Every GROUNDED signal
-    (test/compile/lint/reviewer/user — the signal hierarchy's trusted
-    tiers) injects at the prompt floor (default 0.25). The original
-    draft omitted ``user`` from the trusted set, which silently dropped
-    user-stated memories from every hook (caught by the pre-existing
-    tests/test_launcher.js sentinel round-trip canary, seeded
-    signal=user — a regression the Python-only local loop missed).
-
-    Returns (selected, status) where status is 'injected' (anything
-    qualified) or 'silent' (nothing passed).
-    """
-    if grounded_signals is None:
-        grounded_signals = _FALLBACK_GROUNDED_SIGNALS
-    selected = []
-    for r in rows:
-        try:
-            conf = float(r.get("confidence", 0) or 0)
-        except (TypeError, ValueError):
-            conf = 0.0
-        sig = (r.get("signal") or "none").lower()
-        if sig == "none":
-            if conf >= gate_none_floor:
-                selected.append(r)
-        elif sig in grounded_signals and conf >= floor:
-            selected.append(r)
-    status = "injected" if selected else "silent"
-    return selected, status
 
 
 # Log bound (PRR-023 fix): zmem-bg.log was maintenance-only (~lines/day)
