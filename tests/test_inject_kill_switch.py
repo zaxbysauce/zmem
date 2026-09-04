@@ -338,6 +338,36 @@ class KillSwitchHermesReflectTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_disabled_whitespace_variants_still_disable(self):
+        # Issue #133 item 2: the reflect hook predicate is whitespace-
+        # tolerated literal-"0" — pin "0 "/" 0" behaviorally so a parser
+        # drift on THIS surface (one of the two sites the PR #132 follow-up
+        # called out) is caught; near-miss enabled values stay enabled.
+        for value in ("0 ", " 0"):
+            tmp = tempfile.mkdtemp(prefix="zmem-killsw-hr-ws-")
+            try:
+                r = self._run(
+                    tmp, {"session_id": "sess-hr-ws",
+                          "user_message": "harmless prompt text"},
+                    ZMEM_INJECT=value)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout.strip(), "{}")
+                self.assertIn(DISABLED_LINE, r.stderr)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        for value in ("", "false", "00"):
+            tmp = tempfile.mkdtemp(prefix="zmem-killsw-hr-ws-")
+            try:
+                r = self._run(
+                    tmp, {"session_id": "sess-hr-ws2",
+                          "user_message": "harmless prompt text"},
+                    ZMEM_INJECT=value)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn(DISABLED_LINE, r.stderr,
+                                 f"{value!r} must keep injection ENABLED")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
     def test_remote_mode_disabled_skips_lan_call(self):
         # PRR-005: the disabled gate must precede the _remote_enabled()
         # branch. ZMEM_MCP_URL points at a closed port: if the gate ever
@@ -491,6 +521,19 @@ class KillSwitchMcpSessionStartTest(unittest.TestCase):
             else:
                 os.environ[k] = v
 
+    def test_session_start_whitespace_zero_disabled(self):
+        # Issue #133 item 2: the MCP session_start predicate is
+        # whitespace-tolerated literal-"0" — pin "0 "/" 0" behaviorally
+        # (one of the two sites the PR #132 follow-up called out).
+        import asyncio
+        for value in ("0 ", " 0"):
+            with mock.patch.dict(os.environ, {"ZMEM_INJECT": value}):
+                result = asyncio.run(self.server._tool_manager.call_tool(
+                    "session_start", {"namespace": "user:global"},
+                    context=None))
+            self.assertEqual(result["reason"], "disabled", value)
+            self.assertEqual(result["context"], "")
+
     def test_session_start_disabled_envelope(self):
         import asyncio
         with mock.patch.dict(os.environ, {"ZMEM_INJECT": "0"}):
@@ -521,6 +564,21 @@ class KillSwitchSourceContractTest(unittest.TestCase):
                        '_INJECT_REASON_DISABLED = "disabled"',
                        'INJECT_REASON_DISABLED'):
             self.assertIn(needle, text, f"mcp_server.py lost {needle!r}")
+
+    def test_hermes_reflect_and_mcp_predicates_strip(self):
+        # Issue #133 item 2, source pin (always runs, no mcp needed): both
+        # remaining kill-switch sites carry the whitespace-tolerated
+        # literal-"0" predicate — the behavioral twins live above wherever
+        # the optional deps exist.
+        import re
+        needle = re.compile(
+            r'os\.environ\.get\("ZMEM_INJECT", "1"\)\.strip\(\) == "0"')
+        for path in (HERMES_REFLECT, MCP_SERVER):
+            text = path.read_text(encoding="utf-8")
+            self.assertRegex(
+                text, needle,
+                f"{path.name} must keep the whitespace-tolerated "
+                'literal-"0" predicate')
 
     def test_schema_meta_has_disabled_reason_constant(self):
         sys.path.insert(0, str(SCRIPTS))

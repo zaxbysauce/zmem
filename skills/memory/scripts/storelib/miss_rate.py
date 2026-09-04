@@ -670,6 +670,12 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
                 if ln.get("reason") == "injected"
                 or (ln.get("reason") is None
                     and ln.get("status") == "injected")]
+    # Issue #133 (PR #132 follow-up): reason=disabled lines are the
+    # ZMEM_INJECT=0 kill-switch marker — the hook was TOLD to inject
+    # nothing, so a failure in such a window is "switch off", never a
+    # retrieval miss. Without this bucket every disabled line collapses
+    # into missed and a disabled box reports a false 100% miss rate.
+    disabled_lines = [ln for ln in lines if ln.get("reason") == "disabled"]
     decision_ts = [ln["ts"] for ln in lines]
     period = [min(decision_ts), max(decision_ts)] if decision_ts else None
     sid_lines = sum(1 for ln in lines if ln.get("sid") is not None)
@@ -709,7 +715,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     failures = deduped[:max(1, int(limit))]
 
     counts = {"surfaced_sid": 0, "surfaced_legacy": 0, "missed": 0,
-              "capture_gap": 0, "no_query": 0}
+              "capture_gap": 0, "no_query": 0, "disabled": 0}
     query_source = {"operation": 0, "ring": 0, "none": 0}
     missed_all_only = 0
     legacy_attributions = 0
@@ -793,6 +799,13 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         elif any(matched & set(ln["ids"]) for ln in cand_legacy):
             counts["surfaced_legacy"] += 1
             legacy_attributions += 1
+        elif disabled_lines and any(
+                lo <= ln["ts"] <= hi for ln in disabled_lines):
+            # Issue #133: the switch was OFF around this failure — the hook
+            # logged reason=disabled and injected nothing by design. Not a
+            # miss: excluded from the numerator AND the denominator so a
+            # disabled window reads as "switch off", never 100% miss.
+            counts["disabled"] += 1
         else:
             counts["missed"] += 1
             tool = f.get("tool") or "?"
@@ -866,6 +879,18 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
             f"{legacy_attributions} surfaced attribution(s) rest on pre-#94 "
             "sid-less bg-log lines (time-window + id overlap only); "
             "miss_rate_strict_sid excludes them.")
+    if counts["disabled"]:
+        caveats.append(
+            f"{counts['disabled']} failure(s) fell in ZMEM_INJECT=0 "
+            "kill-switch windows (bg-log reason=disabled) — the inject "
+            "switch was off, so nothing could have been injected; excluded "
+            "from miss_rate and miss_rate_strict_sid. Read this as "
+            "'switch off', not as misses.")
+    if disabled_lines and not counts["disabled"]:
+        caveats.append(
+            f"{len(disabled_lines)} kill-switch decision line(s) "
+            "(reason=disabled) present in the bg log, but no examined "
+            "failure fell inside those windows.")
     if counts["missed"] and period and in_period < counts["missed"]:
         caveats.append(
             "bg-log coverage is partial (the log truncates at its size cap);"

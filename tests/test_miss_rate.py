@@ -275,6 +275,60 @@ class _JoinFixture:
             db_path=self.db, **kwargs)
 
 
+class DisabledWindowClassificationTest(_JoinFixture, unittest.TestCase):
+    """Issue #133 (PR #132 follow-up): reason=disabled bg-log lines are the
+    ZMEM_INJECT=0 kill-switch marker — a failure in such a window is "switch
+    off", never a retrieval miss. Pre-#133 every disabled line collapsed
+    into missed and a disabled box reported a false miss_rate=1.0."""
+
+    def test_disabled_only_window_is_switch_off_not_miss(self):
+        self._fixture()
+        self._bg_log([
+            _bg_line(self.now, [], reason="disabled", status="silent"),
+        ])
+        report = self._run()
+        self.assertEqual(report["counts"]["disabled"], 1)
+        self.assertEqual(report["counts"]["missed"], 0)
+        self.assertIsNone(report["miss_rate"],
+                          "a disabled-only report reads as switch-off, "
+                          "never 100% miss")
+        self.assertTrue(any("switch off" in c for c in report["caveats"]),
+                        report["caveats"])
+
+    def test_mixed_disabled_window_and_genuine_miss(self):
+        _make_fixture_db(self.db, [
+            {"session_id": "sess-a", "ts_s": self.now, "call_id": "call-1",
+             "tool": "Bash", "operation": "git stash pop",
+             "error_message": "conflict"},
+            {"session_id": "sess-b", "ts_s": self.now - 7200,
+             "call_id": "call-2", "tool": "Bash",
+             "operation": "git stash pop", "error_message": "conflict"},
+        ])
+        self._bg_log([
+            # switch off around the FIRST failure only
+            _bg_line(self.now, [], reason="disabled", status="silent"),
+        ])
+        report = self._run()
+        self.assertEqual(report["counts"]["disabled"], 1)
+        self.assertEqual(report["counts"]["missed"], 1,
+                         "the out-of-window failure stays a real miss")
+        self.assertEqual(report["miss_rate"], 1.0,
+                         "1 real miss over 1 measured failure")
+
+    def test_disabled_lines_present_but_no_window_overlap(self):
+        self._fixture()
+        self._bg_log([
+            _bg_line(self.now - 86400, [], reason="disabled",
+                     status="silent"),
+        ])
+        report = self._run()
+        self.assertEqual(report["counts"]["disabled"], 0)
+        self.assertEqual(report["counts"]["missed"], 1)
+        self.assertTrue(any("kill-switch decision line" in c
+                            for c in report["caveats"]),
+                        report["caveats"])
+
+
 class JoinClassificationTest(_JoinFixture, unittest.TestCase):
     def test_a_matched_and_injected_sid_line_is_surfaced_sid(self):
         self._fixture()

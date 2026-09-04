@@ -283,8 +283,14 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         return r
 
     def _ss_line(self) -> str:
-        """The session-start decision line: the one WITHOUT reason=."""
-        lines = [ln for ln in _hook_lines(self._tmp) if "reason=" not in ln]
+        """The session-start decision line.
+
+        Pre-#114 the session-start writer was the one bg-log writer WITHOUT
+        reason= (writer B); issue #114 aligned it to the shared-body format,
+        so it now carries reason= and the PRE-gATE candidate set in all=.
+        Only session-start writes decision lines in these fixtures, so the
+        last decision line is the session-start one."""
+        lines = _hook_lines(self._tmp)
         self.assertTrue(lines,
                         "session-start decision line missing (check the "
                         "inline python ran; stderr above)")

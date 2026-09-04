@@ -22,7 +22,7 @@ from storelib.entity import entities_for_memory, entities_for_memories, entity_m
 from storelib.links import expand_recall_links
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
-from storelib.inject import estimate_tokens, inject_token_budget
+from storelib.inject import apply_token_budget, classify_silent_reason, estimate_tokens, inject_token_budget, selective_inject_filter
 from schema_meta import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
 import embed_profiles as _profiles
 from storelib.cross_encoder import maybe_rerank as _cross_maybe_rerank
@@ -120,6 +120,12 @@ def _uses_count(row: sqlite3.Row | dict) -> int:
     is a non-double-counted usefulness metric. Used everywhere retrieval_count was
     previously the SOLE usefulness signal.
 
+    Issue #114: this sum NO LONGER feeds compute_score — popularity reads
+    retrieval_count only (passive surfaces kept inflating scores for rows the
+    model never saw). surfaced_count is still recorded (promote/prune/consolidate
+    consume it) but is excluded from ranking until #124 lands real
+    applied/violated counters.
+
     Compute score accepts sqlite3.Row OR dict; both raise (KeyError / IndexError / absent
     column) on a missing/mismatched key, so default to 0 via try/except — not dict-style
     `.get`, which sqlite3.Row does not have.
@@ -180,10 +186,17 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
     else:
         recency = 0.5  # unknown age — neutral
 
-    # Popularity component: total surface events (retrieval_count + surfaced_count)
-    # with diminishing returns — blends the passive signals that retrieval_count alone
-    # missed (issue #21).
-    rc = _uses_count(row)
+    # Popularity component (issue #114): EXPLICIT reads only —
+    # retrieval_count, never surfaced_count. Passive surfaces used to feed
+    # this term, so every hook pull inflated the score of rows the model
+    # never saw (measured: five identical passive recalls raised scores
+    # monotonically). surfaced_count is still recorded per #21 (promote/
+    # prune/consolidate consume it) but stays out of ranking until #124
+    # lands applied/violated counters; the weight itself is unchanged.
+    try:
+        rc = int(row["retrieval_count"] or 0)
+    except (KeyError, IndexError, TypeError):
+        rc = 0
     popularity = min(1.0, 0.15 * (rc ** 0.5))
 
     return (
@@ -1061,6 +1074,7 @@ def recall_memory(
     weights: dict | None = None,
     no_telemetry: bool = False,
     no_unfold: bool = False,
+    for_injection: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -1070,6 +1084,17 @@ def recall_memory(
     this so heavy subagent fan-out does not turn every delegated agent into a concurrent
     retrieval_count writer on the shared store (PLAN.md §5), while the surface event is
     still counted. Explicit skill-invoked recall keeps the default (bumps retrieval_count).
+
+    ``for_injection`` (issue #114, P2-3): the passive INJECTION lane. The selective
+    inject gate and the token budget run INSIDE this call (after MMR, rerank, entity
+    cards, link expansion and unfold; before telemetry), the returned rows are exactly
+    the rendered set, and the surfaced_count/last_surfaced write covers only those
+    rendered rows that were also QUERY-MATCHED (the pre-expansion bump set — same law
+    as always: popularity rewards matches, not link neighbors). Implies no_bump
+    semantics; the envelope gains ``reason`` and ``candidate_ids`` (pre-gate ids) so
+    hook-side bg-log ``all=`` keeps its miss-rate-join meaning. ``no_telemetry``
+    suppresses the write but NOT the filters, so the eval harness can exercise this
+    lane as a zero-write read.
 
     Candidates are fetched via FTS5 BM25, then re-ranked by a composite score
     that incorporates BM25 relevance, confidence, recency decay, and retrieval
@@ -1116,6 +1141,14 @@ def recall_memory(
     ``link_hops=0`` contract (see ``_unfold_enabled``).
     """
     now_epoch = _now_epoch()
+    # Issue #114: --for-injection is a passive surface by construction (the
+    # injection lane never writes retrieval_count), so it inherits every
+    # no_bump semantic downstream: the injection-risk/untrusted_web omit
+    # filter, the unfold gate, and surfaced-style telemetry. The ONLY things
+    # for_injection adds beyond no_bump are the in-store gate+budget, the
+    # rendered-only bump set, and the envelope reason/candidate_ids keys.
+    if for_injection:
+        no_bump = True
     # Issue #58, 3.3: resolve the ``hybrid=None`` sentinel before passing
     # to the per-tier helper (which only accepts a concrete bool). When
     # embeddings are unavailable AND ``hybrid=True`` was explicitly
@@ -1261,7 +1294,42 @@ def recall_memory(
     # and the pre-expansion count missed them (violating this function's
     # own 'flagged rows are counted too' contract).
     injection_risk_count = sum(1 for r in results if r.get("prompt_injection_risk"))
-    if bump_ids:
+
+    # Issue #114 (P2-3): the injection lane applies the SAME gate + token
+    # budget the hook used to apply after this subprocess returned — here,
+    # INSIDE the single store call, so telemetry counts only what renders.
+    # Placement (plan-critic pinned): AFTER link expansion and unfold (so
+    # expansion rows are eligible for gate-drop and consume budget exactly
+    # as they did under the hook's post-return budget) and BEFORE telemetry.
+    candidate_rows = results
+    candidate_ids = [r["id"] for r in candidate_rows]
+    inj_reason = None
+    if for_injection:
+        selected_rows, _gate_status = selective_inject_filter(results)
+        budget_emptied = False
+        if selected_rows:
+            selected_rows, _est, _dropped = apply_token_budget(selected_rows)
+            if not selected_rows:
+                budget_emptied = True
+        results = selected_rows
+        if results:
+            inj_reason = "injected"
+        else:
+            inj_reason = classify_silent_reason(
+                candidate_rows, omitted=omitted, budget_emptied=budget_emptied)
+
+    if for_injection:
+        # Issue #114: surfaced telemetry covers ONLY the rendered rows that
+        # were also QUERY-MATCHED — the pre-expansion bump set (same law as
+        # ever: link/unfold neighbors render but never feed the counters).
+        # v12 (issue #64): no_telemetry (the eval harness) records nothing,
+        # but the filters above still ran.
+        matched = set(bump_ids)
+        surface_ids = [r["id"] for r in results if r["id"] in matched]
+        if surface_ids:
+            _bump_telemetry(conn, surface_ids, no_bump=True,
+                            disabled=no_telemetry)
+    elif bump_ids:
         # v11 (issue #61, 6.3): bump ONLY the query-matched rows — expansion
         # neighbors joined via `bump_ids` capture above, before expansion.
         # v12 (issue #64): no_telemetry (the eval harness) records nothing.
@@ -1275,14 +1343,23 @@ def recall_memory(
         # storelib.inject.envelope_results (hooks body, Hermes, MCP); a bare
         # list keeps working for every library caller (the return value below).
         tokens_used = sum(estimate_tokens(r.get("content", "") or "") for r in results)
-        print(json.dumps({
+        envelope = {
             "results": results,
             "count": len(results),
             "omitted": omitted,
             "injection_risk": injection_risk_count,
             "tokens_used": tokens_used,
             "tokens_budget": inject_token_budget(),
-        }, indent=2))
+        }
+        if for_injection:
+            # Issue #114: flag-only additions so every plain-path envelope
+            # stays byte-identical (characterization freeze). ``reason`` is
+            # the #87 closed-set silent reason (or "injected"); the hook logs
+            # it verbatim. ``candidate_ids`` is the PRE-gate id set — the
+            # bg-log ``all=`` pre-image the miss-rate join matches against.
+            envelope["reason"] = inj_reason
+            envelope["candidate_ids"] = candidate_ids
+        print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: hook/text surface uses the fenced render
         # with full provenance (id, confidence, signal, ns, type,
@@ -1870,6 +1947,8 @@ def recent_memory(
     include_global: bool = False,
     global_limit: int = 3,
     as_of: str | None = None,
+    no_telemetry: bool = False,
+    for_injection: bool = False,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -1878,6 +1957,17 @@ def recent_memory(
     (issue #21). Hook-driven subagent recall passes this so a dispatch fan-out does not
     make every subagent a concurrent retrieval_count writer on the shared store
     (PLAN.md §5), while the surface event is still counted.
+
+    ``no_telemetry`` (issue #114 symmetry with recall_memory): records NEITHER
+    counter while keeping the passive omit-filter semantics — the zero-write
+    seam the eval harness uses on recall.
+
+    ``for_injection`` (issue #114): the passive INJECTION lane — the selective
+    inject gate and token budget run INSIDE this call (after the SQL floor; the
+    gate is shape-parity with the recall lane even though the 0.5 SQL floor
+    already dominates), the returned rows are exactly the rendered set, and the
+    surfaced_count write covers only those rows. Implies no_bump semantics;
+    the envelope gains ``reason`` and ``candidate_ids`` under the flag.
 
     When ``include_global`` is True and ``namespace`` is set to something other
     than ``GLOBAL_NAMESPACE`` ("user:global"), the result ALSO includes up to
@@ -1888,6 +1978,10 @@ def recent_memory(
     so ``recent --namespace <old pre-v5 key>`` finds rows migrated to the new
     key. (issue #18)
     """
+    # Issue #114: the injection lane is passive by construction (see
+    # recall_memory's twin comment).
+    if for_injection:
+        no_bump = True
     project_rows: list[dict] = []
     # PRR-022 fix: same entry-point normalization as recall_memory.
     as_of = _normalize_as_of(as_of)
@@ -1934,20 +2028,51 @@ def recent_memory(
                 omitted += 1
         results = kept_rows
     injection_risk_count = sum(1 for r in results if r.get("prompt_injection_risk"))
-    if results:
+
+    # Issue #114 (P2-3): the injection lane — gate + budget INSIDE this call,
+    # surfaced telemetry only for the rendered rows. recent has no expansion
+    # or unfold, so every candidate is query-legitimate; the write set is
+    # simply the gate+budget survivors.
+    candidate_rows = results
+    candidate_ids = [r["id"] for r in candidate_rows]
+    inj_reason = None
+    if for_injection:
+        selected_rows, _gate_status = selective_inject_filter(results)
+        budget_emptied = False
+        if selected_rows:
+            selected_rows, _est, _dropped = apply_token_budget(selected_rows)
+            if not selected_rows:
+                budget_emptied = True
+        results = selected_rows
+        if results:
+            inj_reason = "injected"
+        else:
+            inj_reason = classify_silent_reason(
+                candidate_rows, omitted=omitted, budget_emptied=budget_emptied)
+        if results:
+            # no_telemetry (the eval harness) records nothing; the filters
+            # above still ran.
+            _bump_telemetry(conn, [r["id"] for r in results], no_bump=True,
+                            disabled=no_telemetry)
+    elif results:
         ids = [r["id"] for r in results]
         _bump_telemetry(conn, ids, no_bump=no_bump)
     if as_json:
         # v13 (issue #65, 10.8/10.9): read envelope, same shape as recall.
         tokens_used = sum(estimate_tokens(r.get("content", "") or "") for r in results)
-        print(json.dumps({
+        envelope = {
             "results": results,
             "count": len(results),
             "omitted": omitted,
             "injection_risk": injection_risk_count,
             "tokens_used": tokens_used,
             "tokens_budget": inject_token_budget(),
-        }, indent=2))
+        }
+        if for_injection:
+            # Issue #114: flag-only envelope additions (see recall_memory).
+            envelope["reason"] = inj_reason
+            envelope["candidate_ids"] = candidate_ids
+        print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: same fence + provenance as recall. Recent is
         # the high-confidence admin pull used by SessionStart /

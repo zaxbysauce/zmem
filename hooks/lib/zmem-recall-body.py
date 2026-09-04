@@ -276,7 +276,8 @@ _BG_LOG_DEFAULT_MAX_BYTES = 262144
 
 def _log_inject_decision(rows, selected, status: str, reason: str,
                          omitted=0, tokens_used=None, tokens_budget=None,
-                         ops_count=0, session_id: str = "") -> None:
+                         ops_count=0, session_id: str = "",
+                         all_ids=None) -> None:
     """Append the injected|silent decision to the existing bg log.
 
     Issue #87 / #85 direction 1: every line carries ``reason=`` (closed set
@@ -314,6 +315,12 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
         except OSError:
             pass
         ids_all = [r.get("id") for r in rows]
+        if all_ids is not None:
+            # Issue #114: on the --for-injection lane the hook receives only
+            # the RENDERED rows; the pre-gate candidate ids ride the envelope
+            # (candidate_ids) so this field keeps its miss-rate-join meaning
+            # ("what the recall would have matched") unchanged.
+            ids_all = list(all_ids)
         ids_sel = [r.get("id") for r in selected]
         # v13 (issue #65, 10.9): tokens kept/budget ride on the same line so
         # budget behavior is auditable in the existing bg log.
@@ -609,9 +616,9 @@ def main() -> int:
     if not store_py or not os.path.isfile(store_py):
         return 0
 
-    # PRR-017 fix: floors + grounded set come from schema_meta (single
-    # source of truth) with literal fallbacks for a partially-deployed tree.
-    floor, gate_none_floor, grounded_signals = _gate_constants(store_py)
+    # Issue #114: the selective gate now runs store-side on the
+    # --for-injection lane (storelib.inject.selective_inject_filter, same
+    # schema_meta constants), so this hook no longer resolves floors here.
     # issue #65, 10.9: budget helpers (None when storelib is not importable).
     _inj = None
     # issue #87: envelope omitted count (passive injection-risk drops) and the
@@ -743,6 +750,7 @@ def main() -> int:
                     "--include-global",
                     "--global-limit", recent_global_limit,
                     "--no-bump",
+                    "--for-injection",
                     "--json",
                 ],
                 stderr=subprocess.DEVNULL,
@@ -758,6 +766,7 @@ def main() -> int:
                     "--include-global",
                     "--global-limit", "3",
                     "--no-bump",
+                    "--for-injection",
                     "--json",
                 ],
                 stderr=subprocess.DEVNULL,
@@ -769,11 +778,24 @@ def main() -> int:
         # envelope's omitted count BEFORE the unwrap discards it — it counts
         # rows the passive --no-bump filter dropped (injection-risk /
         # untrusted_web), the difference between "omitted" and "empty-pool".
+        # Issue #114: the --for-injection lane also stamps the closed-set
+        # silent reason and the PRE-gATE candidate ids on the envelope; read
+        # both here, before envelope_results discards them.
+        envelope_reason = None
+        envelope_candidates = None
         if isinstance(rows, dict):
             try:
                 omitted = int(rows.get("omitted", 0) or 0)
             except (TypeError, ValueError):
                 omitted = 0
+            _er = rows.get("reason")
+            if isinstance(_er, str) and _er:
+                envelope_reason = _er
+            _ec = rows.get("candidate_ids")
+            if isinstance(_ec, list):
+                envelope_candidates = [
+                    str(_x) for _x in _ec if isinstance(_x, str)
+                ]
         _inj = _inject_helpers(store_py)
         if _inj is not None:
             rows = _inj.envelope_results(rows)
@@ -785,34 +807,29 @@ def main() -> int:
     except Exception:
         rows = []
         omitted = 0
+        envelope_reason = None
+        envelope_candidates = None
 
-    selected, status = _selective_inject_filter(
-        rows, floor=floor, gate_none_floor=gate_none_floor,
-        grounded_signals=grounded_signals,
-    )
-    # v13 (issue #65, 10.9): token-budget admission BEFORE the fence. Protected
-    # types (decision/constraint) are never dropped; lowest-score signal=none
-    # rows drop first. ZMEM_CTX_BUDGET char truncation below stays as the hard
-    # outer stop (the token estimate does not include every fence byte).
+    # Issue #114 (P2-3): the store subprocess ran the injection lane
+    # (--for-injection) — the selective gate and the token budget were applied
+    # INSIDE it, so `rows` is already the RENDERED set and the surfaced
+    # telemetry was written there for exactly these rows. No local gate, no
+    # local budget, no second ack process. Status/reason come from the
+    # envelope; `all=` logs the envelope's pre-gate candidate ids.
+    selected = rows
+    status = "injected" if rows else "silent"
     tokens_budget = None
     tokens_used = None
-    budget_emptied = False
-    if selected and _inj is not None:
-        selected, _est, _dropped = _inj.apply_token_budget(selected)
+    if _inj is not None:
         tokens_budget = _inj.inject_token_budget()
-        if not selected:
-            status = "silent"
-            budget_emptied = True
-
+    reason = injected_reason
     if not selected:
-        # Issue #87 / #85 direction 1: name WHY the inject is silent instead
-        # of always blaming the bar. Fail-open on classification errors —
-        # degrade to the retrieved-empty one-liner (never the bar: blaming the
-        # bar for an empty pool is the exact misattribution #85 hit), still
-        # exit 0. F18 survives: a budget wipe still logs the token fields.
+        # Fail-open mirrors the pre-114 hook: an envelope without a reason
+        # (bare-list store, parse hiccup) degrades to the local classifier
+        # over the candidates we do have.
         try:
-            reason = _classify_silent_reason(
-                rows, omitted=omitted, budget_emptied=budget_emptied,
+            reason = envelope_reason or _classify_silent_reason(
+                rows, omitted=omitted, budget_emptied=False,
                 allowed=silent_reasons,
             )
         except Exception:
@@ -825,6 +842,10 @@ def main() -> int:
             # empty-pool and omitted share the string: do not teach the model
             # that omitted injection-risk rows existed (#87 spec).
             ctx = _SILENT_CTX_RETRIEVED_EMPTY
+        # F18: a budget wipe still logs the token fields — on the #114 lane
+        # the store already classified it (reason=budget-drop from the
+        # envelope), so derive the marker instead of a local flag.
+        budget_emptied = reason == "budget-drop"
         _log_inject_decision(
             rows, selected, status, reason,
             omitted=omitted,
@@ -832,6 +853,7 @@ def main() -> int:
             tokens_budget=tokens_budget if budget_emptied else None,
             ops_count=len(ops_tokens),
             session_id=session_id,
+            all_ids=envelope_candidates,
         )
         if mode == "pretool":
             # Issue #90 / #85 C: a per-tool-call one-liner would inject noise
@@ -881,7 +903,8 @@ def main() -> int:
                          omitted=omitted,
                          tokens_used=tokens_used, tokens_budget=tokens_budget,
                          ops_count=len(ops_tokens),
-                         session_id=session_id)
+                         session_id=session_id,
+                         all_ids=envelope_candidates)
     if mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude":
         # Issue #90 / #85 C: older Claude builds ignore pre-tool
         # additionalContext (documented since 2.1.9) — park the

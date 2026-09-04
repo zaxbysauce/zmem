@@ -138,3 +138,107 @@ def envelope_results(parsed: Any) -> list:
         results = parsed.get("results", [])
         return results if isinstance(results, list) else []
     return []
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if value != value or value in (float("inf"), float("-inf")):
+        return default
+    return value
+
+
+def _gate_constants() -> Tuple[float, float, frozenset]:
+    """Floors + grounded set, single-sourced from schema_meta (PRR-017).
+
+    Literals mirror the schema_meta defaults so a partially-deployed tree
+    (schema_meta unreachable) keeps the documented gate.
+    """
+    floor = _env_float(
+        getattr(_schema_meta, "INJECT_FLOOR_PROMPT_ENV", "ZMEM_INJECT_FLOOR_PROMPT"),
+        getattr(_schema_meta, "INJECT_FLOOR_PROMPT_DEFAULT", 0.25),
+    )
+    gate_none_floor = _env_float(
+        getattr(_schema_meta, "INJECT_FLOOR_GATE_NONE_ENV",
+               "ZMEM_INJECT_FLOOR_GATE_NONE"),
+        getattr(_schema_meta, "INJECT_FLOOR_GATE_NONE_DEFAULT", 0.4),
+    )
+    grounded = getattr(
+        _schema_meta, "INJECT_GROUNDED_SIGNALS",
+        frozenset({"test", "compile", "lint", "reviewer", "user"}),
+    )
+    return floor, gate_none_floor, frozenset(grounded)
+
+
+def selective_inject_filter(
+    rows: list[dict[str, Any]],
+    floor: Optional[float] = None,
+    gate_none_floor: Optional[float] = None,
+    grounded_signals: Optional[frozenset] = None,
+) -> Tuple[list[dict[str, Any]], str]:
+    """Store-side twin of the hook selective-inject gate (issue #58, 3.8; #114).
+
+    Issue spec: tighten ONLY ``signal=none`` (the agent's self-opinion) to
+    ``gate_none_floor`` (default 0.4). Every GROUNDED signal
+    (test/compile/lint/reviewer/user) passes at the prompt floor (default
+    0.25). Semantics are byte-identical to the hook body's
+    ``_selective_inject_filter`` so the ``--for-injection`` lane (issue #114)
+    applies the same decision the hook used to apply after the subprocess
+    returned — one gate, one source of truth, counted before the write.
+
+    Returns ``(selected, status)`` where status is ``"injected"`` (anything
+    qualified) or ``"silent"`` (nothing passed).
+    """
+    if floor is None or gate_none_floor is None or grounded_signals is None:
+        c_floor, c_gate_none, c_grounded = _gate_constants()
+        floor = c_floor if floor is None else floor
+        gate_none_floor = c_gate_none if gate_none_floor is None else gate_none_floor
+        grounded_signals = (c_grounded if grounded_signals is None
+                            else frozenset(grounded_signals))
+    selected = []
+    for r in rows:
+        try:
+            conf = float(r.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        sig = (r.get("signal") or "none").lower()
+        if sig == "none":
+            if conf >= gate_none_floor:
+                selected.append(r)
+        elif sig in grounded_signals and conf >= floor:
+            selected.append(r)
+    status = "injected" if selected else "silent"
+    return selected, status
+
+
+def classify_silent_reason(rows: list, omitted: int = 0,
+                           budget_emptied: bool = False) -> str:
+    """Name WHY a silent inject is silent (issue #87; store-side twin).
+
+    Same precedence as the hook body's classifier: budget-drop wins over
+    below-bar (a budget wipe of a gate-passed set is a budget fact, not a gate
+    fact); empty rows with omitted==0 is empty-pool even if the prompt was
+    long — do not guess. The closed set comes from schema_meta
+    (INJECT_SILENT_REASONS); a drift/unknown value degrades to empty-pool
+    rather than inventing a reason.
+    """
+    allowed = tuple(getattr(
+        _schema_meta, "INJECT_SILENT_REASONS",
+        ("empty-pool", "omitted", "below-bar", "budget-drop"),
+    ))
+    if budget_emptied:
+        reason = "budget-drop"
+    elif rows:
+        reason = "below-bar"
+    elif omitted > 0:
+        reason = "omitted"
+    else:
+        reason = "empty-pool"
+    if reason not in allowed:
+        return "empty-pool"
+    return reason

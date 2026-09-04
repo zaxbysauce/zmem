@@ -12,6 +12,63 @@ README.
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-09-04
+
+The Phase-2 popularity fix from the proactive-memory epic (#100): passive
+recall can no longer write ranking popularity for rows that never reached the
+model (#114), plus the miss-rate kill-switch discrimination the P2 onboarding
+owns (#133).
+
+### Changed
+
+- **memory** (issue #114, P2-3): ranking popularity now reads
+  `retrieval_count` only. Passive `--no-bump` surfaces are still RECORDED
+  (`surfaced_count`/`last_surfaced`, issue #21 — promote/prune/consolidate
+  consume them) but they no longer feed `compute_score`, so passive pulls
+  cannot inflate their own ranking. Weights unchanged at
+  relevance .55 / confidence .20 / recency .15 / popularity .10 — no
+  redistribution; explicit reads are the honest interim popularity signal
+  until #124 lands applied/violated counters. Gold delta (CI eval command,
+  `scripts/eval_runner.py --gold eval/gold.jsonl`, before vs after):
+  hit_at_k 1.0 → 1.0, mrr 0.947917 → 0.947917, as_of_accuracy 1.0 → 1.0,
+  injection_omit_rate 1.0 → 1.0, per-item diffs none.
+- **memory** (issue #114, P2-3): new `--for-injection` flag on `recall` and
+  `recent` — the passive injection lane. The selective inject gate and the
+  token budget now run INSIDE the single store subprocess (after MMR, rerank,
+  entity cards, link expansion and unfold; before telemetry); the returned
+  rows are exactly the rendered set; `surfaced_count` advances only for
+  rendered QUERY-MATCHED rows (link/unfold neighbors render but never count);
+  the `--json` envelope gains `reason` (the #87 closed set, or `injected`)
+  and `candidate_ids` (pre-gate ids, the bg-log `all=` pre-image) under the
+  flag only, so plain-path output stays byte-identical. `recent_memory` also
+  gains the `no_telemetry` seam for symmetry with `recall_memory`. No second
+  ack process (one store.py start ~1.5 s against a 15 s hook timeout, #121).
+- **hooks** (issue #114): the recall body and the SessionStart Tier-2 lane
+  pass `--for-injection` and stop gate/budget-ing locally — the store already
+  did it, in the same process that writes the telemetry. The bg-log decision
+  line format is unchanged; `all=` is now pinned to the PRE-gate candidate
+  set everywhere (the session-start writer previously logged the post-gate
+  rows — aligned to the convention the #94/#105 miss-rate join matches
+  against); session-start lines now carry `reason=` and are written whenever
+  the pull produced an envelope — including budget-drop and empty-pool
+  silences, which previously logged nothing on this surface.
+- **doctor** (issue #133): `--miss-rate` classifies `reason=disabled`
+  bg-log lines (the ZMEM_INJECT=0 kill-switch marker) into a distinct
+  `counts.disabled` bucket, excluded from the numerator AND denominator with
+  a caveat — a disabled window now reads as "switch off", not 100% miss.
+- **tests** (issue #133): near-miss whitespace pins (`"0 "`/`" 0"`, plus
+  enabled near-misses) for the two kill-switch sites that only had
+  literal-"0" coverage (the Hermes reflect hook and MCP `session_start`),
+  behaviorally where the optional deps exist and via an always-running
+  source pin otherwise. New `tests/test_zero_write_passive.py` pins the
+  #114 acceptance criteria (gate/budget-dropped rows untouched; rendered
+  rows counted exactly once per decision; five pinned-clock recalls with
+  stable scores; `--explain`/eval zero-write; the flag/telemetry truth
+  table).
+- Schema unchanged at v13 — `surfaced_count`/`last_surfaced` columns are
+  retained, nothing dropped; older released clients keep working against
+  the shared store until they pull this version.
+
 ## [0.15.0] — 2026-09-03
 
 Two P0 safety mechanisms from the proactive-memory epic (#100): the release

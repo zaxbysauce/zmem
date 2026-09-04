@@ -623,7 +623,14 @@ class AgentWriteSurfaceParityTest(unittest.TestCase):
 
 
 class ComputeScorePopularityBlendTest(unittest.TestCase):
-    """compute_score popularity must blend surfaced + retrieval (defect-class fix)."""
+    """compute_score popularity input (issue #114: explicit reads only).
+
+    Pre-#114 the popularity term read retrieval_count + surfaced_count, so
+    every passive hook pull inflated the score of rows the model never saw
+    (surfaced_count=371/retrieval_count=0 in the live store). The term now
+    reads retrieval_count ONLY; surfaced_count is still recorded (#21,
+    promote/prune/consolidate consume it) but stays out of ranking until
+    #124 lands applied/violated counters."""
 
     def _row(self, retrieval: int, surfaced: int) -> dict:
         return {
@@ -633,20 +640,27 @@ class ComputeScorePopularityBlendTest(unittest.TestCase):
             "ingestion_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
 
-    def test_surfaced_only_outranks_inert(self):
+    def test_surfaced_only_does_not_outrank_inert(self):
+        # The #114 flip of the pre-existing pin: passive surfaces no longer
+        # buy ranking. (Before #114 this asserted assertGreater — the loop.)
         now = time.time()
         surfaced = store.compute_score(self._row(0, 5), None, now, vec_sim=0.5)
+        more_surfaced = store.compute_score(self._row(0, 999), None, now, vec_sim=0.5)
         inert = store.compute_score(self._row(0, 0), None, now, vec_sim=0.5)
-        self.assertGreater(surfaced, inert,
-                           "a surfaced-only memory should outrank a never-surfaced one")
+        self.assertEqual(surfaced, inert,
+                         "a surfaced-only memory must NOT outrank a "
+                         "never-surfaced one (issue #114)")
+        self.assertEqual(more_surfaced, inert,
+                         "surfaced_count magnitude must not move the score")
 
-    def test_equivalent_totals_score_equal(self):
+    def test_retrieval_only_outranks_inert(self):
         now = time.time()
-        via_surfaced = store.compute_score(self._row(0, 5), None, now, vec_sim=0.5)
-        via_retrieval = store.compute_score(self._row(5, 0), None, now, vec_sim=0.5)
-        self.assertAlmostEqual(
-            via_surfaced, via_retrieval, places=12,
-            msg="popularity counts total surface events regardless of which counter carried them")
+        retrieved = store.compute_score(self._row(5, 0), None, now, vec_sim=0.5)
+        inert = store.compute_score(self._row(0, 999), None, now, vec_sim=0.5)
+        self.assertGreater(retrieved, inert,
+                           "explicit retrieval is the honest popularity "
+                           "signal and still outranks even heavy passive "
+                           "surfacing (issue #114)")
 
 
 class UnrecalledPruneExtensionTest(unittest.TestCase):

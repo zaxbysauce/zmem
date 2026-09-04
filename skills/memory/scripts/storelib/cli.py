@@ -222,6 +222,14 @@ def main():
                                "surfaced_count/last_surfaced instead (passive recall, used "
                                "by hook-driven recall so subagent fan-out does not create N "
                                "concurrent retrieval_count writers — issue #21)")
+    p_recall.add_argument("--for-injection", action="store_true",
+                          help="passive INJECTION lane (issue #114, P2-3): apply the "
+                               "selective inject gate and token budget INSIDE this call, "
+                               "return only the rendered rows, and record exactly one "
+                               "surfaced_count event per rendered QUERY-MATCHED row "
+                               "(link/unfold neighbors render but are never counted). "
+                               "Implies --no-bump; the --json envelope gains reason and "
+                               "candidate_ids (pre-gate ids) for the hook decision log.")
     p_recall.add_argument("--as-of", type=_iso8601, default=None,
                           help="temporal predicate (issue #59, 4.4): only return "
                                "rows VALID at as_of — valid_from <= as_of AND "
@@ -275,6 +283,13 @@ def main():
                           help="suppress the retrieval_count/last_retrieved write; record "
                                "surfaced_count/last_surfaced instead (passive recent, used "
                                "by hook-driven subagent recall — issue #21)")
+    p_recent.add_argument("--for-injection", action="store_true",
+                          help="passive INJECTION lane (issue #114, P2-3): apply the "
+                               "selective inject gate and token budget INSIDE this call, "
+                               "return only the rendered rows, and record exactly one "
+                               "surfaced_count event per rendered row. Implies --no-bump; "
+                               "the --json envelope gains reason and candidate_ids "
+                               "(pre-gate ids) for the hook decision log.")
     p_recent.add_argument("--include-global", action="store_true",
                           help="also surface user:global rows (project-first merge). "
                                "The automatic hooks pass this so cross-project "
@@ -1234,12 +1249,14 @@ def main():
                               no_mmr=args.no_mmr,
                               link_hops=args.link_hops, link_budget=args.link_budget,
                               cross_rerank=rerank_flag,
-                              no_unfold=args.no_unfold)
+                              no_unfold=args.no_unfold,
+                              for_injection=args.for_injection)
         elif args.cmd == "recent":
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
                           min_confidence=args.min_confidence, as_json=args.json,
                           no_bump=args.no_bump, include_global=args.include_global,
-                          global_limit=args.global_limit, as_of=args.as_of)
+                          global_limit=args.global_limit, as_of=args.as_of,
+                          for_injection=args.for_injection)
         elif args.cmd == "search":
             # I1 critic-fix: ``search`` is keyword-only by contract — pass
             # hybrid=False explicitly so the new default sentinel does
