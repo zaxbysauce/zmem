@@ -53,6 +53,25 @@ failing Codex SessionStart hook, add a per-host injection canary (#108).
   + `hooks/hooks.codex.json`) in its `host-surfaces` check — the #108 recurrence
   sweep found the Codex surface was invisible to doctor exactly while codex-cli
   was silently ignoring its hooks.
+- **Canary hardening (post-review sweep, same 0.18.0 release).** The canary's
+  ids grounding is now field-scoped to `ids=[...]` — a row present only in the
+  pre-gate `all=[...]` candidate list no longer false-passes; the launcher's
+  host-detection vars (`ZMEM_HOST`, `PLUGIN_ROOT`, `PLUGIN_DATA`,
+  `CLAUDE_PLUGIN_ROOT`, `ZCODE_PLUGIN_ROOT`) are stripped before the chosen
+  host's var is set, so an ambient var cannot redirect the canary to the wrong
+  host or plugin tree; the Codex lane verifies the manifest `./` contract
+  before driving (new `codex-manifest-contract` failure slug, exit 2); a
+  non-runnable `ZMEM_CANARY_HOST_BIN` (directory, non-executable) follows the
+  skip contract instead of crashing; seed/launch spawn failures degrade to the
+  documented exit codes (seed-failed / hook-not-fired) instead of tracebacks;
+  live-mode host exit codes + a stderr tail are printed for attribution;
+  `--probe-store-path` works without `--data-dir` and ends in the documented
+  verdict line (`mode=probe`); fresh-line detection compares bytes, not
+  characters; `scripts/` joined the release-manifest drift surface so
+  served-tree drift can see the canary itself; doctor's required-surface
+  failure names the 0.18.0 refresh; and negative-path tests now pin the doctor
+  surface requirement (all four groups), ids grounding, seed spawn exceptions,
+  leaked host-detect vars, directory overrides, and the manifest precheck.
 - Full Codex SessionStart-lane parity (hook trust UX aside, Codex 0.153.0
   still marks zmem's SessionStart/Stop hooks Failed while their inner scripts
   succeed) remains tracked in #95 (D-3); hermes adapter-based delivery in

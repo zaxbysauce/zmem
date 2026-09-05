@@ -65,7 +65,7 @@ def _write_bytes(path: Path, data: bytes) -> None:
 
 
 def _make_tree(root: Path) -> dict:
-    """A minimal served tree across all four surface prefixes.
+    """A minimal served tree across all five surface prefixes.
 
     Returns the files written (relpath -> bytes) so tests can re-derive the
     manifest after mutating the tree."""
@@ -75,6 +75,7 @@ def _make_tree(root: Path) -> dict:
         "skills/memory/scripts/store.py": b"# store shim\n",
         "skills/memory/SKILL.md": b"# memory skill\n",
         "hermes-plugin/plugin.yaml": b"name: zmem\n",
+        "scripts/host_canary.py": b"# canary shim\n",
     }
     for rel, data in files.items():
         _write_bytes(root / rel, data)
@@ -149,6 +150,9 @@ class DriftSurfaceTest(unittest.TestCase):
         self.assertIn("skills/memory/scripts/store.py", files)
         self.assertIn("skills/memory/SKILL.md", files)
         self.assertIn("hermes-plugin/plugin.yaml", files)
+        # 0.18.0 (issue #108 review): scripts/ is a drift surface — the
+        # canary must be integrity-visible.
+        self.assertIn("scripts/host_canary.py", files)
         for rel in files:
             self.assertNotIn("__pycache__", rel.split("/"))
             self.assertFalse(rel.endswith((".pyc", ".pyo")))

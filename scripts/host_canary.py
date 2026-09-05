@@ -24,21 +24,29 @@ Two modes:
 live (default)
               Seeds the scratch store, then runs a minimal non-interactive
               session of the real host binary in the scratch workdir. Host
-              binary resolution: $ZMEM_CANARY_HOST_BIN (literal path if it
-              exists; extension-less dir-bearing paths resolve via PATHEXT;
-              bare names via PATH lookup — see _resolve_override), else PATH
-              lookup of the host's default binary name. Absent binary =>
+              binary resolution: $ZMEM_CANARY_HOST_BIN (literal path if it is
+              a regular file; extension-less dir-bearing paths resolve via
+              PATHEXT; bare names via PATH lookup — see _resolve_override;
+              a directory or other non-runnable path never resolves), else
+              PATH lookup of the host's default binary name. Absent binary =>
               verdict=skip reason=host-binary-absent, exit 0.
 
 Assertions on every run (post-install canary semantics):
   1. a FRESH ``zmem-hook status=... reason=...`` decision line appears in the
      scratch zmem-bg.log after the drive (no fresh line => fail
      hook-not-fired, exit 2);
-  2. the seeded row's UUID is in the line's ``ids=[...]`` — otherwise fail
-     no-row-id, exit 3. In --self-test mode the rendered fence (the launcher
-     envelope's additionalContext) must additionally contain the marker text;
-     live hosts consume the envelope themselves, so there the decision line's
-     ids are the fence proxy (the marker check is best-effort on stdout).
+  2. the seeded row's UUID appears in the line's ``ids=[...]`` FIELD —
+     otherwise fail no-row-id, exit 3. Only ids= counts: a row present
+     solely in the pre-gate ``all=[...]`` candidate list was filtered out
+     before injection and never grounds a pass. On the codex lane the
+     ``.codex-plugin/plugin.json`` manifest is additionally checked against
+     the ``./`` contract BEFORE the drive (violation => fail
+     reason=codex-manifest-contract, exit 2 — codex-cli >= 0.153.0 would
+     silently ignore those hooks). In --self-test mode the rendered fence
+     (the launcher envelope's additionalContext) must additionally contain
+     the marker text; live hosts consume the envelope themselves, so there
+     the decision line's ids are the fence proxy (the marker check is
+     best-effort on stdout).
 
 The served-tree drift status from issue #107 is printed in the verdict line
 (``drift=matched|drifted|unknown``) via skills/memory/scripts/drift.py check;
@@ -46,11 +54,12 @@ it is informational and never gates the verdict.
 
 Output contract — the LAST stdout line is always::
 
-    zmem-canary host=<h> mode=<live|self-test> verdict=<pass|fail|skip>
+    zmem-canary host=<h> mode=<live|self-test|probe> verdict=<pass|fail|skip>
     reason=<slug|-> store=<path> row_id=<uuid|none> drift=<matched|drifted|unknown>
 
-Exit codes: 0 pass/skip; 2 hook-not-fired; 3 no-row-id; 4 seed-failed;
-5 host-session-unsupported.
+Exit codes: 0 pass/skip; 2 hook-not-fired (including a codex lane whose
+manifest violates the ./ contract: reason=codex-manifest-contract);
+3 no-row-id; 4 seed-failed; 5 host-session-unsupported.
 
 Runs standalone: python scripts/host_canary.py --host claude --self-test
 """
@@ -68,9 +77,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MARKER = "zmem-canary-probe-row"
 
-# Store-affecting (or lane-altering) ambient vars, stripped by EXACT NAME before
-# any child runs. Host-detection vars (CLAUDE_PLUGIN_ROOT / PLUGIN_ROOT /
-# ZCODE_PLUGIN_ROOT / ZMEM_HOST) are SET after the strip and never stripped.
+# Ambient vars stripped by EXACT NAME before any child runs: every
+# store-affecting var AND every launcher host-detection var — the launcher's
+# detectHost precedence (ZMEM_HOST > PLUGIN_ROOT/PLUGIN_DATA >
+# CLAUDE_PLUGIN_ROOT > ZCODE_PLUGIN_ROOT) would otherwise let an ambient var
+# from the surrounding host session win over the canary's chosen --host and
+# drive the wrong host and plugin tree. build_child_env re-sets ONLY the
+# chosen host's var after the strip.
 STRIP_VARS = (
     "ZMEM_STORE",
     "ZMEM_DATA",
@@ -80,6 +93,11 @@ STRIP_VARS = (
     "ZMEM_TIER0",
     "ZMEM_CORE_MD",
     "ZMEM_NAMESPACE",
+    "ZMEM_HOST",
+    "PLUGIN_ROOT",
+    "PLUGIN_DATA",
+    "CLAUDE_PLUGIN_ROOT",
+    "ZCODE_PLUGIN_ROOT",
 )
 
 HOSTS = ("claude", "codex", "zcode", "hermes")
@@ -93,6 +111,20 @@ HOST_DETECT_ENV = {
 HOST_BINARIES = {"claude": "claude", "codex": "codex", "zcode": "zcode", "hermes": "hermes"}
 
 DECISION_LINE_RE = re.compile(r"\[\d+\] zmem-hook status=\S+ reason=\S+.*ids=\[[^\]]*\]")
+
+# The ids FIELD only. In the decision line, ids=[...] is the POST-gate row set
+# while all=[...] is the PRE-gate candidate list (zmem-session-start.sh) — a
+# row present only in all=[...] was filtered out before injection, so
+# grounding must never read it (a whole-line substring check would let a
+# gate/budget-filtered row false-pass — the silent-no-injection class this
+# canary exists to catch).
+IDS_FIELD_RE = re.compile(r"\bids=(\[[^\]]*\])")
+
+
+def line_ids_ground_row(line, row_id):
+    """True iff the decision line's ids=[...] field carries row_id."""
+    m = IDS_FIELD_RE.search(line)
+    return bool(m) and row_id in m.group(1)
 
 EXIT_HOOK_NOT_FIRED = 2
 EXIT_NO_ROW_ID = 3
@@ -151,29 +183,38 @@ def run_drift_check(plugin_root):
 
 def seed_row(env, plugin_root, namespace, data_dir):
     store_py = Path(plugin_root) / "skills" / "memory" / "scripts" / "store.py"
-    proc = subprocess.run(
-        [
-            sys.executable,
-            str(store_py),
-            "add",
-            "--namespace",
-            namespace,
-            "--type",
-            "fact",
-            "--content",
-            "%s host canary marker" % MARKER,
-            "--signal",
-            "test",
-            "--source-ref",
-            "issue-108-canary",
-            "--json",
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(data_dir),
-        timeout=120,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(store_py),
+                "add",
+                "--namespace",
+                namespace,
+                "--type",
+                "fact",
+                "--content",
+                "%s host canary marker" % MARKER,
+                "--signal",
+                "test",
+                "--source-ref",
+                "issue-108-canary",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(data_dir),
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        # Locked store / slow disk: degrade to the documented seed-failed
+        # contract (verdict line + exit 4), never a bare traceback.
+        print("zmem-canary: seed failed — timed out after 120s", file=sys.stderr)
+        return None
+    except OSError as exc:
+        print("zmem-canary: seed failed — cannot spawn store.py (%s)" % exc, file=sys.stderr)
+        return None
     if proc.returncode != 0:
         print("zmem-canary: seed failed rc=%d" % proc.returncode, file=sys.stderr)
         print((proc.stderr or "")[-800:], file=sys.stderr)
@@ -188,12 +229,16 @@ def seed_row(env, plugin_root, namespace, data_dir):
 def fresh_decision_line(bg_log, pre_size):
     if not bg_log.exists():
         return None
-    data = bg_log.read_text(encoding="utf-8", errors="replace")
+    raw = bg_log.read_bytes()
+    data = raw.decode("utf-8", errors="replace")
     for line in reversed(data.splitlines()):
         if DECISION_LINE_RE.search(line):
             # A fresh line must postdate the pre-drive snapshot; identical old
-            # lines (same content) can only appear if the log grew.
-            return line if len(data) > pre_size else None
+            # lines (same content) can only appear if the log grew. Compare in
+            # BYTES (st_size domain) — len(data) counts characters, and a
+            # pre-existing log with multi-byte UTF-8 content would otherwise
+            # make a genuinely fresh line read as stale.
+            return line if len(raw) > pre_size else None
     return None
 
 
@@ -219,18 +264,23 @@ def verdict_line(host, mode, verdict, reason, store, row_id, drift):
     )
 
 
-def probe_store_path(args):
+def probe_store_path(args, data_dir):
     """AC4: prove the strip+set construction resolves to the isolated fixture
     even with every ambient store var set."""
     for var in STRIP_VARS:
         os.environ.pop(var, None)
-    os.environ["ZMEM_STORE"] = str(Path(args.data_dir) / "store.sqlite")
-    os.environ["ZMEM_DATA"] = str(args.data_dir)
+    os.environ["ZMEM_STORE"] = str(Path(data_dir) / "store.sqlite")
+    os.environ["ZMEM_DATA"] = str(data_dir)
     host_mod = import_host_module(args.plugin_root)
     resolved = host_mod.resolve_store_path().resolve()
-    fixture = (Path(args.data_dir) / "store.sqlite").resolve()
+    fixture = (Path(data_dir) / "store.sqlite").resolve()
     print("zmem-canary probe store=%s" % resolved)
-    if resolved != fixture:
+    ok = resolved == fixture
+    # Probe mode still ends in the documented verdict line (mode=probe) so
+    # output consumers never meet a contract-less tail.
+    verdict_line(args.host, "probe", "pass" if ok else "fail",
+                 "-" if ok else "store-escaped", str(resolved), None, "unknown")
+    if not ok:
         print("zmem-canary: resolution escaped the fixture (source=ambient)", file=sys.stderr)
         return 1
     return 0
@@ -297,20 +347,22 @@ LIVE_SESSIONS = {
 def _resolve_override(override):
     """Resolve ZMEM_CANARY_HOST_BIN to a runnable path, or None.
 
-    Precedence: the literal path if it exists; then PATHEXT probing for
+    Precedence: the literal path if it is a regular FILE (a directory — or any
+    non-runnable path — never resolves, so a typo degrades to the documented
+    skip contract instead of a spawn crash); then PATHEXT probing for
     dir-bearing extension-less paths (shutil.which does NOT do this — it
     short-circuits any command with a directory component, so
     'C:/x/python' never finds python.exe); then shutil.which for bare
     names (PATH + PATHEXT). No resolution => None (skip, never fail).
     """
-    if Path(override).exists():
+    if Path(override).is_file():
         return override
     pathext = os.environ.get("PATHEXT", "")
     for ext in pathext.split(os.pathsep):
         if not ext:
             continue
         candidate = override + ext
-        if Path(candidate).exists() and os.access(candidate, os.X_OK):
+        if Path(candidate).is_file() and os.access(candidate, os.X_OK):
             return candidate
     return shutil.which(override)
 
@@ -353,7 +405,47 @@ def live_session(args, env, workdir):
     except subprocess.TimeoutExpired:
         print("zmem-canary: hook not fired — host session timed out", file=sys.stderr)
         return EXIT_HOOK_NOT_FIRED, ""
+    except OSError as exc:
+        # Present-but-unspawnable (permission denied, bad executable image):
+        # never a verified pass — fail loudly like the other spawn errors.
+        print("zmem-canary: hook not fired — host not spawnable (%s)" % exc, file=sys.stderr)
+        return EXIT_HOOK_NOT_FIRED, ""
+    if proc.returncode != 0:
+        # Attribution only: the canary's contract is "hook fired + grounded
+        # decision line", so a host that fired the hook and then exits
+        # non-zero still passes — but the failure mode must be diagnosable
+        # in stderr rather than swallowed.
+        print(
+            "zmem-canary: host session exited rc=%d" % proc.returncode,
+            file=sys.stderr,
+        )
+        for tail_line in (proc.stderr or "").strip().splitlines()[-5:]:
+            print("  host> %s" % tail_line, file=sys.stderr)
     return 0, proc.stdout
+
+
+def codex_manifest_precheck(host, plugin_root):
+    """Issue #108 regression guard: codex-cli >= 0.153.0 silently IGNORES a
+    plugin's hooks whose manifest path lacks the ./ prefix. The self-test lane
+    drives the launcher directly, so without this check the codex manifest is
+    never consulted and a reverted manifest would still green-light. Returns
+    None when the contract holds (or no codex manifest exists to check), else
+    a human-readable violation message."""
+    if host != "codex":
+        return None
+    manifest = Path(plugin_root) / ".codex-plugin" / "plugin.json"
+    if not manifest.is_file():
+        return None
+    try:
+        hooks = json.loads(manifest.read_text(encoding="utf-8")).get("hooks")
+    except (OSError, ValueError):
+        return "codex manifest contract violated: %s is not parseable JSON" % manifest
+    if not isinstance(hooks, str) or not hooks.startswith("./"):
+        return (
+            "codex manifest contract violated: %s hooks=%r lacks the required "
+            "./ prefix — codex-cli >= 0.153.0 silently ignores these hooks" % (manifest, hooks)
+        )
+    return None
 
 
 def main(argv=None):
@@ -405,11 +497,19 @@ def main(argv=None):
     bg_log = data_dir / "zmem-bg.log"
 
     if args.probe_store_path:
-        return probe_store_path(args)
+        return probe_store_path(args, data_dir)
 
     plugin_root = Path(args.plugin_root).resolve()
     env = build_child_env(args.host, plugin_root, data_dir)
     mode = "self-test" if args.self_test else "live"
+
+    manifest_err = codex_manifest_precheck(args.host, plugin_root)
+    if manifest_err:
+        drift = run_drift_check(plugin_root)
+        print("zmem-canary: %s" % manifest_err, file=sys.stderr)
+        verdict_line(args.host, mode, "fail", "codex-manifest-contract",
+                     env["ZMEM_STORE"], None, drift)
+        return EXIT_HOOK_NOT_FIRED
 
     # Self-test drives the launcher ourselves, so a missing launcher (or a
     # broken plugin tree without skills/memory/scripts/host.py) means the hook
@@ -481,7 +581,7 @@ def main(argv=None):
         print("zmem-canary: fired but empty — unseeded store injected nothing", file=sys.stderr)
         verdict_line(args.host, mode, "fail", "no-row-id", env["ZMEM_STORE"], None, drift)
         return EXIT_NO_ROW_ID
-    if row_id not in line:
+    if not line_ids_ground_row(line, row_id):
         print(
             "zmem-canary: fired but empty — seeded row %s not in the decision ids" % row_id,
             file=sys.stderr,

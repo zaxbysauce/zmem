@@ -14,8 +14,9 @@ gives the runtime surface a CONTENT-addressed identity instead:
     resolves, because this file lives inside it — and reports matched /
     drifted / unknown.
 
-Surface (the issue's runtime surface, nothing else): ``hooks/**``,
-``skills/memory/scripts/**``, ``skills/**/SKILL.md``, ``hermes-plugin/**``.
+Surface (the runtime surface, nothing else): ``hooks/**``,
+``skills/memory/scripts/**``, ``skills/**/SKILL.md``, ``hermes-plugin/**``,
+``scripts/**`` (joined in 0.18.0, issue #108 review round — see _SURFACE_DIRS).
 Excluded: any ``__pycache__`` path segment and ``.pyc``/``.pyo`` suffixes.
 ``release-manifest.json`` sits at the repo root, outside every prefix, so it
 is never self-hashed.
@@ -62,7 +63,12 @@ MANIFEST_NAME = "release-manifest.json"
 ALGORITHM = "sha256-crlf-norm"
 
 # Repo-relative (POSIX-separator) directory prefixes of the runtime surface.
-_SURFACE_DIRS = ("hooks/", "skills/memory/scripts/", "hermes-plugin/")
+# scripts/ joined in 0.18.0 (issue #108 review round): the per-host injection
+# canary and the release gate live there — a served tree whose canary was
+# modified or dropped must be drift-detectable, not invisible. Keep in sync
+# with release_gate's runtime-surface description (this tuple is the single
+# source of truth both hash through).
+_SURFACE_DIRS = ("hooks/", "skills/memory/scripts/", "hermes-plugin/", "scripts/")
 # skills/**/SKILL.md — any depth under skills/, but only there (an unrelated
 # docs/SKILL.md is not runtime surface).
 _SKILL_MD_SELF = "skills/SKILL.md"

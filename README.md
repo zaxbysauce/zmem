@@ -137,10 +137,14 @@ exits 3 (`reason=no-row-id`). The `drift=` field is informational only —
 the run. Live mode ships one-shot session forms for `claude` and `codex`
 today; `zcode`/`hermes` live runs exit 5
 (`reason=host-session-unsupported`) until their session forms land in #96 —
-their `--self-test` lanes work. On Codex, an install whose hook trust has not
-been granted (interactive `/hooks` browser after a refresh) correctly reports
-`hook-not-fired` until you re-trust — that is the canary doing its job, not a
-canary bug. Hermes' `--self-test` exercises the shared hook machinery under
+their `--self-test` lanes work. On Codex the canary also reads
+`.codex-plugin/plugin.json` before driving the chain: a manifest whose
+`hooks` path lost the required `./` prefix fails
+`reason=codex-manifest-contract` (exit 2) instead of green-lighting hooks
+codex-cli >= 0.153.0 would silently ignore. On Codex, an install whose hook
+trust has not been granted (interactive `/hooks` browser after a refresh)
+correctly reports `hook-not-fired` until you re-trust — that is the canary
+doing its job, not a canary bug. Hermes' `--self-test` exercises the shared hook machinery under
 hermes identity; hermes' adapter-based delivery lane is tracked in #122.
 
 ### ZCode — from this GitHub repo (recommended)
@@ -504,7 +508,8 @@ A version string cannot tell you which code is actually running: a partially
 refreshed plugin cache can serve different bytes under the same `version`. Since
 0.17.0 every release ships `release-manifest.json` — a sha-256 content hash of
 the runtime surface (`hooks/**`, `skills/memory/scripts/**`, `skills/**/SKILL.md`,
-`hermes-plugin/**`), committed at the repo root and attached to the GitHub
+`hermes-plugin/**`, `scripts/**` — the last joined in 0.18.0 so the canary is
+integrity-visible), committed at the repo root and attached to the GitHub
 Release. zmem compares the served tree against it in two places:
 
 - **`doctor`** — the `served-drift` check reports `matched` (pass), `drifted`

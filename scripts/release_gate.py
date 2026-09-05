@@ -299,7 +299,7 @@ def check_unreleased_drift(repo_root: Path) -> int:
 # --- Release-manifest modes (issue #107) --------------------------------------
 #
 # The runtime surface (hooks/**, skills/memory/scripts/**, skills/**/SKILL.md,
-# hermes-plugin/**) gets a CONTENT-addressed identity: `--emit-manifest`
+# hermes-plugin/**, scripts/** since 0.18.0) gets a CONTENT-addressed identity: `--emit-manifest`
 # writes release-manifest.json (committed at the repo root, outside every
 # surface prefix so it is never self-hashed) and `--verify-manifest` proves
 # the committed manifest still describes the tree at release time. Both hash

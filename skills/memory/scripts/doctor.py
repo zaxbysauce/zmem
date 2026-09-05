@@ -1421,7 +1421,11 @@ def _check_surfaces(repo_root: Path) -> dict:
 
     if missing_required:
         status = "fail"
-        summary = f"Required host surfaces are missing: {', '.join(missing_required)}."
+        summary = (
+            f"Required host surfaces are missing: {', '.join(missing_required)}. "
+            "A tree predating the 0.18.0 codex_plugin surface reports this by "
+            "design — refresh the tree to the current release."
+        )
     elif optional_present:
         status = "pass"
         summary = ("Claude, Codex, and ZCode plugin surfaces plus the memory skill "

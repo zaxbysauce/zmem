@@ -191,6 +191,39 @@ class DoctorCliTest(unittest.TestCase):
             "optional Codex adapter files missing must not fail the doctor",
         )
 
+    def test_missing_required_host_surface_fails_per_group(self):
+        """F-003 (pr-review #142): every required-surface group's negative
+        path must be pinned. Dropping an entry from doctor's required dict
+        (e.g. the codex_plugin guard this PR adds for issue #108) must fail
+        the suite, not pass silently."""
+        groups = {
+            "claude_plugin": [".claude-plugin/plugin.json", "hooks/hooks.claude.json"],
+            "codex_plugin": [".codex-plugin/plugin.json", "hooks/hooks.codex.json"],
+            "zcode_plugin": [".zcode-plugin/plugin.json", "hooks/hooks.zcode.json"],
+            "memory_skill": ["skills/memory/SKILL.md"],
+        }
+        for group, rels in groups.items():
+            with self.subTest(group=group):
+                for rel in rels:
+                    (self.repo / rel).unlink()
+                try:
+                    result = self._run(
+                        "--format", "json",
+                        "--repo-root", str(self.repo),
+                        "--project", str(self.project),
+                    )
+                finally:
+                    self._write_repo_surfaces()
+                self.assertNotEqual(
+                    result.returncode, 0,
+                    "missing %s must fail doctor" % group)
+                report = json.loads(result.stdout)
+                self.assertFalse(report["ok"], group)
+                check = next(
+                    c for c in report["checks"] if c["id"] == "host-surfaces")
+                self.assertEqual(check["status"], "fail", group)
+                self.assertIn(group, check["summary"])
+
     def test_human_report_returns_nonzero_on_native_memory_blockers(self):
         store_dir = self.home / ".zmem"
         _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)
