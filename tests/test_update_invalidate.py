@@ -705,5 +705,69 @@ class V9MigrationAndSupersedeTest(_StoreCase):
             c.close()
 
 
+# ---------------------------------------------------------------------------
+# Issue #109: --expected-namespace store-level guard on supersede/invalidate
+# ---------------------------------------------------------------------------
+class ExpectedNamespaceGuardTest(_StoreCase):
+    """The atomic store-side half of the #109 fix.
+
+    The MCP server pins the scoped token's verified namespace via
+    --expected-namespace; the store must make the tombstone UPDATE
+    conditional on it, so neither a server-side read-then-write race
+    (TOCTOU under concurrent rekey) nor a bypassed/removed server-side
+    check can land a cross-namespace tombstone.
+    """
+
+    def test_supersede_wrong_expected_namespace_refused_row_live(self):
+        mid = self.store.add("project:other", "foreign row for ns guard")
+        r = self.store.run("supersede", "--id", mid, "--reason", "attempt",
+                           "--expected-namespace", "project:mine")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("[zmem] namespace guard:", r.stderr)
+        self.assertIsNone(self.store.row(mid)["superseded_at"])
+
+    def test_supersede_correct_expected_namespace_tombstones(self):
+        mid = self.store.add("project:other", "foreign row ns guard ok case")
+        r = self.store.run("supersede", "--id", mid, "--reason", "guard pass",
+                           "--expected-namespace", "project:other")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.store.row(mid)["superseded_at"])
+
+    def test_invalidate_wrong_expected_namespace_refused_row_live(self):
+        mid = self.store.add("user:global", "global row for ns guard")
+        r = self.store.run("invalidate", "--id", mid,
+                           "--reason", "no longer true",
+                           "--expected-namespace", "project:mine")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("[zmem] namespace guard:", r.stderr)
+        self.assertIsNone(self.store.row(mid)["superseded_at"])
+
+    def test_invalidate_correct_expected_namespace_tombstones(self):
+        mid = self.store.add("user:global", "global row ns guard ok case")
+        r = self.store.run("invalidate", "--id", mid,
+                           "--reason", "no longer true",
+                           "--expected-namespace", "user:global")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.store.row(mid)["superseded_at"])
+
+    def test_expected_namespace_garbage_value_fails_closed(self):
+        # An expectation matching no namespace can never authorize a
+        # tombstone — the guard fails closed, never open.
+        mid = self.store.add("project:other", "garbage expectation row")
+        r = self.store.run("supersede", "--id", mid, "--reason", "x",
+                           "--expected-namespace", "not-a-namespace")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("[zmem] namespace guard:", r.stderr)
+        self.assertIsNone(self.store.row(mid)["superseded_at"])
+
+    def test_without_flag_behavior_unchanged(self):
+        # Omitted guard = the historical unguarded local-CLI behavior
+        # (an operator at the store has no token scope to enforce).
+        mid = self.store.add("project:other", "unguarded cli row")
+        r = self.store.run("supersede", "--id", mid, "--reason", "legacy")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.store.row(mid)["superseded_at"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

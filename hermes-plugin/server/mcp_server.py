@@ -1029,13 +1029,46 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
 
     @mcp.tool()
     async def supersede(id: str, reason: Optional[str] = None) -> dict[str, Any]:
-        """Mark a stored memory obsolete (corrected or OBE)."""
+        """Mark a stored memory obsolete (corrected or OBE).
+
+        Issue #109: for a SCOPED token this tool is namespace-guarded exactly
+        like ``update`` — the target row's namespace is read first and must be
+        in the token's allow-list (same ``namespace_not_allowed`` denial
+        shape), and the verified namespace is PINNED on the store mutation via
+        ``--expected-namespace`` so the tombstone itself is conditional and a
+        concurrent rekey between the two subprocesses can never land it in a
+        foreign namespace. Unscoped operator tokens are unchanged (no extra
+        read, no pin).
+        """
         mid = (id or "").strip()
         if not mid:
             return _error("id is required")
+        ns_pin = None
+        if token_config.scoped:
+            gr = await _run_store_async(["get", "--id", mid])
+            if not gr["ok"]:
+                return _error(
+                    _sanitize_store_error(gr) or f"memory id {mid} not found"
+                )
+            try:
+                target_ns = (json.loads((gr["stdout"] or "").strip())
+                             .get("namespace") or "")
+            except (json.JSONDecodeError, AttributeError):
+                target_ns = ""
+            denied = _guard_namespace(target_ns)
+            if denied:
+                return denied
+            # Same F6 rationale as update: pin the VERIFIED namespace on the
+            # mutation itself. The get/supersede pair is two subprocesses (no
+            # cross-process lease), so --expected-namespace makes the store
+            # UPDATE conditional — the row can only be tombstoned while it
+            # still lives in the namespace we just scope-checked.
+            ns_pin = target_ns
         args = ["supersede", "--id", mid]
         if reason:
             args += ["--reason", str(reason)]
+        if ns_pin:
+            args += ["--expected-namespace", ns_pin]
         r = await _run_store_async(args)
         if not r["ok"]:
             return _error(
@@ -1176,6 +1209,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         Like ``supersede`` but REQUIRES a ``reason`` so the contradiction
         correction is auditable. Future recall skips it (history preserved).
         Prefer this over ``supersede`` when the memory is wrong or obsolete.
+
+        Issue #109: for a SCOPED token this tool is namespace-guarded exactly
+        like ``update``/``supersede`` — the target row's namespace is read and
+        scope-checked first (same ``namespace_not_allowed`` denial shape), then
+        pinned via ``--expected-namespace`` so the store tombstone is
+        conditional (TOCTOU-safe under concurrent rekeys). Unscoped operator
+        tokens are unchanged.
         """
         mid = (id or "").strip()
         why = (reason or "").strip()
@@ -1186,7 +1226,26 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 "reason is required — invalidation records why the fact is no "
                 "longer true (issue #59, 4.3)"
             )
-        r = await _run_store_async(["invalidate", "--id", mid, "--reason", why])
+        ns_pin = None
+        if token_config.scoped:
+            gr = await _run_store_async(["get", "--id", mid])
+            if not gr["ok"]:
+                return _error(
+                    _sanitize_store_error(gr) or f"memory id {mid} not found"
+                )
+            try:
+                target_ns = (json.loads((gr["stdout"] or "").strip())
+                             .get("namespace") or "")
+            except (json.JSONDecodeError, AttributeError):
+                target_ns = ""
+            denied = _guard_namespace(target_ns)
+            if denied:
+                return denied
+            ns_pin = target_ns
+        args = ["invalidate", "--id", mid, "--reason", why]
+        if ns_pin:
+            args += ["--expected-namespace", ns_pin]
+        r = await _run_store_async(args)
         if not r["ok"]:
             # PR-review PRR-B: a second invalidate now exits 2 with the stable
             # "[zmem] … already superseded …" line, which the sanitizer passes

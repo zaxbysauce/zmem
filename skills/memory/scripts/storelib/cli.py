@@ -332,6 +332,12 @@ def main():
     p_sup = _add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
     p_sup.add_argument("--reason", default="")
+    p_sup.add_argument(
+        "--expected-namespace", default=None,
+        help="refuse (exit 2, nothing written) unless the target row lives in "
+             "exactly this namespace — the atomic store-side guard the MCP "
+             "server pins a scoped token's verified namespace through "
+             "(issue #109). Omit for the historical unguarded behavior.")
 
     p_inv = _add_parser(
         "invalidate",
@@ -346,6 +352,11 @@ def main():
     p_inv.add_argument("--id", required=True, help="id of the memory to invalidate")
     p_inv.add_argument("--reason", required=True,
                        help="why the fact is no longer true (REQUIRED)")
+    p_inv.add_argument(
+        "--expected-namespace", default=None,
+        help="same guard as `supersede --expected-namespace`: refuse (exit 2, "
+             "nothing written) unless the target row lives in exactly this "
+             "namespace (issue #109).")
 
     p_upd = _add_parser(
         "update",
@@ -1160,10 +1171,12 @@ def main():
                       "is the audit trail", file=sys.stderr)
                 sys.exit(2)
             try:
-                ok = supersede_memory(conn, args.id, args.reason)
+                ok = supersede_memory(conn, args.id, args.reason,
+                                      expected_namespace=args.expected_namespace)
             except ValueError as exc:
                 # PR-review PRR-B: already-tombstoned rows are refused (never
-                # re-tombstoned) — a stable exit-2 refusal, not a traceback.
+                # re-tombstoned); issue #109: cross-namespace expectations are
+                # refused — both stable exit-2 refusals, not tracebacks.
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
             sys.exit(0 if ok else 1)
@@ -1289,10 +1302,12 @@ def main():
                           hybrid=False, as_of=args.as_of, link_hops=0)
         elif args.cmd == "supersede":
             try:
-                ok = supersede_memory(conn, args.id, args.reason)
+                ok = supersede_memory(conn, args.id, args.reason,
+                                      expected_namespace=args.expected_namespace)
             except ValueError as exc:
                 # PR-review PRR-B: already-tombstoned rows are refused (never
-                # re-tombstoned) — a stable exit-2 refusal, not a traceback.
+                # re-tombstoned); issue #109: cross-namespace expectations are
+                # refused — both stable exit-2 refusals, not tracebacks.
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
             sys.exit(0 if ok else 1)

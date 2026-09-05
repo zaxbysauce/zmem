@@ -789,10 +789,15 @@ every namespace, exactly the pre-v13 behavior. To scope it, point
 ```
 
 Requests outside the allow-list fail closed with the stable
-`namespace_not_allowed` error. Note: `supersede`/`invalidate` are
-id-addressed and deliberately NOT namespace-confined (a scoped token
-holding an id may tombstone it) — namespace confinement applies to the
-namespace-bearing tools. Scoped tokens MUST pass an allowed namespace
+`namespace_not_allowed` error. `supersede`/`invalidate` are namespace-guarded
+too (issue #109): for a scoped token the server reads the target row's
+namespace, denies with the same `namespace_not_allowed` shape when it is
+outside the allow-list, and pins the verified namespace on the store
+mutation via `--expected-namespace` (a new `supersede`/`invalidate` CLI flag
+that makes the tombstone UPDATE conditional on the row's namespace — refuse
+exit 2, nothing written, on mismatch; omit it for the historical unguarded
+local-operator behavior). Unscoped operator tokens keep full tombstone
+powers everywhere. Scoped tokens MUST pass an allowed namespace
 explicitly on every read — a namespace-less read spans the whole store and
 is denied — and the implicit `user:global` union on scoped reads is
 suppressed unless `user:global` is itself in the list. Malformed JSON, an
