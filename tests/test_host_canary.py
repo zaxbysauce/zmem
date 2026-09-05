@@ -74,7 +74,12 @@ class CanarySelfTestTest(unittest.TestCase):
         self.assertRegex(bg, r"zmem-hook status=\S+ reason=\S+")
         self.assertIn("sid=zmem-canary-selftest", bg)
         # The store the canary reports is the isolated fixture (AC4 invariant).
-        self.assertIn(str(d / "store.sqlite"), proc.stdout)
+        # Compare resolved+case-normalized forms: on Windows CI the temp dir
+        # arrives as an 8.3 short name (RUNNER~1) while the canary prints the
+        # resolved long form (runneradmin) — a raw substring assert
+        # false-fails there.
+        fixture = os.path.normcase(str((d / "store.sqlite").resolve()))
+        self.assertIn(fixture, os.path.normcase(proc.stdout))
 
     def test_no_seed_fails_no_row_id(self):
         d = self._data_dir("noseed")
@@ -117,6 +122,37 @@ class CanarySelfTestTest(unittest.TestCase):
                 self.assertIn("verdict=skip", proc.stdout)
                 self.assertIn("reason=host-binary-absent", proc.stdout)
 
+    def test_unsupported_live_session_reason_slug(self):
+        """A host with a present binary but no known one-shot session form
+        (zcode) must exit 5 with the honest reason slug, not
+        hook-not-fired (final-critic finding)."""
+        d = self._data_dir("unsupported")
+        proc = run_canary(
+            "--host", "zcode", "--data-dir", str(d),
+            extra_env={"ZMEM_CANARY_HOST_BIN": sys.executable},
+        )
+        self.assertEqual(proc.returncode, 5, proc.stdout + proc.stderr)
+        self.assertIn("reason=host-session-unsupported", proc.stdout)
+
+    def test_override_extensionless_path_resolves_via_pathext(self):
+        """Windows: an override naming an extension-less path whose .exe
+        sibling exists must resolve via PATHEXT (shutil.which cannot — it
+        short-circuits dir-bearing names), not report the host binary
+        absent (final-critic finding 2, extension-less repro)."""
+        if os.name != "nt" or not sys.executable.lower().endswith(".exe"):
+            self.skipTest("Windows PATHEXT repro only")
+        exe = Path(sys.executable)
+        stem = exe.with_suffix("")  # same dir, no extension
+        d = self._data_dir("pathext")
+        proc = run_canary(
+            "--host", "zcode", "--data-dir", str(d),
+            extra_env={"ZMEM_CANARY_HOST_BIN": str(stem)},
+        )
+        # Resolved binary + no session form => exit 5 unsupported. A skip
+        # (exit 0, host-binary-absent) would mean PATHEXT probing failed.
+        self.assertEqual(proc.returncode, 5, proc.stdout + proc.stderr)
+        self.assertIn("reason=host-session-unsupported", proc.stdout)
+
     def test_probe_store_path_beats_ambient_decoys(self):
         d = self._data_dir("probe")
         proc = run_canary(
@@ -130,9 +166,8 @@ class CanarySelfTestTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("zmem-canary probe store=", proc.stdout)
-        fixture = (d / "store.sqlite").resolve()
-        self.assertIn(str(fixture), proc.stdout.replace("\\", "/").replace(
-            str(fixture).replace("\\", "/"), str(fixture)))
+        fixture = os.path.normcase(str((d / "store.sqlite").resolve()))
+        self.assertIn(fixture, os.path.normcase(proc.stdout))
         self.assertNotIn("decoy", proc.stdout)
 
 

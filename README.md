@@ -132,7 +132,12 @@ drift status from #107. Without `--self-test` it runs a real minimal session
 of the host binary instead — a host binary that is absent yields
 `verdict=skip reason=host-binary-absent` (exit 0); a hook that never fires
 exits 2 (`reason=hook-not-fired`); a hook that fires but injects nothing
-exits 3 (`reason=no-row-id`). On Codex, an install whose hook trust has not
+exits 3 (`reason=no-row-id`). The `drift=` field is informational only —
+`drift=unknown` (including on pre-0.17.0 trees with no manifest) never fails
+the run. Live mode ships one-shot session forms for `claude` and `codex`
+today; `zcode`/`hermes` live runs exit 5
+(`reason=host-session-unsupported`) until their session forms land in #96 —
+their `--self-test` lanes work. On Codex, an install whose hook trust has not
 been granted (interactive `/hooks` browser after a refresh) correctly reports
 `hook-not-fired` until you re-trust — that is the canary doing its job, not a
 canary bug. Hermes' `--self-test` exercises the shared hook machinery under

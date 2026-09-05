@@ -24,9 +24,11 @@ Two modes:
 live (default)
               Seeds the scratch store, then runs a minimal non-interactive
               session of the real host binary in the scratch workdir. Host
-              binary resolution: $ZMEM_CANARY_HOST_BIN (used verbatim, no PATH
-              fallback), else PATH lookup. Absent binary => verdict=skip
-              reason=host-binary-absent, exit 0.
+              binary resolution: $ZMEM_CANARY_HOST_BIN (literal path if it
+              exists; extension-less dir-bearing paths resolve via PATHEXT;
+              bare names via PATH lookup — see _resolve_override), else PATH
+              lookup of the host's default binary name. Absent binary =>
+              verdict=skip reason=host-binary-absent, exit 0.
 
 Assertions on every run (post-install canary semantics):
   1. a FRESH ``zmem-hook status=... reason=...`` decision line appears in the
@@ -292,13 +294,35 @@ LIVE_SESSIONS = {
 }
 
 
+def _resolve_override(override):
+    """Resolve ZMEM_CANARY_HOST_BIN to a runnable path, or None.
+
+    Precedence: the literal path if it exists; then PATHEXT probing for
+    dir-bearing extension-less paths (shutil.which does NOT do this — it
+    short-circuits any command with a directory component, so
+    'C:/x/python' never finds python.exe); then shutil.which for bare
+    names (PATH + PATHEXT). No resolution => None (skip, never fail).
+    """
+    if Path(override).exists():
+        return override
+    pathext = os.environ.get("PATHEXT", "")
+    for ext in pathext.split(os.pathsep):
+        if not ext:
+            continue
+        candidate = override + ext
+        if Path(candidate).exists() and os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which(override)
+
+
 def live_session(args, env, workdir):
     """Returns (status, stdout): status 0 = session ran; 'skip' = binary
     absent; EXIT_SESSION_UNSUPPORTED = no known session form; else a
     hook-not-fired exit code."""
     override = os.environ.get("ZMEM_CANARY_HOST_BIN")
-    binpath = override if override else shutil.which(HOST_BINARIES[args.host])
-    if not binpath or (override and not Path(override).exists()):
+    binpath = _resolve_override(override) if override else shutil.which(
+        HOST_BINARIES[args.host])
+    if not binpath:
         print(
             "zmem-canary: host binary absent (%s) — skipping"
             % (override or HOST_BINARIES[args.host]),
@@ -437,7 +461,9 @@ def main(argv=None):
             return 0
     drift = run_drift_check(plugin_root)
     if status != 0:
-        verdict_line(args.host, mode, "fail", "hook-not-fired",
+        reason = ("host-session-unsupported"
+                  if status == EXIT_SESSION_UNSUPPORTED else "hook-not-fired")
+        verdict_line(args.host, mode, "fail", reason,
                      env["ZMEM_STORE"], row_id, drift)
         return status
 
