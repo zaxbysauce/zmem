@@ -51,3 +51,7 @@ graphify-out/
 
 # Issue #82 self-corpus probe reports (may embed operator content)
 self-corpus-results.json
+
+# zvec-grep workspace index cache (operator-machine search tool;
+# never read by repo code, regenerated locally on demand)
+.zvec-grep/

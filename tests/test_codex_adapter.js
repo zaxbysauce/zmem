@@ -125,10 +125,12 @@ console.log("\n[1] Codex plugin metadata");
 
     eq("plugin: name", plugin.name, "zmem");
     eq("plugin: skills path", plugin.skills, "./skills/");
-    // The Codex manifest declares its hooks file explicitly (hooks/hooks.codex.json)
+    // The Codex manifest declares its hooks file explicitly (./hooks/hooks.codex.json)
     // rather than relying on the default-named hooks/hooks.json, which CC would
-    // ALSO auto-load and double-register (#36 M12).
-    eq("plugin: declares codex hooks file explicitly", plugin.hooks, "hooks/hooks.codex.json");
+    // ALSO auto-load and double-register (#36 M12). The ./ prefix is load-bearing:
+    // codex-cli 0.152.1+ silently ignores hooks whose manifest path does not start
+    // with ./ relative to the plugin root (issue #108, RC2).
+    eq("plugin: declares codex hooks file explicitly", plugin.hooks, "./hooks/hooks.codex.json");
     ok("plugin: author.name present", !!(plugin.author && plugin.author.name));
     ok("plugin: interface.displayName present", !!(plugin.interface && plugin.interface.displayName));
     ok("plugin: interface.category present", !!(plugin.interface && plugin.interface.category));
