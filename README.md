@@ -114,6 +114,30 @@ an overgrown file cannot silently eat the context budget, and the Claude Code
 transcript retention window (`cleanupPeriodDays`) that bounds how far back
 the transcript-mining commands can see.
 
+### Post-install canary
+
+After any install or refresh, verify the delivery lane end to end (issue #108):
+
+```bash
+python scripts/host_canary.py --host claude --self-test
+python scripts/host_canary.py --host codex --self-test   # also: zcode, hermes
+```
+
+The canary seeds one recognizable row into an **isolated** scratch store (your
+real store is never touched — ambient `ZMEM_STORE`/`ZMEM_DATA` and the
+plugin-data vars are stripped, so they cannot redirect it), drives the host's
+SessionStart hook chain, and asserts a fresh `zmem-hook status=... reason=...`
+decision line whose `ids=[...]` carries the seeded row, plus the served-tree
+drift status from #107. Without `--self-test` it runs a real minimal session
+of the host binary instead — a host binary that is absent yields
+`verdict=skip reason=host-binary-absent` (exit 0); a hook that never fires
+exits 2 (`reason=hook-not-fired`); a hook that fires but injects nothing
+exits 3 (`reason=no-row-id`). On Codex, an install whose hook trust has not
+been granted (interactive `/hooks` browser after a refresh) correctly reports
+`hook-not-fired` until you re-trust — that is the canary doing its job, not a
+canary bug. Hermes' `--self-test` exercises the shared hook machinery under
+hermes identity; hermes' adapter-based delivery lane is tracked in #122.
+
 ### ZCode — from this GitHub repo (recommended)
 
 1. In ZCode: **Settings → Plugin Management → Discover → `+`**
@@ -727,14 +751,17 @@ rollback is a re-pin, not a download:
 the discriminator — but read the RECALL-BODY line, not a session-start line:
 trigger a prompt, then check the line that prompt just appended. On current
 code every recall-body line carries `reason=`; a host stuck on a pre-#87 tree
-writes `status=`-only recall lines. Do **not** use session-start lines for
-this check: they carry no `reason=` on ANY version (old or current — the only
-exception being the `reason=disabled` kill-switch line), so a
-`status=`-only session-start line proves nothing either way (that writer
-shape is where the #106 field proof originated, which is why the recall-body
-line is the reliable discriminator). `doctor` corroborates (version surfaces
-+ `inject-switch` state). The per-host injection canary that automates this
-check is tracked in #108.
+writes `status=`-only recall lines. Session-start lines are a weaker
+discriminator here: their `reason=` field is recent (#89/#114-era; verified
+2026-09-05 — an older tree writes `status=`-only session-start lines too, and
+the `reason=disabled` kill-switch line has existed the longest), so a
+`status=`-only session-start line only proves the tree predates the
+reason-era (that writer shape is where the #106 field proof originated,
+which is why the recall-body line is the reliable discriminator). `doctor`
+corroborates (version surfaces + `inject-switch` state). The per-host
+injection canary that automates the delivery check — seed, fire, and assert
+the fence — ships as **`python scripts/host_canary.py --host claude
+--self-test`** (see *Post-install canary* above; issue #108).
 
 ### Embeddings (semantic recall / dedup)
 

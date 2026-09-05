@@ -77,6 +77,19 @@ jobs:
             python "$f"
           done
 
+      # Issue #108: post-install canary in deterministic --self-test mode —
+      # seeds an isolated scratch store, drives the SessionStart hook chain,
+      # and asserts the decision line carries the seeded row (plus the #107
+      # drift status). No host binaries, no network, no model. The live-mode
+      # lanes (claude -p / codex exec) are operator-run; absent host binaries
+      # take the exit-0 skip path by design.
+      - name: Host injection canary (self-test)
+        shell: bash
+        run: |
+          set -e
+          python scripts/host_canary.py --host claude --self-test
+          python scripts/host_canary.py --host codex --self-test
+
       # Issue #107 follow-up: a release-prep PR (manifest version bump) must
       # carry a fresh release-manifest.json — fail the PR, not the post-merge
       # release. Non-bump PRs pass (the manifest is intentionally stale
