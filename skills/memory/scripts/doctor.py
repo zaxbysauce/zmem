@@ -1382,6 +1382,14 @@ def _check_surfaces(repo_root: Path) -> dict:
             repo_root / ".claude-plugin" / "plugin.json",
             repo_root / "hooks" / "hooks.claude.json",
         ],
+        # Issue #108 recurrence sweep: the Codex plugin surface was invisible
+        # to doctor while codex-cli silently ignored its hooks (the manifest
+        # ./ defect) — a missing codex surface must now be a doctor failure,
+        # not a blind spot.
+        "codex_plugin": [
+            repo_root / ".codex-plugin" / "plugin.json",
+            repo_root / "hooks" / "hooks.codex.json",
+        ],
         "zcode_plugin": [
             repo_root / ".zcode-plugin" / "plugin.json",
             repo_root / "hooks" / "hooks.zcode.json",
@@ -1413,13 +1421,19 @@ def _check_surfaces(repo_root: Path) -> dict:
 
     if missing_required:
         status = "fail"
-        summary = f"Required host surfaces are missing: {', '.join(missing_required)}."
+        summary = (
+            f"Required host surfaces are missing: {', '.join(missing_required)}. "
+            "A tree predating the 0.18.0 codex_plugin surface reports this by "
+            "design — refresh the tree to the current release."
+        )
     elif optional_present:
         status = "pass"
-        summary = "Claude plugin, ZCode plugin, and memory skill surfaces are present; optional Codex adapter files are also present."
+        summary = ("Claude, Codex, and ZCode plugin surfaces plus the memory skill "
+                    "are present; optional Codex adapter files are also present.")
     else:
         status = "pass"
-        summary = "Claude plugin, ZCode plugin, and memory skill surfaces are present; optional Codex adapter files are not in this repo yet."
+        summary = ("Claude, Codex, and ZCode plugin surfaces plus the memory skill "
+                    "are present; optional Codex adapter files are not in this repo yet.")
 
     return _check("host-surfaces", status, summary, surfaces=details)
 
