@@ -102,6 +102,8 @@ class DoctorCliTest(unittest.TestCase):
             ),
         )
         _write_text(self.repo / "hooks" / "hooks.claude.json", "{}\n")
+        _write_text(self.repo / ".codex-plugin" / "plugin.json", "{}\n")
+        _write_text(self.repo / "hooks" / "hooks.codex.json", "{}\n")
         _write_text(self.repo / ".zcode-plugin" / "plugin.json", "{}\n")
         _write_text(self.repo / "hooks" / "hooks.zcode.json", "{}\n")
         _write_text(self.repo / "skills" / "memory" / "SKILL.md", "# memory\n")
@@ -752,6 +754,8 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         # checks' statuses are asserted.
         _write_text(self.repo / ".claude-plugin" / "plugin.json", "{}\n")
         _write_text(self.repo / "hooks" / "hooks.claude.json", "{}\n")
+        _write_text(self.repo / ".codex-plugin" / "plugin.json", "{}\n")
+        _write_text(self.repo / "hooks" / "hooks.codex.json", "{}\n")
         _write_text(self.repo / ".zcode-plugin" / "plugin.json", "{}\n")
         _write_text(self.repo / "hooks" / "hooks.zcode.json", "{}\n")
         _write_text(self.repo / "skills" / "memory" / "SKILL.md", "# memory\n")

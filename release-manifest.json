@@ -1,13 +1,13 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "fc4acb79ee68cbcdc20fcae492c34749bf93b6d6f924d2df6071a7f0efe8abc4",
+  "digest": "dfb3263513fa2d6ebc8b3b44b33b116be5ad342d206b7c9189488ce103652e2b",
   "files": {
     "hermes-plugin/__init__.py": "39ad2617be05846d35aa6eef2bd63ba513ce14fafe0816f381efe836a804f036",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "3340d1de69bfb4f7ef3c190ae10ab40c5de11f947241d3e468b564dcf9ec5854",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "5d85553ce7f2d32e2f9dd482d01c15b9a8ef5fa661532e1043ef66aeef3c9fea",
+    "hermes-plugin/plugin.yaml": "9c657f0d4a4fcb93640c4827bcdb3c27989908faf439c694946c8465ca4705d2",
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "8f09b3987ae01ec7d250881d2bb6b885e07e78743951d5b8f725ff07d6f48b97",
@@ -35,7 +35,7 @@
     "skills/memory/SKILL.md": "e2103eb533826f451b8a9963da28fe71c9a8dd6f8a842a54e0edda1d5e067638",
     "skills/memory/scripts/correction_queue.py": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
-    "skills/memory/scripts/doctor.py": "22beef410f9d3cf85bd9619a9a1c0abeab63149a2c412b7258ede612d61d21a2",
+    "skills/memory/scripts/doctor.py": "836833d70df4185edd1cc64e1bfb0739e639002f4142c0746456b50c1fcab11f",
     "skills/memory/scripts/drift.py": "d3d3c8f33632ce4851156b80ad35477f535f3fc3f42f402582cfdd7310fb0d40",
     "skills/memory/scripts/embed_profiles.py": "0666878e7c4924bf8798fed0641bbdaf36b33edad1c7f7d16ecf5e984e06899c",
     "skills/memory/scripts/embeddings.py": "5828b0a26701315f730ba383bc4545bffe9f64859ec7426161dde65acfa6cd0a",
@@ -65,5 +65,5 @@
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
     "skills/memory/scripts/storelib/write.py": "31bbd4f3a55b7c089bc1886055762b78133aa09db6afc027ebd053e413f0d43f"
   },
-  "version": "0.17.0"
+  "version": "0.18.0"
 }

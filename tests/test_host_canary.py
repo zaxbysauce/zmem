@@ -58,6 +58,13 @@ class CanarySelfTestTest(unittest.TestCase):
                 self.assertRegex(proc.stdout, UUID_RE.pattern)
                 self.assertRegex(proc.stdout, r"drift=(matched|drifted|unknown)")
                 self.assertIn("seeded id=", proc.stdout)
+                # Ground the pass in the bg log itself, not just the canary's
+                # own verdict line: the seeded row id must appear in the fresh
+                # decision line's ids=[...] (closes the fire-and-print-vacuous
+                # gap the implementation reviewer flagged).
+                m = re.search(r"row_id=([0-9a-f-]{36})", proc.stdout)
+                bg = (d / "zmem-bg.log").read_text(encoding="utf-8")
+                self.assertIn(m.group(1), bg)
 
     def test_decision_line_carries_reason_and_session(self):
         d = self._data_dir("reason")
