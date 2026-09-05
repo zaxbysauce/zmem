@@ -77,6 +77,15 @@ jobs:
             python "$f"
           done
 
+      # Issue #107 follow-up: a release-prep PR (manifest version bump) must
+      # carry a fresh release-manifest.json — fail the PR, not the post-merge
+      # release. Non-bump PRs pass (the manifest is intentionally stale
+      # between releases); indeterminate version reads fail closed.
+      - name: Manifest freshness on release-prep changes
+        if: github.event_name == 'pull_request' && !cancelled()
+        shell: bash
+        run: python scripts/release_gate.py --check-manifest-freshness --base origin/main
+
       # Issue #106 (P0-1, durable half): fail a merge to main that leaves
       # content under ## [Unreleased] without a version bump at HEAD — the
       # exact 8-merge static-0.13.1 stall (PRs #86–#104). PR runs skip the

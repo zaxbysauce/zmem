@@ -362,10 +362,47 @@ def _manifest_version(repo_root: Path) -> str:
     return next(iter(distinct))
 
 
+def _tracked_surface_hashes(repo_root: Path) -> dict | None:
+    """{relpath: sha256} over the TRACKED runtime surface, or None (with an
+    ::error already printed) when git enumeration fails or a tracked surface
+    file is unreadable.
+
+    Both --emit-manifest and --verify-manifest must describe exactly the set
+    the release ships (tracked files only) — hashing the raw disk tree at
+    emit time would put unshippable scratch files into every consumer's
+    manifest, and hashing it at verify time would fail verification on the
+    same unshippable scratch. Unreadable tracked surface files fail loudly;
+    a release never ships a file it cannot identify."""
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=str(repo_root),
+        capture_output=True, text=True, timeout=60,
+    )
+    if tracked.returncode != 0:
+        print("::error::release-manifest tooling requires git (tracked-file "
+              f"enumeration): {tracked.stderr.strip()}")
+        return None
+    hashes = {}
+    for rel in sorted(
+            r for r in tracked.stdout.splitlines() if drift._is_surface(r)):
+        h = drift.file_hash(repo_root / rel)
+        if h is None:
+            print(f"::error::cannot read tracked surface file {rel} — fix "
+                  f"or remove it, then re-run")
+            return None
+        hashes[rel] = h
+    return hashes
+
+
 def emit_manifest(repo_root: Path) -> int:
-    """Write release-manifest.json over the CURRENT working tree."""
+    """Write release-manifest.json describing what the release SHIPS.
+
+    The manifest describes the TRACKED surface via _tracked_surface_hashes
+    (see there for why not the raw disk tree). Refuses to emit an empty
+    manifest or one containing unreadable files."""
     version = _manifest_version(repo_root)
-    files = drift.tree_hashes(repo_root)
+    files = _tracked_surface_hashes(repo_root)
+    if files is None:
+        return 1
     if not files:
         print("::error::--emit-manifest found zero runtime-surface files "
               "under the repo root — refusing to emit an empty manifest")
@@ -391,12 +428,39 @@ def verify_manifest(repo_root: Path) -> int:
 
     Release-time use only (release.yml publish step): a stale manifest here
     means the release would ship code its manifest cannot identify — the
-    exact blind spot issue #107 closes."""
-    result = drift.evaluate(repo_root)
+    exact blind spot issue #107 closes. The served side is the TRACKED
+    surface (the same enumeration --emit-manifest recorded), not the raw
+    disk tree, so untracked scratch in a maintainer checkout cannot fail
+    verification."""
+    served = _tracked_surface_hashes(repo_root)
+    if served is None:
+        return 1
+    result = drift.evaluate(repo_root, served_hashes=served)
     if result["status"] == "unknown":
-        print(f"::error::no readable {drift.MANIFEST_NAME} at the repo root "
-              f"— run `python scripts/release_gate.py --emit-manifest` and "
-              f"commit it with the release (issue #107)")
+        if result.get("manifest_status") == "corrupt":
+            print(f"::error::{drift.MANIFEST_NAME} is present but fails its "
+                  f"algorithm/digest integrity gate — regenerate it with "
+                  f"`python scripts/release_gate.py --emit-manifest` and "
+                  f"commit (issue #107)")
+        else:
+            print(f"::error::no readable {drift.MANIFEST_NAME} at the repo "
+                  f"root — run `python scripts/release_gate.py "
+                  f"--emit-manifest` and commit it with the release "
+                  f"(issue #107)")
+        return 1
+    # The manifest must describe THIS release: its version must equal the
+    # host-facing manifest parity version, else the release would ship a
+    # manifest claiming another release's identity.
+    try:
+        current_version = _manifest_version(repo_root)
+    except SystemExit:
+        return 1
+    if result.get("version") != current_version:
+        print(f"::error::release manifest declares version "
+              f"{result.get('version')!r} but the host-facing manifests "
+              f"declare {current_version!r} — re-run `python "
+              f"scripts/release_gate.py --emit-manifest` after the version "
+              f"bump and commit (issue #107)")
         return 1
     if result["status"] == "drifted":
         differing = result.get("differing", [])
@@ -411,6 +475,39 @@ def verify_manifest(repo_root: Path) -> int:
     print(f"[release-gate] release manifest fresh ({result['files_compared']} "
           f"files, digest {result['served']})")
     return 0
+
+
+def check_manifest_freshness(repo_root: Path, base_ref: str) -> int:
+    """PR-time gate (issue #107 follow-up): fail when a release-prep change
+    (any host-facing manifest version differs from <base_ref>) leaves the
+    committed manifest stale. Non-bump changes pass — the manifest is
+    intentionally stale between releases while work sits under
+    [Unreleased]. Indeterminate version reads (git hiccup, unreadable
+    manifest) FAIL the check, never silently skip it."""
+    try:
+        manifests = discover_manifests(repo_root)
+    except RuntimeError as exc:
+        print(f"::error::--check-manifest-freshness could not enumerate "
+              f"manifests: {exc}")
+        return 1
+    bumped = False
+    for rel in manifests:
+        cur = _version_at(repo_root, "HEAD", rel)
+        base = _version_at(repo_root, base_ref, rel)
+        if cur is None or base is None:
+            print(f"::error::--check-manifest-freshness could not read "
+                  f"version of {rel} at HEAD or {base_ref} — failing closed")
+            return 1
+        if cur != base:
+            bumped = True
+    if not bumped:
+        print("[release-gate] not a release-prep change (no manifest "
+              "version bump vs "
+              f"{base_ref}) — manifest freshness not required")
+        return 0
+    print("[release-gate] release-prep change detected — verifying the "
+          "committed manifest describes the tree")
+    return verify_manifest(repo_root)
 
 
 def _github_output(name: str, value: str) -> None:
@@ -445,6 +542,14 @@ def main(argv: list[str] | None = None) -> int:
         help="issue #107: fail when the committed release-manifest.json no "
              "longer describes the tree (release-time use only)")
     ap.add_argument(
+        "--check-manifest-freshness", action="store_true",
+        help="issue #107: fail only when a release-prep change (manifest "
+             "version bump vs --base) leaves the committed manifest stale; "
+             "pass elsewhere (PR-time use)")
+    ap.add_argument(
+        "--base", default="origin/main",
+        help="base ref for --check-manifest-freshness (default origin/main)")
+    ap.add_argument(
         "--repo-root", default=None,
         help="repo root for --check-unreleased-drift/--emit-manifest/"
              "--verify-manifest (synthetic-repo tests); ignored by the "
@@ -457,6 +562,8 @@ def main(argv: list[str] | None = None) -> int:
         return emit_manifest(root)
     if args.verify_manifest:
         return verify_manifest(root)
+    if args.check_manifest_freshness:
+        return check_manifest_freshness(root, args.base)
 
     manifests = discover_manifests()
     if len(manifests) < MIN_MANIFESTS:

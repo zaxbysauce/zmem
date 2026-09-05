@@ -218,8 +218,21 @@ export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 # -f guard keeps a pre-0.17 tree (no drift.py) behaving exactly as before.
 DRIFT_JSON=""
 if [ -n "$PLUGIN_ROOT" ] && [ -f "$PLUGIN_ROOT/skills/memory/scripts/drift.py" ]; then
-  DRIFT_JSON="$("$PYTHON_BIN" "$PLUGIN_ROOT/skills/memory/scripts/drift.py" log-once \
-    --data-dir "$DATA_DIR_PY" --sid "$SESSION_ID" 2>/dev/null || true)"
+  # Python-native path (same to_py_path treatment as STORE_PY_PY): a raw
+  # MSYS /c/... PLUGIN_ROOT is invisible to Windows Python and would
+  # silently disable drift detection on Git Bash manual installs.
+  DRIFT_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts drift.py)"
+  # Bounded like the recall-body fallback (10s vs its 5s: the session path
+  # gets slightly more headroom). `timeout` is GNU coreutils — present in
+  # Git Bash, absent on stock macOS, where the call runs unguarded exactly
+  # as before (fail-open).
+  if command -v timeout >/dev/null 2>&1; then
+    DRIFT_JSON="$(timeout 10 "$PYTHON_BIN" "$DRIFT_PY" log-once \
+      --data-dir "$DATA_DIR_PY" --sid "$SESSION_ID" 2>/dev/null || true)"
+  else
+    DRIFT_JSON="$("$PYTHON_BIN" "$DRIFT_PY" log-once \
+      --data-dir "$DATA_DIR_PY" --sid "$SESSION_ID" 2>/dev/null || true)"
+  fi
 fi
 
 # Background sleep-time organization: fully detached, fire-and-forget. stdio is

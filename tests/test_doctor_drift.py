@@ -94,6 +94,18 @@ class DoctorServedDriftUnitTest(unittest.TestCase):
         self.assertEqual(check["status"], "skip", check["summary"])
         self.assertIn("No release-manifest.json", check["summary"])
 
+    def test_corrupt_manifest_warns_not_skips(self):
+        """F-009: a PRESENT-but-corrupt manifest is a damaged mirror (warn),
+        never indistinguishable from an absent one (skip)."""
+        _write_manifest(self.root)
+        mp = self.root / "release-manifest.json"
+        manifest = json.loads(mp.read_text(encoding="utf-8"))
+        manifest["digest"] = "f" * 64  # breaks the digest integrity gate
+        mp.write_text(json.dumps(manifest), encoding="utf-8")
+        check = doctor._check_served_drift(self.root)
+        self.assertEqual(check["status"], "warn", check["summary"])
+        self.assertIn("corrupt", check["summary"])
+
 
 class DoctorServedDriftCliTest(unittest.TestCase):
     """Exit-code contract end to end: warn/skip never flip doctor ok (AC2)."""

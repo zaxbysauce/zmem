@@ -113,9 +113,14 @@ def _drift_lines(tmp: str | Path) -> list:
 
 
 def _run_cli(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    # Strip every ambient ZMEM_* var (F-013): the drift CLI must be
+    # env-independent in tests, not silently steered by the developer shell.
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("ZMEM")
+           and k not in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")}
     return subprocess.run(
         [PYTHON, str(DRIFT_PY), *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, timeout=timeout, env=env,
     )
 
 
@@ -301,9 +306,29 @@ class DriftCliTest(unittest.TestCase):
         # is nothing to report.
         second = _run_log_once(self.root, self.data, "sess-a")
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(json.loads(second.stdout)["status"], "already")
+        second_payload = json.loads(second.stdout)
+        self.assertEqual(second_payload["status"], "matched")
+        self.assertTrue(second_payload["already"])
         self.assertEqual(_drift_lines(self.data), [])
         self.assertTrue(drift._marker_path(self.data, "sess-a").is_file())
+
+    def test_already_path_still_surfaces_operator_notice(self):
+        """F-008: when a recall-body fallback won the marker race, the
+        session-start call re-evaluates (logged=False) and still carries the
+        operator system_message — the notice is never silently lost."""
+        _write_manifest(self.root)
+        (self.root / "hooks/zmem-recall.sh").write_bytes(b"#!/bin/sh" + bytes([10]))
+        first = _run_log_once(self.root, self.data, "sess-a")
+        self.assertEqual(json.loads(first.stdout)["status"], "drifted")
+        self.assertEqual(len(_drift_lines(self.data)), 1)
+        second = _run_log_once(self.root, self.data, "sess-a")
+        payload = json.loads(second.stdout)
+        self.assertTrue(payload["already"])
+        self.assertFalse(payload["logged"])
+        self.assertEqual(payload["status"], "drifted")
+        self.assertIn("system_message", payload)
+        self.assertEqual(len(_drift_lines(self.data)), 1,
+                         "already path must never duplicate the line")
 
     def test_log_once_missing_manifest_never_blocks(self):
         """AC2: no manifest -> unknown, exit 0, no line, marker still set."""
@@ -405,6 +430,55 @@ class DriftCliTest(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertTrue(json.loads(r2.stdout)["logged"])
         self.assertEqual(len(_drift_lines(self.data)), 1)
+
+    def test_corrupt_manifest_degrades_to_unknown_with_status(self):
+        """F-009/F-012: a manifest present but failing its algorithm or
+        digest integrity gate is CORRUPT (manifest_status corrupt), never
+        whole-tree drift and never indistinguishable from absent."""
+        _write_manifest(self.root)
+        manifest_path = self.root / "release-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        # Algorithm mismatch.
+        manifest["algorithm"] = "md5"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        result = drift.evaluate(self.root)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["manifest_status"], "corrupt")
+        # Digest inconsistent with its own file hashes.
+        manifest["algorithm"] = "sha256-crlf-norm"
+        manifest["digest"] = "f" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        result = drift.evaluate(self.root)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["manifest_status"], "corrupt")
+        # Absent file stays absent.
+        manifest_path.unlink()
+        result = drift.evaluate(self.root)
+        self.assertEqual(result["manifest_status"], "absent")
+
+    def test_golden_hash_vector(self):
+        """Cubic P2 anti-self-fulfilling pin: file_hash must equal an
+        independently precomputed SHA-256, not merely agree with itself."""
+        import hashlib
+        f = self.tmp / "golden.txt"
+        f.write_bytes(b"zmem drift golden vector" + bytes([10]))
+        expected = hashlib.sha256(b"zmem drift golden vector" + bytes([10])).hexdigest()
+        self.assertEqual(drift.file_hash(f), expected)
+
+    def test_nonempty_marker_directory_left_alone(self):
+        """Cubic run-2 P2: a NON-EMPTY directory at the marker path may hold
+        unrelated data — log_once must not delete it; report error instead."""
+        _write_manifest(self.root)
+        (self.root / "hooks/zmem-recall.sh").write_bytes(b"#!/bin/sh" + bytes([10]))
+        marker = drift._marker_path(self.data, "sess-a")
+        marker.mkdir()
+        (marker / "unrelated.txt").write_text("keep me", encoding="utf-8")
+        r = _run_log_once(self.root, self.data, "sess-a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["status"], "error")
+        self.assertTrue((marker / "unrelated.txt").is_file(),
+                        "unrelated data must survive")
+        self.assertEqual(_drift_lines(self.data), [])
 
     def test_hostile_version_sanitized_in_system_message(self):
         """ST-1: newlines/ANSI escapes in a hostile manifest version must not

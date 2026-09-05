@@ -495,6 +495,20 @@ class ReleaseManifestTest(unittest.TestCase):
             "name: zmem\nversion: 0.17.0\n", encoding="utf-8")
         # Off-surface file: must never be hashed.
         (repo / "README.md").write_text("# readme\n", encoding="utf-8")
+        # Emit enumerates TRACKED files (git ls-files) — the fixture must be
+        # a git repo with its surface files committed. The untracked surface
+        # file below proves the tracked-only exclusion.
+        def git(*args: str):
+            r = subprocess.run(
+                ["git", "-c", "user.email=t@example.com", "-c",
+                 "user.name=T", *args],
+                cwd=str(repo), capture_output=True, text=True, timeout=60)
+            assert r.returncode == 0, f"fixture git failed: {r.stderr}"
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-qm", "fixture")
+        (repo / "hooks" / "untracked-junk.sh").write_text(
+            "# untracked" + chr(10), encoding="utf-8")
         return repo
 
     def _run_gate(self, repo: Path, *args: str):
@@ -520,6 +534,9 @@ class ReleaseManifestTest(unittest.TestCase):
             self.assertIn("hermes-plugin/plugin.yaml", manifest["files"])
             self.assertNotIn("README.md", manifest["files"])
             self.assertNotIn("release-manifest.json", manifest["files"])
+            # Untracked surface file: emit describes the TRACKED surface —
+            # unshippable scratch must never enter the release manifest.
+            self.assertNotIn("hooks/untracked-junk.sh", manifest["files"])
             # Deterministic: a re-emit over an unchanged tree is byte-identical.
             r2 = self._run_gate(repo, "--emit-manifest")
             self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)

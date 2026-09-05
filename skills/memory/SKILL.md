@@ -73,7 +73,10 @@ store or host config. Checks:
   Codex adapter files are optional until that lane exists)
 - served-tree drift vs `release-manifest.json` (`served-drift` check, issue
   #107): `matched`/`drifted` (warn — first 10 differing paths + both digests)/
-  `unknown` when the tree predates 0.17.0 and carries no manifest. Log-only;
+  `unknown`-skip when the tree predates 0.17.0 and carries no manifest, and
+  `unknown`-WARN when a manifest is present but corrupt (failed its
+  algorithm/digest integrity gate — the served mirror itself is damaged).
+  Log-only;
   a drifted session start also appends one `zmem-drift` line to `zmem-bg.log`
   and shows the operator a systemMessage — never model context.
 

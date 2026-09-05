@@ -103,13 +103,20 @@ def _is_surface(rel: str) -> bool:
 
 
 def surface_files(root: Path) -> list:
-    """Sorted POSIX relpaths of every surface file under ``root`` (disk walk)."""
+    """Sorted POSIX relpaths of every surface file under ``root`` (disk walk).
+
+    File symlinks are skipped (parity with release_gate's manifest fallback):
+    a link could point outside the tree, and a served mirror that swaps a
+    runtime file for a link is drift, not identity."""
     root = Path(root)
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_SEGMENTS]
         for name in filenames:
-            rel = Path(dirpath).joinpath(name).relative_to(root).as_posix()
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full):
+                continue
+            rel = Path(full).relative_to(root).as_posix()
             if _is_surface(rel):
                 out.append(rel)
     return sorted(out)
@@ -121,8 +128,14 @@ def normalize(data: bytes) -> bytes:
 
 
 def file_hash(path: Path):
-    """sha256 hexdigest of the normalized file bytes, or None when unreadable."""
+    """sha256 hexdigest of the normalized file bytes, or None when unreadable
+    or not a regular file (a FIFO/device/special file is drift, not
+    identity — hashing it could hang or exhaust memory)."""
     try:
+        import stat as _stat
+        st = os.stat(path)
+        if not _stat.S_ISREG(st.st_mode):
+            return None
         with open(path, "rb") as fh:
             return hashlib.sha256(normalize(fh.read())).hexdigest()
     except OSError:
@@ -143,7 +156,12 @@ def aggregate(files: dict) -> str:
 
 
 def load_manifest(root: Path):
-    """Parsed release manifest dict, or None when absent/malformed."""
+    """Parsed release manifest dict, or None when absent/malformed.
+
+    A manifest that is present but fails ANY structural gate (bad JSON,
+    files not a dict of strings, wrong algorithm, digest inconsistent with
+    its own file hashes) is malformed — callers distinguish this from
+    "absent" via ``manifest_status`` in evaluate()'s result."""
     path = Path(root) / MANIFEST_NAME
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -159,23 +177,46 @@ def load_manifest(root: Path):
     # hash and report whole-tree drift (wrong remediation path).
     if not all(isinstance(v, str) for v in files.values()):
         return None
+    # Algorithm gate: the field is written by emit and must be honored, not
+    # ignored — hashes made under another algorithm are not comparable.
+    if data.get("algorithm") != ALGORITHM:
+        return None
+    # Integrity gate: the digest must equal the aggregate of its own file
+    # hashes, or the manifest is internally inconsistent (corrupt).
+    if data.get("digest") != aggregate(files):
+        return None
     return data
 
 
-def evaluate(root: Path) -> dict:
+def manifest_present(root: Path) -> bool:
+    """True when a release-manifest.json exists (even if unreadable)."""
+    return (Path(root) / MANIFEST_NAME).exists()
+
+
+def evaluate(root: Path, served_hashes: dict | None = None) -> dict:
     """Compare the served tree at ``root`` against its release manifest.
 
-    Returns {"status": matched|drifted|unknown, "version", "served" (sha8),
-    "release" (sha8 or None), "files_compared", "differing_count",
-    "differing" (first 10 paths)}. A path differs on hash mismatch, presence
-    on only one side, or an unreadable served file."""
+    Returns {"status": matched|drifted|unknown, "manifest_status":
+    absent|corrupt|ok, "version", "served" (sha8), "release" (sha8 or None),
+    "files_compared", "differing_count", "differing" (first 10 paths)}. A
+    path differs on hash mismatch, presence on only one side, or an
+    unreadable served file. status unknown + manifest_status corrupt means
+    the manifest EXISTS but is unreadable/internally inconsistent — a
+    damaged cache mirror, not a pre-manifest tree.
+
+    ``served_hashes`` ({relpath: hash-or-None}) replaces the disk walk:
+    release_gate's --verify-manifest passes the TRACKED surface hashes so
+    repo-side verification compares the same file set --emit-manifest
+    recorded — untracked scratch in a maintainer tree is not part of what
+    a release ships and must not fail verify."""
     root = Path(root)
-    served = tree_hashes(root)
+    served = tree_hashes(root) if served_hashes is None else dict(served_hashes)
     served_sha8 = aggregate(served)[:8]
     manifest = load_manifest(root)
     if manifest is None:
         return {
             "status": "unknown",
+            "manifest_status": "corrupt" if manifest_present(root) else "absent",
             "version": None,
             "served": served_sha8,
             "release": None,
@@ -192,6 +233,7 @@ def evaluate(root: Path) -> dict:
     )
     return {
         "status": "drifted" if differing else "matched",
+        "manifest_status": "ok",
         "version": manifest.get("version"),
         "served": served_sha8,
         "release": release_sha8[:8],
@@ -260,24 +302,37 @@ def log_once(root: Path, data_dir: Path, sid: str) -> dict:
     """Evaluate drift at most once per session id and log when drifted.
 
     The exclusive marker is created FIRST (the .native-nudge-shown race
-    pattern): only the process that wins the create evaluates, so concurrent
+    pattern): only the process that wins the create logs, so concurrent
     first decisions of one session produce at most one line (issue #107
-    acceptance criterion 3). A wedged marker path (a DIRECTORY at the marker
-    path) is removed best-effort so one stray directory cannot suppress the
-    session's drift line forever; if removal fails the function reports error
-    and does NOT log. Failure-recovery contract: if the evaluate or the
-    bg-log append fails AFTER the marker was created, the marker is removed
-    so a later call retries, instead of leaving a permanent marker with no
-    drift line."""
+    acceptance criterion 3). When the marker ALREADY exists this call still
+    re-evaluates (log=False) so a session-start that lost the race to a
+    recall-body fallback can still surface the operator notice. A stray
+    EMPTY directory at the marker path is removed so it cannot suppress the
+    session's line; a NON-EMPTY one is left untouched (never delete data we
+    did not create) and reported as error. Failure-recovery contract: if the
+    evaluate or the bg-log append fails AFTER the marker was created, the
+    marker is removed so a later call retries, instead of leaving a permanent
+    marker with no drift line."""
     marker = _marker_path(data_dir, sid)
     if os.path.isfile(marker):
-        return {"status": "already", "logged": False}
+        # Lost the race (a sibling writer already logged for this session).
+        # Re-evaluate WITHOUT logging so the caller can still render the
+        # operator notice; the at-most-once line contract is untouched.
+        result = evaluate(root)
+        payload = dict(result)
+        payload["logged"] = False
+        payload["already"] = True
+        if result["status"] == "drifted":
+            payload["system_message"] = _operator_message(result)
+        return payload
     if os.path.isdir(marker):
-        # Stray directory at the marker path (manual intervention, a partial
-        # makedirs): remove so detection is not silently suppressed.
-        import shutil
+        # Stray EMPTY directory at the marker path (manual intervention, a
+        # partial makedirs): remove so detection is not silently suppressed.
+        # A NON-EMPTY directory may hold unrelated data — never delete what
+        # we did not create.
+        import os as _os
         try:
-            shutil.rmtree(marker)
+            _os.rmdir(marker)
         except OSError:
             return {"status": "error", "logged": False}
     try:

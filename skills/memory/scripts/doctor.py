@@ -34,12 +34,18 @@ except ImportError:
     import host  # type: ignore
 
 # Issue #107: served-code drift detection (content-hash manifest). drift.py is
-# stdlib-only and side-effect-free at import (no store access).
+# stdlib-only and side-effect-free at import (no store access). Both import
+# attempts are guarded: a partially refreshed served tree can carry this
+# doctor.py without drift.py — doctor must still produce its report (the
+# served-drift check degrades to skip), never crash.
 try:
     import drift
 except ImportError:
-    sys.path.insert(0, os.path.dirname(__file__))
-    import drift  # type: ignore
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        import drift  # type: ignore
+    except ImportError:
+        drift = None  # type: ignore
 
 
 # Single source of truth: import the schema version from schema_meta (the same
@@ -1433,6 +1439,11 @@ def _check_served_drift(repo_root: Path) -> dict:
     counts as fail, so a tree without a manifest (pre-0.17.0 served trees,
     dev checkouts) also keeps exit 0.
     """
+    if drift is None:
+        return _check(
+            "served-drift", "skip",
+            "Served-tree drift check unavailable: drift.py is missing from "
+            "this tree (pre-0.17.0 served tree or partial mirror).")
     try:
         result = drift.evaluate(repo_root)
     except Exception:
@@ -1466,6 +1477,19 @@ def _check_served_drift(repo_root: Path) -> dict:
             served=result.get("served"),
             release=result.get("release"),
             files_compared=result.get("files_compared"),
+        )
+    # unknown: manifest absent OR present-but-corrupt. These are DIFFERENT
+    # operator situations and must not render identically: a corrupt manifest
+    # means the served cache mirror itself is damaged — say so loudly (warn),
+    # while an absent manifest is the benign pre-0.17.0 / dev-checkout case
+    # (skip).
+    if result.get("manifest_status") == "corrupt":
+        return _check(
+            "served-drift", "warn",
+            "release-manifest.json is PRESENT but unreadable/corrupt "
+            "(failed its algorithm or digest integrity gate) — this served "
+            "cache mirror is damaged; force a refresh per README Upgrade.",
+            served=result.get("served"),
         )
     return _check(
         "served-drift", "skip",
