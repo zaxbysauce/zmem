@@ -12,6 +12,29 @@ README.
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-09-04
+
+Workstream A PR 2 of 5 from the proactive-memory epic (#100): the served code
+is now identified by content hash, not by version string (#107).
+
+- Every release ships `release-manifest.json` — a sha-256 hash per runtime
+  surface file (`hooks/**`, `skills/memory/scripts/**`, `skills/**/SKILL.md`,
+  `hermes-plugin/**`) plus an aggregate digest — committed at the repo root by
+  `scripts/release_gate.py --emit-manifest` and attached to the GitHub Release;
+  the Release workflow refuses to publish a release whose manifest does not
+  describe its own tree (`--verify-manifest`).
+- `doctor` gains the `served-drift` check: matched / drifted (warn, first 10
+  differing paths + served vs release digests) / unknown (pre-0.17.0 tree with
+  no manifest). Report-only — it never fails doctor or blocks a hook.
+- On the first hook decision of a session, a drifted served tree appends one
+  `zmem-drift served=<sha8> release=<sha8> files=<n>` line to `zmem-bg.log`
+  (log-only, never in model context, at most once per session id) and shows
+  the OPERATOR a `systemMessage` notice — including under `ZMEM_INJECT=0`.
+  The `zmem-drift` prefix is invisible to the 0.14–0.16 miss-rate parser, and
+  no store/schema surface changed: 0.13.1–0.16.0 clients keep working against
+  the shared store until they refresh.
+- README documents how to detect drift and force a per-host refresh.
+
 ## [0.16.0] — 2026-09-04
 
 The Phase-2 popularity fix from the proactive-memory epic (#100): passive

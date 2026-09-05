@@ -1767,6 +1767,58 @@ console.log("\n[18] SessionStart pending-candidate note (real session-start.sh)"
     }
 }
 
+// --- issue #107: systemMessage passthrough (operator channel) ---------------
+// The drift notice rides payload.systemMessage; it must reach every host
+// envelope, survive the empty-additionalContext (kill-switch) shape, and stay
+// absent when the payload carries none (byte-identical old behavior).
+{
+    const MSG = "zmem: served code drifted from release 9.9.9 - 3 runtime file(s) differ";
+    const sent = (obj) => "<<<ZMEM_JSON>>>" + JSON.stringify(obj) + "<<<END>>>";
+
+    const claudeBoth = launch.translate(
+        sent({ additionalContext: "ctx", systemMessage: MSG }),
+        "claude", "session-start", 9000);
+    ok("systemMessage/claude: rides hookSpecificOutput sibling",
+        claudeBoth.hookSpecificOutput
+            && claudeBoth.hookSpecificOutput.additionalContext === "ctx"
+            && claudeBoth.systemMessage === MSG,
+        JSON.stringify(claudeBoth));
+
+    const zcodeBoth = launch.translate(
+        sent({ additionalContext: "ctx", systemMessage: MSG }),
+        "zcode", "session-start", 9000);
+    ok("systemMessage/zcode: rides bare additionalContext sibling",
+        zcodeBoth.additionalContext === "ctx" && zcodeBoth.systemMessage === MSG,
+        JSON.stringify(zcodeBoth));
+
+    const codexKillSwitch = launch.translate(
+        sent({ systemMessage: MSG }), "codex", "session-start", 9000);
+    ok("systemMessage/codex: emitted with EMPTY additionalContext",
+        codexKillSwitch.hookSpecificOutput
+            && codexKillSwitch.hookSpecificOutput.additionalContext === ""
+            && codexKillSwitch.systemMessage === MSG,
+        JSON.stringify(codexKillSwitch));
+
+    const legacyShape = launch.translate(
+        sent({ additionalContext: "ctx" }), "claude", "session-start", 9000);
+    ok("systemMessage absent: envelope identical to the old shape",
+        legacyShape.hookSpecificOutput
+            && legacyShape.hookSpecificOutput.additionalContext === "ctx"
+            && !("systemMessage" in legacyShape),
+        JSON.stringify(legacyShape));
+
+    const neither = launch.translate(
+        sent({}), "claude", "session-start", 9000);
+    ok("empty payload: still fails open to {}",
+        JSON.stringify(neither) === "{}", JSON.stringify(neither));
+
+    const nonString = launch.translate(
+        sent({ additionalContext: "ctx", systemMessage: 42 }),
+        "claude", "session-start", 9000);
+    ok("non-string systemMessage ignored",
+        !("systemMessage" in nonString), JSON.stringify(nonString));
+}
+
 // --- cleanup + report ------------------------------------------------------
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }
 

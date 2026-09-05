@@ -209,6 +209,32 @@ NUDGE_MARKER_PY="$(join_path "$DATA_DIR_PY" .native-nudge-shown)"
 export ZMEM_DATA="${ZMEM_DATA:-$DATA_DIR}"
 export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
 
+# Issue #107 (Workstream A PR 2): served-code drift check, BEFORE the payload
+# block so it runs under ZMEM_INJECT=0 too (the disabled decision is still the
+# session first logged decision). drift.py log-once is marker-guarded (at most
+# one zmem-drift bg-log line per session id, exit 0 always — never blocking),
+# and its JSON rides argv 13 into the payload block below so a drifted tree
+# surfaces to the OPERATOR via systemMessage, never in additionalContext. The
+# -f guard keeps a pre-0.17 tree (no drift.py) behaving exactly as before.
+DRIFT_JSON=""
+if [ -n "$PLUGIN_ROOT" ] && [ -f "$PLUGIN_ROOT/skills/memory/scripts/drift.py" ]; then
+  # Python-native path (same to_py_path treatment as STORE_PY_PY): a raw
+  # MSYS /c/... PLUGIN_ROOT is invisible to Windows Python and would
+  # silently disable drift detection on Git Bash manual installs.
+  DRIFT_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts drift.py)"
+  # Bounded like the recall-body fallback (10s vs its 5s: the session path
+  # gets slightly more headroom). `timeout` is GNU coreutils — present in
+  # Git Bash, absent on stock macOS, where the call runs unguarded exactly
+  # as before (fail-open).
+  if command -v timeout >/dev/null 2>&1; then
+    DRIFT_JSON="$(timeout 10 "$PYTHON_BIN" "$DRIFT_PY" log-once \
+      --data-dir "$DATA_DIR_PY" --sid "$SESSION_ID" 2>/dev/null || true)"
+  else
+    DRIFT_JSON="$("$PYTHON_BIN" "$DRIFT_PY" log-once \
+      --data-dir "$DATA_DIR_PY" --sid "$SESSION_ID" 2>/dev/null || true)"
+  fi
+fi
+
 # Background sleep-time organization: fully detached, fire-and-forget. stdio is
 # redirected to the $BG_SINK maintenance log below (a best-effort log file that
 # falls back to /dev/null when the data dir is unwritable) so it (a) can't
@@ -339,6 +365,26 @@ try:
     session_id = sys.argv[12]
 except IndexError:
     session_id = ""
+try:
+    drift_json = sys.argv[13]
+except IndexError:
+    drift_json = ""
+
+# Issue #107 (Workstream A PR 2): the operator-facing drift notice. The bash
+# layer already ran drift.py log-once (marker-guarded, log-only, exit 0) and
+# handed its JSON here. Parse defensively: any absent, unparseable, or
+# non-drifted payload degrades to today exact behavior. The message rides the
+# systemMessage channel (operator-visible), NEVER additionalContext.
+_drift_msg = ""
+if drift_json:
+    try:
+        _dj = json.loads(drift_json)
+        if (isinstance(_dj, dict) and _dj.get("status") == "drifted"
+                and isinstance(_dj.get("system_message"), str)
+                and _dj["system_message"]):
+            _drift_msg = _dj["system_message"]
+    except ValueError:
+        _drift_msg = ""
 
 # issue #110 (P0-5): ZMEM_INJECT=0 is the passive-injection kill switch.
 # Tier 0 (core.md / AGENTS.md), Tier 2 recall, the store-path nudge, the
@@ -361,7 +407,12 @@ if os.environ.get("ZMEM_INJECT", "1").strip() == "0":
                         int(__import__("time").time()), _safe_sid))
     except Exception:
         pass  # fail-open: the audit log never blocks session start
-    print("{}")
+    # Issue #107: keep the operator notice alive on the kill-switch path —
+    # the drift evaluation already ran in the bash layer above.
+    if _drift_msg:
+        print(json.dumps({"systemMessage": _drift_msg}))
+    else:
+        print("{}")
     sys.exit(0)
 
 parts = []
@@ -671,16 +722,23 @@ if budget > 0 and len(ctx) > budget:
     _last_open = _cut.rfind("<<<ZMEM_UNTRUSTED_FENCE>>>")
     _last_close_in_cut = _cut.rfind(_closer)
     if _last_open > _last_close_in_cut:
-        # The cut lands inside a fence: KEEP the partial body (up to
-        # the cut) and append the closer so the fence is complete —
+        # The cut lands inside a fence: KEEP the partial body (up to the
+        # cut) and append the closer so the fence is complete —
         # never an unclosed or orphaned marker (final-critic round-3
         # fix: the previous branch dropped the opener and emitted a
         # dangling closer).
         ctx = _cut.rstrip() + "\n" + _closer + "\n[recall truncated]"
     else:
         ctx = _cut + "\n[recall truncated]"
-print(json.dumps({"additionalContext": ctx}) if ctx else "{}")
-' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" "$SESSION_ID" 2>/dev/null || echo '{}')"
+# Issue #107: systemMessage rides ONLY when the served tree drifted — an
+# operator-facing notice that must never enter additionalContext.
+_payload = {}
+if ctx:
+    _payload["additionalContext"] = ctx
+if _drift_msg:
+    _payload["systemMessage"] = _drift_msg
+print(json.dumps(_payload) if _payload else "{}")
+' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" "$SESSION_ID" "$DRIFT_JSON" 2>/dev/null || echo '{}')"
 
 # Neutralize any sentinel token a MEMORY'S OWN CONTENT happens to contain
 # before wrapping. The launcher locates the payload by scanning stdout for the

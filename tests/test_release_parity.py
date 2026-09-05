@@ -469,6 +469,165 @@ class CiWorkflowContractTest(unittest.TestCase):
             "the drift gate is skipped whenever any earlier step fails — "
             "add !cancelled() to the condition")
 
+    def test_freshness_step_fetches_base_ref_before_the_gate(self):
+        # The PR checkout is shallow and carries no origin/main ref; the
+        # freshness gate fails closed on an unreadable base. Pin that the
+        # step fetches the base tip BEFORE invoking the gate, or every
+        # release-prep PR goes red on an infra-shaped error.
+        import re
+        step = re.search(
+            r"- name: Manifest freshness on release-prep changes"
+            r".*?run: \|(.*?)\n      - ", self.yml, re.DOTALL)
+        self.assertIsNotNone(
+            step, "ci.yml lost the manifest-freshness step")
+        body = step.group(1)
+        fetch = body.find("git fetch")
+        gate = body.find("--check-manifest-freshness --base origin/main")
+        self.assertGreater(fetch, -1,
+                           "the freshness step must fetch origin/main "
+                           "(shallow PR checkouts have no base ref)")
+        self.assertGreater(gate, -1,
+                           "the freshness step must run the gate")
+        self.assertLess(fetch, gate,
+                        "the fetch must run BEFORE the gate")
+
+
+class ReleaseManifestTest(unittest.TestCase):
+    """Issue #107: --emit-manifest writes the content-hash manifest over the
+    working tree, --verify-manifest passes fresh and fails stale/missing, and
+    the manifest never joins the version-parity set."""
+
+    def _make_repo(self, tmp: Path) -> Path:
+        repo = tmp / "synthetic"
+        repo.mkdir(parents=True)
+        (repo / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+        (repo / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "zmem", "version": "0.17.0"}),
+            encoding="utf-8")
+        # Runtime-surface files across all four prefixes (the hermes manifest
+        # carries a version: line — the emit parity check reads it).
+        for rel in ("hooks/zmem-recall.sh", "hooks/lib/body.py",
+                    "skills/memory/scripts/store.py",
+                    "skills/memory/SKILL.md"):
+            p = repo / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(f"# {rel}\n", encoding="utf-8")
+        (repo / "hermes-plugin").mkdir(parents=True, exist_ok=True)
+        (repo / "hermes-plugin" / "plugin.yaml").write_text(
+            "name: zmem\nversion: 0.17.0\n", encoding="utf-8")
+        # Off-surface file: must never be hashed.
+        (repo / "README.md").write_text("# readme\n", encoding="utf-8")
+        # Emit enumerates TRACKED files (git ls-files) — the fixture must be
+        # a git repo with its surface files committed. The untracked surface
+        # file below proves the tracked-only exclusion.
+        def git(*args: str):
+            r = subprocess.run(
+                ["git", "-c", "user.email=t@example.com", "-c",
+                 "user.name=T", *args],
+                cwd=str(repo), capture_output=True, text=True, timeout=60)
+            assert r.returncode == 0, f"fixture git failed: {r.stderr}"
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-qm", "fixture")
+        (repo / "hooks" / "untracked-junk.sh").write_text(
+            "# untracked" + chr(10), encoding="utf-8")
+        return repo
+
+    def _run_gate(self, repo: Path, *args: str):
+        return subprocess.run(
+            [PYTHON, str(GATE_PY), *args, "--repo-root", str(repo)],
+            capture_output=True, text=True, timeout=120, cwd=str(REPO_ROOT),
+        )
+
+    def test_emit_writes_deterministic_manifest(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="zmem-rm107-") as td:
+            repo = self._make_repo(Path(td))
+            r1 = self._run_gate(repo, "--emit-manifest")
+            self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
+            self.assertIn("[release-gate] wrote release-manifest.json", r1.stdout)
+            first = (repo / "release-manifest.json").read_text(encoding="utf-8")
+            manifest = json.loads(first)
+            self.assertEqual(manifest["version"], "0.17.0")
+            self.assertEqual(manifest["algorithm"], "sha256-crlf-norm")
+            self.assertIn("hooks/zmem-recall.sh", manifest["files"])
+            self.assertIn("skills/memory/scripts/store.py", manifest["files"])
+            self.assertIn("skills/memory/SKILL.md", manifest["files"])
+            self.assertIn("hermes-plugin/plugin.yaml", manifest["files"])
+            self.assertNotIn("README.md", manifest["files"])
+            self.assertNotIn("release-manifest.json", manifest["files"])
+            # Untracked surface file: emit describes the TRACKED surface —
+            # unshippable scratch must never enter the release manifest.
+            self.assertNotIn("hooks/untracked-junk.sh", manifest["files"])
+            # Deterministic: a re-emit over an unchanged tree is byte-identical.
+            r2 = self._run_gate(repo, "--emit-manifest")
+            self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+            self.assertEqual(
+                first, (repo / "release-manifest.json").read_text(
+                    encoding="utf-8"),
+                "emit must be deterministic (no timestamp, sorted keys)")
+
+    def test_verify_passes_fresh_fails_stale_and_missing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="zmem-rm107-") as td:
+            repo = self._make_repo(Path(td))
+            # Missing manifest: rc 1 with a clear remediation.
+            r = self._run_gate(repo, "--verify-manifest")
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("::error::", r.stdout)
+            self.assertIn("--emit-manifest", r.stdout)
+            # Fresh manifest: rc 0.
+            self._run_gate(repo, "--emit-manifest")
+            r = self._run_gate(repo, "--verify-manifest")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("release manifest fresh", r.stdout)
+            # Stale (one surface file edited after emit): rc 1 naming the file.
+            (repo / "hooks" / "zmem-recall.sh").write_text(
+                "# drifted\n", encoding="utf-8")
+            r = self._run_gate(repo, "--verify-manifest")
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("STALE", r.stdout)
+            self.assertIn("hooks/zmem-recall.sh", r.stdout)
+
+    def test_manifest_never_joins_the_version_parity_set(self):
+        """release-manifest.json carries a digest, not a release version —
+        the default gate mode (and its byte-identical stdout contract) must
+        never see it as a host-facing manifest."""
+        manifests = gate.discover_manifests()
+        self.assertNotIn("release-manifest.json", manifests)
+
+
+class ReleaseWorkflowManifestPinsTest(unittest.TestCase):
+    """Issue #107 workflow pins: the publish step verifies the manifest
+    before creating the release and attaches it as a release asset."""
+
+    def setUp(self):
+        self.yml = (REPO_ROOT / ".github" / "workflows" / "release.yml"
+                    ).read_text(encoding="utf-8")
+
+    def test_publish_step_verifies_manifest_before_create(self):
+        import re
+        verify = self.yml.find("release_gate.py --verify-manifest")
+        create = self.yml.find("gh release create")
+        self.assertGreater(
+            verify, -1, "release.yml lost the --verify-manifest step")
+        self.assertGreater(
+            create, -1, "release.yml lost gh release create")
+        self.assertLess(
+            verify, create,
+            "--verify-manifest must run BEFORE gh release create so a stale "
+            "manifest aborts the release under set -euo pipefail")
+
+    def test_manifest_attached_as_release_asset(self):
+        import re
+        create = re.search(
+            r"gh release create \"v\$\{VERSION\}\".*?release-manifest\.json",
+            self.yml, re.DOTALL)
+        self.assertIsNotNone(
+            create,
+            "release-manifest.json must be attached to the GitHub Release "
+            "(issue #107 scope item 1)")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
