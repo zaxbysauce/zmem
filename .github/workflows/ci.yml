@@ -80,11 +80,16 @@ jobs:
       # Issue #107 follow-up: a release-prep PR (manifest version bump) must
       # carry a fresh release-manifest.json — fail the PR, not the post-merge
       # release. Non-bump PRs pass (the manifest is intentionally stale
-      # between releases); indeterminate version reads fail closed.
+      # between releases); indeterminate version reads fail closed. The PR
+      # checkout is shallow and carries no origin/main ref, so the step
+      # fetches the base tip explicitly (depth-1 suffices: the gate reads
+      # only git show <ref>:<manifest> per tracked version surface).
       - name: Manifest freshness on release-prep changes
         if: github.event_name == 'pull_request' && !cancelled()
         shell: bash
-        run: python scripts/release_gate.py --check-manifest-freshness --base origin/main
+        run: |
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          python scripts/release_gate.py --check-manifest-freshness --base origin/main
 
       # Issue #106 (P0-1, durable half): fail a merge to main that leaves
       # content under ## [Unreleased] without a version bump at HEAD — the

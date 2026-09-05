@@ -469,6 +469,28 @@ class CiWorkflowContractTest(unittest.TestCase):
             "the drift gate is skipped whenever any earlier step fails — "
             "add !cancelled() to the condition")
 
+    def test_freshness_step_fetches_base_ref_before_the_gate(self):
+        # The PR checkout is shallow and carries no origin/main ref; the
+        # freshness gate fails closed on an unreadable base. Pin that the
+        # step fetches the base tip BEFORE invoking the gate, or every
+        # release-prep PR goes red on an infra-shaped error.
+        import re
+        step = re.search(
+            r"- name: Manifest freshness on release-prep changes"
+            r".*?run: \|(.*?)\n      - ", self.yml, re.DOTALL)
+        self.assertIsNotNone(
+            step, "ci.yml lost the manifest-freshness step")
+        body = step.group(1)
+        fetch = body.find("git fetch")
+        gate = body.find("--check-manifest-freshness --base origin/main")
+        self.assertGreater(fetch, -1,
+                           "the freshness step must fetch origin/main "
+                           "(shallow PR checkouts have no base ref)")
+        self.assertGreater(gate, -1,
+                           "the freshness step must run the gate")
+        self.assertLess(fetch, gate,
+                        "the fetch must run BEFORE the gate")
+
 
 class ReleaseManifestTest(unittest.TestCase):
     """Issue #107: --emit-manifest writes the content-hash manifest over the
