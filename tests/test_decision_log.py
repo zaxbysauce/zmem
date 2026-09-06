@@ -673,14 +673,15 @@ class MomentFieldParserTest(unittest.TestCase):
         # And the counter buckets it under the SANITIZED literal (review
         # PRR-014: the reader applies the same charset rule as the writers,
         # so metacharacters cannot become report keys or leak into the
-        # doctor summary text) — no field of the report is forged.
+        # doctor summary text) — no field of the report is forged. Four
+        # unsafe chars (( ) + =) each map to one underscore.
         from storelib import false_inject
         report = false_inject.build_false_injection_report(
             parsed, conn=None, data_dir=None, failure_rows=[])
         self.assertNotIn(hostile, report["per_moment"])
-        self.assertIn("evil_-_status_silent", report["per_moment"])
+        self.assertIn("evil___status_silent", report["per_moment"])
         self.assertEqual(
-            report["per_moment"]["evil_-_status_silent"]["injected"], 1)
+            report["per_moment"]["evil___status_silent"]["injected"], 1)
         self.assertEqual(report["overall"]["injected"], 1)
 
     def test_hostile_moment_cannot_append_a_forged_field(self):
