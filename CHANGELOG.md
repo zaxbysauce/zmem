@@ -12,10 +12,11 @@ README.
 
 ## [Unreleased]
 
-## [0.19.0] — 2026-09-05
+## [0.19.0] — 2026-09-06
 
 Workstream A PR 4 of 5 from the proactive-memory epic (#100): namespace-guard
-the MCP `supersede`/`invalidate` tombstone tools (#109, security).
+the MCP `supersede`/`invalidate` tombstone tools (#109, security), plus the
+PR-review feedback round hardening.
 
 - **Fix: scoped MCP tokens can no longer tombstone rows outside their
   namespace allow-list.** The two tombstone tools were the only mutating MCP
@@ -37,17 +38,33 @@ the MCP `supersede`/`invalidate` tombstone tools (#109, security).
   cross-namespace tombstone. Omitting the flag keeps the historical
   unguarded behavior for local CLI operators; unscoped operator tokens are
   byte-for-byte unchanged (no extra read, no pin).
-- **New guardrail test** (`tests/test_mcp_mutating_tools_guard.py`): every
-  `@mcp.tool()` handler whose store argv carries a mutating subcommand
-  (add/update/supersede/invalidate) must reference `_guard_namespace` — the
-  source contract fails on exactly the pre-fix tree and catches any future
-  mutating tool that forgets the guard. Behavioral coverage in
-  `tests/test_mcp_auth.py` (scoped denials on `project:other` and
-  `user:global` rows with rows-stay-live assertions, own-namespace and
-  `user:global`-scoped allow-cases, unscoped regression guard) and
-  `tests/test_update_invalidate.py` (CLI-level guard: wrong expectation
-  refuses with the row left live, correct expectation tombstones, garbage
-  expectations fail closed).
+- **New CLI flag: `update --expected-old-namespace <ns>`** (feedback round).
+  Update's OLD-row tombstone is the same class of destructive write; the MCP
+  server now pins the verified target namespace on it too, so a scoped
+  token's update cannot tombstone a row that drifted out of the allow-list
+  in the read-to-write window (the explicit `--namespace` override branch is
+  unchanged — rekeying a row into scope is the documented v13 operation).
+  Store-level: the namespace guard fires before the liveness reveal (no
+  cross-namespace oracle), and both guarded mutations carry a fail-closed
+  rowcount backstop for a row that moved or was deleted mid-flight.
+- **Feedback-round hardening (PR #143 review):** `--expected-namespace ""`
+  (an explicitly supplied empty expectation) now fails closed instead of
+  falling through to the unguarded path; a store-level namespace-guard
+  refusal surfaced through the MCP server now returns the SAME structured
+  `namespace_not_allowed` shape as the server-side guard (clients
+  pattern-match one token, not prose); the scoped-token section of
+  `skills/memory/SKILL.md` names the refusal line and the new flags.
+- **Tests:** behavioral coverage in `tests/test_mcp_auth.py` (scoped denials
+  on `project:other` and `user:global` rows with rows-stay-live assertions
+  and token-leak/detail-text checks, own-namespace and `user:global`-scoped
+  allow-cases, multi-namespace token case, scoped not-found shape,
+  unscoped regression guard) and `tests/test_update_invalidate.py`
+  (CLI-level guard: wrong/correct/empty expectations, blank-reason ordering,
+  deterministic read-to-write race backstop tests, unguarded default).
+  `tests/test_mcp_mutating_tools_guard.py` is a source-contract guardrail:
+  every mutating `@mcp.tool()` handler must reference `_guard_namespace`,
+  and all three tombstone-carrying handlers must keep their namespace pins —
+  it fails on exactly the pre-fix tree.
 - **Docs:** the scoped-token section of `skills/memory/SKILL.md` no longer
   states that `supersede`/`invalidate` are "deliberately NOT
   namespace-confined" — that exemption was the documented form of this bug.

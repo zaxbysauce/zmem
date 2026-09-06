@@ -100,6 +100,22 @@ class MutatingToolsGuardContractTest(unittest.TestCase):
             f"tombstone handlers not pinning --expected-namespace "
             f"(expected the executable argv append): {missing}")
 
+    def test_update_handler_pins_expected_old_namespace(self):
+        # PRR-002 closure: update's OLD-row tombstone is also a namespace-
+        # confined destructive write. The behavioral tests cannot catch a
+        # dropped pin (the server-side guard denies first), so the source
+        # contract is the tripwire here too — same rationale as
+        # test_tombstone_handlers_pin_expected_namespace.
+        pin_line = 'args += ["--expected-old-namespace", ns_pin]'
+        source = SERVER_PY.read_text(encoding="utf-8")
+        segments = dict(_tool_segments(source))
+        self.assertIn("update", segments,
+                      "update handler not found — scanner rotted")
+        self.assertIn(
+            pin_line, segments["update"],
+            "update handler no longer pins --expected-old-namespace on the "
+            "scoped no-override path (issue #109 follow-up)")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

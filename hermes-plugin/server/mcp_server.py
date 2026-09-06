@@ -448,6 +448,37 @@ def _sanitize_store_error(r: dict[str, Any], limit: int = 200) -> str:
     return chosen
 
 
+# Marker the store CLI prints when the atomic --expected-namespace guard
+# (issue #109) refuses a mutation. Surfaced here so a store-level guard
+# refusal maps onto the SAME structured denial dict the server-side
+# _guard_namespace returns — clients pattern-match the stable
+# namespace_not_allowed token, not prose.
+_NAMESPACE_GUARD_MARKER = "[zmem] namespace guard:"
+
+
+def _namespace_guard_denial(
+    sanitized: str, expected_ns: Optional[str]
+) -> Optional[dict[str, Any]]:
+    """Map a store-level namespace-guard refusal to the structured denial.
+
+    Returns the ``namespace_not_allowed`` dict when ``sanitized`` (the
+    _sanitize_store_error output of a failed store call) is the atomic
+    ``--expected-namespace`` guard's stable refusal line; None for any other
+    error. ``expected_ns`` is the namespace the mutation was pinned to (the
+    denial's ``namespace`` field carries the scope the refusal is about, not
+    the row's post-race namespace, which the server cannot know without
+    another read). Keeps the two denial paths — server-side guard and
+    store-side guard — wire-compatible.
+    """
+    if _NAMESPACE_GUARD_MARKER in sanitized:
+        return {
+            "error": NAMESPACE_NOT_ALLOWED,
+            "namespace": expected_ns,
+            "detail": sanitized,
+        }
+    return None
+
+
 def _run_store(args: list[str], input_text: str | None = None) -> dict[str, Any]:
     """Run ``store.py <args>``; returns {ok, stdout, stderr, returncode}.
 
@@ -1071,9 +1102,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args += ["--expected-namespace", ns_pin]
         r = await _run_store_async(args)
         if not r["ok"]:
-            return _error(
-                _sanitize_store_error(r) or f"memory id {mid} not found"
-            )
+            sanitized = _sanitize_store_error(r)
+            # A store-level --expected-namespace refusal (rekey race between
+            # the get and the mutation) is a namespace denial, not a generic
+            # store error — map it to the structured shape clients branch on.
+            guard_denial = _namespace_guard_denial(sanitized, ns_pin)
+            if guard_denial:
+                return guard_denial
+            return _error(sanitized or f"memory id {mid} not found")
         return {"result": "superseded", "id": mid}
 
     @mcp.tool()
@@ -1174,6 +1210,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args += ["--namespace", ns_override]
         elif ns_pin:
             args += ["--namespace", ns_pin]
+            # Issue #109 follow-up: pin the verified namespace on the OLD-row
+            # tombstone too — a concurrent rekey between the get and the
+            # update must not let the scoped token tombstone a row that
+            # drifted out of its allow-list. (The explicit-override branch
+            # intentionally skips this: --namespace is the sanctioned
+            # rekey-to-my-scope operation, where replacing a foreign row is
+            # the documented v13 behavior.)
+            args += ["--expected-old-namespace", ns_pin]
         if type:
             mt = str(type).strip()
             if mt not in _ALLOWED_TYPES:
@@ -1247,12 +1291,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args += ["--expected-namespace", ns_pin]
         r = await _run_store_async(args)
         if not r["ok"]:
+            sanitized = _sanitize_store_error(r)
+            guard_denial = _namespace_guard_denial(sanitized, ns_pin)
+            if guard_denial:
+                return guard_denial
             # PR-review PRR-B: a second invalidate now exits 2 with the stable
             # "[zmem] … already superseded …" line, which the sanitizer passes
             # through verbatim; anything else is truncated, never raw stderr.
-            return _error(
-                _sanitize_store_error(r) or f"memory id {mid} not found"
-            )
+            return _error(sanitized or f"memory id {mid} not found")
         return {"result": "invalidated", "id": mid}
 
     @mcp.tool()

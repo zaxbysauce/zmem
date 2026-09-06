@@ -378,6 +378,13 @@ def main():
                             "stdin (use for payloads near the content cap — "
                             "Windows argv caps far below MAX_CONTENT_CHARS)")
     p_upd.add_argument("--namespace", default=None)
+    p_upd.add_argument("--expected-old-namespace", default=None,
+                       help="same guard family as `supersede --expected-namespace`: "
+                            "refuse (exit 2, nothing written) unless the TARGET row "
+                            "being replaced lives in exactly this namespace — the "
+                            "pin the MCP server sets for scoped tokens so the "
+                            "old-row tombstone cannot land on a row that drifted "
+                            "out of scope (issue #109 follow-up).")
     p_upd.add_argument("--type", default=None, choices=list(ALLOWED_TYPES))
     p_upd.add_argument("--tags", default=None)
     p_upd.add_argument("--source-ref", default=None)
@@ -1200,6 +1207,7 @@ def main():
                         signal=args.signal,
                         taint=args.taint,
                         capture_mode=args.capture_mode,
+                        expected_old_namespace=args.expected_old_namespace,
                     )
                 finally:
                     if _human_out is not None:
