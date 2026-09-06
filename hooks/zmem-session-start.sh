@@ -278,6 +278,13 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   # paths and snapshot filenames — it is a plaintext file under the (typically
   # owner-only) data dir, and ZMEM_BG_LOG=0 disables it entirely if the info
   # surface is undesirable on a shared/co-located box (PRR-011).
+  # Issue #129: rotation helper for the sink, defined ABOVE the assignment
+  # block on purpose — source-text extractors (the L22 behavioral test) cut
+  # that block at the first python-interpreter invocation after the sink
+  # assignment, so this literal must not appear between the two.
+  zmem_rotate_maintenance_sink() {
+    "$PYTHON_BIN" -c 'import sys; sys.path.insert(0, sys.argv[1]); from storelib.log_rotate import rotate_on_append; rotate_on_append(sys.argv[2])' "$(dirname "$STORE_PY_PY")" "$1" 2>/dev/null || true
+  }
   BG_SINK="/dev/null"
   if [ "${ZMEM_BG_LOG:-1}" != "0" ] && [ -n "$DATA_DIR" ]; then
     BG_LOG_PATH="$DATA_DIR/zmem-bg.log"
@@ -291,6 +298,13 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
     # (no `||`) so any failure falls through to /dev/null.
     if mkdir -p "$DATA_DIR" 2>/dev/null && [ -w "$DATA_DIR" ] && { : 2>/dev/null >>"$BG_LOG_PATH"; }; then
       BG_SINK="$BG_LOG_PATH"
+      # Issue #129: rotate the maintenance sink before the detached worker
+      # redirects into it — bounded segments instead of unbounded growth.
+      # Size-gated so steady state pays only a wc -c. Fail-open: if the
+      # helper call fails the worker appends to the existing file.
+      if [ -f "$BG_LOG_PATH" ] && [ "$(wc -c < "$BG_LOG_PATH" 2>/dev/null || echo 0)" -gt "${ZMEM_BG_LOG_MAX_BYTES:-262144}" ]; then
+        zmem_rotate_maintenance_sink "$BG_LOG_PATH"
+      fi
     fi
   fi
   # Batch the three cadence ops into ONE detached python process (#39 E9):
@@ -401,9 +415,26 @@ if os.environ.get("ZMEM_INJECT", "1").strip() == "0":
             _safe_sid = re.sub(
                 r"[^A-Za-z0-9._-]", "_",
                 (session_id or ""))[:128] or "unknown"
-            with open(os.path.join(data_dir, "zmem-bg.log"), "a", encoding="utf-8") as _lf:
+            # Issue #129: decision lines go to the dedicated, rotated
+            # decisions log; the moment field lands at line end (additive).
+            _dl = os.path.join(data_dir, "zmem-decisions.log")
+            try:
+                if store_py and os.path.isfile(store_py):
+                    _sp = sys.path[:]
+                    try:
+                        # Review PRR-005: the rotation package imports from
+                        # the scripts dir (storelib parent), not from the
+                        # storelib dir itself.
+                        sys.path.insert(0, os.path.dirname(store_py))
+                        from storelib.log_rotate import rotate_on_append as _rota
+                        _rota(_dl)
+                    finally:
+                        sys.path[:] = _sp
+            except Exception:
+                pass  # fail-open: append proceeds, growth never loss
+            with open(_dl, "a", encoding="utf-8") as _lf:
                 _lf.write(
-                    "[%d] zmem-hook status=silent reason=disabled ids=[] all=[] sid=%s\n" % (
+                    "[%d] zmem-hook status=silent reason=disabled ids=[] all=[] sid=%s moment=session_start\n" % (
                         int(__import__("time").time()), _safe_sid))
     except Exception:
         pass  # fail-open: the audit log never blocks session start
@@ -525,9 +556,16 @@ if store_py and os.path.isfile(store_py):
             # with --for-injection (issue #114), which is why the rendered
             # set arrives already filtered and counted.
             try:
-                sys.path.insert(0, os.path.dirname(store_py))
-                sys.path.insert(0, os.path.join(os.path.dirname(store_py), "storelib"))
-                from storelib import _format_fenced_recall
+                _sp = sys.path[:]
+                try:
+                    sys.path.insert(0, os.path.dirname(store_py))
+                    sys.path.insert(0, os.path.join(os.path.dirname(store_py), "storelib"))
+                    from storelib import _format_fenced_recall
+                finally:
+                    # Review PRR-005 hygiene: restore the path like every
+                    # sibling helper, so later imports here cannot free-ride
+                    # on this leak.
+                    sys.path[:] = _sp
                 # PRR-014 fix: record the injected|silent decision in the
                 # SAME bg log the other hook surfaces use (recall /
                 # precompact / subagent-recall via the shared body).
@@ -555,8 +593,23 @@ if store_py and os.path.isfile(store_py):
                                 break
                     if not _log_dir:
                         _log_dir = os.path.join(os.path.expanduser("~"), ".zmem")
-                    _log_path = os.path.join(_log_dir, "zmem-bg.log")
+                    _log_path = os.path.join(_log_dir, "zmem-decisions.log")
                     if os.path.isdir(_log_dir):
+                        # Issue #129: rotate, never truncate — the decisions
+                        # log is the audit evidence substrate.
+                        try:
+                            _sp = sys.path[:]
+                            try:
+                                # Review PRR-005: insert the package parent
+                                # explicitly — this site previously relied on
+                                # the fence import above leaking it.
+                                sys.path.insert(0, os.path.dirname(store_py))
+                                from storelib.log_rotate import rotate_on_append as _rota
+                                _rota(_log_path)
+                            finally:
+                                sys.path[:] = _sp
+                        except Exception:
+                            pass
                         with open(_log_path, "a", encoding="utf-8") as _lf:
                             _tok = ""
                             if _tok_used is not None:
@@ -575,7 +628,7 @@ if store_py and os.path.isfile(store_py):
                                 r"[^A-Za-z0-9._-]", "_",
                                 (session_id or ""))[:128] or "unknown"
                             _lf.write(
-                                "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s sid=%s\n" % (
+                                "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s sid=%s moment=session_start\n" % (
                                     int(__import__("time").time()),
                                     "injected" if rows else "silent",
                                     (_env_reason or ("injected" if rows else "empty-pool")),

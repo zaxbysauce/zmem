@@ -15,7 +15,9 @@ Parameterized over every passive surface the issue names:
 - doctor's inject-switch line.
 
 Under the switch each surface emits its EMPTY envelope and logs
-status=silent reason=disabled; a seeded store row proves the enabled path
+status=silent reason=disabled (issue #129: into zmem-decisions.log, with
+the additive moment= field — the body stamps its mode, session-start
+stamps moment=session_start); a seeded store row proves the enabled path
 still injects (control cases), the literal-"0"-only convention is pinned,
 and a parked pre-tool fence survives the switch and delivers on re-enable.
 
@@ -91,7 +93,9 @@ def _seed(env: dict, ns: str, content: str) -> None:
 
 
 def _hook_lines(tmp: str) -> list:
-    path = Path(tmp) / "zmem-bg.log"
+    """Decision lines from the #129 decisions log (the kill-switch line's
+    sink; zmem-bg.log keeps only maintenance/cadence output)."""
+    path = Path(tmp) / "zmem-decisions.log"
     if not path.is_file():
         return []
     return [ln for ln in path.read_text(encoding="utf-8").splitlines()
@@ -134,6 +138,8 @@ class KillSwitchBodyTest(unittest.TestCase):
         self.assertIn(DISABLED_LINE, lines[0])
         self.assertIn("ids=[]", lines[0])
         self.assertIn("sid=", lines[0])
+        # #129: the body's kill-switch line carries its mode as the moment
+        self.assertIn(" moment=", lines[0])
 
     def test_user_prompt_mode_silenced_with_env_sid(self):
         r = _run_body(
@@ -142,8 +148,10 @@ class KillSwitchBodyTest(unittest.TestCase):
              "session_id": "sess-abc"},
             self.ns, ZMEM_INJECT="0")
         self._assert_disabled(r)
-        self.assertIn("sid=sess-abc", _hook_lines(self._tmp)[0],
+        line = _hook_lines(self._tmp)[0]
+        self.assertIn("sid=sess-abc", line,
                       "the env/stdin session id threads into the log line")
+        self.assertIn(" moment=user_prompt", line)
 
     def test_pretool_mode_silenced(self):
         r = _run_body(
@@ -152,12 +160,14 @@ class KillSwitchBodyTest(unittest.TestCase):
              "session_id": "sess-pt"},
             self.ns, mode="pretool", ZMEM_INJECT="0")
         self._assert_disabled(r)
+        self.assertIn(" moment=pretool", _hook_lines(self._tmp)[0])
 
     def test_precompact_mode_silenced(self):
         r = _run_body(
             self._tmp, {"session_id": "sess-pc"}, self.ns,
             mode="precompact", ZMEM_INJECT="0")
         self._assert_disabled(r)
+        self.assertIn(" moment=precompact", _hook_lines(self._tmp)[0])
 
     def test_control_without_switch_still_injects(self):
         r = _run_body(
@@ -258,12 +268,24 @@ class KillSwitchSessionStartTest(unittest.TestCase):
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def _envelope_json(self, r: "subprocess.CompletedProcess") -> dict:
+        """The sentinel-wrapped envelope the hook emitted, parsed.
+
+        #107 keeps the operator drift notice (systemMessage) alive on the
+        kill-switch path, so on a drifted worktree the envelope is
+        ``{"systemMessage": ...}`` rather than a bare ``{}`` — the switch's
+        contract is the ABSENCE of additionalContext, not byte-emptiness."""
+        self.assertIn("<<<ZMEM_JSON>>>", r.stdout)
+        self.assertIn("<<<END>>>", r.stdout)
+        payload = r.stdout.split("<<<ZMEM_JSON>>>")[1].split("<<<END>>>")[0]
+        return json.loads(payload)
+
     def test_disabled_emits_empty_envelope_and_logs(self):
         r = self._run(ZMEM_INJECT="0")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", r.stdout,
-                      "the sentinel-wrapped EMPTY envelope")
-        self.assertNotIn("additionalContext", r.stdout)
+        envelope = self._envelope_json(r)
+        self.assertNotIn("additionalContext", envelope,
+                         "the kill switch must emit no injection payload")
         self.assertNotIn("killswitchcanary", r.stdout)
         self.assertNotIn("Loaded from memory", r.stdout,
                          "Tier 0 is suppressed too")
@@ -271,6 +293,10 @@ class KillSwitchSessionStartTest(unittest.TestCase):
         self.assertEqual(len(lines), 1, lines)
         self.assertIn(DISABLED_LINE, lines[0])
         self.assertIn("sid=sess-ss", lines[0])
+        # #129: the session-start kill-switch line lands in the decisions
+        # log with its own moment stamp.
+        self.assertIn(" moment=session_start", lines[0])
+        self.assertRegex(lines[0], r" sid=\S+ moment=session_start$")
 
     def test_disabled_whitespace_variants_still_disable(self):
         # The inline-python parser is ".strip() == '0'" — whitespace-tolerated
@@ -280,8 +306,8 @@ class KillSwitchSessionStartTest(unittest.TestCase):
             lines_before = len(_hook_lines(self._tmp))
             r = self._run(ZMEM_INJECT=value)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", r.stdout)
-            self.assertNotIn("additionalContext", r.stdout)
+            envelope = self._envelope_json(r)
+            self.assertNotIn("additionalContext", envelope)
             lines = _hook_lines(self._tmp)
             self.assertEqual(len(lines), lines_before + 1, lines)
             self.assertIn(DISABLED_LINE, lines[-1])

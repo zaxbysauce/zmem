@@ -494,7 +494,19 @@ def main(argv=None):
     data_dir.mkdir(parents=True, exist_ok=True)
     workdir = data_dir / "workdir"
     workdir.mkdir(parents=True, exist_ok=True)
-    bg_log = data_dir / "zmem-bg.log"
+    bg_log = data_dir / "zmem-decisions.log"
+    # Both candidates are tracked from here on: review PRR-009 — the
+    # selection below runs BEFORE the drive, and on a fresh scratch dir
+    # neither log exists yet, so a legacy served tree (pre-split writers)
+    # appends its decision line to zmem-bg.log while this script watches
+    # zmem-decisions.log. The post-drive check retries the alternate.
+    legacy_log = data_dir / "zmem-bg.log"
+    if not bg_log.exists():
+        # Issue #129 split: decision lines moved to zmem-decisions.log; on
+        # a legacy deployment (old served tree, pre-split writers) fall
+        # back to the original zmem-bg.log location.
+        if legacy_log.exists():
+            bg_log = legacy_log
 
     if args.probe_store_path:
         return probe_store_path(args, data_dir)
@@ -549,7 +561,9 @@ def main(argv=None):
             return EXIT_SEED_FAILED
         print("seeded id=%s marker=%s" % (row_id, MARKER))
 
-    pre_size = bg_log.stat().st_size if bg_log.exists() else 0
+    pre_sizes = {p: (p.stat().st_size if p.exists() else 0)
+                 for p in {bg_log, legacy_log}}
+    pre_size = pre_sizes[bg_log]
     if args.self_test:
         status, stdout_text = self_test(args, env, workdir)
     else:
@@ -568,6 +582,16 @@ def main(argv=None):
         return status
 
     line = fresh_decision_line(bg_log, pre_size)
+    if line is None and bg_log != legacy_log:
+        # Review PRR-009: the candidate selection ran BEFORE the drive, so
+        # on a fresh scratch dir it always picked zmem-decisions.log — a
+        # legacy served tree (pre-split writers) appends its decision line
+        # to zmem-bg.log instead. Retry the alternate candidate (with its
+        # own pre-drive size) before declaring hook-not-fired against a
+        # hook that fired correctly.
+        alt_line = fresh_decision_line(legacy_log, pre_sizes[legacy_log])
+        if alt_line is not None:
+            line = alt_line
     if line is None:
         print(
             "zmem-canary: hook not fired — no fresh zmem-hook decision line in %s" % bg_log,

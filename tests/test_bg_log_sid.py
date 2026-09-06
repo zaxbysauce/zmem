@@ -1,8 +1,9 @@
-"""sid= on every bg-log decision line (issue #94, task 1).
+"""sid= on every decision line (issue #94, task 1; migrated for #129).
 
 Proves the session-key contract end to end on both writers:
 - the shared hook body (user_prompt / pretool modes) appends
-  ``sid=<sanitized session id>`` at line end on injected AND silent lines;
+  ``sid=<sanitized session id>`` (with the additive #129 ``moment=`` field
+  after it) on injected AND silent lines;
 - the session-start hook (bash) threads ZMEM_SESSION/CLAUDE_SESSION_ID/
   ZCODE_SESSION_ID into its inline python and appends the same field;
 - a hostile session id cannot forge log structure (charset, one field,
@@ -11,6 +12,11 @@ Proves the session-key contract end to end on both writers:
 - the pre-existing ``tokens=\\d+/\\d+`` pin still passes on sid-carrying
   lines (the field is additive, appended at line end);
 - both docstrings (module + _log_inject_decision) document the field.
+
+Issue #129 split: decision lines now live in ``zmem-decisions.log``
+(``_hook_lines`` below reads THAT file); ``zmem-bg.log`` keeps only
+maintenance/cadence output. The legacy twin proves the decisions file is
+the writer's target even when a pre-split ``zmem-bg.log`` is present.
 
 All stores are throwaway temp stores; ambient zmem env is stripped from
 every child process. The operator's real store is never touched.
@@ -32,11 +38,14 @@ from pathlib import Path
 
 
 def _remove_log(tmp: str) -> None:
-    path = Path(tmp) / "zmem-bg.log"
-    try:
-        path.unlink()
-    except OSError:
-        pass
+    # #129: decision lines live in zmem-decisions.log; remove BOTH so a
+    # legacy leftover can never satisfy an assertion by accident.
+    for name in ("zmem-decisions.log", "zmem-bg.log"):
+        path = Path(tmp) / name
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
@@ -87,7 +96,8 @@ def _seed(env: dict, ns: str, content: str) -> None:
 
 
 def _hook_lines(tmp: str) -> list:
-    path = Path(tmp) / "zmem-bg.log"
+    """Decision lines from the #129 decisions log (the writer's target)."""
+    path = Path(tmp) / "zmem-decisions.log"
     if not path.is_file():
         return []
     return [ln for ln in path.read_text(encoding="utf-8").splitlines()
@@ -128,11 +138,13 @@ class BgLogSidBodyTest(unittest.TestCase):
             self.ns)
         self.assertIn("sidcanary", out)  # the row actually injected
         lines = _hook_lines(self._tmp)
-        self.assertTrue(lines, "bg log decision line missing")
+        self.assertTrue(lines, "decision-log line missing")
         line = lines[-1]
         self.assertIn("status=injected", line)
         self.assertIn(f" sid={_sanitize(HOSTILE_SID)}", line)
-        self.assertRegex(line, r" sid=\S+$")
+        # #129: the additive moment field rides at line end after sid=
+        self.assertRegex(line, r" sid=\S+ moment=\S+$")
+        self.assertIn(" moment=user_prompt", line)
         # exactly one sid field, one physical line, hostile charset gone
         self.assertEqual(line.count(" sid="), 1)
         self.assertNotIn("<", line)
@@ -147,7 +159,7 @@ class BgLogSidBodyTest(unittest.TestCase):
         self.assertIn("status=silent", line)
         self.assertIn("reason=empty-pool", line)
         self.assertIn(" sid=unknown", line)
-        self.assertRegex(line, r" sid=\S+$")
+        self.assertRegex(line, r" sid=\S+ moment=\S+$")
 
     def test_silent_line_with_session_carries_sanitized_sid(self):
         _run_body(self._tmp, "user_prompt",
@@ -164,9 +176,11 @@ class BgLogSidBodyTest(unittest.TestCase):
                   self.ns)
         line = _hook_lines(self._tmp)[-1]
         self.assertRegex(line, r"tokens=\d+/\d+")
-        self.assertRegex(line, r" sid=\S+$")
-        # sid is the LAST field: tokens= must not be swallowed by it
+        self.assertRegex(line, r" sid=\S+( moment=\S+)?$")
+        # sid precedes the trailing moment field: tokens= must not be
+        # swallowed by sid (nor sid by moment)
         self.assertLess(line.index("tokens="), line.index(" sid="))
+        self.assertLess(line.index(" sid="), line.index(" moment="))
 
     def test_pretool_line_carries_sid(self):
         _run_body(self._tmp, "pretool",
@@ -175,7 +189,8 @@ class BgLogSidBodyTest(unittest.TestCase):
                   self.ns)
         line = _hook_lines(self._tmp)[-1]
         self.assertIn(" sid=sess-pretool", line)
-        self.assertRegex(line, r" sid=\S+$")
+        self.assertRegex(line, r" sid=\S+ moment=\S+$")
+        self.assertIn(" moment=pretool", line)
 
     def test_env_fallback_when_stdin_omits_session(self):
         # Bot round (cubic #3): a host that omits session_id from the event
@@ -227,6 +242,36 @@ class BgLogSidBodyTest(unittest.TestCase):
             self.assertIn(needle, fn_doc,
                           "the _log_inject_decision docstring must document "
                           "the field; keep the needle on ONE physical line")
+        # #129: the _log_inject_decision docstring also documents the
+        # additive moment field (current wording: ``moment=<mode>``).
+        self.assertIn("moment=<mode>", fn_doc,
+                      "the _log_inject_decision docstring must document the "
+                      "additive #129 moment field")
+
+    def test_legacy_bg_log_present_decisions_file_still_used(self):
+        # #129 legacy twin: a pre-split zmem-bg.log (with a stale decision
+        # line in it) must NOT divert the writer — the new decision line
+        # lands in zmem-decisions.log and the legacy file is left alone.
+        legacy = Path(self._tmp) / "zmem-bg.log"
+        stale = ("[1700000000] zmem-hook status=silent reason=empty-pool "
+                 "ids=[] all=[] sid=stale\n")
+        legacy.write_text(stale, encoding="utf-8")
+        _run_body(self._tmp, "user_prompt",
+                  {"prompt": "how do I handle git stash pop conflicts?",
+                   "session_id": "sess-split"},
+                  self.ns)
+        lines = _hook_lines(self._tmp)
+        self.assertTrue(lines, "decision line missing from zmem-decisions.log")
+        line = lines[-1]
+        self.assertIn(" sid=sess-split", line)
+        self.assertNotIn("sid=stale", line)
+        # the legacy file gains no decision line: the stale one stays its
+        # ONLY zmem-hook line (maintenance output like zmem-drift may still
+        # land there — that sink did not move).
+        legacy_hook = [ln for ln in
+                       legacy.read_text(encoding="utf-8").splitlines()
+                       if "zmem-hook" in ln]
+        self.assertEqual(legacy_hook, [stale.rstrip("\n")])
 
 
 class BgLogSidSessionStartTest(unittest.TestCase):
@@ -283,13 +328,13 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         return r
 
     def _ss_line(self) -> str:
-        """The session-start decision line.
+        """The session-start decision line (from zmem-decisions.log, #129).
 
-        Pre-#114 the session-start writer was the one bg-log writer WITHOUT
-        reason= (writer B); issue #114 aligned it to the shared-body format,
-        so it now carries reason= and the PRE-gATE candidate set in all=.
-        Only session-start writes decision lines in these fixtures, so the
-        last decision line is the session-start one."""
+        Pre-#114 the session-start writer was the one decision-line writer
+        WITHOUT reason= (writer B); issue #114 aligned it to the shared-body
+        format, so it now carries reason= and the PRE-gATE candidate set in
+        all=. Only session-start writes decision lines in these fixtures,
+        so the last decision line is the session-start one."""
         lines = _hook_lines(self._tmp)
         self.assertTrue(lines,
                         "session-start decision line missing (check the "
@@ -301,7 +346,8 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-800:])
         line = self._ss_line()
         self.assertIn(f" sid={_sanitize(HOSTILE_SID)}", line)
-        self.assertRegex(line, r" sid=\S+$")
+        # #129: the session-start writer's trailing field is its moment
+        self.assertRegex(line, r" sid=\S+ moment=session_start$")
         self.assertEqual(line.count(" sid="), 1)
         self.assertNotIn("<", line)
         # Issue #114 review (PRR-014): the aligned session-start line must
@@ -315,6 +361,7 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-800:])
         line = self._ss_line()
         self.assertIn(" sid=unknown", line)
+        self.assertRegex(line, r" sid=\S+ moment=session_start$")
 
     def test_session_start_legacy_env_fallback_chain(self):
         # CLAUDE_SESSION_ID is the documented legacy fallback when the
@@ -340,7 +387,7 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         line = self._ss_line()
         self.assertIn("status=silent", line)
         self.assertIn(" sid=sess-quiet", line)
-        self.assertRegex(line, r" sid=\S+$")
+        self.assertRegex(line, r" sid=\S+ moment=session_start$")
         # PRR-014: silent lines carry the envelope reason (budget-drop here)
         self.assertIn(" reason=", line)
 

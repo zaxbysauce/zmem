@@ -71,10 +71,12 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 _SID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 # One bg-log decision line, either writer shape:
-#   writer A: [ts] zmem-hook status=.. reason=.. [omitted=N] ids=[..] all=[..] [tokens=a/b] [ops=N] [sid=..]
+#   writer A: [ts] zmem-hook status=.. reason=.. [omitted=N] ids=[..] all=[..] [tokens=a/b] [ops=N] [sid=..] [moment=..]
 #   writer B: [ts] zmem-hook status=.. ids=[..] all=[..] [tokens=a/b] [sid=..]
 # reason/omitted/tokens/ops/sid are all optional in the regex because writer B
-# omits reason=/omitted=/ops= and every pre-#94 line omits sid=.
+# omits reason=/omitted=/ops= and every pre-#94 line omits sid=. moment= is
+# the additive #129 field (injection moment: session_start/user_prompt/
+# pretool/subagent/precompact); every pre-#129 line omits it (legacy bucket).
 _BG_LINE_RE = re.compile(
     r"^\[(\d+)\] zmem-hook status=(\S+)"
     r"(?: reason=(\S+))?"
@@ -83,6 +85,7 @@ _BG_LINE_RE = re.compile(
     r"(?: tokens=(\S+))?"
     r"(?: ops=(\d+))?"
     r"(?: sid=(\S+))?"
+    r"(?: moment=(\S+))?"
     r"\s*$"
 )
 
@@ -121,43 +124,68 @@ def _parse_id_list(raw: str) -> list:
 
 
 def parse_bg_log(path) -> list:
-    """Parse decision lines from a zmem-bg.log.
+    """Parse decision lines from a decision log, ROTATION-AWARE (#129).
 
-    Returns ``[{ts, status, reason, omitted, ids, all, ops, sid}]`` where
-    ``reason``/``ops`` are None when the line lacks them (writer B omits
-    ``reason=``; pre-#94 lines lack ``sid=``) and ``ids``/``all`` are lists
-    of memory id strings. Torn or maintenance lines (no ``zmem-hook``
-    marker, unparseable shape) are skipped — the log is appended
+    Given the ACTIVE log path, also reads its rotated sibling segments
+    (``<path>.1`` .. ``<path>.N``, ascending segment number — the active
+    file LAST), so the join sees the full history across rotation
+    boundaries instead of only the most recent cap-worth of decisions.
+    Every consumer of the parsed lines is ts-keyed, so segment order does
+    not affect any count. Rotation marker lines
+    (``# zmem-seq=...``) and maintenance output (``[zmem] backup: ...``)
+    never match the line regex and are skipped.
+
+    Returns ``[{ts, status, reason, omitted, ids, all, ops, sid, moment}]``
+    where ``reason``/``ops``/``sid``/``moment`` are None when the line
+    lacks them (writer B omits ``reason=``; pre-#94 lines lack ``sid=``;
+    pre-#129 lines lack ``moment=``) and ``ids``/``all`` are lists of
+    memory id strings. Torn lines are skipped — the log is appended
     concurrently, so a torn final line is normal. Never raises.
     """
     out = []
+    paths = []
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
-    except OSError:
-        return out
-    for line in lines:
-        if "zmem-hook" not in line:
-            continue  # maintenance output ([zmem] backup: ...) etc.
-        m = _BG_LINE_RE.match(line.strip())
-        if not m:
-            continue
-        (ts, status, reason, omitted, ids_raw, all_raw, _tok, ops, sid) = \
-            m.groups()
+        from storelib.log_rotate import iter_segments
+        # iter_segments returns ascending segment numbers: .1 is the MOST
+        # RECENTLY rotated segment, the active file is appended last
+        # (review PRR-013 — the old "oldest first" comment stated the
+        # inverted model; consumers are ts-keyed either way).
+        paths = iter_segments(path)
+    except Exception:
+        # iter_segments RAISES on a listing failure (review PRR-003):
+        # degrade to the active file only rather than reading a partial
+        # history as complete.
+        paths = []
+    paths.append(str(path))  # active file LAST (newest)
+    for p in paths:
         try:
-            ts = int(ts)
-        except ValueError:
+            with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
             continue
-        out.append({
-            "ts": ts,
-            "status": status,
-            "reason": reason,
-            "omitted": int(omitted) if omitted else 0,
-            "ids": _parse_id_list(ids_raw),
-            "all": _parse_id_list(all_raw),
-            "ops": int(ops) if ops else None,
-            "sid": sid,
-        })
+        for line in lines:
+            if "zmem-hook" not in line:
+                continue  # maintenance/markers/rotation stamps
+            m = _BG_LINE_RE.match(line.strip())
+            if not m:
+                continue
+            (ts, status, reason, omitted, ids_raw, all_raw, _tok, ops,
+             sid, moment) = m.groups()
+            try:
+                ts = int(ts)
+            except ValueError:
+                continue
+            out.append({
+                "ts": ts,
+                "status": status,
+                "reason": reason,
+                "omitted": int(omitted) if omitted else 0,
+                "ids": _parse_id_list(ids_raw),
+                "all": _parse_id_list(all_raw),
+                "ops": int(ops) if ops else None,
+                "sid": sid,
+                "moment": moment,
+            })
     return out
 
 
@@ -596,15 +624,20 @@ def _pct(numerator: int, denominator: int):
 def run_miss_report(store_path, db_path=None, transcripts=(),
                     bg_log_path=None, data_dir=None,
                     window_before_s=1800, window_after_s=300,
-                    limit=200, verbose=False) -> dict:
-    """Join mined failures × store recall × bg-log injections (read-only).
+                    limit=200, verbose=False,
+                    min_token_overlap=2) -> dict:
+    """Join mined failures × store recall × decision-log injections
+    (read-only), plus the false-injection counter (issue #129).
 
     See the module docstring for the pinned bucket definitions. Returns a
     plain dict; ``{"error": ...}`` (never an exception) when the store is
     missing/unreadable/too old for the join — the report must not create or
     migrate stores. Memory CONTENT stays out of the default output (ids and
     namespaces only); ``verbose=True`` adds a short content preview per top
-    missed id.
+    missed id. ``min_token_overlap`` is the false-injection reference
+    threshold (distinct ops tokens shared between an injected row and a
+    later same-session reference event); the value used is echoed in
+    ``report["false_injection"]["min_token_overlap"]``.
     """
     try:
         store = Path(store_path).expanduser()
@@ -659,7 +692,18 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     if data_dir is None:
         data_dir = str(store.resolve().parent)
     if bg_log_path is None:
-        bg_log_path = os.path.join(data_dir, "zmem-bg.log")
+        # Issue #129 split: decision lines live in zmem-decisions.log
+        # (with rotated segments); legacy deployments that never produced
+        # one still read from zmem-bg.log. An explicit bg_log_path wins
+        # over both.
+        decisions_path = os.path.join(data_dir, "zmem-decisions.log")
+        legacy_path = os.path.join(data_dir, "zmem-bg.log")
+        if os.path.exists(decisions_path):
+            bg_log_path = decisions_path
+        elif os.path.exists(legacy_path):
+            bg_log_path = legacy_path
+        else:
+            bg_log_path = decisions_path
     lines = parse_bg_log(bg_log_path)
     # An injection line is EITHER writer A's explicit reason=injected OR
     # writer B's legacy shape (status=injected with no reason field — the
@@ -683,6 +727,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
 
     failures = []
     unmatched_globs = []
+    transcript_files = []
     db_error = None
     if db_path:
         try:
@@ -696,6 +741,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         if not matches:
             unmatched_globs.append(str(pattern))
         for path in matches:
+            transcript_files.append(path)
             failures.extend(failures_from_transcript_rich(path))
     # Fair merge before the limit truncates (broad-review M4): db-first
     # concatenation would starve every transcript failure whenever the db
@@ -714,6 +760,11 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         deduped.append(f)
     failures_truncated = len(deduped) > max(1, int(limit))
     failures = deduped[:max(1, int(limit))]
+    # Review PRR-008: the false-injection counter's reference side must not
+    # shrink with --miss-limit (that would inflate the false rate). The
+    # join keeps its truncation for the window attribution; the counter
+    # sees every deduped failure and its row scope rides the report.
+    counter_failures = deduped
 
     counts = {"surfaced_sid": 0, "surfaced_legacy": 0, "missed": 0,
               "capture_gap": 0, "no_query": 0, "disabled": 0}
@@ -827,6 +878,29 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
             if any(matched & set(ln["all"]) for ln in cand_sid + cand_legacy):
                 missed_all_only += 1
 
+    # Issue #129: the false-injection direction rides the same report so
+    # both rates always print together (doctor --miss-rate). The counter
+    # consumes the SAME parsed decision lines, the open store connection
+    # (row content for the token arm — must run BEFORE conn.close()), and
+    # the mined failure rows; the ops ring is read per sid from data_dir.
+    # Best-effort: a counter failure must never take the join report down.
+    try:
+        from storelib.false_inject import build_false_injection_report
+        false_injection = build_false_injection_report(
+            lines, conn=conn, data_dir=data_dir,
+            failure_rows=counter_failures, transcripts=transcript_files,
+            min_token_overlap=min_token_overlap)
+    except Exception as exc:
+        false_injection = {
+            "degraded": True,
+            "overall": {"injected": 0, "used": 0, "false": 0,
+                        "false_rate": None},
+            "per_moment": {},
+            "min_token_overlap": max(1, int(min_token_overlap)),
+            "caveats": ["false-injection counter failed: "
+                        f"{type(exc).__name__}: {exc}"],
+        }
+
     try:
         conn.close()
     except Exception:
@@ -921,6 +995,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         "bg_log_period": period,
         "failures_examined": len(failures),
         "failures_truncated": failures_truncated,
+        "false_injection_failure_rows": len(counter_failures),
         "no_timestamp": no_timestamp,
         "recall_errors": recall_errors,
         "db_error": db_error,
@@ -928,6 +1003,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         "counts": counts,
         "miss_rate": miss_rate,
         "miss_rate_strict_sid": strict,
+        "false_injection": false_injection,
         "missed_all_only": missed_all_only,
         "query_source": query_source,
         "no_query_pct": _pct(counts["no_query"], len(failures)),
