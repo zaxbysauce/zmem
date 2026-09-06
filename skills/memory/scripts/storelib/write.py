@@ -1072,7 +1072,8 @@ def _merge_on_dedup(
     )
 
 def supersede_memory(
-    conn: sqlite3.Connection, mid: str, reason: str = "", *, at: str | None = None
+    conn: sqlite3.Connection, mid: str, reason: str = "", *, at: str | None = None,
+    expected_namespace: str | None = None,
 ) -> bool:
     """Tombstone a memory (mark superseded_at). Does not delete — keeps history.
 
@@ -1080,6 +1081,19 @@ def supersede_memory(
     uses this to apply a remote tombstone with the ORIGINATING store's
     superseded_at, not the local ingest time — otherwise two synced copies of
     the same tombstone would disagree on when it happened.
+
+    ``expected_namespace`` (issue #109) makes the tombstone CONDITIONAL on the
+    target row's namespace: when set and the row lives in a different
+    namespace, nothing is written and a ValueError refusal is raised (the CLI
+    maps it to the stable exit-2 ``[zmem] namespace guard:`` line). The check
+    and the UPDATE run inside this function's own ``BEGIN IMMEDIATE``
+    transaction (the CLI path opens a fresh connection, so the pair is
+    serialized — no cross-process rekey can land between them); callers that
+    pass an already-open transaction rely on the caller's own atomicity, and
+    the namespace predicate on the UPDATE itself is the fail-closed backstop
+    there. The MCP server pins the scoped token's verified namespace through
+    this flag so a namespace-scoped fleet token can never tombstone a row
+    outside its allow-list, even under a concurrent rekey race.
 
     v9 (issue #59, 4.3/4.4): the tombstone ALSO writes ``valid_until`` (same
     timestamp). Point-in-time as-of recall DROPS the ``superseded_at IS NULL``
@@ -1105,13 +1119,27 @@ def supersede_memory(
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
         row = conn.execute(
-            "SELECT id, superseded_at FROM memory WHERE id=?", (mid,)
+            "SELECT id, superseded_at, namespace FROM memory WHERE id=?", (mid,)
         ).fetchone()
         if not row:
             print(f"[zmem] no memory with id {mid}", file=sys.stderr)
             if started_tx and conn.in_transaction:
                 conn.rollback()
             return False
+        # Issue #109: the namespace guard fires BEFORE the liveness reveal so
+        # a scoped caller cannot use the refusal text as a cross-namespace
+        # oracle (a foreign already-tombstoned row is denied on namespace,
+        # never on already-superseded). Identity check, not truthiness: an
+        # explicitly supplied empty expectation matches no namespace and must
+        # fail closed, never fall through to the unguarded path (PR feedback).
+        if expected_namespace is not None and row["namespace"] != expected_namespace:
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise ValueError(
+                f"[zmem] namespace guard: memory {mid} lives in namespace "
+                f"{row['namespace']}, expected {expected_namespace} — "
+                "cross-namespace supersede/invalidate refused (issue #109)"
+            )
         if row["superseded_at"] is not None:
             if started_tx and conn.in_transaction:
                 conn.rollback()
@@ -1122,10 +1150,31 @@ def supersede_memory(
                 "append-only history"
             )
         ts = at or now_iso()
-        conn.execute(
-            "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? WHERE id=?",
-            (ts, ts, reason, mid),
-        )
+        if expected_namespace is not None:
+            cur = conn.execute(
+                "UPDATE memory SET superseded_at=?, valid_until=?, "
+                "supersede_reason=? WHERE id=? AND namespace=?",
+                (ts, ts, reason, mid, expected_namespace),
+            )
+            if cur.rowcount == 0:
+                # The SELECT saw the row a moment ago, so a namespace mismatch
+                # here means the row moved under us (caller-owned transaction
+                # without BEGIN IMMEDIATE); rowcount==0 can also mean the row
+                # was deleted in the same window. Either way: fail closed,
+                # nothing was written.
+                if started_tx and conn.in_transaction:
+                    conn.rollback()
+                raise ValueError(
+                    f"[zmem] namespace guard: memory {mid} no longer lives "
+                    f"in namespace {expected_namespace} — the row moved or "
+                    "was deleted between read and write; refusing to "
+                    "tombstone it (issue #109)"
+                )
+        else:
+            conn.execute(
+                "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? WHERE id=?",
+                (ts, ts, reason, mid),
+            )
         # Also remove from the vec0 table to prevent orphaned vectors consuming KNN slots.
         try:
             conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
@@ -1167,6 +1216,7 @@ def update_memory(
     taint: str | None = None,
     capture_mode: str = "manual",
     link_attr_propagate: bool = True,
+    expected_old_namespace: str | None = None,
 ) -> tuple[WriteResult, bool]:
     """Append-only knowledge update (issue #59, 4.2): create a NEW live row
     that replaces ``mid``, tombstone ``mid``, and link the new row back to it
@@ -1179,6 +1229,15 @@ def update_memory(
     valid_until='', update_of=mid``. Namespace/type/tags/source_ref are copied
     from the old row unless overridden; confidence/signal/taint are
     caller-supplied or inherited.
+
+    ``expected_old_namespace`` (issue #109 review follow-up) pins the OLD
+    row's namespace the same way ``supersede_memory``'s
+    ``expected_namespace`` does: the namespace guard fires BEFORE the
+    liveness reveal, the tombstone UPDATE is conditional on the row still
+    living in that namespace, and a rowcount==0 backstop (row moved or
+    deleted between read and write) fails closed. The MCP server passes the
+    verified target namespace here so a scoped token's update can never
+    tombstone an old row that has drifted out of the token's allow-list.
 
     Dedup runs against OTHER live rows — ``mid`` is already tombstoned by that
     point, so it cannot self-match (an unchanged-content "update" still creates
@@ -1195,6 +1254,16 @@ def update_memory(
     old = conn.execute("SELECT * FROM memory WHERE id=?", (mid,)).fetchone()
     if old is None:
         raise ValueError(f"[zmem] no memory with id {mid}; cannot update")
+    # Issue #109 follow-up: the namespace guard fires BEFORE the liveness
+    # reveal (no cross-namespace oracle), mirroring supersede_memory.
+    # Identity check, not truthiness: an explicitly supplied empty
+    # expectation matches no namespace and fails closed.
+    if expected_old_namespace is not None and old["namespace"] != expected_old_namespace:
+        raise ValueError(
+            f"[zmem] namespace guard: memory {mid} lives in namespace "
+            f"{old['namespace']}, expected {expected_old_namespace} — "
+            "cross-namespace update refused (issue #109)"
+        )
     if old["superseded_at"] is not None:
         raise ValueError(
             f"[zmem] memory {mid} is already superseded (at "
@@ -1257,12 +1326,33 @@ def update_memory(
 
         # 1) Tombstone the old row (append-only history). valid_until=now so
         # point-in-time as-of never resurrects it (see supersede_memory).
+        # Issue #109 follow-up: when an old-namespace expectation is armed,
+        # the tombstone is CONDITIONAL on the row still living in that
+        # namespace — a concurrent rekey/delete in the read-to-write window
+        # (the SELECT above runs before BEGIN IMMEDIATE) matches zero rows
+        # and the backstop fails closed instead of tombstoning a foreign row.
         ts = now_iso()
-        conn.execute(
-            "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? "
-            "WHERE id=?",
-            (ts, ts, "updated", mid),
-        )
+        if expected_old_namespace is not None:
+            cur = conn.execute(
+                "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? "
+                "WHERE id=? AND namespace=?",
+                (ts, ts, "updated", mid, expected_old_namespace),
+            )
+            if cur.rowcount == 0:
+                if started_tx and conn.in_transaction:
+                    conn.rollback()
+                raise ValueError(
+                    f"[zmem] namespace guard: memory {mid} no longer lives "
+                    f"in namespace {expected_old_namespace} — the row moved "
+                    "or was deleted between read and write; refusing to "
+                    "update it (issue #109)"
+                )
+        else:
+            conn.execute(
+                "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? "
+                "WHERE id=?",
+                (ts, ts, "updated", mid),
+            )
         try:
             conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
         except sqlite3.OperationalError:

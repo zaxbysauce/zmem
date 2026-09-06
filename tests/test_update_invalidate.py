@@ -705,5 +705,158 @@ class V9MigrationAndSupersedeTest(_StoreCase):
             c.close()
 
 
+# ---------------------------------------------------------------------------
+# Issue #109: --expected-namespace store-level guard on supersede/invalidate
+# ---------------------------------------------------------------------------
+class ExpectedNamespaceGuardTest(_StoreCase):
+    """The atomic store-side half of the #109 fix.
+
+    The MCP server pins the scoped token's verified namespace via
+    --expected-namespace; the store must make the tombstone UPDATE
+    conditional on it, so neither a server-side read-then-write race
+    (TOCTOU under concurrent rekey) nor a bypassed/removed server-side
+    check can land a cross-namespace tombstone.
+    """
+
+    def test_supersede_wrong_expected_namespace_refused_row_live(self):
+        mid = self.store.add("project:other", "foreign row for ns guard")
+        r = self.store.run("supersede", "--id", mid, "--reason", "attempt",
+                           "--expected-namespace", "project:mine")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("[zmem] namespace guard:", r.stderr)
+        self.assertIsNone(self.store.row(mid)["superseded_at"])
+
+    def test_supersede_correct_expected_namespace_tombstones(self):
+        mid = self.store.add("project:other", "foreign row ns guard ok case")
+        r = self.store.run("supersede", "--id", mid, "--reason", "guard pass",
+                           "--expected-namespace", "project:other")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.store.row(mid)["superseded_at"])
+
+    def test_invalidate_wrong_expected_namespace_refused_row_live(self):
+        mid = self.store.add("user:global", "global row for ns guard")
+        r = self.store.run("invalidate", "--id", mid,
+                           "--reason", "no longer true",
+                           "--expected-namespace", "project:mine")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("[zmem] namespace guard:", r.stderr)
+        self.assertIsNone(self.store.row(mid)["superseded_at"])
+
+    def test_invalidate_correct_expected_namespace_tombstones(self):
+        mid = self.store.add("user:global", "global row ns guard ok case")
+        r = self.store.run("invalidate", "--id", mid,
+                           "--reason", "no longer true",
+                           "--expected-namespace", "user:global")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.store.row(mid)["superseded_at"])
+
+    def test_expected_namespace_garbage_value_fails_closed(self):
+        # An expectation matching no namespace can never authorize a
+        # tombstone — the guard fails closed, never open.
+        mid = self.store.add("project:other", "garbage expectation row")
+        r = self.store.run("supersede", "--id", mid, "--reason", "x",
+                           "--expected-namespace", "not-a-namespace")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("[zmem] namespace guard:", r.stderr)
+        self.assertIsNone(self.store.row(mid)["superseded_at"])
+
+    def test_without_flag_behavior_unchanged(self):
+        # Omitted guard = the historical unguarded local-CLI behavior
+        # (an operator at the store has no token scope to enforce).
+        mid = self.store.add("project:other", "unguarded cli row")
+        r = self.store.run("supersede", "--id", mid, "--reason", "legacy")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.store.row(mid)["superseded_at"])
+
+    def test_expected_namespace_empty_string_fails_closed(self):
+        # Feedback round (PRR-004 / cubic #4): "" is a SUPPLIED expectation
+        # that matches no namespace — identity check, not truthiness — so it
+        # must fail closed, never fall through to the unguarded path.
+        mid = self.store.add("project:other", "empty expectation row")
+        r = self.store.run("supersede", "--id", mid, "--reason", "x",
+                           "--expected-namespace", "")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("[zmem] namespace guard:", r.stderr)
+        self.assertIsNone(self.store.row(mid)["superseded_at"])
+
+    def test_invalidate_blank_reason_wins_over_namespace_guard(self):
+        # Ordering pin: the blank-reason refusal (cli boundary) fires before
+        # the namespace guard, so a blank-reason probe cannot be used to
+        # distinguish guard outcomes on a foreign row.
+        mid = self.store.add("project:other", "blank reason order row")
+        r = self.store.run("invalidate", "--id", mid, "--reason", "   ",
+                           "--expected-namespace", "project:mine")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("must be non-empty", r.stderr)
+        self.assertNotIn("namespace guard", r.stderr)
+
+    def test_update_expected_old_namespace_wrong_refused(self):
+        # PRR-002 closure: update's OLD-row tombstone pins the verified
+        # namespace the same way supersede does.
+        mid = self.store.add("project:other", "old-ns pin wrong target")
+        r = self.store.run("update", "--id", mid, "--content", "rewritten",
+                           "--expected-old-namespace", "project:mine")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("[zmem] namespace guard:", r.stderr)
+        self.assertIsNone(self.store.row(mid)["superseded_at"])
+
+    def test_update_expected_old_namespace_correct_updates(self):
+        mid = self.store.add("project:other", "old-ns pin ok target")
+        r = self.store.run("update", "--id", mid, "--content", "rewritten ok",
+                           "--expected-old-namespace", "project:other")
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        self.assertIsNotNone(self.store.row(mid)["superseded_at"])
+
+    def _backstop_probe_setup(self, mid):
+        """Pin env, import storelib in-process, arm the vanish trigger.
+
+        Deterministically simulates the read-to-write race the rowcount==0
+        backstop defends: a TEMP trigger deletes the row when the guarded
+        UPDATE fires, so the SELECT-time guard passes but the conditional
+        UPDATE matches zero rows (verified to produce rowcount==0 and a
+        rollback-restored row — nothing written).
+        """
+        saved = os.environ.get("ZMEM_STORE")
+        os.environ["ZMEM_STORE"] = self.store.path
+        try:
+            sys.path.insert(0, str(SCRIPTS_DIR))
+            from storelib.write import supersede_memory, update_memory
+        finally:
+            if saved is None:
+                os.environ.pop("ZMEM_STORE", None)
+            else:
+                os.environ["ZMEM_STORE"] = saved
+        conn = self.store.conn()
+        # The id is a uuid4 minted by this very store — safe to inline.
+        conn.execute(
+            f"CREATE TEMP TRIGGER vanish BEFORE UPDATE ON memory "
+            f"WHEN new.id = '{mid}' BEGIN DELETE FROM memory WHERE id = "
+            f"'{mid}'; END"
+        )
+        return conn, supersede_memory, update_memory
+
+    def test_supersede_rowcount_backstop_fails_closed_when_row_vanishes(self):
+        mid = self.store.add("project:other", "vanishing row for supersede")
+        conn, supersede_memory, _ = self._backstop_probe_setup(mid)
+        with self.assertRaises(ValueError) as ctx:
+            supersede_memory(conn, mid, "race probe",
+                             expected_namespace="project:other")
+        self.assertIn("namespace guard", str(ctx.exception))
+        self.assertIn("moved or was deleted", str(ctx.exception))
+        # Rollback restored the pre-call state: row live, nothing written.
+        self.assertIsNone(self.store.row(mid)["superseded_at"])
+
+    def test_update_rowcount_backstop_fails_closed_when_row_vanishes(self):
+        mid = self.store.add("project:other", "vanishing row for update")
+        conn, _, update_memory = self._backstop_probe_setup(mid)
+        with self.assertRaises(ValueError) as ctx:
+            update_memory(conn, mid=mid, content="race probe content",
+                          signal="test",
+                          expected_old_namespace="project:other")
+        self.assertIn("namespace guard", str(ctx.exception))
+        # Rollback restored the pre-call state: row live, nothing written.
+        self.assertIsNone(self.store.row(mid)["superseded_at"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

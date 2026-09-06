@@ -332,6 +332,12 @@ def main():
     p_sup = _add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
     p_sup.add_argument("--reason", default="")
+    p_sup.add_argument(
+        "--expected-namespace", default=None,
+        help="refuse (exit 2, nothing written) unless the target row lives in "
+             "exactly this namespace — the atomic store-side guard the MCP "
+             "server pins a scoped token's verified namespace through "
+             "(issue #109). Omit for the historical unguarded behavior.")
 
     p_inv = _add_parser(
         "invalidate",
@@ -346,6 +352,11 @@ def main():
     p_inv.add_argument("--id", required=True, help="id of the memory to invalidate")
     p_inv.add_argument("--reason", required=True,
                        help="why the fact is no longer true (REQUIRED)")
+    p_inv.add_argument(
+        "--expected-namespace", default=None,
+        help="same guard as `supersede --expected-namespace`: refuse (exit 2, "
+             "nothing written) unless the target row lives in exactly this "
+             "namespace (issue #109).")
 
     p_upd = _add_parser(
         "update",
@@ -367,6 +378,13 @@ def main():
                             "stdin (use for payloads near the content cap — "
                             "Windows argv caps far below MAX_CONTENT_CHARS)")
     p_upd.add_argument("--namespace", default=None)
+    p_upd.add_argument("--expected-old-namespace", default=None,
+                       help="same guard family as `supersede --expected-namespace`: "
+                            "refuse (exit 2, nothing written) unless the TARGET row "
+                            "being replaced lives in exactly this namespace — the "
+                            "pin the MCP server sets for scoped tokens so the "
+                            "old-row tombstone cannot land on a row that drifted "
+                            "out of scope (issue #109 follow-up).")
     p_upd.add_argument("--type", default=None, choices=list(ALLOWED_TYPES))
     p_upd.add_argument("--tags", default=None)
     p_upd.add_argument("--source-ref", default=None)
@@ -1160,10 +1178,12 @@ def main():
                       "is the audit trail", file=sys.stderr)
                 sys.exit(2)
             try:
-                ok = supersede_memory(conn, args.id, args.reason)
+                ok = supersede_memory(conn, args.id, args.reason,
+                                      expected_namespace=args.expected_namespace)
             except ValueError as exc:
                 # PR-review PRR-B: already-tombstoned rows are refused (never
-                # re-tombstoned) — a stable exit-2 refusal, not a traceback.
+                # re-tombstoned); issue #109: cross-namespace expectations are
+                # refused — both stable exit-2 refusals, not tracebacks.
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
             sys.exit(0 if ok else 1)
@@ -1187,6 +1207,7 @@ def main():
                         signal=args.signal,
                         taint=args.taint,
                         capture_mode=args.capture_mode,
+                        expected_old_namespace=args.expected_old_namespace,
                     )
                 finally:
                     if _human_out is not None:
@@ -1289,10 +1310,12 @@ def main():
                           hybrid=False, as_of=args.as_of, link_hops=0)
         elif args.cmd == "supersede":
             try:
-                ok = supersede_memory(conn, args.id, args.reason)
+                ok = supersede_memory(conn, args.id, args.reason,
+                                      expected_namespace=args.expected_namespace)
             except ValueError as exc:
                 # PR-review PRR-B: already-tombstoned rows are refused (never
-                # re-tombstoned) — a stable exit-2 refusal, not a traceback.
+                # re-tombstoned); issue #109: cross-namespace expectations are
+                # refused — both stable exit-2 refusals, not tracebacks.
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
             sys.exit(0 if ok else 1)

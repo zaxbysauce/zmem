@@ -239,7 +239,7 @@ class ScopedTokenToolSurfaceTest(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-    def _build(self, *, scoped: bool):
+    def _build(self, *, scoped: bool, scoped_namespaces=("project:mine",)):
         """Build a server with an unscoped env token or a scoped file token."""
         import asyncio
 
@@ -247,7 +247,7 @@ class ScopedTokenToolSurfaceTest(unittest.TestCase):
             tok = os.path.join(self._tmp, "scoped-token.json")
             with open(tok, "w", encoding="utf-8") as f:
                 json.dump({"token": "scoped-secret",
-                           "namespaces": ["project:mine"]}, f)
+                           "namespaces": list(scoped_namespaces)}, f)
             os.environ["ZMEM_MCP_TOKEN_FILE"] = tok
             os.environ.pop("ZMEM_MCP_TOKEN", None)
         else:
@@ -334,6 +334,189 @@ class ScopedTokenToolSurfaceTest(unittest.TestCase):
             "update", id=mine["id"], content="scoped rewrite of own row"))
         self.assertEqual(ok.get("result"), "updated", ok)
 
+    def _row_live(self, mid):
+        import sqlite3
+        conn = sqlite3.connect(self._store)
+        try:
+            row = conn.execute(
+                "SELECT superseded_at FROM memory WHERE id=?", (mid,)
+            ).fetchone()
+            return row is not None and row[0] is None
+        finally:
+            conn.close()
+
+    def _seed_rows(self, namespaces):
+        """Seed one live row per namespace via the UNSCOPED operator token."""
+        import uuid
+        _call_unscoped = self._build(scoped=False)
+        ids = {}
+        for ns in namespaces:
+            r = asyncio_run(_call_unscoped(
+                "add", type="fact",
+                content=f"issue 109 guard target {ns} nonce {uuid.uuid4().hex[:8]}",
+                namespace=ns, signal="test"))
+            self.assertEqual(r.get("result"), "stored", r)
+            ids[ns] = r["id"]
+        return ids
+
+    def test_scoped_token_cannot_supersede_foreign_namespace(self):
+        # Issue #109: `supersede` was the one mutating tool with no
+        # _guard_namespace call — a scoped token could tombstone ANY row.
+        ids = self._seed_rows(("project:other", "user:global"))
+        _call = self._build(scoped=True)
+        for ns, mid in ids.items():
+            denied = asyncio_run(_call("supersede", id=mid, reason="i109 attempt"))
+            self.assertEqual(denied.get("error"), "namespace_not_allowed", denied)
+            self.assertEqual(denied.get("namespace"), ns, denied)
+            # Detail-text assertion (PRR-015): the stable _guard_namespace
+            # wording, not just a truthy blob.
+            self.assertIn("this token is scoped", denied.get("detail", ""), denied)
+            self.assertNotIn("scoped-secret", json.dumps(denied))
+            self.assertTrue(self._row_live(mid),
+                            f"foreign {ns} row must stay live after denial")
+
+    def test_scoped_token_cannot_invalidate_foreign_namespace(self):
+        # Issue #109 twin: `invalidate` had the same missing guard.
+        ids = self._seed_rows(("project:other", "user:global"))
+        _call = self._build(scoped=True)
+        for ns, mid in ids.items():
+            denied = asyncio_run(_call(
+                "invalidate", id=mid, reason="i109 no longer true"))
+            self.assertEqual(denied.get("error"), "namespace_not_allowed", denied)
+            self.assertEqual(denied.get("namespace"), ns, denied)
+            self.assertIn("this token is scoped", denied.get("detail", ""), denied)
+            # PRR-010 / cubic #3: the invalidate twin carries the same
+            # token-leak assertion its supersede twin has.
+            self.assertNotIn("scoped-secret", json.dumps(denied))
+            self.assertTrue(self._row_live(mid),
+                            f"foreign {ns} row must stay live after denial")
+
+    def test_scoped_multi_namespace_token_tombstones_across_allow_list(self):
+        # PRR-009: per-row allow-list lookup for a token allowing MORE THAN
+        # ONE namespace — allowed on every listed namespace, denied outside.
+        import uuid
+        _call_unscoped = self._build(scoped=False)
+        ids = {}
+        for ns in ("project:mine", "user:global"):
+            r = asyncio_run(_call_unscoped(
+                "add", type="fact",
+                content=f"i109 multi-ns allow target {ns} nonce {uuid.uuid4().hex[:8]}",
+                namespace=ns, signal="test"))
+            self.assertEqual(r.get("result"), "stored", r)
+            ids[ns] = r["id"]
+        foreign = asyncio_run(_call_unscoped(
+            "add", type="fact",
+            content=f"i109 multi-ns foreign target nonce {uuid.uuid4().hex[:8]}",
+            namespace="project:other", signal="test"))
+        self.assertEqual(foreign.get("result"), "stored", foreign)
+
+        _call = self._build(scoped=True,
+                            scoped_namespaces=("project:mine", "user:global"))
+        sup = asyncio_run(_call("supersede", id=ids["project:mine"],
+                                reason="multi ns ok"))
+        self.assertEqual(sup.get("result"), "superseded", sup)
+        inv = asyncio_run(_call("invalidate", id=ids["user:global"],
+                                reason="multi ns ok too"))
+        self.assertEqual(inv.get("result"), "invalidated", inv)
+        denied = asyncio_run(_call("supersede", id=foreign["id"],
+                                   reason="out of list"))
+        self.assertEqual(denied.get("error"), "namespace_not_allowed", denied)
+        self.assertEqual(denied.get("namespace"), "project:other", denied)
+        self.assertTrue(self._row_live(foreign["id"]))
+
+    def test_scoped_token_tombstone_not_found_shape(self):
+        # PRR-013: a scoped tombstone of an unknown id surfaces the stable
+        # not-found error (the internal get fails before any guard branch).
+        _call = self._build(scoped=True)
+        for tool, kwargs in (
+            ("supersede", {"reason": "x"}),
+            ("invalidate", {"reason": "x"}),
+        ):
+            result = asyncio_run(_call(
+                tool, id="00000000-0000-0000-0000-000000000000", **kwargs))
+            self.assertIn("error", result, (tool, result))
+            self.assertIn("no memory with id", result["error"], (tool, result))
+
+    def test_namespace_guard_denial_mapping(self):
+        # PRR-001: a STORE-level guard refusal (rekey race between the get
+        # and the mutation) maps onto the same structured denial shape the
+        # server-side _guard_namespace returns.
+        m = self.mcp_server
+        d = m._namespace_guard_denial(
+            "[zmem] namespace guard: memory x lives in namespace "
+            "project:other, expected project:mine — cross-namespace "
+            "supersede/invalidate refused (issue #109)",
+            "project:mine")
+        self.assertEqual(d.get("error"), "namespace_not_allowed", d)
+        self.assertEqual(d.get("namespace"), "project:mine", d)
+        self.assertIn("namespace guard", d.get("detail", ""), d)
+        # Non-guard errors must NOT be remapped.
+        self.assertIsNone(
+            m._namespace_guard_denial(
+                "[zmem] memory x is already superseded (at ...)", "project:mine"))
+        self.assertIsNone(m._namespace_guard_denial("", None))
+
+    def test_scoped_token_can_supersede_and_invalidate_own_namespace(self):
+        # The guard must not over-block: the token's OWN namespace tombstones.
+        import uuid
+        _call_unscoped = self._build(scoped=False)
+        rows = []
+        for n in (1, 2):
+            r = asyncio_run(_call_unscoped(
+                "add", type="fact",
+                content=f"i109 own-ns tombstone target {n} nonce {uuid.uuid4().hex[:8]}",
+                namespace="project:mine", signal="test"))
+            self.assertEqual(r.get("result"), "stored", r)
+            rows.append(r["id"])
+
+        _call = self._build(scoped=True)
+        sup = asyncio_run(_call("supersede", id=rows[0], reason="own ns ok"))
+        self.assertEqual(sup.get("result"), "superseded", sup)
+        inv = asyncio_run(_call("invalidate", id=rows[1], reason="own ns ok too"))
+        self.assertEqual(inv.get("result"), "invalidated", inv)
+        self.assertFalse(self._row_live(rows[0]))
+        self.assertFalse(self._row_live(rows[1]))
+
+    def test_scoped_global_token_can_tombstone_user_global_rows(self):
+        # Plan-critic symmetry revision: a token scoped to user:global itself
+        # keeps tombstone powers over user:global (the allow-list decides,
+        # not the namespace prefix).
+        import uuid
+        _call_unscoped = self._build(scoped=False)
+        seeded = asyncio_run(_call_unscoped(
+            "add", type="fact",
+            content=f"i109 user global own row nonce {uuid.uuid4().hex[:8]}",
+            namespace="user:global", signal="test"))
+        self.assertEqual(seeded.get("result"), "stored", seeded)
+
+        _call = self._build(scoped=True, scoped_namespaces=("user:global",))
+        sup = asyncio_run(_call("supersede", id=seeded["id"], reason="global ok"))
+        self.assertEqual(sup.get("result"), "superseded", sup)
+        # A second tombstone of the now-dead row must be refused (append-only
+        # history is never re-written) — any error response is correct here;
+        # what must NEVER happen is another successful mutation.
+        denied = asyncio_run(_call(
+            "supersede", id=seeded["id"], reason="second tombstone"))
+        self.assertIn("error", denied, denied)
+
+    def test_unscoped_token_keeps_tombstone_powers(self):
+        # Regression guard: unscoped operator tokens lose nothing (issue #109
+        # scope item 2 — behavior unchanged for unscoped tokens).
+        ids = self._seed_rows(("project:other",))
+        import uuid
+        _call = self._build(scoped=False)
+        r1 = asyncio_run(_call(
+            "add", type="fact",
+            content=f"one more foreign row nonce {uuid.uuid4().hex[:8]}",
+            signal="test"))
+        self.assertEqual(r1.get("result"), "stored", r1)
+        sup = asyncio_run(_call(
+            "supersede", id=ids["project:other"], reason="operator supersede"))
+        self.assertEqual(sup.get("result"), "superseded", sup)
+        inv = asyncio_run(_call(
+            "invalidate", id=r1["id"], reason="operator invalidate"))
+        self.assertEqual(inv.get("result"), "invalidated", inv)
+
     def test_unscoped_token_still_full_access(self):
         _call = self._build(scoped=False)
         r1 = asyncio_run(_call("add", type="fact", content="unscoped write ok",
@@ -350,6 +533,12 @@ class ScopedTokenToolSurfaceTest(unittest.TestCase):
             ("search", {"query": "x"}),
             ("recent", {}),
             ("session_start", {}),
+            # PRR-010 / cubic #3: the tombstone tools are in the leak loop
+            # too (unknown id exercises their error surface under scope).
+            ("supersede", {"id": "00000000-0000-0000-0000-000000000000",
+                           "reason": "x"}),
+            ("invalidate", {"id": "00000000-0000-0000-0000-000000000000",
+                            "reason": "x"}),
         ):
             result = asyncio_run(_call(name, **args))
             blob = json.dumps(result)

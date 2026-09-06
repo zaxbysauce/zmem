@@ -12,6 +12,68 @@ README.
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-09-06
+
+Workstream A PR 4 of 5 from the proactive-memory epic (#100): namespace-guard
+the MCP `supersede`/`invalidate` tombstone tools (#109, security), plus the
+PR-review feedback round hardening.
+
+- **Fix: scoped MCP tokens can no longer tombstone rows outside their
+  namespace allow-list.** The two tombstone tools were the only mutating MCP
+  tools that never called the scoped-token namespace guard (the v13 / #65
+  gap), so a token scoped to `project:a` could destructively supersede or
+  invalidate any row in `project:b` or `user:global` given its id — and ids
+  are printed in every injected fence and add/update response. Both tools now
+  read the target row's namespace, deny with the same stable
+  `namespace_not_allowed` error shape every other scoped tool returns, and
+  pin the verified namespace on the mutation.
+- **New CLI flag: `supersede`/`invalidate` `--expected-namespace <ns>`.** The
+  enforcement is atomic in the store, not a server-side read-then-write: the
+  tombstone UPDATE is conditional on the target row's namespace matching
+  (checked and applied inside the function's `BEGIN IMMEDIATE` transaction),
+  and a mismatch refuses with exit 2, the stable
+  `[zmem] namespace guard:` stderr line, and NOTHING written. The MCP server
+  passes the scoped token's verified namespace through this flag, so even a
+  concurrent rekey between the server's read and the mutation cannot land a
+  cross-namespace tombstone. Omitting the flag keeps the historical
+  unguarded behavior for local CLI operators; unscoped operator tokens are
+  byte-for-byte unchanged (no extra read, no pin).
+- **New CLI flag: `update --expected-old-namespace <ns>`** (feedback round).
+  Update's OLD-row tombstone is the same class of destructive write; the MCP
+  server now pins the verified target namespace on it too, so a scoped
+  token's update cannot tombstone a row that drifted out of the allow-list
+  in the read-to-write window (the explicit `--namespace` override branch is
+  unchanged — rekeying a row into scope is the documented v13 operation).
+  Store-level: the namespace guard fires before the liveness reveal (no
+  cross-namespace oracle), and both guarded mutations carry a fail-closed
+  rowcount backstop for a row that moved or was deleted mid-flight.
+- **Feedback-round hardening (PR #143 review):** `--expected-namespace ""`
+  (an explicitly supplied empty expectation) now fails closed instead of
+  falling through to the unguarded path; a store-level namespace-guard
+  refusal surfaced through the MCP server now returns the SAME structured
+  `namespace_not_allowed` shape as the server-side guard (clients
+  pattern-match one token, not prose); the scoped-token section of
+  `skills/memory/SKILL.md` names the refusal line and the new flags.
+- **Tests:** behavioral coverage in `tests/test_mcp_auth.py` (scoped denials
+  on `project:other` and `user:global` rows with rows-stay-live assertions
+  and token-leak/detail-text checks, own-namespace and `user:global`-scoped
+  allow-cases, multi-namespace token case, scoped not-found shape,
+  unscoped regression guard) and `tests/test_update_invalidate.py`
+  (CLI-level guard: wrong/correct/empty expectations, blank-reason ordering,
+  deterministic read-to-write race backstop tests, unguarded default).
+  `tests/test_mcp_mutating_tools_guard.py` is a source-contract guardrail:
+  every mutating `@mcp.tool()` handler must reference `_guard_namespace`,
+  and all three tombstone-carrying handlers must keep their namespace pins —
+  it fails on exactly the pre-fix tree.
+- **Docs:** the scoped-token section of `skills/memory/SKILL.md` no longer
+  states that `supersede`/`invalidate` are "deliberately NOT
+  namespace-confined" — that exemption was the documented form of this bug.
+- **Scope note for fleet operators:** the LOCAL Hermes plugin tools
+  `zmem_supersede`/`zmem_invalidate` are intentionally still unguarded — that
+  surface runs in-process with no auth layer at all (no tokens to scope);
+  the issue #109 threat model is the network-exposed MCP server. Rate
+  limiting and token rotation remain deliberately absent (#77 / E-6).
+
 ## [0.18.0] — 2026-09-05
 
 Workstream A PR 3 of 5 from the proactive-memory epic (#100): attribute the
