@@ -278,10 +278,10 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   # paths and snapshot filenames — it is a plaintext file under the (typically
   # owner-only) data dir, and ZMEM_BG_LOG=0 disables it entirely if the info
   # surface is undesirable on a shared/co-located box (PRR-011).
-  # Issue #129: rotation helper for the sink, defined ABOVE the BG_SINK block
-  # on purpose — source-text extractors (the L22 behavioral test) cut the
-  # block at the first `"$PYTHON_BIN"` after `BG_SINK=`, so the literal must
-  # not appear between the assignment and the maintenance dispatch.
+  # Issue #129: rotation helper for the sink, defined ABOVE the assignment
+  # block on purpose — source-text extractors (the L22 behavioral test) cut
+  # that block at the first python-interpreter invocation after the sink
+  # assignment, so this literal must not appear between the two.
   zmem_rotate_maintenance_sink() {
     "$PYTHON_BIN" -c 'import sys; sys.path.insert(0, sys.argv[1]); from storelib.log_rotate import rotate_on_append; rotate_on_append(sys.argv[2])' "$(dirname "$STORE_PY_PY")" "$1" 2>/dev/null || true
   }
