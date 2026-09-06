@@ -146,8 +146,15 @@ def parse_bg_log(path) -> list:
     paths = []
     try:
         from storelib.log_rotate import iter_segments
-        paths = iter_segments(path)  # oldest rotated segments first
+        # iter_segments returns ascending segment numbers: .1 is the MOST
+        # RECENTLY rotated segment, the active file is appended last
+        # (review PRR-013 — the old "oldest first" comment stated the
+        # inverted model; consumers are ts-keyed either way).
+        paths = iter_segments(path)
     except Exception:
+        # iter_segments RAISES on a listing failure (review PRR-003):
+        # degrade to the active file only rather than reading a partial
+        # history as complete.
         paths = []
     paths.append(str(path))  # active file LAST (newest)
     for p in paths:
@@ -720,6 +727,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
 
     failures = []
     unmatched_globs = []
+    transcript_files = []
     db_error = None
     if db_path:
         try:
@@ -733,6 +741,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         if not matches:
             unmatched_globs.append(str(pattern))
         for path in matches:
+            transcript_files.append(path)
             failures.extend(failures_from_transcript_rich(path))
     # Fair merge before the limit truncates (broad-review M4): db-first
     # concatenation would starve every transcript failure whenever the db
@@ -751,6 +760,11 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         deduped.append(f)
     failures_truncated = len(deduped) > max(1, int(limit))
     failures = deduped[:max(1, int(limit))]
+    # Review PRR-008: the false-injection counter's reference side must not
+    # shrink with --miss-limit (that would inflate the false rate). The
+    # join keeps its truncation for the window attribution; the counter
+    # sees every deduped failure and its row scope rides the report.
+    counter_failures = deduped
 
     counts = {"surfaced_sid": 0, "surfaced_legacy": 0, "missed": 0,
               "capture_gap": 0, "no_query": 0, "disabled": 0}
@@ -874,10 +888,11 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         from storelib.false_inject import build_false_injection_report
         false_injection = build_false_injection_report(
             lines, conn=conn, data_dir=data_dir,
-            failure_rows=failures, transcripts=transcripts,
+            failure_rows=counter_failures, transcripts=transcript_files,
             min_token_overlap=min_token_overlap)
     except Exception as exc:
         false_injection = {
+            "degraded": True,
             "overall": {"injected": 0, "used": 0, "false": 0,
                         "false_rate": None},
             "per_moment": {},
@@ -980,6 +995,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         "bg_log_period": period,
         "failures_examined": len(failures),
         "failures_truncated": failures_truncated,
+        "false_injection_failure_rows": len(counter_failures),
         "no_timestamp": no_timestamp,
         "recall_errors": recall_errors,
         "db_error": db_error,

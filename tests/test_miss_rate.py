@@ -835,6 +835,173 @@ class RingQueryTest(_JoinFixture, unittest.TestCase):
         self.assertEqual(rep["counts"]["capture_gap"], 1)
 
 
+class FalseInjectionReviewHardeningTest(unittest.TestCase):
+    """PR #144 review-hardening regressions on the counter itself
+    (PRR-007/010/014/015): direct build_false_injection_report calls — no
+    store needed (id-literal arm only)."""
+
+    def _ln(self, ts=100, ids=("r1",), sid="sess-a", status="injected",
+            reason="injected", moment="user_prompt"):
+        return {"ts": ts, "status": status, "reason": reason,
+                "omitted": None, "ids": list(ids), "all": list(ids),
+                "ops": None, "sid": sid, "moment": moment}
+
+    def test_contradictory_silent_reason_injected_not_counted(self):
+        # PRR-010: status=silent + reason=injected is a writer bug; the
+        # explicit-reason branch must not count it as injected.
+        from storelib import false_inject
+        report = false_inject.build_false_injection_report(
+            [self._ln(status="silent", reason="injected")], failure_rows=[])
+        self.assertEqual(report["overall"]["injected"], 0)
+
+    def test_prompt_reference_from_transcript_marks_used(self):
+        # PRR-007: user prompts mined from the same transcripts the join
+        # consumes are reference events; before this the transcripts
+        # parameter was accepted but inert, so a line whose only
+        # same-session evidence was the operator prompt read as false.
+        from storelib import false_inject
+        tmp = tempfile.mkdtemp(prefix="zmem-fi129prompt-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        tr = Path(tmp, "t.jsonl")
+        tr.write_text(json.dumps({
+            "type": "user", "sessionId": "sess-a",
+            "timestamp": "2026-01-01T00:10:00Z",
+            "message": {"role": "user", "content": [
+                {"type": "text", "text": "what about row-1 again?"}]}},
+        ) + "\n", encoding="utf-8")
+        lines = [self._ln(ts=100, ids=("row-1",))]
+        r0 = false_inject.build_false_injection_report(
+            lines, failure_rows=[])
+        self.assertEqual(r0["overall"]["false"], 1)
+        r1 = false_inject.build_false_injection_report(
+            lines, failure_rows=[], transcripts=[tr])
+        self.assertEqual(r1["overall"]["used"], 1)
+
+    def test_tool_result_blocks_are_not_prompt_references(self):
+        # PRR-007 scoping: tool_result blocks belong to the captured-
+        # failure lane; only text blocks (and bare strings) are prompts.
+        from storelib import false_inject
+        tmp = tempfile.mkdtemp(prefix="zmem-fi129tool-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        tr = Path(tmp, "t.jsonl")
+        tr.write_text(json.dumps({
+            "type": "user", "sessionId": "sess-a",
+            "timestamp": "2026-01-01T00:10:00Z",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "content": "row-1 was here"}]}},
+        ) + "\n", encoding="utf-8")
+        report = false_inject.build_false_injection_report(
+            [self._ln(ts=100, ids=("row-1",))], failure_rows=[],
+            transcripts=[tr])
+        self.assertEqual(report["overall"]["false"], 1)
+
+    def test_moment_metacharacters_sanitized_in_report_keys(self):
+        # PRR-014: the reader applies the writers' charset rule so a
+        # forged moment cannot smuggle metacharacters into report keys.
+        from storelib import false_inject
+        report = false_inject.build_false_injection_report(
+            [self._ln(moment="evil\nstatus=x")], failure_rows=[])
+        self.assertNotIn("evil\nstatus=x", report["per_moment"])
+        self.assertEqual(
+            report["per_moment"]["evil_status_x"]["injected"], 1)
+
+    def test_hostile_ts_values_never_raise(self):
+        # PRR-015: the "Never raises" contract held for None/ints but
+        # ValueError-escaped on non-numeric strings.
+        from storelib import false_inject
+        report = false_inject.build_false_injection_report(
+            [self._ln(ts="notanint")],
+            failure_rows=[{"session_id": "sess-a", "ts_s": "bogus",
+                           "tool": "Bash", "operation": "op",
+                           "error": "err"}])
+        self.assertEqual(report["overall"]["injected"], 1)
+
+
+class FalseInjectionScopeAndDegradedTest(_JoinFixture, unittest.TestCase):
+    """PRR-006/008: the counter rides the join with an UNBOUNDED reference
+    scope and reports its own degradation distinctly."""
+
+    def _transcript_with_failures(self, n):
+        path = Path(self._tmp, "tr.jsonl")
+        recs = []
+        for i in range(n):
+            recs.append({
+                "sessionId": "sess-a",
+                "timestamp": "2026-01-01T00:1%d:00Z" % i,
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call-%d" % i,
+                     "name": "Bash",
+                     "input": {"command": "git stash pop"}}]},
+                "toolUseResult": "Error: conflict %d" % i,
+            })
+        path.write_text("".join(json.dumps(r) + "\n" for r in recs),
+                        encoding="utf-8")
+        return str(path)
+
+    def _run(self, **kw):
+        return miss_rate.run_miss_report(
+            store_path=os.path.join(self._tmp, "store.sqlite"),
+            db_path=None,
+            bg_log_path=os.path.join(self._tmp, "zmem-decisions.log"),
+            **kw)
+
+    def test_counter_reference_scope_ignores_miss_limit(self):
+        # PRR-008: with --miss-limit 1 and two mined failures the join
+        # examines 1 while the counter still sees both — the counter's
+        # rate must not inflate as the operator shrinks the join's limit.
+        tr = self._transcript_with_failures(2)
+        Path(self._tmp, "zmem-decisions.log").write_text(
+            _bg_line(self.now - 60, [self.row_id], moment="user_prompt")
+            + "\n", encoding="utf-8")
+        report = self._run(transcripts=[tr], limit=1)
+        self.assertEqual(report["failures_examined"], 1)
+        self.assertEqual(report["false_injection_failure_rows"], 2)
+
+    def test_counter_failure_degrades_loudly(self):
+        # PRR-006 (join layer): a counter crash yields a degraded stub the
+        # doctor can distinguish from a genuine zero.
+        from unittest import mock
+        from storelib import false_inject
+        tr = self._transcript_with_failures(1)
+        Path(self._tmp, "zmem-decisions.log").write_text(
+            _bg_line(self.now - 60, [self.row_id], moment="user_prompt")
+            + "\n", encoding="utf-8")
+        with mock.patch.object(false_inject, "build_false_injection_report",
+                               side_effect=RuntimeError("boom")):
+            report = self._run(transcripts=[tr])
+        self.assertTrue(report["false_injection"]["degraded"])
+        self.assertIn("RuntimeError: boom",
+                      "".join(report["false_injection"]["caveats"]))
+
+    def test_doctor_renders_degraded_counter_distinctly(self):
+        # PRR-006 (doctor layer): the human summary must not print "no
+        # injected decision lines" for a crashed counter — it prints
+        # DEGRADED with the cause and downgrades the check to warn.
+        from unittest import mock
+        import doctor as doctor_mod
+        canned = {
+            "error": None,
+            "counts": {"surfaced_sid": 0, "surfaced_legacy": 0,
+                       "missed": 0, "capture_gap": 1, "no_query": 0,
+                       "disabled": 0},
+            "failures_examined": 1, "bg_log_decision_lines": 1,
+            "db_error": None, "failures_truncated": False,
+            "false_injection": {
+                "degraded": True,
+                "overall": {"injected": 0, "used": 0, "false": 0,
+                            "false_rate": None},
+                "per_moment": {}, "min_token_overlap": 2,
+                "caveats": ["false-injection counter failed: "
+                            "RuntimeError: boom"]},
+        }
+        store = os.path.join(self._tmp, "store.sqlite")
+        with mock.patch.object(miss_rate, "run_miss_report",
+                               return_value=canned):
+            chk = doctor_mod._check_miss_rate(store, {}, True)
+        self.assertEqual(chk.get("status"), "warn", chk)
+        self.assertIn("DEGRADED", chk.get("summary") or "", chk)
+
+
 class FalseInjectionTest(_JoinFixture, unittest.TestCase):
     """Issue #129: the false-injection counter subtree.
 

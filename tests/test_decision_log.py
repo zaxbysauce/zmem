@@ -670,13 +670,17 @@ class MomentFieldParserTest(unittest.TestCase):
         self.assertEqual(parsed[0]["moment"], hostile)
         self.assertEqual(parsed[0]["status"], "injected")
         self.assertEqual(parsed[0]["sid"], "sess-h")
-        # And the counter buckets it under the inert literal — no field of
-        # the report is forged by the metacharacters.
+        # And the counter buckets it under the SANITIZED literal (review
+        # PRR-014: the reader applies the same charset rule as the writers,
+        # so metacharacters cannot become report keys or leak into the
+        # doctor summary text) — no field of the report is forged.
         from storelib import false_inject
         report = false_inject.build_false_injection_report(
             parsed, conn=None, data_dir=None, failure_rows=[])
-        self.assertIn(hostile, report["per_moment"])
-        self.assertEqual(report["per_moment"][hostile]["injected"], 1)
+        self.assertNotIn(hostile, report["per_moment"])
+        self.assertIn("evil_-_status_silent", report["per_moment"])
+        self.assertEqual(
+            report["per_moment"]["evil_-_status_silent"]["injected"], 1)
         self.assertEqual(report["overall"]["injected"], 1)
 
     def test_hostile_moment_cannot_append_a_forged_field(self):

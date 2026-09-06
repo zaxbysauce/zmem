@@ -18,12 +18,18 @@ Conservative and auditable, no LLM judgment:
   literally, or (b) shares >= ``min_token_overlap`` distinct
   ``derive_ops_tokens`` tokens with the injected row's store content.
 - Reference events: captured failures (the same mined rows the miss-rate
-  join consumes), the per-session ops ring, and transcript-derived failure
-  rows (already merged into the join's failure list upstream). Sid
-  discipline mirrors the PRR-004 rule the disabled bucket follows: a
-  reference from session B never credits session A's lines; sid-less
-  legacy lines (``sid=unknown`` or missing) weak-match any session,
-  mirroring the surfaced_sid/surfaced_legacy split.
+  join consumes), the per-session ops ring, transcript user prompts mined
+  from the same JSONL transcripts the join consumes, and transcript-
+  derived failure rows (already merged into the join's failure list
+  upstream). Sid discipline mirrors the PRR-004 rule the disabled bucket
+  follows: a reference from session B never credits session A's lines;
+  sid-less legacy lines (``sid=unknown`` or missing) weak-match any
+  session, mirroring the surfaced_sid/surfaced_legacy split.
+- Sid normalization (review PRR-017, documented): the shared
+  ``[^A-Za-z0-9._-]`` + 128-char rule is many-to-one, so distinct crafted
+  session ids can collide into one bucket and cross-pollinate ring reads.
+  Inherent to the writer-side sanitize rule (paths and log labels share
+  it); accepted for this telemetry surface.
 
 Legacy decision lines (no ``moment=`` field, pre-#129) are NOT excluded:
 they report under the ``legacy`` bucket so old windows stay measurable,
@@ -54,7 +60,11 @@ _INJECTED_REASONS = ("injected",)
 def _is_injected_line(ln: dict) -> bool:
     reason = ln.get("reason")
     if reason is not None:
-        return reason in _INJECTED_REASONS
+        # Review PRR-010: the explicit-reason branch must not count a
+        # contradictory writer bug (status=silent + reason=injected);
+        # legacy writer-B lines carry no reason and keep the status path.
+        return reason in _INJECTED_REASONS and ln.get("status") in (
+            None, "injected")
     return ln.get("status") == "injected"
 
 
@@ -67,7 +77,10 @@ def _norm_sid(sid) -> str:
 def _moment_of(ln: dict) -> str:
     moment = ln.get("moment")
     if isinstance(moment, str) and moment.strip():
-        return moment.strip()[:32]
+        # Same charset rule the writers apply (review PRR-014): a forged or
+        # hand-edited line must not smuggle metacharacters into per_moment
+        # report keys or the doctor summary text.
+        return _SID_SAFE_RE.sub("_", moment.strip())[:32]
     return LEGACY_MOMENT
 
 
@@ -141,6 +154,82 @@ def _derive(text: str) -> list:
         return []
 
 
+def _iso_to_epoch_s(value) -> int:
+    """ISO-8601 transcript timestamp -> epoch seconds (0 on anything
+    unusable). Local to this module so the counter never imports the
+    heavier miss_rate stack."""
+    if not isinstance(value, str) or not value:
+        return 0
+    try:
+        from datetime import datetime, timezone
+        raw = value.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _read_prompt_events(transcripts) -> list:
+    """[(ts, text, sid)] user-prompt reference events mined from transcript
+    JSONL files (review PRR-007: prompts are the second reference surface
+    of the contract — the parameter used to be accepted but inert, so a
+    failure whose only same-session evidence was the operator's own prompt
+    quoting the row read as a false injection). Record shape mirrors
+    ``miss_rate.failures_from_transcript_rich``: ``message.content`` is a
+    list of typed blocks (only ``text`` blocks are prompts — tool_result
+    blocks belong to the captured-failure lane) or a bare string;
+    ``timestamp`` is ISO-8601; the session id rides ``session_id`` OR
+    ``sessionId`` and feeds the same sid partition as every other
+    reference. Never raises; [] per unreadable file."""
+    import glob as _glob
+    events = []
+    for pattern in transcripts or ():
+        try:
+            matches = _glob.glob(str(pattern), recursive=True)
+        except Exception:
+            continue
+        for path in matches:
+            try:
+                with open(path, "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    raw = fh.readlines()
+            except OSError:
+                continue
+            for line in raw:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                msg = obj.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
+                texts = []
+                if isinstance(content, str):
+                    texts.append(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if (isinstance(block, dict)
+                                and block.get("type") == "text"
+                                and isinstance(block.get("text"), str)):
+                            texts.append(block["text"])
+                if not texts:
+                    continue
+                sid_raw = obj.get("session_id") or obj.get("sessionId")
+                sid = _norm_sid(sid_raw if isinstance(sid_raw, str) else "")
+                ts = _iso_to_epoch_s(obj.get("timestamp"))
+                for text in texts:
+                    text = text.strip()
+                    if text:
+                        events.append((ts, text, sid))
+    return events
+
+
 def build_false_injection_report(decision_lines, conn=None, data_dir=None,
                                  failure_rows=(), transcripts=(),
                                  min_token_overlap: int = 2) -> dict:
@@ -149,9 +238,9 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
     ``decision_lines``: the list ``parse_bg_log`` returns (with ``moment``).
     ``conn``: read-only sqlite connection to the store (row content arm).
     ``failure_rows``: the join's mined failures (dicts with session_id,
-    ts_s, tool, operation, error). ``transcripts`` is accepted for surface
-    parity with ``run_miss_report`` — transcript-derived failures arrive
-    merged in ``failure_rows`` upstream. Never raises.
+    ts_s, tool, operation, error). ``transcripts``: resolved transcript
+    JSONL paths whose user prompts are mined as reference events (review
+    PRR-007). Never raises.
     """
     try:
         threshold = max(1, int(min_token_overlap))
@@ -168,8 +257,14 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
                         ("operation", "error", "tool")).strip()
         if not text:
             continue
-        references.append((int(f.get("ts_s") or 0), text,
-                           _norm_sid(f.get("session_id"))))
+        # Review PRR-015: ts fields from non-standard callers are guarded,
+        # keeping the documented "Never raises" contract true.
+        try:
+            ts_val = int(f.get("ts_s") or 0)
+        except (TypeError, ValueError):
+            ts_val = 0
+        references.append((ts_val, text, _norm_sid(f.get("session_id"))))
+    references.extend(_read_prompt_events(transcripts))
     ring_sids = {_norm_sid(ln.get("sid")) for ln in decision_lines
                  if isinstance(ln, dict) and ln.get("sid")}
     for sid in sorted(ring_sids):
@@ -191,6 +286,16 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
 
     # Row-content token cache across lines.
     token_cache: dict = {}
+    derive_cache: dict = {}
+
+    def _derive_cached(text: str) -> list:
+        # Review PRR-011: each reference text is tokenized once, not once
+        # per candidate injected id.
+        toks = derive_cache.get(text)
+        if toks is None:
+            toks = _derive(text)
+            derive_cache[text] = toks
+        return toks
 
     def _bucket() -> dict:
         return {"injected": 0, "used": 0, "false": 0, "false_rate": None}
@@ -220,7 +325,11 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
             # from ANY session still proves the row reached an operator).
             refs = [(ts, text) for evs in by_sid.values()
                     for (ts, text) in evs]
-        ts_line = int(ln.get("ts") or 0)
+        # Review PRR-015: hostile/non-standard ts values never raise.
+        try:
+            ts_line = int(ln.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts_line = 0
         later = [(ts, text) for ts, text in refs if ts and ts > ts_line]
         used = False
         if later:
@@ -237,7 +346,7 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
                     if not row_toks:
                         continue
                     for _ts, text in later:
-                        shared = row_toks.intersection(_derive(text))
+                        shared = row_toks.intersection(_derive_cached(text))
                         if len(shared) >= threshold:
                             used = True
                             break

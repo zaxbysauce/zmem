@@ -2810,7 +2810,8 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
     remediation = (
         "snapshot the store into a temp dir — copy store.sqlite AND any "
         "store.sqlite-wal/-shm beside it (plus zmem-decisions.log, its "
-        ".1/.2 rotated segments, and zmem-bg.log, plus the ops/ ring dir "
+        "rotated segments (.1 .. .N per ZMEM_LOG_ROTATIONS), and "
+        "zmem-bg.log, plus the ops/ ring dir "
         "when present) — then re-run with --store <snapshot path>. exit 1 "
         "from --miss-rate most often means exactly this: snapshot the "
         "store and re-run with --store.")
@@ -2885,6 +2886,16 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
     # inside it), so guard the read.
     fi = report.get("false_injection") or {}
     fi_overall = fi.get("overall") or {}
+    fi_degraded = bool(fi.get("degraded"))
+    if fi_degraded:
+        # Review PRR-006: a crashed counter must not read as a genuine
+        # zero — the old else-branch printed "no injected decision lines"
+        # for both. Degrade the status so a passing check cannot hide the
+        # failure; the cause stays in false_injection.caveats.
+        status = "warn"
+        fi_caveats = fi.get("caveats") or []
+        summary += ("; false-injection counter DEGRADED (%s)"
+                    % (fi_caveats[0] if fi_caveats else "unknown cause"))
     if fi_overall.get("injected"):
         summary += (
             f"; false-injection {fi_overall.get('false', 0)}/"
@@ -2895,7 +2906,7 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
         for m, b in sorted((fi.get("per_moment") or {}).items()):
             summary += (f"; [{m}] {b.get('false', 0)}/{b.get('injected', 0)}"
                         f" (rate {b.get('false_rate')})")
-    else:
+    elif not fi_degraded:
         summary += "; false-injection: no injected decision lines in the log"
     return _check("miss-rate", status, summary, report=report)
 
