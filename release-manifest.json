@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "fadb14949e8fb876fa23d3f1ccc4eb9f669edbe96b467e576c4e06d7fa44c7ec",
+  "digest": "6f039e30ad97db66287f8053db896b3f7fa039e665acb3379fadb91f3c702a40",
   "files": {
     "hermes-plugin/__init__.py": "39ad2617be05846d35aa6eef2bd63ba513ce14fafe0816f381efe836a804f036",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -27,7 +27,7 @@
     "hooks/zmem-pretool-recall.sh": "8e218d93afa7410af5580b9b03e0461d7205788d0dd0718d48151a68a9fc35a8",
     "hooks/zmem-recall.sh": "cb4262b4ec0eb3dc6e89698bfdd684976746a9700b43c0970d14efa53f05d91a",
     "hooks/zmem-reflect.sh": "b6b9c78658cf7e6b5006a8d5cb6cf9d72f34bb1b0337125ba01b9a135a2de114",
-    "hooks/zmem-session-start.sh": "356e5b7d9b7b9b3482ae3acdb01c36eb2b958fb8a0e382defbd35ba12156c3e6",
+    "hooks/zmem-session-start.sh": "d2ded5b6a47cd469b6426ca867ef073a84c597cb80cf797b8b1ed5bdbab29d9a",
     "hooks/zmem-subagent-recall.sh": "aab144cf0b1723fe113200f22659cbba0aabcccdb18e1e3cc5e14660a25e9588",
     "hooks/zmem-subagent-reflect.sh": "7dd0f5da6ad99fb50a20d072f19755a837ac53e16975c8e4e2ccd23053e3b775",
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",

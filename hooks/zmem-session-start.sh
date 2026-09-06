@@ -278,6 +278,13 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   # paths and snapshot filenames — it is a plaintext file under the (typically
   # owner-only) data dir, and ZMEM_BG_LOG=0 disables it entirely if the info
   # surface is undesirable on a shared/co-located box (PRR-011).
+  # Issue #129: rotation helper for the sink, defined ABOVE the BG_SINK block
+  # on purpose — source-text extractors (the L22 behavioral test) cut the
+  # block at the first `"$PYTHON_BIN"` after `BG_SINK=`, so the literal must
+  # not appear between the assignment and the maintenance dispatch.
+  zmem_rotate_maintenance_sink() {
+    "$PYTHON_BIN" -c 'import sys; sys.path.insert(0, sys.argv[1]); from storelib.log_rotate import rotate_on_append; rotate_on_append(sys.argv[2])' "$(dirname "$STORE_PY_PY")" "$1" 2>/dev/null || true
+  }
   BG_SINK="/dev/null"
   if [ "${ZMEM_BG_LOG:-1}" != "0" ] && [ -n "$DATA_DIR" ]; then
     BG_LOG_PATH="$DATA_DIR/zmem-bg.log"
@@ -296,7 +303,7 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
       # Size-gated so steady state pays only a wc -c. Fail-open: if the
       # helper call fails the worker appends to the existing file.
       if [ -f "$BG_LOG_PATH" ] && [ "$(wc -c < "$BG_LOG_PATH" 2>/dev/null || echo 0)" -gt "${ZMEM_BG_LOG_MAX_BYTES:-262144}" ]; then
-        "$PYTHON_BIN" -c 'import sys; sys.path.insert(0, sys.argv[1]); from storelib.log_rotate import rotate_on_append; rotate_on_append(sys.argv[2])' "$(dirname "$STORE_PY_PY")" "$BG_LOG_PATH" 2>/dev/null || true
+        zmem_rotate_maintenance_sink "$BG_LOG_PATH"
       fi
     fi
   fi
