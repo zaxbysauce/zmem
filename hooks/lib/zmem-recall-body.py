@@ -214,9 +214,12 @@ def _classify_silent_reason(rows, omitted=0, budget_emptied=False,
     return reason
 
 
-# Log bound (PRR-023 fix): zmem-bg.log was maintenance-only (~lines/day)
-# and is now appended per hook event. Cap it: past this size, truncate to
-# empty before appending (operator can raise the cap via ZMEM_BG_LOG_MAX_BYTES).
+# Log bound (PRR-023 fix, superseded by #129 rotation): zmem-bg.log was
+# maintenance-only (~lines/day) and is now appended per hook event. Growth
+# control is BOUNDED ROTATION via storelib.log_rotate (see
+# _rotate_telemetry_logs): past ZMEM_BG_LOG_MAX_BYTES the active content
+# becomes a marked .1 segment — history survives, the destructive
+# truncate-to-empty behavior this comment used to describe is gone.
 
 def _maybe_log_drift(session_id: str) -> None:
     """Issue #107: run the served-tree drift check once per session id.

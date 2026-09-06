@@ -45,6 +45,20 @@ false-injection counter and the decision-log split/rotation - the half of
   legacy single-file deployments keep working (readers fall back to
   `zmem-bg.log` when no decisions log exists). `scripts/host_canary.py`
   grounds on the decisions log with the same legacy fallback.
+- **memory** (issue #129 review hardening): the rotation, counter, canary,
+  and doctor surfaces were hardened against an execution-verified
+  independent review. Rotation now evicts the OLDEST segment (the first
+  cut could destroy the newest rotated generation), never deletes before
+  a failure can still lose history, aborts untouched when the directory
+  listing fails, stamps each new segment with a monotonic `zmem-seq`
+  generation, and is crash-safe on the stamp write. Rotation is actually
+  reachable on every writer path (the helper import used to fail on the
+  kill-switch and silent paths). The counter mines transcript user
+  prompts as reference events, sees all deduped failures regardless of
+  `--miss-limit`, and a counter crash renders as `counter DEGRADED` with
+  a warn status instead of reading as a genuine zero; the host canary
+  retries the legacy log after the drive before declaring
+  hook-not-fired.
 
 ## [0.19.0] — 2026-09-06
 
