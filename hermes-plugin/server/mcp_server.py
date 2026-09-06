@@ -1244,6 +1244,17 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args[args.index("--content") + 1] = "-"
             input_text = body
         r = await _run_store_async(args, input_text=input_text)
+        if not r["ok"]:
+            # The pinned branch arms a store-level --expected-old-namespace
+            # guard; its refusal is a namespace denial, not a generic store
+            # error — map it to the structured shape clients branch on
+            # (final-critic: same uniformity this round gave
+            # supersede/invalidate). ns_pin is None on the unscoped and
+            # explicit-override branches, where the marker can never appear.
+            guard_denial = _namespace_guard_denial(
+                _sanitize_store_error(r), ns_pin)
+            if guard_denial:
+                return guard_denial
         return _write_response(r, ok_result="updated")
 
     @mcp.tool()

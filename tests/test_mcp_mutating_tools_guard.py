@@ -116,6 +116,20 @@ class MutatingToolsGuardContractTest(unittest.TestCase):
             "update handler no longer pins --expected-old-namespace on the "
             "scoped no-override path (issue #109 follow-up)")
 
+    def test_update_handler_maps_store_guard_refusal_to_structured_shape(self):
+        # Final-critic revision: update's not-ok branch must remap the
+        # store-level namespace-guard refusal to the structured
+        # namespace_not_allowed shape (same uniformity as supersede /
+        # invalidate); otherwise the rekey-race denial surfaces as prose.
+        needle = "_namespace_guard_denial("
+        source = SERVER_PY.read_text(encoding="utf-8")
+        for name in ("supersede", "invalidate", "update"):
+            segment = dict(_tool_segments(source))[name]
+            self.assertIn(
+                needle, segment,
+                f"{name} handler does not map store-level guard refusals "
+                "through _namespace_guard_denial (uniform denial shape)")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

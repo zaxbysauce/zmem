@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "00cc2087b4e26ee9722e92cacf14cf488a31611b89e9d506bf29b782b8febd14",
+  "digest": "6b09cabb9be9ec99d2f01a7b5d8d809a55553c537af629aea32881ed980f92f5",
   "files": {
     "hermes-plugin/__init__.py": "39ad2617be05846d35aa6eef2bd63ba513ce14fafe0816f381efe836a804f036",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -11,7 +11,7 @@
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "8f09b3987ae01ec7d250881d2bb6b885e07e78743951d5b8f725ff07d6f48b97",
-    "hermes-plugin/server/mcp_server.py": "9b63ec5573e373686bdfff99613d35389808bc15a535855d559057ba04e9f825",
+    "hermes-plugin/server/mcp_server.py": "677fc91155b0ad3640aa26c89098ffb9202d2acb95b15ac90f5e1c7e367acb62",
     "hermes-plugin/server/requirements-embeddings.txt": "437505a8ebb55933f5b50e9334849e88a9ce0b57ee534c5f6864a5cda1f8aca6",
     "hermes-plugin/server/requirements.txt": "799aad6ca2a111d8c21b746fae1a2770278b29554900f95b9241c686d7149189",
     "hooks/hooks.claude.json": "85e4978f002cd1f6deeef9c2cd1db5b376a4ae01e33b1a5e5cc82bd4202afff6",
