@@ -174,6 +174,25 @@ class BodyRotationTest(_SeededStore):
         self.assertEqual([p["sid"] for p in parsed],
                          [f"old-{i}" for i in range(len(old))] + ["sess-rot"])
 
+    def test_silent_path_rotates_without_format_fence_leak(self):
+        # Review PRR-005: the silent (kill-switch) decision-write path runs
+        # BEFORE _format_fence, so its rotation import used to fail on the
+        # wrong sys.path depth and the log grew unbounded there. Rotation
+        # must actually fire on this path — .1 appears with the history.
+        old = self._prefill()  # ~630 bytes >> the 200-byte cap
+        _run_body(self._tmp, "user_prompt",
+                  {"prompt": "unrelated", "session_id": "sess-rot2"},
+                  self.ns, ZMEM_INJECT="0", ZMEM_BG_LOG_MAX_BYTES="200")
+        seg = Path(self._tmp, "zmem-decisions.log.1")
+        self.assertTrue(seg.is_file(), "rotation must run on the silent "
+                        "writer path too, not only on the injected one")
+        seg_lines = seg.read_text(encoding="utf-8").splitlines()
+        for line in old:
+            self.assertIn(line, seg_lines)
+        active = _decision_lines(self._tmp)
+        self.assertEqual(len(active), 1, active)
+        self.assertIn("status=silent reason=disabled", active[0])
+
 
 class LogRotateUnitTest(unittest.TestCase):
     """Unit layer: storelib/log_rotate.py (new in #129)."""
@@ -183,6 +202,11 @@ class LogRotateUnitTest(unittest.TestCase):
         self._saved = {k: os.environ.get(k) for k in
                        ("ZMEM_BG_LOG_MAX_BYTES", "ZMEM_LOG_ROTATIONS")}
         os.environ["ZMEM_BG_LOG_MAX_BYTES"] = "10"
+        # Review PRR-012: the knobs must be ABSENT in-process too, not just
+        # restored afterwards — an ambient ZMEM_LOG_ROTATIONS (the exact
+        # hazard _STRIP_ENV warns about for children) used to leak into
+        # rotation() here and break segment-count assertions.
+        os.environ.pop("ZMEM_LOG_ROTATIONS", None)
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -295,6 +319,160 @@ class LogRotateUnitTest(unittest.TestCase):
     def test_missing_file_is_noop_not_error(self):
         self.assertFalse(log_rotate.rotate_on_append(
             os.path.join(self._tmp, "absent.log")))
+
+
+class RotationReviewHardeningTest(unittest.TestCase):
+    """Regressions for the execution-proven rotation defects found by the
+    independent PR #144 review (PRR-001/002/003 + the stale-stamp finding):
+    each test reproduces the defect shape against the CURRENT algorithm.
+    All rotation calls pass the knobs explicitly so no ambient env can
+    steer the fixtures."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="zmem-dl129-hard-")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _log(self):
+        return os.path.join(self._tmp, "fam.log")
+
+    def _rotate(self, content):
+        p = self._log()
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        self.assertTrue(log_rotate.rotate_on_append(
+            p, max_bytes_value=10, rotations_value=3))
+
+    def test_eviction_drops_oldest_generation_not_newest(self):
+        # PRR-001: the pre-review code sliced the FRONT of the ascending
+        # list, destroying the newest rotated generation while ancient
+        # content survived forever (proven by a 5-generation drive: the
+        # surviving numbers drifted .1/.3/.4...). Five generations at
+        # keep=3 must leave gens 5/4/3 — never a surviving gen 1.
+        for gen in range(1, 6):
+            self._rotate("GEN%d;" % gen + "x" * 30)
+        segs = log_rotate.iter_segments(self._log())
+        self.assertEqual([os.path.basename(s) for s in segs],
+                         ["fam.log.1", "fam.log.2", "fam.log.3"])
+        bodies = [Path(s).read_text(encoding="utf-8") for s in segs]
+        self.assertIn("GEN5;", bodies[0])
+        self.assertIn("GEN4;", bodies[1])
+        self.assertIn("GEN3;", bodies[2])
+        self.assertNotIn("GEN1;", "".join(bodies))
+        self.assertNotIn("GEN2;", "".join(bodies))
+
+    def test_marker_seq_is_a_monotonic_generation(self):
+        # Review finding (stale stamps): only .1 was ever stamped, so every
+        # segment claimed seq=1. The stamp on each new .1 is now one higher
+        # than the highest marker in the family — a copied-out segment
+        # self-describes its rotation generation with a UNIQUE seq, and
+        # gaps mean evicted generations.
+        for gen in range(1, 6):
+            self._rotate("G%d;" % gen + "x" * 30)
+        seqs = []
+        for seg in log_rotate.iter_segments(self._log()):
+            first = Path(seg).read_text(encoding="utf-8").splitlines()[0]
+            m = re.match(r"^# zmem-seq=(\d+) rotated_at=\d+$", first)
+            self.assertTrue(m, first)
+            seqs.append(int(m.group(1)))
+        self.assertEqual(seqs, [5, 4, 3], seqs)
+
+    def test_gapped_family_retention_stays_bounded(self):
+        # PRR-001 corollary: a hand-pruned family (.1/.3/.5) must keep the
+        # NEWEST three generations after one rotation regardless of number
+        # gaps — retention is positional (ascending-number list order),
+        # never by literal number.
+        p = self._log()
+        for n, body in ((1, "G1;"), (3, "G3;"), (5, "G5;")):
+            Path(p + ".%d" % n).write_text(body + "y" * 30, encoding="utf-8")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("NEW;" + "z" * 30)
+        self.assertTrue(log_rotate.rotate_on_append(
+            p, max_bytes_value=10, rotations_value=3))
+        segs = log_rotate.iter_segments(p)
+        self.assertEqual(len(segs), 3, segs)
+        bodies = "".join(Path(s).read_text(encoding="utf-8") for s in segs)
+        self.assertIn("NEW;", bodies)      # the fresh rotation
+        self.assertIn("G1;", bodies)       # newest surviving old generation
+        self.assertIn("G3;", bodies)
+        self.assertNotIn("G5;", bodies)    # the OLDEST content is evicted
+
+    def test_mid_shift_oserror_loses_no_bytes(self):
+        # PRR-002: eviction used to run BEFORE the shift, so a rename
+        # failure destroyed .1 while the call reported False ("nothing
+        # happened"). Eviction now only runs after the family is complete,
+        # and a mid-shift failure loses no byte at all.
+        p = self._log()
+        Path(p + ".1").write_text("OLD1;" + "a" * 30, encoding="utf-8")
+        Path(p + ".2").write_text("OLD2;" + "b" * 30, encoding="utf-8")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("ACTIVE;" + "c" * 30)
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky_replace(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("locked mid-shift")
+            return real_replace(src, dst)
+
+        with mock.patch.object(log_rotate.os, "replace", flaky_replace):
+            self.assertFalse(log_rotate.rotate_on_append(
+                p, max_bytes_value=10, rotations_value=3))
+        names = sorted(os.listdir(self._tmp))
+        blobs = "".join(
+            Path(self._tmp, n).read_text(encoding="utf-8") for n in names)
+        for marker in ("OLD1;", "OLD2;", "ACTIVE;"):
+            self.assertIn(marker, blobs,
+                          "a failed rotation must lose no byte (got %r)"
+                          % names)
+        # The pre-call .1 in particular was NOT deleted (the old code
+        # evicted it before the failing rename).
+        self.assertIn("fam.log.1", names)
+
+    def test_listdir_failure_aborts_without_touching_anything(self):
+        # PRR-003: a failed directory listing used to read as an empty
+        # family, so the shift no-op'd and os.replace clobbered a precious
+        # .1 with the active file. The listing error now aborts the
+        # rotation with nothing touched.
+        p = self._log()
+        Path(p + ".1").write_text("PRECIOUS;" + "p" * 30, encoding="utf-8")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("ACTIVE;" + "q" * 30)
+        with mock.patch.object(log_rotate.os, "listdir",
+                               side_effect=OSError("listing denied")):
+            self.assertFalse(log_rotate.rotate_on_append(
+                p, max_bytes_value=10, rotations_value=3))
+        self.assertEqual(
+            Path(p + ".1").read_text(encoding="utf-8"),
+            "PRECIOUS;" + "p" * 30,
+            "a listing failure must never clobber the existing segment")
+        with open(p, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "ACTIVE;" + "q" * 30)
+
+    def test_rotation_import_needs_the_scripts_dir_not_storelib(self):
+        # PRR-005: `from storelib.log_rotate import ...` resolves against
+        # the PARENT of the storelib package. The writers insert the
+        # scripts dir; inserting the storelib dir itself (the old bug, now
+        # fixed in both writers) must keep failing — this documents WHY the
+        # parent is the correct insertion.
+        prog_ok = (
+            "import sys; sys.path.insert(0, r'%s'); "
+            "from storelib.log_rotate import rotate_on_append; "
+            "assert callable(rotate_on_append); print('OK')" % SCRIPTS)
+        r = subprocess.run([sys.executable, "-c", prog_ok],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("OK", r.stdout)
+        prog_bad = (
+            "import sys; sys.path.insert(0, r'%s'); "
+            "from storelib.log_rotate import rotate_on_append"
+            % (SCRIPTS / "storelib"))
+        r = subprocess.run([sys.executable, "-c", prog_bad],
+                           capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(r.returncode, 0,
+                            "the storelib-dir-on-path shape must not import")
 
 
 class SplitPathResolutionTest(_SeededStore):
@@ -433,6 +611,30 @@ class MomentFieldSessionStartTest(unittest.TestCase):
         self.assertIn("status=silent reason=disabled", lines[0])
         self.assertIn(" sid=sess-ss129", lines[0])
         self.assertRegex(lines[0], r" moment=session_start$")
+
+    def test_kill_switch_rotates_over_cap_decisions_log(self):
+        # Review PRR-005 (session-start site): the kill-switch block used
+        # to insert the storelib dir itself on sys.path, so its rotation
+        # import failed silently and an over-cap decisions log grew
+        # unbounded. The .1 segment must appear when the disabled line is
+        # appended.
+        old = [_old_line(i) for i in range(6)]
+        Path(self._tmp, "zmem-decisions.log").write_text(
+            "\n".join(old) + "\n", encoding="utf-8")
+        r = self._run_session_start({"ZMEM_INJECT": "0",
+                                     "ZMEM_SESSION": "sess-ss129",
+                                     "ZMEM_BG_LOG_MAX_BYTES": "200"})
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        seg = Path(self._tmp, "zmem-decisions.log.1")
+        self.assertTrue(seg.is_file(), "session-start kill-switch rotation "
+                        "must run (import depth fix)")
+        seg_text = seg.read_text(encoding="utf-8")
+        for line in old:
+            self.assertIn(line, seg_text)
+        lines = _decision_lines(self._tmp)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("status=silent reason=disabled", lines[0])
+        self.assertIn(" sid=sess-ss129", lines[0])
 
 
 class MomentFieldParserTest(unittest.TestCase):

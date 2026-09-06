@@ -269,6 +269,29 @@ def _maybe_log_drift(session_id: str) -> None:
         pass  # fail-open: drift reporting never blocks a decision
 
 
+def _rotate_telemetry_logs(store_py: str, data_dir: str) -> None:
+    """Rotate the decision log and the legacy bg log before an append
+    (issue #129). The rotation package imports from the SCRIPTS dir —
+    storelib's parent — on sys.path (review PRR-005: the original inserted
+    the storelib dir itself, so the import failed on every writer path that
+    had not already leaked the parent onto sys.path, silently skipping
+    rotation there). Fail-open: any failure leaves the appends proceeding
+    uncapped — growth, never loss."""
+    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
+    if not scripts_dir:
+        return
+    saved = sys.path[:]
+    try:
+        sys.path.insert(0, scripts_dir)
+        from storelib.log_rotate import rotate_on_append
+        rotate_on_append(os.path.join(data_dir, "zmem-decisions.log"))
+        rotate_on_append(os.path.join(data_dir, "zmem-bg.log"))
+    except Exception:
+        pass
+    finally:
+        sys.path[:] = saved
+
+
 def _log_inject_decision(rows, selected, status: str, reason: str,
                          omitted=0, tokens_used=None, tokens_budget=None,
                          ops_count=0, session_id: str = "",
@@ -315,21 +338,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
         # (over-cap, from a pre-split deployment) is folded into bounded
         # rotation here too, so its history becomes a marked segment on
         # the first post-split decision instead of growing forever.
-        try:
-            scripts_dir = (os.path.dirname(os.path.abspath(store_py))
-                           if store_py else "")
-            if scripts_dir:
-                saved = sys.path[:]
-                try:
-                    sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
-                    from storelib.log_rotate import rotate_on_append
-                    rotate_on_append(log_path)
-                    rotate_on_append(
-                        os.path.join(_data_dir(), "zmem-bg.log"))
-                finally:
-                    sys.path[:] = saved
-        except Exception:
-            pass
+        _rotate_telemetry_logs(store_py, _data_dir())
         ids_all = [r.get("id") for r in rows]
         if all_ids is not None:
             # Issue #114: on the --for-injection lane the hook receives only
@@ -401,14 +410,22 @@ def _format_fence(rows, header: str, store_py: str = "") -> str:
     ``schema_meta`` are importable from. Deriving the path from this
     file's own location is WRONG — this file lives in hooks/lib, two
     levels away from the scripts dir (caught by the round-2 behavioral
-    smoke, not by any source-text assertion).
+    smoke, not by any source-text assertion). The path insertion is
+    restored on exit (review PRR-005: the old un-restored leak accidentally
+    rescued the rotation import at the one decision-write site that runs
+    after this helper, hiding that the other sites inserted the wrong
+    directory).
     """
     scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
-    if scripts_dir:
-        sys.path.insert(0, scripts_dir)
-        sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
-    from storelib import _format_fenced_recall
-    return _format_fenced_recall(rows, header)
+    saved = sys.path[:]
+    try:
+        if scripts_dir:
+            sys.path.insert(0, scripts_dir)
+            sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
+        from storelib import _format_fenced_recall
+        return _format_fenced_recall(rows, header)
+    finally:
+        sys.path[:] = saved
 
 
 def _inject_helpers(store_py: str):

@@ -420,9 +420,16 @@ if os.environ.get("ZMEM_INJECT", "1").strip() == "0":
             _dl = os.path.join(data_dir, "zmem-decisions.log")
             try:
                 if store_py and os.path.isfile(store_py):
-                    sys.path.insert(0, os.path.join(os.path.dirname(store_py), "storelib"))
-                    from storelib.log_rotate import rotate_on_append as _rota
-                    _rota(_dl)
+                    _sp = sys.path[:]
+                    try:
+                        # Review PRR-005: the rotation package imports from
+                        # the scripts dir (storelib parent), not from the
+                        # storelib dir itself.
+                        sys.path.insert(0, os.path.dirname(store_py))
+                        from storelib.log_rotate import rotate_on_append as _rota
+                        _rota(_dl)
+                    finally:
+                        sys.path[:] = _sp
             except Exception:
                 pass  # fail-open: append proceeds, growth never loss
             with open(_dl, "a", encoding="utf-8") as _lf:
@@ -549,9 +556,16 @@ if store_py and os.path.isfile(store_py):
             # with --for-injection (issue #114), which is why the rendered
             # set arrives already filtered and counted.
             try:
-                sys.path.insert(0, os.path.dirname(store_py))
-                sys.path.insert(0, os.path.join(os.path.dirname(store_py), "storelib"))
-                from storelib import _format_fenced_recall
+                _sp = sys.path[:]
+                try:
+                    sys.path.insert(0, os.path.dirname(store_py))
+                    sys.path.insert(0, os.path.join(os.path.dirname(store_py), "storelib"))
+                    from storelib import _format_fenced_recall
+                finally:
+                    # Review PRR-005 hygiene: restore the path like every
+                    # sibling helper, so later imports here cannot free-ride
+                    # on this leak.
+                    sys.path[:] = _sp
                 # PRR-014 fix: record the injected|silent decision in the
                 # SAME bg log the other hook surfaces use (recall /
                 # precompact / subagent-recall via the shared body).
@@ -584,8 +598,16 @@ if store_py and os.path.isfile(store_py):
                         # Issue #129: rotate, never truncate — the decisions
                         # log is the audit evidence substrate.
                         try:
-                            from storelib.log_rotate import rotate_on_append as _rota
-                            _rota(_log_path)
+                            _sp = sys.path[:]
+                            try:
+                                # Review PRR-005: insert the package parent
+                                # explicitly — this site previously relied on
+                                # the fence import above leaking it.
+                                sys.path.insert(0, os.path.dirname(store_py))
+                                from storelib.log_rotate import rotate_on_append as _rota
+                                _rota(_log_path)
+                            finally:
+                                sys.path[:] = _sp
                         except Exception:
                             pass
                         with open(_log_path, "a", encoding="utf-8") as _lf:
