@@ -2809,10 +2809,11 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
                           f"join library import failed: {exc}")
     remediation = (
         "snapshot the store into a temp dir — copy store.sqlite AND any "
-        "store.sqlite-wal/-shm beside it (plus zmem-bg.log and the ops/ "
-        "ring dir when present) — then re-run with --store <snapshot "
-        "path>. exit 1 from --miss-rate most often means exactly this: "
-        "snapshot the store and re-run with --store.")
+        "store.sqlite-wal/-shm beside it (plus zmem-decisions.log, its "
+        ".1/.2 rotated segments, and zmem-bg.log, plus the ops/ ring dir "
+        "when present) — then re-run with --store <snapshot path>. exit 1 "
+        "from --miss-rate most often means exactly this: snapshot the "
+        "store and re-run with --store.")
     if not store_explicit:
         return _check(
             "miss-rate", "fail",
@@ -2847,6 +2848,7 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
             window_after_s=opts.get("window_after_s", 300),
             limit=opts.get("limit", 200),
             verbose=bool(opts.get("verbose")),
+            min_token_overlap=opts.get("min_overlap", 2),
         )
     except Exception as exc:
         return _check("miss-rate", "fail",
@@ -2878,6 +2880,23 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
         f"capture-gap {counts['capture_gap']}, "
         f"no-query {counts['no_query']}"
     )
+    # Issue #129: both directions always print together. The counter
+    # subtree is best-effort in the join (a failure degrades to a caveat
+    # inside it), so guard the read.
+    fi = report.get("false_injection") or {}
+    fi_overall = fi.get("overall") or {}
+    if fi_overall.get("injected"):
+        summary += (
+            f"; false-injection {fi_overall.get('false', 0)}/"
+            f"{fi_overall.get('injected', 0)} injected lines unreferenced "
+            f"(rate {fi_overall.get('false_rate')}, "
+            f"min_overlap {fi.get('min_token_overlap', 2)})"
+        )
+        for m, b in sorted((fi.get("per_moment") or {}).items()):
+            summary += (f"; [{m}] {b.get('false', 0)}/{b.get('injected', 0)}"
+                        f" (rate {b.get('false_rate')})")
+    else:
+        summary += "; false-injection: no injected decision lines in the log"
     return _check("miss-rate", status, summary, report=report)
 
 
@@ -3012,8 +3031,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--miss-bg-log",
         default=None,
-        help="explicit zmem-bg.log path (default: <dir of --store>/"
-             "zmem-bg.log, co-located like the writers)",
+        help="explicit decision-log path (default: <dir of --store>/"
+             "zmem-decisions.log, falling back to the legacy co-located "
+             "zmem-bg.log when no decisions log exists)",
     )
     ap.add_argument(
         "--miss-window-before", type=_nonnegative_int, default=1800,
@@ -3029,6 +3049,12 @@ def main(argv: list[str] | None = None) -> int:
         "--miss-limit", type=_positive_int, default=200,
         help="max failures to examine, newest first (default 200; must be "
              ">= 1)",
+    )
+    ap.add_argument(
+        "--miss-min-overlap", type=_positive_int, default=2,
+        help="issue #129: minimum distinct ops-token overlaps between an "
+             "injected row and a later same-session reference for the row "
+             "to count as used (default 2; must be >= 1)",
     )
     ap.add_argument(
         "--miss-verbose",
@@ -3048,6 +3074,7 @@ def main(argv: list[str] | None = None) -> int:
             "window_after_s": args.miss_window_after,
             "limit": args.miss_limit,
             "verbose": args.miss_verbose,
+            "min_overlap": args.miss_min_overlap,
         }
 
     report = build_report(Path(args.project).expanduser(),

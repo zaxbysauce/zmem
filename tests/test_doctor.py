@@ -767,6 +767,48 @@ class DoctorCliTest(unittest.TestCase):
         nsm = next(c for c in report["checks"] if c["id"] == "ns-migration")
         self.assertEqual(nsm["status"], "pass", nsm)
 
+    def test_miss_min_overlap_passes_through_to_false_injection(self):
+        """Issue #129: --miss-min-overlap reaches the join — the report's
+        false_injection.min_token_overlap equals the flag value, and the
+        miss-rate summary prints BOTH directions (miss + false-injection)."""
+        self._disable_native_memory()
+        # A snapshot store (NOT the host default) with the tables the join
+        # probes (memory + memory_fts), plus a #129 decisions log carrying
+        # one injected decision line for the counter's denominator.
+        snap = self.tmp / "snapshot"
+        store = snap / "store.sqlite"
+        self._make_store_with_rows(store, [("project:fi", "git stash pop")])
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.execute("CREATE TABLE memory_fts(memory_rowid TEXT)")
+            conn.commit()
+        finally:
+            conn.close()
+        _write_text(
+            snap / "zmem-decisions.log",
+            "[1740000000] zmem-hook status=injected reason=injected "
+            "ids=['row-0'] all=['row-0'] sid=sess-fi moment=user_prompt\n",
+        )
+        result = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project),
+            "--store", str(store),
+            "--miss-rate", "--miss-min-overlap", "3",
+        )
+        report = json.loads(result.stdout)
+        check = next(c for c in report["checks"] if c["id"] == "miss-rate")
+        fi = check["details"]["report"]["false_injection"]
+        self.assertEqual(fi["min_token_overlap"], 3,
+                         "the flag value must pass through to the counter")
+        self.assertEqual(fi["overall"]["injected"], 1,
+                         "the counter consumed the decisions-log line")
+        self.assertIn("missed", check["summary"],
+                      "the summary keeps the miss direction")
+        self.assertIn("false-injection", check["summary"],
+                      "the summary prints the false-injection direction "
+                      "alongside the miss rate")
+        self.assertIn("min_overlap 3", check["summary"])
+
 
 class DoctorIssue49ChecksTest(unittest.TestCase):
     """The issue #49 C checks: Tier-0 size (core.md / project AGENTS.md) and

@@ -12,6 +12,40 @@ README.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-06
+
+Workstream B PR 2 of 4 from the proactive-memory epic (#100): the
+false-injection counter and the decision-log split/rotation - the half of
+#94 that PR #105 does not deliver (#129).
+
+### Added
+
+- **memory** (issue #129): `doctor --miss-rate` now prints BOTH gate
+  directions together - the miss rate AND a false-injection rate (rate of
+  injected decision lines never referenced by any later same-session
+  operation, prompt, or captured failure). Conservative and auditable, no
+  LLM judgment: a line counts as used when a later same-session reference
+  contains one of its memory ids literally or shares >= 2 distinct
+  `ops_tokens` tokens with the injected row's content (tune with the new
+  `--miss-min-overlap`; per-moment rates reported for session start, user
+  prompt, pre-tool, subagent, compaction, and a legacy bucket for pre-#129
+  lines). The counter is read-only over the same snapshot the join uses.
+- **memory** (issue #129): decision telemetry moves to its own file,
+  `<data dir>/zmem-decisions.log` - cadence/maintenance output and
+  `zmem-drift` lines stay in `zmem-bg.log`, so decision lines no longer
+  interleave with maintenance output. Every decision line carries a new
+  additive `moment=` field (the injection moment) after `sid=`.
+- **memory** (issue #129): rotation replaces the destructive 256 KB
+  truncate-to-empty cap on the decision log, `zmem-bg.log`, and the drift
+  writer (`storelib/log_rotate.py`): N rotated segments (default 3, env
+  `ZMEM_LOG_ROTATIONS`) with `# zmem-seq=` sequence markers. Crossing the
+  cap (`ZMEM_BG_LOG_MAX_BYTES`, unchanged) now PRESERVES history in
+  bounded segments instead of destroying it in one burst. `doctor
+  --miss-rate` and the false-injection counter read rotated segments;
+  legacy single-file deployments keep working (readers fall back to
+  `zmem-bg.log` when no decisions log exists). `scripts/host_canary.py`
+  grounds on the decisions log with the same legacy fallback.
+
 ## [0.19.0] — 2026-09-06
 
 Workstream A PR 4 of 5 from the proactive-memory epic (#100): namespace-guard

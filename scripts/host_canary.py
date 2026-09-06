@@ -494,7 +494,14 @@ def main(argv=None):
     data_dir.mkdir(parents=True, exist_ok=True)
     workdir = data_dir / "workdir"
     workdir.mkdir(parents=True, exist_ok=True)
-    bg_log = data_dir / "zmem-bg.log"
+    bg_log = data_dir / "zmem-decisions.log"
+    if not bg_log.exists():
+        # Issue #129 split: decision lines moved to zmem-decisions.log; on
+        # a legacy deployment (old served tree, pre-split writers) fall
+        # back to the original zmem-bg.log location.
+        legacy = data_dir / "zmem-bg.log"
+        if legacy.exists():
+            bg_log = legacy
 
     if args.probe_store_path:
         return probe_store_path(args, data_dir)

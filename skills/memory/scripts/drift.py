@@ -83,7 +83,6 @@ _SID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 # Same bound/env knob as the shared body's decision logger, so the drift line
 # obeys the same growth cap as every other line in zmem-bg.log.
-_BG_LOG_DEFAULT_MAX_BYTES = 262144
 
 
 def _marker_key(sid: str) -> str:
@@ -270,25 +269,20 @@ def _marker_path(data_dir: Path, sid: str) -> Path:
     return Path(data_dir) / f".drift-checked-{_marker_key(sid)}"
 
 
-def _bg_log_max_bytes() -> int:
-    raw = os.environ.get("ZMEM_BG_LOG_MAX_BYTES", "")
-    try:
-        value = int(raw) if raw else _BG_LOG_DEFAULT_MAX_BYTES
-    except ValueError:
-        return _BG_LOG_DEFAULT_MAX_BYTES
-    return value if value > 0 else _BG_LOG_DEFAULT_MAX_BYTES
-
-
 def _append_bg_line(data_dir: Path, result: dict) -> bool:
-    """Append the zmem-drift line to <data_dir>/zmem-bg.log. Fail-open."""
+    """Append the zmem-drift line to <data_dir>/zmem-bg.log. Fail-open.
+
+    Issue #129: rotation via the shared helper replaced the destructive
+    truncate-to-empty cap — drift telemetry is audit evidence too, and the
+    rotation failure direction is unbounded growth, never content loss.
+    """
     try:
         log_path = Path(data_dir) / "zmem-bg.log"
         try:
-            if os.path.getsize(log_path) > _bg_log_max_bytes():
-                with open(log_path, "w", encoding="utf-8"):
-                    pass
-        except OSError:
-            pass
+            from storelib.log_rotate import rotate_on_append
+            rotate_on_append(str(log_path))
+        except Exception:
+            pass  # fail-open: append proceeds without size control
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(
                 "[{ts}] zmem-drift served={served} release={release} "

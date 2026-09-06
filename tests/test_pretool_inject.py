@@ -122,7 +122,7 @@ class PreToolModeTest(unittest.TestCase):
         ctx = _ctx(out)
         self.assertIn("pretoolcanary", ctx)
         self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
-        line = [l for l in (Path(self._tmp) / "zmem-bg.log")
+        line = [l for l in (Path(self._tmp) / "zmem-decisions.log")
                 .read_text(encoding="utf-8").splitlines()
                 if "zmem-hook" in l][-1]
         self.assertIn("reason=injected", line)

@@ -260,13 +260,13 @@ class HookBodyBudgetTest(unittest.TestCase):
         )
 
     def test_bg_log_line_carries_tokens(self):
-        log = os.path.join(self._tmp, "zmem-bg.log")
+        log = os.path.join(self._tmp, "zmem-decisions.log")
         if os.path.exists(log):
             os.remove(log)
         self._run_body("user_prompt")
         with open(log, encoding="utf-8") as f:
             lines = [ln for ln in f.read().splitlines() if "zmem-hook" in ln]
-        self.assertTrue(lines, "bg log line missing")
+        self.assertTrue(lines, "decisions log line missing")
         self.assertRegex(lines[-1], r"tokens=\d+/\d+")
 
 

@@ -76,19 +76,20 @@ class CanarySelfTestTest(unittest.TestCase):
                 self.assertRegex(proc.stdout, UUID_RE.pattern)
                 self.assertRegex(proc.stdout, r"drift=(matched|drifted|unknown)")
                 self.assertIn("seeded id=", proc.stdout)
-                # Ground the pass in the bg log itself, not just the canary's
-                # own verdict line: the seeded row id must appear in the fresh
-                # decision line's ids=[...] (closes the fire-and-print-vacuous
-                # gap the implementation reviewer flagged).
+                # Ground the pass in the decision log itself, not just the
+                # canary's own verdict line: the seeded row id must appear in
+                # the fresh decision line's ids=[...] (closes the
+                # fire-and-print-vacuous gap the implementation reviewer
+                # flagged). #129: decision lines live in zmem-decisions.log.
                 m = re.search(r"row_id=([0-9a-f-]{36})", proc.stdout)
-                bg = (d / "zmem-bg.log").read_text(encoding="utf-8")
+                bg = (d / "zmem-decisions.log").read_text(encoding="utf-8")
                 self.assertIn(m.group(1), bg)
 
     def test_decision_line_carries_reason_and_session(self):
         d = self._data_dir("reason")
         proc = run_canary("--host", "claude", "--self-test", "--data-dir", str(d))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        bg = (d / "zmem-bg.log").read_text(encoding="utf-8")
+        bg = (d / "zmem-decisions.log").read_text(encoding="utf-8")
         self.assertRegex(bg, r"zmem-hook status=\S+ reason=\S+")
         self.assertIn("sid=zmem-canary-selftest", bg)
         # The store the canary reports is the isolated fixture (AC4 invariant).
@@ -376,9 +377,11 @@ class CanaryHelperUnitTest(unittest.TestCase):
             # Stand-in for the real drive: the hook "fires" and appends a
             # fresh decision line whose ids carry an UNRELATED post-gate row
             # (the ids-non-empty-without-seeded-id shape, e.g. a namespace
-            # mismatch). Appending at drive time keeps the freshness
-            # heuristic honest (pre_size snapshot happens before this).
-            with (Path(args.data_dir) / "zmem-bg.log").open("a", encoding="utf-8") as fh:
+            # mismatch) to the #129 decisions log. Appending at drive time
+            # keeps the freshness heuristic honest (pre_size snapshot happens
+            # before this).
+            with (Path(args.data_dir) / "zmem-decisions.log").open(
+                    "a", encoding="utf-8") as fh:
                 fh.write(line)
             # The rendered fence DOES carry the marker (seed succeeded) — so
             # the self-test marker check passes and the ONLY path to exit 3
@@ -407,6 +410,66 @@ class CanaryHelperUnitTest(unittest.TestCase):
         # row_id must be NON-None here: this is the grounding consumer, not
         # the --no-seed / seed-failure branch.
         self.assertIsNotNone(verdict[5])
+
+    def test_canary_reads_decisions_log_when_both_logs_exist(self):
+        """Issue #129 regression: with BOTH a stale zmem-bg.log (pre-split
+        deployment leftover holding a fresh-looking decoy decision line) and
+        a zmem-decisions.log (holding the real fresh line), the canary must
+        ground its verdict on the DECISIONS file — reading the legacy file
+        instead would exit 3 (decoy ids never ground the seeded row)."""
+        import contextlib
+        import io
+
+        mod = self._load()
+        d = Path(tempfile.mkdtemp(prefix="zmem-canary-bothlogs-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        seeded_id = "seeded-row-fixed-0000"
+        stale = "[1700000000] zmem-hook status=silent reason=empty-pool sid=old\n"
+        # Identical stale prefixes in BOTH files so the pre_size snapshot
+        # cannot bias which file's tail reads as fresh.
+        (d / "zmem-bg.log").write_text(stale, encoding="utf-8")
+        (d / "zmem-decisions.log").write_text(stale, encoding="utf-8")
+        good = ("[1700000001] zmem-hook status=injected reason=injected "
+                "ids=['%s'] all=['%s'] sid=zmem-canary-selftest\n"
+                % (seeded_id, seeded_id))
+        decoy = ("[1700000001] zmem-hook status=injected reason=injected "
+                 "ids=['legacy-decoy-row'] all=['legacy-decoy-row'] sid=old\n")
+
+        def fake_self_test(args, env, workdir):
+            # The drive appends the REAL fresh line to the decisions log and
+            # a same-second decoy to the legacy bg log — a canary still
+            # reading zmem-bg.log picks the decoy and fails to ground.
+            with (Path(args.data_dir) / "zmem-decisions.log").open(
+                    "a", encoding="utf-8") as fh:
+                fh.write(good)
+            with (Path(args.data_dir) / "zmem-bg.log").open(
+                    "a", encoding="utf-8") as fh:
+                fh.write(decoy)
+            envelope = json.dumps(
+                {"hookSpecificOutput": {"additionalContext":
+                                        "ctx %s ctx" % mod.MARKER}})
+            return 0, envelope + "\n"
+
+        captured = []
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            with unittest.mock.patch.object(mod, "seed_row",
+                                            lambda *a: seeded_id):
+                with unittest.mock.patch.object(mod, "self_test",
+                                                fake_self_test):
+                    with unittest.mock.patch.object(
+                            mod, "verdict_line",
+                            lambda *a: captured.append(a)):
+                        rc = mod.main([
+                            "--host", "claude", "--self-test",
+                            "--data-dir", str(d),
+                        ])
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertEqual(len(captured), 1, buf.getvalue())
+        verdict = captured[0]
+        self.assertEqual(verdict[2], "pass",
+                         "the canary must ground on zmem-decisions.log when "
+                         "both logs exist")
+        self.assertEqual(verdict[5], seeded_id)
 
 
 class ReadmeCanaryDocTest(unittest.TestCase):

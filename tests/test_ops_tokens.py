@@ -509,7 +509,7 @@ class HookBodyComposeTest(unittest.TestCase):
             ring.write_text(
                 json.dumps({"ts": 1, "tool": "Bash", "ops": "git stash pop"}),
                 encoding="utf-8")
-            log = Path(tmp, "zmem-bg.log")
+            log = Path(tmp, "zmem-decisions.log")
             if log.exists():
                 log.unlink()
 
@@ -602,12 +602,13 @@ class DataDirPrecedenceTest(unittest.TestCase):
         return json.loads(r.stdout.strip())["additionalContext"]
 
     def _last_hook_line(self, data_dir: Path) -> str:
-        log = data_dir / "zmem-bg.log"
+        # #129: decision lines live in zmem-decisions.log.
+        log = data_dir / "zmem-decisions.log"
         self.assertTrue(log.is_file(),
-                        "bg log must co-locate with the ring's data dir")
+                        "decision log must co-locate with the ring's data dir")
         lines = [l for l in log.read_text(encoding="utf-8").splitlines()
                  if "zmem-hook" in l]
-        self.assertTrue(lines, "no zmem-hook line in the bg log")
+        self.assertTrue(lines, "no zmem-hook line in the decision log")
         return lines[-1]
 
     def test_reader_finds_ring_written_under_plugin_data_var(self):
@@ -763,7 +764,7 @@ class DataDirPrecedenceTest(unittest.TestCase):
             bash = shutil.which("bash")
             if not bash:
                 self.skipTest("no bash on PATH")
-            _bg = zd_dir / "zmem-bg.log"
+            _bg = zd_dir / "zmem-decisions.log"
             _before = (_bg.read_text(encoding="utf-8").splitlines()
                        if _bg.is_file() else [])
             r = subprocess.run(
@@ -802,13 +803,15 @@ class DataDirPrecedenceTest(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_session_start_bg_log_lands_in_plugin_data_dir(self):
-        # V1 (PRR-101-002): session-start's own bg-log writers (the bash
-        # BG_SINK block and the inline Tier-2 decision block) must resolve
-        # the SAME chain as the body — in a plugin-data-only environment the
-        # whole diagnostic log lands in ONE file instead of splitting across
-        # the plugin-data dir and ~/.zmem. CLAUDE-only is the catcher env:
-        # the pre-fix bash chain covered ZCODE but omitted CLAUDE entirely,
-        # so a ZCODE-only env would mask the split.
+        # V1 (PRR-101-002): session-start's own log writers (the bash BG_SINK
+        # block and the inline Tier-2 decision block) must resolve the SAME
+        # chain as the body — in a plugin-data-only environment the whole
+        # diagnostic output lands in ONE dir instead of splitting across the
+        # plugin-data dir and ~/.zmem. CLAUDE-only is the catcher env: the
+        # pre-fix bash chain covered ZCODE but omitted CLAUDE entirely, so a
+        # ZCODE-only env would mask the split. #129: the Tier-2 decision line
+        # lands in zmem-decisions.log while BG_SINK output stays in
+        # zmem-bg.log — BOTH must co-locate in the plugin-data dir.
         tmp = tempfile.mkdtemp(prefix="zmem-ops-ssstart-")
         try:
             plugdata = Path(tmp, "plugdata")
@@ -829,15 +832,24 @@ class DataDirPrecedenceTest(unittest.TestCase):
                 input=json.dumps({"session_id": "sess-ss"}),
                 capture_output=True, text=True, env=env, timeout=180, cwd=tmp)
             self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            decisions = plugdata / "zmem-decisions.log"
+            self.assertTrue(
+                decisions.is_file(),
+                "session-start must write the decision log into the "
+                "plugin-data dir like the shared body does")
+            self.assertIn("zmem-hook",
+                          decisions.read_text(encoding="utf-8"))
             log = plugdata / "zmem-bg.log"
             self.assertTrue(
                 log.is_file(),
-                "session-start must write the bg log into the plugin-data "
-                "dir like the shared body does")
-            self.assertIn("zmem-hook", log.read_text(encoding="utf-8"))
+                "session-start must write the maintenance bg log into the "
+                "plugin-data dir like the shared body does")
             self.assertFalse(
                 (Path(env["HOME"]) / ".zmem" / "zmem-bg.log").exists(),
                 "the bg log must not split off to the home fallback")
+            self.assertFalse(
+                (Path(env["HOME"]) / ".zmem" / "zmem-decisions.log").exists(),
+                "the decision log must not split off to the home fallback")
             # End-to-end worker proof (reviewer gate finding): the detached
             # cadence worker starts through a python wrapper after a 15s
             # race-guard delay — assert its output ACTUALLY lands in this bg
@@ -866,8 +878,10 @@ class DataDirPrecedenceTest(unittest.TestCase):
     def test_session_start_expands_tilde_plugin_data(self):
         # Final-critic finding on the fix round: session-start's bash chain
         # must expand a tilde-valued plugin-data var exactly like the
-        # convention-capture writer, or its core.md/markers/bg log land in a
+        # convention-capture writer, or its core.md/markers/logs land in a
         # literal '~' directory while the ring lane uses the expanded one.
+        # #129: the Tier-2 decision line lands in zmem-decisions.log (and
+        # the maintenance sink in zmem-bg.log) — both under the expanded dir.
         tmp = tempfile.mkdtemp(prefix="zmem-ops-sstilde-")
         try:
             env = self._plugin_data_env(tmp)
@@ -888,14 +902,20 @@ class DataDirPrecedenceTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "~").exists(),
                              "a literal '~' directory must never be created "
                              "in the process cwd")
-            log = pd_dir / "zmem-bg.log"
+            log = pd_dir / "zmem-decisions.log"
             self.assertTrue(
                 log.is_file(),
                 "session-start must expand a tilde-valued plugin-data var "
                 "like the ring writer does")
             self.assertIn("zmem-hook", log.read_text(encoding="utf-8"))
+            self.assertTrue(
+                (pd_dir / "zmem-bg.log").is_file(),
+                "the maintenance bg log must land in the expanded dir too")
             self.assertFalse(
                 (Path(env["HOME"]) / ".zmem" / "zmem-bg.log").exists(),
+                "no session-start artifact may split off to ~/.zmem")
+            self.assertFalse(
+                (Path(env["HOME"]) / ".zmem" / "zmem-decisions.log").exists(),
                 "no session-start artifact may split off to ~/.zmem")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

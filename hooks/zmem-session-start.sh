@@ -291,6 +291,13 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
     # (no `||`) so any failure falls through to /dev/null.
     if mkdir -p "$DATA_DIR" 2>/dev/null && [ -w "$DATA_DIR" ] && { : 2>/dev/null >>"$BG_LOG_PATH"; }; then
       BG_SINK="$BG_LOG_PATH"
+      # Issue #129: rotate the maintenance sink before the detached worker
+      # redirects into it — bounded segments instead of unbounded growth.
+      # Size-gated so steady state pays only a wc -c. Fail-open: if the
+      # helper call fails the worker appends to the existing file.
+      if [ -f "$BG_LOG_PATH" ] && [ "$(wc -c < "$BG_LOG_PATH" 2>/dev/null || echo 0)" -gt "${ZMEM_BG_LOG_MAX_BYTES:-262144}" ]; then
+        "$PYTHON_BIN" -c 'import sys; sys.path.insert(0, sys.argv[1]); from storelib.log_rotate import rotate_on_append; rotate_on_append(sys.argv[2])' "$(dirname "$STORE_PY_PY")" "$BG_LOG_PATH" 2>/dev/null || true
+      fi
     fi
   fi
   # Batch the three cadence ops into ONE detached python process (#39 E9):
@@ -401,9 +408,19 @@ if os.environ.get("ZMEM_INJECT", "1").strip() == "0":
             _safe_sid = re.sub(
                 r"[^A-Za-z0-9._-]", "_",
                 (session_id or ""))[:128] or "unknown"
-            with open(os.path.join(data_dir, "zmem-bg.log"), "a", encoding="utf-8") as _lf:
+            # Issue #129: decision lines go to the dedicated, rotated
+            # decisions log; the moment field lands at line end (additive).
+            _dl = os.path.join(data_dir, "zmem-decisions.log")
+            try:
+                if store_py and os.path.isfile(store_py):
+                    sys.path.insert(0, os.path.join(os.path.dirname(store_py), "storelib"))
+                    from storelib.log_rotate import rotate_on_append as _rota
+                    _rota(_dl)
+            except Exception:
+                pass  # fail-open: append proceeds, growth never loss
+            with open(_dl, "a", encoding="utf-8") as _lf:
                 _lf.write(
-                    "[%d] zmem-hook status=silent reason=disabled ids=[] all=[] sid=%s\n" % (
+                    "[%d] zmem-hook status=silent reason=disabled ids=[] all=[] sid=%s moment=session_start\n" % (
                         int(__import__("time").time()), _safe_sid))
     except Exception:
         pass  # fail-open: the audit log never blocks session start
@@ -555,8 +572,15 @@ if store_py and os.path.isfile(store_py):
                                 break
                     if not _log_dir:
                         _log_dir = os.path.join(os.path.expanduser("~"), ".zmem")
-                    _log_path = os.path.join(_log_dir, "zmem-bg.log")
+                    _log_path = os.path.join(_log_dir, "zmem-decisions.log")
                     if os.path.isdir(_log_dir):
+                        # Issue #129: rotate, never truncate — the decisions
+                        # log is the audit evidence substrate.
+                        try:
+                            from storelib.log_rotate import rotate_on_append as _rota
+                            _rota(_log_path)
+                        except Exception:
+                            pass
                         with open(_log_path, "a", encoding="utf-8") as _lf:
                             _tok = ""
                             if _tok_used is not None:
@@ -575,7 +599,7 @@ if store_py and os.path.isfile(store_py):
                                 r"[^A-Za-z0-9._-]", "_",
                                 (session_id or ""))[:128] or "unknown"
                             _lf.write(
-                                "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s sid=%s\n" % (
+                                "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s sid=%s moment=session_start\n" % (
                                     int(__import__("time").time()),
                                     "injected" if rows else "silent",
                                     (_env_reason or ("injected" if rows else "empty-pool")),

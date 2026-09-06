@@ -83,13 +83,14 @@ store or host config. Checks:
 Use it before first install, before cutover, and after any store-path or hook
 surface change.
 
-#### doctor `--miss-rate` — the miss-rate join (issue #94)
+#### doctor `--miss-rate` — the miss-rate join + false-injection counter (issues #94, #129)
 
 ```
 python <doctor.py> --miss-rate --store <snapshot-store.sqlite> [--miss-db PATH]
                    [--miss-transcripts GLOB ...] [--miss-bg-log PATH]
                    [--miss-window-before 1800] [--miss-window-after 300]
-                   [--miss-limit 200] [--miss-verbose] [--format json]
+                   [--miss-limit 200] [--miss-min-overlap 2] [--miss-verbose]
+                   [--format json]
 ```
 Opt-in check that measures the miss rate — "a failure occurred in a session,
 a matching memory existed in the store, and nothing surfaced at that moment".
@@ -113,10 +114,34 @@ carried `reason=`). Definitions (pinned):
   ops-ring lane is not yet deployed this bucket can dominate until rings
   accumulate.
 
+Issue #129 adds the OTHER gate direction to the same report: the
+**false-injection rate** — of the injected decision lines, how many were
+NEVER referenced by any later same-session operation, prompt, or captured
+failure. A line counts as USED when a later reference (mined failure
+operation/error text, the session's ops-ring events, or transcript
+prompts) contains one of its memory ids literally, or shares >=
+`--miss-min-overlap` (default 2) distinct ops tokens with the injected
+row's content. Rates print overall AND per moment (`session_start`,
+`user_prompt`, `pretool`, `subagent`, `precompact`; pre-#129 lines
+without `moment=` report under `legacy` with a caveat). Each decision
+LINE counts once — the same row re-injected at two moments is two
+denominator lines, never double-counted.
+
+Decision telemetry lives in `<data dir>/zmem-decisions.log` (issue #129
+split): maintenance output and `zmem-drift` lines stay in `zmem-bg.log`.
+Both logs rotate instead of truncating — `ZMEM_BG_LOG_MAX_BYTES` (default
+262144) caps the active file and `ZMEM_LOG_ROTATIONS` (default 3) keeps
+bounded segments named `<name>.1`..`<name>.N`, each stamped with a
+`# zmem-seq=` marker; the join and the counter read rotated segments.
+Legacy deployments with only `zmem-bg.log` keep working: readers fall
+back to it when no decisions log exists, and an explicit `--miss-bg-log`
+wins over both.
+
 REFUSES to run without an explicit `--store`, and refuses the
 host-default store even when given explicitly — the join reads session
 data, so snapshot first: copy `store.sqlite` AND any
-`store.sqlite-wal`/`-shm` beside it into a temp dir (plus `zmem-bg.log`
+`store.sqlite-wal`/`-shm` beside it into a temp dir (plus
+`zmem-decisions.log` and its rotated `.1`..`.N` segments, `zmem-bg.log`,
 and the `ops/` ring dir when present), then pass that path. exit 1 from
 `--miss-rate` most often means exactly that:
 snapshot the store and re-run with `--store`; exit 1 from

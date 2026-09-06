@@ -95,17 +95,19 @@ def _seed(env: dict, ns: str, content: str, signal: str = "test",
 
 
 def _read_last_hook_line(tmp: str) -> str:
-    log = Path(tmp) / "zmem-bg.log"
+    # Issue #129 split: decision lines live in zmem-decisions.log
+    log = Path(tmp) / "zmem-decisions.log"
     text = log.read_text(encoding="utf-8") if log.is_file() else ""
     lines = [ln for ln in text.splitlines() if "zmem-hook" in ln]
-    assert lines, "zmem-bg.log has no zmem-hook line"
+    assert lines, "zmem-decisions.log has no zmem-hook line"
     return lines[-1]
 
 
 def _remove_log(tmp: str) -> None:
-    log = Path(tmp) / "zmem-bg.log"
-    if log.is_file():
-        log.unlink()
+    for name in ("zmem-bg.log", "zmem-decisions.log"):
+        log = Path(tmp) / name
+        if log.is_file():
+            log.unlink()
 
 
 class HookBodyReasonTest(unittest.TestCase):

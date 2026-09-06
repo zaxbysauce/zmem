@@ -140,7 +140,8 @@ def _make_fixture_db(path: str, failures: list) -> None:
 
 
 def _bg_line(ts: int, ids, all_ids=None, sid="sess-a",
-             reason="injected", status="injected") -> str:
+             reason="injected", status="injected",
+             moment=None) -> str:
     ids = list(ids)
     all_ids = list(all_ids if all_ids is not None else ids)
     line = f"[{ts}] zmem-hook status={status}"
@@ -149,6 +150,8 @@ def _bg_line(ts: int, ids, all_ids=None, sid="sess-a",
     line += f" ids={ids} all={all_ids}"
     if sid is not None:
         line += f" sid={sid}"
+    if moment is not None:
+        line += f" moment={moment}"
     return line
 
 
@@ -832,6 +835,188 @@ class RingQueryTest(_JoinFixture, unittest.TestCase):
         self.assertEqual(rep["counts"]["capture_gap"], 1)
 
 
+class FalseInjectionTest(_JoinFixture, unittest.TestCase):
+    """Issue #129: the false-injection counter subtree.
+
+    Counter semantics under test: the denominator is injected decision
+    LINES (status=injected + non-empty ids) counted once each; a line is
+    USED when a same-sid reference event strictly after its ts contains one
+    of its ids literally OR shares >= min_token_overlap distinct ops tokens
+    with the injected row's content; sid-less/unknown lines weak-match any
+    session; legacy (moment-less) lines report under per_moment["legacy"].
+
+    The token fixtures are exact: TOKEN_ROW content derives exactly
+    {git, stash, pop}; "git stash pop" shares 3 of them, "git stash list"
+    shares exactly 2 — the boundary the min_token_overlap threshold rides.
+    """
+
+    # Command-shaped content: derive_ops_tokens yields {git, stash, pop}.
+    TOKEN_ROW = "git stash pop conflicts need stash drop after resolve"
+
+    def setUp(self):
+        super().setUp()
+        self.tok_row = _seed_and_get_id(self._tmp, "project:fi129",
+                                        self.TOKEN_ROW)
+
+    def _ring(self, session, events):
+        ops_dir = os.path.join(self._tmp, "ops")
+        os.makedirs(ops_dir, exist_ok=True)
+        safe = miss_rate.sanitize_sid(session)
+        Path(os.path.join(ops_dir, safe + ".log")).write_text(
+            "".join(json.dumps(ev) + "\n" for ev in events), encoding="utf-8")
+
+    def _decisions_log(self, lines):
+        """Write the canonical #129 decisions log (preferred over any
+        legacy zmem-bg.log when both exist)."""
+        Path(os.path.join(self._tmp, "zmem-decisions.log")).write_text(
+            "\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_used_via_ops_ring_overlap_three_tokens(self):
+        self._decisions_log([
+            _bg_line(self.now - 60, [self.tok_row],
+                     moment="user_prompt"),
+        ])
+        self._ring("sess-a", [{"ts": self.now, "tool": "Bash",
+                               "ops": "git stash pop"}])  # 3 shared >= 2
+        rep = self._run()  # no db file: failures side is legitimately []
+        self.assertNotIn("error", rep)
+        fi = rep["false_injection"]
+        self.assertEqual(fi["min_token_overlap"], 2)
+        self.assertEqual(fi["overall"],
+                         {"injected": 1, "used": 1, "false": 0,
+                          "false_rate": 0.0})
+        self.assertEqual(fi["per_moment"]["user_prompt"]["used"], 1)
+
+    def test_used_via_db_failure_operation_overlap_exactly_two(self):
+        # The mined failure's recovered operation "git stash list" shares
+        # EXACTLY 2 tokens with the row content — the == threshold edge.
+        self._decisions_log([
+            _bg_line(self.now - 60, [self.tok_row], moment="pretool"),
+        ])
+        self._fixture(operation="git stash list")
+        rep = self._run()
+        fi = rep["false_injection"]
+        self.assertEqual(fi["overall"]["injected"], 1)
+        self.assertEqual(fi["overall"]["used"], 1,
+                         "an exactly-2-token overlap credits at the default "
+                         "min_token_overlap=2")
+
+    def test_false_when_never_referenced(self):
+        self._decisions_log([
+            _bg_line(self.now - 60, [self.tok_row],
+                     moment="user_prompt"),
+        ])
+        rep = self._run()  # no ring, no db: nothing references the line
+        fi = rep["false_injection"]
+        self.assertEqual(fi["overall"],
+                         {"injected": 1, "used": 0, "false": 1,
+                          "false_rate": 1.0})
+        self.assertIsInstance(fi["overall"]["false_rate"], float)
+        self.assertTrue(any("no reference events" in c
+                            for c in fi["caveats"]), fi["caveats"])
+
+    def test_sid_discipline_and_sidless_weak_match(self):
+        # PRR-004 rule: session B's reference never credits session A's
+        # line; a sid-less legacy line weak-matches ANY session. The sess-b
+        # ring only enters the reference pool because a sess-b decision
+        # line names it (the counter mines rings per decision-line sid).
+        self._decisions_log([
+            _bg_line(self.now - 60, [self.tok_row], sid="sess-a",
+                     moment="user_prompt"),
+            # denominator-neutral carrier of the sess-b sid
+            _bg_line(self.now - 60, [], sid="sess-b",
+                     reason="empty-pool", status="silent"),
+            # sid-less legacy line (no moment= -> legacy bucket)
+            _bg_line(self.now - 60, [self.tok_row], sid=None),
+        ])
+        self._ring("sess-b", [{"ts": self.now, "tool": "Bash",
+                               "ops": "git stash pop"}])
+        rep = self._run()
+        fi = rep["false_injection"]
+        self.assertEqual(fi["overall"]["injected"], 2,
+                         "the empty-pool carrier line is not a denominator "
+                         "line")
+        self.assertEqual(fi["overall"]["used"], 1,
+                         "only the sid-less line may credit from sess-b's "
+                         "ring")
+        self.assertEqual(fi["overall"]["false"], 1,
+                         "sess-b's ring event must NOT credit sess-a's line")
+        self.assertEqual(fi["per_moment"]["user_prompt"]["false"], 1)
+        self.assertEqual(fi["per_moment"]["legacy"]["used"], 1)
+
+    def test_min_token_overlap_three_flips_overlap_two_to_false(self):
+        # The overlap-2 reference ("git stash list") credits at threshold 2
+        # and fails at threshold 3 — the override provably reaches the arm.
+        self._decisions_log([
+            _bg_line(self.now - 60, [self.tok_row],
+                     moment="user_prompt"),
+        ])
+        self._ring("sess-a", [{"ts": self.now, "tool": "Bash",
+                               "ops": "git stash list"}])  # exactly 2 shared
+        rep2 = self._run(min_token_overlap=2)
+        self.assertEqual(rep2["false_injection"]["min_token_overlap"], 2)
+        self.assertEqual(rep2["false_injection"]["overall"]["used"], 1)
+        rep3 = self._run(min_token_overlap=3)
+        fi3 = rep3["false_injection"]
+        self.assertEqual(fi3["min_token_overlap"], 3)
+        self.assertEqual(fi3["overall"]["used"], 0,
+                         "a 2-token overlap must NOT credit at threshold 3")
+        self.assertEqual(fi3["overall"]["false"], 1)
+
+    def test_legacy_momentless_lines_bucket_and_caveat(self):
+        self._decisions_log([
+            _bg_line(self.now - 60, [self.tok_row]),  # no moment= field
+        ])
+        rep = self._run()
+        fi = rep["false_injection"]
+        self.assertEqual(list(fi["per_moment"]), ["legacy"])
+        self.assertEqual(fi["per_moment"]["legacy"]["injected"], 1)
+        self.assertEqual(fi["overall"]["injected"], 1,
+                         "legacy lines still count in the overall rate")
+        self.assertTrue(any("no moment= field" in c for c in fi["caveats"]),
+                        fi["caveats"])
+        self.assertTrue(any("legacy bucket" in c for c in fi["caveats"]),
+                        fi["caveats"])
+
+    def test_per_line_double_count_guard(self):
+        # The same memory id re-injected at two moments is TWO denominator
+        # LINES — counted once per line, never once per id.
+        self._decisions_log([
+            _bg_line(self.now - 120, [self.tok_row],
+                     moment="user_prompt"),
+            _bg_line(self.now - 60, [self.tok_row],
+                     moment="pretool"),
+        ])
+        rep = self._run()
+        fi = rep["false_injection"]
+        self.assertEqual(fi["overall"]["injected"], 2)
+        self.assertEqual(fi["overall"]["false"], 2)
+        self.assertEqual(fi["per_moment"]["user_prompt"]["injected"], 1)
+        self.assertEqual(fi["per_moment"]["pretool"]["injected"], 1)
+
+    def test_parse_bg_log_rotation_aware_thirteen_lines(self):
+        # 13 parseable decision lines across .2 (4) + .1 (5) + active (4);
+        # the marker lines must not count. The join sees the full history
+        # across rotation boundaries instead of the active cap-worth.
+        base = os.path.join(self._tmp, "zmem-decisions.log")
+        def _seg_lines(prefix, n):
+            return "".join(
+                _bg_line(self.now - 1000 + i, [f"{prefix}-{i}"],
+                         sid=f"sess-{prefix}-{i}", moment="user_prompt")
+                + "\n" for i in range(n))
+        Path(base + ".2").write_text(
+            "# zmem-seq=1 rotated_at=1740000000\n" + _seg_lines("old", 4),
+            encoding="utf-8")
+        Path(base + ".1").write_text(
+            "# zmem-seq=1 rotated_at=1740000100\n" + _seg_lines("mid", 5),
+            encoding="utf-8")
+        Path(base).write_text(_seg_lines("new", 4), encoding="utf-8")
+        parsed = miss_rate.parse_bg_log(base)
+        self.assertEqual(len(parsed), 13)
+        rep = self._run()  # decisions file preferred over legacy bg log
+        self.assertEqual(rep["bg_log_decision_lines"], 13)
+
+
 class DoctorSurfaceTest(_JoinFixture, unittest.TestCase):
     def _doctor(self, *args, env_extra=None):
         env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV}
@@ -912,6 +1097,36 @@ class DoctorSurfaceTest(_JoinFixture, unittest.TestCase):
         rep = self._report(r)
         self.assertFalse([c for c in rep["checks"]
                           if c["id"] == "miss-rate"])
+
+
+
+
+class SilentLinesWithIdsExcludedTest(_JoinFixture, unittest.TestCase):
+    """PR-review hardening (implementation-review probe C, issue #129): a
+    line with status=silent must NEVER enter the false-injection
+    denominator even when it carries a non-empty ids list — the
+    denominator is injected decision LINES only. Writers never emit
+    silent+ids today, but the counter must not depend on that."""
+
+    def test_silent_line_with_ids_is_excluded(self):
+        now = int(time.time())
+        self._bg_log([
+            _bg_line(now - 3600, [], sid="sess-fi",
+                     status="silent", reason="empty-pool"),
+        ])
+        # hand-patch the ids list non-empty on the silent line: the
+        # writers never produce this shape, the counter must reject it
+        log = Path(self._tmp) / "zmem-bg.log"
+        rid = self.row_id
+        text = log.read_text(encoding="utf-8").replace(
+            "ids=[]", "ids=['{}']".format(rid))
+        log.write_text(text, encoding="utf-8")
+        report = self._run()
+        fi = report["false_injection"]
+        self.assertEqual(fi["overall"]["injected"], 0,
+                         "a silent line with ids must not enter the "
+                         "false-injection denominator (injected lines "
+                         "only); fix the counter, never weaken this pin")
 
 
 if __name__ == "__main__":

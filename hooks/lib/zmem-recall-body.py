@@ -217,8 +217,6 @@ def _classify_silent_reason(rows, omitted=0, budget_emptied=False,
 # Log bound (PRR-023 fix): zmem-bg.log was maintenance-only (~lines/day)
 # and is now appended per hook event. Cap it: past this size, truncate to
 # empty before appending (operator can raise the cap via ZMEM_BG_LOG_MAX_BYTES).
-_BG_LOG_DEFAULT_MAX_BYTES = 262144
-
 
 def _maybe_log_drift(session_id: str) -> None:
     """Issue #107: run the served-tree drift check once per session id.
@@ -274,46 +272,63 @@ def _maybe_log_drift(session_id: str) -> None:
 def _log_inject_decision(rows, selected, status: str, reason: str,
                          omitted=0, tokens_used=None, tokens_budget=None,
                          ops_count=0, session_id: str = "",
-                         all_ids=None) -> None:
-    """Append the injected|silent decision to the existing bg log.
+                         all_ids=None, moment: str = "",
+                         store_py: str = "") -> None:
+    """Append the injected|silent decision to the decision log (#129).
 
-    Issue #87 / #85 direction 1: every line carries ``reason=`` (closed set
-    from schema_meta plus ``injected``), and ``omitted=N`` when the passive
-    injection-risk filter dropped rows — so an operator can tell an
-    empty-pool silent (query construction problem) from a below-bar silent
-    (scoring problem) from a budget-drop without log forensics. Field order:
-    ``status``, ``reason``, optional ``omitted=N``, ``ids``, ``all``,
-    optional ``tokens=used/budget`` (the ``tokens=\\d+/\\d+`` shape pinned by
-    tests/test_token_budget.py is unchanged), optional ``ops=N``, then
-    ALWAYS ``sid=<sanitized session id>`` at line end (issue #94: the
-    session key the miss-rate join binds failures to injections with).
-    Sanitization is the canonical ops-lane rule
-    (``[^A-Za-z0-9._-]`` → ``_``, cap 128) so a hostile session id cannot
-    forge log structure; an absent session id logs ``sid=unknown`` — the
-    "unknown" fallback is deliberately distinct from ``_ring_path``'s
-    filename fallback ("session") because this is a log label, not a path
-    component.
+    Issue #129 split: decision lines go to ``zmem-decisions.log`` (rotated,
+    never truncated) so cadence/maintenance output in ``zmem-bg.log`` can
+    never interleave with them and the miss-rate join / false-injection
+    counter read a clean stream. Issue #87 / #85 direction 1: every line
+    carries ``reason=`` (closed set from schema_meta plus ``injected``),
+    and ``omitted=N`` when the passive injection-risk filter dropped rows —
+    so an operator can tell an empty-pool silent (query construction
+    problem) from a below-bar silent (scoring problem) from a budget-drop
+    without log forensics. Field order: ``status``, ``reason``, optional
+    ``omitted=N``, ``ids``, ``all``, optional ``tokens=used/budget`` (the
+    ``tokens=\\d+/\\d+`` shape pinned by tests/test_token_budget.py is
+    unchanged), optional ``ops=N``, ALWAYS ``sid=<sanitized session id>``
+    at line end (issue #94), then the additive ``moment=<mode>`` field
+    (#129: the injection moment — session_start/user_prompt/pretool/
+    subagent/precompact — absent only when unknown). Sanitization is the
+    canonical ops-lane rule (``[^A-Za-z0-9._-]`` → ``_``, cap 128) so a
+    hostile session id cannot forge log structure; an absent session id
+    logs ``sid=unknown`` — the "unknown" fallback is deliberately distinct
+    from ``_ring_path``'s filename fallback ("session") because this is a
+    log label, not a path component.
 
-    PRR-016 fix: the log used to read a stale ``ZMEM_DATA_DIR`` var and so
-    always landed in ~/.zmem even on store-overridden deployments; it now
-    reads the live env. Superseded again by ring-reader parity (PRR-91-001
-    follow-up): the resolution goes through ``_data_dir()`` so the log lands
-    next to the ops ring it describes — ZMEM_STORE-first like the ring read
-    path, with the same plugin-data steps for non-launcher environments.
+    Retention (issue #129): rotation via ``storelib.log_rotate`` keeps N
+    bounded segments with sequence markers; the destructive truncate-to-
+    empty cap is gone. When the rotation helper cannot be imported the
+    append proceeds WITHOUT any size control — unbounded growth is the
+    accepted failure direction, never evidence destruction.
     """
-    log_path = os.path.join(_data_dir(), "zmem-bg.log")
+    log_path = os.path.join(_data_dir(), "zmem-decisions.log")
     # Issue #107: the first decision of a session also fires the (marker
     # guarded, once-per-session) served-tree drift check — the session-start
     # hook normally wins the race; this covers wirings where it never ran.
     _maybe_log_drift(session_id)
     try:
-        # PRR-023: bounded growth — truncate to empty when over the cap so
-        # per-event appends cannot grow the log without limit.
+        # Issue #129: rotate, never truncate. Fail-open to append-without-
+        # cap when the helper is unavailable (no storelib path) — the
+        # failure direction is growth, not loss. The legacy zmem-bg.log
+        # (over-cap, from a pre-split deployment) is folded into bounded
+        # rotation here too, so its history becomes a marked segment on
+        # the first post-split decision instead of growing forever.
         try:
-            if os.path.getsize(log_path) > _bg_log_max_bytes():
-                with open(log_path, "w", encoding="utf-8"):
-                    pass
-        except OSError:
+            scripts_dir = (os.path.dirname(os.path.abspath(store_py))
+                           if store_py else "")
+            if scripts_dir:
+                saved = sys.path[:]
+                try:
+                    sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
+                    from storelib.log_rotate import rotate_on_append
+                    rotate_on_append(log_path)
+                    rotate_on_append(
+                        os.path.join(_data_dir(), "zmem-bg.log"))
+                finally:
+                    sys.path[:] = saved
+        except Exception:
             pass
         ids_all = [r.get("id") for r in rows]
         if all_ids is not None:
@@ -348,11 +363,18 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
         import re as _re_sid
         safe_sid = _re_sid.sub(
             r"[^A-Za-z0-9._-]", "_", (session_id or ""))[:128] or "unknown"
+        # Issue #129: the additive moment field (the hook mode) rides at
+        # line end after sid= — the per-moment false-injection bucket key.
+        mom = ""
+        if moment:
+            safe_moment = _re_sid.sub(r"[^A-Za-z0-9._-]", "_", moment)[:32]
+            if safe_moment:
+                mom = " moment={0}".format(safe_moment)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
                 "ids={ids_sel} all={ids_all}{tok}{ops} "
-                "sid={safe_sid}\n".format(
+                "sid={safe_sid}{mom}\n".format(
                     ts=int(time.time()),
                     status=status,
                     reason=reason,
@@ -362,20 +384,12 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     tok=tok,
                     ops=ops,
                     safe_sid=safe_sid,
+                    mom=mom,
                 )
             )
     except OSError:
         # Fail-open: never let the audit log block the hook.
         pass
-
-
-def _bg_log_max_bytes() -> int:
-    raw = os.environ.get("ZMEM_BG_LOG_MAX_BYTES", "")
-    try:
-        value = int(raw) if raw else _BG_LOG_DEFAULT_MAX_BYTES
-    except ValueError:
-        return _BG_LOG_DEFAULT_MAX_BYTES
-    return value if value > 0 else _BG_LOG_DEFAULT_MAX_BYTES
 
 
 def _format_fence(rows, header: str, store_py: str = "") -> str:
@@ -612,7 +626,7 @@ def main() -> int:
                     or os.environ.get("ZCODE_SESSION_ID", ""))
         _log_inject_decision(
             [], [], "silent", _reason_disabled(store_py),
-            session_id=_sid)
+            session_id=_sid, moment=mode, store_py=store_py)
         print("{}")
         return 0
 
@@ -871,6 +885,7 @@ def main() -> int:
             ops_count=len(ops_tokens),
             session_id=session_id,
             all_ids=envelope_candidates,
+            moment=mode, store_py=store_py,
         )
         if mode == "pretool":
             # Issue #90 / #85 C: a per-tool-call one-liner would inject noise
@@ -921,7 +936,8 @@ def main() -> int:
                          tokens_used=tokens_used, tokens_budget=tokens_budget,
                          ops_count=len(ops_tokens),
                          session_id=session_id,
-                         all_ids=envelope_candidates)
+                         all_ids=envelope_candidates,
+                         moment=mode, store_py=store_py)
     if mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude":
         # Issue #90 / #85 C: older Claude builds ignore pre-tool
         # additionalContext (documented since 2.1.9) — park the
