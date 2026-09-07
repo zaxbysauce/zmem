@@ -40,7 +40,14 @@ from typing import Any
 # the split: original six >= 5, new three >= 3).
 BUCKETS = ("as-of", "injection", "entity-alias", "namespace", "contested",
            "fts", "adapter", "retraction", "polarity", "change-intent",
-           "decision-point")
+           "decision-point", "negative-control")
+
+# Issue #111: the four hook query shapes the injection gold scores. Each is a
+# different query against the same store (the hook builds a different query
+# string per moment — prose, ops tokens, task text, or a query-less recent
+# pull), so the gold carries a `moment` per item and the harness reproduces
+# exactly what the hook would send.
+INJECTION_MOMENTS = ("user-prompt", "pretool", "subagent", "precompact")
 
 
 class GoldError(ValueError):
@@ -66,6 +73,13 @@ class GoldItem:
     # slice inside the 500-char cap) — the eval measures the hook's real
     # query, not a forked one. Items without ops run byte-identical to today.
     ops: str = ""
+    # Issue #111: injection-gold fields (additive, defaulted — legacy items
+    # never carry `moment` and keep byte-identical behavior). `moment` routes
+    # the item through the hook's real per-moment lane; `expect="silent"`
+    # marks a negative control (no genuine retrieval need): the rendered set
+    # must be empty (silent), never injected.
+    moment: str = ""
+    expect: str = "inject"
 
 
 def load_gold(path: str) -> list[GoldItem]:
@@ -116,9 +130,37 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
         raise GoldError(
             f"field 'bucket' must be one of {', '.join(BUCKETS)}, got {bucket!r}"
         )
-    query = obj.get("query")
-    if not isinstance(query, str) or not query.strip():
-        raise GoldError("missing required non-empty string field 'query'")
+    # Issue #111: parse the injection-gold fields FIRST so the query rule can
+    # relax for the query-less precompact lane (a recent pull has no prompt).
+    moment = obj.get("moment", "")
+    expect = obj.get("expect", "inject")
+    if not isinstance(moment, str):
+        raise GoldError("field 'moment' must be a string when present")
+    if moment and moment not in INJECTION_MOMENTS:
+        raise GoldError(
+            "field 'moment' must be one of "
+            f"{', '.join(INJECTION_MOMENTS)} when present, got {moment!r}"
+        )
+    if not isinstance(expect, str) or expect not in ("inject", "silent"):
+        raise GoldError(
+            "field 'expect' must be 'inject' or 'silent' when present, "
+            f"got {expect!r}"
+        )
+    if expect != "inject" and not moment:
+        raise GoldError(
+            "field 'expect' requires 'moment' (legacy items are positive "
+            "recall items)")
+    query = obj.get("query", "")
+    if moment == "precompact":
+        if not isinstance(query, str):
+            raise GoldError("field 'query' must be a string when present")
+        if query.strip():
+            raise GoldError(
+                "a precompact item is a query-less recent pull; 'query' must "
+                "be empty or omitted")
+    else:
+        if not isinstance(query, str) or not query.strip():
+            raise GoldError("missing required non-empty string field 'query'")
 
     include_ids = obj.get("must_include_ids", [])
     exclude_ids = obj.get("must_exclude_ids", [])
@@ -134,7 +176,18 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
         )
     if include_text is not None and not isinstance(include_text, str):
         raise GoldError("field 'must_include_text' must be a string")
-    if not include_ids and not exclude_ids and not include_text:
+    if moment and expect == "silent":
+        # A negative control asserts by its silence: labeling relevant ids
+        # would contradict the no-retrieval-need premise.
+        if include_ids:
+            raise GoldError(
+                "a negative-control item (moment set, expect 'silent') must "
+                "not carry must_include_ids")
+    elif moment and not include_ids:
+        raise GoldError(
+            "an injection-gold positive (moment set, expect 'inject') must "
+            "label must_include_ids")
+    if not moment and not include_ids and not exclude_ids and not include_text:
         raise GoldError("item asserts nothing: give must_include_ids, "
                         "must_exclude_ids, or must_include_text")
 
@@ -184,7 +237,286 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
         must_include_text=include_text,
         explicit=explicit,
         ops=ops,
+        moment=moment,
+        expect=expect,
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #111: the injection-direction precision gold. Where `evaluate_items`
+# measures raw recall on a narrowed pipeline, `evaluate_injection_items`
+# executes the hook's REAL lane (`for_injection=True` with the hook's flag
+# parity: include-global, MMR on, default link expansion) and scores the
+# RENDERED set — the rows that would land in the fence the agent sees.
+
+INJECTION_PER_ITEM_REPORT_KEYS = (
+    "id", "bucket", "moment", "expect", "namespace", "query", "ops_query",
+    "as_of", "reason", "rendered_ids", "candidate_ids", "tokens_used",
+    "tokens_budget", "hit", "precision", "fence_ok", "ok",
+)
+
+
+class BypassError(RuntimeError):
+    """Raised when the rendered set is inconsistent with the real gate +
+    token budget having run (issue #111 no-silent-bypass contract). The
+    runner maps this to exit 2 naming the item and the failed invariant.
+
+    Deliberately NOT verified by calling ``selective_inject_filter`` /
+    ``apply_token_budget`` back: a caller that stubbed those functions (the
+    exact names the lane calls at recall.py's injection branch) would stub
+    the verification too. Instead the invariants are re-derived from the
+    pure primitives the gate/budget are built on — the floor constants and
+    the per-row token cost — so stubbing the gate or budget functions
+    cannot silence the check.
+    """
+
+
+def _injection_silent_reasons() -> tuple:
+    # schema_meta lives at the TOP of skills/memory/scripts/ next to store.py
+    # (same import discipline as inject.py's guarded import above).
+    import schema_meta as _sm  # lazy: keep module import cheap
+    return tuple(getattr(_sm, "INJECT_SILENT_REASONS",
+                         ("empty-pool", "omitted", "below-bar", "budget-drop")))
+
+
+def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
+                      fence: str) -> None:
+    """Re-derive the lane's invariants from pure primitives (see
+    BypassError). Raises BypassError naming the item on any violation."""
+    import storelib.inject as _inject
+    from storelib.recall import ZMEM_FENCE_CLOSE, ZMEM_FENCE_OPEN
+
+    floor, gate_none_floor, grounded = _inject._gate_constants()
+    for r in rows:
+        try:
+            conf = float(r.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        if conf != conf or conf in (float("inf"), float("-inf")):
+            conf = 0.0
+        sig = (r.get("signal") or "none").lower()
+        if sig == "none":
+            if conf < gate_none_floor:
+                raise BypassError(
+                    f"{item_id}: rendered row {r.get('id')} has signal=none "
+                    f"confidence {conf} below the gate-none floor "
+                    f"{gate_none_floor} — the selective-inject gate did not "
+                    "run on the rendered set")
+        elif sig in grounded:
+            if conf < floor:
+                raise BypassError(
+                    f"{item_id}: rendered row {r.get('id')} has grounded "
+                    f"signal {sig} confidence {conf} below the prompt floor "
+                    f"{floor} — the selective-inject gate did not run")
+        else:
+            raise BypassError(
+                f"{item_id}: rendered row {r.get('id')} carries ungrounded "
+                f"signal {sig!r}, which the real gate never admits")
+    budget = _inject.inject_token_budget()
+    used = sum(_inject.row_token_cost(r) for r in rows)
+    protected = getattr(_inject, "_PROTECTED_TYPES",
+                        ("decision", "constraint"))
+    all_protected = bool(rows) and all(
+        (r.get("type") or "") in protected for r in rows)
+    if used > budget and not all_protected:
+        raise BypassError(
+            f"{item_id}: rendered set costs ~{used} tokens, over the "
+            f"{budget}-token budget, with non-protected rows present — the "
+            "token budget did not run")
+    for r in rows:
+        if f"- [{r['id']}]" not in fence:
+            raise BypassError(
+                f"{item_id}: rendered row {r.get('id')} is absent from the "
+                "fence text — metrics must come off the rendered fence")
+    if rows and not (fence.startswith(ZMEM_FENCE_OPEN)
+                     and ZMEM_FENCE_CLOSE in fence):
+        raise BypassError(f"{item_id}: fence markers missing from the render")
+    if envelope.get("tokens_budget") != budget:
+        raise BypassError(
+            f"{item_id}: envelope tokens_budget "
+            f"{envelope.get('tokens_budget')!r} != resolved budget "
+            f"{budget} — the envelope did not come from the injection lane")
+    if (envelope.get("reason") == "injected") != bool(rows):
+        raise BypassError(
+            f"{item_id}: envelope reason {envelope.get('reason')!r} "
+            f"inconsistent with {len(rows)} rendered rows")
+
+
+def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
+                             *, k_default: int = 5,
+                             ) -> tuple[list[dict], dict]:
+    """Run every injection-gold item through the hook's REAL lane and score
+    the rendered set (issue #111).
+
+    Per moment the harness reproduces exactly what the hook executes:
+    - ``user-prompt``: prose query, ops-composed when the item carries ops
+      (the same ``compose_inject_query`` the legacy harness and the hook
+      share), ``recall_memory(limit=k, include_global=True, global_limit=3,
+      for_injection=True)`` — MMR on, default link expansion (hops 1,
+      budget 2), hybrid auto.
+    - ``pretool``: the item's ops-token string verbatim (the hook derives
+      tokens from the in-flight command and sends them as the query), same
+      recall flags.
+    - ``subagent``: task text truncated to the hook's 500-char cap, same
+      recall flags.
+    - ``precompact``: the query-less recent pull the hook sends —
+      ``recent_memory(limit=3, min_confidence=0.5, include_global=True,
+      global_limit=2, for_injection=True)``.
+
+    Every call runs with ``as_json=True`` under captured stdout so the
+    harness scores the same ENVELOPE the hook parses (``reason``,
+    ``candidate_ids``, ``tokens_used``, ``tokens_budget``), and with
+    ``no_telemetry=True`` so the run is a zero-write read. Metrics are
+    computed from the rendered rows after they are verified to appear in
+    the rendered fence text (``_format_fenced_recall``), and the lane's
+    gate/budget invariants are re-derived from pure primitives
+    (``_verify_real_lane``) so a stubbed gate or budget FAILS the harness
+    instead of silently scoring.
+
+    Returns (per_item list, metrics dict). Metrics: ``hit_at_k`` (positives:
+    every must_include id rendered), ``precision_at_k`` (positives: mean of
+    |rendered ∩ labeled| / |rendered|; an empty positive render scores 0),
+    ``false_injection_rate`` (negatives with a non-empty render / negatives
+    — the same "injected without need" notion the B-2 counter measures in
+    production), ``empty_pool_rate`` (all items whose silent reason is
+    ``empty-pool`` / all items), ``mrr`` (positives), plus item counts and a
+    ``silent_reasons`` tally. Never raises on low scores — a bad SCORE is
+    data; only the BypassError invariants and operational failures raise.
+    """
+    import contextlib
+    import io
+    import json as _json
+    from storelib.ops_tokens import compose_inject_query
+    from storelib.recall import (_format_fenced_recall, _normalize_as_of,
+                                 recent_memory, recall_memory)
+
+    def _run_lane(item: GoldItem, query: str, k: int) -> tuple[list, dict]:
+        if item.moment == "precompact":
+            fn, kwargs = recent_memory, {"limit": 3, "min_confidence": 0.5}
+        else:
+            fn, kwargs = recall_memory, {"limit": k}
+        extra: dict = {}
+        if item.moment != "precompact":
+            extra["query"] = query
+        if item.as_of:
+            extra["as_of"] = item.as_of
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            fn(conn, namespace=item.namespace,
+               include_global=True,
+               global_limit=3 if item.moment != "precompact" else 2,
+               no_telemetry=True, for_injection=True, as_json=True,
+               **kwargs, **extra)
+        envelope = _json.loads(captured.getvalue())
+        from storelib.inject import envelope_results
+        return envelope_results(envelope), envelope
+
+    per_item: list[dict] = []
+    for item in items:
+        k = item.k if item.k is not None else k_default
+        if item.moment == "precompact":
+            executed_query = None
+        elif item.ops:
+            executed_query = compose_inject_query(item.query, item.ops)
+        elif item.moment == "subagent":
+            executed_query = item.query[:500]
+        else:
+            executed_query = item.query
+        rows, envelope = _run_lane(item, executed_query or "", k)
+        rendered_ids = [r["id"] for r in rows]
+        fence = _format_fenced_recall(
+            rows, header=f"Relevant memories (namespace {item.namespace or 'unscoped'}).")
+        _verify_real_lane(item.id, rows, envelope, fence)
+        fence_ok = all(f"- [{rid}]" in fence for rid in rendered_ids)
+
+        labeled = set(item.must_include_ids)
+        if item.expect == "silent":
+            hit = len(rendered_ids) == 0
+            precision = 1.0 if not rendered_ids else 0.0
+            false_injection = bool(rendered_ids)
+        else:
+            hit = all(rid in rendered_ids for rid in labeled)
+            precision = (len(labeled & set(rendered_ids)) / len(rendered_ids)
+                         if rendered_ids else 0.0)
+            false_injection = False
+        reason = envelope.get("reason")
+        first_hit_rank = 0
+        for i, rid in enumerate(rendered_ids, start=1):
+            if rid in labeled:
+                first_hit_rank = i
+                break
+        per_item.append({
+            "id": item.id,
+            "bucket": item.bucket,
+            "moment": item.moment,
+            "expect": item.expect,
+            "namespace": item.namespace,
+            "query": item.query,
+            "ops_query": executed_query if (item.moment != "precompact"
+                                            and item.ops) else None,
+            "as_of": _normalize_as_of(item.as_of) if item.as_of else None,
+            "reason": reason,
+            "rendered_ids": rendered_ids,
+            "candidate_ids": envelope.get("candidate_ids", []),
+            "tokens_used": envelope.get("tokens_used"),
+            "tokens_budget": envelope.get("tokens_budget"),
+            "hit": hit,
+            "precision": precision,
+            "fence_ok": fence_ok,
+            "first_hit_rank": first_hit_rank,
+            "ok": hit and fence_ok,
+        })
+
+    positives = [it for it in per_item if it["expect"] == "inject"]
+    negatives = [it for it in per_item if it["expect"] == "silent"]
+    allowed_reasons = _injection_silent_reasons()
+    silent_reasons = {r: 0 for r in allowed_reasons}
+    for it in per_item:
+        if it["reason"] in silent_reasons:
+            silent_reasons[it["reason"]] += 1
+    metrics = {
+        "hit_at_k": _share(positives, lambda it: it["hit"]),
+        "precision_at_k": _share(positives, lambda it: it["precision"]),
+        "false_injection_rate": _share(negatives,
+                                       lambda it: bool(it["rendered_ids"])),
+        "empty_pool_rate": _share(per_item,
+                                  lambda it: it["reason"] == "empty-pool"),
+        "mrr": sum((1.0 / it["first_hit_rank"] if it.get("first_hit_rank")
+                    else 0.0) for it in positives) / len(per_item)
+        if per_item else 0.0,
+        "items": len(per_item),
+        "positive_items": len(positives),
+        "negative_items": len(negatives),
+        "silent_reasons": silent_reasons,
+    }
+    return per_item, metrics
+
+
+def injection_per_moment(per_item: list[dict]) -> dict:
+    """Recompute the injection metric block per moment (issue #111).
+
+    Kept as a module function so the runner and any consumer share ONE
+    definition of the per-moment rollup (the partition must be exhaustive:
+    every item lands in exactly one moment block)."""
+    out: dict[str, dict] = {}
+    for moment in INJECTION_MOMENTS:
+        subset = [it for it in per_item if it["moment"] == moment]
+        positives = [it for it in subset if it["expect"] == "inject"]
+        negatives = [it for it in subset if it["expect"] == "silent"]
+        out[moment] = {
+            "items": len(subset),
+            "positive_items": len(positives),
+            "negative_items": len(negatives),
+            "hit_at_k": _share(positives, lambda it: it["hit"]),
+            "precision_at_k": _share(positives, lambda it: it["precision"]),
+            "false_injection_rate": _share(
+                negatives, lambda it: bool(it["rendered_ids"])),
+            "empty_pool_rate": _share(
+                subset, lambda it: it["reason"] == "empty-pool"),
+            "mrr": sum((1.0 / it["first_hit_rank"] if it.get("first_hit_rank")
+                        else 0.0) for it in positives) / len(subset)
+            if subset else 0.0,
+        }
+    return out
 
 
 def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,

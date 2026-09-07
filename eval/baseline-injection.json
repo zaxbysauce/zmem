@@ -1,0 +1,68 @@
+{
+  "baseline_for": "scripts/eval_inject_runner.py",
+  "issue": 111,
+  "gold": "eval/injection_gold.jsonl",
+  "profile": "fake (model-absent)",
+  "clock": "2026-06-01T00:00:00Z",
+  "k": 5,
+  "lane": "for-injection",
+  "metrics": {
+    "hit_at_k": 1.0,
+    "precision_at_k": 1.0,
+    "false_injection_rate": 0.3,
+    "empty_pool_rate": 0.06363636363636363,
+    "mrr": 0.8772727272727273,
+    "items": 110,
+    "positive_items": 100,
+    "negative_items": 10,
+    "silent_reasons": {
+      "empty-pool": 7,
+      "omitted": 0,
+      "below-bar": 0,
+      "budget-drop": 0
+    }
+  },
+  "per_moment": {
+    "user-prompt": {
+      "items": 71,
+      "positive_items": 65,
+      "negative_items": 6,
+      "hit_at_k": 1.0,
+      "precision_at_k": 1.0,
+      "false_injection_rate": 0.3333333333333333,
+      "empty_pool_rate": 0.056338028169014086,
+      "mrr": 0.8873239436619719
+    },
+    "pretool": {
+      "items": 20,
+      "positive_items": 18,
+      "negative_items": 2,
+      "hit_at_k": 1.0,
+      "precision_at_k": 1.0,
+      "false_injection_rate": 0.5,
+      "empty_pool_rate": 0.05,
+      "mrr": 0.9
+    },
+    "subagent": {
+      "items": 17,
+      "positive_items": 16,
+      "negative_items": 1,
+      "hit_at_k": 1.0,
+      "precision_at_k": 1.0,
+      "false_injection_rate": 0.0,
+      "empty_pool_rate": 0.058823529411764705,
+      "mrr": 0.8529411764705882
+    },
+    "precompact": {
+      "items": 2,
+      "positive_items": 1,
+      "negative_items": 1,
+      "hit_at_k": 1.0,
+      "precision_at_k": 1.0,
+      "false_injection_rate": 0.0,
+      "empty_pool_rate": 0.5,
+      "mrr": 0.5
+    }
+  },
+  "note": "Committed HEAD baseline (issue #111 AC-7): metrics from the real for-injection lane on the deterministic fixture corpus. Later phases diff against this via --compare-baseline; regenerate deliberately when the gold or the lane changes."
+}

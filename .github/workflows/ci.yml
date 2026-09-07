@@ -139,6 +139,30 @@ jobs:
           path: .eval-tmp/eval-results.json
           if-no-files-found: warn
 
+      # Issue #111: the injection-direction precision gold — the REAL
+      # for-injection lane (gate + token budget) scored on the rendered set,
+      # with negative controls. Record-only, same as the eval above: the
+      # score never gates the build (no --fail-under-*, no
+      # --compare-baseline) and nothing is downloaded. The committed
+      # baseline (eval/baseline-injection.json) is what later phases diff
+      # against; flipping this to a gate is ONE flag.
+      - name: Run injection eval (model-absent, fake profile)
+        if: always()
+        shell: bash
+        env:
+          ZMEM_EMBED_PROFILE: fake
+        run: |
+          set -e
+          python scripts/eval_inject_runner.py --store .eval-tmp/store.sqlite --gold eval/injection_gold.jsonl --json-out .eval-tmp/eval-inject-results.json
+
+      - name: Upload injection eval report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-inject-results-${{ matrix.os }}
+          path: .eval-tmp/eval-inject-results.json
+          if-no-files-found: warn
+
       - name: Run Node test suites
         # always(): the eval step above can fail operationally (exit 2) — a
         # JS-coverage blackout on one matrix leg must not be its side effect.
