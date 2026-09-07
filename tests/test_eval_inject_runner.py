@@ -25,7 +25,7 @@ sys.path.insert(0, str(REPO / "tests" / "fixtures"))
 from eval_store import BASE_ENV, EVAL_PIN_TS  # noqa: E402
 
 for _k, _v in BASE_ENV.items():
-    os.environ.setdefault(_k, _v)
+    os.environ[_k] = _v
 os.environ["ZMEM_EMBED_PROFILE"] = "fake"
 os.environ["ZMEM_TEST_NOW"] = EVAL_PIN_TS
 for _k in ("ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_INJECT_FLOOR_PROMPT",
@@ -90,13 +90,12 @@ class EndToEndReportTest(unittest.TestCase):
             used = it["tokens_used"]
             self.assertIsInstance(used, int, it["id"])
             self.assertGreaterEqual(used, 0, it["id"])
-            # Non-protected renders must fit the budget (the protected-type
-            # overflow exception is the documented carve-out).
-            if used > 1500:
-                self.assertTrue(
-                    all(r["type"] in ("decision", "constraint")
-                        for r in it["rendered_ids"]) or not it["rendered_ids"],
-                    it["id"])
+            # The budget/protected-overflow invariant is enforced by the
+            # harness's own _verify_real_lane (which sees full candidate
+            # rows); here we pin the auditable rank field instead.
+            rank = it["first_hit_rank"]
+            self.assertIsInstance(rank, int, it["id"])
+            self.assertGreaterEqual(rank, 0, it["id"])
             self.assertTrue(it["fence_ok"], it["id"])
 
     def test_per_moment_partition_is_exhaustive(self):

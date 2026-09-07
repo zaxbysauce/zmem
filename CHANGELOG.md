@@ -25,7 +25,8 @@ README.
   rate and hit@k, overall and per moment (user prompt, pre-tool operation
   tokens, subagent task text, post-compaction). 100 labeled positives
   including the six #85 decision-point lessons, plus 10 negative controls
-  (no-retrieval-need prompts); the committed baseline records the known
+  (no-retrieval-need prompts); any local labeled JSONL can be scored
+  ad hoc by passing `--gold`; the committed baseline records the known
   failure at HEAD — 3 of 10 negatives inject (false-injection rate 0.30).
   No-silent-bypass: the harness re-derives the gate/budget invariants from
   pure primitives and refuses (exit 2) if either is stubbed out

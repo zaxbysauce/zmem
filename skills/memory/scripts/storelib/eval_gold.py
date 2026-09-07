@@ -252,7 +252,7 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
 INJECTION_PER_ITEM_REPORT_KEYS = (
     "id", "bucket", "moment", "expect", "namespace", "query", "ops_query",
     "as_of", "reason", "rendered_ids", "candidate_ids", "tokens_used",
-    "tokens_budget", "hit", "precision", "fence_ok", "ok",
+    "tokens_budget", "hit", "precision", "first_hit_rank", "fence_ok", "ok",
 )
 
 
@@ -280,37 +280,57 @@ def _injection_silent_reasons() -> tuple:
 
 
 def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
-                      fence: str) -> None:
+                      fence: str, conn: sqlite3.Connection = None,
+                      candidate_ids: list[str] = None) -> None:
     """Re-derive the lane's invariants from pure primitives (see
-    BypassError). Raises BypassError naming the item on any violation."""
+    BypassError). Raises BypassError naming the item on any violation.
+
+    Threat model: the invariants are checked WITHOUT calling
+    ``selective_inject_filter``/``apply_token_budget`` through the names the
+    lane binds (``storelib.recall.selective_inject_filter`` /
+    ``storelib.recall.apply_token_budget`` — stubbing those exact names is
+    the "gate/budget stubbed out" scenario this contract exists to catch).
+    The floor/budget arithmetic is re-derived from pure primitives, and the
+    EXPECTED selection is independently reconstructed from the envelope's
+    pre-gate ``candidate_ids`` by re-reading those rows from the store and
+    applying the owning-module (``storelib.inject``) gate/budget — so a
+    recall-level stub that drops or inflates the rendered set is detected
+    even when every output invariant happens to hold (e.g. a stub that
+    empties the set, or one that passes sub-floor rows)."""
     import storelib.inject as _inject
     from storelib.recall import ZMEM_FENCE_CLOSE, ZMEM_FENCE_OPEN
 
     floor, gate_none_floor, grounded = _inject._gate_constants()
-    for r in rows:
+
+    def _conf(r) -> float:
         try:
-            conf = float(r.get("confidence", 0) or 0)
+            value = float(r.get("confidence", 0) or 0)
         except (TypeError, ValueError):
-            conf = 0.0
-        if conf != conf or conf in (float("inf"), float("-inf")):
-            conf = 0.0
+            return 0.0
+        if value != value or value in (float("inf"), float("-inf")):
+            return 0.0
+        return value
+
+    for r in rows:
+        conf = _conf(r)
+        rid = r.get("id", "?")
         sig = (r.get("signal") or "none").lower()
         if sig == "none":
             if conf < gate_none_floor:
                 raise BypassError(
-                    f"{item_id}: rendered row {r.get('id')} has signal=none "
+                    f"{item_id}: rendered row {rid} has signal=none "
                     f"confidence {conf} below the gate-none floor "
                     f"{gate_none_floor} — the selective-inject gate did not "
                     "run on the rendered set")
         elif sig in grounded:
             if conf < floor:
                 raise BypassError(
-                    f"{item_id}: rendered row {r.get('id')} has grounded "
+                    f"{item_id}: rendered row {rid} has grounded "
                     f"signal {sig} confidence {conf} below the prompt floor "
                     f"{floor} — the selective-inject gate did not run")
         else:
             raise BypassError(
-                f"{item_id}: rendered row {r.get('id')} carries ungrounded "
+                f"{item_id}: rendered row {rid} carries ungrounded "
                 f"signal {sig!r}, which the real gate never admits")
     budget = _inject.inject_token_budget()
     used = sum(_inject.row_token_cost(r) for r in rows)
@@ -324,7 +344,7 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
             f"{budget}-token budget, with non-protected rows present — the "
             "token budget did not run")
     for r in rows:
-        if f"- [{r['id']}]" not in fence:
+        if f"- [{r.get('id')}]" not in fence:
             raise BypassError(
                 f"{item_id}: rendered row {r.get('id')} is absent from the "
                 "fence text — metrics must come off the rendered fence")
@@ -340,6 +360,60 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
         raise BypassError(
             f"{item_id}: envelope reason {envelope.get('reason')!r} "
             f"inconsistent with {len(rows)} rendered rows")
+
+    # Independent reconstruction: rebuild the expected selection from the
+    # envelope's pre-gate candidate ids and compare membership with the
+    # rendered set. This catches the remaining stub shape — a gate/budget
+    # stub that DROPS rows (rendered empty or partial) — which the
+    # output-only invariants above cannot see.
+    if conn is not None and candidate_ids:
+        placeholders = ",".join("?" * len(candidate_ids))
+        cand_rows = [
+            dict(r) for r in conn.execute(
+                f"SELECT id, confidence, signal, type, content FROM memory "
+                f"WHERE id IN ({placeholders})", candidate_ids)
+        ]
+        if len(cand_rows) != len(set(candidate_ids)):
+            raise BypassError(
+                f"{item_id}: only {len(cand_rows)} of "
+                f"{len(set(candidate_ids))} candidate ids found in the "
+                "store — envelope candidates inconsistent with the store")
+        expected_gate = [r for r in cand_rows
+                         if _gate_passes(r, floor, gate_none_floor, grounded)]
+        expected_kept = _inject.apply_token_budget(expected_gate)[0]
+        rendered_set = {r.get("id") for r in rows}
+        expected_ids = {r["id"] for r in expected_kept}
+        if rendered_set != expected_ids:
+            raise BypassError(
+                f"{item_id}: rendered set does not match the independently "
+                f"reconstructed gate+budget selection "
+                f"(rendered={sorted(rendered_ids_sort(rendered_set))} "
+                f"expected={sorted(expected_ids)}) — the gate or token "
+                "budget did not run on the candidate pool")
+
+
+def _rendered_ids_sort(ids):
+    return sorted(i for i in ids if i)
+
+
+def _gate_passes(r, floor, gate_none_floor, grounded) -> bool:
+    conf = _conf_row(r)
+    sig = (r.get("signal") or "none").lower()
+    if sig == "none":
+        return conf >= gate_none_floor
+    if sig in grounded:
+        return conf >= floor
+    return False
+
+
+def _conf_row(r) -> float:
+    try:
+        value = float(r.get("confidence", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value or value in (float("inf"), float("-inf")):
+        return 0.0
+    return value
 
 
 def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
@@ -415,17 +489,19 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
         k = item.k if item.k is not None else k_default
         if item.moment == "precompact":
             executed_query = None
-        elif item.ops:
-            executed_query = compose_inject_query(item.query, item.ops)
-        elif item.moment == "subagent":
-            executed_query = item.query[:500]
         else:
-            executed_query = item.query
+            # Hook parity: every query lane caps the query at 500 chars
+            # (UserPromptSubmit prose, derived ops tokens, subagent task
+            # text all go through the cap), so the eval must too.
+            base_query = (compose_inject_query(item.query, item.ops)
+                          if item.ops else item.query)
+            executed_query = base_query[:500]
         rows, envelope = _run_lane(item, executed_query or "", k)
         rendered_ids = [r["id"] for r in rows]
         fence = _format_fenced_recall(
             rows, header=f"Relevant memories (namespace {item.namespace or 'unscoped'}).")
-        _verify_real_lane(item.id, rows, envelope, fence)
+        _verify_real_lane(item.id, rows, envelope, fence, conn=conn,
+                          candidate_ids=envelope.get("candidate_ids"))
         fence_ok = all(f"- [{rid}]" in fence for rid in rendered_ids)
 
         labeled = set(item.must_include_ids)
@@ -473,16 +549,28 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
     for it in per_item:
         if it["reason"] in silent_reasons:
             silent_reasons[it["reason"]] += 1
+
+    def _mean_precision(pop: list[dict]) -> float:
+        # Mean of the per-item rendered precision (not a truthiness share:
+        # a 0.001-precision item must count as 0.001, not as 1.0).
+        if not pop:
+            return 0.0
+        return sum(it["precision"] for it in pop) / len(pop)
+
+    def _mrr(pop: list[dict], denom: int) -> float:
+        if not pop or denom <= 0:
+            return 0.0
+        return sum((1.0 / it["first_hit_rank"] if it["first_hit_rank"]
+                    else 0.0) for it in pop) / denom
+
     metrics = {
         "hit_at_k": _share(positives, lambda it: it["hit"]),
-        "precision_at_k": _share(positives, lambda it: it["precision"]),
+        "precision_at_k": _mean_precision(positives),
         "false_injection_rate": _share(negatives,
                                        lambda it: bool(it["rendered_ids"])),
         "empty_pool_rate": _share(per_item,
                                   lambda it: it["reason"] == "empty-pool"),
-        "mrr": sum((1.0 / it["first_hit_rank"] if it.get("first_hit_rank")
-                    else 0.0) for it in positives) / len(per_item)
-        if per_item else 0.0,
+        "mrr": _mrr(positives, len(positives)),
         "items": len(per_item),
         "positive_items": len(positives),
         "negative_items": len(negatives),
@@ -507,14 +595,16 @@ def injection_per_moment(per_item: list[dict]) -> dict:
             "positive_items": len(positives),
             "negative_items": len(negatives),
             "hit_at_k": _share(positives, lambda it: it["hit"]),
-            "precision_at_k": _share(positives, lambda it: it["precision"]),
+            "precision_at_k": (
+                sum(it["precision"] for it in positives) / len(positives)
+                if positives else 0.0),
             "false_injection_rate": _share(
                 negatives, lambda it: bool(it["rendered_ids"])),
             "empty_pool_rate": _share(
                 subset, lambda it: it["reason"] == "empty-pool"),
-            "mrr": sum((1.0 / it["first_hit_rank"] if it.get("first_hit_rank")
-                        else 0.0) for it in positives) / len(subset)
-            if subset else 0.0,
+            "mrr": sum((1.0 / it["first_hit_rank"] if it["first_hit_rank"]
+                        else 0.0) for it in positives) / len(positives)
+            if positives else 0.0,
         }
     return out
 
@@ -550,13 +640,24 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
 
     Returns (per_item list, aggregate metrics dict). Never raises on low
     scores — a bad SCORE is data; only operational failures raise.
+    Import errors aside, evaluation contract: ``evaluate_items`` measures the
+    RECALL-direction gold only. Injection-gold items (``moment`` set, added
+    for issue #111) run on a different pipeline and are REFUSED here —
+    point ``scripts/eval_inject_runner.py`` (or ``store.py tune-weights``
+    at a recall-direction gold) instead.
     """
-    # Imported here so load_gold()/validation stay importable without the
-    # recall stack (mirrors doctor.py's lazy-import discipline).
     import io
     import contextlib
     from storelib.ops_tokens import compose_inject_query
     from storelib.recall import _normalize_as_of, recall_memory
+
+    for item in items:
+        if item.moment:
+            raise GoldError(
+                f"{item.id!r}: item has moment={item.moment!r} — "
+                "injection-gold items must be evaluated with "
+                "evaluate_injection_items (scripts/eval_inject_runner.py), "
+                "not the recall-direction evaluate_items")
 
     per_item: list[dict] = []
     for item in items:

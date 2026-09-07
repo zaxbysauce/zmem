@@ -78,15 +78,17 @@ def _bootstrap_env(store: str) -> None:
     (identical contract to scripts/eval_runner.py: storelib freezes
     STORE_PATH and env-derived tunables at import time). The determinism
     pins come from the fixture's own BASE_ENV — ONE source of truth shared
-    with the corpus builder instead of a re-typed copy."""
+    with the corpus builder — and are OVERWRITTEN, not setdefault: an
+    ambient ZMEM_MODELS_DIR / ZMEM_LINK_THRESHOLD must not leak into an
+    eval run."""
     os.environ["ZMEM_STORE"] = store
     sys.path.insert(0, str(FIXTURES_DIR))
     from eval_store import BASE_ENV, EVAL_PIN_TS  # noqa: E402
     for key, value in BASE_ENV.items():
-        os.environ.setdefault(key, value)
+        os.environ[key] = value
     os.environ["ZMEM_EMBED_PROFILE"] = "fake"
     os.environ["ZMEM_TEST_NOW"] = EVAL_PIN_TS
-    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ["PYTHONUTF8"] = "1"
 
 
 def _ensure_store(store: str) -> None:
@@ -119,6 +121,12 @@ def _load_baseline(path: str) -> dict:
         print(f"[eval] baseline {path} metrics missing keys: "
               + ", ".join(missing), file=sys.stderr)
         sys.exit(2)
+    for key in BASELINE_RATE_KEYS:
+        value = metrics[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            print(f"[eval] baseline {path} metric {key} is not numeric: "
+                  f"{value!r}", file=sys.stderr)
+            sys.exit(2)
     return metrics
 
 
@@ -179,6 +187,8 @@ def main() -> int:
                     help="also write the JSON report to this path (CI uploads "
                          "it as a workflow artifact)")
     args = ap.parse_args()
+    if args.k < 1:
+        ap.error(f"--k must be a positive integer, got {args.k}")
     for _stream in (sys.stdout, sys.stderr):
         try:
             _stream.reconfigure(encoding="utf-8")

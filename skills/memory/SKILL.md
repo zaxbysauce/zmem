@@ -880,6 +880,20 @@ Exit codes: 0 success; 1 target missing or not live (tombstoned rows refuse);
 ```
 python scripts/eval_runner.py --store <path> [--gold eval/gold.jsonl] [--k 5] [--fail-under X] [--json-out PATH]
 ```
+
+### eval-inject — injection precision gold (issue #111)
+```
+python scripts/eval_inject_runner.py --store <path> [--gold eval/injection_gold.jsonl] [--k 5] [--fail-under-precision X] [--fail-under-false-injection X] [--compare-baseline eval/baseline-injection.json] [--json-out PATH]
+```
+Runs every injection-gold item through the REAL `--for-injection` lane —
+the same selective-inject gate and token budget the hooks execute — and
+scores the RENDERED set with negative controls: `precision_at_k`,
+`false_injection_rate`, `empty_pool_rate`, `hit_at_k`, overall and per
+moment (user prompt, pre-tool operation tokens, subagent task text,
+post-compaction). Refuses (exit 2) if the gate or budget is stubbed out.
+`--gold` accepts a local labeled JSONL (e.g. derived from your own decision
+log) without code changes. Record-only by default; the ratchet flags are
+the one-switch CI gate.
 Runs every gold item through the REAL recall pipeline and prints one JSON
 report: `hit_at_k`, `mrr`, `as_of_accuracy`, `injection_omit_rate` (+ per-bucket
 and per-item detail). `--store` is REQUIRED — the runner never resolves the
