@@ -12,6 +12,21 @@ README.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-06
+
+### Changed
+- **Lexical query hygiene (issue #112, Workstream C-1)**: the FTS MATCH is now
+  built from a normalized term list — casefolded, deduped, edge punctuation
+  stripped, closed-class English stop words dropped, tokens under 3 characters
+  matched exactly instead of prefix-wildcard, term count capped at 24 (the ops
+  token tail always survives) — and the MATCH is column-filtered to
+  `{content tags}`, so namespace text alone can never make a row a candidate.
+  Measured on the committed injection gold: false-injection rate 0.3 -> 0.1
+  (the remaining control, `neg-pt-status`, is a genuine-term match owned by
+  #113's relevance floor), precision@k 0.4707 -> 0.6032, mrr 0.965 -> 0.97,
+  hit@k 1.0 unchanged. `recall --explain` now records the normalized shape in
+  a `query_shape` field.
+
 ## [0.21.0] - 2026-09-06
 
 ### Added

@@ -403,7 +403,15 @@ class UnfoldSafetyTests(UnfoldFixtureBase):
             env=self.env, capture_output=True, text=True, timeout=60)
         r = self._recall("--query",
                          "what changed about the scraper digest",
-                         "--namespace", NS)
+                         "--namespace", NS,
+                         # #112 drift realignment: pin the lexical lane —
+                         # this test exercises the unfold+taint contract,
+                         # not vec ranking. Pre-#112 the stopword flood gave
+                         # every row an fts_rank so BM25 decided the hit;
+                         # now an unrelated vec-only row can outrank on the
+                         # FAKE embedder's 16-bucket hash cosine (the
+                         # composite re-rank discard is #113 C-2 scope 1-2).
+                         "--no-hybrid")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("[PREVIOUSLY]", r.stdout)
         prev_block = r.stdout.split("[PREVIOUSLY]")[1]

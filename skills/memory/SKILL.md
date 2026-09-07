@@ -1448,6 +1448,14 @@ are provenance inputs; trust_score is the contradiction ledger.
   auto-normalized. If a `file:` ref cannot be opened, a stderr warning is emitted.
 
 ## How recall works
+Query hygiene (#112): the lexical query is normalized before it becomes the
+FTS5 MATCH — tokens are casefolded, deduped, stripped of edge punctuation,
+closed-class English stop words are dropped, tokens under 3 characters match
+exactly instead of prefix-wildcard, the term list is capped at 24 (the last
+terms — the ops-token tail — always survive), and the MATCH is column-filtered
+to `{content tags}` so namespace text alone can never make a row a candidate.
+`recall --explain` records the resulting shape in its `query_shape` field.
+
 Retrieval is a **three-signal pipeline**: FTS5/BM25 keyword match (always),
 vector KNN over stored embeddings (when the optional embedding runtime is
 available), and entity matching (v10 — always, no model needed): the query's

@@ -179,11 +179,16 @@ class ExplainJsonShapeTests(ExplainFixtureBase):
         exp = doc["explain"]
         # The issue-mandated keys plus the effective settings that make the
         # verdicts interpretable (limit/scope shape below_limit + namespace).
+        # query_shape is the #112 addition: the normalized FTS shape.
         self.assertEqual(sorted(exp.keys()),
-                         sorted(["query", "target", "no_bump", "as_of",
-                                 "hybrid", "verdicts", "namespace", "limit",
-                                 "include_global", "global_limit",
+                         sorted(["query", "query_shape", "target", "no_bump",
+                                 "as_of", "hybrid", "verdicts", "namespace",
+                                 "limit", "include_global", "global_limit",
                                  "no_mmr"]))
+        self.assertIn("terms", exp["query_shape"])
+        self.assertIn("fts_query", exp["query_shape"])
+        self.assertTrue(exp["query_shape"]["fts_query"].startswith(
+            "{content tags} : ("))
         self.assertIsNone(exp["target"])
         self.assertFalse(exp["no_bump"])
         self.assertEqual(exp["namespace"], NS)
@@ -222,10 +227,12 @@ class ExplainReasonCoverageTests(ExplainFixtureBase):
         self.assertEqual(doc["explain"]["verdicts"][0]["reason"], "found")
 
     def test_below_limit(self):
-        # No-target mode: with --limit 1 over a query ("the") that matches
-        # several in-floor rows, the presented row is `found` and the rest of
-        # the scored pool MUST show up as below_limit with a pool rank > 1.
-        doc = self._explain_json("--query", "the", "--namespace", NS,
+        # No-target mode: with --limit 1 over a query ("deploy") that matches
+        # several in-floor rows (live-row + inj-row), the presented row is
+        # `found` and the rest of the scored pool MUST show up as below_limit
+        # with a pool rank > 1. (Was query "the" before #112 — every fixture
+        # row led with that stop word, which the query hygiene now drops.)
+        doc = self._explain_json("--query", "deploy", "--namespace", NS,
                                  "--limit", "1")
         verdicts = self._verdicts_by_reason(doc)
         self.assertIn("found", verdicts)
@@ -357,10 +364,13 @@ class ExplainReasonCoverageTests(ExplainFixtureBase):
         self.assertEqual(doc["explain"]["verdicts"][0]["id"], self.ids["live-row"])
 
     def test_multiple_matches_get_one_verdict_per_id(self):
-        doc = self._explain_json("--query", "the", "--namespace", NS,
-                                 "--target", "the")
+        # (Was query/target "the" before #112 — the hygiene drops that stop
+        # word; "deploy" is the fragment shared by several fixture rows.)
+        doc = self._explain_json("--query", "deploy", "--namespace", NS,
+                                 "--target", "deploy")
         reasons = [v["reason"] for v in doc["explain"]["verdicts"]]
-        self.assertGreater(len(reasons), 1, "fragment 'the' matches many rows")
+        self.assertGreater(len(reasons), 1,
+                           "fragment 'deploy' matches many rows")
         self.assertNotIn("not_in_db", reasons)
 
 

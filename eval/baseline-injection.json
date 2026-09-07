@@ -1,6 +1,6 @@
 {
   "baseline_for": "scripts/eval_inject_runner.py",
-  "issue": 111,
+  "issue": "112+111",
   "gold": "eval/injection_gold.jsonl",
   "profile": "fake (model-absent)",
   "clock": "2026-06-01T00:00:00Z",
@@ -8,15 +8,15 @@
   "lane": "for-injection",
   "metrics": {
     "hit_at_k": 1.0,
-    "precision_at_k": 0.4706666666666667,
-    "false_injection_rate": 0.3,
-    "empty_pool_rate": 0.06363636363636363,
-    "mrr": 0.965,
+    "precision_at_k": 0.6031666666666667,
+    "false_injection_rate": 0.1,
+    "empty_pool_rate": 0.08181818181818182,
+    "mrr": 0.97,
     "items": 110,
     "positive_items": 100,
     "negative_items": 10,
     "silent_reasons": {
-      "empty-pool": 7,
+      "empty-pool": 9,
       "omitted": 0,
       "below-bar": 0,
       "budget-drop": 0
@@ -28,17 +28,17 @@
       "positive_items": 65,
       "negative_items": 6,
       "hit_at_k": 1.0,
-      "precision_at_k": 0.42282051282051286,
-      "false_injection_rate": 0.3333333333333333,
-      "empty_pool_rate": 0.056338028169014086,
-      "mrr": 0.9692307692307692
+      "precision_at_k": 0.5187179487179487,
+      "false_injection_rate": 0.0,
+      "empty_pool_rate": 0.08450704225352113,
+      "mrr": 0.9769230769230769
     },
     "pretool": {
       "items": 20,
       "positive_items": 18,
       "negative_items": 2,
       "hit_at_k": 1.0,
-      "precision_at_k": 0.675,
+      "precision_at_k": 0.7916666666666666,
       "false_injection_rate": 0.5,
       "empty_pool_rate": 0.05,
       "mrr": 1.0
@@ -48,7 +48,7 @@
       "positive_items": 16,
       "negative_items": 1,
       "hit_at_k": 1.0,
-      "precision_at_k": 0.40208333333333335,
+      "precision_at_k": 0.709375,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.058823529411764705,
       "mrr": 0.90625
@@ -64,5 +64,5 @@
       "mrr": 1.0
     }
   },
-  "note": "Committed HEAD baseline (issue #111 AC-7): metrics from the real for-injection lane on the deterministic fixture corpus. Later phases diff against this via --compare-baseline; regenerate deliberately when the gold or the lane changes."
+  "note": "Committed HEAD baseline (issue #112 C-1, supersedes the #111 baseline): metrics from the real for-injection lane on the deterministic fixture corpus AFTER lexical query hygiene (stoplist, term cap, column-filtered MATCH). vs the #111 baseline: false_injection_rate 0.3 -> 0.1 (the one remaining injected control, neg-pt-status, is a genuine-term match owned by #113 C-2's relevance floor); precision_at_k 0.4707 -> 0.6032; mrr 0.965 -> 0.97; hit_at_k 1.0 unchanged; empty-pool silent reasons 7 -> 9. Later phases diff against this via --compare-baseline; regenerate deliberately when the gold or the lane changes."
 }
