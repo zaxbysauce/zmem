@@ -9,6 +9,10 @@ claims; zmem publishes only what its own harness measures on its own fixture.
 
 | Claim (README / docs surface) | Evidence (path + symbol) | Status |
 |---|---|---|
+| Lexical query hygiene: stoplist/casefold/dedupe/cap-24, sub-3-char exact
+  terms, column-filtered FTS MATCH, `query_shape` in explain (#112) | `storelib/recall.py`
+  `_normalize_query_terms` / `_fts_expression`; measured in `eval/baseline-injection.json`
+  (false-injection 0.3 -> 0.1); pinned by `tests/test_query_hygiene_*.py` | shipped |
 | Hybrid FTS5 + vector + entity recall, RRF-fused, composite re-ranked | `skills/memory/scripts/storelib/recall.py` `recall_memory` / `_recall_one_tier` / `_rrf_fuse`; pinned by `tests/test_mmr.py`, `tests/test_hybrid_default.py` | shipped |
 | Keyword recall with a confidence floor, high-precision-first | `storelib/schema.py` `CONFIDENCE_FLOOR`, `storelib/recall.py` `_recall_one_tier` (floor in lane SQL); `tests/test_injection_recall.py` | shipped |
 | `--as-of` point-in-time recall; `update`/`supersede`/`invalidate` are append-only (tombstone + lineage) | `storelib/recall.py` `_as_of_temporal_predicate` usage; `storelib/write.py` `update_memory`/`supersede_memory`; `tests/test_as_of_recall.py`, `tests/test_update_invalidate.py` | shipped |

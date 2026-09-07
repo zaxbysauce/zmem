@@ -153,7 +153,7 @@ class TestRunnerEndToEnd(EvalRunnerTestBase):
         # still passes (the MRR pin below would then fail opaquely).
         expected_ranks = {
             "decision-stash-65": 1,
-            "decision-reset-66": 2,
+            "decision-reset-66": 1,
             "decision-ratchet-67": 1,
             "decision-queue-68": 1,
             "decision-push-69": 1,
@@ -198,8 +198,8 @@ class TestRunnerEndToEnd(EvalRunnerTestBase):
         # MRR counts only items with an include-assertion; the two
         # exclude-only retraction items legitimately contribute 0 (40 of 42
         # pre-#88). Issue #88 adds six decision-point items with deterministic
-        # ranks 1,2,1,1,1,1 → rr sum 5.5 → (40 + 5.5) / 48.
-        self.assertAlmostEqual(self.report["metrics"]["mrr"], 45.5 / 48)
+        # ranks 1,1,1,1,1,1 → rr sum 6.0 → (40 + 6.0) / 48.
+        self.assertAlmostEqual(self.report["metrics"]["mrr"], 46.0 / 48)
         self.assertAlmostEqual(self.report["metrics"]["as_of_accuracy"], 1.0)
         self.assertAlmostEqual(self.report["metrics"]["injection_omit_rate"], 1.0)
         self.assertEqual(self.report["metrics"]["as_of_items"], 6)

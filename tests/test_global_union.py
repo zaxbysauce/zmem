@@ -457,6 +457,34 @@ class TestHybridRrfGlobalUnion(_StoreCase):
                  confidence=0.9)
         self.add(PROJECT_NS, "completely unrelated project scaffolding note",
                  confidence=0.9)
+        # #112 drift realignment: the seeding env forces the embedding model
+        # absent, so CLI-added rows are UNEMBEDDED — pre-#112 this test passed
+        # because the query's stop word "the" lexically matched the fox row
+        # (the exact flood #112 removes), never via the vec lane. Make the
+        # premise real: point the subprocesses at the REAL models dir (the
+        # store redirect above makes the default models-dir resolution land in
+        # the tmp dir) and re-embed through the production surface, so the
+        # match is genuinely vector-only. Where the full stack cannot be
+        # constructed (no runtime, or sqlite-vec unloadable so the lane fails
+        # open to empty), SKIP — the premise is unconstructible there and the
+        # test never actually exercised the vec lane on such boxes.
+        real_models_dir = emb_mod.availability_status()["models_dir"]
+        env["ZMEM_MODELS_DIR"] = str(real_models_dir)
+        r2 = self.run_store("reembed", "--all", "--confirm", env=env)
+        if r2.returncode != 0:
+            self.skipTest("embedding runtime unavailable in subprocess — "
+                          + r2.stderr.strip()[:120])
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, r'%s');"
+             "from storelib.schema import connect;"
+             "c = connect();"
+             "c.execute('SELECT count(*) FROM memory_vec').fetchone();"
+             "print('vec-ok')" % str(SCRIPTS_DIR)],
+            env=env, capture_output=True, text=True, timeout=60)
+        if probe.returncode != 0 or "vec-ok" not in probe.stdout:
+            self.skipTest("sqlite-vec extension unavailable — vec-only "
+                          "premise cannot run here")
         r = self.run_store("recall", "--query", "fast nimble canine vaults the sleepy hound",
                            "--namespace", PROJECT_NS, "--include-global",
                            "--hybrid", "--no-bump", "--json", env=env)

@@ -604,6 +604,135 @@ def unfold_change_history(
         return []
 
 
+# --- Lexical query hygiene (issue #112, Workstream C-1) ----------------------
+#
+# The FTS term builder used to turn EVERY whitespace token of the (composed)
+# query into a `"<token>"*` prefix wildcard joined with OR, matched
+# unqualified against memory_fts — whose column list includes `namespace`
+# (schema.py). Three flooding mechanisms followed: stop words and short
+# tokens prefix-matched huge row populations, any query token equal to a
+# namespace-string token ("project", "zmem", "github") matched every row in
+# that namespace, and nothing bounded the term count. These constants and
+# `_normalize_query_terms` are the fix; they are the single choke point every
+# recall surface (CLI recall/search, MCP, hooks, Hermes, eval harnesses,
+# miss-rate mirror, --explain) flows through.
+
+# Closed-class English function words (articles, conjunctions,
+# prepositions, pronouns, auxiliaries) plus common degree/time adverbs
+# (now, also, just, very, too, again) that carry no retrieval signal.
+# Deliberately EXCLUDES every
+# operation-token vocabulary word (git, stash, pop, bun, test, gh, pr,
+# merge, fetch, push, reset, soft, origin, main, head, worktree, list, run,
+# queue, auto, ...) — the ops lane is the high-signal lane and must never be
+# stoplisted (issue #85/#112). tests/test_query_hygiene_terms.py pins the
+# disjointness.
+QUERY_STOPWORDS = frozenset("""
+a an the and or but nor so yet for of to in on at by with from as is are was
+were be been being am do does did have has had will would shall should can
+could may might must i you he she it we they them his her its their our your
+my me us this that these those there here what which who whom when where why
+how if then than not no nor up down out off about into over under again once
+all any some such own same very too just also because while during before
+after between through against s t don now
+""".split())
+
+# A prefix wildcard needs at least this many characters to carry signal;
+# shorter tokens become EXACT terms (keeps 2-char ops tokens like "gh"/"pr"
+# queryable while killing `"a"*`/`"ls"*` floods).
+MIN_PREFIX_TERM_LEN = 3
+
+# The documented term cap (issue #112: "start at 24, make it a named
+# constant"): a bounded OR expression no matter how long the prompt is.
+MAX_QUERY_TERMS = 24
+
+# Under the cap, the LAST terms always survive: compose_inject_query
+# (ops_tokens.py) places the ops-token tail at the END of the composed query
+# (reserved slice <= 150 chars, <= _MAX_TOKENS = 12 tokens), and issue #112
+# forbids truncating the ops lane away. 12 mirrors that bound.
+_QUERY_TERM_TAIL_SLOTS = 12
+
+# Punctuation stripped from token EDGES only, before casefolding — internal
+# punctuation (dots/hyphens/slashes in file names, refs) is preserved so
+# unicode61 phrase semantics keep matching exactly as before. Edge-stripping
+# also keeps FTS5 operator characters (*, :, (, )) out of the expression.
+# The Unicode quote/dash entries close the #112-review bypass: FTS5's
+# unicode61 tokenizer drops “ ” ‘ ’ – — … when PARSING the query, so a
+# curly-quoted stop word ("“the”") would otherwise reach the MATCH as a
+# bare stopword term and resurrect the flood for that token.
+_TERM_EDGE_PUNCT = "\"'`;,(){}[]<>|&$!?:.*+-_=\u201c\u201d\u2018\u2019\u201a\u201e\u2013\u2014\u2026"
+
+
+def _normalize_query_terms(query: str) -> list[str]:
+    """Normalize a raw recall query into the bounded FTS term list (#112).
+
+    Whitespace-split, edge-strip punctuation, casefold, drop closed-class
+    stop words, dedupe preserving first-seen order, then apply the
+    head+tail cap (MAX_QUERY_TERMS total, _QUERY_TERM_TAIL_SLOTS of which
+    are reserved for the tail so the ops lane survives long prompts).
+    """
+    raw = [t for t in re.split(r"\s+", (query or "").strip()) if t]
+    terms: list[str] = []
+    seen: set[str] = set()
+    for tok in raw:
+        tok = tok.strip(_TERM_EDGE_PUNCT).casefold()
+        if not tok or tok in QUERY_STOPWORDS or tok in seen:
+            continue
+        if "'" in tok or "\u2019" in tok:
+            # Contraction handling (#112 review): FTS5 tokenizes "don't" as
+            # the phrase [don, t] and the trailing prefix wildcard turns it
+            # into a [don, t*] adjacency match — stopword halves make those
+            # segments noise. Split on the apostrophe, drop stopword and
+            # 1-char segments, keep the first meaningful stem (None if the
+            # token was ALL stopword/short — "it's", "o'clock" — drop it).
+            kept = [s for s in re.split(r"['\u2019]", tok)
+                    if s and s not in QUERY_STOPWORDS and len(s) >= 2]
+            if not kept:
+                continue
+            tok = kept[0]
+            if tok in QUERY_STOPWORDS or tok in seen:
+                continue
+        seen.add(tok)
+        terms.append(tok)
+    if len(terms) > MAX_QUERY_TERMS:
+        tail_n = min(_QUERY_TERM_TAIL_SLOTS, MAX_QUERY_TERMS)
+        head_n = MAX_QUERY_TERMS - tail_n
+        head = terms[:head_n]
+        tail = [t for t in terms[len(terms) - tail_n:] if t not in set(head)]
+        terms = head + tail
+    return terms
+
+
+def _fts_expression(terms: list[str]) -> str:
+    """Build the column-filtered FTS5 MATCH expression from normalized
+    terms (#112): `{content tags} : (...)` — the row's namespace text can
+    never by itself make a row a candidate. Tokens >= MIN_PREFIX_TERM_LEN
+    get the `*` prefix wildcard; shorter tokens match exactly. Note: the
+    lane already fails open to `rows = []` on sqlite3.OperationalError, so
+    a hypothetical sqlite without FTS5 column-filter syntax would silently
+    empty every pool — the CI contrast guards in the #112 acceptance checks
+    are the detection rung (column filters are original FTS5 grammar,
+    present in every bundled sqlite CPython 3.11+ ships).
+    """
+    if not terms:
+        return ""
+    safe_terms = []
+    for t in terms:
+        t_escaped = t.replace('"', '""')
+        if len(t) >= MIN_PREFIX_TERM_LEN:
+            safe_terms.append(f'"{t_escaped}"*')
+        else:
+            safe_terms.append(f'"{t_escaped}"')
+    return "{content tags} : (" + " OR ".join(safe_terms) + ")"
+
+
+def _explain_query_shape(query: str) -> dict:
+    """Normalized terms + exact MATCH expression for the explain envelope
+    (#112): one normalization call shared by both fields so they cannot
+    drift from each other or from the lane."""
+    terms = _normalize_query_terms(query)
+    return {"terms": terms, "fts_query": _fts_expression(terms)}
+
+
 def _normalize_as_of(as_of: str | None) -> str | None:
     """Normalize an --as-of timestamp to the canonical Z-suffixed UTC form
     the store compares against (PRR-022 fix, issue #58 3.6).
@@ -666,6 +795,15 @@ def _recall_one_tier(
     CLI flag — the shipped ranking weights stay the W_* module constants.
     """
     terms = [t for t in re.split(r"\s+", query.strip()) if t]
+    # Query hygiene (#112): the MATCH is built from the NORMALIZED term list
+    # (stop words, dupes, degenerate prefix wildcards and unbounded term
+    # counts removed) and is column-filtered to {content tags} so namespace
+    # text can never make a row a candidate. The RAW `terms` keeps feeding
+    # the entity/vec lane gates below — those lanes are exact/continuous
+    # matchers with no OR-flood semantics, and changing their inputs is
+    # #113's relevance-floor territory, not this fix.
+    fts_terms = _normalize_query_terms(query)
+    fts_query = _fts_expression(fts_terms)
     floor = min_confidence if min_confidence is not None else CONFIDENCE_FLOOR
     # v9 (#59, 4.4): full as-of predicate from the shared helper (issue #58
     # 3.6 built only the valid_from half; the valid_until half was a (1=1)
@@ -674,14 +812,9 @@ def _recall_one_tier(
     # may surface; without as_of the live filter stays (default = as of now).
     as_of_clause, as_of_params = _as_of_temporal_predicate(as_of, alias="m")
     live_clause = "" if as_of else "AND m.superseded_at IS NULL"
-    if not terms:
+    if not terms or not fts_terms:
         rows = []
     else:
-        safe_terms = []
-        for t in terms:
-            t_escaped = t.replace('"', '""')
-            safe_terms.append(f'"{t_escaped}"*')
-        fts_query = " OR ".join(safe_terms)
         params: list = [fts_query]
         ns_clause = ""
         if ns_list:
@@ -1823,6 +1956,11 @@ def explain_recall(
     results = presented
     explain_obj = {
         "query": query,
+        # Issue #112: record what the FTS lane ACTUALLY matched — the
+        # normalized, bounded term list and the exact column-filtered MATCH
+        # expression, from the same helpers the lane uses so the two cannot
+        # drift.
+        "query_shape": _explain_query_shape(query),
         "target": target,
         # The effective settings that materially shape the verdicts: a
         # below_limit/namespace verdict is only interpretable next to the
