@@ -12,6 +12,30 @@ README.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-09-06
+
+### Added
+
+- **memory** (issue #111): the injection-direction precision gold —
+  `scripts/eval_inject_runner.py` + `eval/injection_gold.jsonl` +
+  `eval/baseline-injection.json`. The harness drives the REAL `--for-injection`
+  lane (same composition, selective-inject gate and token budget the hooks
+  execute; MMR and link expansion at hook defaults) and scores the RENDERED
+  fence set, not raw recall: precision@k, false-injection rate, empty-pool
+  rate and hit@k, overall and per moment (user prompt, pre-tool operation
+  tokens, subagent task text, pre-compaction). 100 labeled positives
+  including the six #85 decision-point lessons, plus 10 negative controls
+  (no-retrieval-need prompts); any local labeled JSONL can be scored
+  ad hoc by passing `--gold`; the committed baseline records the known
+  failure at HEAD — 3 of 10 negatives inject (false-injection rate 0.30).
+  No-silent-bypass: the harness re-derives the gate/budget invariants from
+  pure primitives and refuses (exit 2) if either is stubbed out
+  (tests/test_eval_inject_runner.py). Record-only in CI with artifact
+  upload; the ratchet later is one flag (`--fail-under-precision` /
+  `--fail-under-false-injection` / `--compare-baseline`). Thresholds and
+  ranking are untouched (measure first).
+
+
 ## [0.20.0] - 2026-09-06
 
 Workstream B PR 2 of 4 from the proactive-memory epic (#100): the

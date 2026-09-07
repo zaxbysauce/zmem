@@ -70,6 +70,16 @@ retrieval floor by default). This follows the finding that intrinsic self-correc
 - The offline eval covers retraction, polarity, and change-intent buckets
   alongside the original six, and `scripts/eval_self_corpus.py` measures recall
   against a snapshot of your own corpus (home store refused by design).
+- The injection-direction precision gold (issue #111) runs the REAL
+  `--for-injection` lane — the same composition, selective-inject gate and
+  token budget the hooks execute — and scores the rendered set with negative
+  controls and per-moment suites: `python scripts/eval_inject_runner.py
+  --store <path>`. Reports precision@k, false-injection rate, empty-pool rate
+  and hit@k overall and per moment; the committed
+  `eval/baseline-injection.json` records the HEAD numbers (including the
+  measured failure that negative controls DO inject — 0.30 at the gold's
+  seed set) so later phases show a delta via `--compare-baseline`. The
+  harness refuses (exit 2) if the gate or the token budget is stubbed out.
 - Every public capability claim is audited in `docs/CLAIMS-AUDIT.md`; scores
   never gate CI.
 

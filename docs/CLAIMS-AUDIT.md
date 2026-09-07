@@ -1,8 +1,9 @@
 # Claims Audit — what zmem actually claims (issue #82)
 
 Every public capability claim in `README.md` maps to a code path, a committed
-eval artifact, or is marked **aspirational**. Scores from `eval_runner.py`
-never gate CI (`--fail-under` is off; `.github/workflows/ci.yml`). No Argos /
+eval artifact, or is marked **aspirational**. Scores from `eval_runner.py` and
+`eval_inject_runner.py` never gate CI (`--fail-under` / `--fail-under-*` /
+`--compare-baseline` are off; `.github/workflows/ci.yml`). No Argos /
 LongMemEval / third-party benchmark numbers appear anywhere in this repo's
 claims; zmem publishes only what its own harness measures on its own fixture.
 
@@ -12,6 +13,7 @@ claims; zmem publishes only what its own harness measures on its own fixture.
 | Keyword recall with a confidence floor, high-precision-first | `storelib/schema.py` `CONFIDENCE_FLOOR`, `storelib/recall.py` `_recall_one_tier` (floor in lane SQL); `tests/test_injection_recall.py` | shipped |
 | `--as-of` point-in-time recall; `update`/`supersede`/`invalidate` are append-only (tombstone + lineage) | `storelib/recall.py` `_as_of_temporal_predicate` usage; `storelib/write.py` `update_memory`/`supersede_memory`; `tests/test_as_of_recall.py`, `tests/test_update_invalidate.py` | shipped |
 | Offline eval harness, 48-item gold (42 through issue #82 + 6 decision-point items), deterministic (fake embedder + pinned clock), scores do NOT gate CI | `scripts/eval_runner.py` (`--store` required, `--fail-under` default None), `storelib/eval_gold.py` `BUCKETS`/`evaluate_items`, `eval/gold.jsonl`, `.github/workflows/ci.yml` (no `--fail-under`) | shipped |
+| Injection precision gold (issue #111): the REAL `--for-injection` lane scored on the rendered fence set — precision@k, false-injection rate, empty-pool rate, hit@k, per moment (user prompt / pretool ops tokens / subagent task / precompact recent), 100 labeled positives + 10 negative controls, committed baseline; no-silent-bypass invariant (refuses exit 2 if gate or token budget is stubbed); record-only in CI | `scripts/eval_inject_runner.py`, `storelib/eval_gold.py` `evaluate_injection_items`/`injection_per_moment`/`BypassError`, `eval/injection_gold.jsonl`, `eval/baseline-injection.json`, `tests/test_eval_inject_runner.py`, `.github/workflows/ci.yml` (no `--fail-under-*`) | shipped |
 | Retrieval debugger: `recall --explain [--target ID\|fragment] [--json]`, zero-write, closed reason set | `storelib/recall.py` `EXPLAIN_REASONS`/`explain_recall`; `tests/test_explain_recall.py` | shipped (issue #82) |
 | Change-intent lineage unfold on EXPLICIT recall only (`[PREVIOUSLY]`, budgeted, never bumped; hooks/`--no-bump`/`search` never unfold) | `storelib/recall.py` `_CHANGE_INTENT_RES`/`_unfold_enabled`/`unfold_change_history`; `tests/test_chain_unfold.py` | shipped (issue #82) |
 | Eval honesty buckets: retraction, polarity, change-intent (+ optional `explicit` gold flag) | `eval/gold.jsonl` items `retract-*`, `polarity-*`, `ci-*`; `tests/fixtures/eval_store.py` rowids 51–64; `tests/test_eval_runner.py` | shipped (issue #82) |
