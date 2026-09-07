@@ -468,7 +468,7 @@ class TestHybridRrfGlobalUnion(_StoreCase):
         # constructed (no runtime, or sqlite-vec unloadable so the lane fails
         # open to empty), SKIP — the premise is unconstructible there and the
         # test never actually exercised the vec lane on such boxes.
-        real_models_dir = emb_mod._resolve_models_dir()
+        real_models_dir = emb_mod.availability_status()["models_dir"]
         env["ZMEM_MODELS_DIR"] = str(real_models_dir)
         r2 = self.run_store("reembed", "--all", "--confirm", env=env)
         if r2.returncode != 0:

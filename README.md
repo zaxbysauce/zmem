@@ -62,7 +62,9 @@ retrieval floor by default). This follows the finding that intrinsic self-correc
   with ZERO writes and explains every verdict — found, below_limit, below_floor,
   omitted_injection, omitted_untrusted_web, namespace, superseded,
   not_valid_at_as_of, vec_lane_miss, not_in_pool, not_in_db — using zmem's own
-  gates as first-class reasons.
+  gates as first-class reasons. With `--json`, the `explain` object also records
+  `query_shape`: the normalized, capped FTS terms and the exact column-filtered
+  MATCH expression that ran (#112).
 - On explicit recall only, a change-intent query ("what changed about X") can
   append the tombstoned predecessors of a hit as budgeted `[PREVIOUSLY]` rows
   (never counted against the limit, never popularity-bumped). Hooks and other

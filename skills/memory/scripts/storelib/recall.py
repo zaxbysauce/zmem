@@ -617,8 +617,10 @@ def unfold_change_history(
 # recall surface (CLI recall/search, MCP, hooks, Hermes, eval harnesses,
 # miss-rate mirror, --explain) flows through.
 
-# Closed-class English function words ONLY (articles, conjunctions,
-# prepositions, pronouns, auxiliaries). Deliberately EXCLUDES every
+# Closed-class English function words (articles, conjunctions,
+# prepositions, pronouns, auxiliaries) plus common degree/time adverbs
+# (now, also, just, very, too, again) that carry no retrieval signal.
+# Deliberately EXCLUDES every
 # operation-token vocabulary word (git, stash, pop, bun, test, gh, pr,
 # merge, fetch, push, reset, soft, origin, main, head, worktree, list, run,
 # queue, auto, ...) — the ops lane is the high-signal lane and must never be
@@ -653,7 +655,11 @@ _QUERY_TERM_TAIL_SLOTS = 12
 # punctuation (dots/hyphens/slashes in file names, refs) is preserved so
 # unicode61 phrase semantics keep matching exactly as before. Edge-stripping
 # also keeps FTS5 operator characters (*, :, (, )) out of the expression.
-_TERM_EDGE_PUNCT = "\"'`;,(){}[]<>|&$!?:.*+-_="
+# The Unicode quote/dash entries close the #112-review bypass: FTS5's
+# unicode61 tokenizer drops “ ” ‘ ’ – — … when PARSING the query, so a
+# curly-quoted stop word ("“the”") would otherwise reach the MATCH as a
+# bare stopword term and resurrect the flood for that token.
+_TERM_EDGE_PUNCT = "\"'`;,(){}[]<>|&$!?:.*+-_=\u201c\u201d\u2018\u2019\u201a\u201e\u2013\u2014\u2026"
 
 
 def _normalize_query_terms(query: str) -> list[str]:
@@ -671,6 +677,20 @@ def _normalize_query_terms(query: str) -> list[str]:
         tok = tok.strip(_TERM_EDGE_PUNCT).casefold()
         if not tok or tok in QUERY_STOPWORDS or tok in seen:
             continue
+        if "'" in tok or "\u2019" in tok:
+            # Contraction handling (#112 review): FTS5 tokenizes "don't" as
+            # the phrase [don, t] and the trailing prefix wildcard turns it
+            # into a [don, t*] adjacency match — stopword halves make those
+            # segments noise. Split on the apostrophe, drop stopword and
+            # 1-char segments, keep the first meaningful stem (None if the
+            # token was ALL stopword/short — "it's", "o'clock" — drop it).
+            kept = [s for s in re.split(r"['\u2019]", tok)
+                    if s and s not in QUERY_STOPWORDS and len(s) >= 2]
+            if not kept:
+                continue
+            tok = kept[0]
+            if tok in QUERY_STOPWORDS or tok in seen:
+                continue
         seen.add(tok)
         terms.append(tok)
     if len(terms) > MAX_QUERY_TERMS:
@@ -703,6 +723,14 @@ def _fts_expression(terms: list[str]) -> str:
         else:
             safe_terms.append(f'"{t_escaped}"')
     return "{content tags} : (" + " OR ".join(safe_terms) + ")"
+
+
+def _explain_query_shape(query: str) -> dict:
+    """Normalized terms + exact MATCH expression for the explain envelope
+    (#112): one normalization call shared by both fields so they cannot
+    drift from each other or from the lane."""
+    terms = _normalize_query_terms(query)
+    return {"terms": terms, "fts_query": _fts_expression(terms)}
 
 
 def _normalize_as_of(as_of: str | None) -> str | None:
@@ -1932,10 +1960,7 @@ def explain_recall(
         # normalized, bounded term list and the exact column-filtered MATCH
         # expression, from the same helpers the lane uses so the two cannot
         # drift.
-        "query_shape": {
-            "terms": _normalize_query_terms(query),
-            "fts_query": _fts_expression(_normalize_query_terms(query)),
-        },
+        "query_shape": _explain_query_shape(query),
         "target": target,
         # The effective settings that materially shape the verdicts: a
         # below_limit/namespace verdict is only interpretable next to the

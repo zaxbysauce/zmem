@@ -179,10 +179,11 @@ degrades to the `explain_unavailable` verdict and the results still print).
 `--target` takes a memory id (full or unambiguous prefix) or a content
 fragment (case-insensitive substring, then token overlap >= 0.7); multiple
 matches produce one verdict per id, never a guess. With `--json` the read
-envelope gains an `explain` object: `query`, `target`, the effective
-settings (`namespace`, `limit`, `include_global`, `global_limit`, `no_mmr`,
-`no_bump`, `as_of`, `hybrid`), and `verdicts[]` with
-`id`/`reason`/`rank`/`score`/`detail`.
+envelope gains an `explain` object: `query`, `query_shape` (the
+normalized terms + exact FTS MATCH expression, #112), `target`, the
+effective settings (`namespace`, `limit`, `include_global`,
+`global_limit`, `no_mmr`, `no_bump`, `as_of`, `hybrid`), and
+`verdicts[]` with `id`/`reason`/`rank`/`score`/`detail`.
 
 Verdict reasons are a CLOSED set (`EXPLAIN_REASONS` in `storelib/recall.py`):
 
