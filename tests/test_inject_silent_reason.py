@@ -60,6 +60,10 @@ _STRIP_ENV = (
     "ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_NAMESPACE",
     "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_INJECT_FLOOR_RECENT",
     "ZMEM_INJECT_FLOOR_PROMPT", "ZMEM_INJECT_FLOOR_GATE_NONE",
+    # issue #113: the per-lane relevance floors must be stripped too, or an
+    # ambient operator value (e.g. ZMEM_INJECT_FLOOR_LEX=0.0) flips the
+    # below-relevance / happy-path assertions non-hermetically.
+    "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS", "ZMEM_INJECT_FLOOR_ENT",
     "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
     # #93 A1 residue: eval-runner pollution vars — a single-process
     # multi-file runner must not leak the fake embedder or pinned clock in.

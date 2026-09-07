@@ -60,6 +60,7 @@ import io  # noqa: E402
 import math  # noqa: E402
 import struct  # noqa: E402
 import unittest  # noqa: E402
+from unittest import mock  # noqa: E402
 
 import storelib.recall as recall_mod  # noqa: E402  (env pinned above)
 import storelib.write as write_mod  # noqa: E402
@@ -220,6 +221,31 @@ class RecallLaneCompositionTest(unittest.TestCase):
         self.assertAlmostEqual(lanes["rel"], expected_rel, places=12,
                                msg="rel must be the max of measured lanes")
 
+    def test_per_pk_fallback_measures_cos_when_knn_misses(self):
+        # Issue #113 review round (tc-3): a candidate the KNN generator did
+        # NOT surface must still get a measured cosine lane via the per-PK
+        # embedding lookup (recall.py:1011-1024). Simulate a KNN total miss
+        # (vec lane returns nothing) — every row then rides the fallback,
+        # reading the stored memory.embedding blob.
+        both_id = self.ids["both"]
+        self.assertGreater(
+            float(self.conn.execute(
+                "SELECT length(embedding) FROM memory WHERE id = ?",
+                (both_id,)).fetchone()[0]), 0,
+            "fixture precondition: memory.embedding must be populated")
+        with mock.patch.object(recall_mod, "_vec_knn_in_namespace",
+                               lambda *a, **k: []):
+            scored = self._recall()
+        rows = {item["id"]: item for _score, item in scored}
+        both = rows[both_id]
+        self.assertGreater(both["_lanes"]["cos"], 0.0,
+                           "per-PK fallback must measure the cosine lane "
+                           "when the KNN lane surfaces nothing")
+        self.assertGreater(both["_rel_cos"], 0.0)
+        # The fallback value is the same primitive the KNN path produces:
+        # cos(Q, both) ~ 0.514 for the hand-placed geometry.
+        self.assertAlmostEqual(both["_rel_cos"], 0.514, delta=0.05)
+
     def test_one_term_row_lex_is_measured_zero(self):
         scored = self._recall()
         rows = {item["id"]: item for _score, item in scored}
@@ -248,6 +274,121 @@ class RecallLaneCompositionTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # C. inject gate precedence
 # ---------------------------------------------------------------------------
+
+class _RrBindsStub:
+    """Per-row hand-placed blobs for the rr-binds fixture (issue #113 tc-2).
+
+    The write path dedups on embedding cosine >= 0.85, so every fixture row
+    needs its OWN blob: the shared STUB above returns one weak blob for any
+    unknown text, which silently collapses this fixture into pre-existing
+    rows (probed 2026-09-07: add_memory returned another row's id). Geometry:
+    query = _BLOB_QUERY (0.6 e0 + 1.0 e1 + 0.05 e3); target = e15 so its
+    cosine lane is 0.0 and ONLY the lexical lane can admit it; decoy_i =
+    unit(e_(2+i) + 0.9 e0) — pairwise cos ~0.45, cos to query ~0.34, cos to
+    the target 0.0, all far under the 0.85 dedup threshold."""
+
+    def __init__(self, blobs: dict):
+        self._blobs = blobs
+
+    def is_available(self) -> bool:
+        return True
+
+    def embed_text(self, text: str):
+        return self._blobs.get((text or "").strip(), _BLOB_WEAK)
+
+
+# Target: both query terms at tf=1 spread across a 150-token unique-filler
+# body — long enough that its bm25 sinks well under the short tf=4 decoys'
+# (rr needs real headroom under 0.30, and bm25's tf saturation caps how far
+# tf alone can go).
+_RR_TARGET_CONTENT = (QUERY + " "
+                      + " ".join(f"filler{i}" for i in range(250)))
+_RR_DECOY_CONTENTS = [
+    f"kubernetes kubernetes kubernetes kubernetes tolerations "
+    f"decoy{i} zzz{i} qqq{i}" for i in range(8)
+]
+_RR_BLOBS = {
+    QUERY: _BLOB_QUERY,
+    _RR_TARGET_CONTENT: _unit_blob(_axis(15)),
+}
+for _i, _c in enumerate(_RR_DECOY_CONTENTS):
+    _RR_BLOBS[_c] = _unit_blob(
+        [0.9 if _j == 0 else (1.0 if _j == 2 + _i else 0.0)
+         for _j in range(DIM)])
+RR_STUB = _RrBindsStub(_RR_BLOBS)
+
+
+class RrBindsIntegrationTest(unittest.TestCase):
+    """Integration pin (issue #113 review round, tc-2): a cov=1.0 row that is
+    NOT pool-best gets lex = 1.0 x rr with rr << 1, so the 0.30 lexical floor
+    actually TRIPS through the real recall pipeline — short tf-heavy decoys
+    dominate |bm25| and dilute the long target's rank ratio."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.conn = connect()
+        _prepare_store(cls.conn)
+        original = write_mod._embeddings
+        write_mod._embeddings = RR_STUB
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                # Target: matches BOTH query terms (cov = 1.0, eligible) but
+                # long content dilutes its term frequency -> deep pool rank.
+                cls.target_id = add_memory(
+                    cls.conn, namespace=NS, type_="fact",
+                    content=_RR_TARGET_CONTENT,
+                    tags="rrbind", signal="test", confidence=0.9,
+                    source_ref="session:rr-seed",
+                )
+                # Decoys: short docs with tf=4 on term 1 AND term 2 present
+                # -> high |bm25| on both lanes; they dominate the pool-best
+                # rank the rr ratio uses (a decoy WITHOUT "tolerations"
+                # cannot bind: the rare term's idf hands the long target
+                # the pool-best bm25 regardless of dilution).
+                for content in _RR_DECOY_CONTENTS:
+                    add_memory(
+                        cls.conn, namespace=NS, type_="fact",
+                        content=content,
+                        tags="rrbind", signal="test", confidence=0.9,
+                        source_ref="session:rr-seed",
+                    )
+        finally:
+            write_mod._embeddings = original
+        cls.conn.execute(
+            "UPDATE memory SET ingestion_ts=?, valid_from=? WHERE namespace=?",
+            (PIN_TS, PIN_TS, NS),
+        )
+        cls.conn.commit()
+        cls.addClassCleanup(cls.conn.close)
+
+    def test_deep_pool_cov_full_row_trips_the_lexical_floor(self):
+        orig_emb = recall_mod._embeddings
+        recall_mod._embeddings = RR_STUB
+        self.addCleanup(setattr, recall_mod, "_embeddings", orig_emb)
+        scored = recall_mod._recall_one_tier(
+            self.conn, query=QUERY, ns_list=[NS], limit=25,
+            min_confidence=None, hybrid=True, now_epoch=FIXED_NOW,
+            collect_lanes=True,
+        )
+        # The fixture must survive write-path dedup: 9 rows written, so the
+        # pool must still hold most of them (a dedup collapse silently
+        # empties the decoy pool and pins rr at 1.0).
+        self.assertGreaterEqual(
+            len(scored), 7,
+            "fixture collapsed: write-path dedup ate the decoy pool")
+        rows = {item["id"]: item for _score, item in scored}
+        target = rows[self.target_id]
+        lanes = target["_lanes"]
+        self.assertEqual(lanes["cov"], 1.0, "target matches both terms")
+        self.assertLess(lanes["rr"], 1.0, "target is NOT pool-best")
+        self.assertLess(
+            lanes["lex"], 0.30,
+            f"cov*rr must trip the 0.30 lexical floor; got {lanes}")
+        selected, status, stats = selective_inject_filter(
+            [target], with_stats=True)
+        self.assertEqual(selected, [], "lex below floor -> relevance-dropped")
+        self.assertEqual(stats["relevance_failed"], 1)
+
 
 class GatePrecedenceTest(unittest.TestCase):
     """Trust gate first, per-lane relevance floors second (issue #113)."""

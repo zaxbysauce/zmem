@@ -194,7 +194,10 @@ def _lane_floors() -> Tuple[float, float, float]:
         getattr(_schema_meta, "INJECT_FLOOR_ENT_ENV", "ZMEM_INJECT_FLOOR_ENT"),
         getattr(_schema_meta, "INJECT_FLOOR_ENT_DEFAULT", 0.5),
     )
-    return lex, cos, ent
+    # A negative floor would trivially clear every measured lane (relevance
+    # values are >= 0), i.e. silently disable the gate. Treat it as operator
+    # error and clamp to 0.0 (the honest "disable this lane" value).
+    return max(0.0, lex), max(0.0, cos), max(0.0, ent)
 
 
 def selective_inject_filter(
@@ -217,12 +220,16 @@ def selective_inject_filter(
     returned — one gate, one source of truth, counted before the write.
 
     Issue #113: rows may also carry per-lane relevance values
-    (``_rel_lex`` / ``_rel_cos`` / ``_rel_ent``). A PRESENT lane value must
-    clear its own floor (default 0.30 / 0.50 / 0.50); an ABSENT lane (the
-    key missing or None — query-less surfaces, link-expansion rows,
-    model-absent cosine) is exempt from that lane. The trust gate is NOT
-    replaced: a row must pass BOTH the trust conditions and every present
-    relevance lane.
+    (``_rel_lex`` / ``_rel_cos`` / ``_rel_ent``). The floors are DISJUNCTIVE
+    across lanes: a trusted row is admitted when ANY MEASURED lane clears its
+    own floor (default 0.30 / 0.50 / 0.50); a measured-but-failing lane does
+    not veto a row another lane admits. An ABSENT lane (the key missing or
+    None — query-less surfaces, link-expansion rows, model-absent cosine) is
+    exempt: it is neither measured nor judged. If at least one lane was
+    measured and NO measured lane clears its floor, the row is not relevant
+    enough and counts in ``relevance_failed``. The trust gate is NOT
+    replaced: a row must pass BOTH the trust conditions AND the relevance
+    disjunction.
 
     Returns ``(selected, status)`` where status is ``"injected"`` (anything
     qualified) or ``"silent"`` (nothing passed). With ``with_stats=True``

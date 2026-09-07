@@ -957,20 +957,22 @@ def _recall_one_tier(
     # |bm25| for the per-query rank ratio, and the combined per-candidate
     # relevance that feeds compute_score AND the inject gate's floors.
     term_hit_ids: dict[str, set[str]] = {}
-    if fts_terms:
-        ns_clause_l = ""
-        params_l: list = []
-        if ns_list:
-            ph_l = ",".join("?" * len(ns_list))
-            ns_clause_l = f"AND m.namespace IN ({ph_l})"
-            params_l.extend(ns_list)
-        params_l.extend(as_of_params)
+    if fts_terms and rows:
+        # Bound every per-term probe by the ALREADY-FETCHED candidate pool:
+        # rows outside the pool never influence matched/cov, so scanning the
+        # whole FTS index per term is pure waste (measured ~250x on a
+        # 2000-row store without the id bound). The id IN list keeps each
+        # probe O(pool) index lookups. Namespace/as-of/live filtering is
+        # unnecessary here — the pool rows were already fetched under those
+        # exact predicates.
+        pool_ids = [r["id"] for r in rows]
+        id_ph = ",".join("?" * len(pool_ids))
         for t in fts_terms:
             try:
                 rows_t = conn.execute(
                     "SELECT m.id FROM memory_fts f JOIN memory m ON m.rowid=f.rowid "
-                    f"WHERE memory_fts MATCH ? {ns_clause_l} {as_of_clause} {live_clause}",
-                    [_fts_expression([t])] + params_l,
+                    f"WHERE memory_fts MATCH ? AND m.id IN ({id_ph})",
+                    [_fts_expression([t])] + pool_ids,
                 ).fetchall()
                 term_hit_ids[t] = {x[0] for x in rows_t}
             except sqlite3.OperationalError:
@@ -2142,7 +2144,11 @@ def explain_recall(
                     expansion = expand_recall_links(
                         conn, presented, ns_list=ns_list, budget=link_budget,
                         as_of=as_of, min_confidence=min_confidence,
-                        no_bump=True,
+                        # Mirror the caller's surface: an explicit recall
+                        # (no_bump=False) keeps injection-risk/untrusted_web
+                        # neighbors, so explain must too — otherwise it
+                        # reports not_in_pool for a row real recall surfaces.
+                        no_bump=no_bump,
                     )
                 except Exception:
                     expansion = []

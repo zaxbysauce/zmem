@@ -37,7 +37,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 
-_TMP = tempfile.mkdtemp(prefix="zmem-explain-lanes-")
+_TMP_KEEPALIVE = tempfile.TemporaryDirectory(prefix="zmem-explain-lanes-")
+_TMP = _TMP_KEEPALIVE.name  # TemporaryDirectory cleans up at exit
 os.environ["ZMEM_STORE"] = os.path.join(_TMP, "store.sqlite")
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "nonexistent-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
