@@ -69,6 +69,9 @@ class EndToEndReportTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        from storelib.eval_gold import load_gold
+        cls.labels = {g.id: g.must_include_ids
+                      for g in load_gold(str(GOLD))}
         cls.proc, cls.report = run_runner()
 
     def test_run_succeeds_with_lane_and_provenance(self):
@@ -95,7 +98,12 @@ class EndToEndReportTest(unittest.TestCase):
             # rows); here we pin the auditable rank field instead.
             rank = it["first_hit_rank"]
             self.assertIsInstance(rank, int, it["id"])
-            self.assertGreaterEqual(rank, 0, it["id"])
+            # Exact cross-check: the rank is the 1-based position of the
+            # FIRST labeled id in rendered order, 0 when none rendered.
+            present = [it["rendered_ids"].index(x) + 1
+                       for x in self.labels.get(it["id"], ())
+                       if x in it["rendered_ids"]]
+            self.assertEqual(rank, min(present) if present else 0, it["id"])
             self.assertTrue(it["fence_ok"], it["id"])
 
     def test_per_moment_partition_is_exhaustive(self):
@@ -213,6 +221,29 @@ class NoSilentBypassTest(unittest.TestCase):
         finally:
             recall_mod.apply_token_budget = real
         self.assertIn("budget", str(caught).lower())
+
+    def test_stubbed_gate_dropping_rows_refuses_via_reconstruction(self):
+        # A gate stub that DROPS rows (not pass-through, not inflate) is
+        # invisible to the output-only invariants; the independent
+        # reconstruction must catch it at DEFAULT thresholds — the
+        # mismatch is structural (empty rendered set vs non-empty expected
+        # selection), so no boundary-cranking is needed. Regression pin:
+        # this path previously crashed with a NameError instead of
+        # raising BypassError.
+        import storelib.recall as recall_mod
+        from storelib.eval_gold import BypassError, evaluate_injection_items
+        from storelib.schema import connect
+        real = recall_mod.selective_inject_filter
+        caught = None
+        try:
+            recall_mod.selective_inject_filter = (
+                lambda rows, *a, **k: ([], "silent"))
+            with self.assertRaises(BypassError) as ctx:
+                evaluate_injection_items(connect(), self._items())
+            caught = ctx.exception
+        finally:
+            recall_mod.selective_inject_filter = real
+        self.assertIn("reconstructed", str(caught))
 
 
 class BaselineAndRatchetTest(unittest.TestCase):

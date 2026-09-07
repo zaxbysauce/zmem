@@ -23,7 +23,7 @@ README.
   execute; MMR and link expansion at hook defaults) and scores the RENDERED
   fence set, not raw recall: precision@k, false-injection rate, empty-pool
   rate and hit@k, overall and per moment (user prompt, pre-tool operation
-  tokens, subagent task text, post-compaction). 100 labeled positives
+  tokens, subagent task text, pre-compaction). 100 labeled positives
   including the six #85 decision-point lessons, plus 10 negative controls
   (no-retrieval-need prompts); any local labeled JSONL can be scored
   ad hoc by passing `--gold`; the committed baseline records the known

@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -88,7 +89,7 @@ def _bootstrap_env(store: str) -> None:
         os.environ[key] = value
     os.environ["ZMEM_EMBED_PROFILE"] = "fake"
     os.environ["ZMEM_TEST_NOW"] = EVAL_PIN_TS
-    os.environ["PYTHONUTF8"] = "1"
+    os.environ.setdefault("PYTHONUTF8", "1")
 
 
 def _ensure_store(store: str) -> None:
@@ -123,7 +124,8 @@ def _load_baseline(path: str) -> dict:
         sys.exit(2)
     for key in BASELINE_RATE_KEYS:
         value = metrics[key]
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value)):
             print(f"[eval] baseline {path} metric {key} is not numeric: "
                   f"{value!r}", file=sys.stderr)
             sys.exit(2)

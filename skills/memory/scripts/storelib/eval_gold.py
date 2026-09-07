@@ -296,7 +296,17 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
     applying the owning-module (``storelib.inject``) gate/budget — so a
     recall-level stub that drops or inflates the rendered set is detected
     even when every output invariant happens to hold (e.g. a stub that
-    empties the set, or one that passes sub-floor rows)."""
+    empties the set, or one that passes sub-floor rows).
+
+    Known limitation: the reconstruction re-applies the budget to rows
+    re-read from SQL, which carry ``confidence`` but not the recall-time
+    ``_score`` composite — ``_row_priority`` therefore falls back to
+    ``confidence`` ordering. When the token budget actually binds AND
+    ``_score`` ordering differs from ``confidence`` ordering, a legitimate
+    run could be refused (a false positive, never a false pass). The
+    committed fixture never binds the budget (default 1500 vs max observed
+    ``tokens_used`` 205); treat the reconstruction as a backstop against
+    drop/inflate stubs, not a bit-exact replay under a binding budget."""
     import storelib.inject as _inject
     from storelib.recall import ZMEM_FENCE_CLOSE, ZMEM_FENCE_OPEN
 
@@ -387,13 +397,31 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
             raise BypassError(
                 f"{item_id}: rendered set does not match the independently "
                 f"reconstructed gate+budget selection "
-                f"(rendered={sorted(rendered_ids_sort(rendered_set))} "
+                f"(rendered={_rendered_ids_sort(rendered_set)} "
                 f"expected={sorted(expected_ids)}) — the gate or token "
                 "budget did not run on the candidate pool")
 
 
 def _rendered_ids_sort(ids):
     return sorted(i for i in ids if i)
+
+
+def _mean_precision(pop: list[dict]) -> float:
+    # Mean of the per-item rendered precision (not a truthiness share:
+    # a 0.001-precision item must count as 0.001, not as 1.0).
+    if not pop:
+        return 0.0
+    return sum(it["precision"] for it in pop) / len(pop)
+
+
+def _mrr(pop: list[dict], denom: int) -> float:
+    # Reciprocal-rank mean: the denominator must be the same population
+    # the numerator sums over (positives-only numerator needs a
+    # positives-only denominator).
+    if not pop or denom <= 0:
+        return 0.0
+    return sum((1.0 / it["first_hit_rank"] if it["first_hit_rank"]
+                else 0.0) for it in pop) / denom
 
 
 def _gate_passes(r, floor, gate_none_floor, grounded) -> bool:
@@ -550,19 +578,6 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
         if it["reason"] in silent_reasons:
             silent_reasons[it["reason"]] += 1
 
-    def _mean_precision(pop: list[dict]) -> float:
-        # Mean of the per-item rendered precision (not a truthiness share:
-        # a 0.001-precision item must count as 0.001, not as 1.0).
-        if not pop:
-            return 0.0
-        return sum(it["precision"] for it in pop) / len(pop)
-
-    def _mrr(pop: list[dict], denom: int) -> float:
-        if not pop or denom <= 0:
-            return 0.0
-        return sum((1.0 / it["first_hit_rank"] if it["first_hit_rank"]
-                    else 0.0) for it in pop) / denom
-
     metrics = {
         "hit_at_k": _share(positives, lambda it: it["hit"]),
         "precision_at_k": _mean_precision(positives),
@@ -595,16 +610,12 @@ def injection_per_moment(per_item: list[dict]) -> dict:
             "positive_items": len(positives),
             "negative_items": len(negatives),
             "hit_at_k": _share(positives, lambda it: it["hit"]),
-            "precision_at_k": (
-                sum(it["precision"] for it in positives) / len(positives)
-                if positives else 0.0),
+            "precision_at_k": _mean_precision(positives),
             "false_injection_rate": _share(
                 negatives, lambda it: bool(it["rendered_ids"])),
             "empty_pool_rate": _share(
                 subset, lambda it: it["reason"] == "empty-pool"),
-            "mrr": sum((1.0 / it["first_hit_rank"] if it["first_hit_rank"]
-                        else 0.0) for it in positives) / len(positives)
-            if positives else 0.0,
+            "mrr": _mrr(positives, len(positives)),
         }
     return out
 

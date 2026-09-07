@@ -890,7 +890,7 @@ the same selective-inject gate and token budget the hooks execute — and
 scores the RENDERED set with negative controls: `precision_at_k`,
 `false_injection_rate`, `empty_pool_rate`, `hit_at_k`, overall and per
 moment (user prompt, pre-tool operation tokens, subagent task text,
-post-compaction). Refuses (exit 2) if the gate or budget is stubbed out.
+pre-compaction). Refuses (exit 2) if the gate or budget is stubbed out.
 `--gold` accepts a local labeled JSONL (e.g. derived from your own decision
 log) without code changes. Record-only by default; the ratchet flags are
 the one-switch CI gate.
