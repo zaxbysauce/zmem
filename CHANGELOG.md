@@ -12,6 +12,31 @@ README.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-07
+
+### Added
+- **memory** (issue #113): per-lane relevance gate on the injection path.
+  Every scored recall row carries measured per-lane relevance values
+  (`_rel_lex`/`_rel_cos`/`_rel_ent`; a lane with no signal is absent and
+  exempt), and the selective-inject gate requires a PRESENT lane to clear its
+  own floor before a row may render. A silent inject whose rows passed the
+  trust gate but failed these floors names the new closed-set reason
+  `below-relevance` ("nothing relevant") — distinct from `below-bar`
+  ("nothing trusted"). Env overrides `ZMEM_INJECT_FLOOR_LEX`,
+  `ZMEM_INJECT_FLOOR_COS` and `ZMEM_INJECT_FLOOR_ENT` are documented with the
+  calibrated starting values (0.30 / 0.50 / 0.50). `recall --explain` reports
+  the per-lane numbers — `detail.lanes` on `found`/`below_limit` verdicts and
+  the resolved `lane_floors` on the envelope — plus a new `link_expansion`
+  verdict for targets/rows that enter context only via the 1-hop link walk.
+
+### Changed
+- **memory** (issue #113): the composite score's relevance term is now the
+  MAX of the measured lanes — lexical coverage x rank-ratio (eligible when
+  the row matches >= 2 distinct query terms or covers all of them), vec
+  cosine, or entity fraction — instead of the saturated
+  `|bm25|/(1+|bm25|)` back-solve, so a lexically-matched row keeps its
+  cosine and the score carries rank information from every lane.
+
 ## [0.22.0] - 2026-09-06
 
 ### Changed

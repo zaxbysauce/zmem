@@ -1,6 +1,6 @@
 {
   "baseline_for": "scripts/eval_inject_runner.py",
-  "issue": "112+111",
+  "issue": "112+111+113",
   "gold": "eval/injection_gold.jsonl",
   "profile": "fake (model-absent)",
   "clock": "2026-06-01T00:00:00Z",
@@ -8,10 +8,10 @@
   "lane": "for-injection",
   "metrics": {
     "hit_at_k": 1.0,
-    "precision_at_k": 0.6031666666666667,
-    "false_injection_rate": 0.1,
+    "precision_at_k": 0.8978333333333333,
+    "false_injection_rate": 0.0,
     "empty_pool_rate": 0.08181818181818182,
-    "mrr": 0.97,
+    "mrr": 0.98,
     "items": 110,
     "positive_items": 100,
     "negative_items": 10,
@@ -19,7 +19,8 @@
       "empty-pool": 9,
       "omitted": 0,
       "below-bar": 0,
-      "budget-drop": 0
+      "budget-drop": 0,
+      "below-relevance": 1
     }
   },
   "per_moment": {
@@ -28,18 +29,18 @@
       "positive_items": 65,
       "negative_items": 6,
       "hit_at_k": 1.0,
-      "precision_at_k": 0.5187179487179487,
+      "precision_at_k": 0.8735897435897435,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.08450704225352113,
-      "mrr": 0.9769230769230769
+      "mrr": 0.9846153846153847
     },
     "pretool": {
       "items": 20,
       "positive_items": 18,
       "negative_items": 2,
       "hit_at_k": 1.0,
-      "precision_at_k": 0.7916666666666666,
-      "false_injection_rate": 0.5,
+      "precision_at_k": 0.9722222222222222,
+      "false_injection_rate": 0.0,
       "empty_pool_rate": 0.05,
       "mrr": 1.0
     },
@@ -48,10 +49,10 @@
       "positive_items": 16,
       "negative_items": 1,
       "hit_at_k": 1.0,
-      "precision_at_k": 0.709375,
+      "precision_at_k": 0.90625,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.058823529411764705,
-      "mrr": 0.90625
+      "mrr": 0.9375
     },
     "precompact": {
       "items": 2,
@@ -64,5 +65,5 @@
       "mrr": 1.0
     }
   },
-  "note": "Committed HEAD baseline (issue #112 C-1, supersedes the #111 baseline): metrics from the real for-injection lane on the deterministic fixture corpus AFTER lexical query hygiene (stoplist, term cap, column-filtered MATCH). vs the #111 baseline: false_injection_rate 0.3 -> 0.1 (the one remaining injected control, neg-pt-status, is a genuine-term match owned by #113 C-2's relevance floor); precision_at_k 0.4707 -> 0.6032; mrr 0.965 -> 0.97; hit_at_k 1.0 unchanged; empty-pool silent reasons 7 -> 9. Later phases diff against this via --compare-baseline; regenerate deliberately when the gold or the lane changes."
+  "note": "Committed HEAD baseline (issue #113, supersedes the #112 baseline): metrics from the real for-injection lane on the deterministic fixture corpus AFTER the #113 relevance composition (lane-max of lexical coverage-x-rank-ratio / cosine / entity feeding compute_score) and the per-lane inject relevance floors (lex 0.30 with >=2-term eligibility, cos 0.50, ent 0.50) plus the below-relevance silent reason. vs the #112 baseline: false_injection_rate 0.1 -> 0.0 (the one previously injected control, neg-pt-status / 'git status', matched a single generic token and is now silent with reason below-relevance); precision_at_k 0.6032 -> 0.8978; mrr 0.97 -> 0.98; hit_at_k 1.0 unchanged; empty-pool silent reasons unchanged at 9 (the 10th negative moved from injected to below-relevance). Later phases diff against this via --compare-baseline; regenerate deliberately when the gold or the lane changes."
 }

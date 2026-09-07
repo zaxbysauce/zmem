@@ -22,7 +22,7 @@ from storelib.entity import entities_for_memory, entities_for_memories, entity_m
 from storelib.links import expand_recall_links
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
-from storelib.inject import apply_token_budget, classify_silent_reason, estimate_tokens, inject_token_budget, selective_inject_filter
+from storelib.inject import _lane_floors, apply_token_budget, classify_silent_reason, estimate_tokens, inject_token_budget, selective_inject_filter
 from schema_meta import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
 import embed_profiles as _profiles
 from storelib.cross_encoder import maybe_rerank as _cross_maybe_rerank
@@ -48,10 +48,13 @@ MMR_LAMBDA = _env_float("ZMEM_MMR_LAMBDA", MMR_LAMBDA_DEFAULT)
 
 # Issue #82: closed vocabulary for `recall --explain` verdicts. One source of
 # truth; tests import this tuple and pin every value against a fixture row.
+# Issue #113 adds link_expansion: a target that missed every retrieval pool
+# but WOULD enter context via the read-only 1-hop link walk.
 EXPLAIN_REASONS = (
     "found", "below_limit", "below_floor", "omitted_injection",
     "omitted_untrusted_web", "namespace", "superseded", "not_valid_at_as_of",
     "vec_lane_miss", "not_in_pool", "not_in_db", "explain_unavailable",
+    "link_expansion",
 )
 
 # Issue #82: change-intent trigger for the explicit-recall lineage unfold.
@@ -143,6 +146,7 @@ def _uses_count(row: sqlite3.Row | dict) -> int:
 
 def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: float,
                   vec_sim: float | None = None,
+                  relevance: float | None = None,
                   weights: dict | None = None) -> float:
     """Composite score: BM25 relevance + confidence boost + recency + popularity.
 
@@ -150,6 +154,13 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
     that came from the vector path only (no FTS match), fts_rank is None — in
     that case vec_sim (cosine similarity, 0..1) is used as the relevance proxy.
     All other factors come from the memory row itself.
+
+    ``relevance`` (issue #113): a pre-computed combined relevance value in
+    [0, 1] from the per-lane composition in ``_recall_one_tier`` — clamped
+    and used DIRECTLY as the relevance component, so the saturated
+    ``abs(fts_rank)/(1+abs(fts_rank))`` back-solve no longer feeds the score
+    on the lane-aware path. When None (every legacy caller: tune-weights,
+    unit callers), the historical formula below runs byte-identically.
 
     ``weights`` (issue #64, 9.6): optional {"bm25", "confidence", "recency",
     "popularity"} override evaluated INSTEAD of the W_* module constants.
@@ -166,14 +177,22 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
         w_rec = float(weights.get("recency", W_RECENCY))
         w_pop = float(weights.get("popularity", W_POPULARITY))
 
+    if relevance is not None:
+        # Issue #113 lane-aware path: the caller already normalized across
+        # lanes (per-query coverage x rank ratio / cosine / entity proxy).
+        # Clamp defensively — a NaN would poison every downstream sort.
+        relevance = float(relevance)
+        if relevance != relevance or relevance in (float("inf"), float("-inf")):
+            relevance = 0.0
+        relevance_comp = max(0.0, min(1.0, relevance))
     # Relevance component: BM25 if available, else vector similarity as proxy.
-    if fts_rank is not None:
+    elif fts_rank is not None:
         ar = abs(fts_rank)
-        relevance = ar / (1.0 + ar)
+        relevance_comp = ar / (1.0 + ar)
     elif vec_sim is not None:
-        relevance = max(0.0, vec_sim)  # cosine sim already 0..1 for normalized vecs
+        relevance_comp = max(0.0, vec_sim)  # cosine sim already 0..1 for normalized vecs
     else:
-        relevance = 0.0
+        relevance_comp = 0.0
 
     # Confidence component: already 0..1.
     confidence = float(row["confidence"]) if row["confidence"] is not None else 0.3
@@ -200,7 +219,7 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
     popularity = min(1.0, 0.15 * (rc ** 0.5))
 
     return (
-        w_bm25 * relevance
+        w_bm25 * relevance_comp
         + w_conf * confidence
         + w_rec * recency
         + w_pop * popularity
@@ -771,6 +790,7 @@ def _recall_one_tier(
     as_of: str | None = None,
     mmr: bool = True,
     weights: dict | None = None,
+    collect_lanes: bool = False,
 ) -> list[tuple[float, dict]]:
     """FTS5 + composite scoring for ONE namespace set (a single recall tier).
 
@@ -793,6 +813,10 @@ def _recall_one_tier(
     ``weights`` (issue #64, 9.6): optional compute_score weight override,
     threaded from recall_memory for the tune-weights evaluator ONLY. Never a
     CLI flag — the shipped ranking weights stay the W_* module constants.
+
+    ``collect_lanes`` (issue #113): explain-only. When True each scored row
+    additionally carries ``_lanes`` (per-lane diagnostic numbers). Default
+    False keeps every production envelope free of the extra dict.
     """
     terms = [t for t in re.split(r"\s+", query.strip()) if t]
     # Query hygiene (#112): the MATCH is built from the NORMALIZED term list
@@ -858,13 +882,17 @@ def _recall_one_tier(
     # alias ⇒ empty list ⇒ the other lanes fuse exactly as before.
     entity_ids: list[str] = []
     entity_rel_map: dict[str, float] = {}  # memory_id -> matched/total entities
+    query_emb: bytes | None = None
     if terms:
+        if hybrid and _embeddings and _embeddings.is_available():
+            query_emb = _embeddings.embed_text(query)
         entity_ids, entity_rel_map = entity_match_ids(
             conn, query, ns_list=ns_list, as_of=as_of, limit=limit,
         )
     vec_ids: list[str] = []
     if hybrid and _embeddings and _embeddings.is_available() and terms:
-        query_emb = _embeddings.embed_text(query)
+        if query_emb is None:
+            query_emb = _embeddings.embed_text(query)
         if query_emb is not None:
             # Get vec results WITH distances for the similarity map. Issue
             # #58 3.3: over-fetch is bounded at K=15 (max(15, limit+10)) so
@@ -918,7 +946,44 @@ def _recall_one_tier(
                 fts_rank_map[r["id"]] = r["fts_rank"]
         fts_ids = [r["id"] for r in rows]
         fused_ids = _rrf_fuse(fts_ids, vec_ids, entity_ids, k=60)
+        rrf_pos = {mid: i for i, mid in enumerate(fused_ids, 1)}
         rows = _fetch_by_ids(conn, fused_ids, ns_list, floor, as_of=as_of)
+    else:
+        rrf_pos = {}
+
+    # Issue #113: per-lane relevance inputs. Per-term hit sets over the same
+    # namespace/live/as-of filters as the fetch above (one indexed FTS query
+    # per normalized term; terms are capped at 24 by #112), the pool-best
+    # |bm25| for the per-query rank ratio, and the combined per-candidate
+    # relevance that feeds compute_score AND the inject gate's floors.
+    term_hit_ids: dict[str, set[str]] = {}
+    if fts_terms:
+        ns_clause_l = ""
+        params_l: list = []
+        if ns_list:
+            ph_l = ",".join("?" * len(ns_list))
+            ns_clause_l = f"AND m.namespace IN ({ph_l})"
+            params_l.extend(ns_list)
+        params_l.extend(as_of_params)
+        for t in fts_terms:
+            try:
+                rows_t = conn.execute(
+                    "SELECT m.id FROM memory_fts f JOIN memory m ON m.rowid=f.rowid "
+                    f"WHERE memory_fts MATCH ? {ns_clause_l} {as_of_clause} {live_clause}",
+                    [_fts_expression([t])] + params_l,
+                ).fetchall()
+                term_hit_ids[t] = {x[0] for x in rows_t}
+            except sqlite3.OperationalError:
+                term_hit_ids[t] = set()
+    best_rank: float | None = None
+    for r in rows:
+        fr = r["fts_rank"]
+        if fr is None and r["id"] in fts_rank_map:
+            fr = fts_rank_map[r["id"]]
+        if fr is not None:
+            ar_ = abs(fr)
+            if best_rank is None or ar_ > best_rank:
+                best_rank = ar_
 
     # Re-rank by composite score (relevance + confidence + recency + popularity).
     scored: list[tuple[float, dict]] = []
@@ -942,15 +1007,53 @@ def _recall_one_tier(
         fts_r = r["fts_rank"]
         if fts_r is None and r["id"] in fts_rank_map:
             fts_r = fts_rank_map[r["id"]]  # restore rank lost during fusion re-fetch
-        vsim = vec_sim_map.get(r["id"]) if fts_r is None else None
-        # v10 (issue #60, 5.3): an ENTITY-only match carries neither an FTS
-        # rank nor a vec similarity — use the entity relevance proxy
-        # (matched query entities / total matched entities) so the row's
-        # composite score is comparable instead of relevance-less.
-        if fts_r is None and vsim is None:
-            vsim = entity_rel_map.get(r["id"])
+        vsim = vec_sim_map.get(r["id"])
+        if vsim is None and query_emb is not None:
+            # Issue #113: measure the cosine lane DIRECTLY for candidates the
+            # KNN generator did not surface — a candidate's cosine must not
+            # depend on KNN membership. Schema-neutral per-PK lookup (the
+            # embedding column is migration-added; pool is small so the
+            # per-row cost is trivial). Fail-open to lane-absent on stores
+            # predating the embedding migration.
+            try:
+                erow = conn.execute(
+                    "SELECT embedding FROM memory WHERE id = ?", (r["id"],)
+                ).fetchone()
+            except sqlite3.OperationalError:
+                erow = None
+            vsim = _cosine_blob(query_emb, erow[0]) if erow else None
+        entv = entity_rel_map.get(r["id"])
+        # Issue #113 lane composition — a candidate's relevance is the MAX of
+        # its measured lanes, so no lane silently nulls another (the cosine
+        # of a lexically-matched row now survives; the old code kept vec_sim
+        # only when fts_r was None). The lexical leg is per-query normalized:
+        # (matched terms / total) x (row |bm25| / pool-best |bm25|), counted
+        # ONLY when the row matches >= 2 distinct terms or covers all of
+        # them — one shared generic token is not relevance (the measured
+        # "git status" failure shape). Lane ABSENCE is None: the inject
+        # gate's floors judge only measured lanes.
+        rel_lex: float | None = None
+        matched: int | None = None
+        cov: float | None = None
+        rr: float | None = None
+        if fts_r is not None and best_rank and fts_terms:
+            matched = sum(1 for t in fts_terms if r["id"] in term_hit_ids.get(t, ()))
+            cov = matched / len(fts_terms)
+            rr = abs(fts_r) / best_rank
+            # A row WITH a lexical rank always has a MEASURED lex lane: 0.0
+            # when ineligible (matched < 2 and not full coverage) so the
+            # gate's lex floor judges it; None (absent/exempt) is reserved
+            # for rows with no lexical rank at all.
+            if matched >= 2 or cov >= 1.0:
+                rel_lex = cov * rr
+            else:
+                rel_lex = 0.0
+        cos_leg = max(0.0, vsim) if vsim is not None else None
+        ent_leg = max(0.0, entv) if entv is not None else None
+        lane_vals = [v for v in (rel_lex, cos_leg, ent_leg) if v is not None]
+        rel = max(lane_vals) if lane_vals else 0.0
         score = compute_score(row_fields, fts_r, now_epoch, vec_sim=vsim,
-                              weights=weights)
+                              relevance=rel, weights=weights)
         norm_map[r["id"]] = r["content_norm"] or ""
         scored.append((score, {
             "id": r["id"],
@@ -969,7 +1072,25 @@ def _recall_one_tier(
             "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
             "_stale_note": stale_note,
             "_score": round(score, 4),
+            # Issue #113 gate lanes: measured per-lane relevance values (None
+            # = lane absent for this row — the inject gate exempts absent
+            # lanes). Leading-underscore keys, same family as _score.
+            "_rel_lex": rel_lex,
+            "_rel_cos": cos_leg,
+            "_rel_ent": ent_leg,
         }))
+        if collect_lanes:
+            scored[-1][1]["_lanes"] = {
+                "bm25_rank": fts_r,
+                "matched": matched,
+                "cov": cov,
+                "rr": rr,
+                "rrf_rank": rrf_pos.get(r["id"]),
+                "lex": rel_lex,
+                "cos": cos_leg,
+                "entity": ent_leg,
+                "rel": rel,
+            }
 
     # Sort by composite score descending within this tier, take top `limit`.
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -1442,7 +1563,8 @@ def recall_memory(
     if for_injection:
         candidate_rows = results
         candidate_ids = [r["id"] for r in candidate_rows]
-        selected_rows, _gate_status = selective_inject_filter(results)
+        selected_rows, _gate_status, _gate_stats = selective_inject_filter(
+            results, with_stats=True)
         budget_emptied = False
         if selected_rows:
             selected_rows, _est, _dropped = apply_token_budget(selected_rows)
@@ -1453,7 +1575,8 @@ def recall_memory(
             inj_reason = "injected"
         else:
             inj_reason = classify_silent_reason(
-                candidate_rows, omitted=omitted, budget_emptied=budget_emptied)
+                candidate_rows, omitted=omitted, budget_emptied=budget_emptied,
+                lane_stats=_gate_stats)
 
     if for_injection:
         # Issue #114: surfaced telemetry covers ONLY the rendered rows that
@@ -1497,6 +1620,14 @@ def recall_memory(
             # bg-log ``all=`` pre-image the miss-rate join matches against.
             envelope["reason"] = inj_reason
             envelope["candidate_ids"] = candidate_ids
+            # Issue #113: per-candidate lane values (pre-gate), so the eval
+            # harness's primitive re-derivation of the gate can model the
+            # relevance floors without re-running recall.
+            envelope["candidate_lanes"] = {
+                r["id"]: {"lex": r.get("_rel_lex"), "cos": r.get("_rel_cos"),
+                          "ent": r.get("_rel_ent")}
+                for r in candidate_rows
+            }
         print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: hook/text surface uses the fenced render
@@ -1683,18 +1814,23 @@ def _explain_run_pipeline(
     global_deep). The deep pool runs the same tiers at over-fetch depth so
     'scored but beyond --limit' rows are observable; the presented list comes
     from the real-limit run, so it is identical to a plain recall's presented
-    set by construction. NEVER bumps, NEVER unfolds, NEVER prints."""
+    set by construction. NEVER bumps, NEVER unfolds, NEVER prints.
+
+    Issue #113: every tier runs with ``collect_lanes=True`` so explain rows
+    carry the per-lane ``_lanes`` diagnostic dict. Collecting lanes is
+    read-only (the lane inputs are computed for scoring anyway on this path);
+    production recall envelopes keep the default False and stay lean."""
     project_scored = _recall_one_tier(
         conn, query=query, ns_list=ns_list, limit=limit,
         min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-        as_of=as_of, mmr=not no_mmr, weights=weights,
+        as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
     )
     global_scored: list[tuple[float, dict]] = []
     if global_ns_list:
         global_scored = _recall_one_tier(
             conn, query=query, ns_list=global_ns_list, limit=global_limit,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-            as_of=as_of, mmr=not no_mmr, weights=weights,
+            as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
         )
     for _s, item in project_scored:
         item["prompt_injection_risk"] = _classify_injection(item)
@@ -1707,7 +1843,7 @@ def _explain_run_pipeline(
     project_deep = _recall_one_tier(
         conn, query=query, ns_list=ns_list, limit=max(limit * 3, limit + 5),
         min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-        as_of=as_of, mmr=not no_mmr, weights=weights,
+        as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
     )
     global_deep: list[tuple[float, dict]] = []
     if global_ns_list:
@@ -1715,9 +1851,31 @@ def _explain_run_pipeline(
             conn, query=query, ns_list=global_ns_list,
             limit=max(global_limit * 3, global_limit + 5),
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-            as_of=as_of, mmr=not no_mmr, weights=weights,
+            as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
         )
     return presented, project_deep, global_deep
+
+
+def _explain_lane_detail(row: dict) -> dict:
+    """Issue #113: the ``lanes`` sub-dict for a verdict's detail — a COPY of
+    the scored row's ``_lanes`` when the pipeline collected it (explain-only;
+    production rows never carry the key). Empty dict when absent so verdict
+    detail stays a plain JSON object either way."""
+    lanes = row.get("_lanes")
+    return dict(lanes) if lanes else {}
+
+
+def _explain_link_expansion_verdict(mid: str, row: dict) -> dict:
+    """The link_expansion verdict (issue #113): ``mid`` missed every
+    retrieval pool but WOULD enter context via the 1-hop link walk — name
+    the parent row, relation, and generating similarity so the operator can
+    see exactly which edge carried it in."""
+    return {
+        "id": mid, "reason": "link_expansion", "rank": None, "score": None,
+        "detail": {"link_of": row.get("link_of"),
+                   "link_relation": row.get("link_relation"),
+                   "link_score": row.get("link_score")},
+    }
 
 
 def _explain_verdict_for_target(
@@ -1737,6 +1895,11 @@ def _explain_verdict_for_target(
     A row dropped by the confidence floor never reaches the scored pool (the
     floor is applied inside the lane SQL), so below_floor is a pre-check on
     the target row itself — that is the only way the reason can ever fire.
+
+    Issue #113: ``found`` and ``below_limit`` verdicts carry the row's
+    per-lane numbers in ``detail["lanes"]`` (lex/cos/entity + the lexical
+    inputs), so an operator can see WHY a row scored where it did next to
+    the gate thresholds reported top-level as ``lane_floors``.
     """
     mid = row["id"]
     in_project = ns_list is None or row["namespace"] in ns_list
@@ -1761,9 +1924,12 @@ def _explain_verdict_for_target(
     for rank, r in enumerate(presented, start=1):
         if r["id"] == mid:
             return {"id": mid, "reason": "found", "rank": rank,
-                    "score": r.get("_score"), "detail": {}}
+                    "score": r.get("_score"),
+                    "detail": {"lanes": _explain_lane_detail(r)}}
     for r, why in omitted:
         if r["id"] == mid:
+            # Omitted rows keep their why — the injection/untrusted drop is
+            # the verdict; lane numbers would only blur it.
             return {"id": mid, "reason": why, "rank": None,
                     "score": r.get("_score"), "detail": {}}
     deep = project_deep + global_deep
@@ -1771,7 +1937,8 @@ def _explain_verdict_for_target(
         if r["id"] == mid:
             return {"id": mid, "reason": "below_limit", "rank": rank,
                     "score": round(score, 4),
-                    "detail": {"pool_size": len(deep)}}
+                    "detail": {"pool_size": len(deep),
+                               "lanes": _explain_lane_detail(r)}}
     if (as_of and hybrid and row["superseded_at"]
             and _explain_valid_at(row, as_of) and row["embedding"]):
         return {"id": mid, "reason": "vec_lane_miss", "rank": None,
@@ -1857,14 +2024,24 @@ def explain_recall(
     ``superseded`` verdict detail). Fail-open: a thrown tracer yields a single
     ``explain_unavailable`` verdict and the recall results still print.
 
-    The ``link_hops``/``link_budget`` kwargs are accepted for CLI
-    parameter-passing symmetry but deliberately unused: explain never expands
-    links and never unfolds. ``cross_rerank`` (PR-review PRR-001) keeps the
-    debugger faithful when the cross-encoder is CLI-enabled: the presented
-    list is re-ranked exactly like recall_memory's (the helper fails open to
-    input order), so `found`/rank verdicts match what a real recall presents.
-    Deep-pool ranks stay pre-rerank (the pool measures retrieval, not the
-    rerank presentation).
+    Issue #113: every explain row carries the per-lane relevance numbers;
+    ``found``/``below_limit`` verdicts expose them as ``detail["lanes"]`` and
+    the envelope reports the resolved inject-gate thresholds top-level as
+    ``lane_floors`` (so a debugger reads score + gate side by side).
+
+    ``link_hops``/``link_budget`` drive the link-aware verdict (issue #113):
+    when ``link_hops >= 1``, a target that missed every retrieval pool but
+    WOULD enter context via the real recall's 1-hop link expansion gets a
+    ``link_expansion`` verdict naming the parent row, relation, and link
+    score, instead of the misleading ``not_in_pool``. The expansion walk is
+    the same read-only ``expand_recall_links`` recall uses (SELECT-only,
+    ``no_bump`` semantics), so the zero-write guarantee is unchanged.
+    ``cross_rerank`` (PR-review PRR-001) keeps the debugger faithful when the
+    cross-encoder is CLI-enabled: the presented list is re-ranked exactly
+    like recall_memory's (the helper fails open to input order), so
+    `found`/rank verdicts match what a real recall presents. Deep-pool ranks
+    stay pre-rerank (the pool measures retrieval, not the rerank
+    presentation).
     """
     now_epoch = _now_epoch()
     if hybrid is None:
@@ -1935,7 +2112,7 @@ def explain_recall(
             for rank, r in enumerate(presented, start=1):
                 verdicts.append({"id": r["id"], "reason": "found",
                                  "rank": rank, "score": r.get("_score"),
-                                 "detail": {}})
+                                 "detail": {"lanes": _explain_lane_detail(r)}})
             for r, why in omitted:
                 verdicts.append({"id": r["id"], "reason": why, "rank": None,
                                  "score": r.get("_score"), "detail": {}})
@@ -1947,7 +2124,42 @@ def explain_recall(
                     continue
                 verdicts.append({"id": r["id"], "reason": "below_limit",
                                  "rank": rank, "score": round(score, 4),
-                                 "detail": {"pool_size": len(deep)}})
+                                 "detail": {"pool_size": len(deep),
+                                            "lanes": _explain_lane_detail(r)}})
+        # Issue #113 link-aware verdicts: a row that missed every pool but
+        # would ride the real recall's 1-hop link walk into context names
+        # THAT path instead of not_in_pool. Same read-only expansion the real
+        # recall runs (SELECT-only); guarded so a walk failure degrades to
+        # the pre-existing verdicts rather than failing the whole explain.
+        # Target mode: replace the not_in_pool verdict. No-target mode:
+        # append a verdict per expansion row no other verdict covered (rows
+        # that scored stay below_limit — only pool-missed expandees report).
+        if link_hops >= 1 and link_budget >= 1 and presented:
+            miss_ids = {v["id"] for v in verdicts
+                        if v["reason"] == "not_in_pool" and v["id"]}
+            if miss_ids or not target:
+                try:
+                    expansion = expand_recall_links(
+                        conn, presented, ns_list=ns_list, budget=link_budget,
+                        as_of=as_of, min_confidence=min_confidence,
+                        no_bump=True,
+                    )
+                except Exception:
+                    expansion = []
+                by_id = {r["id"]: r for r in expansion}
+                for i, v in enumerate(verdicts):
+                    if v["reason"] != "not_in_pool" or v["id"] not in by_id:
+                        continue
+                    verdicts[i] = _explain_link_expansion_verdict(
+                        v["id"], by_id[v["id"]])
+                if not target:
+                    seen = {v["id"] for v in verdicts if v["id"]}
+                    for row in expansion:
+                        if row["id"] in seen:
+                            continue
+                        seen.add(row["id"])
+                        verdicts.append(_explain_link_expansion_verdict(
+                            row["id"], row))
     except Exception:
         verdicts = [{"id": (target_rows[0]["id"] if target_rows else target),
                      "reason": "explain_unavailable", "rank": None,
@@ -1973,6 +2185,10 @@ def explain_recall(
         "no_bump": no_bump,
         "as_of": as_of,
         "hybrid": hybrid,
+        # Issue #113: the resolved per-lane inject-gate floors next to the
+        # verdicts' lane numbers, so a debugger sees score AND threshold in
+        # one envelope (absent lanes are exempt; these judge measured ones).
+        "lane_floors": dict(zip(("lex", "cos", "ent"), _lane_floors())),
         "verdicts": verdicts,
     }
     if as_json:
@@ -2180,7 +2396,8 @@ def recent_memory(
     if for_injection:
         candidate_rows = results
         candidate_ids = [r["id"] for r in candidate_rows]
-        selected_rows, _gate_status = selective_inject_filter(results)
+        selected_rows, _gate_status, _gate_stats = selective_inject_filter(
+            results, with_stats=True)
         budget_emptied = False
         if selected_rows:
             selected_rows, _est, _dropped = apply_token_budget(selected_rows)
@@ -2191,7 +2408,8 @@ def recent_memory(
             inj_reason = "injected"
         else:
             inj_reason = classify_silent_reason(
-                candidate_rows, omitted=omitted, budget_emptied=budget_emptied)
+                candidate_rows, omitted=omitted, budget_emptied=budget_emptied,
+                lane_stats=_gate_stats)
         if results:
             # no_telemetry (the eval harness) records nothing; the filters
             # above still ran.
@@ -2219,6 +2437,14 @@ def recent_memory(
             # Issue #114: flag-only envelope additions (see recall_memory).
             envelope["reason"] = inj_reason
             envelope["candidate_ids"] = candidate_ids
+            # Issue #113: per-candidate lane values (pre-gate), so the eval
+            # harness's primitive re-derivation of the gate can model the
+            # relevance floors without re-running recall.
+            envelope["candidate_lanes"] = {
+                r["id"]: {"lex": r.get("_rel_lex"), "cos": r.get("_rel_cos"),
+                          "ent": r.get("_rel_ent")}
+                for r in candidate_rows
+            }
         print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: same fence + provenance as recall. Recent is

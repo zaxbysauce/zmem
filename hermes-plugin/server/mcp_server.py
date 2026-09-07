@@ -71,7 +71,7 @@ _ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "con
 _ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
 # Issue #87 / #85 direction 1: closed reason set for silent injects — loaded
 # from schema_meta (same source as the hook body and the Hermes twin).
-_INJECT_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop")
+_INJECT_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance")
 _INJECT_REASON_INJECTED = "injected"
 # Issue #110 (P0-5): kill-switch reason, written only by the ZMEM_INJECT=0
 # short-circuit (never by classification).

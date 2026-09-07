@@ -74,19 +74,33 @@ class _Store(unittest.TestCase):
         return [r["content"] for r in rows]
 
     def seed_crowded(self):
-        """8 near-paraphrases + 1 distinct fact sharing exactly one query
-        term ('docker') — the distinct row enters the candidate pool but
-        ranks below the paraphrase cluster on pure composite score."""
+        """8 near-paraphrases + 1 distinct fact sharing the FULL query term
+        set.
+
+        Issue #113: a distinct row matching only ONE generic query term
+        ('docker') is no longer relevance-equivalent — its lexical lane is
+        measured-zero (matched < 2 terms and cov < 1.0), so the paraphrase
+        cluster crowds it out of every surface. The test's purpose (MMR
+        must rescue a DISTINCT-but-relevant fact from near-duplicate
+        crowding) still holds when the distinct fact is relevant: it now
+        covers all four query terms. The crowd is split by document length
+        so the distinct row sits deterministically MID-pack on pure
+        composite score (rank 3 of 9 — the two 7-token paraphrases carry a
+        higher bm25 rank-ratio, the six 10-token ones a lower ratio);
+        uniform-length crowds pin the distinct row at rank 1 or 9 outright,
+        which would make the MMR-promotion assertion vacuous or failing."""
         for i, w in enumerate(WORDS):
+            tail = "core" if i < 2 else f"number {i} extra pad"
             self.run_store(
                 "add", "--namespace", "project:mmr", "--type", "fact",
                 "--content",
-                f"docker networking bridge setup variant {w} number {i}",
+                f"docker networking bridge setup variant {w} {tail}",
                 "--signal", "test",
             )
         self.run_store(
             "add", "--namespace", "project:mmr", "--type", "fact",
-            "--content", "docker compose override file syntax quick note",
+            "--content", "docker networking bridge setup compose override "
+            "quick note",
             "--signal", "test",
         )
 
@@ -107,9 +121,9 @@ class MmrAcceptanceTest(_Store):
         )
         self.assertTrue(
             any(self._is_distinct(c) for c in no_mmr),
-            "the distinct fact shares a query term, so it is expected in the "
-            "no-mmr pool too (the issue's 'may return four paraphrases' is a "
-            "MAY, not a must)",
+            "the distinct fact covers every query term (issue #113 >=2-term "
+            "eligibility), so it is expected in the no-mmr pool too (the "
+            "issue's 'may return four paraphrases' is a MAY, not a must)",
         )
         # And MMR promotes it strictly earlier than pure score order does.
         self.assertLess(

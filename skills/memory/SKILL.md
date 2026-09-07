@@ -1476,6 +1476,27 @@ Candidates are namespace-filtered (the tier's expanded alias set) and subject
 to the confidence floor (below 0.25 is dropped before scoring). Staleness
 demotion halves confidence, which feeds into the confidence component.
 
+**Per-lane relevance composition and inject floors (issue #113)**: a
+candidate's relevance term is the MAX of its measured lanes — lexical
+(matched-terms/total-terms x row-|bm25|/pool-best-|bm25|), vec cosine, or the
+entity fraction — replacing the saturated `|bm25|/(1+|bm25|)` back-solve, so a
+lexically-matched row keeps the cosine it earned and the score carries rank
+information from every lane. The lexical leg counts only when the row matches
+>= 2 distinct query terms or covers all of them — one shared generic token is
+not relevance (the measured "git status" failure shape); an ineligible-but-
+ranked row carries a measured 0.0, a lane with no signal carries `null`
+(absent). The inject gate consumes these values: a PRESENT lane must clear
+its own floor — lex 0.30 / cos 0.50 / entity 0.50 (env `ZMEM_INJECT_FLOOR_LEX`
+/ `ZMEM_INJECT_FLOOR_COS` / `ZMEM_INJECT_FLOOR_ENT`, calibrated starting
+values) — while ABSENT lanes are exempt (link-expansion rows carry none). A
+silent inject whose rows passed the trust gate but failed these floors names
+the new closed-set reason `below-relevance` ("nothing relevant") instead of
+`below-bar` ("nothing trusted"). `recall --explain` shows the numbers:
+`found`/`below_limit` verdicts carry `detail.lanes`, the envelope reports the
+resolved `lane_floors`, and a row that missed every pool but would ride the
+1-hop link walk reports a `link_expansion` verdict (parent, relation, score)
+instead of `not_in_pool`.
+
 **Entity matching (v10, issue #60 5.3)** is the third lane: the query runs
 through the same deterministic extractor used at write time, and plain query
 tokens are additionally matched against stored entity aliases. Memories

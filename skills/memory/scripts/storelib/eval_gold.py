@@ -281,7 +281,8 @@ def _injection_silent_reasons() -> tuple:
 
 def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
                       fence: str, conn: sqlite3.Connection = None,
-                      candidate_ids: list[str] = None) -> None:
+                      candidate_ids: list[str] = None,
+                      candidate_lanes: dict | None = None) -> None:
     """Re-derive the lane's invariants from pure primitives (see
     BypassError). Raises BypassError naming the item on any violation.
 
@@ -388,8 +389,17 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
                 f"{item_id}: only {len(cand_rows)} of "
                 f"{len(set(candidate_ids))} candidate ids found in the "
                 "store — envelope candidates inconsistent with the store")
+        # Issue #113: attach the envelope's pre-gate lane values so the
+        # reconstruction models the relevance floors too (rows re-read from
+        # SQL do not carry recall-time lane keys).
+        for r in cand_rows:
+            lanes = (candidate_lanes or {}).get(r["id"]) or {}
+            r["_rel_lex"] = lanes.get("lex")
+            r["_rel_cos"] = lanes.get("cos")
+            r["_rel_ent"] = lanes.get("ent")
         expected_gate = [r for r in cand_rows
-                         if _gate_passes(r, floor, gate_none_floor, grounded)]
+                         if _gate_passes(r, floor, gate_none_floor, grounded,
+                                         lane_floors=_inject._lane_floors())]
         expected_kept = _inject.apply_token_budget(expected_gate)[0]
         rendered_set = {r.get("id") for r in rows}
         expected_ids = {r["id"] for r in expected_kept}
@@ -424,14 +434,42 @@ def _mrr(pop: list[dict], denom: int) -> float:
                 else 0.0) for it in pop) / denom
 
 
-def _gate_passes(r, floor, gate_none_floor, grounded) -> bool:
+def _gate_passes(r, floor, gate_none_floor, grounded,
+                 lane_floors=None) -> bool:
     conf = _conf_row(r)
     sig = (r.get("signal") or "none").lower()
     if sig == "none":
-        return conf >= gate_none_floor
-    if sig in grounded:
-        return conf >= floor
-    return False
+        trusted = conf >= gate_none_floor
+    elif sig in grounded:
+        trusted = conf >= floor
+    else:
+        return False
+    if not trusted:
+        return False
+    # Issue #113: model the per-lane relevance floors — disjunctive, exactly
+    # like the real gate: ANY measured lane clearing its own floor passes; a
+    # row with no measured lane is exempt. Rows re-read from SQL carry lanes
+    # only when the caller attached the envelope's ``candidate_lanes``.
+    if lane_floors is not None:
+        measured = False
+        for key, fl in (("_rel_lex", lane_floors[0]),
+                        ("_rel_cos", lane_floors[1]),
+                        ("_rel_ent", lane_floors[2])):
+            val = r.get(key)
+            if val is None:
+                continue
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val != val or val in (float("inf"), float("-inf")):
+                val = 0.0
+            measured = True
+            if val >= fl:
+                return True
+        if measured:
+            return False
+    return True
 
 
 def _conf_row(r) -> float:
@@ -529,7 +567,8 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
         fence = _format_fenced_recall(
             rows, header=f"Relevant memories (namespace {item.namespace or 'unscoped'}).")
         _verify_real_lane(item.id, rows, envelope, fence, conn=conn,
-                          candidate_ids=envelope.get("candidate_ids"))
+                          candidate_ids=envelope.get("candidate_ids"),
+                          candidate_lanes=envelope.get("candidate_lanes"))
         fence_ok = all(f"- [{rid}]" in fence for rid in rendered_ids)
 
         labeled = set(item.must_include_ids)
