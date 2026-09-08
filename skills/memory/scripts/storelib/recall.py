@@ -523,7 +523,7 @@ def _fetch_lineage_rows(
     sql = f"""
         SELECT id, namespace, type, content, tags, source_ref,
                confidence, signal, valid_from, valid_until,
-               update_of, taint
+               update_of, taint, trust_score
         FROM memory
         WHERE id IN ({placeholders})
           {ns_clause}
@@ -562,6 +562,7 @@ def _lineage_row_dict(r: sqlite3.Row) -> dict:
         "valid_until": r["valid_until"],
         "update_of": r["update_of"],
         "taint": r["taint"],
+        "trust_score": _row_trust(r),
         "stale": False,
         "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
         "_stale_note": "",
@@ -1588,8 +1589,10 @@ def recall_memory(
         selected_rows, _gate_status, _gate_stats = selective_inject_filter(
             results, with_stats=True)
         budget_emptied = False
+        budget_dropped = 0
         if selected_rows:
             selected_rows, _est, _dropped = apply_token_budget(selected_rows)
+            budget_dropped = _dropped
             if not selected_rows:
                 budget_emptied = True
         results = selected_rows
@@ -1651,6 +1654,10 @@ def recall_memory(
                           "trust": _row_trust(r)}
                 for r in candidate_rows
             }
+            # Issue #115 review round: the store-side token-budget drop
+            # count, so --for-injection consumers report the real drop
+            # instead of a client-side residual of an already-budgeted set.
+            envelope["budget_dropped"] = budget_dropped
         print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: hook/text surface uses the fenced render
@@ -2432,8 +2439,10 @@ def recent_memory(
         selected_rows, _gate_status, _gate_stats = selective_inject_filter(
             results, with_stats=True)
         budget_emptied = False
+        budget_dropped = 0
         if selected_rows:
             selected_rows, _est, _dropped = apply_token_budget(selected_rows)
+            budget_dropped = _dropped
             if not selected_rows:
                 budget_emptied = True
         results = selected_rows
@@ -2479,6 +2488,10 @@ def recent_memory(
                           "trust": _row_trust(r)}
                 for r in candidate_rows
             }
+            # Issue #115 review round: the store-side token-budget drop
+            # count, so --for-injection consumers report the real drop
+            # instead of a client-side residual of an already-budgeted set.
+            envelope["budget_dropped"] = budget_dropped
         print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: same fence + provenance as recall. Recent is

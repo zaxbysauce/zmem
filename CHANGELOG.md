@@ -23,9 +23,14 @@ README.
   (each −0.10, clamped at 0.0 by the v11 ledger) stop a row from riding the
   passive UserPromptSubmit / PreCompact / SessionStart lanes, symmetrically
   for link-expansion neighbors; a once-contradicted neighbor (trust 0.9)
-  still renders with its `[CONTESTED LINK]` marker. Floor-dropped rows
+  still rendering with its `[CONTESTED LINK]` marker. Floor-dropped rows
   count in the gate's existing `trust_failed` bucket, so a drained pool
-  reports `below-bar` ("nothing trusted").
+  reports `below-bar` ("nothing trusted"). The gate covers every passive
+  surface: the Hermes `prefetch` / `session_start` lanes, the MCP
+  `session_start` twin, the `zmem-hermes-reflect` pre-call hook, and the
+  UserPromptSubmit / PreCompact / SubagentStart hooks all route through the
+  in-store gate (`--for-injection`), and `[PREVIOUSLY]` lineage rows carry
+  the same `trust_score` metadata as query-matched rows.
 - **memory** (issue #115): `compute_score` multiplies the composite by
   `trust_score` — identity at the schema default 1.0, so every
   uncontradicted row's ranking is byte-identical, while a contradicted row
@@ -38,7 +43,9 @@ README.
   contribution — `lane_floors` gains a `trust` entry (plus top-level
   `trust_floor`), and `found`/`below_limit` verdicts carry the row's
   applied multiplier in `detail.lanes.trust`; `--for-injection` envelopes
-  add a `trust` value per `candidate_lanes` entry so the eval re-derivation
+  add a `trust` value per `candidate_lanes` entry plus a store-side
+  `budget_dropped` count (so hosts report the real token-budget drop
+  instead of a client-side residual) — the eval re-derivation
   (`eval_gold._gate_passes`) models the floor and the no-silent-bypass
   invariant keeps holding. Result rows expose `trust_score`; expansion
   neighbors inherit it through the same projection (the v12 additive-key

@@ -1428,6 +1428,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if _inject is not None:
             rows, _est, budget_dropped = _inject.apply_token_budget(rows)
             tokens_budget = _inject.inject_token_budget()
+        # Issue #115 review round: the envelope's budget_dropped is the
+        # store-side count (authoritative — the store already applied the
+        # budget); the client pass above is a legacy fallback for old
+        # envelopes that lack the field.
+        if isinstance(parsed, dict) and "budget_dropped" in parsed:
+            budget_dropped = parsed["budget_dropped"]
         renderer = _fence_renderer() or _local_fenced_recall
         header = (
             f"Session memories (namespace {resolved_ns}). High-confidence "

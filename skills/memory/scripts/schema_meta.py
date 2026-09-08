@@ -166,11 +166,13 @@ def worse_taint(a: str, b: str) -> str:
     rb = TAINT_RANK.get(b, 2)
     return a if ra >= rb else b
 
-# Inject-floor constants for hook surfaces (issue #58, 3.8). These three
+# Inject-floor constants for hook surfaces (issue #58, 3.8). These
 # thresholds are intentionally distinct: each reflects a different surface's
 # precision-vs-coverage tradeoff. They are env-overridable; see
-# storelib/cli.py for the env names. Document all three in SKILL.md so
-# operators understand which floor their hook currently applies.
+# storelib/cli.py for the env names. Document each in SKILL.md so
+# operators understand which floor their hook currently applies (the
+# recall-path floors including the #115 trust floor live in the block
+# below; SKILL.md's floor table covers all of them).
 #
 #  - PROMPT (0.25): `recall` default. The default confidence floor for
 #    FTS/vec recall. Anything below this is dropped before scoring.

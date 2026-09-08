@@ -151,6 +151,14 @@ class TrustRecallCliBase(unittest.TestCase):
         self.env = dict(os.environ)
         self.env["ZMEM_DATA"] = str(self.data).replace("\\", "/")
         self.env.pop("ZMEM_TEST_NOW", None)
+        # Review round (PRR): floor env overrides must not leak from the
+        # operator environment into these fixtures — the boundary tests pin
+        # exact floor semantics at the 0.2 default.
+        for _k in ("ZMEM_INJECT_FLOOR_TRUST", "ZMEM_INJECT_FLOOR_PROMPT",
+                   "ZMEM_INJECT_FLOOR_RECENT", "ZMEM_INJECT_FLOOR_GATE_NONE",
+                   "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
+                   "ZMEM_INJECT_FLOOR_ENT"):
+            self.env.pop(_k, None)
         # Fixture rows must not semantic-dedup into each other (write-path
         # cosine merge returns the PRE-EXISTING id), so every content is
         # lexically distinct; dedup knob pinned anyway for model-present
@@ -220,12 +228,42 @@ class TrustBlocksInjectionButNotSearchTest(TrustRecallCliBase):
 
     def test_candidate_lanes_carry_trust(self):
         probe = self.add(PROBE)
+        self.set_trust(probe, 0.6)
         envelope = self.recall_json(QUERY)
         lanes = envelope["candidate_lanes"][probe]
         self.assertIn("trust", lanes)
-        self.assertIsInstance(lanes["trust"], float)
-        self.assertGreaterEqual(lanes["trust"], 0.0)
-        self.assertLessEqual(lanes["trust"], 1.0)
+        # Review round (PRR): pin the EXACT row trust, not just the range —
+        # a hardcoded constant must not satisfy this test.
+        self.assertAlmostEqual(lanes["trust"], 0.6, places=6)
+
+    def test_row_trust_overflow_fails_closed(self):
+        # Review round (PRR): a huge-int trust_score raises OverflowError
+        # in float(); _row_trust must fail closed to 0.0, not crash the gate.
+        from storelib.inject import _row_trust
+        self.assertEqual(_row_trust({"trust_score": 10 ** 400}), 0.0)
+
+    def test_absence_form_every_no_bump_builder_has_gate_flag(self):
+        # Review round (PRR): pin the absence-form invariant from the 4.2
+        # sweep — every argv builder that passes --no-bump must also pass
+        # --for-injection, or a contradicted row could ride an ungated lane.
+        import re
+        builders = [
+            "hermes-plugin/__init__.py",
+            "hermes-plugin/server/mcp_server.py",
+            "hermes-plugin/hooks/zmem-hermes-reflect.py",
+            "hooks/lib/zmem-recall-body.py",
+            "hooks/zmem-session-start.sh",
+        ]
+        checked = 0
+        for rel in builders:
+            text = (REPO / rel).read_text(encoding="utf-8")
+            for m in re.finditer(r'"--no-bump"', text):
+                window = text[max(0, m.start() - 400):m.end() + 400]
+                self.assertIn('"--for-injection"', window,
+                              f"{rel}: a --no-bump builder lacks the "
+                              f"--for-injection gate flag")
+                checked += 1
+        self.assertGreaterEqual(checked, 7, "expected >=7 builders")
 
 
 class UncontradictedRankingStableTest(TrustRecallCliBase):

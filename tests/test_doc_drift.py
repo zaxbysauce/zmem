@@ -159,6 +159,10 @@ class SkillDocDriftTest(unittest.TestCase):
                       "SKILL.md must document INJECT_FLOOR_RECENT_DEFAULT")
         self.assertIn("INJECT_FLOOR_GATE_NONE", text,
                       "SKILL.md must document INJECT_FLOOR_GATE_NONE")
+        # Issue #115 review round: the trust floor is a documented surface
+        # too — the doc-drift guard must cover it like the other three.
+        self.assertIn("INJECT_FLOOR_TRUST_DEFAULT", text,
+                      "SKILL.md must document INJECT_FLOOR_TRUST_DEFAULT")
 
     # -- issue #59, 4.x: the append-only revision surface is documented -------
 

@@ -1268,12 +1268,18 @@ class ZmemMemoryProvider(MemoryProvider):
         # incl. the trust floor) emptied the set; fall back to the local
         # classification for older envelopes.
         store_reason = parsed.get("reason") if isinstance(parsed, dict) else None
-        budget_dropped = 0
         if _INJECT is not None:
             rows, _est, budget_dropped = _INJECT.apply_token_budget(rows)
             tokens_budget = _INJECT.inject_token_budget()
         else:
+            budget_dropped = 0
             tokens_budget = None
+        # Issue #115 review round: the envelope's budget_dropped is the
+        # store-side count (authoritative — the store already applied the
+        # budget); the client pass above is a legacy fallback for old
+        # envelopes that lack the field.
+        if isinstance(parsed, dict) and "budget_dropped" in parsed:
+            budget_dropped = parsed["budget_dropped"]
         renderer = _fence_renderer() or _local_fenced_recall
         header = (
             f"Session memories (namespace {ns}). High-confidence prefetch. "

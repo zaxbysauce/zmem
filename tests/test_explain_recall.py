@@ -50,6 +50,7 @@ os.environ["ZMEM_STORE"] = INPROC_STORE
 os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
 os.environ["ZMEM_MODELS_DIR"] = "/nonexistent-zmem-models-dir"
 os.environ["ZMEM_EMBED_PROFILE"] = "fake"
+os.environ.pop("ZMEM_INJECT_FLOOR_TRUST", None)  # PRR: floor default must hold
 
 
 def _pin_env(store: str) -> dict:

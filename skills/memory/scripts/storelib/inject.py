@@ -207,7 +207,11 @@ def _trust_floor() -> float:
     are hard-dropped (the contradiction ledger's end state: nine or more
     distinct contradicts). Literals mirror the schema_meta default so a
     partially-deployed tree keeps the documented gate; a negative value is
-    operator error and clamps to 0.0 (the honest "only trust=0 drops").
+    operator error and clamps to 0.0 — and because _row_trust clamps every
+    trust value into [0.0, 1.0], a floor of 0.0 means the comparison
+    `< 0.0` never fires: the trust gate is fully DISABLED at floor 0.0
+    (even trust=0 rows pass). Operators who want "drop nothing" have it;
+    nobody gets it by accident without setting the env to 0 explicitly.
     """
     return max(0.0, _env_float(
         getattr(_schema_meta, "INJECT_FLOOR_TRUST_ENV",
@@ -237,7 +241,9 @@ def _row_trust(row: Any) -> float:
         return 1.0
     try:
         value = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a huge int (e.g. 10**400) converts to neither a
+        # finite float nor a raised ValueError — fail closed like the rest.
         return 0.0
     if value != value or value in (float("inf"), float("-inf")):
         return 0.0

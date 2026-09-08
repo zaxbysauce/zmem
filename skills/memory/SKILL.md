@@ -230,7 +230,7 @@ Hermes `_tool_search` — byte-identical; MCP `recall` unfolds for free).
 
 #### Confidence floors (issue #58, 3.8)
 
-Three distinct floors live on the recall path. Each reflects a different
+Four distinct floors live on the recall path. Each reflects a different
 surface's precision-vs-coverage tradeoff. They are env-overridable; the
 constants live in `schema_meta.py`.
 
