@@ -203,6 +203,27 @@ INJECT_FLOOR_LEX_DEFAULT = 0.30
 INJECT_FLOOR_COS_DEFAULT = 0.50
 INJECT_FLOOR_ENT_DEFAULT = 0.5
 
+# Trust floor (issue #115, Workstream C-4): the v11 contradiction ledger
+# (links.py adjust_trust: one distinct `contradicts` event = -0.10, clamped
+# to [0.0, 1.0]) was invisible at recall — a row contradicted ten times kept
+# injecting on its original confidence. The selective-inject gate now
+# hard-drops rows whose trust_score sits below this floor, and compute_score
+# multiplies the composite by trust_score above it (identity at the schema
+# default 1.0, so uncontradicted rankings are byte-identical). Conservative
+# start: 0.2 means EIGHT distinct contradicts (1.0 - 8x0.10) still inject;
+# nine or more (trust <= 0.1) hard-drop from the passive lane. A single
+# contradiction (0.9) only discounts ranking — the row stays retrievable by
+# explicit recall/search, which never run the gate.
+#
+# violated_count participation (decided for E-5, issue #124): trust_score is
+# the SINGLE read-side ledger input. violated_count participates only
+# THROUGH trust_score — today via feedback_memory's one-time
+# TRUST_VIOLATION_FLOOR_DROP at violated_count==2; when #124 starts
+# recording violations automatically it must apply trust DELTAS to this same
+# column (weights stated and gold-tested there), never become a second
+# independent ranking/gate input.
+INJECT_FLOOR_TRUST_DEFAULT = 0.2
+
 # Signals considered GROUNDED (trusted) by the hook selective-inject
 # gate (issue #58, 3.8): rows with these signals clear the PROMPT floor
 # (0.25); rows with any other signal — in practice only `none`, the
@@ -218,6 +239,7 @@ INJECT_FLOOR_GATE_NONE_ENV = "ZMEM_INJECT_FLOOR_GATE_NONE"
 INJECT_FLOOR_LEX_ENV = "ZMEM_INJECT_FLOOR_LEX"
 INJECT_FLOOR_COS_ENV = "ZMEM_INJECT_FLOOR_COS"
 INJECT_FLOOR_ENT_ENV = "ZMEM_INJECT_FLOOR_ENT"
+INJECT_FLOOR_TRUST_ENV = "ZMEM_INJECT_FLOOR_TRUST"
 
 # Closed reason set for silent inject decisions (issue #87 / #85 direction 1).
 # When a passive surface (--no-bump) injects nothing, it names WHICH gate fired

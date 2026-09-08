@@ -200,6 +200,50 @@ def _lane_floors() -> Tuple[float, float, float]:
     return max(0.0, lex), max(0.0, cos), max(0.0, ent)
 
 
+def _trust_floor() -> float:
+    """The trust_score hard floor (issue #115), single-sourced from schema_meta.
+
+    Rows in the selective-inject gate whose trust_score sits below this floor
+    are hard-dropped (the contradiction ledger's end state: nine or more
+    distinct contradicts). Literals mirror the schema_meta default so a
+    partially-deployed tree keeps the documented gate; a negative value is
+    operator error and clamps to 0.0 (the honest "only trust=0 drops").
+    """
+    return max(0.0, _env_float(
+        getattr(_schema_meta, "INJECT_FLOOR_TRUST_ENV",
+                "ZMEM_INJECT_FLOOR_TRUST"),
+        getattr(_schema_meta, "INJECT_FLOOR_TRUST_DEFAULT", 0.2),
+    ))
+
+
+def _row_trust(row: Any) -> float:
+    """The row's trust_score, normalized for ranking/gate use (issue #115).
+
+    Accepts sqlite3.Row AND dict (indexing with try/except — sqlite3.Row has
+    no ``.get``). Missing key or None (legacy dict callers, lineage extras,
+    any store predating the v11 column) -> 1.0: the neutral identity, so
+    every existing caller is byte-identical. A value that cannot be parsed
+    as a float, or a non-finite one (NaN/inf), -> 0.0: fail-closed, the same
+    normalization the gate applies to NaN/inf confidence. Anything else is
+    clamped to [0.0, 1.0] — the schema has NO CHECK on the column, so a
+    corrupted out-of-range value must not produce a negative composite score
+    or break the sort.
+    """
+    try:
+        raw = row["trust_score"]
+    except (KeyError, IndexError, TypeError):
+        return 1.0
+    if raw is None:
+        return 1.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value or value in (float("inf"), float("-inf")):
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
 def selective_inject_filter(
     rows: list[dict[str, Any]],
     floor: Optional[float] = None,
@@ -231,6 +275,16 @@ def selective_inject_filter(
     replaced: a row must pass BOTH the trust conditions AND the relevance
     disjunction.
 
+    Issue #115: BEFORE the confidence check, the row's ``trust_score``
+    (``_row_trust``: missing key -> 1.0, unparseable/non-finite -> 0.0,
+    clamped to [0, 1]) must clear ``_trust_floor()`` (default 0.2 — nine or
+    more distinct contradicts). A row below the floor counts in the EXISTING
+    ``trust_failed`` bucket — no new stats key — so a fully floor-drained
+    pool reports ``below-bar`` ("nothing trusted"), which is the truthful
+    reason. Explicit recall/search never run this gate, so the same row
+    stays retrievable there; compute_score separately discounts ranking by
+    trust_score on every surface.
+
     Returns ``(selected, status)`` where status is ``"injected"`` (anything
     qualified) or ``"silent"`` (nothing passed). With ``with_stats=True``
     returns ``(selected, status, stats)`` where stats is
@@ -251,7 +305,16 @@ def selective_inject_filter(
     trust_passed = 0
     relevance_failed = 0
     trust_failed = 0
+    trust_floor = _trust_floor()
     for r in rows:
+        # Issue #115: the contradiction ledger's hard floor. A row whose
+        # trust_score sits below the floor (nine or more distinct contradicts
+        # at the 0.2 default) is not trusted, period — it counts in the same
+        # trust_failed bucket as a below-confidence row (no new stats key),
+        # so an all-drained pool classifies as below-bar ("nothing trusted").
+        if _row_trust(r) < trust_floor:
+            trust_failed += 1
+            continue
         try:
             conf = float(r.get("confidence", 0) or 0)
         except (TypeError, ValueError):
