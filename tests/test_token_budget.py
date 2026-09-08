@@ -23,6 +23,13 @@ sys.path.insert(0, str(SCRIPTS))
 
 from storelib import inject  # noqa: E402
 
+try:
+    import mcp  # noqa: F401
+
+    MCP_AVAILABLE = True
+except Exception:
+    MCP_AVAILABLE = False
+
 
 def _row(content: str, *, type_="fact", signal="none", score=0.5):
     return {"id": content[:8], "type": type_, "signal": signal,
@@ -534,10 +541,13 @@ class DegradedFenceFallbackTest(unittest.TestCase):
         plain = mod._local_fenced_recall(rows, "hdr")
         self.assertNotIn("[budget:", plain)
 
+    @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed")
     def test_mcp_fallback_accepts_budget_note(self):
-        # PR-review F11f: the old skipTest("mcp package not installed") was
-        # dead — mcp is imported lazily inside build_server(), so exec_module
-        # never needs it. mcp_server DOES import auth/bind_guard from its own
+        # PR-review F11f: mcp_server transitively imports mcp at module
+        # import time (mcp_server -> auth -> mcp.server.auth.provider), so
+        # exec_module does need it; skip only where mcp is genuinely absent
+        # (bare CI) — not a dead skip, the parity pin executes wherever mcp
+        # is installed. mcp_server DOES import auth/bind_guard from its own
         # dir, so make that dir importable and let real errors fail loudly.
         import importlib.util
         server_dir = str(REPO_ROOT / "hermes-plugin" / "server")
