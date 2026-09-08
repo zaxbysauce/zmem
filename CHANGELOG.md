@@ -23,7 +23,7 @@ README.
   (each −0.10, clamped at 0.0 by the v11 ledger) stop a row from riding the
   passive UserPromptSubmit / PreCompact / SessionStart lanes, symmetrically
   for link-expansion neighbors; a once-contradicted neighbor (trust 0.9)
-  still rendering with its `[CONTESTED LINK]` marker. Floor-dropped rows
+  still renders with its `[CONTESTED LINK]` marker. Floor-dropped rows
   count in the gate's existing `trust_failed` bucket, so a drained pool
   reports `below-bar` ("nothing trusted"). The gate covers every passive
   surface: the Hermes `prefetch` / `session_start` lanes, the MCP
