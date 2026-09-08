@@ -175,12 +175,40 @@ def _gate_constants() -> Tuple[float, float, frozenset]:
     return floor, gate_none_floor, frozenset(grounded)
 
 
+def _lane_floors() -> Tuple[float, float, float]:
+    """Per-lane relevance floors (issue #113), single-sourced from schema_meta.
+
+    A row's PRESENT lane value must clear its own floor; an ABSENT lane
+    (None) is exempt. Literals mirror the schema_meta defaults so a
+    partially-deployed tree keeps the documented gate.
+    """
+    lex = _env_float(
+        getattr(_schema_meta, "INJECT_FLOOR_LEX_ENV", "ZMEM_INJECT_FLOOR_LEX"),
+        getattr(_schema_meta, "INJECT_FLOOR_LEX_DEFAULT", 0.30),
+    )
+    cos = _env_float(
+        getattr(_schema_meta, "INJECT_FLOOR_COS_ENV", "ZMEM_INJECT_FLOOR_COS"),
+        getattr(_schema_meta, "INJECT_FLOOR_COS_DEFAULT", 0.50),
+    )
+    ent = _env_float(
+        getattr(_schema_meta, "INJECT_FLOOR_ENT_ENV", "ZMEM_INJECT_FLOOR_ENT"),
+        getattr(_schema_meta, "INJECT_FLOOR_ENT_DEFAULT", 0.5),
+    )
+    # A negative floor would trivially clear every measured lane (relevance
+    # values are >= 0), i.e. silently disable the gate. Treat it as operator
+    # error and clamp to 0.0 (the honest "disable this lane" value).
+    return max(0.0, lex), max(0.0, cos), max(0.0, ent)
+
+
 def selective_inject_filter(
     rows: list[dict[str, Any]],
     floor: Optional[float] = None,
     gate_none_floor: Optional[float] = None,
     grounded_signals: Optional[frozenset] = None,
-) -> Tuple[list[dict[str, Any]], str]:
+    *,
+    lane_floors: Optional[Tuple[float, float, float]] = None,
+    with_stats: bool = False,
+) -> Any:
     """Store-side twin of the hook selective-inject gate (issue #58, 3.8; #114).
 
     Issue spec: tighten ONLY ``signal=none`` (the agent's self-opinion) to
@@ -191,8 +219,25 @@ def selective_inject_filter(
     applies the same decision the hook used to apply after the subprocess
     returned — one gate, one source of truth, counted before the write.
 
+    Issue #113: rows may also carry per-lane relevance values
+    (``_rel_lex`` / ``_rel_cos`` / ``_rel_ent``). The floors are DISJUNCTIVE
+    across lanes: a trusted row is admitted when ANY MEASURED lane clears its
+    own floor (default 0.30 / 0.50 / 0.50); a measured-but-failing lane does
+    not veto a row another lane admits. An ABSENT lane (the key missing or
+    None — query-less surfaces, link-expansion rows, model-absent cosine) is
+    exempt: it is neither measured nor judged. If at least one lane was
+    measured and NO measured lane clears its floor, the row is not relevant
+    enough and counts in ``relevance_failed``. The trust gate is NOT
+    replaced: a row must pass BOTH the trust conditions AND the relevance
+    disjunction.
+
     Returns ``(selected, status)`` where status is ``"injected"`` (anything
-    qualified) or ``"silent"`` (nothing passed).
+    qualified) or ``"silent"`` (nothing passed). With ``with_stats=True``
+    returns ``(selected, status, stats)`` where stats is
+    ``{"trust_passed": int, "relevance_failed": int, "trust_failed": int}`` —
+    the inputs the silent-reason classifier needs to separate
+    ``below-relevance`` ("nothing relevant") from ``below-bar`` ("nothing
+    trusted"). The default branch stays a 2-tuple.
     """
     if floor is None or gate_none_floor is None or grounded_signals is None:
         c_floor, c_gate_none, c_grounded = _gate_constants()
@@ -200,7 +245,12 @@ def selective_inject_filter(
         gate_none_floor = c_gate_none if gate_none_floor is None else gate_none_floor
         grounded_signals = (c_grounded if grounded_signals is None
                             else frozenset(grounded_signals))
+    if lane_floors is None:
+        lane_floors = _lane_floors()
     selected = []
+    trust_passed = 0
+    relevance_failed = 0
+    trust_failed = 0
     for r in rows:
         try:
             conf = float(r.get("confidence", 0) or 0)
@@ -213,31 +263,82 @@ def selective_inject_filter(
             conf = 0.0
         sig = (r.get("signal") or "none").lower()
         if sig == "none":
-            if conf >= gate_none_floor:
-                selected.append(r)
-        elif sig in grounded_signals and conf >= floor:
+            trusted = conf >= gate_none_floor
+        elif sig in grounded_signals:
+            trusted = conf >= floor
+        else:
+            trusted = False
+        if not trusted:
+            trust_failed += 1
+            continue
+        trust_passed += 1
+        # Relevance lanes (issue #113): the row passes the relevance gate iff
+        # ANY measured lane clears ITS OWN floor — a lane strong on one
+        # signal is relevant regardless of a weaker second signal, and a row
+        # with NO measured lane (all absent) is exempt (query-less surfaces,
+        # link-expansion rows). A measured-but-failing lane (e.g. lex 0.0
+        # for a single-generic-token row) simply does not clear its floor;
+        # if NO lane clears, the row is not relevant enough to inject.
+        lane_ok = False
+        measured = False
+        for key, fl in (("_rel_lex", lane_floors[0]),
+                        ("_rel_cos", lane_floors[1]),
+                        ("_rel_ent", lane_floors[2])):
+            val = r.get(key)
+            if val is None:
+                continue
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val != val or val in (float("inf"), float("-inf")):
+                val = 0.0
+            measured = True
+            if val >= fl:
+                lane_ok = True
+                break
+        if lane_ok or not measured:
             selected.append(r)
+        else:
+            relevance_failed += 1
     status = "injected" if selected else "silent"
+    if with_stats:
+        stats = {"trust_passed": trust_passed,
+                 "relevance_failed": relevance_failed,
+                 "trust_failed": trust_failed}
+        return selected, status, stats
     return selected, status
 
 
 def classify_silent_reason(rows: list, omitted: int = 0,
-                           budget_emptied: bool = False) -> str:
+                           budget_emptied: bool = False,
+                           lane_stats: Optional[dict] = None) -> str:
     """Name WHY a silent inject is silent (issue #87; store-side twin).
 
     Same precedence as the hook body's classifier: budget-drop wins over
-    below-bar (a budget wipe of a gate-passed set is a budget fact, not a gate
-    fact); empty rows with omitted==0 is empty-pool even if the prompt was
-    long — do not guess. The closed set comes from schema_meta
+    below-bar (a budget wipe of a gate-passed set is a budget fact, not a
+    gate fact); empty rows with omitted==0 is empty-pool even if the prompt
+    was long — do not guess. The closed set comes from schema_meta
     (INJECT_SILENT_REASONS); a drift/unknown value degrades to empty-pool
     rather than inventing a reason.
+
+    Issue #113: when the caller passes the gate's ``lane_stats`` (the
+    ``with_stats=True`` third element), a silent decision where at least one
+    row passed the TRUST gate but every trust-passing row failed a relevance
+    floor names ``below-relevance`` ("nothing relevant") instead of
+    ``below-bar`` ("nothing trusted"). Without lane_stats the legacy
+    behavior is byte-identical.
     """
     allowed = tuple(getattr(
         _schema_meta, "INJECT_SILENT_REASONS",
-        ("empty-pool", "omitted", "below-bar", "budget-drop"),
+        ("empty-pool", "omitted", "below-bar", "budget-drop",
+         "below-relevance"),
     ))
     if budget_emptied:
         reason = "budget-drop"
+    elif rows and lane_stats is not None \
+            and lane_stats.get("trust_passed", 0) >= 1:
+        reason = "below-relevance"
     elif rows:
         reason = "below-bar"
     elif omitted > 0:

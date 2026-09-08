@@ -110,7 +110,13 @@ DATA_SHA = {
         # v13 (issue #65, 10.8): recall --json re-captured for the read
     # ENVELOPE ({"results", "count", "omitted", "injection_risk",
     # "tokens_used", "tokens_budget"}); the rows inside are unchanged.
-    "recall": "a572b9484683f043e594dbef0c8cc643e27b99bf1f2820e48c97e3ee8a5a784a",
+    # issue #113: relevance composition changed scores -> hash updated.
+    # Recall relevance is now the lane-max (lexical coverage-x-rank-ratio /
+    # cosine / entity) feeding compute_score directly instead of the
+    # saturating ar/(1+ar) back-solve, so the fixture rows' `_score` values
+    # (and their order at the top-5 boundary) legitimately moved.
+    # stats/list/export_jsonl are byte-identical to their prior freezes.
+    "recall": "dec42e0d65c0514cfa276e14ed7854f95d29bd033a4c892bee26164a9fb30b92",
     # v11 (issue #61): export-jsonl re-captured ONLY for the two new row keys
     # (`trust_score`, `links`) — stripping exactly those keys from the new
     # output reproduces the v10 freeze 8552767c… byte-for-byte (verified at

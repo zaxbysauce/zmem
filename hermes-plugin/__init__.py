@@ -165,7 +165,7 @@ _STORE_CONSTANTS = {
     "MAX_CONTENT_CHARS": 65536,
     # issue #87 / #85 direction 1: closed reason set for silent injects (the
     # session_start twin classifies with the SAME tuple the hook body uses).
-    "INJECT_SILENT_REASONS": ("empty-pool", "omitted", "below-bar", "budget-drop"),
+    "INJECT_SILENT_REASONS": ("empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance"),
     "INJECT_REASON_INJECTED": "injected",
     # issue #110 (P0-5): kill-switch reason, written only by the
     # ZMEM_INJECT=0 short-circuit (never by classification).

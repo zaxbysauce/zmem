@@ -115,18 +115,38 @@ class EndToEndReportTest(unittest.TestCase):
             total += block["items"]
         self.assertEqual(total, self.report["metrics"]["items"])
 
-    def test_negative_controls_reproduce_known_failure(self):
+    def test_negative_controls_now_silent_below_relevance(self):
+        # Issue #113: the negative controls used to reproduce the KNOWN
+        # FAILURE the fix targets — neg-pt-status ("git status") injected a
+        # single-generic-token match. The post-fix pinned state: every
+        # negative control is silent (false_injection_rate 0.0) and the
+        # non-empty-pool one is silent BECAUSE OF the relevance floor, with
+        # reason exactly "below-relevance" (candidates existed and passed
+        # the trust gate; every query-matched candidate failed a lane
+        # floor) — not below-bar and not empty-pool.
         metrics = self.report["metrics"]
-        self.assertGreater(metrics["false_injection_rate"], 0.0)
+        self.assertEqual(metrics["false_injection_rate"], 0.0)
         injecting = [it for it in self.report["per_item"]
                      if it["expect"] == "silent" and it["rendered_ids"]]
-        self.assertTrue(injecting,
-                        "no negative control rendered rows; the known "
-                        "failure (negatives inject) is not reproduced")
-        queries = {it["query"] for it in self.report["per_item"]
-                   if it["expect"] == "silent"}
+        self.assertEqual(
+            injecting, [],
+            "no negative control may render rows after the #113 relevance "
+            "floor; the known failure is FIXED, not reproduced")
+        negatives = {it["id"]: it for it in self.report["per_item"]
+                     if it["expect"] == "silent"}
+        self.assertIn("neg-pt-status", negatives)
+        status = negatives["neg-pt-status"]
+        self.assertEqual(status["reason"], "below-relevance")
+        self.assertTrue(status["candidate_ids"],
+                        "neg-pt-status must have a non-empty candidate pool "
+                        "(the below-relevance reason is only reachable when "
+                        "candidates existed)")
+        # The gold's negative queries are pinned so this scenario cannot
+        # silently drift into testing different prompts.
+        queries = {it["query"] for it in negatives.values()}
         self.assertIn("write a haiku about autumn leaves", queries)
         self.assertIn("update the README wording", queries)
+        self.assertIn("git status", queries)
 
 
 class GoldValidationTest(unittest.TestCase):
@@ -186,8 +206,17 @@ class NoSilentBypassTest(unittest.TestCase):
         real = recall_mod.selective_inject_filter
         caught = None
         try:
+            # Issue #113: the injection lane calls the gate with
+            # with_stats=True and unpacks (selected, status, stats) — the
+            # stub must return that 3-tuple shape or it crashes as an
+            # unpack error instead of exercising the bypass detection. The
+            # stubbed gate passes EVERY row through (fabricated stats claim
+            # all rows were trust-passing and none relevance-failed).
             recall_mod.selective_inject_filter = (
-                lambda rows, *a, **k: (rows, "injected"))
+                lambda rows, *a, **k: (
+                    rows, "injected",
+                    {"trust_passed": len(rows), "relevance_failed": 0,
+                     "trust_failed": 0}))
             with unittest.mock.patch.dict(os.environ,
                                           {"ZMEM_INJECT_FLOOR_PROMPT": "0.95"}):
                 with self.assertRaises(BypassError) as ctx:
@@ -229,7 +258,12 @@ class NoSilentBypassTest(unittest.TestCase):
         # mismatch is structural (empty rendered set vs non-empty expected
         # selection), so no boundary-cranking is needed. Regression pin:
         # this path previously crashed with a NameError instead of
-        # raising BypassError.
+        # raising BypassError. Issue #113: the lane now calls the gate
+        # with with_stats=True, so the stub returns the 3-tuple shape
+        # (fabricating an all-relevance-failed stats dict so the stubbed
+        # scenario stays internally coherent); the reconstruction — which
+        # models the per-lane floors from the envelope's candidate_lanes —
+        # still produces a non-empty expected selection and refuses.
         import storelib.recall as recall_mod
         from storelib.eval_gold import BypassError, evaluate_injection_items
         from storelib.schema import connect
@@ -237,7 +271,10 @@ class NoSilentBypassTest(unittest.TestCase):
         caught = None
         try:
             recall_mod.selective_inject_filter = (
-                lambda rows, *a, **k: ([], "silent"))
+                lambda rows, *a, **k: (
+                    [], "silent",
+                    {"trust_passed": len(rows), "relevance_failed": len(rows),
+                     "trust_failed": 0}))
             with self.assertRaises(BypassError) as ctx:
                 evaluate_injection_items(connect(), self._items())
             caught = ctx.exception

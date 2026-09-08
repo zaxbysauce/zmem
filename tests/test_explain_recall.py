@@ -180,11 +180,13 @@ class ExplainJsonShapeTests(ExplainFixtureBase):
         # The issue-mandated keys plus the effective settings that make the
         # verdicts interpretable (limit/scope shape below_limit + namespace).
         # query_shape is the #112 addition: the normalized FTS shape.
+        # lane_floors is the #113 addition: the per-lane inject floors the
+        # verdicts are judged against.
         self.assertEqual(sorted(exp.keys()),
                          sorted(["query", "query_shape", "target", "no_bump",
                                  "as_of", "hybrid", "verdicts", "namespace",
                                  "limit", "include_global", "global_limit",
-                                 "no_mmr"]))
+                                 "no_mmr", "lane_floors"]))
         self.assertIn("terms", exp["query_shape"])
         self.assertIn("fts_query", exp["query_shape"])
         self.assertTrue(exp["query_shape"]["fts_query"].startswith(
@@ -218,6 +220,7 @@ class ExplainReasonCoverageTests(ExplainFixtureBase):
             {"found", "below_limit", "below_floor", "omitted_injection",
              "omitted_untrusted_web", "namespace", "superseded",
              "not_valid_at_as_of", "vec_lane_miss", "not_in_pool",
+             "link_expansion",  # issue #113: link-hop-aware verdict
              "not_in_db", "explain_unavailable"},
         )
 

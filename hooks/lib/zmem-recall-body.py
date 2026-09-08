@@ -93,7 +93,7 @@ _FALLBACK_FLOOR_RECENT = 0.5
 # Issue #87 / #85 direction 1: import-failure fallbacks mirroring
 # schema_meta.INJECT_SILENT_REASONS / INJECT_REASON_INJECTED (a
 # partially-deployed tree still classifies with the documented set).
-_FALLBACK_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop")
+_FALLBACK_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance")
 _FALLBACK_REASON_INJECTED = "injected"
 # Issue #110 (P0-5): mirror of schema_meta.INJECT_REASON_DISABLED for the
 # passive-injection kill switch below.

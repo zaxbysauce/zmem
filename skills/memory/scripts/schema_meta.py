@@ -185,6 +185,24 @@ INJECT_FLOOR_PROMPT_DEFAULT = 0.25
 INJECT_FLOOR_RECENT_DEFAULT = 0.5
 INJECT_FLOOR_GATE_NONE_DEFAULT = 0.4
 
+# Per-lane relevance floors (issue #113, Workstream C PR 2): the injection
+# gate now also judges WHETHER A ROW IS RELEVANT, not only whether it is
+# trusted. Recall attaches one value per lane to every query-matched row:
+#   lex — (matched normalized terms / total) x (row |bm25| / pool-best |bm25|),
+#         counted ONLY when the row matches >= 2 distinct terms or covers all
+#         of them (one shared generic token is not relevance — the measured
+#         "git status" failure shape)
+#   cos — embedding cosine of the query vs the row (0..1), when a lane value
+#         exists
+#   ent — entity-lane relevance proxy (matched / total matched entities)
+# A lane with a present value must clear its floor; an ABSENT lane (None)
+# is exempt (query-less surfaces, link-expansion rows, model-absent cos).
+# Calibrated on the committed injection gold (fake-embedder profile):
+# 0.30 / 0.50 / 0.50 separates every labeled positive from every negative.
+INJECT_FLOOR_LEX_DEFAULT = 0.30
+INJECT_FLOOR_COS_DEFAULT = 0.50
+INJECT_FLOOR_ENT_DEFAULT = 0.5
+
 # Signals considered GROUNDED (trusted) by the hook selective-inject
 # gate (issue #58, 3.8): rows with these signals clear the PROMPT floor
 # (0.25); rows with any other signal — in practice only `none`, the
@@ -197,6 +215,9 @@ INJECT_GROUNDED_SIGNALS = frozenset({"test", "compile", "lint", "reviewer", "use
 INJECT_FLOOR_PROMPT_ENV = "ZMEM_INJECT_FLOOR_PROMPT"
 INJECT_FLOOR_RECENT_ENV = "ZMEM_INJECT_FLOOR_RECENT"
 INJECT_FLOOR_GATE_NONE_ENV = "ZMEM_INJECT_FLOOR_GATE_NONE"
+INJECT_FLOOR_LEX_ENV = "ZMEM_INJECT_FLOOR_LEX"
+INJECT_FLOOR_COS_ENV = "ZMEM_INJECT_FLOOR_COS"
+INJECT_FLOOR_ENT_ENV = "ZMEM_INJECT_FLOOR_ENT"
 
 # Closed reason set for silent inject decisions (issue #87 / #85 direction 1).
 # When a passive surface (--no-bump) injects nothing, it names WHICH gate fired
@@ -206,10 +227,16 @@ INJECT_FLOOR_GATE_NONE_ENV = "ZMEM_INJECT_FLOOR_GATE_NONE"
 #   omitted     — rows existed but every one was dropped by the passive
 #                 injection-risk/untrusted_web filter (envelope omitted > 0)
 #   below-bar   — rows reached the hook selective-inject gate and none passed
+#                 the TRUST gate (signal/confidence)
 #   budget-drop — the gate passed rows but the inject token budget emptied
+#   below-relevance (issue #113) — at least one row passed the trust gate but
+#                 EVERY query-matched candidate failed a per-lane relevance
+#                 floor: "nothing relevant", distinct from below-bar's
+#                 "nothing trusted" so the #94 report can separate the two.
 # The hook body, Hermes session_start, and the MCP twin import this tuple as
 # the single source (PRR-017 discipline). Do not invent extra reasons.
-INJECT_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop")
+INJECT_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop",
+                         "below-relevance")
 
 # Success-line reason (not a silent reason): logged alongside status=injected
 # so every zmem-hook log line carries a reason= field.
