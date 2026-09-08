@@ -86,7 +86,30 @@ class TrustFloorEnvTest(unittest.TestCase):
             self.assertAlmostEqual(_trust_floor(), 0.2)
 
 
-class GateTrustFloorTest(unittest.TestCase):
+class _FloorEnvHermetic:
+    """Review round (PRR): in-process classes read os.environ directly via
+    _trust_floor()/selective_inject_filter — strip every floor override so
+    the tests pin default-floor semantics regardless of operator env."""
+
+    FLOOR_ENVS = ("ZMEM_INJECT_FLOOR_TRUST", "ZMEM_INJECT_FLOOR_PROMPT",
+                  "ZMEM_INJECT_FLOOR_RECENT", "ZMEM_INJECT_FLOOR_GATE_NONE",
+                  "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
+                  "ZMEM_INJECT_FLOOR_ENT")
+
+    def setUp(self):
+        self._saved_floors = {k: os.environ.get(k) for k in self.FLOOR_ENVS}
+        for k in self.FLOOR_ENVS:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved_floors.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+class GateTrustFloorTest(_FloorEnvHermetic, unittest.TestCase):
     def test_row_below_floor_dropped_at_boundary_semantics(self):
         at_floor = _row(id="at", trust_score=0.2)
         just_below = _row(id="below", trust_score=0.19)
@@ -310,7 +333,7 @@ class ExplainReportsTrustTest(TrustRecallCliBase):
             self.assertIsInstance(t, float)
 
 
-class EvalRederivationTrustTest(unittest.TestCase):
+class EvalRederivationTrustTest(_FloorEnvHermetic, unittest.TestCase):
     def test_gate_passes_models_trust_floor(self):
         import storelib.eval_gold as eg
         import storelib.inject as inj
