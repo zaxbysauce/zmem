@@ -460,6 +460,11 @@ class _SessionStartReasonBase:
     def assert_budget_drop_reason(self, d):
         self.assertEqual(d.get("reason"), "budget-drop", d)
         self.assertEqual(d.get("context"), S_SESSION_BUDGET_DROP, d)
+        # Issue #115 (+ review round): the gate AND the token budget run
+        # IN-STORE (--for-injection) and the envelope's budget_dropped now
+        # carries the STORE-side drop count, so a budget-drained prefetch
+        # reports the real number again (the interim ==0 pin pre-dated the
+        # envelope field).
         self.assertGreaterEqual(d.get("budget_dropped", 0), 1, d)
 
 

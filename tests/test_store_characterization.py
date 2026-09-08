@@ -116,7 +116,15 @@ DATA_SHA = {
     # saturating ar/(1+ar) back-solve, so the fixture rows' `_score` values
     # (and their order at the top-5 boundary) legitimately moved.
     # stats/list/export_jsonl are byte-identical to their prior freezes.
-    "recall": "dec42e0d65c0514cfa276e14ed7854f95d29bd033a4c892bee26164a9fb30b92",
+    # issue #115: recall rows gained the `trust_score` key — the row data
+    # the inject gate and compute_score now read. RE-CAPTURED 2026-09-07 via
+    # ZMEM_CHAR_RECORD=1: ONLY the recall surface moved; stats/list/
+    # export_jsonl are byte-identical to their prior freezes. The fixture
+    # rows are uncontradicted (trust_score = 1.0 schema default), so the
+    # `_score` values and ordering are unchanged — compute_score's trust
+    # factor is the identity at 1.0 (pinned by tests/test_trust_recall.py);
+    # the hash moved because the rows carry the new key.
+    "recall": "76ada8482a93302bff9b775ded507e94e415c27471b69ba2ede68bff83d0d4a8",
     # v11 (issue #61): export-jsonl re-captured ONLY for the two new row keys
     # (`trust_score`, `links`) — stripping exactly those keys from the new
     # output reproduces the v10 freeze 8552767c… byte-for-byte (verified at

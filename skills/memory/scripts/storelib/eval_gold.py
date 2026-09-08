@@ -381,7 +381,8 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
         placeholders = ",".join("?" * len(candidate_ids))
         cand_rows = [
             dict(r) for r in conn.execute(
-                f"SELECT id, confidence, signal, type, content FROM memory "
+                f"SELECT id, confidence, signal, type, content, "
+                f"trust_score FROM memory "
                 f"WHERE id IN ({placeholders})", candidate_ids)
         ]
         if len(cand_rows) != len(set(candidate_ids)):
@@ -397,9 +398,14 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
             r["_rel_lex"] = lanes.get("lex")
             r["_rel_cos"] = lanes.get("cos")
             r["_rel_ent"] = lanes.get("ent")
+            # Issue #115: the envelope's pre-gate trust value is what the
+            # real gate judged; a lane map without the entry degrades to the
+            # exempt 1.0 path inside _row_trust (legacy envelopes).
+            r["trust_score"] = lanes.get("trust")
         expected_gate = [r for r in cand_rows
                          if _gate_passes(r, floor, gate_none_floor, grounded,
-                                         lane_floors=_inject._lane_floors())]
+                                         lane_floors=_inject._lane_floors(),
+                                         trust_floor=_inject._trust_floor())]
         expected_kept = _inject.apply_token_budget(expected_gate)[0]
         rendered_set = {r.get("id") for r in rows}
         expected_ids = {r["id"] for r in expected_kept}
@@ -435,7 +441,14 @@ def _mrr(pop: list[dict], denom: int) -> float:
 
 
 def _gate_passes(r, floor, gate_none_floor, grounded,
-                 lane_floors=None) -> bool:
+                 lane_floors=None, trust_floor=None) -> bool:
+    # Issue #115: mirror the gate's trust_score hard floor FIRST (same
+    # normalization via the owning module's _row_trust: missing -> 1.0
+    # exempt, unparseable/non-finite -> 0.0, clamped to [0,1]).
+    if trust_floor is not None:
+        import storelib.inject as _inject_mod
+        if _inject_mod._row_trust(r) < trust_floor:
+            return False
     conf = _conf_row(r)
     sig = (r.get("signal") or "none").lower()
     if sig == "none":

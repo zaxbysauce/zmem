@@ -838,7 +838,13 @@ class ZmemMemoryProvider(MemoryProvider):
                 "--limit", str(_PREFETCH_LIMIT),
                 "--include-global",
                 "--global-limit", "3",
-                "--no-bump",  # passive path: surface counted, retrieval not bumped (issue #21)
+                # passive path: surface counted, retrieval not bumped (issue #21)
+                "--no-bump",
+                # Issue #115 (final-critic round): the selective-inject gate
+                # (confidence floors, relevance lanes, trust_score hard
+                # floor) runs IN-STORE on this per-turn passive lane — same
+                # parity as every other --for-injection surface.
+                "--for-injection",
                 "--json",
             ]
         )
@@ -1234,6 +1240,10 @@ class ZmemMemoryProvider(MemoryProvider):
                 return 0.5
             return value
 
+        # Issue #115: the selective-inject gate (signal/confidence floors,
+        # relevance lanes AND the trust_score hard floor) now runs IN-STORE
+        # on this passive prefetch lane — same parity as the bash
+        # zmem-session-start.sh twin. The envelope's reason is authoritative.
         r = _run_store([
             "recent",
             "--namespace", ns,
@@ -1242,6 +1252,7 @@ class ZmemMemoryProvider(MemoryProvider):
             "--include-global",
             "--global-limit", "2",
             "--no-bump",
+            "--for-injection",
             "--json",
         ])
         if not r["ok"]:
@@ -1253,12 +1264,22 @@ class ZmemMemoryProvider(MemoryProvider):
             return _tool_error("Session prefetch returned non-JSON")
         rows = _envelope_results(parsed)
         omitted = parsed.get("omitted", 0) if isinstance(parsed, dict) else 0
-        budget_dropped = 0
+        # Issue #115: the store names the silent reason when the gate (now
+        # incl. the trust floor) emptied the set; fall back to the local
+        # classification for older envelopes.
+        store_reason = parsed.get("reason") if isinstance(parsed, dict) else None
         if _INJECT is not None:
             rows, _est, budget_dropped = _INJECT.apply_token_budget(rows)
             tokens_budget = _INJECT.inject_token_budget()
         else:
+            budget_dropped = 0
             tokens_budget = None
+        # Issue #115 review round: the envelope's budget_dropped is the
+        # store-side count (authoritative — the store already applied the
+        # budget); the client pass above is a legacy fallback for old
+        # envelopes that lack the field.
+        if isinstance(parsed, dict) and "budget_dropped" in parsed:
+            budget_dropped = parsed["budget_dropped"]
         renderer = _fence_renderer() or _local_fenced_recall
         header = (
             f"Session memories (namespace {ns}). High-confidence prefetch. "
@@ -1266,17 +1287,20 @@ class ZmemMemoryProvider(MemoryProvider):
             "if they apply and ignore if not."
         )
         # Issue #87 / #85 direction 1: name why a silent prefetch is silent.
-        # No post-prefetch confidence gate runs on this path (the store's
-        # --min-confidence floor already applied), so an empty prefetch is
-        # retrieved-empty — the session inject bar is never the true cause
-        # here and its string is intentionally dead on this path. Classify
-        # fail-open: any error degrades to empty-pool, never _tool_error.
+        # Since issue #115 the gate (confidence floors, relevance lanes and
+        # the trust_score hard floor) runs IN-STORE via --for-injection, so
+        # the envelope's own reason is authoritative when present; the local
+        # classification below remains the fallback for older envelopes.
+        # Classify fail-open: any error degrades to empty-pool, never
+        # _tool_error.
         reasons = _store_constants()
         allowed = reasons["INJECT_SILENT_REASONS"]
         reason = reasons["INJECT_REASON_INJECTED"]
         try:
             if not rows:
-                if budget_dropped:
+                if store_reason and store_reason in allowed:
+                    reason = store_reason
+                elif budget_dropped:
                     reason = "budget-drop"
                 elif omitted > 0:
                     reason = "omitted"

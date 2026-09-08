@@ -12,6 +12,45 @@ README.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-07
+
+### Added
+- **memory** (issue #115, Workstream C-4): trust_score applied at recall —
+  the contradiction ledger finally bites on the read side. The
+  selective-inject gate hard-drops rows whose `trust_score` sits below the
+  new `INJECT_FLOOR_TRUST_DEFAULT` (0.2, env
+  `ZMEM_INJECT_FLOOR_TRUST`) — nine or more distinct `contradict` events
+  (each −0.10, clamped at 0.0 by the v11 ledger) stop a row from riding the
+  passive UserPromptSubmit / PreCompact / SessionStart lanes, symmetrically
+  for link-expansion neighbors; a once-contradicted neighbor (trust 0.9)
+  still renders with its `[CONTESTED LINK]` marker. Floor-dropped rows
+  count in the gate's existing `trust_failed` bucket, so a drained pool
+  reports `below-bar` ("nothing trusted"). The gate covers every passive
+  surface: the Hermes `prefetch` / `session_start` lanes, the MCP
+  `session_start` twin, the `zmem-hermes-reflect` pre-call hook, and the
+  UserPromptSubmit / PreCompact / SubagentStart hooks all route through the
+  in-store gate (`--for-injection`), and `[PREVIOUSLY]` lineage rows carry
+  the same `trust_score` metadata as query-matched rows.
+- **memory** (issue #115): `compute_score` multiplies the composite by
+  `trust_score` — identity at the schema default 1.0, so every
+  uncontradicted row's ranking is byte-identical, while a contradicted row
+  demotes proportionally on every surface that ranks (explicit recall and
+  `search` still retrieve it; the gate only shapes the passive lane).
+  Design decision recorded for E-5 (#124): `violated_count` feeds ranking
+  only THROUGH `trust_score` (today via the one-time feedback drop; #124's
+  automatic violations must apply trust deltas to the same column).
+- **memory** (issue #115): `recall --explain` reports the trust
+  contribution — `lane_floors` gains a `trust` entry (plus top-level
+  `trust_floor`), and `found`/`below_limit` verdicts carry the row's
+  applied multiplier in `detail.lanes.trust`; `--for-injection` envelopes
+  add a `trust` value per `candidate_lanes` entry plus a store-side
+  `budget_dropped` count (so hosts report the real token-budget drop
+  instead of a client-side residual) — the eval re-derivation
+  (`eval_gold._gate_passes`) models the floor and the no-silent-bypass
+  invariant keeps holding. Result rows expose `trust_score`; expansion
+  neighbors inherit it through the same projection (the v12 additive-key
+  precedent).
+
 ## [0.23.0] - 2026-09-07
 
 ### Added

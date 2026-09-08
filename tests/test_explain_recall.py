@@ -50,6 +50,7 @@ os.environ["ZMEM_STORE"] = INPROC_STORE
 os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
 os.environ["ZMEM_MODELS_DIR"] = "/nonexistent-zmem-models-dir"
 os.environ["ZMEM_EMBED_PROFILE"] = "fake"
+os.environ.pop("ZMEM_INJECT_FLOOR_TRUST", None)  # PRR: floor default must hold
 
 
 def _pin_env(store: str) -> dict:
@@ -181,12 +182,14 @@ class ExplainJsonShapeTests(ExplainFixtureBase):
         # verdicts interpretable (limit/scope shape below_limit + namespace).
         # query_shape is the #112 addition: the normalized FTS shape.
         # lane_floors is the #113 addition: the per-lane inject floors the
-        # verdicts are judged against.
+        # verdicts are judged against. trust_floor is the #115 addition: the
+        # resolved trust_score hard floor (also mirrored as
+        # lane_floors["trust"]).
         self.assertEqual(sorted(exp.keys()),
                          sorted(["query", "query_shape", "target", "no_bump",
                                  "as_of", "hybrid", "verdicts", "namespace",
                                  "limit", "include_global", "global_limit",
-                                 "no_mmr", "lane_floors"]))
+                                 "no_mmr", "lane_floors", "trust_floor"]))
         self.assertIn("terms", exp["query_shape"])
         self.assertIn("fts_query", exp["query_shape"])
         self.assertTrue(exp["query_shape"]["fts_query"].startswith(

@@ -1390,12 +1390,16 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if denied:
             return denied
         n = max(1, min(int(limit or 3), _HARD_LIMIT_MAX))
+        # Issue #115: in-store selective gate (incl. the trust_score hard
+        # floor) on this passive prefetch lane — twin parity with
+        # hermes-plugin/__init__.py _tool_session_start.
         args = [
             "recent",
             "--namespace", resolved_ns,
             "--limit", str(n),
             "--min-confidence", str(_recent_floor()),
             "--no-bump",
+            "--for-injection",
             "--json",
         ]
         if _include_global_allowed() and resolved_ns != "user:global":
@@ -1415,12 +1419,21 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if not isinstance(rows, list):
             rows = []
         omitted = parsed.get("omitted", 0) if isinstance(parsed, dict) else 0
+        # Issue #115: the store names the silent reason when the in-store
+        # gate (now incl. the trust floor) emptied the set.
+        store_reason = parsed.get("reason") if isinstance(parsed, dict) else None
         # Token budget (10.9): admission control on rows BEFORE the fence.
         tokens_budget = None
         budget_dropped = 0
         if _inject is not None:
             rows, _est, budget_dropped = _inject.apply_token_budget(rows)
             tokens_budget = _inject.inject_token_budget()
+        # Issue #115 review round: the envelope's budget_dropped is the
+        # store-side count (authoritative — the store already applied the
+        # budget); the client pass above is a legacy fallback for old
+        # envelopes that lack the field.
+        if isinstance(parsed, dict) and "budget_dropped" in parsed:
+            budget_dropped = parsed["budget_dropped"]
         renderer = _fence_renderer() or _local_fenced_recall
         header = (
             f"Session memories (namespace {resolved_ns}). High-confidence "
@@ -1428,16 +1441,17 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "consider if they apply and ignore if not."
         )
         # Issue #87 / #85 direction 1: name why a silent prefetch is silent.
-        # No post-prefetch confidence gate runs on this path (the store's
-        # --min-confidence floor already applied), so an empty prefetch is
-        # retrieved-empty — the session inject bar is never the true cause
-        # here and its string is intentionally dead on this path. Classify
-        # fail-open: any error degrades to empty-pool, never _error.
+        # Since issue #115 the gate (confidence floors, relevance lanes and
+        # the trust_score hard floor) runs IN-STORE via --for-injection, so
+        # the envelope's own reason is authoritative when present; the local
+        # classification below remains the fallback for older envelopes.
         # Twin of hermes-plugin/__init__.py _tool_session_start (do not fork).
         reason = _INJECT_REASON_INJECTED
         try:
             if not rows:
-                if budget_dropped:
+                if store_reason and store_reason in _INJECT_SILENT_REASONS:
+                    reason = store_reason
+                elif budget_dropped:
                     reason = "budget-drop"
                 elif omitted > 0:
                     reason = "omitted"

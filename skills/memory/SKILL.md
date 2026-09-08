@@ -230,7 +230,7 @@ Hermes `_tool_search` — byte-identical; MCP `recall` unfolds for free).
 
 #### Confidence floors (issue #58, 3.8)
 
-Three distinct floors live on the recall path. Each reflects a different
+Four distinct floors live on the recall path. Each reflects a different
 surface's precision-vs-coverage tradeoff. They are env-overridable; the
 constants live in `schema_meta.py`.
 
@@ -239,10 +239,13 @@ constants live in `schema_meta.py`.
 | `INJECT_FLOOR_PROMPT_DEFAULT` | 0.25 | `ZMEM_INJECT_FLOOR_PROMPT` | `recall` (UserPromptSubmit / PreCompact). Hard floor on FTS/vec results — anything below is dropped before scoring. |
 | `INJECT_FLOOR_RECENT_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_RECENT` | `recent` (SessionStart / subagent recall). Tighter because the surface is high-confidence recent material, not query-best match. |
 | `INJECT_FLOOR_GATE_NONE_DEFAULT` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; grounded-signal rows (`test`/`compile`/`lint`/`reviewer`/`user`) keep the 0.25 floor. |
+| `INJECT_FLOOR_TRUST_DEFAULT` | 0.2 | `ZMEM_INJECT_FLOOR_TRUST` | Selective-inject gate (issue #115). Hard floor on `trust_score`: a row the contradiction ledger has driven below 0.2 (nine or more distinct `contradict` events) can no longer ride the passive lane; `compute_score` also multiplies every composite by `trust_score` (identity at the default 1.0, so uncontradicted rankings do not move — explicit recall/search keep retrieving the row, just ranked lower). When E-5 (#124) starts recording violations automatically, they must feed THIS ledger via trust deltas — `violated_count` never becomes a second independent gate input. |
 
-The three floors are intentional. Do not silently unify them. The
-selective-inject gate (3.8) is a hook-only filter; it does not change
-the Python recall path.
+The floors are intentional. Do not silently unify them. The
+selective-inject gate (3.8) is a passive-lane filter; the trust floor
+applies symmetrically to link-expansion neighbors that ride the passive
+lane (a once-contradicted neighbor at trust 0.9 still renders with its
+`[CONTESTED LINK]` marker).
 
 When a passive inject surfaces nothing, it names WHICH gate fired (issue #87 /
 #85 direction 1): `no durable memories retrieved for this prompt.` means the

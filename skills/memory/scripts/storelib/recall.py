@@ -22,7 +22,10 @@ from storelib.entity import entities_for_memory, entities_for_memories, entity_m
 from storelib.links import expand_recall_links
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
-from storelib.inject import _lane_floors, apply_token_budget, classify_silent_reason, estimate_tokens, inject_token_budget, selective_inject_filter
+from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
+                             apply_token_budget, classify_silent_reason,
+                             estimate_tokens, inject_token_budget,
+                             selective_inject_filter)
 from schema_meta import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
 import embed_profiles as _profiles
 from storelib.cross_encoder import maybe_rerank as _cross_maybe_rerank
@@ -218,12 +221,20 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
         rc = 0
     popularity = min(1.0, 0.15 * (rc ** 0.5))
 
+    # Trust discount (issue #115): the composite is multiplied by the row's
+    # trust_score — identity at the schema default 1.0, so every
+    # uncontradicted row and every legacy caller whose rows lack the key
+    # (_row_trust -> 1.0) keeps byte-identical scores; a contradicted row
+    # demotes proportionally on every surface that ranks (retrieval is
+    # untouched — explicit recall/search still return it, only lower).
+    trust = _row_trust(row)
+
     return (
         w_bm25 * relevance_comp
         + w_conf * confidence
         + w_rec * recency
         + w_pop * popularity
-    )
+    ) * trust
 
 def _vector_knn(conn: sqlite3.Connection, embedding: bytes, k: int) -> list[str]:
     """Query the vec0 table for k nearest neighbors. Returns memory_id list.
@@ -473,7 +484,7 @@ def _fetch_by_ids(
         SELECT id, namespace, type, content, tags, source_ref,
                source_hash, confidence, signal, valid_from,
                ingestion_ts, retrieval_count, surfaced_count, last_retrieved,
-               valid_until, update_of, taint,
+               valid_until, update_of, taint, trust_score,
                content_norm, applied_count, violated_count,
                NULL AS fts_rank
         FROM memory
@@ -512,7 +523,7 @@ def _fetch_lineage_rows(
     sql = f"""
         SELECT id, namespace, type, content, tags, source_ref,
                confidence, signal, valid_from, valid_until,
-               update_of, taint
+               update_of, taint, trust_score
         FROM memory
         WHERE id IN ({placeholders})
           {ns_clause}
@@ -551,6 +562,7 @@ def _lineage_row_dict(r: sqlite3.Row) -> dict:
         "valid_until": r["valid_until"],
         "update_of": r["update_of"],
         "taint": r["taint"],
+        "trust_score": _row_trust(r),
         "stale": False,
         "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
         "_stale_note": "",
@@ -855,7 +867,7 @@ def _recall_one_tier(
             SELECT m.id, m.namespace, m.type, m.content, m.tags, m.source_ref,
                    m.source_hash, m.confidence, m.signal, m.valid_from,
                    m.ingestion_ts, m.retrieval_count, m.surfaced_count, m.last_retrieved,
-                   m.valid_until, m.update_of, m.taint,
+                   m.valid_until, m.update_of, m.taint, m.trust_score,
                    m.content_norm, m.applied_count, m.violated_count,
                    rank AS fts_rank
             FROM memory_fts f
@@ -1054,6 +1066,9 @@ def _recall_one_tier(
         ent_leg = max(0.0, entv) if entv is not None else None
         lane_vals = [v for v in (rel_lex, cos_leg, ent_leg) if v is not None]
         rel = max(lane_vals) if lane_vals else 0.0
+        # Issue #115: the trust multiplier compute_score applied to this row
+        # (same normalization the gate uses), reported under --explain.
+        trust = _row_trust(row_fields)
         score = compute_score(row_fields, fts_r, now_epoch, vec_sim=vsim,
                               relevance=rel, weights=weights)
         norm_map[r["id"]] = r["content_norm"] or ""
@@ -1080,6 +1095,11 @@ def _recall_one_tier(
             "_rel_lex": rel_lex,
             "_rel_cos": cos_leg,
             "_rel_ent": ent_leg,
+            # Issue #115: the row's trust multiplier, EXPOSED so the shared
+            # inject gate (_row_trust) can judge scored rows — a plain key
+            # because it is row data, not a diagnostic (the SQL-backed rows
+            # from _fetch_by_ids/_recent_one_tier carry it the same way).
+            "trust_score": trust,
         }))
         if collect_lanes:
             scored[-1][1]["_lanes"] = {
@@ -1092,6 +1112,7 @@ def _recall_one_tier(
                 "cos": cos_leg,
                 "entity": ent_leg,
                 "rel": rel,
+                "trust": trust,
             }
 
     # Sort by composite score descending within this tier, take top `limit`.
@@ -1568,8 +1589,10 @@ def recall_memory(
         selected_rows, _gate_status, _gate_stats = selective_inject_filter(
             results, with_stats=True)
         budget_emptied = False
+        budget_dropped = 0
         if selected_rows:
             selected_rows, _est, _dropped = apply_token_budget(selected_rows)
+            budget_dropped = _dropped
             if not selected_rows:
                 budget_emptied = True
         results = selected_rows
@@ -1627,9 +1650,14 @@ def recall_memory(
             # relevance floors without re-running recall.
             envelope["candidate_lanes"] = {
                 r["id"]: {"lex": r.get("_rel_lex"), "cos": r.get("_rel_cos"),
-                          "ent": r.get("_rel_ent")}
+                          "ent": r.get("_rel_ent"),
+                          "trust": _row_trust(r)}
                 for r in candidate_rows
             }
+            # Issue #115 review round: the store-side token-budget drop
+            # count, so --for-injection consumers report the real drop
+            # instead of a client-side residual of an already-budgeted set.
+            envelope["budget_dropped"] = budget_dropped
         print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: hook/text surface uses the fenced render
@@ -2194,7 +2222,12 @@ def explain_recall(
         # Issue #113: the resolved per-lane inject-gate floors next to the
         # verdicts' lane numbers, so a debugger sees score AND threshold in
         # one envelope (absent lanes are exempt; these judge measured ones).
-        "lane_floors": dict(zip(("lex", "cos", "ent"), _lane_floors())),
+        # Issue #115: the trust floor rides beside them (plain --explain, no
+        # for_injection needed), and found/below_limit verdicts carry the
+        # row's applied trust multiplier in detail.lanes.trust.
+        "lane_floors": dict(zip(("lex", "cos", "ent", "trust"),
+                                (*_lane_floors(), _trust_floor()))),
+        "trust_floor": _trust_floor(),
         "verdicts": verdicts,
     }
     if as_json:
@@ -2265,7 +2298,7 @@ def _recent_one_tier(
     rows = conn.execute(
         f"""SELECT id, namespace, type, content, tags, source_ref, source_hash,
                   confidence, signal, valid_from, ingestion_ts, last_retrieved,
-                  valid_until, update_of, taint
+                  valid_until, update_of, taint, trust_score
             FROM memory
             WHERE {live_clause} confidence >= ?
             {ns_clause}
@@ -2295,6 +2328,7 @@ def _recent_one_tier(
             "valid_until": r["valid_until"],
             "update_of": r["update_of"],
             "taint": r["taint"],
+            "trust_score": _row_trust(r),
             "stale": bool(stale_note),
             "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
             "_stale_note": stale_note,
@@ -2405,8 +2439,10 @@ def recent_memory(
         selected_rows, _gate_status, _gate_stats = selective_inject_filter(
             results, with_stats=True)
         budget_emptied = False
+        budget_dropped = 0
         if selected_rows:
             selected_rows, _est, _dropped = apply_token_budget(selected_rows)
+            budget_dropped = _dropped
             if not selected_rows:
                 budget_emptied = True
         results = selected_rows
@@ -2448,9 +2484,14 @@ def recent_memory(
             # relevance floors without re-running recall.
             envelope["candidate_lanes"] = {
                 r["id"]: {"lex": r.get("_rel_lex"), "cos": r.get("_rel_cos"),
-                          "ent": r.get("_rel_ent")}
+                          "ent": r.get("_rel_ent"),
+                          "trust": _row_trust(r)}
                 for r in candidate_rows
             }
+            # Issue #115 review round: the store-side token-budget drop
+            # count, so --for-injection consumers report the real drop
+            # instead of a client-side residual of an already-budgeted set.
+            envelope["budget_dropped"] = budget_dropped
         print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: same fence + provenance as recall. Recent is
