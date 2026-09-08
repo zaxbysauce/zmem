@@ -237,10 +237,11 @@ class UncontradictedRankingStableTest(TrustRecallCliBase):
                 f"own marker token zebra{i} for ordering"))
         results = [r["id"] for r in self.search_json(
             "frobnicator quuxlet deployment zebra", )["results"]][:4]
-        # search is explicit, unexpanded, no gate: the all-trust-1.0 order
-        # must be the deterministic insertion order (recency 1s apart is not
-        # guaranteed at CLI speed, so pin the SET and assert compute_score
-        # identity separately — the frozen C2 check pins the full order).
+        # search is explicit, unexpanded, no gate. This is the SET-pin only:
+        # recency 1s apart is not guaranteed at CLI speed, so the strict
+        # ORDER pin lives in the frozen C2 acceptance check (which replays
+        # base and head with identical fixture timing); we additionally pin
+        # compute_score's trust identity separately below.
         self.assertEqual(sorted(results), sorted(ids))
 
     def test_compute_score_identity_keeps_order(self):

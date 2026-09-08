@@ -460,7 +460,12 @@ class _SessionStartReasonBase:
     def assert_budget_drop_reason(self, d):
         self.assertEqual(d.get("reason"), "budget-drop", d)
         self.assertEqual(d.get("context"), S_SESSION_BUDGET_DROP, d)
-        self.assertGreaterEqual(d.get("budget_dropped", 0), 1, d)
+        # Issue #115: the gate AND the token budget now run IN-STORE
+        # (--for-injection), so the drop the client used to count happens in
+        # the store, which names reason=budget-drop itself; budget_dropped
+        # here reports only residual client-side drops — 0 on the in-store
+        # lane (the pre-#115 architecture asserted >= 1 here).
+        self.assertEqual(d.get("budget_dropped", 0), 0, d)
 
 
 class HermesSessionStartReasonTest(unittest.TestCase, _SessionStartReasonBase):
