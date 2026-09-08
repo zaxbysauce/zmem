@@ -748,7 +748,8 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     # (both numeric) counts here; post-fix this must read zero.
     over_budget = sum(
         1 for ln in lines
-        if ln.get("tok_used") is not None and ln.get("tok_budget")
+        if ln.get("tok_used") is not None
+        and ln.get("tok_budget") is not None
         and ln["tok_used"] > ln["tok_budget"])
 
     failures = []

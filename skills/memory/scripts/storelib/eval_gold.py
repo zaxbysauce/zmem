@@ -347,13 +347,17 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
     # Issue #116: the guard must mirror the estimator admission actually
     # charges — fence_row_cost (full render contribution), not the legacy
     # content-only row_token_cost, or a stub could pass this check while the
-    # real admission over-budgets.
+    # real admission over-budgets. Admission also reserves the fence shell
+    # (available = budget - FENCE_SHELL_ALLOWANCE), so the guard compares
+    # against the SAME ceiling; otherwise a stub landing in
+    # (budget-128, budget] slips past undetected.
+    shell = getattr(_inject, "FENCE_SHELL_ALLOWANCE", 0)
     used = sum(_inject.fence_row_cost(r) for r in rows)
     protected = getattr(_inject, "_PROTECTED_TYPES",
                         ("decision", "constraint"))
     all_protected = bool(rows) and all(
         (r.get("type") or "") in protected for r in rows)
-    if used > budget and not all_protected:
+    if used + shell > budget and not all_protected:
         raise BypassError(
             f"{item_id}: rendered set costs ~{used} tokens, over the "
             f"{budget}-token budget, with non-protected rows present — the "

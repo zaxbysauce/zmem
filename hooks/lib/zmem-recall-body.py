@@ -453,7 +453,13 @@ def _format_fence(rows, header: str, store_py: str = "",
             sys.path.insert(0, scripts_dir)
             sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
         from storelib import _format_fenced_recall
-        return _format_fenced_recall(rows, header, budget_note=budget_note)
+        try:
+            return _format_fenced_recall(rows, header, budget_note=budget_note)
+        except TypeError:
+            # PR-review hardening: a storelib older than #116 has no
+            # budget_note kwarg — degrade to the legacy call instead of
+            # crashing the hook (fail-open discipline).
+            return _format_fenced_recall(rows, header)
     finally:
         sys.path[:] = saved
 
@@ -874,14 +880,19 @@ def main() -> int:
                 envelope_candidates = [
                     str(_x) for _x in _ec if isinstance(_x, str)
                 ]
-            try:
-                envelope_admission = int(rows.get("budget_admission") or 0)
-                envelope_bdrop = int(rows.get("budget_dropped") or 0)
-                envelope_btrunc = int(rows.get("budget_truncated") or 0)
-                envelope_bprot = int(
-                    rows.get("budget_dropped_protected") or 0)
-            except (TypeError, ValueError):
-                envelope_admission = None
+            # Issue #116 (PR-review round): gate on KEY PRESENCE, not `or 0`
+            # coercion — `int(None or 0)` is 0, which would fabricate
+            # measured-looking zeros into the audit log on legacy (pre-#116)
+            # store envelopes instead of leaving the fields absent.
+            if "budget_admission" in rows:
+                try:
+                    envelope_admission = int(rows.get("budget_admission") or 0)
+                    envelope_bdrop = int(rows.get("budget_dropped") or 0)
+                    envelope_btrunc = int(rows.get("budget_truncated") or 0)
+                    envelope_bprot = int(
+                        rows.get("budget_dropped_protected") or 0)
+                except (TypeError, ValueError):
+                    envelope_admission = None
             _bn = rows.get("budget_note")
             if isinstance(_bn, str):
                 envelope_note = _bn

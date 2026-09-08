@@ -415,14 +415,17 @@ they can carry information: a row that fits renders whole, one that does not
 is TRUNCATED with an explicit `…[budget-truncated]` marker, and only a row
 too large for even a minimal stub is dropped — never silently. When anything
 was omitted, the fence carries a machine-readable line
-`# [budget: dropped N rows, truncated M]` and the hook decision line reports
-`tokens=<rendered>/<budget>` plus the distinct labeled fields
-`admission_budget=`, `rendered_estimate=`, `budget_dropped=`,
-`budget_truncated=`, `budget_dropped_protected=` (after `sid=`'s
-predecessors, before `ops=`). Every read `--json` envelope reports
+`# [budget: dropped N rows, truncated M]` and the shared hook body's
+decision line (UserPromptSubmit / PreCompact / SubagentStart / SessionStart
+tier-2 python path) reports `tokens=<rendered>/<budget>` plus the distinct
+labeled fields `rendered_estimate=`, `admission_budget=`, `budget_dropped=`,
+`budget_truncated=`, `budget_dropped_protected=` (the same order as the
+field-order list above; emitted only when budget accounting ran). The
+separate `zmem-session-start.sh` bash writer keeps its legacy
+`tokens=<used>/<budget>`-only line. Every read `--json` envelope reports
 `tokens_used`/`tokens_budget` and, on the `--for-injection` lane,
-`budget_admission`/`budget_truncated`/`budget_dropped_protected`/
-`budget_note`. The B-1 report (`doctor --miss-rate`) counts
+`budget_dropped`/`budget_admission`/`budget_truncated`/
+`budget_dropped_protected`/`budget_note`. The B-1 report (`doctor --miss-rate`) counts
 `over-budget N` decisions so the ceiling can be verified on a live log
 window. `ZMEM_CTX_BUDGET` (character cap) remains the hard outer truncation
 on the rendered block.

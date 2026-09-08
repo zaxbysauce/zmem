@@ -1700,12 +1700,16 @@ def recall_memory(
         if not results:
             print("[zmem] no matching memories found.")
         else:
+            # Issue #116 (PR-review round): the --for-injection text path
+            # (direct CLI, no --json) carries the budget note too, so drops
+            # and truncation are visible outside the JSON envelope.
             print(_format_fenced_recall(
                 results,
                 header=(
                     f"Relevant memories (namespace {namespace or 'unscoped'}). "
                     f"Consider if they apply; ignore if not."
                 ),
+                budget_note=inj_budget_note if for_injection else None,
             ))
     return results
 
@@ -2555,12 +2559,15 @@ def recent_memory(
         if not results:
             print("[zmem] no recent memories.")
         else:
+            # Issue #116 (PR-review round): --for-injection text path
+            # carries the budget note (same rationale as recall).
             print(_format_fenced_recall(
                 results,
                 header=(
                     f"Recent memories (namespace {namespace or 'unscoped'}). "
                     f"High-confidence admin pull. Consider if relevant; ignore if not."
                 ),
+                budget_note=inj_budget_note if for_injection else None,
             ))
     return results
 

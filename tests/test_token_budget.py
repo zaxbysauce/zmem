@@ -357,6 +357,142 @@ class HookBodyBudgetTest(unittest.TestCase):
         self.assertTrue(lines, "decisions log line missing")
         self.assertRegex(lines[-1], r"tokens=\d+/\d+")
 
+    def test_partial_drop_fence_carries_budget_marker(self):
+        # PR-review F11a: the rendered FENCE (not just the log) carries the
+        # machine-readable [budget: ...] line when the budget drops rows.
+        # Two TOPICALLY DISTINCT rows (semantic dedup-on-write absorbs
+        # near-identical text at similarity > 0.85) and a budget that admits
+        # the first but drops the second: a partial drop, so the fence
+        # renders WITH the marker.
+        import subprocess
+        for content in ("budget probe payment webhook retry handler "
+                        + "with exponential backoff " + "x" * 300,
+                        "budget probe git rebase cleanup workflow "
+                        + "for stalled feature branches " + "y" * 300):
+            subprocess.run(
+                [sys.executable, str(SCRIPTS / "store.py"), "add",
+                 "--namespace", "project:budget", "--type", "lesson",
+                 "--content", content, "--signal", "test"],
+                capture_output=True, text=True, timeout=120,
+            )
+        event = json.dumps({"prompt": "budget probe"})
+        # 278 - 128 shell = 150 available: row 1 (~112 tok) fits, row 2 is
+        # budget-dropped -> partial drop with a rendered fence.
+        os.environ["ZMEM_INJECT_TOKEN_BUDGET"] = "278"
+        try:
+            r = subprocess.run(
+                [sys.executable, str(REPO_ROOT / "hooks" / "lib" /
+                                     "zmem-recall-body.py"),
+                 str(SCRIPTS / "store.py"), "project:budget", "25000",
+                 "user_prompt"],
+                input=event, capture_output=True, text=True, timeout=60,
+            )
+        finally:
+            os.environ.pop("ZMEM_INJECT_TOKEN_BUDGET", None)
+        if not r.stdout.strip():
+            self.fail("hook emitted nothing; stderr=" + r.stderr[-500:])
+        out = json.loads(r.stdout)
+        ctx = out["additionalContext"]
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        self.assertRegex(ctx, r"\[budget: dropped [1-9]\d* rows")
+
+    def test_log_line_fields_absent_without_budget_keys(self):
+        # PR-review F11c/F1 regression pin: admission_used=None (legacy
+        # envelope shape) must leave the budget fields ABSENT from the
+        # decision line, not emit fabricated zeros.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "zmem_hook_body_log",
+            REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        log = os.path.join(self._tmp, "zmem-decisions.log")
+        if os.path.exists(log):
+            os.remove(log)
+        row = {"id": "legacy-1", "confidence": 0.9, "signal": "test",
+               "namespace": "project:budget", "type": "fact",
+               "content": "legacy envelope row"}
+        mod._log_inject_decision(
+            [row], [row], "injected", "injected",
+            tokens_used=77, tokens_budget=1500,
+            session_id="legacy-test", moment="user_prompt",
+            admission_used=None,
+            budget_dropped=None, budget_truncated=None,
+            budget_dropped_protected=None)
+        with open(log, encoding="utf-8") as f:
+            line = [ln for ln in f.read().splitlines()
+                    if "zmem-hook" in ln][-1]
+        self.assertRegex(line, r"tokens=77/1500")
+        # rendered_estimate rides whenever tokens_used is present...
+        self.assertIn("rendered_estimate=77", line)
+        # ...but the admission/budget fields stay ABSENT on legacy envelopes.
+        self.assertNotIn("admission_budget=", line)
+        self.assertNotIn("budget_dropped=", line)
+        # And with admission stats provided, the fields ARE present
+        # (zero-counts included — byte-stable shape).
+        if os.path.exists(log):
+            os.remove(log)
+        mod._log_inject_decision(
+            [row], [row], "injected", "injected",
+            tokens_used=77, tokens_budget=1500,
+            session_id="legacy-test", moment="user_prompt",
+            admission_used=0,
+            budget_dropped=0, budget_truncated=0,
+            budget_dropped_protected=0)
+        with open(log, encoding="utf-8") as f:
+            line = [ln for ln in f.read().splitlines()
+                    if "zmem-hook" in ln][-1]
+        self.assertIn("rendered_estimate=77", line)
+        self.assertIn("admission_budget=0", line)
+        self.assertIn("budget_dropped=0", line)
+        self.assertIn("budget_truncated=0", line)
+        self.assertIn("budget_dropped_protected=0", line)
+
+
+    def test_truncate_fail_closed_branch(self):
+        # PR-review F11b: when the re-measure disagrees with the conservative
+        # arithmetic (simulated by a cost function that inflates once content
+        # is present), _truncate_protected_row must return None -> the row is
+        # DROPPED with a protected-drop count, never admitted over ceiling.
+        real_cost = inject.fence_row_cost
+
+        def inflating_cost(row):
+            base = real_cost(row)
+            if (row.get("content") or "") and \
+                    "…[budget-truncated]" in (row.get("content") or ""):
+                return base + 10_000  # re-measure disagrees
+            return base
+
+        saved = inject.fence_row_cost
+        try:
+            inject.fence_row_cost = inflating_cost
+            row = _row("decision " + "d" * 2000, type_="decision", score=0.9)
+            stub = inject._truncate_protected_row(row, remaining=300)
+            self.assertIsNone(stub)
+            kept, used, dropped, stats = inject.apply_token_budget(
+                [row], budget=inject.FENCE_SHELL_ALLOWANCE + 300,
+                with_stats=True)
+            self.assertEqual(kept, [])
+            self.assertEqual(stats["dropped_protected"], 1)
+            self.assertEqual(stats["truncated"], 0)
+        finally:
+            inject.fence_row_cost = saved
+
+    def test_header_cap_and_budget_note_interplay(self):
+        # PR-review F11d: a max-length header TOGETHER with a budget note
+        # renders capped and complete — the shell allowance budgeted for
+        # both.
+        from storelib.recall import _format_fenced_recall
+        rows = [_row("cap+note row " + "c" * 100)]
+        fence = _format_fenced_recall(
+            rows, "H" * 500, budget_note="[budget: dropped 1 rows, truncated 0]")
+        self.assertIn("# [budget: dropped 1 rows, truncated 0]", fence)
+        header_lines = [ln for ln in fence.splitlines() if ln.startswith("# H")]
+        self.assertEqual(len(header_lines), 1)
+        self.assertLessEqual(len(header_lines[0]), 244)
+        self.assertTrue(
+            fence.strip().endswith("<<<END_ZMEM_UNTRUSTED_FENCE>>>"))
+
 
 class DegradedFenceFallbackTest(unittest.TestCase):
     """Issue #116 final-critic catch: the degraded-mode fallback renderers in
@@ -382,6 +518,7 @@ class DegradedFenceFallbackTest(unittest.TestCase):
             REPO_ROOT / "hermes-plugin" / "__init__.py")
         mod = importlib.util.module_from_spec(spec)
         sys.modules["zmem_hermes_fallback"] = mod
+        self.addCleanup(sys.modules.pop, "zmem_hermes_fallback", None)
         spec.loader.exec_module(mod)
         return mod
 
@@ -398,16 +535,21 @@ class DegradedFenceFallbackTest(unittest.TestCase):
         self.assertNotIn("[budget:", plain)
 
     def test_mcp_fallback_accepts_budget_note(self):
-        try:
-            import importlib.util
-            spec = importlib.util.spec_from_file_location(
-                "zmem_mcp_fallback",
-                REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py")
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-        except ImportError:
-            self.skipTest("mcp package not installed")
-            return
+        # PR-review F11f: the old skipTest("mcp package not installed") was
+        # dead — mcp is imported lazily inside build_server(), so exec_module
+        # never needs it. mcp_server DOES import auth/bind_guard from its own
+        # dir, so make that dir importable and let real errors fail loudly.
+        import importlib.util
+        server_dir = str(REPO_ROOT / "hermes-plugin" / "server")
+        sys.path.insert(0, server_dir)
+        self.addCleanup(sys.path.remove, server_dir)
+        spec = importlib.util.spec_from_file_location(
+            "zmem_mcp_fallback",
+            REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["zmem_mcp_fallback"] = mod
+        self.addCleanup(sys.modules.pop, "zmem_mcp_fallback", None)
+        spec.loader.exec_module(mod)
         rows = [{"id": "fb2", "confidence": 0.9, "signal": "test",
                  "namespace": "project:x", "type": "fact", "content": "c"}]
         out = mod._local_fenced_recall(
