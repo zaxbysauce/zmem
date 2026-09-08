@@ -1,11 +1,11 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "193e677686a7c8d28e250752585e6a3aca124b42e584ee3a993735b3fef855d8",
+  "digest": "fb97a8e5288597c8ed7a4643b8f6f4300f687df11405ccbb0af06a9b6fa6161d",
   "files": {
-    "hermes-plugin/__init__.py": "40256b75f65100f8684bd554c0281f48354172b694d3416b71bb94ac0f5f83b2",
+    "hermes-plugin/__init__.py": "c4bec2bca928cf74d62f3f112d79a81052e53e4f083adbe8f901ce58b106e675",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60",
-    "hermes-plugin/hooks/zmem-hermes-reflect.py": "3340d1de69bfb4f7ef3c190ae10ab40c5de11f947241d3e468b564dcf9ec5854",
+    "hermes-plugin/hooks/zmem-hermes-reflect.py": "4a950f72b0db7e470f79866338a59a459df9ea1abd0e526abb99c2a3ab4c1c14",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
     "hermes-plugin/plugin.yaml": "91dae4026f26178533b7d1eb9f5059f12f091c3f2ccb79c025f8d7320df431a5",
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",

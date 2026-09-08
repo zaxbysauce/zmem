@@ -838,7 +838,13 @@ class ZmemMemoryProvider(MemoryProvider):
                 "--limit", str(_PREFETCH_LIMIT),
                 "--include-global",
                 "--global-limit", "3",
-                "--no-bump",  # passive path: surface counted, retrieval not bumped (issue #21)
+                # passive path: surface counted, retrieval not bumped (issue #21)
+                "--no-bump",
+                # Issue #115 (final-critic round): the selective-inject gate
+                # (confidence floors, relevance lanes, trust_score hard
+                # floor) runs IN-STORE on this per-turn passive lane — same
+                # parity as every other --for-injection surface.
+                "--for-injection",
                 "--json",
             ]
         )

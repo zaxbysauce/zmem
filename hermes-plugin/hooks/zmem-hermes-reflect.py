@@ -370,7 +370,10 @@ def _query_context_delivery(conn: sqlite3.Connection, session: str,
              "--query", query[:500],
              "--namespace", _resolve_hook_namespace(),
              "--limit", "5", "--include-global", "--global-limit", "3",
-             "--no-bump", "--json"],
+             # Issue #115 (final-critic round): in-store selective gate
+             # (incl. the trust_score hard floor) on this passive
+             # pre_llm_call lane.
+             "--no-bump", "--for-injection", "--json"],
             capture_output=True, text=True, timeout=10,
         )
         stdout = (r.stdout or "").strip()
