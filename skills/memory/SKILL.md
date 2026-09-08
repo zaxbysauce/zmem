@@ -266,9 +266,7 @@ when the passive injection-risk filter dropped rows. The closed set lives in
 `schema_meta.py` (`INJECT_SILENT_REASONS`). Since issue #94 every line also
 ends with `sid=<sanitized session id>` (`[^A-Za-z0-9._-]` → `_`, cap 128;
 `sid=unknown` when the host sent none) — the session key doctor's
-`--miss-rate` join binds failures to injections with. Field order:
-`status`, `reason`, `omitted=`, `ids=`, `all=`, `tokens=`, `ops=`, `sid=`
-(last, always present).
+`--miss-rate` join binds failures to injections with. Field order: `status`, `reason`, `omitted=`, `ids=`, `all=`, `tokens=`, `rendered_estimate=`, `admission_budget=`, `budget_dropped=`, `budget_truncated=`, `budget_dropped_protected=`, `ops=`, `sid=` (last, always present; the `rendered_estimate=`/`admission_budget=`/`budget_*` fields are issue #116's distinct labeled numbers and ride only when budget accounting ran).
 
 #### Query context (prior-turn operation tokens) — issue #88 / #85 direction 2
 
@@ -403,18 +401,31 @@ and recalling memories — with a one-time stderr NOTICE — until it updates.
 Above the ceiling the refusal names the update, and
 `ZMEM_ALLOW_NEWER_SCHEMA=1` overrides at the operator's own risk.
 
-#### Injection token budget (issue #65, 10.9)
+#### Injection token budget (issues #65 10.9, #116)
 
-`ZMEM_INJECT_TOKEN_BUDGET` (default 1500, estimated at 4 chars/token — no
-tokenizer is bundled) caps the memories injected by the hooks
+`ZMEM_INJECT_TOKEN_BUDGET` (default 1500, measured at 4 chars/token — no
+tokenizer is bundled) is a HARD CEILING on the memories injected by the hooks
 (UserPromptSubmit / PreCompact / SubagentStart / SessionStart Tier 2) and by
-the `session_start` MCP/Hermes tools. When the budget is hit, bullet
-admission stops: lowest-score `signal=none` rows drop first, and
-`decision`/`constraint` rows are NEVER dropped (once only they remain,
-enforcement stops — they are kept even over budget). The hook bg-log line
-reports `tokens=<used>/<budget>`, and every read `--json` envelope reports
-`tokens_used`/`tokens_budget`. `ZMEM_CTX_BUDGET` (character cap) remains the
-hard outer truncation on the rendered block.
+the `session_start` MCP/Hermes tools. Admission charges each row its FULL
+rendered fence contribution plus the fence shell, with the same estimator the
+reporting uses — the rendered fence never exceeds the budget. When the
+ceiling is hit, admission skips past rows that do not fit (a later smaller
+row is still admitted); `decision`/`constraint` rows are never dropped while
+they can carry information: a row that fits renders whole, one that does not
+is TRUNCATED with an explicit `…[budget-truncated]` marker, and only a row
+too large for even a minimal stub is dropped — never silently. When anything
+was omitted, the fence carries a machine-readable line
+`# [budget: dropped N rows, truncated M]` and the hook decision line reports
+`tokens=<rendered>/<budget>` plus the distinct labeled fields
+`admission_budget=`, `rendered_estimate=`, `budget_dropped=`,
+`budget_truncated=`, `budget_dropped_protected=` (after `sid=`'s
+predecessors, before `ops=`). Every read `--json` envelope reports
+`tokens_used`/`tokens_budget` and, on the `--for-injection` lane,
+`budget_admission`/`budget_truncated`/`budget_dropped_protected`/
+`budget_note`. The B-1 report (`doctor --miss-rate`) counts
+`over-budget N` decisions so the ceiling can be verified on a live log
+window. `ZMEM_CTX_BUDGET` (character cap) remains the hard outer truncation
+on the rendered block.
 
 `--include-global` (opt-in) ALSO surfaces up to `--global-limit` query-relevant
 rows from the `user:global` tier, merged project-first so a global row never

@@ -344,7 +344,11 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
                 f"{item_id}: rendered row {rid} carries ungrounded "
                 f"signal {sig!r}, which the real gate never admits")
     budget = _inject.inject_token_budget()
-    used = sum(_inject.row_token_cost(r) for r in rows)
+    # Issue #116: the guard must mirror the estimator admission actually
+    # charges — fence_row_cost (full render contribution), not the legacy
+    # content-only row_token_cost, or a stub could pass this check while the
+    # real admission over-budgets.
+    used = sum(_inject.fence_row_cost(r) for r in rows)
     protected = getattr(_inject, "_PROTECTED_TYPES",
                         ("decision", "constraint"))
     all_protected = bool(rows) and all(

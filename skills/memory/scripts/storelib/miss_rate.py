@@ -83,6 +83,13 @@ _BG_LINE_RE = re.compile(
     r"(?: omitted=(\d+))?"
     r" ids=(\[[^\]]*\]) all=(\[[^\]]*\])"
     r"(?: tokens=(\S+))?"
+    # Issue #116: the additive budget-accounting fields (between tokens=
+    # and ops=) must keep old lines matching AND parse new-format lines.
+    r"(?: rendered_estimate=\S+)?"
+    r"(?: admission_budget=\S+)?"
+    r"(?: budget_dropped=\S+)?"
+    r"(?: budget_truncated=\S+)?"
+    r"(?: budget_dropped_protected=\S+)?"
     r"(?: ops=(\d+))?"
     r"(?: sid=(\S+))?"
     r"(?: moment=(\S+))?"
@@ -175,6 +182,15 @@ def parse_bg_log(path) -> list:
                 ts = int(ts)
             except ValueError:
                 continue
+            # Issue #116 (AC3): keep the tokens=a/b field as numbers so the
+            # report can count over-budget decisions. Non-numeric shapes
+            # (legacy "-", garbage) stay None and never count.
+            tok_used = tok_budget = None
+            if _tok and "/" in _tok:
+                used_s, budget_s = _tok.split("/", 1)
+                if used_s.isdigit() and budget_s.isdigit():
+                    tok_used = int(used_s)
+                    tok_budget = int(budget_s)
             out.append({
                 "ts": ts,
                 "status": status,
@@ -182,6 +198,8 @@ def parse_bg_log(path) -> list:
                 "omitted": int(omitted) if omitted else 0,
                 "ids": _parse_id_list(ids_raw),
                 "all": _parse_id_list(all_raw),
+                "tok_used": tok_used,
+                "tok_budget": tok_budget,
                 "ops": int(ops) if ops else None,
                 "sid": sid,
                 "moment": moment,
@@ -724,6 +742,14 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     decision_ts = [ln["ts"] for ln in lines]
     period = [min(decision_ts), max(decision_ts)] if decision_ts else None
     sid_lines = sum(1 for ln in lines if ln.get("sid") is not None)
+    # Issue #116 (AC3): over-budget decisions in the log window — the B-1
+    # report's verifier that the token budget is now a measured hard
+    # ceiling. A decision line whose tokens=used/budget has used > budget
+    # (both numeric) counts here; post-fix this must read zero.
+    over_budget = sum(
+        1 for ln in lines
+        if ln.get("tok_used") is not None and ln.get("tok_budget")
+        and ln["tok_used"] > ln["tok_budget"])
 
     failures = []
     unmatched_globs = []
@@ -1003,6 +1029,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         "counts": counts,
         "miss_rate": miss_rate,
         "miss_rate_strict_sid": strict,
+        "over_budget": over_budget,
         "false_injection": false_injection,
         "missed_all_only": missed_all_only,
         "query_source": query_source,

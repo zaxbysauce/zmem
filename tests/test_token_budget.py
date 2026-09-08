@@ -85,8 +85,10 @@ class BudgetAdmissionTest(unittest.TestCase):
     def test_signal_none_drops_first_at_equal_score(self):
         none_row = _row("none signal row " + "z" * 400, signal="none", score=0.5)
         grounded = _row("test signal row " + "z" * 400, signal="test", score=0.5)
-        # Budget fits exactly one row: the grounded one wins.
-        one_cost = inject.row_token_cost(grounded)
+        # Budget fits exactly one row (admission estimator + reserved
+        # shell): the grounded one wins.
+        one_cost = inject.fence_row_cost(grounded) \
+            + inject.FENCE_SHELL_ALLOWANCE
         kept, _u, dropped = inject.apply_token_budget(
             [none_row, grounded], budget=one_cost)
         self.assertEqual([r["id"] for r in kept], [grounded["id"]])
@@ -95,31 +97,117 @@ class BudgetAdmissionTest(unittest.TestCase):
     def test_lowest_score_drops_first(self):
         rows = [_row("low " + "x" * 400, score=0.2),
                 _row("high " + "y" * 400, score=0.9)]
-        one_cost = inject.row_token_cost(rows[1])
+        # Issue #116: budgets are computed from the admission estimator
+        # (fence_row_cost) plus the reserved fence shell, so exactly ONE
+        # row fits and the higher-scored one wins.
+        one_cost = inject.fence_row_cost(rows[1]) \
+            + inject.FENCE_SHELL_ALLOWANCE
         kept, _u, _d = inject.apply_token_budget(rows, budget=one_cost)
         self.assertEqual([r["id"] for r in kept], [rows[1]["id"]])
 
-    def test_decision_and_constraint_never_dropped(self):
+    def test_decision_and_constraint_truncated_not_dropped(self):
+        # Issue #116 spec change (was: protected rows kept whole over
+        # budget). A decision row that does not fit the remaining ceiling
+        # is TRUNCATED with an explicit marker — still present, never
+        # silently dropped; the higher-scored normal row is skipped because
+        # it does not fit either.
         rows = [
             _row("trivia one " + "x" * 400, score=0.9),
             _row("decision one " + "d" * 400, type_="decision", score=0.1),
-            _row("constraint one " + "c" * 400, type_="constraint", score=0.1),
         ]
-        # A budget smaller than the two protected rows alone still keeps them.
-        tiny = inject.row_token_cost(rows[1]) - 1
-        kept, _u, dropped = inject.apply_token_budget(rows, budget=tiny)
-        kept_ids = {r["id"] for r in kept}
-        self.assertIn(rows[1]["id"], kept_ids)
-        self.assertIn(rows[2]["id"], kept_ids)
+        budget = inject.FENCE_SHELL_ALLOWANCE + 60
+        kept, used, dropped, stats = inject.apply_token_budget(
+            rows, budget=budget, with_stats=True)
+        kept_ids = [r["id"] for r in kept]
         self.assertNotIn(rows[0]["id"], kept_ids)
-        self.assertEqual(dropped, 1)
+        self.assertIn(rows[1]["id"], kept_ids)
+        kept_decision = kept[kept_ids.index(rows[1]["id"])]
+        self.assertTrue(
+            kept_decision["content"].endswith(inject.TRUNCATION_MARKER),
+            "truncated protected row must carry the explicit marker")
+        self.assertEqual(stats["truncated"], 1)
+        self.assertEqual(stats["dropped_protected"], 0)
+        self.assertLessEqual(used + inject.FENCE_SHELL_ALLOWANCE, budget)
 
-    def test_protected_only_rows_exceeding_budget_are_kept(self):
-        # Once ONLY decision/constraint rows remain, budget enforcement stops:
-        # they are kept even when they alone exceed the budget.
+    def test_protected_only_truncated_to_fit(self):
+        # Issue #116 spec change (was: kept even when they alone exceed the
+        # budget). Protected rows alone over budget are truncated to fit —
+        # the ceiling holds and the row survives with the marker.
         rows = [_row("big decision " + "d" * 4000, type_="decision")]
-        kept, _u, _d = inject.apply_token_budget(rows, budget=1)
+        budget = inject.FENCE_SHELL_ALLOWANCE + 100
+        kept, used, dropped, stats = inject.apply_token_budget(
+            rows, budget=budget, with_stats=True)
         self.assertEqual(len(kept), 1)
+        self.assertTrue(kept[0]["content"].endswith(inject.TRUNCATION_MARKER))
+        self.assertEqual(stats["truncated"], 1)
+        self.assertLessEqual(used + inject.FENCE_SHELL_ALLOWANCE, budget)
+
+    def test_absurd_budget_drops_protected_with_count(self):
+        # Below the fence-shell allowance nothing fits — protected rows are
+        # dropped WITH a count, never silently.
+        rows = [_row("big decision " + "d" * 4000, type_="decision")]
+        kept, _u, _d, stats = inject.apply_token_budget(
+            rows, budget=10, with_stats=True)
+        self.assertEqual(kept, [])
+        self.assertEqual(stats["dropped_protected"], 1)
+        self.assertEqual(stats["truncated"], 0)
+
+    def test_scan_continues_past_oversized_row(self):
+        # Issue #116: a later small row must not be lost to an earlier
+        # oversized one.
+        big = _row("big first " + "b" * 4000, score=0.9)
+        small = _row("small late lesson", score=0.4)
+        filler = _row("filler " + "f" * 4000, score=0.8)
+        kept, _u, _d = inject.apply_token_budget(
+            [big, filler, small], budget=1500)
+        self.assertIn(small["id"], [r["id"] for r in kept])
+
+    def test_budget_note_formatting(self):
+        self.assertEqual(inject.budget_note({"dropped": 0, "truncated": 0}),
+                         "")
+        self.assertEqual(
+            inject.budget_note({"dropped": 2, "truncated": 1}),
+            "[budget: dropped 2 rows, truncated 1]")
+        self.assertEqual(
+            inject.budget_note({"dropped": 1, "truncated": 0,
+                                "dropped_protected": 1}),
+            "[budget: dropped 1 rows, truncated 0]")
+
+    def test_renderer_header_capped(self):
+        from storelib.recall import _format_fenced_recall
+        rows = [_row("cap probe row " + "c" * 200)]
+        long_header = "H" * 500
+        fence = _format_fenced_recall(rows, long_header)
+        header_lines = [ln for ln in fence.splitlines()
+                        if ln.startswith("# H")]
+        self.assertEqual(len(header_lines), 1)
+        self.assertLessEqual(len(header_lines[0]), 244)  # "# " + 240 + ...
+
+    def test_fence_row_cost_covers_real_render(self):
+        # The admission charge must cover what the renderer actually emits
+        # for the row (renderer-mirror property), over varied shapes. A
+        # row's true contribution is render([row]) - render([]) — the
+        # fence shell is FENCE_SHELL_ALLOWANCE's job, not the row cost's.
+        from storelib.recall import _format_fenced_recall
+        varied = [
+            _row("plain content row " + "p" * 100),
+            _row("rich " + "r" * 300, signal="test"),
+        ]
+        varied[1]["source_ref"] = "session:abc123"
+        varied[1]["tags"] = "one,two"
+        varied[1]["entities"] = [{"name": "Entity"}, {"name": "Beta"},
+                                 {"name": "Gamma"}, {"name": "Delta"}]
+        varied[1]["_stale_note"] = " [stale]"
+        shell = inject.estimate_tokens(
+            _format_fenced_recall([], "header words here"))
+        for row in varied:
+            rendered = inject.estimate_tokens(
+                _format_fenced_recall([row], "header words here"))
+            contribution = rendered - shell
+            self.assertGreaterEqual(
+                inject.fence_row_cost(row), contribution,
+                "fence_row_cost must cover the row's real fence "
+                "contribution for %s" % row["id"])
 
 
 class EnvelopeResultsTest(unittest.TestCase):
@@ -268,6 +356,65 @@ class HookBodyBudgetTest(unittest.TestCase):
             lines = [ln for ln in f.read().splitlines() if "zmem-hook" in ln]
         self.assertTrue(lines, "decisions log line missing")
         self.assertRegex(lines[-1], r"tokens=\d+/\d+")
+
+
+class DegradedFenceFallbackTest(unittest.TestCase):
+    """Issue #116 final-critic catch: the degraded-mode fallback renderers in
+    both Hermes twins must accept the ``budget_note`` kwarg the session_start
+    paths now pass — the fallback exists for exactly the import-failure
+    scenario where a TypeError would defeat the fail-open contract."""
+
+    def _load_hermes(self):
+        import importlib.util
+        import types
+        agent = types.ModuleType("agent")
+
+        class MemoryProvider:  # minimal stand-in (provided by the gateway)
+            pass
+
+        mp = types.ModuleType("agent.memory_provider")
+        mp.MemoryProvider = MemoryProvider
+        agent.memory_provider = mp
+        sys.modules.setdefault("agent", agent)
+        sys.modules.setdefault("agent.memory_provider", mp)
+        spec = importlib.util.spec_from_file_location(
+            "zmem_hermes_fallback",
+            REPO_ROOT / "hermes-plugin" / "__init__.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["zmem_hermes_fallback"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_hermes_fallback_accepts_budget_note(self):
+        mod = self._load_hermes()
+        rows = [{"id": "fb1", "confidence": 0.9, "signal": "test",
+                 "namespace": "project:x", "type": "fact", "content": "c"}]
+        out = mod._local_fenced_recall(
+            rows, "hdr", budget_note="[budget: dropped 1 rows, truncated 0]")
+        self.assertIn("[budget: dropped 1 rows, truncated 0]", out)
+        self.assertTrue(
+            out.strip().endswith("<<<END_ZMEM_UNTRUSTED_FENCE>>>"))
+        plain = mod._local_fenced_recall(rows, "hdr")
+        self.assertNotIn("[budget:", plain)
+
+    def test_mcp_fallback_accepts_budget_note(self):
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "zmem_mcp_fallback",
+                REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except ImportError:
+            self.skipTest("mcp package not installed")
+            return
+        rows = [{"id": "fb2", "confidence": 0.9, "signal": "test",
+                 "namespace": "project:x", "type": "fact", "content": "c"}]
+        out = mod._local_fenced_recall(
+            rows, "hdr", budget_note="[budget: dropped 0 rows, truncated 1]")
+        self.assertIn("[budget: dropped 0 rows, truncated 1]", out)
+        plain = mod._local_fenced_recall(rows, "hdr")
+        self.assertNotIn("[budget:", plain)
 
 
 if __name__ == "__main__":

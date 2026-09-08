@@ -12,6 +12,33 @@ README.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-09-08
+
+### Added
+- **memory** (issue #116, Workstream C-5): the 1500-token injection budget is
+  now a measured HARD CEILING. Admission charges each row its full rendered
+  fence contribution (`fence_row_cost`) plus a reserved fence shell, with the
+  SAME 4-chars/token estimator the reporting uses — the rendered fence never
+  exceeds the budget (previously 191/263 live decisions reported over-budget).
+
+### Changed
+- **memory** (issue #116): protected `decision`/`constraint` rows are no
+  longer admitted whole over budget — a row that fits renders whole, one that
+  does not is truncated with an explicit `…[budget-truncated]` marker, and
+  only a row too large for even a minimal stub is dropped (counted, never
+  silent). The admission scan continues past a row that does not fit, so a
+  later smaller high-value row is no longer lost. The fence carries a
+  machine-readable `# [budget: dropped N rows, truncated M]` line when
+  anything was omitted.
+- **memory** (issue #116): the hook decision line reports the two formerly
+  conflated numbers as distinct labeled fields — `admission_budget=`,
+  `rendered_estimate=`, plus byte-stable `budget_dropped=` /
+  `budget_truncated=` / `budget_dropped_protected=` counts — while the
+  pinned `tokens=a/b` shape stays. The `--for-injection` envelope gains
+  `budget_admission` / `budget_truncated` / `budget_dropped_protected` /
+  `budget_note`; the B-1 report (`doctor --miss-rate`) now counts
+  `over-budget` decisions so the ceiling is verifiable on a live log window.
+
 ## [0.24.0] - 2026-09-07
 
 ### Added

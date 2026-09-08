@@ -299,7 +299,10 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                          omitted=0, tokens_used=None, tokens_budget=None,
                          ops_count=0, session_id: str = "",
                          all_ids=None, moment: str = "",
-                         store_py: str = "") -> None:
+                         store_py: str = "",
+                         admission_used=None, budget_dropped=None,
+                         budget_truncated=None,
+                         budget_dropped_protected=None) -> None:
     """Append the injected|silent decision to the decision log (#129).
 
     Issue #129 split: decision lines go to ``zmem-decisions.log`` (rotated,
@@ -362,6 +365,25 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
             tok = " tokens={used}/{budget}".format(
                 used=tokens_used, budget=tokens_budget if tokens_budget is not None else "-"
             )
+        # Issue #116: the two numbers the legacy tokens=a/b line used to
+        # conflate get their own labels. rendered_estimate = the measured
+        # final render (the same value as tokens=a/b's numerator, now
+        # guaranteed <= budget); admission_budget = admission's own token
+        # accounting for the admitted set. The three omission counts ride
+        # whenever admission stats were provided (zero-counts included —
+        # byte-stable shape, the addendum's eval-assertable diagnostics),
+        # and stay absent on legacy stores that predate the envelope keys.
+        rend = ""
+        if tokens_used is not None:
+            rend = " rendered_estimate={0}".format(int(tokens_used))
+        adm = ""
+        bcnt = ""
+        if admission_used is not None:
+            adm = " admission_budget={0}".format(int(admission_used))
+            bcnt = " budget_dropped={0} budget_truncated={1} " \
+                "budget_dropped_protected={2}".format(
+                    int(budget_dropped or 0), int(budget_truncated or 0),
+                    int(budget_dropped_protected or 0))
         # Issue #88 / #85 direction 2: when operation tokens augmented the
         # query, say how many — an invisible query lane cannot be debugged
         # (the #85 lesson). Additive; appended at line end.
@@ -385,7 +407,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
-                "ids={ids_sel} all={ids_all}{tok}{ops} "
+                "ids={ids_sel} all={ids_all}{tok}{rend}{adm}{bcnt}{ops} "
                 "sid={safe_sid}{mom}\n".format(
                     ts=int(time.time()),
                     status=status,
@@ -394,6 +416,9 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     ids_sel=ids_sel,
                     ids_all=ids_all,
                     tok=tok,
+                    rend=rend,
+                    adm=adm,
+                    bcnt=bcnt,
                     ops=ops,
                     safe_sid=safe_sid,
                     mom=mom,
@@ -404,7 +429,8 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
         pass
 
 
-def _format_fence(rows, header: str, store_py: str = "") -> str:
+def _format_fence(rows, header: str, store_py: str = "",
+                  budget_note: str = "") -> str:
     """Render the hook-text fence (issue #58, 3.5). Imports the
     Python helper from storelib so the constants stay in one place.
 
@@ -417,7 +443,8 @@ def _format_fence(rows, header: str, store_py: str = "") -> str:
     restored on exit (review PRR-005: the old un-restored leak accidentally
     rescued the rotation import at the one decision-write site that runs
     after this helper, hiding that the other sites inserted the wrong
-    directory).
+    directory). ``budget_note`` (issue #116) rides through to the storelib
+    renderer for the machine-readable omission marker line.
     """
     scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
     saved = sys.path[:]
@@ -426,7 +453,7 @@ def _format_fence(rows, header: str, store_py: str = "") -> str:
             sys.path.insert(0, scripts_dir)
             sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
         from storelib import _format_fenced_recall
-        return _format_fenced_recall(rows, header)
+        return _format_fenced_recall(rows, header, budget_note=budget_note)
     finally:
         sys.path[:] = saved
 
@@ -615,6 +642,11 @@ def main() -> int:
         agent_label = sys.argv[7]
     except IndexError:
         agent_label = ""
+    # Issue #116: cap the label — it feeds the fence HEADER (the one shell
+    # component inject.FENCE_SHELL_ALLOWANCE cannot measure per-row) and the
+    # decision log; 64 chars is generous for a host agent-type label.
+    if len(agent_label) > 64:
+        agent_label = agent_label[:64]
 
     # Issue #110 (P0-5): ZMEM_INJECT=0 is the passive-injection kill switch.
     # It gates the whole body BEFORE the store.py existence check, the stdin
@@ -820,6 +852,15 @@ def main() -> int:
         # both here, before envelope_results discards them.
         envelope_reason = None
         envelope_candidates = None
+        # Issue #116: hard-ceiling accounting from the store lane —
+        # admission's own token accounting, protected truncation/drop
+        # counts, and the ready-made fence note. None = legacy store
+        # without the keys (log fields stay absent, byte-compatible).
+        envelope_admission = None
+        envelope_bdrop = None
+        envelope_btrunc = None
+        envelope_bprot = None
+        envelope_note = ""
         if isinstance(rows, dict):
             try:
                 omitted = int(rows.get("omitted", 0) or 0)
@@ -833,6 +874,17 @@ def main() -> int:
                 envelope_candidates = [
                     str(_x) for _x in _ec if isinstance(_x, str)
                 ]
+            try:
+                envelope_admission = int(rows.get("budget_admission") or 0)
+                envelope_bdrop = int(rows.get("budget_dropped") or 0)
+                envelope_btrunc = int(rows.get("budget_truncated") or 0)
+                envelope_bprot = int(
+                    rows.get("budget_dropped_protected") or 0)
+            except (TypeError, ValueError):
+                envelope_admission = None
+            _bn = rows.get("budget_note")
+            if isinstance(_bn, str):
+                envelope_note = _bn
         _inj = _inject_helpers(store_py)
         if _inj is not None:
             rows = _inj.envelope_results(rows)
@@ -846,6 +898,11 @@ def main() -> int:
         omitted = 0
         envelope_reason = None
         envelope_candidates = None
+        envelope_admission = None
+        envelope_bdrop = None
+        envelope_btrunc = None
+        envelope_bprot = None
+        envelope_note = ""
         # Issue #114 review (PRR-005): a store failure (timeout, crash, or an
         # older store.py that predates --for-injection) must not masquerade
         # as a silent empty pool with no trace. Still fail closed (inject
@@ -906,6 +963,10 @@ def main() -> int:
             session_id=session_id,
             all_ids=envelope_candidates,
             moment=mode, store_py=store_py,
+            admission_used=envelope_admission,
+            budget_dropped=envelope_bdrop,
+            budget_truncated=envelope_btrunc,
+            budget_dropped_protected=envelope_bprot,
         )
         if mode == "pretool":
             # Issue #90 / #85 C: a per-tool-call one-liner would inject noise
@@ -927,7 +988,8 @@ def main() -> int:
         + (f", agent {agent_label}" if agent_label else "")
         + "). Consider if they apply to this task; ignore if not."
     )
-    ctx = _format_fence(selected, header, store_py=store_py)
+    ctx = _format_fence(selected, header, store_py=store_py,
+                        budget_note=envelope_note)
     if budget > 0 and len(ctx) > budget:
         # PRR-015 fix: actually truncate. The previous branch reconstructed
         # the original string unchanged (no-op), so oversized memories
@@ -957,7 +1019,11 @@ def main() -> int:
                          ops_count=len(ops_tokens),
                          session_id=session_id,
                          all_ids=envelope_candidates,
-                         moment=mode, store_py=store_py)
+                         moment=mode, store_py=store_py,
+                         admission_used=envelope_admission,
+                         budget_dropped=envelope_bdrop,
+                         budget_truncated=envelope_btrunc,
+                         budget_dropped_protected=envelope_bprot)
     if mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude":
         # Issue #90 / #85 C: older Claude builds ignore pre-tool
         # additionalContext (documented since 2.1.9) — park the

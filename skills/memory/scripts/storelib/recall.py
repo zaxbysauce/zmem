@@ -23,9 +23,9 @@ from storelib.links import expand_recall_links
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
-                             apply_token_budget, classify_silent_reason,
-                             estimate_tokens, inject_token_budget,
-                             selective_inject_filter)
+                             apply_token_budget, budget_note,
+                             classify_silent_reason, estimate_tokens,
+                             inject_token_budget, selective_inject_filter)
 from schema_meta import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
 import embed_profiles as _profiles
 from storelib.cross_encoder import maybe_rerank as _cross_maybe_rerank
@@ -1175,7 +1175,8 @@ def _merge_tiers(
 ZMEM_FENCE_OPEN = "<<<ZMEM_UNTRUSTED_FENCE>>>"
 ZMEM_FENCE_CLOSE = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
 
-def _format_fenced_recall(rows: list[dict], header: str) -> str:
+def _format_fenced_recall(rows: list[dict], header: str,
+                          budget_note: str | None = None) -> str:
     """Render a fenced, provenance-tagged bullet block for hook inject.
 
     Issue #58, 3.5: wrap hook-injected memories in a non-executable
@@ -1185,7 +1186,16 @@ def _format_fenced_recall(rows: list[dict], header: str) -> str:
     the agent can attribute every injected claim without having to
     parse freeform text. JSON-only callers (CLI --json, MCP, Hermes)
     bypass this and get the raw dict list instead.
+
+    Issue #116: the header is capped at 240 chars (the one unbounded
+    SHELL component — inject.FENCE_SHELL_ALLOWANCE budgets exactly this
+    cap), and a non-empty ``budget_note`` (inject.budget_note output,
+    e.g. ``[budget: dropped 2 rows, truncated 1]``) rides as a
+    machine-readable line immediately before the fence close so an eval
+    can assert omission behavior instead of inferring it from length.
     """
+    if header and len(header) > 240:
+        header = header[:237] + "..."
     lines = [
         ZMEM_FENCE_OPEN,
         "# " + header,
@@ -1247,6 +1257,10 @@ def _format_fenced_recall(rows: list[dict], header: str) -> str:
                     e.get("name", "?") for e in _ents[:3]
                 )
             )
+    if budget_note:
+        # Issue #116 addendum: byte-stable omission diagnostics inside the
+        # fence, emitted by the renderer from caller-supplied counts only.
+        lines.append("# " + budget_note)
     lines.append(ZMEM_FENCE_CLOSE)
     return "\n".join(lines)
 
@@ -1590,9 +1604,20 @@ def recall_memory(
             results, with_stats=True)
         budget_emptied = False
         budget_dropped = 0
+        budget_admission = 0
+        budget_truncated = 0
+        budget_dropped_protected = 0
+        inj_budget_note = ""
         if selected_rows:
-            selected_rows, _est, _dropped = apply_token_budget(selected_rows)
-            budget_dropped = _dropped
+            # Issue #116: hard-ceiling admission with measured fence costs;
+            # stats feed the envelope (log fields + fence budget note).
+            selected_rows, _est, _dropped, bstats = apply_token_budget(
+                selected_rows, with_stats=True)
+            budget_dropped = bstats["dropped"]
+            budget_admission = bstats["admission_used"]
+            budget_truncated = bstats["truncated"]
+            budget_dropped_protected = bstats["dropped_protected"]
+            inj_budget_note = budget_note(bstats)
             if not selected_rows:
                 budget_emptied = True
         results = selected_rows
@@ -1658,6 +1683,14 @@ def recall_memory(
             # count, so --for-injection consumers report the real drop
             # instead of a client-side residual of an already-budgeted set.
             envelope["budget_dropped"] = budget_dropped
+            # Issue #116: hard-ceiling accounting — admission's own token
+            # accounting, protected-row truncation/drop counts, and the
+            # ready-made fence note, so every renderer/logs report the same
+            # omission facts without rebuilding stats.
+            envelope["budget_admission"] = budget_admission
+            envelope["budget_truncated"] = budget_truncated
+            envelope["budget_dropped_protected"] = budget_dropped_protected
+            envelope["budget_note"] = inj_budget_note
         print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: hook/text surface uses the fenced render
@@ -2440,9 +2473,20 @@ def recent_memory(
             results, with_stats=True)
         budget_emptied = False
         budget_dropped = 0
+        budget_admission = 0
+        budget_truncated = 0
+        budget_dropped_protected = 0
+        inj_budget_note = ""
         if selected_rows:
-            selected_rows, _est, _dropped = apply_token_budget(selected_rows)
-            budget_dropped = _dropped
+            # Issue #116: hard-ceiling admission with measured fence costs;
+            # stats feed the envelope (log fields + fence budget note).
+            selected_rows, _est, _dropped, bstats = apply_token_budget(
+                selected_rows, with_stats=True)
+            budget_dropped = bstats["dropped"]
+            budget_admission = bstats["admission_used"]
+            budget_truncated = bstats["truncated"]
+            budget_dropped_protected = bstats["dropped_protected"]
+            inj_budget_note = budget_note(bstats)
             if not selected_rows:
                 budget_emptied = True
         results = selected_rows
@@ -2492,6 +2536,14 @@ def recent_memory(
             # count, so --for-injection consumers report the real drop
             # instead of a client-side residual of an already-budgeted set.
             envelope["budget_dropped"] = budget_dropped
+            # Issue #116: hard-ceiling accounting — admission's own token
+            # accounting, protected-row truncation/drop counts, and the
+            # ready-made fence note, so every renderer/logs report the same
+            # omission facts without rebuilding stats.
+            envelope["budget_admission"] = budget_admission
+            envelope["budget_truncated"] = budget_truncated
+            envelope["budget_dropped_protected"] = budget_dropped_protected
+            envelope["budget_note"] = inj_budget_note
         print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: same fence + provenance as recall. Recent is

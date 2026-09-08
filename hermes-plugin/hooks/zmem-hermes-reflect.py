@@ -384,10 +384,12 @@ def _query_context_delivery(conn: sqlite3.Connection, session: str,
         if not isinstance(rows, list) or not rows:
             return ""
         try:
-            from storelib.inject import apply_token_budget  # noqa: E402
-            rows, _est, _dropped = apply_token_budget(rows)
+            from storelib.inject import apply_token_budget, budget_note  # noqa: E402
+            rows, _est, _dropped, bstats = apply_token_budget(
+                rows, with_stats=True)
+            budget_note_text = budget_note(bstats)
         except Exception:
-            pass
+            budget_note_text = ""
         if not rows:
             return ""
         from storelib.recall import _format_fenced_recall  # noqa: E402
@@ -395,7 +397,7 @@ def _query_context_delivery(conn: sqlite3.Connection, session: str,
             "Relevant memories (zmem pre_llm_call operation context, session "
             f"{session}). Consider if they apply; ignore if not."
         )
-        return _format_fenced_recall(rows, header)
+        return _format_fenced_recall(rows, header, budget_note=budget_note_text)
     except Exception:
         return ""
 

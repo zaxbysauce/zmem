@@ -232,12 +232,20 @@ class NoSilentBypassTest(unittest.TestCase):
         from storelib.schema import connect
         real = recall_mod.apply_token_budget
 
-        def _identity(rows, budget=None):
-            return rows, sum(estimate_cost(r) for r in rows), 0
-
-        def estimate_cost(r):
-            from storelib.inject import row_token_cost
-            return row_token_cost(r)
+        # Issue #116: the lane now calls the budget with with_stats=True,
+        # so the identity stub returns the 4-tuple shape (all-zero
+        # omissions — an admitted-everything stub, the exact bypass this
+        # test refuses). Costs use fence_row_cost, the estimator the real
+        # admission charges.
+        def _identity(rows, budget=None, *, with_stats=False):
+            from storelib.inject import fence_row_cost
+            used = sum(fence_row_cost(r) for r in rows)
+            if with_stats:
+                return rows, used, 0, {"admission_used": used,
+                                       "dropped": 0, "truncated": 0,
+                                       "dropped_protected": 0,
+                                       "budget": budget}
+            return rows, used, 0
 
         caught = None
         try:
