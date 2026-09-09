@@ -184,12 +184,14 @@ class ExplainJsonShapeTests(ExplainFixtureBase):
         # lane_floors is the #113 addition: the per-lane inject floors the
         # verdicts are judged against. trust_floor is the #115 addition: the
         # resolved trust_score hard floor (also mirrored as
-        # lane_floors["trust"]).
+        # lane_floors["trust"]). arms is the #136 addition: per-arm
+        # pre/post-cap candidate accounting.
         self.assertEqual(sorted(exp.keys()),
                          sorted(["query", "query_shape", "target", "no_bump",
                                  "as_of", "hybrid", "verdicts", "namespace",
                                  "limit", "include_global", "global_limit",
-                                 "no_mmr", "lane_floors", "trust_floor"]))
+                                 "no_mmr", "lane_floors", "trust_floor",
+                                 "arms"]))
         self.assertIn("terms", exp["query_shape"])
         self.assertIn("fts_query", exp["query_shape"])
         self.assertTrue(exp["query_shape"]["fts_query"].startswith(

@@ -93,6 +93,11 @@ _BG_LINE_RE = re.compile(
     r"(?: ops=(\d+))?"
     r"(?: sid=(\S+))?"
     r"(?: moment=(\S+))?"
+    # Issue #136: the additive arms= attribution field (per-arm pre/post-cap
+    # counts, e.g. arms=fts:3/15,vec:0/25,ent:2/50,graph:1/5) must keep old
+    # lines matching AND parse new-format lines — same additive rule as the
+    # #116 budget fields and the #129 moment field before it.
+    r"(?: arms=(\S+))?"
     r"\s*$"
 )
 
@@ -142,12 +147,14 @@ def parse_bg_log(path) -> list:
     (``# zmem-seq=...``) and maintenance output (``[zmem] backup: ...``)
     never match the line regex and are skipped.
 
-    Returns ``[{ts, status, reason, omitted, ids, all, ops, sid, moment}]``
-    where ``reason``/``ops``/``sid``/``moment`` are None when the line
+    Returns ``[{ts, status, reason, omitted, ids, all, ops, sid, moment,
+    arms}]``
+    where ``reason``/``ops``/``sid``/``moment``/``arms`` are None when the line
     lacks them (writer B omits ``reason=``; pre-#94 lines lack ``sid=``;
-    pre-#129 lines lack ``moment=``) and ``ids``/``all`` are lists of
-    memory id strings. Torn lines are skipped — the log is appended
-    concurrently, so a torn final line is normal. Never raises.
+    pre-#129 lines lack ``moment=``; pre-#136 lines lack ``arms=``) and
+    ``ids``/``all`` are lists of memory id strings. Torn lines are skipped —
+    the log is appended concurrently, so a torn final line is normal. Never
+    raises.
     """
     out = []
     paths = []
@@ -177,7 +184,7 @@ def parse_bg_log(path) -> list:
             if not m:
                 continue
             (ts, status, reason, omitted, ids_raw, all_raw, _tok, ops,
-             sid, moment) = m.groups()
+             sid, moment, arms) = m.groups()
             try:
                 ts = int(ts)
             except ValueError:
@@ -203,6 +210,9 @@ def parse_bg_log(path) -> list:
                 "ops": int(ops) if ops else None,
                 "sid": sid,
                 "moment": moment,
+                # Issue #136: the additive arms= attribution field, verbatim
+                # (the B-1 report surfaces which arm carried a hit).
+                "arms": arms,
             })
     return out
 

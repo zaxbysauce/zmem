@@ -19,7 +19,7 @@ import glob
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.entity import entities_for_memory, entities_for_memories, entity_match_ids
-from storelib.links import expand_recall_links
+from storelib.links import expand_recall_links, graph_seed_ids
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
@@ -274,10 +274,23 @@ def _vec_knn_in_namespace(
     return _helper(conn, embedding, namespaces=namespaces, k=k,
                    overfetch=overfetch, k_cap=k_cap)
 
+def _arm_cap(env_name: str, default: int) -> int:
+    """Per-arm candidate cap (issue #136): how many ranked ids one arm may
+    contribute to RRF fusion, applied BEFORE fusion so an over-generous
+    backend cannot fill the reranker window (the Hindsight TEMPR lesson the
+    issue names). Defaults equal the pre-#136 windows, so the default
+    behavior is byte-identical; the env override truncates. 0 disables the
+    arm (it still reports {pre, post: 0, cap: 0} in the arms accounting).
+    Read PER CALL so tests/operators can vary it via os.environ inside one
+    process (same contract as the ZMEM_TEST_NOW seam)."""
+    return _env_int(env_name, default, lo=0, hi=1000)
+
+
 def _rrf_fuse(
     bm25_ids: list[str],
     vec_ids: list[str],
     entity_ids: list[str] | None = None,
+    graph_ids: list[str] | None = None,
     k: int = 60,
 ) -> list[str]:
     """Reciprocal Rank Fusion: combine ranked lists by 1/(k+rank).
@@ -290,6 +303,11 @@ def _rrf_fuse(
     ADDITIVE (a memory in several lists accumulates each list's
     1/(k+rank) contribution) — do not "fix" that; it is the property that
     makes cross-lane agreement float rows up.
+
+    v10.6 (issue #136): ``graph_ids`` is the optional FOURTH ranked list —
+    the graph-seed arm's capped neighbors (entity-anchored seeds, one bounded
+    hop over seed-safe relations). Additive like every other arm; an empty
+    list contributes nothing, so a link-free store fuses byte-identically.
     """
     scores: dict[str, float] = {}
     for rank, mid in enumerate(bm25_ids, 1):
@@ -297,6 +315,8 @@ def _rrf_fuse(
     for rank, mid in enumerate(vec_ids, 1):
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
     for rank, mid in enumerate(entity_ids or [], 1):
+        scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+    for rank, mid in enumerate(graph_ids or [], 1):
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
     return sorted(scores, key=scores.get, reverse=True)
 
@@ -803,6 +823,7 @@ def _recall_one_tier(
     mmr: bool = True,
     weights: dict | None = None,
     collect_lanes: bool = False,
+    arm_stats: dict | None = None,
 ) -> list[tuple[float, dict]]:
     """FTS5 + composite scoring for ONE namespace set (a single recall tier).
 
@@ -942,7 +963,50 @@ def _recall_one_tier(
                 vec_ids = [mid for mid in vec_ids if mid in keep_ids]
             for mid, dist in knn:
                 vec_sim_map[mid] = max(0.0, 1.0 - dist)
-    if vec_ids or entity_ids:
+    # --- Issue #136: per-arm caps + the graph-seed arm ---------------------
+    # Caps are applied BEFORE fusion (named defaults equal the pre-#136
+    # windows, so default behavior is byte-identical; ZMEM_ARM_CAP_* override)
+    # so one over-generous backend cannot fill the fused window. The graph
+    # arm seeds from the ENTITY lane's ids — already namespace/as-of/live
+    # filtered, deterministic, model-free; ops tokens ride the composed query
+    # through the same alias path — and walks ONE bounded hop over
+    # related/supports/updates/derives (never contradicts) via
+    # links.graph_seed_ids. ZMEM_GRAPH_SEED=0 disables the arm (the fts/vec/
+    # entity arms are unaffected, so a no-links store stays byte-identical
+    # with the switch on or off).
+    caps = {
+        "fts": _arm_cap("ZMEM_ARM_CAP_FTS", max(limit * 3, limit + 5)),
+        "vec": _arm_cap("ZMEM_ARM_CAP_VEC",
+                        max(15, limit + 10) * (2 if as_of else 1)),
+        "entity": _arm_cap("ZMEM_ARM_CAP_ENTITY", max(50, limit * 10)),
+        "graph": _arm_cap("ZMEM_ARM_CAP_GRAPH", max(4, limit)),
+    }
+    graph_ids: list[str] = []
+    graph_rel_map: dict[str, float] = {}
+    if entity_ids and os.environ.get("ZMEM_GRAPH_SEED", "1").strip() != "0":
+        graph_ids, graph_rel_map = graph_seed_ids(
+            conn, entity_ids[:caps["entity"]],
+            cap=caps["graph"], ns_list=ns_list, as_of=as_of)
+    if arm_stats is not None:
+        # Merge across tiers (recall_memory passes one shared dict): pre/post
+        # accumulate, cap takes the max (tiers can differ on global_limit).
+        for arm, pre, post in (
+            ("fts", len(rows), min(len(rows), caps["fts"])),
+            ("vec", len(vec_ids), min(len(vec_ids), caps["vec"])),
+            ("entity", len(entity_ids),
+             min(len(entity_ids), caps["entity"])),
+            ("graph", len(graph_rel_map), len(graph_ids)),
+        ):
+            cur = arm_stats.get(arm)
+            if cur is None:
+                arm_stats[arm] = {"pre": pre, "post": post,
+                                  "cap": caps[arm]}
+            else:
+                cur["pre"] += pre
+                cur["post"] += post
+                cur["cap"] = max(cur["cap"], caps[arm])
+
+    if vec_ids or entity_ids or graph_ids:
         # Fuse whenever ANY lane beyond FTS produced ids (v10: that includes
         # the entity lane alone — the model-absent default). Preserve FTS
         # ranks BEFORE rows are replaced by the re-fetch, then re-fetch the
@@ -956,8 +1020,10 @@ def _recall_one_tier(
         for r in rows:
             if r["fts_rank"] is not None:
                 fts_rank_map[r["id"]] = r["fts_rank"]
-        fts_ids = [r["id"] for r in rows]
-        fused_ids = _rrf_fuse(fts_ids, vec_ids, entity_ids, k=60)
+        # Issue #136: per-arm caps truncate each ranked list before fusion.
+        fts_ids = [r["id"] for r in rows[:caps["fts"]]]
+        fused_ids = _rrf_fuse(fts_ids, vec_ids[:caps["vec"]],
+                              entity_ids[:caps["entity"]], graph_ids, k=60)
         rrf_pos = {mid: i for i, mid in enumerate(fused_ids, 1)}
         rows = _fetch_by_ids(conn, fused_ids, ns_list, floor, as_of=as_of)
     else:
@@ -1101,6 +1167,12 @@ def _recall_one_tier(
             # from _fetch_by_ids/_recent_one_tier carry it the same way).
             "trust_score": trust,
         }))
+        # Issue #136: the graph arm's MEASURED lane value (best entry-edge
+        # score) on rows IT contributed — key ABSENT on every other row, so
+        # non-graph rows stay exempt exactly as before and a graph row is
+        # floor-JUDGED by the inject gate instead of riding the exemption.
+        if r["id"] in graph_rel_map:
+            scored[-1][1]["_rel_graph"] = graph_rel_map[r["id"]]
         if collect_lanes:
             scored[-1][1]["_lanes"] = {
                 "bm25_rank": fts_r,
@@ -1111,6 +1183,7 @@ def _recall_one_tier(
                 "lex": rel_lex,
                 "cos": cos_leg,
                 "entity": ent_leg,
+                "graph": graph_rel_map.get(r["id"]),
                 "rel": rel,
                 "trust": trust,
             }
@@ -1470,6 +1543,12 @@ def recall_memory(
     else:
         global_ns_list = None
 
+    # Issue #136: ONE arms dict shared across tiers — _recall_one_tier merges
+    # per-arm pre/post-cap counts in place so the envelopes below report the
+    # whole pipeline's attribution (the B-1 report's "which arm carried a
+    # hit").
+    arms: dict = {}
+
     # Project tier: scoped to the project namespace aliases only. It is NOT
     # widened to include global aliases on the hybrid path — the global tier's
     # own _recall_one_tier run below performs the same namespace-agnostic vec
@@ -1481,7 +1560,7 @@ def recall_memory(
     project_scored = _recall_one_tier(
         conn, query=query, ns_list=ns_list, limit=limit,
         min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-        as_of=as_of, mmr=not no_mmr, weights=weights,
+        as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
     )
 
     global_scored: list[tuple[float, dict]] = []
@@ -1489,7 +1568,7 @@ def recall_memory(
         global_scored = _recall_one_tier(
             conn, query=query, ns_list=global_ns_list, limit=global_limit,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-            as_of=as_of, mmr=not no_mmr, weights=weights,
+            as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
         )
 
     # Issue #58, 3.4: at emit time, re-classify each row for
@@ -1676,9 +1755,17 @@ def recall_memory(
             envelope["candidate_lanes"] = {
                 r["id"]: {"lex": r.get("_rel_lex"), "cos": r.get("_rel_cos"),
                           "ent": r.get("_rel_ent"),
+                          # Issue #136: the graph arm's measured lane (None
+                          # for every row the arm did not contribute).
+                          "graph": r.get("_rel_graph"),
                           "trust": _row_trust(r)}
                 for r in candidate_rows
             }
+            # Issue #136: per-arm pre/post-cap counts (merged across tiers),
+            # so the decision log can attribute a hit to the arm that
+            # carried it. All four arms are always present; the kill switch
+            # zero-fills the graph arm without changing the shape.
+            envelope["arms"] = arms
             # Issue #115 review round: the store-side token-budget drop
             # count, so --for-injection consumers report the real drop
             # instead of a client-side residual of an already-budgeted set.
@@ -1875,6 +1962,7 @@ def _explain_run_pipeline(
     global_ns_list: list[str] | None, limit: int, global_limit: int,
     min_confidence: float | None, hybrid: bool, now_epoch: float,
     as_of: str | None, no_mmr: bool, weights: dict | None,
+    arm_stats: dict | None = None,
 ) -> tuple[list[dict], list[tuple[float, dict]], list[tuple[float, dict]]]:
     """Run the SAME orchestration recall_memory runs (same helpers, same
     order, same real `limit`) and return (presented_pre_omit, project_deep,
@@ -1886,11 +1974,16 @@ def _explain_run_pipeline(
     Issue #113: every tier runs with ``collect_lanes=True`` so explain rows
     carry the per-lane ``_lanes`` diagnostic dict. Collecting lanes is
     read-only (the lane inputs are computed for scoring anyway on this path);
-    production recall envelopes keep the default False and stay lean."""
+    production recall envelopes keep the default False and stay lean.
+
+    Issue #136: ``arm_stats`` (when given) collects the per-arm pre/post-cap
+    counts from the REAL-LIMIT presented runs only — the over-fetch deep
+    re-run is a diagnostic and is deliberately not double-counted."""
     project_scored = _recall_one_tier(
         conn, query=query, ns_list=ns_list, limit=limit,
         min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
         as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
+        arm_stats=arm_stats,
     )
     global_scored: list[tuple[float, dict]] = []
     if global_ns_list:
@@ -1898,6 +1991,7 @@ def _explain_run_pipeline(
             conn, query=query, ns_list=global_ns_list, limit=global_limit,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
+            arm_stats=arm_stats,
         )
     for _s, item in project_scored:
         item["prompt_injection_risk"] = _classify_injection(item)
@@ -2135,12 +2229,16 @@ def explain_recall(
     project_deep: list[tuple[float, dict]] = []
     global_deep: list[tuple[float, dict]] = []
     pipeline_error = False
+    # Issue #136: per-arm pre/post-cap counts from the presented (real-limit)
+    # runs, reported in the explain envelope beside the verdicts.
+    explain_arms: dict = {}
     try:
         presented, project_deep, global_deep = _explain_run_pipeline(
             conn, query=query, ns_list=ns_list, global_ns_list=global_ns_list,
             limit=limit, global_limit=global_limit,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, no_mmr=no_mmr, weights=weights,
+            arm_stats=explain_arms,
         )
         if no_bump:
             presented, omitted = _explain_omit_filter(presented)
@@ -2262,9 +2360,14 @@ def explain_recall(
         # Issue #115: the trust floor rides beside them (plain --explain, no
         # for_injection needed), and found/below_limit verdicts carry the
         # row's applied trust multiplier in detail.lanes.trust.
-        "lane_floors": dict(zip(("lex", "cos", "ent", "trust"),
+        # Issue #136: the graph floor joins them (the graph arm's measured
+        # lane is the best entry-edge score; default 0.75 = LINK_THRESHOLD).
+        "lane_floors": dict(zip(("lex", "cos", "ent", "graph", "trust"),
                                 (*_lane_floors(), _trust_floor()))),
         "trust_floor": _trust_floor(),
+        # Issue #136: per-arm pre/post-cap counts from the real-limit runs —
+        # which arm carried a hit is now observable per recall.
+        "arms": explain_arms,
         "verdicts": verdicts,
     }
     if as_json:
@@ -2529,10 +2632,13 @@ def recent_memory(
             envelope["candidate_ids"] = candidate_ids
             # Issue #113: per-candidate lane values (pre-gate), so the eval
             # harness's primitive re-derivation of the gate can model the
-            # relevance floors without re-running recall.
+            # relevance floors without re-running recall. Issue #136: the
+            # graph key keeps the lane schema uniform across surfaces (the
+            # recent surface runs no recall tiers, so the value is None).
             envelope["candidate_lanes"] = {
                 r["id"]: {"lex": r.get("_rel_lex"), "cos": r.get("_rel_cos"),
                           "ent": r.get("_rel_ent"),
+                          "graph": r.get("_rel_graph"),
                           "trust": _row_trust(r)}
                 for r in candidate_rows
             }

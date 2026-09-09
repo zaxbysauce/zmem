@@ -1475,11 +1475,12 @@ terms — the ops-token tail — always survive), and the MATCH is column-filter
 to `{content tags}` so namespace text alone can never make a row a candidate.
 `recall --explain` records the resulting shape in its `query_shape` field.
 
-Retrieval is a **three-signal pipeline**: FTS5/BM25 keyword match (always),
+Retrieval is a **four-signal pipeline**: FTS5/BM25 keyword match (always),
 vector KNN over stored embeddings (when the optional embedding runtime is
-available), and entity matching (v10 — always, no model needed): the query's
+available), entity matching (v10 — always, no model needed), and the
+graph-seed arm (issue #136 — always, no model needed): the query's
 identifiers and plain tokens are matched against stored entity aliases. The
-three lanes' rankings are fused with Reciprocal Rank Fusion (RRF, k=60,
+lanes' rankings are fused with Reciprocal Rank Fusion (RRF, k=60,
 per-id additive: a memory appearing in several lanes accumulates each lane's
 contribution), then re-ranked by a **composite score** that combines:
 
@@ -1517,9 +1518,28 @@ the new closed-set reason `below-relevance` ("nothing relevant") instead of
 resolved `lane_floors`, and a row that missed every pool but would ride the
 1-hop link walk reports a `link_expansion` verdict (parent, relation, score)
 instead of `not_in_pool`. Recall rows also carry the underscore-prefixed
-diagnostic keys `_rel_lex` / `_rel_cos` / `_rel_ent` — the measured lane
-values the inject gate floors judge (same family as the existing `_score`
-key).
+diagnostic keys `_rel_lex` / `_rel_cos` / `_rel_ent` / `_rel_graph` — the
+measured lane values the inject gate floors judge (same family as the
+existing `_score` key).
+
+**Graph-seed arm and per-arm caps (issue #136)**: recall runs FOUR candidate
+arms — FTS, vector, entity, and graph-seed — each capped BEFORE fusion so one
+over-generous arm cannot fill the fused window (named defaults equal the
+pre-#136 windows, so default behavior is unchanged; `ZMEM_ARM_CAP_FTS` /
+`ZMEM_ARM_CAP_VEC` / `ZMEM_ARM_CAP_ENTITY` / `ZMEM_ARM_CAP_GRAPH` override,
+`ZMEM_GRAPH_SEED=0` disables the graph arm). The graph-seed arm resolves the
+query's entities (and ops tokens, which ride the same alias path) to seed
+memories, then walks ONE bounded hop over `related`/`supports`/`updates`/
+`derives` edges — never `contradicts` as a seed — and emits the capped,
+deterministically ranked neighbors as the fourth RRF list. Each
+graph-arm row carries a MEASURED `_rel_graph` lane: the best entry-edge
+score, judged against the graph floor (default 0.75 = the write path's own
+`LINK_THRESHOLD`; env `ZMEM_INJECT_FLOOR_GRAPH`) by the same disjunctive
+inject gate — a graph-rescued row injects only when its edge to the
+query-anchored seed is strong, never by the absent-lane exemption. `--explain`
+and the `--for-injection` envelope report per-arm `pre`/`post`/`cap` counts
+(`arms`), and the hook's decision line carries `arms=fts:P/Q,vec:P/Q,...`
+so the miss-rate report can attribute a hit to the arm that carried it.
 
 **Entity matching (v10, issue #60 5.3)** is the third lane: the query runs
 through the same deterministic extractor used at write time, and plain query

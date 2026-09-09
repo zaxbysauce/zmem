@@ -143,7 +143,7 @@ class BgLogSidBodyTest(unittest.TestCase):
         self.assertIn("status=injected", line)
         self.assertIn(f" sid={_sanitize(HOSTILE_SID)}", line)
         # #129: the additive moment field rides at line end after sid=
-        self.assertRegex(line, r" sid=\S+ moment=\S+$")
+        self.assertRegex(line, r" sid=\S+ moment=\S+(?: arms=\S+)?$")  # issue #136: additive trailing arms field
         self.assertIn(" moment=user_prompt", line)
         # exactly one sid field, one physical line, hostile charset gone
         self.assertEqual(line.count(" sid="), 1)
@@ -159,7 +159,7 @@ class BgLogSidBodyTest(unittest.TestCase):
         self.assertIn("status=silent", line)
         self.assertIn("reason=empty-pool", line)
         self.assertIn(" sid=unknown", line)
-        self.assertRegex(line, r" sid=\S+ moment=\S+$")
+        self.assertRegex(line, r" sid=\S+ moment=\S+(?: arms=\S+)?$")  # issue #136: additive trailing arms field
 
     def test_silent_line_with_session_carries_sanitized_sid(self):
         _run_body(self._tmp, "user_prompt",
@@ -176,7 +176,7 @@ class BgLogSidBodyTest(unittest.TestCase):
                   self.ns)
         line = _hook_lines(self._tmp)[-1]
         self.assertRegex(line, r"tokens=\d+/\d+")
-        self.assertRegex(line, r" sid=\S+( moment=\S+)?$")
+        self.assertRegex(line, r" sid=\S+( moment=\S+)?(?: arms=\S+)?$")  # issue #136
         # sid precedes the trailing moment field: tokens= must not be
         # swallowed by sid (nor sid by moment)
         self.assertLess(line.index("tokens="), line.index(" sid="))
@@ -189,7 +189,7 @@ class BgLogSidBodyTest(unittest.TestCase):
                   self.ns)
         line = _hook_lines(self._tmp)[-1]
         self.assertIn(" sid=sess-pretool", line)
-        self.assertRegex(line, r" sid=\S+ moment=\S+$")
+        self.assertRegex(line, r" sid=\S+ moment=\S+(?: arms=\S+)?$")  # issue #136: additive trailing arms field
         self.assertIn(" moment=pretool", line)
 
     def test_env_fallback_when_stdin_omits_session(self):
@@ -347,7 +347,7 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         line = self._ss_line()
         self.assertIn(f" sid={_sanitize(HOSTILE_SID)}", line)
         # #129: the session-start writer's trailing field is its moment
-        self.assertRegex(line, r" sid=\S+ moment=session_start$")
+        self.assertRegex(line, r" sid=\S+ moment=session_start(?: arms=\S+)?$")  # issue #136
         self.assertEqual(line.count(" sid="), 1)
         self.assertNotIn("<", line)
         # Issue #114 review (PRR-014): the aligned session-start line must
@@ -361,7 +361,7 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-800:])
         line = self._ss_line()
         self.assertIn(" sid=unknown", line)
-        self.assertRegex(line, r" sid=\S+ moment=session_start$")
+        self.assertRegex(line, r" sid=\S+ moment=session_start(?: arms=\S+)?$")  # issue #136
 
     def test_session_start_legacy_env_fallback_chain(self):
         # CLAUDE_SESSION_ID is the documented legacy fallback when the
@@ -387,7 +387,7 @@ class BgLogSidSessionStartTest(unittest.TestCase):
         line = self._ss_line()
         self.assertIn("status=silent", line)
         self.assertIn(" sid=sess-quiet", line)
-        self.assertRegex(line, r" sid=\S+ moment=session_start$")
+        self.assertRegex(line, r" sid=\S+ moment=session_start(?: arms=\S+)?$")  # issue #136
         # PRR-014: silent lines carry the envelope reason (budget-drop here)
         self.assertIn(" reason=", line)
 

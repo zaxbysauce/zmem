@@ -527,7 +527,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=injected", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt$")
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: arms=\S+)?$")  # issue #136: additive trailing arms field
 
     def test_pretool_mode_moment(self):
         _run_body(self._tmp, "pretool",
@@ -535,7 +535,7 @@ class MomentFieldBodyTest(_SeededStore):
                    "tool_input": {"command": "git stash pop"}},
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
-        self.assertRegex(line, r" sid=\S+ moment=pretool$")
+        self.assertRegex(line, r" sid=\S+ moment=pretool(?: arms=\S+)?$")  # issue #136
 
     def test_kill_switch_body_line_carries_mode_moment(self):
         _run_body(self._tmp, "user_prompt",
@@ -543,7 +543,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns, ZMEM_INJECT="0")
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=silent reason=disabled", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt$")
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: arms=\S+)?$")  # issue #136: additive trailing arms field
 
 
 class MomentFieldSessionStartTest(unittest.TestCase):
@@ -598,7 +598,7 @@ class MomentFieldSessionStartTest(unittest.TestCase):
         self.assertEqual(r.returncode == 0, True, r.stderr[-800:])
         lines = _decision_lines(self._tmp)
         self.assertTrue(lines, "session-start decision line missing")
-        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start$")
+        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start(?: arms=\S+)?$")  # issue #136
 
     def test_kill_switch_line_carries_session_start_moment(self):
         # The kill-switch block resolves the sid from the env chain (the
