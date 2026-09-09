@@ -260,7 +260,13 @@ console.log("\n[1] End-to-end envelope translation (real session-start.sh, seede
 }
 
 {
-    const r = runLauncher("session-start", SESSION_PAYLOAD, envWith({
+    // Issue #117: distinct session id — the delivery ledger now suppresses
+    // re-delivery for a repeated session id, and this leg tests envelope
+    // SHAPE (bare additionalContext), not dedup.
+    const ZC_PAYLOAD = JSON.stringify({
+        ...JSON.parse(SESSION_PAYLOAD), session_id: "sess-p3-zcode",
+    });
+    const r = runLauncher("session-start", ZC_PAYLOAD, envWith({
         ZMEM_DATA: DATA, ZCODE_PLUGIN_ROOT: REPO, ZCODE_PROJECT_DIR: PROJ,
     }));
     let obj = null;
@@ -294,7 +300,12 @@ console.log("\n[2] Payload survives stray organize-style stdout noise");
         "exit $rc\n";
     fs.writeFileSync(path.join(WROOT, "hooks", "zmem-session-start.sh"), wrapper);
 
-    const r = runLauncher("session-start", SESSION_PAYLOAD, envWith({
+    // Issue #117: distinct session id (dedup would suppress a third
+    // delivery of the same rows to sess-p3); this leg tests noise handling.
+    const NOISE_PAYLOAD = JSON.stringify({
+        ...JSON.parse(SESSION_PAYLOAD), session_id: "sess-p3-noise",
+    });
+    const r = runLauncher("session-start", NOISE_PAYLOAD, envWith({
         ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: WROOT, CLAUDE_PROJECT_DIR: PROJ,
     }));
     let obj = null;
@@ -694,9 +705,13 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
             tool_name: "Bash", tool_input: { command: "git stash pop" },
             hook_event_name: "PreToolUse",
         });
+        // Issue #117 AMENDMENT: the sidecar is retired by default; the
+        // park/deliver contract is pinned under the narrow fallback env
+        // (writer AND consumer are env-gated). The parked file is
+        // hash-keyed (sha256 of the full session id), so glob for it.
         const r = runLauncher("pretool-recall", prePayload, envWith({
             ZMEM_DATA: D90, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
-            ZMEM_HOST: "claude",
+            ZMEM_HOST: "claude", ZMEM_PENDING_SIDECAR: "1",
         }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         ok("pretool-recall/claude: valid JSON", obj !== null, r.stdout.slice(0, 200));
@@ -705,8 +720,15 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("pretool-recall: stash hazard lesson injected", /P90_STASH/.test(ac), ac.slice(0, 300));
         ok("pretool-recall: no permissionDecision emitted", !/permissionDecision/.test(r.stdout));
+        const parkedFiles = (() => {
+            const ops = path.join(D90, "ops");
+            return fs.existsSync(ops)
+                ? fs.readdirSync(ops).filter((f) => f.endsWith(".pending"))
+                : [];
+        })();
         ok("pretool-recall/claude: pending sidecar parked",
-            fs.existsSync(path.join(D90, "ops", "p90-sess.pending")));
+            parkedFiles.length === 1 && !parkedFiles[0].includes("p90-sess"),
+            "parked: " + JSON.stringify(parkedFiles));
     }
 
     // (ii) pretool-recall / zcode: bare additionalContext, NO sidecar.
@@ -770,18 +792,24 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
 
     // (iv) the consumed sidecar delivers on the next user prompt and clears.
     {
+        // Issue #117: consumer half is env-gated too (arming-only would
+        // strand the fence).
         const r = runLauncher("recall", JSON.stringify({
             prompt: "carry on with unrelated zebra work", session_id: "p90-sess",
             cwd: PROJ,
         }), envWith({
             ZMEM_DATA: D90, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
-            ZMEM_HOST: "claude",
+            ZMEM_HOST: "claude", ZMEM_PENDING_SIDECAR: "1",
         }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("pending sidecar delivered on the next user prompt", /P90_STASH/.test(ac), ac.slice(0, 300));
-        ok("pending sidecar cleared after delivery",
-            !fs.existsSync(path.join(D90, "ops", "p90-sess.pending")));
+        const leftPending = fs.existsSync(path.join(D90, "ops"))
+            ? fs.readdirSync(path.join(D90, "ops"))
+                .filter((f) => f.endsWith(".pending"))
+            : [];
+        ok("pending sidecar cleared after delivery", leftPending.length === 0,
+            "left: " + JSON.stringify(leftPending));
     }
 }
 
