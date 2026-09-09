@@ -603,7 +603,7 @@ class Issue87DocDriftTest(unittest.TestCase):
                 # the sid= field doc (bg-log section)
                 "sid=<sanitized session id>",
                 "sid=unknown",
-                "`status`, `reason`, `omitted=`, `ids=`, `all=`, `tokens=`, `ops=`, `sid=`",
+                "`status`, `reason`, `omitted=`, `ids=`, `all=`, `tokens=`, `rendered_estimate=`, `admission_budget=`, `budget_dropped=`, `budget_truncated=`, `budget_dropped_protected=`, `ops=`, `sid=`",
                 # the miss-rate report block (doctor section)
                 "--miss-rate",
                 "capture-gap",

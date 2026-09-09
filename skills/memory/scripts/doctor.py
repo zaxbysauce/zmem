@@ -2881,6 +2881,11 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
         f"capture-gap {counts['capture_gap']}, "
         f"no-query {counts['no_query']}"
     )
+    # Issue #116 (AC3): the B-1 window's over-budget decision count — the
+    # verifier that the injection token budget is a measured hard ceiling.
+    # Additive; a missing key (older report shape) renders nothing.
+    if "over_budget" in report:
+        summary += f", over-budget {report['over_budget']}"
     # Issue #129: both directions always print together. The counter
     # subtree is best-effort in the join (a failure degrades to a caveat
     # inside it), so guard the read.

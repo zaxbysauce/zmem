@@ -8,13 +8,21 @@ import inside store.py itself. Anything heavier than stdlib would break one of
 those paths.
 
 Token accounting uses the documented 4-chars-per-token heuristic (no tokenizer
-is in-tree). Budget admission control charges each row its content tokens plus
-``FENCE_OVERHEAD_TOKENS`` to approximate the fence's provenance lines; callers
-REPORT ``tokens_used`` measured on the final rendered fenced text, so the
-reported number is honest even when the estimate under- or over-counts the
-render. The existing ``ZMEM_CTX_BUDGET`` character truncation in the hooks
-stays as the hard outer stop — the token budget stops adding bullets, the
-character budget can still cut the tail.
+is in-tree) for BOTH admission and reporting — one estimator, so the two can
+never diverge silently (issue #116). Budget admission control charges each row
+its FULL fence-render contribution (``fence_row_cost``: the exact bullet block
+``_format_fenced_recall`` would emit, modeled dependency-free here) plus a
+fixed ``FENCE_SHELL_ALLOWANCE`` for the fence shell, and enforces the budget
+as a HARD CEILING: the final rendered fence never exceeds it. Protected
+``decision``/``constraint`` rows are truncated to fit with an explicit
+``…[budget-truncated]`` marker (never admitted whole over budget, never
+silently dropped — the drop counts ride the envelope and the decision log).
+The admission scan CONTINUES past a row that does not fit, so a later smaller
+high-value row is not lost. Callers REPORT ``tokens_used`` measured on the
+final rendered fenced text, now guaranteed <= budget by construction. The
+existing ``ZMEM_CTX_BUDGET`` character truncation in the hooks stays as the
+hard outer stop — the token budget stops adding bullets, the character budget
+can still cut the tail.
 """
 
 from __future__ import annotations
@@ -38,8 +46,25 @@ DEFAULT_INJECT_TOKEN_BUDGET = 1500
 INJECT_TOKEN_BUDGET_ENV = "ZMEM_INJECT_TOKEN_BUDGET"
 # Documented approximation of the fence's per-row provenance lines
 # (id/signal/ns/type/conf + source_ref) in tokens at 4 chars/token.
+# Legacy cost model kept for episodes.py episode token_count and its
+# characterization pin — admission no longer uses it (issue #116).
 FENCE_OVERHEAD_TOKENS = 12
 CHARS_PER_TOKEN = 4
+# Fixed reservation for everything the fence renders AROUND the rows
+# (issue #116): open line + "# " + header + disclaimer + blank + the
+# optional budget-note line + close + newline separators. Arithmetic at
+# CHARS_PER_TOKEN=4: header capped by the renderer at 240 chars (60 tok)
+# + shell lines ~136 chars (34 tok) + budget note <= ~80 chars (20 tok)
+# + rounding/newline margin (~14) = 128. Reserved up front so the note
+# line never pushes the render past the ceiling.
+FENCE_SHELL_ALLOWANCE = 128
+# Marker appended to truncated protected-row content (issue #116 scope 2:
+# truncate with an explicit marker rather than admit whole).
+TRUNCATION_MARKER = " …[budget-truncated]"
+# A truncated protected row must keep at least this many characters of
+# content (8 tokens) — below that the row is dropped and counted in
+# stats["dropped_protected"] instead of admitted as marker-only noise.
+MIN_STUB_CHARS = 32
 
 
 def estimate_tokens(text: str) -> int:
@@ -48,9 +73,87 @@ def estimate_tokens(text: str) -> int:
 
 
 def row_token_cost(row: dict[str, Any]) -> int:
-    """Admission-control token cost of one recall row (content + fence overhead)."""
+    """Legacy admission-control cost (content + flat fence overhead).
+
+    Kept for episodes.py episode token_count and its characterization pin.
+    Budget admission uses ``fence_row_cost`` since issue #116.
+    """
     content = row.get("content", "") or ""
     return estimate_tokens(content) + FENCE_OVERHEAD_TOKENS
+
+
+def _row_markers(row: dict[str, Any]) -> list:
+    """Marker prefixes the fence renderer would put on this row's bullet."""
+    markers = []
+    if row.get("unfold_hop"):
+        markers.append("[PREVIOUSLY]")
+    if row.get("prompt_injection_risk"):
+        markers.append("[INJECTION RISK]")
+    taint = row.get("taint")
+    if taint == "untrusted_tool":
+        markers.append("[UNTRUSTED TOOL]")
+    elif taint == "untrusted_web":
+        markers.append("[UNTRUSTED WEB]")
+    if row.get("contested_link"):
+        markers.append("[CONTESTED LINK]")
+    return markers
+
+
+def fence_row_cost(row: dict[str, Any]) -> int:
+    """Admission-control token cost of one row's FULL fence contribution
+    (issue #116).
+
+    Models the exact block ``storelib.recall._format_fenced_recall`` renders
+    for the row — marker-prefixed bullet header (id/conf/signal/ns/type,
+    ``_stale_note`` suffix), the indented content line, and the optional
+    source_ref/tags/entities lines — measured with the SAME
+    ``estimate_tokens`` the callers report on the final render, so admission
+    and reporting can never diverge silently. Row values are charged exactly
+    as carried (a long source_ref self-pays); the +2 margin covers only
+    join/newline arithmetic variance. Input contract: dict-like rows
+    (missing keys cost as empty, matching the renderer's ``.get``-style
+    defaults); the +2 margin is what the renderer's line separators cost.
+    """
+    markers = _row_markers(row)
+    inj_prefix = (" " + " ".join(markers)) if markers else ""
+    header = (
+        "{}- [{}] [conf={}] [signal={}] [ns={}] [type={}]{}".format(
+            inj_prefix,
+            row.get("id", ""),
+            row.get("confidence", ""),
+            row.get("signal", ""),
+            row.get("namespace", ""),
+            row.get("type", ""),
+            row.get("_stale_note", "") or "",
+        )
+    )
+    lines = [header, "    " + (row.get("content", "") or "")]
+    if row.get("source_ref"):
+        lines.append("    source_ref: {}".format(row["source_ref"]))
+    if row.get("tags"):
+        lines.append("    tags: {}".format(row["tags"]))
+    ents = row.get("entities") or []
+    if ents:
+        lines.append(
+            "    entities: " + ", ".join(
+                e.get("name", "?") for e in ents[:3]
+            )
+        )
+    # "\n".join separators + the newline that separates the block from the
+    # next row in the rendered fence (+2 margin).
+    return estimate_tokens("\n".join(lines)) + 1 + 1
+
+
+def budget_note(stats: dict[str, Any]) -> str:
+    """Machine-readable omission marker for the rendered fence (issue #116
+    addendum, funes byte-stable diagnostics): ``[budget: dropped N rows,
+    truncated M]``. Empty string when nothing was omitted — the fence stays
+    byte-identical whenever the budget did not bite."""
+    dropped = int(stats.get("dropped", 0) or 0)
+    truncated = int(stats.get("truncated", 0) or 0)
+    if dropped <= 0 and truncated <= 0:
+        return ""
+    return "[budget: dropped {} rows, truncated {}]".format(dropped, truncated)
 
 
 def inject_token_budget() -> int:
@@ -81,46 +184,120 @@ def _row_priority(row: dict[str, Any], index: int) -> Tuple[float, int, int]:
     return (-score, none_last, index)
 
 
+def _truncate_protected_row(
+    row: dict[str, Any], remaining: int
+) -> Optional[Tuple[dict[str, Any], int]]:
+    """Fit a protected row into ``remaining`` tokens by clipping its content
+    (issue #116 scope 2). Returns ``(new_row, cost)`` with a SHALLOW COPY of
+    the row (the caller's dict is never mutated) and an explicit
+    ``…[budget-truncated]`` marker, or None when even a minimal stub does not
+    fit. The copy is re-measured with the exact admission estimator, so the
+    charge always covers what the renderer will emit."""
+    if remaining < 1:
+        return None
+    content = row.get("content", "") or ""
+    # Token cost of the row WITHOUT its content: header + optional lines.
+    probe = dict(row)
+    probe["content"] = ""
+    overhead = fence_row_cost(probe)
+    marker = TRUNCATION_MARKER
+    # Characters of content that keep the whole block within `remaining`.
+    # estimate_tokens = chars // 4, so allowed total chars for the block is
+    # remaining * 4; subtract the marker and a safety margin, then floor.
+    allowed = (remaining * CHARS_PER_TOKEN) - len(marker) \
+        - (overhead * CHARS_PER_TOKEN) - CHARS_PER_TOKEN
+    if allowed < MIN_STUB_CHARS:
+        return None
+    clipped = row.copy()
+    clipped["content"] = content[:allowed].rstrip() + marker
+    cost = fence_row_cost(clipped)
+    if cost > remaining:
+        # Fail-closed: the arithmetic above is conservative, but if the
+        # re-measure ever disagrees, drop instead of breaking the ceiling.
+        return None
+    return clipped, cost
+
+
 def apply_token_budget(
-    rows: list[dict[str, Any]], budget: Optional[int] = None
-) -> Tuple[list[dict[str, Any]], int, int]:
-    """Admit rows under ``budget`` tokens (issue #65, 10.9).
+    rows: list[dict[str, Any]], budget: Optional[int] = None,
+    *, with_stats: bool = False,
+) -> Any:
+    """Admit rows under ``budget`` tokens as a MEASURED HARD CEILING
+    (issue #116; original policy issue #65, 10.9).
 
-    Policy: ``decision``/``constraint`` rows are PROTECTED — never dropped to
-    stay under budget, and kept even when they alone exceed it (once only they
-    remain, budget enforcement stops). Everything else is admitted in
-    descending score order (``signal=none`` after grounded rows at the same
-    score) until the next row would exceed the budget. Admission stops there;
-    already-admitted rows are never evicted to fit a later row.
+    Policy: ``decision``/``constraint`` rows are PROTECTED — they are never
+    dropped while they can still carry information: each is admitted whole
+    when it fits the remaining budget, else TRUNCATED to fit with an explicit
+    ``…[budget-truncated]`` marker on its content, and only dropped (counted
+    in ``stats["dropped_protected"]``, never silently) when even a minimal
+    stub does not fit. Everything else is admitted in descending score order
+    (``signal=none`` after grounded rows at the same score); the scan
+    CONTINUES past a row that does not fit, so a later smaller high-value row
+    is still admitted. ``FENCE_SHELL_ALLOWANCE`` is reserved up front for the
+    fence shell (open/close/header/disclaimer/optional budget-note line), so
+    the FINAL RENDERED FENCE — measured with the same ``estimate_tokens`` —
+    never exceeds the budget.
 
-    Returns ``(kept, tokens_estimate, dropped)``. ``kept`` preserves the
-    caller's original row order (admission decides membership, not order) so
-    the fence render stays score-ranked. ``tokens_estimate`` is the sum of
-    admission costs of the kept rows — callers report ``tokens_used`` measured
-    on their final rendered text instead.
+    Admission charges each row ``fence_row_cost`` (its full rendered fence
+    contribution). Returns ``(kept, tokens_estimate, dropped)`` where
+    ``tokens_estimate`` is the admission accounting of the kept rows; kept
+    preserves the caller's original row order (membership is decided by
+    admission, order by the caller's score-ranked render). With
+    ``with_stats=True`` returns ``(kept, tokens_estimate, dropped, stats)``
+    where stats carries ``admission_used`` (= tokens_estimate), ``dropped``,
+    ``truncated``, ``dropped_protected``, and ``budget`` — the inputs the
+    envelope/log fields and ``budget_note`` render from.
     """
     if budget is None:
         budget = inject_token_budget()
-    protected_ids = set()
+    available = budget - FENCE_SHELL_ALLOWANCE
+    protected_idx = []
     normal: list[Tuple[Tuple[float, int, int], int]] = []
     for i, row in enumerate(rows):
         if (row.get("type") or "") in _PROTECTED_TYPES:
-            protected_ids.add(i)
+            protected_idx.append(i)
         else:
             normal.append((_row_priority(row, i), i))
     normal.sort(key=lambda pair: pair[0])
 
-    admitted = set(protected_ids)
-    used = sum(row_token_cost(rows[i]) for i in protected_ids)
+    admitted: dict[int, Tuple[dict[str, Any], int]] = {}
+    used = 0
+    truncated = 0
+    dropped_protected = 0
+    for i in protected_idx:
+        cost = fence_row_cost(rows[i])
+        if cost <= available - used:
+            admitted[i] = (rows[i], cost)
+            used += cost
+            continue
+        stub = _truncate_protected_row(rows[i], available - used)
+        if stub is not None:
+            admitted[i] = stub
+            used += stub[1]
+            truncated += 1
+        else:
+            dropped_protected += 1
     for _key, i in normal:
-        cost = row_token_cost(rows[i])
-        if used + cost > budget:
-            break
-        admitted.add(i)
+        cost = fence_row_cost(rows[i])
+        if used + cost > available:
+            # Issue #116 scope 3: skip and keep scanning — a later smaller
+            # row must not be lost to an earlier oversized one.
+            continue
+        admitted[i] = (rows[i], cost)
         used += cost
 
-    kept = [row for i, row in enumerate(rows) if i in admitted]
-    return kept, used, len(rows) - len(kept)
+    kept = [admitted[i][0] for i in sorted(admitted)]
+    dropped = len(rows) - len(kept)
+    if with_stats:
+        stats = {
+            "admission_used": used,
+            "dropped": dropped,
+            "truncated": truncated,
+            "dropped_protected": dropped_protected,
+            "budget": budget,
+        }
+        return kept, used, dropped, stats
+    return kept, used, dropped
 
 
 def envelope_results(parsed: Any) -> list:
