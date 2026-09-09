@@ -408,16 +408,19 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
         # Issue #136: the additive arms attribution field — per-arm
         # post-cap/cap pairs (P/Q) from the recall envelope's ``arms`` dict,
         # so the B-1 report can see which arm carried a hit. Compact wire
-        # format; absent on stores whose envelope predates the key.
+        # format; absent on stores whose envelope predates the key. Wire
+        # labels: fts/vec/ent/graph (the envelope key for the entity arm is
+        # "entity" — issue #136 review round fixed the silent mismatch).
         armf = ""
         if isinstance(arms, dict) and arms:
             try:
                 armf = " arms=" + ",".join(
                     "{0}:{1}/{2}".format(
-                        name, int(arms[name].get("post", 0)),
-                        int(arms[name].get("cap", 0)))
-                    for name in ("fts", "vec", "ent", "graph")
-                    if name in arms
+                        label, int(arms[key].get("post", 0)),
+                        int(arms[key].get("cap", 0)))
+                    for label, key in (("fts", "fts"), ("vec", "vec"),
+                                       ("ent", "entity"), ("graph", "graph"))
+                    if key in arms
                 )
             except (TypeError, ValueError, AttributeError):
                 armf = ""  # malformed envelope — never break the log write

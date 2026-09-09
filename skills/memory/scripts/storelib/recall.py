@@ -290,8 +290,9 @@ def _rrf_fuse(
     bm25_ids: list[str],
     vec_ids: list[str],
     entity_ids: list[str] | None = None,
-    graph_ids: list[str] | None = None,
     k: int = 60,
+    *,
+    graph_ids: list[str] | None = None,
 ) -> list[str]:
     """Reciprocal Rank Fusion: combine ranked lists by 1/(k+rank).
 
@@ -308,6 +309,9 @@ def _rrf_fuse(
     the graph-seed arm's capped neighbors (entity-anchored seeds, one bounded
     hop over seed-safe relations). Additive like every other arm; an empty
     list contributes nothing, so a link-free store fuses byte-identically.
+    It is keyword-only so ``k`` keeps its original fourth positional slot —
+    a positional graph list would silently rebind a caller's ``k``
+    (review round).
     """
     scores: dict[str, float] = {}
     for rank, mid in enumerate(bm25_ids, 1):
@@ -983,10 +987,12 @@ def _recall_one_tier(
     }
     graph_ids: list[str] = []
     graph_rel_map: dict[str, float] = {}
+    graph_ids_set: set[str] = set()
     if entity_ids and os.environ.get("ZMEM_GRAPH_SEED", "1").strip() != "0":
         graph_ids, graph_rel_map = graph_seed_ids(
             conn, entity_ids[:caps["entity"]],
             cap=caps["graph"], ns_list=ns_list, as_of=as_of)
+        graph_ids_set = set(graph_ids)
     if arm_stats is not None:
         # Merge across tiers (recall_memory passes one shared dict): pre/post
         # accumulate, cap takes the max (tiers can differ on global_limit).
@@ -1022,12 +1028,21 @@ def _recall_one_tier(
                 fts_rank_map[r["id"]] = r["fts_rank"]
         # Issue #136: per-arm caps truncate each ranked list before fusion.
         fts_ids = [r["id"] for r in rows[:caps["fts"]]]
-        fused_ids = _rrf_fuse(fts_ids, vec_ids[:caps["vec"]],
-                              entity_ids[:caps["entity"]], graph_ids, k=60)
+        vec_fused = vec_ids[:caps["vec"]]
+        ent_fused = entity_ids[:caps["entity"]]
+        fused_ids = _rrf_fuse(fts_ids, vec_fused, ent_fused,
+                              graph_ids=graph_ids, k=60)
+        # Issue #136 review round: rows whose ONLY arrival is the graph arm
+        # (not also surfaced by a query-measuring arm) are link-rescued
+        # neighbors in the #114 sense — they render but never feed the
+        # surfaced/retrieval counters (bump_ids excludes them below).
+        graph_only_ids = (set(graph_ids) - set(fts_ids)
+                          - set(vec_fused) - set(ent_fused))
         rrf_pos = {mid: i for i, mid in enumerate(fused_ids, 1)}
         rows = _fetch_by_ids(conn, fused_ids, ns_list, floor, as_of=as_of)
     else:
         rrf_pos = {}
+        graph_only_ids = set()
 
     # Issue #113: per-lane relevance inputs. Per-term hit sets over the same
     # namespace/live/as-of filters as the fetch above (one indexed FTS query
@@ -1131,6 +1146,17 @@ def _recall_one_tier(
         cos_leg = max(0.0, vsim) if vsim is not None else None
         ent_leg = max(0.0, entv) if entv is not None else None
         lane_vals = [v for v in (rel_lex, cos_leg, ent_leg) if v is not None]
+        # Issue #136 review round: the graph arm's measured lane participates
+        # in the #113 max-of-measured-lanes relevance, so the rank agrees
+        # with the gate that judges it (a graph-only row no longer scores
+        # rel=0.0 and rank dead-last under pool pressure). Only rows the
+        # CAPPED arm contributed carry the lane (cubic: cap governs
+        # attribution as well as fusion); graph_rel_map stays the full
+        # pre-cap eligibility map for the arm_stats "pre" count.
+        gv = (graph_rel_map.get(r["id"])
+              if r["id"] in graph_ids_set else None)
+        if gv is not None:
+            lane_vals.append(gv)
         rel = max(lane_vals) if lane_vals else 0.0
         # Issue #115: the trust multiplier compute_score applied to this row
         # (same normalization the gate uses), reported under --explain.
@@ -1161,18 +1187,22 @@ def _recall_one_tier(
             "_rel_lex": rel_lex,
             "_rel_cos": cos_leg,
             "_rel_ent": ent_leg,
+            # Issue #136: the graph arm's MEASURED lane value (best
+            # entry-edge score) on rows the CAPPED arm contributed — None on
+            # every other row, so non-graph rows stay exempt exactly as
+            # before and a graph row is floor-JUDGED by the inject gate
+            # instead of riding the exemption.
+            "_rel_graph": gv,
+            # Issue #136 review round: rows whose ONLY arrival is the graph
+            # arm are link-rescued neighbors — they render but never feed
+            # the surfaced/retrieval counters (bump_ids excludes them).
+            "_graph_arrival_only": r["id"] in graph_only_ids,
             # Issue #115: the row's trust multiplier, EXPOSED so the shared
             # inject gate (_row_trust) can judge scored rows — a plain key
             # because it is row data, not a diagnostic (the SQL-backed rows
             # from _fetch_by_ids/_recent_one_tier carry it the same way).
             "trust_score": trust,
         }))
-        # Issue #136: the graph arm's MEASURED lane value (best entry-edge
-        # score) on rows IT contributed — key ABSENT on every other row, so
-        # non-graph rows stay exempt exactly as before and a graph row is
-        # floor-JUDGED by the inject gate instead of riding the exemption.
-        if r["id"] in graph_rel_map:
-            scored[-1][1]["_rel_graph"] = graph_rel_map[r["id"]]
         if collect_lanes:
             scored[-1][1]["_lanes"] = {
                 "bm25_rank": fts_r,
@@ -1183,7 +1213,7 @@ def _recall_one_tier(
                 "lex": rel_lex,
                 "cos": cos_leg,
                 "entity": ent_leg,
-                "graph": graph_rel_map.get(r["id"]),
+                "graph": gv,
                 "rel": rel,
                 "trust": trust,
             }
@@ -1636,7 +1666,12 @@ def recall_memory(
         # caller passing cross_rerank=True with for_injection=True still
         # cannot reach the scorer on the passive injection lane.
         results = _cross_maybe_rerank(query, results)
-    bump_ids = [r["id"] for r in results]
+    # Issue #136 review round: graph-only rows (rescued via the graph arm,
+    # not also surfaced by a query-measuring arm) render but NEVER feed the
+    # surfaced/retrieval counters — the same law as link-expansion extras
+    # below (#114: popularity rewards query-MATCHED rows only).
+    bump_ids = [r["id"] for r in results
+                if not r.get("_graph_arrival_only")]
     if link_hops >= 1 and link_budget >= 1 and results:
         results = results + expand_recall_links(
             conn, results, ns_list=ns_list, budget=link_budget, as_of=as_of,

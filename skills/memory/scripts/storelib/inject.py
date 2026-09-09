@@ -542,10 +542,11 @@ def selective_inject_filter(
         # if NO lane clears, the row is not relevant enough to inject.
         lane_ok = False
         measured = False
-        for key, fl in (("_rel_lex", lane_floors[0]),
-                        ("_rel_cos", lane_floors[1]),
-                        ("_rel_ent", lane_floors[2]),
-                        ("_rel_graph", lane_floors[3])):
+        # Issue #136 review round: zip (not fixed indexes) so a legacy
+        # 3-value lane_floors override keeps working — the graph floor joins
+        # the disjunction only when a fourth value is supplied.
+        for key, fl in zip(("_rel_lex", "_rel_cos", "_rel_ent", "_rel_graph"),
+                           lane_floors):
             val = r.get(key)
             if val is None:
                 continue

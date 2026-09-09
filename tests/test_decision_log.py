@@ -781,6 +781,49 @@ class NoTruncateToEmptyGuardrailTest(unittest.TestCase):
         self.assertIn("zmem-decisions.log", ss)
 
 
+class ArmsAttributionReportTest(_SeededStore):
+    """Issue #136 (review round): run_miss_report aggregates the decision
+    log's additive arms= field into a per-arm carried (injected/silent)
+    attribution. The scan log rides in via bg_log_path so the seeded
+    store's own decision line cannot pollute the counts."""
+
+    def _scan(self, lines):
+        scan = Path(self._tmp, "arms-scan.log")
+        scan.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return self._report(bg_log_path=str(scan))
+
+    def test_arms_aggregation_counts_carried_decisions(self):
+        ts = 1740000000
+        rep = self._scan([
+            f"[{ts}] zmem-hook status=injected reason=injected ids=['a'] "
+            "all=['a'] sid=sess-arm moment=user_prompt "
+            "arms=fts:3/15,vec:0/25,ent:2/50,graph:1/5",
+            f"[{ts + 1}] zmem-hook status=silent reason=below-bar ids=[] "
+            "all=['b'] sid=sess-arm moment=user_prompt "
+            "arms=fts:2/15,vec:1/25,ent:0/50,graph:0/5",
+            f"[{ts + 2}] zmem-hook status=silent reason=empty-pool ids=[] "
+            "all=[] sid=sess-arm moment=user_prompt",
+        ])
+        arms = rep["arms"]
+        self.assertEqual(arms["lines_with_arms"], 2)
+        self.assertEqual(arms["lines_without_arms"], 1)
+        self.assertEqual(arms["carried"]["fts"], {"injected": 1, "silent": 1})
+        self.assertEqual(arms["carried"]["vec"], {"injected": 0, "silent": 1})
+        self.assertEqual(arms["carried"]["ent"], {"injected": 1, "silent": 0})
+        self.assertEqual(arms["carried"]["graph"],
+                         {"injected": 1, "silent": 0})
+
+    def test_arms_absent_lines_count_without(self):
+        ts = 1740000000
+        rep = self._scan([
+            f"[{ts}] zmem-hook status=injected reason=injected ids=['a'] "
+            "all=['a'] sid=sess-arm moment=user_prompt",
+        ])
+        arms = rep["arms"]
+        self.assertEqual(arms["lines_with_arms"], 0)
+        self.assertEqual(arms["lines_without_arms"], 1)
+        self.assertEqual(arms["carried"]["fts"],
+                         {"injected": 0, "silent": 0})
 
 
 if __name__ == "__main__":

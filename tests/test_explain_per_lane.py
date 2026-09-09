@@ -46,7 +46,8 @@ os.environ["ZMEM_EMBED_PROFILE"] = "fake"
 os.environ["ZMEM_TEST_NOW"] = "2026-06-01T00:00:00Z"
 for _k in ("ZMEM_DATA", "ZMEM_BACKUP_DIR",
            "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
-           "ZMEM_INJECT_FLOOR_ENT", "ZMEM_INJECT_FLOOR_TRUST"):
+           "ZMEM_INJECT_FLOOR_ENT", "ZMEM_INJECT_FLOOR_GRAPH",
+           "ZMEM_INJECT_FLOOR_TRUST"):
     os.environ.pop(_k, None)
 
 sys.path.insert(0, str(SCRIPTS_DIR))

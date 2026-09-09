@@ -761,6 +761,37 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         if ln.get("tok_used") is not None
         and ln.get("tok_budget") is not None
         and ln["tok_used"] > ln["tok_budget"])
+    # Issue #136 (review round): per-arm attribution. parse_bg_log carries
+    # the additive arms= field verbatim; the report aggregates it so an
+    # operator can see WHICH arm carried a decision (post>0 = the arm
+    # contributed candidates post-cap), split by whether the decision
+    # injected anything. Lines without the field (pre-#136 logs,
+    # reason=disabled kill-switch lines) count under lines_without_arms.
+    arm_names = ("fts", "vec", "ent", "graph")
+    arm_carry: dict = {a: {"injected": 0, "silent": 0} for a in arm_names}
+    arms_lines_with = 0
+    arms_lines_without = 0
+    for ln in lines:
+        raw = ln.get("arms")
+        if not raw:
+            arms_lines_without += 1
+            continue
+        arms_lines_with += 1
+        did_inject = (ln.get("reason") == "injected"
+                      or (ln.get("reason") is None
+                          and ln.get("status") == "injected"))
+        bucket = "injected" if did_inject else "silent"
+        for seg in str(raw).split(","):
+            label, _, pq = seg.partition(":")
+            if label not in arm_carry or not pq:
+                continue
+            post, _, _cap = pq.partition("/")
+            try:
+                carried = int(post) > 0
+            except ValueError:
+                carried = False
+            if carried:
+                arm_carry[label][bucket] += 1
 
     failures = []
     unmatched_globs = []
@@ -1041,6 +1072,9 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         "miss_rate": miss_rate,
         "miss_rate_strict_sid": strict,
         "over_budget": over_budget,
+        "arms": {"lines_with_arms": arms_lines_with,
+                 "lines_without_arms": arms_lines_without,
+                 "carried": arm_carry},
         "false_injection": false_injection,
         "missed_all_only": missed_all_only,
         "query_source": query_source,

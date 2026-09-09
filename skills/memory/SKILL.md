@@ -1370,7 +1370,7 @@ Lists the entities the deterministic extractor minted: id, kind, canonical
 name, all normalized aliases, and how many memories link to each. `--kind`
 filters to one kind; `--json` emits `[{id, kind, name, aliases, links}]`.
 This is the inspection surface for humans and doctor — use it to see what
-the third RRF lane is actually matching.
+the entity lane actually matches.
 
 ### entity-merge — reconcile duplicate entities (v10, issue #60)
 ```
@@ -1477,9 +1477,12 @@ to `{content tags}` so namespace text alone can never make a row a candidate.
 
 Retrieval is a **four-signal pipeline**: FTS5/BM25 keyword match (always),
 vector KNN over stored embeddings (when the optional embedding runtime is
-available), entity matching (v10 — always, no model needed), and the
-graph-seed arm (issue #136 — always, no model needed): the query's
-identifiers and plain tokens are matched against stored entity aliases. The
+available), entity matching (v10 — always, no model needed; the query's
+identifiers and plain tokens are matched against stored entity aliases),
+and the graph-seed arm (issue #136 — always, no model needed): the matched
+entities seed one bounded hop over seed-safe links (`related`, `supports`,
+`updates`, `derives`) so a linked neighbor can enter the pool without
+sharing any query token. The
 lanes' rankings are fused with Reciprocal Rank Fusion (RRF, k=60,
 per-id additive: a memory appearing in several lanes accumulates each lane's
 contribution), then re-ranked by a **composite score** that combines:
@@ -1541,7 +1544,8 @@ and the `--for-injection` envelope report per-arm `pre`/`post`/`cap` counts
 (`arms`), and the hook's decision line carries `arms=fts:P/Q,vec:P/Q,...`
 so the miss-rate report can attribute a hit to the arm that carried it.
 
-**Entity matching (v10, issue #60 5.3)** is the third lane: the query runs
+**Entity matching (v10, issue #60 5.3)** is the third fused list (after
+FTS/BM25 and vector; the graph-seed arm above is the fourth): the query runs
 through the same deterministic extractor used at write time, and plain query
 tokens are additionally matched against stored entity aliases. Memories
 linked to matched entities join RRF ranked by (number of matched entities,

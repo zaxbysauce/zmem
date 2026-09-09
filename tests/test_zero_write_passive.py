@@ -168,10 +168,15 @@ class AcceptanceRecallTest(ForInjectionBase):
         self.assertTrue(all(counts[p][1] == 0 for p in dropped))
 
     def test_link_neighbor_rendered_but_never_counted(self):
-        # PRR-013 (review round): the PR's load-bearing telemetry law, pinned
-        # end-to-end — a link-expansion neighbor RENDERS on the injection
-        # lane but must never gain surfaced_count (popularity rewards
-        # query-matched rows, not link neighbors).
+        # PRR-013 (review round), revised in the issue-#136 round: the
+        # load-bearing telemetry law, pinned end-to-end — an expansion-only
+        # neighbor RENDERS on the injection lane but must never gain
+        # surfaced_count (popularity rewards query-matched rows, not
+        # expansion rows). Post-#136 the neighbor can arrive either as a
+        # link row (link_relation) or as a graph-arm candidate (measured
+        # graph lane in candidate_lanes); both are expansion arrivals, so
+        # the pin accepts either and additionally requires that the
+        # neighbor did not lexically match the query.
         counts = self._counts()
         rendered = next(p for p in counts if self._signal_of(p) == "test")
         r = self._run("add", "--namespace", NS, "--type", "lesson",
@@ -194,10 +199,10 @@ class AcceptanceRecallTest(ForInjectionBase):
                       "--id", neighbor_full,
                       "--relation", "related", "--json")
         self.assertEqual(r.returncode, 0, r.stderr)
-        # --no-hybrid: the zebra row shares no token with the query, so in
-        # lexical mode the link is the ONLY way it can render (with
-        # embeddings available the vector lane would surface it as a direct
-        # match, making the pin vacuous locally while CI stays lexical).
+        # --no-hybrid: lexical mode. The zebra row shares no token with the
+        # query, so no query-measuring lane can carry it; it can only arrive
+        # via the related-link expansion or (issue #136) the graph-seed arm
+        # seeded by the rendered row's flange alias — both expansion.
         r = self._run("recall", "--query", "flange calibrated launch",
                       "--namespace", NS, "--limit", "5", "--no-hybrid",
                       "--no-bump", "--for-injection", "--json")
@@ -205,18 +210,25 @@ class AcceptanceRecallTest(ForInjectionBase):
         doc = json.loads(r.stdout)
         ids = [x["id"][:8] for x in doc["results"]]
         self.assertIn(neighbor, ids,
-                      "precondition: the neighbor must render via the link "
-                      "expansion, or this test proves nothing")
-        self.assertTrue(any(x.get("link_relation") for x in doc["results"]
-                            if x["id"][:8] == neighbor),
-                        "neighbor must arrive as a link row, not a direct "
+                      "precondition: the neighbor must render, or this "
+                      "test proves nothing")
+        row = next(x for x in doc["results"] if x["id"][:8] == neighbor)
+        lanes = doc["candidate_lanes"][neighbor_full]
+        via_link = bool(row.get("link_relation"))
+        via_graph = lanes.get("graph") is not None
+        self.assertTrue(via_link or via_graph,
+                        "neighbor must arrive as an expansion row (link "
+                        "relation or measured graph lane), not a direct "
                         "match, for this pin to be meaningful")
+        self.assertFalse(lanes.get("lex"),
+                         "neighbor must not lexically match the query")
         after = self._counts()
         self.assertGreaterEqual(after[rendered][1], 1,
                                 "the query-matched row is counted")
         self.assertEqual(after[neighbor][1], 0,
-                         "the link neighbor rendered but must never be "
-                         "surfaced-counted (issue #114 review PRR-013)")
+                         "the expansion-only neighbor rendered but must "
+                         "never be surfaced-counted (issue #114 review "
+                         "PRR-013; the #136 graph-arm round keeps the law)")
 
     def test_budget_dropped_rows_unchanged_and_reason_budget_drop(self):
         # A budget no normal row can fit under (fence overhead alone is 12) —

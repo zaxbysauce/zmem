@@ -383,11 +383,76 @@ class ByteIdenticalNoLinksTest(_FloorEnvHermetic, unittest.TestCase):
         self.assertEqual(on_raw, off_raw)
 
 
+class TwoTierArmsMergeTest(unittest.TestCase):
+    """F12 (review round): the ONE shared arms dict accumulates across the
+    project + user:global tiers — post is the merged count, never the last
+    tier's overwrite."""
+
+    def test_arms_merge_across_tiers(self):
+        conn, ids = _build_store()
+        self.addCleanup(conn.close)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gid = add_memory(
+                conn, namespace="user:global", type_="fact",
+                content="search code with rg ripgrep guide", tags="grapharm",
+                signal="test", confidence=0.9, source_ref="session:grapharm-G")
+        conn.execute("UPDATE memory SET ingestion_ts=?, valid_from=? "
+                     "WHERE id=?", (PIN_TS, PIN_TS, gid))
+        conn.commit()
+        env = _recall_envelope(conn, include_global=True)
+        self.assertGreaterEqual(
+            env["arms"]["fts"]["post"], 2,
+            "fts post must sum BOTH tiers (project row + global row)")
+        self.assertIn("user:global",
+                      {r["namespace"] for r in env["results"]})
+
+
+class RecentSurfaceGraphKeyTest(unittest.TestCase):
+    """F12 (review round): the recent surface's candidate_lanes keeps the
+    graph key (None everywhere — the recent lane runs no recall tiers), so
+    the lane schema stays uniform across surfaces."""
+
+    def test_recent_candidate_lanes_carry_graph_key(self):
+        conn, ids = _build_store(edges=(("H", "T", "related", 0.85),))
+        self.addCleanup(conn.close)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            recall_mod.recent_memory(
+                conn, namespace=NS, as_json=True, no_bump=True,
+                no_telemetry=True, for_injection=True, limit=5)
+        env = json.loads(buf.getvalue())
+        self.assertTrue(env["candidate_lanes"])
+        for lanes in env["candidate_lanes"].values():
+            self.assertIn("graph", lanes)
+        self.assertIsNone(env["candidate_lanes"][ids["T"]]["graph"],
+                          "recent runs no tiers — graph lane stays unmeasured")
+
+
+class AsOfGraphArmTest(_FloorEnvHermetic, unittest.TestCase):
+    """F12 (review round): the graph arm honors the as_of time-travel
+    predicate — a row invisible at the as_of instant cannot enter via the
+    arm either."""
+
+    def test_graph_arm_respects_as_of(self):
+        conn, ids = _build_store(edges=(("H", "T", "related", 0.85),))
+        self.addCleanup(conn.close)
+        # Rows are backdated to PIN_TS (2026-06-01) by _build_store.
+        after = _recall_envelope(conn, as_of="2026-06-02T00:00:00Z")
+        self.assertGreaterEqual(after["arms"]["graph"]["post"], 1)
+        self.assertIn(ids["T"], after["candidate_ids"])
+        before = _recall_envelope(conn, as_of="2026-05-01T00:00:00Z")
+        self.assertEqual(before["arms"]["graph"]["post"], 0,
+                         "nothing is visible before the rows exist — the "
+                         "graph arm must not conjure them")
+        self.assertNotIn(ids["T"], before["candidate_ids"])
+
+
 class RrfFuseUnitTest(unittest.TestCase):
     """The 4th list is additive; legacy 2/3-arg callers are unchanged."""
 
     def test_four_lists_accumulate_additively(self):
-        fused = recall_mod._rrf_fuse(["a", "b"], ["b"], ["c"], ["d"], k=60)
+        fused = recall_mod._rrf_fuse(["a", "b"], ["b"], ["c"],
+                                     graph_ids=["d"], k=60)
         self.assertEqual(fused, ["b", "a", "c", "d"])
 
     def test_legacy_call_shapes_unchanged(self):
@@ -440,6 +505,34 @@ class LaneFloorsUnitTest(_FloorEnvHermetic, unittest.TestCase):
             os.environ.pop("ZMEM_INJECT_FLOOR_GRAPH", None)
 
 
+class LegacyLaneFloorsCompatTest(_FloorEnvHermetic, unittest.TestCase):
+    """F8 (review round): a legacy 3-value lane_floors override must not
+    IndexError the gate — the graph floor simply does not apply, exactly
+    as before the graph lane existed."""
+
+    ROW = {"id": "g", "signal": "test", "confidence": 0.9,
+           "_rel_lex": None, "_rel_cos": None, "_rel_ent": None,
+           "_rel_graph": 0.99}
+
+    def test_three_value_override_tolerated(self):
+        kept, _status = selective_inject_filter(
+            [dict(self.ROW)], lane_floors=(0.30, 0.50, 0.5))
+        self.assertEqual([r["id"] for r in kept], ["g"],
+                         "with a 3-tuple the graph lane carries no floor, "
+                         "so the row keeps its absent-lane exemption")
+
+    def test_four_value_override_applies_graph_floor(self):
+        kept, _status = selective_inject_filter(
+            [dict(self.ROW)], lane_floors=(0.30, 0.50, 0.5, 0.75))
+        self.assertEqual([r["id"] for r in kept], ["g"])
+        strict, _status = selective_inject_filter(
+            [dict(self.ROW, _rel_graph=0.5)],
+            lane_floors=(0.30, 0.50, 0.5, 0.75))
+        self.assertEqual(strict, [],
+                         "0.5 < the supplied 0.75 graph floor: "
+                         "measured-but-failing must drop")
+
+
 class BgLogArmsFieldTest(unittest.TestCase):
     """[B1] parse_bg_log must parse the arms= decision-line field both ways."""
 
@@ -472,14 +565,46 @@ class BgLogArmsFieldTest(unittest.TestCase):
             self.assertIsNone(out[0]["arms"])
 
     def test_hook_renders_arms_from_envelope(self):
-        src = HOOK_BODY.read_text(encoding="utf-8")
-        self.assertIn(" arms=", src,
-                      "hook decision line must carry the arms= field")
-        # The envelope-side plumbing: extraction gates on dict shape and the
-        # writer param is threaded to both _log_inject_decision call sites.
-        self.assertIn("envelope_arms", src)
-        self.assertGreaterEqual(src.count("arms=envelope_arms"), 2,
-                                "both injecting call sites must pass arms")
+        # F11 (review round): functional, not source-grep — load the real
+        # hook body module and prove _log_inject_decision renders the
+        # arms= field from the envelope's arms dict, INCLUDING the ent
+        # wire label mapped from the envelope's "entity" key (the #136
+        # round's F1 fix: the serializer used to look up arms["ent"],
+        # which no caller supplies, silently dropping entity attribution).
+        import importlib.util
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["ZMEM_DATA"] = tmp
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "zmem_recall_body_under_test", str(HOOK_BODY))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                # Resolve the log home through the module's own resolver
+                # (this checkout's chain prefers ZMEM_STORE's parent, so the
+                # line may land in the module fixture dir, not tmp) — the
+                # pin targets the arms RENDERING, not data-dir precedence
+                # (that is PR #101's pinned contract).
+                data_dir = mod._data_dir()
+                mod._log_inject_decision(
+                    [{"id": "a"}], [{"id": "a"}], "injected", "injected",
+                    tokens_used=10, tokens_budget=1500,
+                    session_id="sess-armtest", store_py="",
+                    arms={"fts": {"pre": 5, "post": 3, "cap": 15},
+                          "vec": {"pre": 2, "post": 0, "cap": 25},
+                          "entity": {"pre": 4, "post": 2, "cap": 50},
+                          "graph": {"pre": 3, "post": 1, "cap": 5}})
+            finally:
+                os.environ.pop("ZMEM_DATA", None)
+            log = Path(data_dir) / "zmem-decisions.log"
+            self.assertTrue(log.is_file(), "decision line must be written")
+            lines = log.read_text(encoding="utf-8").splitlines()
+        arms_lines = [ln for ln in lines if " arms=" in ln]
+        self.assertEqual(len(arms_lines), 1, lines)
+        self.assertIn("fts:3/15", arms_lines[0])
+        self.assertIn("vec:0/25", arms_lines[0])
+        self.assertIn("ent:2/50", arms_lines[0],
+                      "envelope key 'entity' must render as wire label ent")
+        self.assertIn("graph:1/5", arms_lines[0])
 
 
 if __name__ == "__main__":

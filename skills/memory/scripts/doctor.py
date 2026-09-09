@@ -2886,6 +2886,23 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
     # Additive; a missing key (older report shape) renders nothing.
     if "over_budget" in report:
         summary += f", over-budget {report['over_budget']}"
+    # Issue #136 (review round): per-arm attribution from the decision log's
+    # additive arms= field — decisions each arm carried (post>0), split by
+    # whether the decision injected anything ("inj/silent"). Additive
+    # render; a missing key (older report shape) renders nothing, and a log
+    # with no arms= lines at all (pre-#136) renders nothing rather than a
+    # row of zeros.
+    arm_rep = report.get("arms") or {}
+    if (arm_rep.get("lines_with_arms") or 0) > 0:
+        arm_bits = []
+        for _a in ("fts", "vec", "ent", "graph"):
+            _b = (arm_rep.get("carried") or {}).get(_a) or {}
+            if _b.get("injected", 0) or _b.get("silent", 0):
+                arm_bits.append("{0} {1}/{2}".format(
+                    _a, _b.get("injected", 0), _b.get("silent", 0)))
+        if arm_bits:
+            summary += ("; arm attribution carried (inj/silent): "
+                        + ", ".join(arm_bits))
     # Issue #129: both directions always print together. The counter
     # subtree is best-effort in the join (a failure degrades to a caveat
     # inside it), so guard the read.

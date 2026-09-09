@@ -31,6 +31,18 @@ README.
   per-arm `pre`/`post`/`cap` counts (`arms`), and the hook decision line
   gains `arms=fts:P/Q,vec:P/Q,ent:P/Q,graph:P/Q` so the miss-rate report can
   attribute a hit to the arm that carried it.
+- **memory** (issue #136 review round): the graph arm is now load-bearing in
+  composition — its measured edge score joins the lane-max relevance and the
+  gate only stamps the lane on rows the arm actually contributed (cap
+  governed), and graph-only rows (rescued without any query-measuring lane)
+  render but never feed the surfaced/retrieval counters, extending the #114
+  law. Recall rows carry the always-present `_rel_graph` lane key plus a
+  `_graph_arrival_only` marker; `doctor --miss-rate` aggregates the decision
+  log's `arms=` field into a per-arm carried (injected/silent) attribution;
+  the hook's `ent:` wire label correctly reads the envelope's `entity` key;
+  `_rrf_fuse` keeps `k` in its fourth positional slot (`graph_ids` is
+  keyword-only); and a legacy 3-value `lane_floors` gate override is still
+  tolerated (the graph floor applies only when a fourth value is supplied).
 
 ### Changed
 - **memory** (issue #136): the inject gate's disjunctive relevance floors gain
@@ -41,8 +53,8 @@ README.
   sub-threshold neighbor is judged and dropped instead of riding the
   absent-lane exemption the old link-expansion path gave it. A store with no
   links produces byte-identical results with the arm on or off, and the
-  committed injection-gold baseline is unchanged (all five metrics equal —
-  no false-injection regression).
+  committed injection-gold baseline is unchanged from 0.25.0 (all five
+  metrics match — no false-injection regression).
 
 ## [0.25.0] - 2026-09-08
 
