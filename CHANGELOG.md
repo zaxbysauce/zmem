@@ -12,6 +12,50 @@ README.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-09-08
+
+### Added
+- **memory** (issue #136, Workstream C-6): recall now runs a **graph-seed
+  candidate arm** beside FTS, vector, and entity — the query's entities (and
+  ops tokens, via the same alias path) resolve to seed memories, and ONE
+  bounded hop over `related`/`supports`/`updates`/`derives` edges (never
+  `contradicts` as a seed) emits a capped, deterministically ranked neighbor
+  list as the fourth RRF input. A prompt that shares an entity with a hit can
+  now rescue the linked lesson it shares no content token with — links can
+  create candidates, not only explain hits.
+- **memory** (issue #136): **per-arm caps** applied before fusion, named
+  defaults equal to the previous windows (default behavior unchanged), each
+  env-overridable (`ZMEM_ARM_CAP_FTS` / `ZMEM_ARM_CAP_VEC` /
+  `ZMEM_ARM_CAP_ENTITY` / `ZMEM_ARM_CAP_GRAPH`; `ZMEM_GRAPH_SEED=0` disables
+  the graph arm). `--explain` and the `--for-injection` envelope report
+  per-arm `pre`/`post`/`cap` counts (`arms`), and the hook decision line
+  gains `arms=fts:P/Q,vec:P/Q,ent:P/Q,graph:P/Q` so the miss-rate report can
+  attribute a hit to the arm that carried it.
+- **memory** (issue #136 review round): the graph arm is now load-bearing in
+  composition — its measured edge score joins the lane-max relevance and the
+  gate only stamps the lane on rows the arm actually contributed (cap
+  governed), and graph-only rows (rescued without any query-measuring lane)
+  render but never feed the surfaced/retrieval counters, extending the #114
+  law. Recall rows carry the always-present `_rel_graph` lane key plus a
+  `_graph_arrival_only` marker; `doctor --miss-rate` aggregates the decision
+  log's `arms=` field into a per-arm carried (injected/silent) attribution;
+  the hook's `ent:` wire label correctly reads the envelope's `entity` key;
+  `_rrf_fuse` keeps `k` in its fourth positional slot (`graph_ids` is
+  keyword-only); and a legacy 3-value `lane_floors` gate override is still
+  tolerated (the graph floor applies only when a fourth value is supplied).
+
+### Changed
+- **memory** (issue #136): the inject gate's disjunctive relevance floors gain
+  a fourth lane — `graph` (default 0.75, the write path's own
+  `LINK_THRESHOLD`; env `ZMEM_INJECT_FLOOR_GRAPH`). Graph-arm rows carry a
+  MEASURED `_rel_graph` (best entry-edge score), so a graph-rescued row
+  injects only when its edge to the query-anchored seed is strong; a curated
+  sub-threshold neighbor is judged and dropped instead of riding the
+  absent-lane exemption the old link-expansion path gave it. A store with no
+  links produces byte-identical results with the arm on or off, and the
+  committed injection-gold baseline is unchanged from 0.25.0 (all five
+  metrics match — no false-injection regression).
+
 ## [0.25.0] - 2026-09-08
 
 ### Added

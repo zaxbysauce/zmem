@@ -352,12 +352,16 @@ def _gate_constants() -> Tuple[float, float, frozenset]:
     return floor, gate_none_floor, frozenset(grounded)
 
 
-def _lane_floors() -> Tuple[float, float, float]:
-    """Per-lane relevance floors (issue #113), single-sourced from schema_meta.
+def _lane_floors() -> Tuple[float, float, float, float]:
+    """Per-lane relevance floors (issue #113; graph lane issue #136),
+    single-sourced from schema_meta.
 
     A row's PRESENT lane value must clear its own floor; an ABSENT lane
     (None) is exempt. Literals mirror the schema_meta defaults so a
-    partially-deployed tree keeps the documented gate.
+    partially-deployed tree keeps the documented gate. The graph floor
+    defaults to LINK_THRESHOLD (0.75): the graph arm's lane value is the
+    best entry-edge score, and 0.75 is the same bar the write path requires
+    before it auto-links two rows as related.
     """
     lex = _env_float(
         getattr(_schema_meta, "INJECT_FLOOR_LEX_ENV", "ZMEM_INJECT_FLOOR_LEX"),
@@ -371,10 +375,15 @@ def _lane_floors() -> Tuple[float, float, float]:
         getattr(_schema_meta, "INJECT_FLOOR_ENT_ENV", "ZMEM_INJECT_FLOOR_ENT"),
         getattr(_schema_meta, "INJECT_FLOOR_ENT_DEFAULT", 0.5),
     )
+    graph = _env_float(
+        getattr(_schema_meta, "INJECT_FLOOR_GRAPH_ENV",
+                "ZMEM_INJECT_FLOOR_GRAPH"),
+        getattr(_schema_meta, "INJECT_FLOOR_GRAPH_DEFAULT", 0.75),
+    )
     # A negative floor would trivially clear every measured lane (relevance
     # values are >= 0), i.e. silently disable the gate. Treat it as operator
     # error and clamp to 0.0 (the honest "disable this lane" value).
-    return max(0.0, lex), max(0.0, cos), max(0.0, ent)
+    return (max(0.0, lex), max(0.0, cos), max(0.0, ent), max(0.0, graph))
 
 
 def _trust_floor() -> float:
@@ -433,7 +442,7 @@ def selective_inject_filter(
     gate_none_floor: Optional[float] = None,
     grounded_signals: Optional[frozenset] = None,
     *,
-    lane_floors: Optional[Tuple[float, float, float]] = None,
+    lane_floors: Optional[Tuple[float, float, float, float]] = None,
     with_stats: bool = False,
 ) -> Any:
     """Store-side twin of the hook selective-inject gate (issue #58, 3.8; #114).
@@ -457,6 +466,12 @@ def selective_inject_filter(
     enough and counts in ``relevance_failed``. The trust gate is NOT
     replaced: a row must pass BOTH the trust conditions AND the relevance
     disjunction.
+
+    Issue #136: the graph-seed arm stamps ``_rel_graph`` (best entry-edge
+    score) on the rows it contributes, so a graph-rescued row is FLOOR-JUDGED
+    on its own merits instead of riding the absent-lane exemption — it passes
+    only when its edge to the query-anchored seed clears the graph floor
+    (default 0.75 = LINK_THRESHOLD).
 
     Issue #115: BEFORE the confidence check, the row's ``trust_score``
     (``_row_trust``: missing key -> 1.0, unparseable/non-finite -> 0.0,
@@ -527,9 +542,11 @@ def selective_inject_filter(
         # if NO lane clears, the row is not relevant enough to inject.
         lane_ok = False
         measured = False
-        for key, fl in (("_rel_lex", lane_floors[0]),
-                        ("_rel_cos", lane_floors[1]),
-                        ("_rel_ent", lane_floors[2])):
+        # Issue #136 review round: zip (not fixed indexes) so a legacy
+        # 3-value lane_floors override keeps working — the graph floor joins
+        # the disjunction only when a fourth value is supplied.
+        for key, fl in zip(("_rel_lex", "_rel_cos", "_rel_ent", "_rel_graph"),
+                           lane_floors):
             val = r.get(key)
             if val is None:
                 continue

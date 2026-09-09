@@ -527,7 +527,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=injected", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt$")
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: arms=\S+)?$")  # issue #136: additive trailing arms field
 
     def test_pretool_mode_moment(self):
         _run_body(self._tmp, "pretool",
@@ -535,7 +535,7 @@ class MomentFieldBodyTest(_SeededStore):
                    "tool_input": {"command": "git stash pop"}},
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
-        self.assertRegex(line, r" sid=\S+ moment=pretool$")
+        self.assertRegex(line, r" sid=\S+ moment=pretool(?: arms=\S+)?$")  # issue #136
 
     def test_kill_switch_body_line_carries_mode_moment(self):
         _run_body(self._tmp, "user_prompt",
@@ -543,7 +543,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns, ZMEM_INJECT="0")
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=silent reason=disabled", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt$")
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: arms=\S+)?$")  # issue #136: additive trailing arms field
 
 
 class MomentFieldSessionStartTest(unittest.TestCase):
@@ -598,7 +598,7 @@ class MomentFieldSessionStartTest(unittest.TestCase):
         self.assertEqual(r.returncode == 0, True, r.stderr[-800:])
         lines = _decision_lines(self._tmp)
         self.assertTrue(lines, "session-start decision line missing")
-        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start$")
+        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start(?: arms=\S+)?$")  # issue #136
 
     def test_kill_switch_line_carries_session_start_moment(self):
         # The kill-switch block resolves the sid from the env chain (the
@@ -781,6 +781,49 @@ class NoTruncateToEmptyGuardrailTest(unittest.TestCase):
         self.assertIn("zmem-decisions.log", ss)
 
 
+class ArmsAttributionReportTest(_SeededStore):
+    """Issue #136 (review round): run_miss_report aggregates the decision
+    log's additive arms= field into a per-arm carried (injected/silent)
+    attribution. The scan log rides in via bg_log_path so the seeded
+    store's own decision line cannot pollute the counts."""
+
+    def _scan(self, lines):
+        scan = Path(self._tmp, "arms-scan.log")
+        scan.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return self._report(bg_log_path=str(scan))
+
+    def test_arms_aggregation_counts_carried_decisions(self):
+        ts = 1740000000
+        rep = self._scan([
+            f"[{ts}] zmem-hook status=injected reason=injected ids=['a'] "
+            "all=['a'] sid=sess-arm moment=user_prompt "
+            "arms=fts:3/15,vec:0/25,ent:2/50,graph:1/5",
+            f"[{ts + 1}] zmem-hook status=silent reason=below-bar ids=[] "
+            "all=['b'] sid=sess-arm moment=user_prompt "
+            "arms=fts:2/15,vec:1/25,ent:0/50,graph:0/5",
+            f"[{ts + 2}] zmem-hook status=silent reason=empty-pool ids=[] "
+            "all=[] sid=sess-arm moment=user_prompt",
+        ])
+        arms = rep["arms"]
+        self.assertEqual(arms["lines_with_arms"], 2)
+        self.assertEqual(arms["lines_without_arms"], 1)
+        self.assertEqual(arms["carried"]["fts"], {"injected": 1, "silent": 1})
+        self.assertEqual(arms["carried"]["vec"], {"injected": 0, "silent": 1})
+        self.assertEqual(arms["carried"]["ent"], {"injected": 1, "silent": 0})
+        self.assertEqual(arms["carried"]["graph"],
+                         {"injected": 1, "silent": 0})
+
+    def test_arms_absent_lines_count_without(self):
+        ts = 1740000000
+        rep = self._scan([
+            f"[{ts}] zmem-hook status=injected reason=injected ids=['a'] "
+            "all=['a'] sid=sess-arm moment=user_prompt",
+        ])
+        arms = rep["arms"]
+        self.assertEqual(arms["lines_with_arms"], 0)
+        self.assertEqual(arms["lines_without_arms"], 1)
+        self.assertEqual(arms["carried"]["fts"],
+                         {"injected": 0, "silent": 0})
 
 
 if __name__ == "__main__":

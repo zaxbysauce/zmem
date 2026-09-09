@@ -302,7 +302,8 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                          store_py: str = "",
                          admission_used=None, budget_dropped=None,
                          budget_truncated=None,
-                         budget_dropped_protected=None) -> None:
+                         budget_dropped_protected=None,
+                         arms=None) -> None:
     """Append the injected|silent decision to the decision log (#129).
 
     Issue #129 split: decision lines go to ``zmem-decisions.log`` (rotated,
@@ -404,11 +405,30 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
             safe_moment = _re_sid.sub(r"[^A-Za-z0-9._-]", "_", moment)[:32]
             if safe_moment:
                 mom = " moment={0}".format(safe_moment)
+        # Issue #136: the additive arms attribution field — per-arm
+        # post-cap/cap pairs (P/Q) from the recall envelope's ``arms`` dict,
+        # so the B-1 report can see which arm carried a hit. Compact wire
+        # format; absent on stores whose envelope predates the key. Wire
+        # labels: fts/vec/ent/graph (the envelope key for the entity arm is
+        # "entity" — issue #136 review round fixed the silent mismatch).
+        armf = ""
+        if isinstance(arms, dict) and arms:
+            try:
+                armf = " arms=" + ",".join(
+                    "{0}:{1}/{2}".format(
+                        label, int(arms[key].get("post", 0)),
+                        int(arms[key].get("cap", 0)))
+                    for label, key in (("fts", "fts"), ("vec", "vec"),
+                                       ("ent", "entity"), ("graph", "graph"))
+                    if key in arms
+                )
+            except (TypeError, ValueError, AttributeError):
+                armf = ""  # malformed envelope — never break the log write
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
                 "ids={ids_sel} all={ids_all}{tok}{rend}{adm}{bcnt}{ops} "
-                "sid={safe_sid}{mom}\n".format(
+                "sid={safe_sid}{mom}{armf}\n".format(
                     ts=int(time.time()),
                     status=status,
                     reason=reason,
@@ -422,6 +442,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     ops=ops,
                     safe_sid=safe_sid,
                     mom=mom,
+                    armf=armf,
                 )
             )
     except OSError:
@@ -867,6 +888,9 @@ def main() -> int:
         envelope_btrunc = None
         envelope_bprot = None
         envelope_note = ""
+        # Issue #136: the per-arm pre/post-cap attribution dict. None =
+        # legacy store without the key (the arms= log field stays absent).
+        envelope_arms = None
         if isinstance(rows, dict):
             try:
                 omitted = int(rows.get("omitted", 0) or 0)
@@ -880,6 +904,10 @@ def main() -> int:
                 envelope_candidates = [
                     str(_x) for _x in _ec if isinstance(_x, str)
                 ]
+            # Issue #136: gate on dict-shape, like the budget fields gate on
+            # key presence — a malformed arms value never reaches the log.
+            if isinstance(rows.get("arms"), dict):
+                envelope_arms = rows.get("arms")
             # Issue #116 (PR-review round): gate on KEY PRESENCE, not `or 0`
             # coercion — `int(None or 0)` is 0, which would fabricate
             # measured-looking zeros into the audit log on legacy (pre-#116)
@@ -914,6 +942,7 @@ def main() -> int:
         envelope_btrunc = None
         envelope_bprot = None
         envelope_note = ""
+        envelope_arms = None
         # Issue #114 review (PRR-005): a store failure (timeout, crash, or an
         # older store.py that predates --for-injection) must not masquerade
         # as a silent empty pool with no trace. Still fail closed (inject
@@ -978,6 +1007,7 @@ def main() -> int:
             budget_dropped=envelope_bdrop,
             budget_truncated=envelope_btrunc,
             budget_dropped_protected=envelope_bprot,
+            arms=envelope_arms,
         )
         if mode == "pretool":
             # Issue #90 / #85 C: a per-tool-call one-liner would inject noise
@@ -1034,7 +1064,8 @@ def main() -> int:
                          admission_used=envelope_admission,
                          budget_dropped=envelope_bdrop,
                          budget_truncated=envelope_btrunc,
-                         budget_dropped_protected=envelope_bprot)
+                         budget_dropped_protected=envelope_bprot,
+                         arms=envelope_arms)
     if mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude":
         # Issue #90 / #85 C: older Claude builds ignore pre-tool
         # additionalContext (documented since 2.1.9) — park the

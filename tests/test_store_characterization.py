@@ -124,7 +124,18 @@ DATA_SHA = {
     # `_score` values and ordering are unchanged — compute_score's trust
     # factor is the identity at 1.0 (pinned by tests/test_trust_recall.py);
     # the hash moved because the rows carry the new key.
-    "recall": "76ada8482a93302bff9b775ded507e94e415c27471b69ba2ede68bff83d0d4a8",
+    # issue #136 (review round, 2026-09-09): recall rows gained TWO keys —
+    # `_rel_graph` (the graph arm's measured lane, None for every row the
+    # arm did not contribute; now ALWAYS present so the lane schema is
+    # uniform) and `_graph_arrival_only` (the telemetry-exclusion marker
+    # behind the #114 law for graph-only rows). VERIFIED before this
+    # re-capture: capturing the same surface at the PR head (2195fdb) and
+    # stripping exactly these two keys from the new output reproduces the
+    # prior freeze's parsed rows byte-for-byte (old == new_after_strip) —
+    # no `_score`, ordering, or content change on this link-free fixture
+    # (the graph lane joins the lane-max at None, which max() ignores).
+    # stats/list/export_jsonl are byte-identical to their prior freezes.
+    "recall": "641ee074f45cba623cdffe70970fabcb670886732d3d31fe0f0274ccdd8d6e05",
     # v11 (issue #61): export-jsonl re-captured ONLY for the two new row keys
     # (`trust_score`, `links`) — stripping exactly those keys from the new
     # output reproduces the v10 freeze 8552767c… byte-for-byte (verified at

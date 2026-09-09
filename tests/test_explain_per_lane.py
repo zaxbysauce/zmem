@@ -46,7 +46,8 @@ os.environ["ZMEM_EMBED_PROFILE"] = "fake"
 os.environ["ZMEM_TEST_NOW"] = "2026-06-01T00:00:00Z"
 for _k in ("ZMEM_DATA", "ZMEM_BACKUP_DIR",
            "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
-           "ZMEM_INJECT_FLOOR_ENT", "ZMEM_INJECT_FLOOR_TRUST"):
+           "ZMEM_INJECT_FLOOR_ENT", "ZMEM_INJECT_FLOOR_GRAPH",
+           "ZMEM_INJECT_FLOOR_TRUST"):
     os.environ.pop(_k, None)
 
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -166,9 +167,12 @@ class ExplainPerLaneTest(unittest.TestCase):
                                "the vector-matched row must report a numeric "
                                "cosine lane")
         # The resolved gate thresholds ride the envelope next to the numbers.
-        # Issue #115 added the trust floor as a fourth entry.
+        # Issue #115 added the trust floor as a fourth entry. Issue #136 added
+        # the graph floor as a fifth (the graph arm's measured lane is the
+        # best entry-edge score; default 0.75 = LINK_THRESHOLD).
         self.assertEqual(exp["lane_floors"],
-                         {"lex": 0.30, "cos": 0.50, "ent": 0.50, "trust": 0.2})
+                         {"lex": 0.30, "cos": 0.50, "ent": 0.50,
+                          "graph": 0.75, "trust": 0.2})
         for floor in exp["lane_floors"].values():
             self.assertIsInstance(floor, float)
 

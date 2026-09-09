@@ -406,6 +406,8 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
             r["_rel_lex"] = lanes.get("lex")
             r["_rel_cos"] = lanes.get("cos")
             r["_rel_ent"] = lanes.get("ent")
+            # Issue #136: the graph arm's measured lane rides the same map.
+            r["_rel_graph"] = lanes.get("graph")
             # Issue #115: the envelope's pre-gate trust value is what the
             # real gate judged; a lane map without the entry degrades to the
             # exempt 1.0 path inside _row_trust (legacy envelopes).
@@ -473,9 +475,12 @@ def _gate_passes(r, floor, gate_none_floor, grounded,
     # only when the caller attached the envelope's ``candidate_lanes``.
     if lane_floors is not None:
         measured = False
-        for key, fl in (("_rel_lex", lane_floors[0]),
-                        ("_rel_cos", lane_floors[1]),
-                        ("_rel_ent", lane_floors[2])):
+        # Issue #136: the graph lane joins the disjunction. zip (not fixed
+        # indexes, review round) so a legacy 3-value lane_floors override
+        # still works — the graph floor applies only when a fourth value is
+        # supplied (the gate's 4-tuple).
+        for key, fl in zip(("_rel_lex", "_rel_cos", "_rel_ent", "_rel_graph"),
+                           lane_floors):
             val = r.get(key)
             if val is None:
                 continue

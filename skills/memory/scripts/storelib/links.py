@@ -74,6 +74,16 @@ LINK_THRESHOLD = _env_float("ZMEM_LINK_THRESHOLD", 0.75)
 # too — gated by the confidence floor and tagged [CONTESTED LINK] at emit.
 _EXPANSION_RELATIONS = ("related", "supports", "contradicts")
 
+# Issue #136: relations the graph-SEED arm may follow from an entity-anchored
+# seed node. `contradicts` is deliberately absent — a contradiction is an
+# explanatory edge (post-result [CONTESTED LINK] expansion), never a
+# candidate-rescue edge: surfacing a contradicted row as a fresh candidate
+# would rescue exactly the rows the trust floor exists to suppress. `extends`
+# is also out (not in the issue's seed list); `updates`/`derives` are typed
+# single-direction edges walked from BOTH endpoints so a prompt about the
+# superseded thing finds its updater and vice versa.
+GRAPH_SEED_RELATIONS = ("related", "supports", "updates", "derives")
+
 
 class LinkTargetError(ValueError):
     """A link endpoint is unusable: unknown id, self-link, or cross-namespace
@@ -359,6 +369,81 @@ def generate_links_on_write(
                     )
                     relink_memory(conn, row["id"])
     return report
+
+
+def graph_seed_ids(
+    conn: sqlite3.Connection, seed_ids: list[str], *,
+    cap: int, ns_list: list[str] | None, as_of: str | None = None,
+) -> tuple[list[str], dict[str, float]]:
+    """The graph-seed arm of recall (issue #136): one bounded hop from
+    entity-anchored seed nodes over ``GRAPH_SEED_RELATIONS`` edges, emitted as
+    a capped ranked list into RRF fusion.
+
+    Seeds are memory ids the ENTITY lane already resolved from the query
+    (deterministic, namespace/as-of filtered, model-free) — ops tokens ride
+    the same alias path because the passive hook composes them into the query
+    before recall. The walk is ONE batched indexed query (placeholders exactly
+    4 + 2*len(seeds); the PR #147 bounding rule: never per-seed round-trips),
+    namespace/liveness re-verified per neighbor through the same
+    ``_fetch_by_ids`` eligibility the other lanes use.
+
+    Returns ``(capped_ids, rel_map)`` where ``rel_map[mid]`` is the BEST
+    entry-edge score clamped to [0, 1] — the graph lane's measured relevance
+    value. Auto-generated edges carry a cosine >= LINK_THRESHOLD by
+    construction, so the value doubles as an honest "how related is this
+    neighbor to a query-anchored row" signal; a curated sub-threshold edge is
+    operator intent and measures below the inject gate's graph floor.
+    Deterministic: ties break by (relation, seed id) on best-edge selection
+    and by id on the final rank — same pattern as ``expand_recall_links``.
+    """
+    from storelib.recall import _fetch_by_ids
+
+    if cap <= 0 or not seed_ids:
+        return [], {}
+
+    seeds = list(dict.fromkeys(seed_ids))  # dedup, preserve rank order
+    rel_ph = ",".join("?" * len(GRAPH_SEED_RELATIONS))
+    seed_ph = ",".join("?" * len(seeds))
+    try:
+        edges = conn.execute(
+            f"SELECT src_id, dst_id, relation, score FROM memory_link "
+            f"WHERE relation IN ({rel_ph}) "
+            f"AND (src_id IN ({seed_ph}) OR dst_id IN ({seed_ph}))",
+            [*GRAPH_SEED_RELATIONS, *seeds, *seeds],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return [], {}  # pre-v11 store edge (table absent) — fail open
+    if not edges:
+        return [], {}
+
+    # Best edge per candidate neighbor: highest score wins; ties break by
+    # (relation, seed id) so the choice is deterministic run-to-run.
+    seed_set = set(seeds)
+    best: dict[str, tuple[float, str, str]] = {}
+    for e in edges:
+        other = e["dst_id"] if e["src_id"] in seed_set else e["src_id"]
+        if other in seed_set:
+            continue  # a seed is already an entity-lane candidate
+        key = (float(e["score"]), e["relation"],
+               e["src_id"] if e["src_id"] in seed_set else e["dst_id"])
+        cur = best.get(other)
+        if cur is None or key[:1] > cur[:1] or (
+            key[:1] == cur[:1] and (key[1], key[2]) < (cur[1], cur[2])
+        ):
+            best[other] = key
+    if not best:
+        return [], {}
+
+    # Same eligibility filter as every lane: namespace containment + live
+    # (or the as-of half-open predicate). Floor 0.0 — the inject gate's graph
+    # floor judges relevance; the arm only gates eligibility.
+    fetched = _fetch_by_ids(conn, list(best), ns_list, 0.0, as_of=as_of)
+    if not fetched:
+        return [], {}
+
+    ranked = sorted(fetched, key=lambda r: (-best[r["id"]][0], r["id"]))
+    rel_map = {r["id"]: max(0.0, min(1.0, best[r["id"]][0])) for r in ranked}
+    return [r["id"] for r in ranked[:cap]], rel_map
 
 
 def expand_recall_links(

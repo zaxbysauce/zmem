@@ -204,6 +204,11 @@ INJECT_FLOOR_GATE_NONE_DEFAULT = 0.4
 INJECT_FLOOR_LEX_DEFAULT = 0.30
 INJECT_FLOOR_COS_DEFAULT = 0.50
 INJECT_FLOOR_ENT_DEFAULT = 0.5
+# Issue #136: the graph-seed arm's relevance lane is the best entry-edge
+# score, so its floor mirrors LINK_THRESHOLD (0.75) — the same bar the write
+# path already requires before it will call two rows "related". Auto-generated
+# edges clear it by construction; a curated sub-threshold edge measures below.
+INJECT_FLOOR_GRAPH_DEFAULT = 0.75
 
 # Trust floor (issue #115, Workstream C-4): the v11 contradiction ledger
 # (links.py adjust_trust: one distinct `contradicts` event = -0.10, clamped
@@ -241,6 +246,7 @@ INJECT_FLOOR_GATE_NONE_ENV = "ZMEM_INJECT_FLOOR_GATE_NONE"
 INJECT_FLOOR_LEX_ENV = "ZMEM_INJECT_FLOOR_LEX"
 INJECT_FLOOR_COS_ENV = "ZMEM_INJECT_FLOOR_COS"
 INJECT_FLOOR_ENT_ENV = "ZMEM_INJECT_FLOOR_ENT"
+INJECT_FLOOR_GRAPH_ENV = "ZMEM_INJECT_FLOOR_GRAPH"
 INJECT_FLOOR_TRUST_ENV = "ZMEM_INJECT_FLOOR_TRUST"
 
 # Closed reason set for silent inject decisions (issue #87 / #85 direction 1).
