@@ -88,6 +88,29 @@ def _read(rel):
     return (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
 
 
+class SidecarRetirementDocPinTest(unittest.TestCase):
+    """Issue #117 ceiling pins (doc-rot convention): PRESENCE needles only.
+
+    The pre-tool rows legitimately mention the retired sidecar in order to
+    say it was superseded, so absence needles would false-fail forever; each
+    corrected claim gets an assertIn instead.
+    """
+
+    def test_pre_tool_rows_carry_the_ledger_supersession(self):
+        text = (Path(__file__).resolve().parents[1]
+                / "skills" / "memory" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("issue #117 superseded the pending sidecar", text,
+                      "SKILL.md must name the supersession with its owner issue")
+        self.assertIn("sha256-of-session-id", text,
+                      "SKILL.md must describe the collision-free ledger key")
+        self.assertIn("ZMEM_PENDING_SIDECAR=1", text,
+                      "SKILL.md must name the narrow fallback env")
+        self.assertIn("strongly match the row", text,
+                      "SKILL.md must document the PreToolUse escalation")
+        self.assertIn("D-2 #118", text,
+                      "SKILL.md must point at the compaction-snapshot handoff")
+
+
 class SkillDocDriftTest(unittest.TestCase):
 
     # -- v13 (issue #65) -----------------------------------------------------

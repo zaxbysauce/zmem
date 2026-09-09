@@ -18,7 +18,7 @@
 #     it alongside the tool result; pausing is driven by the permission
 #     decision field only) → direct emit, PLUS a pending sidecar the next UserPromptSubmit
 #     run must deliver — the sidecar covers older hosts that ignore the
-#     field (worst case one duplicate, never lost).
+#     field (issue #117: the old truncate-on-write sidecar duplicated AND lost fences — superseded by the ledger).
 #   - Codex: NOT registered YET — upstream has since shipped a full hooks
 #     system (PreToolUse accepts hookSpecificOutput.additionalContext;
 #     PreCompact and SubagentStart exist — openai/codex#19385 was resolved; Codex hooks

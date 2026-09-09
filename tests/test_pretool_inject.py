@@ -210,16 +210,31 @@ class PendingSidecarTest(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_claude_parks_and_next_prompt_delivers(self):
-        # 1) Pre-tool run on the claude host parks the fence.
+        # Issue #117 AMENDMENT: the sidecar is retired by default, so the
+        # park/deliver contract now pins the NARROW FALLBACK
+        # (ZMEM_PENDING_SIDECAR=1) on the parking AND delivery legs (the
+        # writer gates the park, the consumer gates the delivery). The
+        # parked file is hash-keyed now (sha256 of the full session id),
+        # hence the glob instead of the literal sanitize+truncate name.
+        # Leg 3 runs WITHOUT the env: after the fence is consumed, the
+        # delivery ledger alone must keep the row suppressed.
+        def _pending_file():
+            ops = Path(self._tmp, "ops")
+            files = sorted(ops.glob("*.pending")) if ops.is_dir() else []
+            return files[0] if files else None
+
+        # 1) Pre-tool run on the claude host parks the fence (fallback env).
         out, rc = _run_body(
             self._tmp, "pretool",
             {"tool_name": "Bash", "tool_input": {"command": "git stash pop"},
              "session_id": "s-pend"},
-            ns="project:pending", ZMEM_HOST="claude")
+            ns="project:pending", ZMEM_HOST="claude",
+            ZMEM_PENDING_SIDECAR="1")
         self.assertEqual(rc, 0)
         self.assertIn("pretoolcanary", _ctx(out))  # direct emit still happens
-        pending = Path(self._tmp, "ops", "s-pend.pending")
-        self.assertTrue(pending.is_file(), "claude must park the fence")
+        pending = _pending_file()
+        self.assertTrue(pending is not None and pending.is_file(),
+                        "claude must park the fence (under the fallback env)")
 
         # 2) Next user_prompt run (prose that recalls NOTHING) still
         #    delivers the parked fence and clears the sidecar.
@@ -227,13 +242,16 @@ class PendingSidecarTest(unittest.TestCase):
             self._tmp, "user_prompt",
             {"prompt": "keep going with unrelated zebra work",
              "session_id": "s-pend"},
-            ns="project:pending", ZMEM_HOST="claude")
+            ns="project:pending", ZMEM_HOST="claude",
+            ZMEM_PENDING_SIDECAR="1")
         self.assertEqual(rc, 0)
         ctx = _ctx(out)
         self.assertIn("pretoolcanary", ctx)
-        self.assertFalse(pending.exists(), "sidecar must be consumed")
+        self.assertTrue(_pending_file() is None, "sidecar must be consumed")
 
-        # 3) A third run does not re-deliver.
+        # 3) A third run (default mode) does not re-deliver: the ledger
+        #    recorded the pretool delivery, so the row stays suppressed
+        #    with no sidecar involved at all.
         out, rc = _run_body(
             self._tmp, "user_prompt",
             {"prompt": "keep going with unrelated zebra work",

@@ -477,6 +477,39 @@ if store_py and os.path.isfile(store_py):
             _recent_floor = float(_rf_raw) if _rf_raw else 0.5
         except ValueError:
             _recent_floor = 0.5
+        # Issue #117 D-1: consult the delivery ledger so a row delivered at
+        # an earlier moment of this session is not delivered again here.
+        # Fail-open: import or read error = no exclusion (pre-#117 behavior).
+        _ss_exclude_argv = []
+        _ss_ledger = None
+        _ss_dd_known = ""
+        try:
+            _sp_ss = sys.path[:]
+            try:
+                sys.path.insert(0, os.path.join(os.path.dirname(store_py), "storelib"))
+                import delivery_ledger as _dl_ss
+            finally:
+                sys.path[:] = _sp_ss
+            _ss_dd = ""
+            _ss_store_env = os.environ.get("ZMEM_STORE", "")
+            if _ss_store_env:
+                _ss_dd = os.path.expanduser(os.path.dirname(_ss_store_env))
+            if not _ss_dd:
+                _ss_dd = os.path.expanduser(os.environ.get("ZMEM_DATA", ""))
+            if not _ss_dd:
+                for _pdv in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+                    _pv = os.environ.get(_pdv, "")
+                    if _pv:
+                        _ss_dd = os.path.expanduser(_pv)
+                        break
+            if not _ss_dd:
+                _ss_dd = os.path.join(os.path.expanduser("~"), ".zmem")
+            for _did in _dl_ss.delivered_ids(_ss_dd, session_id)[:200]:
+                _ss_exclude_argv.extend(["--exclude", _did])
+            _ss_ledger = _dl_ss
+            _ss_dd_known = _ss_dd
+        except Exception:
+            pass
         # The detached session-cadence worker (dispatched above, same store)
         # can hold the database while this read fires: on slow runners a
         # first recent attempt fails transiently (SQLITE_BUSY -> non-zero
@@ -487,7 +520,7 @@ if store_py and os.path.isfile(store_py):
         for _recent_attempt in range(3):
             try:
                 out = subprocess.check_output(
-                    [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", str(_recent_floor), "--include-global", "--global-limit", "2", "--no-bump", "--for-injection", "--json"],
+                    [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", str(_recent_floor), "--include-global", "--global-limit", "2", "--no-bump", "--for-injection", "--json", *_ss_exclude_argv],
                     # 30s: a cold store.py spawn (full storelib import,
                     # first-touch AV scanning on CI windows runners) can
                     # exceed a tight timeout.
@@ -520,6 +553,7 @@ if store_py and os.path.isfile(store_py):
         _env_all = None
         _tok_used = None
         _tok_budget = None
+        _env_exc = None
         if isinstance(rows, dict):
             _er = rows.get("reason")
             if isinstance(_er, str) and _er:
@@ -533,6 +567,9 @@ if store_py and os.path.isfile(store_py):
                 _tok_used = _tu
             if isinstance(_tb, int):
                 _tok_budget = _tb
+            _ee_ss = rows.get("excluded")
+            if isinstance(_ee_ss, int) and not isinstance(_ee_ss, bool):
+                _env_exc = _ee_ss
         # v13 (issue #65, 10.8): unwrap the read envelope via the SHARED
         # shim (C38) — same helper the hooks body / Hermes / MCP use; the
         # inline dict/list fallback covers a failed import (fail-open).
@@ -627,14 +664,18 @@ if store_py and os.path.isfile(store_py):
                             _safe_sid = re.sub(
                                 r"[^A-Za-z0-9._-]", "_",
                                 (session_id or ""))[:128] or "unknown"
+                            _exc_ss = ""
+                            if _env_exc:
+                                _exc_ss = " exc=%d" % _env_exc
                             _lf.write(
-                                "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s sid=%s moment=session_start\n" % (
+                                "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=session_start\n" % (
                                     int(__import__("time").time()),
                                     "injected" if rows else "silent",
                                     (_env_reason or ("injected" if rows else "empty-pool")),
                                     [r.get("id") for r in rows],
                                     (_env_all if _env_all is not None else [r.get("id") for r in rows]),
                                     _tok,
+                                    _exc_ss,
                                     _safe_sid,
                                 )
                             )
@@ -649,6 +690,14 @@ if store_py and os.path.isfile(store_py):
                         ),
                     )
                     parts.append(block)
+                    # Issue #117 D-1: record the delivered rows so the
+                    # next moment of this session (user_prompt, pretool)
+                    # suppresses them. Fail-open like everything here.
+                    if _ss_ledger is not None and session_id:
+                        try:
+                            _ss_ledger.record(_ss_dd_known, session_id, rows, "session_start")
+                        except Exception:
+                            pass
             except Exception:
                 # PRR-006 fix: the storelib import failed, so the fence
                 # renderer is unavailable. OMIT Tier 2 entirely rather than

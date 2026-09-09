@@ -10,7 +10,54 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.27.0] - 2026-09-09
+
+> Session delivery ledger — a memory row delivered at one hook moment is no
+> longer re-delivered at the next moment of the same session, and the Claude
+> pending sidecar (which both duplicated and lost fences) is retired to a
+> narrow env-gated fallback. Workstream D-1 (#117).
+
+### Added
+- **Session delivery ledger (issue #117, D-1)**: every passive injection
+  moment (SessionStart, UserPromptSubmit, PreToolUse, SubagentStart) now
+  consults a bounded per-session ledger of delivered ids
+  (`<data>/ops/<sha256-of-session-id>.ledger` — atomic write-temp-then-replace,
+  window-pruned via `ZMEM_DELIVER_WINDOW_S` (default 6 h), capped via
+  `ZMEM_LEDGER_CAP` (default 256)) and passes them to the store as a new
+  repeatable `--exclude` flag on `recall` / `recent` / `search`. The filter
+  runs AFTER the envelope's `candidate_ids` capture (the miss-rate `all=`
+  pre-image is unchanged) and BEFORE the inject gate, so token budget and lane
+  floors judge only rows that can render; the `--json` envelope reports the
+  drop count as `excluded` (present only when ids were excluded), and the
+  decision line gains the additive `exc=` field.
+- **PreToolUse escalation**: the one deliberate repeat-delivery exception — a
+  row already delivered this session is STILL injected pre-tool when every
+  operation token about to run appears in the row's recorded text, so the
+  session-start hazard fires before the dangerous command.
+- **Ledger lifecycle**: cleared at PreCompact (post-compaction delivery is
+  legal again — "already delivered" is false once context is summarized;
+  D-2 #118 adds its snapshot before this clear) and at SessionEnd (Claude
+  registration `hooks.claude.json` → `zmem-session-end.sh` → body mode
+  `session_end`, running before the kill switch so cleanup always happens;
+  hosts without the event rely on the window + sweep). `.ledger` joined the
+  ops sweep suffixes in `backup.py` for orphan reaping.
+
+### Changed
+- **Pending sidecar retired by default (issue #117 scope 4; supersedes the
+  #93 C1-C3 accepted-bounded-behavior items)**: the Claude pre-tool sidecar
+  duplicated (fence parked AND emitted, then re-delivered beside a fresh
+  recall of the same ids) and lost (truncate-on-write: N matched tool calls
+  between prompts kept only the last fence) under a sanitize-and-truncate
+  filename that let distinct long session ids collide. Delivery now rides the
+  direct pre-tool emit plus the ledger's cross-moment dedup;
+  `ZMEM_PENDING_SIDECAR=1` re-enables a narrow fallback for older host
+  builds — append-with-dedup under the same atomic hash-keyed storage
+  (`<sha256>.pending`), so N parked fences all survive and no id parks twice.
+- SKILL.md pre-tool rows refreshed in place with the supersession pointer
+  (ceiling-pinned by presence needles in `tests/test_doc_drift.py`).
+
 ## [Unreleased]
+
 
 ## [0.26.0] - 2026-09-08
 

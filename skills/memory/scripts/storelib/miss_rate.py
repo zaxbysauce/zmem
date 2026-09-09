@@ -91,6 +91,10 @@ _BG_LINE_RE = re.compile(
     r"(?: budget_truncated=\S+)?"
     r"(?: budget_dropped_protected=\S+)?"
     r"(?: ops=(\d+))?"
+    # Issue #117: the additive exc= exclusion count (rows the caller
+    # suppressed via the delivery ledger) — same additive rule as every
+    # field above; absent on pre-#117 lines.
+    r"(?: exc=(\d+))?"
     r"(?: sid=(\S+))?"
     r"(?: moment=(\S+))?"
     # Issue #136: the additive arms= attribution field (per-arm pre/post-cap
@@ -184,7 +188,7 @@ def parse_bg_log(path) -> list:
             if not m:
                 continue
             (ts, status, reason, omitted, ids_raw, all_raw, _tok, ops,
-             sid, moment, arms) = m.groups()
+             exc, sid, moment, arms) = m.groups()
             try:
                 ts = int(ts)
             except ValueError:
@@ -208,6 +212,11 @@ def parse_bg_log(path) -> list:
                 "tok_used": tok_used,
                 "tok_budget": tok_budget,
                 "ops": int(ops) if ops else None,
+                # Issue #117: the additive exc= exclusion count (rows the
+                # caller suppressed via the delivery ledger). None on lines
+                # that predate the field - no join reads it today, but parsed
+                # parity keeps the report honest about suppressions.
+                "exc": int(exc) if exc else None,
                 "sid": sid,
                 "moment": moment,
                 # Issue #136: the additive arms= attribution field, verbatim

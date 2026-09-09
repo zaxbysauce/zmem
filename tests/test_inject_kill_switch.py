@@ -200,31 +200,58 @@ class KillSwitchBodyTest(unittest.TestCase):
                 f"ZMEM_INJECT={value!r} must leave injection enabled")
 
     def test_parked_fence_survives_and_delivers_on_reenable(self):
-        # Arm the pending sidecar on the enabled path (pretool + claude
-        # parks the fence), run one disabled user_prompt (fence untouched,
-        # nothing delivered), then re-enable and prove the fence delivers.
+        # Issue #117 AMENDMENT: the sidecar is retired by default, so this
+        # contract now pins the NARROW FALLBACK (ZMEM_PENDING_SIDECAR=1) on
+        # ALL THREE calls - the writer gates the park AND the consumer gates
+        # the delivery, so arming-only would strand the fence. The parked
+        # file is hash-keyed now (sha256 of the full session id), not
+        # sanitize-and-truncate, hence the glob instead of the literal name.
+        # The delivery guarantee is unchanged: park -> survives the kill
+        # switch -> delivers on re-enable.
         sid = "sess-park"
         arm = _run_body(
             self._tmp,
             {"tool_input": {"command": "git stash pop"}, "session_id": sid},
-            self.ns, mode="pretool", ZMEM_HOST="claude")
+            self.ns, mode="pretool", ZMEM_HOST="claude",
+            ZMEM_PENDING_SIDECAR="1")
         self.assertEqual(arm.returncode, 0, arm.stderr)
-        pending = Path(self._tmp) / "ops" / (sid + ".pending")
-        self.assertTrue(pending.is_file(), "control: the fence parked")
+        pending = self._pending_file()
+        self.assertTrue(pending is not None and pending.is_file(),
+                        "control: the fence parked under the fallback env")
 
         silenced = _run_body(
             self._tmp, {"prompt": "unrelated prompt text", "session_id": sid},
-            self.ns, ZMEM_INJECT="0")
+            self.ns, ZMEM_INJECT="0", ZMEM_PENDING_SIDECAR="1")
         self.assertEqual(silenced.stdout.strip(), "{}")
         self.assertTrue(pending.is_file(),
                         "the kill switch must NOT consume or drop the fence")
 
         resumed = _run_body(
             self._tmp, {"prompt": "unrelated prompt text", "session_id": sid},
-            self.ns)
+            self.ns, ZMEM_PENDING_SIDECAR="1")
         self.assertIn("killswitchcanary", resumed.stdout,
                       "re-enabled: the parked fence is delivered")
         self.assertFalse(pending.is_file(), "and then consumed")
+
+    def _pending_file(self):
+        ops = Path(self._tmp) / "ops"
+        files = list(ops.glob("*.pending")) if ops.is_dir() else []
+        return files[0] if files else None
+
+    def test_sidecar_retired_by_default(self):
+        # Issue #117 scope 4: with NO fallback env, a claude pretool event
+        # delivers its fence via the direct emit and records the delivery in
+        # the ledger - it must NOT park a .pending file.
+        sid = "sess-retired"
+        r = _run_body(
+            self._tmp,
+            {"tool_input": {"command": "git stash pop"}, "session_id": sid},
+            self.ns, mode="pretool", ZMEM_HOST="claude")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(self._pending_file(),
+                          "retired by default: no sidecar without the env")
+        self.assertIn("killswitchcanary", r.stdout,
+                      "retirement must not break pre-tool delivery")
 
 
 class KillSwitchSessionStartTest(unittest.TestCase):
