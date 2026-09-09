@@ -67,6 +67,12 @@ def _cap() -> int:
     return v if v > 0 else CAP_DEFAULT
 
 
+def cap() -> int:
+    """Public accessor for the ledger cap (callers bound their --exclude
+    argv with it so no delivered id can fall off the exclusion list)."""
+    return _cap()
+
+
 def _hashed_name(session_id: str, suffix: str) -> Optional[str]:
     if not session_id:
         return None
@@ -231,12 +237,16 @@ def park_pending(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
                 and r["id"] not in parked_ids]
     if not new_rows:
         return  # every id in this fence is already parked — dedup
-    for r in new_rows:
+    for i, r in enumerate(new_rows):
         entries.append({
             "id": r["id"],
             "moment": str(moment or ""),
             "ts": now,
-            "fence": fence,
+            # Issue #151 review (COPILOT-2): the fence covers ALL new rows
+            # of this park call — store it ONCE (on the first entry) so
+            # consume cannot join the identical fence N times for an
+            # N-row event; consume_pending drops empty fences.
+            "fence": fence if i == 0 else "",
         })
     try:
         _atomic_write_json(path, {"entries": entries})
@@ -271,9 +281,25 @@ def clear_delivery_state(data_dir: str, session_id: str) -> None:
         pass
 
 
+def rows_present_in(rows: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
+    """The subset of rows whose fence bullet ``- [<id>]`` appears in the
+    FINAL emitted context (issue #151 review: a char-budget cut can drop
+    tail rows AFTER scoring — recording them anyway would suppress rows
+    the model never saw). The renderer always embeds ``- [<id>]`` per row,
+    so the bullet form is the reliable marker (bare id substring could
+    false-positive across prefix ids like r1/r10)."""
+    if not text or not rows:
+        return rows
+    present = [r for r in rows
+               if ("- [" + str(r.get("id", "")) + "]") in text]
+    return present
+
+
 def strong_token_match(text: str, tokens: List[str]) -> bool:
     """The issue's escalation rule: the operation tokens match the row
-    STRONGLY when every derived token appears in the row's recorded text.
+    STRONGLY when every derived token appears in the row's recorded text
+    as a WHOLE token (non-alphanumeric boundaries — issue #151 review:
+    bare substring semantics let "popular" satisfy the token "pop").
 
     Deliberately conservative in the direction of NOT escalating: a single
     missing token keeps the row suppressed (the row had its chance this
@@ -284,4 +310,24 @@ def strong_token_match(text: str, tokens: List[str]) -> bool:
     if not toks:
         return False
     hay = str(text or "").lower()
-    return all(t in hay for t in toks)
+    for t in toks:
+        pat = _boundary_pattern(t)
+        if not pat.search(hay):
+            return False
+    return True
+
+
+_BOUNDARY_CACHE: Dict[str, "re.Pattern"] = {}
+
+
+def _boundary_pattern(token: str) -> "re.Pattern":
+    """(?<![A-Za-z0-9])token(?![A-Za-z0-9]) — the token must not be glued
+    to an alphanumeric on either side (punctuation-adjacent is fine, so
+    path/flag-shaped tokens like -rf or ./x still match)."""
+    pat = _BOUNDARY_CACHE.get(token)
+    if pat is None:
+        import re as _re
+        pat = _re.compile(
+            r"(?<![A-Za-z0-9])" + _re.escape(token) + r"(?![A-Za-z0-9])")
+        _BOUNDARY_CACHE[token] = pat
+    return pat

@@ -401,7 +401,8 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
         # Issue #94: always carry the sanitized session id at line end so a
         # mined failure can be bound to the injection decisions of its own
         # session (the miss-rate join key). Same sanitize rule as
-        # _pending_ops_path / ops_tokens._ring_path.
+        # ops_tokens._ring_path (the delivery ledger is hash-keyed,
+        # issue #117 — no sanitize-truncate path component remains).
         import re as _re_sid
         safe_sid = _re_sid.sub(
             r"[^A-Za-z0-9._-]", "_", (session_id or ""))[:128] or "unknown"
@@ -517,26 +518,6 @@ def _inject_helpers(store_py: str):
 
 def _emit_envelope(ctx: str) -> None:
     print(json.dumps({"additionalContext": ctx}))
-
-
-def _pending_ops_path(session_id: str):
-    """Path of the pending-inject sidecar for a session (issue #117 rewrite).
-
-    The pre-#117 sidecar was ``ops/<sanitize(sid)[:128]>.pending`` — a
-    many-to-one key (two distinct long ids shared one file) written with
-    truncate-on-write (N parked fences collapsed to the last). The fallback
-    sidecar is now ``ops/<sha256(sid)[:32]>.pending``, JSON, append-with-
-    dedup, atomic — the same storage law as the delivery ledger. Kept for
-    the kill-switch test contract and C2/C3/C7; the default (env unset)
-    never creates this file at all.
-    """
-    mod = _LEDGER_MOD
-    if mod is None or not session_id:
-        return None
-    try:
-        return mod.pending_path(_data_dir(), session_id)
-    except Exception:
-        return None
 
 
 def _write_pending(session_id: str, ctx: str, rows=None) -> None:
@@ -939,8 +920,20 @@ def main() -> int:
             except Exception:
                 excluded_ids = []
         _exclude_argv = []
-        for _eid in excluded_ids[:200]:
+        # Issue #151 review (body-942): bound the argv by the ledger cap —
+        # a fixed 200 slice below the cap let delivered ids fall off the
+        # exclusion list and re-deliver.
+        _exclude_cap = _LEDGER_MOD.cap() if _LEDGER_MOD is not None else 200
+        for _eid in excluded_ids[:_exclude_cap]:
             _exclude_argv.extend(["--exclude", _eid])
+
+        # Issue #151 review (CUBIC-body-1135): precompact CONSUMES the parked
+        # fence here — clearing it undelivered lost the content (the fallback
+        # lane exists precisely for hosts that ignored the pre-tool emit).
+        # Delivery happens below: prepended to the injected ctx, or emitted
+        # alone on the silent path — then the delivery state clears.
+        if mode == "precompact" and _sidecar_fallback_enabled():
+            pending_ctx = _consume_pending(session_id)
 
         if use_recent_pull:
             out = subprocess.check_output(
@@ -1131,18 +1124,19 @@ def main() -> int:
             # A parked pending fence is still delivered by the NEXT
             # user_prompt run, so nothing is lost.
             return 0
-        if mode == "precompact":
-            # Issue #117: the clear is not injected-path-only - a silent
-            # precompact (everything already delivered) must still clear,
-            # exactly like an injecting one: compaction is happening either
-            # way. Sits before the pending delivery below so the fallback
-            # sidecar cannot outlive compaction either.
-            _clear_delivery_state(session_id)
         if pending_ctx:
             # Issue #90 / #85 C: deliver the parked pre-tool fence even when
             # this prompt's own recall is silent — it was never seen.
             _emit_envelope(pending_ctx)
+            if mode == "precompact":
+                # Issue #151 review (CUBIC-body-1135): the parked fence was
+                # DELIVERED above — now clear the delivery state so the
+                # post-compaction ledger starts clean (clear-after-deliver,
+                # never clear-before).
+                _clear_delivery_state(session_id)
             return 0
+        if mode == "precompact":
+            _clear_delivery_state(session_id)
         _emit_envelope(ctx)
         return 0
 
@@ -1196,8 +1190,20 @@ def main() -> int:
         # does not record — it clears right after (the context is about
         # to be summarized; post-compaction delivery must not be
         # suppressed — the D-2 coordination point).
+        # Issue #151 review (CUBIC-body-1200): the char-budget cut above
+        # can drop tail rows from the emitted fence — recording the full
+        # `selected` set would suppress rows the model never saw. Record
+        # only rows whose ``- [<id>]`` bullet survived in the final ctx
+        # (residual: a cut landing between a bullet and its content line
+        # still counts that row — narrow, documented).
         try:
-            _LEDGER_MOD.record(_data_dir(), session_id, selected, mode)
+            _LEDGER_MOD.record(_data_dir(), session_id,
+                               _LEDGER_MOD.rows_present_in(selected, ctx)
+                               if len(ctx) < len(_format_fence(selected, header,
+                                                   store_py=store_py,
+                                                   budget_note=envelope_note))
+                               else selected,
+                               mode)
         except Exception:
             pass
     if (mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude"

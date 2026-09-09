@@ -1701,6 +1701,18 @@ def recall_memory(
             and _is_change_intent_query(query) and results):
         results = results + unfold_change_history(conn, results)
 
+    # Issue #151 review (CUBIC-recall-1681): link expansion and unfold walk
+    # neighbors of the KEPT rows and can re-admit an id this caller
+    # excluded. Re-apply the exclusion to the final expanded/unfolded set
+    # (before entity cards, so dropped rows cost no lookups); re-entered
+    # drops join the `excluded` envelope count so it stays honest.
+    if exclude_ids and not for_injection and results:
+        _excl_expand = set(exclude_ids)
+        _reentered = [r for r in results if r["id"] in _excl_expand]
+        if _reentered:
+            excluded += len(_reentered)
+            results = [r for r in results if r["id"] not in _excl_expand]
+
     # v10 (issue #60, 5.4): entity cards on every recall row (JSON gains
     # `entities: [{id, kind, name}]`; the fenced text render shows at most
     # THREE names per row, never ids). Attached AFTER the filters so dropped
@@ -1760,8 +1772,17 @@ def recall_memory(
         if results:
             inj_reason = "injected"
         else:
+            # Issue #151 review (CUBIC-recall-1735): classify on the
+            # POST-exclusion pool — when the delivery ledger emptied the
+            # set, the pre-exclude candidate_rows would misattribute the
+            # silence to below-bar/below-relevance instead of empty-pool.
+            _gate_pool = candidate_rows
+            if exclude_ids:
+                _excl_cls = set(exclude_ids)
+                _gate_pool = [r for r in candidate_rows
+                              if r["id"] not in _excl_cls]
             inj_reason = classify_silent_reason(
-                candidate_rows, omitted=omitted, budget_emptied=budget_emptied,
+                _gate_pool, omitted=omitted, budget_emptied=budget_emptied,
                 lane_stats=_gate_stats)
 
     if for_injection:
@@ -2677,8 +2698,15 @@ def recent_memory(
         if results:
             inj_reason = "injected"
         else:
+            # Issue #151 review (CUBIC-recall-1735): post-exclusion pool
+            # (see recall_memory's twin comment).
+            _gate_pool = candidate_rows
+            if exclude_ids:
+                _excl_cls = set(exclude_ids)
+                _gate_pool = [r for r in candidate_rows
+                              if r["id"] not in _excl_cls]
             inj_reason = classify_silent_reason(
-                candidate_rows, omitted=omitted, budget_emptied=budget_emptied,
+                _gate_pool, omitted=omitted, budget_emptied=budget_emptied,
                 lane_stats=_gate_stats)
         if results:
             # no_telemetry (the eval harness) records nothing; the filters

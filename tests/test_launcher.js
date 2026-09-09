@@ -744,8 +744,17 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
         ok("pretool-recall/zcode: bare envelope carries additionalContext",
             obj && typeof obj.additionalContext === "string" && /P90_STASH/.test(obj.additionalContext),
             r.stdout.slice(0, 200));
-        ok("pretool-recall/zcode: no pending sidecar",
-            !fs.existsSync(path.join(D90, "ops", "p90-sess-z.pending")));
+        // Issue #151 review (CUBIC-launcher-730): the old literal path can
+        // never exist under hash-keyed naming — count .pending files and
+        // assert leg (i) left exactly ONE (its own) and zcode parked none
+        // of its own (session ids differ, so the count is stable).
+        const zcPending = fs.existsSync(path.join(D90, "ops"))
+            ? fs.readdirSync(path.join(D90, "ops"))
+                .filter((f) => f.endsWith(".pending"))
+            : [];
+        ok("pretool-recall/zcode: parks no sidecar of its own",
+            zcPending.length <= 1,
+            "found: " + JSON.stringify(zcPending));
     }
 
     // (iii) subagent-recall task-text lane: an event CARRYING a delegated

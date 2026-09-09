@@ -65,6 +65,9 @@ _STRIP_ENV = (
     "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
     "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW", "ZMEM_AUTO_REKEY",
     "ZMEM_HERMES_CORRECTIONS", "ZMEM_MCP_URL",
+    # Issue #151 review (CUBIC-killsw-251): the #117 knobs — an ambient
+    # ZMEM_PENDING_SIDECAR=1 flips test_sidecar_retired_by_default.
+    "ZMEM_PENDING_SIDECAR", "ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP",
 )
 
 

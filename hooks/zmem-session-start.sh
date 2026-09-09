@@ -504,7 +504,10 @@ if store_py and os.path.isfile(store_py):
                         break
             if not _ss_dd:
                 _ss_dd = os.path.join(os.path.expanduser("~"), ".zmem")
-            for _did in _dl_ss.delivered_ids(_ss_dd, session_id)[:200]:
+            # Issue #151 review (ssstart-507): bound by the ledger cap,
+            # not a smaller fixed slice — delivered ids must never fall off
+            # the exclusion list.
+            for _did in _dl_ss.delivered_ids(_ss_dd, session_id)[:_dl_ss.cap()]:
                 _ss_exclude_argv.extend(["--exclude", _did])
             _ss_ledger = _dl_ss
             _ss_dd_known = _ss_dd
@@ -693,9 +696,21 @@ if store_py and os.path.isfile(store_py):
                     # Issue #117 D-1: record the delivered rows so the
                     # next moment of this session (user_prompt, pretool)
                     # suppresses them. Fail-open like everything here.
+                    # Issue #151 review (ssstart-698): record only rows whose
+                    # bullet is in the rendered block, and skip recording
+                    # entirely when the projected payload already exceeds the
+                    # context budget (the bash-side final truncation would cut
+                    # them before the model sees them; documented residual for
+                    # the tail-cut case).
                     if _ss_ledger is not None and session_id:
                         try:
-                            _ss_ledger.record(_ss_dd_known, session_id, rows, "session_start")
+                            _ss_budget = int(os.environ.get("ZMEM_CTX_BUDGET", "25000") or 25000)
+                            _ss_proj = sum(len(x) for x in parts) + len(block) + 512
+                            _ss_rows = rows
+                            if _ss_budget > 0 and _ss_proj > _ss_budget:
+                                _ss_rows = _dl_ss.rows_present_in(rows, block[:max(0, _ss_budget - (sum(len(x) for x in parts)))])
+                            if _ss_rows:
+                                _ss_ledger.record(_ss_dd_known, session_id, _ss_rows, "session_start")
                         except Exception:
                             pass
             except Exception:

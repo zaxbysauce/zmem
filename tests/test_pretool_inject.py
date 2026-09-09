@@ -56,13 +56,16 @@ _STRIP_ENV = (
     "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET",
     "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR", "ZMEM_CONVENTION_INTERVAL",
     "ZMEM_SESSION", "CLAUDE_SESSION_ID", "ZCODE_SESSION_ID",
-    # Hook dir-resolution chains consult the plugin-data vars (host.py:42-66);
+    # Hook dir-resolution chains consult the plugin-data vars (host.py:42-66,
     # strip them like test_sweep's DATA_DIR_ENV_VARS so ambient dev-box values
     # can never receive subprocess writes.
     "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
-    # #93 A1 residue: eval-runner pollution vars — a single-process
+    # #93 A1 residue: eval-runner pollution vars - a single-process
     # multi-file runner must not leak the fake embedder or pinned clock in.
     "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW", "ZMEM_AUTO_REKEY",
+    # Issue #151 review (CUBIC-killsw-251): the #117 knobs - an ambient
+    # ZMEM_PENDING_SIDECAR=1 flips the retired-by-default premise.
+    "ZMEM_PENDING_SIDECAR", "ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP",
 )
 
 

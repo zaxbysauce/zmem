@@ -193,6 +193,38 @@ class LedgerModuleTest(unittest.TestCase):
         self.assertEqual(self.dl.delivered_ids(self.tmp, "sess-a"), [])
         self.assertEqual(self.dl.consume_pending(self.tmp, "sess-a"), "")
 
+    def test_park_multi_row_single_fence_stored_once(self):
+        # Issue #151 review (COPILOT-2): a single pretool event selecting
+        # N rows parks ONE fence — never N copies of the same fence.
+        fence = "<<<ZMEM_UNTRUSTED_FENCE>>> F <<<END_ZMEM_UNTRUSTED_FENCE>>>"
+        rows = [{"id": f"r{i}", "content": f"row {i}"} for i in range(3)]
+        self.dl.park_pending(self.tmp, "sess-m", rows, fence, "pretool")
+        ctx = self.dl.consume_pending(self.tmp, "sess-m")
+        self.assertEqual(ctx.count(fence), 1,
+                         "multi-row park must store the fence once")
+        # the parked ids are all recorded (dedup preserved)
+        self.dl.park_pending(self.tmp, "sess-m2", rows, fence, "pretool")
+        self.dl.park_pending(self.tmp, "sess-m2", rows, fence, "pretool")
+        self.assertEqual(self.dl.consume_pending(self.tmp, "sess-m2").count(fence), 1)
+
+    def test_strong_token_match_boundaries(self):
+        # Issue #151 review (CUBIC-ledger-287): tokens must match as whole
+        # words, not substrings ("popular" does not satisfy "pop").
+        f = self.dl.strong_token_match
+        self.assertFalse(f("this popular command is fine", ["pop"]))
+        self.assertTrue(f("git stash pop here", ["pop"]))
+        # punctuation-adjacent tokens still match (path/flag shapes)
+        self.assertTrue(f("never run rm -rf /tmp", ["-rf"]))
+        self.assertTrue(f("about to git stash pop", ["git", "stash", "pop"]))
+
+    def test_rows_present_in_filters_by_bullet(self):
+        # Issue #151 review (CUBIC-body-1200): record-only-what-rendered.
+        rows = [{"id": "r1", "content": "a"}, {"id": "r10", "content": "b"}]
+        text = "- [r1] [conf=0.9] test\n    a"
+        present = self.dl.rows_present_in(rows, text)
+        self.assertEqual([r["id"] for r in present], ["r1"],
+                         "bullet-form match must not confuse r1 with r10")
+
     def test_ops_tokens_escalation_input_contract(self):
         import storelib.ops_tokens as ot
         toks = ot.derive_ops_tokens("git stash pop")
@@ -250,6 +282,18 @@ class CliExcludeTest(unittest.TestCase):
         env2 = self._recall()
         self.assertIn(self.mid, [r["id"] for r in env2["results"]])
         self.assertNotIn("excluded", env2)
+
+    def test_explain_rejects_exclude(self):
+        # Issue #151 review (CUBIC-cli-278): --explain --exclude is refused,
+        # never silently ignored.
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "recall",
+             "--query", "git stash pop", "--namespace", self.ns,
+             "--explain", "--exclude", "some-id"],
+            capture_output=True, text=True, env=_clean_env(self.tmp),
+            timeout=120)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--exclude", r.stderr)
 
     def test_recent_and_search_exclude(self):
         env = self._recall("--exclude", self.mid, sub="recent")
@@ -331,10 +375,5 @@ class HookBodyDeliveryTest(unittest.TestCase):
                       f"decision line must carry the exc= field: {lines[-1]}")
 
 
-def main() -> int:
-    unittest.main(module=sys.modules[__name__], exit=False, verbosity=2)
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    unittest.main(verbosity=2)

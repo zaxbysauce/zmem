@@ -1290,6 +1290,15 @@ def main():
                           "or budget. Re-run without one of the flags.",
                           file=sys.stderr)
                     sys.exit(2)
+                if getattr(args, "exclude", None):
+                    # Issue #151 review (CUBIC-cli-278): --exclude is parsed
+                    # on recall but explain_recall has no exclusion surface —
+                    # reject loudly instead of silently ignoring the flag.
+                    print("[zmem] --exclude is not supported with --explain: "
+                          "explain is the read-only retrieval debugger and "
+                          "never filters. Re-run without --exclude.",
+                          file=sys.stderr)
+                    sys.exit(2)
                 explain_recall(conn, query=args.query, target=args.target,
                                namespace=args.namespace, limit=args.limit,
                                as_json=args.json, hybrid=hybrid_arg,
