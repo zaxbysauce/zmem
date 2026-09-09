@@ -303,7 +303,8 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                          admission_used=None, budget_dropped=None,
                          budget_truncated=None,
                          budget_dropped_protected=None,
-                         arms=None) -> None:
+                         arms=None,
+                         excluded_count=0) -> None:
     """Append the injected|silent decision to the decision log (#129).
 
     Issue #129 split: decision lines go to ``zmem-decisions.log`` (rotated,
@@ -391,10 +392,17 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
         ops = ""
         if ops_count and ops_count > 0:
             ops = " ops={0}".format(int(ops_count))
+        # Issue #117: the additive exc= field — rows suppressed via the
+        # delivery-ledger --exclude (present only when > 0, same additive
+        # rule as ops/moment/arms; slot pinned between ops= and sid=).
+        exc = ""
+        if excluded_count and excluded_count > 0:
+            exc = " exc={0}".format(int(excluded_count))
         # Issue #94: always carry the sanitized session id at line end so a
         # mined failure can be bound to the injection decisions of its own
         # session (the miss-rate join key). Same sanitize rule as
-        # _pending_ops_path / ops_tokens._ring_path.
+        # ops_tokens._ring_path (the delivery ledger is hash-keyed,
+        # issue #117 — no sanitize-truncate path component remains).
         import re as _re_sid
         safe_sid = _re_sid.sub(
             r"[^A-Za-z0-9._-]", "_", (session_id or ""))[:128] or "unknown"
@@ -427,7 +435,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
-                "ids={ids_sel} all={ids_all}{tok}{rend}{adm}{bcnt}{ops} "
+                "ids={ids_sel} all={ids_all}{tok}{rend}{adm}{bcnt}{ops}{exc} "
                 "sid={safe_sid}{mom}{armf}\n".format(
                     ts=int(time.time()),
                     status=status,
@@ -440,6 +448,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     adm=adm,
                     bcnt=bcnt,
                     ops=ops,
+                    exc=exc,
                     safe_sid=safe_sid,
                     mom=mom,
                     armf=armf,
@@ -511,50 +520,43 @@ def _emit_envelope(ctx: str) -> None:
     print(json.dumps({"additionalContext": ctx}))
 
 
-def _pending_ops_path(session_id: str):
-    """Path of the pending-inject sidecar for a session (issue #90 / #85 C).
+def _write_pending(session_id: str, ctx: str, rows=None) -> None:
+    """Park the pre-tool fence for the fallback sidecar (issue #117).
 
-    A pre-tool fence parked for hosts that may ignore pre-tool
-    additionalContext (Claude: documented since 2.1.9 but honored only on
-    newer builds) is consumed (and cleared) by the next user_prompt run —
-    guaranteed delivery even if the field is ignored. None without a
-    session id.
+    Append-with-dedup by memory id under atomic hashed storage: N matched
+    pre-tool events between two prompts ALL survive, and a fence whose ids
+    are already parked is not appended twice. Fail-open, like before.
     """
-    if not session_id:
-        return None
-    import re as _re
-    safe = _re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:128]
-    if not safe:
-        return None
-    return os.path.join(_data_dir(), "ops", safe + ".pending")
-
-
-def _write_pending(session_id: str, ctx: str) -> None:
-    path = _pending_ops_path(session_id)
-    if not path or not ctx:
+    mod = _LEDGER_MOD
+    if mod is None or not session_id or not ctx:
         return
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(ctx)
-    except OSError:
+        mod.park_pending(_data_dir(), session_id, rows or [],
+                         ctx, moment="pretool")
+    except Exception:
         pass  # fail-open: delivery degrades to the pre-tool emit alone
 
 
 def _consume_pending(session_id: str) -> str:
-    path = _pending_ops_path(session_id)
-    if not path:
+    """Deliver every parked fence (each id once) and clear the sidecar."""
+    mod = _LEDGER_MOD
+    if mod is None or not session_id:
         return ""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            ctx = f.read()
-    except OSError:
+        return mod.consume_pending(_data_dir(), session_id)
+    except Exception:
         return ""
+
+
+def _clear_delivery_state(session_id: str) -> None:
+    """Issue #117: compaction / session end — "already delivered" is false."""
+    mod = _LEDGER_MOD
+    if mod is None or not session_id:
+        return
     try:
-        os.unlink(path)
-    except OSError:
+        mod.clear_delivery_state(_data_dir(), session_id)
+    except Exception:
         pass
-    return ctx if ctx.strip() else ""
 
 
 def _ops_helpers(store_py: str):
@@ -574,6 +576,35 @@ def _ops_helpers(store_py: str):
         return None
     finally:
         sys.path[:] = saved
+
+
+def _ledger_helpers(store_py: str):
+    """Load storelib/delivery_ledger.py (issue #117 D-1 — the per-session
+    delivery ledger consulted by every injection moment). Same path
+    derivation as _ops_helpers; None on import failure and every ledger
+    operation no-ops (fail-open: dedup degrades, delivery never breaks)."""
+    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
+    if not scripts_dir:
+        return None
+    saved = sys.path[:]
+    try:
+        sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
+        import delivery_ledger as _ledger_mod
+        return _ledger_mod
+    except Exception:
+        return None
+    finally:
+        sys.path[:] = saved
+
+
+def _sidecar_fallback_enabled() -> bool:
+    """Issue #117: the pre-tool pending sidecar is RETIRED by default —
+    hosts that honor pre-tool additionalContext (Claude 2.1.9+, ZCode) get
+    delivery straight from the emit plus the ledger's dedup. ZMEM_PENDING_SIDECAR=1
+    re-enables a narrow fallback for older host builds: append-with-dedup
+    under the same atomic, hash-keyed storage as the ledger (no sanitize-
+    and-truncate filename, no truncate-on-write loss)."""
+    return os.environ.get("ZMEM_PENDING_SIDECAR", "") == "1"
 
 
 def _data_dir() -> str:
@@ -640,6 +671,9 @@ def _ops_query_tokens(store_py: str, session_id: str, _ops_cache={}):
         return []
 
 
+_LEDGER_MOD = None  # issue #117: set in main(); None = dedup unavailable
+
+
 def main() -> int:
     if len(sys.argv) < 4:
         return 0
@@ -650,6 +684,8 @@ def main() -> int:
     except (IndexError, ValueError):
         budget = 25000
     mode = sys.argv[4] if len(sys.argv) > 4 else "user_prompt"
+    global _LEDGER_MOD
+    _LEDGER_MOD = _ledger_helpers(store_py)
     # Optional per-mode limits (issue #58 final-critic round 2): callers
     # that previously pulled wider recent windows (subagent-recall used
     # 5 project / 3 global) can pass them instead of forking the render.
@@ -674,6 +710,28 @@ def main() -> int:
     # decision log; 64 chars is generous for a host agent-type label.
     if len(agent_label) > 64:
         agent_label = agent_label[:64]
+
+    # Issue #117 (D5): session-end cleanup runs BEFORE the kill switch —
+    # clearing the delivery state is not an injection and must happen even
+    # under ZMEM_INJECT=0. Never recalls; emits the empty envelope; exit 0.
+    if mode == "session_end":
+        _end_sid = ""
+        try:
+            if not sys.stdin.isatty():
+                _end_obj = json.loads(sys.stdin.read() or "{}")
+                if isinstance(_end_obj, dict):
+                    _v = _end_obj.get("session_id", "")
+                    if isinstance(_v, str):
+                        _end_sid = _v
+        except Exception:
+            pass
+        if not _end_sid:
+            _end_sid = (os.environ.get("ZMEM_SESSION", "")
+                        or os.environ.get("CLAUDE_SESSION_ID", "")
+                        or os.environ.get("ZCODE_SESSION_ID", ""))
+        _clear_delivery_state(_end_sid)
+        print("{}")
+        return 0
 
     # Issue #110 (P0-5): ZMEM_INJECT=0 is the passive-injection kill switch.
     # It gates the whole body BEFORE the store.py existence check, the stdin
@@ -822,7 +880,12 @@ def main() -> int:
             # parked for a host that may not honor additionalContext
             # pre-tool (Claude) — deliver it even if this prompt's own
             # recall is silent, then clear the sidecar.
-            pending_ctx = _consume_pending(session_id)
+            # Issue #117: the sidecar is retired by default; this consume
+            # half pairs with the ZMEM_PENDING_SIDECAR=1 writer half.
+            # Default mode parks nothing, so consuming would be a no-op
+            # anyway — and a stray pre-#117 file is left to the sweep.
+            if _sidecar_fallback_enabled():
+                pending_ctx = _consume_pending(session_id)
             # Issue #88 / #85 direction 2: decision-point prompts are prose
             # with zero lexical overlap with the operation-adjacent lessons
             # that matter; append this session's recent tool-operation tokens
@@ -836,6 +899,42 @@ def main() -> int:
             else:
                 query = prompt[:500]
 
+        # Issue #117 (D-1): consult the delivery ledger and pass the
+        # delivered ids as --exclude so a row is not re-delivered within
+        # the window. PreToolUse escalation: an entry whose recorded text
+        # strong-matches the current operation tokens is NOT excluded —
+        # the row seen at session start must still fire before the
+        # dangerous command. Fail-open: any error = no exclusions.
+        excluded_ids = []
+        if _LEDGER_MOD is not None and session_id:
+            try:
+                _entries = _LEDGER_MOD.delivered(_data_dir(), session_id)
+                if mode == "pretool" and ops_tokens:
+                    excluded_ids = [
+                        _e["id"] for _e in _entries
+                        if not _LEDGER_MOD.strong_token_match(
+                            _e.get("text", ""), ops_tokens)
+                    ]
+                else:
+                    excluded_ids = [_e["id"] for _e in _entries]
+            except Exception:
+                excluded_ids = []
+        _exclude_argv = []
+        # Issue #151 review (body-942): bound the argv by the ledger cap —
+        # a fixed 200 slice below the cap let delivered ids fall off the
+        # exclusion list and re-deliver.
+        _exclude_cap = _LEDGER_MOD.cap() if _LEDGER_MOD is not None else 200
+        for _eid in excluded_ids[:_exclude_cap]:
+            _exclude_argv.extend(["--exclude", _eid])
+
+        # Issue #151 review (CUBIC-body-1135): precompact CONSUMES the parked
+        # fence here — clearing it undelivered lost the content (the fallback
+        # lane exists precisely for hosts that ignored the pre-tool emit).
+        # Delivery happens below: prepended to the injected ctx, or emitted
+        # alone on the silent path — then the delivery state clears.
+        if mode == "precompact" and _sidecar_fallback_enabled():
+            pending_ctx = _consume_pending(session_id)
+
         if use_recent_pull:
             out = subprocess.check_output(
                 [
@@ -848,6 +947,7 @@ def main() -> int:
                     "--no-bump",
                     "--for-injection",
                     "--json",
+                    *_exclude_argv,
                 ],
                 stderr=subprocess.DEVNULL,
                 timeout=8,
@@ -864,6 +964,7 @@ def main() -> int:
                     "--no-bump",
                     "--for-injection",
                     "--json",
+                    *_exclude_argv,
                 ],
                 stderr=subprocess.DEVNULL,
                 timeout=10,
@@ -879,6 +980,8 @@ def main() -> int:
         # both here, before envelope_results discards them.
         envelope_reason = None
         envelope_candidates = None
+        # Issue #117: rows the store actually dropped via --exclude.
+        envelope_excluded = None
         # Issue #116: hard-ceiling accounting from the store lane —
         # admission's own token accounting, protected truncation/drop
         # counts, and the ready-made fence note. None = legacy store
@@ -924,6 +1027,9 @@ def main() -> int:
             _bn = rows.get("budget_note")
             if isinstance(_bn, str):
                 envelope_note = _bn
+            _ee = rows.get("excluded")
+            if isinstance(_ee, int) and not isinstance(_ee, bool):
+                envelope_excluded = _ee
         _inj = _inject_helpers(store_py)
         if _inj is not None:
             rows = _inj.envelope_results(rows)
@@ -937,6 +1043,7 @@ def main() -> int:
         omitted = 0
         envelope_reason = None
         envelope_candidates = None
+        envelope_excluded = None
         envelope_admission = None
         envelope_bdrop = None
         envelope_btrunc = None
@@ -1003,6 +1110,7 @@ def main() -> int:
             session_id=session_id,
             all_ids=envelope_candidates,
             moment=mode, store_py=store_py,
+            excluded_count=envelope_excluded,
             admission_used=envelope_admission,
             budget_dropped=envelope_bdrop,
             budget_truncated=envelope_btrunc,
@@ -1020,7 +1128,15 @@ def main() -> int:
             # Issue #90 / #85 C: deliver the parked pre-tool fence even when
             # this prompt's own recall is silent — it was never seen.
             _emit_envelope(pending_ctx)
+            if mode == "precompact":
+                # Issue #151 review (CUBIC-body-1135): the parked fence was
+                # DELIVERED above — now clear the delivery state so the
+                # post-compaction ledger starts clean (clear-after-deliver,
+                # never clear-before).
+                _clear_delivery_state(session_id)
             return 0
+        if mode == "precompact":
+            _clear_delivery_state(session_id)
         _emit_envelope(ctx)
         return 0
 
@@ -1061,20 +1177,53 @@ def main() -> int:
                          session_id=session_id,
                          all_ids=envelope_candidates,
                          moment=mode, store_py=store_py,
+            excluded_count=envelope_excluded,
                          admission_used=envelope_admission,
                          budget_dropped=envelope_bdrop,
                          budget_truncated=envelope_btrunc,
                          budget_dropped_protected=envelope_bprot,
                          arms=envelope_arms)
-    if mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude":
-        # Issue #90 / #85 C: older Claude builds ignore pre-tool
-        # additionalContext (documented since 2.1.9) — park the
-        # fence so the next user_prompt run is REQUIRED to deliver it even
-        # if the pre-tool emit was ignored. ZCode additionalContext is
-        # documented honored, so no sidecar there; worst case on Claude is
-        # one duplicate delivery, never a lost one.
-        _write_pending(session_id, ctx)
+    if (_LEDGER_MOD is not None and session_id
+            and mode not in ("precompact", "session_end")):
+        # Issue #117 (D-1): record the delivered ids so the NEXT moment
+        # of this session suppresses them (within the window). precompact
+        # does not record — it clears right after (the context is about
+        # to be summarized; post-compaction delivery must not be
+        # suppressed — the D-2 coordination point).
+        # Issue #151 review (CUBIC-body-1200): the char-budget cut above
+        # can drop tail rows from the emitted fence — recording the full
+        # `selected` set would suppress rows the model never saw. Record
+        # only rows whose ``- [<id>]`` bullet survived in the final ctx
+        # (residual: a cut landing between a bullet and its content line
+        # still counts that row — narrow, documented).
+        try:
+            _LEDGER_MOD.record(_data_dir(), session_id,
+                               _LEDGER_MOD.rows_present_in(selected, ctx)
+                               if len(ctx) < len(_format_fence(selected, header,
+                                                   store_py=store_py,
+                                                   budget_note=envelope_note))
+                               else selected,
+                               mode)
+        except Exception:
+            pass
+    if (mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude"
+            and _sidecar_fallback_enabled()):
+        # Issue #117: RETIRED by default — delivered ids live in the
+        # per-session ledger (ops/<sha256>.ledger) every moment consults,
+        # so the pre-tool emit is the delivery and the next prompt cannot
+        # re-select the same rows. ZMEM_PENDING_SIDECAR=1 re-enables a
+        # narrow fallback for older host builds: append-with-dedup under
+        # atomic hash-keyed storage (the pre-#117 file was a
+        # sanitize-and-truncate name written with truncate-on-write — it
+        # both duplicated and lost fences, exactly what #117 removes).
+        _write_pending(session_id, ctx, rows=selected)
     _emit_envelope(ctx)
+    if mode == "precompact":
+        # Issue #117 (D-1 scope 3): compaction — "already delivered" is
+        # false once the context has been summarized away. Clear the
+        # session's ledger (and any fallback pending) AFTER the emit;
+        # D-2 (#118) will add its snapshot before this clear.
+        _clear_delivery_state(session_id)
     return 0
 
 

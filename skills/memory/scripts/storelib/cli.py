@@ -275,6 +275,13 @@ def main():
                                "[PREVIOUSLY] update_of predecessors). Passive "
                                "surfaces never unfold regardless (--no-bump).")
 
+    p_recall.add_argument("--exclude", action="append", default=None,
+                          help="repeatable: exclude these memory ids from the results "
+                               "(issue #117 D-1: the hooks pass the "
+                               "session delivery ledger so a row is not "
+                               "re-delivered within the window); the --json "
+                               "envelope reports the drop count as 'excluded'")
+
     p_recent = _add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
     p_recent.add_argument("--limit", type=nonnegative_int, default=5)
@@ -303,6 +310,13 @@ def main():
                                "rows VALID at as_of (valid_from <= as_of AND "
                                "(valid_until empty OR valid_until > as_of)).")
 
+    p_recent.add_argument("--exclude", action="append", default=None,
+                          help="repeatable: exclude these memory ids from the results "
+                               "(issue #117 D-1: the hooks pass the "
+                               "session delivery ledger so a row is not "
+                               "re-delivered within the window); the --json "
+                               "envelope reports the drop count as 'excluded'")
+
     p_search = _add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
     p_search.add_argument("--namespace", default=None)
@@ -328,6 +342,13 @@ def main():
                           help="print the result envelope {results, count, omitted, "
                                "injection_risk, tokens_used, tokens_budget} (issue "
                                "#65, 10.8) — plain output is unchanged")
+
+    p_search.add_argument("--exclude", action="append", default=None,
+                          help="repeatable: exclude these memory ids from the results "
+                               "(issue #117 D-1: the hooks pass the "
+                               "session delivery ledger so a row is not "
+                               "re-delivered within the window); the --json "
+                               "envelope reports the drop count as 'excluded'")
 
     p_sup = _add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
@@ -1269,6 +1290,15 @@ def main():
                           "or budget. Re-run without one of the flags.",
                           file=sys.stderr)
                     sys.exit(2)
+                if getattr(args, "exclude", None):
+                    # Issue #151 review (CUBIC-cli-278): --exclude is parsed
+                    # on recall but explain_recall has no exclusion surface —
+                    # reject loudly instead of silently ignoring the flag.
+                    print("[zmem] --exclude is not supported with --explain: "
+                          "explain is the read-only retrieval debugger and "
+                          "never filters. Re-run without --exclude.",
+                          file=sys.stderr)
+                    sys.exit(2)
                 explain_recall(conn, query=args.query, target=args.target,
                                namespace=args.namespace, limit=args.limit,
                                as_json=args.json, hybrid=hybrid_arg,
@@ -1288,13 +1318,15 @@ def main():
                               link_hops=args.link_hops, link_budget=args.link_budget,
                               cross_rerank=rerank_flag,
                               no_unfold=args.no_unfold,
-                              for_injection=args.for_injection)
+                              for_injection=args.for_injection,
+                              exclude_ids=args.exclude)
         elif args.cmd == "recent":
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
                           min_confidence=args.min_confidence, as_json=args.json,
                           no_bump=args.no_bump, include_global=args.include_global,
                           global_limit=args.global_limit, as_of=args.as_of,
-                          for_injection=args.for_injection)
+                          for_injection=args.for_injection,
+                          exclude_ids=args.exclude)
         elif args.cmd == "search":
             # I1 critic-fix: ``search`` is keyword-only by contract — pass
             # hybrid=False explicitly so the new default sentinel does
@@ -1307,7 +1339,8 @@ def main():
                           as_json=args.json, min_confidence=0.0,
                           include_global=args.include_global,
                           global_limit=args.global_limit, no_bump=args.no_bump,
-                          hybrid=False, as_of=args.as_of, link_hops=0)
+                          hybrid=False, as_of=args.as_of, link_hops=0,
+                          exclude_ids=args.exclude)
         elif args.cmd == "supersede":
             try:
                 ok = supersede_memory(conn, args.id, args.reason,

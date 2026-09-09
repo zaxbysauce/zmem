@@ -1469,6 +1469,7 @@ def recall_memory(
     no_telemetry: bool = False,
     no_unfold: bool = False,
     for_injection: bool = False,
+    exclude_ids: list[str] | None = None,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -1666,6 +1667,18 @@ def recall_memory(
         # caller passing cross_rerank=True with for_injection=True still
         # cannot reach the scorer on the passive injection lane.
         results = _cross_maybe_rerank(query, results)
+    # Issue #117 (D-1): per-id exclusion — drop already-delivered rows BEFORE
+    # the telemetry capture below on the plain path (an excluded row is not
+    # presented, so popularity must not reward it). On the for-injection lane
+    # the filter runs INSIDE the gate block below, AFTER the candidate_ids
+    # capture, so candidate_ids keeps its documented PRE-exclude meaning (the
+    # miss-rate join's ``all=`` pre-image) and the delta is explained by the
+    # envelope's ``excluded`` count.
+    excluded = 0
+    if exclude_ids and not for_injection:
+        _excl = set(exclude_ids)
+        excluded = sum(1 for r in results if r["id"] in _excl)
+        results = [r for r in results if r["id"] not in _excl]
     # Issue #136 review round: graph-only rows (rescued via the graph arm,
     # not also surfaced by a query-measuring arm) render but NEVER feed the
     # surfaced/retrieval counters — the same law as link-expansion extras
@@ -1687,6 +1700,18 @@ def recall_memory(
     if (_unfold_enabled(no_bump=no_bump, no_unfold=no_unfold, link_hops=link_hops)
             and _is_change_intent_query(query) and results):
         results = results + unfold_change_history(conn, results)
+
+    # Issue #151 review (CUBIC-recall-1681): link expansion and unfold walk
+    # neighbors of the KEPT rows and can re-admit an id this caller
+    # excluded. Re-apply the exclusion to the final expanded/unfolded set
+    # (before entity cards, so dropped rows cost no lookups); re-entered
+    # drops join the `excluded` envelope count so it stays honest.
+    if exclude_ids and not for_injection and results:
+        _excl_expand = set(exclude_ids)
+        _reentered = [r for r in results if r["id"] in _excl_expand]
+        if _reentered:
+            excluded += len(_reentered)
+            results = [r for r in results if r["id"] not in _excl_expand]
 
     # v10 (issue #60, 5.4): entity cards on every recall row (JSON gains
     # `entities: [{id, kind, name}]`; the fenced text render shows at most
@@ -1714,6 +1739,15 @@ def recall_memory(
     if for_injection:
         candidate_rows = results
         candidate_ids = [r["id"] for r in candidate_rows]
+        # Issue #117 (D-1): the exclusion filter runs AFTER the capture above
+        # so candidate_ids stays the PRE-exclude set (the miss-rate join's
+        # ``all=`` pre-image) and BEFORE the gate so token budget + lane
+        # floors judge only rows that can actually render. ``excluded``
+        # explains the delta in the envelope.
+        if exclude_ids:
+            _excl = set(exclude_ids)
+            excluded = sum(1 for r in results if r["id"] in _excl)
+            results = [r for r in results if r["id"] not in _excl]
         selected_rows, _gate_status, _gate_stats = selective_inject_filter(
             results, with_stats=True)
         budget_emptied = False
@@ -1738,8 +1772,17 @@ def recall_memory(
         if results:
             inj_reason = "injected"
         else:
+            # Issue #151 review (CUBIC-recall-1735): classify on the
+            # POST-exclusion pool — when the delivery ledger emptied the
+            # set, the pre-exclude candidate_rows would misattribute the
+            # silence to below-bar/below-relevance instead of empty-pool.
+            _gate_pool = candidate_rows
+            if exclude_ids:
+                _excl_cls = set(exclude_ids)
+                _gate_pool = [r for r in candidate_rows
+                              if r["id"] not in _excl_cls]
             inj_reason = classify_silent_reason(
-                candidate_rows, omitted=omitted, budget_emptied=budget_emptied,
+                _gate_pool, omitted=omitted, budget_emptied=budget_emptied,
                 lane_stats=_gate_stats)
 
     if for_injection:
@@ -1776,6 +1819,10 @@ def recall_memory(
             "tokens_used": tokens_used,
             "tokens_budget": inject_token_budget(),
         }
+        # Issue #117 (D-1): present ONLY when an exclusion list was supplied,
+        # so every unused-path envelope stays byte-identical (C5 freeze).
+        if exclude_ids:
+            envelope["excluded"] = excluded
         if for_injection:
             # Issue #114: flag-only additions so every plain-path envelope
             # stays byte-identical (characterization freeze). ``reason`` is
@@ -2523,6 +2570,7 @@ def recent_memory(
     as_of: str | None = None,
     no_telemetry: bool = False,
     for_injection: bool = False,
+    exclude_ids: list[str] | None = None,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -2601,6 +2649,12 @@ def recent_memory(
             else:
                 omitted += 1
         results = kept_rows
+    # Issue #117 (D-1): plain-path exclusion (see recall_memory's twin site).
+    excluded = 0
+    if exclude_ids and not for_injection:
+        _excl = set(exclude_ids)
+        excluded = sum(1 for r in results if r["id"] in _excl)
+        results = [r for r in results if r["id"] not in _excl]
     injection_risk_count = sum(1 for r in results if r.get("prompt_injection_risk"))
 
     # Issue #114 (P2-3): the injection lane — gate + budget INSIDE this call,
@@ -2611,6 +2665,15 @@ def recent_memory(
     if for_injection:
         candidate_rows = results
         candidate_ids = [r["id"] for r in candidate_rows]
+        # Issue #117 (D-1): the exclusion filter runs AFTER the capture above
+        # so candidate_ids stays the PRE-exclude set (the miss-rate join's
+        # ``all=`` pre-image) and BEFORE the gate so token budget + lane
+        # floors judge only rows that can actually render. ``excluded``
+        # explains the delta in the envelope.
+        if exclude_ids:
+            _excl = set(exclude_ids)
+            excluded = sum(1 for r in results if r["id"] in _excl)
+            results = [r for r in results if r["id"] not in _excl]
         selected_rows, _gate_status, _gate_stats = selective_inject_filter(
             results, with_stats=True)
         budget_emptied = False
@@ -2635,8 +2698,15 @@ def recent_memory(
         if results:
             inj_reason = "injected"
         else:
+            # Issue #151 review (CUBIC-recall-1735): post-exclusion pool
+            # (see recall_memory's twin comment).
+            _gate_pool = candidate_rows
+            if exclude_ids:
+                _excl_cls = set(exclude_ids)
+                _gate_pool = [r for r in candidate_rows
+                              if r["id"] not in _excl_cls]
             inj_reason = classify_silent_reason(
-                candidate_rows, omitted=omitted, budget_emptied=budget_emptied,
+                _gate_pool, omitted=omitted, budget_emptied=budget_emptied,
                 lane_stats=_gate_stats)
         if results:
             # no_telemetry (the eval harness) records nothing; the filters
@@ -2661,6 +2731,10 @@ def recent_memory(
             "tokens_used": tokens_used,
             "tokens_budget": inject_token_budget(),
         }
+        # Issue #117 (D-1): present ONLY when an exclusion list was supplied,
+        # so every unused-path envelope stays byte-identical (C5 freeze).
+        if exclude_ids:
+            envelope["excluded"] = excluded
         if for_injection:
             # Issue #114: flag-only envelope additions (see recall_memory).
             envelope["reason"] = inj_reason

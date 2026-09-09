@@ -327,14 +327,26 @@ setting.
 #### Pre-tool inject — issue #90 / #85 direction C
 
 On hosts whose pre-tool contract was probed and confirmed (ZCode: documented;
-Claude: emitted plus a pending sidecar the next prompt must deliver), a
+Claude: emitted — issue #117 retired the sidecar default in favor of the
+per-session delivery ledger), a
 PreToolUse hook (`zmem-pretool-recall.sh`, matcher
 `Edit|Write|MultiEdit|NotebookEdit|Bash`) derives the recall query from the
 tool input ITSELF — the command or file path about to run — and injects
 matching hazard lessons before the tool executes. Pre-tool
 `additionalContext` is documented on Claude Code (since 2.1.9 it lands
 alongside the tool result; pausing is `permissionDecision`-driven only) —
-the pending sidecar covers older hosts that ignore the field, and requires
+issue #117 superseded the pending sidecar (retired by default): delivered
+ids now live in a bounded per-session ledger
+(`<data>/ops/<sha256-of-session-id>.ledger`, atomic, window- and
+cap-bounded) that EVERY injection moment consults, so the same row is not
+re-delivered within the window — with one deliberate exception: PreToolUse
+re-delivers when the operation tokens about to run strongly match the row
+(the session-start hazard still fires before the dangerous command). The
+ledger clears at PreCompact (post-compaction delivery is legal again;
+D-2 #118 snapshots before that clear) and at SessionEnd (Claude;
+other hosts rely on the window + sweep). `ZMEM_PENDING_SIDECAR=1`
+re-enables a narrow append-with-dedup sidecar fallback for older host
+builds that ignore the field, and requires
 the host event's `session_id` (without it the direct emit is the only
 delivery). The hook NEVER denies (a surfaced hazard is information, not
 grounds to block a legitimate command) and stays fully silent when nothing
@@ -348,7 +360,7 @@ delivery's namespace follows the hook chain `ZMEM_MCP_NAMESPACE` →
 recall, and correction capture — Hermes hook events themselves carry no
 namespace); project-scoped operation context delivers
 on the coding-host PreToolUse surface. All query-context persistence
-(rings, delivery markers, pending fences) lives under `<data>/ops/`
+(rings, delivery markers, the session delivery ledger, pending fences) lives under `<data>/ops/`
 sidecars and never grows the store's tables. Codex pre-tool injection is
 deliberately unwired: upstream Codex has since shipped a full hooks system
 (`PreToolUse` accepts `hookSpecificOutput.additionalContext` — model-visible,
