@@ -31,6 +31,18 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" pretool-recall",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
@@ -80,6 +92,17 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" subagent-reflect",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" precompact",
             "timeout": 15
           }
         ]

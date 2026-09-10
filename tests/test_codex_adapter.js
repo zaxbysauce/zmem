@@ -150,16 +150,26 @@ console.log("\n[1] Codex plugin metadata");
     eq("marketplace: category", marketplace.plugins[0].category, "Productivity");
 
     ok("hooks: PostToolUseFailure is absent on Codex", !hooks.hooks.PostToolUseFailure);
+    // Issue #95: PostCompact stays unregistered until #118 defines the
+    // shared handlers (upstream Codex PostCompact carries only
+    // trigger:manual|auto — no compact_summary — and accepts no
+    // additionalContext, so registering it now would be dead config).
+    ok("hooks: PostCompact is absent on Codex (deferred to #118)",
+        !hooks.hooks.PostCompact);
     for (const eventName of [
         "SessionStart",
         "UserPromptSubmit",
+        "PreToolUse",
         "PostToolUse",
+        "PreCompact",
         "Stop",
         "SubagentStart",
         "SubagentStop",
     ]) {
         ok(`hooks: ${eventName} present`, Array.isArray(hooks.hooks[eventName]));
     }
+    eq("hooks: PreToolUse uses the dump-verified matcher",
+        hooks.hooks.PreToolUse[0].matcher, "Bash|apply_patch");
     eq("hooks: PostToolUse has two entries", hooks.hooks.PostToolUse.length, 2);
     const postToolCommands = hooks.hooks.PostToolUse
         .flatMap((entry) => entry.hooks || [])
@@ -425,6 +435,240 @@ console.log("\n[5] Three-host shared-store round trip");
                 (recalled.stderr || recalled.stdout || "").slice(0, 300));
         }
     }
+}
+
+console.log("\n[6] Codex envelope clamp (issue #95: upstream spills above 2,500 tokens)");
+
+{
+    // Upstream codex-rs spills hook output over DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT
+    // = 2,500 tokens (verified 2026-09-09, tag rust-v0.153.0). The launcher must
+    // clamp the codex envelope to 8000 encoded chars (~2000 tokens at the
+    // plugin's 4-chars/token estimator) EVEN WHEN the operator sets a huge
+    // ZMEM_CTX_BUDGET — and the clamp must be codex-specific. PRR-001: a
+    // large systemMessage must consume budget too (it is appended to the same
+    // envelope), and a systemMessage that alone cannot fit is dropped
+    // (fail-open) instead of guaranteed to spill. PRR-002: an operator budget
+    // above the cap produces a stderr warning on codex.
+    function runClampCase(host, sysMsgLen) {
+        const tree = fs.mkdtempSync(path.join(TMP_ROOT, "clamp-"));
+        const pluginRoot = path.join(tree, "plugin");
+        fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
+        const giant = "A".repeat(30000);
+        const sysMsg = sysMsgLen > 0 ? "S".repeat(sysMsgLen) : "";
+        const payloadObj = { additionalContext: giant };
+        if (sysMsg) payloadObj.systemMessage = sysMsg;
+        fs.writeFileSync(path.join(pluginRoot, "hooks", "zmem-recall.sh"),
+            "#!/usr/bin/env bash\n" +
+            "printf '<<<ZMEM_JSON>>>%s<<<END>>>\\n' " +
+            "'" + JSON.stringify(payloadObj).replace(/'/g, "'\\''") + "'\n");
+        const env = envWith({
+            [hostVarName(host)]: pluginRoot,
+            ZMEM_DATA: path.join(tree, "data"),
+            ZMEM_CTX_BUDGET: "50000",
+        });
+        const proc = spawnSync("node", [LAUNCHER, "recall"], {
+            input: JSON.stringify({ session_id: "clamp", cwd: tree }),
+            env, encoding: "utf8", timeout: 60000,
+        });
+        let envelope = null;
+        try { envelope = JSON.parse(proc.stdout.trim()); } catch (e) { /* */ }
+        const result = {
+            encoded: envelope ? Buffer.byteLength(JSON.stringify(envelope), "utf8") : -1,
+            sysMsgPresent: !!(envelope && envelope.systemMessage),
+            stderr: proc.stderr || "",
+        };
+        fs.rmSync(tree, { recursive: true, force: true });
+        return result;
+    }
+    function hostVarName(host) {
+        return host === "codex" ? "PLUGIN_ROOT" : "CLAUDE_PLUGIN_ROOT";
+    }
+
+    const codexPlain = runClampCase("codex", 0);
+    ok("clamp: codex envelope stays <= CODEX_ENVELOPE_CAP_CHARS",
+        codexPlain.encoded >= 0 && codexPlain.encoded <= launch.CODEX_ENVELOPE_CAP_CHARS,
+        "encoded=" + codexPlain.encoded + " cap=" + launch.CODEX_ENVELOPE_CAP_CHARS);
+    const claudePlain = runClampCase("claude", 0);
+    ok("clamp: claude control is NOT clamped by the codex cap",
+        claudePlain.encoded > launch.CODEX_ENVELOPE_CAP_CHARS,
+        "encoded=" + claudePlain.encoded);
+
+    // PRR-001: a modest systemMessage is PRESERVED and the total stays in cap.
+    const codexSmallSys = runClampCase("codex", 200);
+    ok("clamp: codex envelope with systemMessage stays <= cap",
+        codexSmallSys.encoded >= 0 && codexSmallSys.encoded <= launch.CODEX_ENVELOPE_CAP_CHARS,
+        "encoded=" + codexSmallSys.encoded);
+    ok("clamp: modest systemMessage is preserved",
+        codexSmallSys.sysMsgPresent, "systemMessage was dropped");
+
+    // PRR-001: a systemMessage that alone cannot fit is DROPPED (fail-open).
+    const codexGiantSys = runClampCase("codex", 30000);
+    ok("clamp: un-fittable systemMessage is dropped, envelope <= cap",
+        codexGiantSys.encoded >= 0 && codexGiantSys.encoded <= launch.CODEX_ENVELOPE_CAP_CHARS
+            && !codexGiantSys.sysMsgPresent,
+        "encoded=" + codexGiantSys.encoded + " sysMsgPresent=" + codexGiantSys.sysMsgPresent);
+
+    // PRR-002: operator budget above the cap warns on stderr (codex only,
+    // only when explicitly set).
+    function runWarnCase(host, budgetValue) {
+        const tree = fs.mkdtempSync(path.join(TMP_ROOT, "warn-"));
+        const pluginRoot = path.join(tree, "plugin");
+        fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
+        fs.writeFileSync(path.join(pluginRoot, "hooks", "zmem-recall.sh"),
+            "#!/usr/bin/env bash\nprintf '{}\\n'\n");
+        const overrides = { [hostVarName(host)]: pluginRoot, ZMEM_DATA: path.join(tree, "data") };
+        if (budgetValue !== null) overrides.ZMEM_CTX_BUDGET = budgetValue;
+        const proc = spawnSync("node", [LAUNCHER, "recall"], {
+            input: JSON.stringify({ session_id: "warn", cwd: tree }),
+            env: envWith(overrides), encoding: "utf8", timeout: 60000,
+        });
+        const warned = (proc.stderr || "").indexOf("exceeds the codex envelope cap") !== -1;
+        fs.rmSync(tree, { recursive: true, force: true });
+        return warned;
+    }
+    ok("clamp: operator budget above cap warns on stderr (codex)",
+        runWarnCase("codex", "20000"));
+    ok("clamp: no warning when the budget is not operator-set (codex default 9000 > 8000)",
+        !runWarnCase("codex", null));
+}
+
+console.log("\n[7] Codex registered pre-tool path (issue #95)");
+
+{
+    // Simulate exactly what the Codex host does: load hooks.codex.json, apply
+    // the matcher (exact alternation for all-alnum/pipe strings — codex-rs
+    // events/common.rs matches_matcher), then drive the real launcher chain
+    // against a seeded scratch store.
+    const codexHooks = JSON.parse(
+        fs.readFileSync(path.join(REPO, "hooks", "hooks.codex.json"), "utf8")).hooks;
+    const matcher = codexHooks.PreToolUse[0].matcher;
+    function matchesMatcher(matcherStr, toolName) {
+        if (matcherStr === undefined || matcherStr === "" || matcherStr === "*") return true;
+        const exact = /^[A-Za-z0-9_|]+$/.test(matcherStr);
+        if (exact) return matcherStr.split("|").some((c) => c === toolName);
+        return new RegExp(matcherStr).test(toolName);
+    }
+    ok("matcher: Bash matches", matchesMatcher(matcher, "Bash"));
+    ok("matcher: apply_patch matches", matchesMatcher(matcher, "apply_patch"));
+    ok("matcher: MCP tool does not match", !matchesMatcher(matcher, "mcp__srv__tool"));
+    ok("matcher: write_stdin does not match", !matchesMatcher(matcher, "write_stdin"));
+
+    const dataDir = path.join(TMP, "pretool-data");
+    const workdir = path.join(TMP, "pretool-workdir");
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(workdir, { recursive: true });
+    // Resolve the namespace EXACTLY like the launcher does (host.py
+    // resolve_namespace on the payload cwd) so the seed lands where the
+    // drive recalls.
+    const nsProc = spawnSync(PYTHON, [
+        "-c",
+        "import sys; sys.path.insert(0, sys.argv[1]); import host; " +
+        "print(host.resolve_namespace(sys.argv[2]))",
+        path.join(REPO, "skills", "memory", "scripts"),
+        workdir,
+    ], { encoding: "utf8", timeout: 60000 });
+    const namespace = nsProc.stdout.trim().split("\n").filter(Boolean).pop();
+    ok("pretool: namespace resolved", !!namespace, nsProc.stderr || nsProc.stdout);
+    const marker = "zmem95-adapter-row";
+    const storeEnv = envWith({
+        ZMEM_DATA: dataDir,
+        ZMEM_STORE: path.join(dataDir, "store.sqlite"),
+    });
+    const added = spawnSync(PYTHON, [
+        STORE, "add",
+        "--namespace", namespace,
+        "--type", "lesson",
+        "--content", "git stash pop on a foreign stash applies someone "
+            + "else's changes - always verify git stash list before stash "
+            + "pop (" + marker + ")",
+        "--signal", "test",
+        "--source-ref", "issue-95-adapter",
+        "--json",
+    ], { env: storeEnv, encoding: "utf8", timeout: 120000 });
+    eq("pretool: seed succeeds", added.status, 0);
+
+    // The lane's canonical hazard scenario: a shell command strongly
+    // matching the seeded lesson (a patch stub is legitimately below-bar
+    // and the lane stays silent).
+    const payload = JSON.stringify({
+        session_id: "codex-pretool",
+        turn_id: "codex-pretool-turn",
+        cwd: workdir,
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "git stash pop" },
+        tool_use_id: "exec-adapter",
+    });
+    const env = envWith({
+        PLUGIN_ROOT: REPO,
+        PLUGIN_DATA: path.join(TMP, "codex-plugin-data"),
+        ZMEM_DATA: dataDir,
+        ZMEM_STORE: path.join(dataDir, "store.sqlite"),
+        ZMEM_CTX_BUDGET: "50000",
+    });
+    const drove = spawnSync("node", [LAUNCHER, "pretool-recall"], {
+        input: payload, env, encoding: "utf8", timeout: 120000,
+    });
+    let envelope = null;
+    try { envelope = JSON.parse(drove.stdout.trim()); } catch (e) { /* */ }
+    ok("pretool: launcher emits a JSON envelope", envelope !== null, drove.stdout.slice(0, 200));
+    eq("pretool: hookEventName is PreToolUse",
+        envelope && envelope.hookSpecificOutput && envelope.hookSpecificOutput.hookEventName,
+        "PreToolUse");
+    ok("pretool: fence carries the seeded marker",
+        !!(envelope && envelope.hookSpecificOutput &&
+            (envelope.hookSpecificOutput.additionalContext || "").indexOf(marker) !== -1),
+        "marker missing from fence");
+    ok("pretool: surfacing-only (no decision fields)",
+        !/(permissionDecision|"decision")/.test(JSON.stringify(envelope || {})));
+    ok("pretool: encoded envelope within the codex cap",
+        Buffer.byteLength(JSON.stringify(envelope || {}), "utf8")
+            <= launch.CODEX_ENVELOPE_CAP_CHARS);
+
+    // PreCompact leg: the ledger for the session must be cleared by the drive
+    // (upstream drops additionalContext on PreCompact, so the clear IS the
+    // payload on Codex).
+    const crypto = require("crypto");
+    // delivery_ledger._hashed_name truncates the sha256 hex to 32 chars and
+    // stores one {"id", "ts"} entry per delivered row.
+    const ledgerName = crypto.createHash("sha256")
+        .update("codex-pretool", "utf8").digest("hex").slice(0, 32) + ".ledger";
+    const opsDir = path.join(dataDir, "ops");
+    fs.mkdirSync(opsDir, { recursive: true });
+    fs.writeFileSync(path.join(opsDir, ledgerName), JSON.stringify({
+        entries: [{ id: "seed-1", ts: Math.floor(Date.now() / 1000) }],
+    }));
+    const pcEnv = envWith({
+        PLUGIN_ROOT: REPO,
+        PLUGIN_DATA: path.join(TMP, "codex-plugin-data"),
+        ZMEM_DATA: dataDir,
+        ZMEM_STORE: path.join(dataDir, "store.sqlite"),
+        ZMEM_SESSION: "codex-pretool",
+    });
+    const drovePc = spawnSync("node", [LAUNCHER, "precompact"], {
+        input: JSON.stringify({
+            session_id: "codex-pretool",
+            cwd: workdir,
+            hook_event_name: "PreCompact",
+            trigger: "manual",
+        }),
+        env: pcEnv, encoding: "utf8", timeout: 120000,
+    });
+    let pcEnvelope = null;
+    try { pcEnvelope = JSON.parse(drovePc.stdout.trim()); } catch (e) { /* */ }
+    eq("precompact: hookEventName is PreCompact",
+        pcEnvelope && pcEnvelope.hookSpecificOutput && pcEnvelope.hookSpecificOutput.hookEventName,
+        "PreCompact");
+    const ledgerAfter = path.join(opsDir, ledgerName);
+    let cleared = true;
+    if (fs.existsSync(ledgerAfter)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(ledgerAfter, "utf8"));
+            cleared = !data.entries || data.entries.length === 0;
+        } catch (e) { cleared = false; }
+    }
+    ok("precompact: session delivery ledger cleared by the drive", cleared,
+        "ledger still present at " + ledgerName);
 }
 
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }

@@ -362,20 +362,36 @@ namespace); project-scoped operation context delivers
 on the coding-host PreToolUse surface. All query-context persistence
 (rings, delivery markers, the session delivery ledger, pending fences) lives under `<data>/ops/`
 sidecars and never grows the store's tables. Codex pre-tool injection is
-deliberately unwired: upstream Codex has since shipped a full hooks system
-(`PreToolUse` accepts `hookSpecificOutput.additionalContext` — model-visible,
-non-blocking — and `PreCompact`/`SubagentStart` exist; openai/codex#19385 was
-resolved; Codex hooks reference: https://learn.chatgpt.com/docs/hooks), so
-the old "host rejects pre-tool context" claim is retired;
-wiring is tracked in #95 (verification-first) behind the miss-rate
-baseline (#94).
+WIRED (issue #95): `hooks.codex.json` registers `PreToolUse` with matcher
+`Bash|apply_patch` — dumped live from codex-cli 0.153.0 (Windows,
+2026-09-09: shell operations emit the hook tool name `Bash`, file patches
+emit `apply_patch`; Codex treats an all-alphanumeric/pipe matcher string as
+EXACT alternation, so it matches precisely those two names). MCP tools
+(`mcp__<server>__<tool>`) and `write_stdin` are deliberately OUT — pre-tool
+recall derives its query from shell/file-patch inputs, not arbitrary MCP
+arguments. Upstream accepts `hookSpecificOutput.additionalContext` on
+PreToolUse (model-visible, non-blocking); Codex hooks reference:
+https://learn.chatgpt.com/docs/hooks. Codex envelopes are additionally
+capped at 8000 chars (≈2000 tokens at the plugin's 4-chars/token
+estimator; dense multi-byte (CJK) content has less real headroom) — 20% margin under upstream's 2,500-token hook-output spill
+limit (`DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT`, codex-rs output_spill.rs,
+verified against tag rust-v0.153.0); the cap applies even when an operator
+sets a larger `ZMEM_CTX_BUDGET`. Keep the verification-first convention: re-probe
+with a live tool_name dump before changing the matcher.
 
 Inject surface parity (host facts, not aspirations): Claude Code registers
 SubagentStart (task-text recall when the event carries the delegated
-prompt) and PreCompact; Codex registers SubagentStart/SubagentStop, and
-upstream now also ships PreToolUse/PreCompact context injection — but zmem
-wires those only in #95 (verification-first), so they stay unregistered
-until then. **ZCode supports exactly
+prompt) and PreCompact. Codex registers SessionStart, UserPromptSubmit,
+PreToolUse (matcher `Bash|apply_patch`, probe 2026-09-09, codex-cli
+0.153.0), PostToolUse, Stop, SubagentStart, SubagentStop, and PreCompact —
+upstream drops `additionalContext` on PreCompact (decision control only,
+verified 2026-09-09 from codex-rs source), so zmem's Codex PreCompact
+entry exists for the delivery-ledger clear before compaction;
+post-compaction re-injection rides the registered SessionStart, which
+upstream fires with `source=compact` after every compaction. PostCompact
+stays unregistered pending #118 (upstream Codex PostCompact carries only
+`trigger: manual|auto` — no compact_summary; #118 owns the shared
+compaction handlers). **ZCode supports exactly
 seven hook events — SessionStart, UserPromptSubmit, PreToolUse,
 PermissionRequest, PostToolUse, PostToolUseFailure, Stop — so SubagentStart
 and PreCompact are host gaps on ZCode** (an unsupported event name would be
@@ -1643,9 +1659,15 @@ For Codex, the safe cutover shape is:
 - **Do not assume Codex can write `~/.zmem`.** If the shared store path is
   outside Codex's writable roots, add a writable root or use a local broker
   that owns the store and mediates read/write operations.
-- **Reapprove hooks after hook-surface changes.** If a repo-local Codex hook
-  adapter is added later, trust the project and reapprove that surface as part
-  of cutover.
+- **Reapprove hooks after hook-surface changes.** Codex trusts hooks by a
+  SHA-256 over each normalized hook entry (event name + matcher + handler
+  fields). Every new or changed hook entry — this plugin's hooks file
+  changed in 0.28.0 (#95: PreToolUse + PreCompact entries) — carries a new
+  trusted hash, and an untrusted entry is SILENTLY SKIPPED: the hook simply
+  never runs. After upgrading, re-approve the hook surface in the Codex TUI
+  `/hooks` review (or re-record the `hooks.state` trusted hashes); for
+  vetted automation only, `codex exec --dangerously-bypass-hook-trust`
+  runs hooks without persisted trust for that invocation.
 
 ## The reflection loop (Loop 1)
 The `zmem-reflect.sh` Stop hook checks the episodic db for failed tool calls

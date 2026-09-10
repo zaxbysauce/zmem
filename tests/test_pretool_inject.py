@@ -409,11 +409,11 @@ class HermesReflectDeliveryTest(unittest.TestCase):
 
 
 class RegistrationAndContractTest(unittest.TestCase):
-    """Where PreToolUse is registered (probed hosts) and where wiring is
-    deliberately deferred (Codex → issue #95); the E skill-contract text;
-    launcher verbs."""
+    """Where PreToolUse is registered (probed hosts); the wired Codex state
+    (issue #95 flipped the former deferral pin in this PR); the E
+    skill-contract text; launcher verbs."""
 
-    def test_pretool_registered_on_zcode_and_claude_only(self):
+    def test_pretool_registered_on_zcode_claude_and_codex(self):
         for name in ("hooks.zcode.json", "hooks.claude.json"):
             cfg = json.loads(
                 (REPO_ROOT / "hooks" / name).read_text(encoding="utf-8"))
@@ -425,48 +425,58 @@ class RegistrationAndContractTest(unittest.TestCase):
                           entries[0]["hooks"][0]["command"], name)
         codex = json.loads(
             (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8"))
-        self.assertNotIn(
-            "PreToolUse", codex["hooks"],
-            "Codex PreToolUse wiring is deliberately deferred to issue #95 "
-            "(upstream has since shipped a full hooks system — PreToolUse "
-            "accepts hookSpecificOutput.additionalContext; "
-            "openai/codex#19385 was resolved — so a registration would NOT "
-            "be inert; flip this assertion inside #95's PR together with "
-            "the registration, never before)")
+        # Issue #95 flip (this PR): the former assertNotIn deferral pin is
+        # inverted. Codex PreToolUse is REGISTERED with the matcher dumped
+        # live from codex-cli 0.153.0 (2026-09-09): shell ops emit `Bash`,
+        # file patches emit `apply_patch`, and Codex treats an all-alnum/pipe
+        # matcher as EXACT alternation. Do not change the matcher without a
+        # fresh live tool_name re-probe, and never revert this assertion to
+        # an absence pin except alongside a deliberate un-registration.
+        self.assertIn("PreToolUse", codex["hooks"],
+                      "Codex PreToolUse registration (issue #95) is missing — "
+                      "this assertion is the #95 flip; re-probe live tool "
+                      "names before touching the matcher, never revert to the "
+                      "absence pin without un-registering deliberately")
+        entries = codex["hooks"]["PreToolUse"]
+        self.assertEqual(entries[0]["matcher"], "Bash|apply_patch",
+                         "matcher must stay the dump-verified exact "
+                         "alternation (live codex-cli 0.153.0 dump, "
+                         "2026-09-09, issue #95)")
+        self.assertIn("pretool-recall",
+                      entries[0]["hooks"][0]["command"])
+        # Codex PreCompact rides the same shared precompact handler Claude
+        # uses; upstream drops additionalContext on that event, so its
+        # payload on Codex is the delivery-ledger clear.
+        self.assertIn("PreCompact", codex["hooks"],
+                      "Codex PreCompact registration (issue #95) is missing")
+        self.assertIn("precompact",
+                      codex["hooks"]["PreCompact"][0]["hooks"][0]["command"])
 
-    def test_memory_skill_names_issue_95_as_codex_wiring_owner(self):
-        # The 2026-08-30 probe's Codex row ("host rejects
-        # hookSpecificOutput.additionalContext") expired when upstream
-        # shipped a full hooks system (openai/codex#19385 resolved).
-        # The shipped surface map must state the CURRENT truth — Codex
-        # wiring deferred to #95 — so it cannot silently re-stale.
-        # PRR-005 (PR #103 review): the pin is a CEILING, not just a
-        # floor — each factual claim that makes the paragraph true is
-        # ratcheted, so a future edit cannot keep the #95 phrase while
-        # restoring stale capability claims around it. Needles are
-        # newline-safe: each is contiguous within ONE physical line of
-        # SKILL.md (assertIn does not match across wrapped lines).
+    def test_memory_skill_pins_wired_codex_parity_state(self):
+        # Issue #95 flip: the former pin required SKILL.md to say the Codex
+        # wiring was deferred to #95; the wiring has landed, so the ceiling
+        # pin now ratchets the WIRED-state claim set (presence needles per
+        # the host-capability-rot convention — dated probe, matcher, MCP-out
+        # decision, PostCompact deferral owner).
         memory_skill = (REPO_ROOT / "skills" / "memory" / "SKILL.md") \
             .read_text(encoding="utf-8")
-        self.assertIn("wiring is tracked in #95", memory_skill,
-                      "SKILL.md's parity section must name #95 as the "
-                      "Codex pre-tool wiring owner")
+        self.assertIn("`Bash|apply_patch`", memory_skill,
+                      "SKILL.md must state the dump-verified Codex matcher")
+        self.assertIn("2026-09-09", memory_skill,
+                      "SKILL.md must carry the live-dump probe date")
+        self.assertIn("codex-cli 0.153.0", memory_skill,
+                      "SKILL.md must carry the probe's codex-cli version")
+        self.assertIn("#118", memory_skill,
+                      "SKILL.md must name #118 as the PostCompact deferral "
+                      "owner")
         self.assertIn(
-            "(`PreToolUse` accepts `hookSpecificOutput.additionalContext`",
+            "with a live tool_name dump before changing the matcher",
             memory_skill,
-            "SKILL.md must state the envelope contract (PreToolUse accepts "
-            "hookSpecificOutput.additionalContext)")
+            "SKILL.md must keep the live-dump-first re-probe convention")
         self.assertIn(
-            "`PreCompact`/`SubagentStart` exist; openai/codex#19385 was",
+            "and `write_stdin` are deliberately OUT",
             memory_skill,
-            "SKILL.md must state upstream ships PreCompact/SubagentStart "
-            "and cite the resolved rejection issue")
-        self.assertIn(
-            "resolved; Codex hooks reference: "
-            "https://learn.chatgpt.com/docs/hooks",
-            memory_skill,
-            "SKILL.md must cite the resolution and the current Codex "
-            "hooks reference URL")
+            "SKILL.md must record the MCP-and-write_stdin-out decision")
 
     def test_launcher_knows_the_verb(self):
         src = (REPO_ROOT / "hooks" / "zmem-launch.js").read_text(encoding="utf-8")
