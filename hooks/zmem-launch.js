@@ -563,6 +563,19 @@ function translate(raw, host, hookName, budget) {
     return envelope;
 }
 
+// Codex-only envelope cap. Upstream codex-cli spills hook output above
+// DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT = 2_500 tokens (codex-rs/hooks/src/
+// output_spill.rs; verified 2026-09-09 against tag rust-v0.153.0 == main):
+// the text is written to a temp file and the model sees only a head/tail
+// preview — a spilled fence is effectively lost. At the plugin's 4-chars-
+// per-token estimator, 8000 chars ≈ 2000 tokens = 20% margin under the
+// spill point (the former 9000-char default sat within ~10% of it, issue
+// #95's units trap). The clamp is applied in main() AFTER resolveBudget, so
+// it binds the host default AND any operator-set ZMEM_CTX_BUDGET on codex —
+// an override must not reintroduce the spill risk. Claude/ZCode are
+// unaffected (BUDGET_DEFAULT stays 9000 there).
+const CODEX_ENVELOPE_CAP_CHARS = 8000;
+
 // Resolve and VALIDATE the context budget (issue #39 E3). A negative value is
 // truthy after parseInt (e.g. parseInt("-5") === -5), so the former
 // `parseInt(env.ZMEM_CTX_BUDGET, 10) || 9000` let it through: fitEnvelope then
@@ -641,7 +654,9 @@ async function main() {
     }
 
     const env = buildCanonicalEnv(host, prepared.meta, hookName);
-    const budget = resolveBudget(env);
+    const budget = host === "codex"
+        ? Math.min(resolveBudget(env), CODEX_ENVELOPE_CAP_CHARS)
+        : resolveBudget(env);
     // Export the validated/clamped budget so spawned hook scripts see the same
     // effective value the launcher uses internally (#39 E3 / cubic-re #1).
     // Without this, a huge operator-set ZMEM_CTX_BUDGET is clamped for
@@ -716,6 +731,7 @@ module.exports = {
     fitEnvelope,
     translate,
     resolveBudget,
+    CODEX_ENVELOPE_CAP_CHARS,
     EVENT_MAP,
     TRANSLATED_HOOKS,
     NEEDS_NAMESPACE,

@@ -19,12 +19,15 @@
 #     decision field only) → direct emit, PLUS a pending sidecar the next UserPromptSubmit
 #     run must deliver — the sidecar covers older hosts that ignore the
 #     field (issue #117: the old truncate-on-write sidecar duplicated AND lost fences — superseded by the ledger).
-#   - Codex: NOT registered YET — upstream has since shipped a full hooks
-#     system (PreToolUse accepts hookSpecificOutput.additionalContext;
-#     PreCompact and SubagentStart exist — openai/codex#19385 was resolved; Codex hooks
-#     reference: https://learn.chatgpt.com/docs/hooks), so the old gap
-#     claim is retired; wiring lands in #95 (verification-first: live
-#     tool_name dump before matchers).
+#   - Codex: registered since #95 — matcher `Bash|apply_patch`, derived from a
+#     live tool_name dump (codex-cli 0.153.0, Windows, 2026-09-09: shell ops
+#     emit `Bash`, file patches emit `apply_patch`; Codex's matcher treats an
+#     all-alnum/pipe string as EXACT alternation). Re-probe with a live
+#     tool_name dump before changing the matcher. MCP tools
+#     (`mcp__<server>__<tool>`) are deliberately out. Upstream drops
+#     additionalContext on PreCompact, so the Codex precompact entry exists
+#     for the delivery-ledger clear; post-compaction re-injection rides the
+#     SessionStart(source=compact) moment.
 #   - NEVER denies: surfacing a hazard is information for the model, not
 #     grounds to block a legitimate command. No permission decision is emitted.
 #

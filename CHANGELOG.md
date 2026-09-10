@@ -10,6 +10,47 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.28.0] - 2026-09-09
+
+> Codex parity — the Codex host now fires zmem's pre-tool hazard recall and
+> the compaction ledger-clear, with a hard envelope cap below upstream's
+> hook-output spill limit. Workstream D-3 (#95).
+
+### Added
+- **Codex PreToolUse registration (issue #95)**: `hooks.codex.json` now
+  registers `PreToolUse` with the matcher `Bash|apply_patch`, dumped live
+  from codex-cli 0.153.0 (2026-09-09, Windows): shell operations emit the
+  hook tool name `Bash` (the model-facing tool is `exec_command`), file
+  patches emit `apply_patch`, and Codex treats an all-alphanumeric/pipe
+  matcher as EXACT alternation. MCP tools (`mcp__<server>__<tool>`) and
+  `write_stdin` are deliberately out. Hazard lessons now surface before the
+  dangerous command runs on Codex, same as Claude/ZCode.
+- **Codex PreCompact registration (issue #95)**: wired to the same shared
+  `precompact` handler Claude uses. Upstream Codex drops
+  `additionalContext` on PreCompact (decision control only, verified
+  2026-09-09 from codex-rs source), so the functional payload on Codex is
+  the delivery-ledger clear before compaction — post-compaction
+  re-injection rides the registered SessionStart, which upstream fires
+  with `source=compact` after every compaction. PostCompact stays
+  unregistered pending #118 (upstream PostCompact carries only
+  `trigger: manual|auto`).
+- **Codex envelope cap (issue #95 addendum)**: hook envelopes on Codex are
+  clamped to 8000 encoded chars (≈2000 tokens at the plugin's
+  4-chars/token estimator) — a 20% margin under upstream's
+  `DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT = 2_500` tokens, above which Codex
+  spills the text to a file and the model sees only a head/tail preview.
+  The former 9000-char default sat within ~10% of the spill point. The cap
+  applies even when an operator sets a larger `ZMEM_CTX_BUDGET`; Claude and
+  ZCode budgets are unchanged.
+
+### Changed
+- **Upgraded Codex installs must re-approve the hook surface**: Codex trusts
+  hooks by a SHA-256 over each hook entry, so the two new entries carry new
+  hashes and an untrusted entry is silently skipped. Re-approve in the TUI
+  `/hooks` review after upgrading (see SKILL.md "Reapprove hooks after
+  hook-surface changes"); `codex exec --dangerously-bypass-hook-trust`
+  exists for vetted automation only.
+
 ## [0.27.0] - 2026-09-09
 
 > Session delivery ledger — a memory row delivered at one hook moment is no

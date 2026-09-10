@@ -324,12 +324,28 @@ class PreCompactHookTests(unittest.TestCase):
         )
         self.assertNotIn("PreCompact", config["hooks"])
 
-    def test_codex_json_does_not_have_precompact(self):
+    def test_codex_json_registers_precompact(self):
+        # Issue #95 flip (this PR): the former assertNotIn deferral pin is
+        # inverted. Codex PreCompact is REGISTERED and wired to the same
+        # shared precompact handler Claude uses; upstream Codex drops
+        # additionalContext on that event (decision control only, verified
+        # 2026-09-09 from codex-rs source at rust-v0.153.0), so its
+        # functional payload on Codex is the delivery-ledger clear before
+        # compaction — post-compaction re-injection rides the registered
+        # SessionStart, which upstream fires with source=compact.
         import json
         config = json.loads(
             (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8")
         )
-        self.assertNotIn("PreCompact", config["hooks"])
+        self.assertIn(
+            "PreCompact", config["hooks"],
+            "Codex PreCompact registration (issue #95) is missing — this "
+            "assertion is the #95 flip; do not revert it to an absence pin "
+            "without deliberately un-registering the hook")
+        self.assertIn(
+            "precompact",
+            config["hooks"]["PreCompact"][0]["hooks"][0]["command"],
+            "Codex PreCompact must invoke the shared precompact handler")
 
     def test_launcher_precompact_verb_wired(self):
         text = (REPO_ROOT / "hooks" / "zmem-launch.js").read_text(encoding="utf-8")
