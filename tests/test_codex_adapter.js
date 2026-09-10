@@ -443,19 +443,26 @@ console.log("\n[6] Codex envelope clamp (issue #95: upstream spills above 2,500 
     // Upstream codex-rs spills hook output over DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT
     // = 2,500 tokens (verified 2026-09-09, tag rust-v0.153.0). The launcher must
     // clamp the codex envelope to 8000 encoded chars (~2000 tokens at the
-    // plugin's 4-chars/token estimator) EVEN when the operator sets a huge
-    // ZMEM_CTX_BUDGET — and the clamp must be codex-specific.
-    function giantEnvelopeEncoded(hostVar, hostValue) {
+    // plugin's 4-chars/token estimator) EVEN WHEN the operator sets a huge
+    // ZMEM_CTX_BUDGET — and the clamp must be codex-specific. PRR-001: a
+    // large systemMessage must consume budget too (it is appended to the same
+    // envelope), and a systemMessage that alone cannot fit is dropped
+    // (fail-open) instead of guaranteed to spill. PRR-002: an operator budget
+    // above the cap produces a stderr warning on codex.
+    function runClampCase(host, sysMsgLen) {
         const tree = fs.mkdtempSync(path.join(TMP_ROOT, "clamp-"));
         const pluginRoot = path.join(tree, "plugin");
         fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
         const giant = "A".repeat(30000);
+        const sysMsg = sysMsgLen > 0 ? "S".repeat(sysMsgLen) : "";
+        const payloadObj = { additionalContext: giant };
+        if (sysMsg) payloadObj.systemMessage = sysMsg;
         fs.writeFileSync(path.join(pluginRoot, "hooks", "zmem-recall.sh"),
             "#!/usr/bin/env bash\n" +
             "printf '<<<ZMEM_JSON>>>%s<<<END>>>\\n' " +
-            "'{\"additionalContext\":\"" + giant + "\"}'\n");
+            "'" + JSON.stringify(payloadObj).replace(/'/g, "'\\''") + "'\n");
         const env = envWith({
-            [hostVar]: pluginRoot,
+            [hostVarName(host)]: pluginRoot,
             ZMEM_DATA: path.join(tree, "data"),
             ZMEM_CTX_BUDGET: "50000",
         });
@@ -465,19 +472,64 @@ console.log("\n[6] Codex envelope clamp (issue #95: upstream spills above 2,500 
         });
         let envelope = null;
         try { envelope = JSON.parse(proc.stdout.trim()); } catch (e) { /* */ }
-        const encoded = envelope
-            ? Buffer.byteLength(JSON.stringify(envelope), "utf8") : -1;
+        const result = {
+            encoded: envelope ? Buffer.byteLength(JSON.stringify(envelope), "utf8") : -1,
+            sysMsgPresent: !!(envelope && envelope.systemMessage),
+            stderr: proc.stderr || "",
+        };
         fs.rmSync(tree, { recursive: true, force: true });
-        return encoded;
+        return result;
     }
-    const codexEncoded = giantEnvelopeEncoded("PLUGIN_ROOT", REPO);
+    function hostVarName(host) {
+        return host === "codex" ? "PLUGIN_ROOT" : "CLAUDE_PLUGIN_ROOT";
+    }
+
+    const codexPlain = runClampCase("codex", 0);
     ok("clamp: codex envelope stays <= CODEX_ENVELOPE_CAP_CHARS",
-        codexEncoded >= 0 && codexEncoded <= launch.CODEX_ENVELOPE_CAP_CHARS,
-        "encoded=" + codexEncoded + " cap=" + launch.CODEX_ENVELOPE_CAP_CHARS);
-    const claudeEncoded = giantEnvelopeEncoded("CLAUDE_PLUGIN_ROOT", REPO);
+        codexPlain.encoded >= 0 && codexPlain.encoded <= launch.CODEX_ENVELOPE_CAP_CHARS,
+        "encoded=" + codexPlain.encoded + " cap=" + launch.CODEX_ENVELOPE_CAP_CHARS);
+    const claudePlain = runClampCase("claude", 0);
     ok("clamp: claude control is NOT clamped by the codex cap",
-        claudeEncoded > launch.CODEX_ENVELOPE_CAP_CHARS,
-        "encoded=" + claudeEncoded);
+        claudePlain.encoded > launch.CODEX_ENVELOPE_CAP_CHARS,
+        "encoded=" + claudePlain.encoded);
+
+    // PRR-001: a modest systemMessage is PRESERVED and the total stays in cap.
+    const codexSmallSys = runClampCase("codex", 200);
+    ok("clamp: codex envelope with systemMessage stays <= cap",
+        codexSmallSys.encoded >= 0 && codexSmallSys.encoded <= launch.CODEX_ENVELOPE_CAP_CHARS,
+        "encoded=" + codexSmallSys.encoded);
+    ok("clamp: modest systemMessage is preserved",
+        codexSmallSys.sysMsgPresent, "systemMessage was dropped");
+
+    // PRR-001: a systemMessage that alone cannot fit is DROPPED (fail-open).
+    const codexGiantSys = runClampCase("codex", 30000);
+    ok("clamp: un-fittable systemMessage is dropped, envelope <= cap",
+        codexGiantSys.encoded >= 0 && codexGiantSys.encoded <= launch.CODEX_ENVELOPE_CAP_CHARS
+            && !codexGiantSys.sysMsgPresent,
+        "encoded=" + codexGiantSys.encoded + " sysMsgPresent=" + codexGiantSys.sysMsgPresent);
+
+    // PRR-002: operator budget above the cap warns on stderr (codex only,
+    // only when explicitly set).
+    function runWarnCase(host, budgetValue) {
+        const tree = fs.mkdtempSync(path.join(TMP_ROOT, "warn-"));
+        const pluginRoot = path.join(tree, "plugin");
+        fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
+        fs.writeFileSync(path.join(pluginRoot, "hooks", "zmem-recall.sh"),
+            "#!/usr/bin/env bash\nprintf '{}\\n'\n");
+        const overrides = { [hostVarName(host)]: pluginRoot, ZMEM_DATA: path.join(tree, "data") };
+        if (budgetValue !== null) overrides.ZMEM_CTX_BUDGET = budgetValue;
+        const proc = spawnSync("node", [LAUNCHER, "recall"], {
+            input: JSON.stringify({ session_id: "warn", cwd: tree }),
+            env: envWith(overrides), encoding: "utf8", timeout: 60000,
+        });
+        const warned = (proc.stderr || "").indexOf("exceeds the codex envelope cap") !== -1;
+        fs.rmSync(tree, { recursive: true, force: true });
+        return warned;
+    }
+    ok("clamp: operator budget above cap warns on stderr (codex)",
+        runWarnCase("codex", "20000"));
+    ok("clamp: no warning when the budget is not operator-set (codex default 9000 > 8000)",
+        !runWarnCase("codex", null));
 }
 
 console.log("\n[7] Codex registered pre-tool path (issue #95)");

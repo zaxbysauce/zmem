@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "775d9436c3d7ccfe26c5c57a5ca8e9b3ee29e77f4dd48b6e4b5e5a97a1b67c4b",
+  "digest": "2024db35a369a4ea1fa034be2bf1c149105af85206043474393b99554c2c2d22",
   "files": {
     "hermes-plugin/__init__.py": "49921ae0fcbb7343b9f77eae4d5684bd1e35b89ecf858744179ffb755b0993b0",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -22,7 +22,7 @@
     "hooks/zmem-capture-correction.sh": "f71aef6f46825723e908dbdcd81cccc1299c45e78025f8011db50c02037c75b2",
     "hooks/zmem-capture-failure.sh": "8c1b45dd1f29a1ac502861ee3942e43e829123cbe7b67c17e8b910227a7af002",
     "hooks/zmem-convention-capture.sh": "3982e825c0f3c310d4a867edcf9551d7ccbbd036af53134378a9faff6beea257",
-    "hooks/zmem-launch.js": "5eb5cbfab77b89bcc3af46f4b5ff7e1265ec1e17a22748679a0fdc2e568db4d5",
+    "hooks/zmem-launch.js": "1efc51e9d9d664db32a857f81605e0df0bcca666001e2c3aec71e100adf90373",
     "hooks/zmem-precompact.sh": "0b935644aa4c291d67ddfb2e16b69a5578dee113d4512ccaca5677de6a5a6673",
     "hooks/zmem-pretool-recall.sh": "65c824791fa6b2d7172a7a40e3a55f5882ca41ccf900ccb0246ff0e64c22c52e",
     "hooks/zmem-recall.sh": "cb4262b4ec0eb3dc6e89698bfdd684976746a9700b43c0970d14efa53f05d91a",
@@ -41,7 +41,7 @@
     "scripts/release_gate.py": "15b940d1fa778c8c5395c8dee3aab7cbb52fc788ca9b42c2fd6c436b588a1410",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "ac20e80713cf3ec05159ac0f609313cb094ed5515c387258fa5369faec963aa5",
-    "skills/memory/SKILL.md": "2497e68a7af98f5504e3b94c633d8b65035705755be83817d17f180981bc54f6",
+    "skills/memory/SKILL.md": "d5051a2e2d6cfb946141ea9bfea54e288fb63fc5c37843e7afe44ad05cc3246b",
     "skills/memory/scripts/correction_queue.py": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
     "skills/memory/scripts/doctor.py": "23a5e1ea02aac2dcce0cfcf18dc252f186779258b18f6f58ed1d4c307dc9f195",

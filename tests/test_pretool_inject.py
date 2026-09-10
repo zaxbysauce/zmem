@@ -469,11 +469,14 @@ class RegistrationAndContractTest(unittest.TestCase):
         self.assertIn("#118", memory_skill,
                       "SKILL.md must name #118 as the PostCompact deferral "
                       "owner")
-        self.assertIn("live tool", memory_skill,
-                      "SKILL.md must keep the live-dump-first re-probe "
-                      "convention")
-        self.assertIn("mcp__", memory_skill,
-                      "SKILL.md must record the MCP-tools-out decision")
+        self.assertIn(
+            "with a live tool_name dump before changing the matcher",
+            memory_skill,
+            "SKILL.md must keep the live-dump-first re-probe convention")
+        self.assertIn(
+            "and `write_stdin` are deliberately OUT",
+            memory_skill,
+            "SKILL.md must record the MCP-and-write_stdin-out decision")
 
     def test_launcher_knows_the_verb(self):
         src = (REPO_ROOT / "hooks" / "zmem-launch.js").read_text(encoding="utf-8")

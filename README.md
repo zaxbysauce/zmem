@@ -430,7 +430,7 @@ Consolidate / recall / dedup tuning:
 | `ZMEM_CONSOLIDATE_THRESHOLD` | Cosine similarity above which two memories consolidate (embedding mode). | `0.80` |
 | `ZMEM_CONSOLIDATE_LEXICAL_THRESHOLD` | Jaccard token-overlap threshold used in the no-embeddings lexical fallback. | `0.60` |
 | `ZMEM_DEDUP_THRESHOLD` | Cosine similarity above which an incoming memory is deduped against an existing one. | `0.85` |
-| `ZMEM_CTX_BUDGET` | Approx byte budget for the Tier-1 pack / context payload. Host-dependent when unset: `25000` (ZCode) vs `9000` (Claude Code). On Codex the envelope is capped at `8000` (approx 2000 tokens, a 20% margin under Codex's 2,500-token hook-output spill limit); an operator-set value on Codex is clamped to the cap. | `25000` / `9000` / codex cap `8000` |
+| `ZMEM_CTX_BUDGET` | Approx byte budget for the Tier-1 pack / context payload. Host-dependent when unset: `25000` (ZCode) vs `9000` (Claude Code). On Codex the envelope is capped at `8000` (approx 2000 tokens, a 20% margin under Codex's 2,500-token hook-output spill limit; dense multi-byte content such as CJK tokenizes at fewer chars/token, so it has less real headroom); an operator-set value on Codex is clamped to the cap with a stderr warning. | `25000` / `9000` / codex cap `8000` |
 | `ZMEM_INJECT_TOKEN_BUDGET` | Token budget (default 1500, 4 chars/token heuristic) for hook/session_start memory injection: bullet admission stops at the budget, `decision`/`constraint` rows are never dropped, lowest-score `signal=none` rows drop first (issue #65, 10.9). | `1500` |
 | `ZMEM_CONVENTION_INTERVAL` | Fire the convention nudge every N successful tool calls. | `10` |
 

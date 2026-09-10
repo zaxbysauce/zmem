@@ -302,8 +302,8 @@ class SelectiveInjectGateTests(unittest.TestCase):
 
 
 class PreCompactHookTests(unittest.TestCase):
-    """Issue #58, 3.9: PreCompact registered in claude.json only, sources
-    shared body, fail-open."""
+    """Issue #58, 3.9: PreCompact registered in claude.json (and codex.json
+    since issue #95), sources shared body, fail-open."""
 
     def test_claude_json_has_precompact(self):
         import json

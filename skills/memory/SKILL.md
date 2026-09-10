@@ -373,7 +373,7 @@ arguments. Upstream accepts `hookSpecificOutput.additionalContext` on
 PreToolUse (model-visible, non-blocking); Codex hooks reference:
 https://learn.chatgpt.com/docs/hooks. Codex envelopes are additionally
 capped at 8000 chars (≈2000 tokens at the plugin's 4-chars/token
-estimator) — 20% margin under upstream's 2,500-token hook-output spill
+estimator; dense multi-byte (CJK) content has less real headroom) — 20% margin under upstream's 2,500-token hook-output spill
 limit (`DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT`, codex-rs output_spill.rs,
 verified against tag rust-v0.153.0); the cap applies even when an operator
 sets a larger `ZMEM_CTX_BUDGET`. Keep the verification-first convention: re-probe

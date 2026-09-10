@@ -544,22 +544,45 @@ function fitEnvelope(host, hookName, content, budget) {
 // Issue #107: the operator-facing systemMessage is read BEFORE the
 // empty-content early-return — a kill-switch session emits no
 // additionalContext, but its served-tree drift notice must still reach the
-// user. systemMessage is never part of fitEnvelope's content trimming (it is
-// a fixed operator string, never model context).
+// user. systemMessage is not content-trimmed by fitEnvelope (it is an
+// operator string, never model context), but it DOES consume budget: its
+// exact encoded marginal size is reserved from the budget before the
+// content is fitted, so the ASSEMBLED envelope stays within the host cap
+// (issue #95 PRR-001 — the pre-#95 code appended sysMsg post-fit, which a
+// child-script regression could push over the codex spill threshold). An
+// operator message that alone cannot fit is dropped entirely (fail-open)
+// rather than guaranteed to spill.
 function translate(raw, host, hookName, budget) {
     const payload = extractPayload(raw);
     if (payload === null) return {}; // missing/invalid sentinel → fail open
     const content = payload.additionalContext;
-    const sysMsg =
+    let sysMsg =
         typeof payload.systemMessage === "string" && payload.systemMessage.trim()
             ? payload.systemMessage
             : null;
     const hasContent = !(content === undefined || content === null || content === "");
     if (!hasContent && !sysMsg) return {};
+    let contentBudget = budget;
+    if (sysMsg) {
+        const sysBytes = encodedSize(_withSystemMessage(makeEnvelope(host, hookName, ""), sysMsg))
+            - encodedSize(makeEnvelope(host, hookName, ""));
+        if (sysBytes >= budget) {
+            sysMsg = null;
+        } else {
+            contentBudget = budget - sysBytes;
+        }
+    }
     const envelope = hasContent
-        ? fitEnvelope(host, hookName, String(content), budget)
+        ? fitEnvelope(host, hookName, String(content), contentBudget)
         : makeEnvelope(host, hookName, "");
     if (sysMsg) envelope.systemMessage = sysMsg;
+    return envelope;
+}
+
+// Shallow-copy helper: an envelope with ONLY the operator message attached,
+// used to measure systemMessage's exact encoded marginal size.
+function _withSystemMessage(envelope, sysMsg) {
+    envelope.systemMessage = sysMsg;
     return envelope;
 }
 
@@ -570,10 +593,14 @@ function translate(raw, host, hookName, budget) {
 // preview — a spilled fence is effectively lost. At the plugin's 4-chars-
 // per-token estimator, 8000 chars ≈ 2000 tokens = 20% margin under the
 // spill point (the former 9000-char default sat within ~10% of it, issue
-// #95's units trap). The clamp is applied in main() AFTER resolveBudget, so
-// it binds the host default AND any operator-set ZMEM_CTX_BUDGET on codex —
-// an override must not reintroduce the spill risk. Claude/ZCode are
-// unaffected (BUDGET_DEFAULT stays 9000 there).
+// #95's units trap). Caveat (PRR-003): the estimator is per-CHARACTER —
+// dense multi-byte content (CJK) tokenizes at fewer chars per token, so
+// such fences have less real headroom than the 20% figure suggests. The
+// clamp is applied in main() AFTER resolveBudget, so it binds the host
+// default AND any operator-set ZMEM_CTX_BUDGET on codex (an override that
+// exceeds the cap is clamped WITH a stderr warning) — an override must not
+// reintroduce the spill risk. Claude/ZCode are unaffected (BUDGET_DEFAULT
+// stays 9000 there).
 const CODEX_ENVELOPE_CAP_CHARS = 8000;
 
 // Resolve and VALIDATE the context budget (issue #39 E3). A negative value is
@@ -654,9 +681,18 @@ async function main() {
     }
 
     const env = buildCanonicalEnv(host, prepared.meta, hookName);
-    const budget = host === "codex"
-        ? Math.min(resolveBudget(env), CODEX_ENVELOPE_CAP_CHARS)
-        : resolveBudget(env);
+    let budget = resolveBudget(env);
+    if (host === "codex" && budget > CODEX_ENVELOPE_CAP_CHARS) {
+        // PRR-002 (#95): an explicitly-set operator budget above the codex
+        // host cap gets clamped — say so on stderr instead of shrinking it
+        // silently. The 9000 host DEFAULT also exceeds the cap but is not
+        // operator-set, so it must not warn on every codex run.
+        if (process.env.ZMEM_CTX_BUDGET) {
+            process.stderr.write(`zmem: ZMEM_CTX_BUDGET=${budget} exceeds the `
+                + `codex envelope cap ${CODEX_ENVELOPE_CAP_CHARS}; clamping\n`);
+        }
+        budget = CODEX_ENVELOPE_CAP_CHARS;
+    }
     // Export the validated/clamped budget so spawned hook scripts see the same
     // effective value the launcher uses internally (#39 E3 / cubic-re #1).
     // Without this, a huge operator-set ZMEM_CTX_BUDGET is clamped for
