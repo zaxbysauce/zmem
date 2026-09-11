@@ -402,10 +402,17 @@ def compact_self_test(args, env, workdir):
         ("precompact", {"hook_event_name": "PreCompact", "trigger": "manual"}),
         ("postcompact", {
             "hook_event_name": "PostCompact", "trigger": "manual",
+            # The summary carries the seeded row's distinctive tokens
+            # VERBATIM: on a bare interpreter (no embedding model — the CI
+            # shape) the recall lane is lexical-only and the #113 relevance
+            # floor drops a thin summary match (observed: verdict=fail
+            # reason=no-row-id on both CI legs). The exact-token overlap
+            # keeps the fixture deterministic with OR without the model.
             "compact_summary": (
                 "Compaction summary: the session was verifying that the "
-                "injection canary row (%s) still reaches the model after a "
-                "compaction." % MARKER),
+                "injection canary probe row zmem-canary-probe-row host "
+                "canary marker still reaches the model after a "
+                "compaction."),
         }),
     ):
         payload = dict(base)
