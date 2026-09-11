@@ -169,18 +169,17 @@ def _atomic_write_json(path: str, obj: Any) -> None:
     if d:
         os.makedirs(d, exist_ok=True)
     tmp = path + ".tmp." + uuid.uuid4().hex
-    with open(tmp, "w", encoding="utf-8") as f:
+    # PR #192 review (cubic P2): create the tmp at 0600 AT OPEN — a
+    # plain open("w") plus a post-write chmod left the fully-written
+    # content group/other-readable in between (and plain chmod on
+    # Windows only toggles the readonly attribute, it does not restrict
+    # access; the ops dir lives under the operator profile, accepted
+    # residual on Windows).
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(obj, f)
         f.flush()
         os.fsync(f.fileno())
-    # PR #191 review: ops sidecars carry session-derived prose (task
-    # texts, compact summaries) — harden tmp and final to owner-only,
-    # mirroring correction_queue._harden. Best-effort: platforms or
-    # filesystems without chmod support degrade silently.
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
     os.replace(tmp, path)
     try:
         os.chmod(path, 0o600)

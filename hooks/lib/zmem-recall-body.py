@@ -677,11 +677,24 @@ def _transcript_tail(max_lines: int = 8, max_chars: int = 500) -> str:
                             break
                 if piece:
                     break
-                # tool_use shape: {"type": "tool_use", "name": "Agent",
-                #                  "input": {"prompt": ...}}
+                # tool_use shape (PR #192 review, cubic P2): the Agent
+                # delegation lives in a content ITEM's input —
+                # {"message": {"content": [{"type": "tool_use",
+                # "input": {"prompt": ...}}]}} — so gather inputs from
+                # the cand itself AND its content items.
+                inputs = []
                 inp = cand.get("input")
                 if isinstance(inp, dict):
-                    iv = (inp.get("prompt") or inp.get("description") or "")
+                    inputs.append(inp)
+                content_items = cand.get("content")
+                if isinstance(content_items, list):
+                    inputs.extend(
+                        p_item.get("input") for p_item in content_items
+                        if isinstance(p_item, dict)
+                        and isinstance(p_item.get("input"), dict))
+                for inp_d in inputs:
+                    iv = (inp_d.get("prompt")
+                          or inp_d.get("description") or "")
                     if isinstance(iv, str) and iv.strip():
                         piece = iv.strip()
                         break
@@ -961,10 +974,20 @@ def main() -> int:
                         # PR #191 review F-001: the parked prompt persists
                         # verbatim in the sidecar — apply the same advisory
                         # secret-pattern redaction the capture paths use,
-                        # at this call site (storelib must not import the
-                        # scripts layer directly). Advisory only: prose
-                        # credentials/PII are not pattern-matchable.
+                        # PR #192 review (cubic/Copilot, both confirmed by
+                        # an executed probe): the bare
+                        # `import correction_queue` here NEVER resolved —
+                        # sys.path[0] is hooks/lib and the scripts dir is
+                        # two levels away, so the ImportError was silently
+                        # swallowed and the prompt parked verbatim. Insert
+                        # dirname(store_py) first, exactly like every
+                        # other dynamic load in this body. Advisory only:
+                        # prose credentials/PII are not pattern-matchable.
                         try:
+                            _cq_dir = os.path.dirname(os.path.abspath(
+                                store_py))
+                            if _cq_dir not in sys.path:
+                                sys.path.insert(0, _cq_dir)
                             import correction_queue as _cq_tt
                             _task_text, _ = _cq_tt.redact_secret_like_text(
                                 _task_text)

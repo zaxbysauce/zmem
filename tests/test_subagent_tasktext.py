@@ -272,6 +272,45 @@ class TaskTextSequenceTest(unittest.TestCase):
         self.assertIn(MARKER_A, ctx_a)
         self.assertIn(MARKER_B, ctx_b)
 
+    def test_redaction_runs_and_agent_park_silent(self):
+        # PR #192 review: the F-001 redaction must actually RUN in the
+        # production shape (the bare import was a silent no-op — cubic
+        # P2/Copilot) and the parent stays silent.
+        env = dict(self._env, **_FLOOR)
+        p = self._drive("pretool-recall", {
+            "hook_event_name": "PreToolUse", "tool_name": "Agent",
+            "tool_input": {"description": "delegated lane",
+                           "prompt": "fix the AKIAIOSFODNN7EXAMPLE leak"},
+            "session_id": self.SID, "cwd": self._workdir}, env=env)
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(_ctx(p.stdout), "")
+        stash = _ops_path(self._tmp, self.SID, ".tasktext")
+        self.assertTrue(stash.exists())
+        content = stash.read_text(encoding="utf-8")
+        self.assertIn("[REDACTED_SECRET]", content)
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", content)
+
+    def test_transcript_tail_reads_tool_use_input(self):
+        # PR #192 review (cubic P2): tool_use content items carry the
+        # delegation in input.prompt — the tail rung must extract them.
+        transcript = Path(self._tmp) / "parent-tu.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Agent",
+                 "input": {"prompt": "fix the failing merge-queue ratchet "
+                                     "flake quarantine lane about "
+                                     + MARKER_A}}]}}) + chr(10),
+            encoding="utf-8")
+        env = dict(self._env, **_FLOOR)
+        p = self._drive("subagent-recall", {
+            "hook_event_name": "SubagentStart", "session_id": self.SID,
+            "agent_id": "agent-tu", "agent_type": "general-purpose",
+            "cwd": self._workdir, "transcript_path": str(transcript)},
+            env=env)
+        self.assertEqual(p.returncode, 0)
+        ctx = _ctx(p.stdout)
+        self.assertIn(MARKER_A, ctx)
+
     def test_transcript_tail_fallback_rung(self):
         # No stash; the parent transcript tail (exported by the launcher
         # from transcript_path) drives the query.
@@ -354,11 +393,7 @@ class RegistrationNeedleTest(unittest.TestCase):
                       "unverified by #119")
         self.assertIn("#96", text,
                       "SKILL.md must name #96 as the live-probe owner")
-        self.assertIn("UNVERIFIED by #119", text,
-                      "SKILL.md must mark the Codex delegation surface "
-                      "unverified by #119")
-        self.assertIn("#96", text,
-                      "SKILL.md must name #96 as the live-probe owner")
+
 
     def test_body_carries_ladder_and_stash(self):
         text = (REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py") \

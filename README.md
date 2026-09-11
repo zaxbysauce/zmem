@@ -651,12 +651,11 @@ Notes:
   the box-wide model: a lesson captured in one host is recallable in the others.
   Subagent auto-recall/reflect is wired for Claude Code and Codex (which emit
   `SubagentStart`/`SubagentStop` hook events); ZCode supports exactly seven hook
-  events and does **not** emit subagent lifecycle hooks, so on ZCode subagent
-task-text recall (issue #119: the delegating `Agent` call's prompt is
-stashed at PreToolUse and becomes the child's SubagentStart recall query;
-Claude Code only) is likewise unavailable
-  memory is scoped to the parent session rather than getting its own recall/reflect
-  cycle. Override with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
+  events and does **not** emit subagent lifecycle hooks, so on ZCode
+  subagent memory is scoped to the parent session rather than getting its own recall/reflect
+  cycle. Task-text recall (issue #119: the delegating `Agent` call's prompt is
+  stashed at PreToolUse and becomes the child's SubagentStart recall query) is
+  likewise Claude Code only. Override with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
   userConfig option) if you want it elsewhere.
 - **Legacy per-plugin data dirs** (`${ZCODE_PLUGIN_DATA}` /
   `${CLAUDE_PLUGIN_DATA}`) still work as a fallback if `ZMEM_DATA` isn't set
