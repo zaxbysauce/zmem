@@ -758,8 +758,14 @@ class NoTruncateToEmptyGuardrailTest(unittest.TestCase):
                 ).read_text(encoding="utf-8")
         drift = (repo / "skills" / "memory" / "scripts" / "drift.py"
                  ).read_text(encoding="utf-8")
-        ss = (repo / "hooks" / "zmem-session-start.sh"
-              ).read_text(encoding="utf-8")
+        # PR #190: session-start's decision-line writer lives in its
+        # payload companion (the inline python -c form outgrew the
+        # Windows ~32K CreateProcess limit); scan both.
+        ss = ((repo / "hooks" / "zmem-session-start.sh").read_text(
+              encoding="utf-8")
+              + "\n"
+              + (repo / "hooks" / "lib" / "zmem-session-start-payload.py"
+                 ).read_text(encoding="utf-8"))
         # every python writer routes through the shared rotation helper
         self.assertIn("rotate_on_append", body,
                       "the hook body must rotate the decision log")

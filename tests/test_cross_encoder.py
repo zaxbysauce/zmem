@@ -283,6 +283,7 @@ class HookStructuralExclusion(unittest.TestCase):
         "hooks/zmem-subagent-recall.sh",
         "hooks/zmem-precompact.sh",
         "hooks/zmem-session-start.sh",
+        "hooks/lib/zmem-session-start-payload.py",
         "hooks/lib/zmem-recall-body.py",
         "hermes-plugin/__init__.py",
     ]
