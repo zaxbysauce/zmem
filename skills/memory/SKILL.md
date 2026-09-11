@@ -404,7 +404,17 @@ composes a query from the stashed `compact_summary` plus the
 pre-compaction ledger snapshot, and runs the query-aware recall lane
 instead of the cold-start recency pull (decision line
 `moment=session_start_compact`); an empty stash degrades to the
-cold-start lane. Whether the PreCompact fence itself survives a live
+cold-start lane. PR #190 review (2026-09-11): the compact lane honors the
+global `ZMEM_QUERY_CONTEXT=0` kill switch (falls back to the recency
+lane), skips the ledger exclusion argv (the moment deliberately
+re-delivers the pre-compaction working set), passes the same 0.5
+confidence floor as cold start (`recall --min-confidence`, new flag),
+falls back to the recency pull when the query returns zero rows (never
+silent), and discards the compact stash only after the pull completes (a
+failed pull preserves it for retry). The payload block lives in
+`hooks/lib/zmem-session-start-payload.py` — NEVER inline it back as
+`python -c`: the string outgrew the Windows ~32K CreateProcess
+command-line limit and silently degraded the hook to `{}`. Whether the PreCompact fence itself survives a live
 `/compact` is UNPROBED — no claim either way until #96's live canary
 lands (the host-capability rot convention from #103/#104). **ZCode supports exactly
 seven hook events — SessionStart, UserPromptSubmit, PreToolUse,

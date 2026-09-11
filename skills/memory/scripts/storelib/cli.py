@@ -246,6 +246,12 @@ def main():
     p_recall.add_argument("--global-limit", type=nonnegative_int, default=3,
                           help="max user:global rows when --include-global is set "
                                f"(default 3). No effect without --include-global.")
+    p_recall.add_argument("--min-confidence", type=float, default=None,
+                          help="SQL confidence floor (PR #190 review PRR-006): "
+                               "drop rows below this confidence before scoring. "
+                               "Default None = recall's internal CONFIDENCE_FLOOR "
+                               "(0.25); the session-start compact lane passes 0.5 "
+                               "for parity with the cold-start recent pull.")
     p_recall.add_argument("--link-hops", type=int, choices=[0, 1], default=1,
                           help="v11 (issue #61, 6.3): walk related/supports links "
                                "ONE hop from each recalled memory and append up to "
@@ -1314,6 +1320,7 @@ def main():
                               limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
                               no_bump=args.no_bump, include_global=args.include_global,
                               global_limit=args.global_limit, as_of=args.as_of,
+                              min_confidence=args.min_confidence,
                               no_mmr=args.no_mmr,
                               link_hops=args.link_hops, link_budget=args.link_budget,
                               cross_rerank=rerank_flag,
