@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "d589b992ab1745dd86d528c7984af53093d6e78745b958941449429e49507816",
+  "digest": "a5b01f95e32b8dc613c2b57d559ca5a48ea356ff1356a6f83c011c7c1c4b3d51",
   "files": {
     "hermes-plugin/__init__.py": "49921ae0fcbb7343b9f77eae4d5684bd1e35b89ecf858744179ffb755b0993b0",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -17,7 +17,7 @@
     "hooks/hooks.claude.json": "23ebe4f8e1eaf8500b49483e532cd3460c382f5051e4f0ee56ea69713747ddd5",
     "hooks/hooks.codex.json": "1eb67efe6d29e8d945b37dbdb59b1904d3ef876ff9a62ebecfac47b08cb80be1",
     "hooks/hooks.zcode.json": "1be14c3027b406f999ce3b813f6a5d0c9c37e45357b864eabc7adb65dc7958b4",
-    "hooks/lib/zmem-recall-body.py": "ce3d25c2c30b72bb8f11f00b967366484f0ad0f34b2efc6078c79549e6e650a9",
+    "hooks/lib/zmem-recall-body.py": "b589b003e95404f06b08f3cbf924c89e6a7c7c05d6fcf83e7ac583aa82be1750",
     "hooks/lib/zmem-session-start-payload.py": "6ba9c702e52990ecd49587a3d02a3b6e6b5d088e3c1001cf7a65bb4360fd1df8",
     "hooks/lib/zmem-tilde-expand.sh": "c026ac5d29070a25bfb46aec140b1487908a51d70e8f413934d0265a7e4cbe88",
     "hooks/zmem-capture-correction.sh": "f71aef6f46825723e908dbdcd81cccc1299c45e78025f8011db50c02037c75b2",
@@ -60,7 +60,7 @@
     "skills/memory/scripts/storelib/cli.py": "7f3f5e1c5b42185e43f848906a925f3bf02e3be1d40498f51fd8c3a62a5b7295",
     "skills/memory/scripts/storelib/consolidate.py": "1e937fbfda27401057891c980b5e0c4f006035fc6c2d8bae8508697bf8157d58",
     "skills/memory/scripts/storelib/cross_encoder.py": "be9da0f236b28d38f5963a3bd1b48861c85039cee7b620543f74543fadbda4da",
-    "skills/memory/scripts/storelib/delivery_ledger.py": "31079241540393e8043a1a9e76af5073485a23a33cc9d509347cd3476c020b43",
+    "skills/memory/scripts/storelib/delivery_ledger.py": "c86ca4f691144f230ed7ecde5cfe2a8aae81c30320b5491a638f03c0b3935bc6",
     "skills/memory/scripts/storelib/entity.py": "915fdbafdbe79f1643af751a19ed366e3e2bec3beddcef42e881122310527949",
     "skills/memory/scripts/storelib/episodes.py": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb",
     "skills/memory/scripts/storelib/eval_gold.py": "a491764d3b8dc809de90d7d4ae3414782b41e86d6ea5aedefacfa3689190d313",
