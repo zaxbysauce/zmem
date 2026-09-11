@@ -10,6 +10,39 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.30.0] - 2026-09-10
+
+> Subagent task-text recall — a delegated child now starts with the memory
+> relevant to ITS task: the delegating Agent call's prompt is stashed at
+> PreToolUse and becomes the SubagentStart recall query. Workstream D PR 4
+> (#119).
+
+### Added
+- **`Agent` in the Claude PreToolUse matcher (issue #119)**: the matcher
+  becomes `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent`. The delegating
+  call's `tool_input.prompt` (description fallback) is the only observable
+  carrying the child's task text — SubagentStart has none on any probed
+  host — so the pretool lane parks it in the hashed task-text sidecar
+  (`<data>/ops/<sha256-of-session-id>.tasktext`, bounded, atomic,
+  window-pruned, swept) and stays SILENT for the parent; the child's own
+  moment delivers.
+- **SubagentStart query ladder (issue #119)**: payload task text (if a
+  host ever sends it — unchanged, still pinned) → the stashed delegating
+  text (FIFO; exact `agent_id` match is future-host wiring — no probed
+  host supplies agent_id at park time) → the parent transcript tail (a
+  defensive, bounded FALLBACK, never the primary) → the queryless recency
+  pull last. A "fix CI" child now queries the ratchet lessons instead of
+  whatever recently landed (the #85 swarm-child failure shape).
+
+### Changed
+- **SKILL.md host-facts**: dated (2026-09-10, owner #119) task-text entry;
+  the Codex delegation surface is recorded as UNVERIFIED by #119 (the #95
+  dump covered only the shell/patch tools and cannot say whether a
+  delegation facility fires PreToolUse — no matcher entry was guessed; the
+  fresh dump is deferred to the live-probe owner #96); ZCode keeps the
+  plain matcher (no SubagentStart event — a parked task text would have
+  no consumer).
+
 ## [0.29.0] - 2026-09-10
 
 > Query-aware re-injection after compaction — the post-compaction

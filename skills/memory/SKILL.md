@@ -380,15 +380,26 @@ sets a larger `ZMEM_CTX_BUDGET`. Keep the verification-first convention: re-prob
 with a live tool_name dump before changing the matcher.
 
 Inject surface parity (host facts, not aspirations): Claude Code registers
-SubagentStart (task-text recall when the event carries the delegated
-prompt), PreCompact, and PostCompact (issue #118, probe 2026-09-10:
+SubagentStart (task-text recall — issue #119, probe 2026-09-10: neither
+host's SubagentStart payload carries task text, so the query ladder is
+payload-field-if-present → the task text stashed by the delegating
+PreToolUse(`Agent`) call (Claude matcher `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent`,
+issue #119 — the delegating `tool_input.prompt` is the only observable
+carrying it; consumption is FIFO because no probed host supplies agent_id
+at park time) → the parent transcript tail (a FALLBACK, never the primary)
+→ the queryless recency pull), PreCompact, and PostCompact (issue #118, probe 2026-09-10:
 Claude PostCompact carries `compact_summary` and has no injection channel,
 so the entry is a pure stash — `zmem-postcompact.sh` writes the summary to
 the compact sidecar and emits no context). Codex registers SessionStart,
 UserPromptSubmit,
 PreToolUse (matcher `Bash|apply_patch`, probe 2026-09-09, codex-cli
 0.153.0), PostToolUse, Stop, SubagentStart, SubagentStop, and PreCompact —
-upstream drops `additionalContext` on PreCompact (decision control only,
+the Codex DELEGATION tool surface is UNVERIFIED by #119 (2026-09-10): the
+#95 dump covered only the shell and patch/apply tools and cannot say
+whether a delegation facility fires PreToolUse at all, so no matcher entry
+was added and Codex SubagentStart rides the transcript-tail/recent rungs
+(fresh delegation-tool dump deferred to the live-probe owner #96).
+Upstream drops `additionalContext` on PreCompact (decision control only,
 verified 2026-09-09 from codex-rs source), so zmem's Codex PreCompact
 entry exists for the delivery-ledger snapshot+clear before compaction
 (issue #118, 2026-09-10: PreCompact now snapshots the ledger into the
@@ -411,7 +422,9 @@ seven hook events — SessionStart, UserPromptSubmit, PreToolUse,
 PermissionRequest, PostToolUse, PostToolUseFailure, Stop — so SubagentStart,
 PreCompact, and PostCompact are host gaps on ZCode** (an unsupported event name would be
 dead config under the host's strict schema, so they are documented here
-instead of registered). If ZCode grows either event, wire
+instead of registered; likewise ZCode's PreToolUse matcher deliberately
+omits `Agent` — with no SubagentStart event, a parked task text would
+have no consumer). If ZCode grows either event, wire
 `zmem-subagent-recall.sh` / `zmem-precompact.sh` / `zmem-postcompact.sh`
 immediately.
 

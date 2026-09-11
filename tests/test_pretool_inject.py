@@ -414,13 +414,22 @@ class RegistrationAndContractTest(unittest.TestCase):
     skill-contract text; launcher verbs."""
 
     def test_pretool_registered_on_zcode_claude_and_codex(self):
-        for name in ("hooks.zcode.json", "hooks.claude.json"):
+        # Issue #119 (2026-09-10): Claude Code gains the delegation tool
+        # `Agent` in the PreToolUse matcher — the delegating call's
+        # tool_input.prompt is the ONLY observable carrying the child task
+        # text (SubagentStart has none on any probed host). ZCode keeps the
+        # plain matcher: it has no SubagentStart event, so a parked task
+        # text would have no consumer (documented host gap in SKILL.md).
+        for name, matcher in (
+            ("hooks.zcode.json", "Edit|Write|MultiEdit|NotebookEdit|Bash"),
+            ("hooks.claude.json",
+             "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent"),
+        ):
             cfg = json.loads(
                 (REPO_ROOT / "hooks" / name).read_text(encoding="utf-8"))
             self.assertIn("PreToolUse", cfg["hooks"], name)
             entries = cfg["hooks"]["PreToolUse"]
-            self.assertEqual(entries[0]["matcher"],
-                             "Edit|Write|MultiEdit|NotebookEdit|Bash", name)
+            self.assertEqual(entries[0]["matcher"], matcher, name)
             self.assertIn("pretool-recall",
                           entries[0]["hooks"][0]["command"], name)
         codex = json.loads(
@@ -438,10 +447,16 @@ class RegistrationAndContractTest(unittest.TestCase):
                       "names before touching the matcher, never revert to the "
                       "absence pin without un-registering deliberately")
         entries = codex["hooks"]["PreToolUse"]
+        # Issue #119 (2026-09-10) re-verification: the Codex matcher stays
+        # `Bash|apply_patch` — no Codex delegation tool name has been
+        # dump-verified, and the exact-equality assertion below CEILINGS any
+        # guessed addition. SKILL.md documents the Codex delegation surface
+        # as UNVERIFIED by #119 (deferred to the live-probe owner #96).
         self.assertEqual(entries[0]["matcher"], "Bash|apply_patch",
                          "matcher must stay the dump-verified exact "
                          "alternation (live codex-cli 0.153.0 dump, "
-                         "2026-09-09, issue #95)")
+                         "2026-09-09, issue #95; re-verified 2026-09-10, "
+                         "issue #119)")
         self.assertIn("pretool-recall",
                       entries[0]["hooks"][0]["command"])
         # Codex PreCompact rides the same shared precompact handler Claude
