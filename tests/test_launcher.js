@@ -851,6 +851,42 @@ console.log("\n[10] Phase 7 unit: buildCanonicalEnv exports agent transcript + i
     eq("EVENT_MAP subagent-reflect → SubagentStop", launch.EVENT_MAP["subagent-reflect"], "SubagentStop");
 }
 
+console.log("\n[9c] Issue #119: Agent tool_input parks the subagent task text");
+
+{
+    // PreToolUse on the delegation tool stashes tool_input.prompt for the
+    // child's SubagentStart (the delegating parent stays silent). Asserts
+    // the stash lands in the hashed ops sidecar through the REAL launcher.
+    const crypto = require("crypto");
+    const SID9 = "sess-p3-agent-stash";
+    const payload = JSON.stringify({
+        session_id: SID9, cwd: PROJ, hook_event_name: "PreToolUse",
+        tool_name: "Agent",
+        tool_input: {
+            description: "fix the failing lane",
+            prompt: "launcher-test: fix the merge-queue ratchet flake lane.",
+        },
+    });
+    const r = runLauncher("pretool-recall", payload, envWith({
+        ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+    }));
+    eq("agent pretool: exit code 0", r.status, 0);
+    let out9 = null;
+    try { out9 = JSON.parse((r.stdout || "").trim()); } catch (e) { /* */ }
+    const ctx9 = out9 && (out9.hookSpecificOutput
+        ? out9.hookSpecificOutput.additionalContext : out9.additionalContext);
+    eq("agent pretool: parent stays silent (no context)", ctx9 || "", "");
+    const h9 = crypto.createHash("sha256").update(SID9, "utf8").digest("hex").slice(0, 32);
+    const stash9 = path.join(DATA, "ops", h9 + ".tasktext");
+    ok("agent pretool: task-text sidecar written", fs.existsSync(stash9));
+    if (fs.existsSync(stash9)) {
+        const stash = JSON.parse(fs.readFileSync(stash9, "utf8"));
+        ok("agent pretool: sidecar carries the prompt",
+            /merge-queue ratchet flake/.test(stash.entries[0].text || ""));
+    }
+}
+
+console.log("\n[10b] Issue #118: SessionStart source export + postcompact stash");
 console.log("\n[10b] Issue #118: SessionStart source export + postcompact stash");
 
 {

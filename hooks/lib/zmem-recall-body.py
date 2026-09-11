@@ -607,6 +607,73 @@ def _sidecar_fallback_enabled() -> bool:
     return os.environ.get("ZMEM_PENDING_SIDECAR", "") == "1"
 
 
+def _transcript_tail(max_lines: int = 8, max_chars: int = 500) -> str:
+    """Issue #119 fallback rung: the tail of the PARENT transcript.
+
+    ``ZMEM_TRANSCRIPT`` is the launcher export of the hook payload's
+    ``transcript_path`` — on SubagentStart that is the PARENT session's
+    transcript (the launcher documents that the subagent's own turns live
+    in ``agent_transcript_path`` instead). Deliberately defensive: the
+    transcript format carries no compatibility guarantee and the file may
+    be mid-write — every failure returns "" and the caller falls through to
+    the recency pull. Never raises; output is query FUEL (bounded, never
+    rendered raw)."""
+    path = os.environ.get("ZMEM_TRANSCRIPT", "")
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return ""
+    texts: list = []
+    total = 0
+    for line in reversed(lines[-max_lines:]):
+        line = line.strip()
+        if not line:
+            continue
+        piece = ""
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            # Real transcript lines nest the payload one level deep
+            # ({"type": ..., "message": {"content": [...]}}); accept both
+            # the flat and the nested shape, plus string or block-list
+            # content — the format has no compat guarantee, so every
+            # miss just yields no piece for that line.
+            candidates = [obj]
+            msg = obj.get("message")
+            if isinstance(msg, dict):
+                candidates.append(msg)
+            for cand in candidates:
+                for key in ("text", "content"):
+                    v = cand.get(key)
+                    if isinstance(v, str) and v.strip():
+                        piece = v.strip()
+                        break
+                    if isinstance(v, list):
+                        joined = " ".join(
+                            p.get("text", "") for p in v
+                            if isinstance(p, dict)
+                            and isinstance(p.get("text"), str))
+                        if joined.strip():
+                            piece = joined.strip()
+                            break
+                if piece:
+                    break
+        elif not line.startswith("{"):
+            piece = line
+        if not piece:
+            continue
+        texts.append(piece)
+        total += len(piece)
+        if total >= max_chars:
+            break
+    return " ".join(texts)[:max_chars]
+
+
 def _data_dir() -> str:
     """Resolve the data dir for the ops ring and the bg log — the single
     resolver for every passive-lane read/write in this body.
@@ -842,6 +909,29 @@ def main() -> int:
                     return 0
             except Exception:
                 pass  # degrade to enabled — the switch itself must not crash
+            # Issue #119: the DELEGATION tool. The delegating prompt is the
+            # ideal recall query for the child and is observable ONLY here
+            # (SubagentStart carries no task text on any probed host). Park
+            # it for the child's SubagentStart and stay SILENT for the
+            # parent — the child's own moment delivers it, and
+            # double-injecting the parent would be noise. Fail-open: a
+            # stash error changes nothing (the child degrades to the
+            # transcript/recent rungs).
+            if isinstance(stdin_obj, dict) and stdin_obj.get("tool_name") == "Agent":
+                _task_text = ""
+                _ti_agent = stdin_obj.get("tool_input")
+                if isinstance(_ti_agent, dict):
+                    _v = _ti_agent.get("prompt") or _ti_agent.get("description") or ""
+                    if isinstance(_v, str):
+                        _task_text = _v
+                if (len(_task_text.strip()) >= 5 and session_id
+                        and _LEDGER_MOD is not None):
+                    try:
+                        _LEDGER_MOD.park_task_text(
+                            _data_dir(), session_id, _task_text)
+                    except Exception:
+                        pass
+                return 0
             tool_desc = ""
             if isinstance(stdin_obj, dict):
                 ti = stdin_obj.get("tool_input")
@@ -859,18 +949,42 @@ def main() -> int:
                 return 0
             query = " ".join(ops_tokens)
         elif mode == "subagent":
-            # SubagentStart (issue #90 / #85 D): prefer the delegated task
-            # text when the host event carries it (prompt/task/description),
-            # so a "fix CI" subagent queries the ratchet lessons instead of
-            # whatever recently landed; fall back to the recent pull when it
-            # does not (the payload historically has no task text).
+            # SubagentStart (issue #90 / #85 D, ladder amended by #119).
+            # Query ladder, each rung fail-opening to the next:
+            #   1. payload task text when the host carries it (no probed
+            #      host does — the synthetic-field tests pin the shape);
+            #   2. the task text stashed by the delegating PreToolUse(Agent)
+            #      call (FIFO; exact agent_id match when a host parks one —
+            #      neither probed host supplies agent_id at park time, so
+            #      this is FIFO in practice);
+            #   3. the parent transcript tail (a FALLBACK, never the
+            #      primary: the delegating assistant message may not be
+            #      flushed when SubagentStart fires, and the format carries
+            #      no compatibility guarantee);
+            #   4. the queryless recency pull.
             task = ""
+            _agent_id = ""
             if isinstance(stdin_obj, dict):
                 for field in ("prompt", "task", "description"):
                     _v = stdin_obj.get(field, "")
                     if isinstance(_v, str) and len(_v.strip()) >= 5:
                         task = _v
                         break
+                _v = stdin_obj.get("agent_id", "")
+                if isinstance(_v, str):
+                    _agent_id = _v
+            if (not task and _LEDGER_MOD is not None and session_id):
+                # Issue #119 rung 2: the stashed delegating task text.
+                try:
+                    _stashed = _LEDGER_MOD.consume_task_text(
+                        _data_dir(), session_id, _agent_id)
+                    if isinstance(_stashed, str) and len(_stashed.strip()) >= 5:
+                        task = _stashed
+                except Exception:
+                    task = ""
+            if not task:
+                # Issue #119 rung 3: the parent transcript tail.
+                task = _transcript_tail()
             if task:
                 query = task[:500]
             else:

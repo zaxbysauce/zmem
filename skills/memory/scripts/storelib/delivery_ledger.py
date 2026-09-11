@@ -60,6 +60,12 @@ TEXT_MAX = 400
 # a generous headroom that still cannot balloon the ops file suffices.
 COMPACT_SUMMARY_MAX = 2000
 
+# Issue #119: bounds for the subagent task-text stash — the delegating
+# prompt/description parked at PreToolUse(Agent) and consumed at the
+# child's SubagentStart.
+TASK_TEXT_MAX = 800
+TASK_TEXT_CAP = 16
+
 
 def _window_s() -> int:
     raw = os.environ.get("ZMEM_DELIVER_WINDOW_S", "")
@@ -116,6 +122,19 @@ def compact_path(data_dir: str, session_id: str) -> Optional[str]:
     SURVIVE the delivery-state clear that follows in the same hook run.
     """
     name = _hashed_name(session_id, ".compact")
+    if not name or not data_dir:
+        return None
+    return os.path.join(data_dir, "ops", name)
+
+
+def tasktext_path(data_dir: str, session_id: str) -> Optional[str]:
+    """Path of the session's subagent task-text stash (issue #119, same
+    hash key). Parked at PreToolUse(Agent), consumed (entry-removed) at the
+    child's SubagentStart. NOT part of ``clear_delivery_state``: a
+    subagent's task text must survive another moment's delivery-state
+    clear; the suppression-window prune and the backup sweep own its
+    lifecycle instead."""
+    name = _hashed_name(session_id, ".tasktext")
     if not name or not data_dir:
         return None
     return os.path.join(data_dir, "ops", name)
@@ -410,6 +429,99 @@ def consume_compact_context(data_dir: str, session_id: str):
     summary, entries = read_compact_context(data_dir, session_id)
     discard_compact_context(data_dir, session_id)
     return (summary, entries)
+
+
+def _load_tasktext(path: Optional[str], now: float) -> List[Dict[str, Any]]:
+    """Load the task-text stash, pruning entries older than the same
+    suppression window the ledger uses (an orphaned delegation — a stash
+    whose child never started — expires with the window, and the backup
+    sweep reaps the file)."""
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        entries = raw.get("entries", []) if isinstance(raw, dict) else []
+        if not isinstance(entries, list):
+            return []
+    except (OSError, ValueError):
+        return []
+    cutoff = now - _window_s()
+    kept = []
+    for e in entries:
+        if isinstance(e, dict) and isinstance(e.get("text"), str):
+            try:
+                if float(e.get("ts", 0) or 0) >= cutoff:
+                    kept.append(e)
+            except (TypeError, ValueError):
+                kept.append(e)
+    return kept
+
+
+def park_task_text(data_dir: str, session_id: str, text: str,
+                   agent_id: str = "", now: Optional[float] = None) -> None:
+    """Issue #119: park a delegating task text at PreToolUse(Agent) for the
+    child's SubagentStart to consume. Append, cap oldest-first, atomic
+    write, fail-open.
+
+    ``agent_id`` is wiring for a future host that supplies it at PARK time:
+    neither Claude Code nor Codex does today (the id is assigned at
+    SubagentStart), so on every probed host consumption is FIFO. Accepted
+    race (plan R6, mirrored on the pre-#117 .pending sidecar): two parallel
+    Agent calls in one session race the read-modify-write; the worst case
+    is one child consuming the sibling's text — degraded relevance, never
+    a crash or store corruption. A file lock would add a failure mode to a
+    fail-open hot path for a rare, non-corrupting race."""
+    path = tasktext_path(data_dir, session_id)
+    if not path or not text or not text.strip():
+        return
+    if now is None:
+        now = time.time()
+    entries = _load_tasktext(path, now)
+    entries.append({
+        "agent_id": str(agent_id or ""),
+        "text": text[:TASK_TEXT_MAX],
+        "ts": now,
+    })
+    if len(entries) > TASK_TEXT_CAP:
+        entries = entries[-TASK_TEXT_CAP:]
+    try:
+        _atomic_write_json(path, {"entries": entries})
+    except OSError:
+        pass
+
+
+def consume_task_text(data_dir: str, session_id: str,
+                      agent_id: str = "") -> str:
+    """Issue #119: the child's SubagentStart takes one task text — an
+    exact ``agent_id`` match wins when a host parks one; otherwise the
+    OLDEST unconsumed entry (host dispatch order: serially-spawned children
+    start in the order they were delegated; out-of-order arrival of truly
+    concurrent children is the documented FIFO limitation). Removes the
+    consumed entry; returns "" when nothing is stashed. Fail-open."""
+    path = tasktext_path(data_dir, session_id)
+    if not path:
+        return ""
+    now = time.time()
+    entries = _load_tasktext(path, now)
+    if not entries:
+        return ""
+    idx = 0
+    if agent_id:
+        for i, e in enumerate(entries):
+            if e.get("agent_id") == agent_id:
+                idx = i
+                break
+    text = str(entries[idx].get("text", ""))
+    del entries[idx]
+    try:
+        if entries:
+            _atomic_write_json(path, {"entries": entries})
+        else:
+            os.unlink(path)
+    except OSError:
+        pass
+    return text
 
 
 def rows_present_in(rows: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
