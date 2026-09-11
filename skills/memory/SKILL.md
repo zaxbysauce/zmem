@@ -381,23 +381,39 @@ with a live tool_name dump before changing the matcher.
 
 Inject surface parity (host facts, not aspirations): Claude Code registers
 SubagentStart (task-text recall when the event carries the delegated
-prompt) and PreCompact. Codex registers SessionStart, UserPromptSubmit,
+prompt), PreCompact, and PostCompact (issue #118, probe 2026-09-10:
+Claude PostCompact carries `compact_summary` and has no injection channel,
+so the entry is a pure stash — `zmem-postcompact.sh` writes the summary to
+the compact sidecar and emits no context). Codex registers SessionStart,
+UserPromptSubmit,
 PreToolUse (matcher `Bash|apply_patch`, probe 2026-09-09, codex-cli
 0.153.0), PostToolUse, Stop, SubagentStart, SubagentStop, and PreCompact —
 upstream drops `additionalContext` on PreCompact (decision control only,
 verified 2026-09-09 from codex-rs source), so zmem's Codex PreCompact
-entry exists for the delivery-ledger clear before compaction;
-post-compaction re-injection rides the registered SessionStart, which
-upstream fires with `source=compact` after every compaction. PostCompact
-stays unregistered pending #118 (upstream Codex PostCompact carries only
-`trigger: manual|auto` — no compact_summary; #118 owns the shared
-compaction handlers). **ZCode supports exactly
+entry exists for the delivery-ledger snapshot+clear before compaction
+(issue #118, 2026-09-10: PreCompact now snapshots the ledger into the
+compact sidecar before clearing it); post-compaction re-injection rides
+the registered SessionStart, which upstream fires with `source=compact`
+after every compaction. PostCompact stays UNREGISTERED on Codex (issue
+#118 decision, 2026-09-10: upstream Codex PostCompact carries only
+`trigger: manual|auto` — no compact_summary, so there is nothing to
+stash). The compact branch itself (issue #118, 2026-09-10, both Claude
+and Codex): SessionStart branches on `source == "compact"` only — the
+launcher exports the payload field as `ZMEM_SESSION_SOURCE`, the hook
+composes a query from the stashed `compact_summary` plus the
+pre-compaction ledger snapshot, and runs the query-aware recall lane
+instead of the cold-start recency pull (decision line
+`moment=session_start_compact`); an empty stash degrades to the
+cold-start lane. Whether the PreCompact fence itself survives a live
+`/compact` is UNPROBED — no claim either way until #96's live canary
+lands (the host-capability rot convention from #103/#104). **ZCode supports exactly
 seven hook events — SessionStart, UserPromptSubmit, PreToolUse,
-PermissionRequest, PostToolUse, PostToolUseFailure, Stop — so SubagentStart
-and PreCompact are host gaps on ZCode** (an unsupported event name would be
+PermissionRequest, PostToolUse, PostToolUseFailure, Stop — so SubagentStart,
+PreCompact, and PostCompact are host gaps on ZCode** (an unsupported event name would be
 dead config under the host's strict schema, so they are documented here
 instead of registered). If ZCode grows either event, wire
-`zmem-subagent-recall.sh` / `zmem-precompact.sh` immediately.
+`zmem-subagent-recall.sh` / `zmem-precompact.sh` / `zmem-postcompact.sh`
+immediately.
 
 #### Decision-point checkpoints (REQUIRED skill contract) — #85 direction E
 

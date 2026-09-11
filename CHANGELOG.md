@@ -10,6 +10,55 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.29.0] - 2026-09-10
+
+> Query-aware re-injection after compaction — the post-compaction
+> SessionStart moment now rebuilds context from the compaction summary and
+> the session's pre-compaction deliveries instead of a cold-start recency
+> pull. Workstream D-2 (#118).
+
+### Added
+- **SessionStart `source == "compact"` branch (issue #118, Claude and
+  Codex)**: the launcher exports the hook payload's `source` field as
+  `ZMEM_SESSION_SOURCE`, and `zmem-session-start.sh` branches on
+  `source == "compact"` only — composing a QUERY from the stashed
+  `compact_summary` plus the pre-compaction delivery-ledger snapshot and
+  running the query-aware recall lane (decision line
+  `moment=session_start_compact`, "Post-compaction memories" fence header)
+  instead of the queryless recency pull. Empty stash, empty query, or a
+  missing session id degrade to exactly the cold-start lane; every other
+  source value (and hosts that send no source) is byte-identical to
+  pre-0.29. No resume handling, per the 2026-09-10 amendment.
+- **PostCompact registration + stash handler (issue #118, Claude only)**:
+  `hooks.claude.json` registers `PostCompact` wired to the new
+  `hooks/zmem-postcompact.sh`, which stashes the payload's
+  `compact_summary` into the compact sidecar and emits no context (the
+  event has no injection channel). Codex stays unregistered by decision:
+  upstream Codex PostCompact carries only `trigger` — no `compact_summary`
+  (verified 2026-09-09 from codex-rs during #95) — so there is nothing to
+  stash there.
+- **PreCompact ledger snapshot (issue #118)**: the shared recall body's
+  precompact mode snapshots the delivery ledger into the compact sidecar
+  BEFORE its #117 clear, so post-compaction recall composes from what the
+  session was actually delivered.
+- **Compact sidecar API (`storelib/delivery_ledger.py`, issue #118)**:
+  `compact_path` / `snapshot_for_compact` / `park_compact_summary` /
+  `consume_compact_context` — hashed, atomic, fail-open, swept like the
+  other ops sidecars (`.compact` joined the backup-sweep suffixes).
+- **Compaction canary lane (issue #118)**: `scripts/host_canary.py
+  --compact-self-test` drives the full `precompact` → `postcompact` →
+  `session-start(source=compact)` sequence through the real launcher and
+  passes only when the query-aware branch re-injects the seeded row
+  (grounded on the `moment=session_start_compact` decision line, never the
+  precompact moment's own line).
+
+### Changed
+- **SKILL.md host-facts paragraph**: records the dated (2026-09-10, owner
+  #118) compact-branch facts, the Claude-only PostCompact decision with
+  the Codex rationale, and leaves the PreCompact fence-survival question
+  explicitly UNPROBED pending #96's live canary (no claim either way).
+- **README canary section** documents `--compact-self-test`.
+
 ## [0.28.0] - 2026-09-09
 
 > Codex parity — the Codex host now fires zmem's pre-tool hazard recall and

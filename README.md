@@ -135,7 +135,12 @@ python scripts/host_canary.py --host claude --self-test
 python scripts/host_canary.py --host codex --self-test   # also: zcode, hermes
 ```
 
-The canary seeds one recognizable row into an **isolated** scratch store (your
+`--compact-self-test` (issue #118) runs the deterministic compaction lane
+instead: it drives the full `precompact` → `postcompact` →
+`session-start(source=compact)` sequence through the launcher and passes
+only when the query-aware post-compaction branch re-injects the seeded row
+(`moment=session_start_compact` in the decision line plus the marker in the
+rendered fence). The canary seeds one recognizable row into an **isolated** scratch store (your
 real store is never touched — ambient `ZMEM_STORE`/`ZMEM_DATA` and the
 plugin-data vars are stripped, so they cannot redirect it), drives the host's
 SessionStart hook chain, and asserts a fresh `zmem-hook status=... reason=...`

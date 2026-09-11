@@ -811,6 +811,19 @@ def main() -> int:
             # PreCompact and subagent-recall: re-inject the
             # high-confidence recent payload. No prompt text.
             use_recent_pull = True
+            if mode == "precompact" and _LEDGER_MOD is not None and session_id:
+                # Issue #118 (D-2 scope 3): snapshot the delivery ledger
+                # into the compact sidecar BEFORE any of this mode's
+                # _clear_delivery_state sites run, so the post-compaction
+                # SessionStart(source=compact) can compose a query-aware
+                # recall from what this session was actually delivered.
+                # Fail-open: a snapshot error changes nothing — the clear
+                # below still runs and the compact moment degrades to the
+                # recency lane.
+                try:
+                    _LEDGER_MOD.snapshot_for_compact(_data_dir(), session_id)
+                except Exception:
+                    pass
         elif mode == "pretool":
             # PreToolUse (issue #90 / #85 C): the query is derived from the
             # TOOL INPUT ITSELF — the command or file path about to run.
@@ -1221,8 +1234,10 @@ def main() -> int:
     if mode == "precompact":
         # Issue #117 (D-1 scope 3): compaction — "already delivered" is
         # false once the context has been summarized away. Clear the
-        # session's ledger (and any fallback pending) AFTER the emit;
-        # D-2 (#118) will add its snapshot before this clear.
+        # session's ledger (and any fallback pending) AFTER the emit; the
+        # pre-compaction snapshot this mode takes at dispatch time (issue
+        # #118, D-2) already holds the entries in the compact sidecar, so
+        # nothing is lost for the post-compaction query.
         _clear_delivery_state(session_id)
     return 0
 

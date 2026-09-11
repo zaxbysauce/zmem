@@ -13,6 +13,14 @@ parked fences. This module is the delivery-state substrate BOTH lanes share:
 - the fallback pending sidecar (env-gated by the caller for older host builds
   that ignore pre-tool additionalContext): the same hashed naming and atomic
   write, but append-with-dedup — N parked fences between prompts all survive.
+- the compaction sidecar (issue #118, Workstream D-2):
+  ``<data>/ops/<sha256(session_id)[:32]>.compact`` — the handoff between the
+  three compaction moments. PreCompact snapshots the ledger into it (then
+  clears the ledger); PostCompact merges the host's ``compact_summary`` into
+  it; the post-compaction SessionStart consumes it exactly once (compose a
+  query-aware recall from summary + the pre-compaction delivered texts) and
+  unlinks it. A second compaction overwrites it via a fresh snapshot, and the
+  backup sweep reaps any stash a dead session left behind.
 
 Atomicity: every write is tmp-file + ``os.replace`` (the correction_queue
 pattern, inlined here — storelib never imports the scripts-layer module).
@@ -47,6 +55,10 @@ CAP_DEFAULT = 256
 # PreToolUse can re-admit a delivered row when the operation about to run
 # token-matches it strongly — without a store round-trip on the hot path.
 TEXT_MAX = 400
+# Issue #118: bound on the stashed compact_summary. The summary is host
+# prose (unbounded upstream); the stash is only ever recall QUERY fuel, so
+# a generous headroom that still cannot balloon the ops file suffices.
+COMPACT_SUMMARY_MAX = 2000
 
 
 def _window_s() -> int:
@@ -90,6 +102,20 @@ def ledger_path(data_dir: str, session_id: str) -> Optional[str]:
 def pending_path(data_dir: str, session_id: str) -> Optional[str]:
     """Path of the session's fallback pending sidecar (same hash key)."""
     name = _hashed_name(session_id, ".pending")
+    if not name or not data_dir:
+        return None
+    return os.path.join(data_dir, "ops", name)
+
+
+def compact_path(data_dir: str, session_id: str) -> Optional[str]:
+    """Path of the session's compaction sidecar (issue #118, same hash key).
+
+    Written by PreCompact (snapshot) and PostCompact (summary merge); read
+    and unlinked once by the post-compaction SessionStart. NOT part of
+    ``clear_delivery_state`` on purpose: at PreCompact the snapshot must
+    SURVIVE the delivery-state clear that follows in the same hook run.
+    """
+    name = _hashed_name(session_id, ".compact")
     if not name or not data_dir:
         return None
     return os.path.join(data_dir, "ops", name)
@@ -279,6 +305,92 @@ def clear_delivery_state(data_dir: str, session_id: str) -> None:
         os.unlink(path)
     except OSError:
         pass
+
+
+def _load_compact(path: Optional[str]) -> Dict[str, Any]:
+    """Read the compaction sidecar, degrading to the empty stash."""
+    if not path:
+        return {"entries": [], "summary": None, "ts": 0}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {"entries": [], "summary": None, "ts": 0}
+    if not isinstance(raw, dict):
+        return {"entries": [], "summary": None, "ts": 0}
+    entries = raw.get("entries", [])
+    if not isinstance(entries, list):
+        entries = []
+    summary = raw.get("summary")
+    if not isinstance(summary, str):
+        summary = None
+    return {"entries": entries, "summary": summary, "ts": raw.get("ts", 0) or 0}
+
+
+def snapshot_for_compact(data_dir: str, session_id: str,
+                         now: Optional[float] = None) -> None:
+    """Issue #118 (D-2 scope 3): PreCompact snapshots the ledger BEFORE the
+    delivery-state clear, so the post-compaction SessionStart can compose a
+    query-aware recall from what this session was actually delivered.
+
+    Overwrites any prior stash unconditionally — a second compaction in the
+    same session supersedes the first one's leftovers (PreCompact strictly
+    precedes PostCompact on every host, so nothing else can be mid-write).
+    Fail-open: a snapshot error changes nothing downstream (the clear still
+    runs; the compact session-start simply finds no stash and degrades to
+    the recency lane).
+    """
+    path = compact_path(data_dir, session_id)
+    if not path:
+        return
+    if now is None:
+        now = time.time()
+    try:
+        entries = _load_entries(ledger_path(data_dir, session_id), now)
+        _atomic_write_json(path, {
+            "entries": entries,
+            "summary": None,
+            "ts": now,
+        })
+    except OSError:
+        pass
+
+
+def park_compact_summary(data_dir: str, session_id: str, summary: str,
+                         now: Optional[float] = None) -> None:
+    """Issue #118 (D-2 scope 2): PostCompact merges the host's
+    ``compact_summary`` into the sidecar (creating it when PreCompact never
+    ran on this host). Read-modify-write is safe: the host fires PostCompact
+    strictly after PreCompact, never concurrently. Fail-open."""
+    path = compact_path(data_dir, session_id)
+    if not path or not summary or not summary.strip():
+        return
+    if now is None:
+        now = time.time()
+    stash = _load_compact(path)
+    stash["summary"] = summary[:COMPACT_SUMMARY_MAX]
+    stash["ts"] = now
+    try:
+        _atomic_write_json(path, stash)
+    except OSError:
+        pass
+
+
+def consume_compact_context(data_dir: str, session_id: str):
+    """Issue #118 (D-2 scope 1): the post-compaction SessionStart reads the
+    stash once — returns ``(summary, entries)`` and unlinks the file, so a
+    later SessionStart cannot re-query a stale compaction. Fail-open:
+    absent/unreadable stash returns the empty shape (the caller degrades to
+    the recency lane)."""
+    path = compact_path(data_dir, session_id)
+    if not path:
+        return (None, [])
+    stash = _load_compact(path)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return (stash.get("summary"), stash.get("entries") or [])
 
 
 def rows_present_in(rows: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:

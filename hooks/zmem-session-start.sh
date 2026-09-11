@@ -199,6 +199,12 @@ HOST="${ZMEM_HOST:-zcode}"
 # cover manual/back-compat invocation). Empty when no host supplied it —
 # the python block logs sid=unknown then.
 SESSION_ID="${ZMEM_SESSION:-${CLAUDE_SESSION_ID:-${ZCODE_SESSION_ID:-}}}"
+# Issue #118 (D-2 scope 1): the launcher exports the SessionStart payload's
+# `source` field verbatim (startup | resume | clear | compact). The only
+# branch is source == "compact" (post-compaction re-injection); every other
+# value — and a host that sends no source at all — takes the cold-start lane
+# unchanged. No resume handling (2026-09-10 amendment).
+SOURCE="${ZMEM_SESSION_SOURCE:-}"
 SETTINGS_DIR_PY="$(join_path "$(to_py_path "$HOME")" .claude)"
 NUDGE_MARKER_PY="$(join_path "$DATA_DIR_PY" .native-nudge-shown)"
 
@@ -383,6 +389,15 @@ try:
     drift_json = sys.argv[13]
 except IndexError:
     drift_json = ""
+# Issue #118: SessionStart source (argv 14, optional — the IndexError
+# tolerance of the argv ladder means an older wrapper/python skew degrades
+# to the cold-start lane instead of crashing the hook).
+try:
+    source = sys.argv[14]
+except IndexError:
+    source = ""
+if not isinstance(source, str):
+    source = ""
 
 # Issue #107 (Workstream A PR 2): the operator-facing drift notice. The bash
 # layer already ran drift.py log-once (marker-guarded, log-only, exit 0) and
@@ -513,6 +528,35 @@ if store_py and os.path.isfile(store_py):
             _ss_dd_known = _ss_dd
         except Exception:
             pass
+        # Issue #118 (D-2 scope 1): SessionStart(source=compact) — the
+        # context was just summarized away. Compose a QUERY-AWARE recall
+        # from the compact sidecar (the stashed compact_summary plus the
+        # pre-compaction ledger snapshot) instead of the cold-start
+        # recency pull. Empty stash, empty query, missing session id, or
+        # a ledger-module import failure degrade to exactly the cold-start
+        # lane below — fail-open, never blocking.
+        _moment = "session_start"
+        _compact_query = ""
+        if source == "compact" and session_id and _ss_ledger is not None:
+            try:
+                _c_summary, _c_entries = _ss_ledger.consume_compact_context(
+                    _ss_dd_known, session_id)
+                _q_parts = []
+                if isinstance(_c_summary, str) and _c_summary.strip():
+                    _q_parts.append(_c_summary[:800])
+                for _ce in (_c_entries or [])[-8:]:
+                    if isinstance(_ce, dict) and isinstance(_ce.get("text"), str):
+                        _t = _ce["text"].strip()
+                        if _t:
+                            _q_parts.append(_t)
+                _compact_query = " ".join(_q_parts).strip()
+            except Exception:
+                _compact_query = ""
+            if len(_compact_query) < 5:
+                # Too short to be a meaningful query — cold-start lane.
+                _compact_query = ""
+            else:
+                _moment = "session_start_compact"
         # The detached session-cadence worker (dispatched above, same store)
         # can hold the database while this read fires: on slow runners a
         # first recent attempt fails transiently (SQLITE_BUSY -> non-zero
@@ -522,8 +566,25 @@ if store_py and os.path.isfile(store_py):
         out = ""
         for _recent_attempt in range(3):
             try:
+                # Issue #118: the compact branch runs the QUERY-AWARE recall
+                # lane (same argv shape the shared body uses for prompts);
+                # the cold-start lane below is byte-identical to pre-#118.
+                if _compact_query:
+                    _ss_argv = [sys.executable, store_py, "recall",
+                                "--query", _compact_query,
+                                "--namespace", ns, "--limit", "5",
+                                "--include-global", "--global-limit", "3",
+                                "--no-bump", "--for-injection", "--json",
+                                *_ss_exclude_argv]
+                else:
+                    _ss_argv = [sys.executable, store_py, "recent",
+                                "--namespace", ns, "--limit", "3",
+                                "--min-confidence", str(_recent_floor),
+                                "--include-global", "--global-limit", "2",
+                                "--no-bump", "--for-injection", "--json",
+                                *_ss_exclude_argv]
                 out = subprocess.check_output(
-                    [sys.executable, store_py, "recent", "--namespace", ns, "--limit", "3", "--min-confidence", str(_recent_floor), "--include-global", "--global-limit", "2", "--no-bump", "--for-injection", "--json", *_ss_exclude_argv],
+                    _ss_argv,
                     # 30s: a cold store.py spawn (full storelib import,
                     # first-touch AV scanning on CI windows runners) can
                     # exceed a tight timeout.
@@ -671,7 +732,7 @@ if store_py and os.path.isfile(store_py):
                             if _env_exc:
                                 _exc_ss = " exc=%d" % _env_exc
                             _lf.write(
-                                "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=session_start\n" % (
+                                "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=%s\n" % (
                                     int(__import__("time").time()),
                                     "injected" if rows else "silent",
                                     (_env_reason or ("injected" if rows else "empty-pool")),
@@ -680,17 +741,27 @@ if store_py and os.path.isfile(store_py):
                                     _tok,
                                     _exc_ss,
                                     _safe_sid,
+                                    _moment,
                                 )
                             )
                 except Exception:
                     pass  # fail-open: audit log never blocks session start
                 if rows:
-                    block = _format_fenced_recall(
-                        rows,
-                        header=(
+                    if _moment == "session_start_compact":
+                        _ss_header = (
+                            f"Post-compaction memories (Tier 2 — namespace {ns}). "
+                            f"Query-aware recall rebuilt from the compaction summary "
+                            f"and the pre-compaction deliveries of this session. "
+                            f"Consider if they apply; ignore if not."
+                        )
+                    else:
+                        _ss_header = (
                             f"Recent memories (Tier 2 — namespace {ns}). "
                             f"High-confidence admin pull. Consider if relevant; ignore if not."
-                        ),
+                        )
+                    block = _format_fenced_recall(
+                        rows,
+                        header=_ss_header,
                     )
                     parts.append(block)
                     # Issue #117 D-1: record the delivered rows so the
@@ -710,7 +781,7 @@ if store_py and os.path.isfile(store_py):
                             if _ss_budget > 0 and _ss_proj > _ss_budget:
                                 _ss_rows = _dl_ss.rows_present_in(rows, block[:max(0, _ss_budget - (sum(len(x) for x in parts)))])
                             if _ss_rows:
-                                _ss_ledger.record(_ss_dd_known, session_id, _ss_rows, "session_start")
+                                _ss_ledger.record(_ss_dd_known, session_id, _ss_rows, _moment)
                         except Exception:
                             pass
             except Exception:
@@ -855,7 +926,7 @@ if ctx:
 if _drift_msg:
     _payload["systemMessage"] = _drift_msg
 print(json.dumps(_payload) if _payload else "{}")
-' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" "$SESSION_ID" "$DRIFT_JSON" 2>/dev/null || echo '{}')"
+' "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" "$SESSION_ID" "$DRIFT_JSON" "$SOURCE" 2>/dev/null || echo '{}')"
 
 # Neutralize any sentinel token a MEMORY'S OWN CONTENT happens to contain
 # before wrapping. The launcher locates the payload by scanning stdout for the
