@@ -887,6 +887,8 @@ console.log("\n[9c] Issue #119: Agent tool_input parks the subagent task text");
 }
 
 console.log("\n[10b] Issue #118: SessionStart source export + postcompact stash");
+console.log("\n[10b] Issue #118: SessionStart source export + postcompact stash");
+
 {
     // Unit: the adapter exports the payload's source field verbatim and
     // postcompact is a pass-through dispatch (no envelope translation,

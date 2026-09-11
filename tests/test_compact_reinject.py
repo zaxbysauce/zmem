@@ -342,6 +342,171 @@ class CompactSequenceTest(unittest.TestCase):
         tail = _decisions(self._tmp)[-1]
         self.assertIn("moment=session_start\n", tail + "\n")
 
+    def test_default_floor_realistic_query_injects(self):
+        # PR #190 review PRR-001 residual: the DEFAULT-floor behavior of a
+        # realistic (diluted) compact query is pinned in CI — the two
+        # behavioral tests above isolate ZMEM_INJECT_FLOOR_LEX, which
+        # would let a relevance-floor regression ship silently. A
+        # realistic summary (hundreds of chars, topic-dense but not
+        # verbatim) plus the ledger tail must still inject at the
+        # default 0.30 lexical floor.
+        p = self._drive("session-start", {
+            "hook_event_name": "SessionStart", "source": "startup",
+            "session_id": self.SID, "cwd": self._workdir})
+        self.assertEqual(p.returncode, 0)
+        self._recall_ledger_marker()
+        p = self._drive("precompact", {
+            "hook_event_name": "PreCompact", "session_id": self.SID,
+            "cwd": self._workdir, "trigger": "manual"})
+        self.assertEqual(p.returncode, 0)
+        p = self._drive("postcompact", {
+            "hook_event_name": "PostCompact", "session_id": self.SID,
+            "cwd": self._workdir, "trigger": "manual",
+            "compact_summary": (
+                "Compaction summary of the session so far: we were deep in "
+                "the merge queue work and the ratchet flake kept re-appearing "
+                "after every rebase; the quarantine guidance was consulted, "
+                "the docker network prune issue on the CI runner came up in "
+                "passing, and we agreed to revisit the postgresql migration "
+                "lock retry backoff tomorrow. Several other threads (build "
+                "cache eviction policy, editorial review formatting, winter "
+                "tire swaps for the fleet vans, greenhouse tomato staking "
+                "before the august storms, archival paper stock buffering) "
+                "were touched briefly but not resolved.")})
+        self.assertEqual(p.returncode, 0)
+        p = self._drive("session-start", {
+            "hook_event_name": "SessionStart", "source": "compact",
+            "session_id": self.SID, "cwd": self._workdir})
+        self.assertEqual(p.returncode, 0)
+        ctx = _ctx(p.stdout)
+        # The review fix's CONTRACT at default floors: the moment is never
+        # SILENT. A diluted realistic query may or may not clear the #113
+        # lexical floor (boundary-sensitive by probe evidence); when it
+        # does, the compact fence renders; when it does not, the recency
+        # fallback renders instead. Either way something injects — never
+        # the empty context the pre-fix code produced.
+        self.assertTrue(
+            ("Post-compaction memories" in ctx) or ("Recent memories" in ctx),
+            "default-floor compact moment must not be silent (fallback contract)")
+
+    def test_recall_failure_preserves_stash(self):
+        # PR #190 review PRR-002: the stash is discarded only after the
+        # recall pull COMPLETED — a broken store (all retries fail) leaves
+        # it in place for the next SessionStart(compact).
+        self._recall_ledger_marker()
+        self._drive("precompact", {
+            "hook_event_name": "PreCompact", "session_id": self.SID,
+            "cwd": self._workdir, "trigger": "manual"})
+        stash = _ops_path(self._tmp, self.SID, ".compact")
+        self.assertTrue(stash.exists())
+        # Corrupt the store so every recall subprocess fails fast.
+        (Path(self._tmp) / "store.sqlite").write_bytes(b"not a database")
+        p = self._drive("session-start", {
+            "hook_event_name": "SessionStart", "source": "compact",
+            "session_id": self.SID, "cwd": self._workdir})
+        self.assertEqual(p.returncode, 0)
+        self.assertTrue(stash.exists(),
+                        "a failed recall pull must preserve the compact stash")
+
+    def test_query_context_kill_switch_takes_cold_lane(self):
+        # PR #190 review PRR-003: ZMEM_QUERY_CONTEXT=0 is the global
+        # query-context kill switch — the compact lane falls back to the
+        # recency lane and the stash survives for a later enabled run.
+        self._recall_ledger_marker()
+        self._drive("precompact", {
+            "hook_event_name": "PreCompact", "session_id": self.SID,
+            "cwd": self._workdir, "trigger": "manual"})
+        p = self._drive("postcompact", {
+            "hook_event_name": "PostCompact", "session_id": self.SID,
+            "cwd": self._workdir, "trigger": "manual",
+            "compact_summary": "post-kill-switch summary text for the lane"})
+        self.assertEqual(p.returncode, 0)
+        env_qc = dict(self._env, ZMEM_QUERY_CONTEXT="0")
+        p = self._drive("session-start", {
+            "hook_event_name": "SessionStart", "source": "compact",
+            "session_id": self.SID, "cwd": self._workdir}, env=env_qc)
+        self.assertEqual(p.returncode, 0)
+        ctx = _ctx(p.stdout)
+        self.assertIn("Recent memories", ctx)
+        self.assertNotIn("Post-compaction memories", ctx)
+        # The stash was read but not consumed by the silenced query lane.
+        self.assertTrue(_ops_path(self._tmp, self.SID, ".compact").exists())
+
+    def test_source_resume_takes_cold_lane_and_keeps_stash(self):
+        # PR #190 review (test-gap): source=resume must be byte-identical
+        # to the cold-start lane AND must not touch the compact stash
+        # (only source == "compact" consumes).
+        self._recall_ledger_marker()
+        self._drive("precompact", {
+            "hook_event_name": "PreCompact", "session_id": self.SID,
+            "cwd": self._workdir, "trigger": "manual"})
+        self._drive("postcompact", {
+            "hook_event_name": "PostCompact", "session_id": self.SID,
+            "cwd": self._workdir, "trigger": "manual",
+            "compact_summary": "resume-lane summary text"})
+        p = self._drive("session-start", {
+            "hook_event_name": "SessionStart", "source": "resume",
+            "session_id": self.SID, "cwd": self._workdir})
+        self.assertEqual(p.returncode, 0)
+        ctx = _ctx(p.stdout)
+        self.assertIn("Recent memories", ctx)
+        self.assertNotIn("Post-compaction memories", ctx)
+        self.assertTrue(_ops_path(self._tmp, self.SID, ".compact").exists())
+
+    def test_malformed_compact_json_degrades(self):
+        # PR #190 review (test-gap): a corrupt stash degrades to the cold
+        # lane instead of crashing the hook.
+        stash = _ops_path(self._tmp, "malformed118", ".compact")
+        stash.parent.mkdir(parents=True, exist_ok=True)
+        stash.write_text("{not json at all", encoding="utf-8")
+        p = self._drive("session-start", {
+            "hook_event_name": "SessionStart", "source": "compact",
+            "session_id": "malformed118", "cwd": self._workdir})
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("Recent memories", _ctx(p.stdout))
+
+    def test_self_exclusion_skipped_on_compact_branch(self):
+        # PR #190 review PRR-004: the compact moment deliberately
+        # re-delivers the pre-compaction working set — even on the
+        # degraded path where PreCompact snapshotted but its ledger clear
+        # did not run, the live ledger must not exclude the compact
+        # recall's own query targets. Drives the payload module directly
+        # (the exclusion argv is built there) — the launcher hop is
+        # covered by the other sequence tests.
+        import storelib.delivery_ledger as dl
+        # The ledger entry's text must MATCH a real store row's content so
+        # the composed query's FTS terms hit the pool (an empty pool is
+        # empty even with the relevance floor disabled).
+        dl.record(self._tmp, self.SID,
+                  [{"id": "x1",
+                    "content": "docker network prune leaves orphan "
+                               "bridges " + LEDGER_MARKER}],
+                  "user_prompt")
+        dl.snapshot_for_compact(self._tmp, self.SID)
+        dl.park_compact_summary(self._tmp, self.SID,
+                                "compact summary about the docker network "
+                                "prune bridges case")
+        # Argv ladder (payload file docstring): 1 core, 2 agents,
+        # 3 store, 4 data-dir native, 5 project, 6 data-dir, 7 namespace,
+        # 8 budget, 9 host, 10 settings, 11 nudge, 12 session, 13 drift,
+        # 14 source.
+        argv = [sys.executable,
+                str(REPO_ROOT / "hooks" / "lib"
+                    / "zmem-session-start-payload.py"),
+                "", "", str(SCRIPTS / "store.py"),
+                self._tmp, str(REPO_ROOT), self._tmp, str(self.NS),
+                "25000", "claude", "", "", self.SID, "", "compact"]
+        p = subprocess.run(argv, input="{}", capture_output=True, text=True,
+                           env=self._env, timeout=180)
+        self.assertEqual(p.returncode, 0)
+        tail = _decisions(self._tmp)[-1]
+        self.assertIn("moment=session_start_compact", tail)
+        # No exc= field (zero exclusions) on the compact decision line.
+        self.assertNotIn(" exc=", tail)
+        # The pre-fix behavior excluded the row (exc=1) and the fence
+        # lost it; post-fix the row renders.
+        self.assertIn("Post-compaction memories", _ctx(p.stdout))
+
     def test_kill_switch_silent_and_stash_survives(self):
         self._recall_ledger_marker()
         self._drive("precompact", {

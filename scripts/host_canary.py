@@ -306,42 +306,22 @@ def self_test(args, env, workdir):
     if not launcher.is_file():
         print("zmem-canary: hook not fired — launcher missing at %s" % launcher, file=sys.stderr)
         return EXIT_HOOK_NOT_FIRED, ""
-    payload = json.dumps(
-        {
-            "hook_event_name": "SessionStart",
+    payload = {
+        "hook_event_name": "SessionStart",
+        "session_id": "zmem-canary-selftest",
+        "cwd": str(workdir),
+        "meta": {
             "session_id": "zmem-canary-selftest",
             "cwd": str(workdir),
-            "meta": {
-                "session_id": "zmem-canary-selftest",
-                "cwd": str(workdir),
-                "hook_event_name": "SessionStart",
-            },
-        }
-    )
-    try:
-        proc = subprocess.run(
-            ["node", str(launcher), "session-start"],
-            input=payload,
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=str(workdir),
-            timeout=180,
-        )
-    except FileNotFoundError as exc:
-        print("zmem-canary: hook not fired — cannot spawn node (%s)" % exc, file=sys.stderr)
+            "hook_event_name": "SessionStart",
+        },
+    }
+    # PR #190 review PRR-009: one shared launcher-drive implementation for
+    # both self-test lanes (the docstring on _drive_launcher is now true).
+    out = _drive_launcher(launcher, env, workdir, "session-start", payload)
+    if out is None:
         return EXIT_HOOK_NOT_FIRED, ""
-    except subprocess.TimeoutExpired:
-        print("zmem-canary: hook not fired — launcher timed out", file=sys.stderr)
-        return EXIT_HOOK_NOT_FIRED, ""
-    if proc.returncode != 0:
-        print(
-            "zmem-canary: hook not fired — launcher exited %d" % proc.returncode,
-            file=sys.stderr,
-        )
-        print((proc.stderr or "")[-800:], file=sys.stderr)
-        return EXIT_HOOK_NOT_FIRED, ""
-    return 0, proc.stdout
+    return 0, out
 
 
 LIVE_SESSIONS = {
@@ -398,23 +378,39 @@ def compact_self_test(args, env, workdir):
         return EXIT_HOOK_NOT_FIRED, ""
     sid = "zmem-canary-compact"
     base = {"session_id": sid, "cwd": str(workdir)}
-    for sub, extra in (
-        ("precompact", {"hook_event_name": "PreCompact", "trigger": "manual"}),
-        ("postcompact", {
-            "hook_event_name": "PostCompact", "trigger": "manual",
-            # The summary carries the seeded row's distinctive tokens
-            # VERBATIM: on a bare interpreter (no embedding model — the CI
-            # shape) the recall lane is lexical-only and the #113 relevance
-            # floor drops a thin summary match (observed: verdict=fail
-            # reason=no-row-id on both CI legs). The exact-token overlap
-            # keeps the fixture deterministic with OR without the model.
-            "compact_summary": (
-                "Compaction summary: the session was verifying that the "
-                "injection canary probe row zmem-canary-probe-row host "
-                "canary marker still reaches the model after a "
-                "compaction."),
-        }),
-    ):
+    # PR #190 review PRR-005: only Claude registers PostCompact — driving
+    # it on the codex lane would validate a summary-backed query that no
+    # real Codex host can produce (upstream carries no compact_summary).
+    # Codex instead validates its REAL composition path: a startup
+    # delivery populates the ledger, PreCompact snapshots it, and the
+    # compact moment composes from the snapshot alone.
+    if args.host == "claude":
+        drives = [
+            ("precompact", {"hook_event_name": "PreCompact",
+                            "trigger": "manual"}),
+            ("postcompact", {
+                "hook_event_name": "PostCompact", "trigger": "manual",
+                # PR #190 review PRR-008: the summary is composed FROM
+                # MARKER (single source of truth with seed_row) — on a
+                # bare interpreter (no embedding model — the CI shape)
+                # the recall lane is lexical-only and the #113 relevance
+                # floor drops a thin summary match. The exact-token
+                # overlap keeps the fixture deterministic with OR without
+                # the model.
+                "compact_summary": (
+                    "Compaction summary: the session was verifying that "
+                    "the injection canary probe row %s host canary marker "
+                    "still reaches the model after a compaction." % MARKER),
+            }),
+        ]
+    else:
+        drives = [
+            ("session-start", {"hook_event_name": "SessionStart",
+                               "source": "startup"}),
+            ("precompact", {"hook_event_name": "PreCompact",
+                            "trigger": "manual"}),
+        ]
+    for sub, extra in drives:
         payload = dict(base)
         payload.update(extra)
         out = _drive_launcher(launcher, env, workdir, sub, payload)

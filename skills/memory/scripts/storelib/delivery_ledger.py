@@ -59,6 +59,7 @@ TEXT_MAX = 400
 # prose (unbounded upstream); the stash is only ever recall QUERY fuel, so
 # a generous headroom that still cannot balloon the ops file suffices.
 COMPACT_SUMMARY_MAX = 2000
+
 # Issue #119: bounds for the subagent task-text stash — the delegating
 # prompt/description parked at PreToolUse(Agent) and consumed at the
 # child's SubagentStart.
@@ -394,21 +395,40 @@ def park_compact_summary(data_dir: str, session_id: str, summary: str,
         pass
 
 
-def consume_compact_context(data_dir: str, session_id: str):
-    """Issue #118 (D-2 scope 1): the post-compaction SessionStart reads the
-    stash once — returns ``(summary, entries)`` and unlinks the file, so a
-    later SessionStart cannot re-query a stale compaction. Fail-open:
-    absent/unreadable stash returns the empty shape (the caller degrades to
-    the recency lane)."""
+def read_compact_context(data_dir: str, session_id: str):
+    """Issue #118: read the compaction stash WITHOUT consuming it — returns
+    ``(summary, entries)`` and leaves the file in place, so the caller can
+    discard it only after the moment actually completed (PR #190 review
+    PRR-002/011: an unlink-before-the-recall-subprocess lost the summary
+    and snapshot permanently whenever all recall retries failed).
+    Fail-open: absent/unreadable stash returns the empty shape."""
     path = compact_path(data_dir, session_id)
     if not path:
         return (None, [])
     stash = _load_compact(path)
+    return (stash.get("summary"), stash.get("entries") or [])
+
+
+def discard_compact_context(data_dir: str, session_id: str) -> None:
+    """Issue #118: drop the compaction stash once its moment completed.
+    Fail-open: a missing file or unlink error changes nothing."""
+    path = compact_path(data_dir, session_id)
+    if not path:
+        return
     try:
         os.unlink(path)
     except OSError:
         pass
-    return (stash.get("summary"), stash.get("entries") or [])
+
+
+def consume_compact_context(data_dir: str, session_id: str):
+    """Read-and-discard convenience (the original #118 consume-once shape):
+    :func:`read_compact_context` followed by
+    :func:`discard_compact_context`. Hooks should prefer the split pair so
+    a failed recall can leave the stash in place."""
+    summary, entries = read_compact_context(data_dir, session_id)
+    discard_compact_context(data_dir, session_id)
+    return (summary, entries)
 
 
 def _load_tasktext(path: Optional[str], now: float) -> List[Dict[str, Any]]:

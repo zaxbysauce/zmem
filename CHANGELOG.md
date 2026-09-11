@@ -86,6 +86,20 @@ README.
   precompact moment's own line).
 
 ### Changed
+- **Review-round hardening (PR #190 swarm review, 2026-09-11)**: the
+  compact lane honors `ZMEM_QUERY_CONTEXT=0`, skips the ledger exclusion
+  argv (the moment re-delivers deliberately), passes a 0.5 confidence
+  floor via the new `recall --min-confidence` flag (parity with the
+  cold-start recency pull), falls back to the recency pull when the
+  query returns zero rows (the moment is never silent), and discards the
+  compact stash only after the pull completes (a failed pull — e.g.
+  SQLITE_BUSY across all retries — preserves it for retry). The codex
+  canary lane validates the real snapshot-only composition (a startup
+  drive populates the ledger; no synthetic PostCompact drive on a host
+  that never registers one), and the session-start payload block moved
+  to `hooks/lib/zmem-session-start-payload.py` after the review found
+  the inline `python -c` string had outgrown the Windows ~32K
+  CreateProcess command-line limit (the hook silently degraded to `{}`).
 - **SKILL.md host-facts paragraph**: records the dated (2026-09-10, owner
   #118) compact-branch facts, the Claude-only PostCompact decision with
   the Codex rationale, and leaves the PreCompact fence-survival question

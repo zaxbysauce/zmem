@@ -85,8 +85,11 @@ class AdapterScanTest(unittest.TestCase):
         )
         for rel in sorted(self.PASSIVE):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            # session-start still inlines; recall AND precompact source the
-            # shared body (the literal --no-bump lives in the body's argv).
+            # recall AND precompact source the shared body (the literal
+            # --no-bump lives in the body's argv). session-start's payload
+            # block lives in hooks/lib/zmem-session-start-payload.py since
+            # PR #190 — the inline python -c form outgrew the Windows ~32K
+            # CreateProcess command-line limit and silently degraded.
             if rel in ("hooks/zmem-recall.sh", "hooks/zmem-precompact.sh"):
                 self.assertIn(
                     "lib/zmem-recall-body.py", text,
@@ -94,6 +97,17 @@ class AdapterScanTest(unittest.TestCase):
                     f"--no-bump (issue #58, 3.5/3.8/3.9)",
                 )
                 combined = text + "\n" + body_text
+            elif rel == "hooks/zmem-session-start.sh":
+                payload = (REPO_ROOT / "hooks" / "lib"
+                           / "zmem-session-start-payload.py")
+                self.assertTrue(
+                    payload.is_file(),
+                    "session-start must keep its payload block in "
+                    "hooks/lib/zmem-session-start-payload.py — inlining "
+                    "it as python -c re-exposes the Windows ~32K "
+                    "command-line silent-degradation defect (PR #190)",
+                )
+                combined = text + "\n" + payload.read_text(encoding="utf-8")
             else:
                 combined = text
             self.assertIn(
