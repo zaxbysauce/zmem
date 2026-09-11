@@ -276,6 +276,9 @@ class TrustBlocksInjectionButNotSearchTest(TrustRecallCliBase):
             "hermes-plugin/hooks/zmem-hermes-reflect.py",
             "hooks/lib/zmem-recall-body.py",
             "hooks/zmem-session-start.sh",
+            # PR #190: session-start's argv builders moved into the payload
+            # companion (Windows ~32K inline-python limit) — scan both.
+            "hooks/lib/zmem-session-start-payload.py",
         ]
         checked = 0
         for rel in builders:

@@ -150,11 +150,13 @@ console.log("\n[1] Codex plugin metadata");
     eq("marketplace: category", marketplace.plugins[0].category, "Productivity");
 
     ok("hooks: PostToolUseFailure is absent on Codex", !hooks.hooks.PostToolUseFailure);
-    // Issue #95: PostCompact stays unregistered until #118 defines the
-    // shared handlers (upstream Codex PostCompact carries only
-    // trigger:manual|auto — no compact_summary — and accepts no
-    // additionalContext, so registering it now would be dead config).
-    ok("hooks: PostCompact is absent on Codex (deferred to #118)",
+    // Issue #118 (settled 2026-09-10): PostCompact stays unregistered on
+    // Codex — upstream Codex PostCompact carries only trigger:manual|auto
+    // (no compact_summary, verified 2026-09-09 from codex-rs during #95),
+    // so there is nothing to stash; Claude Code is the only host whose
+    // PostCompact payload carries compact_summary, and its registration
+    // lives in hooks.claude.json (pinned in tests/test_compact_reinject.py).
+    ok("hooks: PostCompact is absent on Codex (no compact_summary upstream)",
         !hooks.hooks.PostCompact);
     for (const eventName of [
         "SessionStart",

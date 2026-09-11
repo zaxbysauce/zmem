@@ -85,6 +85,40 @@ class CanarySelfTestTest(unittest.TestCase):
                 bg = (d / "zmem-decisions.log").read_text(encoding="utf-8")
                 self.assertIn(m.group(1), bg)
 
+    def test_compact_self_test_passes_and_grounded_on_compact_moment(self):
+        # Issue #118 (AC2): the compaction lane drives precompact ->
+        # postcompact -> session-start(source=compact) through the real
+        # launcher and passes only when the query-aware compact branch
+        # re-injects the seeded row.
+        for host in ("claude", "codex"):
+            with self.subTest(host=host):
+                d = self._data_dir("compact-" + host)
+                proc = run_canary("--host", host, "--compact-self-test",
+                                  "--data-dir", str(d))
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("mode=compact-self-test", proc.stdout)
+                self.assertIn("verdict=pass", proc.stdout)
+                bg = (d / "zmem-decisions.log").read_text(encoding="utf-8")
+                self.assertIn("moment=session_start_compact", bg)
+                # Grounded on the COMPACT moment's line specifically: the
+                # precompact drive also writes a decision line and grounding
+                # on it would green-light a broken re-injection.
+                compact_lines = [l for l in bg.splitlines()
+                                 if "moment=session_start_compact" in l]
+                self.assertTrue(compact_lines, "no compact-moment decision line")
+                m = re.search(r"row_id=([0-9a-f-]{36})", proc.stdout)
+                self.assertIn("ids=['%s']" % m.group(1), compact_lines[-1])
+
+    def test_compact_self_test_still_runs_plain_self_test_lane(self):
+        # The existing --self-test lane must be untouched by the compact
+        # lane's addition (guard against flag cross-wiring).
+        d = self._data_dir("plain")
+        proc = run_canary("--host", "claude", "--self-test", "--data-dir", str(d))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("mode=self-test", proc.stdout)
+        bg = (d / "zmem-decisions.log").read_text(encoding="utf-8")
+        self.assertNotIn("moment=session_start_compact", bg)
+
     def test_decision_line_carries_reason_and_session(self):
         d = self._data_dir("reason")
         proc = run_canary("--host", "claude", "--self-test", "--data-dir", str(d))

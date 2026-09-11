@@ -513,7 +513,9 @@ def cmd_sweep(marker_dir: str | None = None,
         # same max-age policy as the sentinels so finished sessions' files
         # cannot accumulate. Same strict-< mtime rule keeps the live
         # session's files (including an undelivered .pending, which only
-        # survives as long as its session does).
+        # survives as long as its session does). Issue #118: the compaction
+        # stash .compact joins the family (a session that dies between
+        # PostCompact and SessionStart leaves one behind).
         ops_dir = d / "ops"
         if ops_dir.is_dir():
             try:
@@ -521,7 +523,7 @@ def cmd_sweep(marker_dir: str | None = None,
             except OSError:
                 ring_names = []
             for rname in ring_names:
-                if not rname.endswith((".log", ".delivered", ".pending", ".ledger")):
+                if not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact")):
                     continue
                 rp = ops_dir / rname
                 try:

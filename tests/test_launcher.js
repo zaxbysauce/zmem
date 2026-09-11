@@ -55,7 +55,7 @@ function envWith(overrides) {
         "ZMEM_HOST", "ZMEM_ROOT", "ZMEM_DATA", "ZMEM_STORE", "ZMEM_PROJECT", "ZMEM_SESSION",
         "ZMEM_TRANSCRIPT", "ZMEM_AGENT_TRANSCRIPT", "ZMEM_AGENT_TYPE",
         "ZMEM_AGENT_ID", "ZMEM_NAMESPACE", "ZMEM_SKILLS_DIRS",
-        "ZMEM_TIER0", "ZMEM_CTX_BUDGET",
+        "ZMEM_TIER0", "ZMEM_CTX_BUDGET", "ZMEM_SESSION_SOURCE",
         "PLUGIN_ROOT", "PLUGIN_DATA", "CODEX_PROJECT_DIR",
         "CLAUDE_PLUGIN_ROOT", "ZCODE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR",
         "ZCODE_PROJECT_DIR", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
@@ -849,6 +849,59 @@ console.log("\n[10] Phase 7 unit: buildCanonicalEnv exports agent transcript + i
     ok("TRANSLATED_HOOKS includes subagent-reflect", launch.TRANSLATED_HOOKS.has("subagent-reflect"));
     eq("EVENT_MAP subagent-recall → SubagentStart", launch.EVENT_MAP["subagent-recall"], "SubagentStart");
     eq("EVENT_MAP subagent-reflect → SubagentStop", launch.EVENT_MAP["subagent-reflect"], "SubagentStop");
+}
+
+console.log("\n[10b] Issue #118: SessionStart source export + postcompact stash");
+
+{
+    // Unit: the adapter exports the payload's source field verbatim and
+    // postcompact is a pass-through dispatch (no envelope translation,
+    // no namespace resolution).
+    const saved = process.env.CLAUDE_PLUGIN_ROOT;
+    process.env.CLAUDE_PLUGIN_ROOT = REPO;
+    const envCompact = launch.buildCanonicalEnv("claude", {
+        session_id: "u-sess-c", cwd: "C:\\proj", source: "compact",
+    });
+    const envNone = launch.buildCanonicalEnv("claude", {
+        session_id: "u-sess-n", cwd: "C:\\proj",
+    });
+    if (saved === undefined) delete process.env.CLAUDE_PLUGIN_ROOT; else process.env.CLAUDE_PLUGIN_ROOT = saved;
+    eq("buildCanonicalEnv: ZMEM_SESSION_SOURCE from payload source",
+        envCompact.ZMEM_SESSION_SOURCE, "compact");
+    eq("buildCanonicalEnv: ZMEM_SESSION_SOURCE empty when host sends none",
+        envNone.ZMEM_SESSION_SOURCE, "");
+    eq("EVENT_MAP postcompact → PostCompact", launch.EVENT_MAP["postcompact"], "PostCompact");
+    ok("postcompact is pass-through (no envelope translation)",
+        !launch.TRANSLATED_HOOKS.has("postcompact"));
+    ok("postcompact skips namespace resolution",
+        !launch.NEEDS_NAMESPACE.has("postcompact"));
+}
+
+{
+    // End-to-end: the registered postcompact hook stashes compact_summary
+    // into the hashed compact sidecar and emits NO context output.
+    const crypto = require("crypto");
+    const PC_SID = "sess-p3-postcompact";
+    const payload = JSON.stringify({
+        session_id: PC_SID, cwd: PROJ, hook_event_name: "PostCompact",
+        trigger: "manual",
+        compact_summary: "launcher-test summary: the session probed the postcompact stash.",
+    });
+    const r = runLauncher("postcompact", payload, envWith({
+        ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+    }));
+    eq("postcompact: exit code 0", r.status, 0);
+    eq("postcompact: emits no context (bare {})", (r.stdout || "").trim(), "{}");
+    const h = crypto.createHash("sha256").update(PC_SID, "utf8").digest("hex").slice(0, 32);
+    const stashPath = path.join(DATA, "ops", h + ".compact");
+    ok("postcompact: compact sidecar written", fs.existsSync(stashPath));
+    if (fs.existsSync(stashPath)) {
+        const stash = JSON.parse(fs.readFileSync(stashPath, "utf8"));
+        ok("postcompact: sidecar carries the summary",
+            /launcher-test summary/.test(stash.summary || ""));
+        eq("postcompact: sidecar entries empty (no PreCompact in this leg)",
+            Array.isArray(stash.entries) && stash.entries.length, 0);
+    }
 }
 
 console.log("\n[11] Phase 8 PERF: ZMEM_NAMESPACE resolved only for NEEDS_NAMESPACE consumers");

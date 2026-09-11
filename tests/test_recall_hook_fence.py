@@ -126,19 +126,32 @@ class HookScriptNeutralizationTests(unittest.TestCase):
     def test_zmem_session_start_sh_produces_fence(self):
         """Issue #58, 3.5 + final-critic fix: Tier 2 in
         zmem-session-start.sh must produce the fence, not just
-        neutralize it. The script must source the shared fence
-        helper (or inline its equivalent)."""
+        neutralize it. Since PR #190 the payload block lives in
+        hooks/lib/zmem-session-start-payload.py (the inline python -c
+        form outgrew the Windows ~32K command-line limit); the fence
+        production is accepted in EITHER file, and the .sh must
+        reference its payload companion so the pairing cannot
+        silently detach."""
         text = (REPO_ROOT / "hooks" / "zmem-session-start.sh").read_text(
             encoding="utf-8"
+        )
+        payload = (REPO_ROOT / "hooks" / "lib"
+                   / "zmem-session-start-payload.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "zmem-session-start-payload.py", text,
+            "zmem-session-start.sh must invoke its payload companion "
+            "(hooks/lib/zmem-session-start-payload.py)",
         )
         # Either sources the shared body OR inlines the equivalent
         # fenced-render call. We accept both paths because either
         # renders through _format_fenced_recall (the canonical
         # implementation).
         self.assertTrue(
-            "_format_fenced_recall" in text
-            or "zmem-recall-body.py" in text,
-            "zmem-session-start.sh must produce the Tier 2 fence "
+            "_format_fenced_recall" in (text + payload)
+            or "zmem-recall-body.py" in (text + payload),
+            "zmem-session-start must produce the Tier 2 fence "
             "(via _format_fenced_recall or by sourcing the shared "
             "body), not the legacy unfenced bullet shape",
         )

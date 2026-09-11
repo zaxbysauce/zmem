@@ -21,6 +21,17 @@ Two modes:
               (#122); its self-test lane checks the shared hook machinery
               under hermes identity).
 
+--compact-self-test
+              Deterministic compaction lane (issue #118): after seeding,
+              drives the full compaction sequence through the same launcher —
+              ``precompact`` (ledger snapshot + clear) → ``postcompact``
+              (stash compact_summary) → ``session-start`` with
+              source=compact (query-aware re-injection). Passes only when a
+              FRESH decision line carrying ``moment=session_start_compact``
+              grounds the seeded row and the rendered fence carries the
+              marker — the precompact moment's own decision line never
+              satisfies the lane (it is not the moment under test).
+
 live (default)
               Seeds the scratch store, then runs a minimal non-interactive
               session of the real host binary in the scratch workdir. Host
@@ -226,13 +237,14 @@ def seed_row(env, plugin_root, namespace, data_dir):
         return None
 
 
-def fresh_decision_line(bg_log, pre_size):
+def fresh_decision_line(bg_log, pre_size, must_contain=""):
     if not bg_log.exists():
         return None
     raw = bg_log.read_bytes()
     data = raw.decode("utf-8", errors="replace")
     for line in reversed(data.splitlines()):
-        if DECISION_LINE_RE.search(line):
+        if DECISION_LINE_RE.search(line) and (
+                not must_contain or must_contain in line):
             # A fresh line must postdate the pre-drive snapshot; identical old
             # lines (same content) can only appear if the log grew. Compare in
             # BYTES (st_size domain) — len(data) counts characters, and a
@@ -294,42 +306,22 @@ def self_test(args, env, workdir):
     if not launcher.is_file():
         print("zmem-canary: hook not fired — launcher missing at %s" % launcher, file=sys.stderr)
         return EXIT_HOOK_NOT_FIRED, ""
-    payload = json.dumps(
-        {
-            "hook_event_name": "SessionStart",
+    payload = {
+        "hook_event_name": "SessionStart",
+        "session_id": "zmem-canary-selftest",
+        "cwd": str(workdir),
+        "meta": {
             "session_id": "zmem-canary-selftest",
             "cwd": str(workdir),
-            "meta": {
-                "session_id": "zmem-canary-selftest",
-                "cwd": str(workdir),
-                "hook_event_name": "SessionStart",
-            },
-        }
-    )
-    try:
-        proc = subprocess.run(
-            ["node", str(launcher), "session-start"],
-            input=payload,
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=str(workdir),
-            timeout=180,
-        )
-    except FileNotFoundError as exc:
-        print("zmem-canary: hook not fired — cannot spawn node (%s)" % exc, file=sys.stderr)
+            "hook_event_name": "SessionStart",
+        },
+    }
+    # PR #190 review PRR-009: one shared launcher-drive implementation for
+    # both self-test lanes (the docstring on _drive_launcher is now true).
+    out = _drive_launcher(launcher, env, workdir, "session-start", payload)
+    if out is None:
         return EXIT_HOOK_NOT_FIRED, ""
-    except subprocess.TimeoutExpired:
-        print("zmem-canary: hook not fired — launcher timed out", file=sys.stderr)
-        return EXIT_HOOK_NOT_FIRED, ""
-    if proc.returncode != 0:
-        print(
-            "zmem-canary: hook not fired — launcher exited %d" % proc.returncode,
-            file=sys.stderr,
-        )
-        print((proc.stderr or "")[-800:], file=sys.stderr)
-        return EXIT_HOOK_NOT_FIRED, ""
-    return 0, proc.stdout
+    return 0, out
 
 
 LIVE_SESSIONS = {
@@ -342,6 +334,94 @@ LIVE_SESSIONS = {
         None,
     ),
 }
+
+
+def _drive_launcher(launcher, env, workdir, subcommand, payload, timeout=180):
+    """One launcher drive with a fabricated hook payload (shared by the
+    self-test and compact-self-test lanes)."""
+    try:
+        proc = subprocess.run(
+            ["node", str(launcher), subcommand],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(workdir),
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        print("zmem-canary: hook not fired — cannot spawn node (%s)" % exc, file=sys.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        print("zmem-canary: hook not fired — launcher timed out", file=sys.stderr)
+        return None
+    if proc.returncode != 0:
+        print(
+            "zmem-canary: hook not fired — launcher exited %d" % proc.returncode,
+            file=sys.stderr,
+        )
+        print((proc.stderr or "")[-800:], file=sys.stderr)
+        return None
+    return proc.stdout
+
+
+def compact_self_test(args, env, workdir):
+    """Issue #118: the compaction sequence, end to end through the launcher.
+
+    precompact (snapshot + clear) → postcompact (stash compact_summary) →
+    session-start with source=compact (query-aware re-injection). Returns
+    (status, stdout-of-the-final-drive).
+    """
+    launcher = Path(args.plugin_root).resolve() / "hooks" / "zmem-launch.js"
+    if not launcher.is_file():
+        print("zmem-canary: hook not fired — launcher missing at %s" % launcher, file=sys.stderr)
+        return EXIT_HOOK_NOT_FIRED, ""
+    sid = "zmem-canary-compact"
+    base = {"session_id": sid, "cwd": str(workdir)}
+    # PR #190 review PRR-005: only Claude registers PostCompact — driving
+    # it on the codex lane would validate a summary-backed query that no
+    # real Codex host can produce (upstream carries no compact_summary).
+    # Codex instead validates its REAL composition path: a startup
+    # delivery populates the ledger, PreCompact snapshots it, and the
+    # compact moment composes from the snapshot alone.
+    if args.host == "claude":
+        drives = [
+            ("precompact", {"hook_event_name": "PreCompact",
+                            "trigger": "manual"}),
+            ("postcompact", {
+                "hook_event_name": "PostCompact", "trigger": "manual",
+                # PR #190 review PRR-008: the summary is composed FROM
+                # MARKER (single source of truth with seed_row) — on a
+                # bare interpreter (no embedding model — the CI shape)
+                # the recall lane is lexical-only and the #113 relevance
+                # floor drops a thin summary match. The exact-token
+                # overlap keeps the fixture deterministic with OR without
+                # the model.
+                "compact_summary": (
+                    "Compaction summary: the session was verifying that "
+                    "the injection canary probe row %s host canary marker "
+                    "still reaches the model after a compaction." % MARKER),
+            }),
+        ]
+    else:
+        drives = [
+            ("session-start", {"hook_event_name": "SessionStart",
+                               "source": "startup"}),
+            ("precompact", {"hook_event_name": "PreCompact",
+                            "trigger": "manual"}),
+        ]
+    for sub, extra in drives:
+        payload = dict(base)
+        payload.update(extra)
+        out = _drive_launcher(launcher, env, workdir, sub, payload)
+        if out is None:
+            return EXIT_HOOK_NOT_FIRED, ""
+    payload = dict(base)
+    payload.update({"hook_event_name": "SessionStart", "source": "compact"})
+    out = _drive_launcher(launcher, env, workdir, "session-start", payload)
+    if out is None:
+        return EXIT_HOOK_NOT_FIRED, ""
+    return 0, out
 
 
 def _resolve_override(override):
@@ -460,6 +540,13 @@ def main(argv=None):
         help="deterministic mode: drive the hook chain directly, no host binary",
     )
     parser.add_argument(
+        "--compact-self-test",
+        action="store_true",
+        help="deterministic compaction lane (issue #118): precompact -> "
+             "postcompact -> session-start(source=compact) through the "
+             "launcher; requires the query-aware compact branch",
+    )
+    parser.add_argument(
         "--data-dir",
         default=None,
         help="isolation root (default: tmp/zmem-canary-<host>-<pid>-<rand> under the repo)",
@@ -513,7 +600,8 @@ def main(argv=None):
 
     plugin_root = Path(args.plugin_root).resolve()
     env = build_child_env(args.host, plugin_root, data_dir)
-    mode = "self-test" if args.self_test else "live"
+    mode = ("compact-self-test" if args.compact_self_test
+            else "self-test" if args.self_test else "live")
 
     manifest_err = codex_manifest_precheck(args.host, plugin_root)
     if manifest_err:
@@ -523,10 +611,10 @@ def main(argv=None):
                      env["ZMEM_STORE"], None, drift)
         return EXIT_HOOK_NOT_FIRED
 
-    # Self-test drives the launcher ourselves, so a missing launcher (or a
-    # broken plugin tree without skills/memory/scripts/host.py) means the hook
-    # chain cannot run at all — classify before seeding or spawning.
-    if args.self_test:
+    # Self-test modes drive the launcher ourselves, so a missing launcher (or
+    # a broken plugin tree without skills/memory/scripts/host.py) means the
+    # hook chain cannot run at all — classify before seeding or spawning.
+    if args.self_test or args.compact_self_test:
         if not (plugin_root / "hooks" / "zmem-launch.js").is_file():
             drift = run_drift_check(plugin_root)
             print(
@@ -564,7 +652,9 @@ def main(argv=None):
     pre_sizes = {p: (p.stat().st_size if p.exists() else 0)
                  for p in {bg_log, legacy_log}}
     pre_size = pre_sizes[bg_log]
-    if args.self_test:
+    if args.compact_self_test:
+        status, stdout_text = compact_self_test(args, env, workdir)
+    elif args.self_test:
         status, stdout_text = self_test(args, env, workdir)
     else:
         status, stdout_text = live_session(args, env, workdir)
@@ -581,15 +671,24 @@ def main(argv=None):
                      env["ZMEM_STORE"], row_id, drift)
         return status
 
-    line = fresh_decision_line(bg_log, pre_size)
+    # Issue #118: the compact lane must ground on the COMPACT moment's own
+    # decision line — the precompact drive also writes one, and grounding on
+    # it would green-light a canary whose re-injection never fired.
+    line = fresh_decision_line(
+        bg_log, pre_size,
+        must_contain=("moment=session_start_compact"
+                      if args.compact_self_test else ""))
     if line is None and bg_log != legacy_log:
         # Review PRR-009: the candidate selection ran BEFORE the drive, so
         # on a fresh scratch dir it always picked zmem-decisions.log — a
-        # legacy served tree (pre-split writers) appends its decision line
-        # to zmem-bg.log instead. Retry the alternate candidate (with its
-        # own pre-drive size) before declaring hook-not-fired against a
-        # hook that fired correctly.
-        alt_line = fresh_decision_line(legacy_log, pre_sizes[legacy_log])
+        # legacy served tree (old served tree, pre-split writers) appends its
+        # decision line to zmem-bg.log instead. Retry the alternate candidate
+        # (with its own pre-drive size) before declaring hook-not-fired
+        # against a hook that fired correctly.
+        alt_line = fresh_decision_line(
+            legacy_log, pre_sizes[legacy_log],
+            must_contain=("moment=session_start_compact"
+                          if args.compact_self_test else ""))
         if alt_line is not None:
             line = alt_line
     if line is None:
@@ -612,7 +711,8 @@ def main(argv=None):
         )
         verdict_line(args.host, mode, "fail", "no-row-id", env["ZMEM_STORE"], row_id, drift)
         return EXIT_NO_ROW_ID
-    if args.self_test and MARKER not in envelope_additional_context(stdout_text):
+    if ((args.self_test or args.compact_self_test)
+            and MARKER not in envelope_additional_context(stdout_text)):
         print(
             "zmem-canary: fired but empty — marker missing from the rendered fence",
             file=sys.stderr,

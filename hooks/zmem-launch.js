@@ -112,6 +112,11 @@ const EVENT_MAP = {
     "convention-capture": "PostToolUse",
     "capture-correction": "UserPromptSubmit",
     "precompact": "PreCompact",
+    // Issue #118 (D-2 scope 2): Claude-only stash hook — no envelope, no
+    // namespace, so it is deliberately absent from TRANSLATED_HOOKS and
+    // NEEDS_NAMESPACE (pass-through: the wrapper's `{}` + exit 0 go to the
+    // host verbatim).
+    "postcompact": "PostCompact",
 };
 
 // --- Detect host ------------------------------------------------------------
@@ -311,6 +316,13 @@ function buildCanonicalEnv(host, meta, hookName) {
     // share one session_id, so lesson-dedup can be per-subagent, not per-session.
     const agentTranscript = (meta && meta.agent_transcript_path) || "";
     const agentId = (meta && meta.agent_id) || "";
+    // Issue #118 (D-2 scope 1): SessionStart fires on every source
+    // (startup | resume | clear | compact on Claude Code; source=compact on
+    // Codex after each compaction). The adapter stays dumb — it exports the
+    // field verbatim and the session-start shell hook owns the one branch
+    // (source == "compact" → query-aware re-injection from the compact
+    // sidecar). Empty on hosts that send no source field (cold-start shape).
+    const sessionSource = (meta && meta.source) || "";
 
     // ZMEM_DATA precedence:
     //   1. explicit ZMEM_DATA env (an operator override always wins)
@@ -364,6 +376,7 @@ function buildCanonicalEnv(host, meta, hookName) {
     env.ZMEM_AGENT_TRANSCRIPT = agentTranscript;
     env.ZMEM_AGENT_TYPE = agentType;
     env.ZMEM_AGENT_ID = agentId;
+    env.ZMEM_SESSION_SOURCE = sessionSource;
     // PERF (Phase 8): only resolve the namespace (python + git subprocess,
     // ~100ms cold-start) for hooks that actually consume ZMEM_NAMESPACE. An
     // unrecognized/omitted hookName resolves anyway (fail safe toward
