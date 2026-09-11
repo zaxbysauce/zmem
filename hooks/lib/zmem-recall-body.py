@@ -622,8 +622,19 @@ def _transcript_tail(max_lines: int = 8, max_chars: int = 500) -> str:
     if not path:
         return ""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        # Bounded tail read (PR #191 review): transcripts are append-only
+        # JSONL and can be very large — read the last ~64KB from the end
+        # instead of the whole file, then split to the last max_lines
+        # complete lines (the first fragment after the seek offset is
+        # likely partial and is dropped).
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            raw = f.read().decode("utf-8", errors="replace")
+        lines = raw.splitlines()
+        if size > 65536 and lines:
+            lines = lines[1:]  # drop the possibly-partial first line
     except OSError:
         return ""
     texts: list = []
@@ -642,7 +653,10 @@ def _transcript_tail(max_lines: int = 8, max_chars: int = 500) -> str:
             # ({"type": ..., "message": {"content": [...]}}); accept both
             # the flat and the nested shape, plus string or block-list
             # content — the format has no compat guarantee, so every
-            # miss just yields no piece for that line.
+            # miss just yields no piece for that line. PR #191 review:
+            # assistant tool_use blocks carry the delegation in
+            # input.prompt / input.description — extract those too, or
+            # this rung can never see an Agent delegation.
             candidates = [obj]
             msg = obj.get("message")
             if isinstance(msg, dict):
@@ -663,6 +677,27 @@ def _transcript_tail(max_lines: int = 8, max_chars: int = 500) -> str:
                             break
                 if piece:
                     break
+                # tool_use shape (PR #192 review, cubic P2): the Agent
+                # delegation lives in a content ITEM's input —
+                # {"message": {"content": [{"type": "tool_use",
+                # "input": {"prompt": ...}}]}} — so gather inputs from
+                # the cand itself AND its content items.
+                inputs = []
+                inp = cand.get("input")
+                if isinstance(inp, dict):
+                    inputs.append(inp)
+                content_items = cand.get("content")
+                if isinstance(content_items, list):
+                    inputs.extend(
+                        p_item.get("input") for p_item in content_items
+                        if isinstance(p_item, dict)
+                        and isinstance(p_item.get("input"), dict))
+                for inp_d in inputs:
+                    iv = (inp_d.get("prompt")
+                          or inp_d.get("description") or "")
+                    if isinstance(iv, str) and iv.strip():
+                        piece = iv.strip()
+                        break
         elif not line.startswith("{"):
             piece = line
         if not piece:
@@ -917,16 +952,47 @@ def main() -> int:
             # double-injecting the parent would be noise. Fail-open: a
             # stash error changes nothing (the child degrades to the
             # transcript/recent rungs).
-            if isinstance(stdin_obj, dict) and stdin_obj.get("tool_name") == "Agent":
+            if isinstance(stdin_obj, dict) and stdin_obj.get("tool_name") in (
+                    "Agent", "Task"):
+                # "Task" is the pre-rename delegation tool name (community
+                # issue 29677, closed stale — not vendor-confirmed); both
+                # names are accepted so older hosts are not silently dead.
                 _task_text = ""
                 _ti_agent = stdin_obj.get("tool_input")
                 if isinstance(_ti_agent, dict):
-                    _v = _ti_agent.get("prompt") or _ti_agent.get("description") or ""
-                    if isinstance(_v, str):
-                        _task_text = _v
+                    # PR #191 review F-003: per-field type+length checks (the
+                    # bare or-chain let a whitespace-only or non-string
+                    # prompt mask a valid description).
+                    for _field in ("prompt", "description"):
+                        _v = _ti_agent.get(_field)
+                        if isinstance(_v, str) and len(_v.strip()) >= 5:
+                            _task_text = _v
+                            break
                 if (len(_task_text.strip()) >= 5 and session_id
                         and _LEDGER_MOD is not None):
                     try:
+                        # PR #191 review F-001: the parked prompt persists
+                        # verbatim in the sidecar — apply the same advisory
+                        # secret-pattern redaction the capture paths use,
+                        # PR #192 review (cubic/Copilot, both confirmed by
+                        # an executed probe): the bare
+                        # `import correction_queue` here NEVER resolved —
+                        # sys.path[0] is hooks/lib and the scripts dir is
+                        # two levels away, so the ImportError was silently
+                        # swallowed and the prompt parked verbatim. Insert
+                        # dirname(store_py) first, exactly like every
+                        # other dynamic load in this body. Advisory only:
+                        # prose credentials/PII are not pattern-matchable.
+                        try:
+                            _cq_dir = os.path.dirname(os.path.abspath(
+                                store_py))
+                            if _cq_dir not in sys.path:
+                                sys.path.insert(0, _cq_dir)
+                            import correction_queue as _cq_tt
+                            _task_text, _ = _cq_tt.redact_secret_like_text(
+                                _task_text)
+                        except Exception:
+                            pass  # fail-open: redaction must never block
                         _LEDGER_MOD.park_task_text(
                             _data_dir(), session_id, _task_text)
                     except Exception:

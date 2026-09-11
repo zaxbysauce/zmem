@@ -423,7 +423,7 @@ class RegistrationAndContractTest(unittest.TestCase):
         for name, matcher in (
             ("hooks.zcode.json", "Edit|Write|MultiEdit|NotebookEdit|Bash"),
             ("hooks.claude.json",
-             "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent"),
+             "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task"),
         ):
             cfg = json.loads(
                 (REPO_ROOT / "hooks" / name).read_text(encoding="utf-8"))

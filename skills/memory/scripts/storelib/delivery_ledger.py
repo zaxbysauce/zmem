@@ -169,11 +169,22 @@ def _atomic_write_json(path: str, obj: Any) -> None:
     if d:
         os.makedirs(d, exist_ok=True)
     tmp = path + ".tmp." + uuid.uuid4().hex
-    with open(tmp, "w", encoding="utf-8") as f:
+    # PR #192 review (cubic P2): create the tmp at 0600 AT OPEN — a
+    # plain open("w") plus a post-write chmod left the fully-written
+    # content group/other-readable in between (and plain chmod on
+    # Windows only toggles the readonly attribute, it does not restrict
+    # access; the ops dir lives under the operator profile, accepted
+    # residual on Windows).
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(obj, f)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def _load_entries(path: Optional[str], now: float) -> List[Dict[str, Any]]:
@@ -467,11 +478,16 @@ def park_task_text(data_dir: str, session_id: str, text: str,
     ``agent_id`` is wiring for a future host that supplies it at PARK time:
     neither Claude Code nor Codex does today (the id is assigned at
     SubagentStart), so on every probed host consumption is FIFO. Accepted
-    race (plan R6, mirrored on the pre-#117 .pending sidecar): two parallel
-    Agent calls in one session race the read-modify-write; the worst case
-    is one child consuming the sibling's text — degraded relevance, never
-    a crash or store corruption. A file lock would add a failure mode to a
-    fail-open hot path for a rare, non-corrupting race."""
+    race (PR #191 review F-002, mirrored on the pre-#117 .pending
+    sidecar): two parallel Agent calls in one session race the
+    read-modify-write. Empirically the loser is DROPPED OUTRIGHT (not
+    swapped, as an earlier revision of this docstring claimed) — the next
+    child finds no entry and falls through to the transcript-tail rung.
+    Degraded relevance, never a crash or store corruption; a file lock
+    would add a failure mode to a fail-open hot path for a rare,
+    non-corrupting race. A cancelled delegation also leaves its entry at
+    the FIFO head until the window prune — the next child may consume
+    stale text (accepted, bounded by the 6h window / 16-entry cap)."""
     path = tasktext_path(data_dir, session_id)
     if not path or not text or not text.strip():
         return

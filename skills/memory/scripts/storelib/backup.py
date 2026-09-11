@@ -515,7 +515,10 @@ def cmd_sweep(marker_dir: str | None = None,
         # session's files (including an undelivered .pending, which only
         # survives as long as its session does). Issue #118: the compaction
         # stash .compact joins the family (a session that dies between
-        # PostCompact and SessionStart leaves one behind).
+        # PostCompact and SessionStart leaves one behind). Issue #119: the
+        # subagent task-text stash .tasktext joins the same family (a
+        # delegation whose child never started is reaped on the same
+        # max-age policy).
         ops_dir = d / "ops"
         if ops_dir.is_dir():
             try:

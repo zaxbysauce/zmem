@@ -272,6 +272,45 @@ class TaskTextSequenceTest(unittest.TestCase):
         self.assertIn(MARKER_A, ctx_a)
         self.assertIn(MARKER_B, ctx_b)
 
+    def test_redaction_runs_and_agent_park_silent(self):
+        # PR #192 review: the F-001 redaction must actually RUN in the
+        # production shape (the bare import was a silent no-op — cubic
+        # P2/Copilot) and the parent stays silent.
+        env = dict(self._env, **_FLOOR)
+        p = self._drive("pretool-recall", {
+            "hook_event_name": "PreToolUse", "tool_name": "Agent",
+            "tool_input": {"description": "delegated lane",
+                           "prompt": "fix the AKIAIOSFODNN7EXAMPLE leak"},
+            "session_id": self.SID, "cwd": self._workdir}, env=env)
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(_ctx(p.stdout), "")
+        stash = _ops_path(self._tmp, self.SID, ".tasktext")
+        self.assertTrue(stash.exists())
+        content = stash.read_text(encoding="utf-8")
+        self.assertIn("[REDACTED_SECRET]", content)
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", content)
+
+    def test_transcript_tail_reads_tool_use_input(self):
+        # PR #192 review (cubic P2): tool_use content items carry the
+        # delegation in input.prompt — the tail rung must extract them.
+        transcript = Path(self._tmp) / "parent-tu.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Agent",
+                 "input": {"prompt": "fix the failing merge-queue ratchet "
+                                     "flake quarantine lane about "
+                                     + MARKER_A}}]}}) + chr(10),
+            encoding="utf-8")
+        env = dict(self._env, **_FLOOR)
+        p = self._drive("subagent-recall", {
+            "hook_event_name": "SubagentStart", "session_id": self.SID,
+            "agent_id": "agent-tu", "agent_type": "general-purpose",
+            "cwd": self._workdir, "transcript_path": str(transcript)},
+            env=env)
+        self.assertEqual(p.returncode, 0)
+        ctx = _ctx(p.stdout)
+        self.assertIn(MARKER_A, ctx)
+
     def test_transcript_tail_fallback_rung(self):
         # No stash; the parent transcript tail (exported by the launcher
         # from transcript_path) drives the query.
@@ -319,8 +358,10 @@ class RegistrationNeedleTest(unittest.TestCase):
     def test_claude_matcher_includes_agent(self):
         hooks = json.loads(
             (REPO_ROOT / "hooks" / "hooks.claude.json").read_text("utf-8"))
+        # 0.31.0: "Task" accepted as the pre-rename delegation tool name
+        # (community issue 29677, closed stale — not vendor-confirmed).
         self.assertEqual(hooks["hooks"]["PreToolUse"][0]["matcher"],
-                         "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent")
+                         "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task")
 
     def test_zcode_matcher_excludes_agent(self):
         hooks = json.loads(
@@ -337,19 +378,29 @@ class RegistrationNeedleTest(unittest.TestCase):
     def test_skill_carries_dated_tasktext_entry(self):
         import re
         text = (REPO_ROOT / "skills" / "memory" / "SKILL.md").read_text("utf-8")
-        self.assertIsNotNone(
-            re.search(r"2026-09-10.*?#119.*?Agent", text, re.DOTALL),
-            "SKILL.md must carry the dated #119 task-text/Agent entry")
+        # F-005 fix: pin the citation PARAGRAPH-scoped (split on blank
+        # lines), not file-wide DOTALL — a file-wide lazy regex was proven
+        # vacuous by mutation (an unrelated Agent token in a different
+        # paragraph satisfied it).
+        para = next((blk for blk in text.split(chr(10) + chr(10))
+                     if "#119" in blk and "Agent" in blk
+                     and "2026-09-10" in blk), "")
+        self.assertTrue(para, "dated #119 task-text/Agent paragraph missing")
+        self.assertIn("Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task", para,
+                      "the #119 paragraph must carry the full matcher")
         self.assertIn("UNVERIFIED by #119", text,
                       "SKILL.md must mark the Codex delegation surface "
                       "unverified by #119")
         self.assertIn("#96", text,
                       "SKILL.md must name #96 as the live-probe owner")
 
+
     def test_body_carries_ladder_and_stash(self):
         text = (REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py") \
             .read_text("utf-8")
-        self.assertIn('stdin_obj.get("tool_name") == "Agent"', text)
+        self.assertIn('in (', text)
+        self.assertIn('"Agent", "Task")', text)
+        self.assertIn("redact_secret_like_text", text)
         self.assertIn("consume_task_text", text)
         self.assertIn("_transcript_tail", text)
 

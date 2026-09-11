@@ -330,7 +330,9 @@ On hosts whose pre-tool contract was probed and confirmed (ZCode: documented;
 Claude: emitted — issue #117 retired the sidecar default in favor of the
 per-session delivery ledger), a
 PreToolUse hook (`zmem-pretool-recall.sh`, matcher
-`Edit|Write|MultiEdit|NotebookEdit|Bash`) derives the recall query from the
+`Edit|Write|MultiEdit|NotebookEdit|Bash|Agent` since 0.30.0 — issue #119;
+the Agent branch parks the delegating task text rather than injecting)
+derives the recall query from the
 tool input ITSELF — the command or file path about to run — and injects
 matching hazard lessons before the tool executes. Pre-tool
 `additionalContext` is documented on Claude Code (since 2.1.9 it lands
@@ -383,7 +385,11 @@ Inject surface parity (host facts, not aspirations): Claude Code registers
 SubagentStart (task-text recall — issue #119, probe 2026-09-10: neither
 host's SubagentStart payload carries task text, so the query ladder is
 payload-field-if-present → the task text stashed by the delegating
-PreToolUse(`Agent`) call (Claude matcher `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent`,
+PreToolUse(`Agent`) call (Claude matcher
+`Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task` since 0.31.0 — issue
+#119; `Task` accepted as the pre-rename delegation tool name per community
+issue 29677, closed stale — not vendor-confirmed; hosts that never emit it
+are unaffected),
 issue #119 — the delegating `tool_input.prompt` is the only observable
 carrying it; consumption is FIFO because no probed host supplies agent_id
 at park time) → the parent transcript tail (a FALLBACK, never the primary)
@@ -415,9 +421,6 @@ composes a query from the stashed `compact_summary` plus the
 pre-compaction ledger snapshot, and runs the query-aware recall lane
 instead of the cold-start recency pull (decision line
 `moment=session_start_compact`); an empty stash degrades to the
-<<<<<<< HEAD
-cold-start lane. Whether the PreCompact fence itself survives a live
-=======
 cold-start lane. PR #190 review (2026-09-11): the compact lane honors the
 global `ZMEM_QUERY_CONTEXT=0` kill switch (falls back to the recency
 lane), skips the ledger exclusion argv (the moment deliberately
@@ -429,20 +432,15 @@ failed pull preserves it for retry). The payload block lives in
 `hooks/lib/zmem-session-start-payload.py` — NEVER inline it back as
 `python -c`: the string outgrew the Windows ~32K CreateProcess
 command-line limit and silently degraded the hook to `{}`. Whether the PreCompact fence itself survives a live
->>>>>>> origin/main
 `/compact` is UNPROBED — no claim either way until #96's live canary
 lands (the host-capability rot convention from #103/#104). **ZCode supports exactly
 seven hook events — SessionStart, UserPromptSubmit, PreToolUse,
 PermissionRequest, PostToolUse, PostToolUseFailure, Stop — so SubagentStart,
 PreCompact, and PostCompact are host gaps on ZCode** (an unsupported event name would be
 dead config under the host's strict schema, so they are documented here
-<<<<<<< HEAD
 instead of registered; likewise ZCode's PreToolUse matcher deliberately
 omits `Agent` — with no SubagentStart event, a parked task text would
 have no consumer). If ZCode grows either event, wire
-=======
-instead of registered). If ZCode grows either event, wire
->>>>>>> origin/main
 `zmem-subagent-recall.sh` / `zmem-precompact.sh` / `zmem-postcompact.sh`
 immediately.
 
