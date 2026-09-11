@@ -10,6 +10,42 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.31.0] - 2026-09-11
+
+> PR #191 review round — fixes for the confirmed findings from the
+> swarm review of the subagent task-text feature (#119). No behavior
+> contracts change; hardening + host-coverage + doc accuracy.
+
+### Fixed
+- **Merge-conflict markers removed from `SKILL.md`** (PR #191 review
+  C-001): the merged 0.30.0 tree shipped two unresolved conflict blocks
+  in the Inject-surface paragraph; both resolved (content unioned).
+- **Delegating prompts are pattern-redacted before parking** (PR #191
+  review F-001): the Agent branch applies
+  `correction_queue.redact_secret_like_text` at the call site before the
+  text lands in the `.tasktext` sidecar — advisory (token-shaped secrets
+  only; prose credentials/PII are not pattern-matchable), fail-open.
+- **`Task` accepted as the pre-rename delegation tool name** (F-004):
+  matcher becomes `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task`
+  and the pretool branch uses a membership test, so older Claude Code
+  hosts that still emit `Task` are not silently dead. Community issue
+  29677 (closed stale — not vendor-confirmed).
+- **Whitespace/non-string prompt no longer masks a valid description**
+  (F-003): per-field type+length checks, matching the sibling
+  SubagentStart ladder.
+- **Transcript-tail rung extracts tool_use blocks** (cubic): assistant
+  `tool_use` blocks carry the delegation in `input.prompt`/`description`
+  — both now feed the fallback query; the tail read is also bounded to
+  the last ~64KB instead of reading the whole transcript.
+- **Ops sidecar writes are owner-only** (0600, tmp + final) across the
+  ledger/pending/compact/tasktext family.
+- **Doc accuracy**: backup sweep comment enumerates `.tasktext`; SKILL
+  matcher prose carries version-range language; README notes the
+  task-text recall host coverage; the vacuous SKILL-regex test is now
+  paragraph-scoped; the park_task_text race docstring states the
+  empirically-proven drop-not-swap outcome and the cancelled-delegation
+  FIFO-head caveat.
+
 ## [0.30.0] - 2026-09-10
 
 > Subagent task-text recall — a delegated child now starts with the memory

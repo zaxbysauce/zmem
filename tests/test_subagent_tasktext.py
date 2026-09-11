@@ -319,8 +319,10 @@ class RegistrationNeedleTest(unittest.TestCase):
     def test_claude_matcher_includes_agent(self):
         hooks = json.loads(
             (REPO_ROOT / "hooks" / "hooks.claude.json").read_text("utf-8"))
+        # 0.31.0: "Task" accepted as the pre-rename delegation tool name
+        # (community issue 29677, closed stale — not vendor-confirmed).
         self.assertEqual(hooks["hooks"]["PreToolUse"][0]["matcher"],
-                         "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent")
+                         "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task")
 
     def test_zcode_matcher_excludes_agent(self):
         hooks = json.loads(
@@ -337,9 +339,21 @@ class RegistrationNeedleTest(unittest.TestCase):
     def test_skill_carries_dated_tasktext_entry(self):
         import re
         text = (REPO_ROOT / "skills" / "memory" / "SKILL.md").read_text("utf-8")
-        self.assertIsNotNone(
-            re.search(r"2026-09-10.*?#119.*?Agent", text, re.DOTALL),
-            "SKILL.md must carry the dated #119 task-text/Agent entry")
+        # F-005 fix: pin the citation PARAGRAPH-scoped (split on blank
+        # lines), not file-wide DOTALL — a file-wide lazy regex was proven
+        # vacuous by mutation (an unrelated Agent token in a different
+        # paragraph satisfied it).
+        para = next((blk for blk in text.split(chr(10) + chr(10))
+                     if "#119" in blk and "Agent" in blk
+                     and "2026-09-10" in blk), "")
+        self.assertTrue(para, "dated #119 task-text/Agent paragraph missing")
+        self.assertIn("Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task", para,
+                      "the #119 paragraph must carry the full matcher")
+        self.assertIn("UNVERIFIED by #119", text,
+                      "SKILL.md must mark the Codex delegation surface "
+                      "unverified by #119")
+        self.assertIn("#96", text,
+                      "SKILL.md must name #96 as the live-probe owner")
         self.assertIn("UNVERIFIED by #119", text,
                       "SKILL.md must mark the Codex delegation surface "
                       "unverified by #119")
@@ -349,7 +363,9 @@ class RegistrationNeedleTest(unittest.TestCase):
     def test_body_carries_ladder_and_stash(self):
         text = (REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py") \
             .read_text("utf-8")
-        self.assertIn('stdin_obj.get("tool_name") == "Agent"', text)
+        self.assertIn('in (', text)
+        self.assertIn('"Agent", "Task")', text)
+        self.assertIn("redact_secret_like_text", text)
         self.assertIn("consume_task_text", text)
         self.assertIn("_transcript_tail", text)
 
