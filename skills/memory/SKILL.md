@@ -227,6 +227,9 @@ Hermes `_tool_search` — byte-identical; MCP `recall` unfolds for free).
 | `ZMEM_UNFOLD_TOP_K` | `3` | max presented hits to walk backward from (clamped 1-10) |
 | `ZMEM_UNFOLD_MAX_HOPS` | `3` | max `update_of` hops per chain (clamped 1-10) |
 | `ZMEM_UNFOLD_BUDGET` | `4` | hard cap on total `[PREVIOUSLY]` extras per recall (clamped 1-20) |
+| `ZMEM_FAILURES_DB_TIMEOUT_S` | `1.0` | Stop-hook db reader busy-wait budget in seconds (clamped 0.1-5.0; invalid → default; `failures --db-timeout` overrides) |
+| `ZMEM_ZCODE_DB` | `~/.zcode/cli/db/db.sqlite` | ZCode episodic db the Stop-hook detector reads (empty/unset = default) |
+| `ZMEM_REFLECT` | enabled | set to exactly `0` to disable the Stop hook entirely |
 
 #### Confidence floors (issue #58, 3.8)
 

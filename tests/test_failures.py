@@ -369,6 +369,11 @@ class TestDbSubstrate(unittest.TestCase):
         with mock.patch.dict(os.environ, {"ZMEM_FAILURES_DB_TIMEOUT_S": "0.5"}):
             self.assertEqual(store._failures_db_timeout(2.5), 2.5)   # explicit wins
             self.assertEqual(store._failures_db_timeout(9.0), 5.0)   # explicit clamped
+            # Non-finite explicit values fall back to the default (PRR-001):
+            # NaN would otherwise propagate through min/max to sqlite3.
+            self.assertEqual(store._failures_db_timeout(float("nan")), 1.0)
+            self.assertEqual(store._failures_db_timeout(float("inf")), 1.0)
+            self.assertEqual(store._failures_db_timeout(float("-inf")), 1.0)
 
     def test_source_never_opens_zcode_db_writable(self):
         # #194 guardrail: the db reader must stay read-only at the source level.

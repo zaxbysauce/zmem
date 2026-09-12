@@ -29,6 +29,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -77,8 +78,13 @@ def _run_hook(hook, env_extra, stdin="{}"):
 def _run_hook_rc(hook, env_extra, stdin="{}"):
     """Like _run_hook but returns (returncode, stdout) so tests can assert the
     hook's exit code itself (#194: the kill switch and lock fail-open paths
-    must exit 0, not merely print an empty envelope)."""
+    must exit 0, not merely print an empty envelope). Strips the hook-sensitive
+    ZMEM_* vars from the ambient environment first (PRR-005): an operator's
+    exported ZMEM_REFLECT=0 or ZMEM_ZCODE_DB must not flip test outcomes."""
     env = dict(os.environ)
+    for key in ("ZMEM_REFLECT", "ZMEM_ZCODE_DB", "ZMEM_TRANSCRIPT",
+                "ZMEM_FAILURES_DB_TIMEOUT_S"):
+        env.pop(key, None)
     env.update(env_extra)
     proc = subprocess.run(
         [_BASH, str(hook)], input=stdin, text=True,
@@ -198,6 +204,10 @@ class TestReflectHookMessaging(unittest.TestCase):
     @staticmethod
     def _make_zcode_db(path):
         conn = sqlite3.connect(path)
+        # Pin rollback-journal mode: the BEGIN EXCLUSIVE lock below only blocks
+        # readers on a delete-journal db (a WAL db would let the reader proceed
+        # instantly and the timing assertion would be meaningless).
+        conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("""CREATE TABLE tool_usage(
             session_id TEXT, tool_name TEXT, read_only INT, status TEXT,
             exit_code INT, error_message TEXT, error_type TEXT,
@@ -212,6 +222,17 @@ class TestReflectHookMessaging(unittest.TestCase):
     def test_locked_zcode_db_fails_open(self):
         # #194: a busy ZCode db (BEGIN EXCLUSIVE holder) must fail open inside
         # the bounded budget — hook exits 0 and never claims failed tool calls.
+        # Substrate note: the production db is WAL-mode, where readers do not
+        # block on a writer's BEGIN EXCLUSIVE at all; this fixture pins
+        # rollback-journal mode as the deterministic substrate that engages
+        # sqlite's busy handler, which is the mechanism the timeout kwarg
+        # controls. The differential-timing assertion (PRR-002) proves the
+        # env-driven bound is real end-to-end: with the lock held, the
+        # 0.2s-budget run must finish well over 2s faster than the 3.0s-budget
+        # run (sqlite's busy handler overshoots ~1.5x, so the slow run waits
+        # ~4.5-5s — still inside the hook's 10s subprocess budget). If the env
+        # var stopped reaching the reader, both runs would take the same
+        # default wait and this assertion would fail.
         if not _BASH:
             self.skipTest("no bash")
         path = os.path.join(self.tmp, "zcode-db.sqlite")
@@ -219,12 +240,25 @@ class TestReflectHookMessaging(unittest.TestCase):
         holder = sqlite3.connect(path)
         try:
             holder.execute("BEGIN EXCLUSIVE")
+            t0 = time.perf_counter()
             rc, raw = self._run_rc("zmem-reflect.sh", {
                 "ZMEM_ZCODE_DB": path,
                 "ZMEM_FAILURES_DB_TIMEOUT_S": "0.2",
             })
+            fast = time.perf_counter() - t0
             self.assertEqual(rc, 0)
             self.assertNotIn("failed tool call(s)", raw, raw)
+            t0 = time.perf_counter()
+            rc2, raw2 = self._run_rc("zmem-reflect.sh", {
+                "ZMEM_ZCODE_DB": path,
+                "ZMEM_FAILURES_DB_TIMEOUT_S": "3.0",
+            })
+            slow = time.perf_counter() - t0
+            self.assertEqual(rc2, 0)
+            self.assertNotIn("failed tool call(s)", raw2, raw2)
+            self.assertLess(
+                fast + 2.0, slow,
+                f"bounded wait not honored end-to-end: fast={fast:.2f}s slow={slow:.2f}s")
         finally:
             holder.rollback()
             holder.close()

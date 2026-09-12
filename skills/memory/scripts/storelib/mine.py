@@ -287,6 +287,11 @@ def _failures_db_timeout(explicit: float | None = None) -> float:
     ZMEM_FAILURES_DB_TIMEOUT_S, else 1.0; clamped to [0.1, 5.0]."""
     if explicit is not None:
         value = float(explicit)
+        # Non-finite explicit values fall back to the default: NaN would
+        # propagate through min/max and reach sqlite3 as timeout=nan (which
+        # its busy handler treats as 0), defeating the bounded-wait promise.
+        if math.isnan(value) or math.isinf(value):
+            value = FAILURES_DB_TIMEOUT_DEFAULT_S
     else:
         raw = os.environ.get("ZMEM_FAILURES_DB_TIMEOUT_S", "")
         value = FAILURES_DB_TIMEOUT_DEFAULT_S
