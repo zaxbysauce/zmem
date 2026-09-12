@@ -18,7 +18,8 @@ argv contract (see main()):
   argv[1] = absolute path to store.py (must exist or exit 0)
   argv[2] = canonical namespace
   argv[3] = budget in chars (optional, default 25000)
-  argv[4] = mode — "user_prompt" | "precompact" | "recent"
+  argv[4] = mode — "user_prompt" | "precompact" | "recent" | "pretool" |
+          "posttoolbatch" | "subagent" | "session_end"
   argv[5] = recent --limit      (recent/precompact modes; default 3)
   argv[6] = recent --global-limit (recent/precompact modes; default 2;
             subagent-recall passes 5/3 to preserve its pull width)
@@ -740,6 +741,10 @@ def _transcript_tail(max_lines: int = 8, max_chars: int = 500) -> str:
 _POSTTOOLBATCH_FIELD_KEYS = ("command", "file_path", "notebook_path", "path")
 _POSTTOOLBATCH_FIELD_CAP = 150
 _POSTTOOLBATCH_QUERY_CAP = 500
+# Decision-log projection bound (PR #193 review): each list is capped so a
+# huge tool_uses array cannot grow a single decision-log line without bound
+# (log rotation bounds segment count and per-file bytes, not line size).
+_POSTTOOLBATCH_SUMMARY_CAP = 12
 
 
 def _posttoolbatch_event(name, input_dict) -> str:
@@ -805,7 +810,14 @@ def build_posttoolbatch_query(payload: dict) -> str:
 def posttoolbatch_tool_summary(payload: dict) -> dict:
     """Decision-log-safe batch projection: ``tool_count``, tool NAMES, and
     path BASENAMES only — raw commands, responses, and results never enter
-    the summary (and therefore never the decision log). Never raises."""
+    the summary (and therefore never the decision log). The singular
+    ``tool_name``/``tool_input`` compatibility shape is reflected when the
+    list shape yields nothing (mirroring extract_posttoolbatch_events), so
+    a singular batch's audit fields are not silently empty while its query
+    still drives recall. Path basenames normalize backslashes before the
+    basename split so the audit field is identical on posix and Windows
+    hosts. Lists are capped (12 entries each) so a huge tool_uses array
+    cannot grow the decision-log line without bound. Never raises."""
     names = []
     basenames = []
     tool_count = 0
@@ -823,9 +835,24 @@ def posttoolbatch_tool_summary(payload: dict) -> dict:
                 for key in ("file_path", "notebook_path", "path"):
                     value = input_dict.get(key)
                     if isinstance(value, str) and value:
-                        basenames.append(os.path.basename(value))
-    return {"tool_count": tool_count, "names": names,
-            "basenames": basenames}
+                        basenames.append(
+                            os.path.basename(value.replace("\\", "/")))
+    if tool_count == 0 and isinstance(payload, dict) and (
+            "tool_name" in payload or "tool_input" in payload):
+        name = payload.get("tool_name")
+        if isinstance(name, str) and name:
+            tool_count = 1
+            names.append(name[:_POSTTOOLBATCH_FIELD_CAP])
+        input_dict = payload.get("tool_input")
+        if isinstance(input_dict, dict):
+            for key in ("file_path", "notebook_path", "path"):
+                value = input_dict.get(key)
+                if isinstance(value, str) and value:
+                    basenames.append(
+                        os.path.basename(value.replace("\\", "/")))
+    return {"tool_count": tool_count,
+            "names": names[:_POSTTOOLBATCH_SUMMARY_CAP],
+            "basenames": basenames[:_POSTTOOLBATCH_SUMMARY_CAP]}
 
 
 def _decision_moment(mode: str) -> str:
@@ -978,9 +1005,11 @@ def main() -> int:
     # lost. Capture paths never consult this switch.
     if _inject_disabled():
         _sid = ""
+        _disabled_obj = None
         try:
             if not sys.stdin.isatty():
                 _obj = json.loads(sys.stdin.read() or "{}")
+                _disabled_obj = _obj if isinstance(_obj, dict) else None
                 if isinstance(_obj, dict):
                     _v = _obj.get("session_id", "")
                     _sid = _v if isinstance(_v, str) else ""
@@ -990,9 +1019,23 @@ def main() -> int:
             _sid = (os.environ.get("ZMEM_SESSION", "")
                     or os.environ.get("CLAUDE_SESSION_ID", "")
                     or os.environ.get("ZCODE_SESSION_ID", ""))
+        # PR #193 review: the batch lane's disabled decision still carries
+        # its lane attribution (batch=1 tools=/paths=) — computed from the
+        # same guarded payload parse, fail-open to empty.
+        _disabled_batch_kwargs = {}
+        if mode == "posttoolbatch" and _disabled_obj is not None:
+            try:
+                _ds = posttoolbatch_tool_summary(_disabled_obj)
+            except Exception:
+                _ds = {"names": [], "basenames": []}
+            _disabled_batch_kwargs = dict(
+                batch=True,
+                tool_names=_ds.get("names") or [],
+                path_basenames=_ds.get("basenames") or [])
         _log_inject_decision(
             [], [], "silent", _reason_disabled(store_py),
-            session_id=_sid, moment=_decision_moment(mode), store_py=store_py)
+            session_id=_sid, moment=_decision_moment(mode), store_py=store_py,
+            **_disabled_batch_kwargs)
         print("{}")
         return 0
 
@@ -1178,13 +1221,21 @@ def main() -> int:
                 path_basenames=_summary.get("basenames") or [],
             )
             _ops_mod = _ops_helpers(store_py)
+            # PR #193 review (CUBIC-5): the GLOBAL ZMEM_QUERY_CONTEXT kill
+            # switch must hold even when the ops module is unavailable — an
+            # operator flipping it expects silence on every query-context
+            # lane regardless of deployment completeness. Consulted directly
+            # from the env with the exact ops_tokens.query_context_enabled
+            # convention ("0" disables), then re-confirmed through the
+            # helper when the module IS importable.
+            if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
+                print("{}")
+                return 0
             if _ops_mod is not None:
                 try:
                     if not _ops_mod.query_context_enabled():
-                        # Global kill switch (review round 1 convention):
-                        # an operator flipping it expects silence on every
-                        # query-context lane. Quiet no-op with the empty
-                        # envelope; no decision line (pretool parity).
+                        # Quiet no-op with the empty envelope; no decision
+                        # line (pretool parity).
                         print("{}")
                         return 0
                 except Exception:

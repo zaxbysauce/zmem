@@ -81,12 +81,6 @@ PLUGIN_ROOT="${ZMEM_ROOT:-${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}"
 DATA_DIR="${ZMEM_DATA:-${ZCODE_PLUGIN_DATA:-}}"
 PROJECT="${ZMEM_PROJECT:-${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}"
 
-if [ -n "$DATA_DIR" ]; then
-  DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
-else
-  DATA_DIR_PY="$(join_path "$(to_py_path "$HOME")" .zmem)"
-fi
-
 if [ -z "$PLUGIN_ROOT" ]; then
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

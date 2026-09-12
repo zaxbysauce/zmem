@@ -411,8 +411,9 @@ the decision log and ledger is the closed-set `pretool` — no
 `posttoolbatch` moment is emitted anywhere. PostToolBatch is deliberately
 UNREGISTERED on Codex (no such upstream event exists in codex-rs hooks as
 of the 0.153.0 probe) and is a documented host gap on ZCode (see the
-seven-event note below); `tool_response` capture stays owned by
-convention-capture on PostToolUse. Codex registers SessionStart,
+seven-event note below); no lane reads `tool_response` — convention-capture
+on PostToolUse parses the same tool_name/tool_input-shaped fields, not the
+response payload. Codex registers SessionStart,
 UserPromptSubmit,
 PreToolUse (matcher `Bash|apply_patch`, probe 2026-09-09, codex-cli
 0.153.0), PostToolUse, Stop, SubagentStart, SubagentStop, and PreCompact —
@@ -461,7 +462,8 @@ have no consumer). If ZCode grows either event, wire
 immediately. PostToolBatch shares that ZCode gap (issue #120): until the
 host grows the event, `zmem-posttoolbatch-recall.sh` stays
 Claude-registered only, and the launcher's translation mapping for the
-verb is inert on hosts whose manifest omits the entry.
+verb is inert on hosts whose manifest omits the entry; if ZCode grows the
+event, wire `zmem-posttoolbatch-recall.sh` immediately (same convention).
 
 #### Decision-point checkpoints (REQUIRED skill contract) — #85 direction E
 

@@ -46,6 +46,17 @@ README.
   the parser bounds, exact query bytes, token derivations, ledger
   suppression, fail-open shapes, launcher routing, and the Codex/ZCode
   registration absence.
+- **PR #193 review round**: `miss_rate._BG_LINE_RE` learns the additive
+  `batch=`/`tools=`/`paths=` tail so posttoolbatch decisions stay visible
+  to the #100-gated miss-rate join (and the doctor/false-inject consumers)
+  instead of being silently skipped; the batch summary reflects the
+  singular compatibility shape, caps its projection at 12 entries, and
+  normalizes backslash paths; `ZMEM_QUERY_CONTEXT=0` now silences the
+  batch lane even when the ops module is unavailable; the `ZMEM_INJECT=0`
+  disabled line carries batch attribution; launcher wrapper dead code
+  removed; SKILL.md wording corrections; commit-suite tests pin the
+  one-call contract, empty-batch log shape, strong-match carve-out, and
+  the PostToolBatch envelope rewrap.
 
 ## [0.31.0] - 2026-09-11
 

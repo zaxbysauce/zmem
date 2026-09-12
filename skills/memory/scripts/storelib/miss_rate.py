@@ -102,6 +102,16 @@ _BG_LINE_RE = re.compile(
     # lines matching AND parse new-format lines — same additive rule as the
     # #116 budget fields and the #129 moment field before it.
     r"(?: arms=(\S+))?"
+    # Issue #120: the additive batch=1/tools=/paths= tail (the Claude
+    # PostToolBatch lane's names-and-basenames projection) must keep old
+    # lines matching AND parse new-format lines — same additive rule as
+    # every field above (arms=#136, moment=#129, exc=#117). Without these
+    # groups every posttoolbatch decision silently vanishes from the
+    # miss-rate join (and the doctor/false-inject surfaces that consume
+    # parse_bg_log), reclassifying delivered rows as misses.
+    r"(?: batch=(\S+))?"
+    r"(?: tools=(\S+))?"
+    r"(?: paths=(\S+))?"
     r"\s*$"
 )
 
@@ -188,7 +198,7 @@ def parse_bg_log(path) -> list:
             if not m:
                 continue
             (ts, status, reason, omitted, ids_raw, all_raw, _tok, ops,
-             exc, sid, moment, arms) = m.groups()
+             exc, sid, moment, arms, _batch, _tools, _paths) = m.groups()
             try:
                 ts = int(ts)
             except ValueError:

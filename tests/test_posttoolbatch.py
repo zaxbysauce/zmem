@@ -42,11 +42,13 @@ from pathlib import Path
 
 # Store-isolation env MUST be pinned before any storelib import anywhere in
 # this process (a test module importing storelib with ambient env freezes
-# STORE_PATH to the operator's real store — the known co-run hazard).
+# STORE_PATH to the operator's real store — the known co-run hazard). Hard
+# assignment, NOT setdefault: an ambient ZMEM_STORE/ZMEM_DATA must never
+# survive into this module's fixtures (PR #193 review CUBIC-2).
 _MODULE_SCRATCH = tempfile.mkdtemp(prefix="zmem-postbatch-module-")
-os.environ.setdefault("ZMEM_STORE", os.path.join(_MODULE_SCRATCH, "store.sqlite"))
-os.environ.setdefault("ZMEM_DATA", _MODULE_SCRATCH)
-os.environ.setdefault("ZMEM_MODELS_DIR", os.path.join(_MODULE_SCRATCH, "missing-models"))
+os.environ["ZMEM_STORE"] = os.path.join(_MODULE_SCRATCH, "store.sqlite")
+os.environ["ZMEM_DATA"] = _MODULE_SCRATCH
+os.environ["ZMEM_MODELS_DIR"] = os.path.join(_MODULE_SCRATCH, "missing-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -224,6 +226,29 @@ class PostToolBatchTest(unittest.TestCase):
         self.assertEqual(summary["basenames"], ["a.py", "guide.md"])
         self.assertEqual(
             set(summary), {"tool_count", "names", "basenames"})
+        # Singular compatibility shape is reflected in the summary too
+        # (PR #193 review CUBIC-3): a singular batch must not log empty
+        # audit fields while its query still drives recall.
+        singular_summary = mod.posttoolbatch_tool_summary(
+            {"tool_name": "Edit", "tool_input": {"file_path": "src/a.py"}})
+        self.assertEqual(singular_summary["tool_count"], 1)
+        self.assertEqual(singular_summary["names"], ["Edit"])
+        self.assertEqual(singular_summary["basenames"], ["a.py"])
+        # Backslash paths normalize to the same basename on every host
+        # (PR #193 review: os.path.basename is posix/no-op for "\\").
+        win_summary = mod.posttoolbatch_tool_summary(
+            {"tool_uses": [{"name": "Edit",
+                            "input": {"file_path": "docs\\src\\a.py"}}]})
+        self.assertEqual(win_summary["basenames"], ["a.py"])
+        # Projection bound: element count is capped (PR #193 review
+        # CUBIC-4) — 13 uses yield at most 12 names/basenames.
+        many = mod.posttoolbatch_tool_summary(
+            {"tool_uses": [{"name": f"T{i}",
+                            "input": {"file_path": f"d{i}/f.py"}}
+                           for i in range(13)]})
+        self.assertEqual(many["tool_count"], 13)
+        self.assertEqual(len(many["names"]), 12)
+        self.assertEqual(len(many["basenames"]), 12)
         # Operation tokens. The batch token list is derive output over the
         # event strings; the pinned `git-stash-pop` slug is the Bash
         # command's own derivation (git ∈ _RUNNER_HEADS, pop ∈
@@ -237,6 +262,37 @@ class PostToolBatchTest(unittest.TestCase):
         # Empty batch: no events, empty query, empty summary.
         self.assertEqual(mod.posttoolbatch_tool_summary({}),
                          {"tool_count": 0, "names": [], "basenames": []})
+        # Query cap is load-bearing: a multi-field payload whose raw event
+        # text exceeds 500 chars must truncate to EXACTLY the cap (asserting
+        # only "<= 500" would survive a deleted or inflated cap — PR #193
+        # review T1). Internal whitespace runs normalize to single spaces.
+        big = {"tool_uses": [
+            {"name": "Bash", "input": {"command": "x" * 300 + "\t" + "y" * 300,
+                                       "file_path": "p" * 300,
+                                       "notebook_path": "q" * 300,
+                                       "path": "r" * 300}},
+            {"name": "Edit", "input": {"file_path": "s" * 300}},
+        ]}
+        big_query = mod.build_posttoolbatch_query(big)
+        self.assertEqual(len(big_query), 500)
+        self.assertNotIn("\t", big_query.split("\n")[0])
+        self.assertEqual(
+            mod.build_posttoolbatch_query(
+                {"tool_uses": [{"name": "Bash",
+                                "input": {"command": "a\tb\n  c"}}]}),
+            "Bash a b c")
+        # Decision-log projection: hostile names sanitize to structure-safe
+        # tokens and the line stays ONE line (PR #193 review T7).
+        mod._log_inject_decision(
+            [], [], "silent", "empty-pool",
+            session_id="s-sanitize", moment="pretool",
+            batch=True,
+            tool_names=["Ed it=x\ny"],
+            path_basenames=["..\\..\\p q.py"])
+        log_line = (Path(mod._data_dir()) / "zmem-decisions.log") \
+            .read_text(encoding="utf-8").splitlines()[-1]
+        self.assertIn("tools=Ed_it_x_y", log_line)
+        self.assertIn("paths=.._.._p_q.py", log_line)
 
     # -- delivery + ledger (AC4) ----------------------------------------------
 
@@ -246,6 +302,15 @@ class PostToolBatchTest(unittest.TestCase):
                   "apply a foreign pre-existing stash; verify git stash list "
                   "before any consuming command")
         _seed(_clean_env(self._tmp), ns, lesson)
+        # A second lesson whose text contains the batch's derived tokens
+        # (guide.md, a.py) whole AND enough query terms to clear the
+        # lexical floor: the pretool strong-match carve-out must keep it
+        # live across batches (re-delivered), while the non-matching
+        # lesson stays suppressed (PR #193 review T4).
+        carveout = ("edit write bash guide.md a.py postbatchcarveout: "
+                    "after this git batch, update the guide and the "
+                    "source file together")
+        _seed(_clean_env(self._tmp), ns, carveout)
         payload = json.loads((FIXTURES / "batch.json").read_text("utf-8"))
         payload = dict(payload, session_id="s-postbatch-suppress")
 
@@ -253,6 +318,7 @@ class PostToolBatchTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         ctx = json.loads(out.strip())["additionalContext"]
         self.assertIn("postbatchcanary", ctx)
+        self.assertIn("postbatchcarveout", ctx)
         self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
         lines = _decision_lines(self._tmp)
         self.assertEqual(len(lines), 1)
@@ -270,19 +336,24 @@ class PostToolBatchTest(unittest.TestCase):
         ledger = _load_module(SCRIPTS / "storelib" / "delivery_ledger.py",
                               "delivery_ledger_postbatch")
         entries = ledger.delivered(str(self._tmp), "s-postbatch-suppress")
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0].get("moment"), "pretool")
+        self.assertEqual(len(entries), 2)
+        for entry in entries:
+            self.assertEqual(entry.get("moment"), "pretool")
 
-        # Second identical batch: the delivered row is excluded — no
-        # re-delivery, and the decision line names the store-side drop.
+        # Second identical batch: the non-matching lesson is excluded (the
+        # ledger suppresses it) while the strong-matching carve-out lesson
+        # is NOT excluded and re-delivers — both directions of the pretool
+        # carve-out semantics in one run.
         out2, rc2 = _run_body(self._tmp, payload, ns=ns)
         self.assertEqual(rc2, 0)
-        self.assertEqual(json.loads(out2.strip()), {})
+        ctx2 = json.loads(out2.strip())["additionalContext"]
+        self.assertIn("postbatchcarveout", ctx2)
+        self.assertNotIn("postbatchcanary", ctx2)
         lines2 = _decision_lines(self._tmp)
         self.assertEqual(len(lines2), 2)
-        self.assertIn("status=silent", lines2[1])
+        self.assertIn("status=injected", lines2[1])
         self.assertIn("moment=pretool", lines2[1])
-        self.assertNotIn("postbatchcanary", out2)
+        self.assertIn("exc=1", lines2[1])
 
     # -- fail-open (AC5) -------------------------------------------------------
 
@@ -299,20 +370,45 @@ class PostToolBatchTest(unittest.TestCase):
         out, rc = _run_body(self._tmp, payload, store_path=str(fake))
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out.strip() or '"-"'), {})
-        # (c) invalid JSON stdin
+        # (c) invalid JSON stdin → {} exit 0, with the empty-pool decision
+        # line carrying the lane attribution but NO tools=/paths= segments
+        # (empty lists render absent — PR #193 review T3).
         out, rc = _run_body(self._tmp, "{not json")
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out.strip() or '"-"'), {})
-        # (d) valid envelope with no rendered rows
+        empty_lines = _decision_lines(self._tmp)
+        self.assertTrue(empty_lines)
+        self.assertIn("reason=empty-pool", empty_lines[-1])
+        self.assertIn("moment=pretool", empty_lines[-1])
+        self.assertIn("batch=1", empty_lines[-1])
+        self.assertNotIn("tools=", empty_lines[-1])
+        self.assertNotIn("paths=", empty_lines[-1])
+        # (d) valid envelope with no rendered rows → {} exit 0. The fake
+        # store also RECORDS its invocations, pinning the ONE-call-per-batch
+        # selector contract inside the committed suite (PR #193 review T2 —
+        # previously only the out-of-tree frozen check asserted this). The
+        # query itself contains newlines, so args are newline-stripped when
+        # recorded — one recorded line == one store invocation.
         empty = Path(self._tmp) / "empty_store.py"
         empty.write_text(
             "import json, sys\n"
+            "open(sys.argv[0] + '.calls', 'a', encoding='utf-8').write("
+            "' '.join(a.replace('\\n', ' ') for a in sys.argv[1:]) + '\\n')\n"
             "print(json.dumps({'results': [], 'omitted': 0, "
             "'reason': 'empty-pool', 'candidate_ids': []}))\n",
             encoding="utf-8")
         out, rc = _run_body(self._tmp, payload, store_path=str(empty))
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out.strip() or '"-"'), {})
+        calls = Path(str(empty) + ".calls").read_text(
+            encoding="utf-8").splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("recall", calls[0])
+        self.assertIn("--for-injection", calls[0])
+        self.assertIn("--no-bump", calls[0])
+        self.assertIn("--json", calls[0])
+        self.assertIn("--query", calls[0])
+        self.assertIn("--namespace", calls[0])
 
     # -- registration (AC1) -----------------------------------------------------
 

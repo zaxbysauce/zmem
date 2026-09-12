@@ -183,6 +183,32 @@ class ParseBgLogTest(unittest.TestCase):
     def test_missing_file_returns_empty(self):
         self.assertEqual(miss_rate.parse_bg_log("Z:/no/such/log"), [])
 
+    def test_posttoolbatch_batch_tail_lines_parse(self):
+        # Issue #120 / PR #193 review C-F3-001: the posttoolbatch writer
+        # appends batch=1 tools=... paths=... AFTER moment=/arms=. The
+        # reader's optional-group chain must keep matching (a silent skip
+        # here reclassifies delivered rows as misses in the #100-gated
+        # report) while pre-#120 lines keep parsing byte-compatibly.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "zmem-bg.log")
+            Path(path).write_text(
+                "[9] zmem-hook status=injected reason=injected"
+                " ids=['a'] all=['a'] tokens=10/1500 ops=2 sid=sess-b"
+                " moment=pretool arms=fts:1/15,vec:0/25"
+                " batch=1 tools=Edit,Write,Bash paths=a.py,guide.md\n"
+                "[10] zmem-hook status=silent reason=empty-pool"
+                " ids=[] all=[] ops=0 sid=sess-b moment=pretool batch=1\n"
+                "[11] zmem-hook status=injected reason=injected"
+                " ids=['x'] all=['x'] tokens=1/1500 sid=sess-c"
+                " moment=pretool arms=fts:1/15\n",
+                encoding="utf-8")
+            lines = miss_rate.parse_bg_log(path)
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[0]["sid"], "sess-b")
+        self.assertEqual(lines[0]["reason"], "injected")
+        self.assertEqual(lines[1]["reason"], "empty-pool")
+        self.assertEqual(lines[2]["arms"], "fts:1/15")  # pre-#120 shape intact
+
 
 class FailuresFromDbRichTest(unittest.TestCase):
     def test_operation_recovery_and_bounds(self):
