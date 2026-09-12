@@ -55,6 +55,17 @@
         ]
       }
     ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" posttoolbatch-recall",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "PostToolUseFailure": [
       {
         "hooks": [

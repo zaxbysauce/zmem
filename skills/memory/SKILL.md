@@ -396,7 +396,24 @@ at park time) → the parent transcript tail (a FALLBACK, never the primary)
 → the queryless recency pull), PreCompact, and PostCompact (issue #118, probe 2026-09-10:
 Claude PostCompact carries `compact_summary` and has no injection channel,
 so the entry is a pure stash — `zmem-postcompact.sh` writes the summary to
-the compact sidecar and emits no context). Codex registers SessionStart,
+the compact sidecar and emits no context). Claude Code also registers
+PostToolBatch (issue #120, 2026-09-11 — post-edit checkpoint recall, the
+batch sibling of PreToolUse): after one completed batch, the hook parses
+ONLY `tool_uses[].name` plus `input.command` / `file_path` /
+`notebook_path` / `path` (plus the singular `tool_name`/`tool_input`
+compatibility shape), bounds every retained field to 150 chars and the
+joined query to 500, derives the existing operation tokens, and makes ONE
+`store.py recall --for-injection --no-bump` decision with the #117 ledger
+exclusion — raw `tool_response`/`result` payloads are never parsed, stored,
+or logged (the decision log carries tool NAMES and path BASENAMES only).
+The internal mode is `posttoolbatch`, but the runtime moment recorded in
+the decision log and ledger is the closed-set `pretool` — no
+`posttoolbatch` moment is emitted anywhere. PostToolBatch is deliberately
+UNREGISTERED on Codex (no such upstream event exists in codex-rs hooks as
+of the 0.153.0 probe) and is a documented host gap on ZCode (see the
+seven-event note below); no lane reads `tool_response` — convention-capture
+on PostToolUse parses the same tool_name/tool_input-shaped fields, not the
+response payload. Codex registers SessionStart,
 UserPromptSubmit,
 PreToolUse (matcher `Bash|apply_patch`, probe 2026-09-09, codex-cli
 0.153.0), PostToolUse, Stop, SubagentStart, SubagentStop, and PreCompact —
@@ -442,7 +459,11 @@ instead of registered; likewise ZCode's PreToolUse matcher deliberately
 omits `Agent` — with no SubagentStart event, a parked task text would
 have no consumer). If ZCode grows either event, wire
 `zmem-subagent-recall.sh` / `zmem-precompact.sh` / `zmem-postcompact.sh`
-immediately.
+immediately. PostToolBatch shares that ZCode gap (issue #120): until the
+host grows the event, `zmem-posttoolbatch-recall.sh` stays
+Claude-registered only, and the launcher's translation mapping for the
+verb is inert on hosts whose manifest omits the entry; if ZCode grows the
+event, wire `zmem-posttoolbatch-recall.sh` immediately (same convention).
 
 #### Decision-point checkpoints (REQUIRED skill contract) — #85 direction E
 

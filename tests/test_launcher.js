@@ -1945,6 +1945,25 @@ console.log("\n[18] SessionStart pending-candidate note (real session-start.sh)"
         !("systemMessage" in nonString), JSON.stringify(nonString));
 }
 
+// --- issue #120: PostToolBatch envelope rewrap (behavioral, not source-grep)
+{
+    const sent = (obj) => "<<<ZMEM_JSON>>>" + JSON.stringify(obj) + "<<<END>>>";
+
+    ok("hookEventNameFor: posttoolbatch-recall maps to PostToolBatch",
+        launch.hookEventNameFor("claude", "posttoolbatch-recall")
+            === "PostToolBatch",
+        launch.hookEventNameFor("claude", "posttoolbatch-recall"));
+
+    const postbatch = launch.translate(
+        sent({ additionalContext: "batch ctx" }),
+        "claude", "posttoolbatch-recall", 9000);
+    ok("translate: posttoolbatch-recall rewraps under PostToolBatch",
+        postbatch.hookSpecificOutput
+            && postbatch.hookSpecificOutput.hookEventName === "PostToolBatch"
+            && postbatch.hookSpecificOutput.additionalContext === "batch ctx",
+        JSON.stringify(postbatch));
+}
+
 // --- cleanup + report ------------------------------------------------------
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }
 
