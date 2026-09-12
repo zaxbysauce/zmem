@@ -64,6 +64,7 @@ const TRANSLATED_HOOKS = new Set([
     "session-start",
     "recall",
     "pretool-recall",
+    "posttoolbatch-recall",
     "reflect",
     "capture-failure",
     "subagent-recall",
@@ -91,6 +92,7 @@ const NEEDS_NAMESPACE = new Set([
     "session-start",
     "recall",
     "pretool-recall",
+    "posttoolbatch-recall",
     "subagent-recall",
     "reflect",
     "capture-failure",
@@ -117,6 +119,12 @@ const EVENT_MAP = {
     // NEEDS_NAMESPACE (pass-through: the wrapper's `{}` + exit 0 go to the
     // host verbatim).
     "postcompact": "PostCompact",
+    // Issue #120 (D-5): Claude-only post-edit batch checkpoint recall. The
+    // launcher only TRANSLATES the verb — it never synthesizes the event:
+    // only hooks.claude.json registers PostToolBatch (hooks.codex.json has
+    // no such upstream event and deliberately stays without one), so a
+    // manifest without the entry can never fire this route.
+    "posttoolbatch-recall": "PostToolBatch",
 };
 
 // --- Detect host ------------------------------------------------------------

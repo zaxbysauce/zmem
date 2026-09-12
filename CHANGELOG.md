@@ -10,6 +10,43 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.32.0] - 2026-09-11
+
+> Workstream D PR 5 of 8 (issue #120): Claude PostToolBatch post-edit
+> checkpoint recall. One completed tool batch makes one bounded recall
+> decision — Codex and ZCode remain without the event.
+
+### Added
+- **Claude PostToolBatch registration (issue #120)**: `hooks.claude.json`
+  registers `PostToolBatch` with the exact command
+  `node "${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js" posttoolbatch-recall`,
+  no matcher, and timeout 15. Codex has no such upstream event and stays
+  unregistered; ZCode's gap is documented in the memory SKILL host matrix.
+- **Post-edit batch checkpoint recall (issue #120)**: after one completed
+  batch, `zmem-posttoolbatch-recall.sh` → `zmem-recall-body.py` mode
+  `posttoolbatch` parses only `tool_uses[].name` plus
+  `input.command`/`file_path`/`notebook_path`/`path` (plus the singular
+  `tool_name`/`tool_input` compatibility shape), bounds every retained
+  field to 150 characters and the joined query to 500 Unicode characters,
+  derives the existing operation tokens, and makes ONE
+  `store.py recall --for-injection --no-bump` decision with the #117
+  delivery-ledger exclusion. `tool_response`/`result` payloads are never
+  parsed, stored, or logged — the decision log carries tool NAMES and path
+  BASENAMES only (`batch=1 tools=… paths=…` additive fields). The internal
+  mode is `posttoolbatch`, but the runtime moment recorded in the decision
+  log and the ledger is the closed-set `pretool` — no `posttoolbatch`
+  moment is emitted anywhere. All failures (malformed input, missing
+  store, nonzero store exit, empty payload) fail open with `{}` and
+  exit 0.
+- **Fixtures for the #124 consumer (issue #120)**:
+  `tests/fixtures/posttoolbatch/{generate.py,batch.json,expected.json}` —
+  the deterministic parser projection (#124 consumes `expected.json` by
+  its exact path); digests pinned by `PostToolBatchTest.test_fixture_digest`.
+- **`PostToolBatchTest` (issue #120)**: `tests/test_posttoolbatch.py` pins
+  the parser bounds, exact query bytes, token derivations, ledger
+  suppression, fail-open shapes, launcher routing, and the Codex/ZCode
+  registration absence.
+
 ## [0.31.0] - 2026-09-11
 
 > PR #191 review round — fixes for the confirmed findings from the

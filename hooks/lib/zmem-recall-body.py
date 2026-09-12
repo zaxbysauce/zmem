@@ -10,6 +10,9 @@ cannot be imported):
     recent pull otherwise; "recent" remains accepted for back-compat)
   - zmem-pretool-recall.sh (PreToolUse, ZCode+Claude) mode "pretool"
     (issue #90 / #85 C: query derived from the tool input itself)
+  - zmem-posttoolbatch-recall.sh (PostToolBatch, Claude only) mode
+    "posttoolbatch" (issue #120: query derived from the COMPLETED batch;
+    the runtime moment everywhere is the closed-set "pretool")
 
 argv contract (see main()):
   argv[1] = absolute path to store.py (must exist or exit 0)
@@ -304,7 +307,9 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                          budget_truncated=None,
                          budget_dropped_protected=None,
                          arms=None,
-                         excluded_count=0) -> None:
+                         excluded_count=0,
+                         batch=False, tool_names=None,
+                         path_basenames=None) -> None:
     """Append the injected|silent decision to the decision log (#129).
 
     Issue #129 split: decision lines go to ``zmem-decisions.log`` (rotated,
@@ -432,11 +437,28 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                 )
             except (TypeError, ValueError, AttributeError):
                 armf = ""  # malformed envelope — never break the log write
+        # Issue #120: the post-edit batch lane's additive tail — ``batch=1``
+        # plus the tool NAMES and path BASENAMES only; raw commands,
+        # responses, and results never enter this log. Every element gets
+        # the canonical ops-lane sanitize (structure forging is the threat,
+        # same as sid) and a length cap; the fields stay ABSENT on every
+        # other mode (default-empty kwargs keep the line byte-identical).
+        bat = tns = pths = ""
+        if batch:
+            bat = " batch=1"
+        if tool_names:
+            tns = " tools=" + ",".join(
+                _re_sid.sub(r"[^A-Za-z0-9._-]", "_", str(t))[:64]
+                for t in tool_names)
+        if path_basenames:
+            pths = " paths=" + ",".join(
+                _re_sid.sub(r"[^A-Za-z0-9._-]", "_", str(p))[:64]
+                for p in path_basenames)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
                 "ids={ids_sel} all={ids_all}{tok}{rend}{adm}{bcnt}{ops}{exc} "
-                "sid={safe_sid}{mom}{armf}\n".format(
+                "sid={safe_sid}{mom}{armf}{bat}{tns}{pths}\n".format(
                     ts=int(time.time()),
                     status=status,
                     reason=reason,
@@ -452,6 +474,9 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     safe_sid=safe_sid,
                     mom=mom,
                     armf=armf,
+                    bat=bat,
+                    tns=tns,
+                    pths=pths,
                 )
             )
     except OSError:
@@ -709,6 +734,108 @@ def _transcript_tail(max_lines: int = 8, max_chars: int = 500) -> str:
     return " ".join(texts)[:max_chars]
 
 
+# Issue #120: the PostToolBatch parser surface — pure functions over the
+# batch payload (no I/O, no storelib import). Parsed fields are bounded query
+# FUEL only; tool_response, result, and unknown keys are never forwarded.
+_POSTTOOLBATCH_FIELD_KEYS = ("command", "file_path", "notebook_path", "path")
+_POSTTOOLBATCH_FIELD_CAP = 150
+_POSTTOOLBATCH_QUERY_CAP = 500
+
+
+def _posttoolbatch_event(name, input_dict) -> str:
+    """One batch event: the tool name (when present) prefixed to each
+    retained string value in exact _POSTTOOLBATCH_FIELD_KEYS order, every
+    component trimmed to _POSTTOOLBATCH_FIELD_CAP. An item with no retained
+    value yields no event — a bare name is not an operation."""
+    values = []
+    if isinstance(input_dict, dict):
+        for key in _POSTTOOLBATCH_FIELD_KEYS:
+            value = input_dict.get(key)
+            if isinstance(value, str) and value:
+                values.append(value[:_POSTTOOLBATCH_FIELD_CAP])
+    if not values:
+        return ""
+    parts = []
+    if isinstance(name, str) and name:
+        parts.append(name[:_POSTTOOLBATCH_FIELD_CAP])
+    parts.extend(values)
+    return " ".join(parts)
+
+
+def extract_posttoolbatch_events(payload: dict) -> list:
+    """Batch events in source order: one per ``tool_uses`` object that
+    retains a field, then at most one event for the singular
+    ``tool_name``/``tool_input`` compatibility shape. A missing list,
+    non-object item, or item with no retained field yields no event.
+    Never raises."""
+    events = []
+    if not isinstance(payload, dict):
+        return events
+    uses = payload.get("tool_uses")
+    if isinstance(uses, list):
+        for use in uses:
+            if not isinstance(use, dict):
+                continue
+            event = _posttoolbatch_event(use.get("name"), use.get("input"))
+            if event:
+                events.append(event)
+    if not events and ("tool_name" in payload or "tool_input" in payload):
+        # The singular shape is a COMPATIBILITY form (a PostToolUse-shaped
+        # payload, not a batch): it fills in only when the list shape
+        # yielded nothing, so a malformed payload carrying both shapes is
+        # parsed once, never duplicated (PR review round).
+        event = _posttoolbatch_event(
+            payload.get("tool_name"), payload.get("tool_input"))
+        if event:
+            events.append(event)
+    return events
+
+
+def build_posttoolbatch_query(payload: dict) -> str:
+    """The bounded batch query: per-event whitespace normalization, events
+    joined with one ASCII newline, truncated to 500 Unicode characters.
+    Never raises."""
+    events = [
+        " ".join(event.split())
+        for event in extract_posttoolbatch_events(payload)
+    ]
+    return "\n".join(events)[:_POSTTOOLBATCH_QUERY_CAP]
+
+
+def posttoolbatch_tool_summary(payload: dict) -> dict:
+    """Decision-log-safe batch projection: ``tool_count``, tool NAMES, and
+    path BASENAMES only — raw commands, responses, and results never enter
+    the summary (and therefore never the decision log). Never raises."""
+    names = []
+    basenames = []
+    tool_count = 0
+    uses = payload.get("tool_uses") if isinstance(payload, dict) else None
+    if isinstance(uses, list):
+        for use in uses:
+            if not isinstance(use, dict):
+                continue
+            tool_count += 1
+            name = use.get("name")
+            if isinstance(name, str) and name:
+                names.append(name[:_POSTTOOLBATCH_FIELD_CAP])
+            input_dict = use.get("input")
+            if isinstance(input_dict, dict):
+                for key in ("file_path", "notebook_path", "path"):
+                    value = input_dict.get(key)
+                    if isinstance(value, str) and value:
+                        basenames.append(os.path.basename(value))
+    return {"tool_count": tool_count, "names": names,
+            "basenames": basenames}
+
+
+def _decision_moment(mode: str) -> str:
+    """The RUNTIME moment a mode's decisions are recorded under (issue
+    #120): the batch lane's internal mode name never enters the decision
+    log or the ledger — it records under the closed-set ``pretool`` moment,
+    like its checkpoint sibling. Every other mode records as itself."""
+    return "pretool" if mode == "posttoolbatch" else mode
+
+
 def _data_dir() -> str:
     """Resolve the data dir for the ops ring and the bg log — the single
     resolver for every passive-lane read/write in this body.
@@ -865,11 +992,16 @@ def main() -> int:
                     or os.environ.get("ZCODE_SESSION_ID", ""))
         _log_inject_decision(
             [], [], "silent", _reason_disabled(store_py),
-            session_id=_sid, moment=mode, store_py=store_py)
+            session_id=_sid, moment=_decision_moment(mode), store_py=store_py)
         print("{}")
         return 0
 
     if not store_py or not os.path.isfile(store_py):
+        # Issue #120: the batch lane's fail-open contract is the EMPTY
+        # envelope on every failure path (frozen checks C4), not silent
+        # stdout — other modes keep their exact historical behavior here.
+        if mode == "posttoolbatch":
+            print("{}")
         return 0
 
     # Issue #114: the selective gate now runs store-side on the
@@ -883,6 +1015,9 @@ def main() -> int:
     ops_tokens = []
     session_id = ""
     pending_ctx = ""
+    # Issue #120: additive decision-log kwargs for the batch lane; empty on
+    # every other mode so the shared log calls stay byte-identical.
+    _batch_log_kwargs = {}
     silent_reasons, injected_reason = _reason_constants(store_py)
 
     # Query selection per mode. `use_recent_pull` selects the query-less
@@ -1014,6 +1149,65 @@ def main() -> int:
             if not ops_tokens:
                 return 0
             query = " ".join(ops_tokens)
+        elif mode == "posttoolbatch":
+            # Issue #120 (Workstream D PR 5): Claude PostToolBatch — the
+            # post-edit checkpoint. The query is derived from the COMPLETED
+            # batch (tool names + command/path fields, bounded 150/500), and
+            # the runtime moment stays the closed-set "pretool" everywhere:
+            # the decision log and the ledger record NEVER see the internal
+            # "posttoolbatch" mode name (see _decision_moment). The GLOBAL
+            # ZMEM_QUERY_CONTEXT kill switch applies, like every other
+            # query-context lane — consulted when the ops module is
+            # importable; a missing module degrades to a query-only recall
+            # (tokens=[]), never a crash. AC3's --session-id/--moment/
+            # --lane/--ops-token argv belongs to the open #158 selector
+            # contract; on today's store surface the same facts ride the
+            # #117 --exclude argv (session), the shared moment fields, and
+            # the ops=N/ops-token derivation below. The wrapper never sees
+            # tool_response/result: the parser forwards only name + the four
+            # retained fields, and the decision log carries names and
+            # basenames only.
+            _payload = stdin_obj if isinstance(stdin_obj, dict) else {}
+            try:
+                _summary = posttoolbatch_tool_summary(_payload)
+            except Exception:
+                _summary = {"tool_count": 0, "names": [], "basenames": []}
+            _batch_log_kwargs.update(
+                batch=True,
+                tool_names=_summary.get("names") or [],
+                path_basenames=_summary.get("basenames") or [],
+            )
+            _ops_mod = _ops_helpers(store_py)
+            if _ops_mod is not None:
+                try:
+                    if not _ops_mod.query_context_enabled():
+                        # Global kill switch (review round 1 convention):
+                        # an operator flipping it expects silence on every
+                        # query-context lane. Quiet no-op with the empty
+                        # envelope; no decision line (pretool parity).
+                        print("{}")
+                        return 0
+                except Exception:
+                    pass  # degrade to enabled — the switch must not crash
+            batch_events = extract_posttoolbatch_events(_payload)
+            query = build_posttoolbatch_query(_payload)
+            if _ops_mod is not None:
+                try:
+                    ops_tokens = _ops_mod.derive_ops_tokens(*batch_events)
+                except Exception:
+                    ops_tokens = []
+            else:
+                ops_tokens = []
+            if not query.strip() and not ops_tokens:
+                # Empty batch (or malformed payload): ONE silent decision
+                # naming the empty pool, then the empty envelope.
+                _log_inject_decision(
+                    [], [], "silent", "empty-pool",
+                    ops_count=0, session_id=session_id,
+                    moment=_decision_moment(mode), store_py=store_py,
+                    **_batch_log_kwargs)
+                print("{}")
+                return 0
         elif mode == "subagent":
             # SubagentStart (issue #90 / #85 D, ladder amended by #119).
             # Query ladder, each rung fail-opening to the next:
@@ -1102,7 +1296,12 @@ def main() -> int:
         if _LEDGER_MOD is not None and session_id:
             try:
                 _entries = _LEDGER_MOD.delivered(_data_dir(), session_id)
-                if mode == "pretool" and ops_tokens:
+                # Issue #120: the batch lane shares pretool's runtime moment
+                # AND its strong-match carve-out — a delivered entry whose
+                # text strong-matches the CURRENT operation tokens is not
+                # excluded, so the hazard stays live while the operation
+                # context is; everything else already delivered is.
+                if mode in ("pretool", "posttoolbatch") and ops_tokens:
                     excluded_ids = [
                         _e["id"] for _e in _entries
                         if not _LEDGER_MOD.strong_token_match(
@@ -1302,20 +1501,26 @@ def main() -> int:
             ops_count=len(ops_tokens),
             session_id=session_id,
             all_ids=envelope_candidates,
-            moment=mode, store_py=store_py,
+            moment=_decision_moment(mode), store_py=store_py,
             excluded_count=envelope_excluded,
             admission_used=envelope_admission,
             budget_dropped=envelope_bdrop,
             budget_truncated=envelope_btrunc,
             budget_dropped_protected=envelope_bprot,
             arms=envelope_arms,
+            **_batch_log_kwargs,
         )
-        if mode == "pretool":
+        if mode in ("pretool", "posttoolbatch"):
             # Issue #90 / #85 C: a per-tool-call one-liner would inject noise
             # on every unmatched operation — PreToolUse stays fully silent
             # when nothing qualified (the log line above carries the reason).
             # A parked pending fence is still delivered by the NEXT
-            # user_prompt run, so nothing is lost.
+            # user_prompt run, so nothing is lost. Issue #120: the batch
+            # lane additionally emits the empty envelope `{}` — its
+            # fail-open contract (AC5) is the empty envelope on every
+            # silent path, pinned by the frozen checks.
+            if mode == "posttoolbatch":
+                print("{}")
             return 0
         if pending_ctx:
             # Issue #90 / #85 C: deliver the parked pre-tool fence even when
@@ -1369,13 +1574,14 @@ def main() -> int:
                          ops_count=len(ops_tokens),
                          session_id=session_id,
                          all_ids=envelope_candidates,
-                         moment=mode, store_py=store_py,
+                         moment=_decision_moment(mode), store_py=store_py,
             excluded_count=envelope_excluded,
                          admission_used=envelope_admission,
                          budget_dropped=envelope_bdrop,
                          budget_truncated=envelope_btrunc,
                          budget_dropped_protected=envelope_bprot,
-                         arms=envelope_arms)
+                         arms=envelope_arms,
+                         **_batch_log_kwargs)
     if (_LEDGER_MOD is not None and session_id
             and mode not in ("precompact", "session_end")):
         # Issue #117 (D-1): record the delivered ids so the NEXT moment
@@ -1390,13 +1596,16 @@ def main() -> int:
         # (residual: a cut landing between a bullet and its content line
         # still counts that row — narrow, documented).
         try:
+            # Issue #120: the batch lane records under its RUNTIME moment
+            # ("pretool") — the ledger never sees the internal mode name.
+            _ledger_moment = _decision_moment(mode)
             _LEDGER_MOD.record(_data_dir(), session_id,
                                _LEDGER_MOD.rows_present_in(selected, ctx)
                                if len(ctx) < len(_format_fence(selected, header,
                                                    store_py=store_py,
                                                    budget_note=envelope_note))
                                else selected,
-                               mode)
+                               _ledger_moment)
         except Exception:
             pass
     if (mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude"
