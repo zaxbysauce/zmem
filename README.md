@@ -882,6 +882,39 @@ script under it — no manual configuration needed.
 If the auto-detection fails (non-standard Git install), set the
 `ZMEM_BASH_PATH` environment variable to your bash executable path.
 
+### Stop-hook controls (ZCode db reader)
+
+The Stop hook's failure detector reads ZCode's episodic db
+(`~/.zcode/cli/db/db.sqlite`) read-only (a `mode=ro` SQLite URI plus
+`PRAGMA query_only`) and never waits on a busy database for long. Three
+environment variables control it:
+
+- `ZMEM_FAILURES_DB_TIMEOUT_S` — seconds the reader waits for a busy ZCode db
+  before reporting a substrate error and failing open (default `1.0`; clamped
+  to 0.1–5.0; an invalid value falls back to the default;
+  `store.py failures --db-timeout <s>` overrides).
+- `ZMEM_ZCODE_DB` — path override for the ZCode db, so tests and operators can
+  point the detector at a scratch copy without touching `~/.zcode` (empty or
+  unset means the default path).
+- `ZMEM_REFLECT` — set to exactly `0` to disable the Stop hook entirely;
+  unset, empty, or any other value keeps it enabled.
+
+#### A/B test under ZCode lock storms
+
+To measure whether the Stop hook contributes to ZCode `database is locked`
+events, run the same parallel-subagent workload twice — once with
+`ZMEM_REFLECT=0` exported in ZCode's environment (hook fully disabled) and
+once without — and compare the counts:
+
+```bash
+grep -cF "database is locked" ~/.zcode/cli/log/zcode-<date>.jsonl
+```
+
+A count that does not change with the hook disabled shows no measurable
+contribution from the hook in that run (it does not prove the hook can never
+contribute); a count that drops is the contention the bounded read-only reader
+addresses.
+
 ## License
 
 MIT

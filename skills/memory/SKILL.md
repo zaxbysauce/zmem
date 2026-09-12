@@ -1741,6 +1741,16 @@ The `zmem-reflect.sh` Stop hook checks the episodic db for failed tool calls
 If found and no lesson references this session, it injects an additionalContext
 prompt at stop time. It is **non-blocking** (exit 0) — it only reminds you.
 
+Three env vars control the Stop hook's ZCode-db reader (#194): the reader opens
+the db read-only (`mode=ro` URI plus `PRAGMA query_only`);
+`ZMEM_FAILURES_DB_TIMEOUT_S` bounds how long it waits on a busy ZCode db before
+reporting a substrate error (default 1.0; invalid or unset falls back to the
+default; clamped to 0.1-5.0; `store.py failures --db-timeout` overrides);
+`ZMEM_ZCODE_DB` overrides the ZCode db path (tests and operators can point the
+detector at a scratch copy without touching `~/.zcode`; empty/unset means the
+default `~/.zcode/cli/db/db.sqlite`); `ZMEM_REFLECT=0` (exactly `0`) disables
+the whole Stop hook — unset, empty, or any other value keeps it enabled.
+
 Capture a lesson only if it generalizes to a future session facing a similar
 situation. If the failure was a one-off (typo, transient), do nothing — the prompt
 explicitly allows that. Do not capture in-trajectory refinement tweaks as durable

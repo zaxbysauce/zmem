@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,16 @@ def _rejection(tid, name, reason):
 def _run_hook(hook, env_extra, stdin="{}"):
     """Run a hook script with `stdin` on stdin and env_extra merged, returning
     the raw stdout (the <<<ZMEM_JSON>>>…<<<END>>> envelope)."""
+    rc, stdout = _run_hook_rc(hook, env_extra, stdin=stdin)
+    if rc != 0:
+        return ""
+    return stdout
+
+
+def _run_hook_rc(hook, env_extra, stdin="{}"):
+    """Like _run_hook but returns (returncode, stdout) so tests can assert the
+    hook's exit code itself (#194: the kill switch and lock fail-open paths
+    must exit 0, not merely print an empty envelope)."""
     env = dict(os.environ)
     env.update(env_extra)
     proc = subprocess.run(
@@ -74,9 +85,7 @@ def _run_hook(hook, env_extra, stdin="{}"):
         capture_output=True, encoding="utf-8", errors="replace",
         env=env, timeout=60,
     )
-    if proc.returncode != 0:
-        return ""
-    return proc.stdout
+    return proc.returncode, proc.stdout
 
 
 def _extract_ctx(raw):
@@ -99,9 +108,22 @@ class TestReflectHookMessaging(unittest.TestCase):
             "ZMEM_DATA": self.tmp,
             "ZMEM_SESSION": "hooktest",
             "ZMEM_NAMESPACE": "project:hooktest",
+            "ZMEM_MODELS_DIR": os.path.join(self.tmp, "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
         }
         env.update(env_extra)
         return _run_hook(REPO_ROOT / "hooks" / hook_name, env, stdin=stdin)
+
+    def _run_rc(self, hook_name, env_extra, stdin="{}"):
+        env = {
+            "ZMEM_DATA": self.tmp,
+            "ZMEM_SESSION": "hooktest",
+            "ZMEM_NAMESPACE": "project:hooktest",
+            "ZMEM_MODELS_DIR": os.path.join(self.tmp, "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
+        env.update(env_extra)
+        return _run_hook_rc(REPO_ROOT / "hooks" / hook_name, env, stdin=stdin)
 
     def test_failures_plus_rejection_not_miscounted_and_reason_shown(self):
         if not _BASH:
@@ -152,6 +174,71 @@ class TestReflectHookMessaging(unittest.TestCase):
             self.assertEqual(_extract_ctx(raw), {}, raw)
         finally:
             os.remove(trans)
+
+    def test_reflect_kill_switch_emits_empty(self):
+        # #194: ZMEM_REFLECT=0 disables the hook entirely — empty sentinel
+        # envelope, exit 0 — even when the transcript contains a failure.
+        if not _BASH:
+            self.skipTest("no bash")
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            rc, raw = self._run_rc("zmem-reflect.sh", {
+                "ZMEM_TRANSCRIPT": os.path.abspath(trans),
+                "ZMEM_REFLECT": "0",
+            })
+            self.assertEqual(rc, 0)
+            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", raw, raw)
+            self.assertEqual(_extract_ctx(raw), {}, raw)
+        finally:
+            os.remove(trans)
+
+    @staticmethod
+    def _make_zcode_db(path):
+        conn = sqlite3.connect(path)
+        conn.execute("""CREATE TABLE tool_usage(
+            session_id TEXT, tool_name TEXT, read_only INT, status TEXT,
+            exit_code INT, error_message TEXT, error_type TEXT,
+            retry_count INT, destructive INT, completed_at TEXT)""")
+        conn.execute("INSERT INTO tool_usage VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     ("hooktest", "Bash", 0, "error", 1, "compile failed",
+                      "BuildError", 0, 0, "2026-01-01"))
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_locked_zcode_db_fails_open(self):
+        # #194: a busy ZCode db (BEGIN EXCLUSIVE holder) must fail open inside
+        # the bounded budget — hook exits 0 and never claims failed tool calls.
+        if not _BASH:
+            self.skipTest("no bash")
+        path = os.path.join(self.tmp, "zcode-db.sqlite")
+        self._make_zcode_db(path)
+        holder = sqlite3.connect(path)
+        try:
+            holder.execute("BEGIN EXCLUSIVE")
+            rc, raw = self._run_rc("zmem-reflect.sh", {
+                "ZMEM_ZCODE_DB": path,
+                "ZMEM_FAILURES_DB_TIMEOUT_S": "0.2",
+            })
+            self.assertEqual(rc, 0)
+            self.assertNotIn("failed tool call(s)", raw, raw)
+        finally:
+            holder.rollback()
+            holder.close()
+
+    def test_zcode_db_override_is_used(self):
+        # #194: ZMEM_ZCODE_DB points the db substrate at a scratch copy; a
+        # qualifying row there must be detected (override honored end-to-end).
+        if not _BASH:
+            self.skipTest("no bash")
+        path = os.path.join(self.tmp, "zcode-db.sqlite")
+        self._make_zcode_db(path)
+        rc, raw = self._run_rc("zmem-reflect.sh", {"ZMEM_ZCODE_DB": path})
+        self.assertEqual(rc, 0)
+        self.assertIn("1 failed tool call(s)", raw, raw)
 
 
 class TestSubagentReflectMessaging(unittest.TestCase):

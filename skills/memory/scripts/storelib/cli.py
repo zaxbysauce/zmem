@@ -750,6 +750,10 @@ def main():
                         help="Claude Code transcript JSONL path (wins when present)")
     p_fail.add_argument("--db", default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
                         help="ZCode episodic db.sqlite path (default ~/.zcode/cli/db/db.sqlite)")
+    p_fail.add_argument("--db-timeout", dest="db_timeout", type=float, default=None,
+                        help="seconds to wait for a busy ZCode db before reporting a "
+                             "substrate error (default: ZMEM_FAILURES_DB_TIMEOUT_S or 1.0; "
+                             "clamped to 0.1-5.0)")
 
     p_corr = _add_parser(
         "corrections",
@@ -963,7 +967,8 @@ def main():
     # connect()/assert_local_fs()/migrate() so a bad ZMEM_DATA location, a
     # locked store, or a mid-migration state can never break failure detection.
     if args.cmd == "failures":
-        sys.exit(cmd_failures(session=args.session, transcript=args.transcript, db=args.db))
+        sys.exit(cmd_failures(session=args.session, transcript=args.transcript, db=args.db,
+                              db_timeout=args.db_timeout))
 
     # `corrections` is store-independent (it mines a transcript JSONL, never the
     # ZMem store) and read-only by design (candidates are reviewed by an
