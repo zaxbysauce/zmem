@@ -10,6 +10,41 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.33.0] - 2026-09-12
+
+> Workstream O PR 1 of 1 (issue #194): the Stop-hook failure detector's
+> ZCode db reader becomes read-only and time-bounded, and the hook gains an
+> operator kill switch and db-path override.
+
+### Changed
+- **Read-only, bounded ZCode db reader (issue #194)**:
+  `storelib/mine.py:_failures_from_db` now opens ZCode's episodic db via a
+  `file:...?mode=ro` URI (`_readonly_uri`, mirroring `miss_rate._ro_connect`
+  and the schema probe) with `PRAGMA query_only=1` set before any SELECT, so
+  the Stop hook holds a strictly read-only handle. The busy wait is bounded by
+  `_failures_db_timeout` — explicit `--db-timeout` on `store.py failures`,
+  else `ZMEM_FAILURES_DB_TIMEOUT_S`, else 1.0 s, clamped to 0.1–5.0 s, with a
+  one-line stderr warning for invalid values — replacing the 5-second
+  `sqlite3` default that a ZCode lock storm used to burn per Stop event.
+  Detection output and the exit-2 substrate-error contract are unchanged.
+
+### Added
+- **`ZMEM_REFLECT` kill switch (issue #194)**: `hooks/zmem-reflect.sh` exits
+  immediately with the empty envelope when `ZMEM_REFLECT=0` (exactly `0`;
+  unset/empty/any other value keeps the hook enabled), so an operator can
+  A/B-test the hook against ZCode lock storms without editing
+  `hooks/hooks.zcode.json`.
+- **`ZMEM_ZCODE_DB` path override (issue #194)**: `hooks/zmem-reflect.sh`
+  reads the episodic db from `$ZMEM_ZCODE_DB` when set (tests and operators
+  can point the detector at a scratch copy without touching `~/.zcode`).
+- Tests: read-only-URI/timeout capture, query_only-before-SELECT plus DML
+  refusal, env parsing/clamp table, locked-db exit-2, CLI flag forwarding,
+  source-level no-writable-open guard, and hook-level kill-switch /
+  locked-fail-open / override-honored pins (`tests/test_failures.py`,
+  `tests/test_reflect_hook.py`).
+- Docs: the three env vars documented in `README.md` (with the lock-storm A/B
+  procedure) and in the memory SKILL's reflection-loop section.
+
 ## [0.32.0] - 2026-09-11
 
 > Workstream D PR 5 of 8 (issue #120): Claude PostToolBatch post-edit

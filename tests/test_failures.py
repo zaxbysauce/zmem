@@ -20,7 +20,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -31,16 +31,57 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 def _load_store():
     """Load store.py as a module instance with STORE_PATH pointed at a throwaway
-    temp path (import resolves it eagerly; the failures path never opens it)."""
+    temp path (import resolves it eagerly; the failures path never opens it).
+    ZMEM_DATA/MODELS/AUTODOWNLOAD are pinned too (#194) so no test can ever
+    resolve the operator's real data dir or trigger a model download."""
     tmp = Path(tempfile.mkdtemp()) / "store.sqlite"
     spec = importlib.util.spec_from_file_location("zmem_store_failtest", SCRIPTS_DIR / "store.py")
-    with mock.patch.dict(os.environ, {"ZMEM_STORE": str(tmp)}, clear=False):
+    with mock.patch.dict(os.environ, {
+        "ZMEM_STORE": str(tmp),
+        "ZMEM_DATA": str(tmp.parent),
+        "ZMEM_MODELS_DIR": str(tmp.parent / "missing-models"),
+        "ZMEM_MODEL_AUTODOWNLOAD": "0",
+    }, clear=False):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     return mod
 
 
 store = _load_store()
+
+
+def _make_failures_db(with_enrichment=True):
+    """Build the ZCode db.sqlite fixture (#194): session s1 has exactly two
+    qualifying failure rows (status='error' + nonzero-exit), plus ok/read-only/
+    other-session rows that must not count. Shared by TestDbSubstrate and
+    TestFailuresExitCode."""
+    fd, path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    conn = sqlite3.connect(path)
+    if with_enrichment:
+        conn.execute("""CREATE TABLE tool_usage(
+            session_id TEXT, tool_name TEXT, read_only INT, status TEXT,
+            exit_code INT, error_message TEXT, error_type TEXT,
+            retry_count INT, destructive INT, completed_at TEXT)""")
+        rows = [
+            ("s1", "Bash", 0, "error", 1, "compile failed", "BuildError", 2, 1, "2026-01-01"),
+            ("s1", "Bash", 0, "ok", 0, None, None, 0, 0, "2026-01-02"),   # success
+            ("s1", "Read", 1, "error", 1, "nope", "X", 0, 0, "2026-01-03"),  # read-only skip
+            ("s1", "Edit", 0, None, 3, "bad", "Y", 0, 0, "2026-01-04"),   # nonzero exit
+            ("s2", "Bash", 0, "error", 1, "other session", "Z", 0, 0, "2026-01-05"),
+        ]
+        conn.executemany("INSERT INTO tool_usage VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    else:
+        conn.execute("""CREATE TABLE tool_usage(
+            session_id TEXT, read_only INT, status TEXT, exit_code INT)""")
+        conn.executemany("INSERT INTO tool_usage VALUES (?,?,?,?)", [
+            ("s1", 0, "error", 1),
+            ("s1", 0, "ok", 0),
+            ("s1", 0, None, 5),
+        ])
+    conn.commit()
+    conn.close()
+    return path
 
 
 def _write_jsonl(records) -> str:
@@ -219,33 +260,7 @@ class TestMaliciousFencing(unittest.TestCase):
 
 class TestDbSubstrate(unittest.TestCase):
     def _make_db(self, with_enrichment=True):
-        fd, path = tempfile.mkstemp(suffix=".sqlite")
-        os.close(fd)
-        conn = sqlite3.connect(path)
-        if with_enrichment:
-            conn.execute("""CREATE TABLE tool_usage(
-                session_id TEXT, tool_name TEXT, read_only INT, status TEXT,
-                exit_code INT, error_message TEXT, error_type TEXT,
-                retry_count INT, destructive INT, completed_at TEXT)""")
-            rows = [
-                ("s1", "Bash", 0, "error", 1, "compile failed", "BuildError", 2, 1, "2026-01-01"),
-                ("s1", "Bash", 0, "ok", 0, None, None, 0, 0, "2026-01-02"),   # success
-                ("s1", "Read", 1, "error", 1, "nope", "X", 0, 0, "2026-01-03"),  # read-only skip
-                ("s1", "Edit", 0, None, 3, "bad", "Y", 0, 0, "2026-01-04"),   # nonzero exit
-                ("s2", "Bash", 0, "error", 1, "other session", "Z", 0, 0, "2026-01-05"),
-            ]
-            conn.executemany("INSERT INTO tool_usage VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
-        else:
-            conn.execute("""CREATE TABLE tool_usage(
-                session_id TEXT, read_only INT, status TEXT, exit_code INT)""")
-            conn.executemany("INSERT INTO tool_usage VALUES (?,?,?,?)", [
-                ("s1", 0, "error", 1),
-                ("s1", 0, "ok", 0),
-                ("s1", 0, None, 5),
-            ])
-        conn.commit()
-        conn.close()
-        return path
+        return _make_failures_db(with_enrichment=with_enrichment)
 
     def test_db_counts_and_enriches(self):
         db = self._make_db(with_enrichment=True)
@@ -274,6 +289,110 @@ class TestDbSubstrate(unittest.TestCase):
 
     def test_db_empty_session(self):
         self.assertEqual(store._failures_from_db(r"C:\nope\db.sqlite", ""), (0, []))
+
+    def test_db_opened_with_readonly_uri_and_bounded_timeout(self):
+        # #194: the ZCode db reader must open mode=ro via a file URI with a
+        # bounded busy timeout (env-driven), never a bare read-write path.
+        db = self._make_db(with_enrichment=True)
+        try:
+            with mock.patch.dict(os.environ, {"ZMEM_FAILURES_DB_TIMEOUT_S": "0.25"}):
+                with mock.patch("sqlite3.connect", wraps=sqlite3.connect) as connect:
+                    count, _details = store._failures_from_db(db, "s1")
+            self.assertEqual(count, 2)
+            arg = connect.call_args.args[0]
+            self.assertTrue(arg.startswith("file:///"), f"not a file URI: {arg}")
+            self.assertTrue(arg.endswith("?mode=ro"), f"not read-only: {arg}")
+            self.assertIs(connect.call_args.kwargs["uri"], True)
+            self.assertEqual(connect.call_args.kwargs["timeout"], 0.25)
+        finally:
+            os.remove(db)
+
+    def test_db_query_only_pragma_precedes_select_and_refuses_dml(self):
+        # #194: PRAGMA query_only=1 must run before any SELECT so even a future
+        # accidental write statement fails instead of writing ZCode's db.
+        db = self._make_db(with_enrichment=True)
+        recorded = []
+        outer = sqlite3.connect(db)
+        try:
+            class _RecordingConn:
+                def __init__(self, inner):
+                    self._inner = inner
+                    self.closed = False
+                def execute(self, sql, *a, **k):
+                    recorded.append(sql)
+                    return self._inner.execute(sql, *a, **k)
+                def __getattr__(self, name):
+                    return getattr(self._inner, name)
+                def __setattr__(self, name, value):
+                    if name in ("_inner", "closed"):
+                        object.__setattr__(self, name, value)
+                    else:
+                        setattr(self._inner, name, value)
+                def close(self):
+                    self.closed = True  # survive _failures_from_db's finally
+            with mock.patch("sqlite3.connect", return_value=_RecordingConn(outer)):
+                count, _details = store._failures_from_db(db, "s1")
+            self.assertEqual(count, 2)
+            self.assertEqual(recorded[0], "PRAGMA query_only=1")
+            self.assertTrue(
+                " ".join(recorded[1].split()).startswith("SELECT count(*)"),
+                f"second statement was not the count query: {recorded[1][:80]}")
+            with self.assertRaises(sqlite3.OperationalError) as cm:
+                _RecordingConn(outer).execute("INSERT INTO tool_usage(session_id) VALUES ('x')")
+            self.assertIn("readonly", str(cm.exception))
+        finally:
+            outer.close()
+            os.remove(db)
+
+    def test_timeout_env_parsing_and_clamp(self):
+        # #194: explicit arg > env > default 1.0; unparseable/NaN/inf -> default
+        # plus exactly one stderr warning; everything clamped to [0.1, 5.0].
+        cases = [("", 1.0, False), ("0.01", 0.1, False), ("-1", 0.1, False),
+                 ("0", 0.1, False), ("2.5", 2.5, False), ("30", 5.0, False),
+                 ("abc", 1.0, True), ("nan", 1.0, True), ("inf", 1.0, True)]
+        for raw, expected, warn in cases:
+            with mock.patch.dict(os.environ, {"ZMEM_FAILURES_DB_TIMEOUT_S": raw}):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    value = store._failures_db_timeout(None)
+            self.assertEqual(value, expected, f"env {raw!r}")
+            output = err.getvalue()
+            if warn:
+                lines = output.splitlines()
+                self.assertEqual(len(lines), 1, f"env {raw!r}: {output!r}")
+                self.assertTrue(lines[0].startswith(
+                    "[zmem] failures: ignoring invalid ZMEM_FAILURES_DB_TIMEOUT_S="),
+                    f"env {raw!r}: {lines!r}")
+                self.assertTrue(lines[0].endswith(f"={raw}"), f"env {raw!r}: {lines!r}")
+            else:
+                self.assertEqual(output, "", f"env {raw!r} must not warn")
+        with mock.patch.dict(os.environ, {"ZMEM_FAILURES_DB_TIMEOUT_S": "0.5"}):
+            self.assertEqual(store._failures_db_timeout(2.5), 2.5)   # explicit wins
+            self.assertEqual(store._failures_db_timeout(9.0), 5.0)   # explicit clamped
+            # Non-finite explicit values fall back to the default (PRR-001):
+            # NaN would otherwise propagate through min/max to sqlite3.
+            self.assertEqual(store._failures_db_timeout(float("nan")), 1.0)
+            self.assertEqual(store._failures_db_timeout(float("inf")), 1.0)
+            self.assertEqual(store._failures_db_timeout(float("-inf")), 1.0)
+
+    def test_source_never_opens_zcode_db_writable(self):
+        # #194 guardrail: the db reader must stay read-only at the source level.
+        src = (REPO_ROOT / "skills" / "memory" / "scripts" / "storelib" / "mine.py").read_text(
+            encoding="utf-8")
+        def block(def_name):
+            start = src.index(f"def {def_name}(")
+            rest = src[start:]
+            end = len(rest)
+            for marker in ("\ndef ", "\nasync def "):
+                idx = rest.find(marker, 1)
+                if idx != -1:
+                    end = min(end, idx)
+            return rest[:end]
+        self.assertIn("?mode=ro", block("_readonly_uri"))
+        fdb = block("_failures_from_db")
+        self.assertIn("_readonly_uri(", fdb)
+        self.assertIn("PRAGMA query_only=1", fdb)
+        self.assertNotIn("sqlite3.connect(db_path)", src)
 
 
 class TestSubstrateSwitch(unittest.TestCase):
@@ -321,10 +440,11 @@ class TestFailuresExitCode(unittest.TestCase):
     `error` field) from a checked-but-empty result (exit 0). Previously every
     exception was swallowed into {count:0} + exit 0."""
 
-    def _run_cmd(self, session, transcript, db):
+    def _run_cmd(self, session, transcript, db, db_timeout=None):
         buf = io.StringIO()
         with redirect_stdout(buf):
-            rc = store.cmd_failures(session=session, transcript=transcript, db=db)
+            rc = store.cmd_failures(session=session, transcript=transcript, db=db,
+                                    db_timeout=db_timeout)
         return rc, json.loads(buf.getvalue())
 
     def test_missing_db_session_is_exit0_empty(self):
@@ -333,6 +453,46 @@ class TestFailuresExitCode(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out, {"count": 0, "details": [], "rejections": []})
         self.assertNotIn("error", out)
+
+    def test_locked_db_exits2_with_locked_error(self):
+        # #194: a db locked with BEGIN EXCLUSIVE must surface a bounded wait,
+        # then the substrate-error contract (count 0, "locked" error, exit 2).
+        path = _make_failures_db(with_enrichment=True)
+        holder = sqlite3.connect(path)
+        try:
+            holder.execute("BEGIN EXCLUSIVE")
+            rc, out = self._run_cmd(session="s1", transcript="", db=path, db_timeout=0.2)
+            self.assertEqual(rc, 2)
+            self.assertEqual(out["count"], 0)
+            self.assertIn("locked", out["error"])
+        finally:
+            holder.rollback()
+            holder.close()
+            os.remove(path)
+
+    def test_cli_db_timeout_flag_is_forwarded(self):
+        # #194: --db-timeout must reach cmd_failures as db_timeout (patched at
+        # storelib.cli, where the dispatch binds the name); a non-float value is
+        # rejected by argparse (exit 2) before cmd_failures ever runs.
+        cli = sys.modules["storelib.cli"]
+        path = _make_failures_db(with_enrichment=True)
+        try:
+            with mock.patch.object(cli, "cmd_failures", return_value=0) as fake:
+                with mock.patch.object(sys, "argv", ["store.py", "failures", "--session",
+                                                     "s1", "--db", path, "--db-timeout", "0.3"]):
+                    with self.assertRaises(SystemExit) as cm:
+                        cli.main()
+            self.assertEqual(cm.exception.code, 0)
+            self.assertEqual(fake.call_args.kwargs["db_timeout"], 0.3)
+            with mock.patch.object(cli, "cmd_failures", return_value=0) as fake:
+                with mock.patch.object(sys, "argv", ["store.py", "failures", "--session",
+                                                     "s1", "--db", path, "--db-timeout", "abc"]):
+                    with self.assertRaises(SystemExit) as cm:
+                        cli.main()
+            self.assertEqual(cm.exception.code, 2)
+            fake.assert_not_called()
+        finally:
+            os.remove(path)
 
     def test_corrupt_db_exits2_with_error(self):
         # A file that exists but is not a valid SQLite db is a BROKEN substrate,

@@ -28,6 +28,14 @@ set -u
 # Read the full hook payload (needed for the stop_hook_active loop guard).
 INPUT="$(cat)"
 
+# Operator kill switch (#194): ZMEM_REFLECT=0 (exactly "0") disables this hook
+# entirely — A/B-testing the hook against ZCode lock storms, or opting out.
+# Any other value (unset, empty, 1, yes, ...) keeps the hook enabled.
+if [ "${ZMEM_REFLECT:-1}" = "0" ]; then
+  printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' '{}'
+  exit 0
+fi
+
 # --- Cross-platform setup ---
 IS_WINDOWS=0
 if [[ "$(uname -s 2>/dev/null)" == MINGW* ]] || [[ "$(uname -s 2>/dev/null)" == CYGWIN* ]] || [[ "$(uname -s 2>/dev/null)" == MSYS* ]]; then
@@ -118,7 +126,13 @@ else
 fi
 
 # ZCode episodic db (used only when there is no transcript, i.e. the db substrate).
-DB_PATH_PY="$(join_path "$(to_py_path "$HOME")" .zcode cli db db.sqlite)"
+# ZMEM_ZCODE_DB (#194) overrides the path so tests and operators can point the
+# detector at a scratch copy without touching ~/.zcode.
+if [ -n "${ZMEM_ZCODE_DB:-}" ]; then
+  DB_PATH_PY="$(to_py_path "$ZMEM_ZCODE_DB")"
+else
+  DB_PATH_PY="$(join_path "$(to_py_path "$HOME")" .zcode cli db db.sqlite)"
+fi
 
 # Canonical namespace (single derived key) with legacy basename fallback.
 NS="${ZMEM_NAMESPACE:-}"

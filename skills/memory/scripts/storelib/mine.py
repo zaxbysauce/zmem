@@ -279,7 +279,41 @@ def _failures_from_transcript(path: str):
             })
     return details[::-1], rejections
 
-def _failures_from_db(db_path: str, session_id: str):
+FAILURES_DB_TIMEOUT_DEFAULT_S = 1.0
+FAILURES_DB_TIMEOUT_BOUNDS_S = (0.1, 5.0)
+
+def _failures_db_timeout(explicit: float | None = None) -> float:
+    """Busy-wait budget for the ZCode db reader: explicit arg, else
+    ZMEM_FAILURES_DB_TIMEOUT_S, else 1.0; clamped to [0.1, 5.0]."""
+    if explicit is not None:
+        value = float(explicit)
+        # Non-finite explicit values fall back to the default: NaN would
+        # propagate through min/max and reach sqlite3 as timeout=nan (which
+        # its busy handler treats as 0), defeating the bounded-wait promise.
+        if math.isnan(value) or math.isinf(value):
+            value = FAILURES_DB_TIMEOUT_DEFAULT_S
+    else:
+        raw = os.environ.get("ZMEM_FAILURES_DB_TIMEOUT_S", "")
+        value = FAILURES_DB_TIMEOUT_DEFAULT_S
+        if raw != "":
+            try:
+                parsed = float(raw)
+            except ValueError:
+                parsed = None
+            if parsed is None or math.isnan(parsed) or math.isinf(parsed):
+                print(f"[zmem] failures: ignoring invalid ZMEM_FAILURES_DB_TIMEOUT_S={raw}",
+                      file=sys.stderr)
+            else:
+                value = parsed
+    lo, hi = FAILURES_DB_TIMEOUT_BOUNDS_S
+    return float(min(max(value, lo), hi))
+
+def _readonly_uri(db_path: str) -> str:
+    """file:///... URI with mode=ro for an existing SQLite file (never creates it)."""
+    return Path(db_path).resolve().as_uri() + "?mode=ro"
+
+def _failures_from_db(db_path: str, session_id: str, *,
+                      timeout_s: float | None = None) -> tuple[int, list]:
     """Detect failed tool calls for a session from the ZCode episodic db.sqlite.
     Returns (count, details). The load-bearing detection uses ONLY the columns
     the original reflect query used (session_id, read_only, status, exit_code);
@@ -296,7 +330,13 @@ def _failures_from_db(db_path: str, session_id: str):
         return 0, []
     conn = None
     try:
-        conn = sqlite3.connect(db_path)
+        # Read-only at the SQLite level (#194): mode=ro never creates or writes,
+        # query_only makes any future accidental DML raise instead of writing.
+        # The bounded timeout replaces the 5 s sqlite3 default so a ZCode lock
+        # storm costs the hook at most this budget, not 5+ seconds per Stop.
+        conn = sqlite3.connect(_readonly_uri(db_path), uri=True,
+                               timeout=_failures_db_timeout(timeout_s))
+        conn.execute("PRAGMA query_only=1")
         row = conn.execute(
             """
             SELECT count(*) FROM tool_usage
@@ -375,7 +415,8 @@ def _sanitize_exc_text(text: str, limit: int = 300) -> str:
         s = s[:limit] + "..."
     return s
 
-def cmd_failures(session: str, transcript: str, db: str) -> int:
+def cmd_failures(session: str, transcript: str, db: str,
+                 db_timeout: float | None = None) -> int:
     """Print {"count":N,"details":[...],"rejections":[...]} for the session's
     failed tool calls and return an exit code. Transcript wins when given and
     present (Claude Code); else the db substrate (ZCode). Entirely
@@ -396,7 +437,7 @@ def cmd_failures(session: str, transcript: str, db: str) -> int:
             details, rejections = _failures_from_transcript(transcript)
             result = {"count": len(details), "details": details, "rejections": rejections}
         else:
-            count, details = _failures_from_db(db, session)
+            count, details = _failures_from_db(db, session, timeout_s=db_timeout)
             result = {"count": count, "details": details, "rejections": []}
     except Exception as exc:
         msg = _sanitize_exc_text(str(exc))

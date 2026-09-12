@@ -1,13 +1,13 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "c4735f091d3ac01b133b16d4dcbef57935773f0807c3e3c1900ba92931c6f2f7",
+  "digest": "ff6466a9b746ee1bf9f60e3e0c6cf3141a33c9a9905110dd536bec11556a1942",
   "files": {
     "hermes-plugin/__init__.py": "49921ae0fcbb7343b9f77eae4d5684bd1e35b89ecf858744179ffb755b0993b0",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "064eb5767b12039759f9a0bf166e86d6214360af9aebc7747bba436a6d5fde29",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "ae9b2499dbee840f1b8f34a25691a2802482e6701209c39513960f0fe42472ef",
+    "hermes-plugin/plugin.yaml": "8b44f6d6d4f6fa1fa82f7a5703fef09c72da5e97f24661ddae9c30df86084ee3",
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "8f09b3987ae01ec7d250881d2bb6b885e07e78743951d5b8f725ff07d6f48b97",
@@ -29,7 +29,7 @@
     "hooks/zmem-precompact.sh": "0b935644aa4c291d67ddfb2e16b69a5578dee113d4512ccaca5677de6a5a6673",
     "hooks/zmem-pretool-recall.sh": "65c824791fa6b2d7172a7a40e3a55f5882ca41ccf900ccb0246ff0e64c22c52e",
     "hooks/zmem-recall.sh": "cb4262b4ec0eb3dc6e89698bfdd684976746a9700b43c0970d14efa53f05d91a",
-    "hooks/zmem-reflect.sh": "b6b9c78658cf7e6b5006a8d5cb6cf9d72f34bb1b0337125ba01b9a135a2de114",
+    "hooks/zmem-reflect.sh": "a2169dc25ce131f1b6024ea8570536b3a523bb7bf2a7cef6af1d4f12e65a8953",
     "hooks/zmem-session-end.sh": "8734408904c0382a94b55d0b1a4c39a49a2da797bd473050d2b2891c9a283cfe",
     "hooks/zmem-session-start.sh": "f0f9e30065d9baf4a6c34132efd7c49369ca09c4e5cd07db64171ed33d7241c8",
     "hooks/zmem-subagent-recall.sh": "aab144cf0b1723fe113200f22659cbba0aabcccdb18e1e3cc5e14660a25e9588",
@@ -44,7 +44,7 @@
     "scripts/release_gate.py": "15b940d1fa778c8c5395c8dee3aab7cbb52fc788ca9b42c2fd6c436b588a1410",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "ac20e80713cf3ec05159ac0f609313cb094ed5515c387258fa5369faec963aa5",
-    "skills/memory/SKILL.md": "b35634e38148e088ca2d52cea55783ae939b1de143a57d1da6ec9111a4ca3c39",
+    "skills/memory/SKILL.md": "2dd7d9e5752f9b450510c35a5d5e3a7ed0f283d64412fe8ca1e4061d6f0c374e",
     "skills/memory/scripts/correction_queue.py": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
     "skills/memory/scripts/doctor.py": "23a5e1ea02aac2dcce0cfcf18dc252f186779258b18f6f58ed1d4c307dc9f195",
@@ -56,9 +56,9 @@
     "skills/memory/scripts/import-store.py": "75047ada65ad486b1acaa9ff13e38c316ca8dd586d567b3d78f2f9c189398b0d",
     "skills/memory/scripts/schema_meta.py": "e4163c99f8c6cf00fe25ca1f7111444d32ed24f5d0c849a95daa6c9676185d99",
     "skills/memory/scripts/store.py": "99d721f53e8f8c2ba0df6bd60f839f44235f22d8a0dd751020cbad26b4543ffb",
-    "skills/memory/scripts/storelib/__init__.py": "0530e597c4410b58864795cc4837e2f15320275f07330414643e1496daa57e37",
+    "skills/memory/scripts/storelib/__init__.py": "025deae1324d72220c2197ca0ceb1878d41c8fa29819ca25327eb48d22744fc8",
     "skills/memory/scripts/storelib/backup.py": "d0a345f3eeb209d7946bd916492d35463f47c1840d9ac3194c8af6be84c150fc",
-    "skills/memory/scripts/storelib/cli.py": "7f3f5e1c5b42185e43f848906a925f3bf02e3be1d40498f51fd8c3a62a5b7295",
+    "skills/memory/scripts/storelib/cli.py": "4c10f0d4c7dea410ba2cd494731400dd79200d79f10506e5b407f8996e026d40",
     "skills/memory/scripts/storelib/consolidate.py": "1e937fbfda27401057891c980b5e0c4f006035fc6c2d8bae8508697bf8157d58",
     "skills/memory/scripts/storelib/cross_encoder.py": "be9da0f236b28d38f5963a3bd1b48861c85039cee7b620543f74543fadbda4da",
     "skills/memory/scripts/storelib/delivery_ledger.py": "c86ca4f691144f230ed7ecde5cfe2a8aae81c30320b5491a638f03c0b3935bc6",
@@ -69,7 +69,7 @@
     "skills/memory/scripts/storelib/inject.py": "98fd5d54f372ed0b6f367d130643a6190313aac174b5bcd14b0efcc4a7204234",
     "skills/memory/scripts/storelib/links.py": "5bf96acb962728cfa77e2d826dd8d3f85cee979787a7cb1799940c1f68c0302d",
     "skills/memory/scripts/storelib/log_rotate.py": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055",
-    "skills/memory/scripts/storelib/mine.py": "bfd3a039c810242605163e8ffcb0f1adf7468374c62e9404e6cd7f8f5fdefd87",
+    "skills/memory/scripts/storelib/mine.py": "532e1e042dad30710ff9379dddfac4a2638288ea9fa683f62db5163f29053568",
     "skills/memory/scripts/storelib/miss_rate.py": "56d10e875e8172843bd5f58e7e00cb5bad0f66c188ee9343d2ca8458333a2ef2",
     "skills/memory/scripts/storelib/ops_tokens.py": "b65e1e9e86766e218224a8ad4f9e23e8b953b7d134459f478baebf0803e0939b",
     "skills/memory/scripts/storelib/organize.py": "e47b1b7d347a840bb01101b2f843561834045daf50c99e51f7ea86a750de1173",
@@ -80,5 +80,5 @@
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
     "skills/memory/scripts/storelib/write.py": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
   },
-  "version": "0.32.0"
+  "version": "0.33.0"
 }
