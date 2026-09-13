@@ -1291,16 +1291,6 @@ def main():
             # debugger (zero writes, never unfolds, fail-open). It is a flag,
             # not a subcommand, so KNOWN_SUBCMDS stays byte-identical.
             if getattr(args, "explain", False):
-                if args.for_injection:
-                    # Issue #114 review (PRR-003): explain is the read-only
-                    # debugger and has no injection-lane mode; reject the
-                    # combination loudly instead of silently ignoring the
-                    # flag.
-                    print("[zmem] --for-injection is not supported with "
-                          "--explain: explain never applies the inject gate "
-                          "or budget. Re-run without one of the flags.",
-                          file=sys.stderr)
-                    sys.exit(2)
                 if getattr(args, "exclude", None):
                     # Issue #151 review (CUBIC-cli-278): --exclude is parsed
                     # on recall but explain_recall has no exclusion surface —
@@ -1319,7 +1309,8 @@ def main():
                                no_mmr=args.no_mmr,
                                link_hops=args.link_hops,
                                link_budget=args.link_budget,
-                               cross_rerank=rerank_flag)
+                               cross_rerank=rerank_flag,
+                               for_injection=args.for_injection)
             else:
                 recall_memory(conn, query=args.query, namespace=args.namespace,
                               limit=args.limit, as_json=args.json, hybrid=hybrid_arg,

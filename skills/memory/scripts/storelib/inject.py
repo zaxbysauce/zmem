@@ -27,6 +27,7 @@ can still cut the tail.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any, Optional, Tuple
 
@@ -168,6 +169,60 @@ def inject_token_budget() -> int:
     except ValueError:
         return DEFAULT_INJECT_TOKEN_BUDGET
     return value if value > 0 else DEFAULT_INJECT_TOKEN_BUDGET
+
+
+def inject_score_margin() -> float:
+    """Resolve the optional score-margin threshold (issue #182)."""
+    env_name = getattr(_schema_meta, "INJECT_MARGIN_ENV", "ZMEM_INJECT_MARGIN")
+    default = getattr(_schema_meta, "INJECT_MARGIN_DEFAULT", 0.0)
+    return min(1.0, max(0.0, _env_float(env_name, default)))
+
+
+def apply_score_margin(
+    rows: list[dict[str, Any]], *, margin: float | None = None,
+) -> tuple[list[dict[str, Any]], float | None, list[dict[str, Any]]]:
+    """Apply the opt-in score-margin gate to a stable score-descending view.
+
+    The caller supplies rows in score-descending order.  If the configured
+    threshold is disabled or either leading score is unusable, the helper
+    fails open.  Otherwise it reports the six-decimal relative margin and,
+    when that rounded margin is strictly below the threshold, retains only the
+    top ordinary row.  A leading ``decision`` or ``constraint`` protects the
+    entire candidate set while still reporting the observed margin.
+    """
+    retained = list(rows)
+    if len(retained) < 2:
+        return retained, None, []
+
+    if margin is None:
+        threshold = inject_score_margin()
+    else:
+        try:
+            threshold = float(margin)
+        except (TypeError, ValueError, OverflowError):
+            return retained, None, []
+        if not math.isfinite(threshold):
+            return retained, None, []
+        threshold = max(0.0, min(1.0, threshold))
+    if threshold <= 0.0:
+        return retained, None, []
+
+    try:
+        top = float(retained[0].get("_score"))
+        second = float(retained[1].get("_score"))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return retained, None, []
+    if not math.isfinite(top) or not math.isfinite(second) or top <= 0.0:
+        return retained, None, []
+
+    observed = round((top - second) / top, 6)
+    if (
+        observed < threshold
+        and retained[0].get("type") not in _PROTECTED_TYPES
+        and retained[1].get("type") not in _PROTECTED_TYPES
+    ):
+        return [retained[0]], observed, retained[1:]
+    return retained, observed, []
 
 
 def _row_priority(row: dict[str, Any], index: int) -> Tuple[float, int, int]:

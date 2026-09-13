@@ -10,6 +10,35 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.34.0] - 2026-09-12
+
+> Workstream M PR 1 of 2 (issue #182): opt-in score-margin gating for passive
+> injection, with explain and hook diagnostics.
+
+### Added
+- **Score-margin injection gate (issue #182)**: the new
+  `ZMEM_INJECT_MARGIN` setting defaults to `0.0` (disabled); operators can
+  begin the recommended rollout at `0.05`. The gate runs after selective
+  injection filtering and before token-budget admission, pruning ordinary
+  rows only when the relative margin between the top two usable scores is
+  strictly below the threshold. A `decision` or `constraint` in either of the
+  two leading score positions protects the candidate set. Missing, invalid,
+  negative, NaN, or infinite settings fail open to `0.0`; values above `1.0`
+  clamp to `1.0`.
+- **Injection diagnostics (issue #182)**: valid decisions add six-decimal
+  `margin` and ordered `margin_pruned_ids` fields to injection JSON. The
+  read-only `--for-injection --explain` replay reports pruned targets with the
+  `margin_pruned` reason and its observed-margin/threshold detail. Hook
+  decision lines append `margin=` and, when non-empty,
+  `margin_pruned=[...]` after the existing optional fields; absent or malformed
+  diagnostics remain fail-open and preserve legacy lines.
+
+### Deferred
+- **Replay/baseline measurement (#155)** remains a follow-on publication gate.
+  Once its replay artifacts exist, run the exact
+  `--fail-under miss_delta=0` check; this release intentionally creates none
+  of those future artifacts.
+
 ## [0.33.0] - 2026-09-12
 
 > Workstream O PR 1 of 1 (issue #194): the Stop-hook failure detector's

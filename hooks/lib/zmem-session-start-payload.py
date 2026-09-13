@@ -20,6 +20,7 @@ Args (all optional beyond 1, IndexError-tolerant):
 """
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -324,6 +325,11 @@ if store_py and os.path.isfile(store_py):
         _tok_used = None
         _tok_budget = None
         _env_exc = None
+        # Issue #182: score-margin diagnostics are optional envelope fields.
+        # Validate each independently so malformed telemetry never hides a
+        # valid sibling field or changes the legacy decision line.
+        _env_margin = None
+        _env_margin_pruned_ids = None
         if isinstance(rows, dict):
             _er = rows.get("reason")
             if isinstance(_er, str) and _er:
@@ -337,6 +343,29 @@ if store_py and os.path.isfile(store_py):
                 _tok_used = _tu
             if isinstance(_tb, int):
                 _tok_budget = _tb
+            if "margin" in rows:
+                _raw_margin = rows.get("margin")
+                _margin_value = None
+                if (isinstance(_raw_margin, (int, float))
+                        and not isinstance(_raw_margin, bool)):
+                    _margin_value = _raw_margin
+                elif isinstance(_raw_margin, str):
+                    try:
+                        _margin_value = float(_raw_margin)
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                try:
+                    if (_margin_value is not None
+                            and math.isfinite(float(_margin_value))):
+                        _env_margin = float(_margin_value)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            if "margin_pruned_ids" in rows:
+                _raw_pruned = rows.get("margin_pruned_ids")
+                if (isinstance(_raw_pruned, list) and _raw_pruned
+                        and all(isinstance(_mid, str)
+                                for _mid in _raw_pruned)):
+                    _env_margin_pruned_ids = _raw_pruned
             _ee_ss = rows.get("excluded")
             if isinstance(_ee_ss, int) and not isinstance(_ee_ss, bool):
                 _env_exc = _ee_ss
@@ -467,8 +496,17 @@ if store_py and os.path.isfile(store_py):
                             _exc_ss = ""
                             if _env_exc:
                                 _exc_ss = " exc=%d" % _env_exc
+                            _margin_ss = ""
+                            if _env_margin is not None:
+                                _margin_ss = " margin=%.6f" % _env_margin
+                            _margin_pruned_ss = ""
+                            if _env_margin_pruned_ids:
+                                _margin_pruned_ss = (
+                                    " margin_pruned=%s"
+                                    % _env_margin_pruned_ids
+                                )
                             _lf.write(
-                                "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=%s\n" % (
+                                "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=%s%s%s\n" % (
                                     int(__import__("time").time()),
                                     "injected" if rows else "silent",
                                     (_env_reason or ("injected" if rows else "empty-pool")),
@@ -478,6 +516,8 @@ if store_py and os.path.isfile(store_py):
                                     _exc_ss,
                                     _safe_sid,
                                     _moment,
+                                    _margin_ss,
+                                    _margin_pruned_ss,
                                 )
                             )
                 except Exception:

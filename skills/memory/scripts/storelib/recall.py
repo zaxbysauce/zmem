@@ -23,10 +23,12 @@ from storelib.links import expand_recall_links, graph_seed_ids
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
-                             apply_token_budget, budget_note,
+                             apply_score_margin, apply_token_budget, budget_note,
                              classify_silent_reason, estimate_tokens,
-                             inject_token_budget, selective_inject_filter)
-from schema_meta import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV
+                             inject_score_margin, inject_token_budget,
+                             selective_inject_filter)
+from schema_meta import (PROTECTED_INJECT_TYPES,
+                         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
 import embed_profiles as _profiles
 from storelib.cross_encoder import maybe_rerank as _cross_maybe_rerank
 
@@ -57,7 +59,7 @@ EXPLAIN_REASONS = (
     "found", "below_limit", "below_floor", "omitted_injection",
     "omitted_untrusted_web", "namespace", "superseded", "not_valid_at_as_of",
     "vec_lane_miss", "not_in_pool", "not_in_db", "explain_unavailable",
-    "link_expansion",
+    "link_expansion", "margin_pruned",
 )
 
 # Issue #82: change-intent trigger for the explicit-recall lineage unfold.
@@ -1448,6 +1450,26 @@ def _now_epoch() -> float:
     return time.time()
 
 
+def _stable_score_desc(rows: list[dict]) -> list[dict]:
+    """Return a stable numeric-score-descending view without mutating rows.
+
+    The score-margin helper owns the decision, while callers own the ordering
+    boundary: usable finite scores lead the view, and missing/malformed scores
+    remain at the end in their original order.  Python's sort is stable, so
+    equal scores retain the caller's presentation order.
+    """
+    def key(row: dict) -> tuple[int, float]:
+        try:
+            score = float(row.get("_score"))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return (1, 0.0)
+        if not math.isfinite(score):
+            return (1, 0.0)
+        return (0, -score)
+
+    return sorted(rows, key=key)
+
+
 def recall_memory(
     conn: sqlite3.Connection,
     *,
@@ -1736,6 +1758,9 @@ def recall_memory(
     # expansion rows are eligible for gate-drop and consume budget exactly
     # as they did under the hook's post-return budget) and BEFORE telemetry.
     inj_reason = None
+    margin_observed = None
+    margin_pruned_ids: list[str] = []
+    margin_pruned_rows: list[dict] = []
     if for_injection:
         candidate_rows = results
         candidate_ids = [r["id"] for r in candidate_rows]
@@ -1750,6 +1775,20 @@ def recall_memory(
             results = [r for r in results if r["id"] not in _excl]
         selected_rows, _gate_status, _gate_stats = selective_inject_filter(
             results, with_stats=True)
+        # Issue #182: score separation is evaluated on a temporary stable
+        # score-descending view, but the caller's presentation order remains
+        # authoritative for rendering and telemetry.  Filter the original
+        # list by the helper's pruned ids rather than returning its ranked
+        # view; this also keeps project-before-global ordering intact.
+        _margin_view = _stable_score_desc(selected_rows)
+        _margin_retained, margin_observed, margin_pruned_rows = (
+            apply_score_margin(_margin_view, margin=inject_score_margin())
+        )
+        if margin_pruned_rows:
+            margin_pruned_ids = [r["id"] for r in margin_pruned_rows]
+            _margin_ids = set(margin_pruned_ids)
+            selected_rows = [r for r in selected_rows
+                             if r["id"] not in _margin_ids]
         budget_emptied = False
         budget_dropped = 0
         budget_admission = 0
@@ -1843,6 +1882,9 @@ def recall_memory(
                           "trust": _row_trust(r)}
                 for r in candidate_rows
             }
+            if margin_observed is not None:
+                envelope["margin"] = format(margin_observed, ".6f")
+                envelope["margin_pruned_ids"] = margin_pruned_ids
             # Issue #136: per-arm pre/post-cap counts (merged across tiers),
             # so the decision log can attribute a hit to the arm that
             # carried it. All four arms are always present; the kill switch
@@ -1955,6 +1997,16 @@ def _resolve_explain_targets(
     target = (target or "").strip()
     if not target:
         return [], False
+    # Explicit ids are authoritative even when a deterministic test or a
+    # private caller uses a non-UUID identifier.  UUID-shaped prefixes retain
+    # their existing whole-store lookup below; arbitrary ids should not be
+    # mistaken for content fragments when they name a stored row exactly.
+    exact = conn.execute(
+        f"SELECT {_EXPLAIN_TARGET_COLUMNS} FROM memory WHERE id = ?",
+        (target,),
+    ).fetchall()
+    if exact:
+        return exact, False
     looks_uuid = re.fullmatch(r"[0-9a-fA-F-]{4,36}", target) is not None
     if looks_uuid:
         rows = conn.execute(
@@ -2130,6 +2182,8 @@ def _explain_verdict_for_target(
     presented: list[dict], omitted: list[tuple[dict, str]],
     project_deep: list[tuple[float, dict]],
     global_deep: list[tuple[float, dict]],
+    margin_pruned: dict[str, dict] | None = None,
+    margin_pruned_scores: dict[str, object] | None = None,
 ) -> dict:
     """First-match-wins gate analysis for one --target row (issue #82).
 
@@ -2175,6 +2229,11 @@ def _explain_verdict_for_target(
             # the verdict; lane numbers would only blur it.
             return {"id": mid, "reason": why, "rank": None,
                     "score": r.get("_score"), "detail": {}}
+    if margin_pruned and mid in margin_pruned:
+        return {"id": mid, "reason": "margin_pruned", "rank": None,
+                "score": ((margin_pruned_scores or {}).get(mid)
+                          if margin_pruned_scores is not None else None),
+                "detail": margin_pruned[mid]}
     deep = project_deep + global_deep
     for rank, (score, r) in enumerate(deep, start=1):
         if r["id"] == mid:
@@ -2211,6 +2270,27 @@ def _explain_omit_filter(
         else:
             kept.append(r)
     return kept, dropped
+
+
+def _explain_margin_detail(
+    score_view: list[dict], observed: float, threshold: float,
+) -> dict:
+    """Describe one score-margin decision using the exact leading pair."""
+    top, second = score_view[0], score_view[1]
+    top_type = top.get("type")
+    second_type = second.get("type")
+    return {
+        "top_id": top["id"],
+        "top_score": float(top["_score"]),
+        "second_id": second["id"],
+        "second_score": float(second["_score"]),
+        "observed_margin": format(observed, ".6f"),
+        "threshold": threshold,
+        "top_type": top_type,
+        "second_type": second_type,
+        "top_protected": top_type in PROTECTED_INJECT_TYPES,
+        "second_protected": second_type in PROTECTED_INJECT_TYPES,
+    }
 
 
 def _format_explain_blameline(v: dict) -> str:
@@ -2255,6 +2335,7 @@ def explain_recall(
     link_budget: int = 2,
     weights: dict | None = None,
     cross_rerank: bool = False,
+    for_injection: bool = False,
 ) -> list[dict]:
     """Read-only retrieval debugger behind `recall --explain` (issue #82).
 
@@ -2287,6 +2368,10 @@ def explain_recall(
     presentation).
     """
     now_epoch = _now_epoch()
+    if for_injection:
+        # Injection explain mirrors the passive lane and remains strictly
+        # read-only; this also makes omit/filter semantics match recall.
+        no_bump = True
     if hybrid is None:
         hybrid = bool(_embeddings and _embeddings.is_available())
     as_of = _normalize_as_of(as_of)
@@ -2314,6 +2399,10 @@ def explain_recall(
     # Issue #136: per-arm pre/post-cap counts from the presented (real-limit)
     # runs, reported in the explain envelope beside the verdicts.
     explain_arms: dict = {}
+    margin_observed = None
+    margin_pruned_ids: list[str] = []
+    margin_pruned_details: dict[str, dict] = {}
+    margin_pruned_scores: dict[str, object] = {}
     try:
         presented, project_deep, global_deep = _explain_run_pipeline(
             conn, query=query, ns_list=ns_list, global_ns_list=global_ns_list,
@@ -2324,10 +2413,36 @@ def explain_recall(
         )
         if no_bump:
             presented, omitted = _explain_omit_filter(presented)
+        if for_injection:
+            # Issue #182: replay omit -> selective -> margin -> budget in the
+            # explain path without writes.  Use a score view for the decision
+            # only; retain original presentation order for the final rows.
+            presented, _gate_status, _gate_stats = selective_inject_filter(
+                presented, with_stats=True)
+            _margin_view = _stable_score_desc(presented)
+            _margin_threshold = inject_score_margin()
+            _margin_retained, margin_observed, _margin_pruned = (
+                apply_score_margin(_margin_view, margin=_margin_threshold)
+            )
+            if margin_observed is not None and _margin_pruned:
+                margin_pruned_ids = [r["id"] for r in _margin_pruned]
+                _margin_detail = _explain_margin_detail(
+                    _margin_view, margin_observed, _margin_threshold)
+                margin_pruned_details = {
+                    r["id"]: _margin_detail for r in _margin_pruned
+                }
+                margin_pruned_scores = {
+                    r["id"]: r.get("_score") for r in _margin_pruned
+                }
+                _margin_ids = set(margin_pruned_ids)
+                presented = [r for r in presented
+                             if r["id"] not in _margin_ids]
+            if presented:
+                presented, _est, _dropped = apply_token_budget(presented)
         # PRR-001: mirror recall_memory's post-filter rerank stage so the
         # presented ranks the verdicts cite match a real recall when the
         # cross-encoder is CLI-enabled (the helper fails open to input order).
-        if cross_rerank and presented:
+        if cross_rerank and presented and not for_injection:
             presented = _cross_maybe_rerank(query, presented)
     except Exception:
         pipeline_error = True
@@ -2351,6 +2466,8 @@ def explain_recall(
                     min_confidence=min_confidence, presented=presented,
                     omitted=omitted, project_deep=project_deep,
                     global_deep=global_deep,
+                    margin_pruned=margin_pruned_details,
+                    margin_pruned_scores=margin_pruned_scores,
                 )
                 for row in target_rows
             ]
@@ -2360,14 +2477,21 @@ def explain_recall(
                 verdicts.append({"id": r["id"], "reason": "found",
                                  "rank": rank, "score": r.get("_score"),
                                  "detail": {"lanes": _explain_lane_detail(r)}})
+            for mid, detail in margin_pruned_details.items():
+                verdicts.append({"id": mid, "reason": "margin_pruned",
+                                 "rank": None,
+                                 "score": margin_pruned_scores.get(mid),
+                                 "detail": detail})
             for r, why in omitted:
                 verdicts.append({"id": r["id"], "reason": why, "rank": None,
                                  "score": r.get("_score"), "detail": {}})
             deep = project_deep + global_deep
             presented_ids = {r["id"] for r in presented}
             omitted_ids = {r["id"] for r, _why in omitted}
+            margin_ids = set(margin_pruned_details)
             for rank, (score, r) in enumerate(deep, start=1):
-                if r["id"] in presented_ids or r["id"] in omitted_ids:
+                if (r["id"] in presented_ids or r["id"] in omitted_ids
+                        or r["id"] in margin_ids):
                     continue
                 verdicts.append({"id": r["id"], "reason": "below_limit",
                                  "rank": rank, "score": round(score, 4),
@@ -2457,7 +2581,7 @@ def explain_recall(
                           for r in results)
         injection_risk_count = sum(
             1 for r in results if r.get("prompt_injection_risk"))
-        print(json.dumps({
+        envelope = {
             "results": results,
             "count": len(results),
             "omitted": len(omitted),
@@ -2465,7 +2589,11 @@ def explain_recall(
             "tokens_used": tokens_used,
             "tokens_budget": inject_token_budget(),
             "explain": explain_obj,
-        }, indent=2))
+        }
+        if for_injection and margin_observed is not None:
+            envelope["margin"] = format(margin_observed, ".6f")
+            envelope["margin_pruned_ids"] = margin_pruned_ids
+        print(json.dumps(envelope, indent=2))
     else:
         if not results:
             print("[zmem] no matching memories found.")
@@ -2662,6 +2790,9 @@ def recent_memory(
     # or unfold, so every candidate is query-legitimate; the write set is
     # simply the gate+budget survivors.
     inj_reason = None
+    margin_observed = None
+    margin_pruned_ids: list[str] = []
+    margin_pruned_rows: list[dict] = []
     if for_injection:
         candidate_rows = results
         candidate_ids = [r["id"] for r in candidate_rows]
@@ -2676,6 +2807,18 @@ def recent_memory(
             results = [r for r in results if r["id"] not in _excl]
         selected_rows, _gate_status, _gate_stats = selective_inject_filter(
             results, with_stats=True)
+        # Issue #182: decide on a stable score-descending view, then remove
+        # only the helper's pruned ids from the original recent presentation
+        # order. Recent rows normally have no _score and therefore fail open.
+        _margin_view = _stable_score_desc(selected_rows)
+        _margin_retained, margin_observed, margin_pruned_rows = (
+            apply_score_margin(_margin_view, margin=inject_score_margin())
+        )
+        if margin_pruned_rows:
+            margin_pruned_ids = [r["id"] for r in margin_pruned_rows]
+            _margin_ids = set(margin_pruned_ids)
+            selected_rows = [r for r in selected_rows
+                             if r["id"] not in _margin_ids]
         budget_emptied = False
         budget_dropped = 0
         budget_admission = 0
@@ -2751,6 +2894,9 @@ def recent_memory(
                           "trust": _row_trust(r)}
                 for r in candidate_rows
             }
+            if margin_observed is not None:
+                envelope["margin"] = format(margin_observed, ".6f")
+                envelope["margin_pruned_ids"] = margin_pruned_ids
             # Issue #115 review round: the store-side token-budget drop
             # count, so --for-injection consumers report the real drop
             # instead of a client-side residual of an already-budgeted set.

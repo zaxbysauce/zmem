@@ -19,6 +19,7 @@ Run: python tests/test_explain_recall.py   (no pytest required — repo conventi
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -226,8 +227,77 @@ class ExplainReasonCoverageTests(ExplainFixtureBase):
              "omitted_untrusted_web", "namespace", "superseded",
              "not_valid_at_as_of", "vec_lane_miss", "not_in_pool",
              "link_expansion",  # issue #113: link-hop-aware verdict
-             "not_in_db", "explain_unavailable"},
+             "not_in_db", "explain_unavailable", "margin_pruned"},
         )
+
+    def _seed_margin_rows(self):
+        """Seed the deterministic scored pair required by issue #182."""
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            self.assertEqual(
+                conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            for mid, confidence in (
+                ("m-top", 0.50),
+                ("m-second", 0.45),
+                ("m-third", 0.25),
+            ):
+                conn.execute(
+                    """INSERT INTO memory
+                       (id, namespace, type, content, tags, source_ref,
+                        source_hash, confidence, signal, valid_from,
+                        valid_until, update_of, taint, superseded_at,
+                        ingestion_ts)
+                       VALUES (?, ?, 'fact', 'margin', 'eval', '', '', ?, 'test',
+                               '2026-01-01T00:00:00Z', '', '',
+                               'trusted_internal', NULL,
+                               '2026-06-01T00:00:00Z')""",
+                    (mid, NS, confidence),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_margin_pruned_detail(self):
+        self._seed_margin_rows()
+        before = hashlib.sha256(Path(self.store).read_bytes()).hexdigest()
+        env = dict(self.env)
+        env.update({
+            "ZMEM_DATA": os.path.join(self.tmp, "missing-data"),
+            "ZMEM_MODELS_DIR": os.path.join(self.tmp, "missing-models"),
+            "ZMEM_INJECT_MARGIN": "0.05",
+        })
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), "recall", "--query", "margin",
+             "--namespace", NS, "--limit", "3", "--no-mmr",
+             "--for-injection", "--explain", "--json",
+             "--target", "m-second"],
+            env=env, capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        doc = json.loads(r.stdout)
+        verdicts = [v for v in doc["explain"]["verdicts"]
+                    if v["reason"] == "margin_pruned"]
+        self.assertEqual(len(verdicts), 1)
+        self.assertEqual(verdicts[0]["id"], "m-second")
+        self.assertEqual(
+            verdicts[0]["detail"],
+            {
+                "top_id": "m-top",
+                "top_score": 0.8,
+                "second_id": "m-second",
+                "second_score": 0.79,
+                "observed_margin": "0.012500",
+                "threshold": 0.05,
+                "top_type": "fact",
+                "second_type": "fact",
+                "top_protected": False,
+                "second_protected": False,
+            },
+        )
+        after = hashlib.sha256(Path(self.store).read_bytes()).hexdigest()
+        self.assertEqual(after, before,
+                         "injection explain must be zero-write")
 
     def test_found(self):
         doc = self._explain_json("--query", "deploy pipeline", "--namespace", NS,
