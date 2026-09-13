@@ -960,6 +960,20 @@ def main():
     p_ep_list.add_argument("--json", action="store_true",
                            help="print episodes as JSON")
 
+    p_hyg = _add_parser(
+        "hygiene",
+        help="read-only store hygiene snapshot report (issue #97)")
+    p_hyg.add_argument("--store", dest="store", type=str, required=True,
+                       help="SQLite snapshot to inspect")
+    p_hyg.add_argument("--origin-map", dest="origin_map", type=str, required=True,
+                       help="Reviewed Hermes origin map JSON path")
+    p_hyg.add_argument("--evidence-map", dest="evidence_map", type=str, required=True,
+                       help="None-upgrade evidence map JSON path")
+    p_hyg.add_argument("--out", dest="out", type=str, required=True,
+                       help="Canonical report output path")
+    p_hyg.add_argument("--format", dest="format", choices=("json", "text"),
+                       default="json", help="Report format")
+
     args = ap.parse_args()
 
     # `failures` is store-independent (it reads a transcript JSONL or the ZCode
@@ -1053,6 +1067,22 @@ def main():
     if args.cmd == "path":
         print(STORE_PATH)
         sys.exit(0)
+
+    # `hygiene` inspects an operator-supplied SNAPSHOT read-only (issue #97),
+    # never the resolved store, so — like `failures`/`path` above — it
+    # dispatches BEFORE connect()/_prepare_store()/_auto_near_miss_rekey():
+    # a locked, absent, or mid-migration live store can never block a report,
+    # and running a report can never remediate (that is #168's boundary).
+    if args.cmd == "hygiene":
+        from storelib.hygiene import main as _hygiene_main
+
+        sys.exit(_hygiene_main([
+            "--store", args.store,
+            "--origin-map", args.origin_map,
+            "--evidence-map", args.evidence_map,
+            "--out", args.out,
+            "--format", args.format,
+        ]))
 
     # PR-review PRR-P (issue #59 review round): `--content -` reads the content
     # from stdin. Windows argv caps near 32k chars while the content cap is

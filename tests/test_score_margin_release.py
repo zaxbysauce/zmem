@@ -23,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_VERSION = "0.36.0"
 SCORE_MARGIN_VERSION = "0.34.0"
 _SCORE_MARGIN_VERSION_RE = re.escape(SCORE_MARGIN_VERSION)
+
 RELEASE_SECTION_RE = re.compile(
     rf"^## \[{_SCORE_MARGIN_VERSION_RE}\][^\n]*[-—]\s*(\d{{4}}-\d{{2}}-\d{{2}})\s*$",
     re.MULTILINE,

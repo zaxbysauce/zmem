@@ -22,6 +22,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+# Issue #97: pin the store/env family BEFORE any storelib import — storelib
+# freezes STORE_PATH at first import, and this module imports storelib.schema
+# below. Without the pin, a co-run with ambient env could freeze the
+# operator's real store into the process.
+import uuid as _uuid  # noqa: E402
+
+_test_scratch = Path(tempfile.gettempdir()) / (
+    "zmem-namespace-tests-" + _uuid.uuid4().hex
+)
+os.environ["ZMEM_STORE"] = str(_test_scratch / "store.sqlite")
+os.environ["ZMEM_DATA"] = str(_test_scratch)
+os.environ["ZMEM_MODELS_DIR"] = str(_test_scratch / "missing-models")
+os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+
 import host  # noqa: E402
 
 
@@ -988,6 +1002,152 @@ class TestV5MigrationRetryAfterCheckoutAppears(unittest.TestCase):
                 after["value"] if after else None,
             )
             conn.close()
+
+
+class NamespaceCacheTest(unittest.TestCase):
+    """Issue #97: the three git statuses and the namespace cache contract.
+
+    A git ERROR inside a checkout that HAS an origin must resolve to the
+    cached remote key (warm) or exactly ``user:global`` (cold) — never a
+    path-shaped key. ``absent`` keeps the historical path-key behavior.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="zmem-ns-cache-")
+        self.addCleanup(self._tmp.cleanup)
+        self.data_dir = Path(self._tmp.name) / "data"
+        self.patcher = mock.patch.dict(
+            os.environ, {"ZMEM_DATA": str(self.data_dir)}, clear=False
+        )
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def _healthy_repo(self, name: str) -> Path:
+        repo = Path(self._tmp.name) / name
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://github.com/example/repo.git"],
+            cwd=str(repo), check=True,
+        )
+        return repo
+
+    def _break_git(self, repo: Path) -> None:
+        """Force `git -C <repo> remote get-url origin` to exit non-zero while
+        the directory still looks like a checkout (worktree-style pointer to
+        a missing gitdir)."""
+        git_path = repo / ".git"
+        if git_path.is_dir():
+            import shutil
+
+            shutil.rmtree(git_path)
+        git_path.write_text("gitdir: /nonexistent/CorruptGitDir\n", encoding="utf-8")
+
+    def test_error_uses_cached_remote(self):
+        repo = self._healthy_repo("warm")
+        self.assertEqual(
+            host.resolve_namespace(repo), "project:github.com/example/repo"
+        )
+        self._break_git(repo)
+        status = host._get_git_remote_status(repo)
+        self.assertEqual(status[1], "error")
+        self.assertIsNone(status[0])
+        self.assertEqual(
+            host.resolve_namespace(repo), "project:github.com/example/repo"
+        )
+
+    def test_error_cache_miss_uses_global(self):
+        repo = self._healthy_repo("cold")
+        self._break_git(repo)
+        result = host.resolve_namespace(repo)
+        self.assertEqual(result, "user:global")
+        self.assertFalse(result.startswith("project:"))
+
+    def test_absent_uses_path(self):
+        repo = Path(self._tmp.name) / "absent"
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+        self.assertEqual(
+            host.resolve_namespace(repo),
+            f"project:{host._norm_abspath_key(repo)}",
+        )
+
+    def test_corrupt_cache_fails_open(self):
+        repo = self._healthy_repo("corrupt")
+        self.assertEqual(
+            host.resolve_namespace(repo), "project:github.com/example/repo"
+        )
+        from storelib.namespace_cache import get_cached_namespace
+
+        cache_files = list((self.data_dir / "namespace-cache").glob("*.json"))
+        self.assertEqual(len(cache_files), 1)
+        cache_files[0].write_bytes(b"\x00not json at all")
+        self._break_git(repo)
+        # Fail open: corrupt cache behaves like a cold cache, no exception.
+        self.assertEqual(
+            get_cached_namespace(
+                self.data_dir, repo, now=10_000.0, ttl_seconds=3600
+            ),
+            None,
+        )
+        self.assertEqual(host.resolve_namespace(repo), "user:global")
+
+    def test_success_refreshes_cache(self):
+        from storelib.namespace_cache import (
+            NAMESPACE_CACHE_TTL_SECONDS,
+            get_cached_namespace,
+            put_cached_namespace,
+        )
+
+        self.assertEqual(NAMESPACE_CACHE_TTL_SECONDS, 3600)
+        repo = self._healthy_repo("refresh")
+        self.assertEqual(
+            host.resolve_namespace(repo), "project:github.com/example/repo"
+        )
+        cached = get_cached_namespace(
+            self.data_dir, repo, now=10_000.0, ttl_seconds=3600
+        )
+        self.assertEqual(cached, "project:github.com/example/repo")
+        # Direct roundtrip + expiry.
+        put_cached_namespace(
+            self.data_dir, repo, "project:github.com/other/repo", now=10_000.0
+        )
+        self.assertEqual(
+            get_cached_namespace(
+                self.data_dir, repo, now=10_000.0 + 3600, ttl_seconds=3600
+            ),
+            "project:github.com/other/repo",
+        )
+        self.assertIsNone(
+            get_cached_namespace(
+                self.data_dir, repo, now=10_000.0 + 3600 + 0.5, ttl_seconds=3600
+            )
+        )
+        # Re-resolving a healthy checkout refreshes the cached key back.
+        self.assertEqual(
+            host.resolve_namespace(repo), "project:github.com/example/repo"
+        )
+        self.assertEqual(
+            get_cached_namespace(
+                self.data_dir, repo, now=99_999.0, ttl_seconds=3600
+            ),
+            "project:github.com/example/repo",
+        )
+
+    def test_entry_valid_at_exact_ttl(self):
+        from storelib.namespace_cache import get_cached_namespace, put_cached_namespace
+
+        repo = Path(self._tmp.name) / "exact"
+        repo.mkdir()
+        put_cached_namespace(
+            self.data_dir, repo, "project:github.com/exact/repo", now=1_000.0
+        )
+        self.assertEqual(
+            get_cached_namespace(
+                self.data_dir, repo, now=1_000.0 + 3600, ttl_seconds=3600
+            ),
+            "project:github.com/exact/repo",
+        )
 
 
 if __name__ == "__main__":

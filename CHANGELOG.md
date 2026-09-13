@@ -12,6 +12,44 @@ README.
 
 ## [0.36.0] - 2026-09-13
 
+## [0.37.0] - 2026-09-13
+
+> Workstream E PR 1 of 7 (issue #97): a Git failure can no longer invent a
+> path-shaped project namespace, and a read-only hygiene report audits the
+> store's debris without ever touching it.
+
+### Added
+- **`store.py hygiene` (issue #97)**: read-only snapshot report for store
+  hygiene — totals and live counts, sorted namespaces/signals, the reviewed
+  Hermes-origin id map, the six known junk namespaces, duplicate logical
+  keys (live rows sharing a `content_norm`), and an evidence-gated
+  `signal=none` upgrade action plan. Every proposed upgrade requires a live
+  later grounded row, a live `supports`/`updates`/`extends`/`derives` link,
+  a non-empty proof reference, and a justification; the emitted
+  `store.py update` commands are review artifacts and are never executed.
+  Opens the snapshot with SQLite `mode=ro`; invalid input (unreadable
+  files, malformed JSON, duplicate or unknown mapped ids, SQLite errors)
+  exits 2 with `[zmem] hygiene: invalid input` and creates no output.
+  Hermes-origin mutations remain owned by issue #168.
+- **`storelib/namespace_cache.py` (issue #97)**: disk cache of successful
+  remote-derived namespaces (`<data-dir>/namespace-cache/`,
+  `NAMESPACE_CACHE_TTL_SECONDS = 3600`); read, write, and corruption
+  failures fail open silently.
+- **Operator documentation** in `skills/memory/SKILL.md`: the snapshot-copy
+  / report-review / verified-backup / dry-run rekey workflow and the #168
+  mutation boundary.
+
+### Changed
+- **Namespace resolution (issue #97)**: `host.py` now classifies each
+  lookup as git `remote`, `absent`, or `error`. A successful remote key is
+  cached; an `absent` checkout keeps its historical path key; a git ERROR
+  inside a checkout resolves to the cached remote key or exactly
+  `user:global` — never a path-shaped namespace, so a transient Git
+  failure can no longer strand captured memories under a path namespace
+  nothing resolves.
+
+## [0.36.0] - 2026-09-13
+
 > Workstream N PR 1 of 6 (issue #184): fail-closed host-cache refresh from a
 > checkout-derived release, with transactional registry and marketplace updates.
 
@@ -35,6 +73,7 @@ README.
   execution, fail-fast behavior, and nonzero exit propagation; installer steps
   are skipped when refresh fails. The updater remains operator-local and
   untracked, so existing copies must be reordered before use.
+
 
 ## [0.35.0] - 2026-09-13
 
