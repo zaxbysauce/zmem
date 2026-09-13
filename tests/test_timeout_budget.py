@@ -18,10 +18,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO_ROOT / "hooks" / "zmem-launch.js"
+PAYLOAD = REPO_ROOT / "hooks" / "lib" / "zmem-session-start-payload.py"
+NL = chr(10)
 FIXTURES_TIMEOUT = REPO_ROOT / "tests" / "fixtures" / "timeout"
 
 sys.path.insert(0, str(REPO_ROOT / "tests" / "fixtures"))
@@ -452,3 +455,71 @@ console.log(JSON.stringify(out));
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class SpawnFailureFailOpenTest(unittest.TestCase):
+    """Final critic: the F-001 restructure dropped the spawn-error
+    fail-open handler — an unhandled error event crashed the launcher
+    (exit 1, zero stdout) on a real deployment shape (no Git Bash, so
+    findBash falls back to bare bash). Pinned: a launcher whose bash is
+    a non-executable junk file must exit 0 with an empty envelope."""
+
+    def test_spawn_failure_fails_open(self):
+        scratch = _scratch("zmem-121-spawnfail-")
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        hooks = scratch / "hooks"
+        hooks.mkdir()
+        (hooks / "zmem-session-start.sh").write_text(
+            "#!/usr/bin/env bash\ntrue\n",
+            encoding="utf-8", newline=NL)
+        not_bash = scratch / "not-bash.txt"
+        not_bash.write_text("definitely not an executable\n",
+                            encoding="utf-8")
+        data = scratch / "data"
+        data.mkdir()
+        env = dict(os.environ)
+        env.update({
+            "ZMEM_BASH_PATH": str(not_bash),
+            "ZCODE_PLUGIN_ROOT": scratch.as_posix(),
+            "ZMEM_DATA": data.as_posix(),
+            "ZMEM_LAUNCHER_WATCHDOG_MS": "12000",
+        })
+        proc = subprocess.run(
+            ["node", str(LAUNCHER), "session-start"],
+            input='{"session_id":"spawnfail"}',
+            capture_output=True, text=True, env=env,
+            cwd=str(REPO_ROOT), timeout=30)
+        self.assertEqual(proc.returncode, 0,
+                         "spawn failure must fail open (exit 0): "
+                         + proc.stderr[:200])
+        self.assertIn("{}", proc.stdout,
+                      "spawn failure must emit an empty envelope")
+
+    def test_budget_default_fallback_is_seconds(self):
+        """Final critic: _budget_default_s divides the JSON value by 1000
+        but must return the FALLBACK verbatim (seconds) when the table is
+        unreadable — the pre-fix code passed 8000 (ms) and silently set a
+        ~133-minute store cap on a partial install."""
+        import importlib.util
+        import builtins
+        spec = importlib.util.spec_from_file_location(
+            "ss_payload_fallback", PAYLOAD)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # Key miss path: the fallback (seconds) is returned verbatim.
+        self.assertEqual(mod._budget_default_s("no_such_key", 8.0), 8.0)
+        # File-unreadable path: open raising must hit the except and
+        # return the seconds fallback, never a millisecond value.
+        real_open = builtins.open
+
+        def raising_open(*args, **kwargs):
+            raise OSError("simulated partial install")
+
+        with unittest.mock.patch("builtins.open", side_effect=raising_open):
+            self.assertEqual(
+                mod._budget_default_s("store_recall_ms", 8.0), 8.0)
+            self.assertLessEqual(
+                mod._store_timeout_s(), 8.0,
+                "an unreadable budget table must fall back to seconds, "
+                "never milliseconds")

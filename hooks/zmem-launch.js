@@ -978,7 +978,8 @@ async function main() {
             let envelope;
             try {
                 envelope = translate(raw, fireState.host || detectHost(), hookName,
-                    fireState.budget || resolveBudget(process.env));
+                    fireState.budget
+                    || (process.env.ZMEM_CTX_BUDGET ? resolveBudget(process.env) : 9000));
             } catch {
                 envelope = {};
             }
@@ -1053,15 +1054,44 @@ async function main() {
     // HOST read side open past our own exit — with a launcher-owned pipe,
     // the host sees EOF the moment we exit no matter what the tree kill
     // reached.
-    const child = spawn(bashPath, [scriptPath], {
-        stdio: ["pipe", translated ? "pipe" : "inherit", translated ? "pipe" : "inherit"],
-        env: buildChildEnv(env, bashPath),
-    });
-    if (translated && child.stderr) {
+    // Final critic: spawn() can either emit an async error event (ENOENT
+    // on POSIX) or THROW synchronously (Windows EFTYPE for a
+    // non-executable bash path) — both fail open: clear the watchdog,
+    // emit an empty envelope, exit 0. The old error handler was lost in
+    // the F-001 restructure and the launcher crashed (exit 1, zero
+    // stdout) on this path.
+    let child;
+    try {
+        child = spawn(bashPath, [scriptPath], {
+            stdio: ["pipe", translated ? "pipe" : "inherit", translated ? "pipe" : "inherit"],
+            env: buildChildEnv(env, bashPath),
+        });
+    } catch (spawnErr) {
+        if (watchdog) watchdog.clear();
+        process.stdout.write("{}\n");
+        process.exit(0);
+    }
+    child.on("error", () => {
+        if (watchdog) watchdog.clear();
+        process.stdout.write("{}\n");
+        process.exit(0);
+    });    if (translated && child.stderr) {
         child.stderr.on("data", (c) => {
             try { process.stderr.write(c); } catch { /* host stderr gone */ }
         });
     }
+
+    // Spawn failure (bash not found, ENOEXEC/EACCES): fail open — clear the
+    // watchdog, emit an empty envelope, exit 0. Final critic on the review
+    // round caught this handler being dropped in the F-001 restructure: an
+    // unhandled 'error' event crashed the launcher (exit 1, zero stdout),
+    // breaking the fail-open invariant on a real deployment shape (no Git
+    // Bash found → findBash falls back to bare "bash").
+    child.on("error", () => {
+        if (watchdog) watchdog.clear();
+        process.stdout.write("{}\n");
+        process.exit(0);
+    });
 
     // The watchdog (armed above, before startup) now binds the child:
     // everything before this line already consumed its budget.

@@ -96,7 +96,7 @@ def _store_timeout_s():
     """
     global _store_timeout_warned
     raw = os.environ.get("ZMEM_STORE_RECALL_TIMEOUT_S", "")
-    value = _budget_default_s("store_recall_ms", 8000)
+    value = _budget_default_s("store_recall_ms", 8.0)  # fallback is SECONDS
     warned = False
     if raw.strip():
         try:
