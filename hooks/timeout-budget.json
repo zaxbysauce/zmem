@@ -1,0 +1,8 @@
+{
+  "launcher_watchdog_ms": 12000,
+  "namespace_resolve_ms": 2000,
+  "store_recall_ms": 8000,
+  "sqlite_busy_ms": 5000,
+  "hermes_manager_join_ms": 8000,
+  "hermes_provider_deadline_ms": 6000
+}

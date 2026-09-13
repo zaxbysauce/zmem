@@ -31,8 +31,8 @@
 "use strict";
 
 const { spawn, execFileSync } = require("child_process");
-const { existsSync } = require("fs");
-const { join, dirname, basename, delimiter } = require("path");
+const { existsSync, mkdirSync, appendFileSync, readFileSync } = require("fs");
+const { join, dirname, basename, resolve, delimiter } = require("path");
 const { homedir } = require("os");
 
 // Hooks that emit the <<<ZMEM_JSON>>> sentinel and get envelope translation.
@@ -151,30 +151,305 @@ function getPluginRoot() {
     );
 }
 
+// --- Timeout budget (issue #121) ---------------------------------------------
+// Canonical integer values live in hooks/timeout-budget.json; the runtime
+// reads env overrides and falls back to those defaults. The Hermes rows are
+// #160-owned documentation inputs — no Hermes deadline is enforced here.
+const DEFAULT_LAUNCHER_WATCHDOG_MS = 12000;
+const DEFAULT_NAMESPACE_RESOLVE_MS = 2000;
+const DEFAULT_NAMESPACE_CACHE_TTL_MS = 60000;
+const NAMESPACE_CACHE_MAX_ENTRIES = 128;
+
+// Read one positive-integer millisecond env override. Invalid (non-integer,
+// zero, negative) values fall back to the default and write exactly ONE
+// warning per name per process (warn is injectable for tests).
+function readPositiveIntMs(env, name, dflt, warn) {
+    const raw = env && env[name];
+    if (raw === undefined || raw === "") return dflt;
+    const w = typeof warn === "function" ? warn : (s) => process.stderr.write(s);
+    // PR #198 review F-004: parseInt accepted numeric prefixes, so
+    // ZMEM_LAUNCHER_WATCHDOG_MS=1e9 silently parsed as 1 ms. Require a full
+    // decimal match; anything else takes the documented default + one
+    // warning per name. ("15" stays valid — it IS a positive integer; the
+    // issue contract defines no minimum.)
+    if (!/^[0-9]+$/.test(String(raw).trim())) {
+        warnOnce(warn, "env:" + name,
+            `zmem: invalid ${name}=${JSON.stringify(raw)} (must be a positive integer); using default ${dflt}\n`);
+        return dflt;
+    }
+    const parsed = parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        warnOnce(warn, "env:" + name,
+            `zmem: invalid ${name}=${JSON.stringify(raw)} (must be a positive integer); using default ${dflt}\n`);
+        return dflt;
+    }
+    return parsed;
+}
+
+// F-010: hooks/timeout-budget.json is the canonical table — load it at
+// startup (fail-open to the hardcoded fallbacks) so the runtime defaults
+// and the documented table cannot drift apart.
+function loadTimeoutBudget() {
+    try {
+        return JSON.parse(readFileSync(join(__dirname, "timeout-budget.json"), "utf8"));
+    } catch {
+        return null;
+    }
+}
+const TIMEOUT_BUDGET = loadTimeoutBudget();
+function budgetDefault(key, fallback) {
+    const v = TIMEOUT_BUDGET && TIMEOUT_BUDGET[key];
+    return (typeof v === "number" && v > 0) ? v : fallback;
+}
+
+const _msWarnings = new Set();
+function warnOnce(warn, key, message) {
+    if (_msWarnings.has(key)) return;
+    _msWarnings.add(key);
+    const w = typeof warn === "function" ? warn : (s) => process.stderr.write(s);
+    try { w(message); } catch { /* fail open */ }
+}
+
+// --- Namespace resolution with a process-local cache (issue #121) ------------
+// Keyed by the normalized absolute project path (case-folded on win32 only,
+// where the filesystem is case-insensitive, so C:\X and c:\x share one
+// entry). Only successful non-empty resolutions are cached; a failure or
+// timeout returns "user:global" and never caches the path. An entry expires
+// at exactly TTL (age < ttl is fresh; age == ttl is a miss). The cache is
+// bounded (FIFO eviction, insertion order) so a long-lived host process
+// cannot grow it without limit.
+const namespaceCache = new Map();
+let _nsStats = { hits: 0, misses: 0 };
+let _nsClock = () => Date.now();
+
+function namespaceCacheKey(projectDir) {
+    const resolved = resolve(projectDir);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function clearNamespaceCache() {
+    namespaceCache.clear();
+    _nsStats = { hits: 0, misses: 0 };
+    _nsClock = () => Date.now();
+}
+
+function namespaceCacheStats() {
+    return { hits: _nsStats.hits, misses: _nsStats.misses };
+}
+
 // --- Find python (for namespace resolution) ---------------------------------
 // Windows: prefer `python` (python3 is often a no-op Store stub). Verified by
 // actually resolving the namespace; on failure we fall back to 'user:global'.
-function resolveNamespace(projectDir) {
+function resolveNamespace(projectDir, opts = {}) {
     if (!projectDir) return "user:global";
+    const clock = typeof opts.clock === "function" ? opts.clock : _nsClock;
+    const warn = opts.warn;
+    const ttlMs = opts.ttlMs !== undefined
+        ? opts.ttlMs
+        : readPositiveIntMs(process.env, "ZMEM_NAMESPACE_CACHE_TTL_MS",
+            budgetDefault("namespace_cache_ttl_ms", DEFAULT_NAMESPACE_CACHE_TTL_MS), warn);
+    const resolveMs = opts.resolveMs !== undefined
+        ? opts.resolveMs
+        : readPositiveIntMs(process.env, "ZMEM_NAMESPACE_RESOLVE_MS",
+            budgetDefault("namespace_resolve_ms", DEFAULT_NAMESPACE_RESOLVE_MS), warn);
+    const key = namespaceCacheKey(projectDir);
+    const now = clock();
+    const cached = namespaceCache.get(key);
+    if (cached) {
+        if (now - cached.at < ttlMs) {
+            _nsStats.hits++;
+            return cached.ns;
+        }
+        namespaceCache.delete(key); // expired at exactly TTL
+    }
+    _nsStats.misses++;
     const scriptsDir = join(getPluginRoot(), "skills", "memory", "scripts");
+    // The resolver answers in JSON: host.resolve_namespace is the SOLE
+    // producer of project:* keys, and it falls back to a normalized-abspath
+    // key for non-remote projects. We compare against host.py's own
+    // normalizer so only genuinely remote-derived keys (issue #121: "cache
+    // only successful non-empty remote namespaces ... never cache a path
+    // key") enter the cache — path keys are returned uncached every time.
     const code =
-        "import sys; sys.path.insert(0, sys.argv[1]); import host; " +
-        "print(host.resolve_namespace(sys.argv[2]))";
+        "import json, sys; sys.path.insert(0, sys.argv[1]); " +
+        "from pathlib import Path; import host; " +
+        "_p = Path(sys.argv[2]); _ns = host.resolve_namespace(_p); " +
+        "_fb = None\n" +
+        "try:\n" +
+        "    _fb = 'project:' + host._norm_abspath_key(_p)\n" +
+        "except Exception:\n" +
+        "    _fb = None\n" +
+        "print(json.dumps({'ns': _ns, 'remote': bool(_fb is None or _ns != _fb)}))";
     const candidates =
         process.platform === "win32" ? ["python", "python3"] : ["python3", "python"];
     for (const py of candidates) {
         try {
             const out = execFileSync(py, ["-c", code, scriptsDir, projectDir], {
                 encoding: "utf8",
-                timeout: 8000,
+                timeout: resolveMs,
                 stdio: ["ignore", "pipe", "ignore"],
             }).trim();
-            if (out) return out;
+            if (out) {
+                let resolved = out;
+                let cacheable = true;
+                try {
+                    const parsed = JSON.parse(out);
+                    if (parsed && typeof parsed.ns === "string") {
+                        resolved = parsed.ns;
+                        cacheable = parsed.remote === true;
+                    }
+                } catch {
+                    // A pre-JSON resolver build printing the bare key: treat
+                    // the non-empty result as cacheable (fail-safe).
+                }
+                if (resolved) {
+                    if (cacheable) {
+                        namespaceCache.set(key, { ns: resolved, at: now });
+                        if (namespaceCache.size > NAMESPACE_CACHE_MAX_ENTRIES) {
+                            const oldest = namespaceCache.keys().next().value;
+                            namespaceCache.delete(oldest);
+                        }
+                    }
+                    return resolved;
+                }
+            }
         } catch {
             // try next interpreter
         }
     }
+    warnOnce(warn, "namespace_resolution_error",
+        "zmem: namespace_resolution_error=1 (falling back to user:global)\n");
     return "user:global";
+}
+
+// --- Launcher watchdog (issue #121) -------------------------------------------
+// Bounds a translated hook's total runtime: at the deadline the child tree is
+// terminated, the LAST COMPLETE sentinel payload collected so far is emitted
+// (Tier 0 on the session-start path — the whole point of the fast path), an
+// outer-timeout decision record is appended, and the launcher exits 0. Normal
+// close clears the timer. The clock is injectable: production uses the global
+// timer functions (setTimeout returns an id, clearTimeout accepts it); tests
+// inject a fake clock with the same numeric-id contract.
+const PRODUCTION_CLOCK = {
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (id) => clearTimeout(id),
+};
+
+let _lastTerminateInfo = { mode: "none" };
+
+function _lastTerminateInfoForTests() {
+    return { ..._lastTerminateInfo };
+}
+
+// Terminate the child AND (on win32) its spawned subtree: a bare kill of
+// the bash child would orphan the python grandchildren the hook scripts
+// spawn — and those grandchildren INHERIT stdio handles, so a survivor
+// can hold the HOST read side open past our own exit. taskkill /T walks
+// the tree; two sequencing rules keep that walk effective: (1) taskkill
+// must be spawned async + detached — spawnSync("taskkill") deadlocks the
+// Node event loop when the launcher own stdio are pipes (the host
+// hook-runner configuration); (2) nothing may synchronously kill the
+// direct child first — a dead root PID makes the tree walk fail and
+// re-orphans the grandchildren. The watchdog callback bounds teardown
+// with a grace window plus a child.kill() fallback. Fake children
+// without a real pid skip the taskkill branch so injected-clock unit
+// tests stay pure.
+function _terminateChildTree(child) {
+    if (process.platform === "win32" && child && typeof child.pid === "number" && child.pid > 0) {
+        try {
+            const tk = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+                stdio: "ignore",
+                detached: true,
+                windowsHide: true,
+            });
+            try { tk.unref(); } catch { /* already gone */ }
+            _lastTerminateInfo = { mode: "taskkill", pid: child.pid };
+            return; // the tree kill is in flight; do NOT kill the root first
+        } catch {
+            _lastTerminateInfo = { mode: "kill-fallback", pid: child.pid };
+        }
+    } else {
+        _lastTerminateInfo = { mode: "kill" };
+    }
+    try { if (child && typeof child.kill === "function") child.kill(); } catch { /* already gone */ }
+}
+
+// child may be the child object itself OR a getter evaluated at fire
+// time (issue #121 F-001: the watchdog arms before the child spawns,
+// so startup work counts against the budget). A null/absent child at
+// fire time is a clean kill no-op.
+function startWatchdog(child, timeoutMs, clock, onTimeout) {
+    const c = clock || PRODUCTION_CLOCK;
+    let fired = false;
+    const id = c.setTimeout(() => {
+        if (fired) return;
+        fired = true;
+        _terminateChildTree(typeof child === "function" ? child() : child);
+        try { if (typeof onTimeout === "function") onTimeout(); } catch { /* fail open */ }
+    }, timeoutMs);
+    return {
+        clear() { if (!fired) c.clearTimeout(id); },
+        fired() { return fired; },
+    };
+}
+
+// Data-dir chain mirrors the payload python's _data_dir() resolution
+// (zmem-session-start-payload.py): ZMEM_STORE's directory > ZMEM_DATA >
+// CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA > ~/.zmem, so launcher-side and
+// payload-side decision lines always co-locate.
+function _decisionLogDir(env) {
+    const e = env || {};
+    // PR #198 review F-005: mirror the python resolver — expandHome on
+    // every branch. ZMEM_STORE is a FILE (use its dirname; a bare filename
+    // like "store.sqlite" yields "." and is treated as absent), while
+    // ZMEM_DATA / plugin-data vars ARE the directory (used verbatim).
+    const pickStore = (v) => {
+        if (!v) return null;
+        const expanded = expandHome(String(v));
+        const dir = dirname(expanded);
+        if (!dir || dir === "." || dir === expanded) return null;
+        return dir;
+    };
+    const pickDir = (v) => (v ? expandHome(String(v)) : null);
+    return pickStore(e.ZMEM_STORE)
+        || pickDir(e.ZMEM_DATA)
+        || pickDir(e.CLAUDE_PLUGIN_DATA)
+        || pickDir(e.ZCODE_PLUGIN_DATA)
+        || join(homedir(), ".zmem");
+}
+
+// Append the launcher-side outer-timeout decision record. Returns the
+// structured record (the tests/fixtures/timeout/expected_timeout.json shape);
+// a log-write failure fails open (the record is still returned, the hook
+// still exits 0).
+function appendOuterTimeoutDecision(env, hookName, stage, fields = {}) {
+    const e = env || {};
+    const record = {
+        namespace: e.ZMEM_NAMESPACE || "",
+        outer_timeout: 1,
+        reason: "omitted",
+        stage: stage || "launcher",
+        tier0_emitted: fields.tier0_emitted ? 1 : 0,
+        tier2_rows: 0,
+        timeout_ms: fields.timeout_ms !== undefined && fields.timeout_ms !== null
+            ? fields.timeout_ms
+            : DEFAULT_LAUNCHER_WATCHDOG_MS,
+    };
+    try {
+        const dir = _decisionLogDir(e);
+        try { mkdirSync(dir, { recursive: true }); } catch { /* best-effort */ }
+        appendFileSync(
+            join(dir, "zmem-decisions.log"),
+            `[${Math.floor(Date.now() / 1000)}] zmem-hook status=silent reason=omitted `
+            + `outer_timeout=1 stage=${record.stage} timeout_ms=${record.timeout_ms} `
+            + `tier0_emitted=${record.tier0_emitted} tier2_rows=0 `
+            + `hook=${hookName || ""} ns=${record.namespace} `
+            + `sid=${e.ZMEM_SESSION || ""} `
+            + `moment=${hookEventNameFor(e.ZMEM_HOST, hookName) || hookName || ""}\n`,
+            "utf8"
+        );
+    } catch { /* fail open: the audit log never blocks the hook */ }
+    return record;
 }
 
 // --- Expand a leading ~ in a config-supplied path ---------------------------
@@ -683,6 +958,55 @@ async function main() {
         return;
     }
 
+    // Issue #121 (F-001): the watchdog arms BEFORE any startup work —
+    // the stdin wait, the canonical env build (namespace resolution can
+    // stall its interpreter candidates), and the child spawn all count
+    // against this budget, so TOTAL launcher runtime stays inside the
+    // host hook timeout even when startup itself hangs. At fire: emit
+    // the last complete sentinel collected so far (an empty {} envelope
+    // if nothing arrived), append the outer-timeout decision record, and
+    // exit 0. Pass-through hooks stay unwatched (documented residual).
+    const translated = TRANSLATED_HOOKS.has(hookName);
+    const outChunks = [];
+    const fireState = { child: null, host: "", budget: 0, env: null };
+    let watchdog = null;
+    if (translated) {
+        const watchdogMs = readPositiveIntMs(process.env, "ZMEM_LAUNCHER_WATCHDOG_MS",
+            budgetDefault("launcher_watchdog_ms", DEFAULT_LAUNCHER_WATCHDOG_MS));
+        watchdog = startWatchdog(() => fireState.child, watchdogMs, PRODUCTION_CLOCK, () => {
+            const raw = Buffer.concat(outChunks).toString("utf8");
+            let envelope;
+            try {
+                envelope = translate(raw, fireState.host || detectHost(), hookName,
+                    fireState.budget
+                    || (process.env.ZMEM_CTX_BUDGET ? resolveBudget(process.env) : 9000));
+            } catch {
+                envelope = {};
+            }
+            process.stdout.write(JSON.stringify(envelope) + "\n");
+            appendOuterTimeoutDecision(fireState.env || process.env, hookName, "launcher", {
+                tier0_emitted: hookName === "session-start" && extractPayload(raw) !== null,
+                timeout_ms: watchdogMs,
+            });
+            const child = fireState.child;
+            if (!child) {
+                process.exit(0);
+                return;
+            }
+            // Bounded teardown grace: the detached taskkill needs a moment
+            // to walk the tree. The envelope above is already written, so
+            // this window only affects exit latency, never delivery.
+            const grace = setTimeout(() => {
+                try { child.kill(); } catch { /* already gone */ }
+                process.exit(0);
+            }, 500);
+            child.on("close", () => {
+                clearTimeout(grace);
+                process.exit(0);
+            });
+        });
+    }
+
     const stdinBuf = await readStdin();
 
     // Parse a COPY of stdin to extract fields (tolerate missing / non-JSON).
@@ -720,21 +1044,61 @@ async function main() {
     // fitEnvelope but propagated unclamped to child shell scripts that read
     // $ZMEM_CTX_BUDGET directly.
     env.ZMEM_CTX_BUDGET = String(budget);
-    const translated = TRANSLATED_HOOKS.has(hookName);
     const bashPath = findBash();
 
     // Translated hooks: buffer child stdout so we can rewrap it. Pass-through
-    // hooks: inherit stdout so their output reaches the runner unchanged.
-    const child = spawn(bashPath, [scriptPath], {
-        stdio: ["pipe", translated ? "pipe" : "inherit", "inherit"],
-        env: buildChildEnv(env, bashPath),
-    });
-
+    // hooks: inherit stdout/stderr so their output reaches the runner
+    // unchanged. For translated hooks the child stderr is a LAUNCHER-OWNED
+    // pipe we pump below (issue #121): grandchildren inherit handles from
+    // the child, and an inherited stderr would let a survivor hold the
+    // HOST read side open past our own exit — with a launcher-owned pipe,
+    // the host sees EOF the moment we exit no matter what the tree kill
+    // reached.
+    // Final critic: spawn() can either emit an async error event (ENOENT
+    // on POSIX) or THROW synchronously (Windows EFTYPE for a
+    // non-executable bash path) — both fail open: clear the watchdog,
+    // emit an empty envelope, exit 0. The old error handler was lost in
+    // the F-001 restructure and the launcher crashed (exit 1, zero
+    // stdout) on this path.
+    let child;
+    try {
+        child = spawn(bashPath, [scriptPath], {
+            stdio: ["pipe", translated ? "pipe" : "inherit", translated ? "pipe" : "inherit"],
+            env: buildChildEnv(env, bashPath),
+        });
+    } catch (spawnErr) {
+        if (watchdog) watchdog.clear();
+        process.stdout.write("{}\n");
+        process.exit(0);
+    }
     child.on("error", () => {
-        // Spawn failed (bash not found, etc.) — fail open.
+        if (watchdog) watchdog.clear();
+        process.stdout.write("{}\n");
+        process.exit(0);
+    });    if (translated && child.stderr) {
+        child.stderr.on("data", (c) => {
+            try { process.stderr.write(c); } catch { /* host stderr gone */ }
+        });
+    }
+
+    // Spawn failure (bash not found, ENOEXEC/EACCES): fail open — clear the
+    // watchdog, emit an empty envelope, exit 0. Final critic on the review
+    // round caught this handler being dropped in the F-001 restructure: an
+    // unhandled 'error' event crashed the launcher (exit 1, zero stdout),
+    // breaking the fail-open invariant on a real deployment shape (no Git
+    // Bash found → findBash falls back to bare "bash").
+    child.on("error", () => {
+        if (watchdog) watchdog.clear();
         process.stdout.write("{}\n");
         process.exit(0);
     });
+
+    // The watchdog (armed above, before startup) now binds the child:
+    // everything before this line already consumed its budget.
+    if (translated) fireState.child = child;
+    fireState.host = host;
+    fireState.budget = budget;
+    fireState.env = env;
 
     // Replay the exact original stdin bytes to the child, then close its stdin.
     // Guard EPIPE/ECONNRESET: session-start never reads stdin, so end() can hit
@@ -746,9 +1110,15 @@ async function main() {
     }
 
     if (translated && child.stdout) {
-        const outChunks = [];
         child.stdout.on("data", (c) => outChunks.push(c));
         child.on("close", (code) => {
+            if (watchdog) watchdog.clear(); // normal close: disarm the watchdog
+            if (watchdog && watchdog.fired()) {
+                // The watchdog already emitted the retained envelope
+                // and wrote the decision record — never double-emit.
+                process.exit(0);
+                return;
+            }
             const raw = Buffer.concat(outChunks).toString("utf8");
             let envelope;
             try {
@@ -778,6 +1148,14 @@ module.exports = {
     detectHost,
     getPluginRoot,
     resolveNamespace,
+    namespaceCacheStats,
+    clearNamespaceCache,
+    readPositiveIntMs,
+    startWatchdog,
+    appendOuterTimeoutDecision,
+    _decisionLogDir,
+    _lastTerminateInfoForTests,
+    _terminateChildTree,
     buildCanonicalEnv,
     buildChildEnv,
     hookEventNameFor,
@@ -789,6 +1167,10 @@ module.exports = {
     translate,
     resolveBudget,
     CODEX_ENVELOPE_CAP_CHARS,
+    DEFAULT_LAUNCHER_WATCHDOG_MS,
+    DEFAULT_NAMESPACE_RESOLVE_MS,
+    DEFAULT_NAMESPACE_CACHE_TTL_MS,
+    NAMESPACE_CACHE_MAX_ENTRIES,
     EVENT_MAP,
     TRANSLATED_HOOKS,
     NEEDS_NAMESPACE,

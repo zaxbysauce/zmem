@@ -18,7 +18,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = "0.34.0"
+EXPECTED_VERSION = "0.35.0"
 _EXPECTED_VERSION_RE = re.escape(EXPECTED_VERSION)
 RELEASE_SECTION_RE = re.compile(
     rf"^## \[{_EXPECTED_VERSION_RE}\][^\n]*[-—]\s*(\d{{4}}-\d{{2}}-\d{{2}})\s*$",
@@ -63,22 +63,29 @@ class ScoreMarginReleaseAcceptanceTest(unittest.TestCase):
             f"CHANGELOG.md must contain a dated ## [{EXPECTED_VERSION}] release section",
         )
         assert match is not None
-        section_end = changelog.find("\n## ", match.end())
-        body = changelog[match.end():] if section_end < 0 else changelog[match.end():section_end]
+        # PR #198 (issue #121) merged main and took the NEXT minor: the
+        # score-margin feature shipped in ## [0.34.0] (issue #182), so the
+        # opt-in documentation is anchored to THAT section, not to the
+        # current release section.
+        section_start = changelog.find("## [0.34.0]")
+        assert section_start >= 0
+        section_end = changelog.find("\n## ", section_start)
+        body = (changelog[section_start:]
+                if section_end < 0 else changelog[section_start:section_end])
         self.assertIn(
             "ZMEM_INJECT_MARGIN",
             body,
-            f"the {EXPECTED_VERSION} CHANGELOG section must document the score-margin opt-in",
+            "the 0.34.0 CHANGELOG section must document the score-margin opt-in",
         )
         self.assertIn(
             "score-margin",
             body.lower(),
-            f"the {EXPECTED_VERSION} CHANGELOG section must name the score-margin feature",
+            "the 0.34.0 CHANGELOG section must name the score-margin feature",
         )
         self.assertRegex(
             body.lower(),
             r"opt[- ]?in",
-            f"the {EXPECTED_VERSION} CHANGELOG section must explain that score-margin is opt-in",
+            "the 0.34.0 CHANGELOG section must explain that score-margin is opt-in",
         )
 
     def test_release_manifest_is_034_and_verified_by_existing_gate(self):

@@ -121,7 +121,7 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
                     with contextlib.redirect_stdout(io.StringIO()):
                         return runpy.run_path(
                             str(SESSION_START_PAYLOAD),
-                            run_name="zmem_session_start_score_margin_test",
+                            run_name="__main__",  # issue #121: the payload guards main() behind __name__
                         )
         finally:
             sys.argv = old_argv
@@ -815,7 +815,10 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
             self.assertIn("--no-bump", argv)
             self.assertIn("--for-injection", argv)
             self.assertIn("--json", argv)
-            self.assertEqual(kwargs["timeout"], 10)
+            # Issue #121: the shared body's store timeout is env-driven
+            # (ZMEM_STORE_RECALL_TIMEOUT_S, default 8.0), replacing the
+            # hardcoded 10 s this assertion pinned pre-merge.
+            self.assertEqual(kwargs["timeout"], 8.0)
 
     def test_session_start_consumer_preserves_margin_diagnostics(self):
         row = {

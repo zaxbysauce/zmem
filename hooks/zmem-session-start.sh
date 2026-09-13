@@ -360,26 +360,14 @@ BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 # CreateProcess ~32K command-line limit and silently degraded to `{}`
 # (the spawn failure was swallowed by the || echo fallback). A real
 # file removes that ceiling; the argv contract is unchanged.
+#
+# Issue #121: the payload python now owns the <<<ZMEM_JSON>>>…<<<END>>>
+# sentinel emission (TWO envelopes — Tier 0 flushed before the first store
+# subprocess, then the full context) AND the marker neutralization that
+# used to live here. This script passes the payload stdout through
+# verbatim; only a payload SPAWN FAILURE hits the fail-open fallback below,
+# which keeps the sentinel-wrapped {} shape the launcher parses.
 HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PAYLOAD_PY="$(to_py_path "$(join_path "$HOOKS_DIR" lib zmem-session-start-payload.py)")"
-CTX_JSON="$("$PYTHON_BIN" "$PAYLOAD_PY" "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" "$SESSION_ID" "$DRIFT_JSON" "$SOURCE" 2>/dev/null || echo '{}')"
-
-# Neutralize any sentinel token a MEMORY'S OWN CONTENT happens to contain
-# before wrapping. The launcher locates the payload by scanning stdout for the
-# literal markers, so a stored memory containing "<<<ZMEM_JSON>>>" would move
-# the extraction boundary into the middle of the JSON, the parse would fail,
-# and the whole injection would silently degrade to {} (a self-DoS of this
-# turn — fail-open, not an injection vector). Both replacements are safe
-# inside the serialized JSON string: neither introduces a quote or a backslash.
-CTX_JSON="${CTX_JSON//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
-CTX_JSON="${CTX_JSON//<<<END>>>/<<<END_NEUTRALIZED>>>}"
-# I7 critic-fix (issue #58, 3.5): also neutralize the new fence markers.
-CTX_JSON="${CTX_JSON//<<<ZMEM_UNTRUSTED_FENCE>>>/<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>}"
-CTX_JSON="${CTX_JSON//<<<END_ZMEM_UNTRUSTED_FENCE>>>/<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>}"
-
-# Wrap the payload in the <<<ZMEM_JSON>>>…<<<END>>> sentinel so the host adapter
-# (zmem-launch.js) can extract it even if other stdout noise is present. The
-# payload stays a bare {"additionalContext":…}; the launcher does host-envelope
-# translation. Emitting the sentinel on its own line keeps extraction robust.
-printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' "$CTX_JSON"
+"$PYTHON_BIN" "$PAYLOAD_PY" "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" "$SESSION_ID" "$DRIFT_JSON" "$SOURCE" 2>/dev/null || printf '<<<ZMEM_JSON>>>{}<<<END>>>\n'
 exit 0

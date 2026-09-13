@@ -926,5 +926,44 @@ class MarginDecisionLogTest(unittest.TestCase):
         )
 
 
+
+
+class StoreTimeoutParseParityTest(unittest.TestCase):
+    """F-007 reader parity: the exact writer-emitted timeout-line shapes
+    (session-start, compact lane, shared body) must survive parse_bg_log —
+    a writer-only field silently vanishes from the miss-rate join."""
+
+    def _parse(self, lines):
+        import tempfile
+        import shutil
+        from pathlib import Path as _P
+        from storelib.miss_rate import parse_bg_log
+        tmp = _P(tempfile.mkdtemp(prefix="zmem-121-parse-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        log = tmp / "zmem-decisions.log"
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return parse_bg_log(str(log))
+
+    def test_timeout_tails_parse(self):
+        rows = self._parse([
+            "[1789320000] zmem-hook status=silent reason=omitted ids=[] all=[] "
+            "sid=s1 moment=session_start store_timeout=1",
+            "[1789320001] zmem-hook status=silent reason=omitted ids=[] all=[] "
+            "sid=s2 moment=session_start_compact store_timeout=1",
+            "[1789320002] zmem-hook status=silent reason=omitted ids=[] all=[] "
+            "tokens=5/100 sid=s3 moment=pretool store_timeout=1",
+        ])
+        self.assertEqual(len(rows), 3, "every timeout line must parse")
+        for r in rows:
+            self.assertEqual(r["reason"], "omitted")
+
+    def test_non_timeout_lines_still_parse(self):
+        rows = self._parse([
+            "[1789320003] zmem-hook status=injected reason=injected ids=[b] "
+            "all=[b] tokens=10/100 sid=s4 moment=pretool",
+        ])
+        self.assertEqual(len(rows), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

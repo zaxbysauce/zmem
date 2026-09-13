@@ -1583,6 +1583,35 @@ Always clamped to [0.0, 1.0]; visible in `get --json`, `export-jsonl`,
 and `doctor`. `confidence`/`signal` are never changed by linking — they
 are provenance inputs; trust_score is the contradiction ledger.
 
+## Timeout budget
+
+Issue #121: the hook path runs inside the host's hook timeout (the host
+configs give SessionStart 15 s) with an internal budget. Canonical integer
+values live in `hooks/timeout-budget.json`; runtime overrides read env vars
+and fall back to those defaults (an invalid value falls back with exactly
+one warning).
+
+| Stage | Value | Override env var | Notes |
+|---|---|---|---|
+| Launcher watchdog | 12000 ms | `ZMEM_LAUNCHER_WATCHDOG_MS` | Kills the child tree at the deadline, emits the retained Tier 0 sentinel, logs `outer_timeout=1 reason=omitted`, exits 0. |
+| Namespace resolution | 2000 ms | `ZMEM_NAMESPACE_RESOLVE_MS` | Per interpreter attempt; successful non-empty REMOTE namespaces are cached per process. |
+| Namespace cache TTL | 60000 ms | `ZMEM_NAMESPACE_CACHE_TTL_MS` | Entry expires at exactly TTL; path-key resolutions are never cached. |
+| Store recall | 8000 ms (8.0 s) | `ZMEM_STORE_RECALL_TIMEOUT_S` | SessionStart + the shared recall body. Finite positive float; values above 8.0 clamp to 8.0 (one warning); values below 8.0 are honored. ONE store attempt at SessionStart (no retry loop). |
+| SQLite busy timeout | 5000 ms | - | `storelib/schema.py` (`PRAGMA busy_timeout=5000`); unchanged. |
+| Hermes manager join | 8000 ms | - | Documentation input owned by issue #160 — no runtime change here. |
+| Hermes provider deadline | 6000 ms | - | Documentation input owned by issue #160 — no runtime change here. |
+
+SessionStart emits a complete Tier 0 sentinel BEFORE the first store
+subprocess (the fast path), so a store stall inside the watchdog window
+still delivers Tier 0 to the host. The launcher watchdog arms before
+startup, so namespace resolution counts against the 12,000 ms budget. The
+`scripts/bench_hook_latency.py` benchmark reports deterministic
+injected-clock p50/p95 schedules for the seven stages (launcher,
+namespace, store, embed, fuse, render, time-last-capture) — a
+contract-regression gate whose `--compare-baseline` pins stage keys,
+per-stage values, and a machine-independent `input_digest`; it does not
+measure wall-clock latency.
+
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite
   file. The write-time filter is advisory only (regex heuristic), not a guarantee.
