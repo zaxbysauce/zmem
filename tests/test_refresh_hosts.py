@@ -290,7 +290,11 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
         self.assertEqual(self._main_status(*self._refresh_args()), 0)
         report = self._report()
         schema = json.loads((SCRIPTS / "refresh-report-schema.json").read_text(encoding="utf-8"))
-        import jsonschema
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is unavailable")
+
         jsonschema.validate(report, schema)
         self.assertEqual(report["checkout"], str(self.checkout))
         self.assertEqual(report["version"], VERSION)
