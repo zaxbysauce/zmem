@@ -80,6 +80,7 @@ the session key the miss-rate report joins failures against.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -310,7 +311,8 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                          arms=None,
                          excluded_count=0,
                          batch=False, tool_names=None,
-                         path_basenames=None) -> None:
+                         path_basenames=None, margin=None,
+                         margin_pruned_ids=None) -> None:
     """Append the injected|silent decision to the decision log (#129).
 
     Issue #129 split: decision lines go to ``zmem-decisions.log`` (rotated,
@@ -455,11 +457,44 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
             pths = " paths=" + ",".join(
                 _re_sid.sub(r"[^A-Za-z0-9._-]", "_", str(p))[:64]
                 for p in path_basenames)
+        # Issue #182: additive score-margin telemetry. Validate each field
+        # independently so one malformed optional envelope key cannot hide the
+        # other. A missing/invalid pair leaves the legacy line byte-identical.
+        marginf = ""
+        _margin_value = None
+        if (isinstance(margin, (int, float))
+                and not isinstance(margin, bool)):
+            _margin_value = margin
+        elif isinstance(margin, str):
+            try:
+                _margin_value = float(margin)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        try:
+            if _margin_value is not None and math.isfinite(float(_margin_value)):
+                marginf = " margin={0:.6f}".format(float(_margin_value))
+        except (TypeError, ValueError, OverflowError):
+            pass
+        marginpf = ""
+        if (isinstance(margin_pruned_ids, list)
+                and margin_pruned_ids
+                and all(isinstance(_mid, str)
+                        for _mid in margin_pruned_ids)):
+            # Issue #182: IDs are untrusted envelope data. Apply the same
+            # canonical ops-lane charset rule and 64-character component cap
+            # used by the sibling tools=/paths= fields before list repr can
+            # enter the decision log and forge its structure.
+            _safe_margin_pruned_ids = [
+                _re_sid.sub(r"[^A-Za-z0-9._-]", "_", _mid)[:64]
+                for _mid in margin_pruned_ids
+            ]
+            marginpf = " margin_pruned={0}".format(
+                _safe_margin_pruned_ids)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
                 "ids={ids_sel} all={ids_all}{tok}{rend}{adm}{bcnt}{ops}{exc} "
-                "sid={safe_sid}{mom}{armf}{bat}{tns}{pths}\n".format(
+                "sid={safe_sid}{mom}{armf}{bat}{tns}{pths}{marginf}{marginpf}\n".format(
                     ts=int(time.time()),
                     status=status,
                     reason=reason,
@@ -478,6 +513,8 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     bat=bat,
                     tns=tns,
                     pths=pths,
+                    marginf=marginf,
+                    marginpf=marginpf,
                 )
             )
     except OSError:
@@ -1423,6 +1460,11 @@ def main() -> int:
         # both here, before envelope_results discards them.
         envelope_reason = None
         envelope_candidates = None
+        # Issue #182: score-margin telemetry from the injection envelope.
+        # Keep each raw optional value independent; the logger validates the
+        # numeric and list shapes separately before appending either field.
+        envelope_margin = None
+        envelope_margin_pruned_ids = None
         # Issue #117: rows the store actually dropped via --exclude.
         envelope_excluded = None
         # Issue #116: hard-ceiling accounting from the store lane —
@@ -1450,6 +1492,10 @@ def main() -> int:
                 envelope_candidates = [
                     str(_x) for _x in _ec if isinstance(_x, str)
                 ]
+            if "margin" in rows:
+                envelope_margin = rows.get("margin")
+            if "margin_pruned_ids" in rows:
+                envelope_margin_pruned_ids = rows.get("margin_pruned_ids")
             # Issue #136: gate on dict-shape, like the budget fields gate on
             # key presence — a malformed arms value never reaches the log.
             if isinstance(rows.get("arms"), dict):
@@ -1486,6 +1532,8 @@ def main() -> int:
         omitted = 0
         envelope_reason = None
         envelope_candidates = None
+        envelope_margin = None
+        envelope_margin_pruned_ids = None
         envelope_excluded = None
         envelope_admission = None
         envelope_bdrop = None
@@ -1559,6 +1607,8 @@ def main() -> int:
             budget_truncated=envelope_btrunc,
             budget_dropped_protected=envelope_bprot,
             arms=envelope_arms,
+            margin=envelope_margin,
+            margin_pruned_ids=envelope_margin_pruned_ids,
             **_batch_log_kwargs,
         )
         if mode in ("pretool", "posttoolbatch"):
@@ -1632,6 +1682,8 @@ def main() -> int:
                          budget_truncated=envelope_btrunc,
                          budget_dropped_protected=envelope_bprot,
                          arms=envelope_arms,
+                         margin=envelope_margin,
+                         margin_pruned_ids=envelope_margin_pruned_ids,
                          **_batch_log_kwargs)
     if (_LEDGER_MOD is not None and session_id
             and mode not in ("precompact", "session_end")):

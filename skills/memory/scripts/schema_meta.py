@@ -102,6 +102,13 @@ ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "cons
 # Read by storelib/inject.py (soft import) so the policy has one source.
 PROTECTED_INJECT_TYPES = ("decision", "constraint")
 
+# Score-margin admission control (issue #182, Workstream M PR 1).  The
+# threshold is deliberately opt-in: zero preserves the pre-margin injection
+# behavior, while operators can roll out the documented 0.05 threshold via
+# ``ZMEM_INJECT_MARGIN`` without changing the schema.
+INJECT_MARGIN_ENV = "ZMEM_INJECT_MARGIN"
+INJECT_MARGIN_DEFAULT = 0.0
+
 # Memory `signal` enum. All write surfaces validate against this tuple. Ordered
 # roughly by trustworthiness (test/compile/lint > reviewer/user > none).
 ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
@@ -285,4 +292,3 @@ INJECT_REASON_DISABLED = "disabled"
 # own escalation loop with a 500-row cap and is unaffected by this knob.
 ZMEM_VEC_NS_OVERFETCH_DEFAULT = 8
 ZMEM_VEC_NS_OVERFETCH_ENV = "ZMEM_VEC_NS_OVERFETCH"
-

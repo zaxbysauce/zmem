@@ -112,6 +112,11 @@ _BG_LINE_RE = re.compile(
     r"(?: batch=(\S+))?"
     r"(?: tools=(\S+))?"
     r"(?: paths=(\S+))?"
+    # Issue #182: additive score-margin diagnostics. They are emitted after
+    # the posttoolbatch paths tail, while SessionStart emits the same fields
+    # without batch/tools/paths; both shapes remain readable here.
+    r"(?: margin=(\S+))?"
+    r"(?: margin_pruned=(\[[^\]]*\]))?"
     r"\s*$"
 )
 
@@ -163,12 +168,14 @@ def parse_bg_log(path) -> list:
 
     Returns ``[{ts, status, reason, omitted, ids, all, ops, sid, moment,
     arms}]``
-    where ``reason``/``ops``/``sid``/``moment``/``arms`` are None when the line
-    lacks them (writer B omits ``reason=``; pre-#94 lines lack ``sid=``;
-    pre-#129 lines lack ``moment=``; pre-#136 lines lack ``arms=``) and
-    ``ids``/``all`` are lists of memory id strings. Torn lines are skipped —
-    the log is appended concurrently, so a torn final line is normal. Never
-    raises.
+    where ``reason``/``ops``/``sid``/``moment``/``arms``/``margin`` are None
+    when the line lacks them (writer B omits ``reason=``; pre-#94 lines lack
+    ``sid=``; pre-#129 lines lack ``moment=``; pre-#136 lines lack ``arms=``;
+    pre-#182 lines lack ``margin=``). ``margin_pruned`` is None when its
+    bracketed tail is absent, otherwise a list of memory id strings. The
+    ``ids``/``all`` fields are also lists of memory id strings. Torn lines are
+    skipped — the log is appended concurrently, so a torn final line is
+    normal. Never raises.
     """
     out = []
     paths = []
@@ -198,7 +205,8 @@ def parse_bg_log(path) -> list:
             if not m:
                 continue
             (ts, status, reason, omitted, ids_raw, all_raw, _tok, ops,
-             exc, sid, moment, arms, _batch, _tools, _paths) = m.groups()
+             exc, sid, moment, arms, _batch, _tools, _paths, margin,
+             margin_pruned_raw) = m.groups()
             try:
                 ts = int(ts)
             except ValueError:
@@ -232,6 +240,12 @@ def parse_bg_log(path) -> list:
                 # Issue #136: the additive arms= attribution field, verbatim
                 # (the B-1 report surfaces which arm carried a hit).
                 "arms": arms,
+                # Issue #182: score-margin diagnostics are additive and kept
+                # in their wire representation; margin is already formatted
+                # to six decimals by both writers.
+                "margin": margin,
+                "margin_pruned": (_parse_id_list(margin_pruned_raw)
+                                   if margin_pruned_raw else None),
             })
     return out
 
