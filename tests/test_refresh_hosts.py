@@ -348,7 +348,7 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
         zcode = next(row for row in report["hosts"] if row["host"] == "zcode")
         marketplace_root = self.home / ".zcode/cli/plugins/marketplaces/zmem"
         for path in zcode["marketplacePaths"]:
-            rel = Path(path).relative_to(marketplace_root).as_posix()
+            rel = Path(path).resolve().relative_to(marketplace_root.resolve()).as_posix()
             self.assertIn(rel, marketplace_bytes)
             self.assertEqual(Path(path).read_bytes(), marketplace_bytes[rel])
 
