@@ -1,0 +1,11 @@
+{
+  "name": "zmem-claude",
+  "description": "fixture Claude marketplace",
+  "plugins": [
+    {
+      "name": "zmem",
+      "version": "0.34.0",
+      "source": "./zmem"
+    }
+  ]
+}

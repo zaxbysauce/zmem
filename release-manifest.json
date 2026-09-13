@@ -1,13 +1,13 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "ff6466a9b746ee1bf9f60e3e0c6cf3141a33c9a9905110dd536bec11556a1942",
+  "digest": "da2539a264f105ac00920f92a103647c3248cdb291e54e34c894d3d39f3df9ba",
   "files": {
     "hermes-plugin/__init__.py": "49921ae0fcbb7343b9f77eae4d5684bd1e35b89ecf858744179ffb755b0993b0",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "064eb5767b12039759f9a0bf166e86d6214360af9aebc7747bba436a6d5fde29",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "8b44f6d6d4f6fa1fa82f7a5703fef09c72da5e97f24661ddae9c30df86084ee3",
+    "hermes-plugin/plugin.yaml": "bdc4911d9d6728ad4b7adf3035fc737492ef9143b1a499142001fdef1fe5a9db",
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "8f09b3987ae01ec7d250881d2bb6b885e07e78743951d5b8f725ff07d6f48b97",
@@ -39,9 +39,12 @@
     "scripts/eval_runner.py": "6e9b355425644f38795068259a69bb9c1ca02cdd57509511824ac10ac721ce3a",
     "scripts/eval_self_corpus.py": "ead3aece0562da0fe588ea4d4994aa7ec8fece3ae4d0a7554766e9933e4e76e6",
     "scripts/host_canary.py": "072166ce047afb881e36a11ebf78e7baeb48e5d627c91b364abc3e33b7108605",
+    "scripts/host_registry.py": "394e75cd342447a905da8490c2565b0cbb47811e4fff84f231ea707246181698",
     "scripts/ingest_harvest.py": "4deed83a20c9227afdc45c3ba89b9bd83beadbac1aa72049291dc502b7322e2f",
     "scripts/pattern_harness.py": "428b33978ee59b7c7bbc67f0849adfd750c9277e2e05b216721611741024652b",
-    "scripts/release_gate.py": "15b940d1fa778c8c5395c8dee3aab7cbb52fc788ca9b42c2fd6c436b588a1410",
+    "scripts/refresh-report-schema.json": "8ab42194af5b380efdfaa794c75b26fd5d240168b494275956d7103ba0066c53",
+    "scripts/refresh_hosts.py": "566f693f8830854e79d2835c69da9669324c198aebc7fdb99c0d44fa49bb34c5",
+    "scripts/release_gate.py": "48836068c9c894fe335e00bff8d90bf7ba49e9f993c747eaa2b506082996ca67",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "ac20e80713cf3ec05159ac0f609313cb094ed5515c387258fa5369faec963aa5",
     "skills/memory/SKILL.md": "2dd7d9e5752f9b450510c35a5d5e3a7ed0f283d64412fe8ca1e4061d6f0c374e",
@@ -80,5 +83,5 @@
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
     "skills/memory/scripts/storelib/write.py": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
   },
-  "version": "0.33.0"
+  "version": "0.34.0"
 }

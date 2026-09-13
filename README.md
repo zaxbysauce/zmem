@@ -547,14 +547,61 @@ Release. zmem compares the served tree against it in two places:
 
 To force a refresh per host when doctor reports drift:
 
-1. **ZCode / Claude Code / Codex**: re-run the install/discovery flow from the
+1. **Transactional refresh (recommended)**: from the release checkout, run:
+
+   ```text
+   python scripts/refresh_hosts.py --checkout <checkout> --hosts codex,claude,zcode --report <report-path>
+   ```
+
+   The four public flags are `--checkout`, `--hosts`, `--report`, and
+   `--dry-run`. Omitting `--hosts` refreshes `codex,claude,zcode` in that order.
+   Add `--dry-run` to perform the complete checkout, registry, marketplace, and
+   digest validation without changing any cache, registry, or marketplace path;
+   only the requested report is written.
+2. **ZCode / Claude Code / Codex**: re-run the install/discovery flow from the
    top of this README (or your marketplace update) and restart the session;
    then confirm the active cache path changed.
-2. **Manual cache mirror** (robocopy/rsync flows): re-mirror the release tag's
+3. **Manual cache mirror** (robocopy/rsync flows): re-mirror the release tag's
    tree into the cache dir — a partial mirror is exactly what drift detects.
-3. Verify: `python <plugin-root>/skills/memory/scripts/doctor.py` shows
+4. Verify: `python <plugin-root>/skills/memory/scripts/doctor.py` shows
    `served-drift ... pass (matched)`, and no new `zmem-drift` line appears in
    `zmem-bg.log` on the next session start.
+
+#### Host refresh paths, reports, and recovery (issue #184)
+
+The refresh command mirrors one checkout into version-pinned host directories:
+
+- **Codex**: `~/.codex/plugins/cache/personal/zmem/<version>/`.
+- **Claude Code**: `~/.claude/plugins/cache/zmem/zmem/<version>/`, with the
+  registry at `~/.claude/plugins/installed_plugins.json`.
+- **ZCode**: `~/.zcode/cli/plugins/cache/zmem/zmem/<version>/`, with the
+  registry at `~/.zcode/cli/plugins/installed_plugins.json` and the checkout's
+  `marketplace.json` plus `.claude-plugin/marketplace.json` copied into the
+  `~/.zcode/cli/plugins/marketplaces/zmem/` clone.
+
+The JSON report records the validated `checkout`, release `version`, 40-character
+`gitCommitSha`, ordered `hosts`, aggregate `mismatchCount`, and overall `ok`
+result. Each host record contains `host`, `cacheRoot`, `registryPath`,
+`marketplacePaths`, `beforeDigest`, `afterDigest`, `status`, and `mismatches`.
+The digests cover the served runtime surface; a successful run has
+`mismatchCount: 0`, `ok: true`, and no per-host mismatches. A failure records
+actionable mismatch text and returns nonzero.
+
+Refresh is fail-closed. It validates every requested host, registry shape,
+release manifest, staged copy, marketplace source, and digest before the first
+destination replacement. During commit it backs up every existing destination
+and atomically replaces staged paths. If staging, replacement, digest
+verification, or report writing fails, it restores every preimage, removes
+newly installed paths and staging/backup residue, writes a failure report when
+possible, and leaves the prior host state intact. A dry run never creates a
+cache, registry, or marketplace destination.
+
+The scheduled operator flow in
+`C:\Users\Brett\.codex\scripts\update-zmem.ps1` runs this refresh immediately
+after its existing `codex plugin add` step. It uses an absolute `python.exe`,
+all three hosts, an explicit dated report path, and a 600-second bounded
+process; fail-fast handling propagates a nonzero refresh exit so a failed
+refresh cannot be reported as a successful scheduled update.
 
 Release maintainers: regenerate the manifest with
 `python scripts/release_gate.py --emit-manifest` and commit it with the release;
@@ -769,12 +816,14 @@ rollback is a re-pin, not a download:
   (`~/.claude/plugins/cache/zmem/zmem/<old-version>/`, recorded with its
   `gitCommitSha` in `~/.claude/plugins/installed_plugins.json`) or reinstall
   from the release git tag, then restart the session.
-- **ZCode**: same shape under `~/.zcode/cli/plugins/cache/<marketplace>/zmem/
-  <old-version>/` (+ the `installed_plugins.json` next to it); or reinstall
+- **ZCode**: point the installed plugin back to
+  `~/.zcode/cli/plugins/cache/zmem/zmem/<old-version>/` (+ the
+  `installed_plugins.json` next to it); or reinstall
   from the git tag.
-- **Codex** (shared-store/broker mode): there is no plugin cache — the
-  checkout IS the install, so pin it by checking out the release tag
-  (`git checkout v0.14.0`).
+- **Codex**: point the installed plugin back to
+  `~/.codex/plugins/cache/personal/zmem/<old-version>/`, or pin the checkout
+  to the release tag (`git checkout v0.14.0`) when using shared-store/broker
+  mode.
 
 **Verifying a rollback (or a refresh).** The `zmem-bg.log` decision lines are
 the discriminator — but read the RECALL-BODY line, not a session-start line:

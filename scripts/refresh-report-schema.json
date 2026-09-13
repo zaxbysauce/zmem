@@ -1,0 +1,301 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "checkout": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "gitCommitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "hosts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/definitions/hostRecord"
+      },
+      "allOf": [
+        {
+          "not": {
+            "minItems": 2,
+            "items": [
+              {
+                "properties": {
+                  "host": {
+                    "const": "codex"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "host": {
+                    "const": "codex"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "not": {
+            "minItems": 3,
+            "items": [
+              {
+                "properties": {
+                  "host": {
+                    "const": "codex"
+                  }
+                }
+              },
+              {},
+              {
+                "properties": {
+                  "host": {
+                    "const": "codex"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "not": {
+            "minItems": 3,
+            "items": [
+              {},
+              {
+                "properties": {
+                  "host": {
+                    "const": "codex"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "host": {
+                    "const": "codex"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "not": {
+            "minItems": 2,
+            "items": [
+              {
+                "properties": {
+                  "host": {
+                    "const": "claude"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "host": {
+                    "const": "claude"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "not": {
+            "minItems": 3,
+            "items": [
+              {
+                "properties": {
+                  "host": {
+                    "const": "claude"
+                  }
+                }
+              },
+              {},
+              {
+                "properties": {
+                  "host": {
+                    "const": "claude"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "not": {
+            "minItems": 3,
+            "items": [
+              {},
+              {
+                "properties": {
+                  "host": {
+                    "const": "claude"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "host": {
+                    "const": "claude"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "not": {
+            "minItems": 2,
+            "items": [
+              {
+                "properties": {
+                  "host": {
+                    "const": "zcode"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "host": {
+                    "const": "zcode"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "not": {
+            "minItems": 3,
+            "items": [
+              {
+                "properties": {
+                  "host": {
+                    "const": "zcode"
+                  }
+                }
+              },
+              {},
+              {
+                "properties": {
+                  "host": {
+                    "const": "zcode"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "not": {
+            "minItems": 3,
+            "items": [
+              {},
+              {
+                "properties": {
+                  "host": {
+                    "const": "zcode"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "host": {
+                    "const": "zcode"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "mismatchCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ok": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "checkout",
+    "version",
+    "gitCommitSha",
+    "hosts",
+    "mismatchCount",
+    "ok"
+  ],
+  "definitions": {
+    "sha256OrNull": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "hostRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string",
+          "enum": [
+            "codex",
+            "claude",
+            "zcode"
+          ]
+        },
+        "cacheRoot": {
+          "type": "string"
+        },
+        "registryPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "marketplacePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "beforeDigest": {
+          "$ref": "#/definitions/sha256OrNull"
+        },
+        "afterDigest": {
+          "$ref": "#/definitions/sha256OrNull"
+        },
+        "status": {
+          "type": "string"
+        },
+        "mismatches": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "host",
+        "cacheRoot",
+        "registryPath",
+        "marketplacePaths",
+        "beforeDigest",
+        "afterDigest",
+        "status",
+        "mismatches"
+      ]
+    }
+  }
+}

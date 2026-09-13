@@ -1,0 +1,13 @@
+{
+  "version": "0.34.0",
+  "algorithm": "sha256-crlf-norm",
+  "files": {
+    "hermes-plugin/plugin.yaml": "2447a128f58549e8f7f58c6cd03917123bb02fc4e56509e30c3fd94d236b5097",
+    "hooks/zmem-recall.sh": "c51ebbeb18a4f502fa72a4e09dcc4de8d9d9c92b6c6031aaaac241e8e646fa13",
+    "scripts/host_canary.py": "86df3f27b0107fbaee0d074934a1a6218509d395c0f775a9a66a658ec4bf9469",
+    "scripts/refresh_fixture_helper.txt": "22fc6b7895f695f08ad4f6ecd03d8e99265873e4e8b3cd0625556068c96a7408",
+    "skills/memory/SKILL.md": "264d32dbe1c386318634541ebf4c3219e89c51ca2db8f80d828a906f1d276188",
+    "skills/memory/scripts/store.py": "b566176418df5006082ab893a25d8578333d49042e695daa1e39f4783370fad6"
+  },
+  "digest": "34dd3923d5e9bef46e62d16b4f21eff99c5c08d053c296856199bf08a01e6c8f"
+}

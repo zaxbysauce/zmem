@@ -10,6 +10,30 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.34.0] - 2026-09-12
+
+> Workstream N PR 1 of 6 (issue #184): fail-closed host-cache refresh from a
+> checkout-derived release, with transactional registry and marketplace updates.
+
+### Added
+- **Transactional host refresh**: `python scripts/refresh_hosts.py
+  --checkout <checkout> --hosts codex,claude,zcode --report <report>` refreshes
+  the Codex, Claude Code, and ZCode caches from one validated checkout. The
+  optional `--dry-run` performs the same validation and digest planning while
+  writing only the requested report.
+- **Host registry codecs**: Claude v2 and ZCode v1 `installed_plugins.json`
+  records are updated strictly for zmem, preserving unrelated entries, keys,
+  and sequence order; unsupported versions or shapes fail closed.
+- **Audit and recovery guarantees**: reports include the checkout, release
+  version, commit SHA, per-host cache/registry/marketplace paths, before/after
+  runtime-surface digests, status, mismatches, `mismatchCount`, and `ok`.
+  Every replacement and report-write failure restores all prior host state,
+  removes newly installed paths and temporary residue, and exits nonzero.
+- **Scheduled updater integration**: the operator's scheduled update invokes
+  the refresh after `codex plugin add`, with an absolute Python executable,
+  dated report path, bounded execution, fail-fast behavior, and nonzero exit
+  propagation.
+
 ## [0.33.0] - 2026-09-12
 
 > Workstream O PR 1 of 1 (issue #194): the Stop-hook failure detector's

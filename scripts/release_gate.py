@@ -9,9 +9,10 @@ every release-tracking downstream stayed on old versions until the releases
 were retrofitted by hand. This module is the decision logic the Release
 workflow runs on every push to main:
 
-  1. Enumerate EVERY tracked host-facing manifest (plugin.json /
-     plugin.yaml / marketplace.json — via `git ls-files`, never a hardcoded
-     list, so a newly added surface can never silently escape the check).
+  1. Enumerate EVERY tracked host-facing manifest outside the deterministic
+     test-fixture tree (plugin.json / plugin.yaml / marketplace.json — via
+     `git ls-files`, never a hardcoded list, so a newly added shipping surface
+     can never silently escape the check).
   2. Fail loudly if their versions disagree (a partial version bump is a
      release violation, not a warning).
   3. Fail loudly if the CHANGELOG has no `## [X.Y.Z]` section matching the
@@ -65,8 +66,18 @@ import drift  # noqa: E402
 # A "host-facing manifest" is any tracked plugin/marketplace descriptor that
 # carries a version. Matched against `git ls-files` output so the inventory
 # is discovered, not remembered (the seven-surface lesson: enumerating from
-# memory is how a surface gets missed).
+# memory is how a surface gets missed). Deterministic host-refresh fixtures
+# also contain descriptor-shaped files, but are test data rather than shipped
+# surfaces; keep that test-only tree out of the release inventory.
 MANIFEST_RE = re.compile(r"(?:^|/)(?:plugin\.(?:json|yaml)|marketplace\.json)$")
+FIXTURE_PREFIX = "tests/fixtures/"
+
+
+def _is_shipping_manifest(rel_path: str) -> bool:
+    """Whether a repo-relative POSIX path is a shipped manifest descriptor."""
+    return bool(MANIFEST_RE.search(rel_path)) and not rel_path.startswith(
+        FIXTURE_PREFIX
+    )
 
 # CHANGELOG released sections look like `## [0.10.1] — 2026-08-25`.
 # `[Unreleased]` is explicitly excluded so it can sit above the newest
@@ -107,18 +118,26 @@ def discover_manifests(repo_root: Path | None = None) -> list[str]:
     if out.returncode != 0:
         raise RuntimeError(f"git ls-files failed: {out.stderr.strip()}")
     return sorted(
-        ln for ln in out.stdout.splitlines() if MANIFEST_RE.search(ln)
+        ln
+        for ln in out.stdout.splitlines()
+        if _is_shipping_manifest(ln)
     )
 
 
-def read_version(rel_path: str) -> str | None:
+def read_version(rel_path: str, repo_root: Path | None = None) -> str | None:
     """The version a manifest declares, or None when it carries none.
 
     Handles the three shipped shapes: top-level `version` (plugin.json),
     `plugins[0].version` (marketplace.json), and a `version:` line
     (plugin.yaml — parsed with a regex so no yaml dependency is needed).
+
+    ``repo_root`` is an additive override for callers inspecting another
+    checkout (for example, the host-cache refresher).  Existing callers that
+    pass only the repository-relative path continue to resolve against this
+    checkout's ``REPO_ROOT``.
     """
-    path = REPO_ROOT / rel_path
+    root = Path(repo_root) if repo_root is not None else REPO_ROOT
+    path = root / rel_path
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -327,7 +346,7 @@ def _discover_manifests_disk(repo_root: Path) -> list[str]:
             if os.path.islink(full):
                 continue
             rel = Path(full).relative_to(repo_root).as_posix()
-            if MANIFEST_RE.search(rel):
+            if _is_shipping_manifest(rel):
                 out.append(rel)
     return sorted(out)
 

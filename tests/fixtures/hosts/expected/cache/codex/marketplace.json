@@ -1,0 +1,11 @@
+{
+  "name": "zmem-zcode",
+  "description": "fixture ZCode marketplace",
+  "plugins": [
+    {
+      "name": "zmem",
+      "version": "0.34.0",
+      "source": "./zmem"
+    }
+  ]
+}
