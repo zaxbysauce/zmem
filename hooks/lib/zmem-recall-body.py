@@ -480,7 +480,16 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                 and margin_pruned_ids
                 and all(isinstance(_mid, str)
                         for _mid in margin_pruned_ids)):
-            marginpf = " margin_pruned={0}".format(margin_pruned_ids)
+            # Issue #182: IDs are untrusted envelope data. Apply the same
+            # canonical ops-lane charset rule and 64-character component cap
+            # used by the sibling tools=/paths= fields before list repr can
+            # enter the decision log and forge its structure.
+            _safe_margin_pruned_ids = [
+                _re_sid.sub(r"[^A-Za-z0-9._-]", "_", _mid)[:64]
+                for _mid in margin_pruned_ids
+            ]
+            marginpf = " margin_pruned={0}".format(
+                _safe_margin_pruned_ids)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "

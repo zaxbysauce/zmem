@@ -184,11 +184,12 @@ def apply_score_margin(
     """Apply the opt-in score-margin gate to a stable score-descending view.
 
     The caller supplies rows in score-descending order.  If the configured
-    threshold is disabled or either leading score is unusable, the helper
-    fails open.  Otherwise it reports the six-decimal relative margin and,
-    when that rounded margin is strictly below the threshold, retains only the
-    top ordinary row.  A leading ``decision`` or ``constraint`` protects the
-    entire candidate set while still reporting the observed margin.
+    threshold is disabled or any candidate score is unusable, the helper fails
+    open.  Otherwise it reports the relative margin rounded to six decimals for
+    diagnostics, while comparing the unrounded value to the threshold.  When
+    the raw margin is strictly below the threshold, only the top ordinary row
+    is retained.  A leading ``decision`` or ``constraint`` protects the entire
+    candidate set while still reporting the observed margin.
     """
     retained = list(rows)
     if len(retained) < 2:
@@ -208,16 +209,22 @@ def apply_score_margin(
         return retained, None, []
 
     try:
-        top = float(retained[0].get("_score"))
-        second = float(retained[1].get("_score"))
+        scores = [float(row.get("_score")) for row in retained]
     except (AttributeError, TypeError, ValueError, OverflowError):
         return retained, None, []
-    if not math.isfinite(top) or not math.isfinite(second) or top <= 0.0:
+    if any(not math.isfinite(score) for score in scores):
         return retained, None, []
 
-    observed = round((top - second) / top, 6)
+    top, second = scores[0], scores[1]
+    if top <= 0.0:
+        return retained, None, []
+
+    raw_margin = (top - second) / top
+    if not math.isfinite(raw_margin):
+        return retained, None, []
+    observed = round(raw_margin, 6)
     if (
-        observed < threshold
+        raw_margin < threshold
         and retained[0].get("type") not in _PROTECTED_TYPES
         and retained[1].get("type") not in _PROTECTED_TYPES
     ):

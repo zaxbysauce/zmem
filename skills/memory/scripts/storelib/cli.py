@@ -1310,6 +1310,7 @@ def main():
                                link_hops=args.link_hops,
                                link_budget=args.link_budget,
                                cross_rerank=rerank_flag,
+                               min_confidence=args.min_confidence,
                                for_injection=args.for_injection)
             else:
                 recall_memory(conn, query=args.query, namespace=args.namespace,

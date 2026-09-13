@@ -11,6 +11,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import runpy
@@ -37,6 +38,7 @@ NS = "project:score-margin-integration"
 class ScoreMarginIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="zmem-margin-hook-")
+        self._body_calls = []
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -46,6 +48,7 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
         for key in (
             "ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_NAMESPACE",
             "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT", "ZMEM_INJECT_MARGIN",
+            "ZMEM_INJECT_TOKEN_BUDGET",
             "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR", "ZMEM_SESSION",
             "CLAUDE_SESSION_ID", "ZCODE_SESSION_ID", "CLAUDE_PLUGIN_DATA",
             "ZCODE_PLUGIN_DATA", "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW",
@@ -57,6 +60,7 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
             "ZMEM_EMBED_PROFILE": "fake",
             "ZMEM_TEST_NOW": "2026-06-01T00:00:00Z",
+            "ZMEM_INJECT_TOKEN_BUDGET": "1500",
             "PYTHONUTF8": "1",
         })
         return env
@@ -78,13 +82,16 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
             "session_id": session_id,
         }))
         stdout = io.StringIO()
+        def capture_check_output(*args, **kwargs):
+            self._body_calls.append((args, kwargs))
+            return json.dumps(envelope).encode("utf-8")
         try:
             with patch.dict(os.environ, self._env(), clear=True):
                 with patch.object(
-                    mod.subprocess,
-                    "check_output",
-                    return_value=json.dumps(envelope).encode("utf-8"),
-                ):
+                     mod.subprocess,
+                     "check_output",
+                     side_effect=capture_check_output,
+                 ):
                     with contextlib.redirect_stdout(stdout):
                         return_code = mod.main()
         finally:
@@ -252,6 +259,95 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
         )
         conn.close()
 
+    def test_injection_margin_covers_global_tier_and_link_expansion(self):
+        """The injection candidate set includes both optional delivery stages."""
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+        from storelib.links import add_link_pair
+
+        conn = self._memory_conn()
+        project_id, global_id, neighbor_id = (
+            "tier-project", "tier-global", "tier-neighbor")
+        self._seed_memory_rows(
+            conn, [project_id, global_id, neighbor_id],
+            content_prefix="cross-tier score margin ")
+        conn.execute(
+            "UPDATE memory SET namespace='user:global' WHERE id=?", (global_id,))
+        conn.execute(
+            "UPDATE memory SET content='link-only neighbor' WHERE id=?",
+            (neighbor_id,))
+        add_link_pair(conn, project_id, neighbor_id, "supports", score=0.8,
+                      apply_trust=False)
+        conn.commit()
+
+        margin_calls = []
+        real_apply_score_margin = recall_mod.apply_score_margin
+
+        def capture_margin(rows, *, margin=None):
+            margin_calls.append({
+                "ids": [row["id"] for row in rows],
+                "scores": [row.get("_score") for row in rows],
+                "margin": margin,
+            })
+            return real_apply_score_margin(rows, margin=margin)
+
+        with patch.object(recall_mod, "apply_score_margin",
+                          side_effect=capture_margin), \
+                patch.dict(os.environ, {
+                    "ZMEM_INJECT_MARGIN": "0.05",
+                    "ZMEM_GRAPH_SEED": "0",
+                }, clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            returned = recall_mod.recall_memory(
+                conn, query="cross-tier score", namespace=NS, limit=1,
+                include_global=True, global_limit=1, hybrid=False,
+                no_mmr=True, no_bump=True, link_hops=1, link_budget=1,
+                as_json=True, for_injection=True, no_telemetry=True)
+        envelope = json.loads(stdout.getvalue())
+        returned_ids = [row["id"] for row in returned]
+        self.assertIn(project_id, returned_ids)
+        self.assertIn(global_id, returned_ids)
+        self.assertIn(neighbor_id, returned_ids)
+        self.assertEqual(envelope["candidate_ids"], returned_ids)
+        self.assertNotIn("margin_pruned_ids", envelope)
+        self.assertEqual(len(margin_calls), 1)
+        self.assertEqual(set(margin_calls[0]["ids"]),
+                         {project_id, global_id, neighbor_id})
+        self.assertEqual(len(margin_calls[0]["scores"]), 3)
+        scores_by_id = dict(zip(margin_calls[0]["ids"],
+                                margin_calls[0]["scores"]))
+        self.assertIsNone(scores_by_id[neighbor_id])
+        self.assertTrue(all(
+            isinstance(scores_by_id[mid], float)
+            and math.isfinite(scores_by_id[mid])
+            for mid in (project_id, global_id)
+        ))
+        self.assertEqual(margin_calls[0]["margin"], 0.05)
+        conn.close()
+
+    def test_injection_uses_real_retrieval_and_scoring(self):
+        """The margin gate is exercised with the real FTS/scoring tier helper."""
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+
+        conn = self._memory_conn()
+        ids = ["real-score-one", "real-score-two"]
+        self._seed_memory_rows(
+            conn, ids, content_prefix="real retrieval score margin ")
+        with patch.dict(os.environ, {"ZMEM_INJECT_MARGIN": "0.0"}, clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            returned = recall_mod.recall_memory(
+                conn, query="real retrieval score", namespace=NS, limit=10,
+                hybrid=False, no_mmr=True, no_bump=True, link_hops=0,
+                as_json=True, for_injection=True, no_telemetry=True)
+        envelope = json.loads(stdout.getvalue())
+        self.assertEqual({row["id"] for row in returned}, set(ids))
+        self.assertEqual(set(envelope["candidate_ids"]), set(ids))
+        self.assertTrue(all(
+            isinstance(row.get("_score"), float) and math.isfinite(row["_score"])
+            for row in returned))
+        conn.close()
+
     def test_recent_injection_queryless_rows_fail_open_without_diagnostics(self):
         """Real recent rows have no production score and therefore fail open."""
         sys.path.insert(0, str(SCRIPTS))
@@ -364,6 +460,162 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("--exclude", result.stderr)
 
+    def test_injection_explain_replays_link_and_entity_stages_before_budget(self):
+        """The read-only injection replay must predict passive enrichment."""
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+        from storelib.links import add_link_pair
+
+        conn = self._memory_conn()
+        ids = ["linked-top", "linked-neighbor"]
+        self._seed_memory_rows(conn, ids)
+        add_link_pair(conn, ids[0], ids[1], "supports", score=0.8,
+                      apply_trust=False)
+        conn.execute(
+            "INSERT INTO entity (id, kind, canonical_name, created_at, updated_at) "
+            "VALUES ('entity-linked', 'tool', 'linked-tool', 't', 't')")
+        conn.execute(
+            "INSERT INTO memory_entity (memory_id, entity_id, role) "
+            "VALUES (?, 'entity-linked', 'mentions')", (ids[1],))
+        conn.commit()
+
+        def scored(*_args, **_kwargs):
+            row = self._scored_row(ids[0], 0.9)
+            return [(row["_score"], row)]
+
+        env = {"ZMEM_INJECT_MARGIN": "0.05",
+               "ZMEM_INJECT_TOKEN_BUDGET": "1500"}
+        with patch.object(recall_mod, "_recall_one_tier", side_effect=scored), \
+                patch.dict(os.environ, env, clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            passive = recall_mod.recall_memory(
+                conn, query="linked", namespace=NS, limit=10, hybrid=False,
+                no_mmr=True, no_bump=True, link_hops=1, link_budget=1,
+                as_json=True, for_injection=True, no_telemetry=True)
+        passive_doc = json.loads(stdout.getvalue())
+
+        with patch.object(recall_mod, "_recall_one_tier", side_effect=scored), \
+                patch.dict(os.environ, env, clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            explained = recall_mod.explain_recall(
+                conn, query="linked", namespace=NS, limit=10, hybrid=False,
+                no_mmr=True, link_hops=1, link_budget=1,
+                as_json=True, for_injection=True)
+        explained_doc = json.loads(stdout.getvalue())
+
+        self.assertEqual([r["id"] for r in explained],
+                         [r["id"] for r in passive])
+        self.assertEqual([r["id"] for r in explained], ids)
+        self.assertEqual(explained[1]["entities"][0]["name"], "linked-tool")
+        self.assertEqual(explained_doc["candidate_ids"], ids)
+        self.assertEqual(
+            {v["id"] for v in explained_doc["explain"]["verdicts"]},
+            set(ids),
+        )
+        conn.close()
+
+    def test_injection_explain_target_reports_selective_rejection(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+
+        conn = self._memory_conn()
+        self._seed_memory_rows(conn, ["selective-target"])
+        conn.execute("UPDATE memory SET confidence=0.3, signal='none' "
+                     "WHERE id='selective-target'")
+        conn.commit()
+        row = self._scored_row("selective-target", 0.8)
+        row.update(confidence=0.3, signal="none")
+        with patch.object(recall_mod, "_explain_run_pipeline",
+                          return_value=([row], [(0.8, row)], [])), \
+                patch.dict(os.environ, {"ZMEM_INJECT_TOKEN_BUDGET": "1500"},
+                           clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            recall_mod.explain_recall(
+                conn, query="selective", namespace=NS, limit=1,
+                hybrid=False, no_mmr=True, link_hops=0,
+                target="selective-target", as_json=True,
+                for_injection=True)
+        verdict = json.loads(stdout.getvalue())["explain"]["verdicts"][0]
+        self.assertEqual(verdict["reason"], "selective_rejected")
+        self.assertEqual(verdict["detail"]["stage"], "selective_gate")
+        self.assertEqual(verdict["detail"]["reason"], "below-bar")
+        conn.close()
+
+    def test_injection_explain_target_reports_budget_rejection(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+
+        conn = self._memory_conn()
+        self._seed_memory_rows(conn, ["budget-target"])
+        row = self._scored_row("budget-target", 0.8)
+        row["content"] = "budget target " + ("x" * 2000)
+        with patch.object(recall_mod, "_explain_run_pipeline",
+                          return_value=([row], [(0.8, row)], [])), \
+                patch.dict(os.environ, {"ZMEM_INJECT_TOKEN_BUDGET": "130"},
+                           clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            recall_mod.explain_recall(
+                conn, query="budget", namespace=NS, limit=1,
+                hybrid=False, no_mmr=True, link_hops=0,
+                target="budget-target", as_json=True,
+                for_injection=True)
+        verdict = json.loads(stdout.getvalue())["explain"]["verdicts"][0]
+        self.assertEqual(verdict["reason"], "budget_rejected")
+        self.assertEqual(verdict["detail"]["stage"], "token_budget")
+        self.assertGreater(verdict["detail"]["row_cost"], 0)
+        conn.close()
+
+    def test_injection_explain_entity_card_cost_matches_passive_budget(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+
+        conn = self._memory_conn()
+        mid = "entity-budget"
+        self._seed_memory_rows(conn, [mid])
+        names = ["entity-name-" + (letter * 200)
+                 for letter in ("a", "b", "c")]
+        for index, name in enumerate(names):
+            eid = f"entity-budget-{index}"
+            conn.execute(
+                "INSERT INTO entity (id, kind, canonical_name, created_at, updated_at) "
+                "VALUES (?, 'tool', ?, 't', 't')", (eid, name))
+            conn.execute(
+                "INSERT INTO memory_entity (memory_id, entity_id, role) "
+                "VALUES (?, ?, 'mentions')", (mid, eid))
+        conn.commit()
+
+        def scored(*_args, **_kwargs):
+            row = self._scored_row(mid, 0.9)
+            return [(row["_score"], row)]
+
+        env = {"ZMEM_INJECT_MARGIN": "0.0",
+               "ZMEM_INJECT_TOKEN_BUDGET": "259"}
+        with patch.object(recall_mod, "_recall_one_tier", side_effect=scored), \
+                patch.dict(os.environ, env, clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            passive = recall_mod.recall_memory(
+                conn, query="entity", namespace=NS, limit=1, hybrid=False,
+                no_mmr=True, no_bump=True, link_hops=0,
+                as_json=True, for_injection=True, no_telemetry=True)
+        passive_doc = json.loads(stdout.getvalue())
+
+        with patch.object(recall_mod, "_recall_one_tier", side_effect=scored), \
+                patch.dict(os.environ, env, clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            explained = recall_mod.explain_recall(
+                conn, query="entity", namespace=NS, limit=1, hybrid=False,
+                no_mmr=True, link_hops=0, as_json=True,
+                for_injection=True)
+        explained_doc = json.loads(stdout.getvalue())
+
+        self.assertEqual(passive, [])
+        self.assertEqual(explained, passive)
+        self.assertEqual(passive_doc["budget_dropped"], 1)
+        self.assertEqual(explained_doc["budget_dropped"], 1)
+        self.assertEqual(explained_doc["explain"]["verdicts"][0]["reason"],
+                         "budget_rejected")
+        conn.close()
+
     def test_injection_explain_reports_effective_passive_mode(self):
         env = self._env()
         init = subprocess.run(
@@ -377,6 +629,36 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
             env=env, capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(json.loads(result.stdout)["explain"]["no_bump"])
+
+    def test_cli_forwards_min_confidence_to_injection_explain(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import cli as cli_mod
+
+        conn = self._memory_conn()
+        captured = {}
+
+        def capture_explain(_conn, **kwargs):
+            captured.update(kwargs)
+            return []
+
+        old_argv = sys.argv
+        sys.argv = [
+            str(STORE_PY), "recall", "--query", "forwarding",
+            "--namespace", NS, "--for-injection", "--explain", "--json",
+            "--min-confidence", "0.77",
+        ]
+        try:
+            with patch.object(cli_mod, "connect", return_value=conn), \
+                    patch.object(cli_mod, "_prepare_store"), \
+                    patch.object(cli_mod, "_wait_for_maintenance_clear"), \
+                    patch.object(cli_mod, "assert_embedding_compatible"), \
+                    patch.object(cli_mod, "explain_recall",
+                                 side_effect=capture_explain):
+                cli_mod.main()
+        finally:
+            sys.argv = old_argv
+        self.assertEqual(captured.get("min_confidence"), 0.77)
+        self.assertTrue(captured.get("for_injection"))
 
     def test_finite_zero_and_negative_runner_up_scores_are_usable(self):
         sys.path.insert(0, str(SCRIPTS))
@@ -483,6 +765,17 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
             "ids=[] all=['m-top', 'm-second'] sid=margin-silent "
             "moment=user_prompt margin=0.012500",
         )
+
+        self.assertEqual(len(self._body_calls), 2)
+        for args, kwargs in self._body_calls:
+            argv = args[0]
+            self.assertEqual(argv[:3], [sys.executable, str(STORE_PY), "recall"])
+            self.assertIn("--namespace", argv)
+            self.assertEqual(argv[argv.index("--namespace") + 1], NS)
+            self.assertIn("--no-bump", argv)
+            self.assertIn("--for-injection", argv)
+            self.assertIn("--json", argv)
+            self.assertEqual(kwargs["timeout"], 10)
 
     def test_session_start_consumer_preserves_margin_diagnostics(self):
         row = {

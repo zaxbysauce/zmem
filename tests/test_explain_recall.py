@@ -158,6 +158,26 @@ class ExplainFixtureBase(unittest.TestCase):
             env=self.env, capture_output=True, text=True, timeout=120,
         )
 
+    def _zero_write_surface_snapshot(self) -> dict[str, bytes]:
+        """Capture the store and every local telemetry surface for explain.
+
+        SQLite may create transient ``-wal``, ``-shm``, or journal siblings,
+        while the hook's decision surfaces use the two ``zmem-*.log`` stems.
+        Include all matching paths so this catches both byte changes and a
+        newly-created or removed sidecar.
+        """
+        root = Path(self.store).parent
+        store_name = Path(self.store).name
+        paths = set(root.glob(store_name))
+        paths.update(root.glob(f"{store_name}-*"))
+        for stem in ("zmem-decisions.log", "zmem-bg.log"):
+            paths.update(root.glob(f"{stem}*"))
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in sorted(paths)
+            if path.is_file()
+        }
+
     def _explain_json(self, *args) -> dict:
         r = self._recall("--explain", "--json", *args)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -227,7 +247,8 @@ class ExplainReasonCoverageTests(ExplainFixtureBase):
              "omitted_untrusted_web", "namespace", "superseded",
              "not_valid_at_as_of", "vec_lane_miss", "not_in_pool",
              "link_expansion",  # issue #113: link-hop-aware verdict
-             "not_in_db", "explain_unavailable", "margin_pruned"},
+             "not_in_db", "explain_unavailable", "margin_pruned",
+             "selective_rejected", "budget_rejected"},
         )
 
     def _seed_margin_rows(self):
@@ -454,12 +475,18 @@ class ExplainReasonCoverageTests(ExplainFixtureBase):
 
 class ExplainSafetyTests(ExplainFixtureBase):
     def test_explain_is_zero_write_subprocess(self):
-        before = Path(self.store).read_bytes()
-        r = self._recall("--query", "deploy pipeline", "--namespace", NS,
-                         "--explain")
+        # Keep the telemetry directory in the fixture sandbox too: explain
+        # must not create or mutate either SQLite sidecars or audit logs.
+        env = {**self.env, "ZMEM_DATA": self.tmp}
+        before = self._zero_write_surface_snapshot()
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), "recall", "--query", "deploy pipeline",
+             "--namespace", NS, "--explain"],
+            env=env, capture_output=True, text=True, timeout=120,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(Path(self.store).read_bytes(), before,
-                         "--explain must be a true zero-write read")
+        self.assertEqual(self._zero_write_surface_snapshot(), before,
+                         "--explain must not write SQLite or telemetry surfaces")
 
     def test_explain_is_zero_write_even_with_lineage_present(self):
         subprocess.run(

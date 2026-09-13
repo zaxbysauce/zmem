@@ -270,13 +270,14 @@ are clamped to `1.0`. The recommended initial rollout is `0.05`.
 
 With a positive threshold and at least two usable post-selective rows, the
 gate compares the two highest scores using the stable score-descending view
-and computes `(top - second) / top`. When that observed margin is strictly
-below the threshold, ordinary rows after the winner are pruned before the
-token budget runs. A `decision` or `constraint` in either leading position is
-protected: no rows are pruned, but the valid observed margin is still
-reported. Fewer than two rows, malformed or non-finite scores, and a
-non-positive top score fail open. The original presentation order is retained
-for surviving rows.
+and computes the raw `(top - second) / top`. Every candidate score must be
+usable; a malformed, scoreless, or non-finite score anywhere fails open. When
+the raw margin is strictly below the threshold, ordinary rows after the winner
+are pruned before the token budget runs. A `decision` or `constraint` in either
+leading position is protected: no rows are pruned, but the valid observed
+margin is still reported. Fewer than two rows and a non-positive top score
+also fail open. The original presentation order is retained for surviving
+rows.
 
 When a valid score pair was observed, injection JSON adds `margin` formatted
 to six decimal places and `margin_pruned_ids` in prune order; no fields are

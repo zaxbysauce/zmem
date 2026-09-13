@@ -20,10 +20,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "memory" / "scripts"
 MARGIN_ENV = "ZMEM_INJECT_MARGIN"
 
-# Do this before importing storelib: tests must not inherit an operator's
-# rollout setting and accidentally make expected behaviour non-local.
-os.environ.pop(MARGIN_ENV, None)
-os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
 sys.path.insert(0, str(SCRIPTS))
 
 # Direct imports are deliberate. They make this an honest RED gate on the
@@ -152,6 +148,43 @@ class ScoreMarginTest(unittest.TestCase):
         self.assertEqual(_ids(retained), _ids(rows))
         self.assertEqual(pruned, [])
         self.assertEqual(format(observed_margin, ".6f"), "0.050000")
+
+    def test_raw_margin_below_threshold_prunes_when_rounded_equal(self):
+        rows = [
+            {"id": "top", "type": "fact", "_score": 1.0},
+            {"id": "second", "type": "fact", "_score": 0.9500004},
+            {"id": "third", "type": "lesson", "_score": 0.40},
+        ]
+        retained, observed_margin, pruned = apply_score_margin(rows, margin=0.05)
+        self.assertEqual(observed_margin, 0.05)
+        self.assertEqual(_ids(retained), ["top"])
+        self.assertEqual(_ids(pruned), ["second", "third"])
+        self.assertEqual(format(observed_margin, ".6f"), "0.050000")
+
+    def test_empty_list_fails_open(self):
+        retained, observed_margin, pruned = apply_score_margin([], margin=0.05)
+        self.assertEqual(retained, [])
+        self.assertIsNone(observed_margin)
+        self.assertEqual(pruned, [])
+
+    def test_malformed_tail_score_fails_open(self):
+        for bad_row in (
+            {"id": "missing", "type": "fact"},
+            {"id": "malformed", "type": "fact", "_score": "not-a-number"},
+            {"id": "nan", "type": "fact", "_score": float("nan")},
+        ):
+            with self.subTest(row=bad_row):
+                rows = [
+                    {"id": "top", "type": "fact", "_score": 0.80},
+                    {"id": "second", "type": "fact", "_score": 0.79},
+                    bad_row,
+                ]
+                retained, observed_margin, pruned = apply_score_margin(
+                    rows, margin=0.05
+                )
+                self.assertEqual(retained, rows)
+                self.assertIsNone(observed_margin)
+                self.assertEqual(pruned, [])
 
     def test_missing_malformed_nonfinite_and_nonpositive_scores_fail_open(self):
         unusable_scores = (

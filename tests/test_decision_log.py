@@ -832,6 +832,16 @@ class ArmsAttributionReportTest(_SeededStore):
         self.assertEqual(arms["carried"]["fts"],
                          {"injected": 0, "silent": 0})
 
+
+class MarginDecisionLogTest(unittest.TestCase):
+    """Decision-log margin fields without the unrelated seeded-store fixture."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="zmem-dl-margin-")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
     def _write_hook_decision(self, **kwargs):
         """Load the real hook writer and return its newest decision line."""
         with mock.patch.dict(os.environ, {

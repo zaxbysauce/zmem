@@ -501,9 +501,19 @@ if store_py and os.path.isfile(store_py):
                                 _margin_ss = " margin=%.6f" % _env_margin
                             _margin_pruned_ss = ""
                             if _env_margin_pruned_ids:
+                                # Issue #182: the envelope carries
+                                # untrusted memory IDs. Match the shared
+                                # writer's tools=/paths= charset rule and
+                                # component cap before list repr enters the
+                                # decision log.
+                                _safe_margin_pruned_ids = [
+                                    re.sub(
+                                        r"[^A-Za-z0-9._-]", "_", _mid)[:64]
+                                    for _mid in _env_margin_pruned_ids
+                                ]
                                 _margin_pruned_ss = (
                                     " margin_pruned=%s"
-                                    % _env_margin_pruned_ids
+                                    % _safe_margin_pruned_ids
                                 )
                             _lf.write(
                                 "[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=%s%s%s\n" % (

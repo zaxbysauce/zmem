@@ -25,7 +25,8 @@ from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, 
 from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
                              apply_score_margin, apply_token_budget, budget_note,
                              classify_silent_reason, estimate_tokens,
-                             inject_score_margin, inject_token_budget,
+                             fence_row_cost, inject_score_margin,
+                             inject_token_budget,
                              selective_inject_filter)
 from schema_meta import (PROTECTED_INJECT_TYPES,
                          ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
@@ -59,7 +60,8 @@ EXPLAIN_REASONS = (
     "found", "below_limit", "below_floor", "omitted_injection",
     "omitted_untrusted_web", "namespace", "superseded", "not_valid_at_as_of",
     "vec_lane_miss", "not_in_pool", "not_in_db", "explain_unavailable",
-    "link_expansion", "margin_pruned",
+    "link_expansion", "margin_pruned", "selective_rejected",
+    "budget_rejected",
 )
 
 # Issue #82: change-intent trigger for the explicit-recall lineage unfold.
@@ -2184,11 +2186,16 @@ def _explain_verdict_for_target(
     global_deep: list[tuple[float, dict]],
     margin_pruned: dict[str, dict] | None = None,
     margin_pruned_scores: dict[str, object] | None = None,
+    selective_rejected: dict[str, dict] | None = None,
+    selective_rejected_scores: dict[str, object] | None = None,
+    budget_rejected: dict[str, dict] | None = None,
+    budget_rejected_scores: dict[str, object] | None = None,
 ) -> dict:
     """First-match-wins gate analysis for one --target row (issue #82).
 
     Order: namespace -> not_valid_at_as_of -> superseded -> below_floor ->
-    found -> omitted_* -> below_limit -> vec_lane_miss -> not_in_pool.
+    found -> omitted_* -> selective_rejected -> margin_pruned ->
+    budget_rejected -> below_limit -> vec_lane_miss -> not_in_pool.
     A row dropped by the confidence floor never reaches the scored pool (the
     floor is applied inside the lane SQL), so below_floor is a pre-check on
     the target row itself — that is the only way the reason can ever fire.
@@ -2229,11 +2236,21 @@ def _explain_verdict_for_target(
             # the verdict; lane numbers would only blur it.
             return {"id": mid, "reason": why, "rank": None,
                     "score": r.get("_score"), "detail": {}}
+    if selective_rejected and mid in selective_rejected:
+        return {"id": mid, "reason": "selective_rejected", "rank": None,
+                "score": ((selective_rejected_scores or {}).get(mid)
+                          if selective_rejected_scores is not None else None),
+                "detail": selective_rejected[mid]}
     if margin_pruned and mid in margin_pruned:
         return {"id": mid, "reason": "margin_pruned", "rank": None,
                 "score": ((margin_pruned_scores or {}).get(mid)
                           if margin_pruned_scores is not None else None),
                 "detail": margin_pruned[mid]}
+    if budget_rejected and mid in budget_rejected:
+        return {"id": mid, "reason": "budget_rejected", "rank": None,
+                "score": ((budget_rejected_scores or {}).get(mid)
+                          if budget_rejected_scores is not None else None),
+                "detail": budget_rejected[mid]}
     deep = project_deep + global_deep
     for rank, (score, r) in enumerate(deep, start=1):
         if r["id"] == mid:
@@ -2403,6 +2420,15 @@ def explain_recall(
     margin_pruned_ids: list[str] = []
     margin_pruned_details: dict[str, dict] = {}
     margin_pruned_scores: dict[str, object] = {}
+    selective_rejected_details: dict[str, dict] = {}
+    selective_rejected_scores: dict[str, object] = {}
+    budget_rejected_details: dict[str, dict] = {}
+    budget_rejected_scores: dict[str, object] = {}
+    injection_candidate_rows: list[dict] = []
+    injection_gate_stats: dict = {}
+    injection_budget_stats: dict = {}
+    injection_budget_emptied = False
+    injection_reason: str | None = None
     try:
         presented, project_deep, global_deep = _explain_run_pipeline(
             conn, query=query, ns_list=ns_list, global_ns_list=global_ns_list,
@@ -2414,12 +2440,54 @@ def explain_recall(
         if no_bump:
             presented, omitted = _explain_omit_filter(presented)
         if for_injection:
-            # Issue #182: replay omit -> selective -> margin -> budget in the
-            # explain path without writes.  Use a score view for the decision
-            # only; retain original presentation order for the final rows.
-            presented, _gate_status, _gate_stats = selective_inject_filter(
-                presented, with_stats=True)
-            _margin_view = _stable_score_desc(presented)
+            # Keep this replay in the same order as recall_memory: omission,
+            # link expansion, entity cards, selective gate, score margin, then
+            # token-budget admission. All helpers are SELECT-only here.
+            injection_candidate_rows = list(presented)
+            if link_hops >= 1 and link_budget >= 1 and injection_candidate_rows:
+                injection_candidate_rows += expand_recall_links(
+                    conn, injection_candidate_rows, ns_list=ns_list,
+                    budget=link_budget, as_of=as_of,
+                    min_confidence=min_confidence, no_bump=no_bump,
+                )
+            if injection_candidate_rows:
+                cards = entities_for_memories(
+                    conn, [r["id"] for r in injection_candidate_rows])
+                for r in injection_candidate_rows:
+                    r["entities"] = cards.get(r["id"], [])
+
+            # Retain the pre-gate rows and its aggregate stats. The maps below
+            # let target verdicts explain a rejection instead of falling
+            # through to below_limit/not_in_pool after the list is filtered.
+            selected_rows, _gate_status, injection_gate_stats = (
+                selective_inject_filter(
+                    injection_candidate_rows, with_stats=True))
+            selected_ids = {r["id"] for r in selected_rows}
+            for row in injection_candidate_rows:
+                if row["id"] in selected_ids:
+                    continue
+                # The public selector deliberately returns aggregate stats.
+                # Replaying a single row is read-only and identifies whether
+                # its rejection was the trust/bar or relevance half of the
+                # same gate without duplicating its threshold constants here.
+                _one_selected, _one_status, one_stats = selective_inject_filter(
+                    [row], with_stats=True)
+                gate_reason = ("below-relevance"
+                               if one_stats.get("relevance_failed", 0)
+                               else "below-bar")
+                selective_rejected_scores[row["id"]] = row.get("_score")
+                selective_rejected_details[row["id"]] = {
+                    "stage": "selective_gate",
+                    "reason": gate_reason,
+                    "rejection_reason": gate_reason,
+                    "gate_stats": one_stats,
+                    "pool_stats": injection_gate_stats,
+                }
+
+            # Issue #182: score separation is evaluated on a temporary stable
+            # score-descending view, but the caller's presentation order
+            # remains authoritative for the final rows.
+            _margin_view = _stable_score_desc(selected_rows)
             _margin_threshold = inject_score_margin()
             _margin_retained, margin_observed, _margin_pruned = (
                 apply_score_margin(_margin_view, margin=_margin_threshold)
@@ -2434,11 +2502,36 @@ def explain_recall(
                 margin_pruned_scores = {
                     r["id"]: r.get("_score") for r in _margin_pruned
                 }
-                _margin_ids = set(margin_pruned_ids)
-                presented = [r for r in presented
-                             if r["id"] not in _margin_ids]
+            selected_rows = [r for r in selected_rows
+                             if r["id"] not in set(margin_pruned_ids)]
+            if selected_rows:
+                pre_budget_rows = list(selected_rows)
+                selected_rows, _est, _dropped, injection_budget_stats = (
+                    apply_token_budget(selected_rows, with_stats=True))
+                kept_ids = {r["id"] for r in selected_rows}
+                for row in pre_budget_rows:
+                    if row["id"] in kept_ids:
+                        continue
+                    budget_rejected_scores[row["id"]] = row.get("_score")
+                    budget_rejected_details[row["id"]] = {
+                        "stage": "token_budget",
+                        "reason": "budget-drop",
+                        "rejection_reason": "budget-drop",
+                        "budget": injection_budget_stats.get("budget"),
+                        "admission_used": injection_budget_stats.get(
+                            "admission_used"),
+                        "row_cost": fence_row_cost(row),
+                        "budget_stats": injection_budget_stats,
+                    }
+                injection_budget_emptied = not selected_rows
+            presented = selected_rows
             if presented:
-                presented, _est, _dropped = apply_token_budget(presented)
+                injection_reason = "injected"
+            else:
+                injection_reason = classify_silent_reason(
+                    injection_candidate_rows, omitted=len(omitted),
+                    budget_emptied=injection_budget_emptied,
+                    lane_stats=injection_gate_stats)
         # PRR-001: mirror recall_memory's post-filter rerank stage so the
         # presented ranks the verdicts cite match a real recall when the
         # cross-encoder is CLI-enabled (the helper fails open to input order).
@@ -2468,6 +2561,10 @@ def explain_recall(
                     global_deep=global_deep,
                     margin_pruned=margin_pruned_details,
                     margin_pruned_scores=margin_pruned_scores,
+                    selective_rejected=selective_rejected_details,
+                    selective_rejected_scores=selective_rejected_scores,
+                    budget_rejected=budget_rejected_details,
+                    budget_rejected_scores=budget_rejected_scores,
                 )
                 for row in target_rows
             ]
@@ -2477,10 +2574,20 @@ def explain_recall(
                 verdicts.append({"id": r["id"], "reason": "found",
                                  "rank": rank, "score": r.get("_score"),
                                  "detail": {"lanes": _explain_lane_detail(r)}})
+            for mid, detail in selective_rejected_details.items():
+                verdicts.append({"id": mid, "reason": "selective_rejected",
+                                 "rank": None,
+                                 "score": selective_rejected_scores.get(mid),
+                                 "detail": detail})
             for mid, detail in margin_pruned_details.items():
                 verdicts.append({"id": mid, "reason": "margin_pruned",
                                  "rank": None,
                                  "score": margin_pruned_scores.get(mid),
+                                 "detail": detail})
+            for mid, detail in budget_rejected_details.items():
+                verdicts.append({"id": mid, "reason": "budget_rejected",
+                                 "rank": None,
+                                 "score": budget_rejected_scores.get(mid),
                                  "detail": detail})
             for r, why in omitted:
                 verdicts.append({"id": r["id"], "reason": why, "rank": None,
@@ -2489,9 +2596,12 @@ def explain_recall(
             presented_ids = {r["id"] for r in presented}
             omitted_ids = {r["id"] for r, _why in omitted}
             margin_ids = set(margin_pruned_details)
+            selective_ids = set(selective_rejected_details)
+            budget_ids = set(budget_rejected_details)
             for rank, (score, r) in enumerate(deep, start=1):
                 if (r["id"] in presented_ids or r["id"] in omitted_ids
-                        or r["id"] in margin_ids):
+                        or r["id"] in margin_ids or r["id"] in selective_ids
+                        or r["id"] in budget_ids):
                     continue
                 verdicts.append({"id": r["id"], "reason": "below_limit",
                                  "rank": rank, "score": round(score, 4),
@@ -2580,7 +2690,8 @@ def explain_recall(
         tokens_used = sum(estimate_tokens(r.get("content", "") or "")
                           for r in results)
         injection_risk_count = sum(
-            1 for r in results if r.get("prompt_injection_risk"))
+            1 for r in (injection_candidate_rows if for_injection else results)
+            if r.get("prompt_injection_risk"))
         envelope = {
             "results": results,
             "count": len(results),
@@ -2590,9 +2701,37 @@ def explain_recall(
             "tokens_budget": inject_token_budget(),
             "explain": explain_obj,
         }
-        if for_injection and margin_observed is not None:
-            envelope["margin"] = format(margin_observed, ".6f")
-            envelope["margin_pruned_ids"] = margin_pruned_ids
+        if for_injection:
+            # Keep the injection replay envelope aligned with recall_memory's
+            # passive envelope. In particular, candidate_ids is the pre-gate
+            # post-expansion set, while the rejection maps remain available in
+            # explain.verdicts for target-specific attribution.
+            envelope["reason"] = injection_reason
+            envelope["candidate_ids"] = [r["id"]
+                                          for r in injection_candidate_rows]
+            envelope["candidate_lanes"] = {
+                r["id"]: {
+                    "lex": r.get("_rel_lex"),
+                    "cos": r.get("_rel_cos"),
+                    "ent": r.get("_rel_ent"),
+                    "graph": r.get("_rel_graph"),
+                    "trust": _row_trust(r),
+                }
+                for r in injection_candidate_rows
+            }
+            if margin_observed is not None:
+                envelope["margin"] = format(margin_observed, ".6f")
+                envelope["margin_pruned_ids"] = margin_pruned_ids
+            envelope["arms"] = explain_arms
+            envelope["budget_dropped"] = injection_budget_stats.get(
+                "dropped", 0)
+            envelope["budget_admission"] = injection_budget_stats.get(
+                "admission_used", 0)
+            envelope["budget_truncated"] = injection_budget_stats.get(
+                "truncated", 0)
+            envelope["budget_dropped_protected"] = injection_budget_stats.get(
+                "dropped_protected", 0)
+            envelope["budget_note"] = budget_note(injection_budget_stats)
         print(json.dumps(envelope, indent=2))
     else:
         if not results:
