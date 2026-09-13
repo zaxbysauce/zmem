@@ -54,7 +54,7 @@ def _host_record(host: str, *, mismatches: list[str] | None = None) -> dict[str,
 def _report(hosts: list[str], *, ok: bool = True, mismatch_count: int = 0) -> dict[str, object]:
     return {
         "checkout": "/checkout",
-        "version": "0.35.0",
+        "version": "0.36.0",
         "gitCommitSha": COMMIT_SHA,
         "hosts": [_host_record(host) for host in hosts],
         "mismatchCount": mismatch_count,
@@ -169,7 +169,7 @@ class RefreshFeedbackContractTest(unittest.TestCase):
         updated = host_registry.update_host_registry(
             _claude_registry(),
             host="claude",
-            version="0.35.0",
+            version="0.36.0",
             git_commit_sha=COMMIT_SHA,
             install_path=self.tmp / "cache",
         )
@@ -195,7 +195,7 @@ class RefreshFeedbackContractTest(unittest.TestCase):
         self.assertNotIn("runs this refresh immediately\nafter its existing `codex plugin add`", readme_section)
 
         changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        changelog_section = changelog[changelog.index("## [0.35.0]") :]
+        changelog_section = changelog[changelog.index("## [0.36.0]") :]
         self.assertLess(
             changelog_section.index("refresh before `codex plugin add`"),
             changelog_section.index("`codex plugin add` or"),

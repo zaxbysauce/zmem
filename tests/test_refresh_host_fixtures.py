@@ -31,7 +31,7 @@ import refresh_hosts  # noqa: E402
 
 
 HOSTS = ("codex", "claude", "zcode")
-VERSION = "0.35.0"
+VERSION = "0.36.0"
 MARKETPLACE_PREIMAGE_VERSION = "0.14.0"
 COMMIT_SHA = "0123456789abcdef0123456789abcdef01234567"
 CANONICAL_MANIFESTS = {

@@ -39,7 +39,7 @@ from drift import aggregate, tree_hashes  # noqa: E402
 
 
 HOSTS = ("codex", "claude", "zcode")
-VERSION = "0.35.0"
+VERSION = "0.36.0"
 COMMIT_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
@@ -314,9 +314,9 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
         self.assertEqual(report["mismatchCount"], 0)
         self.assertTrue(report["ok"])
         expected_caches = {
-            "codex": (self.home / ".codex/plugins/cache/personal/zmem/0.35.0").resolve(),
-            "claude": (self.home / ".claude/plugins/cache/zmem/zmem/0.35.0").resolve(),
-            "zcode": (self.home / ".zcode/cli/plugins/cache/zmem/zmem/0.35.0").resolve(),
+            "codex": (self.home / ".codex/plugins/cache/personal/zmem/0.36.0").resolve(),
+            "claude": (self.home / ".claude/plugins/cache/zmem/zmem/0.36.0").resolve(),
+            "zcode": (self.home / ".zcode/cli/plugins/cache/zmem/zmem/0.36.0").resolve(),
         }
         expected_registries = {
             "codex": None,
@@ -650,7 +650,7 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
         """Cleanup errors must not roll back an already committed transaction."""
         self.assertEqual(self._main_status(*self._refresh_args()), 0)
         old_cache = (
-            self.home / ".codex/plugins/cache/personal/zmem/0.35.0"
+            self.home / ".codex/plugins/cache/personal/zmem/0.36.0"
         ).resolve()
         old_bytes = (old_cache / "hooks/zmem-recall.sh").read_bytes()
 

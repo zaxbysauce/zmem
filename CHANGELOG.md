@@ -10,7 +10,7 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.35.0] - 2026-09-13
+## [0.36.0] - 2026-09-13
 
 > Workstream N PR 1 of 6 (issue #184): fail-closed host-cache refresh from a
 > checkout-derived release, with transactional registry and marketplace updates.
@@ -35,6 +35,8 @@ README.
   execution, fail-fast behavior, and nonzero exit propagation; installer steps
   are skipped when refresh fails. The updater remains operator-local and
   untracked, so existing copies must be reordered before use.
+
+## [0.35.0] - 2026-09-13
 
 > Workstream D PR 6 of 8 (issue #121): the hook path fits the host timeout
 > budget, and Tier 0 reaches the host on a fast path even when the store
