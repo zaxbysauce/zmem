@@ -32,7 +32,7 @@ import sys
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parent
-VERSION = "0.34.0"
+VERSION = "0.35.0"
 COMMIT_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 EXCLUDED_DIRS = frozenset({".git", "graphify-out", "__pycache__"})

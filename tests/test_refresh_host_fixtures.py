@@ -31,7 +31,7 @@ import refresh_hosts  # noqa: E402
 
 
 HOSTS = ("codex", "claude", "zcode")
-VERSION = "0.34.0"
+VERSION = "0.35.0"
 MARKETPLACE_PREIMAGE_VERSION = "0.14.0"
 COMMIT_SHA = "0123456789abcdef0123456789abcdef01234567"
 CANONICAL_MANIFESTS = {
@@ -63,6 +63,8 @@ def _tree(root: Path) -> dict[str, tuple[str, bytes | None]]:
     if not root.exists():
         return result
     for path in sorted(root.rglob("*")):
+        if path.name == refresh_hosts._REFRESH_LOCK_NAME:
+            continue
         relative = path.relative_to(root).as_posix()
         if path.is_dir():
             result[relative] = ("dir", None)
@@ -921,6 +923,35 @@ class TempAllocatorTest(unittest.TestCase):
             with self.assertRaisesRegex(refresh_hosts.RefreshError, r"cannot reserve temporary sibling"):
                 refresh_hosts._new_temp_path(".zmem-refresh-unlink-", self.tmp)
         self.assertFalse(any(path.name.startswith(".zmem-refresh-unlink-") for path in self.tmp.iterdir()))
+
+    def test_cleanup_failures_are_returned_instead_of_swallowed(self):
+        source = self.tmp / "staged.tmp"
+        source.write_bytes(b"staged")
+        operation = refresh_hosts._Operation(
+            "codex", "cache", source, self.tmp / "destination"
+        )
+        retained: set[Path] = set()
+        with mock.patch.object(
+            refresh_hosts, "_remove_path", side_effect=OSError("injected cleanup failure")
+        ):
+            failures = refresh_hosts._cleanup_operation_temps([operation], retained)
+
+        self.assertEqual(len(failures), 1)
+        self.assertIn("cleanup failed", failures[0])
+        self.assertIn(str(source), failures[0])
+        self.assertEqual(retained, {source})
+        with mock.patch.object(refresh_hosts, "_remove_path") as retry_remove:
+            self.assertEqual(refresh_hosts._cleanup_operation_temps([operation], retained), [])
+        retry_remove.assert_not_called()
+
+    def test_reparse_point_ancestor_is_rejected_by_boundary_check(self):
+        with mock.patch.object(refresh_hosts, "_is_reparse_point", return_value=True):
+            with self.assertRaisesRegex(
+                refresh_hosts.RefreshError, "symlink or reparse point"
+            ):
+                refresh_hosts._reject_symlink_components(
+                    self.tmp / "nested" / "destination", "destination"
+                )
 
 
 class RollbackSafetyTest(unittest.TestCase):

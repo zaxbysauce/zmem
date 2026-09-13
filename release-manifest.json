@@ -1,13 +1,13 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "7df905f8247c62f45a81c7a1051f03cf9e147209e4cca2210465745bb015febe",
+  "digest": "9a9e07229480405faf493893c50162435a8ae17e1e0468906309012a9051c734",
   "files": {
     "hermes-plugin/__init__.py": "49921ae0fcbb7343b9f77eae4d5684bd1e35b89ecf858744179ffb755b0993b0",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "064eb5767b12039759f9a0bf166e86d6214360af9aebc7747bba436a6d5fde29",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "bdc4911d9d6728ad4b7adf3035fc737492ef9143b1a499142001fdef1fe5a9db",
+    "hermes-plugin/plugin.yaml": "53019f301b5ec929e9a4020dde7c2346d72c4d03c5febc3c73911b79b8762fce",
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "8f09b3987ae01ec7d250881d2bb6b885e07e78743951d5b8f725ff07d6f48b97",
@@ -39,12 +39,12 @@
     "scripts/eval_runner.py": "6e9b355425644f38795068259a69bb9c1ca02cdd57509511824ac10ac721ce3a",
     "scripts/eval_self_corpus.py": "ead3aece0562da0fe588ea4d4994aa7ec8fece3ae4d0a7554766e9933e4e76e6",
     "scripts/host_canary.py": "072166ce047afb881e36a11ebf78e7baeb48e5d627c91b364abc3e33b7108605",
-    "scripts/host_registry.py": "394e75cd342447a905da8490c2565b0cbb47811e4fff84f231ea707246181698",
+    "scripts/host_registry.py": "f6beab143eeec65f7d16f0a3cac2bd2b6436656ab38e84175088e3051511dd8e",
     "scripts/ingest_harvest.py": "4deed83a20c9227afdc45c3ba89b9bd83beadbac1aa72049291dc502b7322e2f",
     "scripts/pattern_harness.py": "428b33978ee59b7c7bbc67f0849adfd750c9277e2e05b216721611741024652b",
-    "scripts/refresh-report-schema.json": "8ab42194af5b380efdfaa794c75b26fd5d240168b494275956d7103ba0066c53",
-    "scripts/refresh_hosts.py": "d2ef3281bbfdcb83ca34ed761bdbbfb83f207f8917b4758f7e1bfd5f5af89d8b",
-    "scripts/release_gate.py": "48836068c9c894fe335e00bff8d90bf7ba49e9f993c747eaa2b506082996ca67",
+    "scripts/refresh-report-schema.json": "a2105db8ca57a6e860c35bf25a6e8f943b70c0f3abaf65fcf2803d9d99b01bea",
+    "scripts/refresh_hosts.py": "6c85a1a2cc0e2264348e9427311958388dc807beeb4b9780ab0ab2b50770d2cf",
+    "scripts/release_gate.py": "a9065f3d55df65dde1f6ed1be4694371543fcc1ab3b3c03b77c0aa86eacfd938",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "ac20e80713cf3ec05159ac0f609313cb094ed5515c387258fa5369faec963aa5",
     "skills/memory/SKILL.md": "75968922c41dc5683138be78ec03900ba28299c95fba85420a776f764f593d62",
@@ -83,5 +83,5 @@
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
     "skills/memory/scripts/storelib/write.py": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
   },
-  "version": "0.34.0"
+  "version": "0.35.0"
 }

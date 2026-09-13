@@ -50,6 +50,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -78,6 +79,25 @@ def _is_shipping_manifest(rel_path: str) -> bool:
     return bool(MANIFEST_RE.search(rel_path)) and not rel_path.startswith(
         FIXTURE_PREFIX
     )
+
+
+def _has_link_component(path: Path, root: Path) -> bool:
+    """Whether a tracked surface path or any of its ancestors is link-like."""
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path
+    candidate = root
+    for component in relative.parts:
+        candidate /= component
+        try:
+            info = os.lstat(candidate)
+        except OSError:
+            continue
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if os.path.islink(candidate) or getattr(info, "st_file_attributes", 0) & reparse:
+            return True
+    return False
 
 # CHANGELOG released sections look like `## [0.10.1] — 2026-08-25`.
 # `[Unreleased]` is explicitly excluded so it can sit above the newest
@@ -403,6 +423,12 @@ def _tracked_surface_hashes(repo_root: Path) -> dict | None:
     hashes = {}
     for rel in sorted(
             r for r in tracked.stdout.splitlines() if drift._is_surface(r)):
+        path = repo_root / rel
+        # The host-cache mirror deliberately skips links.  Keep release
+        # identity symmetric: never hash through a symlink/junction here and
+        # accidentally authenticate bytes the mirror will not serve.
+        if _has_link_component(path, repo_root):
+            continue
         h = drift.file_hash(repo_root / rel)
         if h is None:
             print(f"::error::cannot read tracked surface file {rel} — fix "

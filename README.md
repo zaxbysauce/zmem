@@ -597,11 +597,16 @@ possible, and leaves the prior host state intact. A dry run never creates a
 cache, registry, or marketplace destination.
 
 The external scheduled operator script
-`<codex-scripts-root>\update-zmem.ps1` runs this refresh immediately
-after its existing `codex plugin add` step. It uses an absolute `python.exe`,
+`<codex-scripts-root>\update-zmem.ps1` must run this refresh before any host
+installer or discovery mutation (including `codex plugin add`). The refresh is
+the recoverable boundary: only after it exits successfully may the operator
+perform installer side effects. The script should use an absolute `python.exe`,
 all three hosts, an explicit dated report path, and a 600-second bounded
-process; fail-fast handling propagates a nonzero refresh exit so a failed
-refresh cannot be reported as a successful scheduled update.
+process; fail-fast handling must propagate a nonzero refresh exit and skip
+installer commands so a failed refresh cannot leave a partially updated host.
+The updater is operator-local and untracked here, so deployments that still
+run `codex plugin add` first must be reordered before use; the direct refresh
+command above is the safe fallback.
 
 Release maintainers: regenerate the manifest with
 `python scripts/release_gate.py --emit-manifest` and commit it with the release;

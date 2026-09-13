@@ -11,6 +11,8 @@ below; ``Path.home()`` is the sole source of the operator home.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import json
 import os
 import re
@@ -57,6 +59,7 @@ EXCLUDED_DIRS = {".git", "graphify-out", "__pycache__"}
 EXCLUDED_SUFFIXES = (".pyc", ".pyo")
 _TEMP_CREATE_ATTEMPTS = 8
 _TEMP_RANDOM_BYTES = 16
+_REFRESH_LOCK_NAME = ".zmem-refresh.lock"
 
 
 @dataclass(frozen=True)
@@ -140,13 +143,31 @@ def _lexists(path: Path) -> bool:
     return os.path.lexists(str(path))
 
 
+def _reject_parent_components(path: Path, what: str) -> None:
+    """Reject caller-controlled parent traversal before normalization."""
+    if any(part == ".." for part in Path(path).parts):
+        raise RefreshError(f"{what} contains a parent traversal component: {path}")
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """Return whether an existing Windows path component is a reparse point."""
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return False
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(info, "st_file_attributes", 0) & flag)
+
+
 def _reject_symlink(path: Path, what: str) -> None:
-    if path.is_symlink():
-        raise RefreshError(f"{what} is a symlink: {path}")
+    if path.is_symlink() or _is_reparse_point(path):
+        kind = "symlink or reparse point"
+        raise RefreshError(f"{what} is a {kind}: {path}")
 
 
 def _reject_symlink_components(path: Path, what: str) -> None:
     """Reject symlinks in a lexical path, including existing descendants."""
+    _reject_parent_components(path, what)
     candidate = Path(os.path.abspath(str(path)))
     while True:
         if _lexists(candidate):
@@ -167,11 +188,11 @@ def _reject_tree_links(root: Path, what: str) -> None:
         current = Path(dirpath)
         for name in sorted(dirnames):
             child = current / name
-            if child.is_symlink():
+            if child.is_symlink() or _is_reparse_point(child):
                 raise RefreshError(f"{what} contains a symlink: {child}")
         for name in sorted(filenames):
             child = current / name
-            if child.is_symlink():
+            if child.is_symlink() or _is_reparse_point(child):
                 raise RefreshError(f"{what} contains a symlink: {child}")
             try:
                 mode = os.lstat(child).st_mode
@@ -199,7 +220,7 @@ def _iter_mirror_files(root: Path) -> list[tuple[Path, Path]]:
         retained_dirs: list[str] = []
         for name in sorted(dirnames):
             child = current / name
-            if child.is_symlink():
+            if child.is_symlink() or _is_reparse_point(child):
                 # Symlinked checkout entries are not regular source files and
                 # must never be followed into the mirrored host cache.
                 continue
@@ -220,7 +241,7 @@ def _iter_mirror_files(root: Path) -> list[tuple[Path, Path]]:
             # directory and must not be mirrored into a host cache.
             if current == root and name == ".git":
                 continue
-            if child.is_symlink():
+            if child.is_symlink() or _is_reparse_point(child):
                 continue
             if name.endswith(EXCLUDED_SUFFIXES):
                 continue
@@ -388,11 +409,104 @@ def _git_head(checkout: Path) -> str:
     return sha
 
 
+def _require_clean_checkout(
+    checkout: Path,
+    mirror: Iterable[tuple[Path, Path]] | None = None,
+) -> None:
+    """Bind the mirror to a committed checkout, never mutable worktree bytes."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RefreshError(f"cannot verify checkout cleanliness: {_message(exc)}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit status {result.returncode}"
+        raise RefreshError(f"cannot verify checkout cleanliness: {detail}")
+    if result.stdout.strip():
+        entries = ", ".join(line.strip() for line in result.stdout.splitlines()[:5])
+        suffix = " ..." if len(result.stdout.splitlines()) > 5 else ""
+        raise RefreshError(
+            "checkout must be clean and contain no untracked files; "
+            f"worktree changes: {entries}{suffix}"
+        )
+    if mirror is None:
+        mirror = _iter_mirror_files(checkout)
+    mirrorable = {relative.as_posix() for _, relative in mirror}
+    try:
+        ignored = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+                "--",
+            ],
+            capture_output=True,
+            text=False,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RefreshError(f"cannot verify ignored checkout entries: {_message(exc)}") from exc
+    if ignored.returncode != 0:
+        detail = os.fsdecode(ignored.stderr or b"").strip() or f"exit status {ignored.returncode}"
+        raise RefreshError(f"cannot verify ignored checkout entries: {detail}")
+    ignored_mirrorable = sorted(
+        {
+            Path(os.fsdecode(raw)).as_posix()
+            for raw in (ignored.stdout or b"").split(b"\0")
+            if raw and Path(os.fsdecode(raw)).as_posix() in mirrorable
+        }
+    )
+    if ignored_mirrorable:
+        entries = ", ".join(ignored_mirrorable[:5])
+        suffix = " ..." if len(ignored_mirrorable) > 5 else ""
+        raise RefreshError(
+            "checkout must be clean and contain no ignored mirrorable files; "
+            f"ignored mirrorable files: {entries}{suffix}"
+        )
+
+
+def _require_tracked_file(checkout: Path, relative: Path) -> None:
+    """Require a release input to be tracked by the checkout's HEAD."""
+    rel = relative.as_posix()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(checkout), "ls-files", "--error-unmatch", "--", rel],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RefreshError(f"cannot authenticate checkout input {relative}: {_message(exc)}") from exc
+    if result.returncode != 0 or result.stdout.strip() != rel:
+        raise RefreshError(f"checkout input is not tracked by HEAD: {relative}")
+
+
 def _validate_checkout(checkout: Path) -> tuple[str, str, dict[str, str], list[tuple[Path, Path]]]:
     checkout = Path(checkout)
-    _reject_symlink(checkout, "checkout")
+    _reject_symlink_components(checkout, "checkout")
     if not checkout.exists() or not checkout.is_dir():
         raise RefreshError(f"checkout does not exist or is not a directory: {checkout}")
+    mirror = _iter_mirror_files(checkout)
+    _require_clean_checkout(checkout, mirror)
     try:
         manifests = release_gate.discover_manifests(checkout)
     except Exception as exc:
@@ -433,7 +547,19 @@ def _validate_checkout(checkout: Path) -> tuple[str, str, dict[str, str], list[t
     if gate_status != 0:
         raise RefreshError("release-manifest verification failed; regenerate the committed manifest")
     commit_sha = _git_head(checkout)
-    mirror = _iter_mirror_files(checkout)
+    for adapter in HOST_ADAPTERS.values():
+        for relative in adapter.marketplace_sources:
+            source = checkout.joinpath(*relative)
+            _reject_symlink_components(source, "checkout marketplace source")
+            _require_tracked_file(checkout, Path(*relative))
+            try:
+                mode = os.lstat(str(source)).st_mode
+            except OSError as exc:
+                raise RefreshError(
+                    f"cannot inspect checkout marketplace source {source}: {_message(exc)}"
+                ) from exc
+            if not stat.S_ISREG(mode):
+                raise RefreshError(f"checkout marketplace source is not a regular file: {source}")
     expected_hashes = drift.tree_hashes(checkout)
     if not expected_hashes:
         raise RefreshError("checkout has no runtime-surface files")
@@ -451,7 +577,11 @@ def _adapter_paths(home: Path, host: str, version: str) -> tuple[Path, Path | No
     return cache, registry, marketplaces
 
 
-def _validate_destinations(plans: list[_HostPlan]) -> None:
+def _adapter_cache_root(home: Path, host: str) -> Path:
+    return home.joinpath(*HOST_ADAPTERS[host].cache_relative)
+
+
+def _validate_destinations(plans: list[_HostPlan], checkout: Path | None = None) -> None:
     seen: set[str] = set()
     for plan in plans:
         paths: Iterable[Path] = [plan.cache]
@@ -459,6 +589,7 @@ def _validate_destinations(plans: list[_HostPlan]) -> None:
             paths = (*paths, plan.registry)
         paths = (*paths, *plan.marketplaces)
         for path in paths:
+            _reject_parent_components(path, "destination")
             _reject_symlink_components(path, "destination")
             key = os.path.normcase(os.path.abspath(str(path)))
             if key in seen:
@@ -476,10 +607,23 @@ def _validate_destinations(plans: list[_HostPlan]) -> None:
         for marketplace in plan.marketplaces:
             if _lexists(marketplace) and not marketplace.is_file():
                 raise RefreshError(f"marketplace destination is not a regular file: {marketplace}")
+    if checkout is not None:
+        _reject_parent_components(checkout, "checkout")
+        for plan in plans:
+            paths: Iterable[Path] = [plan.cache]
+            if plan.registry is not None:
+                paths = (*paths, plan.registry)
+            paths = (*paths, *plan.marketplaces)
+            for path in paths:
+                if _path_is_within(path, checkout) or _path_is_within(checkout, path):
+                    raise RefreshError(
+                        f"checkout overlaps destination {path}: {checkout}"
+                    )
 
 
-def _absolute_path(path: Path) -> Path:
+def _absolute_path(path: Path, what: str = "path") -> Path:
     """Make a path absolute without following symlinks."""
+    _reject_parent_components(path, what)
     return Path(os.path.abspath(str(path)))
 
 
@@ -492,7 +636,7 @@ def _path_key(path: Path) -> str:
 
 
 def _path_is_within(path: Path, root: Path) -> bool:
-    """Return whether path is root or a descendant, lexically."""
+    """Return whether canonical path is root or a canonical descendant."""
     candidate = _path_key(path)
     root_key = _path_key(root)
     try:
@@ -511,8 +655,8 @@ def _validate_report_target(
 ) -> None:
     """Reject a report target before it can overwrite any transaction input."""
     report_path = _absolute_path(report_path)
-    if _lexists(report_path) and report_path.is_symlink():
-        raise RefreshError(f"report path is a symlink: {report_path}")
+    if _lexists(report_path):
+        _reject_symlink(report_path, "report path")
     if _lexists(report_path) and not report_path.is_file():
         raise RefreshError(f"report path is not a regular file: {report_path}")
     cursor = report_path.parent
@@ -542,10 +686,14 @@ def _validate_report_path(report_path: Path, checkout: Path, plans: list[_HostPl
     cache_roots: list[tuple[str, Path]] = []
     for plan in plans:
         destinations.append((f"{plan.host} cache", plan.cache))
-        cache_roots.append((f"{plan.host} cache", plan.cache))
+        home = plan.cache.parents[len(HOST_ADAPTERS[plan.host].cache_relative) - 1]
+        cache_roots.append((f"{plan.host} cache", _adapter_cache_root(home, plan.host)))
         if plan.registry is not None:
             destinations.append((f"{plan.host} registry", plan.registry))
         destinations.extend((f"{plan.host} marketplace", path) for path in plan.marketplaces)
+    if plans:
+        home = plans[0].cache.parents[len(HOST_ADAPTERS[plans[0].host].cache_relative) - 1]
+        destinations.append(("refresh lock", home / _REFRESH_LOCK_NAME))
     _validate_report_target(report_path, checkout, destinations, cache_roots)
 
 
@@ -557,11 +705,13 @@ def _report_destination_skeleton(
     """Build report collision targets without reading or staging destinations."""
     destinations: list[tuple[str, Path]] = []
     cache_roots: list[tuple[str, Path]] = []
+    destinations.append(("refresh lock", home / _REFRESH_LOCK_NAME))
     for host in hosts:
         cache, registry, marketplaces = _adapter_paths(home, host, version or "unknown")
+        cache_root = _adapter_cache_root(home, host)
+        cache_roots.append((f"{host} cache", cache_root))
         if version is not None:
             destinations.append((f"{host} cache", cache))
-            cache_roots.append((f"{host} cache", cache))
         if registry is not None:
             destinations.append((f"{host} registry", registry))
         destinations.extend((f"{host} marketplace", path) for path in marketplaces)
@@ -588,7 +738,7 @@ def _stage_plan(
     for host in hosts:
         cache, registry, marketplaces = _adapter_paths(home, host, version)
         plans.append(_HostPlan(host, cache, registry, marketplaces, None, expected_digest))
-    _validate_destinations(plans)
+    _validate_destinations(plans, checkout=checkout)
     _ensure_parent_paths(
         (
             path
@@ -630,6 +780,12 @@ def _stage_plan(
 
             if plan.registry is not None:
                 try:
+                    registry_info = os.stat(str(plan.registry), follow_symlinks=False)
+                    if not stat.S_ISREG(registry_info.st_mode):
+                        raise RefreshError(
+                            f"registry destination is not a regular file: {plan.registry}"
+                        )
+                    registry_mode = stat.S_IMODE(registry_info.st_mode)
                     schema_version, loaded = host_registry.load_host_registry(
                         plan.registry, plan.host
                     )
@@ -646,6 +802,11 @@ def _stage_plan(
                     )
                     staged_paths.append(staged_registry)
                     host_registry.write_host_registry(staged_registry, updated)
+                    # The registry writer intentionally hardens a newly-created
+                    # temporary file.  Restore the destination's mode on the
+                    # staged sibling before the transaction replaces it, so an
+                    # atomic rename does not change the host's permission policy.
+                    os.chmod(str(staged_registry), registry_mode)
                 except Exception as exc:
                     raise RefreshError(
                         f"cannot stage {plan.host} registry {plan.registry}: {_message(exc)}"
@@ -674,9 +835,19 @@ def _stage_plan(
                 operations.append(
                     _Operation(plan.host, "marketplace", staged_marketplace, marketplace)
                 )
-    except Exception:
+    except Exception as exc:
+        cleanup_failures: list[str] = []
         for path in reversed(staged_paths):
-            _remove_path(path)
+            try:
+                _remove_path(path)
+            except OSError as cleanup_exc:
+                cleanup_failures.append(
+                    f"cleanup failed for {path}: {_message(cleanup_exc)}"
+                )
+        if cleanup_failures:
+            raise RefreshError(
+                f"{_message(exc)}; " + "; ".join(cleanup_failures)
+            ) from exc
         raise
     return plans, operations
 
@@ -694,35 +865,52 @@ def _backup_operations(operations: list[_Operation]) -> None:
         try:
             if destination.is_dir() and not destination.is_symlink():
                 _reject_tree_links(destination, "destination backup")
-                shutil.copytree(destination, backup, symlinks=False)
+                # Reserve the sibling name now; the existing directory is
+                # atomically moved there during commit.  Copying a directory
+                # here cannot produce an atomic directory replacement.
             elif destination.is_file() and not destination.is_symlink():
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(destination, backup)
+                # The regular-file preimage is also moved atomically during
+                # commit, preserving its mode and other filesystem metadata.
+                pass
             else:
                 raise RefreshError(f"destination is not backupable: {destination}")
         except Exception as exc:
-            _remove_path(backup)
+            try:
+                _remove_path(backup)
+            except OSError as cleanup_exc:
+                raise RefreshError(
+                    f"cannot back up {destination}: {_message(exc)}; "
+                    f"cleanup failed: {_message(cleanup_exc)}"
+                ) from exc
             raise RefreshError(f"cannot back up {destination}: {_message(exc)}") from exc
-        # Do not mark an operation as having a preimage until the complete
-        # copy succeeded.  If a backup copy fails, commit has not started and
-        # rollback must leave that untouched destination alone.
+        # The sibling reservation succeeded.  The preimage itself is moved
+        # under the transaction lock immediately before its replacement.
         operation.existed = True
         operation.backup = backup
 
 
 def _cleanup_operation_temps(
     operations: list[_Operation], retained_backups: set[Path] | None = None
-) -> None:
-    """Best-effort removal of staged sources and sibling backup preimages."""
-    retained = retained_backups or set()
+) -> list[str]:
+    """Remove staged sources and backups, retaining anything that fails.
+
+    ``retained_backups`` is historically named, but it is also used for staged
+    sources.  A failed cleanup must never be retried by a later cleanup pass:
+    the path is retained for operator recovery instead of being mistaken for a
+    disposable transaction temporary.
+    """
+    retained = retained_backups if retained_backups is not None else set()
+    failures: list[str] = []
     for operation in operations:
         for path in (operation.source, operation.backup):
-            if path is None or (path == operation.backup and path in retained):
+            if path is None or path in retained:
                 continue
             try:
                 _remove_path(path)
-            except OSError:
-                pass
+            except OSError as exc:
+                failures.append(f"cleanup failed for {path}: {_message(exc)}")
+                retained.add(path)
+    return failures
 
 
 def _ensure_parent_paths(destinations: Iterable[Path], created: list[Path]) -> None:
@@ -751,10 +939,6 @@ def _ensure_parent_paths(destinations: Iterable[Path], created: list[Path]) -> N
             _reject_symlink_components(path, "destination parent")
             created.append(path)
             seen.add(key)
-
-
-def _ensure_destination_parents(operations: list[_Operation], created: list[Path]) -> None:
-    _ensure_parent_paths((operation.destination for operation in operations), created)
 
 
 def _ensure_report_parent(path: Path, created: list[Path]) -> None:
@@ -823,23 +1007,14 @@ def _rollback(
     # Temporary sources and successfully restored backups must be gone before
     # created destination parents are considered for removal.  Retained
     # preimages are deliberately excluded so they remain recoverable.
-    _cleanup_operation_temps(operations, retained)
+    failures.extend(_cleanup_operation_temps(operations, retained))
     failures.extend(_cleanup_created_dirs(created_dirs))
     return failures
 
 
-def _atomic_write_report(
-    path: Path,
-    report: dict[str, Any],
-    created_dirs: list[Path] | None = None,
-) -> None:
+def _report_bytes(report: dict[str, Any]) -> bytes:
     _validate_report(report)
-    path = _absolute_path(Path(path))
-    if _lexists(path) and path.is_symlink():
-        raise RefreshError(f"report path is a symlink: {path}")
-    tracked_dirs = created_dirs if created_dirs is not None else []
-    _ensure_report_parent(path, tracked_dirs)
-    data = (
+    return (
         json.dumps(
             report,
             sort_keys=True,
@@ -848,23 +1023,54 @@ def _atomic_write_report(
         )
         + "\n"
     ).encode("utf-8")
-    temp_name: str | None = None
+
+
+def _stage_report(
+    path: Path,
+    report: dict[str, Any],
+    created_dirs: list[Path] | None = None,
+) -> Path:
+    """Serialize a report before commit and return its reserved sibling path."""
+    path = _absolute_path(Path(path), "report path")
+    if _lexists(path):
+        _reject_symlink(path, "report path")
+    tracked_dirs = created_dirs if created_dirs is not None else []
+    _ensure_report_parent(path, tracked_dirs)
+    temp_name = _new_temp_file(f".{path.name}.", path.parent)
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), delete=False
-        ) as fh:
-            temp_name = fh.name
-            fh.write(data)
+        with open(temp_name, "wb") as fh:
+            fh.write(_report_bytes(report))
             fh.flush()
             os.fsync(fh.fileno())
+    except Exception as exc:
+        try:
+            _remove_path(temp_name)
+        except OSError as cleanup_exc:
+            raise RefreshError(
+                f"cannot stage report {path}: {_message(exc)}; "
+                f"cleanup failed: {_message(cleanup_exc)}"
+            ) from exc
+        raise RefreshError(f"cannot stage report {path}: {_message(exc)}") from exc
+    return temp_name
+
+
+def _atomic_write_report(
+    path: Path,
+    report: dict[str, Any],
+    created_dirs: list[Path] | None = None,
+) -> None:
+    path = _absolute_path(Path(path), "report path")
+    temp_name = _stage_report(path, report, created_dirs)
+    try:
         os.replace(temp_name, path)
-        temp_name = None
-    finally:
-        if temp_name is not None:
-            try:
-                Path(temp_name).unlink(missing_ok=True)
-            except OSError:
-                pass
+    except Exception as exc:
+        cleanup_failures = _cleanup_operation_temps(
+            [_Operation("report", "report", temp_name, path)]
+        )
+        detail = f"cannot replace report {path}: {_message(exc)}"
+        if cleanup_failures:
+            detail += "; " + "; ".join(cleanup_failures)
+        raise RefreshError(detail) from exc
 
 
 _REPORT_KEYS = frozenset(
@@ -979,6 +1185,71 @@ def _failed_plans(home: Path, hosts: tuple[str, ...], version: str | None, messa
     return plans
 
 
+@contextlib.contextmanager
+def _refresh_lock(home: Path):
+    """Acquire a kernel-backed single-flight lock for one operator home.
+
+    The lock file is deliberately retained as a pathname after release.  The
+    advisory lock itself is held on the open descriptor, so a process death
+    releases it automatically and cannot leave a stale marker blocking future
+    refreshes.
+    """
+    lock = Path(home) / _REFRESH_LOCK_NAME
+    _reject_symlink_components(home, "home")
+    if not _lexists(home) or not home.is_dir():
+        raise RefreshError(f"home does not exist or is not a directory: {home}")
+    _reject_symlink_components(lock, "refresh lock")
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(lock), flags, 0o600)
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"zmem refresh lock\n")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        busy = (
+            isinstance(exc, BlockingIOError)
+            or getattr(exc, "errno", None) in (errno.EACCES, errno.EAGAIN)
+            or getattr(exc, "winerror", None) in (33, 36)
+        )
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if busy:
+            raise RefreshError(f"another host refresh is already running: {lock}") from exc
+        raise RefreshError(f"cannot acquire refresh lock {lock}: {_message(exc)}") from exc
+    if descriptor is None:
+        raise RefreshError(f"cannot acquire refresh lock {lock}")
+    try:
+        yield lock
+    finally:
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                raise RefreshError(f"cannot close refresh lock {lock}: {_message(exc)}") from exc
+
+
 def _refresh_transaction(
     home: Path,
     checkout: Path,
@@ -993,17 +1264,37 @@ def _refresh_transaction(
     if len(set(hosts)) != len(hosts):
         raise RefreshError("host list contains duplicates")
     home = Path(home)
-    # Reject the caller's lexical home path before resolve() can erase a
-    # symlinked component and make writes escape the requested tree.
+    _reject_parent_components(home, "home")
     _reject_symlink_components(home, "home")
+    home = _absolute_path(home)
+    with _refresh_lock(home):
+        return _refresh_transaction_locked(
+            home, checkout, hosts, report_path, dry_run=dry_run
+        )
+
+
+def _refresh_transaction_locked(
+    home: Path,
+    checkout: Path,
+    hosts: tuple[str, ...],
+    report_path: Path | None = None,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    home = Path(home)
     home = home.resolve()
     checkout = Path(checkout)
     # Check the spelling supplied by the caller before resolving it.  Resolving
     # first would turn a symlinked checkout root into an apparently ordinary
     # directory and undermine the no-links mirror contract.
-    _reject_symlink(checkout, "checkout")
+    _reject_symlink_components(checkout, "checkout")
+    _reject_parent_components(checkout, "checkout")
     checkout = checkout.resolve()
-    report_path = _absolute_path(Path(report_path)) if report_path is not None else None
+    report_path = (
+        _absolute_path(Path(report_path), "report path")
+        if report_path is not None
+        else None
+    )
     plans: list[_HostPlan] = []
     version: str | None = None
     commit_sha: str | None = None
@@ -1012,6 +1303,8 @@ def _refresh_transaction(
     report_preflight_ok = report_path is None
     operations: list[_Operation] = []
     retained_backups: set[Path] = set()
+    commit_succeeded = False
+    cleanup_failures: list[str] = []
     try:
         if report_path is not None:
             skeleton, skeleton_caches = _report_destination_skeleton(home.resolve(), hosts, None)
@@ -1041,18 +1334,39 @@ def _refresh_transaction(
             for plan in plans:
                 plan.status = "dry-run"
             report = _build_report(checkout, version, commit_sha, plans, dry_run=True, ok=True)
+            cleanup_failures = _cleanup_operation_temps(operations)
+            cleanup_failures.extend(_cleanup_created_dirs(created_dirs))
+            if cleanup_failures:
+                raise RefreshError("transaction cleanup failed: " + "; ".join(cleanup_failures))
             if report_path is not None:
                 _atomic_write_report(report_path, report, report_created_dirs)
             return report
 
+        # Stage the final report before any destination is changed.  It is
+        # committed as the last transaction operation, so a report failure
+        # rolls back the cache and registry replacements as well.
+        for plan in plans:
+            plan.status = "refreshed"
+        report_operation: _Operation | None = None
+        if report_path is not None:
+            staged_report = _stage_report(report_path, _build_report(
+                checkout, version, commit_sha, plans, dry_run=False, ok=True
+            ), report_created_dirs)
+            report_operation = _Operation("report", "report", staged_report, report_path)
+            operations.append(report_operation)
         _backup_operations(operations)
         for operation in operations:
             try:
-                # Mark the destination as mutated before removing its
-                # preimage.  If os.replace itself fails, rollback still knows
-                # that this destination must be restored/removed.
+                # Mark the operation before moving its preimage.  Both moves
+                # are atomic renames; unlike delete-before-replace this never
+                # destroys the old state before a recoverable preimage exists.
                 operation.mutated = True
-                _remove_path(operation.destination)
+                if operation.existed:
+                    if operation.backup is None:
+                        raise RefreshError(
+                            f"preimage backup is missing for {operation.destination}"
+                        )
+                    os.replace(str(operation.destination), str(operation.backup))
                 os.replace(str(operation.source), str(operation.destination))
             except Exception as exc:
                 raise RefreshError(
@@ -1066,18 +1380,42 @@ def _refresh_transaction(
                     f"expected {plan.after_digest}, got {actual_digest}"
                 )
             plan.after_digest = actual_digest
-        for plan in plans:
-            plan.status = "refreshed"
         report = _build_report(checkout, version, commit_sha, plans, dry_run=False, ok=True)
-        if report_path is not None:
-            try:
-                _atomic_write_report(report_path, report, report_created_dirs)
-            except Exception as exc:
-                raise RefreshError(f"final report write failed: {_message(exc)}") from exc
+        # Every destination, including the final report, has been replaced and
+        # its runtime digest has been verified.  Cleanup is post-commit work;
+        # failures from here must not send the transaction through rollback.
+        commit_succeeded = True
+        cleanup_failures = _cleanup_operation_temps(operations, retained_backups)
+        if cleanup_failures:
+            raise RefreshError("transaction cleanup failed: " + "; ".join(cleanup_failures))
         return report
     except Exception as exc:
         failure = _message(exc)
         plans_were_validated = bool(plans)
+        if commit_succeeded:
+            # The new state is authoritative even though one or more temporary
+            # paths could not be removed.  Keep those paths in
+            # ``retained_backups`` (the cleanup helper records both failed
+            # sources and failed backups) so the finalizer cannot retry a
+            # potentially recoverable path.  Surface the residue in a valid
+            # failure report while preserving the installed replacements.
+            for plan in plans:
+                plan.mismatches.extend(cleanup_failures or [failure])
+            report = _build_report(checkout, version, commit_sha, plans, dry_run=False, ok=False)
+            if report_path is not None and report_preflight_ok:
+                try:
+                    _atomic_write_report(report_path, report, report_created_dirs)
+                except Exception as report_exc:
+                    report_failure = (
+                        "cannot write cleanup failure report: "
+                        + _message(report_exc)
+                    )
+                    for plan in plans:
+                        plan.mismatches.append(report_failure)
+                    report = _build_report(
+                        checkout, version, commit_sha, plans, dry_run=False, ok=False
+                    )
+            raise RefreshError(failure, report) from exc
         if plans:
             for plan in plans:
                 plan.status = "failed"
@@ -1090,6 +1428,10 @@ def _refresh_transaction(
             for plan in plans:
                 plan.mismatches.extend(rollback_failures)
         elif not dry_run:
+            cleanup_failures = _cleanup_created_dirs(created_dirs)
+            for plan in plans:
+                plan.mismatches.extend(cleanup_failures)
+        else:
             cleanup_failures = _cleanup_created_dirs(created_dirs)
             for plan in plans:
                 plan.mismatches.extend(cleanup_failures)
@@ -1118,6 +1460,9 @@ def _refresh_transaction(
                     plan.mismatches.extend(cleanup_failures)
         raise RefreshError(failure, report) from exc
     finally:
+        # Normal paths perform cleanup before returning; this final pass covers
+        # preflight/staging exceptions without hiding cleanup failures that are
+        # already included in the failure report.
         _cleanup_operation_temps(operations, retained_backups)
         if dry_run:
             _cleanup_created_dirs(created_dirs)

@@ -13,6 +13,7 @@ import copy
 import json
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ _ZCODE_VERSION = 1
 _ZMEM_CLAUDE_KEY = "zmem@zmem"
 _ZMEM_ZCODE_NAME = "zmem"
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _SEMVER_RE = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
@@ -194,17 +196,49 @@ def update_host_registry(
     return updated
 
 
-def _ensure_destination_parent(destination: Path) -> None:
-    """Create missing parents without traversing a symlink component."""
-    if destination.is_symlink():
-        raise OSError(f"registry destination is a symlink: {destination}")
+def _is_link_or_reparse_point(path: Path) -> bool:
+    """Return whether *path* is a symlink or Windows reparse point.
 
-    candidate = Path(os.path.abspath(str(destination)))
+    ``Path.is_symlink`` does not report directory junctions on every supported
+    Python/Windows combination.  ``lstat`` inspects the directory entry
+    without following it, and Windows exposes the reparse attribute on the
+    returned stat result.  A missing component is not a link and is handled by
+    the parent-creation loop below.
+    """
+    try:
+        info = os.lstat(str(path))
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _reject_raw_parent_references(path: Path) -> None:
+    """Reject raw ``..`` components before any path normalization.
+
+    Normalizing first is unsafe: ``link\\..\\registry.json`` can collapse to a
+    path that appears to be inside the trusted parent even though the kernel
+    resolves the ``..`` after traversing the link.  Registry destinations are
+    generated absolute paths, so rejecting the ambiguous spelling is the
+    narrowest fail-closed contract for this writer.
+    """
+    if ".." in Path(str(path)).parts:
+        raise OSError(f"registry destination contains a parent reference: {path}")
+
+
+def _ensure_destination_parent(destination: Path) -> None:
+    """Create missing parents without traversing a link/reparse component."""
+    _reject_raw_parent_references(destination)
+    destination = Path(os.path.abspath(str(destination)))
+    candidate = destination
     while True:
-        if os.path.lexists(str(candidate)) and candidate.is_symlink():
+        if os.path.lexists(str(candidate)) and _is_link_or_reparse_point(candidate):
             if candidate == destination:
                 raise OSError(f"registry destination is a symlink: {destination}")
-            raise OSError(f"registry destination parent is a symlink: {candidate}")
+            raise OSError(
+                f"registry destination parent is a link or reparse point: {candidate}"
+            )
         if candidate.parent == candidate:
             break
         candidate = candidate.parent
@@ -218,8 +252,10 @@ def _ensure_destination_parent(destination: Path) -> None:
             raise OSError(f"cannot resolve registry destination parent: {destination}")
         current = parent
 
-    if current.is_symlink():
-        raise OSError(f"registry destination parent is a symlink: {current}")
+    if _is_link_or_reparse_point(current):
+        raise OSError(
+            f"registry destination parent is a link or reparse point: {current}"
+        )
     if not current.is_dir():
         raise OSError(f"registry destination parent is not a directory: {current}")
 
@@ -230,10 +266,25 @@ def _ensure_destination_parent(destination: Path) -> None:
             # A concurrent creator may have supplied the component.  Recheck
             # it rather than following a newly planted symlink.
             pass
-        if parent.is_symlink():
-            raise OSError(f"registry destination parent is a symlink: {parent}")
+        if _is_link_or_reparse_point(parent):
+            raise OSError(
+                f"registry destination parent is a link or reparse point: {parent}"
+            )
         if not parent.is_dir():
             raise OSError(f"registry destination parent is not a directory: {parent}")
+
+
+def _existing_destination_mode(destination: Path) -> int | None:
+    """Read the existing regular file's mode before atomic replacement."""
+    if not os.path.lexists(str(destination)):
+        return None
+    try:
+        info = os.stat(str(destination), follow_symlinks=False)
+    except OSError as exc:
+        raise OSError(f"cannot inspect registry destination {destination}: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"registry destination is not a regular file: {destination}")
+    return stat.S_IMODE(info.st_mode)
 
 
 def write_host_registry(path: Path, data: object) -> None:
@@ -246,6 +297,7 @@ def write_host_registry(path: Path, data: object) -> None:
     _validate_any_supported(data)
     destination = Path(path)
     _ensure_destination_parent(destination)
+    existing_mode = _existing_destination_mode(destination)
     payload = (
         json.dumps(
             data,
@@ -267,6 +319,13 @@ def write_host_registry(path: Path, data: object) -> None:
             temporary.write(payload)
             temporary.flush()
             os.fsync(temporary.fileno())
+        if existing_mode is not None:
+            # The tempfile is created with owner-only permissions.  Restore
+            # the host registry's existing mode before os.replace so readers
+            # never observe a replacement with an incompatible permission
+            # policy.  Creating it beside the destination also retains the
+            # parent directory's inherited Windows ACL boundary.
+            os.chmod(temp_name, existing_mode)
         os.replace(temp_name, destination)
         temp_name = None
     finally:
