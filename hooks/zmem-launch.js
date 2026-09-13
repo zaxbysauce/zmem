@@ -347,13 +347,17 @@ function _terminateChildTree(child) {
     try { if (child && typeof child.kill === "function") child.kill(); } catch { /* already gone */ }
 }
 
+// child may be the child object itself OR a getter evaluated at fire
+// time (issue #121 F-001: the watchdog arms before the child spawns,
+// so startup work counts against the budget). A null/absent child at
+// fire time is a clean kill no-op.
 function startWatchdog(child, timeoutMs, clock, onTimeout) {
     const c = clock || PRODUCTION_CLOCK;
     let fired = false;
     const id = c.setTimeout(() => {
         if (fired) return;
         fired = true;
-        _terminateChildTree(child);
+        _terminateChildTree(typeof child === "function" ? child() : child);
         try { if (typeof onTimeout === "function") onTimeout(); } catch { /* fail open */ }
     }, timeoutMs);
     return {
@@ -915,6 +919,54 @@ async function main() {
         return;
     }
 
+    // Issue #121 (F-001): the watchdog arms BEFORE any startup work —
+    // the stdin wait, the canonical env build (namespace resolution can
+    // stall its interpreter candidates), and the child spawn all count
+    // against this budget, so TOTAL launcher runtime stays inside the
+    // host hook timeout even when startup itself hangs. At fire: emit
+    // the last complete sentinel collected so far (an empty {} envelope
+    // if nothing arrived), append the outer-timeout decision record, and
+    // exit 0. Pass-through hooks stay unwatched (documented residual).
+    const translated = TRANSLATED_HOOKS.has(hookName);
+    const outChunks = [];
+    const fireState = { child: null, host: "", budget: 0, env: null };
+    let watchdog = null;
+    if (translated) {
+        const watchdogMs = readPositiveIntMs(process.env, "ZMEM_LAUNCHER_WATCHDOG_MS",
+            DEFAULT_LAUNCHER_WATCHDOG_MS);
+        watchdog = startWatchdog(() => fireState.child, watchdogMs, PRODUCTION_CLOCK, () => {
+            const raw = Buffer.concat(outChunks).toString("utf8");
+            let envelope;
+            try {
+                envelope = translate(raw, fireState.host || detectHost(), hookName,
+                    fireState.budget || resolveBudget(process.env));
+            } catch {
+                envelope = {};
+            }
+            process.stdout.write(JSON.stringify(envelope) + "\n");
+            appendOuterTimeoutDecision(fireState.env || process.env, hookName, "launcher", {
+                tier0_emitted: hookName === "session-start" && extractPayload(raw) !== null,
+                timeout_ms: watchdogMs,
+            });
+            const child = fireState.child;
+            if (!child) {
+                process.exit(0);
+                return;
+            }
+            // Bounded teardown grace: the detached taskkill needs a moment
+            // to walk the tree. The envelope above is already written, so
+            // this window only affects exit latency, never delivery.
+            const grace = setTimeout(() => {
+                try { child.kill(); } catch { /* already gone */ }
+                process.exit(0);
+            }, 500);
+            child.on("close", () => {
+                clearTimeout(grace);
+                process.exit(0);
+            });
+        });
+    }
+
     const stdinBuf = await readStdin();
 
     // Parse a COPY of stdin to extract fields (tolerate missing / non-JSON).
@@ -952,7 +1004,6 @@ async function main() {
     // fitEnvelope but propagated unclamped to child shell scripts that read
     // $ZMEM_CTX_BUDGET directly.
     env.ZMEM_CTX_BUDGET = String(budget);
-    const translated = TRANSLATED_HOOKS.has(hookName);
     const bashPath = findBash();
 
     // Translated hooks: buffer child stdout so we can rewrap it. Pass-through
@@ -973,58 +1024,12 @@ async function main() {
         });
     }
 
-    // Issue #121: arm the launcher watchdog BEFORE any stdout handler so a
-    // clean early exit still clears it. At the deadline the child tree is
-    // terminated, the last COMPLETE sentinel payload collected so far is
-    // emitted (Tier 0 on the session-start fast path), an outer-timeout
-    // decision record is appended (log-write failure fails open), and the
-    // launcher exits 0. Pass-through hooks stream stdout live to the host
-    // and have no sentinel to retain, so they stay unwatched (documented
-    // residual — the host budget remains their only bound).
-    let watchdog = null;
-    if (translated) {
-        const watchdogMs = readPositiveIntMs(process.env, "ZMEM_LAUNCHER_WATCHDOG_MS",
-            DEFAULT_LAUNCHER_WATCHDOG_MS);
-        watchdog = startWatchdog(child, watchdogMs, PRODUCTION_CLOCK, () => {
-            const raw = Buffer.concat(outChunks).toString("utf8");
-            let envelope;
-            try {
-                envelope = translate(raw, host, hookName, budget);
-            } catch {
-                envelope = {};
-            }
-            process.stdout.write(JSON.stringify(envelope) + "\n");
-            appendOuterTimeoutDecision(env, hookName, "launcher", {
-                tier0_emitted: extractPayload(raw) !== null,
-                timeout_ms: watchdogMs,
-            });
-            // Bounded teardown grace: the detached taskkill needs a moment to walk
-            // the tree. Exiting instantly is safe for US but can strand the host stdio
-            // pipes in still-alive grandchildren (they inherit our handles); waiting
-            // bounded for the child close — with a child.kill() fallback if the tree
-            // kill failed — closes every handle we opened. The envelope above is
-            // already written, so this window only affects exit latency.
-            const grace = setTimeout(() => {
-                try { child.kill(); } catch { /* already gone */ }
-                process.exit(0);
-            }, 500);
-            child.on("close", () => {
-                clearTimeout(grace);
-                process.exit(0);
-            });
-        });
-    }
-
-    // Translated-hook stdout buffering. Declared at function scope because
-    // the watchdog closure above reads it when it fires mid-stream.
-    const outChunks = [];
-
-    child.on("error", () => {
-        // Spawn failed (bash not found, etc.) — fail open.
-        if (watchdog) watchdog.clear();
-        process.stdout.write("{}\n");
-        process.exit(0);
-    });
+    // The watchdog (armed above, before startup) now binds the child:
+    // everything before this line already consumed its budget.
+    if (translated) fireState.child = child;
+    fireState.host = host;
+    fireState.budget = budget;
+    fireState.env = env;
 
     // Replay the exact original stdin bytes to the child, then close its stdin.
     // Guard EPIPE/ECONNRESET: session-start never reads stdin, so end() can hit
