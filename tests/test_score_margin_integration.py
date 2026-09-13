@@ -514,6 +514,46 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
         )
         conn.close()
 
+    def test_injection_explain_link_verdicts_remain_one_hop(self):
+        """Explain must not report a second-hop chain row as link expansion."""
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+        from storelib.links import add_link_pair
+
+        conn = self._memory_conn()
+        first, second, third = "chain-first", "chain-second", "chain-third"
+        self._seed_memory_rows(conn, [first, second, third])
+        add_link_pair(conn, first, second, "supports", score=0.9,
+                      apply_trust=False)
+        add_link_pair(conn, second, third, "supports", score=0.8,
+                      apply_trust=False)
+        conn.commit()
+
+        def scored(*_args, **_kwargs):
+            row = self._scored_row(first, 0.9)
+            return [(row["_score"], row)]
+
+        with patch.object(recall_mod, "_recall_one_tier", side_effect=scored), \
+                patch.dict(os.environ, {
+                    "ZMEM_INJECT_MARGIN": "0.05",
+                    "ZMEM_INJECT_TOKEN_BUDGET": "1500",
+                }, clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            explained = recall_mod.explain_recall(
+                conn, query="chain", namespace=NS, limit=10, no_mmr=True,
+                link_hops=1, link_budget=2, as_json=True,
+                for_injection=True)
+
+        doc = json.loads(stdout.getvalue())
+        verdicts = {v["id"]: v for v in doc["explain"]["verdicts"]}
+        self.assertEqual([row["id"] for row in explained], [first, second])
+        self.assertEqual(verdicts[second]["reason"], "found")
+        self.assertNotIn(
+            third, verdicts,
+            "one-hop injection explain must not walk from an expansion row",
+        )
+        conn.close()
+
     def test_injection_explain_target_reports_selective_rejection(self):
         sys.path.insert(0, str(SCRIPTS))
         from storelib import recall as recall_mod

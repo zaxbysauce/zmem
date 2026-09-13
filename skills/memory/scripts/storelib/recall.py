@@ -2409,6 +2409,11 @@ def explain_recall(
 
     verdicts: list[dict] = []
     presented: list[dict] = []
+    # Keep the rows that seeded the real one-hop expansion.  Injection explain
+    # later replaces ``presented`` with the gated candidate set, which also
+    # contains first-hop rows; using that set for the shared verdict pass would
+    # incorrectly walk a second hop in a linked chain.
+    link_verdict_seeds: list[dict] = []
     omitted: list[tuple[dict, str]] = []
     project_deep: list[tuple[float, dict]] = []
     global_deep: list[tuple[float, dict]] = []
@@ -2439,6 +2444,7 @@ def explain_recall(
         )
         if no_bump:
             presented, omitted = _explain_omit_filter(presented)
+        link_verdict_seeds = list(presented)
         if for_injection:
             # Keep this replay in the same order as recall_memory: omission,
             # link expansion, entity cards, selective gate, score margin, then
@@ -2621,7 +2627,8 @@ def explain_recall(
             if miss_ids or not target:
                 try:
                     expansion = expand_recall_links(
-                        conn, presented, ns_list=ns_list, budget=link_budget,
+                        conn, link_verdict_seeds, ns_list=ns_list,
+                        budget=link_budget,
                         as_of=as_of, min_confidence=min_confidence,
                         # Mirror the caller's surface: an explicit recall
                         # (no_bump=False) keeps injection-risk/untrusted_web
