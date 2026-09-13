@@ -202,6 +202,15 @@ Verdict reasons are a CLOSED set (`EXPLAIN_REASONS` in `storelib/recall.py`):
 | `not_in_db` | no row matched `--target` (`detail.neighbors` lists up to 5 nearest live rows by token overlap) |
 | `explain_unavailable` | the tracer threw; results still returned (fail-open) |
 
+For an injection-path explanation, combine `--for-injection --explain`. This
+is a read-only replay: it follows the same omit, selective-inject,
+score-margin, and token-budget stages as a passive injection, but never writes
+surface or retrieval telemetry. A target removed by the score-margin stage is
+reported with the closed-set reason `margin_pruned`; its detail includes the
+observed relative margin (formatted to six decimals), the configured threshold,
+and the retained top-row id. The existing omit, selective, scope, validity,
+and budget reasons remain unchanged for rows rejected by those stages.
+
 #### Change-intent lineage unfold — explicit recall only (issue #82)
 
 Already-stored lineage (`update_of` from `update`) becomes visible on the
@@ -249,6 +258,34 @@ selective-inject gate (3.8) is a passive-lane filter; the trust floor
 applies symmetrically to link-expansion neighbors that ride the passive
 lane (a once-contradicted neighbor at trust 0.9 still renders with its
 `[CONTESTED LINK]` marker).
+
+#### Score-margin gate (issue #182)
+
+`ZMEM_INJECT_MARGIN` is an opt-in score-separation gate between the existing
+selective-inject filter and token-budget admission. It defaults to `0.0`,
+which disables the gate and preserves the legacy injection bytes. The setting
+is read dynamically for each injection decision. A missing, negative,
+non-numeric, NaN, or infinite value fails open to `0.0`; values above `1.0`
+are clamped to `1.0`. The recommended initial rollout is `0.05`.
+
+With a positive threshold and at least two usable post-selective rows, the
+gate compares the two highest scores using the stable score-descending view
+and computes the raw `(top - second) / top`. Every candidate score must be
+usable; a malformed, scoreless, or non-finite score anywhere fails open. When
+the raw margin is strictly below the threshold, ordinary rows after the winner
+are pruned before the token budget runs. A `decision` or `constraint` in either
+leading position is protected: no rows are pruned, but the valid observed
+margin is still reported. Fewer than two rows and a non-positive top score
+also fail open. The original presentation order is retained for surviving
+rows.
+
+When a valid score pair was observed, injection JSON adds `margin` formatted
+to six decimal places and `margin_pruned_ids` in prune order; no fields are
+added when the gate could not make a decision. The hook decision line appends
+the same diagnostics, in the order `margin=` then `margin_pruned=[...]`, after
+the existing optional fields. Empty pruned lists are omitted from the hook
+line, and malformed optional values are ignored independently so legacy
+logging remains fail-open and byte-compatible.
 
 When a passive inject surfaces nothing, it names WHICH gate fired (issue #87 /
 #85 direction 1): `no durable memories retrieved for this prompt.` means the
@@ -1010,6 +1047,12 @@ pre-compaction). Refuses (exit 2) if the gate or budget is stubbed out.
 `--gold` accepts a local labeled JSONL (e.g. derived from your own decision
 log) without code changes. Record-only by default; the ratchet flags are
 the one-switch CI gate.
+
+The score-margin replay/baseline gate belongs to the future #155 workstream.
+That workstream owns `scripts/eval_replay.py` and
+`eval/baseline-replay.json`; they are not available in this release and remain
+unchanged here. Its publication contract requires the exact
+`--fail-under miss_delta=0` flag when those artifacts are introduced.
 Runs every gold item through the REAL recall pipeline and prints one JSON
 report: `hit_at_k`, `mrr`, `as_of_accuracy`, `injection_omit_rate` (+ per-bucket
 and per-item detail). `--store` is REQUIRED — the runner never resolves the
