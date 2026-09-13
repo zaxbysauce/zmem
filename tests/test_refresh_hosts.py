@@ -296,21 +296,21 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
             self.skipTest("jsonschema is unavailable")
 
         jsonschema.validate(report, schema)
-        self.assertEqual(report["checkout"], str(self.checkout))
+        self.assertEqual(report["checkout"], str(self.checkout.resolve()))
         self.assertEqual(report["version"], VERSION)
         self.assertRegex(report["gitCommitSha"], r"^[0-9a-f]{40}$")
         self.assertEqual([row["host"] for row in report["hosts"]], list(HOSTS))
         self.assertEqual(report["mismatchCount"], 0)
         self.assertTrue(report["ok"])
         expected_caches = {
-            "codex": self.home / ".codex/plugins/cache/personal/zmem/0.34.0",
-            "claude": self.home / ".claude/plugins/cache/zmem/zmem/0.34.0",
-            "zcode": self.home / ".zcode/cli/plugins/cache/zmem/zmem/0.34.0",
+            "codex": (self.home / ".codex/plugins/cache/personal/zmem/0.34.0").resolve(),
+            "claude": (self.home / ".claude/plugins/cache/zmem/zmem/0.34.0").resolve(),
+            "zcode": (self.home / ".zcode/cli/plugins/cache/zmem/zmem/0.34.0").resolve(),
         }
         expected_registries = {
             "codex": None,
-            "claude": self.home / ".claude/plugins/installed_plugins.json",
-            "zcode": self.home / ".zcode/cli/plugins/installed_plugins.json",
+            "claude": (self.home / ".claude/plugins/installed_plugins.json").resolve(),
+            "zcode": (self.home / ".zcode/cli/plugins/installed_plugins.json").resolve(),
         }
         for row in report["hosts"]:
             self.assertEqual(
@@ -318,13 +318,22 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
                            "beforeDigest", "afterDigest", "status", "mismatches"},
             )
             self.assertEqual(row["mismatches"], [])
-            self.assertEqual(Path(row["cacheRoot"]), expected_caches[row["host"]])
             self.assertEqual(
-                Path(row["registryPath"]) if row["registryPath"] is not None else None,
-                expected_registries[row["host"]],
+                Path(row["cacheRoot"]).resolve(),
+                expected_caches[row["host"]].resolve(),
+            )
+            self.assertEqual(
+                Path(row["registryPath"]).resolve()
+                if row["registryPath"] is not None
+                else None,
+                expected_registries[row["host"]].resolve()
+                if expected_registries[row["host"]] is not None
+                else None,
             )
             for path in row["marketplacePaths"]:
-                self.assertTrue(str(Path(path)).startswith(str(self.home)))
+                self.assertTrue(
+                    str(Path(path).resolve()).startswith(str(self.home.resolve()))
+                )
 
     def test_full_refresh_installs_expected_checkout_and_marketplace_bytes(self):
         self.assertEqual(self._main_status(*self._refresh_args()), 0)
