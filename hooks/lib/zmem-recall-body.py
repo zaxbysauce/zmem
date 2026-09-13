@@ -153,6 +153,29 @@ def _floor(name: str, default: float) -> float:
     return value
 
 
+_store_timeout_warned = False
+
+
+def _store_timeout_s() -> float:
+    """Store-recall subprocess cap (issue #121): ZMEM_STORE_RECALL_TIMEOUT_S
+    as a finite positive float, default 8.0. Non-finite, non-positive, and
+    values above 8.0 all use 8.0; each deviation warns exactly once per
+    process. Values below 8.0 are honored (operator headroom control)."""
+    global _store_timeout_warned
+    value = _floor("ZMEM_STORE_RECALL_TIMEOUT_S", 8.0)
+    if value <= 0 or value > 8.0:
+        if not _store_timeout_warned:
+            _store_timeout_warned = True
+            try:
+                sys.stderr.write(
+                    "zmem: invalid ZMEM_STORE_RECALL_TIMEOUT_S=%r; using 8.0\n"
+                    % (os.environ.get("ZMEM_STORE_RECALL_TIMEOUT_S", ""),))
+            except Exception:
+                pass
+        value = 8.0
+    return value
+
+
 def _recent_floor(store_py: str) -> float:
     sm = _load_schema_meta(store_py)
     if sm is not None:
@@ -1393,7 +1416,7 @@ def main() -> int:
                     *_exclude_argv,
                 ],
                 stderr=subprocess.DEVNULL,
-                timeout=8,
+                timeout=_store_timeout_s(),
             ).decode("utf-8", "replace")
         else:
             out = subprocess.check_output(
@@ -1410,7 +1433,7 @@ def main() -> int:
                     *_exclude_argv,
                 ],
                 stderr=subprocess.DEVNULL,
-                timeout=10,
+                timeout=_store_timeout_s(),
             ).decode("utf-8", "replace")
         rows = json.loads(out) if out.strip() else []
         # v13 (issue #65, 10.8): unwrap the read envelope ({"results": ...});

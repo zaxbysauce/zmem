@@ -1,0 +1,1 @@
+[{"clock_ms":0,"event":"tier0_complete","namespace":"project:fixture/zmem","timestamp":"2026-09-10T00:00:00Z"},{"clock_ms":8000,"event":"store_started","namespace":"project:fixture/zmem","timestamp":"2026-09-10T00:00:00Z"},{"clock_ms":12000,"event":"watchdog_deadline","namespace":"project:fixture/zmem","timestamp":"2026-09-10T00:00:00Z"}]

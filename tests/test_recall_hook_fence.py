@@ -117,11 +117,19 @@ class HookScriptNeutralizationTests(unittest.TestCase):
         self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", text)
 
     def test_zmem_session_start_sh_neutralizes_new_fence(self):
-        text = (REPO_ROOT / "hooks" / "zmem-session-start.sh").read_text(
+        """Issue #121 migration (same either-file precedent the fence-
+        production assertion below already established for PR #190): the
+        sentinel emission AND the marker neutralization moved from
+        zmem-session-start.sh into hooks/lib/zmem-session-start-payload.py,
+        so the payload companion is now the neutralization site. The .sh
+        must still reference the companion (asserted by the test below)."""
+        payload = (REPO_ROOT / "hooks" / "lib"
+                   / "zmem-session-start-payload.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", text,
-                      "zmem-session-start.sh must neutralize the new fence markers")
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", payload,
+                      "the session-start payload must neutralize the new "
+                      "fence markers")
 
     def test_zmem_session_start_sh_produces_fence(self):
         """Issue #58, 3.5 + final-critic fix: Tier 2 in
@@ -493,8 +501,13 @@ class HookBehaviorSmokeTests(unittest.TestCase):
         what production actually delivers.
         """
         import json as _json
-        start = out.find("<<<ZMEM_JSON>>>")
+        # Issue #121: session-start now emits TWO complete sentinels (Tier 0
+        # first, then the full envelope). Decode the LAST complete pair --
+        # exactly what the launcher's extractPayload consumes -- so a
+        # single-sentinel hook and a two-sentinel hook both decode the
+        # envelope the host actually receives.
         end = out.rfind("<<<END>>>")
+        start = out.rfind("<<<ZMEM_JSON>>>", 0, end) if end >= 0 else -1
         assert start >= 0 and end > start, f"no sentinel envelope in: {out[:200]}"
         payload = out[start + len("<<<ZMEM_JSON>>>"):end].strip()
         payload = payload.replace("<<<ZMEM_JSON_NEUTRALIZED>>>", "<<<ZMEM_JSON>>>")
