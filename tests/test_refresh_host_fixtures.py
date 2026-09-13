@@ -716,11 +716,11 @@ class HostRefreshFixtureIntegrationTest(_FixtureCase):
         self.assertEqual(_tree(backup), before)
         self.assertEqual(backup.parent.resolve(), destination.parent.resolve())
         residue = {
-            path
+            path.resolve()
             for path in self.home.rglob("*")
             if path.name.startswith(".zmem-refresh-")
         }
-        self.assertEqual(residue, {backup})
+        self.assertEqual(residue, {backup.resolve()})
 
     def _assert_claude_registry_preservation(self) -> None:
         before = json.loads(
