@@ -32,6 +32,9 @@ README.
   decision lines append `margin=` and, when non-empty,
   `margin_pruned=[...]` after the existing optional fields; absent or malformed
   diagnostics remain fail-open and preserve legacy lines.
+- **Explain target precedence (issue #182)**: `--target` resolves an exact
+  stored memory ID before trying content-fragment matching, including for
+  non-UUID IDs. UUID-prefix and fragment matching remain additive fallbacks.
 
 ### Deferred
 - **Replay/baseline measurement (#155)** remains a follow-on publication gate.

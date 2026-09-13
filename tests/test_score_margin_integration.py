@@ -15,6 +15,7 @@ import os
 import re
 import runpy
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -121,6 +122,233 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
     @staticmethod
     def _without_timestamp(line: str) -> str:
         return re.sub(r"^\[\d+\]", "[TIMESTAMP]", line)
+
+    @staticmethod
+    def _memory_conn():
+        """Return a real, current-schema scratch store for library-path tests."""
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib.schema import init_db, migrate
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        migrate(conn)
+        return conn
+
+    @staticmethod
+    def _seed_memory_rows(conn, ids: list[str], *, content_prefix: str = ""):
+        for index, mid in enumerate(ids):
+            conn.execute(
+                """INSERT INTO memory
+                   (id, namespace, type, content, tags, source_ref,
+                    source_hash, confidence, signal, valid_from, ingestion_ts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (mid, NS, "fact", f"{content_prefix}{mid}", "",
+                 "session:score-margin-integration", "", 0.9, "test",
+                 f"2026-01-01T00:00:0{index}Z",
+                 f"2026-01-01T00:00:0{index}Z"),
+            )
+        conn.commit()
+
+    @staticmethod
+    def _scored_row(mid: str, score: float) -> dict:
+        return {
+            "id": mid,
+            "namespace": NS,
+            "type": "fact",
+            "content": f"score-margin row {mid}",
+            "tags": "",
+            "source_ref": "session:score-margin-integration",
+            "source_hash": "",
+            "confidence": 0.9,
+            "signal": "test",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": "",
+            "update_of": "",
+            "taint": "trusted_internal",
+            "trust_score": 1.0,
+            "_score": score,
+        }
+
+    def test_recall_injection_margin_runs_in_production_path(self):
+        """The actual recall entry point gates, orders, and bumps survivors."""
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+
+        conn = self._memory_conn()
+        ids = ["recall-low", "recall-top", "recall-second"]
+        self._seed_memory_rows(conn, ids)
+        # The scorer's presentation order is deliberately not score order.
+        presented = [
+            self._scored_row("recall-low", 0.5),
+            self._scored_row("recall-top", 0.9),
+            self._scored_row("recall-second", 0.88),
+        ]
+        scored = [(row["_score"], row) for row in presented]
+
+        with patch.object(recall_mod, "_recall_one_tier", return_value=scored), \
+                patch.dict(os.environ, {"ZMEM_INJECT_MARGIN": "0.05"},
+                           clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            returned = recall_mod.recall_memory(
+                conn, query="score margin", namespace=NS, limit=10,
+                hybrid=False, no_mmr=True, link_hops=0, no_unfold=True,
+                as_json=True, no_bump=True, for_injection=True,
+            )
+        envelope = json.loads(stdout.getvalue())
+        self.assertEqual([r["id"] for r in returned], ["recall-top"])
+        self.assertEqual([r["id"] for r in envelope["results"]],
+                         ["recall-top"])
+        self.assertEqual(envelope["candidate_ids"], ids)
+        self.assertEqual(envelope["margin"], "0.022222")
+        self.assertEqual(envelope["margin_pruned_ids"],
+                         ["recall-second", "recall-low"])
+        self.assertEqual(envelope["reason"], "injected")
+
+        telemetry = {
+            row["id"]: (row["surfaced_count"], row["last_surfaced"])
+            for row in conn.execute(
+                "SELECT id, surfaced_count, last_surfaced FROM memory "
+                "WHERE id IN (?, ?, ?)", ids)
+        }
+        self.assertEqual(telemetry["recall-top"][0], 1)
+        self.assertIsNotNone(telemetry["recall-top"][1])
+        self.assertEqual(telemetry["recall-second"], (0, None))
+        self.assertEqual(telemetry["recall-low"], (0, None))
+
+        # With a threshold below the observed gap, all rows survive in their
+        # original presentation order.  no_telemetry proves that this same
+        # production path can be replayed without changing the final-row
+        # telemetry established above.
+        presented_again = [
+            self._scored_row("recall-low", 0.5),
+            self._scored_row("recall-top", 0.9),
+            self._scored_row("recall-second", 0.88),
+        ]
+        with patch.object(recall_mod, "_recall_one_tier", return_value=[
+                (row["_score"], row) for row in presented_again]), \
+                patch.dict(os.environ, {"ZMEM_INJECT_MARGIN": "0.01"},
+                           clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            replay = recall_mod.recall_memory(
+                conn, query="score margin", namespace=NS, limit=10,
+                hybrid=False, no_mmr=True, link_hops=0, no_unfold=True,
+                as_json=True, no_bump=True, no_telemetry=True,
+                for_injection=True,
+            )
+        replay_envelope = json.loads(stdout.getvalue())
+        self.assertEqual([r["id"] for r in replay], ids)
+        self.assertEqual(replay_envelope["candidate_ids"], ids)
+        self.assertEqual(replay_envelope["margin"], "0.022222")
+        self.assertEqual(replay_envelope["margin_pruned_ids"], [])
+        self.assertEqual(
+            telemetry,
+            {
+                row["id"]: (row["surfaced_count"], row["last_surfaced"])
+                for row in conn.execute(
+                    "SELECT id, surfaced_count, last_surfaced FROM memory "
+                    "WHERE id IN (?, ?, ?)", ids)
+            },
+        )
+        conn.close()
+
+    def test_recent_injection_queryless_rows_fail_open_without_diagnostics(self):
+        """Real recent rows have no production score and therefore fail open."""
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+
+        conn = self._memory_conn()
+        ids = ["recent-new", "recent-middle", "recent-old"]
+        self._seed_memory_rows(conn, list(reversed(ids)))
+        before = conn.execute(
+            "SELECT id, content, surfaced_count, last_surfaced FROM memory "
+            "WHERE namespace=? ORDER BY ingestion_ts DESC", (NS,)
+        ).fetchall()
+        with patch.dict(os.environ, {"ZMEM_INJECT_MARGIN": "0.05"},
+                        clear=False), contextlib.redirect_stdout(
+                            io.StringIO()) as stdout:
+            returned = recall_mod.recent_memory(
+                conn, namespace=NS, limit=10, as_json=True, no_bump=True,
+                no_telemetry=True, for_injection=True,
+            )
+        envelope = json.loads(stdout.getvalue())
+        self.assertEqual([r["id"] for r in returned], ids)
+        self.assertEqual([r["id"] for r in envelope["results"]], ids)
+        self.assertEqual(envelope["candidate_ids"], ids)
+        self.assertNotIn("margin", envelope)
+        self.assertNotIn("margin_pruned_ids", envelope)
+        self.assertTrue(all("_score" not in row for row in returned))
+        after = conn.execute(
+            "SELECT id, content, surfaced_count, last_surfaced FROM memory "
+            "WHERE namespace=? ORDER BY ingestion_ts DESC", (NS,)
+        ).fetchall()
+        self.assertEqual(before, after)
+        conn.close()
+
+    def test_recent_injection_scored_stage_applies_gate_before_budget(self):
+        """An internal scored stage exercises recent's real gate placement."""
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+
+        conn = self._memory_conn()
+        ids = ["recent-low", "recent-top", "recent-second"]
+        self._seed_memory_rows(conn, ids)
+        presented = [
+            self._scored_row("recent-low", 0.5),
+            self._scored_row("recent-top", 0.9),
+            self._scored_row("recent-second", 0.88),
+        ]
+        budget_rows = []
+        real_budget = recall_mod.apply_token_budget
+
+        def capture_budget(rows, **kwargs):
+            budget_rows.append([row["id"] for row in rows])
+            return real_budget(rows, **kwargs)
+
+        with patch.object(recall_mod, "_recent_one_tier",
+                          return_value=presented), \
+                patch.object(recall_mod, "apply_token_budget",
+                             side_effect=capture_budget), \
+                patch.dict(os.environ, {"ZMEM_INJECT_MARGIN": "0.05"},
+                           clear=False), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            returned = recall_mod.recent_memory(
+                conn, namespace=NS, limit=10, as_json=True,
+                no_bump=True, for_injection=True,
+            )
+        envelope = json.loads(stdout.getvalue())
+        self.assertEqual([r["id"] for r in returned], ["recent-top"])
+        self.assertEqual(envelope["candidate_ids"], ids)
+        self.assertEqual(envelope["margin"], "0.022222")
+        self.assertEqual(envelope["margin_pruned_ids"],
+                         ["recent-second", "recent-low"])
+        self.assertEqual(budget_rows, [["recent-top"]])
+        self.assertEqual(envelope["budget_dropped"], 0)
+        telemetry = {
+            row["id"]: row["surfaced_count"]
+            for row in conn.execute(
+                "SELECT id, surfaced_count FROM memory "
+                "WHERE id IN (?, ?, ?)", ids)
+        }
+        self.assertEqual(telemetry,
+                         {"recent-low": 0, "recent-top": 1,
+                          "recent-second": 0})
+        conn.close()
+
+    def test_explain_exact_id_precedes_fragment_collision(self):
+        """Exact IDs are additive and win over a colliding content fragment."""
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import recall as recall_mod
+
+        conn = self._memory_conn()
+        exact_id = "collision-id"
+        self._seed_memory_rows(conn, [exact_id, "fragment-row"],
+                               content_prefix="content mentions collision-id ")
+        rows, is_fragment = recall_mod._resolve_explain_targets(
+            conn, exact_id, [NS])
+        self.assertFalse(is_fragment)
+        self.assertEqual([row["id"] for row in rows], [exact_id])
+        conn.close()
 
     def test_explain_rejects_exclude_with_exit_two(self):
         env = self._env()
