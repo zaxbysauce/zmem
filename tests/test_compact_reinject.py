@@ -104,6 +104,26 @@ def _ops_path(tmp: str, sid: str, suffix: str) -> Path:
     return Path(tmp) / "ops" / (h + suffix)
 
 
+def _ctx_from_payload(stdout: str) -> str:
+    """Issue #121: the payload module now emits its own sentinel-wrapped
+    envelopes (two on the normal path). Extract the additionalContext of
+    the LAST complete <<<ZMEM_JSON>>>...<<<END>>> pair — exactly what the
+    launcher's extractPayload consumes — so a direct payload drive parses
+    the same envelope the host receives."""
+    text = (stdout or "")
+    end = text.rfind("<<<END>>>")
+    start = text.rfind("<<<ZMEM_JSON>>>", 0, end) if end >= 0 else -1
+    if start < 0 or end <= start:
+        return ""
+    try:
+        envelope = json.loads(
+            text[start + len("<<<ZMEM_JSON>>>"):end].strip())
+    except ValueError:
+        return ""
+    inner = envelope.get("hookSpecificOutput") or {}
+    return inner.get("additionalContext") or envelope.get("additionalContext") or ""
+
+
 def _decisions(tmp: str) -> list:
     log = Path(tmp) / "zmem-decisions.log"
     if not log.exists():
@@ -505,7 +525,8 @@ class CompactSequenceTest(unittest.TestCase):
         self.assertNotIn(" exc=", tail)
         # The pre-fix behavior excluded the row (exc=1) and the fence
         # lost it; post-fix the row renders.
-        self.assertIn("Post-compaction memories", _ctx(p.stdout))
+        self.assertIn("Post-compaction memories",
+                    _ctx_from_payload(p.stdout))
 
     def test_kill_switch_silent_and_stash_survives(self):
         self._recall_ledger_marker()
