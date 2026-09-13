@@ -112,7 +112,10 @@ class MarginTelemetryParserTest(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()):
                     runpy.run_path(
                         str(SESSION_START_PAYLOAD),
-                        run_name="zmem_session_start_margin_telemetry_test")
+                        # Issue #121 refactor: the payload guards main()
+                        # behind __name__ == "__main__" — the run_name must
+                        # be "__main__" for the entry point to execute.
+                        run_name="__main__")
             finally:
                 sys.argv = old_argv
 

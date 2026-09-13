@@ -154,6 +154,57 @@ def _floor(name: str, default: float) -> float:
     return value
 
 
+_store_timeout_warned = False
+
+
+def _budget_default_s(key, fallback_s):
+    """F-010: hooks/timeout-budget.json is the canonical table; the
+    runtime default comes from it (fail-open to the hardcoded fallback
+    when the file is absent/malformed). Keep in sync with the sibling
+    reader in the other hook file — the parity test pins both."""
+    try:
+        import json
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            os.pardir, "timeout-budget.json")
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f).get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value / 1000.0
+    except Exception:
+        pass
+    return fallback_s
+
+def _store_timeout_s() -> float:
+    """Store-recall subprocess cap (issue #121): ZMEM_STORE_RECALL_TIMEOUT_S
+    as a finite positive float, default 8.0. Unparseable, non-finite,
+    non-positive, and values above 8.0 all use 8.0; each deviation warns
+    exactly once per process (warning parity with the SessionStart payload
+    reader). Values below 8.0 are honored (operator headroom)."""
+    global _store_timeout_warned
+    raw = os.environ.get("ZMEM_STORE_RECALL_TIMEOUT_S", "")
+    value = _budget_default_s("store_recall_ms", 8.0)  # fallback is SECONDS
+    warned = False
+    if raw.strip():
+        try:
+            candidate = float(raw)
+        except ValueError:
+            candidate = None
+        if (candidate is None or candidate != candidate
+                or candidate in (float("inf"), float("-inf"))
+                or candidate <= 0 or candidate > 8.0):
+            value = 8.0
+            warned = True
+        else:
+            value = candidate
+    if warned and not _store_timeout_warned:
+        _store_timeout_warned = True
+        try:
+            sys.stderr.write(
+                "zmem: invalid ZMEM_STORE_RECALL_TIMEOUT_S=%r; using 8.0\n"
+                % (raw,))
+        except Exception:
+            pass
+    return value
 def _recent_floor(store_py: str) -> float:
     sm = _load_schema_meta(store_py)
     if sm is not None:
@@ -312,7 +363,8 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                          excluded_count=0,
                          batch=False, tool_names=None,
                          path_basenames=None, margin=None,
-                         margin_pruned_ids=None) -> None:
+                         margin_pruned_ids=None,
+                         store_timeout=False) -> None:
     """Append the injected|silent decision to the decision log (#129).
 
     Issue #129 split: decision lines go to ``zmem-decisions.log`` (rotated,
@@ -490,11 +542,15 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
             ]
             marginpf = " margin_pruned={0}".format(
                 _safe_margin_pruned_ids)
+        # PR #198 review F-007: a store-subprocess timeout is recorded
+        # as reason=omitted + this additive tail, so a systematic
+        # slowdown is distinguishable from an empty pool in the log.
+        stf = " store_timeout=1" if store_timeout else ""
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
                 "ids={ids_sel} all={ids_all}{tok}{rend}{adm}{bcnt}{ops}{exc} "
-                "sid={safe_sid}{mom}{armf}{bat}{tns}{pths}{marginf}{marginpf}\n".format(
+                "sid={safe_sid}{mom}{armf}{bat}{tns}{pths}{marginf}{marginpf}{stf}\n".format(
                     ts=int(time.time()),
                     status=status,
                     reason=reason,
@@ -515,6 +571,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     pths=pths,
                     marginf=marginf,
                     marginpf=marginpf,
+                    stf=stf,
                 )
             )
     except OSError:
@@ -1430,7 +1487,7 @@ def main() -> int:
                     *_exclude_argv,
                 ],
                 stderr=subprocess.DEVNULL,
-                timeout=8,
+                timeout=_store_timeout_s(),
             ).decode("utf-8", "replace")
         else:
             out = subprocess.check_output(
@@ -1447,7 +1504,7 @@ def main() -> int:
                     *_exclude_argv,
                 ],
                 stderr=subprocess.DEVNULL,
-                timeout=10,
+                timeout=_store_timeout_s(),
             ).decode("utf-8", "replace")
         rows = json.loads(out) if out.strip() else []
         # v13 (issue #65, 10.8): unwrap the read envelope ({"results": ...});
@@ -1460,6 +1517,7 @@ def main() -> int:
         # both here, before envelope_results discards them.
         envelope_reason = None
         envelope_candidates = None
+        store_timeout_hit = False
         # Issue #182: score-margin telemetry from the injection envelope.
         # Keep each raw optional value independent; the logger validates the
         # numeric and list shapes separately before appending either field.
@@ -1527,9 +1585,31 @@ def main() -> int:
                 rows = rows.get("results", [])
             if not isinstance(rows, list):
                 rows = []
+    except subprocess.TimeoutExpired:
+        # PR #198 review F-007: a timeout must not masquerade as an
+        # empty pool. Fail closed (inject nothing) but classify the
+        # miss as reason=omitted + the store_timeout=1 additive tail
+        # so a systematic slowdown is diagnosable from the log.
+        rows = []
+        omitted = 0
+        envelope_reason = "omitted"
+        envelope_candidates = None
+        envelope_margin = None
+        envelope_margin_pruned_ids = None
+        envelope_excluded = None
+        envelope_admission = None
+        envelope_bdrop = None
+        envelope_btrunc = None
+        envelope_bprot = None
+        envelope_note = ""
+        envelope_arms = None
+        store_timeout_hit = True
+        print("[zmem] store recall timed out after the configured cap; "
+              "injecting nothing this event", file=sys.stderr)
     except Exception as _store_exc:
         rows = []
         omitted = 0
+        store_timeout_hit = False
         envelope_reason = None
         envelope_candidates = None
         envelope_margin = None
@@ -1601,6 +1681,7 @@ def main() -> int:
             session_id=session_id,
             all_ids=envelope_candidates,
             moment=_decision_moment(mode), store_py=store_py,
+            store_timeout=store_timeout_hit,
             excluded_count=envelope_excluded,
             admission_used=envelope_admission,
             budget_dropped=envelope_bdrop,
@@ -1676,6 +1757,7 @@ def main() -> int:
                          session_id=session_id,
                          all_ids=envelope_candidates,
                          moment=_decision_moment(mode), store_py=store_py,
+                         store_timeout=store_timeout_hit,
             excluded_count=envelope_excluded,
                          admission_used=envelope_admission,
                          budget_dropped=envelope_bdrop,

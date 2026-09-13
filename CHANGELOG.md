@@ -36,6 +36,90 @@ README.
   are skipped when refresh fails. The updater remains operator-local and
   untracked, so existing copies must be reordered before use.
 
+> Workstream D PR 6 of 8 (issue #121): the hook path fits the host timeout
+> budget, and Tier 0 reaches the host on a fast path even when the store
+> stalls.
+
+### Added
+- **Launcher watchdog (`hooks/zmem-launch.js`)**: translated hooks are
+  bounded at 12000 ms (`ZMEM_LAUNCHER_WATCHDOG_MS`, positive integer,
+  invalid falls back with one warning). At the deadline the child TREE is
+  terminated (win32: `taskkill /T /F` + kill fallback), the LAST COMPLETE
+  sentinel payload collected so far is emitted (the retained Tier 0 on the
+  session-start path), an outer-timeout decision record
+  (`outer_timeout=1 reason=omitted stage=launcher timeout_ms=<ms>
+  tier0_emitted=<0|1>`) lands in `<data dir>/zmem-decisions.log` (log-write
+  failure fails open), and the launcher exits 0. Normal close clears the
+  timer. Pass-through hooks (no sentinel to retain) are out of scope by
+  design.
+- **Namespace cache (issue #121)**: process-local, keyed by the normalized
+  absolute project path (case-folded on win32), 2000 ms resolution deadline
+  (`ZMEM_NAMESPACE_RESOLVE_MS`), 60000 ms TTL
+  (`ZMEM_NAMESPACE_CACHE_TTL_MS`, entry expires at exactly TTL), 128-entry
+  FIFO cap, and it caches ONLY remote-derived namespaces — path-key
+  resolutions are returned uncached every time (resolver crash/timeout
+  still returns `user:global` with a one-line
+  `namespace_resolution_error=1` warning). Observable via the exported
+  `namespaceCacheStats()` / `clearNamespaceCache()`.
+- **`hooks/timeout-budget.json`** is now the runtime source of truth for
+  the defaults (review F-010): the launcher and both Python store-timeout
+  readers load their defaults from it (fail-open to the hardcoded values);
+  the two Hermes rows stay documentation inputs owned by issue #160.
+- **Deterministic benchmark `scripts/bench_hook_latency.py`**: cold/warm/
+  freshness p50/p95 for the seven stages (launcher, namespace, store,
+  embed, fuse, render, time-last-capture) from a fixed injected-clock
+  schedule — a contract-regression gate, NOT a wall-clock measurement.
+  `--compare-baseline` pins the full contract: stage keys, per-stage
+  p50/p95 VALUES, and a machine-independent `input_digest` (the store path
+  is excluded so baselines compare across machines); non-object baselines
+  and drifted values exit 1 with a clean message. Exact usage-error strings
+  and exit codes per the issue contract.
+- **Watchdog covers startup (review F-001)**: the 12,000 ms watchdog arms
+  before stdin/env/namespace work, so TOTAL launcher runtime — including a
+  stalled namespace resolution — stays inside the host's hook timeout
+  (verified worst case 12.6 s vs 16.5 s before the fix).
+- **Store timeouts are classified, not silent (review F-007/F-008)**: the
+  shared recall body's `TimeoutExpired` now lands as
+  `reason=omitted store_timeout=1` in the decision log (previously
+  misclassified as empty-pool by a bare except), the SessionStart timeout
+  tail moved to the reader-parsed line end, and the compact lane logs the
+  same record. Reader extended in `storelib/miss_rate.py` (same commit).
+- **Issue #182 preserved through the refactor**: the score-margin envelope
+  parsing and `margin=`/`margin_pruned=` decision tails are ported into the
+  refactored payload (the merge conflict would otherwise have silently
+  reverted #182 — review F-002).
+- **Timeout fixtures `tests/fixtures/timeout/`** (`generate.py`,
+  `slow_store.json`, `expected_timeout.json`) with pinned SHA-256 digests.
+- **Tests**: `tests/test_timeout_budget.py` (`TimeoutBudgetTest` —
+  `test_fixture_digest`, `test_watchdog_deadline`, `test_namespace_cache`,
+  `test_benchmark_shape`, `test_baseline_mismatch`, plus the win32
+  tree-kill integration test and the watchdog-against-the-real-payload
+  integration test) and `tests/test_session_start.py`
+  (`SessionStartTimeoutTest` — `test_tier0_before_store`,
+  `test_one_store_attempt`, `test_slow_fixture_output`). No wall-clock
+  assertions.
+### Changed
+- **Tier 0 fast path**: the SessionStart payload
+  (`hooks/lib/zmem-session-start-payload.py`) now owns the
+  `<<<ZMEM_JSON>>>...<<<END>>>` sentinel emission and marker neutralization
+  (moved from the bash wrapper, which keeps a sentinel-wrapped `{}` spawn
+  fallback) and emits TWO complete envelopes — Tier 0 + local nudges
+  flushed BEFORE the first store subprocess, then the full context. The
+  bash wrapper passes the payload stdout through verbatim; the kill-switch
+  path still emits exactly one sentinel-wrapped envelope.
+- **One bounded store attempt**: the SessionStart 30 s × 3 retry loop is
+  replaced by a single `store.py recent` call capped by
+  `ZMEM_STORE_RECALL_TIMEOUT_S` (finite positive float seconds; values
+  above 8.0 clamp to 8.0 with one warning; values below 8.0 are honored) —
+  the same knob now drives the shared recall body's recent/recall
+  subprocesses (`hooks/lib/zmem-recall-body.py`, previously hardcoded
+  8 s/10 s). On timeout Tier 2 is empty and a `reason=omitted
+  store_timeout=1` decision line lands in the decisions log; the issue
+  #118 compact lane keeps its retry structure with the same timeout knob.
+  Transient SQLITE_BUSY on the cold-start lane now degrades fail-open
+  (accepted trade-off of the one-attempt contract).
+- **SKILL.md**: new "Timeout budget" section documenting the table above.
+
 ## [0.34.0] - 2026-09-12
 
 > Workstream M PR 1 of 2 (issue #182): opt-in score-margin gating for passive
@@ -372,7 +456,6 @@ README.
 
 ## [Unreleased]
 
-
 ## [0.26.0] - 2026-09-08
 
 ### Added
@@ -546,7 +629,6 @@ README.
   upload; the ratchet later is one flag (`--fail-under-precision` /
   `--fail-under-false-injection` / `--compare-baseline`). Thresholds and
   ranking are untouched (measure first).
-
 
 ## [0.20.0] - 2026-09-06
 

@@ -116,7 +116,11 @@ _BG_LINE_RE = re.compile(
     # the posttoolbatch paths tail, while SessionStart emits the same fields
     # without batch/tools/paths; both shapes remain readable here.
     r"(?: margin=(\S+))?"
-    r"(?: margin_pruned=(\[[^\]]*\]))?"
+    r"(?: margin_pruned=([^\]]*\]))?"
+    # PR #198 review F-007: the store-timeout tail (reason=omitted +
+    # store_timeout=1) must stay parseable — a writer-only field would
+    # silently drop every timeout decision from the miss-rate join.
+    r"(?: store_timeout=(\S+))?"
     r"\s*$"
 )
 
@@ -206,7 +210,7 @@ def parse_bg_log(path) -> list:
                 continue
             (ts, status, reason, omitted, ids_raw, all_raw, _tok, ops,
              exc, sid, moment, arms, _batch, _tools, _paths, margin,
-             margin_pruned_raw) = m.groups()
+             margin_pruned_raw, _store_timeout) = m.groups()
             try:
                 ts = int(ts)
             except ValueError:
