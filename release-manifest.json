@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "da2539a264f105ac00920f92a103647c3248cdb291e54e34c894d3d39f3df9ba",
+  "digest": "7df905f8247c62f45a81c7a1051f03cf9e147209e4cca2210465745bb015febe",
   "files": {
     "hermes-plugin/__init__.py": "49921ae0fcbb7343b9f77eae4d5684bd1e35b89ecf858744179ffb755b0993b0",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -43,7 +43,7 @@
     "scripts/ingest_harvest.py": "4deed83a20c9227afdc45c3ba89b9bd83beadbac1aa72049291dc502b7322e2f",
     "scripts/pattern_harness.py": "428b33978ee59b7c7bbc67f0849adfd750c9277e2e05b216721611741024652b",
     "scripts/refresh-report-schema.json": "8ab42194af5b380efdfaa794c75b26fd5d240168b494275956d7103ba0066c53",
-    "scripts/refresh_hosts.py": "566f693f8830854e79d2835c69da9669324c198aebc7fdb99c0d44fa49bb34c5",
+    "scripts/refresh_hosts.py": "d2ef3281bbfdcb83ca34ed761bdbbfb83f207f8917b4758f7e1bfd5f5af89d8b",
     "scripts/release_gate.py": "48836068c9c894fe335e00bff8d90bf7ba49e9f993c747eaa2b506082996ca67",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "ac20e80713cf3ec05159ac0f609313cb094ed5515c387258fa5369faec963aa5",
