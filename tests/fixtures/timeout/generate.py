@@ -46,12 +46,19 @@ def _dump(obj):
 
 
 def main() -> int:
-    (FIXTURE_DIR / "slow_store.json").write_text(
+    # PR #198 review F-003: support generating into a scratch directory so
+    # tests can verify generator parity WITHOUT overwriting the committed
+    # fixture bytes in the source tree (a read-only checkout must work).
+    out_dir = FIXTURE_DIR
+    if "--out-dir" in sys.argv:
+        out_dir = Path(sys.argv[sys.argv.index("--out-dir") + 1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "slow_store.json").write_text(
         _dump(SLOW_STORE), encoding="utf-8", newline="\n")
-    (FIXTURE_DIR / "expected_timeout.json").write_text(
+    (out_dir / "expected_timeout.json").write_text(
         _dump(EXPECTED_TIMEOUT), encoding="utf-8", newline="\n")
     for name in ("slow_store.json", "expected_timeout.json"):
-        digest = hashlib.sha256((FIXTURE_DIR / name).read_bytes()).hexdigest()
+        digest = hashlib.sha256((out_dir / name).read_bytes()).hexdigest()
         print("%s %s" % (name, digest))
     return 0
 

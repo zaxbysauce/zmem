@@ -394,8 +394,11 @@ def build_tier2_context(store_py, namespace, session_id, budget,
         except subprocess.TimeoutExpired:
             _write_decision_line(
                 store_py,
-                "[%d] zmem-hook status=silent reason=omitted store_timeout=1 "
-                "ids=[] all=[] sid=%s moment=session_start\n" % (
+                # store_timeout=1 rides at line END (reader-parity: the
+                # fixed-order _BG_LINE_RE only tolerates additive fields
+                # after moment=).
+                "[%d] zmem-hook status=silent reason=omitted "
+                "ids=[] all=[] sid=%s moment=session_start store_timeout=1\n" % (
                     int(__import__("time").time()), _safe_sid(session_id)))
             return ""
         # PRR-006 gate (pre-#121 coupling preserved): no renderer means no
@@ -478,6 +481,14 @@ def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
             break
         except subprocess.TimeoutExpired:
             out = ""
+            # F-008: a compact-lane timeout must land a decision line too,
+            # symmetric with the cold-start lane (store_timeout=1 at line
+            # END for reader parity).
+            _write_decision_line(
+                store_py,
+                "[%d] zmem-hook status=silent reason=omitted "
+                "ids=[] all=[] sid=%s moment=session_start_compact store_timeout=1\n" % (
+                    int(__import__("time").time()), _safe_sid(session_id)))
             break  # a hang is pathological — do not triple the stall
         except Exception:
             out = ""

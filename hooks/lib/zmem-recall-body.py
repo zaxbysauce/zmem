@@ -346,7 +346,8 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                          excluded_count=0,
                          batch=False, tool_names=None,
                          path_basenames=None, margin=None,
-                         margin_pruned_ids=None) -> None:
+                         margin_pruned_ids=None,
+                         store_timeout=False) -> None:
     """Append the injected|silent decision to the decision log (#129).
 
     Issue #129 split: decision lines go to ``zmem-decisions.log`` (rotated,
@@ -524,11 +525,15 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
             ]
             marginpf = " margin_pruned={0}".format(
                 _safe_margin_pruned_ids)
+        # PR #198 review F-007: a store-subprocess timeout is recorded
+        # as reason=omitted + this additive tail, so a systematic
+        # slowdown is distinguishable from an empty pool in the log.
+        stf = " store_timeout=1" if store_timeout else ""
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
                 "ids={ids_sel} all={ids_all}{tok}{rend}{adm}{bcnt}{ops}{exc} "
-                "sid={safe_sid}{mom}{armf}{bat}{tns}{pths}{marginf}{marginpf}\n".format(
+                "sid={safe_sid}{mom}{armf}{bat}{tns}{pths}{marginf}{marginpf}{stf}\n".format(
                     ts=int(time.time()),
                     status=status,
                     reason=reason,
@@ -1494,6 +1499,7 @@ def main() -> int:
         # both here, before envelope_results discards them.
         envelope_reason = None
         envelope_candidates = None
+        store_timeout_hit = False
         # Issue #182: score-margin telemetry from the injection envelope.
         # Keep each raw optional value independent; the logger validates the
         # numeric and list shapes separately before appending either field.
@@ -1561,9 +1567,31 @@ def main() -> int:
                 rows = rows.get("results", [])
             if not isinstance(rows, list):
                 rows = []
+    except subprocess.TimeoutExpired:
+        # PR #198 review F-007: a timeout must not masquerade as an
+        # empty pool. Fail closed (inject nothing) but classify the
+        # miss as reason=omitted + the store_timeout=1 additive tail
+        # so a systematic slowdown is diagnosable from the log.
+        rows = []
+        omitted = 0
+        envelope_reason = "omitted"
+        envelope_candidates = None
+        envelope_margin = None
+        envelope_margin_pruned_ids = None
+        envelope_excluded = None
+        envelope_admission = None
+        envelope_bdrop = None
+        envelope_btrunc = None
+        envelope_bprot = None
+        envelope_note = ""
+        envelope_arms = None
+        store_timeout_hit = True
+        print("[zmem] store recall timed out after the configured cap; "
+              "injecting nothing this event", file=sys.stderr)
     except Exception as _store_exc:
         rows = []
         omitted = 0
+        store_timeout_hit = False
         envelope_reason = None
         envelope_candidates = None
         envelope_margin = None
@@ -1635,6 +1663,7 @@ def main() -> int:
             session_id=session_id,
             all_ids=envelope_candidates,
             moment=_decision_moment(mode), store_py=store_py,
+            store_timeout=store_timeout_hit,
             excluded_count=envelope_excluded,
             admission_used=envelope_admission,
             budget_dropped=envelope_bdrop,
@@ -1710,6 +1739,7 @@ def main() -> int:
                          session_id=session_id,
                          all_ids=envelope_candidates,
                          moment=_decision_moment(mode), store_py=store_py,
+                         store_timeout=store_timeout_hit,
             excluded_count=envelope_excluded,
                          admission_used=envelope_admission,
                          budget_dropped=envelope_bdrop,

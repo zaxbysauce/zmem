@@ -59,23 +59,29 @@ class TimeoutBudgetTest(unittest.TestCase):
     # ---- AC4 surface: exact fixture bytes -------------------------------
 
     def test_fixture_digest(self):
-        gen = subprocess.run(
-            [sys.executable, str(FIXTURES_TIMEOUT / "generate.py")],
-            capture_output=True, text=True, timeout=60, cwd=str(REPO_ROOT))
-        self.assertEqual(gen.returncode, 0, gen.stderr)
+        # PR #198 review F-003: hash the COMMITTED bytes FIRST — the pinned
+        # SHA-256 values must describe what is actually checked in, not what
+        # the generator would produce. Then run the generator into a scratch
+        # dir (never the source tree: a read-only checkout must work) and
+        # require byte parity with the committed files.
         slow = FIXTURES_TIMEOUT / "slow_store.json"
         expected = FIXTURES_TIMEOUT / "expected_timeout.json"
         self.assertEqual(
             hashlib.sha256(slow.read_bytes()).hexdigest(), SLOW_STORE_SHA256,
-            "slow_store.json bytes drifted from the frozen fixture")
+            "committed slow_store.json bytes drifted from the frozen fixture")
         self.assertEqual(
             hashlib.sha256(expected.read_bytes()).hexdigest(), EXPECTED_TIMEOUT_SHA256,
-            "expected_timeout.json bytes drifted from the frozen fixture")
-        # The committed files must equal a fresh generator run byte-for-byte.
-        before = (slow.read_bytes(), expected.read_bytes())
-        subprocess.run([sys.executable, str(FIXTURES_TIMEOUT / "generate.py")],
-                       capture_output=True, timeout=60, cwd=str(REPO_ROOT), check=True)
-        self.assertEqual(before, (slow.read_bytes(), expected.read_bytes()))
+            "committed expected_timeout.json bytes drifted from the frozen fixture")
+        scratch = _scratch("zmem-121-fixgen-")
+        gen = subprocess.run(
+            [sys.executable, str(FIXTURES_TIMEOUT / "generate.py"),
+             "--out-dir", str(scratch)],
+            capture_output=True, text=True, timeout=60, cwd=str(REPO_ROOT))
+        self.assertEqual(gen.returncode, 0, gen.stderr)
+        self.assertEqual(slow.read_bytes(), (scratch / "slow_store.json").read_bytes(),
+                         "generator output diverged from committed slow_store.json")
+        self.assertEqual(expected.read_bytes(), (scratch / "expected_timeout.json").read_bytes(),
+                         "generator output diverged from committed expected_timeout.json")
         # timeout-budget.json parity with the documented constants.
         budget = json.loads((REPO_ROOT / "hooks" / "timeout-budget.json").read_text(
             encoding="utf-8"))
