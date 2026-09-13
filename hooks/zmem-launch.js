@@ -400,21 +400,21 @@ function startWatchdog(child, timeoutMs, clock, onTimeout) {
 function _decisionLogDir(env) {
     const e = env || {};
     // PR #198 review F-005: mirror the python resolver — expandHome on
-    // every branch, and a dirname that resolves to "." (a bare-filename
-    // ZMEM_STORE like "store.sqlite") is treated as absent so the chain
-    // falls through instead of writing the audit log into the current
-    // working directory.
-    const pick = (v) => {
+    // every branch. ZMEM_STORE is a FILE (use its dirname; a bare filename
+    // like "store.sqlite" yields "." and is treated as absent), while
+    // ZMEM_DATA / plugin-data vars ARE the directory (used verbatim).
+    const pickStore = (v) => {
         if (!v) return null;
         const expanded = expandHome(String(v));
         const dir = dirname(expanded);
         if (!dir || dir === "." || dir === expanded) return null;
         return dir;
     };
-    return pick(e.ZMEM_STORE)
-        || pick(e.ZMEM_DATA)
-        || pick(e.CLAUDE_PLUGIN_DATA)
-        || pick(e.ZCODE_PLUGIN_DATA)
+    const pickDir = (v) => (v ? expandHome(String(v)) : null);
+    return pickStore(e.ZMEM_STORE)
+        || pickDir(e.ZMEM_DATA)
+        || pickDir(e.CLAUDE_PLUGIN_DATA)
+        || pickDir(e.ZCODE_PLUGIN_DATA)
         || join(homedir(), ".zmem");
 }
 
