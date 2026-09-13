@@ -484,7 +484,11 @@ def _absolute_path(path: Path) -> Path:
 
 
 def _path_key(path: Path) -> str:
-    return os.path.normcase(os.path.abspath(str(path)))
+    # ``realpath`` canonicalizes Windows 8.3 aliases as well as symlink and
+    # junction components for comparison.  Callers still validate the
+    # original lexical path for symlinks before using this key for safety
+    # decisions.
+    return os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
 
 
 def _path_is_within(path: Path, root: Path) -> bool:

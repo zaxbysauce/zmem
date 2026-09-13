@@ -596,8 +596,8 @@ newly installed paths and staging/backup residue, writes a failure report when
 possible, and leaves the prior host state intact. A dry run never creates a
 cache, registry, or marketplace destination.
 
-The scheduled operator flow in
-`<zmem-root>\scripts\update-zmem.ps1` runs this refresh immediately
+The external scheduled operator script
+`<codex-scripts-root>\update-zmem.ps1` runs this refresh immediately
 after its existing `codex plugin add` step. It uses an absolute `python.exe`,
 all three hosts, an explicit dated report path, and a 600-second bounded
 process; fail-fast handling propagates a nonzero refresh exit so a failed

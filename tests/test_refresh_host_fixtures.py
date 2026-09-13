@@ -563,7 +563,10 @@ class HostRefreshFixtureIntegrationTest(_FixtureCase):
             [row["afterDigest"] for row in report["hosts"]],
         )
         with self.subTest(report_schema=True):
-            import jsonschema
+            try:
+                import jsonschema
+            except ImportError:
+                self.skipTest("jsonschema is unavailable")
 
             schema = json.loads(
                 (SCRIPTS / "refresh-report-schema.json").read_text(encoding="utf-8")
@@ -711,7 +714,7 @@ class HostRefreshFixtureIntegrationTest(_FixtureCase):
         backup = retained.pop()
         self.assertTrue(backup.is_dir())
         self.assertEqual(_tree(backup), before)
-        self.assertEqual(backup.parent, destination.parent)
+        self.assertEqual(backup.parent.resolve(), destination.parent.resolve())
         residue = {
             path
             for path in self.home.rglob("*")
