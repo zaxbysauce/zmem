@@ -12,10 +12,41 @@ README.
 
 ## [0.34.0] - 2026-09-12
 
+> Workstream M PR 1 of 2 (issue #182): opt-in score-margin gating for passive
+> injection, with explain and hook diagnostics.
+
+### Added
+- **Score-margin injection gate (issue #182)**: the new
+  `ZMEM_INJECT_MARGIN` setting defaults to `0.0` (disabled); operators can
+  begin the recommended rollout at `0.05`. The gate runs after selective
+  injection filtering and before token-budget admission, pruning ordinary
+  rows only when the relative margin between the top two usable scores is
+  strictly below the threshold. A `decision` or `constraint` in either of the
+  two leading score positions protects the candidate set. Missing, invalid,
+  negative, NaN, or infinite settings fail open to `0.0`; values above `1.0`
+  clamp to `1.0`.
+- **Injection diagnostics (issue #182)**: valid decisions add six-decimal
+  `margin` and ordered `margin_pruned_ids` fields to injection JSON. The
+  read-only `--for-injection --explain` replay reports pruned targets with the
+  `margin_pruned` reason and its observed-margin/threshold detail. Hook
+  decision lines append `margin=` and, when non-empty,
+  `margin_pruned=[...]` after the existing optional fields; absent or malformed
+  diagnostics remain fail-open and preserve legacy lines.
+- **Explain target precedence (issue #182)**: `--target` resolves an exact
+  stored memory ID before trying content-fragment matching, including for
+  non-UUID IDs. UUID-prefix and fragment matching remain additive fallbacks.
+
+### Deferred
+- **Replay/baseline measurement (#155)** remains a follow-on publication gate.
+  Once its replay artifacts exist, run the exact
+  `--fail-under miss_delta=0` check; this release intentionally creates none
+  of those future artifacts.
+
+## [0.35.0] - 2026-09-13
+
 > Workstream D PR 6 of 8 (issue #121): the hook path fits the host timeout
 > budget, and Tier 0 reaches the host on a fast path even when the store
 > stalls.
-
 ### Added
 - **Launcher watchdog (`hooks/zmem-launch.js`)**: translated hooks are
   bounded at 12000 ms (`ZMEM_LAUNCHER_WATCHDOG_MS`, positive integer,
@@ -56,7 +87,6 @@ README.
   (`SessionStartTimeoutTest` — `test_tier0_before_store`,
   `test_one_store_attempt`, `test_slow_fixture_output`). No wall-clock
   assertions.
-
 ### Changed
 - **Tier 0 fast path**: the SessionStart payload
   (`hooks/lib/zmem-session-start-payload.py`) now owns the
@@ -383,7 +413,6 @@ README.
 
 ## [Unreleased]
 
-
 ## [0.26.0] - 2026-09-08
 
 ### Added
@@ -557,7 +586,6 @@ README.
   upload; the ratchet later is one flag (`--fail-under-precision` /
   `--fail-under-false-injection` / `--compare-baseline`). Thresholds and
   ranking are untouched (measure first).
-
 
 ## [0.20.0] - 2026-09-06
 

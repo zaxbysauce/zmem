@@ -25,6 +25,7 @@ Runs standalone: python tests/test_decision_log.py
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import re
 import shutil
@@ -830,6 +831,99 @@ class ArmsAttributionReportTest(_SeededStore):
         self.assertEqual(arms["lines_without_arms"], 1)
         self.assertEqual(arms["carried"]["fts"],
                          {"injected": 0, "silent": 0})
+
+
+class MarginDecisionLogTest(unittest.TestCase):
+    """Decision-log margin fields without the unrelated seeded-store fixture."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="zmem-dl-margin-")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _write_hook_decision(self, **kwargs):
+        """Load the real hook writer and return its newest decision line."""
+        with mock.patch.dict(os.environ, {
+            "ZMEM_DATA": self._tmp,
+            "ZMEM_STORE": "",
+            "CLAUDE_PLUGIN_DATA": "",
+            "ZCODE_PLUGIN_DATA": "",
+        }, clear=False):
+            spec = importlib.util.spec_from_file_location(
+                "zmem_recall_body_decision_log_under_test", str(BODY))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod._log_inject_decision(
+                [{"id": "m-top"}, {"id": "m-second"},
+                 {"id": "m-third"}],
+                [{"id": "m-top"}],
+                "injected", "injected", all_ids=["m-top", "m-second",
+                                                   "m-third"],
+                session_id="margin-log-test", moment="user_prompt",
+                **kwargs)
+        lines = _decision_lines(self._tmp)
+        self.assertTrue(lines, "decision line must be written")
+        return lines[-1]
+
+    def test_margin_fields_are_additive_and_stable(self):
+        line = self._write_hook_decision(
+            tokens_used=10,
+            tokens_budget=1500,
+            ops_count=2,
+            excluded_count=1,
+            admission_used=10,
+            budget_dropped=0,
+            budget_truncated=0,
+            budget_dropped_protected=0,
+            arms={"fts": {"post": 1, "cap": 15}},
+            batch=True,
+            tool_names=["Read"],
+            path_basenames=["notes.md"],
+            margin=0.0125,
+            margin_pruned_ids=["m-second", "m-third"],
+        )
+        self.assertIn("margin=0.012500", line)
+        self.assertIn("margin_pruned=['m-second', 'm-third']", line)
+        self.assertLess(line.index("paths=notes.md"), line.index("margin="))
+        self.assertLess(line.index("margin="),
+                        line.index("margin_pruned="))
+
+    def test_invalid_margin_is_omitted_but_valid_pruned_ids_are_preserved(self):
+        line = self._write_hook_decision(
+            margin=float("nan"),
+            margin_pruned_ids=["m-second", "m-third"],
+        )
+        self.assertNotIn("margin=", line)
+        self.assertIn("margin_pruned=['m-second', 'm-third']", line)
+
+    def test_invalid_pruned_ids_are_omitted_but_valid_margin_is_preserved(self):
+        line = self._write_hook_decision(
+            margin=0.0125,
+            margin_pruned_ids=["m-second", 17],
+        )
+        self.assertIn("margin=0.012500", line)
+        self.assertNotIn("margin_pruned=", line)
+
+    def test_legacy_decision_line_bytes_are_unchanged_when_margin_absent(self):
+        with mock.patch.dict(os.environ, {
+            "ZMEM_DATA": self._tmp,
+            "ZMEM_STORE": "",
+            "CLAUDE_PLUGIN_DATA": "",
+            "ZCODE_PLUGIN_DATA": "",
+        }, clear=False):
+            spec = importlib.util.spec_from_file_location(
+                "zmem_recall_body_legacy_decision_under_test", str(BODY))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod._log_inject_decision([], [], "silent", "empty-pool")
+        line = _decision_lines(self._tmp)[-1]
+        normalized = re.sub(r"^\[\d+\]", "[TIMESTAMP]", line)
+        self.assertEqual(
+            normalized,
+            "[TIMESTAMP] zmem-hook status=silent reason=empty-pool "
+            "ids=[] all=[] sid=unknown",
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1 @@
+[{"threshold":0.05,"retained":["m-top"],"pruned":["m-second","m-third"],"margin":"0.012500"},{"threshold":0.0,"retained":["m-top","m-second","m-third"],"pruned":[],"margin":null},{"threshold":0.05,"retained":["m-top","m-second","m-third"],"pruned":[],"margin":"0.012500"},{"threshold":0.05,"retained":["m-top","m-second","m-third"],"pruned":[],"margin":"0.012500"}]

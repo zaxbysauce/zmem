@@ -249,7 +249,8 @@ def _render_fenced(store_py, rows, header):
 def _unwrap_rows(raw_out):
     rows = json.loads(raw_out) if raw_out.strip() else []
     extras = {"reason": None, "all": None, "tokens_used": None,
-              "tokens_budget": None, "excluded": None}
+              "tokens_budget": None, "excluded": None,
+              "margin": None, "margin_pruned_ids": None}
     if isinstance(rows, dict):
         er = rows.get("reason")
         if isinstance(er, str) and er:
@@ -266,6 +267,32 @@ def _unwrap_rows(raw_out):
         ee = rows.get("excluded")
         if isinstance(ee, int) and not isinstance(ee, bool):
             extras["excluded"] = ee
+        # Issue #182: score-margin diagnostics are optional envelope
+        # fields. Validate each independently so malformed telemetry
+        # never hides a valid sibling field or changes the legacy
+        # decision line.
+        if "margin" in rows:
+            raw_margin = rows.get("margin")
+            margin_value = None
+            if (isinstance(raw_margin, (int, float))
+                    and not isinstance(raw_margin, bool)):
+                margin_value = raw_margin
+            elif isinstance(raw_margin, str):
+                try:
+                    margin_value = float(raw_margin)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            try:
+                if (margin_value is not None
+                        and math.isfinite(float(margin_value))):
+                    extras["margin"] = float(margin_value)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        if "margin_pruned_ids" in rows:
+            raw_pruned = rows.get("margin_pruned_ids")
+            if (isinstance(raw_pruned, list) and raw_pruned
+                    and all(isinstance(mid, str) for mid in raw_pruned)):
+                extras["margin_pruned_ids"] = raw_pruned
     try:
         import inject as _inj_mod
         rows = _inj_mod.envelope_results(rows)
@@ -290,9 +317,22 @@ def _decision_line(rows, extras, moment, session_id, pull_ran):
         exc = " exc=%d" % extras["excluded"]
     ids = [r.get("id") for r in rows] if isinstance(rows, list) else []
     all_ids = extras["all"] if extras["all"] is not None else ids
-    return ("[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=%s\n" % (
+    margin_ss = ""
+    if extras["margin"] is not None:
+        margin_ss = " margin=%.6f" % extras["margin"]
+    margin_pruned_ss = ""
+    if extras["margin_pruned_ids"]:
+        # Issue #182: the envelope carries untrusted memory IDs. Match
+        # the shared writer's tools=/paths= charset rule and component
+        # cap before list repr enters the decision log.
+        safe_pruned = [
+            re.sub(r"[^A-Za-z0-9._-]", "_", mid)[:64]
+            for mid in extras["margin_pruned_ids"]
+        ]
+        margin_pruned_ss = " margin_pruned=%s" % safe_pruned
+    return ("[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=%s%s%s\n" % (
         int(__import__("time").time()), status, reason, ids, all_ids, tok, exc,
-        _safe_sid(session_id), moment)) if pull_ran else None
+        _safe_sid(session_id), moment, margin_ss, margin_pruned_ss)) if pull_ran else None
 
 
 def _record_ledger(ledger, data_dir, session_id, rows, block, parts, moment):

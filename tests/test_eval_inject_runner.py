@@ -299,6 +299,21 @@ class BaselineAndRatchetTest(unittest.TestCase):
         proc, _ = run_runner("--compare-baseline", str(BASELINE))
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_zero_margin_negative_controls_preserve_output_bytes(self):
+        baseline = SCRATCH / "test-margin-default.json"
+        zero_margin = SCRATCH / "test-margin-zero.json"
+
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ZMEM_INJECT_MARGIN", None)
+            baseline_proc, _ = run_runner("--json-out", str(baseline))
+        self.assertEqual(baseline_proc.returncode, 0, baseline_proc.stderr)
+
+        with unittest.mock.patch.dict(
+                os.environ, {"ZMEM_INJECT_MARGIN": "0"}, clear=False):
+            zero_proc, _ = run_runner("--json-out", str(zero_margin))
+        self.assertEqual(zero_proc.returncode, 0, zero_proc.stderr)
+        self.assertEqual(baseline.read_bytes(), zero_margin.read_bytes())
+
     def test_baseline_drift_exits_one(self):
         bad = SCRATCH / "test-drift-baseline.json"
         doc = json.loads(BASELINE.read_text(encoding="utf-8"))
