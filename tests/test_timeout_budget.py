@@ -154,8 +154,10 @@ console.log(JSON.stringify({step: 'env', a, b, c, warnings: warnings.length}));
         self.assertEqual(by_step["env"]["a"], 12000)
         self.assertEqual(by_step["env"]["b"], 12000)
         self.assertEqual(by_step["env"]["c"], 2500)
-        self.assertEqual(by_step["env"]["warnings"], 2,
-                         "one warning per invalid value, none for the valid one")
+        # F-004/cubic: warnings are keyed per env-var NAME (warnOnce), so two
+        # invalid values of the same name warn once; the valid value warns never.
+        self.assertEqual(by_step["env"]["warnings"], 1,
+                         "one warning per invalid NAME, none for the valid one")
 
     def test_terminate_child_tree(self):
         """RC1: on win32 the kill must take the bash child's python grandchild

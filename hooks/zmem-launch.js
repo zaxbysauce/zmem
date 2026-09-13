@@ -166,10 +166,21 @@ const NAMESPACE_CACHE_MAX_ENTRIES = 128;
 function readPositiveIntMs(env, name, dflt, warn) {
     const raw = env && env[name];
     if (raw === undefined || raw === "") return dflt;
-    const parsed = parseInt(raw, 10);
     const w = typeof warn === "function" ? warn : (s) => process.stderr.write(s);
+    // PR #198 review F-004: parseInt accepted numeric prefixes, so
+    // ZMEM_LAUNCHER_WATCHDOG_MS=1e9 silently parsed as 1 ms. Require a full
+    // decimal match; anything else takes the documented default + one
+    // warning per name. ("15" stays valid — it IS a positive integer; the
+    // issue contract defines no minimum.)
+    if (!/^[0-9]+$/.test(String(raw).trim())) {
+        warnOnce(warn, "env:" + name,
+            `zmem: invalid ${name}=${JSON.stringify(raw)} (must be a positive integer); using default ${dflt}\n`);
+        return dflt;
+    }
+    const parsed = parseInt(raw, 10);
     if (!Number.isFinite(parsed) || parsed <= 0) {
-        w(`zmem: invalid ${name}=${JSON.stringify(raw)} (must be a positive integer); using default ${dflt}\n`);
+        warnOnce(warn, "env:" + name,
+            `zmem: invalid ${name}=${JSON.stringify(raw)} (must be a positive integer); using default ${dflt}\n`);
         return dflt;
     }
     return parsed;
@@ -372,11 +383,23 @@ function startWatchdog(child, timeoutMs, clock, onTimeout) {
 // payload-side decision lines always co-locate.
 function _decisionLogDir(env) {
     const e = env || {};
-    if (e.ZMEM_STORE) return dirname(String(e.ZMEM_STORE));
-    if (e.ZMEM_DATA) return String(e.ZMEM_DATA);
-    if (e.CLAUDE_PLUGIN_DATA) return String(e.CLAUDE_PLUGIN_DATA);
-    if (e.ZCODE_PLUGIN_DATA) return String(e.ZCODE_PLUGIN_DATA);
-    return join(homedir(), ".zmem");
+    // PR #198 review F-005: mirror the python resolver — expandHome on
+    // every branch, and a dirname that resolves to "." (a bare-filename
+    // ZMEM_STORE like "store.sqlite") is treated as absent so the chain
+    // falls through instead of writing the audit log into the current
+    // working directory.
+    const pick = (v) => {
+        if (!v) return null;
+        const expanded = expandHome(String(v));
+        const dir = dirname(expanded);
+        if (!dir || dir === "." || dir === expanded) return null;
+        return dir;
+    };
+    return pick(e.ZMEM_STORE)
+        || pick(e.ZMEM_DATA)
+        || pick(e.CLAUDE_PLUGIN_DATA)
+        || pick(e.ZCODE_PLUGIN_DATA)
+        || join(homedir(), ".zmem");
 }
 
 // Append the launcher-side outer-timeout decision record. Returns the
