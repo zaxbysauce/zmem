@@ -67,6 +67,23 @@ def _emit(payload):
     sys.stdout.flush()
 
 
+def _budget_default_s(key, fallback_s):
+    """F-010: hooks/timeout-budget.json is the canonical table; the
+    runtime default comes from it (fail-open to the hardcoded fallback
+    when the file is absent/malformed). Keep in sync with the sibling
+    reader in the other hook file — the parity test pins both."""
+    try:
+        import json
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            os.pardir, "timeout-budget.json")
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f).get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value / 1000.0
+    except Exception:
+        pass
+    return fallback_s
+
 _store_timeout_warned = False
 
 
@@ -79,7 +96,7 @@ def _store_timeout_s():
     """
     global _store_timeout_warned
     raw = os.environ.get("ZMEM_STORE_RECALL_TIMEOUT_S", "")
-    value = 8.0
+    value = _budget_default_s("store_recall_ms", 8000)
     warned = False
     if raw.strip():
         try:
@@ -186,21 +203,9 @@ def _ledger_module(store_py):
 
 
 def _data_dir_for_ledger():
-    dd = ""
-    store_env = os.environ.get("ZMEM_STORE", "")
-    if store_env:
-        dd = os.path.expanduser(os.path.dirname(store_env))
-    if not dd:
-        dd = os.path.expanduser(os.environ.get("ZMEM_DATA", ""))
-    if not dd:
-        for pdv in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
-            pv = os.environ.get(pdv, "")
-            if pv:
-                dd = os.path.expanduser(pv)
-                break
-    if not dd:
-        dd = os.path.join(os.path.expanduser("~"), ".zmem")
-    return dd
+    # Copilot dedupe: identical resolution chain to _log_dir — one
+    # implementation, two names (call-site readability).
+    return _log_dir()
 
 
 def _write_decision_line(store_py, text):
@@ -427,7 +432,7 @@ def build_tier2_context(store_py, namespace, session_id, budget,
 
 
 def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
-                  exclude_argv, recent_floor, context_parts=None):
+                  recent_floor, context_parts=None):
     """Issue #118 SessionStart(source=compact): query-aware recall rebuilt
     from the compact sidecar. Retry structure and stash semantics are #118's
     owned surface, kept intact here; only the subprocess timeout moved to
@@ -440,10 +445,6 @@ def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
         return "", ""
     if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
         return "", ""
-    # The compact moment DELIBERATELY re-delivers the pre-compaction working
-    # set (the context holding those rows was summarized away) — never
-    # exclude its own query targets (PR #190 review PRR-004).
-    exclude = []
     try:
         # READ the stash without consuming it — discard happens only after a
         # completed pull, so an exhausted path leaves it for the next
@@ -472,8 +473,7 @@ def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
                     "--namespace", namespace, "--limit", "5",
                     "--min-confidence", str(recent_floor),
                     "--include-global", "--global-limit", "3",
-                    "--no-bump", "--for-injection", "--json",
-                    *exclude]
+                    "--no-bump", "--for-injection", "--json"]
             out = subprocess.check_output(
                 argv, stderr=subprocess.DEVNULL, timeout=timeout_s,
             ).decode("utf-8", "replace")
@@ -732,19 +732,15 @@ def main():
             recent_floor = 0.5
         ledger = _ledger_module(store_py)
         data_dir_known = _data_dir_for_ledger() if ledger is not None else ""
-        exclude_argv = []
-        if ledger is not None:
-            for did in ledger.delivered_ids(data_dir_known, session_id)[:ledger.cap()]:
-                exclude_argv.extend(["--exclude", did])
         if source == "compact" and session_id and ledger is not None:
             tier2_block, _ = _compact_lane(
                 store_py, ns, session_id, ledger, data_dir_known,
-                exclude_argv, recent_floor,
-                context_parts=[p for p in [tier0] if p])
+                recent_floor,
+                context_parts=[p for p in [correction_note, tier0] if p])
         if not tier2_block:
             tier2_block = build_tier2_context(
                 store_py, ns, session_id, budget,
-                context_parts=[p for p in [tier0] if p])
+                context_parts=[p for p in [correction_note, tier0] if p])
 
     # Promotion candidates (non-blocking, one-line suggestion) — a store
     # subprocess by design; it runs AFTER envelope 1 so Tier 0 is never

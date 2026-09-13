@@ -1603,10 +1603,14 @@ one warning).
 
 SessionStart emits a complete Tier 0 sentinel BEFORE the first store
 subprocess (the fast path), so a store stall inside the watchdog window
-still delivers Tier 0 to the host. The deterministic cold/warm/freshness
-benchmark is `scripts/bench_hook_latency.py` (p50/p95 for launcher,
-namespace, store, embed, fuse, render, time-last-capture, plus a stable
-`input_digest`).
+still delivers Tier 0 to the host. The launcher watchdog arms before
+startup, so namespace resolution counts against the 12,000 ms budget. The
+`scripts/bench_hook_latency.py` benchmark reports deterministic
+injected-clock p50/p95 schedules for the seven stages (launcher,
+namespace, store, embed, fuse, render, time-last-capture) — a
+contract-regression gate whose `--compare-baseline` pins stage keys,
+per-stage values, and a machine-independent `input_digest`; it does not
+measure wall-clock latency.
 
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite

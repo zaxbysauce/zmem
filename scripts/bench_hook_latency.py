@@ -87,7 +87,7 @@ def _sample(case: str, stage: str, run_index: int) -> float:
     return float(base + spread)
 
 
-def _fixture(case: str, clock_mode: str, runs: int, store: Path) -> dict:
+def _fixture(case: str, clock_mode: str, runs: int) -> dict:
     """The digest input: compact sorted-key fixture JSON, timestamps removed
     by construction (only deterministic schedule data enters)."""
     return {
@@ -96,12 +96,11 @@ def _fixture(case: str, clock_mode: str, runs: int, store: Path) -> dict:
         "runs": runs,
         "stages": list(STAGES),
         "schedule_ms": _SCHEDULE_MS[case],
-        "store": str(store),
     }
 
 
-def _input_digest(case: str, clock_mode: str, runs: int, store: Path) -> str:
-    blob = json.dumps(_fixture(case, clock_mode, runs, store),
+def _input_digest(case: str, clock_mode: str, runs: int) -> str:
+    blob = json.dumps(_fixture(case, clock_mode, runs),
                       sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -123,7 +122,7 @@ def run_case(case: str, *, store: Path, log: Path, clock_mode: str,
             "p50": percentile(samples, 50),
             "p95": percentile(samples, 95),
         }
-    digest = _input_digest(case, clock_mode, runs, store)
+    digest = _input_digest(case, clock_mode, runs)
     try:
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "a", encoding="utf-8") as lf:
@@ -182,6 +181,11 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write("bench: cannot read baseline %s: %s\n"
                              % (args.compare_baseline, exc))
             return 1
+        # F-014: a well-formed but non-dict baseline is a clean exit 1,
+        # never a traceback.
+        if not isinstance(baseline, dict):
+            sys.stderr.write("bench: baseline root must be a JSON object\n")
+            return 1
         base_stages = baseline.get("stages")
         if not isinstance(base_stages, dict) or \
                 set(base_stages) != set(STAGES):
@@ -191,6 +195,14 @@ def main(argv: list[str] | None = None) -> int:
         if baseline.get("input_digest") != report["input_digest"]:
             sys.stderr.write("bench: baseline input_digest differs\n")
             return 1
+        # F-006: compare the per-stage p50/p95 VALUES too — the schedule
+        # is deterministic, so identical inputs must produce identical
+        # numbers; a drifted value means the pinned schedule changed.
+        for stage, stats in report["stages"].items():
+            base = base_stages.get(stage) or {}
+            if base.get("p50") != stats["p50"] or base.get("p95") != stats["p95"]:
+                sys.stderr.write("bench: baseline stage values differ: %s\n" % stage)
+                return 1
     return 0
 
 

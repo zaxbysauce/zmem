@@ -31,7 +31,7 @@
 "use strict";
 
 const { spawn, execFileSync } = require("child_process");
-const { existsSync, mkdirSync, appendFileSync } = require("fs");
+const { existsSync, mkdirSync, appendFileSync, readFileSync } = require("fs");
 const { join, dirname, basename, resolve, delimiter } = require("path");
 const { homedir } = require("os");
 
@@ -186,6 +186,22 @@ function readPositiveIntMs(env, name, dflt, warn) {
     return parsed;
 }
 
+// F-010: hooks/timeout-budget.json is the canonical table — load it at
+// startup (fail-open to the hardcoded fallbacks) so the runtime defaults
+// and the documented table cannot drift apart.
+function loadTimeoutBudget() {
+    try {
+        return JSON.parse(readFileSync(join(__dirname, "timeout-budget.json"), "utf8"));
+    } catch {
+        return null;
+    }
+}
+const TIMEOUT_BUDGET = loadTimeoutBudget();
+function budgetDefault(key, fallback) {
+    const v = TIMEOUT_BUDGET && TIMEOUT_BUDGET[key];
+    return (typeof v === "number" && v > 0) ? v : fallback;
+}
+
 const _msWarnings = new Set();
 function warnOnce(warn, key, message) {
     if (_msWarnings.has(key)) return;
@@ -231,11 +247,11 @@ function resolveNamespace(projectDir, opts = {}) {
     const ttlMs = opts.ttlMs !== undefined
         ? opts.ttlMs
         : readPositiveIntMs(process.env, "ZMEM_NAMESPACE_CACHE_TTL_MS",
-            DEFAULT_NAMESPACE_CACHE_TTL_MS, warn);
+            budgetDefault("namespace_cache_ttl_ms", DEFAULT_NAMESPACE_CACHE_TTL_MS), warn);
     const resolveMs = opts.resolveMs !== undefined
         ? opts.resolveMs
         : readPositiveIntMs(process.env, "ZMEM_NAMESPACE_RESOLVE_MS",
-            DEFAULT_NAMESPACE_RESOLVE_MS, warn);
+            budgetDefault("namespace_resolve_ms", DEFAULT_NAMESPACE_RESOLVE_MS), warn);
     const key = namespaceCacheKey(projectDir);
     const now = clock();
     const cached = namespaceCache.get(key);
@@ -956,7 +972,7 @@ async function main() {
     let watchdog = null;
     if (translated) {
         const watchdogMs = readPositiveIntMs(process.env, "ZMEM_LAUNCHER_WATCHDOG_MS",
-            DEFAULT_LAUNCHER_WATCHDOG_MS);
+            budgetDefault("launcher_watchdog_ms", DEFAULT_LAUNCHER_WATCHDOG_MS));
         watchdog = startWatchdog(() => fireState.child, watchdogMs, PRODUCTION_CLOCK, () => {
             const raw = Buffer.concat(outChunks).toString("utf8");
             let envelope;

@@ -157,6 +157,23 @@ def _floor(name: str, default: float) -> float:
 _store_timeout_warned = False
 
 
+def _budget_default_s(key, fallback_s):
+    """F-010: hooks/timeout-budget.json is the canonical table; the
+    runtime default comes from it (fail-open to the hardcoded fallback
+    when the file is absent/malformed). Keep in sync with the sibling
+    reader in the other hook file — the parity test pins both."""
+    try:
+        import json
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            os.pardir, "timeout-budget.json")
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f).get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value / 1000.0
+    except Exception:
+        pass
+    return fallback_s
+
 def _store_timeout_s() -> float:
     """Store-recall subprocess cap (issue #121): ZMEM_STORE_RECALL_TIMEOUT_S
     as a finite positive float, default 8.0. Unparseable, non-finite,
@@ -165,7 +182,7 @@ def _store_timeout_s() -> float:
     reader). Values below 8.0 are honored (operator headroom)."""
     global _store_timeout_warned
     raw = os.environ.get("ZMEM_STORE_RECALL_TIMEOUT_S", "")
-    value = 8.0
+    value = _budget_default_s("store_recall_ms", 8000)
     warned = False
     if raw.strip():
         try:
@@ -554,6 +571,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     pths=pths,
                     marginf=marginf,
                     marginpf=marginpf,
+                    stf=stf,
                 )
             )
     except OSError:

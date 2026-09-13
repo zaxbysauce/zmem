@@ -260,7 +260,22 @@ setTimeout(() => {
     # ---- AC2 surface: namespace cache ------------------------------------
 
     def test_namespace_cache(self):
-        root_str = str(REPO_ROOT).replace("\\", "\\\\")
+        # F-013: resolveNamespace caches only remote-derived keys. On a
+        # checkout with no configured origin remote the repo root would
+        # resolve to a path key and the hit/miss assertions would not hold —
+        # fall back to a scratch repo with origin configured.
+        root_path = REPO_ROOT
+        probe = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "config", "--get", "remote.origin.url"],
+            capture_output=True)
+        if probe.returncode != 0:
+            fallback = _scratch("zmem-121-origin-")
+            subprocess.run(["git", "init", str(fallback)], capture_output=True)
+            subprocess.run(["git", "-C", str(fallback), "remote", "add",
+                            "origin", "https://github.com/zaxbysauce/zmem.git"],
+                           capture_output=True)
+            root_path = fallback
+        root_str = str(root_path).replace("\\", "\\\\")
         script = r"""
 const l = require('./hooks/zmem-launch.js');
 const out = {};

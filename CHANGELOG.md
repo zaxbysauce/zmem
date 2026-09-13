@@ -10,38 +10,6 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.34.0] - 2026-09-12
-
-> Workstream M PR 1 of 2 (issue #182): opt-in score-margin gating for passive
-> injection, with explain and hook diagnostics.
-
-### Added
-- **Score-margin injection gate (issue #182)**: the new
-  `ZMEM_INJECT_MARGIN` setting defaults to `0.0` (disabled); operators can
-  begin the recommended rollout at `0.05`. The gate runs after selective
-  injection filtering and before token-budget admission, pruning ordinary
-  rows only when the relative margin between the top two usable scores is
-  strictly below the threshold. A `decision` or `constraint` in either of the
-  two leading score positions protects the candidate set. Missing, invalid,
-  negative, NaN, or infinite settings fail open to `0.0`; values above `1.0`
-  clamp to `1.0`.
-- **Injection diagnostics (issue #182)**: valid decisions add six-decimal
-  `margin` and ordered `margin_pruned_ids` fields to injection JSON. The
-  read-only `--for-injection --explain` replay reports pruned targets with the
-  `margin_pruned` reason and its observed-margin/threshold detail. Hook
-  decision lines append `margin=` and, when non-empty,
-  `margin_pruned=[...]` after the existing optional fields; absent or malformed
-  diagnostics remain fail-open and preserve legacy lines.
-- **Explain target precedence (issue #182)**: `--target` resolves an exact
-  stored memory ID before trying content-fragment matching, including for
-  non-UUID IDs. UUID-prefix and fragment matching remain additive fallbacks.
-
-### Deferred
-- **Replay/baseline measurement (#155)** remains a follow-on publication gate.
-  Once its replay artifacts exist, run the exact
-  `--fail-under miss_delta=0` check; this release intentionally creates none
-  of those future artifacts.
-
 ## [0.35.0] - 2026-09-13
 
 > Workstream D PR 6 of 8 (issue #121): the hook path fits the host timeout
@@ -68,15 +36,33 @@ README.
   still returns `user:global` with a one-line
   `namespace_resolution_error=1` warning). Observable via the exported
   `namespaceCacheStats()` / `clearNamespaceCache()`.
-- **`hooks/timeout-budget.json`**: the canonical integer table (launcher
-  12000, namespace 2000, store 8000, SQLite 5000, Hermes join 8000 and
-  provider deadline 6000 — the two Hermes rows are documentation inputs
-  owned by issue #160).
+- **`hooks/timeout-budget.json`** is now the runtime source of truth for
+  the defaults (review F-010): the launcher and both Python store-timeout
+  readers load their defaults from it (fail-open to the hardcoded values);
+  the two Hermes rows stay documentation inputs owned by issue #160.
 - **Deterministic benchmark `scripts/bench_hook_latency.py`**: cold/warm/
   freshness p50/p95 for the seven stages (launcher, namespace, store,
-  embed, fuse, render, time-last-capture) plus a stable `input_digest`;
-  `--compare-baseline` exits 1 on differing stage keys or digest. Exact
-  usage-error strings and exit codes per the issue contract.
+  embed, fuse, render, time-last-capture) from a fixed injected-clock
+  schedule — a contract-regression gate, NOT a wall-clock measurement.
+  `--compare-baseline` pins the full contract: stage keys, per-stage
+  p50/p95 VALUES, and a machine-independent `input_digest` (the store path
+  is excluded so baselines compare across machines); non-object baselines
+  and drifted values exit 1 with a clean message. Exact usage-error strings
+  and exit codes per the issue contract.
+- **Watchdog covers startup (review F-001)**: the 12,000 ms watchdog arms
+  before stdin/env/namespace work, so TOTAL launcher runtime — including a
+  stalled namespace resolution — stays inside the host's hook timeout
+  (verified worst case 12.6 s vs 16.5 s before the fix).
+- **Store timeouts are classified, not silent (review F-007/F-008)**: the
+  shared recall body's `TimeoutExpired` now lands as
+  `reason=omitted store_timeout=1` in the decision log (previously
+  misclassified as empty-pool by a bare except), the SessionStart timeout
+  tail moved to the reader-parsed line end, and the compact lane logs the
+  same record. Reader extended in `storelib/miss_rate.py` (same commit).
+- **Issue #182 preserved through the refactor**: the score-margin envelope
+  parsing and `margin=`/`margin_pruned=` decision tails are ported into the
+  refactored payload (the merge conflict would otherwise have silently
+  reverted #182 — review F-002).
 - **Timeout fixtures `tests/fixtures/timeout/`** (`generate.py`,
   `slow_store.json`, `expected_timeout.json`) with pinned SHA-256 digests.
 - **Tests**: `tests/test_timeout_budget.py` (`TimeoutBudgetTest` —
@@ -108,6 +94,38 @@ README.
   Transient SQLITE_BUSY on the cold-start lane now degrades fail-open
   (accepted trade-off of the one-attempt contract).
 - **SKILL.md**: new "Timeout budget" section documenting the table above.
+
+## [0.34.0] - 2026-09-12
+
+> Workstream M PR 1 of 2 (issue #182): opt-in score-margin gating for passive
+> injection, with explain and hook diagnostics.
+
+### Added
+- **Score-margin injection gate (issue #182)**: the new
+  `ZMEM_INJECT_MARGIN` setting defaults to `0.0` (disabled); operators can
+  begin the recommended rollout at `0.05`. The gate runs after selective
+  injection filtering and before token-budget admission, pruning ordinary
+  rows only when the relative margin between the top two usable scores is
+  strictly below the threshold. A `decision` or `constraint` in either of the
+  two leading score positions protects the candidate set. Missing, invalid,
+  negative, NaN, or infinite settings fail open to `0.0`; values above `1.0`
+  clamp to `1.0`.
+- **Injection diagnostics (issue #182)**: valid decisions add six-decimal
+  `margin` and ordered `margin_pruned_ids` fields to injection JSON. The
+  read-only `--for-injection --explain` replay reports pruned targets with the
+  `margin_pruned` reason and its observed-margin/threshold detail. Hook
+  decision lines append `margin=` and, when non-empty,
+  `margin_pruned=[...]` after the existing optional fields; absent or malformed
+  diagnostics remain fail-open and preserve legacy lines.
+- **Explain target precedence (issue #182)**: `--target` resolves an exact
+  stored memory ID before trying content-fragment matching, including for
+  non-UUID IDs. UUID-prefix and fragment matching remain additive fallbacks.
+
+### Deferred
+- **Replay/baseline measurement (#155)** remains a follow-on publication gate.
+  Once its replay artifacts exist, run the exact
+  `--fail-under miss_delta=0` check; this release intentionally creates none
+  of those future artifacts.
 
 ## [0.33.0] - 2026-09-12
 
