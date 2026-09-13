@@ -314,18 +314,19 @@ function _lastTerminateInfoForTests() {
     return { ..._lastTerminateInfo };
 }
 
-// Terminate the child AND (on win32) its spawned subtree: a bare kill of the
-// bash child would orphan the python grandchildren the hook scripts spawn.
-// taskkill /T walks the process tree — it MUST be spawned async + detached:
-// spawnSync("taskkill") deadlocks the Node event loop when the launcher's
-// own stdio are pipes (the host hook-runner configuration), hanging the
-// launcher instead of firing the watchdog. A detached taskkill completes on
-// in flight main() bounds teardown with a grace window plus a
-// child.kill() fallback; synchronously killing the direct child FIRST
-// would make taskkill tree-walk fail against a dead root PID and
-// re-orphan the grandchildren. Fake
-// children without a real pid skip the taskkill branch so injected-clock
-// unit tests stay pure.
+// Terminate the child AND (on win32) its spawned subtree: a bare kill of
+// the bash child would orphan the python grandchildren the hook scripts
+// spawn — and those grandchildren INHERIT stdio handles, so a survivor
+// can hold the HOST read side open past our own exit. taskkill /T walks
+// the tree; two sequencing rules keep that walk effective: (1) taskkill
+// must be spawned async + detached — spawnSync("taskkill") deadlocks the
+// Node event loop when the launcher own stdio are pipes (the host
+// hook-runner configuration); (2) nothing may synchronously kill the
+// direct child first — a dead root PID makes the tree walk fail and
+// re-orphans the grandchildren. The watchdog callback bounds teardown
+// with a grace window plus a child.kill() fallback. Fake children
+// without a real pid skip the taskkill branch so injected-clock unit
+// tests stay pure.
 function _terminateChildTree(child) {
     if (process.platform === "win32" && child && typeof child.pid === "number" && child.pid > 0) {
         try {
@@ -1038,6 +1039,12 @@ async function main() {
         child.stdout.on("data", (c) => outChunks.push(c));
         child.on("close", (code) => {
             if (watchdog) watchdog.clear(); // normal close: disarm the watchdog
+            if (watchdog && watchdog.fired()) {
+                // The watchdog already emitted the retained envelope
+                // and wrote the decision record — never double-emit.
+                process.exit(0);
+                return;
+            }
             const raw = Buffer.concat(outChunks).toString("utf8");
             let envelope;
             try {

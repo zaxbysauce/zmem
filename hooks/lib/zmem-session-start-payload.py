@@ -311,7 +311,8 @@ def _record_ledger(ledger, data_dir, session_id, rows, block, parts, moment):
         pass
 
 
-def build_tier2_context(store_py, namespace, session_id, budget):
+def build_tier2_context(store_py, namespace, session_id, budget,
+                          context_parts=None):
     """ONE bounded `store.py recent` pull + fence + decision line + ledger.
 
     Issue #121: the pre-fix 30 s triple-retry loop is replaced by exactly one
@@ -374,7 +375,8 @@ def build_tier2_context(store_py, namespace, session_id, budget):
                         "High-confidence admin pull. Consider if relevant; "
                         "ignore if not." % namespace))
             if block:
-                _record_ledger(ledger, data_dir, session_id, rows, block, [], "session_start")
+                _record_ledger(ledger, data_dir, session_id, rows, block,
+                                context_parts or [], "session_start")
                 return block
         return ""
     except Exception:
@@ -382,7 +384,7 @@ def build_tier2_context(store_py, namespace, session_id, budget):
 
 
 def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
-                  exclude_argv, recent_floor):
+                  exclude_argv, recent_floor, context_parts=None):
     """Issue #118 SessionStart(source=compact): query-aware recall rebuilt
     from the compact sidecar. Retry structure and stash semantics are #118's
     owned surface, kept intact here; only the subprocess timeout moved to
@@ -463,7 +465,8 @@ def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
                     "and the pre-compaction deliveries of this session. "
                     "Consider if they apply; ignore if not." % namespace))
         if block:
-            _record_ledger(ledger, data_dir, session_id, rows, block, [], moment)
+            _record_ledger(ledger, data_dir, session_id, rows, block,
+                            context_parts or [], moment)
             return block, moment
     # Zero-row compact recall must not leave the moment silent (the #113
     # relevance gate may legitimately drop everything) — fall back to the
@@ -489,8 +492,8 @@ def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
                         "High-confidence admin pull. Consider if relevant; "
                         "ignore if not." % namespace))
             if block:
-                _record_ledger(ledger, data_dir, session_id, rows, block, [],
-                               "session_start")
+                _record_ledger(ledger, data_dir, session_id, rows, block,
+                                context_parts or [], "session_start")
                 return block, "session_start"
     except Exception:
         pass
@@ -685,9 +688,12 @@ def main():
         if source == "compact" and session_id and ledger is not None:
             tier2_block, _ = _compact_lane(
                 store_py, ns, session_id, ledger, data_dir_known,
-                exclude_argv, recent_floor)
+                exclude_argv, recent_floor,
+                context_parts=[p for p in [tier0] if p])
         if not tier2_block:
-            tier2_block = build_tier2_context(store_py, ns, session_id, budget)
+            tier2_block = build_tier2_context(
+                store_py, ns, session_id, budget,
+                context_parts=[p for p in [tier0] if p])
 
     # Promotion candidates (non-blocking, one-line suggestion) — a store
     # subprocess by design; it runs AFTER envelope 1 so Tier 0 is never

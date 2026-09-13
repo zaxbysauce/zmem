@@ -158,24 +158,35 @@ _store_timeout_warned = False
 
 def _store_timeout_s() -> float:
     """Store-recall subprocess cap (issue #121): ZMEM_STORE_RECALL_TIMEOUT_S
-    as a finite positive float, default 8.0. Non-finite, non-positive, and
-    values above 8.0 all use 8.0; each deviation warns exactly once per
-    process. Values below 8.0 are honored (operator headroom control)."""
+    as a finite positive float, default 8.0. Unparseable, non-finite,
+    non-positive, and values above 8.0 all use 8.0; each deviation warns
+    exactly once per process (warning parity with the SessionStart payload
+    reader). Values below 8.0 are honored (operator headroom)."""
     global _store_timeout_warned
-    value = _floor("ZMEM_STORE_RECALL_TIMEOUT_S", 8.0)
-    if value <= 0 or value > 8.0:
-        if not _store_timeout_warned:
-            _store_timeout_warned = True
-            try:
-                sys.stderr.write(
-                    "zmem: invalid ZMEM_STORE_RECALL_TIMEOUT_S=%r; using 8.0\n"
-                    % (os.environ.get("ZMEM_STORE_RECALL_TIMEOUT_S", ""),))
-            except Exception:
-                pass
-        value = 8.0
+    raw = os.environ.get("ZMEM_STORE_RECALL_TIMEOUT_S", "")
+    value = 8.0
+    warned = False
+    if raw.strip():
+        try:
+            candidate = float(raw)
+        except ValueError:
+            candidate = None
+        if (candidate is None or candidate != candidate
+                or candidate in (float("inf"), float("-inf"))
+                or candidate <= 0 or candidate > 8.0):
+            value = 8.0
+            warned = True
+        else:
+            value = candidate
+    if warned and not _store_timeout_warned:
+        _store_timeout_warned = True
+        try:
+            sys.stderr.write(
+                "zmem: invalid ZMEM_STORE_RECALL_TIMEOUT_S=%r; using 8.0\n"
+                % (raw,))
+        except Exception:
+            pass
     return value
-
-
 def _recent_floor(store_py: str) -> float:
     sm = _load_schema_meta(store_py)
     if sm is not None:

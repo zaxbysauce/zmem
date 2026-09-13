@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -181,6 +182,101 @@ class SessionStartTimeoutTest(unittest.TestCase):
         line = decisions.read_text(encoding="utf-8")
         self.assertIn("reason=omitted", line)
         self.assertIn("store_timeout=1", line)
+
+
+
+class LedgerOverBudgetScopingTest(unittest.TestCase):
+    """Final-critic RC-FC1 (issue #151 parity): when Tier 0 + Tier 2 exceed
+    ZMEM_CTX_BUDGET, rows trimmed out of the delivered block must NOT be
+    recorded as delivered — otherwise they are suppressed at every later
+    moment of the session without the model ever seeing them."""
+
+    def _load_payload_module(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ss_payload_mod", PAYLOAD)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_record_ledger_scopes_against_the_assembled_prefix(self):
+        mod = self._load_payload_module()
+        recorded = []
+
+        class FakeLedger:
+            @staticmethod
+            def rows_present_in(rows, rendered):
+                return [r for r in rows if r["id"] in rendered]
+
+            @staticmethod
+            def record(data_dir, session_id, rows, moment):
+                recorded.append(list(rows))
+
+        rows = [{"id": "r1", "text": "row one"}]
+        block = "z" * 200 + "[r1]" + "z" * 100
+        with unittest.mock.patch.dict(os.environ, {"ZMEM_CTX_BUDGET": "300"}):
+            mod._record_ledger(FakeLedger, "/nonexistent", "sid-fc1", rows,
+                               block, ["x" * 200], "session_start")
+        self.assertEqual(recorded, [],
+                         "a row cut out of the delivered block must not be "
+                         "recorded as delivered (Tier 0 in the projection)")
+        # Contrast: the regression shape (empty parts) treats the row as
+        # delivered because the slice reaches it.
+        with unittest.mock.patch.dict(os.environ, {"ZMEM_CTX_BUDGET": "300"}):
+            mod._record_ledger(FakeLedger, "/nonexistent", "sid-fc1", rows,
+                               block, [], "session_start")
+        self.assertEqual([r["id"] for r in recorded[0]], ["r1"],
+                         "the empty-parts projection shape is the regression "
+                         "the final critic caught")
+
+    def test_build_tier2_threads_context_parts_into_the_recording(self):
+        mod = self._load_payload_module()
+        captured = []
+
+        real_record = mod._record_ledger
+
+        def spy_record(ledger, data_dir, session_id, rows, block, parts, moment):
+            captured.append(list(parts))
+            return real_record(ledger, data_dir, session_id, rows, block,
+                               parts, moment)
+
+        mod._record_ledger = spy_record
+        try:
+            base, data = None, None
+            scratch = Path(tempfile.mkdtemp(prefix="zmem-121-fc1-"))
+            self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+            (scratch / "store.py").write_text(NL.join(STUB_LINES) + NL,
+                                              encoding="utf-8", newline=NL)
+            data = scratch / "data"
+            data.mkdir()
+
+            class FakeLedger:
+                cap = staticmethod(lambda: 200)
+                delivered_ids = staticmethod(lambda dd, sid: [])
+
+            mod._ledger_module = lambda store_py: FakeLedger
+            mod._import_renderer = lambda store_py: (lambda rows, header="": "z" * 200 + "[r1]" + "z" * 100)
+            env = dict(os.environ)
+            env.update(BASE_ENV)
+            env.update({"ZMEM_STORE": str(data / "store.sqlite"),
+                        "ZMEM_DATA": str(data), "ZMEM_INJECT": "1",
+                        "SS_STUB_MODE": "ok",
+                        "SS_STUB_LOG": str(scratch / "stub.log")})
+            with unittest.mock.patch.dict(os.environ, {"ZMEM_STORE": str(data / "store.sqlite"),
+                                                       "ZMEM_DATA": str(data),
+                                                       "ZMEM_INJECT": "1",
+                                                       "ZMEM_CTX_BUDGET": "25000",
+                                                       "SS_STUB_MODE": "ok",
+                                                       "SS_STUB_LOG": str(scratch / "stub.log")}):
+                block = mod.build_tier2_context(
+                    str(scratch / "store.py"), "project:fixture/zmem",
+                    "sid-fc1b", 25000, context_parts=["TIER0-PREFIX" * 40])
+            self.assertTrue(captured, "the ledger recording must have run")
+            self.assertTrue(all(p and p[0].startswith("TIER0-PREFIX")
+                                for p in captured),
+                            "the Tier 0 prefix must be threaded into the "
+                            "projection (context_parts)")
+        finally:
+            mod._record_ledger = real_record
 
 
 if __name__ == "__main__":
