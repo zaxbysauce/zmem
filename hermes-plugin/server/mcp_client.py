@@ -152,7 +152,7 @@ def main() -> int:
         arguments: dict = {}
         if args.namespace:
             arguments["namespace"] = args.namespace
-        if args.lane is not None:
+        if args.tool == "session_start" and args.lane is not None:
             arguments["lane"] = args.lane
         try:
             text = asyncio.run(_call(args.url, token, args.tool, arguments))

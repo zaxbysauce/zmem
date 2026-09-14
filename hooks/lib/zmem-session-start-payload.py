@@ -399,7 +399,6 @@ def _decision_line(rows, extras, moment, session_id, pull_ran,
     # Issue #153: attribution is emitted atomically only when the host lane,
     # manifest semver, and nonnegative attempt duration are all valid.  Keep
     # the exact insertion point after moment and before additive tails.
-    attr = ""
     attr = _format_attribution(lane, version, t_ms)
     return ("[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=%s%s%s%s\n" % (
         int(__import__("time").time()), status, reason, ids, all_ids, tok, exc,

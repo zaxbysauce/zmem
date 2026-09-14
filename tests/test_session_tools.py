@@ -664,6 +664,39 @@ class HermesMcpClientTest(unittest.TestCase):
         self.assertEqual(seen["arguments"], {
             "lane": "hermes-compat", "namespace": "project:compat"})
 
+    def test_client_omits_lane_for_non_session_tools(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "zmem_mcp_client_non_session_test", SERVER_DIR / "mcp_client.py")
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+        seen = {}
+
+        async def fake_call(url, token, tool, arguments):
+            seen.update(url=url, token=token, tool=tool, arguments=arguments)
+            return "search-context"
+
+        saved_argv = sys.argv
+        saved_token = os.environ.get("ZMEM_MCP_TOKEN")
+        try:
+            os.environ["ZMEM_MCP_TOKEN"] = "client-test-token"
+            sys.argv = [str(SERVER_DIR / "mcp_client.py"),
+                        "--url", "http://127.0.0.1:8765/mcp", "call",
+                        "search", "--lane", "hermes-compat",
+                        "--namespace", "project:compat"]
+            with mock.patch.object(mod, "_call", side_effect=fake_call):
+                self.assertEqual(mod.main(), 0)
+        finally:
+            sys.argv = saved_argv
+            if saved_token is None:
+                os.environ.pop("ZMEM_MCP_TOKEN", None)
+            else:
+                os.environ["ZMEM_MCP_TOKEN"] = saved_token
+        self.assertEqual(seen["tool"], "search")
+        self.assertEqual(seen["arguments"], {"namespace": "project:compat"})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

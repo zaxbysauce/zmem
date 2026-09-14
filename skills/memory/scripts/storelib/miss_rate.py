@@ -250,7 +250,14 @@ def parse_bg_log(path) -> list:
                         or not re.fullmatch(r"\d+", t_ms_raw)
                         or (lane is not None and lane not in _ATTR_LANES)):
                     continue
-                t_ms = int(t_ms_raw)
+                try:
+                    t_ms = int(t_ms_raw)
+                except ValueError:
+                    # ``\d+`` admits arbitrarily long decimal strings.  On
+                    # Python versions with a max-digit conversion limit an
+                    # oversized value raises here; malformed log input must
+                    # never abort the report parser.
+                    continue
             else:
                 # A syntactically captured optional group should not be
                 # possible without the token detector, but make the returned

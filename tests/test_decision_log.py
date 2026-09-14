@@ -528,30 +528,93 @@ class DecisionLogAttributionTest(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_production_manifest_resolution_and_legacy_fallback(self):
+        """The real hook writer follows served-tree/home manifests safely."""
+        ns = "project:manifest-153"
+        with tempfile.TemporaryDirectory(prefix="zmem-153-manifest-") as tmp:
+            seed_env = _clean_env(tmp)
+            _seed(seed_env, ns,
+                  "manifest canary: git stash pop conflicts need stash drop")
+
+            served = Path(tmp) / "served"
+            body_path = served / "hooks" / "lib" / "zmem-recall-body.py"
+            body_path.parent.mkdir(parents=True)
+            shutil.copyfile(BODY, body_path)
+            primary = served / "release-manifest.json"
+            alternate = Path(tmp) / "alternate-home"
+            alternate.mkdir()
+            alternate_manifest = alternate / "release-manifest.json"
+
+            def run_case(name, primary_text=None, alternate_text=None):
+                if primary_text is None:
+                    primary.unlink(missing_ok=True)
+                else:
+                    primary.write_text(primary_text, encoding="utf-8")
+                if alternate_text is None:
+                    alternate_manifest.unlink(missing_ok=True)
+                else:
+                    alternate_manifest.write_text(alternate_text,
+                                                  encoding="utf-8")
+                env = _clean_env(
+                    tmp, ZMEM_HOST="claude", ZMEM_HOME=str(alternate))
+                r = subprocess.run(
+                    [sys.executable, str(body_path), str(SCRIPTS / "store.py"),
+                     ns, "25000", "user_prompt"],
+                    input=json.dumps({
+                        "prompt": "manifest canary git stash pop",
+                        "session_id": "manifest-" + name}),
+                    capture_output=True, text=True, env=env, timeout=120)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                lines = _decision_lines(tmp)
+                self.assertTrue(lines, name)
+                return lines[-1]
+
+            valid = run_case("valid", '{"version":"9.8.7"}')
+            self.assertRegex(valid,
+                             r" lane=claude ver=9\.8\.7 t_ms=\d+(?: |$)")
+
+            alternate_line = run_case(
+                "alternate", "{not json", '{"version":"8.7.6"}')
+            self.assertRegex(alternate_line,
+                             r" lane=claude ver=8\.7\.6 t_ms=\d+(?: |$)")
+
+            malformed = run_case("malformed", "{not json")
+            self.assertNotRegex(malformed, r"\b(?:lane|ver|t_ms)=")
+
+            missing = run_case("missing")
+            self.assertNotRegex(missing, r"\b(?:lane|ver|t_ms)=")
+
     def test_five_lane_fixture(self):
-        expected_path = REPO_ROOT / "tests" / "fixtures" / "decisions" / "five-lanes.expected.json"
-        generator = REPO_ROOT / "tests" / "fixtures" / "decisions" / "generate_five_lanes.py"
-        self.assertTrue(generator.is_file(), "five-lane generator is required")
-        self.assertTrue(expected_path.is_file(), "five-lane expected JSON is required")
+        fixture_dir = REPO_ROOT / "tests" / "fixtures" / "decisions"
+        expected_path = fixture_dir / "five-lanes.expected.json"
+        committed_log = fixture_dir / "five-lanes.log"
+        generator_path = fixture_dir / "generate_five_lanes.py"
+        self.assertTrue(generator_path.is_file(),
+                        "five-lane generator is required")
+        self.assertTrue(expected_path.is_file(),
+                        "five-lane expected JSON is required")
+        self.assertTrue(committed_log.is_file(),
+                        "five-lane log is required")
+
+        # Run the real generator into a temporary directory.  The committed
+        # artifacts are then checked byte-for-byte without mutating the repo.
+        spec = importlib.util.spec_from_file_location(
+            "zmem_five_lane_generator", generator_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix="zmem-153-fixture-test-") as tmp:
+            generated_log = Path(tmp) / "five-lanes.log"
+            generated_expected = Path(tmp) / "five-lanes.expected.json"
+            module.generate(generated_log, generated_expected)
+            self.assertEqual(generated_log.read_bytes(), committed_log.read_bytes())
+            self.assertEqual(generated_expected.read_bytes(),
+                             expected_path.read_bytes())
+
         payload = json.loads(expected_path.read_text(encoding="utf-8"))
-        def find_rows(value):
-            if isinstance(value, list):
-                if len(value) == 20 and all(isinstance(item, dict) for item in value):
-                    return value
-                for item in value:
-                    found = find_rows(item)
-                    if found is not None:
-                        return found
-            elif isinstance(value, dict):
-                for item in value.values():
-                    found = find_rows(item)
-                    if found is not None:
-                        return found
-            return None
-        rows = find_rows(payload)
-        self.assertIsNotNone(rows, "expected JSON must expose a 20-row matrix")
+        rows = payload["matrix"]
         self.assertEqual(len(rows), 20)
-        pairs = [(row.get("lane"), row.get("moment")) for row in rows]
+        pairs = [(row["lane"], row["moment"]) for row in rows]
         self.assertEqual(pairs, sorted(pairs))
         self.assertEqual(len(set(pairs)), 20)
 
@@ -633,7 +696,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=injected", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?(?: arms=\S+)?$")  # issue #136/#153 additive tails
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?$")  # issue #136/#153 additive tails
 
     def test_pretool_mode_moment(self):
         _run_body(self._tmp, "pretool",
@@ -641,7 +704,7 @@ class MomentFieldBodyTest(_SeededStore):
                    "tool_input": {"command": "git stash pop"}},
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
-        self.assertRegex(line, r" sid=\S+ moment=pretool(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?(?: arms=\S+)?$")  # issue #136/#153
+        self.assertRegex(line, r" sid=\S+ moment=pretool(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?$")  # issue #136/#153
 
     def test_kill_switch_body_line_carries_mode_moment(self):
         _run_body(self._tmp, "user_prompt",
@@ -649,7 +712,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns, ZMEM_INJECT="0")
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=silent reason=disabled", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?(?: arms=\S+)?$")  # issue #136/#153
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?$")  # issue #136/#153
 
 
 class MomentFieldSessionStartTest(unittest.TestCase):
@@ -704,7 +767,7 @@ class MomentFieldSessionStartTest(unittest.TestCase):
         self.assertEqual(r.returncode == 0, True, r.stderr[-800:])
         lines = _decision_lines(self._tmp)
         self.assertTrue(lines, "session-start decision line missing")
-        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?(?: arms=\S+)?$")  # issue #136/#153
+        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start lane=zcode ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?$")  # issue #136/#153
 
     def test_kill_switch_line_carries_session_start_moment(self):
         # The kill-switch block resolves the sid from the env chain (the
@@ -716,7 +779,7 @@ class MomentFieldSessionStartTest(unittest.TestCase):
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("status=silent reason=disabled", lines[0])
         self.assertIn(" sid=sess-ss129", lines[0])
-        self.assertRegex(lines[0], r" moment=session_start(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?$")
+        self.assertRegex(lines[0], r" moment=session_start lane=zcode ver=\d+\.\d+\.\d+ t_ms=\d+$")
 
     def test_kill_switch_rotates_over_cap_decisions_log(self):
         # Review PRR-005 (session-start site): the kill-switch block used

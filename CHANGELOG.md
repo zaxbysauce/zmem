@@ -66,6 +66,7 @@ README.
   `user:global` — never a path-shaped namespace, so a transient Git
   failure can no longer strand captured memories under a path namespace
   nothing resolves.
+
 > Workstream G PR 1 of 5 (issue #153): host-lane attribution and an
 > already-delivered reason in the decision log.
 

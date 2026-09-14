@@ -253,6 +253,13 @@ class MissRateMomentTest(unittest.TestCase):
         self.assertIsNone(parsed[1]["ver"])
         self.assertIsNone(parsed[1]["t_ms"])
 
+    def test_parser_skips_oversized_timing_without_raising(self):
+        # Python 3.11 rejects int() conversion above its max-digit limit;
+        # malformed decision-log input must remain a skipped line.
+        parsed = self._parse(_enriched_bg_line(
+            1, ["oversized"], lane="claude", t_ms="9" * 5000))
+        self.assertEqual(parsed, [])
+
     def test_lane_less_enriched_line_is_aggregate_only(self):
         parsed = self._parse(_enriched_bg_line(
             1, ["lane-less"], lane=None, moment="user_prompt"))

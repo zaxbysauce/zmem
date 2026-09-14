@@ -302,7 +302,8 @@ def _rotate_decision_log(data_dir: Path) -> None:
 def _append_session_decision(*, status: str, reason: str, ids: list[Any],
                              all_ids: list[Any], omitted: int = 0,
                              excluded: int = 0, session_id: str = "",
-                             moment: str = "session_start", lane: str = "",
+                             moment: str = "session_start",
+                             lane: Optional[str] = None,
                              t_ms: int = 0) -> None:
     """Append the local Hermes SessionStart decision line, fail-open.
 
