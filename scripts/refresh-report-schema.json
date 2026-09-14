@@ -1,0 +1,281 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "checkout": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "gitCommitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "hosts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/definitions/hostRecord"
+      },
+      "oneOf": [
+        {
+          "minItems": 1,
+          "maxItems": 1,
+          "items": [
+            {
+              "$ref": "#/definitions/codexHost"
+            }
+          ],
+          "additionalItems": false
+        },
+        {
+          "minItems": 1,
+          "maxItems": 1,
+          "items": [
+            {
+              "$ref": "#/definitions/claudeHost"
+            }
+          ],
+          "additionalItems": false
+        },
+        {
+          "minItems": 1,
+          "maxItems": 1,
+          "items": [
+            {
+              "$ref": "#/definitions/zcodeHost"
+            }
+          ],
+          "additionalItems": false
+        },
+        {
+          "minItems": 2,
+          "maxItems": 2,
+          "items": [
+            {
+              "$ref": "#/definitions/codexHost"
+            },
+            {
+              "$ref": "#/definitions/claudeHost"
+            }
+          ],
+          "additionalItems": false
+        },
+        {
+          "minItems": 2,
+          "maxItems": 2,
+          "items": [
+            {
+              "$ref": "#/definitions/codexHost"
+            },
+            {
+              "$ref": "#/definitions/zcodeHost"
+            }
+          ],
+          "additionalItems": false
+        },
+        {
+          "minItems": 2,
+          "maxItems": 2,
+          "items": [
+            {
+              "$ref": "#/definitions/claudeHost"
+            },
+            {
+              "$ref": "#/definitions/zcodeHost"
+            }
+          ],
+          "additionalItems": false
+        },
+        {
+          "minItems": 3,
+          "maxItems": 3,
+          "items": [
+            {
+              "$ref": "#/definitions/codexHost"
+            },
+            {
+              "$ref": "#/definitions/claudeHost"
+            },
+            {
+              "$ref": "#/definitions/zcodeHost"
+            }
+          ],
+          "additionalItems": false
+        }
+      ]
+    },
+    "mismatchCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ok": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "checkout",
+    "version",
+    "gitCommitSha",
+    "hosts",
+    "mismatchCount",
+    "ok"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "mismatchCount": {
+            "const": 0
+          },
+          "hosts": {
+            "items": {
+              "properties": {
+                "mismatches": {
+                  "const": []
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "mismatchCount": {
+            "minimum": 1
+          }
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "sha256OrNull": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "hostRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string",
+          "enum": [
+            "codex",
+            "claude",
+            "zcode"
+          ]
+        },
+        "cacheRoot": {
+          "type": "string",
+          "minLength": 1
+        },
+        "registryPath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "marketplacePaths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "beforeDigest": {
+          "$ref": "#/definitions/sha256OrNull"
+        },
+        "afterDigest": {
+          "$ref": "#/definitions/sha256OrNull"
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mismatches": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "host",
+        "cacheRoot",
+        "registryPath",
+        "marketplacePaths",
+        "beforeDigest",
+        "afterDigest",
+        "status",
+        "mismatches"
+      ]
+    },
+    "codexHost": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/hostRecord"
+        },
+        {
+          "properties": {
+            "host": {
+              "const": "codex"
+            }
+          }
+        }
+      ]
+    },
+    "claudeHost": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/hostRecord"
+        },
+        {
+          "properties": {
+            "host": {
+              "const": "claude"
+            }
+          }
+        }
+      ]
+    },
+    "zcodeHost": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/hostRecord"
+        },
+        {
+          "properties": {
+            "host": {
+              "const": "zcode"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

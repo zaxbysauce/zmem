@@ -54,6 +54,13 @@ jobs:
         with:
           python-version: "3.11"
 
+      # The refresh-report schema is a release contract.  Install its
+      # validator explicitly so the schema assertions in the Python suites
+      # cannot silently take the optional-dependency skip path.
+      - name: Install report schema validator
+        shell: bash
+        run: python -m pip install --disable-pip-version-check "jsonschema>=4,<5"
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:

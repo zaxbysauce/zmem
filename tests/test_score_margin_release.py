@@ -1,9 +1,11 @@
 """Acceptance checks for issue #182's release surfaces (AC7).
 
-These checks intentionally pin the seven host-facing manifests, the dated
-release note, and the generated release manifest to the next unused minor
-release.  The release manifest is trusted only when the existing release gate
-verifies it successfully; this test never regenerates it as a side effect.
+These checks intentionally pin the seven host-facing manifests and the
+generated release manifest to the next unused minor release.  The score-margin
+release note remains pinned to its historical 0.34.0 section after the host
+refresh release advances the current release identity to 0.36.0.  The release
+manifest is trusted only when the existing release gate verifies it
+successfully; this test never regenerates it as a side effect.
 """
 
 from __future__ import annotations
@@ -18,10 +20,11 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = "0.35.0"
-_EXPECTED_VERSION_RE = re.escape(EXPECTED_VERSION)
+EXPECTED_VERSION = "0.36.0"
+SCORE_MARGIN_VERSION = "0.34.0"
+_SCORE_MARGIN_VERSION_RE = re.escape(SCORE_MARGIN_VERSION)
 RELEASE_SECTION_RE = re.compile(
-    rf"^## \[{_EXPECTED_VERSION_RE}\][^\n]*[-—]\s*(\d{{4}}-\d{{2}}-\d{{2}})\s*$",
+    rf"^## \[{_SCORE_MARGIN_VERSION_RE}\][^\n]*[-—]\s*(\d{{4}}-\d{{2}}-\d{{2}})\s*$",
     re.MULTILINE,
 )
 RELEASE_GATE = REPO_ROOT / "scripts" / "release_gate.py"
@@ -60,7 +63,7 @@ class ScoreMarginReleaseAcceptanceTest(unittest.TestCase):
         match = RELEASE_SECTION_RE.search(changelog)
         self.assertIsNotNone(
             match,
-            f"CHANGELOG.md must contain a dated ## [{EXPECTED_VERSION}] release section",
+            f"CHANGELOG.md must contain a dated ## [{SCORE_MARGIN_VERSION}] release section",
         )
         assert match is not None
         # PR #198 (issue #121) merged main and took the NEXT minor: the
@@ -75,20 +78,20 @@ class ScoreMarginReleaseAcceptanceTest(unittest.TestCase):
         self.assertIn(
             "ZMEM_INJECT_MARGIN",
             body,
-            "the 0.34.0 CHANGELOG section must document the score-margin opt-in",
+            f"the {SCORE_MARGIN_VERSION} CHANGELOG section must document the score-margin opt-in",
         )
         self.assertIn(
             "score-margin",
             body.lower(),
-            "the 0.34.0 CHANGELOG section must name the score-margin feature",
+            f"the {SCORE_MARGIN_VERSION} CHANGELOG section must name the score-margin feature",
         )
         self.assertRegex(
             body.lower(),
             r"opt[- ]?in",
-            "the 0.34.0 CHANGELOG section must explain that score-margin is opt-in",
+            f"the {SCORE_MARGIN_VERSION} CHANGELOG section must explain that score-margin is opt-in",
         )
 
-    def test_release_manifest_is_034_and_verified_by_existing_gate(self):
+    def test_release_manifest_is_current_and_verified_by_existing_gate(self):
         path = REPO_ROOT / "release-manifest.json"
         self.assertTrue(path.is_file(), "release-manifest.json is required for a release")
         manifest = json.loads(path.read_text(encoding="utf-8"))

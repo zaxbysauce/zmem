@@ -55,3 +55,14 @@ self-corpus-results.json
 # zvec-grep workspace index cache (operator-machine search tool;
 # never read by repo code, regenerated locally on demand)
 .zvec-grep/
+
+# Deterministic issue #184 fixture sentinels.  These are intentionally
+# committed even though the corresponding names are normally ignored globally.
+!/tests/fixtures/hosts/checkout/graphify-out/
+!/tests/fixtures/hosts/checkout/graphify-out/**
+!/tests/fixtures/hosts/checkout/scripts/__pycache__/
+!/tests/fixtures/hosts/checkout/scripts/__pycache__/**
+!/tests/fixtures/hosts/home/.zcode/
+!/tests/fixtures/hosts/home/.zcode/**
+!/tests/fixtures/hosts/checkout/scripts/ignored.pyc
+!/tests/fixtures/hosts/checkout/scripts/ignored.pyo

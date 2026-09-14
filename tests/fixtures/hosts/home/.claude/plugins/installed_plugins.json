@@ -1,0 +1,67 @@
+{
+  "version": 2,
+  "plugins": {
+    "other@official": [
+      {
+        "scope": "user",
+        "installPath": "C:/operator/other",
+        "version": "9.9.9",
+        "gitCommitSha": "ffffffffffffffffffffffffffffffffffffffff",
+        "installedAt": "2026-01-01T00:00:00Z",
+        "lastUpdated": "2026-01-02T00:00:00Z"
+      }
+    ],
+    "zmem@legacy": [
+      {
+        "scope": "project",
+        "installPath": "C:/operator/legacy-zmem",
+        "version": "0.20.0",
+        "gitCommitSha": "dddddddddddddddddddddddddddddddddddddddd",
+        "installedAt": "2025-12-01T00:00:00Z",
+        "lastUpdated": "2025-12-02T00:00:00Z"
+      }
+    ],
+    "zmem@zmem": [
+      {
+        "scope": "user",
+        "installPath": "C:/operator/old-zmem",
+        "version": "0.32.0",
+        "gitCommitSha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "installedAt": "2026-01-01T00:00:00Z",
+        "lastUpdated": "2026-01-02T00:00:00Z",
+        "extraRecordKey": "preserve-user-record"
+      },
+      {
+        "scope": "project",
+        "installPath": "C:/operator/project-zmem",
+        "version": "0.32.0",
+        "gitCommitSha": "cccccccccccccccccccccccccccccccccccccccc",
+        "installedAt": "2026-02-01T00:00:00Z",
+        "lastUpdated": "2026-02-02T00:00:00Z",
+        "extraRecordKey": "preserve-project-record"
+      }
+    ],
+    "other@team": [
+      {
+        "scope": "team",
+        "installPath": "C:/operator/team",
+        "version": "8.8.8",
+        "gitCommitSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "installedAt": "2026-03-01T00:00:00Z"
+      }
+    ]
+  },
+  "metadata": {
+    "keep": true,
+    "scopes": [
+      "user",
+      "project",
+      "team"
+    ],
+    "source": "fixture"
+  },
+  "extraZmemKey": {
+    "name": "zmem@extra",
+    "value": "must-remain-unmodified"
+  }
+}

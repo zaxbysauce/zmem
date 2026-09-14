@@ -1,0 +1,9 @@
+{
+  "name": "zmem-agents",
+  "plugins": [
+    {
+      "name": "zmem",
+      "version": "0.36.0"
+    }
+  ]
+}
