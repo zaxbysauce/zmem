@@ -1030,8 +1030,16 @@ class NamespaceCacheTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="zmem-ns-cache-")
         self.addCleanup(self._tmp.cleanup)
         self.data_dir = Path(self._tmp.name) / "data"
+        # Pin BOTH ZMEM_STORE and ZMEM_DATA: _resolve_data_dir() prefers an
+        # explicit ZMEM_STORE's parent (PR #199 review F1), so a test run
+        # under an ambient ZMEM_STORE (e.g. the frozen C8 check's env) would
+        # otherwise write the cache beside that store while assertions read
+        # self.data_dir — non-hermetic (crank-proven failure).
         self.patcher = mock.patch.dict(
-            os.environ, {"ZMEM_DATA": str(self.data_dir)}, clear=False
+            os.environ,
+            {"ZMEM_STORE": str(self.data_dir / "store.sqlite"),
+             "ZMEM_DATA": str(self.data_dir)},
+            clear=False,
         )
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
