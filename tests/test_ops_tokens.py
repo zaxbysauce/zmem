@@ -197,7 +197,11 @@ class RingTest(unittest.TestCase):
             ok = ops_tokens.append_ops_ring(
                 tmp, "sess-1", "Bash", "git stash pop --quiet 'hunter2 pw'")
             self.assertTrue(ok)
-            raw = Path(tmp, "ops", "sess-1.log").read_text(encoding="utf-8")
+            # Issue #122: ring sidecars are named by hashing the COMPLETE
+            # session id — always locate them through the module's own path
+            # helper instead of hardcoding "<sid>.log".
+            raw = Path(ops_tokens._ring_path(tmp, "sess-1")).read_text(
+                encoding="utf-8")
             # The RAW command never lands on disk: flags, quotes, and the
             # out-of-window argument word are all absent.
             self.assertNotIn("hunter2", raw)
@@ -218,8 +222,8 @@ class RingTest(unittest.TestCase):
         try:
             self.assertTrue(ops_tokens.append_ops_ring(
                 tmp, "s2", "Bash", "git stash pop"))
-            obj = json.loads(
-                Path(tmp, "ops", "s2.log").read_text(encoding="utf-8").strip())
+            obj = json.loads(Path(ops_tokens._ring_path(tmp, "s2"))
+                             .read_text(encoding="utf-8").strip())
             self.assertEqual(obj["ops"], "git stash pop")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -230,7 +234,7 @@ class RingTest(unittest.TestCase):
             self.assertFalse(
                 ops_tokens.append_ops_ring(tmp, "s", "Bash", "plainword"))
             self.assertFalse(
-                Path(tmp, "ops", "s.log").exists())
+                Path(ops_tokens._ring_path(tmp, "s")).exists())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -240,7 +244,7 @@ class RingTest(unittest.TestCase):
             self.assertEqual(ops_tokens.read_ops_ring(tmp, "no-session"), [])
             self.assertEqual(ops_tokens.read_ops_ring("", "s"), [])
             self.assertEqual(ops_tokens.read_ops_ring(tmp, ""), [])
-            ring = Path(tmp, "ops", "torn.log")
+            ring = Path(ops_tokens._ring_path(tmp, "torn"))
             ring.parent.mkdir(parents=True)
             ring.write_text(
                 '{"ops": "git push origin HEAD"}\n'
@@ -256,7 +260,7 @@ class RingTest(unittest.TestCase):
     def test_ring_capped(self):
         tmp = tempfile.mkdtemp(prefix="zmem-ops-ring-")
         try:
-            ring = Path(tmp, "ops", "cap.log")
+            ring = Path(ops_tokens._ring_path(tmp, "cap"))
             ring.parent.mkdir(parents=True)
             with open(ring, "w", encoding="utf-8") as f:
                 f.write('{"ops": "git push filler0"}\n')
@@ -293,7 +297,7 @@ class ConventionCaptureRingTest(unittest.TestCase):
         try:
             out = self._run_hook(tmp, "Bash", {"command": "git stash pop"})
             self.assertIn("<<<ZMEM_JSON>>>", out)  # hook contract intact
-            ring = Path(tmp, "ops", "sess-cap.log")
+            ring = Path(ops_tokens._ring_path(tmp, "sess-cap"))
             self.assertTrue(ring.is_file(), "ring line must be written")
             body = ring.read_text(encoding="utf-8")
             self.assertNotIn("hush", body)
@@ -322,8 +326,9 @@ class ConventionCaptureRingTest(unittest.TestCase):
                 capture_output=True, text=True, env=env, timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("<<<ZMEM_JSON>>>", r.stdout)
-            self.assertFalse(Path(tmp, "ops", "sess-cap.log").exists(),
-                             "no ring line may be written for a corrupt event")
+            self.assertFalse(
+                Path(ops_tokens._ring_path(tmp, "sess-cap")).exists(),
+                "no ring line may be written for a corrupt event")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -346,8 +351,9 @@ class ConventionCaptureRingTest(unittest.TestCase):
                 input=event, capture_output=True, text=True, env=env, timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("<<<ZMEM_JSON>>>", r.stdout)
-            self.assertFalse(Path(tmp, "ops", "sess-cap.log").exists(),
-                             "kill switch must stop ring collection")
+            self.assertFalse(
+                Path(ops_tokens._ring_path(tmp, "sess-cap")).exists(),
+                "kill switch must stop ring collection")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -368,8 +374,9 @@ class ConventionCaptureRingTest(unittest.TestCase):
                 input=event, capture_output=True, text=True, env=env,
                 timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertFalse(Path(tmp, "ops", "sess-cap.log").exists(),
-                             "the case gate must skip non-convention tools")
+            self.assertFalse(
+                Path(ops_tokens._ring_path(tmp, "sess-cap")).exists(),
+                "the case gate must skip non-convention tools")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -380,7 +387,7 @@ class ConventionCaptureRingTest(unittest.TestCase):
                 tmp, "Edit",
                 {"file_path": "src/lib/pr-workflow-gate.ts",
                  "old_string": "a", "new_string": "b"})
-            ring = Path(tmp, "ops", "sess-cap.log")
+            ring = Path(ops_tokens._ring_path(tmp, "sess-cap"))
             self.assertTrue(ring.is_file())
             obj = json.loads(ring.read_text(encoding="utf-8").strip())
             self.assertEqual(obj["ops"], "pr-workflow-gate.ts")
@@ -411,8 +418,9 @@ class HermesConventionRingTest(unittest.TestCase):
                 timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), "{}")
-            self.assertFalse(Path(tmp, "ops", "s-ks.log").exists(),
-                             "kill switch must stop Hermes ring collection")
+            self.assertFalse(
+                Path(ops_tokens._ring_path(tmp, "s-ks")).exists(),
+                "kill switch must stop Hermes ring collection")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -422,7 +430,7 @@ class HermesConventionRingTest(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="zmem-ops-hermes-prec-")
         env = _clean_env(tmp, ZMEM_HOME=str(REPO_ROOT))
         try:
-            ring = Path(tmp, "ops", "s-prec.log")
+            ring = Path(ops_tokens._ring_path(tmp, "s-prec"))
             payload = json.dumps({
                 "session_id": "s-prec",
                 "tool_input": {"command": "git stash pop"},
@@ -471,7 +479,7 @@ class HermesConventionRingTest(unittest.TestCase):
                 timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), "{}")
-            ring = Path(tmp, "ops", "sess-hermes.log")
+            ring = Path(ops_tokens._ring_path(tmp, "sess-hermes"))
             self.assertTrue(ring.is_file(),
                             "post_tool_call must record the verb")
             obj = json.loads(ring.read_text(encoding="utf-8").strip())
@@ -504,7 +512,7 @@ class HookBodyComposeTest(unittest.TestCase):
         try:
             env = _clean_env(tmp)
             _seed(env, "project:ops-e2e", self.LESSON)
-            ring = Path(tmp, "ops", "sess-e2e.log")
+            ring = Path(ops_tokens._ring_path(tmp, "sess-e2e"))
             ring.parent.mkdir(parents=True)
             ring.write_text(
                 json.dumps({"ts": 1, "tool": "Bash", "ops": "git stash pop"}),
@@ -536,7 +544,7 @@ class HookBodyComposeTest(unittest.TestCase):
 
             # A ring cannot affect a prose-only user-prompt miss, and the
             # adapter does not report a hook-owned ops count.
-            ring2 = Path(tmp, "ops", "sess-empty2.log")
+            ring2 = Path(ops_tokens._ring_path(tmp, "sess-empty2"))
             ring2.write_text(
                 json.dumps({"ts": 2, "tool": "Bash",
                             "ops": "kubectl rollout undo"}),
@@ -623,8 +631,9 @@ class DataDirPrecedenceTest(unittest.TestCase):
             env["ZCODE_PLUGIN_DATA"] = str(plugdata)
             _seed(env, "project:prec-plug", HookBodyComposeTest.LESSON)
             self._run_writer(env, "sess-q")
-            self.assertTrue((plugdata / "ops" / "sess-q.log").is_file(),
-                            "writer must resolve the plugin-data dir")
+            self.assertTrue(
+                Path(ops_tokens._ring_path(str(plugdata), "sess-q")).is_file(),
+                "writer must resolve the plugin-data dir")
             self.assertFalse((Path(tmp) / "ops").exists(),
                              "writer must not write under the stripped "
                              "_clean_env data dir")
@@ -657,8 +666,9 @@ class DataDirPrecedenceTest(unittest.TestCase):
             env["ZCODE_PLUGIN_DATA"] = str(zcode_loc)
             _seed(env, "project:prec-order", HookBodyComposeTest.LESSON)
             self._run_writer(env, "sess-o")
-            self.assertTrue((claude_loc / "ops" / "sess-o.log").is_file(),
-                            "writer must prefer CLAUDE_PLUGIN_DATA")
+            self.assertTrue(
+                Path(ops_tokens._ring_path(str(claude_loc), "sess-o")).is_file(),
+                "writer must prefer CLAUDE_PLUGIN_DATA")
             self.assertFalse((zcode_loc / "ops").exists())
             ctx = self._run_reader(env, "project:prec-order", "sess-o")
             self.assertNotIn("ringcanary", ctx,
@@ -686,8 +696,9 @@ class DataDirPrecedenceTest(unittest.TestCase):
             env["ZCODE_PLUGIN_DATA"] = str(zcode_loc)
             _seed(env, "project:prec-zdata", HookBodyComposeTest.LESSON)
             self._run_writer(env, "sess-z")
-            self.assertTrue((data_loc / "ops" / "sess-z.log").is_file(),
-                            "writer must prefer ZMEM_DATA over plugin-data")
+            self.assertTrue(
+                Path(ops_tokens._ring_path(str(data_loc), "sess-z")).is_file(),
+                "writer must prefer ZMEM_DATA over plugin-data")
             self.assertFalse((zcode_loc / "ops").exists())
             ctx = self._run_reader(env, "project:prec-zdata", "sess-z")
             self.assertNotIn("ringcanary", ctx,
@@ -709,9 +720,10 @@ class DataDirPrecedenceTest(unittest.TestCase):
             pd_dir.mkdir(parents=True)
             _seed(env, "project:prec-tilde", HookBodyComposeTest.LESSON)
             self._run_writer(env, "sess-t", cwd=tmp)
-            self.assertTrue((pd_dir / "ops" / "sess-t.log").is_file(),
-                            "writer must expand a tilde-valued plugin-data "
-                            "var like the python readers do")
+            self.assertTrue(
+                Path(ops_tokens._ring_path(str(pd_dir), "sess-t")).is_file(),
+                "writer must expand a tilde-valued plugin-data "
+                "var like the python readers do")
             self.assertFalse((Path(tmp) / "~").exists(),
                              "a literal '~' directory must never be created "
                              "in the process cwd")
@@ -738,8 +750,9 @@ class DataDirPrecedenceTest(unittest.TestCase):
             zd_dir.mkdir(parents=True)
             _seed(env, "project:prec-tilde-zd", HookBodyComposeTest.LESSON)
             self._run_writer(env, "sess-zd", cwd=tmp)
-            self.assertTrue((zd_dir / "ops" / "sess-zd.log").is_file(),
-                            "writer must expand a tilde-valued ZMEM_DATA")
+            self.assertTrue(
+                Path(ops_tokens._ring_path(str(zd_dir), "sess-zd")).is_file(),
+                "writer must expand a tilde-valued ZMEM_DATA")
             self.assertFalse((Path(tmp) / "~").exists())
             ctx = self._run_reader(env, "project:prec-tilde-zd", "sess-zd",
                                    cwd=tmp)
@@ -788,8 +801,9 @@ class DataDirPrecedenceTest(unittest.TestCase):
             pz_dir.mkdir(parents=True)
             _seed(env, "project:prec-tilde-zs", HookBodyComposeTest.LESSON)
             self._run_writer(env, "sess-zs", cwd=tmp)
-            self.assertTrue((pz_dir / "ops" / "sess-zs.log").is_file(),
-                            "writer must expand a tilde-valued ZMEM_STORE")
+            self.assertTrue(
+                Path(ops_tokens._ring_path(str(pz_dir), "sess-zs")).is_file(),
+                "writer must expand a tilde-valued ZMEM_STORE")
             ctx = self._run_reader(env, "project:prec-tilde-zs", "sess-zs",
                                    cwd=tmp)
             self.assertNotIn("ringcanary", ctx,
@@ -941,8 +955,9 @@ class DataDirPrecedenceTest(unittest.TestCase):
                 [bash, str(REPO_ROOT / "hooks" / "zmem-convention-capture.sh")],
                 input=event, capture_output=True, text=True, env=cenv,
                 timeout=60)
-            self.assertTrue((store_dir / "ops" / "sess-p.log").is_file(),
-                            "writer must resolve ZMEM_STORE-first")
+            self.assertTrue(
+                Path(ops_tokens._ring_path(str(store_dir), "sess-p")).is_file(),
+                "writer must resolve ZMEM_STORE-first")
             self.assertFalse((data_dir / "ops").exists())
             # The user-prompt adapter deliberately does not read the ring.
             r = subprocess.run(
@@ -968,7 +983,7 @@ class HermesPrefetchComposeTest(unittest.TestCase):
             _seed(_clean_env(tmp), "project:prefetch-compose",
                   "prefetchcanary hazard: blind git stash pop applies a "
                   "foreign stash; verify git stash list first")
-            ring = Path(tmp, "ops", "sess-pf.log")
+            ring = Path(ops_tokens._ring_path(tmp, "sess-pf"))
             ring.parent.mkdir(parents=True)
             ring.write_text(
                 json.dumps({"ts": 1, "tool": "Bash", "ops": "git stash pop"}),
