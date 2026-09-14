@@ -352,6 +352,11 @@ class KillSwitchHermesReflectTest(unittest.TestCase):
     def _run(self, tmp: str, payload: dict, **extra_env: str):
         env = _clean_env(
             tmp, ZMEM_HOME=str(REPO_ROOT), ZMEM_HERMES_CORRECTIONS="1",
+            # Issue #122: the namespace is DERIVED through
+            # host.resolve_namespace when unpinned, so an unpinned run on a
+            # git checkout queues under project:* — pin it to keep the
+            # capture-side queue path deterministic for this test.
+            ZMEM_NAMESPACE="user:global",
             **extra_env)
         return subprocess.run(
             [sys.executable, str(HERMES_REFLECT)],
