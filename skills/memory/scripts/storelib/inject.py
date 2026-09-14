@@ -214,6 +214,19 @@ def inject_token_budget() -> int:
     return value if value > 0 else DEFAULT_INJECT_TOKEN_BUDGET
 
 
+def inject_recent_floor() -> float:
+    """Resolve the documented confidence floor for passive recent pulls.
+
+    The session-aware selector is the store boundary for hook/SessionStart/
+    Hermes recent delivery, so it must resolve this knob dynamically instead
+    of relying on an adapter's hard-coded CLI default.
+    """
+    env_name = getattr(_schema_meta, "INJECT_FLOOR_RECENT_ENV",
+                       "ZMEM_INJECT_FLOOR_RECENT")
+    default = getattr(_schema_meta, "INJECT_FLOOR_RECENT_DEFAULT", 0.5)
+    return _env_float(env_name, default)
+
+
 def inject_score_margin() -> float:
     """Resolve the optional score-margin threshold (issue #182)."""
     env_name = getattr(_schema_meta, "INJECT_MARGIN_ENV", "ZMEM_INJECT_MARGIN")
@@ -786,6 +799,7 @@ def select_and_budget_for_injection(
     global_limit: int = 3,
     budget_tokens: int = 1500,
     data_dir: str | None = None,
+    min_confidence: float | None = None,
 ) -> dict:
     """Select, render, account, and record one passive injection event.
 
@@ -857,6 +871,13 @@ def select_and_budget_for_injection(
         except Exception:
             pass
 
+    # Query-less passive pulls are the documented recent lane. Resolve its
+    # env-tunable floor at the store boundary, while preserving an explicit
+    # CLI/API floor (notably session-aware ``recent --min-confidence``).
+    effective_min_confidence = min_confidence
+    if not effective_query.strip() and effective_min_confidence is None:
+        effective_min_confidence = inject_recent_floor()
+
     # Validation above intentionally precedes this first ledger call.
     try:
         delivered_ids = list(ledger.delivered_ids(resolved_data, session_id))
@@ -889,6 +910,7 @@ def select_and_budget_for_injection(
             no_telemetry=True, for_injection=True,
             exclude_ids=exclusions, _capture=capture,
             _injection_budget_tokens=budget,
+            min_confidence=effective_min_confidence,
         )
         if effective_query.strip():
             kwargs["query"] = effective_query

@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "19e909eb32b18e396c2c02fb4494e3c8a54e09e92c166eb170d12c7d17e71896",
+  "digest": "7a893696eb28a65a902fca7515a1752a6d7648e1174d81fb51d13a604aa3223e",
   "files": {
     "hermes-plugin/__init__.py": "a8a9d5c1be10f08a6f5810f80da952dee4d4896f70adc71fd902924986ef6938",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -64,7 +64,7 @@
     "skills/memory/scripts/store.py": "99d721f53e8f8c2ba0df6bd60f839f44235f22d8a0dd751020cbad26b4543ffb",
     "skills/memory/scripts/storelib/__init__.py": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757",
     "skills/memory/scripts/storelib/backup.py": "d0a345f3eeb209d7946bd916492d35463f47c1840d9ac3194c8af6be84c150fc",
-    "skills/memory/scripts/storelib/cli.py": "14a5a6a2bba34027263a5c1d16963d1459049b6afde00222dd03898ec834ae30",
+    "skills/memory/scripts/storelib/cli.py": "89ea86b476351aa2cd856d93f88e2eaf27a4662ecb86a774b360541f76115719",
     "skills/memory/scripts/storelib/consolidate.py": "1e937fbfda27401057891c980b5e0c4f006035fc6c2d8bae8508697bf8157d58",
     "skills/memory/scripts/storelib/cross_encoder.py": "be9da0f236b28d38f5963a3bd1b48861c85039cee7b620543f74543fadbda4da",
     "skills/memory/scripts/storelib/delivery_ledger.py": "c3f1daa1cd2b2ae9cca2e260b2c40cad2e2fca6aa0b334ae3f0a94eb9b3d3dc2",
@@ -73,7 +73,7 @@
     "skills/memory/scripts/storelib/eval_gold.py": "a491764d3b8dc809de90d7d4ae3414782b41e86d6ea5aedefacfa3689190d313",
     "skills/memory/scripts/storelib/false_inject.py": "30969b656403bc91ae04cf0204cd473a28414c177aeef77ea0b79d5235097f40",
     "skills/memory/scripts/storelib/hygiene.py": "2aa58e727c6b0a96efeaf7ad103404b2a3916771b0a21d911ce935240be3662b",
-    "skills/memory/scripts/storelib/inject.py": "ce3df00b6efec10632dd65952ab75dae5d9ba7f0003b0797358f42b641bcc0f9",
+    "skills/memory/scripts/storelib/inject.py": "12b2527350d43a34fb39b993e964be68f9579bcf52805a26358b68ca6f69c87d",
     "skills/memory/scripts/storelib/links.py": "5bf96acb962728cfa77e2d826dd8d3f85cee979787a7cb1799940c1f68c0302d",
     "skills/memory/scripts/storelib/log_rotate.py": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055",
     "skills/memory/scripts/storelib/mine.py": "532e1e042dad30710ff9379dddfac4a2638288ea9fa683f62db5163f29053568",

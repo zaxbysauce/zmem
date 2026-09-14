@@ -30,7 +30,8 @@ from storelib.promote import promote_memory
 # importers — removing it broke that chain.
 from storelib.recall import _reembed, explain_recall, get_memory, list_memory, recall_memory, recent_memory, stats
 from storelib.inject import (INJECTION_LANES, INJECTION_MOMENTS,
-                             _injection_data_dir, inject_token_budget,
+                             _injection_data_dir, inject_recent_floor,
+                             inject_token_budget,
                              select_and_budget_for_injection)
 from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import reembed_embeddings
@@ -308,7 +309,9 @@ def main():
     p_recent = _add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
     p_recent.add_argument("--limit", type=nonnegative_int, default=5)
-    p_recent.add_argument("--min-confidence", type=float, default=0.5)
+    p_recent.add_argument("--min-confidence", type=float, default=None,
+                          help="SQL confidence floor; omitted uses the dynamic "
+                               "ZMEM_INJECT_FLOOR_RECENT floor (default 0.5)")
     p_recent.add_argument("--json", action="store_true")
     p_recent.add_argument("--no-bump", action="store_true",
                           help="suppress the retrieval_count/last_retrieved write; record "
@@ -1370,6 +1373,7 @@ def main():
                         ops_tokens=args.ops_token or None,
                         exclude_ids=args.exclude,
                         global_limit=args.global_limit,
+                        min_confidence=args.min_confidence,
                     )
                 except ValueError as exc:
                     print(f"[zmem] {exc}", file=sys.stderr)
@@ -1452,6 +1456,7 @@ def main():
                         ops_tokens=args.ops_token or None,
                         exclude_ids=args.exclude,
                         global_limit=args.global_limit,
+                        min_confidence=args.min_confidence,
                     )
                 except ValueError as exc:
                     print(f"[zmem] {exc}", file=sys.stderr)
@@ -1459,7 +1464,10 @@ def main():
                 print(json.dumps(payload, indent=2))
                 return
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
-                          min_confidence=args.min_confidence, as_json=args.json,
+                          min_confidence=(args.min_confidence
+                                          if args.min_confidence is not None
+                                          else inject_recent_floor()),
+                          as_json=args.json,
                           no_bump=args.no_bump, include_global=args.include_global,
                           global_limit=args.global_limit, as_of=args.as_of,
                           for_injection=args.for_injection,

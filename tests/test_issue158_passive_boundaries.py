@@ -191,6 +191,42 @@ class ProcessBoundaryTest(unittest.TestCase):
 
 
 class SelectorCliTest(unittest.TestCase):
+    def test_session_aware_recent_honors_min_confidence(self):
+        """The selector must preserve an explicit recent SQL floor."""
+        tmp = Path(tempfile.mkdtemp(
+            prefix=f"zmem-phase25-floor-{uuid.uuid4().hex}-"
+        ))
+        try:
+            store = _build_fixture(tmp)
+            conn = sqlite3.connect(str(store))
+            try:
+                conn.execute(
+                    "UPDATE memory SET confidence = 0.30 WHERE id = ?",
+                    (ROW_IDS[0],),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            env = _clean_env(tmp, data_dir=tmp / "data")
+            result = subprocess.run(
+                [
+                    sys.executable, str(REPO_ROOT / "skills" / "memory" /
+                                       "scripts" / "store.py"),
+                    "recent", "--namespace", NAMESPACE, "--limit", "5",
+                    "--min-confidence", "0.25", "--no-bump",
+                    "--for-injection", "--json", "--session-id",
+                    "phase25-explicit-floor", "--moment", "session_start",
+                    "--lane", "claude",
+                ],
+                capture_output=True, text=True, env=env, timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIn(ROW_IDS[0], payload["candidate_ids"])
+            self.assertIn("stash pop recovery note one", payload["rendered"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_ledger_clear_is_store_independent(self):
         tmp = Path(tempfile.mkdtemp(
             prefix=f"zmem-phase25-clear-{uuid.uuid4().hex}-"

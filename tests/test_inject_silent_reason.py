@@ -148,7 +148,7 @@ class HookBodyReasonTest(unittest.TestCase):
                   f"budgetcanary {i} probe " + "x" * 400)
         _seed(cls.env, cls.ns_happy, "happycanary grounded high-signal row")
         _seed(cls.env, cls.ns_recent,
-              "recentcanary low-signal recent row", signal="none",
+              "recentcanary grounded recent row", signal="test",
               confidence="0.30")
         # Issue #113 below-relevance fixture: a grounded, trusted row that
         # matches exactly ONE generic token of its probe prompt (see
@@ -288,17 +288,17 @@ class HookBodyReasonTest(unittest.TestCase):
         self.assertIn("omitted=3", line)
 
     def test_11_recent_mode_uses_store_recent_floor(self):
-        # #158 routes recent selection through the store-owned selector. Rows
-        # below recent_memory's confidence floor never become candidates, so
-        # the adapter records empty-pool rather than reclassifying locally.
+        # #158 routes recent selection through the store-owned selector. The
+        # documented env override must reach that store-owned SQL floor; a
+        # grounded row below the default 0.5 floor is injected only at 0.25.
         _remove_log(self._tmp)
         env = dict(self.env)
         env["ZMEM_INJECT_FLOOR_RECENT"] = "0.25"
-        out = self._run_body("recent", self.ns_recent, "ignored prompt",
+        out = self._run_body("recent", self.ns_recent, "",
                              env=env)
-        self.assertEqual(self._ctx(out), "")
+        self.assertIn("recentcanary grounded recent row", self._ctx(out))
         line = _read_last_hook_line(self._tmp)
-        self.assertIn("status=silent reason=empty-pool", line)
+        self.assertIn("status=injected reason=injected", line)
 
     def test_11b_precompact_mode_uses_store_recent_floor(self):
         # Precompact shares the store-owned recent lane and therefore has the
@@ -308,9 +308,9 @@ class HookBodyReasonTest(unittest.TestCase):
         env["ZMEM_INJECT_FLOOR_RECENT"] = "0.25"
         out = self._run_body("precompact", self.ns_recent, "ignored prompt",
                              env=env)
-        self.assertEqual(self._ctx(out), "")
+        self.assertIn("recentcanary grounded recent row", self._ctx(out))
         line = _read_last_hook_line(self._tmp)
-        self.assertIn("status=silent reason=empty-pool", line)
+        self.assertIn("status=injected reason=injected", line)
 
 
 class ClassifierUnitTests(unittest.TestCase):
