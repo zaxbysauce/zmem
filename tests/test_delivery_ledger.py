@@ -340,6 +340,9 @@ class ForInjectionGlobalScopeTest(unittest.TestCase):
     def test_sessionless_for_injection_requires_global_opt_in(self):
         for sub in ("recall", "recent"):
             without = self._run(sub, include_global=False)
+            self.assertTrue(without["results"],
+                            f"sessionless {sub} vacuity guard: the project "
+                            f"lane must still return rows without --include-global")
             self.assertNotIn(
                 "user:global", {r["namespace"] for r in without["results"]},
                 f"sessionless {sub} --for-injection must not include global rows")

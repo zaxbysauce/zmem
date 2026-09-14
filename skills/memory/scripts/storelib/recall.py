@@ -3153,6 +3153,13 @@ def recall_memory(
     _capture: dict | None = None,
     _injection_budget_tokens: int | None = None,
 ) -> list[dict]:
+    """Explicit recall entry point (UserPromptSubmit, SubagentStart,
+    and SessionStart hook surfaces share this path).
+
+    Issue #23 read-only invariant: this docstring names the hook
+    sources so a guardrail can pin the read-only contract to all of
+    them; passive delivery is owned by the selector, not here.
+    """
     # Candidate acquisition below retains the emit-time _classify_injection
     # pass in _recall_memory_impl; the shared passive details builder runs only
     # after those unsafe rows have been omitted on the no_bump path.

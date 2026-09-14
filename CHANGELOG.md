@@ -1267,7 +1267,8 @@ the ops-ring query-context lane it depends on, and the miss-rate measurement
   UserPromptSubmit body and the Hermes `prefetch` compose
   that ring into the query with the ops slice reserved INSIDE the 500-char
   cap. `ZMEM_QUERY_CONTEXT=0` kill switch (stops collection AND
-  composition); `store.py sweep` collects stale rings; decision-point gold bucket
+  composition); `ops=N` on the `zmem-bg.log`
+  line; `store.py sweep` collects stale rings; decision-point gold bucket
   (fixture rowids 65–70) asserts the #85-shaped prompts retrieve the
   hazard lessons WITH ops context and miss without it.
 - **Ops-lane dir resolution tail parity** (issue #88 follow-up): the hook

@@ -262,6 +262,20 @@ class AdapterScanTest(unittest.TestCase):
         self.assertIn("passive", doc)
         self.assertIn("canonical render", doc)
         self.assertIn("telemetry", doc)
+        # Issue #23 guardrail: recall_memory must keep naming the three hook
+        # sources the read-only contract covers (restored in the #158 rebase;
+        # the original guardrail asserted exactly this).
+        rm_doc = None
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.FunctionDef)
+                    and node.name == "recall_memory"):
+                rm_doc = ast.get_docstring(node)
+                break
+        self.assertIsNotNone(rm_doc, "recall_memory must keep a docstring")
+        for hook_source in ("UserPromptSubmit", "SubagentStart",
+                            "SessionStart"):
+            self.assertIn(hook_source, rm_doc,
+                          f"read-only invariant must name {hook_source}")
 
 
 class SurfaceTempStoreTest(unittest.TestCase):

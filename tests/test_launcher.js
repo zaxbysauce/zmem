@@ -755,7 +755,7 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
                 .filter((f) => f.endsWith(".pending"))
             : [];
         ok("pretool-recall/zcode: parks no sidecar of its own",
-            zcPending.length <= 1,
+            zcPending.length === 0,
             "found: " + JSON.stringify(zcPending));
     }
 

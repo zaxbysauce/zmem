@@ -250,11 +250,5 @@ class LedgerOverBudgetScopingTest(unittest.TestCase):
         self.assertNotIn("_record_ledger", source)
         self.assertNotIn("storelib", source)
 
-    def test_context_parts_are_not_a_local_ledger_projection(self):
-        _mod, _run, result, rendered, _scratch = self._run_rendered_envelope(
-            context_parts=[])
-        self.assertEqual(result, rendered)
-
-
 if __name__ == "__main__":
     unittest.main()

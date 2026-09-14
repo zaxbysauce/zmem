@@ -748,7 +748,7 @@ class ProviderEnvelopeTest(unittest.TestCase):
             for key in (
                 "ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
                 "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_TEST_NOW", "ZMEM_NAMESPACE",
-                "ZMEM_INJECT_TOKEN_BUDGET",
+                "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET",
             )
         }
         os.environ.update({

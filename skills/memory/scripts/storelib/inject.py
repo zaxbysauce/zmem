@@ -950,6 +950,11 @@ def select_and_budget_for_injection(
             rendered = recall_module._format_fenced_recall(
                 rows, header=header, budget_note=parsed.get("budget_note"))
         present = ledger.rows_present_in(rows, rendered)
+        # Expansion rows are rendered but deliberately NOT bumped —
+        # popularity rewards query-MATCHED rows only (recall.py bump law).
+        present = [row for row in present
+                   if not row.get("link_relation")
+                   and not row.get("_graph_arrival_only")]
         if present:
             try:
                 recall_module._bump_telemetry(

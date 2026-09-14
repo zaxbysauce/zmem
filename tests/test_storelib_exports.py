@@ -80,6 +80,7 @@ class ExportSurfaceTests(unittest.TestCase):
         # env).
         cls.tmp = tempfile.mkdtemp(prefix="zmem-export-")
         cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
 
         env = {**os.environ,
                "ZMEM_STORE": os.path.join(cls.tmp, "store.sqlite"),

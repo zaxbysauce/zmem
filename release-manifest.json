@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "78fea447ca2fa4c0dff0fb6b97d3e498414462fb0b08bc5bda143fd01624be9a",
+  "digest": "ae1f3cc2cc3e4cf6c6e89ba347d34b1c64fdc8252a6021b8e4f07674a00fa5f5",
   "files": {
     "hermes-plugin/__init__.py": "d2e60449664fe433d1b785dc5ea8722751e81208b3f26a77015817020ff39756",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -73,7 +73,7 @@
     "skills/memory/scripts/storelib/eval_gold.py": "65d5e0ddb9245d9c7cf606455c208c5c3ce3c833cfbcdb78b97cd24f5833dcad",
     "skills/memory/scripts/storelib/false_inject.py": "bdbc8ae09f4244c2a31d142307177e458ce7c99ef315bf341bbf7f50c0dfef8c",
     "skills/memory/scripts/storelib/hygiene.py": "2aa58e727c6b0a96efeaf7ad103404b2a3916771b0a21d911ce935240be3662b",
-    "skills/memory/scripts/storelib/inject.py": "b669bf2afc86aa34a8e9e5ac699198451cfa7e9be2c9a00fc889d20e80f92394",
+    "skills/memory/scripts/storelib/inject.py": "d7934eb63cd57ad83320039b79011921ad480d3e6bd1c88ca561c87ad90b74a3",
     "skills/memory/scripts/storelib/links.py": "5bf96acb962728cfa77e2d826dd8d3f85cee979787a7cb1799940c1f68c0302d",
     "skills/memory/scripts/storelib/log_rotate.py": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055",
     "skills/memory/scripts/storelib/mine.py": "532e1e042dad30710ff9379dddfac4a2638288ea9fa683f62db5163f29053568",
@@ -82,7 +82,7 @@
     "skills/memory/scripts/storelib/ops_tokens.py": "b65e1e9e86766e218224a8ad4f9e23e8b953b7d134459f478baebf0803e0939b",
     "skills/memory/scripts/storelib/organize.py": "e47b1b7d347a840bb01101b2f843561834045daf50c99e51f7ea86a750de1173",
     "skills/memory/scripts/storelib/promote.py": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022",
-    "skills/memory/scripts/storelib/recall.py": "28c9c198588cacd8ec96f5c18e79309487da2212ccbc5d4f0c8f14218276aa56",
+    "skills/memory/scripts/storelib/recall.py": "a5924004b4b3c5e4556693889356f4e637ba366980ec8705c98ca708888d8cc4",
     "skills/memory/scripts/storelib/schema.py": "f1f2b96d939bb70597ccbe081c3e965639053a55b003697924672a2264b39744",
     "skills/memory/scripts/storelib/sync.py": "0f4ec13847a83758852b33563273e840ab4ab741847e2dd0d307b7bf0e6fc8cd",
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
