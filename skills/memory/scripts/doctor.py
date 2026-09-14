@@ -2930,6 +2930,15 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
                         f" (rate {b.get('false_rate')})")
     elif not fi_degraded:
         summary += "; false-injection: no injected decision lines in the log"
+    # Issue #153: the JSON report carries the complete deterministic named
+    # lane/moment projection.  Keep the human check concise while making the
+    # presence of that projection visible; lane-less and compatibility
+    # moments remain available in report.attribution.aggregate.
+    matrix = report.get("lane_moment_matrix")
+    if isinstance(matrix, list) and len(matrix) == 20:
+        nonzero = sum(1 for row in matrix
+                      if isinstance(row, dict) and row.get("count", 0))
+        summary += f"; attribution matrix 20 cells ({nonzero} non-empty)"
     return _check("miss-rate", status, summary, report=report)
 
 

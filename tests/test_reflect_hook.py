@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -302,7 +303,6 @@ class TestSubagentReflectMessaging(unittest.TestCase):
             self.assertIn("--signal user", msg, msg)
         finally:
             os.remove(trans)
-
     def test_failures_plus_rejection(self):
         if not _BASH:
             self.skipTest("no bash")
@@ -349,6 +349,36 @@ class TestSubagentReflectMessaging(unittest.TestCase):
             self.assertEqual(_extract_ctx(raw), {}, raw)
         finally:
             os.remove(trans)
+
+
+class ReflectCompatibilityLaneTest(unittest.TestCase):
+    def test_compatibility_request_has_explicit_lane(self):
+        import importlib.util
+
+        path = REPO_ROOT / "hermes-plugin" / "hooks" / "zmem-hermes-reflect.py"
+        spec = importlib.util.spec_from_file_location("zmem_hermes_reflect_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+        saved = {key: os.environ.get(key) for key in
+                 ("ZMEM_MCP_URL", "ZMEM_MCP_NAMESPACE")}
+        try:
+            os.environ["ZMEM_MCP_URL"] = "http://127.0.0.1:8765/mcp"
+            os.environ["ZMEM_MCP_NAMESPACE"] = "project:compat"
+            completed = mock.Mock(returncode=0, stdout="compat-context\n", stderr="")
+            with mock.patch.object(mod.subprocess, "run", return_value=completed) as run:
+                self.assertEqual(mod._remote_context(), "compat-context")
+            argv = run.call_args.args[0]
+            self.assertIn("--lane", argv)
+            self.assertEqual(argv[argv.index("--lane") + 1], "hermes-compat")
+            self.assertIn("--namespace", argv)
+            self.assertEqual(argv[argv.index("--namespace") + 1], "project:compat")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":

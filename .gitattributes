@@ -7,6 +7,9 @@
 # text formats (including YAML and sentinel TXT files) LF-stable under
 # Windows autocrlf so committed bytes match the generator output.
 tests/fixtures/hosts/** text eol=lf
+# Decision-log fixtures are byte-contract inputs and must remain LF-stable on
+# Windows as well as POSIX hosts.
+tests/fixtures/decisions/*.log text eol=lf
 # Large model files via Git LFS
 *.onnx filter=lfs diff=lfs merge=lfs -text
 skills/memory/models/tokenizer.json filter=lfs diff=lfs merge=lfs -text

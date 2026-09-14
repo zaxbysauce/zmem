@@ -210,6 +210,175 @@ class ParseBgLogTest(unittest.TestCase):
         self.assertEqual(lines[2]["arms"], "fts:1/15")  # pre-#120 shape intact
 
 
+def _enriched_bg_line(ts: int, ids, *, lane=None,
+                      moment="user_prompt", version="0.36.0", t_ms=0,
+                      reason="injected", status="injected") -> str:
+    """Small fixed-shape issue #153 line helper for parser/report tests."""
+    ids = list(ids)
+    line = (f"[{ts}] zmem-hook status={status} reason={reason} ids={ids} "
+            f"all={ids} sid=fixture moment={moment}")
+    if lane is not None:
+        line += f" lane={lane}"
+    if version is not None:
+        line += f" ver={version}"
+    if t_ms is not None:
+        line += f" t_ms={t_ms}"
+    return line
+
+
+class MissRateMomentTest(unittest.TestCase):
+    """Issue #153 parser strictness and named matrix projection pins."""
+
+    def _parse(self, *lines):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "zmem-decisions.log")
+            Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return miss_rate.parse_bg_log(path)
+
+    def test_parser_refuses_partial_or_invalid_attribution(self):
+        parsed = self._parse(
+            _enriched_bg_line(1, ["valid"], lane="claude", t_ms=4),
+            _enriched_bg_line(2, ["missing"], lane="claude", version=None),
+            _enriched_bg_line(3, ["negative"], lane="claude", t_ms=-1),
+            _enriched_bg_line(4, ["float"], lane="claude", t_ms="1.5"),
+            _enriched_bg_line(5, ["unknown"], lane="other", t_ms=4),
+            _enriched_bg_line(6, ["legacy"], version=None, t_ms=None),
+        )
+        self.assertEqual([row["ids"] for row in parsed],
+                         [["valid"], ["legacy"]])
+        self.assertEqual(parsed[0]["lane"], "claude")
+        self.assertEqual(parsed[0]["ver"], "0.36.0")
+        self.assertEqual(parsed[0]["t_ms"], 4)
+        self.assertIsNone(parsed[1]["lane"])
+        self.assertIsNone(parsed[1]["ver"])
+        self.assertIsNone(parsed[1]["t_ms"])
+
+    def test_parser_skips_oversized_timing_without_raising(self):
+        # Python 3.11 rejects int() conversion above its max-digit limit;
+        # malformed decision-log input must remain a skipped line.
+        parsed = self._parse(_enriched_bg_line(
+            1, ["oversized"], lane="claude", t_ms="9" * 5000))
+        self.assertEqual(parsed, [])
+
+    def test_lane_less_enriched_line_is_aggregate_only(self):
+        parsed = self._parse(_enriched_bg_line(
+            1, ["lane-less"], lane=None, moment="user_prompt"))
+        self.assertEqual(len(parsed), 1)
+        self.assertIsNone(parsed[0]["lane"])
+        matrix = miss_rate.build_decision_matrix(parsed)
+        self.assertEqual(len(matrix), 20)
+        self.assertTrue(all(row["count"] == 0 for row in matrix))
+        aggregate = miss_rate._attribution_aggregate(parsed)
+        self.assertEqual(aggregate["lane_less"], 1)
+
+    def test_session_start_compact_is_aggregate_only(self):
+        parsed = self._parse(_enriched_bg_line(
+            1, ["compact"], lane="claude", moment="session_start_compact"))
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["moment"], "session_start_compact")
+        matrix = miss_rate.build_decision_matrix(parsed)
+        self.assertTrue(all(row["count"] == 0 for row in matrix))
+        aggregate = miss_rate._attribution_aggregate(parsed)
+        self.assertEqual(aggregate["moments_outside_matrix"], 1)
+
+    def test_sparse_zero_fill_matrix(self):
+        parsed = self._parse(_enriched_bg_line(
+            1, ["one"], lane="claude", moment="pretool", t_ms=7))
+        matrix = miss_rate.build_decision_matrix(parsed)
+        pairs = [(row["lane"], row["moment"]) for row in matrix]
+        self.assertEqual(pairs, sorted(pairs))
+        self.assertEqual(len(matrix), 20)
+        nonzero = [row for row in matrix if row["count"]]
+        self.assertEqual(len(nonzero), 1)
+        self.assertEqual(nonzero[0]["count"], 1)
+        self.assertEqual(nonzero[0]["t_ms"], 7)
+        self.assertTrue(all(row["t_ms"] >= 0 for row in matrix))
+
+
+class DecisionReportBucketsTest(unittest.TestCase):
+    """Load-bearing named report test required by issue #153 AC7."""
+
+    def test_reason_set_timing_and_zero_filled_buckets(self):
+        # The committed fixture is part of the public issue contract, not a
+        # generic parser smoke test: pin its timestamp, namespace, UUIDs,
+        # status/reason counts, and moment-specific timings here.
+        fixture_dir = REPO_ROOT / "tests" / "fixtures" / "decisions"
+        log_path = fixture_dir / "five-lanes.log"
+        expected_path = fixture_dir / "five-lanes.expected.json"
+        raw = log_path.read_bytes()
+        self.assertEqual(raw.count(b"\n"), 20)
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertNotIn(b"\r", raw)
+        self.assertTrue(all(line.startswith(b"[1780272000]")
+                            for line in raw.splitlines()))
+        expected_obj = json.loads(expected_path.read_text(encoding="utf-8"))
+        self.assertEqual(expected_obj["fixture"], {
+            "generated_at": "2026-06-01T00:00:00Z",
+            "namespace": "project:fixture",
+            "version": "0.38.0",
+        })
+        fixed_uuids = {
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000002",
+            "00000000-0000-4000-8000-000000000003",
+        }
+        fixture_rows = miss_rate.parse_bg_log(log_path)
+        self.assertEqual(len(fixture_rows), 20)
+        self.assertEqual(
+            {(row["lane"], row["moment"]) for row in fixture_rows},
+            {(lane, moment) for lane in
+             ("claude", "codex", "hermes-compat", "hermes-provider", "zcode")
+             for moment in ("precompact", "pretool", "session_start", "user_prompt")},
+        )
+        self.assertEqual(sum(row["reason"] == "already-delivered"
+                             for row in fixture_rows), 1)
+        self.assertEqual(sum(row["reason"] == "empty-pool"
+                             for row in fixture_rows), 2)
+        self.assertEqual(sum(row["status"] == "injected"
+                             for row in fixture_rows), 17)
+        delivered = next(row for row in fixture_rows
+                         if row["reason"] == "already-delivered")
+        self.assertEqual(delivered["status"], "silent")
+        self.assertEqual(delivered["all"], sorted(fixed_uuids))
+        self.assertEqual(delivered["ids"], [])
+        self.assertEqual(delivered["exc"], 3)
+        self.assertEqual(
+            {row["all"][0] for row in fixture_rows
+             if row["reason"] == "injected"},
+            fixed_uuids,
+        )
+        self.assertEqual(
+            {row["t_ms"] for row in fixture_rows}, {10, 20, 30, 40})
+        expected_timing = {"session_start": 10, "user_prompt": 20,
+                           "pretool": 30, "precompact": 40}
+        self.assertTrue(all(row["t_ms"] == expected_timing[row["moment"]]
+                            for row in fixture_rows))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "zmem-decisions.log")
+            Path(path).write_text("\n".join([
+                _enriched_bg_line(1, ["r1"], lane="claude",
+                                  moment="pretool", t_ms=11),
+                _enriched_bg_line(2, [], lane="codex",
+                                  moment="user_prompt", t_ms=0,
+                                  reason="already-delivered", status="silent"),
+            ]) + "\n", encoding="utf-8")
+            parsed = miss_rate.parse_bg_log(path)
+        matrix = miss_rate.build_decision_matrix(parsed)
+        self.assertEqual(len(matrix), 20)
+        self.assertEqual(
+            {(row["lane"], row["moment"]) for row in matrix},
+            {(lane, moment) for lane in
+             ("claude", "codex", "hermes-compat", "hermes-provider", "zcode")
+             for moment in ("precompact", "pretool", "session_start", "user_prompt")},
+        )
+        by_pair = {(row["lane"], row["moment"]): row for row in matrix}
+        self.assertEqual(by_pair[("claude", "pretool")]["t_ms"], 11)
+        self.assertEqual(by_pair[("codex", "user_prompt")]["already_delivered"], 1)
+        self.assertTrue(all(isinstance(row["t_ms"], int) and row["t_ms"] >= 0
+                            for row in matrix))
+
+
 class FailuresFromDbRichTest(unittest.TestCase):
     def test_operation_recovery_and_bounds(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -481,6 +481,49 @@ MCP server:
 > rare path bounded by `MAX_CONTENT_CHARS`. Neither is a defect; both are noted
 > here so operators can reason about steady-state cost. (#37 L19/L20)
 
+#### Decision attribution and the miss-rate matrix (issue #153)
+
+Passive decision lines carry an additive attribution suffix after `moment=`:
+`lane=<lane> ver=<manifest-semver> t_ms=<nonnegative-rounded-ms>`. The exact
+closed lane vocabulary is `claude`, `codex`, `zcode`, `hermes-provider`, and
+`hermes-compat`. Runtime moments are `session_start`, `user_prompt`,
+`pretool`, `subagent`, and `precompact`. The exact silent-reason vocabulary is
+`empty-pool`, `omitted`, `below-bar`, `budget-drop`, `below-relevance`,
+`already-delivered`, and `expired`; `expired` is reserved for the expiry
+workstream and has no producer here. `reason=injected` is the successful
+decision, while `reason=disabled` is the separate passive-injection kill-switch
+marker.
+
+The field order is stable: historical fields through `sid=` and `moment=`
+come first, then optional `lane=`, `ver=`, and `t_ms=`, followed by historical
+additive tails such as `arms=`, `batch=`, `tools=`, `paths=`, and margin fields.
+`ver=` and `t_ms=` are atomic: a valid release manifest and a nonnegative
+rounded `perf_counter` duration are both required for an enriched line. If a
+writer cannot load a valid manifest, it preserves the complete legacy line and
+omits the attribution suffix. `lane=` is optional for compatibility callers;
+when present it must be one of the closed values above. A lane-less enriched
+line remains visible in aggregate statistics but is not assigned to a named
+matrix cell.
+
+`already-delivered` means the pre-delivery ledger had nonempty candidate ids
+but the post-ledger pool is empty; it outranks relevance/bar/omitted/empty-pool
+classification after `budget-drop`. Empty pre- and post-ledger pools remain
+`empty-pool`. The legacy parser still accepts lines without attribution. If a
+line contains any attribution token, it must have a valid `ver=` semver and a
+decimal, nonnegative `t_ms=`; malformed enriched lines are refused. `moment=`
+remains open for older compatibility values, including
+`session_start_compact`, which is aggregate-only.
+
+The report projection is a deterministic, zero-filled 20-row matrix: the five
+closed lanes crossed with the four report moments `session_start`,
+`user_prompt`, `pretool`, and `precompact`, sorted by `(lane, moment)`. The
+runtime `subagent` moment, lane-less lines, and other compatibility moments
+remain available in aggregate counts but are intentionally excluded from this
+named 5x4 matrix. The Hermes provider writes `hermes-provider`; the remote
+compatibility path writes `hermes-compat`. Invalid explicit compatibility lanes
+are rejected with structured status 2 before store work, while an absent lane
+is omitted for legacy callers.
+
 ### Local directory (for testing / air-gapped)
 
 1. Clone or copy this repo to a stable path.

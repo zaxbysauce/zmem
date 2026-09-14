@@ -32,6 +32,21 @@ import sys
 from pathlib import Path
 
 
+_INJECT_LANES = (
+    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+)
+
+
+def _invalid_argument(field: str, value: object) -> str:
+    return json.dumps({
+        "error": "invalid argument",
+        "field": field,
+        "value": value,
+        "status": 2,
+        "exit_code": 2,
+    }, sort_keys=True)
+
+
 def _resolve_token(args: argparse.Namespace) -> str:
     if args.token:
         return args.token
@@ -114,8 +129,18 @@ def main() -> int:
     call = sub.add_parser("call", help="call a tool")
     call.add_argument("tool", help="tool name, e.g. session_start")
     call.add_argument("--namespace", default="",
-                      help="namespace argument (tool-specific; empty omits it)")
+                       help="namespace argument (tool-specific; empty omits it)")
+    call.add_argument("--lane", default=None,
+                      help="optional closed runtime lane for session_start")
     args = parser.parse_args()
+
+    # Refuse malformed explicit lanes before token resolution or any network
+    # activity, keeping the adapter's status-2 contract deterministic even
+    # when the caller also has missing credentials.
+    if args.action == "call" and args.lane is not None \
+            and args.lane not in _INJECT_LANES:
+        print(_invalid_argument("lane", args.lane))
+        return 2
 
     token = _resolve_token(args)
     if not token:
@@ -127,6 +152,8 @@ def main() -> int:
         arguments: dict = {}
         if args.namespace:
             arguments["namespace"] = args.namespace
+        if args.tool == "session_start" and args.lane is not None:
+            arguments["lane"] = args.lane
         try:
             text = asyncio.run(_call(args.url, token, args.tool, arguments))
         except ImportError as exc:

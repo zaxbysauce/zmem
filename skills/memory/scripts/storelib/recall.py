@@ -1824,7 +1824,8 @@ def recall_memory(
                               if r["id"] not in _excl_cls]
             inj_reason = classify_silent_reason(
                 _gate_pool, omitted=omitted, budget_emptied=budget_emptied,
-                lane_stats=_gate_stats)
+                lane_stats=_gate_stats, candidate_ids=candidate_ids,
+                post_ledger_rows=_gate_pool)
 
     if for_injection:
         # Issue #114: surfaced telemetry covers ONLY the rendered rows that
@@ -2996,7 +2997,8 @@ def recent_memory(
                               if r["id"] not in _excl_cls]
             inj_reason = classify_silent_reason(
                 _gate_pool, omitted=omitted, budget_emptied=budget_emptied,
-                lane_stats=_gate_stats)
+                lane_stats=_gate_stats, candidate_ids=candidate_ids,
+                post_ledger_rows=_gate_pool)
         if results:
             # no_telemetry (the eval harness) records nothing; the filters
             # above still ran.

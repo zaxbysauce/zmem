@@ -326,7 +326,11 @@ class KillSwitchSessionStartTest(unittest.TestCase):
         # #129: the session-start kill-switch line lands in the decisions
         # log with its own moment stamp.
         self.assertIn(" moment=session_start", lines[0])
-        self.assertRegex(lines[0], r" sid=\S+ moment=session_start$")
+        self.assertRegex(
+            lines[0],
+            r" sid=\S+ moment=session_start(?: lane=(?:claude|codex|zcode)"
+            r" ver=\d+\.\d+\.\d+ t_ms=0)?$",
+        )
 
     def test_disabled_whitespace_variants_still_disable(self):
         # The inline-python parser is ".strip() == '0'" — whitespace-tolerated

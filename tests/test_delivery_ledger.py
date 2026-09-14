@@ -277,6 +277,7 @@ class CliExcludeTest(unittest.TestCase):
         env_fi = self._recall("--exclude", self.mid, "--for-injection")
         self.assertEqual([r["id"] for r in env_fi["results"]], [])
         self.assertIn(self.mid, env_fi["candidate_ids"])
+        self.assertEqual(env_fi["reason"], "already-delivered")
         # without the flag: delivered, and NO excluded key (byte-identical
         # unused path)
         env2 = self._recall()
@@ -299,6 +300,11 @@ class CliExcludeTest(unittest.TestCase):
         env = self._recall("--exclude", self.mid, sub="recent")
         self.assertEqual([r["id"] for r in env["results"]], [])
         self.assertGreaterEqual(env["excluded"], 1)
+        env_fi = self._recall("--exclude", self.mid, "--for-injection",
+                              sub="recent")
+        self.assertEqual([r["id"] for r in env_fi["results"]], [])
+        self.assertIn(self.mid, env_fi["candidate_ids"])
+        self.assertEqual(env_fi["reason"], "already-delivered")
         env = self._recall("--exclude", self.mid, sub="search")
         self.assertEqual([r["id"] for r in env["results"]], [])
         self.assertGreaterEqual(env["excluded"], 1)

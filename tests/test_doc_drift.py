@@ -15,6 +15,8 @@ Covered regressions:
   - any tracked file embedding an absolute user home path (leaks the
     operator's username/machine into the distributable; e.g. the graphify
     cache that shipped under graphify-out/ before 0.8.7 untracked it)
+  - issue #153 decision-attribution documentation (closed lanes, moments,
+    reasons, field order, parser compatibility, and the report matrix)
 
 Needles that would match this file's own source are built by concatenation so
 the scan cannot self-match (and a test asserts exactly that).
@@ -436,6 +438,63 @@ class DoctorChecksTest(unittest.TestCase):
             self.assertIn(
                 "embeddings.available=", hd["summary"],
                 "hybrid-default summary must state the availability verdict",
+            )
+
+
+class Issue153DecisionAttributionDocDriftTest(unittest.TestCase):
+    """Issue #153: public docs must describe the deployed wire contract."""
+
+    def test_readme_and_skill_pin_attribution_contract(self):
+        paths = (REPO_ROOT / "README.md", SKILL_MD)
+        needles = (
+            "issue #153",
+            "claude",
+            "codex",
+            "zcode",
+            "hermes-provider",
+            "hermes-compat",
+            "session_start",
+            "user_prompt",
+            "pretool",
+            "subagent",
+            "precompact",
+            "empty-pool",
+            "omitted",
+            "below-bar",
+            "budget-drop",
+            "below-relevance",
+            "already-delivered",
+            "expired",
+            "lane=",
+            "ver=",
+            "t_ms=",
+            "legacy",
+            "session_start_compact",
+            "20-row matrix",
+            "zero-filled",
+        )
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            for needle in needles:
+                self.assertIn(
+                    needle,
+                    text,
+                    f"{path.name} must document {needle!r} (issue #153)",
+                )
+
+    def test_readme_pins_hermes_and_matrix_compatibility(self):
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        for needle in (
+            "Invalid explicit compatibility lanes",
+            "post-ledger pool",
+            "sorted by `(lane, moment)`",
+            "aggregate statistics",
+            "malformed enriched lines are refused",
+        ):
+            self.assertIn(
+                needle,
+                text,
+                f"README.md must document {needle!r} (issue #153)",
             )
 
 

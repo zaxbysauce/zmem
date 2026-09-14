@@ -311,7 +311,10 @@ class CompactSequenceTest(unittest.TestCase):
         self.assertNotIn("Recent memories", ctx)
         self.assertFalse(_ops_path(self._tmp, self.SID, ".compact").exists())
         tail = _decisions(self._tmp)[-1]
-        self.assertIn("moment=session_start_compact", tail)
+        self.assertRegex(
+            tail,
+            r"moment=session_start_compact lane=claude ver=\d+\.\d+\.\d+ "
+            r"t_ms=\d+(?: |$)")
 
     def test_cold_start_path_unchanged(self):
         p = self._drive("session-start", {
@@ -323,7 +326,10 @@ class CompactSequenceTest(unittest.TestCase):
         self.assertNotIn(LEDGER_MARKER, ctx)
         self.assertIn("Recent memories", ctx)
         tail = _decisions(self._tmp)[-1]
-        self.assertIn("moment=session_start\n", tail + "\n")
+        self.assertRegex(
+            tail,
+            r"moment=session_start lane=claude ver=\d+\.\d+\.\d+ "
+            r"t_ms=\d+(?: |$)")
         self.assertNotIn("session_start_compact", tail)
         # No-source payload (ZCode-style / manual invocation) also cold.
         p = self._drive("session-start", {
@@ -331,6 +337,11 @@ class CompactSequenceTest(unittest.TestCase):
             "session_id": "cold118b", "cwd": self._workdir})
         ctx = _ctx(p.stdout)
         self.assertIn("Recent memories", ctx)
+        tail = _decisions(self._tmp)[-1]
+        self.assertRegex(
+            tail,
+            r"moment=session_start lane=claude ver=\d+\.\d+\.\d+ "
+            r"t_ms=\d+(?: |$)")
 
     def test_codex_compact_branch_composes_from_snapshot_only(self):
         """Codex has no PostCompact (no compact_summary upstream) — the
@@ -351,6 +362,11 @@ class CompactSequenceTest(unittest.TestCase):
         ctx = _ctx(p.stdout)
         self.assertIn(LEDGER_MARKER, ctx)
         self.assertIn("Post-compaction memories", ctx)
+        tail = _decisions(self._tmp)[-1]
+        self.assertRegex(
+            tail,
+            r"moment=session_start_compact lane=codex ver=\d+\.\d+\.\d+ "
+            r"t_ms=\d+(?: |$)")
 
     def test_empty_stash_degrades_to_cold_lane(self):
         p = self._drive("session-start", {
@@ -360,7 +376,10 @@ class CompactSequenceTest(unittest.TestCase):
         ctx = _ctx(p.stdout)
         self.assertIn("Recent memories", ctx)
         tail = _decisions(self._tmp)[-1]
-        self.assertIn("moment=session_start\n", tail + "\n")
+        self.assertRegex(
+            tail,
+            r"moment=session_start lane=claude ver=\d+\.\d+\.\d+ "
+            r"t_ms=\d+(?: |$)")
 
     def test_default_floor_realistic_query_injects(self):
         # PR #190 review PRR-001 residual: the DEFAULT-floor behavior of a
