@@ -117,8 +117,12 @@ class AdapterScanTest(unittest.TestCase):
 
     def test_passive_hermes_prefetch_carries_no_bump(self):
         text = (REPO_ROOT / "hermes-plugin" / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn("--no-bump", self._method_body(text, "prefetch"),
-                      "Hermes prefetch is passive and MUST pass --no-bump")
+        prefetch = self._method_body(text, "prefetch")
+        helper = self._method_body(text, "_passive_store_args")
+        self.assertIn("_passive_store_args", prefetch,
+                      "Hermes prefetch must use the shared passive argv builder")
+        self.assertIn("--no-bump", helper,
+                      "the shared Hermes passive argv builder MUST pass --no-bump")
 
     def test_explicit_hermes_tool_search_omits_no_bump(self):
         text = (REPO_ROOT / "hermes-plugin" / "__init__.py").read_text(encoding="utf-8")
@@ -155,7 +159,7 @@ class AdapterScanTest(unittest.TestCase):
         # re-discovered as a bug. The docstring must document the intentional
         # retrieval_count bump. Scoped to the docstring via ast (a body comment
         # must not mask a docstring regression — same discipline as
-        # test_readonly_invariant_docstring_lists_all_hooks above). The
+        # shared-helper docstring check above). The
         # prohibition on the passive flag literal in this file is pinned
         # separately by test_explicit_mcp_recall_omits_no_bump.
         source = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py").read_text(
@@ -242,28 +246,22 @@ class AdapterScanTest(unittest.TestCase):
         self.assertIn("session_start", doc,
                       "the docstring must scope the exclusion to session_start/prefetch")
 
-    def test_readonly_invariant_docstring_lists_all_hooks(self):
-        # The passive-recall read-only contract (the recall_memory DOCSTRING) must
-        # name ALL THREE automatic hook sources — UserPromptSubmit, SubagentStart,
-        # and SessionStart — so the read-only invariant stays checkable and a
-        # comment cannot silently drop one hook again (issue #23). SessionStart was
-        # the one omitted here after it was made --no-bump by PR #29.
-        #
-        # Scope the assertion to the docstring ONLY (via ast.get_docstring), not
-        # the whole function body: a body comment or refactor mention of a hook
-        # name must NOT mask a docstring regression (PRR-002).
-        # Post-split (issue #57) `recall_memory` lives in storelib/recall.py.
+    def test_readonly_invariant_docstring_covers_shared_helper(self):
+        # The passive read-only invariant is owned by the shared post-retrieval
+        # helper.  Keep this assertion scoped to its docstring so an incidental
+        # comment cannot mask a documentation regression.
         source = (SCRIPTS_DIR / "storelib" / "recall.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         doc = None
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "recall_memory":
+            if (isinstance(node, ast.FunctionDef)
+                    and node.name == "_recall_injection_details"):
                 doc = ast.get_docstring(node)
                 break
-        self.assertIsNotNone(doc, "recall_memory must have a docstring")
-        self.assertIn("UserPromptSubmit", doc)
-        self.assertIn("SubagentStart", doc)
-        self.assertIn("SessionStart", doc)
+        self.assertIsNotNone(doc, "shared injection helper must have a docstring")
+        self.assertIn("passive", doc)
+        self.assertIn("canonical render", doc)
+        self.assertIn("telemetry", doc)
 
 
 class SurfaceTempStoreTest(unittest.TestCase):

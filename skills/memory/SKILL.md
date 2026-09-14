@@ -339,7 +339,6 @@ intentionally excluded from that 5×4 projection but remain visible in
 aggregate statistics. The local Hermes provider writes `hermes-provider`; the
 remote compatibility path writes `hermes-compat`, and invalid explicit lanes
 return structured status 2 before store work while absent lanes stay omitted.
-
 #### Query context (prior-turn operation tokens) — issue #88 / #85 direction 2
 
 Decision-point prompts are prose with zero lexical overlap with the
@@ -352,14 +351,15 @@ tokens (git subcommand chains, test-runner verbs, edited-path basenames) —
 never a raw command dump, stdout, or argument values that are bare words;
 secret-shaped tokens (common credential prefixes like `ghp_`/`sk-`/`xox?-`)
 are dropped as well. The ring is byte-capped: past 64 KB it is trimmed to
-the newest 64 lines. The UserPromptSubmit body and the Hermes `prefetch`
-compose that ring into the query, with the ops tail occupying a fixed
-reserved slice INSIDE the 500-char cap (never appended past it; the
-separator shares the slice, so no token is severed).
+the newest 64 lines. The store-owned passive selector composes that ring only
+for the `pretool` moment, with the ops tail occupying a fixed reserved slice
+INSIDE the 500-char cap (never appended past it; the separator shares the
+slice, so no token is severed). UserPromptSubmit and Hermes prefetch no
+longer append a caller-owned ops tail.
 `ZMEM_QUERY_CONTEXT=0` is the lane kill switch — it stops BOTH composition
 and ring collection (an operator disabling the lane expects no sidecar
-writes). `zmem-bg.log` lines carry `ops=N` when tokens augmented
-the query. Explicit surfaces (`recall --query`, `search`) are unchanged.
+writes). Operation derivation remains store-owned; no operation count crosses
+the exact hook envelope. Explicit surfaces (`recall --query`, `search`) are unchanged.
 Limitation (deliberate, see #88): this helps LATER turns only — the first
 tool call of a turn still runs before any operation context exists.
 Cost note (#93 B4): credential-prefix-shaped tokens (`sk-`, `npm_`, `AKIA`,
@@ -403,26 +403,25 @@ Claude: emitted — issue #117 retired the sidecar default in favor of the
 per-session delivery ledger), a
 PreToolUse hook (`zmem-pretool-recall.sh`, matcher
 `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent` since 0.30.0 — issue #119;
-the Agent branch parks the delegating task text rather than injecting)
+the Agent branch passes task text when present and otherwise uses the
+store-owned recent path)
 derives the recall query from the
 tool input ITSELF — the command or file path about to run — and injects
 matching hazard lessons before the tool executes. Pre-tool
 `additionalContext` is documented on Claude Code (since 2.1.9 it lands
 alongside the tool result; pausing is `permissionDecision`-driven only) —
-issue #117 superseded the pending sidecar (retired by default): delivered
+issue #158 makes the store-owned selector the only passive path: delivered
 ids now live in a bounded per-session ledger
 (`<data>/ops/<sha256-of-session-id>.ledger`, atomic, window- and
 cap-bounded) that EVERY injection moment consults, so the same row is not
 re-delivered within the window — with one deliberate exception: PreToolUse
 re-delivers when the operation tokens about to run strongly match the row
 (the session-start hazard still fires before the dangerous command). The
-ledger clears at PreCompact (post-compaction delivery is legal again;
-D-2 #118 snapshots before that clear) and at SessionEnd (Claude;
-other hosts rely on the window + sweep). `ZMEM_PENDING_SIDECAR=1`
-re-enables a narrow append-with-dedup sidecar fallback for older host
-builds that ignore the field, and requires
-the host event's `session_id` (without it the direct emit is the only
-delivery). The hook NEVER denies (a surfaced hazard is information, not
+ledger clears at PreCompact and the following SessionStart uses the ordinary
+`session_start` selector moment. The retired `ZMEM_PENDING_SIDECAR` fallback
+is no longer produced or consumed. The host event's `session_id` (without
+it the adapter stays fail-open) is passed to the selector. The hook NEVER
+denies (a surfaced hazard is information, not
 grounds to block a legitimate command) and stays fully silent when nothing
 qualified. `ZMEM_QUERY_CONTEXT=0` silences every query-context lane, this
 one included. Hermes delivers the equivalent on `pre_llm_call` (after the
@@ -434,7 +433,7 @@ delivery's namespace follows the hook chain `ZMEM_MCP_NAMESPACE` →
 recall, and correction capture — Hermes hook events themselves carry no
 namespace); project-scoped operation context delivers
 on the coding-host PreToolUse surface. All query-context persistence
-(rings, delivery markers, the session delivery ledger, pending fences) lives under `<data>/ops/`
+(rings, delivery markers, and the session delivery ledger) lives under `<data>/ops/`
 sidecars and never grows the store's tables. Codex pre-tool injection is
 WIRED (issue #95): `hooks.codex.json` registers `PreToolUse` with matcher
 `Bash|apply_patch` — dumped live from codex-cli 0.153.0 (Windows,
@@ -456,19 +455,13 @@ with a live tool_name dump before changing the matcher.
 Inject surface parity (host facts, not aspirations): Claude Code registers
 SubagentStart (task-text recall — issue #119, probe 2026-09-10: neither
 host's SubagentStart payload carries task text, so the query ladder is
-payload-field-if-present → the task text stashed by the delegating
-PreToolUse(`Agent`) call (Claude matcher
+payload-field-if-present → task/query text supplied by the event when
+available → the queryless recent selector). The former delegating
+PreToolUse(`Agent`) stash is retired; no zmem task-text sidecar is written or
+consumed. Claude's matcher remains
 `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task` since 0.31.0 — issue
-#119; `Task` accepted as the pre-rename delegation tool name per community
-issue 29677, closed stale — not vendor-confirmed; hosts that never emit it
-are unaffected),
-issue #119 — the delegating `tool_input.prompt` is the only observable
-carrying it; consumption is FIFO because no probed host supplies agent_id
-at park time) → the parent transcript tail (a FALLBACK, never the primary)
-→ the queryless recency pull), PreCompact, and PostCompact (issue #118, probe 2026-09-10:
-Claude PostCompact carries `compact_summary` and has no injection channel,
-so the entry is a pure stash — `zmem-postcompact.sh` writes the summary to
-the compact sidecar and emits no context). Claude Code also registers
+#119; `Task` is accepted as the pre-rename delegation tool name per community
+issue 29677, closed stale and not vendor-confirmed. Claude Code also registers
 PostToolBatch (issue #120, 2026-09-11 — post-edit checkpoint recall, the
 batch sibling of PreToolUse): after one completed batch, the hook parses
 ONLY `tool_uses[].name` plus `input.command` / `file_path` /
@@ -496,28 +489,20 @@ was added and Codex SubagentStart rides the transcript-tail/recent rungs
 (fresh delegation-tool dump deferred to the live-probe owner #96).
 Upstream drops `additionalContext` on PreCompact (decision control only,
 verified 2026-09-09 from codex-rs source), so zmem's Codex PreCompact
-entry exists for the delivery-ledger snapshot+clear before compaction
-(issue #118, 2026-09-10: PreCompact now snapshots the ledger into the
-compact sidecar before clearing it); post-compaction re-injection rides
+entry exists to clear the delivery ledger before compaction;
+post-compaction re-injection rides
 the registered SessionStart, which upstream fires with `source=compact`
 after every compaction. PostCompact stays UNREGISTERED on Codex (issue
 #118 decision, 2026-09-10: upstream Codex PostCompact carries only
 `trigger: manual|auto` — no compact_summary, so there is nothing to
-stash). The compact branch itself (issue #118, 2026-09-10, both Claude
-and Codex): SessionStart branches on `source == "compact"` only — the
-launcher exports the payload field as `ZMEM_SESSION_SOURCE`, the hook
-composes a query from the stashed `compact_summary` plus the
-pre-compaction ledger snapshot, and runs the query-aware recall lane
-instead of the cold-start recency pull (decision line
-`moment=session_start_compact`); an empty stash degrades to the
-cold-start lane. PR #190 review (2026-09-11): the compact lane honors the
-global `ZMEM_QUERY_CONTEXT=0` kill switch (falls back to the recency
-lane), skips the ledger exclusion argv (the moment deliberately
-re-delivers the pre-compaction working set), passes the same 0.5
-confidence floor as cold start (`recall --min-confidence`, new flag),
-falls back to the recency pull when the query returns zero rows (never
-silent), and discards the compact stash only after the pull completes (a
-failed pull preserves it for retry). The payload block lives in
+stash). The compact branch (issue #158): SessionStart branches on `source ==
+"compact"` only — the launcher exports the payload field as
+`ZMEM_SESSION_SOURCE`, clears the delivery ledger at PreCompact, and then
+calls the store-owned selector with moment `session_start` on the next
+SessionStart. The local decision log may retain
+`moment=session_start_compact` for diagnostics, but that label is never sent
+to storelib. There is no compact-summary sidecar or special second budget.
+The payload block lives in
 `hooks/lib/zmem-session-start-payload.py` — NEVER inline it back as
 `python -c`: the string outgrew the Windows ~32K CreateProcess
 command-line limit and silently degraded the hook to `{}`. Whether the PreCompact fence itself survives a live
@@ -528,8 +513,8 @@ PermissionRequest, PostToolUse, PostToolUseFailure, Stop — so SubagentStart,
 PreCompact, and PostCompact are host gaps on ZCode** (an unsupported event name would be
 dead config under the host's strict schema, so they are documented here
 instead of registered; likewise ZCode's PreToolUse matcher deliberately
-omits `Agent` — with no SubagentStart event, a parked task text would
-have no consumer). If ZCode grows either event, wire
+omits `Agent` — with no SubagentStart event, event-provided task text has no
+consumer). If ZCode grows either event, wire
 `zmem-subagent-recall.sh` / `zmem-precompact.sh` / `zmem-postcompact.sh`
 immediately. PostToolBatch shares that ZCode gap (issue #120): until the
 host grows the event, `zmem-posttoolbatch-recall.sh` stays
@@ -687,6 +672,56 @@ recorded (promote/prune/consolidate consume them) but they no longer feed the
 composite score, so passive pulls cannot inflate their own ranking (the
 live-store shape `surfaced_count=371, retrieval_count=0` was this loop). The
 weight itself is unchanged; #124 will repoint it at applied/violated counters.
+
+#### Store-owned passive selector and envelope — issue #158
+
+All passive consumers use the single storelib entry point
+`select_and_budget_for_injection`. It owns selection, delivery-ledger
+exclusion and recording, pre-tool operation-token composition, the hard token
+budget, and the canonical untrusted fenced rendering. The recall hooks,
+SessionStart, and Hermes provider are subprocess-only adapters: they consume
+only the envelope's string `rendered` field and never read SQLite, the
+operation ring, a delivery ledger, or memory rows themselves. The selector's
+closed moments are `session_start`, `user_prompt`, `pretool`, `subagent`, and
+`precompact`; its lanes are `claude`, `codex`, `zcode`, `hermes-provider`, and
+`hermes-compat`. A compact restart is logged locally as
+`session_start_compact`, but the selector and ledger always use
+`session_start`.
+
+The exact session-aware CLI forms are:
+
+```
+python <store.py> recall --query "<text>" --for-injection --json \
+  --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
+  --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
+  [--ops-token <token>]...
+python <store.py> recent --for-injection --json \
+  --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
+  --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
+  [--ops-token <token>]...
+python <store.py> ledger-clear --session-id <id>
+```
+
+The passive `recall` and `recent` commands accept the additive attribution
+flags `--session-id`, `--moment`, `--lane`, and repeatable `--ops-token` when
+called with `--for-injection --json`. An empty query dispatches to recent
+selection. An omitted `--ops-token` list lets the store read the pre-tool ring;
+the ring is composed only for `pretool`, not for UserPromptSubmit or other
+moments. `ledger-clear --session-id <id>` clears one delivery ledger without
+opening SQLite and is idempotent for an absent ledger. A session id requires a
+moment, and a moment requires a session id.
+
+The old hook-owned pending, compact-summary, and task-text sidecars are no
+longer produced or consumed by these adapters. The D-2 #118 compaction-snapshot
+handoff is documented above. This reflects the ownership history: issue #117 superseded the pending sidecar
+with the per-session delivery ledger, and #158 completes that retirement for the passive adapters.
+`ZMEM_PENDING_SIDECAR=1`
+remains only as a documented no-op for operators upgrading from the
+compatibility path. Precompact clears the ledger;
+the next SessionStart performs ordinary `session_start` selection. The MCP
+server's passive path is deliberately unchanged and is the existing #159
+follow-up. This ownership move is schema-free: neither schema-version
+constant changes.
 
 ### add — capture a memory
 ```

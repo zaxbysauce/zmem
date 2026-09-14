@@ -64,6 +64,52 @@ EXPLAIN_REASONS = (
     "budget_rejected",
 )
 
+
+def build_injection_envelope(
+    results: list[dict],
+    *,
+    omitted: int,
+    reason: str,
+    excluded: list[str],
+    candidate_ids: list[str],
+    tokens_used: int,
+    tokens_budget: int,
+    budget_dropped: int,
+    budget_admission: int,
+    budget_truncated: int,
+    budget_dropped_protected: int,
+    arms: dict,
+    rendered: str,
+    injection_risk: int | None = None,
+    candidate_lanes: dict | None = None,
+    budget_note: str | None = None,
+) -> dict:
+    """Build the closed passive-injection envelope shared by adapters."""
+    envelope = {
+        "results": results,
+        "count": len(results),
+        "omitted": omitted,
+        "reason": reason,
+        "excluded": excluded,
+        "candidate_ids": candidate_ids,
+        "tokens_used": tokens_used,
+        "tokens_budget": tokens_budget,
+        "budget_dropped": budget_dropped,
+        "budget_admission": budget_admission,
+        "budget_truncated": budget_truncated,
+        "budget_dropped_protected": budget_dropped_protected,
+        "arms": arms,
+        "rendered": rendered,
+    }
+    if injection_risk is not None:
+        envelope["injection_risk"] = injection_risk
+    if candidate_lanes is not None:
+        envelope["candidate_lanes"] = candidate_lanes
+    if budget_note is not None:
+        envelope["budget_note"] = budget_note
+    return envelope
+
+
 # Issue #82: change-intent trigger for the explicit-recall lineage unfold.
 # Deterministic regexes (no LLM). The false-positive bar is a merge blocker:
 # ordinary hook-shaped coding prompts ("use pytest", "fix the failing test")
@@ -1369,7 +1415,10 @@ def _format_fenced_recall(rows: list[dict], header: str,
         # fence, emitted by the renderer from caller-supplied counts only.
         lines.append("# " + budget_note)
     lines.append(ZMEM_FENCE_CLOSE)
-    return "\n".join(lines)
+    # Passive subprocess adapters consume this as a complete line-oriented
+    # payload.  Keep one terminal LF so the canonical fence is byte-stable
+    # across hook and provider boundaries.
+    return "\n".join(lines) + "\n"
 
 def _classify_injection(item: dict) -> bool:
     """Classify a recall item as injection-risk (issue #58, 3.4).
@@ -1472,7 +1521,120 @@ def _stable_score_desc(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=key)
 
 
-def recall_memory(
+def _recall_injection_details(
+    rows: list[dict],
+    *,
+    omitted: int,
+    exclude_ids: list[str] | None,
+    arms: dict,
+    injection_risk: int,
+    budget_tokens: int | None,
+    surfaced_ids: list[str] | None = None,
+) -> tuple[dict, list[dict]]:
+    """Apply the one passive post-retrieval decision pipeline.
+
+    ``recall_memory`` and ``recent_memory`` intentionally acquire candidates
+    differently, but neither owns a distinct injection gate, exclusion pass,
+    score-margin pass, or budget admission.  This helper is the sole owner of
+    that work and returns the legacy details mapping plus the exact subset that
+    may receive surfaced telemetry.  Keeping accounting outside the mapping
+    lets the session selector account only for rows proven present in its one
+    canonical render.
+    """
+    effective_budget = (inject_token_budget() if budget_tokens is None
+                        else budget_tokens)
+    candidate_rows = list(rows)
+    candidate_ids = [r["id"] for r in candidate_rows]
+    excluded_count = 0
+    selected_rows = candidate_rows
+    if exclude_ids:
+        excluded_set = set(exclude_ids)
+        excluded_count = sum(1 for r in selected_rows
+                             if r["id"] in excluded_set)
+        selected_rows = [r for r in selected_rows
+                         if r["id"] not in excluded_set]
+    selected_rows, _gate_status, gate_stats = selective_inject_filter(
+        selected_rows, with_stats=True)
+    margin_view = _stable_score_desc(selected_rows)
+    _margin_retained, margin_observed, margin_pruned_rows = apply_score_margin(
+        margin_view, margin=inject_score_margin())
+    margin_pruned_ids = [r["id"] for r in margin_pruned_rows]
+    if margin_pruned_ids:
+        margin_ids = set(margin_pruned_ids)
+        selected_rows = [r for r in selected_rows if r["id"] not in margin_ids]
+
+    budget_emptied = False
+    budget_dropped = 0
+    budget_admission = 0
+    budget_truncated = 0
+    budget_dropped_protected = 0
+    injection_budget_note = ""
+    if selected_rows:
+        if budget_tokens is None:
+            # Preserve the long-standing callable shape for direct legacy
+            # callers and test seams; the session selector supplies an
+            # explicit budget without touching process environment.
+            selected_rows, _estimated, _dropped, budget_stats = apply_token_budget(
+                selected_rows, with_stats=True)
+        else:
+            selected_rows, _estimated, _dropped, budget_stats = apply_token_budget(
+                selected_rows, effective_budget, with_stats=True)
+        budget_dropped = budget_stats["dropped"]
+        budget_admission = budget_stats["admission_used"]
+        budget_truncated = budget_stats["truncated"]
+        budget_dropped_protected = budget_stats["dropped_protected"]
+        injection_budget_note = budget_note(budget_stats)
+        budget_emptied = not selected_rows
+
+    if selected_rows:
+        reason = "injected"
+    else:
+        gate_pool = candidate_rows
+        if exclude_ids:
+            excluded_set = set(exclude_ids)
+            gate_pool = [r for r in candidate_rows if r["id"] not in excluded_set]
+        reason = classify_silent_reason(
+            gate_pool, omitted=omitted, budget_emptied=budget_emptied,
+            lane_stats=gate_stats, candidate_ids=candidate_ids,
+            post_ledger_rows=gate_pool)
+
+    details = {
+        "results": selected_rows,
+        "count": len(selected_rows),
+        "omitted": omitted,
+        "injection_risk": injection_risk,
+        "tokens_used": sum(estimate_tokens(r.get("content", "") or "")
+                           for r in selected_rows),
+        "tokens_budget": effective_budget,
+        "reason": reason,
+        "candidate_ids": candidate_ids,
+        "candidate_lanes": {
+            r["id"]: {"lex": r.get("_rel_lex"), "cos": r.get("_rel_cos"),
+                      "ent": r.get("_rel_ent"), "graph": r.get("_rel_graph"),
+                      "trust": _row_trust(r)}
+            for r in candidate_rows
+        },
+        "arms": arms,
+        "budget_dropped": budget_dropped,
+        "budget_admission": budget_admission,
+        "budget_truncated": budget_truncated,
+        "budget_dropped_protected": budget_dropped_protected,
+        "budget_note": injection_budget_note,
+    }
+    # Legacy --for-injection JSON exposes a numeric exclusion count only when
+    # its caller supplied an exclusion list; preserve that byte/shape contract.
+    if exclude_ids:
+        details["excluded"] = excluded_count
+    if margin_observed is not None:
+        details["margin"] = format(margin_observed, ".6f")
+        details["margin_pruned_ids"] = margin_pruned_ids
+
+    surfaced = (selected_rows if surfaced_ids is None else
+                [r for r in selected_rows if r["id"] in set(surfaced_ids)])
+    return details, surfaced
+
+
+def _recall_memory_impl(
     conn: sqlite3.Connection,
     *,
     query: str,
@@ -1494,6 +1656,8 @@ def recall_memory(
     no_unfold: bool = False,
     for_injection: bool = False,
     exclude_ids: list[str] | None = None,
+    _capture: dict | None = None,
+    _injection_budget_tokens: int | None = None,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -1753,89 +1917,22 @@ def recall_memory(
     # own 'flagged rows are counted too' contract).
     injection_risk_count = sum(1 for r in results if r.get("prompt_injection_risk"))
 
-    # Issue #114 (P2-3): the injection lane applies the SAME gate + token
-    # budget the hook used to apply after this subprocess returned — here,
-    # INSIDE the single store call, so telemetry counts only what renders.
-    # Placement (plan-critic pinned): AFTER link expansion and unfold (so
-    # expansion rows are eligible for gate-drop and consume budget exactly
-    # as they did under the hook's post-return budget) and BEFORE telemetry.
-    inj_reason = None
-    margin_observed = None
-    margin_pruned_ids: list[str] = []
-    margin_pruned_rows: list[dict] = []
+    injection_details = None
     if for_injection:
-        candidate_rows = results
-        candidate_ids = [r["id"] for r in candidate_rows]
-        # Issue #117 (D-1): the exclusion filter runs AFTER the capture above
-        # so candidate_ids stays the PRE-exclude set (the miss-rate join's
-        # ``all=`` pre-image) and BEFORE the gate so token budget + lane
-        # floors judge only rows that can actually render. ``excluded``
-        # explains the delta in the envelope.
-        if exclude_ids:
-            _excl = set(exclude_ids)
-            excluded = sum(1 for r in results if r["id"] in _excl)
-            results = [r for r in results if r["id"] not in _excl]
-        selected_rows, _gate_status, _gate_stats = selective_inject_filter(
-            results, with_stats=True)
-        # Issue #182: score separation is evaluated on a temporary stable
-        # score-descending view, but the caller's presentation order remains
-        # authoritative for rendering and telemetry.  Filter the original
-        # list by the helper's pruned ids rather than returning its ranked
-        # view; this also keeps project-before-global ordering intact.
-        _margin_view = _stable_score_desc(selected_rows)
-        _margin_retained, margin_observed, margin_pruned_rows = (
-            apply_score_margin(_margin_view, margin=inject_score_margin())
+        injection_details, surface_rows = _recall_injection_details(
+            results, omitted=omitted, exclude_ids=exclude_ids, arms=arms,
+            injection_risk=injection_risk_count,
+            budget_tokens=_injection_budget_tokens,
+            surfaced_ids=bump_ids,
         )
-        if margin_pruned_rows:
-            margin_pruned_ids = [r["id"] for r in margin_pruned_rows]
-            _margin_ids = set(margin_pruned_ids)
-            selected_rows = [r for r in selected_rows
-                             if r["id"] not in _margin_ids]
-        budget_emptied = False
-        budget_dropped = 0
-        budget_admission = 0
-        budget_truncated = 0
-        budget_dropped_protected = 0
-        inj_budget_note = ""
-        if selected_rows:
-            # Issue #116: hard-ceiling admission with measured fence costs;
-            # stats feed the envelope (log fields + fence budget note).
-            selected_rows, _est, _dropped, bstats = apply_token_budget(
-                selected_rows, with_stats=True)
-            budget_dropped = bstats["dropped"]
-            budget_admission = bstats["admission_used"]
-            budget_truncated = bstats["truncated"]
-            budget_dropped_protected = bstats["dropped_protected"]
-            inj_budget_note = budget_note(bstats)
-            if not selected_rows:
-                budget_emptied = True
-        results = selected_rows
-        if results:
-            inj_reason = "injected"
-        else:
-            # Issue #151 review (CUBIC-recall-1735): classify on the
-            # POST-exclusion pool — when the delivery ledger emptied the
-            # set, the pre-exclude candidate_rows would misattribute the
-            # silence to below-bar/below-relevance instead of empty-pool.
-            _gate_pool = candidate_rows
-            if exclude_ids:
-                _excl_cls = set(exclude_ids)
-                _gate_pool = [r for r in candidate_rows
-                              if r["id"] not in _excl_cls]
-            inj_reason = classify_silent_reason(
-                _gate_pool, omitted=omitted, budget_emptied=budget_emptied,
-                lane_stats=_gate_stats, candidate_ids=candidate_ids,
-                post_ledger_rows=_gate_pool)
-
-    if for_injection:
+        results = injection_details["results"]
         # Issue #114: surfaced telemetry covers ONLY the rendered rows that
         # were also QUERY-MATCHED — the pre-expansion bump set (same law as
         # ever: link neighbors render but never feed the counters;
         # unfold is explicit-recall-only and structurally never runs here).
         # v12 (issue #64): no_telemetry (the eval harness) records nothing,
         # but the filters above still ran.
-        matched = set(bump_ids)
-        surface_ids = [r["id"] for r in results if r["id"] in matched]
+        surface_ids = [r["id"] for r in surface_rows]
         if surface_ids:
             _bump_telemetry(conn, surface_ids, no_bump=True,
                             disabled=no_telemetry)
@@ -1866,46 +1963,12 @@ def recall_memory(
         if exclude_ids:
             envelope["excluded"] = excluded
         if for_injection:
-            # Issue #114: flag-only additions so every plain-path envelope
-            # stays byte-identical (characterization freeze). ``reason`` is
-            # the #87 closed-set silent reason (or "injected"); the hook logs
-            # it verbatim. ``candidate_ids`` is the PRE-gate id set — the
-            # bg-log ``all=`` pre-image the miss-rate join matches against.
-            envelope["reason"] = inj_reason
-            envelope["candidate_ids"] = candidate_ids
-            # Issue #113: per-candidate lane values (pre-gate), so the eval
-            # harness's primitive re-derivation of the gate can model the
-            # relevance floors without re-running recall.
-            envelope["candidate_lanes"] = {
-                r["id"]: {"lex": r.get("_rel_lex"), "cos": r.get("_rel_cos"),
-                          "ent": r.get("_rel_ent"),
-                          # Issue #136: the graph arm's measured lane (None
-                          # for every row the arm did not contribute).
-                          "graph": r.get("_rel_graph"),
-                          "trust": _row_trust(r)}
-                for r in candidate_rows
-            }
-            if margin_observed is not None:
-                envelope["margin"] = format(margin_observed, ".6f")
-                envelope["margin_pruned_ids"] = margin_pruned_ids
-            # Issue #136: per-arm pre/post-cap counts (merged across tiers),
-            # so the decision log can attribute a hit to the arm that
-            # carried it. All four arms are always present; the kill switch
-            # zero-fills the graph arm without changing the shape.
-            envelope["arms"] = arms
-            # Issue #115 review round: the store-side token-budget drop
-            # count, so --for-injection consumers report the real drop
-            # instead of a client-side residual of an already-budgeted set.
-            envelope["budget_dropped"] = budget_dropped
-            # Issue #116: hard-ceiling accounting — admission's own token
-            # accounting, protected-row truncation/drop counts, and the
-            # ready-made fence note, so every renderer/logs report the same
-            # omission facts without rebuilding stats.
-            envelope["budget_admission"] = budget_admission
-            envelope["budget_truncated"] = budget_truncated
-            envelope["budget_dropped_protected"] = budget_dropped_protected
-            envelope["budget_note"] = inj_budget_note
-        print(json.dumps(envelope, indent=2))
+            envelope = injection_details
+        if for_injection and _capture is not None:
+            _capture.clear()
+            _capture.update(envelope)
+        else:
+            print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: hook/text surface uses the fenced render
         # with full provenance (id, confidence, signal, ns, type,
@@ -1923,7 +1986,7 @@ def recall_memory(
                     f"Relevant memories (namespace {namespace or 'unscoped'}). "
                     f"Consider if they apply; ignore if not."
                 ),
-                budget_note=inj_budget_note if for_injection else None,
+                budget_note=(injection_details or {}).get("budget_note") if for_injection else None,
             ))
     return results
 
@@ -2832,7 +2895,7 @@ def _recent_one_tier(
         })
     return results
 
-def recent_memory(
+def _recent_memory_impl(
     conn: sqlite3.Connection,
     *,
     namespace: str | None = None,
@@ -2846,6 +2909,8 @@ def recent_memory(
     no_telemetry: bool = False,
     for_injection: bool = False,
     exclude_ids: list[str] | None = None,
+    _capture: dict | None = None,
+    _injection_budget_tokens: int | None = None,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -2932,77 +2997,18 @@ def recent_memory(
         results = [r for r in results if r["id"] not in _excl]
     injection_risk_count = sum(1 for r in results if r.get("prompt_injection_risk"))
 
-    # Issue #114 (P2-3): the injection lane — gate + budget INSIDE this call,
-    # surfaced telemetry only for the rendered rows. recent has no expansion
-    # or unfold, so every candidate is query-legitimate; the write set is
-    # simply the gate+budget survivors.
-    inj_reason = None
-    margin_observed = None
-    margin_pruned_ids: list[str] = []
-    margin_pruned_rows: list[dict] = []
+    injection_details = None
     if for_injection:
-        candidate_rows = results
-        candidate_ids = [r["id"] for r in candidate_rows]
-        # Issue #117 (D-1): the exclusion filter runs AFTER the capture above
-        # so candidate_ids stays the PRE-exclude set (the miss-rate join's
-        # ``all=`` pre-image) and BEFORE the gate so token budget + lane
-        # floors judge only rows that can actually render. ``excluded``
-        # explains the delta in the envelope.
-        if exclude_ids:
-            _excl = set(exclude_ids)
-            excluded = sum(1 for r in results if r["id"] in _excl)
-            results = [r for r in results if r["id"] not in _excl]
-        selected_rows, _gate_status, _gate_stats = selective_inject_filter(
-            results, with_stats=True)
-        # Issue #182: decide on a stable score-descending view, then remove
-        # only the helper's pruned ids from the original recent presentation
-        # order. Recent rows normally have no _score and therefore fail open.
-        _margin_view = _stable_score_desc(selected_rows)
-        _margin_retained, margin_observed, margin_pruned_rows = (
-            apply_score_margin(_margin_view, margin=inject_score_margin())
+        injection_details, surface_rows = _recall_injection_details(
+            results, omitted=omitted, exclude_ids=exclude_ids, arms={},
+            injection_risk=injection_risk_count,
+            budget_tokens=_injection_budget_tokens,
         )
-        if margin_pruned_rows:
-            margin_pruned_ids = [r["id"] for r in margin_pruned_rows]
-            _margin_ids = set(margin_pruned_ids)
-            selected_rows = [r for r in selected_rows
-                             if r["id"] not in _margin_ids]
-        budget_emptied = False
-        budget_dropped = 0
-        budget_admission = 0
-        budget_truncated = 0
-        budget_dropped_protected = 0
-        inj_budget_note = ""
-        if selected_rows:
-            # Issue #116: hard-ceiling admission with measured fence costs;
-            # stats feed the envelope (log fields + fence budget note).
-            selected_rows, _est, _dropped, bstats = apply_token_budget(
-                selected_rows, with_stats=True)
-            budget_dropped = bstats["dropped"]
-            budget_admission = bstats["admission_used"]
-            budget_truncated = bstats["truncated"]
-            budget_dropped_protected = bstats["dropped_protected"]
-            inj_budget_note = budget_note(bstats)
-            if not selected_rows:
-                budget_emptied = True
-        results = selected_rows
-        if results:
-            inj_reason = "injected"
-        else:
-            # Issue #151 review (CUBIC-recall-1735): post-exclusion pool
-            # (see recall_memory's twin comment).
-            _gate_pool = candidate_rows
-            if exclude_ids:
-                _excl_cls = set(exclude_ids)
-                _gate_pool = [r for r in candidate_rows
-                              if r["id"] not in _excl_cls]
-            inj_reason = classify_silent_reason(
-                _gate_pool, omitted=omitted, budget_emptied=budget_emptied,
-                lane_stats=_gate_stats, candidate_ids=candidate_ids,
-                post_ledger_rows=_gate_pool)
+        results = injection_details["results"]
         if results:
             # no_telemetry (the eval harness) records nothing; the filters
             # above still ran.
-            _bump_telemetry(conn, [r["id"] for r in results], no_bump=True,
+            _bump_telemetry(conn, [r["id"] for r in surface_rows], no_bump=True,
                             disabled=no_telemetry)
     elif results:
         ids = [r["id"] for r in results]
@@ -3027,37 +3033,12 @@ def recent_memory(
         if exclude_ids:
             envelope["excluded"] = excluded
         if for_injection:
-            # Issue #114: flag-only envelope additions (see recall_memory).
-            envelope["reason"] = inj_reason
-            envelope["candidate_ids"] = candidate_ids
-            # Issue #113: per-candidate lane values (pre-gate), so the eval
-            # harness's primitive re-derivation of the gate can model the
-            # relevance floors without re-running recall. Issue #136: the
-            # graph key keeps the lane schema uniform across surfaces (the
-            # recent surface runs no recall tiers, so the value is None).
-            envelope["candidate_lanes"] = {
-                r["id"]: {"lex": r.get("_rel_lex"), "cos": r.get("_rel_cos"),
-                          "ent": r.get("_rel_ent"),
-                          "graph": r.get("_rel_graph"),
-                          "trust": _row_trust(r)}
-                for r in candidate_rows
-            }
-            if margin_observed is not None:
-                envelope["margin"] = format(margin_observed, ".6f")
-                envelope["margin_pruned_ids"] = margin_pruned_ids
-            # Issue #115 review round: the store-side token-budget drop
-            # count, so --for-injection consumers report the real drop
-            # instead of a client-side residual of an already-budgeted set.
-            envelope["budget_dropped"] = budget_dropped
-            # Issue #116: hard-ceiling accounting — admission's own token
-            # accounting, protected-row truncation/drop counts, and the
-            # ready-made fence note, so every renderer/logs report the same
-            # omission facts without rebuilding stats.
-            envelope["budget_admission"] = budget_admission
-            envelope["budget_truncated"] = budget_truncated
-            envelope["budget_dropped_protected"] = budget_dropped_protected
-            envelope["budget_note"] = inj_budget_note
-        print(json.dumps(envelope, indent=2))
+            envelope = injection_details
+        if for_injection and _capture is not None:
+            _capture.clear()
+            _capture.update(envelope)
+        else:
+            print(json.dumps(envelope, indent=2))
     else:
         # Issue #58, 3.5: same fence + provenance as recall. Recent is
         # the high-confidence admin pull used by SessionStart /
@@ -3076,9 +3057,246 @@ def recent_memory(
                     f"Recent memories (namespace {namespace or 'unscoped'}). "
                     f"High-confidence admin pull. Consider if relevant; ignore if not."
                 ),
-                budget_note=inj_budget_note if for_injection else None,
+                budget_note=(injection_details or {}).get("budget_note") if for_injection else None,
             ))
     return results
+
+def _collect_injection_candidates(
+    conn: sqlite3.Connection,
+    *,
+    query: str | None,
+    namespace: str | None,
+    limit: int,
+    min_confidence: float | None,
+    include_global: bool,
+    global_limit: int,
+    as_of: str | None,
+    hybrid: bool | None,
+    no_mmr: bool,
+    link_hops: int,
+    link_budget: int,
+    cross_rerank: bool,
+    weights: dict | None,
+    no_telemetry: bool,
+    no_unfold: bool,
+    exclude_ids: list[str],
+    budget_tokens: int | None,
+) -> dict:
+    """Run one passive retrieval and return its unrendered details object.
+
+    The two public retrieval surfaces use this one seam for the injection
+    lane.  They copy the returned mapping into their private capture dict and
+    either print that same mapping for legacy JSON callers or return its rows;
+    the session-aware selector performs the one moment-specific render.
+    """
+    details: dict = {}
+    common = dict(
+        namespace=namespace,
+        limit=limit,
+        as_json=True,
+        no_bump=True,
+        include_global=include_global,
+        global_limit=global_limit,
+        as_of=as_of,
+        no_telemetry=no_telemetry,
+        for_injection=True,
+        exclude_ids=exclude_ids,
+        _capture=details,
+        _injection_budget_tokens=budget_tokens,
+    )
+    if query is None:
+        _recent_memory_impl(
+            conn,
+            min_confidence=(min_confidence if min_confidence is not None
+                            else 0.5),
+            **common,
+        )
+    else:
+        _recall_memory_impl(
+            conn,
+            query=query,
+            min_confidence=min_confidence,
+            hybrid=hybrid,
+            no_mmr=no_mmr,
+            link_hops=link_hops,
+            link_budget=link_budget,
+            cross_rerank=cross_rerank,
+            weights=weights,
+            no_unfold=no_unfold,
+            **common,
+        )
+    return dict(details)
+
+
+def recall_memory(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    namespace: str | None = None,
+    limit: int = 5,
+    as_json: bool = False,
+    min_confidence: float | None = None,
+    hybrid: bool | None = None,
+    no_bump: bool = False,
+    include_global: bool = False,
+    global_limit: int = 3,
+    as_of: str | None = None,
+    no_mmr: bool = False,
+    link_hops: int = 1,
+    link_budget: int = 2,
+    cross_rerank: bool = False,
+    weights: dict | None = None,
+    no_telemetry: bool = False,
+    no_unfold: bool = False,
+    for_injection: bool = False,
+    exclude_ids: list[str] | None = None,
+    _capture: dict | None = None,
+    _injection_budget_tokens: int | None = None,
+) -> list[dict]:
+    # Candidate acquisition below retains the emit-time _classify_injection
+    # pass in _recall_memory_impl; the shared passive details builder runs only
+    # after those unsafe rows have been omitted on the no_bump path.
+    if not for_injection:
+        return _recall_memory_impl(
+            conn,
+            query=query,
+            namespace=namespace,
+            limit=limit,
+            as_json=as_json,
+            min_confidence=min_confidence,
+            hybrid=hybrid,
+            no_bump=no_bump,
+            include_global=include_global,
+            global_limit=global_limit,
+            as_of=as_of,
+            no_mmr=no_mmr,
+            link_hops=link_hops,
+            link_budget=link_budget,
+            cross_rerank=cross_rerank,
+            weights=weights,
+            no_telemetry=no_telemetry,
+            no_unfold=no_unfold,
+            exclude_ids=exclude_ids,
+        )
+
+    details = _collect_injection_candidates(
+        conn,
+        query=query,
+        namespace=namespace,
+        limit=limit,
+        min_confidence=min_confidence,
+        include_global=include_global,
+        global_limit=global_limit,
+        as_of=as_of,
+        hybrid=hybrid,
+        no_mmr=no_mmr,
+        link_hops=link_hops,
+        link_budget=link_budget,
+        cross_rerank=cross_rerank,
+        weights=weights,
+        no_telemetry=no_telemetry,
+        no_unfold=no_unfold,
+        exclude_ids=list(exclude_ids or []),
+        budget_tokens=_injection_budget_tokens,
+    )
+    if _capture is not None:
+        _capture.clear()
+        _capture.update(details)
+    rows = details.get("results", [])
+    if not isinstance(rows, list):
+        rows = []
+    if as_json and _capture is None:
+        print(json.dumps(details, indent=2))
+    elif _capture is None and not rows:
+        print("[zmem] no matching memories found.")
+    elif _capture is None:
+        print(_format_fenced_recall(
+            rows,
+            header=(
+                f"Relevant memories (namespace {namespace or 'unscoped'}). "
+                "Consider if they apply; ignore if not."
+            ),
+            budget_note=details.get("budget_note"),
+        ))
+    return rows
+
+
+def recent_memory(
+    conn: sqlite3.Connection,
+    *,
+    namespace: str | None = None,
+    limit: int = 5,
+    min_confidence: float = 0.5,
+    as_json: bool = False,
+    no_bump: bool = False,
+    include_global: bool = False,
+    global_limit: int = 3,
+    as_of: str | None = None,
+    no_telemetry: bool = False,
+    for_injection: bool = False,
+    exclude_ids: list[str] | None = None,
+    _capture: dict | None = None,
+    _injection_budget_tokens: int | None = None,
+) -> list[dict]:
+    # _recent_memory_impl performs the same emit-time _classify_injection
+    # filtering before this public wrapper hands candidates to the shared
+    # passive details builder.
+    if not for_injection:
+        return _recent_memory_impl(
+            conn,
+            namespace=namespace,
+            limit=limit,
+            min_confidence=min_confidence,
+            as_json=as_json,
+            no_bump=no_bump,
+            include_global=include_global,
+            global_limit=global_limit,
+            as_of=as_of,
+            no_telemetry=no_telemetry,
+            exclude_ids=exclude_ids,
+        )
+
+    details = _collect_injection_candidates(
+        conn,
+        query=None,
+        namespace=namespace,
+        limit=limit,
+        min_confidence=min_confidence,
+        include_global=include_global,
+        global_limit=global_limit,
+        as_of=as_of,
+        hybrid=None,
+        no_mmr=False,
+        link_hops=0,
+        link_budget=0,
+        cross_rerank=False,
+        weights=None,
+        no_telemetry=no_telemetry,
+        no_unfold=True,
+        exclude_ids=list(exclude_ids or []),
+        budget_tokens=_injection_budget_tokens,
+    )
+    if _capture is not None:
+        _capture.clear()
+        _capture.update(details)
+    rows = details.get("results", [])
+    if not isinstance(rows, list):
+        rows = []
+    if as_json and _capture is None:
+        print(json.dumps(details, indent=2))
+    elif _capture is None and not rows:
+        print("[zmem] no recent memories.")
+    elif _capture is None:
+        print(_format_fenced_recall(
+            rows,
+            header=(
+                f"Recent memories (namespace {namespace or 'unscoped'}). "
+                "High-confidence admin pull. Consider if relevant; ignore if not."
+            ),
+            budget_note=details.get("budget_note"),
+        ))
+    return rows
+
 
 def list_memory(conn, *, namespace=None, limit=50, include_superseded=False):
     params = []

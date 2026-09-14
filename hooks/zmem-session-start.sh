@@ -206,11 +206,11 @@ esac
 # cover manual/back-compat invocation). Empty when no host supplied it —
 # the python block logs sid=unknown then.
 SESSION_ID="${ZMEM_SESSION:-${CLAUDE_SESSION_ID:-${ZCODE_SESSION_ID:-}}}"
-# Issue #118 (D-2 scope 1): the launcher exports the SessionStart payload's
-# `source` field verbatim (startup | resume | clear | compact). The only
-# branch is source == "compact" (post-compaction re-injection); every other
-# value — and a host that sends no source at all — takes the cold-start lane
-# unchanged. No resume handling (2026-09-10 amendment).
+# Issue #158: the launcher exports the SessionStart payload's `source` field
+# verbatim (startup | resume | clear | compact) for audit attribution. The
+# compact value is only a host marker now: the payload always calls the
+# canonical `session_start` selector, so no compact snapshot/summary sidecar
+# branch remains. No resume handling (2026-09-10 amendment).
 SOURCE="${ZMEM_SESSION_SOURCE:-}"
 SETTINGS_DIR_PY="$(join_path "$(to_py_path "$HOME")" .claude)"
 NUDGE_MARKER_PY="$(join_path "$DATA_DIR_PY" .native-nudge-shown)"
@@ -296,11 +296,26 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   # that block at the first python-interpreter invocation after the sink
   # assignment, so this literal must not appear between the two.
   zmem_rotate_maintenance_sink() {
-    "$PYTHON_BIN" -c 'import sys; sys.path.insert(0, sys.argv[1]); from storelib.log_rotate import rotate_on_append; rotate_on_append(sys.argv[2])' "$(dirname "$STORE_PY_PY")" "$1" 2>/dev/null || true
+    # Keep hook rotation independent of the store implementation.  The
+    # adapter is stdlib-only and fail-open, so maintenance logging can never
+    # block SessionStart or lose the active file on an import/path failure.
+    # Its public rotate_on_append contract is intentionally reached through
+    # the standalone helper rather than a store implementation import.
+    LOG_ROTATOR_PY="$(to_py_path "$(dirname "${BASH_SOURCE[0]}")/lib/zmem-log-rotate.py")"
+    if [ -f "$LOG_ROTATOR_PY" ]; then
+      "$PYTHON_BIN" "$LOG_ROTATOR_PY" "$1" 2>/dev/null || true
+    fi
   }
   BG_SINK="/dev/null"
   if [ "${ZMEM_BG_LOG:-1}" != "0" ] && [ -n "$DATA_DIR" ]; then
-    BG_LOG_PATH="$DATA_DIR/zmem-bg.log"
+    # Shell-side probes and redirects need a native MSYS path on Windows;
+    # DATA_DIR_PY intentionally remains a Windows path for the Python
+    # subprocesses above and below.
+    BG_DATA_DIR="$DATA_DIR"
+    if [ "$IS_WINDOWS" -eq 1 ] && command -v cygpath >/dev/null 2>&1; then
+      BG_DATA_DIR="$(cygpath -u "$DATA_DIR" 2>/dev/null || printf '%s' "$DATA_DIR")"
+    fi
+    BG_LOG_PATH="$BG_DATA_DIR/zmem-bg.log"
     # Ensure the dir exists, is writable, AND the log file itself is appendable
     # before redirecting into it. The `{ : 2>/dev/null >>file ; }` probe opens
     # the file for append (creating it if absent) with stderr silenced FIRST —
@@ -309,7 +324,7 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
     # to the hook's stderr or letting the later `>>"$BG_SINK"` redirect fail
     # silently and drop all maintenance output (PRR-004). Strict conjunction
     # (no `||`) so any failure falls through to /dev/null.
-    if mkdir -p "$DATA_DIR" 2>/dev/null && [ -w "$DATA_DIR" ] && { : 2>/dev/null >>"$BG_LOG_PATH"; }; then
+    if mkdir -p "$BG_DATA_DIR" 2>/dev/null && [ -w "$BG_DATA_DIR" ] && { : 2>/dev/null >>"$BG_LOG_PATH"; }; then
       BG_SINK="$BG_LOG_PATH"
       # Issue #129: rotate the maintenance sink before the detached worker
       # redirects into it — bounded segments instead of unbounded growth.
@@ -363,6 +378,8 @@ BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 
 # Build the additionalContext payload using python for guaranteed-valid JSON.
 # The payload block lives in hooks/lib/zmem-session-start-payload.py —
+# Tier 2's canonical fenced text is produced by store.py through the same
+# zmem-recall-body.py adapter contract; this shell wrapper never renders rows.
 # PR #190 review: the inline `python -c` form grew past the Windows
 # CreateProcess ~32K command-line limit and silently degraded to `{}`
 # (the spawn failure was swallowed by the || echo fallback). A real

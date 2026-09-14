@@ -1038,7 +1038,6 @@ class MarginDecisionLogTest(unittest.TestCase):
         line = self._write_hook_decision(
             tokens_used=10,
             tokens_budget=1500,
-            ops_count=2,
             excluded_count=1,
             admission_used=10,
             budget_dropped=0,

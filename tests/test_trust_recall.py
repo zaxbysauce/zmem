@@ -266,9 +266,10 @@ class TrustBlocksInjectionButNotSearchTest(TrustRecallCliBase):
         self.assertEqual(_row_trust({"trust_score": 10 ** 400}), 0.0)
 
     def test_absence_form_every_no_bump_builder_has_gate_flag(self):
-        # Review round (PRR): pin the absence-form invariant from the 4.2
-        # sweep — every argv builder that passes --no-bump must also pass
-        # --for-injection, or a contradicted row could ride an ungated lane.
+        # Review round (PRR): pin the absence-form invariant from the current
+        # passive argv builders — every builder that passes --no-bump must
+        # also pass --for-injection, or a contradicted row could ride an
+        # ungated lane. Hermes' two consumers intentionally share one helper.
         import re
         builders = [
             "hermes-plugin/__init__.py",
@@ -289,7 +290,15 @@ class TrustBlocksInjectionButNotSearchTest(TrustRecallCliBase):
                               f"{rel}: a --no-bump builder lacks the "
                               f"--for-injection gate flag")
                 checked += 1
-        self.assertGreaterEqual(checked, 7, "expected >=7 builders")
+        self.assertGreaterEqual(checked, 5, "expected every current passive builder")
+
+        hermes = (REPO / "hermes-plugin/__init__.py").read_text(encoding="utf-8")
+        helper_start = hermes.index("def _passive_store_args")
+        helper_end = hermes.find("\ndef ", helper_start + 1)
+        helper = hermes[helper_start:helper_end if helper_end != -1 else None]
+        self.assertIn('"--no-bump"', helper)
+        self.assertIn('"--for-injection"', helper)
+        self.assertIn("_passive_store_args(", hermes[helper_end + 1:])
 
 
 class UncontradictedRankingStableTest(TrustRecallCliBase):

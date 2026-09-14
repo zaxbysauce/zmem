@@ -104,7 +104,9 @@ def _run_body(tmp: str, mode: str, event: dict, ns: str = "user:global",
 
 def _ctx(stdout: str) -> str:
     text = stdout.strip()
-    return json.loads(text)["additionalContext"] if text else ""
+    # Silent adapters now emit the canonical empty envelope ``{}``; the old
+    # pre-#158 test seam assumed every response carried an empty string field.
+    return json.loads(text).get("additionalContext", "") if text else ""
 
 
 class PreToolModeTest(unittest.TestCase):
@@ -129,7 +131,7 @@ class PreToolModeTest(unittest.TestCase):
                 .read_text(encoding="utf-8").splitlines()
                 if "zmem-hook" in l][-1]
         self.assertIn("reason=injected", line)
-        self.assertRegex(line, r"ops=\d+")
+        self.assertNotRegex(line, r"(?:^|\s)ops=\d+")
 
     def test_edit_file_path_derives_basename_query(self):
         out, rc = _run_body(
@@ -212,35 +214,26 @@ class PendingSidecarTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def test_claude_parks_and_next_prompt_delivers(self):
-        # Issue #117 AMENDMENT: the sidecar is retired by default, so the
-        # park/deliver contract now pins the NARROW FALLBACK
-        # (ZMEM_PENDING_SIDECAR=1) on the parking AND delivery legs (the
-        # writer gates the park, the consumer gates the delivery). The
-        # parked file is hash-keyed now (sha256 of the full session id),
-        # hence the glob instead of the literal sanitize+truncate name.
-        # Leg 3 runs WITHOUT the env: after the fence is consumed, the
-        # delivery ledger alone must keep the row suppressed.
-        def _pending_file():
-            ops = Path(self._tmp, "ops")
-            files = sorted(ops.glob("*.pending")) if ops.is_dir() else []
-            return files[0] if files else None
-
-        # 1) Pre-tool run on the claude host parks the fence (fallback env).
+    def test_claude_does_not_park_retired_sidecar(self):
+        # Issue #158 retires the pending sidecar entirely. The legacy knob is
+        # intentionally inert: Claude receives the same canonical rendered
+        # envelope as every other passive consumer and no adapter-owned stash
+        # is created.
         out, rc = _run_body(
             self._tmp, "pretool",
             {"tool_name": "Bash", "tool_input": {"command": "git stash pop"},
              "session_id": "s-pend"},
-            ns="project:pending", ZMEM_HOST="claude",
-            ZMEM_PENDING_SIDECAR="1")
+             ns="project:pending", ZMEM_HOST="claude",
+             ZMEM_PENDING_SIDECAR="1")
         self.assertEqual(rc, 0)
-        self.assertIn("pretoolcanary", _ctx(out))  # direct emit still happens
-        pending = _pending_file()
-        self.assertTrue(pending is not None and pending.is_file(),
-                        "claude must park the fence (under the fallback env)")
+        self.assertIn("pretoolcanary", _ctx(out))
+        self.assertFalse(
+            list(Path(self._tmp, "ops").glob("*.pending"))
+            if Path(self._tmp, "ops").is_dir() else False,
+            "the retired pending-sidecar knob must not create a sidecar")
 
-        # 2) Next user_prompt run (prose that recalls NOTHING) still
-        #    delivers the parked fence and clears the sidecar.
+        # A later prompt is an independent canonical selector call; it does
+        # not consume an adapter sidecar or replay the previous fence.
         out, rc = _run_body(
             self._tmp, "user_prompt",
             {"prompt": "keep going with unrelated zebra work",
@@ -249,19 +242,7 @@ class PendingSidecarTest(unittest.TestCase):
             ZMEM_PENDING_SIDECAR="1")
         self.assertEqual(rc, 0)
         ctx = _ctx(out)
-        self.assertIn("pretoolcanary", ctx)
-        self.assertTrue(_pending_file() is None, "sidecar must be consumed")
-
-        # 3) A third run (default mode) does not re-deliver: the ledger
-        #    recorded the pretool delivery, so the row stays suppressed
-        #    with no sidecar involved at all.
-        out, rc = _run_body(
-            self._tmp, "user_prompt",
-            {"prompt": "keep going with unrelated zebra work",
-             "session_id": "s-pend"},
-            ns="project:pending", ZMEM_HOST="claude")
-        self.assertEqual(rc, 0)
-        self.assertNotIn("pretoolcanary", _ctx(out))
+        self.assertNotIn("pretoolcanary", ctx)
 
     def test_zcode_does_not_park(self):
         out, rc = _run_body(

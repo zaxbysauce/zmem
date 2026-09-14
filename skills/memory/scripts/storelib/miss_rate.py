@@ -84,12 +84,13 @@ _REPORT_LANES = tuple(sorted(_ATTR_LANES))
 _REPORT_MOMENTS = tuple(sorted(
     ("session_start", "user_prompt", "pretool", "precompact")))
 
-# One bg-log decision line, either writer shape:
-#   writer A: [ts] zmem-hook status=.. reason=.. [omitted=N] ids=[..] all=[..] [tokens=a/b] [ops=N] [sid=..] [moment=..]
+# One bg-log decision line, either current or historical writer shape:
+#   historical writer A: [ts] zmem-hook status=.. reason=.. [omitted=N] ids=[..] all=[..] [tokens=a/b] [ops=N] [sid=..] [moment=..]
 #   writer B: [ts] zmem-hook status=.. ids=[..] all=[..] [tokens=a/b] [sid=..]
-# reason/omitted/tokens/ops/sid are all optional in the regex because writer B
-# omits reason=/omitted=/ops= and every pre-#94 line omits sid=. moment= is
-# the additive #129 field (injection moment: session_start/user_prompt/
+# reason/omitted/tokens/ops/sid are all optional in the regex because current
+# writer B omits reason=/omitted=/ops= and every pre-#94 line omits sid=. The
+# historical ops= field remains parseable for old logs. moment= is the
+# additive #129 field (injection moment: session_start/user_prompt/
 # pretool/subagent/precompact); every pre-#129 line omits it (legacy bucket).
 _BG_LINE_RE = re.compile(
     r"^\[(\d+)\] zmem-hook status=(\S+)"

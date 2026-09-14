@@ -326,33 +326,44 @@ class HookBodyBudgetTest(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-    def _run_body(self, mode: str) -> str:
+    def _run_body(self, mode: str, session_id: str = "") -> str:
         import subprocess
         body = REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py"
-        event = json.dumps({"prompt": "hook budget probe row"})
+        event = {"prompt": "hook budget probe row"}
+        if session_id:
+            event["session_id"] = session_id
         r = subprocess.run(
             [sys.executable, str(body), str(SCRIPTS / "store.py"),
              "project:budget", "25000", mode],
-            input=event, capture_output=True, text=True, timeout=60,
+            input=json.dumps(event), capture_output=True, text=True, timeout=60,
         )
         return r.stdout
 
     def test_body_respects_tiny_budget(self):
         # Baseline: all three rows inject under the default budget.
-        full = json.loads(self._run_body("user_prompt"))
-        self.assertGreaterEqual(len(full["additionalContext"].split("- [")), 2)
+        full = json.loads(self._run_body("user_prompt", "budget-full"))
+        full_context = full.get("additionalContext", "")
+        self.assertGreaterEqual(len(full_context.split("- [")), 2)
 
         os.environ["ZMEM_INJECT_TOKEN_BUDGET"] = "40"
         try:
-            trimmed = json.loads(self._run_body("user_prompt"))
+            trimmed = json.loads(self._run_body("user_prompt", "budget-tiny"))
         finally:
             os.environ.pop("ZMEM_INJECT_TOKEN_BUDGET", None)
-        # A 40-token budget cannot admit two 100+ token rows: fewer bullets.
+        # A 40-token budget cannot admit two 100+ token rows: the selector must
+        # report a budget drop for this distinct session, not merely go silent
+        # because the delivery ledger deduplicated the baseline session.
+        trimmed_context = trimmed.get("additionalContext", "")
         self.assertLess(
-            len(trimmed["additionalContext"].split("- [")),
-            len(full["additionalContext"].split("- [")),
+            len(trimmed_context.split("- [")),
+            len(full_context.split("- [")),
             "the hook body must stop adding bullets at ZMEM_INJECT_TOKEN_BUDGET",
         )
+        with open(os.path.join(self._tmp, "zmem-decisions.log"), encoding="utf-8") as f:
+            tiny_lines = [line for line in f if "sid=budget-tiny" in line]
+        self.assertTrue(tiny_lines, "tiny-budget decision line missing")
+        self.assertRegex(tiny_lines[-1], r"reason=budget-drop")
+        self.assertRegex(tiny_lines[-1], r"budget_dropped=[1-9]")
 
     def test_bg_log_line_carries_tokens(self):
         log = os.path.join(self._tmp, "zmem-decisions.log")
@@ -502,10 +513,12 @@ class HookBodyBudgetTest(unittest.TestCase):
 
 
 class DegradedFenceFallbackTest(unittest.TestCase):
-    """Issue #116 final-critic catch: the degraded-mode fallback renderers in
-    both Hermes twins must accept the ``budget_note`` kwarg the session_start
-    paths now pass — the fallback exists for exactly the import-failure
-    scenario where a TypeError would defeat the fail-open contract."""
+    """Passive providers consume only the store-owned rendered envelope.
+
+    The #158 adapters no longer carry a local renderer or interpret row and
+    budget fields. Malformed subprocess output must therefore degrade to a
+    silent result instead of being rendered locally.
+    """
 
     def _load_hermes(self):
         import importlib.util
@@ -529,17 +542,19 @@ class DegradedFenceFallbackTest(unittest.TestCase):
         spec.loader.exec_module(mod)
         return mod
 
-    def test_hermes_fallback_accepts_budget_note(self):
+    def test_hermes_consumer_accepts_store_rendered_envelope(self):
         mod = self._load_hermes()
-        rows = [{"id": "fb1", "confidence": 0.9, "signal": "test",
-                 "namespace": "project:x", "type": "fact", "content": "c"}]
-        out = mod._local_fenced_recall(
-            rows, "hdr", budget_note="[budget: dropped 1 rows, truncated 0]")
-        self.assertIn("[budget: dropped 1 rows, truncated 0]", out)
-        self.assertTrue(
-            out.strip().endswith("<<<END_ZMEM_UNTRUSTED_FENCE>>>"))
-        plain = mod._local_fenced_recall(rows, "hdr")
-        self.assertNotIn("[budget:", plain)
+        rendered = ("<<<ZMEM_UNTRUSTED_FENCE>>>\n"
+                    "store-owned row\n"
+                    "<<<END_ZMEM_UNTRUSTED_FENCE>>>")
+        envelope = {"rendered": rendered, "reason": "injected",
+                    "results": [{"id": "fb1"}]}
+        out = mod._decode_rendered_envelope(
+            {"ok": True, "stdout": json.dumps(envelope)})
+        self.assertEqual(out, envelope)
+        self.assertIsNone(mod._decode_rendered_envelope(
+            {"ok": True,
+             "stdout": json.dumps({"results": [{"id": "fb1"}]})}))
 
     @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed")
     def test_mcp_fallback_accepts_budget_note(self):

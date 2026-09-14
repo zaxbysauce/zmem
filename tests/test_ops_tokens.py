@@ -6,8 +6,8 @@ Proves the spec-B contract:
 - compose_inject_query reserves the ops slice INSIDE the 500-char cap and is
   the BYTE-EXACT identity without ops material (the legacy-neutrality pin);
 - the PostToolUse hooks write the ring (coding host + Hermes post_tool_call);
-- the UserPromptSubmit hook body and the Hermes prefetch surface compose the
-  ring into the query (kill switch ZMEM_QUERY_CONTEXT=0 restores prose-only);
+- store-side pretool selection composes the ring while user-prompt and Hermes
+  prefetch adapters remain prose-only (the adapters own no ring access);
 - the eval gold's decision-point items hit WITH ops and MISS prose-only (so
   they measure the lane, not accidental prefix matches), and legacy items
   compose byte-identically;
@@ -481,7 +481,7 @@ class HermesConventionRingTest(unittest.TestCase):
 
 
 class HookBodyComposeTest(unittest.TestCase):
-    """End-to-end: the UserPromptSubmit body composes ring into the query."""
+    """The UserPromptSubmit adapter never reads or composes the ops ring."""
 
     LESSON = ("ringcanary hazard: a later blind git stash pop can apply a "
               "foreign pre-existing stash; verify git stash list before any "
@@ -499,7 +499,7 @@ class HookBodyComposeTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stdout)
         return r.stdout
 
-    def test_ring_changes_retrieval_and_log_carries_ops(self):
+    def test_user_prompt_does_not_compose_ring_or_log_ops(self):
         tmp = tempfile.mkdtemp(prefix="zmem-ops-e2e-")
         try:
             env = _clean_env(tmp)
@@ -513,27 +513,29 @@ class HookBodyComposeTest(unittest.TestCase):
             if log.exists():
                 log.unlink()
 
-            # Prose-only session: no ring → silent (retrieved nothing).
+            # Prose-only session: no matching prose → silent.
             out = self._run_body(tmp, "keep finalizing this work", "no-ring")
-            ctx = json.loads(out.strip())["additionalContext"]
-            self.assertEqual(ctx, "no durable memories retrieved for this prompt.")
+            ctx = json.loads(out.strip()).get("additionalContext", "")
+            self.assertEqual(ctx, "")
 
-            # Same prose WITH the ring session: the lesson injects.
+            # The same prose WITH a ring remains silent: only store-side
+            # moment=pretool selection may compose the ring.
             out = self._run_body(tmp, "keep finalizing this work", "sess-e2e")
-            ctx = json.loads(out.strip())["additionalContext"]
-            self.assertIn("ringcanary", ctx)
+            ctx = json.loads(out.strip()).get("additionalContext", "")
+            self.assertEqual(ctx, "")
             line = [l for l in log.read_text(encoding="utf-8").splitlines()
                     if "zmem-hook" in l][-1]
-            self.assertRegex(line, r"ops=\d+")
+            self.assertNotRegex(line, r"(?:^|\s)ops=\d+")
 
-            # Kill switch restores the prose-only behavior.
+            # The query-context kill switch cannot make a user-prompt adapter
+            # consult the ring either.
             out = self._run_body(tmp, "keep finalizing this work", "sess-e2e",
                                  ZMEM_QUERY_CONTEXT="0")
-            ctx = json.loads(out.strip())["additionalContext"]
-            self.assertEqual(ctx, "no durable memories retrieved for this prompt.")
+            ctx = json.loads(out.strip()).get("additionalContext", "")
+            self.assertEqual(ctx, "")
 
-            # Review PRR-91-013: ring present + recall returns nothing → the
-            # SILENT line still carries ops=N.
+            # A ring cannot affect a prose-only user-prompt miss, and the
+            # adapter does not report a hook-owned ops count.
             ring2 = Path(tmp, "ops", "sess-empty2.log")
             ring2.write_text(
                 json.dumps({"ts": 2, "tool": "Bash",
@@ -541,23 +543,22 @@ class HookBodyComposeTest(unittest.TestCase):
                 encoding="utf-8")
             out = self._run_body(tmp, "keep finalizing this unrelated zebra",
                                  "sess-empty2")
-            ctx = json.loads(out.strip())["additionalContext"]
+            ctx = json.loads(out.strip()).get("additionalContext", "")
             self.assertNotIn("ringcanary", ctx)
             line = [l for l in log.read_text(encoding="utf-8").splitlines()
                     if "zmem-hook" in l][-1]
             self.assertIn("status=silent", line)
-            self.assertRegex(line, r"ops=\d+")
+            self.assertNotRegex(line, r"(?:^|\s)ops=\d+")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
 class DataDirPrecedenceTest(unittest.TestCase):
-    """Review PRR-91-001: the ring reader (hook body) must resolve the data
-    dir ZMEM_STORE-first, matching the convention-capture writer — otherwise
-    split-env deployments silently no-op the lane. The plugin-data cases
-    below extend the same writer/reader-parity contract to the rest of the
-    writer's chain (CLAUDE_PLUGIN_DATA / ZCODE_PLUGIN_DATA): a non-launcher
-    environment that only sets a plugin-data var must still find the ring."""
+    """Convention-capture writers resolve one consistent ring data directory.
+
+    Passive user-prompt adapters deliberately ignore that ring; pretool
+    composition is store-owned and is covered by the passive-injection tests.
+    """
 
     def _plugin_data_env(self, tmp: str) -> dict:
         # _clean_env seeds ZMEM_STORE/ZMEM_DATA; the plugin-data branch of
@@ -599,7 +600,7 @@ class DataDirPrecedenceTest(unittest.TestCase):
                               "session_id": session_id}),
             capture_output=True, text=True, env=env, timeout=120, cwd=cwd)
         self.assertEqual(r.returncode, 0, r.stderr)
-        return json.loads(r.stdout.strip())["additionalContext"]
+        return json.loads(r.stdout.strip()).get("additionalContext", "")
 
     def _last_hook_line(self, data_dir: Path) -> str:
         # #129: decision lines live in zmem-decisions.log.
@@ -612,9 +613,8 @@ class DataDirPrecedenceTest(unittest.TestCase):
         return lines[-1]
 
     def test_reader_finds_ring_written_under_plugin_data_var(self):
-        # THE W1 regression catcher: with ZMEM_STORE/ZMEM_DATA absent and
-        # only ZCODE_PLUGIN_DATA set, the writer lands the ring under the
-        # plugin-data dir and the reader must compose from the SAME dir.
+        # The writer lands the ring under the plugin-data dir. The passive
+        # user-prompt adapter must not consume it locally.
         tmp = tempfile.mkdtemp(prefix="zmem-ops-plugdata-")
         try:
             plugdata = Path(tmp, "plugdata")
@@ -632,15 +632,13 @@ class DataDirPrecedenceTest(unittest.TestCase):
                 (Path(env["HOME"]) / ".zmem" / "ops").exists(),
                 "writer must not fall through to the home fallback")
             ctx = self._run_reader(env, "project:prec-plug", "sess-q")
-            self.assertIn("ringcanary", ctx,
-                          "reader must resolve the ring from the "
-                          "plugin-data dir like the writer")
+            self.assertNotIn("ringcanary", ctx,
+                             "user-prompt adapter must not read the ring")
             line = self._last_hook_line(plugdata)
-            self.assertIn("status=injected", line)
-            # Exact token count: one `git stash pop` event derives exactly
-            # three allowlisted tokens, so the composed tokens provably came
-            # from THIS ring (the sandbox has no other ring to probe).
-            self.assertRegex(line, r"ops=3(?:\s|$)")
+            self.assertIn("status=silent", line)
+            # The writer's descriptor remains allowlisted and persisted, while
+            # the passive adapter does not expose a hook-owned ops count.
+            self.assertNotRegex(line, r"(?:^|\s)ops=\d+")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -663,11 +661,11 @@ class DataDirPrecedenceTest(unittest.TestCase):
                             "writer must prefer CLAUDE_PLUGIN_DATA")
             self.assertFalse((zcode_loc / "ops").exists())
             ctx = self._run_reader(env, "project:prec-order", "sess-o")
-            self.assertIn("ringcanary", ctx,
-                          "reader must prefer CLAUDE_PLUGIN_DATA too")
+            self.assertNotIn("ringcanary", ctx,
+                             "user-prompt adapter must not read the ring")
             line = self._last_hook_line(claude_loc)
-            self.assertIn("status=injected", line)
-            self.assertRegex(line, r"ops=3(?:\s|$)")
+            self.assertIn("status=silent", line)
+            self.assertNotRegex(line, r"(?:^|\s)ops=\d+")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -692,8 +690,8 @@ class DataDirPrecedenceTest(unittest.TestCase):
                             "writer must prefer ZMEM_DATA over plugin-data")
             self.assertFalse((zcode_loc / "ops").exists())
             ctx = self._run_reader(env, "project:prec-zdata", "sess-z")
-            self.assertIn("ringcanary", ctx,
-                          "reader must prefer ZMEM_DATA over plugin-data too")
+            self.assertNotIn("ringcanary", ctx,
+                             "user-prompt adapter must not read the ring")
             self._last_hook_line(data_loc)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -719,11 +717,10 @@ class DataDirPrecedenceTest(unittest.TestCase):
                              "in the process cwd")
             ctx = self._run_reader(env, "project:prec-tilde", "sess-t",
                                    cwd=tmp)
-            self.assertIn("ringcanary", ctx,
-                          "reader must find the ring under the expanded "
-                          "tilde path")
+            self.assertNotIn("ringcanary", ctx,
+                             "user-prompt adapter must not read the ring")
             line = self._last_hook_line(pd_dir)
-            self.assertIn("status=injected", line)
+            self.assertIn("status=silent", line)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -746,9 +743,8 @@ class DataDirPrecedenceTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "~").exists())
             ctx = self._run_reader(env, "project:prec-tilde-zd", "sess-zd",
                                    cwd=tmp)
-            self.assertIn("ringcanary", ctx,
-                          "reader must expand tilde ZMEM_DATA like the "
-                          "writer")
+            self.assertNotIn("ringcanary", ctx,
+                             "user-prompt adapter must not read the ring")
             self._last_hook_line(zd_dir)
 
             # Session-start's inline Tier-2 block must expand too: the outer
@@ -796,9 +792,8 @@ class DataDirPrecedenceTest(unittest.TestCase):
                             "writer must expand a tilde-valued ZMEM_STORE")
             ctx = self._run_reader(env, "project:prec-tilde-zs", "sess-zs",
                                    cwd=tmp)
-            self.assertIn("ringcanary", ctx,
-                          "reader must expand tilde ZMEM_STORE like the "
-                          "writer")
+            self.assertNotIn("ringcanary", ctx,
+                             "user-prompt adapter must not read the ring")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -949,7 +944,7 @@ class DataDirPrecedenceTest(unittest.TestCase):
             self.assertTrue((store_dir / "ops" / "sess-p.log").is_file(),
                             "writer must resolve ZMEM_STORE-first")
             self.assertFalse((data_dir / "ops").exists())
-            # Reader (hook body) must find the ring under the SAME dir.
+            # The user-prompt adapter deliberately does not read the ring.
             r = subprocess.run(
                 [sys.executable, str(BODY), str(SCRIPTS / "store.py"),
                  "project:prec", "25000", "user_prompt"],
@@ -957,16 +952,15 @@ class DataDirPrecedenceTest(unittest.TestCase):
                                   "session_id": "sess-p"}),
                 capture_output=True, text=True, env=env, timeout=120)
             self.assertEqual(r.returncode, 0, r.stderr)
-            ctx = json.loads(r.stdout.strip())["additionalContext"]
-            self.assertIn("ringcanary", ctx,
-                          "reader must resolve the ring from the "
-                          "ZMEM_STORE-parent dir like the writer")
+            ctx = json.loads(r.stdout.strip()).get("additionalContext", "")
+            self.assertNotIn("ringcanary", ctx,
+                             "user-prompt adapter must not read the ring")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
 class HermesPrefetchComposeTest(unittest.TestCase):
-    def test_prefetch_composes_ring(self):
+    def test_prefetch_does_not_compose_ring(self):
         tmp = tempfile.mkdtemp(prefix="zmem-ops-prefetch-")
         saved = {k: os.environ.get(k) for k in _STRIP_ENV}
         try:
@@ -1005,12 +999,11 @@ class HermesPrefetchComposeTest(unittest.TestCase):
             provider._namespace = "project:prefetch-compose"
             out = provider.prefetch("keep finalizing this work",
                                     session_id="sess-pf")
-            self.assertIn("prefetchcanary", out)
+            self.assertNotIn("prefetchcanary", out)
             out_nosid = provider.prefetch("keep finalizing this work")
             self.assertNotIn("prefetchcanary", out_nosid)
 
-            # Review PRR-91-009: the kill switch must silence the Hermes
-            # prefetch composition too.
+            # The kill switch still silences Hermes passive prefetch.
             os.environ["ZMEM_QUERY_CONTEXT"] = "0"
             try:
                 out_ks = provider.prefetch("keep finalizing this work",
@@ -1019,17 +1012,6 @@ class HermesPrefetchComposeTest(unittest.TestCase):
                 os.environ.pop("ZMEM_QUERY_CONTEXT", None)
             self.assertNotIn("prefetchcanary", out_ks)
 
-            # Review round 1: a checkout where ops_tokens cannot be
-            # imported (copy install without skills/, #36 M10) must
-            # degrade to the prose-only query — no crash, no composition.
-            saved_mod = mod._OPS_TOKENS
-            mod._OPS_TOKENS = None
-            try:
-                out_none = provider.prefetch("keep finalizing this work",
-                                             session_id="sess-pf")
-            finally:
-                mod._OPS_TOKENS = saved_mod
-            self.assertNotIn("prefetchcanary", out_none)
         finally:
             for k, v in saved.items():
                 if v is None:

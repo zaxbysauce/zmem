@@ -174,13 +174,16 @@ class HookBodyReasonTest(unittest.TestCase):
 
     @staticmethod
     def _ctx(stdout: str) -> str:
-        return json.loads(stdout.strip())["additionalContext"]
+        # #158 adapters pass through only the store-owned ``rendered`` field;
+        # silent envelopes therefore omit additionalContext instead of
+        # synthesizing a prose explanation in the hook process.
+        return json.loads(stdout.strip()).get("additionalContext", "")
 
     def test_1_empty_pool_names_retrieved_empty_not_bar(self):
         _remove_log(self._tmp)
         out = self._run_body("user_prompt", "project:sr-nothing",
                              "completely unmatched prompt zebra xylophone")
-        self.assertEqual(self._ctx(out), S_RETRIEVED_EMPTY)
+        self.assertEqual(self._ctx(out), "")
         self.assertNotEqual(self._ctx(out), S_BELOW_BAR)
         line = _read_last_hook_line(self._tmp)
         self.assertIn("status=silent reason=empty-pool", line)
@@ -193,7 +196,7 @@ class HookBodyReasonTest(unittest.TestCase):
             "user_prompt", self.ns_omitted,
             "riskcanary instructions knowledge base")
         ctx = self._ctx(out)
-        self.assertEqual(ctx, S_RETRIEVED_EMPTY)
+        self.assertEqual(ctx, "")
         # The model-visible string must not teach that omitted
         # injection-risk rows existed (#87 spec).
         self.assertNotIn("omitted", ctx.lower())
@@ -207,7 +210,7 @@ class HookBodyReasonTest(unittest.TestCase):
         _remove_log(self._tmp)
         out = self._run_body("user_prompt", self.ns_below,
                              "gatecanary release policy")
-        self.assertEqual(self._ctx(out), S_BELOW_BAR)
+        self.assertEqual(self._ctx(out), "")
         line = _read_last_hook_line(self._tmp)
         self.assertIn("status=silent reason=below-bar", line)
         self.assertIn("all=['", line,
@@ -219,7 +222,7 @@ class HookBodyReasonTest(unittest.TestCase):
         env["ZMEM_INJECT_TOKEN_BUDGET"] = "40"
         out = self._run_body("user_prompt", self.ns_budget,
                              "budgetcanary probe", env=env)
-        self.assertEqual(self._ctx(out), S_BUDGET_DROP)
+        self.assertEqual(self._ctx(out), "")
         line = _read_last_hook_line(self._tmp)
         self.assertIn("status=silent reason=budget-drop", line)
         self.assertRegex(line, r"tokens=0/40")
@@ -254,7 +257,7 @@ class HookBodyReasonTest(unittest.TestCase):
         env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
         out = self._run_body("user_prompt", self.ns_below_rel,
                              "belowrelcanary probe", env=env)
-        self.assertEqual(self._ctx(out), S_RETRIEVED_EMPTY)
+        self.assertEqual(self._ctx(out), "")
         self.assertNotEqual(self._ctx(out), S_BELOW_BAR)
         line = _read_last_hook_line(self._tmp)
         self.assertIn("status=silent reason=below-relevance", line)
@@ -284,30 +287,30 @@ class HookBodyReasonTest(unittest.TestCase):
         self.assertIn("status=injected reason=injected", line)
         self.assertIn("omitted=3", line)
 
-    def test_11_recent_mode_below_bar(self):
-        # The spec's tail note: precompact/recent modes have no prompt query,
-        # but rows that clear the store-side recent floor can still fail the
-        # hook gate — that is a real below-bar, not an empty pool.
+    def test_11_recent_mode_uses_store_recent_floor(self):
+        # #158 routes recent selection through the store-owned selector. Rows
+        # below recent_memory's confidence floor never become candidates, so
+        # the adapter records empty-pool rather than reclassifying locally.
         _remove_log(self._tmp)
         env = dict(self.env)
         env["ZMEM_INJECT_FLOOR_RECENT"] = "0.25"
         out = self._run_body("recent", self.ns_recent, "ignored prompt",
                              env=env)
-        self.assertEqual(self._ctx(out), S_BELOW_BAR)
+        self.assertEqual(self._ctx(out), "")
         line = _read_last_hook_line(self._tmp)
-        self.assertIn("status=silent reason=below-bar", line)
+        self.assertIn("status=silent reason=empty-pool", line)
 
-    def test_11b_precompact_mode_below_bar(self):
-        # Review PRR-89-007b: precompact shares the recent-pull lane; the
-        # silent-reason contract must hold there too (spec names all modes).
+    def test_11b_precompact_mode_uses_store_recent_floor(self):
+        # Precompact shares the store-owned recent lane and therefore has the
+        # same candidate-floor behavior as the recent compatibility mode.
         _remove_log(self._tmp)
         env = dict(self.env)
         env["ZMEM_INJECT_FLOOR_RECENT"] = "0.25"
         out = self._run_body("precompact", self.ns_recent, "ignored prompt",
                              env=env)
-        self.assertEqual(self._ctx(out), S_BELOW_BAR)
+        self.assertEqual(self._ctx(out), "")
         line = _read_last_hook_line(self._tmp)
-        self.assertIn("status=silent reason=below-bar", line)
+        self.assertIn("status=silent reason=empty-pool", line)
 
 
 class ClassifierUnitTests(unittest.TestCase):
@@ -464,8 +467,8 @@ class HookBodyBareListEnvelopeTest(unittest.TestCase):
                 capture_output=True, text=True, env=env, timeout=60,
             )
             self.assertEqual(r.returncode, 0, r.stderr)
-            ctx = json.loads(r.stdout.strip())["additionalContext"]
-            self.assertEqual(ctx, S_RETRIEVED_EMPTY)
+            ctx = json.loads(r.stdout.strip()).get("additionalContext", "")
+            self.assertEqual(ctx, "")
             line = _read_last_hook_line(tmp)
             self.assertIn("status=silent reason=empty-pool", line)
             self.assertNotIn("reason=omitted", line)
@@ -522,8 +525,7 @@ class HookBodyClassifierExceptionTest(unittest.TestCase):
             out = captured.getvalue()
             self.assertNotIn("Traceback", out)
             envelope = json.loads(out.strip())
-            self.assertEqual(envelope["additionalContext"], S_RETRIEVED_EMPTY)
-            self.assertNotEqual(envelope["additionalContext"], S_BELOW_BAR)
+            self.assertEqual(envelope.get("additionalContext", ""), "")
         finally:
             for k, v in saved_env.items():
                 if v is None:
@@ -593,6 +595,18 @@ class HermesSessionStartReasonTest(unittest.TestCase, _SessionStartReasonBase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    def assert_empty_prefetch_reason(self, d):
+        # Hermes is an #158 passive adapter: the store owns the rendered
+        # field, and a silent selector result is an empty context. The MCP
+        # twin remains on the #159 contract and keeps its legacy prose.
+        self.assertEqual(d.get("reason"), "empty-pool", d)
+        self.assertEqual(d.get("context"), "", d)
+
+    def assert_budget_drop_reason(self, d):
+        self.assertEqual(d.get("reason"), "budget-drop", d)
+        self.assertEqual(d.get("context"), "", d)
+        self.assertGreaterEqual(d.get("budget_dropped", 0), 1, d)
 
 
     def test_8_empty_recent_is_retrieved_empty_never_bar(self):
@@ -708,7 +722,10 @@ class McpSessionStartReasonTest(unittest.TestCase, _SessionStartReasonBase):
             shutil.rmtree(tmp, ignore_errors=True)
         d_mcp = self._call("session_start")
         self.assertEqual(d_hermes.get("reason"), d_mcp.get("reason"))
-        self.assertEqual(d_hermes.get("context"), d_mcp.get("context"))
+        # #158 rewires Hermes to consume only the store-owned rendered field;
+        # the MCP passive surface remains deliberately owned by #159.
+        self.assertEqual(d_hermes.get("context"), "")
+        self.assertEqual(d_mcp.get("context"), S_SESSION_RETRIEVED_EMPTY)
         self.assertEqual(
             set(d_hermes.keys()) - {"result"}, set(d_mcp.keys()) - {"result"})
 
