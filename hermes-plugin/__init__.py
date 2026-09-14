@@ -284,16 +284,13 @@ def _decision_sid(value: Any) -> str:
 def _rotate_decision_log(data_dir: Path) -> None:
     """Rotate the decision log before append, preserving partial deployments.
 
-    Issue #158 process boundary: the provider must not import storelib, so
-    rotation runs through the standalone stdlib-only adapter
+    Issue #158 process boundary: the provider must not import store-side
+    modules, so rotation runs through the standalone stdlib-only adapter
     (``hooks/lib/zmem-log-rotate.py``) as a subprocess — the same contract
     the session-start hook uses for its maintenance sink.
     """
     try:
-        store_py = _resolve_store_py()
-        if store_py is None:
-            return
-        rotator = (Path(store_py).resolve().parents[2] / "hooks" / "lib"
+        rotator = (Path(__file__).resolve().parent.parent / "hooks" / "lib"
                    / "zmem-log-rotate.py")
         if not rotator.is_file():
             return
