@@ -310,9 +310,11 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   if [ "${ZMEM_BG_LOG:-1}" != "0" ] && [ -n "$DATA_DIR" ]; then
     # Shell-side probes and redirects need a native MSYS path on Windows;
     # DATA_DIR_PY intentionally remains a Windows path for the Python
-    # subprocesses above and below.
+    # subprocesses above and below. Default IS_WINDOWS so the block stays
+    # self-contained when source-extracted standalone (the L22 behavioral
+    # test runs it without the hook's earlier env setup).
     BG_DATA_DIR="$DATA_DIR"
-    if [ "$IS_WINDOWS" -eq 1 ] && command -v cygpath >/dev/null 2>&1; then
+    if [ "${IS_WINDOWS:-0}" -eq 1 ] && command -v cygpath >/dev/null 2>&1; then
       BG_DATA_DIR="$(cygpath -u "$DATA_DIR" 2>/dev/null || printf '%s' "$DATA_DIR")"
     fi
     BG_LOG_PATH="$BG_DATA_DIR/zmem-bg.log"
