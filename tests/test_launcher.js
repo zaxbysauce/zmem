@@ -588,14 +588,20 @@ console.log("\n[9] Phase 7: subagent-recall (SubagentStart) + subagent-reflect (
         ok("subagent-recall: scoped namespace row present", /P7_SCOPED/.test(ac));
         ok("subagent-recall: user:global bridge row present", /P7_GLOBAL/.test(ac));
         ok("subagent-recall: unrelated namespace row absent", !/P7_UNRELATED/.test(ac));
-        ok("subagent-recall: agent_type in header", /agent coder/.test(ac));
+        ok("subagent-recall: store-owned provenance disclaimer",
+            /untrusted retrieved notes/.test(ac));
         eq("subagent-recall: passive — scoped row rc unchanged (0)", rcOf("P7_SCOPED"), 0);
         eq("subagent-recall: passive — global row rc unchanged (0)", rcOf("P7_GLOBAL"), 0);
     }
 
-    // subagent-recall / zcode: bare additionalContext.
+    // subagent-recall / zcode: bare additionalContext. Use a distinct session
+    // id so the passive delivery ledger does not make this shape-only check
+    // silent after the Claude leg above.
     {
-        const r = runLauncher("subagent-recall", startPayload, envWith({
+        const zcodePayload = JSON.stringify({
+            ...JSON.parse(startPayload), session_id: "p7-sess-zcode",
+        });
+        const r = runLauncher("subagent-recall", zcodePayload, envWith({
             ZMEM_DATA: SDATA, ZCODE_PLUGIN_ROOT: REPO, ZCODE_PROJECT_DIR: PROJ,
         }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
@@ -697,21 +703,17 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
         "P90_RATCHET hazard: editing any file cited by the writer "
         + "classification registry requires running the ratchet battery locally.", 0.9);
 
-    // (i) pretool-recall / claude: PreToolUse envelope + hazard fence, and
-    // the pending sidecar is parked for the next user prompt.
+    // (i) pretool-recall / claude: PreToolUse envelope + hazard fence. The
+    // retired task-text/pending sidecar lane must remain absent.
     {
         const prePayload = JSON.stringify({
             session_id: "p90-sess", cwd: PROJ,
             tool_name: "Bash", tool_input: { command: "git stash pop" },
             hook_event_name: "PreToolUse",
         });
-        // Issue #117 AMENDMENT: the sidecar is retired by default; the
-        // park/deliver contract is pinned under the narrow fallback env
-        // (writer AND consumer are env-gated). The parked file is
-        // hash-keyed (sha256 of the full session id), so glob for it.
         const r = runLauncher("pretool-recall", prePayload, envWith({
             ZMEM_DATA: D90, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
-            ZMEM_HOST: "claude", ZMEM_PENDING_SIDECAR: "1",
+            ZMEM_HOST: "claude",
         }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         ok("pretool-recall/claude: valid JSON", obj !== null, r.stdout.slice(0, 200));
@@ -726,9 +728,9 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
                 ? fs.readdirSync(ops).filter((f) => f.endsWith(".pending"))
                 : [];
         })();
-        ok("pretool-recall/claude: pending sidecar parked",
-            parkedFiles.length === 1 && !parkedFiles[0].includes("p90-sess"),
-            "parked: " + JSON.stringify(parkedFiles));
+        ok("pretool-recall/claude: retired sidecar remains absent",
+            parkedFiles.length === 0,
+            "found: " + JSON.stringify(parkedFiles));
     }
 
     // (ii) pretool-recall / zcode: bare additionalContext, NO sidecar.
@@ -753,7 +755,7 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
                 .filter((f) => f.endsWith(".pending"))
             : [];
         ok("pretool-recall/zcode: parks no sidecar of its own",
-            zcPending.length <= 1,
+            zcPending.length === 0,
             "found: " + JSON.stringify(zcPending));
     }
 
@@ -799,25 +801,25 @@ console.log("\n[9b] issue #90: pretool-recall e2e + subagent task-text recall");
             /P90_RATCHET/.test(ac), ac.slice(0, 300));
     }
 
-    // (iv) the consumed sidecar delivers on the next user prompt and clears.
+    // (iv) a later user prompt does not replay retired task-text sidecars.
     {
-        // Issue #117: consumer half is env-gated too (arming-only would
-        // strand the fence).
         const r = runLauncher("recall", JSON.stringify({
             prompt: "carry on with unrelated zebra work", session_id: "p90-sess",
             cwd: PROJ,
         }), envWith({
             ZMEM_DATA: D90, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
-            ZMEM_HOST: "claude", ZMEM_PENDING_SIDECAR: "1",
+            ZMEM_HOST: "claude",
         }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
-        ok("pending sidecar delivered on the next user prompt", /P90_STASH/.test(ac), ac.slice(0, 300));
+        ok("retired sidecar not replayed on the next user prompt",
+            !/P90_STASH/.test(ac), ac.slice(0, 300));
         const leftPending = fs.existsSync(path.join(D90, "ops"))
             ? fs.readdirSync(path.join(D90, "ops"))
                 .filter((f) => f.endsWith(".pending"))
             : [];
-        ok("pending sidecar cleared after delivery", leftPending.length === 0,
+        ok("retired sidecar remains absent after the next user prompt",
+            leftPending.length === 0,
             "left: " + JSON.stringify(leftPending));
     }
 }
@@ -851,16 +853,14 @@ console.log("\n[10] Phase 7 unit: buildCanonicalEnv exports agent transcript + i
     eq("EVENT_MAP subagent-reflect → SubagentStop", launch.EVENT_MAP["subagent-reflect"], "SubagentStop");
 }
 
-console.log("\n[9c] Issue #119: Agent tool_input parks the subagent task text");
+console.log("\n[9c] Issue #158: Agent PreToolUse stays silent without sidecars");
 
 {
-    // PreToolUse on the delegation tool stashes tool_input.prompt for the
-    // child's SubagentStart (the delegating parent stays silent). Asserts
-    // the stash lands in the hashed ops sidecar through the REAL launcher.
-    const crypto = require("crypto");
-    const SID9 = "sess-p3-agent-stash";
+    // PreToolUse on the delegation tool remains silent for the parent. The
+    // child receives its delegated prompt through its own SubagentStart event;
+    // no retired task-text/compact/pending sidecar is written here.
     const payload = JSON.stringify({
-        session_id: SID9, cwd: PROJ, hook_event_name: "PreToolUse",
+        session_id: "sess-p3-agent-stash", cwd: PROJ, hook_event_name: "PreToolUse",
         tool_name: "Agent",
         tool_input: {
             description: "fix the failing lane",
@@ -876,18 +876,16 @@ console.log("\n[9c] Issue #119: Agent tool_input parks the subagent task text");
     const ctx9 = out9 && (out9.hookSpecificOutput
         ? out9.hookSpecificOutput.additionalContext : out9.additionalContext);
     eq("agent pretool: parent stays silent (no context)", ctx9 || "", "");
-    const h9 = crypto.createHash("sha256").update(SID9, "utf8").digest("hex").slice(0, 32);
-    const stash9 = path.join(DATA, "ops", h9 + ".tasktext");
-    ok("agent pretool: task-text sidecar written", fs.existsSync(stash9));
-    if (fs.existsSync(stash9)) {
-        const stash = JSON.parse(fs.readFileSync(stash9, "utf8"));
-        ok("agent pretool: sidecar carries the prompt",
-            /merge-queue ratchet flake/.test(stash.entries[0].text || ""));
-    }
+    const sidecars9 = fs.existsSync(path.join(DATA, "ops"))
+        ? fs.readdirSync(path.join(DATA, "ops"))
+            .filter((f) => /\.(tasktext|pending|compact)$/.test(f))
+        : [];
+    ok("agent pretool: retired sidecars absent", sidecars9.length === 0,
+        "found: " + JSON.stringify(sidecars9));
 }
 
-console.log("\n[10b] Issue #118: SessionStart source export + postcompact stash");
-console.log("\n[10b] Issue #118: SessionStart source export + postcompact stash");
+console.log("\n[10b] Issue #158: SessionStart source export + retired postcompact sidecar");
+console.log("\n[10b] Issue #158: SessionStart source export + retired postcompact sidecar");
 
 {
     // Unit: the adapter exports the payload's source field verbatim and
@@ -914,8 +912,8 @@ console.log("\n[10b] Issue #118: SessionStart source export + postcompact stash"
 }
 
 {
-    // End-to-end: the registered postcompact hook stashes compact_summary
-    // into the hashed compact sidecar and emits NO context output.
+    // End-to-end: the registered postcompact compatibility hook emits no
+    // context and never recreates the retired compact sidecar.
     const crypto = require("crypto");
     const PC_SID = "sess-p3-postcompact";
     const payload = JSON.stringify({
@@ -930,14 +928,7 @@ console.log("\n[10b] Issue #118: SessionStart source export + postcompact stash"
     eq("postcompact: emits no context (bare {})", (r.stdout || "").trim(), "{}");
     const h = crypto.createHash("sha256").update(PC_SID, "utf8").digest("hex").slice(0, 32);
     const stashPath = path.join(DATA, "ops", h + ".compact");
-    ok("postcompact: compact sidecar written", fs.existsSync(stashPath));
-    if (fs.existsSync(stashPath)) {
-        const stash = JSON.parse(fs.readFileSync(stashPath, "utf8"));
-        ok("postcompact: sidecar carries the summary",
-            /launcher-test summary/.test(stash.summary || ""));
-        eq("postcompact: sidecar entries empty (no PreCompact in this leg)",
-            Array.isArray(stash.entries) && stash.entries.length, 0);
-    }
+    ok("postcompact: compact sidecar not written", !fs.existsSync(stashPath));
 }
 
 console.log("\n[11] Phase 8 PERF: ZMEM_NAMESPACE resolved only for NEEDS_NAMESPACE consumers");

@@ -1,13 +1,11 @@
-"""Subagent task-text recall via the Agent tool's PreToolUse payload
-(issue #119, Workstream D PR 4).
+"""Subagent recall through the event-payload lane (issue #158).
 
-Proves the two-moment handoff through the REAL launcher chain:
-- PreToolUse(tool_name=Agent) parks the delegating tool_input.prompt in the
-  hashed task-text sidecar and stays SILENT for the parent;
-- SubagentStart builds its recall query from the stashed text (FIFO; exact
-  agent_id match is future-host wiring — no probed host supplies agent_id
-  at park time), with the parent transcript tail as the fallback rung and
-  the queryless recency pull last.
+Proves the current launcher contract through the REAL chain:
+- SubagentStart reads a prompt/task description from its event payload and
+  passes it to the store-owned selector;
+- a queryless SubagentStart uses the store's recent lane;
+- passive adapters do not create or consume the retired task-text, pending,
+  or compact sidecars.
 
 All stores are throwaway temp stores. Runs standalone:
 python tests/test_subagent_tasktext.py
@@ -224,26 +222,31 @@ class TaskTextSequenceTest(unittest.TestCase):
                            "prompt": prompt},
             "session_id": self.SID, "cwd": self._workdir}, env=env)
 
-    def _subagent_start(self, agent_id, transcript_path="", env=None):
-        return self._drive("subagent-recall", {
+    def _subagent_start(self, agent_id, *, prompt="", description="",
+                        transcript_path="", env=None):
+        payload = {
             "hook_event_name": "SubagentStart", "session_id": self.SID,
             "agent_id": agent_id, "agent_type": "general-purpose",
-            "cwd": self._workdir, "transcript_path": transcript_path},
-            env=env)
+            "cwd": self._workdir, "transcript_path": transcript_path}
+        if prompt:
+            payload["prompt"] = prompt
+        if description:
+            payload["description"] = description
+        return self._drive("subagent-recall", payload, env=env)
 
-    def test_stash_then_subagent_query(self):
+    def test_event_prompt_drives_subagent_query(self):
         env = dict(self._env, **_FLOOR)
-        p = self._agent_pretool(
-            "fix the failing merge-queue ratchet flake quarantine lane "
-            "about " + MARKER_A, env=env)
-        self.assertEqual(p.returncode, 0)
-        p = self._subagent_start("agent-a", env=env)
+        p = self._subagent_start(
+            "agent-a",
+            prompt=("fix the failing merge-queue ratchet flake quarantine "
+                    "lane about " + MARKER_A),
+            env=env)
         self.assertEqual(p.returncode, 0)
         ctx = _ctx(p.stdout)
         self.assertIn(MARKER_A, ctx)
-        # The stash is consumed (entry-removed).
-        stash = _ops_path(self._tmp, self.SID, ".tasktext")
-        self.assertFalse(stash.exists())
+        for suffix in (".tasktext", ".pending", ".compact"):
+            self.assertFalse(_ops_path(self._tmp, self.SID, suffix).exists(),
+                             f"retired {suffix} sidecar must stay absent")
 
     def test_agent_pretool_stays_silent_for_parent(self):
         # R3: the delegating PARENT must not get the child's recall —
@@ -254,80 +257,59 @@ class TaskTextSequenceTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0)
         self.assertEqual(_ctx(p.stdout), "")
 
-    def test_two_children_get_their_own_task_text(self):
-        # SEQUENTIAL dispatch (host dispatch order = FIFO consume order);
-        # out-of-order arrival of truly concurrent children is the
-        # documented FIFO limitation (plan R2/R6).
+    def test_two_subagent_payloads_are_independent(self):
+        # The event payload is the query boundary: each child carries its own
+        # prompt, so no shared stash or FIFO consumption is involved.
         env = dict(self._env, **_FLOOR)
-        self._agent_pretool(
-            "fix the failing merge-queue ratchet flake quarantine lane "
-            "about " + MARKER_A, env=env)
-        p = self._subagent_start("agent-a", env=env)
-        ctx_a = _ctx(p.stdout)
-        self._agent_pretool(
-            "run the code-review swarm pairwise sign-off lane about " + MARKER_B,
+        p = self._subagent_start(
+            "agent-a",
+            prompt=("fix the failing merge-queue ratchet flake quarantine "
+                    "lane about " + MARKER_A),
             env=env)
-        p = self._subagent_start("agent-b", env=env)
+        ctx_a = _ctx(p.stdout)
+        p = self._subagent_start(
+            "agent-b",
+            prompt=("run the code-review swarm pairwise sign-off lane about "
+                    + MARKER_B),
+            env=env)
         ctx_b = _ctx(p.stdout)
         self.assertIn(MARKER_A, ctx_a)
         self.assertIn(MARKER_B, ctx_b)
 
-    def test_redaction_runs_and_agent_park_silent(self):
-        # PR #192 review: the F-001 redaction must actually RUN in the
-        # production shape (the bare import was a silent no-op — cubic
-        # P2/Copilot) and the parent stays silent.
+    def test_event_payload_does_not_create_tasktext_sidecar(self):
+        # The adapter no longer parks task text locally. The prompt crosses
+        # the subprocess boundary as a query and must not be persisted in a
+        # sidecar, including when it contains secret-shaped text.
         env = dict(self._env, **_FLOOR)
-        p = self._drive("pretool-recall", {
-            "hook_event_name": "PreToolUse", "tool_name": "Agent",
-            "tool_input": {"description": "delegated lane",
-                           "prompt": "fix the AKIAIOSFODNN7EXAMPLE leak"},
-            "session_id": self.SID, "cwd": self._workdir}, env=env)
+        p = self._subagent_start(
+            "agent-secret",
+            prompt="fix the AKIAIOSFODNN7EXAMPLE leak",
+            env=env)
         self.assertEqual(p.returncode, 0)
-        self.assertEqual(_ctx(p.stdout), "")
-        stash = _ops_path(self._tmp, self.SID, ".tasktext")
-        self.assertTrue(stash.exists())
-        content = stash.read_text(encoding="utf-8")
-        self.assertIn("[REDACTED_SECRET]", content)
-        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", content)
+        self.assertFalse(_ops_path(self._tmp, self.SID, ".tasktext").exists())
 
-    def test_transcript_tail_reads_tool_use_input(self):
-        # PR #192 review (cubic P2): tool_use content items carry the
-        # delegation in input.prompt — the tail rung must extract them.
-        transcript = Path(self._tmp) / "parent-tu.jsonl"
-        transcript.write_text(
-            json.dumps({"type": "assistant", "message": {"content": [
-                {"type": "tool_use", "name": "Agent",
-                 "input": {"prompt": "fix the failing merge-queue ratchet "
-                                     "flake quarantine lane about "
-                                     + MARKER_A}}]}}) + chr(10),
-            encoding="utf-8")
+    def test_event_description_drives_subagent_query(self):
         env = dict(self._env, **_FLOOR)
-        p = self._drive("subagent-recall", {
-            "hook_event_name": "SubagentStart", "session_id": self.SID,
-            "agent_id": "agent-tu", "agent_type": "general-purpose",
-            "cwd": self._workdir, "transcript_path": str(transcript)},
+        p = self._subagent_start(
+            "agent-description",
+            description=("review the merge-queue ratchet quarantine lane "
+                         "about " + MARKER_A),
             env=env)
         self.assertEqual(p.returncode, 0)
         ctx = _ctx(p.stdout)
         self.assertIn(MARKER_A, ctx)
 
-    def test_transcript_tail_fallback_rung(self):
-        # No stash; the parent transcript tail (exported by the launcher
-        # from transcript_path) drives the query.
-        transcript = Path(self._tmp) / "parent.jsonl"
-        transcript.write_text(
-            json.dumps({"type": "user",
-                        "message": {"content": [
-                            {"type": "text",
-                             "text": "fix the failing merge-queue ratchet "
-                                     "flake quarantine lane about " + MARKER_A}]}}) + "\n",
-            encoding="utf-8")
+    def test_queryless_subagent_uses_recent_lane(self):
+        # With no event query, the adapter asks the store for recent memory;
+        # transcript tail parsing is intentionally retired.
         env = dict(self._env, **_FLOOR)
-        p = self._subagent_start("agent-t",
-                                 transcript_path=str(transcript), env=env)
+        _seed(env, self.NS,
+              "recent lane row for the queryless subagent newerZ")
+        p = self._subagent_start("agent-recent", env=env)
         self.assertEqual(p.returncode, 0)
         ctx = _ctx(p.stdout)
-        self.assertIn(MARKER_A, ctx)
+        self.assertIn("newerZ", ctx)
+        self.assertNotIn(MARKER_A, ctx)
 
     def test_recent_fallback_when_no_stash_no_transcript(self):
         # AC2: the queryless recency pull still works when both query
@@ -395,14 +377,14 @@ class RegistrationNeedleTest(unittest.TestCase):
                       "SKILL.md must name #96 as the live-probe owner")
 
 
-    def test_body_carries_ladder_and_stash(self):
+    def test_body_uses_event_payload_without_retired_sidecars(self):
         text = (REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py") \
             .read_text("utf-8")
-        self.assertIn('in (', text)
-        self.assertIn('"Agent", "Task")', text)
-        self.assertIn("redact_secret_like_text", text)
-        self.assertIn("consume_task_text", text)
-        self.assertIn("_transcript_tail", text)
+        self.assertIn('if mode == "subagent":', text)
+        self.assertIn('"prompt", "task", "task_text", "description"', text)
+        self.assertNotIn("park_task_text", text)
+        self.assertNotIn("consume_task_text", text)
+        self.assertNotIn("_transcript_tail", text)
 
 
 if __name__ == "__main__":

@@ -6,9 +6,9 @@ Surfaces pinned here:
   fallback pending sidecar append-with-dedup, clear_delivery_state.
 - store CLI: --exclude on recall/recent/search filters pre-gate and reports
   the envelope ``excluded`` count (candidate_ids stays PRE-exclude).
-- hook body: sidecar retired by default, fallback env-gated, session_end
-  clears delivery state (even under the kill switch), decision line gains
-  the additive exc= field.
+- hook body: pending sidecars are retired, session_end clears delivery state
+  (even under the kill switch), and the decision line gains the additive
+  exc= field.
 - escalation input contract: derive_ops_tokens("git stash pop") yields the
   git/stash/pop token shape the PreToolUse escalation depends on.
 
@@ -310,6 +310,48 @@ class CliExcludeTest(unittest.TestCase):
         self.assertGreaterEqual(env["excluded"], 1)
 
 
+class ForInjectionGlobalScopeTest(unittest.TestCase):
+    """Sessionless --for-injection must honor the global-tier opt-in."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-fi-global-")
+        self.ns = "project:fi-global"
+        _seed(self.tmp, self.ns, "project-only passive injection lesson")
+        _seed(self.tmp, "user:global", "global-only passive injection lesson")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, sub: str, *, include_global: bool) -> dict:
+        argv = [sys.executable, str(SCRIPTS / "store.py"), sub]
+        if sub == "recall":
+            argv += ["--query", "global-only passive injection lesson"]
+        else:
+            argv += ["--limit", "5"]
+        argv += ["--namespace", self.ns, "--for-injection", "--json"]
+        if include_global:
+            argv.append("--include-global")
+        result = subprocess.run(
+            argv, capture_output=True, text=True,
+            env=_clean_env(self.tmp), timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_sessionless_for_injection_requires_global_opt_in(self):
+        for sub in ("recall", "recent"):
+            without = self._run(sub, include_global=False)
+            self.assertTrue(without["results"],
+                            f"sessionless {sub} vacuity guard: the project "
+                            f"lane must still return rows without --include-global")
+            self.assertNotIn(
+                "user:global", {r["namespace"] for r in without["results"]},
+                f"sessionless {sub} --for-injection must not include global rows")
+            with_global = self._run(sub, include_global=True)
+            self.assertIn(
+                "user:global", {r["namespace"] for r in with_global["results"]},
+                f"sessionless {sub} --for-injection must honor --include-global")
+
+
 class HookBodyDeliveryTest(unittest.TestCase):
     """Retirement, fallback env gate, session_end clear, exc= field."""
 
@@ -336,17 +378,23 @@ class HookBodyDeliveryTest(unittest.TestCase):
                if f.name.endswith(".ledger")]
         self.assertEqual(len(led), 1, "delivery recorded in the ledger")
 
-    def test_fallback_env_parks_hashed_pending(self):
-        _run_body(self.tmp,
-                  {"tool_input": {"command": "git stash pop"},
-                   "session_id": "sess-f"},
-                  self.ns, "pretool", ZMEM_HOST="claude",
-                  ZMEM_PENDING_SIDECAR="1")
+    def test_pending_sidecar_stays_retired_when_legacy_env_is_set(self):
+        # #158 removes the hook-owned raw-row fallback entirely. A leaked
+        # legacy opt-in must not revive a .pending sidecar or bypass the
+        # store-owned rendered envelope/ledger path.
+        r = _run_body(self.tmp,
+                      {"tool_input": {"command": "git stash pop"},
+                       "session_id": "sess-f"},
+                      self.ns, "pretool", ZMEM_HOST="claude",
+                      ZMEM_PENDING_SIDECAR="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
         pend = [f.name for f in _ops_files(self.tmp)
                 if f.name.endswith(".pending")]
-        self.assertEqual(len(pend), 1)
-        self.assertNotIn("sess-f", pend[0],
-                         "fallback file must be hash-keyed, not sanitize+truncate")
+        self.assertEqual(pend, [])
+        led = [f.name for f in _ops_files(self.tmp)
+               if f.name.endswith(".ledger")]
+        self.assertEqual(len(led), 1,
+                         "delivery remains store-owned and ledger-backed")
 
     def test_session_end_clears_even_under_kill_switch(self):
         # deliver first (records the ledger)
@@ -379,6 +427,19 @@ class HookBodyDeliveryTest(unittest.TestCase):
         self.assertTrue(lines)
         self.assertIn(" exc=", lines[-1],
                       f"decision line must carry the exc= field: {lines[-1]}")
+
+    def test_empty_pool_keeps_legacy_decision_token_shape(self):
+        _run_body(self.tmp,
+                  {"prompt": "no matching passive injection lesson",
+                   "session_id": "sess-empty"},
+                  self.ns, "user_prompt")
+        log = Path(self.tmp, "zmem-decisions.log")
+        lines = [ln for ln in log.read_text(encoding="utf-8").splitlines()
+                 if "zmem-hook" in ln and "moment=user_prompt" in ln]
+        self.assertTrue(lines)
+        self.assertIn(" reason=empty-pool", lines[-1])
+        self.assertNotIn(" tokens=", lines[-1])
+        self.assertNotIn(" rendered_estimate=", lines[-1])
 
 
 if __name__ == "__main__":

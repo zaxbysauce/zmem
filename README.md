@@ -44,6 +44,30 @@ Do not let different hosts silently fan out to different physical stores.
 - **Relevance-based recall:** when you submit a prompt, matching memories are
   injected as context *before* the agent starts working — not just the 3 most
   recent at session start.
+
+### One passive-injection path (issue #158)
+
+Passive injection has one store-owned entry point,
+`select_and_budget_for_injection`, and one complete JSON envelope. The store
+owns selection, the per-session delivery ledger, pre-tool operation-token
+composition, token budgeting, and the canonical untrusted fenced rendering.
+The recall hooks, SessionStart, and the Hermes provider are subprocess-only
+adapters: they consume the envelope's `rendered` string and do not read
+SQLite, sidecars, rings, or render memory rows themselves. The selector's
+closed moments are `session_start`, `user_prompt`, `pretool`, `subagent`, and
+`precompact`.
+
+The passive `--for-injection --json` lane of `recall` and `recent` accepts
+`--session-id`, `--moment`, `--lane`, and repeatable `--ops-token` attribution
+flags. An empty query selects recent memories; `pretool` is the only moment
+that composes the store-side operation ring. Use
+`python <store.py> ledger-clear --session-id <id>` to reset delivery at a
+session lifecycle boundary; this command does not open SQLite. The former
+hook-owned pending, compact-summary, and task-text sidecars, plus the
+UserPromptSubmit operation tail, are intentionally retired. The remote MCP
+passive consumer is unchanged and remains the #159 follow-up. This release
+does not change the memory schema.
+
 - **Live correction capture:** a `capture-correction` hook registered under
   `UserPromptSubmit` (Claude Code, ZCode, and Codex) silently queues mid-session
   user corrections ("no, use X", "don't refactor unrelated code",
@@ -138,9 +162,10 @@ python scripts/host_canary.py --host codex --self-test   # also: zcode, hermes
 `--compact-self-test` (issue #118) runs the deterministic compaction lane
 instead: it drives the full `precompact` → `postcompact` →
 `session-start(source=compact)` sequence through the launcher and passes
-only when the query-aware post-compaction branch re-injects the seeded row
-(`moment=session_start_compact` in the decision line plus the marker in the
-rendered fence). The canary seeds one recognizable row into an **isolated** scratch store (your
+only when the store-owned `session_start` selector re-injects the seeded row
+after the delivery ledger is cleared. The decision log may retain
+`moment=session_start_compact` as a local diagnostic label; it is not a
+selector moment. The canary seeds one recognizable row into an **isolated** scratch store (your
 real store is never touched — ambient `ZMEM_STORE`/`ZMEM_DATA` and the
 plugin-data vars are stripped, so they cannot redirect it), drives the host's
 SessionStart hook chain, and asserts a fresh `zmem-hook status=... reason=...`
@@ -748,9 +773,9 @@ Notes:
   `SubagentStart`/`SubagentStop` hook events); ZCode supports exactly seven hook
   events and does **not** emit subagent lifecycle hooks, so on ZCode
   subagent memory is scoped to the parent session rather than getting its own recall/reflect
-  cycle. Task-text recall (issue #119: the delegating `Agent` call's prompt is
-  stashed at PreToolUse and becomes the child's SubagentStart recall query) is
-  likewise Claude Code only. Override with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
+  cycle. Subagent recall uses task/query text present in the event when
+  available and otherwise falls back to the store-owned recent selector; the
+  former hook-owned task-text stash is retired. Override with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
   userConfig option) if you want it elsewhere.
 - **Legacy per-plugin data dirs** (`${ZCODE_PLUGIN_DATA}` /
   `${CLAUDE_PLUGIN_DATA}`) still work as a fallback if `ZMEM_DATA` isn't set

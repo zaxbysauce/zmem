@@ -1,80 +1,11 @@
 #!/usr/bin/env python3
-"""Shared recall body for the injecting hooks (issue #58, 3.5/3.8/3.9).
+"""Subprocess-only passive injection adapter.
 
-Consumers (all invoke this file AS A SCRIPT — the hyphenated filename
-cannot be imported):
-  - zmem-recall.sh        (UserPromptSubmit)         mode "user_prompt"
-  - zmem-precompact.sh    (PreCompact, Claude only)  mode "precompact"
-  - zmem-subagent-recall.sh (SubagentStart)          mode "subagent"
-    (task-text recall when the host event carries the delegated prompt,
-    recent pull otherwise; "recent" remains accepted for back-compat)
-  - zmem-pretool-recall.sh (PreToolUse, ZCode+Claude) mode "pretool"
-    (issue #90 / #85 C: query derived from the tool input itself)
-  - zmem-posttoolbatch-recall.sh (PostToolBatch, Claude only) mode
-    "posttoolbatch" (issue #120: query derived from the COMPLETED batch;
-    the runtime moment everywhere is the closed-set "pretool")
-
-argv contract (see main()):
-  argv[1] = absolute path to store.py (must exist or exit 0)
-  argv[2] = canonical namespace
-  argv[3] = budget in chars (optional, default 25000)
-  argv[4] = mode — "user_prompt" | "precompact" | "recent" | "pretool" |
-          "posttoolbatch" | "subagent" | "session_end"
-  argv[5] = recent --limit      (recent/precompact modes; default 3)
-  argv[6] = recent --global-limit (recent/precompact modes; default 2;
-            subagent-recall passes 5/3 to preserve its pull width)
-
-The body:
-  1. Calls ``python store.py recall|recent ...`` with --no-bump,
-     --for-injection (issue #114: the selective-inject gate and the token
-     budget run INSIDE the store subprocess), --json, and the per-mode
-     query/limit set. Hooks never write the store. A store subprocess that
-     predates --for-injection (mixed-version deployment) fails here and the
-     hook degrades fail-closed to a silent decision line — never ungated
-     injection.
-  2. Reads the JSON envelope from stdout (the rows are already the
-     gate+budget survivors; the envelope carries the decision reason and
-     the pre-gate candidate ids for the bg-log all= field).
-  3. Derives the decision status/reason from the envelope (the closed-set
-     classifier below remains only as a fail-open fallback for stores that
-     do not stamp a reason).
-  4. Renders the rows through ``storelib._format_fenced_recall`` into a
-     fenced, provenance-tagged block.
-  5. Emits ``{"additionalContext": <ctx>}`` on stdout (the .sh wrappers
-     wrap it in the <<<ZMEM_JSON>>>…<<<END>>> sentinel and neutralize
-     sentinel/fence tokens as transport defense).
-  6. If nothing is injected, names WHICH gate fired (issue #87 / #85
-     direction 1) instead of always blaming the bar:
-       - retrieval empty (or rows dropped by the passive injection-risk
-         filter) → "no durable memories retrieved for this prompt."
-       - rows reached the selective-inject gate and none passed →
-         "no durable memories met the inject bar." (byte-identical to the
-         pre-#87 one-liner so existing greps keep working)
-       - the gate passed rows but the token budget emptied the set →
-         "memories withheld: the injection token budget
-         (ZMEM_INJECT_TOKEN_BUDGET) dropped every candidate row."
-  7. Fail-open: an unhandled ``main()`` crash emits nothing (the wrapper's
-     ``|| echo '{}'`` handles it) and exits 0; a recall-subprocess failure
-     sets ``rows=[]`` and STILL emits the retrieved-empty envelope (with its
-     reason classification, per bullet 6); a reason-classification error
-     degrades to the retrieved-empty one-liner (never the bar). Every path
-     exits 0. (#93 B7: split/reworded — the old text claimed only the
-     wrapper-handled case existed.)
-  8. Issue #110 (P0-5): ``ZMEM_INJECT=0`` is the passive-injection kill
-     switch — before any stdin parsing or store subprocess the body logs
-     ``status=silent reason=disabled`` and emits ``{}`` (the empty envelope;
-     the launcher treats a payload without additionalContext as a no-op).
-     Only the literal ``0`` disables, matching the ZMEM_QUERY_CONTEXT
-     convention. Capture paths never consult the switch.
-
-The selective-inject decision is logged to ``<data dir>/zmem-bg.log`` (the
-dir resolved by ``_data_dir()``; I5 critic-fix: existing log file, not a new
-one). Since issue #87 every line carries ``reason=`` (from schema_meta's
-INJECT_SILENT_REASONS tuple, plus ``injected`` on the success line) and
-``omitted=N`` when the passive injection-risk filter dropped rows. Since
-issue #94 every line also carries ``sid=<sanitized session id>`` (the
-stdin event's ``session_id``; ``sid=unknown`` when the host sent none) —
-the session key the miss-rate report joins failures against.
+The host hooks own event decoding and transport wrapping. ``store.py`` owns
+selection, budgeting, rendering, surfaced telemetry, and delivery state. This
+adapter consumes only the envelope's string ``rendered`` member.
+Decision lines carry ``sid=<sanitized session id>`` (or ``sid=unknown`` when
+the host supplies no session id) and a closed-set ``moment=`` attribution.
 
 Issue #153 adds the optional suffix ``lane=<closed host lane> ver=<manifest
 semver> t_ms=<nonnegative rounded store-attempt milliseconds>`` after
@@ -85,25 +16,34 @@ manifest preserves the complete legacy line.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
+import re
 import subprocess
 import sys
 import time
-import re
 
+
+_POSTTOOLBATCH_QUERY_CAP = 500
+_POSTTOOLBATCH_FIELD_CAP = 150
+_POSTTOOLBATCH_SUMMARY_CAP = 12
 
 # Issue #153: decision-line attribution is deliberately small and
 # dependency-free.  The schema module is the canonical source for the
 # vocabulary, but this hook must still run from a partially served tree, so
 # imports and manifest reads fail closed to the pre-attribution line shape.
+# The lane values match the store selector's INJECTION_LANES closed set and
+# the host mapping used for the selector argv below.
 _ATTR_LANES = ("claude", "codex", "zcode", "hermes-provider", "hermes-compat")
 _ATTR_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
-def _validated_attribution_lane(host=None):
+def _validated_attribution_lane(lane=None):
     """Return a closed-set host lane, or ``None`` for legacy output."""
-    value = host if host is not None else os.environ.get("ZMEM_HOST", "")
+    value = lane
+    if value is None:
+        return None
     if not isinstance(value, str):
         return None
     value = value.strip()
@@ -145,1782 +85,529 @@ def _rounded_elapsed_ms(started):
         return 0
 
 
-# Selective-inject constants are imported from schema_meta (the documented
-# single source of truth, PRR-017 fix) once the scripts dir is known — see
-# _load_schema_meta(). The literals below are ONLY the import-failure
-# fallback so a partially-deployed tree still runs with the documented
-# defaults rather than crashing the hook (fail-open).
-_FALLBACK_FLOOR_PROMPT = 0.25
-_FALLBACK_FLOOR_GATE_NONE = 0.4
-_FALLBACK_FLOOR_RECENT = 0.5
-# Issue #87 / #85 direction 1: import-failure fallbacks mirroring
-# schema_meta.INJECT_SILENT_REASONS / INJECT_REASON_INJECTED (a
-# partially-deployed tree still classifies with the documented set).
-_FALLBACK_SILENT_REASONS = (
-    "empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance",
-    "already-delivered", "expired",
-)
-_FALLBACK_REASON_INJECTED = "injected"
-# Issue #110 (P0-5): mirror of schema_meta.INJECT_REASON_DISABLED for the
-# passive-injection kill switch below.
-_FALLBACK_REASON_DISABLED = "disabled"
-
-# User-visible silent one-liners (issue #87 / #85 direction 1). The below-bar
-# string is byte-identical to the pre-#87 single one-liner on purpose —
-# operator greps and muscle memory keep working for the one case it was true.
-_SILENT_CTX_RETRIEVED_EMPTY = "no durable memories retrieved for this prompt."
-_SILENT_CTX_BELOW_BAR = "no durable memories met the inject bar."
-_SILENT_CTX_BUDGET_DROP = (
-    "memories withheld: the injection token budget "
-    "(ZMEM_INJECT_TOKEN_BUDGET) dropped every candidate row."
-)
-
-_schema_meta = None
-
-
-def _load_schema_meta(store_py: str):
-    """Import schema_meta from the scripts dir (next to store.py) so the
-    gate reads the SAME constants every other surface imports (PRR-017).
-    Returns None on import failure; callers then use the literals above.
-    """
-    global _schema_meta
-    if _schema_meta is not None:
-        return _schema_meta
-    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
-    if not scripts_dir:
-        return None
-    saved = sys.path[:]
-    try:
-        sys.path.insert(0, scripts_dir)
-        import schema_meta  # type: ignore
-        _schema_meta = schema_meta
-        return schema_meta
-    except Exception:
-        return None
-    finally:
-        sys.path[:] = saved
-
-
-def _floor(name: str, default: float) -> float:
-    raw = os.environ.get(name, "")
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    # Reject non-finite overrides (nan/inf parse but poison comparisons).
-    if value != value or value in (float("inf"), float("-inf")):
-        return default
-    return value
-
-
-_store_timeout_warned = False
-
-
 def _budget_default_s(key, fallback_s):
-    """F-010: hooks/timeout-budget.json is the canonical table; the
-    runtime default comes from it (fail-open to the hardcoded fallback
-    when the file is absent/malformed). Keep in sync with the sibling
-    reader in the other hook file — the parity test pins both."""
+    """Read the hook timeout table, retaining a seconds fallback."""
     try:
-        import json
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             os.pardir, "timeout-budget.json")
-        with open(path, encoding="utf-8") as f:
-            value = json.load(f).get(key)
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle).get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value / 1000.0
     except Exception:
         pass
     return fallback_s
 
-def _store_timeout_s() -> float:
-    """Store-recall subprocess cap (issue #121): ZMEM_STORE_RECALL_TIMEOUT_S
-    as a finite positive float, default 8.0. Unparseable, non-finite,
-    non-positive, and values above 8.0 all use 8.0; each deviation warns
-    exactly once per process (warning parity with the SessionStart payload
-    reader). Values below 8.0 are honored (operator headroom)."""
+
+_store_timeout_warned = False
+
+
+def _store_timeout_s():
+    """Bound store subprocesses using the shared env/table contract."""
     global _store_timeout_warned
     raw = os.environ.get("ZMEM_STORE_RECALL_TIMEOUT_S", "")
-    value = _budget_default_s("store_recall_ms", 8.0)  # fallback is SECONDS
+    value = _budget_default_s("store_recall_ms", 8.0)
     warned = False
     if raw.strip():
         try:
-            candidate = float(raw)
+            value = float(raw)
         except ValueError:
-            candidate = None
-        if (candidate is None or candidate != candidate
-                or candidate in (float("inf"), float("-inf"))
-                or candidate <= 0 or candidate > 8.0):
-            value = 8.0
-            warned = True
-        else:
-            value = candidate
+            value, warned = 8.0, True
+        if not math.isfinite(value) or value <= 0 or value > 8.0:
+            value, warned = 8.0, True
     if warned and not _store_timeout_warned:
         _store_timeout_warned = True
         try:
-            sys.stderr.write(
-                "zmem: invalid ZMEM_STORE_RECALL_TIMEOUT_S=%r; using 8.0\n"
-                % (raw,))
+            sys.stderr.write("zmem: invalid ZMEM_STORE_RECALL_TIMEOUT_S=%r; using 8.0\n" % raw)
         except Exception:
             pass
     return value
-def _recent_floor(store_py: str) -> float:
-    sm = _load_schema_meta(store_py)
-    if sm is not None:
-        return _floor(
-            getattr(sm, "INJECT_FLOOR_RECENT_ENV", "ZMEM_INJECT_FLOOR_RECENT"),
-            getattr(sm, "INJECT_FLOOR_RECENT_DEFAULT", _FALLBACK_FLOOR_RECENT),
-        )
-    return _floor("ZMEM_INJECT_FLOOR_RECENT", _FALLBACK_FLOOR_RECENT)
-
-
-def _reason_constants(store_py: str):
-    """Resolve (silent_reasons, injected_reason) from schema_meta (the
-    single source of truth, PRR-017), with literal fallbacks for a
-    partially-deployed tree."""
-    sm = _load_schema_meta(store_py)
-    if sm is not None:
-        return (
-            tuple(getattr(sm, "INJECT_SILENT_REASONS", _FALLBACK_SILENT_REASONS)),
-            getattr(sm, "INJECT_REASON_INJECTED", _FALLBACK_REASON_INJECTED),
-        )
-    return (_FALLBACK_SILENT_REASONS, _FALLBACK_REASON_INJECTED)
-
-
-def _reason_disabled(store_py: str) -> str:
-    """Issue #110 (P0-5): the kill-switch reason, single-sourced from
-    schema_meta.INJECT_REASON_DISABLED with the literal fallback for a
-    partially-deployed tree (same discipline as _reason_constants)."""
-    sm = _load_schema_meta(store_py)
-    if sm is not None:
-        return getattr(sm, "INJECT_REASON_DISABLED", _FALLBACK_REASON_DISABLED)
-    return _FALLBACK_REASON_DISABLED
-
-
-def _inject_disabled() -> bool:
-    """Issue #110 (P0-5): ZMEM_INJECT=0 is the passive-injection kill
-    switch. Only the literal ``0`` (whitespace-tolerated) disables — the
-    same convention as ZMEM_QUERY_CONTEXT, so ``false``/``no``/empty keep
-    injection ENABLED. Capture paths never consult this switch."""
-    return os.environ.get("ZMEM_INJECT", "1").strip() == "0"
 
 
 def _classify_silent_reason(rows, omitted=0, budget_emptied=False,
-                            allowed=_FALLBACK_SILENT_REASONS,
-                            candidate_ids=None, post_ledger_rows=None):
-    """Name WHY a silent inject is silent (issue #87 / #85 direction 1).
+                            allowed=None):
+    """Legacy classifier retained for log readers; store reason is canonical.
 
-    Called only when nothing will be injected. Order matters and matches the
-    #87 spec: budget-drop wins first, followed by already-delivered when the
-    pre-ledger candidate set was nonempty but the post-ledger set is empty;
-    empty rows with omitted==0 are empty-pool even if the prompt was long —
-    do not guess. ``allowed`` is the
-    closed set from schema_meta; a drift/unknown value degrades to empty-pool
-    rather than inventing a reason.
+    Historical wording retained for compatibility: "no durable memories met the inject bar.";
+    current adapters receive the structured reason from the store and do not
+    render this prose locally.
     """
-    if candidate_ids is None:
-        candidate_ids = [r.get("id") for r in rows
-                         if isinstance(r, dict)]
-    if post_ledger_rows is None:
-        post_ledger_rows = rows
-    if budget_emptied:
-        reason = "budget-drop"
-    elif candidate_ids and not post_ledger_rows:
-        reason = "already-delivered"
-    elif rows:
-        reason = "below-bar"
-    elif omitted > 0:
-        reason = "omitted"
-    else:
-        reason = "empty-pool"
-    if reason not in allowed:
-        return "empty-pool"
-    return reason
+    valid = set(("empty-pool", "omitted", "below-bar", "budget-drop",
+                 "below-relevance") if allowed is None else allowed)
+    candidate = ("budget-drop" if budget_emptied else
+                 "below-bar" if rows else
+                 "omitted" if omitted else "empty-pool")
+    return candidate if candidate in valid else "empty-pool"
 
 
-# Log bound (PRR-023 fix, superseded by #129 rotation): zmem-bg.log was
-# maintenance-only (~lines/day) and is now appended per hook event. Growth
-# control is BOUNDED ROTATION via storelib.log_rotate (see
-# _rotate_telemetry_logs): past ZMEM_BG_LOG_MAX_BYTES the active content
-# becomes a marked .1 segment — history survives, the destructive
-# truncate-to-empty behavior this comment used to describe is gone.
+def _data_dir() -> str:
+    """Resolve the sidecar/log directory using the host's store chain."""
+    store = os.environ.get("ZMEM_STORE", "")
+    if store and os.path.dirname(store):
+        return os.path.expanduser(os.path.dirname(store))
+    for key in ("ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+        value = os.environ.get(key, "")
+        if value:
+            return os.path.expanduser(value)
+    return os.path.join(os.path.expanduser("~"), ".zmem")
 
-def _maybe_log_drift(session_id: str) -> None:
-    """Issue #107: run the served-tree drift check once per session id.
 
-    The session-start hook runs the same drift.py ``log-once`` first; this
-    choke point covers hosts/wirings where session-start never fired, using
-    the SAME per-session marker so the zmem-drift bg-log line is written at
-    most once per session regardless of which writer wins. Fail-open and
-    bounded: the marker is one stat after the first call, and the drift
-    subprocess gets a 5s timeout — on timeout subprocess.run kills the child;
-    because drift.py creates the marker BEFORE evaluating, even a killed run
-    leaves the marker, so the realistic worst case is one skipped drift check
-    per session (pre-0.17 behavior), not a re-spawn per decision. The drift
-    subprocess costs ~200ms (surface walk + hashing) once per session; that
-    is accepted, documented latency, not a per-decision cost. The drift.py
-    path is derived from THIS file own tree (parents[2]) — never from env —
-    so a partial refresh can never spawn a drift checker from a different
-    tree. The marker name MUST mirror drift.py _marker_path exactly (readable
-    sanitized prefix + sha8 of the full sanitized sid); drift.py owns the
-    authoritative create, this guard is only a fast-path stat."""
+def _safe_label(value: object, cap: int = 128) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(value or ""))[:cap] or "unknown"
+
+
+def _anonymous_session_id() -> str:
+    """Give unattributed manual invocations isolated ledger scope."""
+    return "anonymous-%d-%d" % (os.getpid(), time.time_ns())
+
+
+def _rotate_log(path: str) -> None:
+    """Run the stdlib-only bounded rotator; rotation is always fail-open."""
+    # The helper exposes the same ``rotate_on_append`` contract as the former
+    # implementation, but the hook reaches it through a subprocess boundary.
     try:
-        data_dir = _data_dir()
-        import hashlib as _hashlib
-        import re as _re_drift
-        # Mirror drift.py _marker_key EXACTLY: readable truncated prefix +
-        # sha8 of the FULL sanitized sid (hashing the truncated form would
-        # collide for sids sharing their first 128 sanitized chars).
-        safe_full = _re_drift.sub(
-            r"[^A-Za-z0-9._-]", "_", (session_id or "")) or "unknown"
-        marker_key = "{0}-{1}".format(
-            safe_full[:128],
-            _hashlib.sha256(safe_full.encode("utf-8")).hexdigest()[:8])
-        marker = os.path.join(data_dir, ".drift-checked-{0}".format(marker_key))
-        if os.path.isfile(marker):
-            return
-        drift_py = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__)))),
-            "skills", "memory", "scripts", "drift.py")
-        if not os.path.isfile(drift_py):
-            # Pre-0.17 served tree: drift logging is simply absent.
-            return
-        subprocess.run(
-            [sys.executable, drift_py, "log-once",
-             "--data-dir", data_dir, "--sid", session_id or ""],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-    except Exception:
-        pass  # fail-open: drift reporting never blocks a decision
-
-
-def _rotate_telemetry_logs(store_py: str, data_dir: str) -> None:
-    """Rotate the decision log and the legacy bg log before an append
-    (issue #129). The rotation package imports from the SCRIPTS dir —
-    storelib's parent — on sys.path (review PRR-005: the original inserted
-    the storelib dir itself, so the import failed on every writer path that
-    had not already leaked the parent onto sys.path, silently skipping
-    rotation there). Fail-open: any failure leaves the appends proceeding
-    uncapped — growth, never loss."""
-    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
-    if not scripts_dir:
-        return
-    saved = sys.path[:]
-    try:
-        sys.path.insert(0, scripts_dir)
-        from storelib.log_rotate import rotate_on_append
-        rotate_on_append(os.path.join(data_dir, "zmem-decisions.log"))
-        rotate_on_append(os.path.join(data_dir, "zmem-bg.log"))
+        rotator = os.path.join(os.path.dirname(__file__), "zmem-log-rotate.py")
+        subprocess.run([sys.executable, rotator, path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=2, check=False)
     except Exception:
         pass
-    finally:
-        sys.path[:] = saved
 
 
-def _log_inject_decision(rows, selected, status: str, reason: str,
-                         omitted=0, tokens_used=None, tokens_budget=None,
-                         ops_count=0, session_id: str = "",
-                         all_ids=None, moment: str = "",
-                         store_py: str = "",
-                         admission_used=None, budget_dropped=None,
-                         budget_truncated=None,
-                         budget_dropped_protected=None,
-                         arms=None,
-                         excluded_count=0,
-                         batch=False, tool_names=None,
-                         path_basenames=None, margin=None,
-                         margin_pruned_ids=None,
-                         store_timeout=False, lane=None, version=None,
-                         t_ms=None) -> None:
-    """Append the injected|silent decision to the decision log (#129).
+# Keep the historical seam available to standalone compatibility tests and
+# downstream adapters while the implementation now crosses the stdlib-only
+# helper subprocess boundary.  Calling through the alias lets old callers
+# suppress rotation without reintroducing a storelib import into the hook.
+_rotate_telemetry_logs = _rotate_log
 
-    Issue #129 split: decision lines go to ``zmem-decisions.log`` (rotated,
-    never truncated) so cadence/maintenance output in ``zmem-bg.log`` can
-    never interleave with them and the miss-rate join / false-injection
-    counter read a clean stream. Issue #87 / #85 direction 1: every line
-    carries ``reason=`` (closed set from schema_meta plus ``injected``),
-    and ``omitted=N`` when the passive injection-risk filter dropped rows —
-    so an operator can tell an empty-pool silent (query construction
-    problem) from a below-bar silent (scoring problem) from a budget-drop
-    without log forensics. Field order: ``status``, ``reason``, optional
-    ``omitted=N``, ``ids``, ``all``, optional ``tokens=used/budget`` (the
-    ``tokens=\\d+/\\d+`` shape pinned by tests/test_token_budget.py is
-    unchanged), optional ``ops=N``, ALWAYS ``sid=<sanitized session id>``
-    at line end (issue #94), then the additive ``moment=<mode>`` field
-    (#129: the injection moment — session_start/user_prompt/pretool/
-    subagent/precompact — absent only when unknown). Sanitization is the
-    canonical ops-lane rule (``[^A-Za-z0-9._-]`` → ``_``, cap 128) so a
-    hostile session id cannot forge log structure; an absent session id
-    logs ``sid=unknown`` — the "unknown" fallback is deliberately distinct
-    from ``_ring_path``'s filename fallback ("session") because this is a
-    log label, not a path component.
 
-    Retention (issue #129): rotation via ``storelib.log_rotate`` keeps N
-    bounded segments with sequence markers; the destructive truncate-to-
-    empty cap is gone. When the rotation helper cannot be imported the
-    append proceeds WITHOUT any size control — unbounded growth is the
-    accepted failure direction, never evidence destruction.
+def _log_inject_decision(
+    rows, selected, status: str, reason: str, omitted=0,
+    tokens_used=None, tokens_budget=None, session_id: str = "",
+    all_ids=None, moment: str = "", store_py: str = "", admission_used=None,
+    budget_dropped=None, budget_truncated=None,
+    budget_dropped_protected=None, arms=None, excluded_count=0, batch=False,
+    tool_names=None, path_basenames=None, margin=None,
+    margin_pruned_ids=None, store_timeout=False,
+    lane=None, version=None, t_ms=None,
+) -> None:
+    """Append a sanitized decision line; sid and moment are audit joins.
+
+    Every modern line carries ``sid=<sanitized session id>``; missing host
+    ids use ``sid=unknown`` and the additive mode field is ``moment=<mode>``.
+
+    Issue #153: attribution is an all-or-nothing writer extension.  A valid
+    manifest semver and nonnegative attempt duration are required before any
+    of the three fields is emitted; the optional lane must be closed-set.
+    The exact order is frozen after ``moment`` and before every historical
+    additive tail (arms, batch, tools, paths, and the margin fields).
+
+    The legacy ``zmem-bg.log`` name remains documented for readers migrating
+    to the split decision log, and the canonical template is ``reason={reason}``.
     """
-    log_path = os.path.join(_data_dir(), "zmem-decisions.log")
-    # Issue #107: the first decision of a session also fires the (marker
-    # guarded, once-per-session) served-tree drift check — the session-start
-    # hook normally wins the race; this covers wirings where it never ran.
-    _maybe_log_drift(session_id)
     try:
-        # Issue #129: rotate, never truncate. Fail-open to append-without-
-        # cap when the helper is unavailable (no storelib path) — the
-        # failure direction is growth, not loss. The legacy zmem-bg.log
-        # (over-cap, from a pre-split deployment) is folded into bounded
-        # rotation here too, so its history becomes a marked segment on
-        # the first post-split decision instead of growing forever.
-        _rotate_telemetry_logs(store_py, _data_dir())
-        ids_all = [r.get("id") for r in rows]
-        if all_ids is not None:
-            # Issue #114: on the --for-injection lane the hook receives only
-            # the RENDERED rows; the pre-gate candidate ids ride the envelope
-            # (candidate_ids) so this field keeps its miss-rate-join meaning
-            # ("what the recall would have matched") unchanged. The fallback
-            # below (rows themselves) is post-gate and only reachable for
-            # legacy bare-list stores that predate candidate_ids.
-            ids_all = list(all_ids)
-        ids_sel = [r.get("id") for r in selected]
-        # v13 (issue #65, 10.9): tokens kept/budget ride on the same line so
-        # budget behavior is auditable in the existing bg log.
-        om = ""
-        if omitted and omitted > 0:
-            om = " omitted={0}".format(int(omitted))
-        tok = ""
+        log_path = os.path.join(_data_dir(), "zmem-decisions.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        _maybe_log_drift(session_id)
+        _rotate_telemetry_logs(log_path)
+        ids = [r.get("id") for r in (selected or []) if isinstance(r, dict)]
+        ids_all = ([str(x) for x in all_ids if isinstance(x, str)]
+                   if all_ids is not None else
+                   [r.get("id") for r in (rows or []) if isinstance(r, dict)])
+        fields = ["[%d] zmem-hook" % int(time.time()),
+                  "status=%s" % (status or "silent"),
+                  "reason=%s" % (reason or "empty-pool")]
+        if omitted:
+            fields.append("omitted=%d" % int(omitted))
+        fields.extend(("ids=%s" % ids, "all=%s" % ids_all))
         if tokens_used is not None:
-            tok = " tokens={used}/{budget}".format(
-                used=tokens_used, budget=tokens_budget if tokens_budget is not None else "-"
-            )
-        # Issue #116: the two numbers the legacy tokens=a/b line used to
-        # conflate get their own labels. rendered_estimate = the measured
-        # final render (the same value as tokens=a/b's numerator, now
-        # guaranteed <= budget); admission_budget = admission's own token
-        # accounting for the admitted set. The three omission counts ride
-        # whenever admission stats were provided (zero-counts included —
-        # byte-stable shape, the addendum's eval-assertable diagnostics),
-        # and stay absent on legacy stores that predate the envelope keys.
-        rend = ""
-        if tokens_used is not None:
-            rend = " rendered_estimate={0}".format(int(tokens_used))
-        adm = ""
-        bcnt = ""
+            fields.append("tokens=%s/%s" %
+                          (tokens_used, tokens_budget if tokens_budget is not None else "-"))
+            fields.append("rendered_estimate=%d" % int(tokens_used))
         if admission_used is not None:
-            adm = " admission_budget={0}".format(int(admission_used))
-            bcnt = " budget_dropped={0} budget_truncated={1} " \
-                "budget_dropped_protected={2}".format(
-                    int(budget_dropped or 0), int(budget_truncated or 0),
-                    int(budget_dropped_protected or 0))
-        # Issue #88 / #85 direction 2: when operation tokens augmented the
-        # query, say how many — an invisible query lane cannot be debugged
-        # (the #85 lesson). Additive; appended at line end.
-        ops = ""
-        if ops_count and ops_count > 0:
-            ops = " ops={0}".format(int(ops_count))
-        # Issue #117: the additive exc= field — rows suppressed via the
-        # delivery-ledger --exclude (present only when > 0, same additive
-        # rule as ops/moment/arms; slot pinned between ops= and sid=).
-        exc = ""
-        if excluded_count and excluded_count > 0:
-            exc = " exc={0}".format(int(excluded_count))
-        # Issue #94: always carry the sanitized session id at line end so a
-        # mined failure can be bound to the injection decisions of its own
-        # session (the miss-rate join key). Same sanitize rule as
-        # ops_tokens._ring_path (the delivery ledger is hash-keyed,
-        # issue #117 — no sanitize-truncate path component remains).
-        import re as _re_sid
-        safe_sid = _re_sid.sub(
-            r"[^A-Za-z0-9._-]", "_", (session_id or ""))[:128] or "unknown"
-        # Issue #129: the additive moment field (the hook mode) rides at
-        # line end after sid= — the per-moment false-injection bucket key.
-        mom = ""
+            fields.extend(("admission_budget=%d" % int(admission_used),
+                           "budget_dropped=%d" % int(budget_dropped or 0),
+                           "budget_truncated=%d" % int(budget_truncated or 0),
+                           "budget_dropped_protected=%d" %
+                           int(budget_dropped_protected or 0)))
+        # Exclusion attribution is additive only when delivery actually
+        # excluded a row; older miss-rate readers already treat absence as 0.
+        try:
+            # The shared selector reports concrete excluded IDs.  Older
+            # envelope producers reported a numeric count, so retain both
+            # shapes in this audit-only field.
+            excluded_value = (len(excluded_count)
+                              if isinstance(excluded_count, list)
+                              else int(excluded_count or 0))
+        except (TypeError, ValueError):
+            excluded_value = 0
+        if excluded_value:
+            fields.append("exc=%d" % excluded_value)
+        fields.append("sid=" + _safe_label(session_id))
         if moment:
-            safe_moment = _re_sid.sub(r"[^A-Za-z0-9._-]", "_", moment)[:32]
-            if safe_moment:
-                mom = " moment={0}".format(safe_moment)
-        # Issue #153: attribution is an all-or-nothing writer extension.  A
-        # valid lane and manifest semver are required before any of the three
-        # fields is emitted; this preserves complete legacy lines on mixed or
-        # partially served deployments.  The exact order is frozen after
-        # moment and before every historical additive tail.
+            fields.append("moment=" + _safe_label(moment, 32))
+        # Issue #153: the attribution suffix rides only when the manifest
+        # semver validates; a lane outside the closed set suppresses the
+        # whole suffix while an absent lane keeps ver/t_ms enrichment.
         attr = ""
         if ((lane is None or lane in _ATTR_LANES)
                 and isinstance(version, str)
                 and _ATTR_VERSION_RE.fullmatch(version)
                 and isinstance(t_ms, int) and not isinstance(t_ms, bool)
                 and t_ms >= 0):
-            lane_field = " lane={0}".format(lane) if lane is not None else ""
-            attr = "{0} ver={1} t_ms={2}".format(lane_field, version, t_ms)
-        # Issue #136: the additive arms attribution field — per-arm
-        # post-cap/cap pairs (P/Q) from the recall envelope's ``arms`` dict,
-        # so the B-1 report can see which arm carried a hit. Compact wire
-        # format; absent on stores whose envelope predates the key. Wire
-        # labels: fts/vec/ent/graph (the envelope key for the entity arm is
-        # "entity" — issue #136 review round fixed the silent mismatch).
-        armf = ""
+            lane_field = "lane=%s" % lane if lane is not None else ""
+            attr = "%s ver=%s t_ms=%d" % (lane_field, version, t_ms)
+        if attr:
+            fields.append(attr)
         if isinstance(arms, dict) and arms:
             try:
-                armf = " arms=" + ",".join(
-                    "{0}:{1}/{2}".format(
-                        label, int(arms[key].get("post", 0)),
-                        int(arms[key].get("cap", 0)))
+                fields.append("arms=" + ",".join(
+                    "%s:%d/%d" % (label, int(arms[key].get("post", 0)),
+                                   int(arms[key].get("cap", 0)))
                     for label, key in (("fts", "fts"), ("vec", "vec"),
                                        ("ent", "entity"), ("graph", "graph"))
-                    if key in arms
-                )
-            except (TypeError, ValueError, AttributeError):
-                armf = ""  # malformed envelope — never break the log write
-        # Issue #120: the post-edit batch lane's additive tail — ``batch=1``
-        # plus the tool NAMES and path BASENAMES only; raw commands,
-        # responses, and results never enter this log. Every element gets
-        # the canonical ops-lane sanitize (structure forging is the threat,
-        # same as sid) and a length cap; the fields stay ABSENT on every
-        # other mode (default-empty kwargs keep the line byte-identical).
-        bat = tns = pths = ""
-        if batch:
-            bat = " batch=1"
-        if tool_names:
-            tns = " tools=" + ",".join(
-                _re_sid.sub(r"[^A-Za-z0-9._-]", "_", str(t))[:64]
-                for t in tool_names)
-        if path_basenames:
-            pths = " paths=" + ",".join(
-                _re_sid.sub(r"[^A-Za-z0-9._-]", "_", str(p))[:64]
-                for p in path_basenames)
-        # Issue #182: additive score-margin telemetry. Validate each field
-        # independently so one malformed optional envelope key cannot hide the
-        # other. A missing/invalid pair leaves the legacy line byte-identical.
-        marginf = ""
-        _margin_value = None
-        if (isinstance(margin, (int, float))
-                and not isinstance(margin, bool)):
-            _margin_value = margin
-        elif isinstance(margin, str):
-            try:
-                _margin_value = float(margin)
-            except (TypeError, ValueError, OverflowError):
+                    if key in arms))
+            except (AttributeError, TypeError, ValueError):
                 pass
-        try:
-            if _margin_value is not None and math.isfinite(float(_margin_value)):
-                marginf = " margin={0:.6f}".format(float(_margin_value))
-        except (TypeError, ValueError, OverflowError):
-            pass
-        marginpf = ""
-        if (isinstance(margin_pruned_ids, list)
-                and margin_pruned_ids
-                and all(isinstance(_mid, str)
-                        for _mid in margin_pruned_ids)):
-            # Issue #182: IDs are untrusted envelope data. Apply the same
-            # canonical ops-lane charset rule and 64-character component cap
-            # used by the sibling tools=/paths= fields before list repr can
-            # enter the decision log and forge its structure.
-            _safe_margin_pruned_ids = [
-                _re_sid.sub(r"[^A-Za-z0-9._-]", "_", _mid)[:64]
-                for _mid in margin_pruned_ids
-            ]
-            marginpf = " margin_pruned={0}".format(
-                _safe_margin_pruned_ids)
-        # PR #198 review F-007: a store-subprocess timeout is recorded
-        # as reason=omitted + this additive tail, so a systematic
-        # slowdown is distinguishable from an empty pool in the log.
-        stf = " store_timeout=1" if store_timeout else ""
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(
-                "[{ts}] zmem-hook status={status} reason={reason}{om} "
-                "ids={ids_sel} all={ids_all}{tok}{rend}{adm}{bcnt}{ops}{exc} "
-                "sid={safe_sid}{mom}{attr}{armf}{bat}{tns}{pths}{marginf}{marginpf}{stf}\n".format(
-                    ts=int(time.time()),
-                    status=status,
-                    reason=reason,
-                    om=om,
-                    ids_sel=ids_sel,
-                    ids_all=ids_all,
-                    tok=tok,
-                    rend=rend,
-                    adm=adm,
-                    bcnt=bcnt,
-                    ops=ops,
-                    exc=exc,
-                    safe_sid=safe_sid,
-                    mom=mom,
-                    attr=attr,
-                    armf=armf,
-                    bat=bat,
-                    tns=tns,
-                    pths=pths,
-                    marginf=marginf,
-                    marginpf=marginpf,
-                    stf=stf,
-                )
-            )
-    except OSError:
-        # Fail-open: never let the audit log block the hook.
-        pass
-
-
-def _format_fence(rows, header: str, store_py: str = "",
-                  budget_note: str = "") -> str:
-    """Render the hook-text fence (issue #58, 3.5). Imports the
-    Python helper from storelib so the constants stay in one place.
-
-    ``store_py`` is the absolute path to the caller's store.py; its
-    directory (skills/memory/scripts) is where both ``storelib`` and
-    ``schema_meta`` are importable from. Deriving the path from this
-    file's own location is WRONG — this file lives in hooks/lib, two
-    levels away from the scripts dir (caught by the round-2 behavioral
-    smoke, not by any source-text assertion). The path insertion is
-    restored on exit (review PRR-005: the old un-restored leak accidentally
-    rescued the rotation import at the one decision-write site that runs
-    after this helper, hiding that the other sites inserted the wrong
-    directory). ``budget_note`` (issue #116) rides through to the storelib
-    renderer for the machine-readable omission marker line.
-    """
-    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
-    saved = sys.path[:]
-    try:
-        if scripts_dir:
-            sys.path.insert(0, scripts_dir)
-            sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
-        from storelib import _format_fenced_recall
-        try:
-            return _format_fenced_recall(rows, header, budget_note=budget_note)
-        except TypeError:
-            # PR-review hardening: a storelib older than #116 has no
-            # budget_note kwarg — degrade to the legacy call instead of
-            # crashing the hook (fail-open discipline).
-            return _format_fenced_recall(rows, header)
-    finally:
-        sys.path[:] = saved
-
-
-def _inject_helpers(store_py: str):
-    """Load storelib/inject.py (budget + envelope helpers, issue #65 10.9/10.8).
-
-    Same path derivation as _format_fence (store.py's scripts dir). Returns
-    (apply_token_budget, inject_token_budget, estimate_tokens, envelope_results)
-    or None on import failure — callers fall back to no-budget/no-unwrap
-    legacy behavior (fail-open hook discipline).
-    """
-    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
-    if not scripts_dir:
-        return None
-    saved = sys.path[:]
-    try:
-        sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
-        import inject as _inject_mod
-        return _inject_mod
-    except Exception:
-        return None
-    finally:
-        sys.path[:] = saved
-
-
-def _emit_envelope(ctx: str) -> None:
-    print(json.dumps({"additionalContext": ctx}))
-
-
-def _write_pending(session_id: str, ctx: str, rows=None) -> None:
-    """Park the pre-tool fence for the fallback sidecar (issue #117).
-
-    Append-with-dedup by memory id under atomic hashed storage: N matched
-    pre-tool events between two prompts ALL survive, and a fence whose ids
-    are already parked is not appended twice. Fail-open, like before.
-    """
-    mod = _LEDGER_MOD
-    if mod is None or not session_id or not ctx:
-        return
-    try:
-        mod.park_pending(_data_dir(), session_id, rows or [],
-                         ctx, moment="pretool")
-    except Exception:
-        pass  # fail-open: delivery degrades to the pre-tool emit alone
-
-
-def _consume_pending(session_id: str) -> str:
-    """Deliver every parked fence (each id once) and clear the sidecar."""
-    mod = _LEDGER_MOD
-    if mod is None or not session_id:
-        return ""
-    try:
-        return mod.consume_pending(_data_dir(), session_id)
-    except Exception:
-        return ""
-
-
-def _clear_delivery_state(session_id: str) -> None:
-    """Issue #117: compaction / session end — "already delivered" is false."""
-    mod = _LEDGER_MOD
-    if mod is None or not session_id:
-        return
-    try:
-        mod.clear_delivery_state(_data_dir(), session_id)
+        if batch:
+            fields.append("batch=1")
+        if tool_names:
+            fields.append("tools=" + ",".join(_safe_label(x, _POSTTOOLBATCH_FIELD_CAP)
+                                               for x in tool_names))
+        if path_basenames:
+            fields.append("paths=" + ",".join(_safe_label(x, _POSTTOOLBATCH_FIELD_CAP)
+                                               for x in path_basenames))
+        if not isinstance(margin, bool):
+            try:
+                margin_value = float(margin)
+                if math.isfinite(margin_value):
+                    fields.append("margin=%.6f" % margin_value)
+            except (TypeError, ValueError):
+                pass
+        if (isinstance(margin_pruned_ids, list) and margin_pruned_ids
+                and all(isinstance(x, str) for x in margin_pruned_ids)):
+            fields.append("margin_pruned=" + str([_safe_label(x, 64)
+                                                   for x in margin_pruned_ids
+                                                   if isinstance(x, str)]))
+        if store_timeout:
+            fields.append("store_timeout=1")
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(" ".join(fields) + "\n")
     except Exception:
         pass
 
 
-def _ops_helpers(store_py: str):
-    """Load storelib/ops_tokens.py (issue #88 / #85 direction 2 —
-    operation-token derivation for the inject query). Same path derivation
-    as _inject_helpers; returns None on import failure and the caller
-    degrades to the prose-only query (fail-open)."""
-    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
-    if not scripts_dir:
-        return None
-    saved = sys.path[:]
+def _maybe_log_drift(session_id: str) -> None:
+    """Best-effort served-tree drift marker."""
     try:
-        sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
-        import ops_tokens as _ops_mod
-        return _ops_mod
+        data_dir = _data_dir()
+        # Keep this byte-for-byte aligned with drift.py's marker algorithm:
+        # the readable prefix is bounded, while the digest covers the full
+        # sanitized id so long ids cannot alias one another.
+        safe_full = re.sub(r"[^A-Za-z0-9._-]", "_", (session_id or "")) or "unknown"
+        marker_key = f"{safe_full[:128]}-{hashlib.sha256(safe_full.encode('utf-8')).hexdigest()[:8]}"
+        marker = os.path.join(data_dir, ".drift-checked-" + marker_key)
+        if os.path.isfile(marker):
+            return
+        drift = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
+                                             "skills", "memory", "scripts", "drift.py"))
+        if os.path.isfile(drift):
+            subprocess.run([sys.executable, drift, "log-once", "--data-dir", data_dir,
+                            "--sid", session_id or ""], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5, check=False)
     except Exception:
-        return None
-    finally:
-        sys.path[:] = saved
+        pass
 
 
-def _ledger_helpers(store_py: str):
-    """Load storelib/delivery_ledger.py (issue #117 D-1 — the per-session
-    delivery ledger consulted by every injection moment). Same path
-    derivation as _ops_helpers; None on import failure and every ledger
-    operation no-ops (fail-open: dedup degrades, delivery never breaks)."""
-    scripts_dir = os.path.dirname(os.path.abspath(store_py)) if store_py else ""
-    if not scripts_dir:
-        return None
-    saved = sys.path[:]
+def _clear_delivery_state(store_py: str, session_id: str) -> None:
+    """Clear per-session delivery state through the CLI only."""
+    if not session_id or not store_py or not os.path.isfile(store_py):
+        return
     try:
-        sys.path.insert(0, os.path.join(scripts_dir, "storelib"))
-        import delivery_ledger as _ledger_mod
-        return _ledger_mod
+        subprocess.run([sys.executable, store_py, "ledger-clear", "--session-id", session_id],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5, check=False)
     except Exception:
-        return None
-    finally:
-        sys.path[:] = saved
+        pass
 
 
-def _sidecar_fallback_enabled() -> bool:
-    """Issue #117: the pre-tool pending sidecar is RETIRED by default —
-    hosts that honor pre-tool additionalContext (Claude 2.1.9+, ZCode) get
-    delivery straight from the emit plus the ledger's dedup. ZMEM_PENDING_SIDECAR=1
-    re-enables a narrow fallback for older host builds: append-with-dedup
-    under the same atomic, hash-keyed storage as the ledger (no sanitize-
-    and-truncate filename, no truncate-on-write loss)."""
-    return os.environ.get("ZMEM_PENDING_SIDECAR", "") == "1"
+def _decision_moment(mode: str) -> str:
+    return "pretool" if mode == "posttoolbatch" else ("subagent" if mode == "recent" else mode)
 
 
-def _transcript_tail(max_lines: int = 8, max_chars: int = 500) -> str:
-    """Issue #119 fallback rung: the tail of the PARENT transcript.
-
-    ``ZMEM_TRANSCRIPT`` is the launcher export of the hook payload's
-    ``transcript_path`` — on SubagentStart that is the PARENT session's
-    transcript (the launcher documents that the subagent's own turns live
-    in ``agent_transcript_path`` instead). Deliberately defensive: the
-    transcript format carries no compatibility guarantee and the file may
-    be mid-write — every failure returns "" and the caller falls through to
-    the recency pull. Never raises; output is query FUEL (bounded, never
-    rendered raw)."""
-    path = os.environ.get("ZMEM_TRANSCRIPT", "")
-    if not path:
-        return ""
-    try:
-        # Bounded tail read (PR #191 review): transcripts are append-only
-        # JSONL and can be very large — read the last ~64KB from the end
-        # instead of the whole file, then split to the last max_lines
-        # complete lines (the first fragment after the seek offset is
-        # likely partial and is dropped).
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - 65536))
-            raw = f.read().decode("utf-8", errors="replace")
-        lines = raw.splitlines()
-        if size > 65536 and lines:
-            lines = lines[1:]  # drop the possibly-partial first line
-    except OSError:
-        return ""
-    texts: list = []
-    total = 0
-    for line in reversed(lines[-max_lines:]):
-        line = line.strip()
-        if not line:
-            continue
-        piece = ""
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            obj = None
-        if isinstance(obj, dict):
-            # Real transcript lines nest the payload one level deep
-            # ({"type": ..., "message": {"content": [...]}}); accept both
-            # the flat and the nested shape, plus string or block-list
-            # content — the format has no compat guarantee, so every
-            # miss just yields no piece for that line. PR #191 review:
-            # assistant tool_use blocks carry the delegation in
-            # input.prompt / input.description — extract those too, or
-            # this rung can never see an Agent delegation.
-            candidates = [obj]
-            msg = obj.get("message")
-            if isinstance(msg, dict):
-                candidates.append(msg)
-            for cand in candidates:
-                for key in ("text", "content"):
-                    v = cand.get(key)
-                    if isinstance(v, str) and v.strip():
-                        piece = v.strip()
-                        break
-                    if isinstance(v, list):
-                        joined = " ".join(
-                            p.get("text", "") for p in v
-                            if isinstance(p, dict)
-                            and isinstance(p.get("text"), str))
-                        if joined.strip():
-                            piece = joined.strip()
-                            break
-                if piece:
-                    break
-                # tool_use shape (PR #192 review, cubic P2): the Agent
-                # delegation lives in a content ITEM's input —
-                # {"message": {"content": [{"type": "tool_use",
-                # "input": {"prompt": ...}}]}} — so gather inputs from
-                # the cand itself AND its content items.
-                inputs = []
-                inp = cand.get("input")
-                if isinstance(inp, dict):
-                    inputs.append(inp)
-                content_items = cand.get("content")
-                if isinstance(content_items, list):
-                    inputs.extend(
-                        p_item.get("input") for p_item in content_items
-                        if isinstance(p_item, dict)
-                        and isinstance(p_item.get("input"), dict))
-                for inp_d in inputs:
-                    iv = (inp_d.get("prompt")
-                          or inp_d.get("description") or "")
-                    if isinstance(iv, str) and iv.strip():
-                        piece = iv.strip()
-                        break
-        elif not line.startswith("{"):
-            piece = line
-        if not piece:
-            continue
-        texts.append(piece)
-        total += len(piece)
-        if total >= max_chars:
-            break
-    return " ".join(texts)[:max_chars]
+def _lane() -> str:
+    return {"claude": "claude", "codex": "codex", "zcode": "zcode",
+            "hermes": "hermes-provider", "hermes-provider": "hermes-provider",
+            "hermes-compat": "hermes-compat"}.get(
+                os.environ.get("ZMEM_HOST", "zcode").strip().lower(), "")
 
 
-# Issue #120: the PostToolBatch parser surface — pure functions over the
-# batch payload (no I/O, no storelib import). Parsed fields are bounded query
-# FUEL only; tool_response, result, and unknown keys are never forwarded.
-_POSTTOOLBATCH_FIELD_KEYS = ("command", "file_path", "notebook_path", "path")
-_POSTTOOLBATCH_FIELD_CAP = 150
-_POSTTOOLBATCH_QUERY_CAP = 500
-# Decision-log projection bound (PR #193 review): each list is capped so a
-# huge tool_uses array cannot grow a single decision-log line without bound
-# (log rotation bounds segment count and per-file bytes, not line size).
-_POSTTOOLBATCH_SUMMARY_CAP = 12
+def _event_text(event: dict, *keys: str) -> str:
+    for key in keys:
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
-def _posttoolbatch_event(name, input_dict) -> str:
-    """One batch event: the tool name (when present) prefixed to each
-    retained string value in exact _POSTTOOLBATCH_FIELD_KEYS order, every
-    component trimmed to _POSTTOOLBATCH_FIELD_CAP. An item with no retained
-    value yields no event — a bare name is not an operation."""
-    values = []
-    if isinstance(input_dict, dict):
-        for key in _POSTTOOLBATCH_FIELD_KEYS:
-            value = input_dict.get(key)
-            if isinstance(value, str) and value:
-                values.append(value[:_POSTTOOLBATCH_FIELD_CAP])
-    if not values:
-        return ""
-    parts = []
-    if isinstance(name, str) and name:
-        parts.append(name[:_POSTTOOLBATCH_FIELD_CAP])
-    parts.extend(values)
-    return " ".join(parts)
+def extract_posttoolbatch_events(payload: dict) -> list[str]:
+    """Return bounded, non-sensitive descriptors from a batch event."""
+    def event_text(name, inp):
+        values = []
+        if isinstance(inp, dict):
+            for key in ("command", "file_path", "notebook_path", "path"):
+                value = inp.get(key)
+                if isinstance(value, str) and value:
+                    values.append(value.replace("\\", "/")[:_POSTTOOLBATCH_FIELD_CAP])
+        if not values:
+            return ""
+        parts = [name[:_POSTTOOLBATCH_FIELD_CAP]] if isinstance(name, str) and name else []
+        parts.extend(values)
+        return " ".join(parts)
 
-
-def extract_posttoolbatch_events(payload: dict) -> list:
-    """Batch events in source order: one per ``tool_uses`` object that
-    retains a field, then at most one event for the singular
-    ``tool_name``/``tool_input`` compatibility shape. A missing list,
-    non-object item, or item with no retained field yields no event.
-    Never raises."""
     events = []
-    if not isinstance(payload, dict):
-        return events
-    uses = payload.get("tool_uses")
+    uses = payload.get("tool_uses") if isinstance(payload, dict) else None
     if isinstance(uses, list):
         for use in uses:
             if not isinstance(use, dict):
                 continue
-            event = _posttoolbatch_event(use.get("name"), use.get("input"))
+            name = use.get("name")
+            inp = use.get("input")
+            event = event_text(name, inp)
             if event:
                 events.append(event)
-    if not events and ("tool_name" in payload or "tool_input" in payload):
-        # The singular shape is a COMPATIBILITY form (a PostToolUse-shaped
-        # payload, not a batch): it fills in only when the list shape
-        # yielded nothing, so a malformed payload carrying both shapes is
-        # parsed once, never duplicated (PR review round).
-        event = _posttoolbatch_event(
-            payload.get("tool_name"), payload.get("tool_input"))
+    if not events:
+        name = payload.get("tool_name") if isinstance(payload, dict) else None
+        inp = payload.get("tool_input") if isinstance(payload, dict) else None
+        event = event_text(name, inp)
         if event:
             events.append(event)
     return events
 
 
 def build_posttoolbatch_query(payload: dict) -> str:
-    """The bounded batch query: per-event whitespace normalization, events
-    joined with one ASCII newline, truncated to 500 Unicode characters.
-    Never raises."""
-    events = [
-        " ".join(event.split())
-        for event in extract_posttoolbatch_events(payload)
-    ]
+    # Normalize only within each event; newlines remain the event separator.
+    events = [" ".join(event.split()) for event in extract_posttoolbatch_events(payload)]
     return "\n".join(events)[:_POSTTOOLBATCH_QUERY_CAP]
 
 
 def posttoolbatch_tool_summary(payload: dict) -> dict:
-    """Decision-log-safe batch projection: ``tool_count``, tool NAMES, and
-    path BASENAMES only — raw commands, responses, and results never enter
-    the summary (and therefore never the decision log). The singular
-    ``tool_name``/``tool_input`` compatibility shape is reflected when the
-    list shape yields nothing (mirroring extract_posttoolbatch_events), so
-    a singular batch's audit fields are not silently empty while its query
-    still drives recall. Path basenames normalize backslashes before the
-    basename split so the audit field is identical on posix and Windows
-    hosts. Lists are capped (12 entries each) so a huge tool_uses array
-    cannot grow the decision-log line without bound. Never raises."""
-    names = []
-    basenames = []
-    tool_count = 0
     uses = payload.get("tool_uses") if isinstance(payload, dict) else None
-    if isinstance(uses, list):
-        for use in uses:
-            if not isinstance(use, dict):
-                continue
-            tool_count += 1
-            name = use.get("name")
-            if isinstance(name, str) and name:
-                names.append(name[:_POSTTOOLBATCH_FIELD_CAP])
-            input_dict = use.get("input")
-            if isinstance(input_dict, dict):
-                for key in ("file_path", "notebook_path", "path"):
-                    value = input_dict.get(key)
-                    if isinstance(value, str) and value:
-                        basenames.append(
-                            os.path.basename(value.replace("\\", "/")))
-    if tool_count == 0 and isinstance(payload, dict) and (
-            "tool_name" in payload or "tool_input" in payload):
-        name = payload.get("tool_name")
+    records = uses if isinstance(uses, list) else []
+    if not records and isinstance(payload, dict) and payload.get("tool_name"):
+        records = [{"name": payload.get("tool_name"),
+                    "input": payload.get("tool_input")}]
+    names, paths = [], []
+    for use in records:
+        if not isinstance(use, dict):
+            continue
+        name = use.get("name")
         if isinstance(name, str) and name:
-            tool_count = 1
             names.append(name[:_POSTTOOLBATCH_FIELD_CAP])
-        input_dict = payload.get("tool_input")
-        if isinstance(input_dict, dict):
+        inp = use.get("input")
+        if isinstance(inp, dict):
             for key in ("file_path", "notebook_path", "path"):
-                value = input_dict.get(key)
+                value = inp.get(key)
                 if isinstance(value, str) and value:
-                    basenames.append(
-                        os.path.basename(value.replace("\\", "/")))
-    return {"tool_count": tool_count,
+                    # The audit projection intentionally carries basenames
+                    # only.  Batch queries may retain the original path for
+                    # retrieval, but a decision log must not expand into a
+                    # record of a user's directory layout.
+                    paths.append(os.path.basename(
+                        value.replace("\\", "/"))[:_POSTTOOLBATCH_FIELD_CAP])
+                    break
+    return {"tool_count": len(records),
             "names": names[:_POSTTOOLBATCH_SUMMARY_CAP],
-            "basenames": basenames[:_POSTTOOLBATCH_SUMMARY_CAP]}
+            "basenames": paths[:_POSTTOOLBATCH_SUMMARY_CAP]}
 
 
-def _decision_moment(mode: str) -> str:
-    """The RUNTIME moment a mode's decisions are recorded under (issue
-    #120): the batch lane's internal mode name never enters the decision
-    log or the ledger — it records under the closed-set ``pretool`` moment,
-    like its checkpoint sibling. Every other mode records as itself."""
-    return "pretool" if mode == "posttoolbatch" else mode
-
-
-def _data_dir() -> str:
-    """Resolve the data dir for the ops ring and the bg log — the single
-    resolver for every passive-lane read/write in this body.
-
-    Chain: ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
-    ~/.zmem. ZMEM_STORE-first matches the ring writer (convention-capture.sh)
-    so a split ZMEM_STORE/ZMEM_DATA deployment cannot split reader from
-    writer (review PRR-91-001); the plugin-data steps give the chain the same
-    ORDER as the bash writer's four explicit-env cases (and
-    host.resolve_store_path), so a non-launcher environment that only sets a
-    plugin-data var still finds the ring instead of silently no-op'ing the
-    lane. Normalization: expanduser applies to EVERY branch — host.py
-    expands all four explicit-env values and both bash writers route any
-    tilde-resolved DATA_DIR through expanduser (shared helper
-    hooks/lib/zmem-tilde-expand.sh), so a tilde-valued var resolves to the
-    same directory on every side of the lane (a tilde ZMEM_DATA or
-    ZMEM_STORE previously split reader from writer — cubic round-2 finding).
-    For non-tilde values expanduser is a no-op, so launcher deployments are
-    unchanged. host.py's deeper legacy tail (~/.zcode/memory, plugin scan)
-    stays approximated by ~/.zmem, as before. Launcher-spawned hooks are
-    unaffected: zmem-launch.js always exports ZMEM_DATA."""
-    store = os.environ.get("ZMEM_STORE", "")
-    if store:
-        # #93 B3: a dir-less ZMEM_STORE (bare filename) must fall through to
-        # the rest of the chain, not early-return dirname("")==="" (which
-        # silently mis-writes every sidecar relative to CWD).
-        store_dir = os.path.dirname(store)
-        if store_dir:
-            return os.path.expanduser(store_dir)
-    data_dir = os.environ.get("ZMEM_DATA", "")
-    if not data_dir:
-        claude_data = os.environ.get("CLAUDE_PLUGIN_DATA", "")
-        if claude_data:
-            return os.path.expanduser(claude_data)
-        zcode_data = os.environ.get("ZCODE_PLUGIN_DATA", "")
-        if zcode_data:
-            return os.path.expanduser(zcode_data)
-        data_dir = os.path.join(os.path.expanduser("~"), ".zmem")
-    return os.path.expanduser(data_dir)
-
-
-def _ops_query_tokens(store_py: str, session_id: str, _ops_cache={}):
-    """Derive operation tokens for this session's recent tool events
-    (issue #88 / #85 direction 2). ZMEM_QUERY_CONTEXT=0 disables (kill
-    switch, spec B). Fail-open: any error or missing ring degrades to []
-    (prose-only query, byte-identical to the pre-#88 behavior)."""
-    if not session_id:
-        return []
-    if "mod" in _ops_cache:
-        ops_mod = _ops_cache["mod"]
-    else:
-        ops_mod = _ops_helpers(store_py)
-        _ops_cache["mod"] = ops_mod
-    if ops_mod is None:
-        return []
+def _run_store(store_py: str, args: list[str], timeout=None):
+    command = [sys.executable, store_py, *args]
     try:
-        if not ops_mod.query_context_enabled():
-            return []
-        events = ops_mod.read_ops_ring(_data_dir(), session_id)
-        return ops_mod.derive_ops_tokens(*events)
+        effective_timeout = _store_timeout_s() if timeout is None else timeout
+        output = subprocess.check_output(command, stderr=subprocess.DEVNULL,
+                                         timeout=effective_timeout)
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+    except subprocess.CalledProcessError as exc:
+        output = exc.output
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        return subprocess.CompletedProcess(command, exc.returncode,
+                                            stdout=output or "", stderr="")
     except Exception:
-        return []
+        return None
 
 
-_LEDGER_MOD = None  # issue #117: set in main(); None = dedup unavailable
+def _query_for(mode: str, event: dict) -> str:
+    if mode == "posttoolbatch":
+        return build_posttoolbatch_query(event)
+    if mode == "pretool":
+        inp = event.get("tool_input")
+        if isinstance(inp, dict):
+            # The store owns operation-token derivation.  Pass only the
+            # event's operation/path material so its closed allowlist can
+            # derive the same query tail at the store boundary; no operation
+            # count crosses the exact envelope, and the adapter never imports
+            # or reads the ops ring.
+            pieces = []
+            for key in ("command", "cmd", "file_path", "notebook_path", "path", "description"):
+                if isinstance(inp.get(key), str):
+                    pieces.append(inp[key])
+            return " ".join(x for x in pieces if x)[:500]
+        return _event_text(event, "tool_name", "tool")[:500]
+    if mode == "subagent":
+        return _event_text(event, "prompt", "task", "task_text", "description")[:500]
+    if mode == "precompact":
+        return ""
+    return _event_text(event, "prompt", "query")[:500]
+
+
+def _emit(rendered: str) -> None:
+    print(json.dumps({"additionalContext": rendered}, ensure_ascii=False)
+          if isinstance(rendered, str) and rendered else "{}")
 
 
 def main() -> int:
     if len(sys.argv) < 4:
         return 0
-    store_py = sys.argv[1]
-    ns = sys.argv[2]
+    store_py, namespace = sys.argv[1], sys.argv[2]
     try:
         budget = int(sys.argv[3])
-    except (IndexError, ValueError):
+    except (IndexError, TypeError, ValueError):
         budget = 25000
     mode = sys.argv[4] if len(sys.argv) > 4 else "user_prompt"
-    # Resolve attribution once per hook invocation.  A failed version read or
-    # invalid host lane intentionally selects the legacy line shape.
-    attribution_lane = _validated_attribution_lane()
+    recent_limit = sys.argv[5] if len(sys.argv) > 5 else "3"
+    recent_global_limit = sys.argv[6] if len(sys.argv) > 6 else "2"
+    _ = budget  # budget is enforced by the selector; retained for argv compatibility.
+    agent_label = sys.argv[7][:64] if len(sys.argv) > 7 else ""
+    _ = agent_label
+    # Resolve attribution once per hook invocation (issue #153).  A failed
+    # version read or invalid host lane intentionally selects the legacy
+    # line shape; the lane value is the same closed-set host mapping the
+    # selector argv carries below.
+    attribution_lane = _validated_attribution_lane(_lane())
     attribution_version = _release_version()
-    global _LEDGER_MOD
-    _LEDGER_MOD = _ledger_helpers(store_py)
-    # Optional per-mode limits (issue #58 final-critic round 2): callers
-    # that previously pulled wider recent windows (subagent-recall used
-    # 5 project / 3 global) can pass them instead of forking the render.
-    # Defaults 3/2 match session-start Tier 2 / PreCompact.
-    try:
-        recent_limit = sys.argv[5]
-    except IndexError:
-        recent_limit = "3"
-    try:
-        recent_global_limit = sys.argv[6]
-    except IndexError:
-        recent_global_limit = "2"
-    # Optional agent-type label (SubagentStart consumers only): biases
-    # the rendered header, preserving the pre-#58 header contract
-    # ("... agent <type>") that tests/test_launcher.js pins.
-    try:
-        agent_label = sys.argv[7]
-    except IndexError:
-        agent_label = ""
-    # Issue #116: cap the label — it feeds the fence HEADER (the one shell
-    # component inject.FENCE_SHELL_ALLOWANCE cannot measure per-row) and the
-    # decision log; 64 chars is generous for a host agent-type label.
-    if len(agent_label) > 64:
-        agent_label = agent_label[:64]
-
-    # Issue #117 (D5): session-end cleanup runs BEFORE the kill switch —
-    # clearing the delivery state is not an injection and must happen even
-    # under ZMEM_INJECT=0. Never recalls; emits the empty envelope; exit 0.
-    if mode == "session_end":
-        _end_sid = ""
-        try:
-            if not sys.stdin.isatty():
-                _end_obj = json.loads(sys.stdin.read() or "{}")
-                if isinstance(_end_obj, dict):
-                    _v = _end_obj.get("session_id", "")
-                    if isinstance(_v, str):
-                        _end_sid = _v
-        except Exception:
-            pass
-        if not _end_sid:
-            _end_sid = (os.environ.get("ZMEM_SESSION", "")
-                        or os.environ.get("CLAUDE_SESSION_ID", "")
-                        or os.environ.get("ZCODE_SESSION_ID", ""))
-        _clear_delivery_state(_end_sid)
-        print("{}")
-        return 0
-
-    # Issue #110 (P0-5): ZMEM_INJECT=0 is the passive-injection kill switch.
-    # It gates the whole body BEFORE the store.py existence check, the stdin
-    # try block, and every store subprocess, so no exception path can bypass
-    # it — and the decision line lands even on a broken install where
-    # store.py is missing (exactly when the operator most needs the audit
-    # trail; _log_inject_decision needs only the env-resolved data dir, and
-    # _reason_disabled falls back to its literal when schema_meta is
-    # unreachable). Session id: guarded stdin read first, env chain second —
-    # sid=unknown when the host supplied none, the same fallback the other
-    # decision lines use. The empty envelope is `{}`: the wrapper
-    # crash-fallback shape whose missing additionalContext the launcher
-    # already treats as a clean no-injection no-op. Parked pre-tool sidecars
-    # are left untouched — the next enabled run consumes them, so nothing is
-    # lost. Capture paths never consult this switch.
-    if _inject_disabled():
-        _sid = ""
-        _disabled_obj = None
-        try:
-            if not sys.stdin.isatty():
-                _obj = json.loads(sys.stdin.read() or "{}")
-                _disabled_obj = _obj if isinstance(_obj, dict) else None
-                if isinstance(_obj, dict):
-                    _v = _obj.get("session_id", "")
-                    _sid = _v if isinstance(_v, str) else ""
-        except Exception:
-            _sid = ""
-        if not _sid:
-            _sid = (os.environ.get("ZMEM_SESSION", "")
-                    or os.environ.get("CLAUDE_SESSION_ID", "")
-                    or os.environ.get("ZCODE_SESSION_ID", ""))
-        # PR #193 review: the batch lane's disabled decision still carries
-        # its lane attribution (batch=1 tools=/paths=) — computed from the
-        # same guarded payload parse, fail-open to empty.
-        _disabled_batch_kwargs = {}
-        if mode == "posttoolbatch" and _disabled_obj is not None:
-            try:
-                _ds = posttoolbatch_tool_summary(_disabled_obj)
-            except Exception:
-                _ds = {"names": [], "basenames": []}
-            _disabled_batch_kwargs = dict(
-                batch=True,
-                tool_names=_ds.get("names") or [],
-                path_basenames=_ds.get("basenames") or [])
-        _log_inject_decision(
-            [], [], "silent", _reason_disabled(store_py),
-            session_id=_sid, moment=_decision_moment(mode), store_py=store_py,
-            lane=attribution_lane, version=attribution_version, t_ms=0,
-            **_disabled_batch_kwargs)
-        print("{}")
-        return 0
-
-    if not store_py or not os.path.isfile(store_py):
-        # Issue #120: the batch lane's fail-open contract is the EMPTY
-        # envelope on every failure path (frozen checks C4), not silent
-        # stdout — other modes keep their exact historical behavior here.
-        if mode == "posttoolbatch":
-            print("{}")
-        return 0
-
-    # Issue #114: the selective gate now runs store-side on the
-    # --for-injection lane (storelib.inject.selective_inject_filter, same
-    # schema_meta constants), so this hook no longer resolves floors here.
-    # issue #65, 10.9: budget helpers (None when storelib is not importable).
-    _inj = None
-    # issue #87: envelope omitted count (passive injection-risk drops) and the
-    # closed reason set, resolved once for the classification below.
-    omitted = 0
-    ops_tokens = []
-    session_id = ""
-    pending_ctx = ""
-    # Duration of the exact store subprocess attempt used for this decision.
-    # Zero is also the intentional value for no-attempt paths (for example an
-    # empty PostToolBatch); the disabled path above is explicitly t_ms=0.
-    attribution_t_ms = 0
-    # Issue #120: additive decision-log kwargs for the batch lane; empty on
-    # every other mode so the shared log calls stay byte-identical.
-    _batch_log_kwargs = {}
-    silent_reasons, injected_reason = _reason_constants(store_py)
-
-    # Query selection per mode. `use_recent_pull` selects the query-less
-    # recent lane; otherwise `query` drives the recall lane.
-    use_recent_pull = False
-    query = None
-
-    try:
-        raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
-        try:
-            stdin_obj = json.loads(raw_stdin)
-        except (ValueError, TypeError):
-            stdin_obj = None
-        if isinstance(stdin_obj, dict):
-            _sid = stdin_obj.get("session_id", "")
-            session_id = _sid if isinstance(_sid, str) else ""
-        # Issue #94 (bot round): a host that omits session_id from the
-        # event JSON but launches through the adapter still carries it in
-        # the env — the SAME chain the session-start writer uses, so both
-        # decision-line writers attribute to the same session on every
-        # path (manual/back-compat invocations included).
-        if not session_id:
-            session_id = (os.environ.get("ZMEM_SESSION", "")
-                          or os.environ.get("CLAUDE_SESSION_ID", "")
-                          or os.environ.get("ZCODE_SESSION_ID", ""))
-
-        if mode == "precompact" or mode == "recent":
-            # PreCompact and subagent-recall: re-inject the
-            # high-confidence recent payload. No prompt text.
-            use_recent_pull = True
-            if mode == "precompact" and _LEDGER_MOD is not None and session_id:
-                # Issue #118 (D-2 scope 3): snapshot the delivery ledger
-                # into the compact sidecar BEFORE any of this mode's
-                # _clear_delivery_state sites run, so the post-compaction
-                # SessionStart(source=compact) can compose a query-aware
-                # recall from what this session was actually delivered.
-                # Fail-open: a snapshot error changes nothing — the clear
-                # below still runs and the compact moment degrades to the
-                # recency lane.
-                try:
-                    _LEDGER_MOD.snapshot_for_compact(_data_dir(), session_id)
-                except Exception:
-                    pass
-        elif mode == "pretool":
-            # PreToolUse (issue #90 / #85 C): the query is derived from the
-            # TOOL INPUT ITSELF — the command or file path about to run.
-            # This is the only event that sees `git stash pop` before it
-            # executes (the exact #85 failure shape). Non-operation events
-            # derive to nothing and stay silent (fail-open, exit 0). The
-            # kill switch is GLOBAL (review round 1): ZMEM_QUERY_CONTEXT=0
-            # silences every query-context lane, this one included — an
-            # operator flipping it expects silence, and this lane costs a
-            # subprocess per matched tool call.
-            _ops_mod = _ops_helpers(store_py)
-            if _ops_mod is None:
-                return 0
-            try:
-                if not _ops_mod.query_context_enabled():
-                    return 0
-            except Exception:
-                pass  # degrade to enabled — the switch itself must not crash
-            # Issue #119: the DELEGATION tool. The delegating prompt is the
-            # ideal recall query for the child and is observable ONLY here
-            # (SubagentStart carries no task text on any probed host). Park
-            # it for the child's SubagentStart and stay SILENT for the
-            # parent — the child's own moment delivers it, and
-            # double-injecting the parent would be noise. Fail-open: a
-            # stash error changes nothing (the child degrades to the
-            # transcript/recent rungs).
-            if isinstance(stdin_obj, dict) and stdin_obj.get("tool_name") in (
-                    "Agent", "Task"):
-                # "Task" is the pre-rename delegation tool name (community
-                # issue 29677, closed stale — not vendor-confirmed); both
-                # names are accepted so older hosts are not silently dead.
-                _task_text = ""
-                _ti_agent = stdin_obj.get("tool_input")
-                if isinstance(_ti_agent, dict):
-                    # PR #191 review F-003: per-field type+length checks (the
-                    # bare or-chain let a whitespace-only or non-string
-                    # prompt mask a valid description).
-                    for _field in ("prompt", "description"):
-                        _v = _ti_agent.get(_field)
-                        if isinstance(_v, str) and len(_v.strip()) >= 5:
-                            _task_text = _v
-                            break
-                if (len(_task_text.strip()) >= 5 and session_id
-                        and _LEDGER_MOD is not None):
-                    try:
-                        # PR #191 review F-001: the parked prompt persists
-                        # verbatim in the sidecar — apply the same advisory
-                        # secret-pattern redaction the capture paths use,
-                        # PR #192 review (cubic/Copilot, both confirmed by
-                        # an executed probe): the bare
-                        # `import correction_queue` here NEVER resolved —
-                        # sys.path[0] is hooks/lib and the scripts dir is
-                        # two levels away, so the ImportError was silently
-                        # swallowed and the prompt parked verbatim. Insert
-                        # dirname(store_py) first, exactly like every
-                        # other dynamic load in this body. Advisory only:
-                        # prose credentials/PII are not pattern-matchable.
-                        try:
-                            _cq_dir = os.path.dirname(os.path.abspath(
-                                store_py))
-                            if _cq_dir not in sys.path:
-                                sys.path.insert(0, _cq_dir)
-                            import correction_queue as _cq_tt
-                            _task_text, _ = _cq_tt.redact_secret_like_text(
-                                _task_text)
-                        except Exception:
-                            pass  # fail-open: redaction must never block
-                        _LEDGER_MOD.park_task_text(
-                            _data_dir(), session_id, _task_text)
-                    except Exception:
-                        pass
-                return 0
-            tool_desc = ""
-            if isinstance(stdin_obj, dict):
-                ti = stdin_obj.get("tool_input")
-                if isinstance(ti, dict):
-                    tool_desc = (ti.get("command") or ti.get("file_path")
-                                 or ti.get("notebook_path") or ti.get("path")
-                                 or "")
-                    if not isinstance(tool_desc, str):
-                        tool_desc = ""
-            try:
-                ops_tokens = _ops_mod.derive_ops_tokens(str(tool_desc))
-            except Exception:
-                ops_tokens = []
-            if not ops_tokens:
-                return 0
-            query = " ".join(ops_tokens)
-        elif mode == "posttoolbatch":
-            # Issue #120 (Workstream D PR 5): Claude PostToolBatch — the
-            # post-edit checkpoint. The query is derived from the COMPLETED
-            # batch (tool names + command/path fields, bounded 150/500), and
-            # the runtime moment stays the closed-set "pretool" everywhere:
-            # the decision log and the ledger record NEVER see the internal
-            # "posttoolbatch" mode name (see _decision_moment). The GLOBAL
-            # ZMEM_QUERY_CONTEXT kill switch applies, like every other
-            # query-context lane — consulted when the ops module is
-            # importable; a missing module degrades to a query-only recall
-            # (tokens=[]), never a crash. AC3's --session-id/--moment/
-            # --lane/--ops-token argv belongs to the open #158 selector
-            # contract; on today's store surface the same facts ride the
-            # #117 --exclude argv (session), the shared moment fields, and
-            # the ops=N/ops-token derivation below. The wrapper never sees
-            # tool_response/result: the parser forwards only name + the four
-            # retained fields, and the decision log carries names and
-            # basenames only.
-            _payload = stdin_obj if isinstance(stdin_obj, dict) else {}
-            try:
-                _summary = posttoolbatch_tool_summary(_payload)
-            except Exception:
-                _summary = {"tool_count": 0, "names": [], "basenames": []}
-            _batch_log_kwargs.update(
-                batch=True,
-                tool_names=_summary.get("names") or [],
-                path_basenames=_summary.get("basenames") or [],
-            )
-            _ops_mod = _ops_helpers(store_py)
-            # PR #193 review (CUBIC-5): the GLOBAL ZMEM_QUERY_CONTEXT kill
-            # switch must hold even when the ops module is unavailable — an
-            # operator flipping it expects silence on every query-context
-            # lane regardless of deployment completeness. Consulted directly
-            # from the env with the exact ops_tokens.query_context_enabled
-            # convention ("0" disables), then re-confirmed through the
-            # helper when the module IS importable.
-            if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
-                print("{}")
-                return 0
-            if _ops_mod is not None:
-                try:
-                    if not _ops_mod.query_context_enabled():
-                        # Quiet no-op with the empty envelope; no decision
-                        # line (pretool parity).
-                        print("{}")
-                        return 0
-                except Exception:
-                    pass  # degrade to enabled — the switch must not crash
-            batch_events = extract_posttoolbatch_events(_payload)
-            query = build_posttoolbatch_query(_payload)
-            if _ops_mod is not None:
-                try:
-                    ops_tokens = _ops_mod.derive_ops_tokens(*batch_events)
-                except Exception:
-                    ops_tokens = []
-            else:
-                ops_tokens = []
-            if not query.strip() and not ops_tokens:
-                # Empty batch (or malformed payload): ONE silent decision
-                # naming the empty pool, then the empty envelope.
-                _log_inject_decision(
-                    [], [], "silent", "empty-pool",
-                    ops_count=0, session_id=session_id,
-                    moment=_decision_moment(mode), store_py=store_py,
-                    lane=attribution_lane, version=attribution_version,
-                    t_ms=attribution_t_ms,
-                    **_batch_log_kwargs)
-                print("{}")
-                return 0
-        elif mode == "subagent":
-            # SubagentStart (issue #90 / #85 D, ladder amended by #119).
-            # Query ladder, each rung fail-opening to the next:
-            #   1. payload task text when the host carries it (no probed
-            #      host does — the synthetic-field tests pin the shape);
-            #   2. the task text stashed by the delegating PreToolUse(Agent)
-            #      call (FIFO; exact agent_id match when a host parks one —
-            #      neither probed host supplies agent_id at park time, so
-            #      this is FIFO in practice);
-            #   3. the parent transcript tail (a FALLBACK, never the
-            #      primary: the delegating assistant message may not be
-            #      flushed when SubagentStart fires, and the format carries
-            #      no compatibility guarantee);
-            #   4. the queryless recency pull.
-            task = ""
-            _agent_id = ""
-            if isinstance(stdin_obj, dict):
-                for field in ("prompt", "task", "description"):
-                    _v = stdin_obj.get(field, "")
-                    if isinstance(_v, str) and len(_v.strip()) >= 5:
-                        task = _v
-                        break
-                _v = stdin_obj.get("agent_id", "")
-                if isinstance(_v, str):
-                    _agent_id = _v
-            if (not task and _LEDGER_MOD is not None and session_id):
-                # Issue #119 rung 2: the stashed delegating task text.
-                try:
-                    _stashed = _LEDGER_MOD.consume_task_text(
-                        _data_dir(), session_id, _agent_id)
-                    if isinstance(_stashed, str) and len(_stashed.strip()) >= 5:
-                        task = _stashed
-                except Exception:
-                    task = ""
-            if not task:
-                # Issue #119 rung 3: the parent transcript tail.
-                task = _transcript_tail()
-            if task:
-                query = task[:500]
-            else:
-                use_recent_pull = True
-        else:
-            # UserPromptSubmit: the prompt text is the QUERY.
-            # PRR-003 fix: stdin carries the host's JSON EVENT
-            # ({"prompt": ..., "session_id": ..., "cwd": ...}); parse out
-            # the prompt field (the pre-#58 wrapper contract). Non-JSON
-            # stdin (plain text) is used verbatim for manual invocation.
-            if isinstance(stdin_obj, dict):
-                prompt = stdin_obj.get("prompt", "")
-                if not isinstance(prompt, str):
-                    prompt = ""
-            else:
-                prompt = raw_stdin
-            if not prompt or len(prompt.strip()) < 5:
-                return 0
-            # Issue #90 / #85 C: first consume any pending pre-tool fence
-            # parked for a host that may not honor additionalContext
-            # pre-tool (Claude) — deliver it even if this prompt's own
-            # recall is silent, then clear the sidecar.
-            # Issue #117: the sidecar is retired by default; this consume
-            # half pairs with the ZMEM_PENDING_SIDECAR=1 writer half.
-            # Default mode parks nothing, so consuming would be a no-op
-            # anyway — and a stray pre-#117 file is left to the sweep.
-            if _sidecar_fallback_enabled():
-                pending_ctx = _consume_pending(session_id)
-            # Issue #88 / #85 direction 2: decision-point prompts are prose
-            # with zero lexical overlap with the operation-adjacent lessons
-            # that matter; append this session's recent tool-operation tokens
-            # (from the PostToolUse ring) to the query. Fail-open: no ring /
-            # opt-out / derivation error ⇒ prose-only query, byte-identical
-            # to the pre-#88 behavior (compose is the identity then).
-            _ops_mod = _ops_helpers(store_py)
-            ops_tokens = _ops_query_tokens(store_py, session_id)
-            if _ops_mod is not None and ops_tokens:
-                query = _ops_mod.compose_inject_query(prompt, " ".join(ops_tokens))
-            else:
-                query = prompt[:500]
-
-        # Issue #117 (D-1): consult the delivery ledger and pass the
-        # delivered ids as --exclude so a row is not re-delivered within
-        # the window. PreToolUse escalation: an entry whose recorded text
-        # strong-matches the current operation tokens is NOT excluded —
-        # the row seen at session start must still fire before the
-        # dangerous command. Fail-open: any error = no exclusions.
-        excluded_ids = []
-        if _LEDGER_MOD is not None and session_id:
-            try:
-                _entries = _LEDGER_MOD.delivered(_data_dir(), session_id)
-                # Issue #120: the batch lane shares pretool's runtime moment
-                # AND its strong-match carve-out — a delivered entry whose
-                # text strong-matches the CURRENT operation tokens is not
-                # excluded, so the hazard stays live while the operation
-                # context is; everything else already delivered is.
-                if mode in ("pretool", "posttoolbatch") and ops_tokens:
-                    excluded_ids = [
-                        _e["id"] for _e in _entries
-                        if not _LEDGER_MOD.strong_token_match(
-                            _e.get("text", ""), ops_tokens)
-                    ]
-                else:
-                    excluded_ids = [_e["id"] for _e in _entries]
-            except Exception:
-                excluded_ids = []
-        _exclude_argv = []
-        # Issue #151 review (body-942): bound the argv by the ledger cap —
-        # a fixed 200 slice below the cap let delivered ids fall off the
-        # exclusion list and re-deliver.
-        _exclude_cap = _LEDGER_MOD.cap() if _LEDGER_MOD is not None else 200
-        for _eid in excluded_ids[:_exclude_cap]:
-            _exclude_argv.extend(["--exclude", _eid])
-
-        # Issue #151 review (CUBIC-body-1135): precompact CONSUMES the parked
-        # fence here — clearing it undelivered lost the content (the fallback
-        # lane exists precisely for hosts that ignored the pre-tool emit).
-        # Delivery happens below: prepended to the injected ctx, or emitted
-        # alone on the silent path — then the delivery state clears.
-        if mode == "precompact" and _sidecar_fallback_enabled():
-            pending_ctx = _consume_pending(session_id)
-
-        _attempt_started = time.perf_counter()
-        try:
-            if use_recent_pull:
-                out = subprocess.check_output(
-                    [
-                        sys.executable, store_py, "recent",
-                        "--namespace", ns,
-                        "--limit", recent_limit,
-                        "--min-confidence", str(_recent_floor(store_py)),
-                        "--include-global",
-                        "--global-limit", recent_global_limit,
-                        "--no-bump",
-                        "--for-injection",
-                        "--json",
-                        *_exclude_argv,
-                    ],
-                    stderr=subprocess.DEVNULL,
-                    timeout=_store_timeout_s(),
-                ).decode("utf-8", "replace")
-            else:
-                out = subprocess.check_output(
-                    [
-                        sys.executable, store_py, "recall",
-                        "--query", query,
-                        "--namespace", ns,
-                        "--limit", "5",
-                        "--include-global",
-                        "--global-limit", "3",
-                        "--no-bump",
-                        "--for-injection",
-                        "--json",
-                        *_exclude_argv,
-                    ],
-                    stderr=subprocess.DEVNULL,
-                    timeout=_store_timeout_s(),
-                ).decode("utf-8", "replace")
-        finally:
-            attribution_t_ms = _rounded_elapsed_ms(_attempt_started)
-        rows = json.loads(out) if out.strip() else []
-        # v13 (issue #65, 10.8): unwrap the read envelope ({"results": ...});
-        # a bare list from a pre-v13 store.py still works. Issue #87: read the
-        # envelope's omitted count BEFORE the unwrap discards it — it counts
-        # rows the passive --no-bump filter dropped (injection-risk /
-        # untrusted_web), the difference between "omitted" and "empty-pool".
-        # Issue #114: the --for-injection lane also stamps the closed-set
-        # silent reason and the PRE-gATE candidate ids on the envelope; read
-        # both here, before envelope_results discards them.
-        envelope_reason = None
-        envelope_candidates = None
-        store_timeout_hit = False
-        # Issue #182: score-margin telemetry from the injection envelope.
-        # Keep each raw optional value independent; the logger validates the
-        # numeric and list shapes separately before appending either field.
-        envelope_margin = None
-        envelope_margin_pruned_ids = None
-        # Issue #117: rows the store actually dropped via --exclude.
-        envelope_excluded = None
-        # Issue #116: hard-ceiling accounting from the store lane —
-        # admission's own token accounting, protected truncation/drop
-        # counts, and the ready-made fence note. None = legacy store
-        # without the keys (log fields stay absent, byte-compatible).
-        envelope_admission = None
-        envelope_bdrop = None
-        envelope_btrunc = None
-        envelope_bprot = None
-        envelope_note = ""
-        # Issue #136: the per-arm pre/post-cap attribution dict. None =
-        # legacy store without the key (the arms= log field stays absent).
-        envelope_arms = None
-        if isinstance(rows, dict):
-            try:
-                omitted = int(rows.get("omitted", 0) or 0)
-            except (TypeError, ValueError):
-                omitted = 0
-            _er = rows.get("reason")
-            if isinstance(_er, str) and _er:
-                envelope_reason = _er
-            _ec = rows.get("candidate_ids")
-            if isinstance(_ec, list):
-                envelope_candidates = [
-                    str(_x) for _x in _ec if isinstance(_x, str)
-                ]
-            if "margin" in rows:
-                envelope_margin = rows.get("margin")
-            if "margin_pruned_ids" in rows:
-                envelope_margin_pruned_ids = rows.get("margin_pruned_ids")
-            # Issue #136: gate on dict-shape, like the budget fields gate on
-            # key presence — a malformed arms value never reaches the log.
-            if isinstance(rows.get("arms"), dict):
-                envelope_arms = rows.get("arms")
-            # Issue #116 (PR-review round): gate on KEY PRESENCE, not `or 0`
-            # coercion — `int(None or 0)` is 0, which would fabricate
-            # measured-looking zeros into the audit log on legacy (pre-#116)
-            # store envelopes instead of leaving the fields absent.
-            if "budget_admission" in rows:
-                try:
-                    envelope_admission = int(rows.get("budget_admission") or 0)
-                    envelope_bdrop = int(rows.get("budget_dropped") or 0)
-                    envelope_btrunc = int(rows.get("budget_truncated") or 0)
-                    envelope_bprot = int(
-                        rows.get("budget_dropped_protected") or 0)
-                except (TypeError, ValueError):
-                    envelope_admission = None
-            _bn = rows.get("budget_note")
-            if isinstance(_bn, str):
-                envelope_note = _bn
-            _ee = rows.get("excluded")
-            if isinstance(_ee, int) and not isinstance(_ee, bool):
-                envelope_excluded = _ee
-        _inj = _inject_helpers(store_py)
-        if _inj is not None:
-            rows = _inj.envelope_results(rows)
-        else:
-            if isinstance(rows, dict):
-                rows = rows.get("results", [])
-            if not isinstance(rows, list):
-                rows = []
-    except subprocess.TimeoutExpired:
-        # PR #198 review F-007: a timeout must not masquerade as an
-        # empty pool. Fail closed (inject nothing) but classify the
-        # miss as reason=omitted + the store_timeout=1 additive tail
-        # so a systematic slowdown is diagnosable from the log.
-        rows = []
-        omitted = 0
-        envelope_reason = "omitted"
-        envelope_candidates = None
-        envelope_margin = None
-        envelope_margin_pruned_ids = None
-        envelope_excluded = None
-        envelope_admission = None
-        envelope_bdrop = None
-        envelope_btrunc = None
-        envelope_bprot = None
-        envelope_note = ""
-        envelope_arms = None
-        store_timeout_hit = True
-        print("[zmem] store recall timed out after the configured cap; "
-              "injecting nothing this event", file=sys.stderr)
-    except Exception as _store_exc:
-        rows = []
-        omitted = 0
-        store_timeout_hit = False
-        envelope_reason = None
-        envelope_candidates = None
-        envelope_margin = None
-        envelope_margin_pruned_ids = None
-        envelope_excluded = None
-        envelope_admission = None
-        envelope_bdrop = None
-        envelope_btrunc = None
-        envelope_bprot = None
-        envelope_note = ""
-        envelope_arms = None
-        # Issue #114 review (PRR-005): a store failure (timeout, crash, or an
-        # older store.py that predates --for-injection) must not masquerade
-        # as a silent empty pool with no trace. Still fail closed (inject
-        # nothing) — but say why on stderr so the launcher debug log carries
-        # the cause and mixed-version deployments are diagnosable.
-        # Only the exception TYPE + a caller-safe detail: str() of a
-        # CalledProcessError embeds the full argv, which would leak query
-        # terms into the launcher debug log.
-        _detail = getattr(_store_exc, "returncode", None)
-        _suffix = ("returncode=" + str(_detail)) if _detail is not None else ""
-        print("[zmem] store recall failed ("
-              + type(_store_exc).__name__
-              + (": " + _suffix if _suffix else "")
-              + "); injecting nothing this event", file=sys.stderr)
-
-    # Issue #114 (P2-3): the store subprocess ran the injection lane
-    # (--for-injection) — the selective gate and the token budget were applied
-    # INSIDE it, so `rows` is already the RENDERED set and the surfaced
-    # telemetry was written there for exactly these rows. No local gate, no
-    # local budget, no second ack process. Status/reason come from the
-    # envelope; `all=` logs the envelope's pre-gate candidate ids.
-    selected = rows
-    status = "injected" if rows else "silent"
-    tokens_budget = None
-    tokens_used = None
-    if _inj is not None:
-        tokens_budget = _inj.inject_token_budget()
-    reason = injected_reason
-    if not selected:
-        # Fail-open mirrors the pre-114 hook: an envelope without a reason
-        # (bare-list store, parse hiccup) degrades to the local classifier
-        # over the candidates we do have.
-        try:
-            reason = envelope_reason or _classify_silent_reason(
-                rows, omitted=omitted, budget_emptied=False,
-                allowed=silent_reasons,
-                candidate_ids=envelope_candidates,
-                post_ledger_rows=rows,
-            )
-        except Exception:
-            reason = "empty-pool"
-        if reason == "below-bar":
-            ctx = _SILENT_CTX_BELOW_BAR
-        elif reason == "budget-drop":
-            ctx = _SILENT_CTX_BUDGET_DROP
-        else:
-            # empty-pool and omitted share the string: do not teach the model
-            # that omitted injection-risk rows existed (#87 spec).
-            ctx = _SILENT_CTX_RETRIEVED_EMPTY
-        # F18: a budget wipe still logs the token fields — on the #114 lane
-        # the store already classified it (reason=budget-drop from the
-        # envelope), so derive the marker instead of a local flag.
-        budget_emptied = reason == "budget-drop"
-        _log_inject_decision(
-            rows, selected, status, reason,
-            omitted=omitted,
-            tokens_used=0 if budget_emptied else None,
-            tokens_budget=tokens_budget if budget_emptied else None,
-            ops_count=len(ops_tokens),
-            session_id=session_id,
-            all_ids=envelope_candidates,
-            moment=_decision_moment(mode), store_py=store_py,
-            store_timeout=store_timeout_hit,
-            excluded_count=envelope_excluded,
-            admission_used=envelope_admission,
-            budget_dropped=envelope_bdrop,
-            budget_truncated=envelope_btrunc,
-            budget_dropped_protected=envelope_bprot,
-            arms=envelope_arms,
-            margin=envelope_margin,
-            margin_pruned_ids=envelope_margin_pruned_ids,
-            lane=attribution_lane, version=attribution_version,
-            t_ms=attribution_t_ms,
-            **_batch_log_kwargs,
-        )
-        if mode in ("pretool", "posttoolbatch"):
-            # Issue #90 / #85 C: a per-tool-call one-liner would inject noise
-            # on every unmatched operation — PreToolUse stays fully silent
-            # when nothing qualified (the log line above carries the reason).
-            # A parked pending fence is still delivered by the NEXT
-            # user_prompt run, so nothing is lost. Issue #120: the batch
-            # lane additionally emits the empty envelope `{}` — its
-            # fail-open contract (AC5) is the empty envelope on every
-            # silent path, pinned by the frozen checks.
-            if mode == "posttoolbatch":
-                print("{}")
-            return 0
-        if pending_ctx:
-            # Issue #90 / #85 C: deliver the parked pre-tool fence even when
-            # this prompt's own recall is silent — it was never seen.
-            _emit_envelope(pending_ctx)
-            if mode == "precompact":
-                # Issue #151 review (CUBIC-body-1135): the parked fence was
-                # DELIVERED above — now clear the delivery state so the
-                # post-compaction ledger starts clean (clear-after-deliver,
-                # never clear-before).
-                _clear_delivery_state(session_id)
-            return 0
-        if mode == "precompact":
-            _clear_delivery_state(session_id)
-        _emit_envelope(ctx)
-        return 0
-
-    header = (
-        f"Relevant memories (zmem {mode}, namespace {ns}"
-        + (f", agent {agent_label}" if agent_label else "")
-        + "). Consider if they apply to this task; ignore if not."
+    # The kill switch is evaluated before stdin parsing.  A malformed or
+    # blocking event stream must never delay a disabled passive hook.
+    # ZMEM_INJECT remains global, while ZMEM_QUERY_CONTEXT belongs only to the
+    # operation-context lanes (PreToolUse and PostToolBatch).  Consult both
+    # before stdin parsing or any store subprocess so a disabled operation hook
+    # is always a cheap empty envelope without silencing prose recall.
+    switch_disabled = (
+        os.environ.get("ZMEM_INJECT", "1").strip() == "0"
+        or (mode in ("pretool", "posttoolbatch") and
+            os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0")
     )
-    ctx = _format_fence(selected, header, store_py=store_py,
-                        budget_note=envelope_note)
-    if budget > 0 and len(ctx) > budget:
-        # PRR-015 fix: actually truncate. The previous branch reconstructed
-        # the original string unchanged (no-op), so oversized memories
-        # bypassed the budget. Cut the fence BODY at the budget (minus the
-        # closer), then re-append the closer — the fence is never left
-        # unclosed and the payload respects ZMEM_CTX_BUDGET.
-        closer = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
-        body_budget = max(0, budget - len(closer) - 1)
-        ctx = ctx[:body_budget].rstrip() + "\n" + closer + "\n[recall truncated]"
-    if pending_ctx and ctx:
-        # Issue #90 / #85 C: prepend the parked pre-tool fence (same turn's
-        # operation context) to this prompt's recall — then re-apply the
-        # char budget to the COMBINED block (review round 1): the budget is
-        # the outer stop for the emitted context, not per-recall.
-        ctx = pending_ctx + "\n\n" + ctx
-        if budget > 0 and len(ctx) > budget:
-            closer = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
-            body_budget = max(0, budget - len(closer) - 1)
-            ctx = ctx[:body_budget].rstrip() + "\n" + closer + "\n[recall truncated]"
-    # tokens_used is measured on the FINAL emitted context (post budget,
-    # post char-truncation) - the honest number (issue #65, 10.9).
-    if _inj is not None:
-        tokens_used = _inj.estimate_tokens(ctx)
-    _log_inject_decision(rows, selected, status, injected_reason,
-                         omitted=omitted,
-                         tokens_used=tokens_used, tokens_budget=tokens_budget,
-                         ops_count=len(ops_tokens),
-                         session_id=session_id,
-                         all_ids=envelope_candidates,
-                         moment=_decision_moment(mode), store_py=store_py,
-                         store_timeout=store_timeout_hit,
-            excluded_count=envelope_excluded,
-                         admission_used=envelope_admission,
-                         budget_dropped=envelope_bdrop,
-                         budget_truncated=envelope_btrunc,
-                         budget_dropped_protected=envelope_bprot,
-                         arms=envelope_arms,
-                         margin=envelope_margin,
-                         margin_pruned_ids=envelope_margin_pruned_ids,
-                         lane=attribution_lane, version=attribution_version,
-                         t_ms=attribution_t_ms,
-                         **_batch_log_kwargs)
-    if (_LEDGER_MOD is not None and session_id
-            and mode not in ("precompact", "session_end")):
-        # Issue #117 (D-1): record the delivered ids so the NEXT moment
-        # of this session suppresses them (within the window). precompact
-        # does not record — it clears right after (the context is about
-        # to be summarized; post-compaction delivery must not be
-        # suppressed — the D-2 coordination point).
-        # Issue #151 review (CUBIC-body-1200): the char-budget cut above
-        # can drop tail rows from the emitted fence — recording the full
-        # `selected` set would suppress rows the model never saw. Record
-        # only rows whose ``- [<id>]`` bullet survived in the final ctx
-        # (residual: a cut landing between a bullet and its content line
-        # still counts that row — narrow, documented).
+    session_id = os.environ.get("ZMEM_SESSION", "")
+    log_session_id = session_id
+    if not session_id and mode != "session_end":
+        session_id = _anonymous_session_id()
+    moment = _decision_moment(mode)
+    lane = _lane()
+    # Duration of the exact store subprocess attempt used for this decision.
+    # Zero is also the intentional value for no-attempt paths (the disabled
+    # branch below and every pre-attempt early exit).
+    attribution_t_ms = 0
+    if switch_disabled and mode != "session_end":
+        _log_inject_decision([], [], "silent", "disabled",
+                             session_id=log_session_id, moment=moment,
+                             lane=attribution_lane, version=attribution_version,
+                             t_ms=attribution_t_ms)
+        _emit("")
+        return 0
+    try:
+        event = json.load(sys.stdin)
+    except Exception:
+        event = {}
+    if not isinstance(event, dict):
+        event = {}
+    event_session_id = _event_text(event, "session_id", "sessionId")
+    if event_session_id:
+        session_id = event_session_id
+        log_session_id = event_session_id
+    if mode == "session_end":
+        _clear_delivery_state(store_py, session_id)
+        _emit("")
+        return 0
+    if not lane or not os.path.isfile(store_py):
+        _log_inject_decision([], [], "silent", "empty-pool",
+                             session_id=log_session_id, moment=moment,
+                             lane=attribution_lane, version=attribution_version,
+                             t_ms=attribution_t_ms)
+        _emit("")
+        return 0
+    query = _query_for(mode, event)
+    command = "recent" if not query else "recall"
+    args = [command, "--namespace", namespace,
+            "--limit", recent_limit if command == "recent" else "5",
+            "--include-global", "--global-limit",
+            recent_global_limit if command == "recent" else "3",
+            "--no-bump", "--for-injection", "--json",
+            "--session-id", session_id, "--moment", moment, "--lane", lane]
+    if command == "recall":
+        args[1:1] = ["--query", query]
+    _attempt_started = time.perf_counter()
+    result = _run_store(store_py, args)
+    attribution_t_ms = _rounded_elapsed_ms(_attempt_started)
+    envelope = {}
+    if result is not None and result.returncode == 0:
         try:
-            # Issue #120: the batch lane records under its RUNTIME moment
-            # ("pretool") — the ledger never sees the internal mode name.
-            _ledger_moment = _decision_moment(mode)
-            _LEDGER_MOD.record(_data_dir(), session_id,
-                               _LEDGER_MOD.rows_present_in(selected, ctx)
-                               if len(ctx) < len(_format_fence(selected, header,
-                                                   store_py=store_py,
-                                                   budget_note=envelope_note))
-                               else selected,
-                               _ledger_moment)
-        except Exception:
+            parsed = json.loads(result.stdout)
+            if isinstance(parsed, dict):
+                envelope = parsed
+        except (TypeError, ValueError):
             pass
-    if (mode == "pretool" and os.environ.get("ZMEM_HOST", "") == "claude"
-            and _sidecar_fallback_enabled()):
-        # Issue #117: RETIRED by default — delivered ids live in the
-        # per-session ledger (ops/<sha256>.ledger) every moment consults,
-        # so the pre-tool emit is the delivery and the next prompt cannot
-        # re-select the same rows. ZMEM_PENDING_SIDECAR=1 re-enables a
-        # narrow fallback for older host builds: append-with-dedup under
-        # atomic hash-keyed storage (the pre-#117 file was a
-        # sanitize-and-truncate name written with truncate-on-write — it
-        # both duplicated and lost fences, exactly what #117 removes).
-        _write_pending(session_id, ctx, rows=selected)
-    _emit_envelope(ctx)
+    rendered = envelope.get("rendered")
+    if not isinstance(rendered, str):
+        rendered = ""
+    reason = envelope.get("reason")
+    if not isinstance(reason, str) or not reason:
+        reason = ("omitted" if result is None else
+                  "injected" if rendered else "empty-pool")
+    candidate_ids = envelope.get("candidate_ids")
+    if not isinstance(candidate_ids, list):
+        candidate_ids = []
+    # ``rendered`` is the only delivered context.  The structured result IDs
+    # remain useful audit metadata, however: retaining them in the decision
+    # line lets miss-rate tooling distinguish a selector result from a
+    # transport failure without reconstructing or rendering row text here.
+    selected_rows = envelope.get("results")
+    selected = ([row for row in selected_rows
+                 if isinstance(row, dict) and isinstance(row.get("id"), str)]
+                if isinstance(selected_rows, list) else [])
+    injected = bool(rendered)
+    log_tokens = injected or reason == "budget-drop"
+    summary = posttoolbatch_tool_summary(event) if mode == "posttoolbatch" else {}
+    _log_inject_decision(
+        [], selected, "injected" if injected else "silent", reason,
+        omitted=envelope.get("omitted", 0),
+        tokens_used=envelope.get("tokens_used") if log_tokens else None,
+        tokens_budget=envelope.get("tokens_budget") if log_tokens else None,
+        all_ids=candidate_ids, session_id=log_session_id, moment=moment,
+        admission_used=envelope.get("budget_admission"),
+        budget_dropped=envelope.get("budget_dropped"),
+        budget_truncated=envelope.get("budget_truncated"),
+        budget_dropped_protected=envelope.get("budget_dropped_protected"),
+        arms=envelope.get("arms"), excluded_count=envelope.get("excluded", 0),
+        batch=mode == "posttoolbatch", tool_names=summary.get("names"),
+        path_basenames=summary.get("basenames"),
+        margin=envelope.get("margin"),
+        margin_pruned_ids=envelope.get("margin_pruned_ids"),
+        store_timeout=result is None,
+        lane=attribution_lane, version=attribution_version,
+        t_ms=attribution_t_ms,
+    )
+    _emit(rendered)
     if mode == "precompact":
-        # Issue #117 (D-1 scope 3): compaction — "already delivered" is
-        # false once the context has been summarized away. Clear the
-        # session's ledger (and any fallback pending) AFTER the emit; the
-        # pre-compaction snapshot this mode takes at dispatch time (issue
-        # #118, D-2) already holds the entries in the compact sidecar, so
-        # nothing is lost for the post-compaction query.
-        _clear_delivery_state(session_id)
+        _clear_delivery_state(store_py, session_id)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        print("{}")
+        sys.exit(0)

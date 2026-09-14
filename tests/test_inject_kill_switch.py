@@ -19,7 +19,8 @@ status=silent reason=disabled (issue #129: into zmem-decisions.log, with
 the additive moment= field — the body stamps its mode, session-start
 stamps moment=session_start); a seeded store row proves the enabled path
 still injects (control cases), the literal-"0"-only convention is pinned,
-and a parked pre-tool fence survives the switch and delivers on re-enable.
+and the retired pending sidecar is never produced, even when its legacy
+opt-in variable is present.
 
 All stores are throwaway temp stores; ambient zmem env is stripped from
 every child process. The operator's real store is never touched.
@@ -149,7 +150,7 @@ class KillSwitchBodyTest(unittest.TestCase):
             self._tmp,
             {"prompt": "how do I handle git stash pop conflicts here?",
              "session_id": "sess-abc"},
-            self.ns, ZMEM_INJECT="0")
+            self.ns, ZMEM_INJECT="0", ZMEM_SESSION="sess-abc")
         self._assert_disabled(r)
         line = _hook_lines(self._tmp)[0]
         self.assertIn("sid=sess-abc", line,
@@ -202,15 +203,9 @@ class KillSwitchBodyTest(unittest.TestCase):
                 r.stdout.strip(), "{}",
                 f"ZMEM_INJECT={value!r} must leave injection enabled")
 
-    def test_parked_fence_survives_and_delivers_on_reenable(self):
-        # Issue #117 AMENDMENT: the sidecar is retired by default, so this
-        # contract now pins the NARROW FALLBACK (ZMEM_PENDING_SIDECAR=1) on
-        # ALL THREE calls - the writer gates the park AND the consumer gates
-        # the delivery, so arming-only would strand the fence. The parked
-        # file is hash-keyed now (sha256 of the full session id), not
-        # sanitize-and-truncate, hence the glob instead of the literal name.
-        # The delivery guarantee is unchanged: park -> survives the kill
-        # switch -> delivers on re-enable.
+    def test_retired_pending_sidecar_is_not_produced(self):
+        # Issue #158 completes the #117 ownership move: passive adapters no
+        # longer park raw fences, and the old opt-in variable is inert.
         sid = "sess-park"
         arm = _run_body(
             self._tmp,
@@ -218,23 +213,20 @@ class KillSwitchBodyTest(unittest.TestCase):
             self.ns, mode="pretool", ZMEM_HOST="claude",
             ZMEM_PENDING_SIDECAR="1")
         self.assertEqual(arm.returncode, 0, arm.stderr)
-        pending = self._pending_file()
-        self.assertTrue(pending is not None and pending.is_file(),
-                        "control: the fence parked under the fallback env")
+        self.assertIsNone(self._pending_file())
 
         silenced = _run_body(
             self._tmp, {"prompt": "unrelated prompt text", "session_id": sid},
             self.ns, ZMEM_INJECT="0", ZMEM_PENDING_SIDECAR="1")
         self.assertEqual(silenced.stdout.strip(), "{}")
-        self.assertTrue(pending.is_file(),
-                        "the kill switch must NOT consume or drop the fence")
+        self.assertIsNone(self._pending_file())
 
         resumed = _run_body(
             self._tmp, {"prompt": "unrelated prompt text", "session_id": sid},
             self.ns, ZMEM_PENDING_SIDECAR="1")
-        self.assertIn("killswitchcanary", resumed.stdout,
-                      "re-enabled: the parked fence is delivered")
-        self.assertFalse(pending.is_file(), "and then consumed")
+        self.assertNotIn("killswitchcanary", resumed.stdout)
+        self.assertEqual(resumed.stdout.strip(), "{}")
+        self.assertIsNone(self._pending_file())
 
     def _pending_file(self):
         ops = Path(self._tmp) / "ops"

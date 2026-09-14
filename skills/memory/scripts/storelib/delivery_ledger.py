@@ -10,17 +10,15 @@ parked fences. This module is the delivery-state substrate BOTH lanes share:
   id. The key hashes the FULL session id, ending the sanitize-and-truncate
   collision class of the old ``.pending`` filename (two distinct 130-char ids
   shared one file before #117).
-- the fallback pending sidecar (env-gated by the caller for older host builds
-  that ignore pre-tool additionalContext): the same hashed naming and atomic
-  write, but append-with-dedup — N parked fences between prompts all survive.
+- the fallback pending sidecar (legacy, env-gated callers only; the current
+  #158 adapters consume the rendered selector envelope): the same hashed
+  naming and atomic write, but append-with-dedup — N parked fences between
+  prompts all survive.
 - the compaction sidecar (issue #118, Workstream D-2):
-  ``<data>/ops/<sha256(session_id)[:32]>.compact`` — the handoff between the
-  three compaction moments. PreCompact snapshots the ledger into it (then
-  clears the ledger); PostCompact merges the host's ``compact_summary`` into
-  it; the post-compaction SessionStart consumes it exactly once (compose a
-  query-aware recall from summary + the pre-compaction delivered texts) and
-  unlinks it. A second compaction overwrites it via a fresh snapshot, and the
-  backup sweep reaps any stash a dead session left behind.
+  ``<data>/ops/<sha256(session_id)[:32]>.compact`` — retained as a
+  backward-compatible storelib API for older callers. The #158 adapters no
+  longer produce or consume it: PreCompact clears the ledger and the
+  following SessionStart uses the ordinary selector.
 
 Atomicity: every write is tmp-file + ``os.replace`` (the correction_queue
 pattern, inlined here — storelib never imports the scripts-layer module).
@@ -55,9 +53,9 @@ CAP_DEFAULT = 256
 # PreToolUse can re-admit a delivered row when the operation about to run
 # token-matches it strongly — without a store round-trip on the hot path.
 TEXT_MAX = 400
-# Issue #118: bound on the stashed compact_summary. The summary is host
-# prose (unbounded upstream); the stash is only ever recall QUERY fuel, so
-# a generous headroom that still cannot balloon the ops file suffices.
+# Issue #118: bound on the stashed compact_summary. This remains for the
+# backward-compatible storelib compact helpers; #158 adapters do not call
+# them.
 COMPACT_SUMMARY_MAX = 2000
 
 # Issue #119: bounds for the subagent task-text stash — the delegating
@@ -114,12 +112,10 @@ def pending_path(data_dir: str, session_id: str) -> Optional[str]:
 
 
 def compact_path(data_dir: str, session_id: str) -> Optional[str]:
-    """Path of the session's compaction sidecar (issue #118, same hash key).
+    """Path of the legacy compaction sidecar (issue #118).
 
-    Written by PreCompact (snapshot) and PostCompact (summary merge); read
-    and unlinked once by the post-compaction SessionStart. NOT part of
-    ``clear_delivery_state`` on purpose: at PreCompact the snapshot must
-    SURVIVE the delivery-state clear that follows in the same hook run.
+    Kept for backward-compatible storelib callers. The #158 hook and
+    SessionStart adapters no longer write or read this path.
     """
     name = _hashed_name(session_id, ".compact")
     if not name or not data_dir:
@@ -338,7 +334,7 @@ def clear_delivery_state(data_dir: str, session_id: str) -> None:
 
 
 def _load_compact(path: Optional[str]) -> Dict[str, Any]:
-    """Read the compaction sidecar, degrading to the empty stash."""
+    """Read the legacy compaction sidecar, degrading to an empty stash."""
     if not path:
         return {"entries": [], "summary": None, "ts": 0}
     try:
@@ -359,16 +355,10 @@ def _load_compact(path: Optional[str]) -> Dict[str, Any]:
 
 def snapshot_for_compact(data_dir: str, session_id: str,
                          now: Optional[float] = None) -> None:
-    """Issue #118 (D-2 scope 3): PreCompact snapshots the ledger BEFORE the
-    delivery-state clear, so the post-compaction SessionStart can compose a
-    query-aware recall from what this session was actually delivered.
+    """Legacy #118 PreCompact snapshot helper.
 
-    Overwrites any prior stash unconditionally — a second compaction in the
-    same session supersedes the first one's leftovers (PreCompact strictly
-    precedes PostCompact on every host, so nothing else can be mid-write).
-    Fail-open: a snapshot error changes nothing downstream (the clear still
-    runs; the compact session-start simply finds no stash and degrades to
-    the recency lane).
+    Retained for older direct storelib callers. The #158 PreCompact adapter
+    intentionally uses ``ledger-clear`` instead and never calls this helper.
     """
     path = compact_path(data_dir, session_id)
     if not path:
@@ -388,10 +378,11 @@ def snapshot_for_compact(data_dir: str, session_id: str,
 
 def park_compact_summary(data_dir: str, session_id: str, summary: str,
                          now: Optional[float] = None) -> None:
-    """Issue #118 (D-2 scope 2): PostCompact merges the host's
-    ``compact_summary`` into the sidecar (creating it when PreCompact never
-    ran on this host). Read-modify-write is safe: the host fires PostCompact
-    strictly after PreCompact, never concurrently. Fail-open."""
+    """Legacy #118 PostCompact summary helper, retained for compatibility.
+
+    #158 adapters do not call this function, so live PostCompact events never
+    create the old compact sidecar.
+    """
     path = compact_path(data_dir, session_id)
     if not path or not summary or not summary.strip():
         return
@@ -407,12 +398,7 @@ def park_compact_summary(data_dir: str, session_id: str, summary: str,
 
 
 def read_compact_context(data_dir: str, session_id: str):
-    """Issue #118: read the compaction stash WITHOUT consuming it — returns
-    ``(summary, entries)`` and leaves the file in place, so the caller can
-    discard it only after the moment actually completed (PR #190 review
-    PRR-002/011: an unlink-before-the-recall-subprocess lost the summary
-    and snapshot permanently whenever all recall retries failed).
-    Fail-open: absent/unreadable stash returns the empty shape."""
+    """Read the legacy compact stash without consuming it."""
     path = compact_path(data_dir, session_id)
     if not path:
         return (None, [])
@@ -421,8 +407,7 @@ def read_compact_context(data_dir: str, session_id: str):
 
 
 def discard_compact_context(data_dir: str, session_id: str) -> None:
-    """Issue #118: drop the compaction stash once its moment completed.
-    Fail-open: a missing file or unlink error changes nothing."""
+    """Drop the legacy compact stash once its old caller completes."""
     path = compact_path(data_dir, session_id)
     if not path:
         return
@@ -433,10 +418,7 @@ def discard_compact_context(data_dir: str, session_id: str) -> None:
 
 
 def consume_compact_context(data_dir: str, session_id: str):
-    """Read-and-discard convenience (the original #118 consume-once shape):
-    :func:`read_compact_context` followed by
-    :func:`discard_compact_context`. Hooks should prefer the split pair so
-    a failed recall can leave the stash in place."""
+    """Read-and-discard convenience for legacy compact callers."""
     summary, entries = read_compact_context(data_dir, session_id)
     discard_compact_context(data_dir, session_id)
     return (summary, entries)

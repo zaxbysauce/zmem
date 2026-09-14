@@ -15,6 +15,7 @@ Runs standalone: python tests/test_session_tools.py
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 import sys
@@ -22,6 +23,7 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+import uuid
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -729,6 +731,131 @@ class HermesMcpClientTest(unittest.TestCase):
                 os.environ["ZMEM_MCP_TOKEN"] = saved_token
         self.assertEqual(seen["tool"], "search")
         self.assertEqual(seen["arguments"], {"namespace": "project:compat"})
+
+
+class ProviderEnvelopeTest(unittest.TestCase):
+    """Issue #158: Hermes consumes the store-side rendered envelope."""
+
+    SESSION_ID = "phase25-provider-session"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp(
+            prefix=f"zmem-phase25-provider-{uuid.uuid4().hex}-"
+        )
+        cls._saved = {
+            key: os.environ.get(key)
+            for key in (
+                "ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+                "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_TEST_NOW", "ZMEM_NAMESPACE",
+                "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET",
+            )
+        }
+        os.environ.update({
+            "ZMEM_HOME": str(REPO_ROOT),
+            "ZMEM_STORE": os.path.join(cls._tmp, "store.sqlite"),
+            "ZMEM_DATA": os.path.join(cls._tmp, "missing-data"),
+            "ZMEM_MODELS_DIR": os.path.join(cls._tmp, "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_TEST_NOW": "2026-06-01T00:00:00Z",
+            "ZMEM_NAMESPACE": "project:parity",
+            "ZMEM_INJECT_TOKEN_BUDGET": "1500",
+        })
+
+        import importlib.util
+        fixture_spec = importlib.util.spec_from_file_location(
+            "zmem_phase25_injection_fixture",
+            REPO_ROOT / "tests" / "fixtures" / "injection-parity" /
+            "generate.py",
+        )
+        fixture = importlib.util.module_from_spec(fixture_spec)
+        fixture_spec.loader.exec_module(fixture)
+        fixture.build_fixture_store(os.environ["ZMEM_STORE"])
+
+        # Passive sidecars follow the canonical store resolver: when no
+        # explicit selector data_dir is supplied, ZMEM_STORE outranks
+        # ZMEM_DATA and the ledger lives beside the SQLite store.
+        cls.store_path = Path(os.environ["ZMEM_STORE"]).expanduser().resolve()
+        cls.data_dir = cls.store_path.parent
+        cls.data_dir.mkdir(parents=True, exist_ok=True)
+        ledger_path = cls.data_dir / "ops" / (
+            hashlib.sha256(cls.SESSION_ID.encode("utf-8")).hexdigest()[:32]
+            + ".ledger"
+        )
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_bytes(
+            (REPO_ROOT / "tests" / "fixtures" / "injection-parity" /
+             "ledger.json").read_bytes()
+        )
+
+        # Stub the Hermes host ABC, matching HermesSessionToolsTest above.
+        agent = types.ModuleType("agent")
+        mp = types.ModuleType("agent.memory_provider")
+
+        class MemoryProvider:  # minimal stand-in
+            pass
+
+        mp.MemoryProvider = MemoryProvider
+        agent.memory_provider = mp
+        sys.modules.setdefault("agent", agent)
+        sys.modules.setdefault("agent.memory_provider", mp)
+
+        provider_spec = importlib.util.spec_from_file_location(
+            "zmem_phase25_provider",
+            REPO_ROOT / "hermes-plugin" / "__init__.py",
+        )
+        cls.mod = importlib.util.module_from_spec(provider_spec)
+        sys.modules["zmem_phase25_provider"] = cls.mod
+        provider_spec.loader.exec_module(cls.mod)
+        cls.provider = cls.mod.ZmemMemoryProvider()
+        cls.provider.initialize(cls.SESSION_ID)
+        cls.expected = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "injection-parity" /
+             "expected-envelope.json").read_text(encoding="utf-8")
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+        for key, value in cls._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        sys.modules.pop("zmem_phase25_provider", None)
+
+    def test_prefetch_returns_rendered_and_reuses_store_ledger(self):
+        first = self.provider.prefetch("stash pop", session_id=self.SESSION_ID)
+        self.assertEqual(first, self.expected["rendered"])
+        self.assertNotIn("<memory-context>", first)
+
+        second = self.provider.prefetch("stash pop", session_id=self.SESSION_ID)
+        self.assertEqual(second, "")
+
+        ledger_path = self.data_dir / "ops" / (
+            hashlib.sha256(self.SESSION_ID.encode("utf-8")).hexdigest()[:32]
+            + ".ledger"
+        )
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        entries = ledger["entries"]
+        self.assertEqual(
+            [entry["id"] for entry in entries],
+            [
+                "e0000000-0000-4000-8000-000000000001",
+                "e0000000-0000-4000-8000-000000000002",
+            ],
+        )
+        self.assertEqual(
+            [entry["moment"] for entry in entries],
+            ["user_prompt", "user_prompt"],
+        )
+        for entry, text in zip(
+            entries,
+            ("stash pop recovery note one", "stash pop recovery note two"),
+        ):
+            self.assertIsInstance(entry["ts"], (int, float))
+            self.assertEqual(entry["text"], text)
 
 
 if __name__ == "__main__":

@@ -12,8 +12,10 @@ README.
 
 ## [0.38.0] - 2026-09-14
 
-> Workstream G PR 1 of 5 (issue #153): host-lane attribution and an
-> already-delivered reason in the decision log.
+> Workstream G PR 1 of 5 (issue #153) and Workstream H PR 1 of 8 (issue
+> #158): host-lane attribution with an already-delivered reason in the
+> decision log, and one store-owned passive-injection selector behind a
+> complete rendered envelope.
 
 ### Added
 - **Closed decision attribution**: passive decision lines can identify the
@@ -32,6 +34,29 @@ README.
 - **Hermes compatibility attribution**: local provider and remote MCP paths
   carry their lane identity, reject invalid explicit lanes before store work,
   and omit the optional lane for legacy callers.
+- **Store-owned passive injection**: `select_and_budget_for_injection` owns
+  selection, delivery-ledger exclusion/recording, operation-token composition,
+  token budgeting, and the canonical fenced rendering. The five attributed
+  moments are `session_start`, `user_prompt`, `pretool`, `subagent`, and
+  `precompact`; the returned envelope includes the rendered context and its
+  complete accounting fields.
+- **Session-aware CLI attribution**: `recall` and `recent` accept
+  `--session-id`, `--moment`, `--lane`, and repeatable `--ops-token` options
+  for the passive `--for-injection --json` lane. Empty-query selection uses
+  `recent`; `ledger-clear --session-id` clears the bounded delivery ledger
+  without opening SQLite.
+
+### Changed
+- Recall hooks, SessionStart, and the Hermes provider are now subprocess-only
+  consumers of the store-rendered `rendered` field. Selection, budgeting,
+  rendering, and delivery recording no longer have parallel consumer-owned
+  implementations.
+- Hook-owned pending, compact-summary, and task-text sidecars are retired.
+  Precompact clears the delivery ledger and the following SessionStart uses the
+  ordinary `session_start` selector moment. The old UserPromptSubmit operation
+  tail is retired; operation-ring composition is store-owned for `pretool`.
+- The MCP server's passive surface remains out of scope for #158 and is owned
+  by the existing #159 follow-up. This release makes no schema-version change.
 
 ## [0.37.0] - 2026-09-13
 
@@ -135,7 +160,6 @@ README.
   execution, fail-fast behavior, and nonzero exit propagation; installer steps
   are skipped when refresh fails. The updater remains operator-local and
   untracked, so existing copies must be reordered before use.
-
 
 ## [0.35.0] - 2026-09-13
 

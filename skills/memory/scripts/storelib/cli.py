@@ -29,6 +29,10 @@ from storelib.promote import promote_memory
 # this module's re-export surface for `storelib/__init__.py` and legacy
 # importers — removing it broke that chain.
 from storelib.recall import _reembed, explain_recall, get_memory, list_memory, recall_memory, recent_memory, stats
+from storelib.inject import (INJECTION_LANES, INJECTION_MOMENTS,
+                             _injection_data_dir, inject_recent_floor,
+                             inject_token_budget,
+                             select_and_budget_for_injection)
 from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import reembed_embeddings
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect
@@ -287,11 +291,27 @@ def main():
                                "session delivery ledger so a row is not "
                                "re-delivered within the window); the --json "
                                "envelope reports the drop count as 'excluded'")
+    p_recall.add_argument("--session-id", dest="session_id", type=str,
+                          default=None,
+                          help="Session id for the delivery ledger; enables "
+                               "store-side selection and the rendered field")
+    p_recall.add_argument("--moment", dest="moment", type=str,
+                          choices=INJECTION_MOMENTS, default=None,
+                          help="Injection moment")
+    p_recall.add_argument("--lane", dest="lane", type=str,
+                          choices=INJECTION_LANES, default=None,
+                          help="Injection lane")
+    p_recall.add_argument("--ops-token", dest="ops_token", action="append",
+                          type=str, default=[],
+                          help="Operation token from the pretool ring "
+                               "(repeatable)")
 
     p_recent = _add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
     p_recent.add_argument("--limit", type=nonnegative_int, default=5)
-    p_recent.add_argument("--min-confidence", type=float, default=0.5)
+    p_recent.add_argument("--min-confidence", type=float, default=None,
+                          help="SQL confidence floor; omitted uses the dynamic "
+                               "ZMEM_INJECT_FLOOR_RECENT floor (default 0.5)")
     p_recent.add_argument("--json", action="store_true")
     p_recent.add_argument("--no-bump", action="store_true",
                           help="suppress the retrieval_count/last_retrieved write; record "
@@ -322,6 +342,25 @@ def main():
                                "session delivery ledger so a row is not "
                                "re-delivered within the window); the --json "
                                "envelope reports the drop count as 'excluded'")
+    p_recent.add_argument("--session-id", dest="session_id", type=str,
+                          default=None,
+                          help="Session id for the delivery ledger; enables "
+                               "store-side selection and the rendered field")
+    p_recent.add_argument("--moment", dest="moment", type=str,
+                          choices=INJECTION_MOMENTS, default=None,
+                          help="Injection moment")
+    p_recent.add_argument("--lane", dest="lane", type=str,
+                          choices=INJECTION_LANES, default=None,
+                          help="Injection lane")
+    p_recent.add_argument("--ops-token", dest="ops_token", action="append",
+                          type=str, default=[],
+                          help="Operation token from the pretool ring "
+                               "(repeatable)")
+
+    p_ledger_clear = _add_parser(
+        "ledger-clear", help="clear one session's passive delivery ledger")
+    p_ledger_clear.add_argument("--session-id", required=True,
+                                help="Session id whose delivery ledger will be cleared")
 
     p_search = _add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
@@ -976,6 +1015,14 @@ def main():
 
     args = ap.parse_args()
 
+    # Session attribution is an all-or-nothing pair.  Refuse before any store
+    # preparation so a malformed passive invocation cannot create/open SQLite.
+    if args.cmd in {"recall", "recent"}:
+        if getattr(args, "session_id", None) and not getattr(args, "moment", None):
+            ap.error("--moment is required with --session-id")
+        if getattr(args, "moment", None) and not getattr(args, "session_id", None):
+            ap.error("--session-id is required with --moment")
+
     # `failures` is store-independent (it reads a transcript JSONL or the ZCode
     # episodic db, never the ZMem store) and must be fail-open: branch BEFORE
     # connect()/assert_local_fs()/migrate() so a bad ZMEM_DATA location, a
@@ -1001,6 +1048,21 @@ def main():
     if args.cmd == "queue-clear":
         sys.exit(cmd_queue_clear(namespace=args.namespace, ids=args.id,
                                  clear_all=args.all, drop_stale=args.drop_stale))
+
+    # Delivery state is a sidecar concern.  Clear it before connect()/migrate()
+    # so session lifecycle cleanup remains idempotent and SQLite-independent.
+    if args.cmd == "ledger-clear":
+        from storelib import delivery_ledger
+        try:
+            data_dir = _injection_data_dir(None)
+            delivery_ledger.clear(data_dir, args.session_id)
+        except Exception:
+            print("[zmem] ledger-clear failed", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps({"ok": True, "session_id": args.session_id,
+                          "cleared": True}, separators=(",", ":")) + "\n",
+              end="")
+        sys.exit(0)
 
     # `mine-history` is READ-ONLY against transcripts AND the store (the only
     # write surface is the #47 sidecar queue under --queue), so like
@@ -1164,8 +1226,10 @@ def main():
         # debugger — it must never hold the writer lease (which would make a
         # concurrent restore/backup refuse against a diagnostic read).
         or (args.cmd == "recall" and not args.no_bump
+            and not getattr(args, "for_injection", False)
             and not getattr(args, "explain", False))
-        or (args.cmd == "recent" and not args.no_bump)
+        or (args.cmd == "recent" and not args.no_bump
+            and not getattr(args, "for_injection", False))
         or (args.cmd == "search" and not args.no_bump)
         or (args.cmd == "rekey-namespace" and not args.dry_run and args.confirm)
         # v10 (issue #60): entity-merge writes ONLY under --confirm; the
@@ -1294,6 +1358,28 @@ def main():
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(2)
         elif args.cmd == "recall":
+            if args.for_injection and args.json and args.session_id:
+                try:
+                    payload = select_and_budget_for_injection(
+                        conn,
+                        query=args.query,
+                        namespace=args.namespace,
+                        moment=args.moment,
+                        session_id=args.session_id,
+                        lane=args.lane,
+                        limit=args.limit,
+                        budget_tokens=inject_token_budget(),
+                        data_dir=_injection_data_dir(None),
+                        ops_tokens=args.ops_token or None,
+                        exclude_ids=args.exclude,
+                        global_limit=args.global_limit,
+                        min_confidence=args.min_confidence,
+                    )
+                except ValueError as exc:
+                    print(f"[zmem] {exc}", file=sys.stderr)
+                    sys.exit(2)
+                print(json.dumps(payload, indent=2))
+                return
             # Issue #58, 3.3: --hybrid and --no-hybrid both parse, but
             # the default is hybrid-when-available (sentinel None). PRR-013
             # fix: --no-hybrid takes PRECEDENCE when both are passed — an
@@ -1355,8 +1441,33 @@ def main():
                               for_injection=args.for_injection,
                               exclude_ids=args.exclude)
         elif args.cmd == "recent":
+            if args.for_injection and args.json and args.session_id:
+                try:
+                    payload = select_and_budget_for_injection(
+                        conn,
+                        query="",
+                        namespace=args.namespace,
+                        moment=args.moment,
+                        session_id=args.session_id,
+                        lane=args.lane,
+                        limit=args.limit,
+                        budget_tokens=inject_token_budget(),
+                        data_dir=_injection_data_dir(None),
+                        ops_tokens=args.ops_token or None,
+                        exclude_ids=args.exclude,
+                        global_limit=args.global_limit,
+                        min_confidence=args.min_confidence,
+                    )
+                except ValueError as exc:
+                    print(f"[zmem] {exc}", file=sys.stderr)
+                    sys.exit(2)
+                print(json.dumps(payload, indent=2))
+                return
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
-                          min_confidence=args.min_confidence, as_json=args.json,
+                          min_confidence=(args.min_confidence
+                                          if args.min_confidence is not None
+                                          else inject_recent_floor()),
+                          as_json=args.json,
                           no_bump=args.no_bump, include_global=args.include_global,
                           global_limit=args.global_limit, as_of=args.as_of,
                           for_injection=args.for_injection,

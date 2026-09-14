@@ -118,6 +118,18 @@ def _seed(env: dict, ns: str, content: str) -> None:
     assert r.returncode == 0, f"seed failed: {r.stdout}\n{r.stderr}"
 
 
+def _seed_ops_ring(data_dir: str, session_id: str) -> None:
+    """Persist the command descriptor consumed by store-owned pretool recall."""
+    import ops_tokens
+
+    # Seed the common ``git`` descriptor from the Bash operation. The
+    # path-specific descriptors are appended after the first batch below to
+    # model the next ring update while keeping the first batch broad enough to
+    # deliver both seeded lessons.
+    assert ops_tokens.append_ops_ring(
+        data_dir, session_id, "Bash", "git")
+
+
 def _run_body(tmp: str, payload, ns: str = "user:global",
               store_path: str | None = None, **extra: str) -> tuple[str, int]:
     env = _clean_env(tmp, **extra)
@@ -313,6 +325,9 @@ class PostToolBatchTest(unittest.TestCase):
         _seed(_clean_env(self._tmp), ns, carveout)
         payload = json.loads((FIXTURES / "batch.json").read_text("utf-8"))
         payload = dict(payload, session_id="s-postbatch-suppress")
+        # #158 derives omitted ops tokens store-side from the persisted ring;
+        # the direct body invocation does not pass an explicit token list.
+        _seed_ops_ring(self._tmp, "s-postbatch-suppress")
 
         out, rc = _run_body(self._tmp, payload, ns=ns)
         self.assertEqual(rc, 0)
@@ -325,7 +340,9 @@ class PostToolBatchTest(unittest.TestCase):
         self.assertIn("status=injected", lines[0])
         self.assertIn("moment=pretool", lines[0])
         self.assertIn("batch=1", lines[0])
-        self.assertRegex(lines[0], r"ops=\d+")
+        # The store composes pretool operation tokens, but the hook consumes
+        # only the rendered envelope and no longer owns an ops counter.
+        self.assertNotRegex(lines[0], r"(?:^|\s)ops=\d+")
         self.assertIn("tools=Edit,Write,Bash", lines[0])
         self.assertIn("paths=a.py,guide.md", lines[0])
         # Raw payloads never enter the decision log.
@@ -344,6 +361,13 @@ class PostToolBatchTest(unittest.TestCase):
         # ledger suppresses it) while the strong-matching carve-out lesson
         # is NOT excluded and re-delivers — both directions of the pretool
         # carve-out semantics in one run.
+        import ops_tokens
+        assert ops_tokens.append_ops_ring(self._tmp,
+                                          "s-postbatch-suppress",
+                                          "Edit", "a.py")
+        assert ops_tokens.append_ops_ring(self._tmp,
+                                          "s-postbatch-suppress",
+                                          "Write", "guide.md")
         out2, rc2 = _run_body(self._tmp, payload, ns=ns)
         self.assertEqual(rc2, 0)
         ctx2 = json.loads(out2.strip())["additionalContext"]

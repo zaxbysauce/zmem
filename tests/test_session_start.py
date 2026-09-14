@@ -186,10 +186,14 @@ class SessionStartTimeoutTest(unittest.TestCase):
 
 
 class LedgerOverBudgetScopingTest(unittest.TestCase):
-    """Final-critic RC-FC1 (issue #151 parity): when Tier 0 + Tier 2 exceed
-    ZMEM_CTX_BUDGET, rows trimmed out of the delivered block must NOT be
-    recorded as delivered — otherwise they are suppressed at every later
-    moment of the session without the model ever seeing them."""
+    """SessionStart delegates delivery and ledger ownership to ``store.py``.
+
+    The old tests reached the payload's removed ``_record_ledger`` helper and
+    therefore encoded the pre-#158 adapter boundary.  These checks exercise
+    the replacement contract: the payload invokes the injection lane once,
+    consumes the store's rendered envelope verbatim, and does not own ledger
+    or rendering helpers locally.
+    """
 
     def _load_payload_module(self):
         import importlib.util
@@ -198,86 +202,53 @@ class LedgerOverBudgetScopingTest(unittest.TestCase):
         spec.loader.exec_module(mod)
         return mod
 
-    def test_record_ledger_scopes_against_the_assembled_prefix(self):
+    def _run_rendered_envelope(self, context_parts=None):
         mod = self._load_payload_module()
-        recorded = []
+        scratch = Path(tempfile.mkdtemp(prefix="zmem-158-ss-envelope-"))
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        store = scratch / "store.py"
+        store.write_text("# subprocess fixture\n", encoding="utf-8")
+        rendered = ("<<<ZMEM_UNTRUSTED_FENCE>>>\n"
+                    "canonical store-owned row\n"
+                    "<<<END_ZMEM_UNTRUSTED_FENCE>>>")
+        envelope = {
+            "rendered": rendered,
+            "results": [{"id": "store-row-1"}],
+            "candidate_ids": ["store-row-1", "store-row-2"],
+            "reason": "injected",
+        }
+        with unittest.mock.patch.object(
+                mod.subprocess, "check_output",
+                return_value=json.dumps(envelope).encode("utf-8")) as run:
+            with unittest.mock.patch.dict(os.environ, {
+                    "ZMEM_DATA": str(scratch),
+                    "ZMEM_STORE": str(scratch / "store.sqlite"),
+                    "ZMEM_INJECT": "1"}):
+                result = mod.build_tier2_context(
+                    str(store), "project:fixture/zmem", "sid-158",
+                    25000, context_parts=context_parts)
+        return mod, run, result, rendered, scratch
 
-        class FakeLedger:
-            @staticmethod
-            def rows_present_in(rows, rendered):
-                return [r for r in rows if r["id"] in rendered]
-
-            @staticmethod
-            def record(data_dir, session_id, rows, moment):
-                recorded.append(list(rows))
-
-        rows = [{"id": "r1", "text": "row one"}]
-        block = "z" * 200 + "[r1]" + "z" * 100
-        with unittest.mock.patch.dict(os.environ, {"ZMEM_CTX_BUDGET": "300"}):
-            mod._record_ledger(FakeLedger, "/nonexistent", "sid-fc1", rows,
-                               block, ["x" * 200], "session_start")
-        self.assertEqual(recorded, [],
-                         "a row cut out of the delivered block must not be "
-                         "recorded as delivered (Tier 0 in the projection)")
-        # Contrast: the regression shape (empty parts) treats the row as
-        # delivered because the slice reaches it.
-        with unittest.mock.patch.dict(os.environ, {"ZMEM_CTX_BUDGET": "300"}):
-            mod._record_ledger(FakeLedger, "/nonexistent", "sid-fc1", rows,
-                               block, [], "session_start")
-        self.assertEqual([r["id"] for r in recorded[0]], ["r1"],
-                         "the empty-parts projection shape is the regression "
-                         "the final critic caught")
-
-    def test_build_tier2_threads_context_parts_into_the_recording(self):
-        mod = self._load_payload_module()
-        captured = []
-
-        real_record = mod._record_ledger
-
-        def spy_record(ledger, data_dir, session_id, rows, block, parts, moment):
-            captured.append(list(parts))
-            return real_record(ledger, data_dir, session_id, rows, block,
-                               parts, moment)
-
-        mod._record_ledger = spy_record
-        try:
-            base, data = None, None
-            scratch = Path(tempfile.mkdtemp(prefix="zmem-121-fc1-"))
-            self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
-            (scratch / "store.py").write_text(NL.join(STUB_LINES) + NL,
-                                              encoding="utf-8", newline=NL)
-            data = scratch / "data"
-            data.mkdir()
-
-            class FakeLedger:
-                cap = staticmethod(lambda: 200)
-                delivered_ids = staticmethod(lambda dd, sid: [])
-
-            mod._ledger_module = lambda store_py: FakeLedger
-            mod._import_renderer = lambda store_py: (lambda rows, header="": "z" * 200 + "[r1]" + "z" * 100)
-            env = dict(os.environ)
-            env.update(BASE_ENV)
-            env.update({"ZMEM_STORE": str(data / "store.sqlite"),
-                        "ZMEM_DATA": str(data), "ZMEM_INJECT": "1",
-                        "SS_STUB_MODE": "ok",
-                        "SS_STUB_LOG": str(scratch / "stub.log")})
-            with unittest.mock.patch.dict(os.environ, {"ZMEM_STORE": str(data / "store.sqlite"),
-                                                       "ZMEM_DATA": str(data),
-                                                       "ZMEM_INJECT": "1",
-                                                       "ZMEM_CTX_BUDGET": "25000",
-                                                       "SS_STUB_MODE": "ok",
-                                                       "SS_STUB_LOG": str(scratch / "stub.log")}):
-                block = mod.build_tier2_context(
-                    str(scratch / "store.py"), "project:fixture/zmem",
-                    "sid-fc1b", 25000, context_parts=["TIER0-PREFIX" * 40])
-            self.assertTrue(captured, "the ledger recording must have run")
-            self.assertTrue(all(p and p[0].startswith("TIER0-PREFIX")
-                                for p in captured),
-                            "the Tier 0 prefix must be threaded into the "
-                            "projection (context_parts)")
-        finally:
-            mod._record_ledger = real_record
-
+    def test_session_start_consumes_store_rendered_envelope(self):
+        mod, run, result, rendered, scratch = self._run_rendered_envelope(
+            context_parts=["TIER0-PREFIX" * 40])
+        self.assertEqual(result, rendered,
+                         "SessionStart must consume the store's rendered "
+                         "context verbatim")
+        self.assertNotIn("TIER0-PREFIX", result,
+                         "the adapter must not reconstruct or prepend rows")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[2], "recent")
+        self.assertIn("--for-injection", argv)
+        self.assertIn("--no-bump", argv)
+        self.assertIn("--session-id", argv)
+        self.assertIn("--moment", argv)
+        self.assertIn("--lane", argv)
+        self.assertIn("zmem-hook", (scratch / "zmem-decisions.log").read_text(
+            encoding="utf-8"))
+        source = Path(PAYLOAD).read_text(encoding="utf-8")
+        self.assertNotIn("_record_ledger", source)
+        self.assertNotIn("storelib", source)
 
 if __name__ == "__main__":
     unittest.main()

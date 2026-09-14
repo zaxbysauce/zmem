@@ -10,11 +10,13 @@ Run: python tests/test_storelib_exports.py
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 from pathlib import Path
 
@@ -138,6 +140,104 @@ class ExportSurfaceTests(unittest.TestCase):
             1.0, places=6,
         )
         self.assertGreaterEqual(store.CONFIDENCE_FLOOR, 0.0)
+
+
+class EnvelopeContractTest(unittest.TestCase):
+    """Pin the issue #158 store-side selector/envelope API."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(
+            prefix=f"zmem-phase25-{uuid.uuid4().hex}-"
+        )
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        cls._saved_env = {
+            key: os.environ.get(key)
+            for key in (
+                "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+                "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_TEST_NOW",
+            )
+        }
+        os.environ.update({
+            "ZMEM_STORE": os.path.join(cls.tmp, "store.sqlite"),
+            "ZMEM_DATA": os.path.join(cls.tmp, "missing-data"),
+            "ZMEM_MODELS_DIR": os.path.join(cls.tmp, "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_TEST_NOW": "2026-06-01T00:00:00Z",
+        })
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        cls.addClassCleanup(cls._restore_import_state)
+        for mod_name in list(sys.modules):
+            if mod_name == "storelib" or mod_name.startswith("storelib."):
+                sys.modules.pop(mod_name, None)
+        cls.storelib = importlib.import_module("storelib")
+        cls.expected = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "injection-parity" /
+             "expected-envelope.json").read_text(encoding="utf-8")
+        )
+
+    @classmethod
+    def _restore_import_state(cls):
+        while True:
+            try:
+                sys.path.remove(str(SCRIPTS_DIR))
+            except ValueError:
+                break
+        for key, value in cls._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        for mod_name in list(sys.modules):
+            if mod_name == "storelib" or mod_name.startswith("storelib."):
+                sys.modules.pop(mod_name, None)
+
+    def test_injection_envelope_keys(self):
+        from storelib import (  # noqa: PLC0415
+            INJECTION_ENVELOPE_OPTIONAL,
+            INJECTION_ENVELOPE_REQUIRED,
+            build_injection_envelope,
+        )
+
+        expected_required = {
+            "results", "count", "omitted", "reason", "excluded",
+            "candidate_ids", "tokens_used", "tokens_budget",
+            "budget_dropped", "budget_admission", "budget_truncated",
+            "budget_dropped_protected", "arms", "rendered",
+        }
+        expected_optional = {"injection_risk", "candidate_lanes", "budget_note"}
+        self.assertEqual(set(INJECTION_ENVELOPE_REQUIRED), expected_required)
+        self.assertEqual(set(INJECTION_ENVELOPE_OPTIONAL), expected_optional)
+
+        expected = self.expected
+        envelope = build_injection_envelope(
+            expected["results"],
+            omitted=expected["omitted"],
+            reason=expected["reason"],
+            excluded=expected["excluded"],
+            candidate_ids=expected["candidate_ids"],
+            tokens_used=expected["tokens_used"],
+            tokens_budget=expected["tokens_budget"],
+            budget_dropped=expected["budget_dropped"],
+            budget_admission=expected["budget_admission"],
+            budget_truncated=expected["budget_truncated"],
+            budget_dropped_protected=expected["budget_dropped_protected"],
+            arms=expected["arms"],
+            rendered=expected["rendered"],
+            injection_risk=expected["injection_risk"],
+            candidate_lanes=expected["candidate_lanes"],
+            budget_note=expected["budget_note"],
+        )
+        self.assertGreaterEqual(set(envelope), set(INJECTION_ENVELOPE_REQUIRED))
+        self.assertLessEqual(
+            set(envelope),
+            set(INJECTION_ENVELOPE_REQUIRED) | set(INJECTION_ENVELOPE_OPTIONAL),
+        )
+        self.assertEqual(envelope["rendered"], expected["rendered"])
+
+    def test_core_callables_callable(self):
+        self.assertTrue(callable(self.storelib.select_and_budget_for_injection))
+        self.assertTrue(callable(self.storelib.build_injection_envelope))
 
 
 if __name__ == "__main__":

@@ -1,11 +1,10 @@
-"""Injection shaping helpers shared by hooks, Hermes, and the MCP server (issue #65, 10.9).
+"""Injection shaping and passive selector helpers (issues #65 and #158).
 
-Deliberately dependency-free (stdlib only, plus a best-effort schema_meta import
-for the protected-type literals): this module is loaded four different ways —
-``import storelib.inject`` from the hooks body, ``importlib`` file-location load
-from ``mcp_server.py`` (which never imports store.py in-process), and a plain
-import inside store.py itself. Anything heavier than stdlib would break one of
-those paths.
+The budgeting and filtering primitives remain importable without the recall
+module.  The session-aware selector imports recall, the delivery ledger, and
+the operation-token helpers lazily at call time; this preserves the existing
+``recall -> inject`` import direction while giving passive consumers one
+store-owned selection/render/delivery seam.
 
 Token accounting uses the documented 4-chars-per-token heuristic (no tokenizer
 is in-tree) for BOTH admission and reporting — one estimator, so the two can
@@ -30,6 +29,26 @@ from __future__ import annotations
 import math
 import os
 from typing import Any, Optional, Tuple
+
+
+# Issue #158: the selector's attribution contract is deliberately closed.  A
+# compact delivery is represented by the ordinary ``session_start`` moment;
+# ``session_start_compact`` remains a decision-log label only.
+INJECTION_MOMENTS = (
+    "session_start", "user_prompt", "pretool", "subagent", "precompact",
+)
+INJECTION_LANES = (
+    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+)
+
+INJECTION_ENVELOPE_REQUIRED = frozenset({
+    "results", "count", "omitted", "reason", "excluded", "candidate_ids",
+    "tokens_used", "tokens_budget", "budget_dropped", "budget_admission",
+    "budget_truncated", "budget_dropped_protected", "arms", "rendered",
+})
+INJECTION_ENVELOPE_OPTIONAL = frozenset({
+    "injection_risk", "candidate_lanes", "budget_note",
+})
 
 # Best-effort single-source-of-truth for the protected type literals; the
 # fallbacks keep this module importable with no schema_meta on sys.path.
@@ -193,6 +212,19 @@ def inject_token_budget() -> int:
     except ValueError:
         return DEFAULT_INJECT_TOKEN_BUDGET
     return value if value > 0 else DEFAULT_INJECT_TOKEN_BUDGET
+
+
+def inject_recent_floor() -> float:
+    """Resolve the documented confidence floor for passive recent pulls.
+
+    The session-aware selector is the store boundary for hook/SessionStart/
+    Hermes recent delivery, so it must resolve this knob dynamically instead
+    of relying on an adapter's hard-coded CLI default.
+    """
+    env_name = getattr(_schema_meta, "INJECT_FLOOR_RECENT_ENV",
+                       "ZMEM_INJECT_FLOOR_RECENT")
+    default = getattr(_schema_meta, "INJECT_FLOOR_RECENT_DEFAULT", 0.5)
+    return _env_float(env_name, default)
 
 
 def inject_score_margin() -> float:
@@ -712,3 +744,242 @@ def classify_silent_reason(
     if reason not in allowed:
         return "empty-pool"
     return reason
+
+
+def _ordered_unique(values: Any) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    if not isinstance(values, (list, tuple)):
+        return result
+    for value in values:
+        if not isinstance(value, str) or not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _selector_silent(*, budget_tokens: int, reason: str = "empty-pool",
+                     excluded: list[str] | None = None) -> dict:
+    # Lazy import avoids making inject.py depend on recall at import time.
+    from storelib.recall import build_injection_envelope  # type: ignore
+    return build_injection_envelope(
+        [], omitted=0, reason=reason, excluded=list(excluded or []),
+        candidate_ids=[], tokens_used=0, tokens_budget=budget_tokens,
+        budget_dropped=0, budget_admission=0, budget_truncated=0,
+        budget_dropped_protected=0, arms={}, rendered="",
+    )
+
+
+def _injection_data_dir(data_dir: str | None = None) -> str:
+    """Resolve the passive sidecar directory through the store precedence."""
+    from pathlib import Path
+    # An explicit caller argument is the sole bypass.  Otherwise preserve the
+    # canonical resolver precedence (ZMEM_STORE before ZMEM_DATA/plugin
+    # fallbacks) by deriving the sidecar directory from its resolved store.
+    # Do not create either path here: selector reads remain side-effect free
+    # until ledger.record.
+    if data_dir:
+        return str(Path(data_dir).expanduser().resolve())
+    from storelib.schema import _resolve_store_path  # type: ignore
+    return str(_resolve_store_path().parent)
+
+
+def select_and_budget_for_injection(
+    conn,
+    *,
+    query: str,
+    namespace: str,
+    moment: str,
+    session_id: str,
+    lane: str | None = None,
+    exclude_ids: list[str] | None = None,
+    ops_tokens: list[str] | None = None,
+    limit: int = 5,
+    global_limit: int = 3,
+    budget_tokens: int = 1500,
+    data_dir: str | None = None,
+    min_confidence: float | None = None,
+) -> dict:
+    """Select, render, account, and record one passive injection event.
+
+    Attribution is validated before touching delivery state.  ``ops_tokens``
+    distinguishes omitted (``None``: derive the pretool ring in storelib) from
+    explicitly empty (``[]``: do not read the ring).  The caller owns ``conn``;
+    this function never opens or closes SQLite.
+    """
+    if moment not in INJECTION_MOMENTS:
+        raise ValueError("invalid injection moment: {!r}".format(moment))
+    if lane is not None and lane not in INJECTION_LANES:
+        raise ValueError("invalid injection lane: {!r}".format(lane))
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id is required for passive injection")
+    try:
+        budget = int(budget_tokens)
+    except (TypeError, ValueError):
+        budget = inject_token_budget()
+    if budget <= 0:
+        budget = inject_token_budget()
+
+    try:
+        resolved_data = _injection_data_dir(data_dir)
+    except Exception:
+        return _selector_silent(budget_tokens=budget)
+    # A path that is already a regular file cannot support ledger reads or
+    # writes.  Fail closed before invoking retrieval, as the selector contract
+    # treats delivery-state failures as a silent event.
+    try:
+        if os.path.exists(resolved_data) and not os.path.isdir(resolved_data):
+            return _selector_silent(budget_tokens=budget)
+    except OSError:
+        return _selector_silent(budget_tokens=budget)
+
+    # Lazy imports are essential: recall.py imports this module's gate helpers.
+    from storelib import delivery_ledger as ledger  # type: ignore
+    from storelib import ops_tokens as ops  # type: ignore
+    from storelib import recall as recall_module  # type: ignore
+
+    # Resolve/derive operation context only on the pretool lane.  Explicitly
+    # supplied [] intentionally suppresses ring reads.
+    effective_query = query or ""
+    effective_ops = list(ops_tokens) if ops_tokens is not None else []
+    query_context_enabled = True
+    if moment == "pretool":
+        try:
+            query_context_enabled = bool(ops.query_context_enabled())
+        except Exception:
+            query_context_enabled = False
+    if moment == "pretool" and ops_tokens is None and query_context_enabled:
+        try:
+            events = ops.read_ops_ring(resolved_data, session_id)
+            effective_ops = ops.derive_ops_tokens(*events)
+        except Exception:
+            effective_ops = []
+        # PreToolUse's event payload is the authoritative fallback when the
+        # optional post-tool ring has not recorded this operation yet.  The
+        # derivation still runs here in the store boundary, so adapters never
+        # need to import or duplicate the allowlist logic.
+        if not effective_ops:
+            try:
+                effective_ops = ops.derive_ops_tokens(effective_query)
+            except Exception:
+                effective_ops = []
+    if moment == "pretool" and effective_ops and query_context_enabled:
+        try:
+            effective_query = ops.compose_inject_query(effective_query,
+                                                       " ".join(effective_ops))
+        except Exception:
+            pass
+
+    # Query-less passive pulls are the documented recent lane. Resolve its
+    # env-tunable floor at the store boundary, while preserving an explicit
+    # CLI/API floor (notably session-aware ``recent --min-confidence``).
+    effective_min_confidence = min_confidence
+    if not effective_query.strip() and effective_min_confidence is None:
+        effective_min_confidence = inject_recent_floor()
+
+    # Validation above intentionally precedes this first ledger call.
+    try:
+        delivered_ids = list(ledger.delivered_ids(resolved_data, session_id))
+        delivered_entries = list(ledger.delivered(resolved_data, session_id))
+    except Exception:
+        return _selector_silent(budget_tokens=budget)
+    delivered_ids = _ordered_unique(delivered_ids)
+    delivered_by_id = {
+        e.get("id"): e for e in delivered_entries
+        if isinstance(e, dict) and isinstance(e.get("id"), str)
+    }
+    # Explicit exclusions precede delivered ids, preserving first-seen order
+    # and making duplicate ids deterministic across callers.
+    exclusions = _ordered_unique(list(exclude_ids or []) + delivered_ids)
+    if moment == "pretool" and ops_tokens is None and effective_ops:
+        try:
+            strong = {
+                rid for rid, entry in delivered_by_id.items()
+                if rid and ledger.strong_token_match(entry.get("text", ""), effective_ops)
+            }
+            exclusions = [rid for rid in exclusions if rid not in strong]
+        except Exception:
+            pass
+
+    capture: dict = {}
+    try:
+        kwargs = dict(
+            namespace=namespace, limit=limit, as_json=False, no_bump=True,
+            include_global=True, global_limit=global_limit,
+            no_telemetry=True, for_injection=True,
+            exclude_ids=exclusions, _capture=capture,
+            _injection_budget_tokens=budget,
+            min_confidence=effective_min_confidence,
+        )
+        if effective_query.strip():
+            kwargs["query"] = effective_query
+            recall_module.recall_memory(conn, **kwargs)
+        else:
+            recall_module.recent_memory(conn, **kwargs)
+    except Exception:
+        return _selector_silent(budget_tokens=budget, excluded=exclusions)
+
+    try:
+        parsed = dict(capture) if capture else {"results": []}
+        if not isinstance(parsed, dict):
+            parsed = {"results": parsed if isinstance(parsed, list) else []}
+        rows = parsed.get("results", [])
+        if not isinstance(rows, list):
+            rows = []
+        candidate_ids = _ordered_unique(parsed.get("candidate_ids", []))
+        # If a test seam returns a bare list, retain a useful candidate set.
+        if not candidate_ids:
+            candidate_ids = [r.get("id") for r in rows
+                             if isinstance(r, dict) and isinstance(r.get("id"), str)]
+        excluded = [rid for rid in exclusions if rid in candidate_ids]
+        if not rows and candidate_ids and excluded and set(candidate_ids) <= set(excluded):
+            reason = "already-delivered"
+        else:
+            reason = parsed.get("reason") if isinstance(parsed.get("reason"), str) else "empty-pool"
+        header_kind = "Relevant memories" if effective_query.strip() else "Recent memories"
+        header = (
+            f"{header_kind} (zmem {moment}, namespace {namespace or 'unscoped'}). "
+            "Consider if they apply to this task; ignore if not."
+        )
+        # Resolve the canonical renderer through the module attribute at call
+        # time so both the public shim and module-level test seams remain
+        # observable.
+        rendered = ""
+        if rows:
+            rendered = recall_module._format_fenced_recall(
+                rows, header=header, budget_note=parsed.get("budget_note"))
+        present = ledger.rows_present_in(rows, rendered)
+        # Expansion rows are rendered but deliberately NOT bumped —
+        # popularity rewards query-MATCHED rows only (recall.py bump law).
+        present = [row for row in present
+                   if not row.get("link_relation")
+                   and not row.get("_graph_arrival_only")]
+        if present:
+            try:
+                recall_module._bump_telemetry(
+                    conn, [r["id"] for r in present], no_bump=True)
+            except Exception:
+                pass
+        try:
+            ledger.record(resolved_data, session_id, present, moment)
+        except Exception:
+            # Rendering has already produced safe fenced text; a delivery
+            # write failure is fail-open and must not discard that text.
+            pass
+        from storelib.recall import build_injection_envelope
+        return build_injection_envelope(
+            rows, omitted=parsed.get("omitted", 0), reason=reason,
+            excluded=excluded, candidate_ids=candidate_ids,
+            tokens_used=parsed.get("tokens_used", 0), tokens_budget=budget,
+            budget_dropped=parsed.get("budget_dropped", 0),
+            budget_admission=parsed.get("budget_admission", 0),
+            budget_truncated=parsed.get("budget_truncated", 0),
+            budget_dropped_protected=parsed.get("budget_dropped_protected", 0),
+            arms=parsed.get("arms", {}), rendered=rendered,
+            injection_risk=parsed.get("injection_risk"),
+            candidate_lanes=parsed.get("candidate_lanes"),
+            budget_note=parsed.get("budget_note") if rows else None,
+        )
+    except Exception:
+        return _selector_silent(budget_tokens=budget, excluded=exclusions)

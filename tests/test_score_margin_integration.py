@@ -767,8 +767,12 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
         injected_code, _ = self._run_body(
             {
                 "results": [row],
+                "rendered": "<<<ZMEM_UNTRUSTED_FENCE>>> rendered "
+                             "<<<END_ZMEM_UNTRUSTED_FENCE>>>",
                 "reason": "injected",
                 "candidate_ids": ["m-top", "m-second"],
+                "tokens_used": 96,
+                "tokens_budget": 1500,
                 "margin": "0.012500",
                 "margin_pruned_ids": ["m-second"],
             },
@@ -832,6 +836,8 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
         self._run_session_start(
             {
                 "results": [row],
+                "rendered": "<<<ZMEM_UNTRUSTED_FENCE>>> rendered "
+                             "<<<END_ZMEM_UNTRUSTED_FENCE>>>",
                 "reason": "injected",
                 "candidate_ids": ["m-top", "m-second"],
                 "tokens_used": 96,
@@ -860,13 +866,14 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
             normalized[0],
             r"^\[TIMESTAMP\] zmem-hook status=injected reason=injected "
             r"ids=\['m-top'\] all=\['m-top', 'm-second'\] tokens=96/1500 "
-            r"sid=session-start-injected moment=session_start" + attr +
+            r"exc=0 sid=session-start-injected moment=session_start" + attr +
             r" margin=0\.012500 margin_pruned=\['m-second'\]$",
         )
         self.assertRegex(
             normalized[1],
             r"^\[TIMESTAMP\] zmem-hook status=silent reason=below-bar "
-            r"ids=\[\] all=\['m-top', 'm-second'\] sid=session-start-silent "
+            r"ids=\[\] all=\['m-top', 'm-second'\] exc=0 "
+            r"sid=session-start-silent "
             r"moment=session_start" + attr + r" margin=0\.000000$",
         )
 
