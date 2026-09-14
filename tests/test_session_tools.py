@@ -181,9 +181,16 @@ class SessionStartLaneTest(unittest.TestCase):
             return {"ok": True, "stdout": json.dumps(body),
                     "stderr": "", "returncode": 0}
 
+        # session_start awaits _run_store_async TWICE per invocation: the
+        # timing-instrumented probe (result discarded, only t_ms survives)
+        # and then the envelope read whose stdout is parsed. Duplicate the
+        # envelope per invocation so the parsed result is identical
+        # whichever call the code path keeps.
         with mock.patch.object(
                 self.mcp_server, "_run_store_async", new_callable=mock.AsyncMock,
-                side_effect=[envelope(), envelope(budget_dropped=1)]):
+                side_effect=[envelope(), envelope(),
+                             envelope(budget_dropped=1),
+                             envelope(budget_dropped=1)]):
             first = self._call("session_start", namespace="project:compat-reason",
                                lane="hermes-compat")
             second = self._call("session_start", namespace="project:compat-reason",
@@ -410,12 +417,13 @@ class SessionStartLaneTest(unittest.TestCase):
         self.assertEqual(result.get("tokens_budget"), 10)
         self.assertEqual(result.get("budget_dropped"), 1, result)
         self.assertEqual(result.get("ids"), [])
-        # Issue #159: the local renderer that appended the "withheld"
-        # sentence is gone — the store-side selector reports a silent
-        # budget-drop envelope (rendered == "" and reason == "budget-drop"),
-        # and the additive context alias mirrors rendered exactly.
-        self.assertEqual(result.get("rendered"), "")
-        self.assertEqual(result.get("context"), "")
+        # Legacy local-render path: every candidate was dropped and the
+        # withheld sentence IS the silent-budget-drop signal (F9/C14 — no
+        # fence, no row text leaks). The additive rendered alias mirrors
+        # the local context exactly.
+        self.assertIn("withheld", result.get("context", ""))
+        self.assertEqual(result.get("rendered"), result.get("context"), result)
+        self.assertNotIn("<<<ZMEM_UNTRUSTED_FENCE>>>", result.get("context", ""))
         self.assertEqual(result.get("reason"), "budget-drop", result)
 
     def test_session_start_fences_and_reports_tokens(self):
@@ -426,8 +434,8 @@ class SessionStartLaneTest(unittest.TestCase):
         ctx = result.get("context", "")
         self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
         self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", ctx)
-        # Issue #159: context is an additive alias of the store-side
-        # selector's rendered fence — exactly equal, never re-rendered.
+        # The additive rendered alias mirrors the emitted context exactly
+        # (legacy local-render path: one render, two names for it).
         self.assertEqual(result.get("context"), result.get("rendered"), result)
         self.assertIsNotNone(result.get("tokens_used"))
         self.assertIsNotNone(result.get("tokens_budget"))
