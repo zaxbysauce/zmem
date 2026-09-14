@@ -1558,9 +1558,23 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         denied = _guard_namespace(namespace)
         if denied:
             return denied
+        if not _include_global_allowed() and namespace != "user:global":
+            # Scoped token without user:global in its allow-list: the
+            # selector unions user:global rows into project results, which
+            # would leak cross-namespace content. Gate here (issue #159
+            # review; matches the legacy session_start pattern).
+            return {
+                "results": [], "count": 0, "omitted": 0,
+                "reason": "global-not-allowed", "excluded": [],
+                "candidate_ids": [], "tokens_used": 0, "tokens_budget": 0,
+                "budget_dropped": 0, "budget_admission": 0,
+                "budget_truncated": 0, "budget_dropped_protected": 0,
+                "arms": [], "rendered": "", "context": "",
+            }
+        safe_query = (query or "").strip()[:_MAX_QUERY_CHARS]
         args = [
             "prefetch",
-            "--query", query,
+            "--query", safe_query,
             "--namespace", namespace,
             "--session-id", session_id,
             "--moment", moment,
@@ -1819,24 +1833,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "budget_dropped_protected": budget_dropped_protected,
             "reason": reason,
             "context": context,
+            "rendered": context,
             "tokens_used": tokens_used,
             "tokens_budget": tokens_budget,
         }
-        if not isinstance(parsed, dict):
-            return _error("non-JSON from store.py session prefetch")
-        envelope = dict(parsed)
-        envelope["context"] = parsed.get("rendered", "")
-        # Back-compat aliases over the selector envelope (no second store
-        # call): ids mirror the delivered result rows, result/namespace keep
-        # the historical top-level shape the session tools' clients pin.
-        rows = parsed.get("results")
-        envelope["ids"] = [
-            row.get("id") for row in rows
-            if isinstance(row, dict) and row.get("id")
-        ] if isinstance(rows, list) else []
-        envelope["result"] = "session_started"
-        envelope["namespace"] = resolved_ns
-        return envelope
 
     @mcp.tool()
     async def session_end(
