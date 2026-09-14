@@ -282,18 +282,25 @@ def _decision_sid(value: Any) -> str:
 
 
 def _rotate_decision_log(data_dir: Path) -> None:
-    """Rotate the decision log before append, preserving partial deployments."""
+    """Rotate the decision log before append, preserving partial deployments.
+
+    Issue #158 process boundary: the provider must not import storelib, so
+    rotation runs through the standalone stdlib-only adapter
+    (``hooks/lib/zmem-log-rotate.py``) as a subprocess — the same contract
+    the session-start hook uses for its maintenance sink.
+    """
     try:
         store_py = _resolve_store_py()
         if store_py is None:
             return
-        saved = sys.path[:]
-        try:
-            sys.path.insert(0, str(Path(store_py).resolve().parent))
-            from storelib.log_rotate import rotate_on_append
-            rotate_on_append(str(data_dir / "zmem-decisions.log"))
-        finally:
-            sys.path[:] = saved
+        rotator = (Path(store_py).resolve().parents[2] / "hooks" / "lib"
+                   / "zmem-log-rotate.py")
+        if not rotator.is_file():
+            return
+        subprocess.run(
+            [sys.executable, str(rotator), str(data_dir / "zmem-decisions.log")],
+            capture_output=True, text=True, timeout=10,
+        )
     except (Exception, SystemExit):
         # Rotation is best effort: a missing storelib must not lose telemetry.
         pass
