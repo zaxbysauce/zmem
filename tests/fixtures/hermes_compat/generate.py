@@ -111,6 +111,7 @@ def main() -> int:
     rejected = _dump({
         "results": [],
         "count": 0,
+        "omitted": 0,
         "reason": "below-relevance",
         "excluded": [],
         "candidate_ids": [MEMORY_ID],
