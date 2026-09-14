@@ -61,6 +61,29 @@ jobs:
         shell: bash
         run: python -m pip install --disable-pip-version-check "jsonschema>=4,<5"
 
+      # Issue #159 (Workstream H-2): the MCP transport is a first-class
+      # passive lane — install its declared requirements in BOTH matrix jobs
+      # so the mcp-gated suites RUN instead of silently skipping (the
+      # historical skip-when-absent CI blind spot, closed at the source).
+      - name: Install MCP server requirements
+        shell: bash
+        run: python -m pip install --disable-pip-version-check -r hermes-plugin/server/requirements.txt
+
+      - name: MCP tool suites (skipped=0 gate)
+        shell: bash
+        run: |
+          set -e
+          out="$(python -m unittest -v tests/test_session_tools.py tests/test_mcp_server.py 2>&1)" || {
+            printf '%s\n' "$out"
+            exit 1
+          }
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -Eq 'skipped=[1-9]'; then
+            echo "::error::MCP suites reported skips — the mcp dependency must be installed and exercised on every matrix leg (issue #159)"
+            exit 1
+          fi
+          echo "mcp suites green; skipped=0"
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:

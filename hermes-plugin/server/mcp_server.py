@@ -1517,49 +1517,110 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         return _parse_results(await _run_store_async(args))
 
     @mcp.tool()
+    async def prefetch(
+        query: str,
+        namespace: str,
+        session_id: str,
+        moment: str,
+        lane: Optional[str] = None,
+        ops_tokens: list[str] = [],
+    ) -> dict[str, Any]:
+        """Query-aware passive prefetch (issue #159, Workstream H-2).
+
+        One selector call, one envelope: the store-side selector owns the
+        relevance/trust gate, the 1,500-token budget, the delivery ledger
+        and the ``rendered`` fence. This tool validates the boundary
+        (namespace, session_id, moment required; lane against the five-value
+        tuple — never defaulted to a host lane), enforces namespace scope,
+        and returns the complete selector envelope plus the additive
+        ``context`` alias equal to ``rendered``. ``lane=None`` stays None.
+        """
+        if not (namespace or "").strip() or not (session_id or "").strip() \
+                or not (moment or "").strip():
+            return _error(
+                "prefetch requires namespace, session_id, and moment")
+        if lane is not None and lane not in (
+                "claude", "codex", "zcode", "hermes-provider", "hermes-compat"):
+            return _error(f"invalid lane: {lane!r}")
+        # Issue #110 (P0-5) parity: the global passive kill switch silences
+        # this lane before any store subprocess (twin of session_start).
+        if _inject_disabled():
+            logger.info(
+                "prefetch: status=silent reason=disabled (ZMEM_INJECT=0)")
+            return {
+                "results": [], "count": 0, "omitted": 0,
+                "reason": _INJECT_REASON_DISABLED, "excluded": [],
+                "candidate_ids": [], "tokens_used": 0, "tokens_budget": 0,
+                "budget_dropped": 0, "budget_admission": 0,
+                "budget_truncated": 0, "budget_dropped_protected": 0,
+                "arms": [], "rendered": "", "context": "",
+            }
+        denied = _guard_namespace(namespace)
+        if denied:
+            return denied
+        args = [
+            "prefetch",
+            "--query", query,
+            "--namespace", namespace,
+            "--session-id", session_id,
+            "--moment", moment,
+        ]
+        if lane is not None:
+            args += ["--lane", lane]
+        for _tok in (ops_tokens or []):
+            args += ["--ops-token", _tok]
+        r = await _run_store_async(args)
+        if not r["ok"]:
+            return _error(_sanitize_store_error(r))
+        stdout = (r["stdout"] or "").strip()
+        try:
+            parsed = json.loads(stdout) if stdout else None
+        except json.JSONDecodeError:
+            return _error("non-JSON from store.py prefetch")
+        if not isinstance(parsed, dict) or "rendered" not in parsed \
+                or "results" not in parsed:
+            return _error("incomplete prefetch envelope from store.py")
+        # Pass through the selector envelope (its closed key set already
+        # covers injection_risk/candidate_lanes/budget_note when present);
+        # MCP adds only the additive context alias.
+        out = dict(parsed)
+        out["context"] = parsed.get("rendered", "")
+        return out
+
+    @mcp.tool()
     async def session_start(
         namespace: Optional[str] = None,
         limit: int = 3,
+        session_id: str = "",
         lane: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Passive session prefetch (issue #65, 10.5 — the D4 contract).
+        """Passive session prefetch — the queryless selector envelope path
+        (issue #65, 10.5; reworked by issue #159, Workstream H-2).
 
-        Issue #87 / #85 direction 1: a silent prefetch names WHY — the result
-        carries ``reason`` (empty-pool / omitted / budget-drop / injected)
-        and the context says retrieved-empty (session variant) instead of
-        blaming the session inject bar for an empty pool.
-
-        Returns a fenced, provenance-tagged context block of the namespace's
-        recent high-confidence memories for the START of a session:
-        - NEVER bumps retrieval_count (--no-bump; only a surface event is
-          recorded — pinned by tests/test_session_tools.py);
-        - omits injection-risk and untrusted_web rows (the --no-bump read
-          filter);
-        - applies the Phase 3 fence + selective-inject rules (0.5 recent
-          floor, the SessionStart hook contract);
-        - honors ZMEM_INJECT_TOKEN_BUDGET (decision/constraint rows are
-          never dropped; lowest-score signal=none rows drop first).
-        The response reports ids, omit counts, and tokens_used/tokens_budget
-        (tokens measured on the rendered fence, 4-chars/token heuristic).
-        ``namespace`` omitted resolves to the server default user:global — a
-        scoped token must be allowed for it (or pass its own namespace).
+        The store-side selector (via ``store.py recent --for-injection
+        --json --session-id ... --moment session_start``) owns the gate, the
+        budget, the ledger and the ``rendered`` fence; this tool resolves an
+        omitted namespace to the server default ``user:global``, enforces
+        namespace scope, and returns the complete selector envelope with the
+        additive ``context`` alias equal to ``rendered``. No local renderer
+        and no second budget run here. ``result``/``namespace``/``ids`` are
+        additive back-compat aliases; ``lane=None`` stays omitted in the
+        decision line.
         """
         # ``lane`` is optional for old clients.  An explicit value is closed
         # and rejected before namespace/store work so a typo cannot produce an
         # unattributed compatibility decision or start a subprocess.
         if lane is not None and lane not in _INJECT_LANES:
             return _invalid_argument("lane", lane)
+        if lane is not None and lane not in (
+                "claude", "codex", "zcode", "hermes-provider", "hermes-compat"):
+            return _error(f"invalid lane: {lane!r}")
         resolved_ns = (namespace or "").strip() or "user:global"
         if resolved_ns == "*":
             # F7: recent requires a CONCRETE namespace — '*' would be a
             # literal match against a namespace named '*' (empty result).
             # Resolve it to the server default like an omitted param.
             resolved_ns = "user:global"
-        # Issue #110 (P0-5): passive-injection kill switch — BEFORE the
-        # namespace guard (the switch is global, not per-namespace) and
-        # before any store subprocess. Same 9-key envelope as the enabled
-        # path; the reason/context values distinguish it. Twin of
-        # hermes-plugin/__init__.py _tool_session_start (do not fork).
         if _inject_disabled():
             logger.info(
                 "session_start: status=silent reason=disabled (ZMEM_INJECT=0)")
@@ -1582,15 +1643,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if denied:
             return denied
         n = max(1, min(int(limit or 3), _HARD_LIMIT_MAX))
-        # Issue #115: in-store selective gate (incl. the trust_score hard
-        # floor) on this passive prefetch lane — twin parity with
-        # hermes-plugin/__init__.py _tool_session_start.
         args = [
             "recent",
             "--namespace", resolved_ns,
             "--limit", str(n),
-            "--min-confidence", str(_recent_floor()),
-            "--no-bump",
             "--for-injection",
             "--json",
         ]
@@ -1601,6 +1657,15 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # _run_store records only the actual subprocess attempt.  Semaphore
         # queue time and pre-attempt failures intentionally remain zero.
         elapsed = timing.get("t_ms", 0)
+        if session_id.strip():
+            # Selector path (issue #159): the ledger-keyed envelope with the
+            # rendered fence. store.py's argparse refuses --moment without a
+            # session id, so an omitted session_id takes the legacy
+            # for-injection envelope instead of a usage error.
+            args += ["--session-id", session_id, "--moment", "session_start"]
+            if lane is not None:
+                args += ["--lane", lane]
+        r = await _run_store_async(args)
         if not r["ok"]:
             await _append_session_decision_async(
                 status="silent", reason="omitted", ids=[], all_ids=[], lane=lane,
@@ -1609,7 +1674,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return _error(_sanitize_store_error(r))
         stdout = (r["stdout"] or "").strip()
         try:
-            parsed = json.loads(stdout) if stdout else {}
+            parsed = json.loads(stdout) if stdout else None
         except json.JSONDecodeError:
             await _append_session_decision_async(
                 status="silent", reason="omitted", ids=[], all_ids=[], lane=lane,
@@ -1757,6 +1822,21 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "tokens_used": tokens_used,
             "tokens_budget": tokens_budget,
         }
+        if not isinstance(parsed, dict):
+            return _error("non-JSON from store.py session prefetch")
+        envelope = dict(parsed)
+        envelope["context"] = parsed.get("rendered", "")
+        # Back-compat aliases over the selector envelope (no second store
+        # call): ids mirror the delivered result rows, result/namespace keep
+        # the historical top-level shape the session tools' clients pin.
+        rows = parsed.get("results")
+        envelope["ids"] = [
+            row.get("id") for row in rows
+            if isinstance(row, dict) and row.get("id")
+        ] if isinstance(rows, list) else []
+        envelope["result"] = "session_started"
+        envelope["namespace"] = resolved_ns
+        return envelope
 
     @mcp.tool()
     async def session_end(

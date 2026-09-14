@@ -558,6 +558,43 @@ class McpServerToolSurfaceTest(unittest.TestCase):
             # int coercion; the ToolManager propagates it from call_tool.
             self._call("recent", namespace=self._ns(), limit="not-a-number")
 
+    def test_prefetch_tool_schema(self):
+        """Issue #159 (Workstream H-2): the prefetch tool's pydantic schema —
+        query/namespace/session_id/moment are REQUIRED (the store-side
+        selector refuses an unattributed passive read), lane stays OPTIONAL
+        (None must reach the selector as None, never a defaulted host lane),
+        and ops_tokens defaults to []. Introspected through the same
+        ToolManager the _call helper uses."""
+        tools = {t.name: t.parameters
+                 for t in self.server._tool_manager.list_tools()}
+        self.assertIn("prefetch", tools,
+                      f"prefetch tool missing from surface: {sorted(tools)}")
+        params = tools["prefetch"]
+        self.assertEqual(set(params.get("required", [])),
+                         {"query", "namespace", "session_id", "moment"},
+                         f"prefetch required args drifted: {params}")
+        props = params.get("properties", {})
+        # lane is accepted but optional — never defaulted to a host lane.
+        self.assertIn("lane", props)
+        self.assertNotIn("lane", params.get("required", []))
+        self.assertIsNone(props["lane"].get("default"))
+        # ops_tokens is an optional string array defaulting to [].
+        self.assertIn("ops_tokens", props)
+        self.assertNotIn("ops_tokens", params.get("required", []))
+        self.assertEqual(props["ops_tokens"].get("type"), "array")
+        self.assertEqual(props["ops_tokens"].get("default"), [])
+
+        # session_start (issue #159 rework): the schema now exposes the
+        # session attribution and lane pass-through parameters, both optional.
+        self.assertIn("session_start", tools,
+                      f"session_start tool missing from surface: {sorted(tools)}")
+        ss_props = tools["session_start"].get("properties", {})
+        self.assertIn("session_id", ss_props)
+        self.assertIn("lane", ss_props)
+        ss_required = tools["session_start"].get("required", [])
+        self.assertNotIn("session_id", ss_required)
+        self.assertNotIn("lane", ss_required)
+
     # -- #36 M4: capture-mode auto + warning surfacing ---------------------
 
     def test_add_secret_content_redacted_and_warnings_surfaced(self):

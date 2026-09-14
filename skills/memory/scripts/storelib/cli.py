@@ -357,6 +357,45 @@ def main():
                           help="Operation token from the pretool ring "
                                "(repeatable)")
 
+    # Issue #159 (Workstream H-2): query-aware passive prefetch. One selector
+    # call, one envelope; --for-injection/--no-bump/--json are accepted as
+    # explicit markers of the (only) passive mode the compat hook pins.
+    p_prefetch = _add_parser("prefetch",
+                             help="query-aware passive prefetch (selector "
+                                  "envelope; issue #159)")
+    p_prefetch.add_argument("--query", dest="query", type=str, required=True,
+                            help="query for passive memory selection")
+    p_prefetch.add_argument("--namespace", dest="namespace", type=str,
+                            required=True,
+                            help="scope the passive recall namespace")
+    p_prefetch.add_argument("--session-id", dest="session_id", type=str,
+                            required=True,
+                            help="Session id for the delivery ledger; enables "
+                                 "store-side selection and the rendered field")
+    p_prefetch.add_argument("--moment", dest="moment", type=str,
+                            choices=INJECTION_MOMENTS, required=True,
+                            help="Injection moment")
+    p_prefetch.add_argument("--lane", dest="lane", type=str,
+                            choices=INJECTION_LANES, default=None,
+                            help="Injection lane")
+    p_prefetch.add_argument("--ops-token", dest="ops_tokens", type=str,
+                            action="append", default=[],
+                            help="Operation token from the pretool ring "
+                                 "(repeatable)")
+    p_prefetch.add_argument("--exclude", dest="exclude_ids", type=str,
+                            action="append", default=[],
+                            help="Memory id excluded from passive results "
+                                 "(repeatable)")
+    p_prefetch.add_argument("--for-injection", action="store_true",
+                            help="explicit marker: prefetch is always the "
+                                 "passive injection lane (issue #159)")
+    p_prefetch.add_argument("--no-bump", action="store_true",
+                            help="explicit marker: the selector never bumps "
+                                 "retrieval_count (issue #159)")
+    p_prefetch.add_argument("--json", action="store_true",
+                            help="print the selector envelope as JSON (the "
+                                 "only output mode; issue #159)")
+
     p_ledger_clear = _add_parser(
         "ledger-clear", help="clear one session's passive delivery ledger")
     p_ledger_clear.add_argument("--session-id", required=True,
@@ -1472,6 +1511,31 @@ def main():
                           global_limit=args.global_limit, as_of=args.as_of,
                           for_injection=args.for_injection,
                           exclude_ids=args.exclude)
+        elif args.cmd == "prefetch":
+            # Issue #159: one selector call, one envelope. Fixed limit/
+            # global_limit/budget (the contract's exact dispatch values);
+            # data_dir=None so the selector resolves the sidecar dir through
+            # the canonical store precedence.
+            try:
+                payload = select_and_budget_for_injection(
+                    conn,
+                    query=args.query,
+                    namespace=args.namespace,
+                    moment=args.moment,
+                    session_id=args.session_id,
+                    lane=args.lane,
+                    exclude_ids=args.exclude_ids,
+                    ops_tokens=args.ops_tokens,
+                    limit=5,
+                    global_limit=3,
+                    budget_tokens=1500,
+                    data_dir=None,
+                )
+            except ValueError as exc:
+                print(f"[zmem] {exc}", file=sys.stderr)
+                sys.exit(2)
+            print(json.dumps(payload, indent=2))
+            return
         elif args.cmd == "search":
             # I1 critic-fix: ``search`` is keyword-only by contract — pass
             # hybrid=False explicitly so the new default sentinel does
