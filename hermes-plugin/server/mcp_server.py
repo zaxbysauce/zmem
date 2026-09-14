@@ -210,6 +210,11 @@ def _append_session_decision(*, status: str, reason: str, ids: list[Any],
         logger.debug("zmem-mcp: decision-log append failed: %s", exc)
 
 
+async def _append_session_decision_async(**kwargs: Any) -> None:
+    """Append decision telemetry without blocking the MCP event loop."""
+    await asyncio.to_thread(_append_session_decision, **kwargs)
+
+
 def _inject_disabled() -> bool:
     """Issue #110 (P0-5): ZMEM_INJECT=0 disables passive injection on this
     surface (session_start). Only the literal ``0`` (whitespace-tolerated)
@@ -1558,7 +1563,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if _inject_disabled():
             logger.info(
                 "session_start: status=silent reason=disabled (ZMEM_INJECT=0)")
-            _append_session_decision(
+            await _append_session_decision_async(
                 status="silent", reason=_INJECT_REASON_DISABLED,
                 ids=[], all_ids=[], lane=lane, t_ms=0,
             )
@@ -1597,7 +1602,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # queue time and pre-attempt failures intentionally remain zero.
         elapsed = timing.get("t_ms", 0)
         if not r["ok"]:
-            _append_session_decision(
+            await _append_session_decision_async(
                 status="silent", reason="omitted", ids=[], all_ids=[], lane=lane,
                 t_ms=elapsed,
             )
@@ -1606,7 +1611,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         try:
             parsed = json.loads(stdout) if stdout else {}
         except json.JSONDecodeError:
-            _append_session_decision(
+            await _append_session_decision_async(
                 status="silent", reason="omitted", ids=[], all_ids=[], lane=lane,
                 t_ms=elapsed,
             )
@@ -1732,7 +1737,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # Measured on the FINAL emitted context (post empty-
             # replacement), matching the Hermes twin (final-critic A4).
             tokens_used = _inject.estimate_tokens(context)
-        _append_session_decision(
+        await _append_session_decision_async(
             status="injected" if rows else "silent", reason=reason,
             ids=[row.get("id") for row in rows],
             all_ids=candidate_ids or [row.get("id") for row in rows],

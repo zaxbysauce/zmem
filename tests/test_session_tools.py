@@ -199,6 +199,39 @@ class SessionStartLaneTest(unittest.TestCase):
         self.assertTrue(rotated.exists(), "MCP append must rotate at the cap")
         self.assertIn("old decision line", rotated.read_text(encoding="utf-8"))
 
+    def test_session_decision_append_does_not_block_event_loop(self):
+        import asyncio
+        import time
+
+        state = {"started": False, "finished": False}
+        marker_states = []
+
+        def delayed_append(**_kwargs):
+            state["started"] = True
+            time.sleep(0.15)
+            state["finished"] = True
+
+        async def concurrent_marker():
+            while not state["started"]:
+                await asyncio.sleep(0)
+            marker_states.append(not state["finished"])
+
+        async def exercise():
+            with mock.patch.object(
+                    self.mcp_server, "_append_session_decision",
+                    side_effect=delayed_append):
+                await asyncio.gather(
+                    self.mcp_server._append_session_decision_async(
+                        status="silent", reason="empty-pool", ids=[],
+                        all_ids=[], session_id="async-probe"),
+                    concurrent_marker(),
+                )
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            marker_states, [True],
+            "a delayed decision append must yield to concurrent MCP work")
+
     def test_decision_log_follows_authoritative_legacy_store_without_env(self):
         legacy_store = Path(self._tmp) / "legacy" / "store.sqlite"
         env_names = ("ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA",

@@ -3,7 +3,7 @@
 These checks intentionally pin the seven host-facing manifests and the
 generated release manifest to the next unused minor release.  The score-margin
 release note remains pinned to its historical 0.34.0 section after the host
-attribution release advances the current release identity to 0.37.0.  The release
+attribution release advances the current release identity to 0.38.0.  The release
 manifest is trusted only when the existing release gate verifies it
 successfully; this test never regenerates it as a side effect.
 """
@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = "0.37.0"
+EXPECTED_VERSION = "0.38.0"
 SCORE_MARGIN_VERSION = "0.34.0"
 _SCORE_MARGIN_VERSION_RE = re.escape(SCORE_MARGIN_VERSION)
 

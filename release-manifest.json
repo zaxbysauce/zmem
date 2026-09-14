@@ -1,17 +1,17 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "56ed72966ec54a2c8f1ebefb4e1c637056029236d696b3f0b8874e954cf44eb3",
+  "digest": "d563708f4217b8d45271a660fba397034cae385917afa09a98c1fe31338e8d22",
   "files": {
     "hermes-plugin/__init__.py": "9b2a8bd3d508da60af059bdddd475887558df084325f725ac200d1c06185a263",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "70338bcac85152e0d964fd70a6cea57cae06e93fe185ce5c1528f99c71e33c3b",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "3a86448f93e4a7be9307ff4bf3028f14b1ed6ea8cefe5c5dc51529808f849337",
+    "hermes-plugin/plugin.yaml": "e66fbe46c8a38eae893d8a3d6cb5a015739ce71f6280baa7cbff162597018c1f",
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "b4574d0caac1c1d863efef0fa7e5ebf6b9d1498a68330fc0f14e2b73ff56b399",
-    "hermes-plugin/server/mcp_server.py": "928d893d267ddc4a44871fd4461a1450f21f7c509c255f490f3eb91c7aefbf20",
+    "hermes-plugin/server/mcp_server.py": "a0cae7ca221e1d028535cf5f8119e9a5caf38331ab6567ef0d1c206ca70cf679",
     "hermes-plugin/server/requirements-embeddings.txt": "437505a8ebb55933f5b50e9334849e88a9ce0b57ee534c5f6864a5cda1f8aca6",
     "hermes-plugin/server/requirements.txt": "799aad6ca2a111d8c21b746fae1a2770278b29554900f95b9241c686d7149189",
     "hooks/hooks.claude.json": "20b9b56a3e5f1683025f0ed67e9b254f48b86bf7f0bd0b962cb3a9029b85474d",
@@ -87,5 +87,5 @@
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
     "skills/memory/scripts/storelib/write.py": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
   },
-  "version": "0.37.0"
+  "version": "0.38.0"
 }
