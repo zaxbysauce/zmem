@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -96,8 +97,14 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     ).fetchone() is not None
 
 
-def build_report(conn: sqlite3.Connection, *, origin_map: dict, evidence_map: dict) -> dict:
+def build_report(conn: sqlite3.Connection, *, origin_map: dict, evidence_map: list) -> dict:
     """Build the hygiene report dict from a read-only snapshot connection.
+
+    ``evidence_map`` is a LIST of {none_id, grounded_id, proof_ref,
+    justification} rows (the issue text's `dict` annotation was a typo; the
+    runtime contract was always list-shaped — PR #199 review F5). Multiple
+    rows may cite the same grounded_id (one grounded lesson can corroborate
+    several none rows); only duplicate none_ids are rejected at parse time.
 
     No-action cases for an evidence row (each silently omitted from the plan,
     never an error): none target superseded or no longer signal='none' (the
@@ -111,6 +118,7 @@ def build_report(conn: sqlite3.Connection, *, origin_map: dict, evidence_map: di
 
     conn.row_factory = sqlite3.Row
     total = conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+    has_links = _table_exists(conn, "memory_link")
     live_rows = conn.execute(
         "SELECT id, namespace, signal, ingestion_ts, content, content_norm"
         " FROM memory WHERE superseded_at IS NULL"
@@ -168,11 +176,13 @@ def build_report(conn: sqlite3.Connection, *, origin_map: dict, evidence_map: di
             continue
         if not proof_ref or not justification:
             continue
-        linked = conn.execute(
-            "SELECT 1 FROM memory_link WHERE relation IN (?,?,?,?)"
-            " AND ((src_id=? AND dst_id=?) OR (src_id=? AND dst_id=?)) LIMIT 1",
-            (*TRIAGE_RELATIONS, none_id, grounded_id, grounded_id, none_id),
-        ).fetchone()
+        linked = None
+        if has_links:
+            linked = conn.execute(
+                "SELECT 1 FROM memory_link WHERE relation IN (?,?,?,?)"
+                " AND ((src_id=? AND dst_id=?) OR (src_id=? AND dst_id=?)) LIMIT 1",
+                (*TRIAGE_RELATIONS, none_id, grounded_id, grounded_id, none_id),
+            ).fetchone()
         if linked is None:
             continue
         actions.append({
@@ -295,9 +305,25 @@ def main(argv: list[str] | None = None) -> int:
 
     report["snapshot_sha256"] = digest.hexdigest()
 
+    # Read-only safety (PR #199 review V3): the report must never destroy one
+    # of its own inputs. Refuse an --out that resolves onto the snapshot or
+    # either input map BEFORE anything is written.
+    try:
+        out_resolved = os.path.normcase(str(out_path.resolve()))
+        for input_path in (snapshot, Path(args.origin_map), Path(args.evidence_map)):
+            if out_resolved == os.path.normcase(str(input_path.resolve())):
+                return _invalid()
+    except OSError:
+        return _invalid()
+
     if args.format == "json":
         rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     else:
         rendered = _render_text(report)
-    out_path.write_text(rendered, encoding="utf-8")
+    try:
+        out_path.write_text(rendered, encoding="utf-8")
+    except OSError:
+        # Unwritable --out (missing parent, permission, is-a-directory) is an
+        # invalid invocation, not a traceback (PR #199 review V4).
+        return _invalid()
     return 0

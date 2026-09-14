@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import atexit
 from pathlib import Path
 
 import uuid as _uuid
@@ -37,6 +38,9 @@ _test_scratch = Path(tempfile.gettempdir()) / (
     "zmem-store-hygiene-tests-" + _uuid.uuid4().hex
 )
 _test_scratch.mkdir(parents=True, exist_ok=True)
+atexit.register(shutil.rmtree, _test_scratch, True)
+_prior_env = {k: os.environ.get(k) for k in
+              ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD")}
 os.environ["ZMEM_STORE"] = str(_test_scratch / "store.sqlite")
 os.environ["ZMEM_DATA"] = str(_test_scratch)
 os.environ["ZMEM_MODELS_DIR"] = str(_test_scratch / "missing-models")
@@ -46,10 +50,17 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from storelib import hygiene  # noqa: E402
 
+# Import-time freeze done — hand the env back (PR #199 review 199-c).
+for _k, _v in _prior_env.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
+
 # The four fixture digests (issue #97 fixture contract). Regenerate fixtures
 # with: python tests/fixtures/store_hygiene/generate.py
 FIXTURE_DIGESTS = {
-    "rows.jsonl": "3514c1150895d2f1cf4ea3a626b7eb01fbcdced2699f57df9cb3b3b926701cfb",
+    "rows.jsonl": "f9ddde2d2463b288c84d46d3e9ebf669e4c4697d13fabeaa09347f6226c511a5",
     "origin-map.json": "85c8f54cb4c69e922b4e243222b89cb11f4a1d35d453d036e3e075db3f039972",
     "evidence-map.json": "1ae0ed47b76f84b0959195fe604c7caf4751c32e72767a2f3754015ce2d69155",
     "expected-report.json": "b8c0ef8bdb9ed1a4586b523043ef7550c3835dd62c08772f0ee61af63166b686",
@@ -88,12 +99,16 @@ class StoreHygieneTest(unittest.TestCase):
         cls.fixtures = cls.scratch / "fixtures"
         cls.snapshot = cls.scratch / "snapshot.sqlite"
         shutil.copyfile(cls.fixtures / "snapshot.sqlite", cls.snapshot)
+        # The COMMITTED, human-reviewed fixture files are the oracle (PR #199
+        # review 199-a/199-b): the regenerated copies only build the snapshot
+        # and prove generator determinism; assertions read the tracked copies
+        # so committed fixture drift can never pass silently.
         cls.origin_map = json.loads(
-            (cls.fixtures / "origin-map.json").read_text(encoding="utf-8"))
+            (FIXTURE_DIR / "origin-map.json").read_text(encoding="utf-8"))
         cls.evidence_map = json.loads(
-            (cls.fixtures / "evidence-map.json").read_text(encoding="utf-8"))
+            (FIXTURE_DIR / "evidence-map.json").read_text(encoding="utf-8"))
         cls.expected = json.loads(
-            (cls.fixtures / "expected-report.json").read_text(encoding="utf-8"))
+            (FIXTURE_DIR / "expected-report.json").read_text(encoding="utf-8"))
 
     @classmethod
     def tearDownClass(cls):
@@ -113,13 +128,21 @@ class StoreHygieneTest(unittest.TestCase):
             conn.close()
 
     def test_fixture_digests_reproducible(self):
+        # The tracked COMMITTED files are the drift-detection target (PR #199
+        # review 199-a): hash them, not the scratch regeneration. CRLF is
+        # normalized because a Windows checkout may materialize the tracked
+        # copies as CRLF while the generator writes LF on every platform.
         for name, expected_digest in FIXTURE_DIGESTS.items():
-            blob = (self.fixtures / name).read_bytes()
-            # Normalize CRLF: the generator writes LF on every platform, but
-            # a Windows checkout may materialize the tracked copies as CRLF.
+            blob = (FIXTURE_DIR / name).read_bytes()
             normalized = blob.replace(b"\r\n", b"\n")
             self.assertEqual(
                 hashlib.sha256(normalized).hexdigest(), expected_digest, name)
+        # Generator determinism: a fresh regeneration must be byte-identical
+        # to the tracked copies (after newline normalization).
+        for name in FIXTURE_DIGESTS:
+            regenerated = (self.fixtures / name).read_bytes().replace(b"\r\n", b"\n")
+            tracked = (FIXTURE_DIR / name).read_bytes().replace(b"\r\n", b"\n")
+            self.assertEqual(regenerated, tracked, name)
 
     def test_report_counts_and_duplicates(self):
         report = self._report()
@@ -146,8 +169,10 @@ class StoreHygieneTest(unittest.TestCase):
         swarm_sizes = sorted(len(g["ids"]) for g in report["duplicates"]
                              if g["namespaces"] == [NS_SWARM])
         self.assertEqual(swarm_sizes, [2, 3])
-        self.assertEqual(report["namespaces"], sorted(report["namespaces"]))
-        self.assertEqual(report["signals"], sorted(report["signals"]))
+        # Sortedness is pinned by equality with the committed expected report
+        # (whose arrays are sorted); standalone sorted() self-comparisons here
+        # could never fail (build_report sorts by construction, PR #199
+        # review 199-d/199-e).
 
     def test_upgrade_requires_later_linked_proof(self):
         report = self._report()
@@ -231,6 +256,137 @@ class StoreHygieneTest(unittest.TestCase):
         # Rerunning against the SAME snapshot is action-identical.
         again = self._report(rerun_snapshot)
         self.assertEqual(again, report)
+
+
+class StoreHygieneCliTest(unittest.TestCase):
+    """In-process coverage of hygiene.main(): the invalid-input contract,
+    the main()-added snapshot digest, and the text renderer (PR #199 review
+    199-f/199-g/199-h — previously only frozen check C7 exercised these)."""
+
+    @classmethod
+    def setUpClass(cls):
+        StoreHygieneTest.setUpClass()
+        cls.snapshot = StoreHygieneTest.snapshot
+        cls.fixtures = StoreHygieneTest.fixtures
+
+    def _run(self, argv, expect_rc=0):
+        import contextlib
+        import io
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = hygiene.main(argv)
+        self.assertEqual(rc, expect_rc, stderr.getvalue())
+        return stderr.getvalue()
+
+    def _argv(self, out: Path, store: Path | None = None,
+              origin_map: Path | None = None, evidence_map: Path | None = None,
+              fmt: str = "json"):
+        return [
+            "--store", str(store or self.snapshot),
+            "--origin-map", str(origin_map or FIXTURE_DIR / "origin-map.json"),
+            "--evidence-map", str(evidence_map or FIXTURE_DIR / "evidence-map.json"),
+            "--out", str(out),
+            "--format", fmt,
+        ]
+
+    def test_main_adds_snapshot_digest(self):
+        out = Path(tempfile.mkdtemp(prefix="zmem-hyg-cli-")) / "report.json"
+        self._run(self._argv(out))  # asserts rc == 0
+        report = json.loads(out.read_text(encoding="utf-8"))
+        digest = report["snapshot_sha256"]
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            digest,
+            hashlib.sha256(self.snapshot.read_bytes()).hexdigest(),
+        )
+
+    def test_missing_required_flags_exit2(self):
+        import contextlib
+        import io
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+                self.assertRaises(SystemExit) as caught:
+            hygiene.main([])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn(
+            "error: the following arguments are required: "
+            "--store, --origin-map, --evidence-map, --out",
+            stderr.getvalue(),
+        )
+
+    def test_malformed_evidence_map_rejected(self):
+        bad = Path(tempfile.mkdtemp(prefix="zmem-hyg-bad-")) / "evidence.json"
+        bad.write_text("{not json at all", encoding="utf-8")
+        out = bad.parent / "report.json"
+        stderr = self._run(self._argv(out, evidence_map=bad), expect_rc=2)
+        self.assertIn("[zmem] hygiene: invalid input", stderr)
+        self.assertFalse(out.exists())
+
+    def test_duplicate_none_id_rejected(self):
+        bad = Path(tempfile.mkdtemp(prefix="zmem-hyg-dup-")) / "evidence.json"
+        rows = json.loads(
+            (FIXTURE_DIR / "evidence-map.json").read_text(encoding="utf-8"))
+        rows.append(dict(rows[0]))
+        bad.write_text(json.dumps(rows), encoding="utf-8")
+        out = bad.parent / "report.json"
+        stderr = self._run(self._argv(out, evidence_map=bad), expect_rc=2)
+        self.assertIn("[zmem] hygiene: invalid input", stderr)
+        self.assertFalse(out.exists())
+
+    def test_unknown_mapped_id_rejected(self):
+        bad = Path(tempfile.mkdtemp(prefix="zmem-hyg-unk-")) / "origin.json"
+        origin = json.loads(
+            (FIXTURE_DIR / "origin-map.json").read_text(encoding="utf-8"))
+        origin["ffffffff-0000-4000-8000-000000000000"] = {"origin": "hermes"}
+        bad.write_text(json.dumps(origin), encoding="utf-8")
+        out = bad.parent / "report.json"
+        stderr = self._run(self._argv(out, origin_map=bad), expect_rc=2)
+        self.assertIn("[zmem] hygiene: invalid input", stderr)
+        self.assertFalse(out.exists())
+
+    def test_out_aliasing_snapshot_rejected(self):
+        """PR #199 review V3: --out must never overwrite an input file."""
+        scratch = Path(tempfile.mkdtemp(prefix="zmem-hyg-alias-"))
+        snap = scratch / "snapshot.sqlite"
+        shutil.copyfile(self.snapshot, snap)
+        before = hashlib.sha256(snap.read_bytes()).hexdigest()
+        self._run(self._argv(snap, store=snap), expect_rc=2)
+        self.assertEqual(hashlib.sha256(snap.read_bytes()).hexdigest(), before)
+
+    def test_out_aliasing_evidence_map_rejected(self):
+        scratch = Path(tempfile.mkdtemp(prefix="zmem-hyg-alias2-"))
+        ev = scratch / "evidence.json"
+        ev.write_text((FIXTURE_DIR / "evidence-map.json").read_text(encoding="utf-8"),
+                      encoding="utf-8")
+        self._run(self._argv(ev, evidence_map=ev), expect_rc=2)
+        self.assertEqual(
+            json.loads(ev.read_text(encoding="utf-8")),
+            json.loads((FIXTURE_DIR / "evidence-map.json").read_text(encoding="utf-8")),
+        )
+
+    def test_unwritable_out_rejected(self):
+        """PR #199 review V4: an unwritable --out is invalid input (exit 2),
+        never an unhandled traceback."""
+        out = Path(tempfile.mkdtemp(prefix="zmem-hyg-ro-")) / "missing-dir" / "r.json"
+        stderr = self._run(self._argv(out), expect_rc=2)
+        self.assertIn("[zmem] hygiene: invalid input", stderr)
+        self.assertFalse(out.exists())
+
+    def test_text_renderer_content(self):
+        out = Path(tempfile.mkdtemp(prefix="zmem-hyg-txt-")) / "report.txt"
+        self._run(self._argv(out, fmt="text"))
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("snapshot_sha256:", text)
+        self.assertIn("namespaces:", text)
+        self.assertIn("none-upgrade actions: 1", text)
+        self.assertIn(
+            "python skills/memory/scripts/store.py update --id "
+            "00000000-0000-4000-8000-000000000001",
+            text,
+        )
+        self.assertIn("review artifacts", text)
 
 
 if __name__ == "__main__":

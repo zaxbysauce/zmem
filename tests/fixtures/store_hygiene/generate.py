@@ -48,7 +48,7 @@ EARLIER_TS = "2026-09-09T23:00:00Z"    # EARLIER grounded row (not later)
 HERMES_NS = "user:global"
 NS_SWARM = "project:github.com/zaxbyhub/opencode-swarm"
 NS_ZMEM = "project:github.com/zaxbysauce/zmem"
-JUNK = ("ns1", "ns2", "project:", "test", "user:t", "unfoldtest")
+JUNK = ("ns1", "ns2", "project:", "test", "unfoldtest", "user:t")
 
 
 def hermes_id(n: int) -> str:

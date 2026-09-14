@@ -356,26 +356,36 @@ def _get_git_remote_status(project_dir: Path) -> tuple[str | None, str]:
     The probes are ordered so the three statuses are mechanical, not guessed
     from stderr text:
 
-    - No ``.git`` entry at all -> ``absent`` (never was a checkout; the
-      historical path-key behavior is preserved unchanged).
-    - ``git rev-parse --git-dir`` fails inside a checkout (broken worktree
-      pointer, unreadable/corrupt .git) or any git invocation raises/times
-      out -> ``error``.
+    - ``git rev-parse --git-dir`` runs FIRST because git resolves the repo
+      through PARENT directories: a checkout subdirectory (where hook
+      capture's ``os.getcwd()`` routinely lands) must classify exactly like
+      the repo root (PR #199 review — an earlier `.git`-exists pre-check
+      here misclassified every subdirectory as absent).
+    - The health probe failing is ambiguous between "broken checkout" and
+      "never was a checkout": a `.git` entry right in project_dir (broken
+      worktree pointer, corrupt/unreadable .git) -> ``error``; no `.git`
+      entry at all -> ``absent`` (never was a checkout; the historical
+      path-key behavior is preserved unchanged).
     - A HEALTHY checkout whose ``git remote get-url origin`` exits non-zero
       simply has no origin -> ``absent`` (the same exit code also covers
       git-machinery failures, which is exactly why the health probe runs
-      first: it separates "no such remote" from "git is broken")."""
-    if not (Path(project_dir) / ".git").exists():
-        return None, "absent"
+      first: it separates "no such remote" from "git is broken").
+    - Any git invocation that raises or times out -> ``error``."""
+    p = Path(project_dir)
     try:
         healthy = subprocess.run(
-            ["git", "-C", str(project_dir), "rev-parse", "--git-dir"],
+            ["git", "-C", str(p), "rev-parse", "--git-dir"],
             capture_output=True, text=True, timeout=5, check=False,
         )
-        if healthy.returncode != 0:
+    except Exception:
+        return None, "error"
+    if healthy.returncode != 0:
+        if (p / ".git").exists():
             return None, "error"
+        return None, "absent"
+    try:
         result = subprocess.run(
-            ["git", "-C", str(project_dir), "remote", "get-url", "origin"],
+            ["git", "-C", str(p), "remote", "get-url", "origin"],
             capture_output=True, text=True, timeout=5, check=False,
         )
     except Exception:
@@ -526,8 +536,13 @@ def _norm_abspath_key(project_dir: Path) -> str:
 
 def _resolve_data_dir() -> Path:
     """Box-wide data dir for sidecar state (namespace cache, issue #97).
-    Mirrors resolve_store_path()'s chain minus the store-file step, so the
-    cache lives beside whatever store resolution would pick."""
+    Mirrors resolve_store_path()'s precedence INCLUDING the explicit-store
+    step: a ZMEM_STORE-selected store keeps its sidecars beside that store,
+    matching correction_queue's data-dir chain (PR #199 review) — only the
+    store-FILE suffix is dropped."""
+    explicit_store = _env("ZMEM_STORE")
+    if explicit_store:
+        return Path(explicit_store).expanduser().parent
     explicit = _env("ZMEM_DATA")
     if explicit:
         return Path(explicit).expanduser()
@@ -559,6 +574,19 @@ def _cache_get(project_dir: Path) -> str | None:
         )
     except Exception:
         return None
+
+
+def _cache_drop(project_dir: Path) -> None:
+    """Forget the cached namespace for project_dir (used on the ``absent``
+    status: git ran fine and there is no origin, so a stale remote key from
+    before ``git remote remove origin`` must never resurface through a later
+    ``error`` fallback — PR #199 review). Best-effort, silent."""
+    try:
+        from storelib.namespace_cache import drop_cached_namespace
+
+        drop_cached_namespace(_resolve_data_dir(), project_dir)
+    except Exception:
+        pass
 
 
 def _cache_put(project_dir: Path, namespace: str) -> None:
@@ -599,6 +627,9 @@ def resolve_namespace(project_dir: str | Path) -> str:
         _cache_put(p, namespace)
         return namespace
     if status == "absent":
+        # git ran fine and there is no origin: drop any cached remote key so
+        # a later `error` can never resurface the removed origin's identity.
+        _cache_drop(p)
         return f"project:{_norm_abspath_key(p)}"
     cached = _cache_get(p)
     if cached:

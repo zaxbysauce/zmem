@@ -1621,12 +1621,23 @@ operator map; this command is strictly report-only.
 
 Operator workflow:
 
-1. **Snapshot copy first.** Copy the store file, run the report against the
-   copy (the command opens the snapshot with SQLite `mode=ro`, so even an
-   accident cannot write):
+1. **Snapshot copy first.** The live store runs in WAL journal mode, so a
+   bare `cp` of `store.sqlite` can miss commits still sitting in the `-wal`
+   file (or open malformed mid-checkpoint). Use a crash-consistent snapshot
+   instead — either the built-in verified backup or SQLite's own backup API:
 
    ```bash
-   cp ~/.zmem/store.sqlite /tmp/snapshot.sqlite
+   # Option A (preferred): the store's verified backup writes a
+   # crash-consistent store-<stamp>.sqlite snapshot.
+   python skills/memory/scripts/store.py backup
+   # Option B: SQLite's online backup API.
+   sqlite3 ~/.zmem/store.sqlite ".backup '/tmp/snapshot.sqlite'"
+   ```
+
+   Then run the report against that snapshot (the command opens it with
+   SQLite `mode=ro`, so even an accident cannot write):
+
+   ```bash
    python skills/memory/scripts/store.py hygiene \
      --store /tmp/snapshot.sqlite \
      --origin-map origin-map.json --evidence-map evidence-map.json \
