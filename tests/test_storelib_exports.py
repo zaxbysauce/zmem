@@ -80,7 +80,6 @@ class ExportSurfaceTests(unittest.TestCase):
         # env).
         cls.tmp = tempfile.mkdtemp(prefix="zmem-export-")
         cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
-        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
 
         env = {**os.environ,
                "ZMEM_STORE": os.path.join(cls.tmp, "store.sqlite"),
@@ -151,6 +150,7 @@ class EnvelopeContractTest(unittest.TestCase):
         cls.tmp = tempfile.mkdtemp(
             prefix=f"zmem-phase25-{uuid.uuid4().hex}-"
         )
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
         cls._saved_env = {
             key: os.environ.get(key)
             for key in (

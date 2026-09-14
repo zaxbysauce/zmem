@@ -295,6 +295,9 @@ class TrustBlocksInjectionButNotSearchTest(TrustRecallCliBase):
         hermes = (REPO / "hermes-plugin/__init__.py").read_text(encoding="utf-8")
         helper_start = hermes.index("def _passive_store_args")
         helper_end = hermes.find("\ndef ", helper_start + 1)
+        self.assertNotEqual(helper_end, -1,
+                            "_passive_store_args must be followed by "
+                            "another top-level def")
         helper = hermes[helper_start:helper_end if helper_end != -1 else None]
         self.assertIn('"--no-bump"', helper)
         self.assertIn('"--for-injection"', helper)
