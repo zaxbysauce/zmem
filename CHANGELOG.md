@@ -10,8 +10,6 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.36.0] - 2026-09-13
-
 ## [0.37.0] - 2026-09-13
 
 > Workstream E PR 1 of 7 (issue #97): a Git failure can no longer invent a
@@ -38,6 +36,27 @@ README.
 - **Operator documentation** in `skills/memory/SKILL.md`: the snapshot-copy
   / report-review / verified-backup / dry-run rekey workflow and the #168
   mutation boundary.
+
+### Fixed
+- **Migration re-key guard (PR #199 review)**: `_rekey_namespaces` re-keys a
+  namespace only when its checkout's origin is verifiably present right now
+  (git status `remote`); on a transient git error or missing origin it
+  follows the existing refuse-and-retry contract instead of writing rows
+  into `user:global`.
+- **Subdirectory resolution (PR #199 review)**: `resolve_namespace` runs the
+  git health probe first, so hook capture from a repo SUBDIRECTORY resolves
+  the project's remote key exactly like the repo root.
+- **Hygiene report safety (PR #199 review)**: `--out` may no longer alias the
+  snapshot or an input map (the read-only contract is enforced against
+  self-destruction), and an unwritable `--out` exits 2 as invalid input
+  instead of raising a traceback.
+- **Namespace cache hardening (PR #199 review)**: cache keys use
+  `os.path.normcase` (no cross-checkout collisions on case-sensitive
+  filesystems), non-finite timestamps never serve, each writer uses a unique
+  temporary file, and an `absent` checkout drops its cached remote key so a
+  removed origin can never resurface through a later error fallback.
+- **Docs**: the hygiene snapshot step now uses the WAL-safe
+  `store.py backup` / SQLite `.backup` path instead of a bare `cp`.
 
 ### Changed
 - **Namespace resolution (issue #97)**: `host.py` now classifies each
