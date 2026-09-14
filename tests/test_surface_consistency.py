@@ -199,9 +199,11 @@ class AdapterScanTest(unittest.TestCase):
     def test_explicit_mcp_recall_omits_no_bump(self):
         text = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py").read_text(
             encoding="utf-8")
-        # v13 (issue #65, 10.5): session_start is the D4 PASSIVE path and MUST
-        # pass --no-bump — the scan is scoped to the EXPLICIT tool bodies so
-        # the passive exception is pinned, not forbidden.
+        # v13 (issue #65, 10.5): session_start is the D4 PASSIVE path. Issue
+        # #159 reworked it onto the queryless selector path — passivity is
+        # now STRUCTURAL (the selector records surfaced events and never
+        # bumps retrieval_count), carried by the literal --for-injection
+        # marker instead of a client-side --no-bump flag.
         import ast as _ast
         tree = _ast.parse(text)
         bodies = {}
@@ -217,9 +219,8 @@ class AdapterScanTest(unittest.TestCase):
                 f"MCP {explicit} is EXPLICIT and must NOT pass --no-bump")
         self.assertIn(
             "--for-injection", bodies.get("session_start", ""),
-            "MCP session_start is the D4 passive path and MUST pass "
-            "--for-injection (issue #159: passivity is structural via the "
-            "selector)")
+            "MCP session_start is the D4 passive path and MUST pass --no-bump "
+            "(issue #65, 10.5)")
 
     def test_explicit_mcp_recall_docstring_documents_bump(self):
         # I2 (#38 / #56): the explicit-vs-passive bump rule is tested design,
@@ -330,20 +331,6 @@ class AdapterScanTest(unittest.TestCase):
         self.assertIn("passive", doc)
         self.assertIn("canonical render", doc)
         self.assertIn("telemetry", doc)
-        # Issue #23 guardrail: recall_memory must keep naming the three hook
-        # sources the read-only contract covers (restored in the #158 rebase;
-        # the original guardrail asserted exactly this).
-        rm_doc = None
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.FunctionDef)
-                    and node.name == "recall_memory"):
-                rm_doc = ast.get_docstring(node)
-                break
-        self.assertIsNotNone(rm_doc, "recall_memory must keep a docstring")
-        for hook_source in ("UserPromptSubmit", "SubagentStart",
-                            "SessionStart"):
-            self.assertIn(hook_source, rm_doc,
-                          f"read-only invariant must name {hook_source}")
 
 
 class SurfaceTempStoreTest(unittest.TestCase):

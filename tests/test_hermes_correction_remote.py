@@ -87,12 +87,17 @@ CORRECTION = "No, use bun not npm for this project's installs from now on"
 
 
 class HermesCorrectionCaptureTest(unittest.TestCase):
-    """Issue #71 D: parity capture on the pre_llm_call path."""
+    """Issue #71 D: parity capture on the pre_llm_call path (since issue
+    #122 the queue write itself happens inside the store bridge)."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="zmem-hermes-corr-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.env = _clean_env(self.tmp, ZMEM_HOME=str(REPO_ROOT))
+        # Pin the namespace: issue #122 derives it from the project dir via
+        # host.resolve_namespace when unpinned, so an unpinned run on a git
+        # checkout would queue under the project namespace, not user:global.
+        self.env = _clean_env(self.tmp, ZMEM_HOME=str(REPO_ROOT),
+                              ZMEM_NAMESPACE="user:global")
 
     def test_user_message_captured_with_host_hermes(self):
         out, rc = _run_reflect(self.env, {"session_id": "s1",
@@ -199,21 +204,56 @@ class HookHelperUnitTest(unittest.TestCase):
                              "project:cfg")
 
     def test_namespace_chain_fallbacks(self):
+        # Issue #122: the chain is MCP_NAMESPACE → NAMESPACE → ZMEM_PROJECT →
+        # ZCODE_PROJECT_DIR → CLAUDE_PROJECT_DIR → cwd, with the project-dir
+        # sources resolved through host.resolve_namespace. With every
+        # project source pointing at a NONEXISTENT dir, git resolution fails
+        # and the documented fallback is exactly user:global.
         with mock.patch.dict(os.environ, {"ZMEM_NAMESPACE": "user:z"},
                              clear=False):
             os.environ.pop("ZMEM_MCP_NAMESPACE", None)
+            for k in ("ZMEM_PROJECT", "ZCODE_PROJECT_DIR",
+                      "CLAUDE_PROJECT_DIR"):
+                os.environ.pop(k, None)
             self.assertEqual(self.hook._resolve_hook_namespace(), "user:z")
         env_backup = {k: os.environ.get(k) for k in
-                      ("ZMEM_MCP_NAMESPACE", "ZMEM_NAMESPACE")}
+                      ("ZMEM_MCP_NAMESPACE", "ZMEM_NAMESPACE", "ZMEM_PROJECT",
+                       "ZCODE_PROJECT_DIR", "CLAUDE_PROJECT_DIR")}
         for k in env_backup:
             os.environ.pop(k, None)
         try:
-            self.assertEqual(self.hook._resolve_hook_namespace(),
-                             "user:global")
+            # Resolver FAILURE (host unimportable — e.g. a broken plugin
+            # copy): the documented fallback is exactly user:global. A real
+            # dir would derive a project:* key (see the test below); git
+            # failure paths are not deterministically arrangeable.
+            with mock.patch.dict(sys.modules, {"host": None}):
+                self.assertEqual(self.hook._resolve_hook_namespace(),
+                                 "user:global")
         finally:
             for k, v in env_backup.items():
                 if v is not None:
                     os.environ[k] = v
+
+    def test_namespace_chain_prefers_project_dir_sources(self):
+        # Issue #122: ZCODE_PROJECT_DIR feeds host.resolve_namespace — a
+        # real git checkout derives its project:* key instead of falling
+        # back to user:global. Assert the derivation THROUGH host (the sole
+        # producer of project:* keys) using this repo as the fixture.
+        repo_root = str(REPO_ROOT)
+        with mock.patch.dict(os.environ, {
+                "ZMEM_MCP_NAMESPACE": "",
+                "ZMEM_NAMESPACE": "",
+                "ZCODE_PROJECT_DIR": repo_root,
+        }, clear=False):
+            os.environ.pop("ZMEM_PROJECT", None)
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            derived = self.hook._resolve_hook_namespace()
+        self.assertTrue(derived.startswith("project:"), derived)
+        if str(SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(SCRIPTS))
+        import host as _host  # the sole producer — same derivation
+        self.assertEqual(derived,
+                         _host.resolve_namespace(repo_root))
 
 
 @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed")
@@ -337,11 +377,18 @@ class HermesRemotePrefetchTest(unittest.TestCase):
         out, rc = _run_reflect(env, {"session_id": "r5",
                                      "user_message": CORRECTION})
         self.assertEqual(rc, 0)
-        sidecar_q = Path(env["ZMEM_DATA"], "queue", "user_cglobal.json")
-        self.assertTrue(sidecar_q.is_file(),
+        # Issue #122: the namespace is DERIVED (project:* on a git
+        # checkout), so scan the REMOTE box's local queue dir rather than
+        # assuming user:global — the pinned intent is that the capture
+        # lands in the local SIDECAR, never on the remote store.
+        queue_dir = Path(env["ZMEM_DATA"], "queue")
+        self.assertTrue(queue_dir.is_dir(),
                         "capture must use the REMOTE box's local sidecar")
-        items = json.loads(sidecar_q.read_text(encoding="utf-8"))
-        self.assertEqual(items[0]["host"], "hermes")
+        hermed = []
+        for q in sorted(queue_dir.glob("*.json")):
+            items = json.loads(q.read_text(encoding="utf-8"))
+            hermed.extend(i for i in items if i.get("host") == "hermes")
+        self.assertEqual(len(hermed), 1)
 
 
     def test_remote_mode_ignores_stale_local_store(self):
