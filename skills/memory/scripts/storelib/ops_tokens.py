@@ -27,6 +27,7 @@ Runs standalone (no storelib siblings required at import time).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -219,12 +220,18 @@ def query_context_enabled() -> bool:
     return os.environ.get(_QUERY_CONTEXT_ENV, "1").strip() != "0"
 
 
+def _sidecar_stem(session_id: str) -> str:
+    """Sidecar names hash the COMPLETE session id (issue #122): two ids whose
+    sanitized forms share a 128-character prefix therefore land on distinct
+    files instead of silently sharing one ring/cursor."""
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+
+
 def _ring_path(data_dir: str, session_id: str) -> str:
-    """Session ids are host-generated (UUID-ish), but sanitize anyway — the
-    ring filename must never escape the ops dir.
+    """Ops ring sidecar path — sha256-truncated stem (issue #122); the ring
+    filename can never escape the ops dir and never collides across long ids.
     """
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:128] or "session"
-    return os.path.join(data_dir, "ops", safe + ".log")
+    return os.path.join(data_dir, "ops", _sidecar_stem(session_id) + ".log")
 
 
 def ring_cursor(data_dir: str, session_id: str) -> tuple:
@@ -273,8 +280,7 @@ def ring_cursor(data_dir: str, session_id: str) -> tuple:
 
 
 def _marker_path(data_dir: str, session_id: str, suffix: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:128] or "session"
-    return os.path.join(data_dir, "ops", safe + suffix)
+    return os.path.join(data_dir, "ops", _sidecar_stem(session_id) + suffix)
 
 
 def read_delivered_cursor(data_dir: str, session_id: str) -> tuple:
@@ -293,13 +299,72 @@ def read_delivered_cursor(data_dir: str, session_id: str) -> tuple:
 
 
 def write_delivered_cursor(data_dir: str, session_id: str, cursor: tuple) -> None:
-    """Persist a delivery cursor marker (best-effort; never raises)."""
+    """Persist a delivery cursor marker (best-effort; never raises). Issue
+    #122 pins the file bytes as ``"<ts> <count>\\n"`` (final LF, no CRLF
+    translation) — the hermes_compat fixtures compare them byte-for-byte."""
     try:
         os.makedirs(os.path.dirname(
             _marker_path(data_dir, session_id, ".delivered")), exist_ok=True)
         with open(_marker_path(data_dir, session_id, ".delivered"), "w",
-                  encoding="utf-8") as f:
-            f.write("{0} {1}".format(float(cursor[0]), int(cursor[1])))
+                  encoding="utf-8", newline="\n") as f:
+            f.write("{0} {1}\n".format(float(cursor[0]), int(cursor[1])))
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Prefetch retry budget (issue #122): a cursor gets two total prefetch
+# attempts — one initial and one retry — persisted as
+# ``ops/<sha256[:32]>.attempts`` holding ``"<cursor-ts> <attempts>\n"``
+# (exact two-field format; pinned by the hermes_compat fixtures). Later
+# invocations skip a cursor whose attempts are exhausted until the ring
+# cursor changes. The hook writes the same file/format itself (it must not
+# import storelib), so the format is a pinned cross-process contract.
+# ---------------------------------------------------------------------------
+
+_ATTEMPTS_SUFFIX = ".attempts"
+
+
+def read_retry_state(data_dir: str, session_id: str,
+                     cursor: tuple[float, int]) -> int:
+    """Attempts already burned on THIS cursor's timestamp; 0 when the marker
+    is absent, unreadable, or belongs to a different cursor ts."""
+    try:
+        with open(_marker_path(data_dir, session_id, _ATTEMPTS_SUFFIX), "r",
+                  encoding="utf-8", errors="replace") as f:
+            parts = f.read().split()
+        if len(parts) >= 2 and float(parts[0]) == float(cursor[0]):
+            return int(parts[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def write_retry_state(data_dir: str, session_id: str, cursor: tuple[float, int],
+                      attempts: int) -> None:
+    """Persist the burned-attempt count for one cursor (best-effort; never
+    raises). Same-dir temp + fsync + os.replace, matching the ring-trim
+    discipline: an interrupted write must never leave partial bytes."""
+    path = _marker_path(data_dir, session_id, _ATTEMPTS_SUFFIX)
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write("{0} {1}\n".format(float(cursor[0]), int(attempts)))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def clear_retry_state(data_dir: str, session_id: str) -> None:
+    """Drop the attempt marker (a successful non-empty render commits once)."""
+    try:
+        os.remove(_marker_path(data_dir, session_id, _ATTEMPTS_SUFFIX))
     except OSError:
         pass
 
@@ -370,10 +435,25 @@ def append_ops_ring(data_dir: str, session_id: str, tool: str, op: str) -> bool:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
             if os.path.getsize(path) > _RING_MAX_BYTES:
+                # Issue #122: rotate atomically — the retained tail is
+                # written to a same-directory temp file (flush + fsync) and
+                # renamed over the live ring, so an interrupted trim can
+                # never leave partial JSONL. A failed replace keeps the
+                # original bytes.
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     tail = f.readlines()[-_RING_TRIM_TO_LINES:]
-                with open(path, "w", encoding="utf-8") as f:
-                    f.writelines(tail)
+                tmp = path + ".tmp"
+                try:
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        f.writelines(tail)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, path)
+                except OSError:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
         except OSError:
             pass
         with open(path, "a", encoding="utf-8") as f:

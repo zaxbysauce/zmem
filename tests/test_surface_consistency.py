@@ -124,6 +124,73 @@ class AdapterScanTest(unittest.TestCase):
         self.assertIn("--no-bump", helper,
                       "the shared Hermes passive argv builder MUST pass --no-bump")
 
+    # --- issue #122: Hermes compatibility adapter surface ---
+
+    def test_compatibility_prefetch_has_shared_injection_flags(self):
+        # The compat hook's LOCAL prefetch command must be the shared
+        # selector shape: namespace + session attribution + the closed
+        # moment/lane vocabulary + the passive injection markers.
+        text = (REPO_ROOT / "hermes-plugin" / "hooks"
+                / "zmem-hermes-reflect.py").read_text(encoding="utf-8")
+        body = self._method_body(text, "_prefetch")
+        for literal in ('"--namespace"', '"--session-id"',
+                        '"--moment", "user_prompt"', '"--lane", "hermes-compat"',
+                        '"--for-injection"', '"--no-bump"', '"--json"'):
+            self.assertIn(literal, body,
+                          f"compat local prefetch command must carry {literal}")
+
+    def test_signal_none_at_030_stays_out_of_compatibility_context(self):
+        # The below-relevance selector response passes through UNTOUCHED:
+        # no memory id may leak into stdout, rendered stays empty, and the
+        # reason is exactly below-relevance (the adapter adds nothing).
+        import importlib.util as _ilu
+        import io
+        from unittest import mock as _mock
+        import types as _types
+        compat = REPO_ROOT / "tests" / "fixtures" / "hermes_compat"
+        envelope = (compat / "rejected-response.json").read_text(
+            encoding="utf-8")
+        memory_id = json.loads(envelope)["candidate_ids"][0]
+        self.assertEqual(len(memory_id), 36, memory_id)
+
+        spec = _ilu.spec_from_file_location(
+            "zmem_reflect_surface_scan",
+            REPO_ROOT / "hermes-plugin" / "hooks" / "zmem-hermes-reflect.py")
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        real_run = mod.subprocess.run
+
+        def fake_run(cmd, **kwargs):
+            if any("mcp_client.py" in str(part) for part in cmd):
+                return _types.SimpleNamespace(returncode=0, stdout=envelope,
+                                              stderr="")
+            return real_run(cmd, **kwargs)
+
+        out, err = io.StringIO(), io.StringIO()
+        with _mock.patch.dict(os.environ, {
+                "ZMEM_STORE": os.path.join(_IMPORT_TMP, "store.sqlite"),
+                "ZMEM_DATA": _IMPORT_TMP,
+                "ZMEM_MODELS_DIR": os.path.join(_IMPORT_TMP, "no-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "ZMEM_MCP_URL": "http://127.0.0.1:9/mcp",
+                "ZMEM_MCP_TOKEN": "scan-token",
+                "ZMEM_MCP_NAMESPACE": "project:github.com/acme/demo",
+        }), _mock.patch.object(mod.subprocess, "run", fake_run), \
+                _mock.patch.object(sys, "stdin", io.StringIO(json.dumps({
+                    "session_id": "00000000-0000-4000-8000-000000000122",
+                    "user_message":
+                        "Please check the stash safety for this turn.",
+                }))), \
+                _mock.patch.object(sys, "stdout", out), \
+                _mock.patch.object(sys, "stderr", err):
+            rc = mod.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue()), {})
+        self.assertNotIn(memory_id, out.getvalue())
+        parsed = json.loads(envelope)
+        self.assertEqual(parsed["rendered"], "")
+        self.assertEqual(parsed["reason"], "below-relevance")
+
     def test_explicit_hermes_tool_search_omits_no_bump(self):
         text = (REPO_ROOT / "hermes-plugin" / "__init__.py").read_text(encoding="utf-8")
         self.assertNotIn("--no-bump", self._method_body(text, "_tool_search"),

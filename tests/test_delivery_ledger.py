@@ -114,6 +114,63 @@ class LedgerModuleTest(unittest.TestCase):
         self.assertEqual(self.dl.ledger_path(self.tmp, a), pa)
         self.assertIsNone(self.dl.ledger_path(self.tmp, ""))
 
+    # --- issue #122: hashed ops sidecars + atomic ring rotation ---
+
+    def test_ops_full_session_hash_separates_sanitized_prefixes(self):
+        # Two 130-char ids whose SANITIZED forms share their first 128
+        # characters must land on DISTINCT ring and delivered-cursor paths
+        # now that ops_tokens hashes the complete session id.
+        import hashlib
+        import storelib.ops_tokens as ops
+        base = "s" + "x" * 127  # 128 shared sanitized chars
+        sid_a = base + "a1"
+        sid_b = base + "b2"
+        self.assertEqual(len(sid_a), 130, len(sid_a))
+        import re
+        self.assertEqual(
+            re.sub(r"[^A-Za-z0-9._-]", "_", sid_a)[:128],
+            re.sub(r"[^A-Za-z0-9._-]", "_", sid_b)[:128])
+        log_a = ops._ring_path(self.tmp, sid_a)
+        log_b = ops._ring_path(self.tmp, sid_b)
+        delivered_a = ops._marker_path(self.tmp, sid_a, ".delivered")
+        delivered_b = ops._marker_path(self.tmp, sid_b, ".delivered")
+        self.assertNotEqual(log_a, log_b)
+        self.assertNotEqual(delivered_a, delivered_b)
+        # the names are the sha256 stem of the COMPLETE id, truncated to 32
+        expected_a = hashlib.sha256(sid_a.encode("utf-8")).hexdigest()[:32]
+        self.assertTrue(log_a.replace("\\", "/").endswith(
+            "/ops/" + expected_a + ".log"), log_a)
+        self.assertTrue(delivered_a.replace("\\", "/").endswith(
+            "/ops/" + expected_a + ".delivered"), delivered_a)
+
+    def test_ring_trim_atomic_has_no_tmp(self):
+        # Fill the ring past _RING_MAX_BYTES, append once more (rotation
+        # fires), and assert the ops dir holds ONLY the expected hashed
+        # .log/.delivered files — no *.tmp residue, still valid JSONL.
+        import hashlib
+        import json as _json
+        import storelib.ops_tokens as ops
+        ops_dir = Path(self.tmp) / "ops"
+        ops_dir.mkdir(parents=True, exist_ok=True)
+        sid = "trim-session-0001"
+        ring = Path(ops._ring_path(self.tmp, sid))
+        line = _json.dumps({"ts": 1700000000, "tool": "bash",
+                            "ops": "git status"}) + "\n"
+        with open(ring, "w", encoding="utf-8") as f:
+            f.write(line * 1400)  # ~90KB, above _RING_MAX_BYTES (65536)
+        # a delivered marker so the expected dir inventory is the pair
+        ops.write_delivered_cursor(self.tmp, sid, (1700000001.0, 1401))
+        self.assertTrue(ops.append_ops_ring(self.tmp, sid, "bash",
+                                            "git stash pop"))
+        names = sorted(p.name for p in ops_dir.iterdir())
+        stem = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:32]
+        self.assertEqual(names, [stem + ".delivered", stem + ".log"])
+        # the retained ring is still fully parseable JSONL
+        with open(ring, "r", encoding="utf-8") as f:
+            parsed = [_json.loads(l) for l in f if l.strip()]
+        self.assertGreaterEqual(len(parsed), 1)
+        self.assertEqual(parsed[-1]["ops"], "git stash pop")
+
     def test_record_delivered_roundtrip_and_upsert(self):
         row = {"id": "row-1", "content": STASH_TEXT}
         self.dl.record(self.tmp, "sess-a", [row], "user_prompt")

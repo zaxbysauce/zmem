@@ -1,0 +1,1 @@
+{"query":"Please check the stash safety for this turn.","namespace":"project:github.com/acme/demo","session_id":"00000000-0000-4000-8000-000000000122","moment":"user_prompt","lane":"hermes-compat","ops_tokens":["git","stash","pop"]}

@@ -1,0 +1,3 @@
+BEGIN;
+INSERT INTO meta(key,value) VALUES ('hermes_pending_failure_00000000-0000-4000-8000-000000000122','1');
+COMMIT;

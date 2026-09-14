@@ -39,6 +39,153 @@ from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPT
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl
 from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory
 from storelib.tune import tune_weights
+from storelib import ops_tokens as _ops_tokens
+
+
+# ---------------------------------------------------------------------------
+# Issue #122: Hermes compatibility bridge. The reflect hook must stay
+# stdlib-only and store-free (no storelib import, no SQLite in the hook
+# process), so correction capture, the pending-failure read/acknowledge, and
+# the operation-ring read + delivered-cursor commit run HERE, inside the
+# store process, behind one JSON-printing subprocess command.
+# ---------------------------------------------------------------------------
+
+def _hermes_failure_nudge(session_id: str) -> str:
+    """Exact pending-failure nudge text pinned by the hermes_compat fixtures
+    (ASCII hyphens; do not 'typograph' the dashes — bytes are contract)."""
+    return (
+        f"ZMem auto-capture: a tool failed earlier this session "
+        f"(source_ref=session:{session_id}). If a generalizable lesson can be "
+        "derived from that failure - a gotcha, a misconfiguration, a wrong "
+        "assumption - capture it now by calling the zmem_add tool:\n"
+        f'  zmem_add with type="lesson", content="<the lesson, with the error '
+        f'context>", signal="none", source_ref="session:{session_id}"\n'
+        "If the failure was transient or not generalizable, do nothing."
+    )
+
+
+def _hermes_capture_correction(namespace: str, session_id: str,
+                               user_message: str, data_dir: str) -> bool:
+    """Classify and queue the current user turn with the SAME
+    corrections/correction_queue modules every other host's capture hook
+    uses (host="hermes"); dedup via the hashed ``.corr`` sidecar. Returns
+    True only when an item was actually queued. Fail-open."""
+    if os.environ.get("ZMEM_HERMES_CORRECTIONS", "1").strip() == "0":
+        return False
+    text = (user_message or "").strip()
+    if len(text) < 5:
+        return False
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    marker = _ops_tokens._marker_path(data_dir, session_id, ".corr")
+    if os.path.isfile(marker):
+        try:
+            with open(marker, "r", encoding="utf-8", errors="replace") as f:
+                if f.read().strip() == digest:
+                    return False
+        except OSError:
+            pass
+    try:
+        import corrections  # type: ignore
+        import correction_queue as cq  # type: ignore
+        if not corrections.should_include_message(text):
+            return False
+        item_type, patterns, confidence, sentiment, decay_days = \
+            corrections.detect_patterns(text)
+        if not item_type:
+            return False
+        item = cq.make_item(
+            message=text, type_=item_type, patterns=patterns,
+            confidence=confidence, sentiment=sentiment, decay_days=decay_days,
+            session=session_id, namespace=namespace, host="hermes",
+        )
+        ok = cq.append_queue(namespace, item)
+    except Exception:
+        return False
+    if ok:
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(digest)
+        except OSError:
+            pass
+    return bool(ok)
+
+
+def cmd_hermes_context(*, action: str, namespace: str, session_id: str,
+                       user_message: str, cursor_ts: float | None,
+                       cursor_count: int | None) -> int:
+    """`store.py hermes-context` — prepare / ack-failure / commit-cursor
+    (issue #122). Always prints UTF-8 compact JSON with one final LF; never
+    creates a missing SQLite file (dispatch happens before connect())."""
+    def _emit(obj: dict) -> None:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False,
+                                    separators=(",", ":")) + "\n")
+
+    data_dir = os.path.dirname(STORE_PATH)
+
+    if action == "commit-cursor":
+        if cursor_ts is None or cursor_count is None:
+            print("store.py: error: --cursor-ts and --cursor-count are "
+                  "required with --action commit-cursor", file=sys.stderr)
+            return 2
+        try:
+            _ops_tokens.write_delivered_cursor(
+                data_dir, session_id, (float(cursor_ts), int(cursor_count)))
+            _ops_tokens.clear_retry_state(data_dir, session_id)
+        except Exception:
+            _emit({"error": "hermes-context unavailable"})
+            return 1
+        _emit({"committed": True})
+        return 0
+
+    if action == "ack-failure":
+        try:
+            if os.path.isfile(STORE_PATH):
+                conn = connect()
+                try:
+                    conn.execute("DELETE FROM meta WHERE key = ?",
+                                 (f"hermes_pending_failure_{session_id}",))
+                    conn.execute("DELETE FROM meta WHERE key = ?",
+                                 (f"hermes_failure_captured_{session_id}",))
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception:
+            _emit({"error": "hermes-context unavailable"})
+            return 1
+        _emit({"acknowledged": True})
+        return 0
+
+    # prepare
+    try:
+        correction_captured = _hermes_capture_correction(
+            namespace, session_id, user_message, data_dir)
+        cursor = _ops_tokens.ring_cursor(data_dir, session_id)
+        events = _ops_tokens.read_ops_ring(data_dir, session_id)
+        tokens = _ops_tokens.derive_ops_tokens(*events)
+        failure_nudge = ""
+        if os.path.isfile(STORE_PATH):
+            conn = connect()
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (f"hermes_pending_failure_{session_id}",),
+                ).fetchone()
+                if row and str(row[0] or "").strip():
+                    failure_nudge = _hermes_failure_nudge(session_id)
+            finally:
+                conn.close()
+        _emit({
+            "cursor": [float(cursor[0]), int(cursor[1])],
+            "ops_tokens": list(tokens),
+            "failure_nudge": failure_nudge,
+            "correction_captured": bool(correction_captured),
+        })
+        return 0
+    except Exception:
+        _emit({"error": "hermes-context unavailable"})
+        return 1
+
 
 def _auto_near_miss_rekey(conn: sqlite3.Connection, force_off: bool = False) -> None:
     """Issue #71 C: run the existing near-miss remediation automatically on
@@ -868,6 +1015,32 @@ def main():
     _qc_grp.add_argument("--drop-stale", action="store_true",
                          help="remove stale items with confidence < 0.6")
 
+    p_hermes_ctx = _add_parser(
+        "hermes-context",
+        help="Hermes compatibility bridge: correction capture, pending-failure "
+             "state and operation-cursor commit inside the store process "
+             "(issue #122; the hook subprocess-calls this)")
+    p_hermes_ctx.add_argument("--action", dest="action", type=str,
+                              choices=("prepare", "ack-failure",
+                                       "commit-cursor"),
+                              required=True,
+                              help="action to perform")
+    p_hermes_ctx.add_argument("--namespace", dest="namespace", type=str,
+                              required=True,
+                              help="resolved memory namespace")
+    p_hermes_ctx.add_argument("--session-id", dest="session_id", type=str,
+                              required=True,
+                              help="full session identifier")
+    p_hermes_ctx.add_argument("--user-message", dest="user_message",
+                              type=str, default="",
+                              help="current user message")
+    p_hermes_ctx.add_argument("--cursor-ts", dest="cursor_ts", type=float,
+                              default=None,
+                              help="delivered cursor timestamp")
+    p_hermes_ctx.add_argument("--cursor-count", dest="cursor_count", type=int,
+                              default=None,
+                              help="delivered operation count")
+
     p_mine = _add_parser(
         "mine-history",
         help="mine corrections/rejections/error-patterns from HISTORICAL Claude Code "
@@ -1184,6 +1357,16 @@ def main():
             "--out", args.out,
             "--format", args.format,
         ]))
+
+    # Issue #122: the Hermes compatibility bridge runs inside the store
+    # process (the hook stays stdlib-only and store-free) and must NEVER
+    # create a missing store — it dispatches before connect(), in the same
+    # store-independent family as hygiene/path/failures.
+    if args.cmd == "hermes-context":
+        sys.exit(cmd_hermes_context(
+            action=args.action, namespace=args.namespace,
+            session_id=args.session_id, user_message=args.user_message,
+            cursor_ts=args.cursor_ts, cursor_count=args.cursor_count))
 
     # PR-review PRR-P (issue #59 review round): `--content -` reads the content
     # from stdin. Windows argv caps near 32k chars while the content cap is
