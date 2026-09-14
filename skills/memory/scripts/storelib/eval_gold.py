@@ -49,6 +49,17 @@ BUCKETS = ("as-of", "injection", "entity-alias", "namespace", "contested",
 # exactly what the hook would send.
 INJECTION_MOMENTS = ("user-prompt", "pretool", "subagent", "precompact")
 
+# Gold files preserve their historical hyphenated labels.  Runtime decision
+# writers use the closed underscore vocabulary from schema_meta; keep the
+# translation explicit at this boundary instead of rewriting committed gold
+# history (issue #153).
+GOLD_MOMENT_TO_RUNTIME = {
+    "user-prompt": "user_prompt",
+    "pretool": "pretool",
+    "subagent": "subagent",
+    "precompact": "precompact",
+}
+
 
 class GoldError(ValueError):
     """Raised for any structurally invalid gold set. The runner maps this to
@@ -275,8 +286,15 @@ def _injection_silent_reasons() -> tuple:
     # schema_meta lives at the TOP of skills/memory/scripts/ next to store.py
     # (same import discipline as inject.py's guarded import above).
     import schema_meta as _sm  # lazy: keep module import cheap
-    return tuple(getattr(_sm, "INJECT_SILENT_REASONS",
-                         ("empty-pool", "omitted", "below-bar", "budget-drop")))
+    # Keep the partial-deployment fallback byte-identical to schema_meta and
+    # storelib.inject.  ``expired`` is reserved vocabulary; no producer is
+    # introduced here (issue #153 / #174 boundary).
+    return tuple(getattr(
+        _sm,
+        "INJECT_SILENT_REASONS",
+        ("empty-pool", "omitted", "below-bar", "budget-drop",
+         "below-relevance", "already-delivered", "expired"),
+    ))
 
 
 def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,

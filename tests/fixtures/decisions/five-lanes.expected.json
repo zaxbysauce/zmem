@@ -1,0 +1,803 @@
+{
+  "decision_lines": [
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "lane": "claude",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "precompact",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-claude",
+      "status": "injected",
+      "t_ms": 40,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [],
+      "arms": null,
+      "exc": null,
+      "ids": [],
+      "lane": "claude",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "pretool",
+      "omitted": 0,
+      "ops": null,
+      "reason": "empty-pool",
+      "sid": "fixture-claude",
+      "status": "silent",
+      "t_ms": 30,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "arms": null,
+      "exc": 3,
+      "ids": [],
+      "lane": "claude",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "session_start",
+      "omitted": 0,
+      "ops": null,
+      "reason": "already-delivered",
+      "sid": "fixture-claude",
+      "status": "silent",
+      "t_ms": 10,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [],
+      "arms": null,
+      "exc": null,
+      "ids": [],
+      "lane": "claude",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "user_prompt",
+      "omitted": 0,
+      "ops": null,
+      "reason": "empty-pool",
+      "sid": "fixture-claude",
+      "status": "silent",
+      "t_ms": 20,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "lane": "codex",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "precompact",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-codex",
+      "status": "injected",
+      "t_ms": 40,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "lane": "codex",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "pretool",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-codex",
+      "status": "injected",
+      "t_ms": 30,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "lane": "codex",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "session_start",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-codex",
+      "status": "injected",
+      "t_ms": 10,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "lane": "codex",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "user_prompt",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-codex",
+      "status": "injected",
+      "t_ms": 20,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "lane": "hermes-compat",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "precompact",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-hermes-compat",
+      "status": "injected",
+      "t_ms": 40,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "lane": "hermes-compat",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "pretool",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-hermes-compat",
+      "status": "injected",
+      "t_ms": 30,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "lane": "hermes-compat",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "session_start",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-hermes-compat",
+      "status": "injected",
+      "t_ms": 10,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "lane": "hermes-compat",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "user_prompt",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-hermes-compat",
+      "status": "injected",
+      "t_ms": 20,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "lane": "hermes-provider",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "precompact",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-hermes-provider",
+      "status": "injected",
+      "t_ms": 40,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "lane": "hermes-provider",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "pretool",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-hermes-provider",
+      "status": "injected",
+      "t_ms": 30,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "lane": "hermes-provider",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "session_start",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-hermes-provider",
+      "status": "injected",
+      "t_ms": 10,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "lane": "hermes-provider",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "user_prompt",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-hermes-provider",
+      "status": "injected",
+      "t_ms": 20,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "lane": "zcode",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "precompact",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-zcode",
+      "status": "injected",
+      "t_ms": 40,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000002"
+      ],
+      "lane": "zcode",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "pretool",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-zcode",
+      "status": "injected",
+      "t_ms": 30,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "lane": "zcode",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "session_start",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-zcode",
+      "status": "injected",
+      "t_ms": 10,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "lane": "zcode",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "user_prompt",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-zcode",
+      "status": "injected",
+      "t_ms": 20,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.37.0"
+    }
+  ],
+  "fixture": {
+    "generated_at": "2026-06-01T00:00:00Z",
+    "namespace": "project:fixture",
+    "version": "0.37.0"
+  },
+  "matrix": [
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "claude",
+      "moment": "precompact",
+      "silent": 0,
+      "t_ms": 40,
+      "t_ms_avg": 40,
+      "t_ms_max": 40,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 1,
+      "injected": 0,
+      "lane": "claude",
+      "moment": "pretool",
+      "silent": 1,
+      "t_ms": 30,
+      "t_ms_avg": 30,
+      "t_ms_max": 30,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 1,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 0,
+      "lane": "claude",
+      "moment": "session_start",
+      "silent": 1,
+      "t_ms": 10,
+      "t_ms_avg": 10,
+      "t_ms_max": 10,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 1,
+      "injected": 0,
+      "lane": "claude",
+      "moment": "user_prompt",
+      "silent": 1,
+      "t_ms": 20,
+      "t_ms_avg": 20,
+      "t_ms_max": 20,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "codex",
+      "moment": "precompact",
+      "silent": 0,
+      "t_ms": 40,
+      "t_ms_avg": 40,
+      "t_ms_max": 40,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "codex",
+      "moment": "pretool",
+      "silent": 0,
+      "t_ms": 30,
+      "t_ms_avg": 30,
+      "t_ms_max": 30,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "codex",
+      "moment": "session_start",
+      "silent": 0,
+      "t_ms": 10,
+      "t_ms_avg": 10,
+      "t_ms_max": 10,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "codex",
+      "moment": "user_prompt",
+      "silent": 0,
+      "t_ms": 20,
+      "t_ms_avg": 20,
+      "t_ms_max": 20,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "hermes-compat",
+      "moment": "precompact",
+      "silent": 0,
+      "t_ms": 40,
+      "t_ms_avg": 40,
+      "t_ms_max": 40,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "hermes-compat",
+      "moment": "pretool",
+      "silent": 0,
+      "t_ms": 30,
+      "t_ms_avg": 30,
+      "t_ms_max": 30,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "hermes-compat",
+      "moment": "session_start",
+      "silent": 0,
+      "t_ms": 10,
+      "t_ms_avg": 10,
+      "t_ms_max": 10,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "hermes-compat",
+      "moment": "user_prompt",
+      "silent": 0,
+      "t_ms": 20,
+      "t_ms_avg": 20,
+      "t_ms_max": 20,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "hermes-provider",
+      "moment": "precompact",
+      "silent": 0,
+      "t_ms": 40,
+      "t_ms_avg": 40,
+      "t_ms_max": 40,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "hermes-provider",
+      "moment": "pretool",
+      "silent": 0,
+      "t_ms": 30,
+      "t_ms_avg": 30,
+      "t_ms_max": 30,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "hermes-provider",
+      "moment": "session_start",
+      "silent": 0,
+      "t_ms": 10,
+      "t_ms_avg": 10,
+      "t_ms_max": 10,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "hermes-provider",
+      "moment": "user_prompt",
+      "silent": 0,
+      "t_ms": 20,
+      "t_ms_avg": 20,
+      "t_ms_max": 20,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "zcode",
+      "moment": "precompact",
+      "silent": 0,
+      "t_ms": 40,
+      "t_ms_avg": 40,
+      "t_ms_max": 40,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "zcode",
+      "moment": "pretool",
+      "silent": 0,
+      "t_ms": 30,
+      "t_ms_avg": 30,
+      "t_ms_max": 30,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "zcode",
+      "moment": "session_start",
+      "silent": 0,
+      "t_ms": 10,
+      "t_ms_avg": 10,
+      "t_ms_max": 10,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "zcode",
+      "moment": "user_prompt",
+      "silent": 0,
+      "t_ms": 20,
+      "t_ms_avg": 20,
+      "t_ms_max": 20,
+      "ver": "0.37.0",
+      "versions": [
+        "0.37.0"
+      ]
+    }
+  ]
+}

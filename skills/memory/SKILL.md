@@ -301,12 +301,44 @@ variants (`no durable memories retrieved for this session.` and
 `zmem-bg.log` carries the same cut per decision line: every
 `zmem-hook` line has `reason=` (`reason=empty-pool`, `reason=omitted`,
 `reason=below-bar`, `reason=budget-drop`, `reason=below-relevance`,
-`reason=injected`), plus `omitted=N`
+`reason=already-delivered`, `reason=injected`), plus `omitted=N`
 when the passive injection-risk filter dropped rows. The closed set lives in
 `schema_meta.py` (`INJECT_SILENT_REASONS`). Since issue #94 every line also
 ends with `sid=<sanitized session id>` (`[^A-Za-z0-9._-]` → `_`, cap 128;
 `sid=unknown` when the host sent none) — the session key doctor's
-`--miss-rate` join binds failures to injections with. Field order: `status`, `reason`, `omitted=`, `ids=`, `all=`, `tokens=`, `rendered_estimate=`, `admission_budget=`, `budget_dropped=`, `budget_truncated=`, `budget_dropped_protected=`, `ops=`, `sid=` (last, always present; the `rendered_estimate=`/`admission_budget=`/`budget_*` fields are issue #116's distinct labeled numbers and ride only when budget accounting ran).
+`--miss-rate` join binds failures to injections with. The pre-attribution legacy order was `status`, `reason`, `omitted=`, `ids=`, `all=`, `tokens=`, `rendered_estimate=`, `admission_budget=`, `budget_dropped=`, `budget_truncated=`, `budget_dropped_protected=`, `ops=`, `sid=`. Current lines append `exc=`, `moment=`, optional `lane=`, `ver=`, `t_ms=`, then `arms=`, `batch=`, `tools=`, `paths=`, and margin fields (the budget fields are issue #116's distinct labeled numbers and ride only when budget accounting ran).
+
+#### Decision attribution and report projection (issue #153)
+
+The additive decision suffix is ordered `lane=`, `ver=`, `t_ms=` after the
+historical `moment=` field and before later additive tails (`arms=`,
+`batch=`, `tools=`, `paths=`, and margin fields). Closed lanes are `claude`,
+`codex`, `zcode`, `hermes-provider`, and `hermes-compat`; runtime moments are
+`session_start`, `user_prompt`, `pretool`, `subagent`, and `precompact`.
+Silent reasons are exactly `empty-pool`, `omitted`, `below-bar`, `budget-drop`,
+`below-relevance`, `already-delivered`, and `expired` (`expired` is reserved
+for the expiry workstream and has no producer here). `reason=injected` is a
+successful decision and `reason=disabled` is the separate kill-switch marker.
+
+`already-delivered` is selected when pre-ledger candidate ids are nonempty but
+the post-ledger pool is empty, after `budget-drop` in the precedence order;
+dual-empty remains `empty-pool`. `ver=` and `t_ms=` are an all-or-nothing
+enrichment pair: `ver=` is the release-manifest semver and `t_ms=` is a
+nonnegative rounded `perf_counter` duration. A manifest/version failure keeps
+the complete legacy line and omits all attribution fields. A lane is optional
+for compatibility callers, but an explicit lane must be closed-set.
+
+`parse_bg_log` accepts legacy lines without attribution. If any attribution
+token appears, it requires valid `ver=` and decimal nonnegative `t_ms=` and
+refuses malformed enrichment; `moment=` remains open for compatibility values.
+Lane-less enriched lines and moments outside the report set stay aggregate-only.
+The named report is always a sorted, zero-filled 20-row matrix: five lanes ×
+the four report moments `session_start`, `user_prompt`, `pretool`, and
+`precompact`. The runtime `subagent` moment and `session_start_compact` are
+intentionally excluded from that 5×4 projection but remain visible in
+aggregate statistics. The local Hermes provider writes `hermes-provider`; the
+remote compatibility path writes `hermes-compat`, and invalid explicit lanes
+return structured status 2 before store work while absent lanes stay omitted.
 
 #### Query context (prior-turn operation tokens) — issue #88 / #85 direction 2
 

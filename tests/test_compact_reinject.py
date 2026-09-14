@@ -323,7 +323,7 @@ class CompactSequenceTest(unittest.TestCase):
         self.assertNotIn(LEDGER_MARKER, ctx)
         self.assertIn("Recent memories", ctx)
         tail = _decisions(self._tmp)[-1]
-        self.assertIn("moment=session_start\n", tail + "\n")
+        self.assertRegex(tail, r"moment=session_start(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?$")
         self.assertNotIn("session_start_compact", tail)
         # No-source payload (ZCode-style / manual invocation) also cold.
         p = self._drive("session-start", {
@@ -360,7 +360,7 @@ class CompactSequenceTest(unittest.TestCase):
         ctx = _ctx(p.stdout)
         self.assertIn("Recent memories", ctx)
         tail = _decisions(self._tmp)[-1]
-        self.assertIn("moment=session_start\n", tail + "\n")
+        self.assertRegex(tail, r"moment=session_start(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?$")
 
     def test_default_floor_realistic_query_injects(self):
         # PR #190 review PRR-001 residual: the DEFAULT-floor behavior of a

@@ -34,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -69,13 +70,144 @@ _MAX_CONTENT_CHARS = 65536
 _ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
 _ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint")
 _ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
+# Issue #153: closed runtime lanes.  The fallback is intentionally kept
+# byte-identical with schema_meta and the local Hermes provider.
+_INJECT_LANES = (
+    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+)
 # Issue #87 / #85 direction 1: closed reason set for silent injects — loaded
 # from schema_meta (same source as the hook body and the Hermes twin).
-_INJECT_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance")
+_INJECT_SILENT_REASONS = (
+    "empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance",
+    "already-delivered", "expired",
+)
 _INJECT_REASON_INJECTED = "injected"
 # Issue #110 (P0-5): kill-switch reason, written only by the ZMEM_INJECT=0
 # short-circuit (never by classification).
 _INJECT_REASON_DISABLED = "disabled"
+
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _release_version() -> Optional[str]:
+    """Load a valid release version, or None for legacy telemetry."""
+    candidates = [Path(__file__).resolve().parents[2] / "release-manifest.json"]
+    home = os.environ.get("ZMEM_HOME", "").strip()
+    if home:
+        candidates.append(Path(home).expanduser() / "release-manifest.json")
+    for path in candidates:
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            value = obj.get("version") if isinstance(obj, dict) else None
+            if isinstance(value, str) and _SEMVER_RE.fullmatch(value):
+                return value
+        except (OSError, ValueError, TypeError):
+            continue
+    return None
+
+
+def _authoritative_store_path() -> Optional[Path]:
+    """Resolve the store path through the same host adapter as ``store.py``.
+
+    Decision telemetry must sit beside the store used by ``session_start``.
+    In particular, a bare installation can resolve to a pre-migration legacy
+    store rather than ``~/.zmem/store.sqlite``.  Keep this best-effort because
+    telemetry is fail-open and the server may be imported without a checkout.
+    """
+    try:
+        import importlib.util
+
+        home = _resolve_zmem_home()
+        host_path = home / "skills" / "memory" / "scripts" / "host.py"
+        if not host_path.is_file():
+            return None
+        spec = importlib.util.spec_from_file_location("zmem_host_mcp", host_path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        path = mod.resolve_store_path()
+        return Path(path) if path is not None else None
+    except (Exception, SystemExit):
+        # ``_resolve_zmem_home`` uses SystemExit for a missing/invalid checkout;
+        # decision logging must never turn that diagnostic into a tool failure.
+        return None
+
+
+def _fallback_store_path() -> Path:
+    """Match storelib.schema's inline path chain when host.py is unavailable."""
+    explicit = os.environ.get("ZMEM_STORE")
+    if explicit:
+        return Path(explicit)
+    plugin_data = os.environ.get("ZCODE_PLUGIN_DATA")
+    if plugin_data:
+        return Path(plugin_data) / "store.sqlite"
+    home = Path(os.path.expanduser("~"))
+    plugin_data_pattern = home / ".zcode" / "cli" / "plugins" / "data"
+    try:
+        if plugin_data_pattern.is_dir():
+            for directory in plugin_data_pattern.iterdir():
+                if "zmem" in directory.name.lower():
+                    return directory / "store.sqlite"
+    except OSError:
+        pass
+    return home / ".zcode" / "memory" / "store.sqlite"
+
+
+def _decision_data_dir() -> Path:
+    """Resolve the actual store parent, with schema-compatible fallback."""
+    actual = _authoritative_store_path()
+    if actual is not None:
+        return actual.parent
+    return _fallback_store_path().parent
+
+
+def _rotate_decision_log(data_dir: Path) -> None:
+    """Rotate the decision log before append, preserving partial deployments."""
+    try:
+        store_py = _resolve_store_py()
+        scripts_dir = str(Path(store_py).resolve().parent)
+        saved = sys.path[:]
+        try:
+            sys.path.insert(0, scripts_dir)
+            from storelib.log_rotate import rotate_on_append
+            rotate_on_append(str(data_dir / "zmem-decisions.log"))
+        finally:
+            sys.path[:] = saved
+    except (Exception, SystemExit):
+        # Rotation is best effort: a missing storelib must not lose telemetry.
+        pass
+
+
+def _append_session_decision(*, status: str, reason: str, ids: list[Any],
+                             all_ids: list[Any], omitted: int = 0,
+                             excluded: int = 0, session_id: str = "",
+                             moment: str = "session_start", lane: str | None = None,
+                             t_ms: int = 0) -> None:
+    """Append one compatibility decision line; telemetry is fail-open."""
+    try:
+        data_dir = _decision_data_dir()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        version = _release_version()
+        attrib = ""
+        if version and (lane is None or lane in _INJECT_LANES):
+            lane_f = f" lane={lane}" if lane is not None else ""
+            attrib = f"{lane_f} ver={version} t_ms={max(0, int(t_ms))}"
+        omitted_f = f" omitted={int(omitted)}" if omitted and omitted > 0 else ""
+        exc_f = f" exc={int(excluded)}" if excluded and excluded > 0 else ""
+        safe_sid = re.sub(r"[^A-Za-z0-9._-]", "_", str(session_id or ""))[:128] or "unknown"
+        safe_moment = re.sub(r"[^A-Za-z0-9._-]", "_", str(moment or ""))[:32]
+        moment_f = f" moment={safe_moment}" if safe_moment else ""
+        line = (
+            f"[{int(time.time())}] zmem-hook status={status} reason={reason}"
+            f"{omitted_f} ids={list(ids)} all={list(all_ids)}{exc_f}"
+            f" sid={safe_sid}{moment_f}{attrib}\n"
+        )
+        _rotate_decision_log(data_dir)
+        with (data_dir / "zmem-decisions.log").open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception as exc:  # pragma: no cover - logging must not break MCP
+        logger.debug("zmem-mcp: decision-log append failed: %s", exc)
 
 
 def _inject_disabled() -> bool:
@@ -173,6 +305,7 @@ def _load_store_constants() -> None:
     lazily via _resolve_zmem_home() at first use.
     """
     global _MAX_CONTENT_CHARS, _ALLOWED_SIGNALS, _ALLOWED_TYPES, _ALLOWED_TAINTS
+    global _INJECT_LANES
     global _INJECT_SILENT_REASONS, _INJECT_REASON_INJECTED
     global _INJECT_REASON_DISABLED
     try:
@@ -215,6 +348,9 @@ def _load_store_constants() -> None:
         reasons = getattr(mod, "INJECT_SILENT_REASONS", None)
         if reasons:
             _INJECT_SILENT_REASONS = tuple(reasons)
+        lanes = getattr(mod, "INJECT_LANES", None)
+        if lanes:
+            _INJECT_LANES = tuple(lanes)
         _INJECT_REASON_INJECTED = getattr(
             mod, "INJECT_REASON_INJECTED", _INJECT_REASON_INJECTED
         )
@@ -489,13 +625,24 @@ def _namespace_guard_denial(
     return None
 
 
-def _run_store(args: list[str], input_text: str | None = None) -> dict[str, Any]:
+def _run_store(
+    args: list[str], input_text: str | None = None,
+    timing: Optional[dict[str, int]] = None,
+) -> dict[str, Any]:
     """Run ``store.py <args>``; returns {ok, stdout, stderr, returncode}.
 
     ``input_text`` (optional) is piped to the child's stdin — used for
     oversize content (see ``_ARGV_SAFE_CONTENT_CHARS``)."""
     store_py = _resolve_store_py()
     cmd = [sys.executable, str(store_py), *args]
+    # Start at the exact subprocess boundary.  Resolving paths and waiting for
+    # the async semaphore happen outside this interval.
+    started = time.perf_counter()
+
+    def _record_timing() -> None:
+        if timing is not None:
+            timing["t_ms"] = max(0, int(round((time.perf_counter() - started) * 1000)))
+
     try:
         proc = subprocess.run(  # noqa: S603
             cmd,
@@ -506,6 +653,7 @@ def _run_store(args: list[str], input_text: str | None = None) -> dict[str, Any]
             errors="replace",
             timeout=_STORE_TIMEOUT_S,
         )
+        _record_timing()
         return {
             "ok": proc.returncode == 0,
             "stdout": proc.stdout,
@@ -513,6 +661,7 @@ def _run_store(args: list[str], input_text: str | None = None) -> dict[str, Any]
             "returncode": proc.returncode,
         }
     except subprocess.TimeoutExpired:
+        _record_timing()
         return {
             "ok": False,
             "stdout": "",
@@ -520,6 +669,7 @@ def _run_store(args: list[str], input_text: str | None = None) -> dict[str, Any]
             "returncode": 124,
         }
     except Exception as exc:  # pragma: no cover — defensive
+        _record_timing()
         return {
             "ok": False,
             "stdout": "",
@@ -561,7 +711,8 @@ def _get_executor() -> "ThreadPoolExecutor":
 
 
 async def _run_store_async(
-    args: list[str], input_text: str | None = None
+    args: list[str], input_text: str | None = None,
+    timing: Optional[dict[str, int]] = None,
 ) -> dict[str, Any]:
     """Async, concurrency-bounded wrapper around the sync ``_run_store``.
 
@@ -603,7 +754,12 @@ async def _run_store_async(
     # done-callback fires when the worker thread returns), not the asyncio
     # wrapper (whose callback fires on cancellation, too early).
     executor = _get_executor()
-    cfut = executor.submit(_run_store, args, input_text=input_text)
+    if timing is None:
+        # Preserve the historical call shape for partial deployments and tests
+        # that provide a compatible _run_store shim without instrumentation.
+        cfut = executor.submit(_run_store, args, input_text=input_text)
+    else:
+        cfut = executor.submit(_run_store, args, input_text=input_text, timing=timing)
 
     def _release_on_worker_done(_cfut, _loop=loop, _sem=sem):
         # Runs in the worker thread on completion — marshal release to the loop.
@@ -650,6 +806,17 @@ def _clamp_limit(raw: Any) -> int:
 
 def _error(message: str) -> dict[str, Any]:
     return {"error": message}
+
+
+def _invalid_argument(field: str, value: Any) -> dict[str, Any]:
+    """Return the structured status-2 adapter refusal used by MCP inputs."""
+    return {
+        "error": "invalid argument",
+        "field": field,
+        "value": value,
+        "status": 2,
+        "exit_code": 2,
+    }
 
 
 def _write_response(r: dict[str, Any], *, ok_result: str) -> dict[str, Any]:
@@ -1348,6 +1515,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
     async def session_start(
         namespace: Optional[str] = None,
         limit: int = 3,
+        lane: Optional[str] = None,
     ) -> dict[str, Any]:
         """Passive session prefetch (issue #65, 10.5 — the D4 contract).
 
@@ -1371,6 +1539,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ``namespace`` omitted resolves to the server default user:global — a
         scoped token must be allowed for it (or pass its own namespace).
         """
+        # ``lane`` is optional for old clients.  An explicit value is closed
+        # and rejected before namespace/store work so a typo cannot produce an
+        # unattributed compatibility decision or start a subprocess.
+        if lane is not None and lane not in _INJECT_LANES:
+            return _invalid_argument("lane", lane)
         resolved_ns = (namespace or "").strip() or "user:global"
         if resolved_ns == "*":
             # F7: recent requires a CONCRETE namespace — '*' would be a
@@ -1385,6 +1558,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if _inject_disabled():
             logger.info(
                 "session_start: status=silent reason=disabled (ZMEM_INJECT=0)")
+            _append_session_decision(
+                status="silent", reason=_INJECT_REASON_DISABLED,
+                ids=[], all_ids=[], lane=lane, t_ms=0,
+            )
             return {
                 "result": "session_started",
                 "namespace": resolved_ns,
@@ -1414,13 +1591,25 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ]
         if _include_global_allowed() and resolved_ns != "user:global":
             args += ["--include-global", "--global-limit", "2"]
-        r = await _run_store_async(args)
+        timing: dict[str, int] = {}
+        r = await _run_store_async(args, timing=timing)
+        # _run_store records only the actual subprocess attempt.  Semaphore
+        # queue time and pre-attempt failures intentionally remain zero.
+        elapsed = timing.get("t_ms", 0)
         if not r["ok"]:
+            _append_session_decision(
+                status="silent", reason="omitted", ids=[], all_ids=[], lane=lane,
+                t_ms=elapsed,
+            )
             return _error(_sanitize_store_error(r))
         stdout = (r["stdout"] or "").strip()
         try:
             parsed = json.loads(stdout) if stdout else {}
         except json.JSONDecodeError:
+            _append_session_decision(
+                status="silent", reason="omitted", ids=[], all_ids=[], lane=lane,
+                t_ms=elapsed,
+            )
             return _error("non-JSON from store.py session prefetch")
         if _inject is not None:
             rows = _inject.envelope_results(parsed)
@@ -1428,6 +1617,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             rows = parsed.get("results", []) if isinstance(parsed, dict) else parsed
         if not isinstance(rows, list):
             rows = []
+        candidate_ids = parsed.get("candidate_ids", []) if isinstance(parsed, dict) else []
+        if not isinstance(candidate_ids, list):
+            candidate_ids = []
+        candidate_ids = [str(mid) for mid in candidate_ids]
+        excluded = parsed.get("excluded", 0) if isinstance(parsed, dict) else 0
+        if not isinstance(excluded, int) or isinstance(excluded, bool):
+            excluded = 0
         omitted = parsed.get("omitted", 0) if isinstance(parsed, dict) else 0
         # Issue #115: the store names the silent reason when the in-store
         # gate (now incl. the trust floor) emptied the set.
@@ -1495,10 +1691,15 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         reason = _INJECT_REASON_INJECTED
         try:
             if not rows:
-                if store_reason and store_reason in _INJECT_SILENT_REASONS:
-                    reason = store_reason
-                elif budget_dropped:
+                # Match the dependency-free classifier for older envelopes:
+                # budget-drop wins, then a nonempty pre-ledger candidate set
+                # with no valid stamped reason is already-delivered.
+                if budget_dropped:
                     reason = "budget-drop"
+                elif store_reason and store_reason in _INJECT_SILENT_REASONS:
+                    reason = store_reason
+                elif candidate_ids:
+                    reason = "already-delivered"
                 elif omitted > 0:
                     reason = "omitted"
                 else:
@@ -1531,6 +1732,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # Measured on the FINAL emitted context (post empty-
             # replacement), matching the Hermes twin (final-critic A4).
             tokens_used = _inject.estimate_tokens(context)
+        _append_session_decision(
+            status="injected" if rows else "silent", reason=reason,
+            ids=[row.get("id") for row in rows],
+            all_ids=candidate_ids or [row.get("id") for row in rows],
+            omitted=omitted, excluded=excluded, lane=lane, t_ms=elapsed,
+        )
         return {
             "result": "session_started",
             "namespace": resolved_ns,

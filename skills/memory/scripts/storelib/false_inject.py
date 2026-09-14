@@ -50,6 +50,16 @@ _SID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 LEGACY_MOMENT = "legacy"
 
+# Keep report projection order stable across miss-rate, false-injection, and
+# doctor consumers.  Runtime ``subagent`` and compatibility moments remain
+# aggregate-visible but are deliberately outside the exact 5x4 named matrix.
+_ATTR_LANES = (
+    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+)
+_REPORT_LANES = tuple(sorted(_ATTR_LANES))
+_REPORT_MOMENTS = tuple(sorted(
+    ("session_start", "user_prompt", "pretool", "precompact")))
+
 # Injected-line predicate: writer A's explicit reason=injected OR writer
 # B's legacy shape (status=injected, no reason field) — the SAME filter the
 # miss-rate join uses (see miss_rate.run_miss_report; filtering on
@@ -302,6 +312,16 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
 
     overall = _bucket()
     per_moment: dict = {}
+    matrix = {
+        (lane, moment): {
+            "lane": lane, "moment": moment, "count": 0,
+            "injected": 0, "used": 0, "false": 0,
+            "false_rate": None, "t_ms": 0, "ver": None, "versions": [],
+        }
+        for lane in _REPORT_LANES for moment in _REPORT_MOMENTS
+    }
+    aggregate = {"lane_less": 0, "moments_outside_matrix": 0,
+                 "legacy": 0, "enriched": 0}
     legacy_lines = 0
 
     for ln in decision_lines:
@@ -313,9 +333,30 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
         moment = _moment_of(ln)
         if moment == LEGACY_MOMENT:
             legacy_lines += 1
+        lane = ln.get("lane")
+        if lane is None:
+            aggregate["lane_less"] += 1
+        if moment not in _REPORT_MOMENTS:
+            aggregate["moments_outside_matrix"] += 1
+        if ln.get("ver") is None and ln.get("t_ms") is None:
+            aggregate["legacy"] += 1
+        else:
+            aggregate["enriched"] += 1
         bucket = per_moment.setdefault(moment, _bucket())
         overall["injected"] += 1
         bucket["injected"] += 1
+        matrix_bucket = matrix.get((lane, moment))
+        if matrix_bucket is not None:
+            matrix_bucket["count"] += 1
+            matrix_bucket["injected"] += 1
+            duration = ln.get("t_ms")
+            if (isinstance(duration, int) and not isinstance(duration, bool)
+                    and duration >= 0):
+                matrix_bucket["t_ms"] += duration
+            version = ln.get("ver")
+            if (isinstance(version, str)
+                    and version not in matrix_bucket["versions"]):
+                matrix_bucket["versions"].append(version)
 
         sid = _norm_sid(ln.get("sid"))
         if sid and sid != "unknown":
@@ -355,9 +396,13 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
         if used:
             overall["used"] += 1
             bucket["used"] += 1
+            if matrix_bucket is not None:
+                matrix_bucket["used"] += 1
         else:
             overall["false"] += 1
             bucket["false"] += 1
+            if matrix_bucket is not None:
+                matrix_bucket["false"] += 1
 
     if legacy_lines:
         caveats.append(
@@ -374,9 +419,20 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
             b["false_rate"] = round(b["false"] / b["injected"], 4)
         return b
 
+    for bucket in matrix.values():
+        bucket["versions"].sort()
+        if len(bucket["versions"]) == 1:
+            bucket["ver"] = bucket["versions"][0]
+        if bucket["injected"]:
+            bucket["false_rate"] = round(
+                bucket["false"] / bucket["injected"], 4)
+    matrix_rows = [matrix[key] for key in sorted(matrix)]
+
     return {
         "overall": _rates(overall),
         "per_moment": {m: _rates(b) for m, b in sorted(per_moment.items())},
+        "lane_moment_matrix": matrix_rows,
+        "attribution": {"matrix": matrix_rows, "aggregate": aggregate},
         "min_token_overlap": threshold,
         "caveats": caveats,
     }

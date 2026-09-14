@@ -460,7 +460,10 @@ def _remote_context() -> str:
         return ""
     timeout_s = _clamp_timeout(os.environ.get("ZMEM_MCP_TIMEOUT", ""))
     ns = _resolve_hook_namespace()
-    cmd = [sys.executable, str(client), "--url", url, "call", "session_start"]
+    # Compatibility lane attribution is carried end-to-end to the remote
+    # SessionStart writer; the server validates it before any store call.
+    cmd = [sys.executable, str(client), "--url", url, "call", "session_start",
+           "--lane", "hermes-compat"]
     if ns:
         cmd += ["--namespace", ns]
     try:

@@ -70,6 +70,20 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 # forge log structure or a ring filename.
 _SID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
+# Issue #153 attribution is an additive wire suffix.  Keep the parser's
+# fallback literals byte-identical to the deployed writers: this module is
+# also used from copied/partially served installations where schema_meta may
+# not be importable.  ``moment`` deliberately remains open below for older
+# compatibility values (for example ``session_start_compact``).
+_ATTR_LANES = (
+    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+)
+_ATTR_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+_ATTR_TOKEN_RE = re.compile(r"(?:^|\s)(?:lane|ver|t_ms)=")
+_REPORT_LANES = tuple(sorted(_ATTR_LANES))
+_REPORT_MOMENTS = tuple(sorted(
+    ("session_start", "user_prompt", "pretool", "precompact")))
+
 # One bg-log decision line, either writer shape:
 #   writer A: [ts] zmem-hook status=.. reason=.. [omitted=N] ids=[..] all=[..] [tokens=a/b] [ops=N] [sid=..] [moment=..]
 #   writer B: [ts] zmem-hook status=.. ids=[..] all=[..] [tokens=a/b] [sid=..]
@@ -97,6 +111,13 @@ _BG_LINE_RE = re.compile(
     r"(?: exc=(\d+))?"
     r"(?: sid=(\S+))?"
     r"(?: moment=(\S+))?"
+    # Issue #153: attribution is inserted after moment and before every
+    # historical additive tail.  The groups are syntactically permissive so
+    # the semantic validator below can reject partial/invalid enrichment
+    # rather than silently treating it as legacy.
+    r"(?: lane=(\S+))?"
+    r"(?: ver=(\S+))?"
+    r"(?: t_ms=(\S+))?"
     # Issue #136: the additive arms= attribution field (per-arm pre/post-cap
     # counts, e.g. arms=fts:3/15,vec:0/25,ent:2/50,graph:1/5) must keep old
     # lines matching AND parse new-format lines — same additive rule as the
@@ -209,12 +230,33 @@ def parse_bg_log(path) -> list:
             if not m:
                 continue
             (ts, status, reason, omitted, ids_raw, all_raw, _tok, ops,
-             exc, sid, moment, arms, _batch, _tools, _paths, margin,
-             margin_pruned_raw, _store_timeout) = m.groups()
+             exc, sid, moment, lane, version, t_ms_raw, arms, _batch,
+             _tools, _paths, margin, margin_pruned_raw, _store_timeout) = m.groups()
             try:
                 ts = int(ts)
             except ValueError:
                 continue
+            # Any attribution token makes the line enriched.  Enrichment is
+            # all-or-nothing: ``ver`` and non-negative decimal ``t_ms`` are
+            # mandatory, while lane is optional but closed-set when present.
+            # Refuse the line on malformed enrichment rather than half-parsing
+            # it as an older decision.  A line without any attribution token
+            # remains fully legacy-compatible.
+            enriched = bool(_ATTR_TOKEN_RE.search(line))
+            if enriched:
+                if (not isinstance(version, str)
+                        or not _ATTR_VERSION_RE.fullmatch(version)
+                        or not isinstance(t_ms_raw, str)
+                        or not re.fullmatch(r"\d+", t_ms_raw)
+                        or (lane is not None and lane not in _ATTR_LANES)):
+                    continue
+                t_ms = int(t_ms_raw)
+            else:
+                # A syntactically captured optional group should not be
+                # possible without the token detector, but make the returned
+                # shape explicit for callers and future regex edits.
+                lane = version = None
+                t_ms = None
             # Issue #116 (AC3): keep the tokens=a/b field as numbers so the
             # report can count over-budget decisions. Non-numeric shapes
             # (legacy "-", garbage) stay None and never count.
@@ -241,6 +283,9 @@ def parse_bg_log(path) -> list:
                 "exc": int(exc) if exc else None,
                 "sid": sid,
                 "moment": moment,
+                "lane": lane,
+                "ver": version,
+                "t_ms": t_ms,
                 # Issue #136: the additive arms= attribution field, verbatim
                 # (the B-1 report surfaces which arm carried a hit).
                 "arms": arms,
@@ -251,6 +296,93 @@ def parse_bg_log(path) -> list:
                 "margin_pruned": (_parse_id_list(margin_pruned_raw)
                                    if margin_pruned_raw else None),
             })
+    return out
+
+
+def _decision_matrix(decision_lines) -> list:
+    """Return the deterministic named-lane/report-moment matrix.
+
+    The matrix is intentionally a *reporting* projection, not a parser gate:
+    lane-less enriched lines and valid compatibility moments remain available
+    in aggregate statistics but cannot be assigned to a named 5x4 cell.  A
+    row is emitted for every cell, including zero cells, so consumers can
+    compare reports without manufacturing missing buckets.  ``t_ms`` is the
+    non-negative sum of decision durations in that cell; ``t_ms_max`` and
+    ``t_ms_avg`` preserve useful timing detail while remaining integer-valued.
+    """
+    buckets = {
+        (lane, moment): {
+            "lane": lane, "moment": moment, "count": 0,
+            "injected": 0, "silent": 0, "already_delivered": 0,
+            "empty_pool": 0, "t_ms": 0, "t_ms_max": 0,
+            "ver": None, "versions": [],
+        }
+        for lane in _REPORT_LANES for moment in _REPORT_MOMENTS
+    }
+    for line in decision_lines or ():
+        if not isinstance(line, dict):
+            continue
+        lane = line.get("lane")
+        moment = line.get("moment")
+        key = (lane, moment)
+        if key not in buckets:
+            continue
+        bucket = buckets[key]
+        bucket["count"] += 1
+        if line.get("status") == "injected":
+            bucket["injected"] += 1
+        else:
+            bucket["silent"] += 1
+        if line.get("reason") == "already-delivered":
+            bucket["already_delivered"] += 1
+        if line.get("reason") == "empty-pool":
+            bucket["empty_pool"] += 1
+        timing = line.get("t_ms")
+        if isinstance(timing, int) and not isinstance(timing, bool) and timing >= 0:
+            bucket["t_ms"] += timing
+            bucket["t_ms_max"] = max(bucket["t_ms_max"], timing)
+        version = line.get("ver")
+        if isinstance(version, str) and version not in bucket["versions"]:
+            bucket["versions"].append(version)
+    for bucket in buckets.values():
+        bucket["versions"].sort()
+        if len(bucket["versions"]) == 1:
+            bucket["ver"] = bucket["versions"][0]
+        bucket["t_ms_avg"] = (
+            int(round(bucket["t_ms"] / bucket["count"]))
+            if bucket["count"] else 0
+        )
+    return [buckets[key] for key in sorted(buckets)]
+
+
+def build_decision_matrix(decision_lines) -> list:
+    """Public wrapper for the stable issue #153 report projection."""
+    return _decision_matrix(decision_lines)
+
+
+# Descriptive alias for callers that name the dimensions explicitly.
+build_lane_moment_matrix = build_decision_matrix
+
+
+def _attribution_aggregate(decision_lines) -> dict:
+    """Summarize attribution that the exact named matrix intentionally omits."""
+    out = {"lane_less": 0, "moments_outside_matrix": 0,
+           "legacy": 0, "enriched": 0, "versions": []}
+    for line in decision_lines or ():
+        if not isinstance(line, dict):
+            continue
+        if line.get("lane") is None:
+            out["lane_less"] += 1
+        if line.get("moment") not in _REPORT_MOMENTS:
+            out["moments_outside_matrix"] += 1
+        if line.get("ver") is None and line.get("t_ms") is None:
+            out["legacy"] += 1
+        else:
+            out["enriched"] += 1
+            version = line.get("ver")
+            if isinstance(version, str) and version not in out["versions"]:
+                out["versions"].append(version)
+    out["versions"].sort()
     return out
 
 
@@ -1092,6 +1224,13 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         caveats.append("no bg-log decision lines found — every matched "
                        "failure is classified missed by construction.")
 
+    # Issue #153: retain the complete parsed attribution surface in the
+    # read-only report.  The exact matrix is always 20 rows, sorted and
+    # zero-filled; the aggregate side records lane-less/compatibility values
+    # that intentionally do not fit the named report projection.
+    attribution_matrix = _decision_matrix(lines)
+    attribution_aggregate = _attribution_aggregate(lines)
+
     return {
         "store": str(store.resolve()),
         "data_dir": data_dir,
@@ -1113,6 +1252,11 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
                  "lines_without_arms": arms_lines_without,
                  "carried": arm_carry},
         "false_injection": false_injection,
+        "lane_moment_matrix": attribution_matrix,
+        "attribution": {
+            "matrix": attribution_matrix,
+            "aggregate": attribution_aggregate,
+        },
         "missed_all_only": missed_all_only,
         "query_source": query_source,
         "no_query_pct": _pct(counts["no_query"], len(failures)),

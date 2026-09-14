@@ -66,6 +66,25 @@ README.
   `user:global` — never a path-shaped namespace, so a transient Git
   failure can no longer strand captured memories under a path namespace
   nothing resolves.
+> Workstream G PR 1 of 5 (issue #153): host-lane attribution and an
+> already-delivered reason in the decision log.
+
+### Added
+- **Closed decision attribution**: passive decision lines can identify the
+  host lane (`claude`, `codex`, `zcode`, `hermes-provider`, or `hermes-compat`),
+  runtime moment, release semver, and nonnegative store-attempt duration while
+  preserving the complete legacy line when a manifest cannot be loaded.
+- **Already-delivered classification**: the classifier distinguishes a
+  nonempty pre-delivery candidate set emptied by the delivery ledger from a
+  genuinely empty pool, with the exact closed seven-reason vocabulary shared
+  by schema, hooks, Hermes, parser, and reports.
+- **Deterministic attribution reports**: miss-rate reporting parses enriched and
+  legacy lines, keeps compatibility values aggregate-visible, and emits a
+  sorted, zero-filled 20-row matrix for the five named lanes and four report
+  moments.
+- **Hermes compatibility attribution**: local provider and remote MCP paths
+  carry their lane identity, reject invalid explicit lanes before store work,
+  and omit the optional lane for legacy callers.
 
 ## [0.36.0] - 2026-09-13
 

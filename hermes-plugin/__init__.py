@@ -21,8 +21,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -98,6 +100,26 @@ def _resolve_store_py() -> Optional[Path]:
     return candidate if candidate.is_file() else None
 
 
+def _fallback_store_path() -> Path:
+    """Match storelib.schema's inline path chain when host.py is unavailable."""
+    explicit = os.environ.get("ZMEM_STORE")
+    if explicit:
+        return Path(explicit)
+    plugin_data = os.environ.get("ZCODE_PLUGIN_DATA")
+    if plugin_data:
+        return Path(plugin_data) / "store.sqlite"
+    home = Path(os.path.expanduser("~"))
+    plugin_data_pattern = home / ".zcode" / "cli" / "plugins" / "data"
+    try:
+        if plugin_data_pattern.is_dir():
+            for directory in plugin_data_pattern.iterdir():
+                if "zmem" in directory.name.lower():
+                    return directory / "store.sqlite"
+    except OSError:
+        pass
+    return home / ".zcode" / "memory" / "store.sqlite"
+
+
 def _resolve_store_data_dir() -> Path:
     """Resolve the zmem data dir holding ``store.sqlite`` and ``core.md``.
 
@@ -113,11 +135,11 @@ def _resolve_store_data_dir() -> Path:
         return _host().resolve_store_path().parent
     except Exception as exc:
         # host.py absent/broken, or a module-name collision in sys.modules.
-        # Fall back to the historical default so the provider degrades rather
-        # than crashes — but log it so the divergence from store.py is visible
-        # (store.py subprocesses resolve via host.py's full chain regardless).
-        logger.warning("zmem: host.py resolution failed (%s); falling back to ~/.zmem", exc)
-        return Path.home() / ".zmem"
+        # Fall back to storelib.schema's dependency-free legacy chain so the
+        # provider degrades without pointing telemetry at a different store.
+        fallback = _fallback_store_path()
+        logger.warning("zmem: host.py resolution failed (%s); falling back to %s", exc, fallback)
+        return fallback.parent
 
 
 def _resolve_core_md() -> Path:
@@ -165,7 +187,15 @@ _STORE_CONSTANTS = {
     "MAX_CONTENT_CHARS": 65536,
     # issue #87 / #85 direction 1: closed reason set for silent injects (the
     # session_start twin classifies with the SAME tuple the hook body uses).
-    "INJECT_SILENT_REASONS": ("empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance"),
+    # Issue #153: closed decision-log vocabularies.  Keep this fallback
+    # byte-identical with schema_meta/inject.py so an in-tree provider with a
+    # temporarily unreachable skills checkout still emits compatible logs.
+    "INJECT_LANES": ("claude", "codex", "zcode", "hermes-provider", "hermes-compat"),
+    "INJECT_MOMENTS": ("session_start", "user_prompt", "pretool", "subagent", "precompact"),
+    "INJECT_SILENT_REASONS": (
+        "empty-pool", "omitted", "below-bar", "budget-drop",
+        "below-relevance", "already-delivered", "expired",
+    ),
     "INJECT_REASON_INJECTED": "injected",
     # issue #110 (P0-5): kill-switch reason, written only by the
     # ZMEM_INJECT=0 short-circuit (never by classification).
@@ -203,6 +233,8 @@ def _store_constants() -> Dict[str, Any]:
             "ALLOWED_TYPES": getattr(mod, "ALLOWED_TYPES", _STORE_CONSTANTS["ALLOWED_TYPES"]),
             "ALLOWED_TAINTS": getattr(mod, "ALLOWED_TAINTS", _STORE_CONSTANTS["ALLOWED_TAINTS"]),
             "MAX_CONTENT_CHARS": getattr(mod, "MAX_CONTENT_CHARS", _STORE_CONSTANTS["MAX_CONTENT_CHARS"]),
+            "INJECT_LANES": tuple(getattr(mod, "INJECT_LANES", _STORE_CONSTANTS["INJECT_LANES"])),
+            "INJECT_MOMENTS": tuple(getattr(mod, "INJECT_MOMENTS", _STORE_CONSTANTS["INJECT_MOMENTS"])),
             "INJECT_SILENT_REASONS": tuple(getattr(mod, "INJECT_SILENT_REASONS", _STORE_CONSTANTS["INJECT_SILENT_REASONS"])),
             "INJECT_REASON_INJECTED": getattr(mod, "INJECT_REASON_INJECTED", _STORE_CONSTANTS["INJECT_REASON_INJECTED"]),
             "INJECT_REASON_DISABLED": getattr(mod, "INJECT_REASON_DISABLED", _STORE_CONSTANTS["INJECT_REASON_DISABLED"]),
@@ -210,6 +242,103 @@ def _store_constants() -> Dict[str, Any]:
     except Exception as exc:
         logger.debug("zmem: schema_meta constants load failed (%s); using defaults", exc)
         return dict(_STORE_CONSTANTS)
+
+
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _release_version() -> Optional[str]:
+    """Return the validated release version used by decision attribution.
+
+    The provider is deliberately fail-open: a missing or malformed manifest
+    keeps the decision audit trail in its complete legacy shape instead of
+    writing a partially-attributed line.  The in-tree manifest is preferred,
+    while ``ZMEM_HOME`` supports a copied plugin installation.
+    """
+    candidates = [Path(__file__).resolve().parent.parent / "release-manifest.json"]
+    home = _resolve_zmem_home()
+    if home is not None:
+        candidates.append(home / "release-manifest.json")
+    for path in candidates:
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            version = obj.get("version") if isinstance(obj, dict) else None
+            if isinstance(version, str) and _SEMVER_RE.fullmatch(version):
+                return version
+        except (OSError, ValueError, TypeError):
+            continue
+    return None
+
+
+def _elapsed_ms(start: float, end: Optional[float] = None) -> int:
+    """Round one local operation duration to a non-negative millisecond value."""
+    stop = time.perf_counter() if end is None else end
+    return max(0, int(round((stop - start) * 1000)))
+
+
+def _decision_sid(value: Any) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(value or ""))[:128]
+    return safe or "unknown"
+
+
+def _rotate_decision_log(data_dir: Path) -> None:
+    """Rotate the decision log before append, preserving partial deployments."""
+    try:
+        store_py = _resolve_store_py()
+        if store_py is None:
+            return
+        saved = sys.path[:]
+        try:
+            sys.path.insert(0, str(Path(store_py).resolve().parent))
+            from storelib.log_rotate import rotate_on_append
+            rotate_on_append(str(data_dir / "zmem-decisions.log"))
+        finally:
+            sys.path[:] = saved
+    except (Exception, SystemExit):
+        # Rotation is best effort: a missing storelib must not lose telemetry.
+        pass
+
+
+def _append_session_decision(*, status: str, reason: str, ids: list[Any],
+                             all_ids: list[Any], omitted: int = 0,
+                             excluded: int = 0, session_id: str = "",
+                             moment: str = "session_start", lane: str = "",
+                             t_ms: int = 0) -> None:
+    """Append the local Hermes SessionStart decision line, fail-open.
+
+    ``lane``, ``ver`` and ``t_ms`` are one atomic attribution suffix.  If the
+    release manifest cannot be validated, all three are omitted so a legacy
+    parser never sees a half-enriched line.  The stable prefix and additive
+    tail match the shared hook writer's wire order.
+    """
+    try:
+        data_dir = _resolve_store_data_dir()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        version = _release_version()
+        attrib = ""
+        if version:
+            consts = _store_constants()
+            # ``lane`` is optional for compatibility callers.  A valid
+            # version/timing pair may still enrich a lane-less line; only an
+            # explicit invalid lane suppresses the atomic suffix (fixed local
+            # provider calls always use hermes-provider).
+            if lane is None or lane in consts["INJECT_LANES"]:
+                lane_f = f" lane={lane}" if lane is not None else ""
+                attrib = f"{lane_f} ver={version} t_ms={max(0, int(t_ms))}"
+        omitted_f = f" omitted={int(omitted)}" if omitted and omitted > 0 else ""
+        exc_f = f" exc={int(excluded)}" if excluded and excluded > 0 else ""
+        safe_moment = re.sub(r"[^A-Za-z0-9._-]", "_", str(moment or ""))[:32]
+        moment_f = f" moment={safe_moment}" if safe_moment else ""
+        line = (
+            f"[{int(time.time())}] zmem-hook status={status} reason={reason}"
+            f"{omitted_f} ids={list(ids)} all={list(all_ids)}{exc_f}"
+            f" sid={_decision_sid(session_id)}{moment_f}{attrib}\n"
+        )
+        _rotate_decision_log(data_dir)
+        with (data_dir / "zmem-decisions.log").open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception as exc:  # pragma: no cover - telemetry must not break tools
+        logger.debug("zmem: Hermes decision-log append failed: %s", exc)
 
 
 def _python_bin() -> str:
@@ -378,7 +507,10 @@ def _sanitize_store_error(r: Dict[str, Any], limit: int = 200) -> str:
     return chosen
 
 
-def _run_store(args: List[str], input_text: str | None = None) -> Dict[str, Any]:
+def _run_store(
+    args: List[str], input_text: str | None = None,
+    timing: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
     """Run ``store.py <args>`` and return ``{ok, stdout, stderr, returncode}``.
 
     Always returns a dict (never raises) — memory must fail-open. The caller
@@ -395,6 +527,14 @@ def _run_store(args: List[str], input_text: str | None = None) -> Dict[str, Any]
             "returncode": 127,
         }
     cmd = [_python_bin(), str(store_py), *args]
+    # Start at the exact subprocess boundary.  Path resolution is outside this
+    # interval, matching the MCP server's attributed timing contract.
+    started = time.perf_counter()
+
+    def _record_timing() -> None:
+        if timing is not None:
+            timing["t_ms"] = _elapsed_ms(started)
+
     try:
         proc = subprocess.run(  # noqa: S603 — argv is constructed, not shell
             cmd,
@@ -405,6 +545,7 @@ def _run_store(args: List[str], input_text: str | None = None) -> Dict[str, Any]
             errors="replace",
             timeout=_STORE_TIMEOUT_S,
         )
+        _record_timing()
         return {
             "ok": proc.returncode == 0,
             "stdout": proc.stdout,
@@ -412,6 +553,7 @@ def _run_store(args: List[str], input_text: str | None = None) -> Dict[str, Any]
             "returncode": proc.returncode,
         }
     except subprocess.TimeoutExpired:
+        _record_timing()
         return {
             "ok": False,
             "stdout": "",
@@ -419,6 +561,7 @@ def _run_store(args: List[str], input_text: str | None = None) -> Dict[str, Any]
             "returncode": 124,
         }
     except Exception as exc:  # pragma: no cover — defensive
+        _record_timing()
         return {
             "ok": False,
             "stdout": "",
@@ -1226,6 +1369,11 @@ class ZmemMemoryProvider(MemoryProvider):
             logger.info(
                 "zmem session_start: status=silent "
                 "reason=disabled (ZMEM_INJECT=0)")
+            _append_session_decision(
+                status="silent", reason=_store_constants()["INJECT_REASON_DISABLED"],
+                ids=[], all_ids=[], session_id=self._session_id,
+                lane="hermes-provider", t_ms=0,
+            )
             return json.dumps({
                 "result": "session_started",
                 "namespace": ns,
@@ -1255,6 +1403,7 @@ class ZmemMemoryProvider(MemoryProvider):
         # relevance lanes AND the trust_score hard floor) now runs IN-STORE
         # on this passive prefetch lane — same parity as the bash
         # zmem-session-start.sh twin. The envelope's reason is authoritative.
+        timing: Dict[str, int] = {}
         r = _run_store([
             "recent",
             "--namespace", ns,
@@ -1265,16 +1414,36 @@ class ZmemMemoryProvider(MemoryProvider):
             "--no-bump",
             "--for-injection",
             "--json",
-        ])
+        ], timing=timing)
+        # _run_store records only the actual subprocess attempt.  A missing
+        # store.py (or any pre-attempt failure) intentionally remains zero.
+        elapsed = timing.get("t_ms", 0)
         if not r["ok"]:
+            _append_session_decision(
+                status="silent", reason="omitted", ids=[], all_ids=[],
+                session_id=self._session_id, lane="hermes-provider",
+                t_ms=elapsed,
+            )
             return _tool_error(f"Session prefetch failed: {_sanitize_store_error(r)}")
         stdout = (r["stdout"] or "").strip()
         try:
             parsed = json.loads(stdout) if stdout else {}
         except json.JSONDecodeError:
+            _append_session_decision(
+                status="silent", reason="omitted", ids=[], all_ids=[],
+                session_id=self._session_id, lane="hermes-provider",
+                t_ms=elapsed,
+            )
             return _tool_error("Session prefetch returned non-JSON")
         rows = _envelope_results(parsed)
         omitted = parsed.get("omitted", 0) if isinstance(parsed, dict) else 0
+        candidate_ids = parsed.get("candidate_ids", []) if isinstance(parsed, dict) else []
+        if not isinstance(candidate_ids, list):
+            candidate_ids = []
+        candidate_ids = [str(mid) for mid in candidate_ids]
+        excluded = parsed.get("excluded", 0) if isinstance(parsed, dict) else 0
+        if not isinstance(excluded, int) or isinstance(excluded, bool):
+            excluded = 0
         # Issue #115: the store names the silent reason when the gate (now
         # incl. the trust floor) emptied the set; fall back to the local
         # classification for older envelopes.
@@ -1343,10 +1512,16 @@ class ZmemMemoryProvider(MemoryProvider):
         reason = reasons["INJECT_REASON_INJECTED"]
         try:
             if not rows:
-                if store_reason and store_reason in allowed:
-                    reason = store_reason
-                elif budget_dropped:
+                # Preserve the classifier precedence for compatibility
+                # envelopes: a budget wipe is authoritative first; then an
+                # older envelope with a pre-ledger candidate set but no
+                # usable stamped reason represents an already-delivered pool.
+                if budget_dropped:
                     reason = "budget-drop"
+                elif store_reason and store_reason in allowed:
+                    reason = store_reason
+                elif candidate_ids:
+                    reason = "already-delivered"
                 elif omitted > 0:
                     reason = "omitted"
                 else:
@@ -1376,6 +1551,13 @@ class ZmemMemoryProvider(MemoryProvider):
         tokens_used = None
         if _INJECT is not None:
             tokens_used = _INJECT.estimate_tokens(context)
+        _append_session_decision(
+            status="injected" if rows else "silent", reason=reason,
+            ids=[row.get("id") for row in rows],
+            all_ids=candidate_ids or [row.get("id") for row in rows],
+            omitted=omitted, excluded=excluded, session_id=self._session_id,
+            lane="hermes-provider", t_ms=elapsed,
+        )
         return json.dumps({
             "result": "session_started",
             "namespace": ns,

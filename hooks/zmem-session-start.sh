@@ -194,6 +194,13 @@ fi
 # autoMemoryEnabled:false. Fires at most once, guarded by a marker file in
 # ZMEM_DATA — never touches settings.json, read-only.
 HOST="${ZMEM_HOST:-zcode}"
+# Issue #153: keep attribution lanes closed at the shell boundary too.  The
+# payload builder still validates independently so direct/back-compat calls
+# remain safe, while native host behavior continues to use the original HOST.
+ATTR_LANE=""
+case "$HOST" in
+  claude|codex|zcode) ATTR_LANE="$HOST" ;;
+esac
 # Session id for the bg-log decision line (issue #94): the env chain the
 # other capture hooks use (launcher exports ZMEM_SESSION; the legacy vars
 # cover manual/back-compat invocation). Empty when no host supplied it —
@@ -369,5 +376,5 @@ BUDGET="${ZMEM_CTX_BUDGET:-25000}"
 # which keeps the sentinel-wrapped {} shape the launcher parses.
 HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PAYLOAD_PY="$(to_py_path "$(join_path "$HOOKS_DIR" lib zmem-session-start-payload.py)")"
-"$PYTHON_BIN" "$PAYLOAD_PY" "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" "$SESSION_ID" "$DRIFT_JSON" "$SOURCE" 2>/dev/null || printf '<<<ZMEM_JSON>>>{}<<<END>>>\n'
+"$PYTHON_BIN" "$PAYLOAD_PY" "$CORE_FILE_PY" "$AGENTS_FILE_PY" "$STORE_PY_PY" "$DATA_DIR_PY" "$PROJECT" "$DATA_DIR" "$NS" "$BUDGET" "$HOST" "$SETTINGS_DIR_PY" "$NUDGE_MARKER_PY" "$SESSION_ID" "$DRIFT_JSON" "$SOURCE" "$ATTR_LANE" 2>/dev/null || printf '<<<ZMEM_JSON>>>{}<<<END>>>\n'
 exit 0

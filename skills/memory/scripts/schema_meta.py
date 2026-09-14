@@ -272,8 +272,17 @@ INJECT_FLOOR_TRUST_ENV = "ZMEM_INJECT_FLOOR_TRUST"
 #                 "nothing trusted" so the #94 report can separate the two.
 # The hook body, Hermes session_start, and the MCP twin import this tuple as
 # the single source (PRR-017 discipline). Do not invent extra reasons.
-INJECT_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop",
-                         "below-relevance")
+# Closed attribution vocabularies for passive injection decisions (issue #153,
+# Workstream G).  These are wire values, not presentation labels: every
+# producer, parser, and report must use the same order and spelling.  ``expired``
+# is reserved for the expiry workstream and intentionally has no producer here.
+INJECT_LANES = ("claude", "codex", "zcode", "hermes-provider", "hermes-compat")
+INJECT_MOMENTS = ("session_start", "user_prompt", "pretool", "subagent",
+                  "precompact")
+INJECT_SILENT_REASONS = (
+    "empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance",
+    "already-delivered", "expired",
+)
 
 # Success-line reason (not a silent reason): logged alongside status=injected
 # so every zmem-hook log line carries a reason= field.

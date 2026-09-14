@@ -351,6 +351,90 @@ class ClassifierUnitTests(unittest.TestCase):
             "empty-pool")
 
 
+class StorelibClassifierContractTests(unittest.TestCase):
+    """Pins the shared store-side classifier contract from issue #153.
+
+    The hook has its own fail-open adapter, but recall and recent must pass the
+    pre-ledger candidate set alongside the post-ledger gate pool so delivery
+    exhaustion is not reported as a retrieval or trust failure.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(SCRIPTS))
+        import schema_meta
+        from storelib import eval_gold, inject
+        cls.schema_meta = schema_meta
+        cls.eval_gold = eval_gold
+        cls.inject = inject
+
+    def test_closed_vocabularies_and_gold_translation(self):
+        expected_reasons = (
+            "empty-pool", "omitted", "below-bar", "budget-drop",
+            "below-relevance", "already-delivered", "expired",
+        )
+        expected_lanes = (
+            "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+        )
+        expected_moments = (
+            "session_start", "user_prompt", "pretool", "subagent", "precompact",
+        )
+        self.assertEqual(self.schema_meta.INJECT_SILENT_REASONS,
+                         expected_reasons)
+        self.assertEqual(self.inject.INJECT_SILENT_REASONS, expected_reasons)
+        self.assertEqual(self.schema_meta.INJECT_LANES, expected_lanes)
+        self.assertEqual(self.inject.INJECT_LANES, expected_lanes)
+        self.assertEqual(self.schema_meta.INJECT_MOMENTS, expected_moments)
+        self.assertEqual(self.inject.INJECT_MOMENTS, expected_moments)
+        self.assertEqual(
+            self.eval_gold.GOLD_MOMENT_TO_RUNTIME,
+            {"user-prompt": "user_prompt", "pretool": "pretool",
+             "subagent": "subagent", "precompact": "precompact"},
+        )
+        self.assertEqual(self.eval_gold._injection_silent_reasons(),
+                         expected_reasons)
+
+        # Exercise the eval harness's partial-deployment fallback rather than
+        # only the normal schema_meta import path; this catches a stale tuple
+        # even when the canonical copy is correct.
+        saved_reasons = self.schema_meta.INJECT_SILENT_REASONS
+        try:
+            del self.schema_meta.INJECT_SILENT_REASONS
+            self.assertEqual(self.eval_gold._injection_silent_reasons(),
+                             expected_reasons)
+        finally:
+            self.schema_meta.INJECT_SILENT_REASONS = saved_reasons
+
+    def test_precedence_distinguishes_delivery_exhaustion(self):
+        classify = self.inject.classify_silent_reason
+        row = {"id": "candidate"}
+        self.assertEqual(
+            classify([], candidate_ids=["candidate"], post_ledger_rows=[],
+                     budget_emptied=True),
+            "budget-drop")
+        self.assertEqual(
+            classify([], candidate_ids=["candidate"], post_ledger_rows=[]),
+            "already-delivered")
+        self.assertEqual(
+            classify([row], candidate_ids=["candidate"], post_ledger_rows=[row],
+                     lane_stats={"trust_passed": 1}),
+            "below-relevance")
+        self.assertEqual(
+            classify([row], candidate_ids=["candidate"], post_ledger_rows=[row]),
+            "below-bar")
+        self.assertEqual(
+            classify([], candidate_ids=[], post_ledger_rows=[], omitted=1),
+            "omitted")
+        self.assertEqual(
+            classify([], candidate_ids=[], post_ledger_rows=[]),
+            "empty-pool")
+
+    def test_legacy_callers_keep_rows_only_behavior(self):
+        classify = self.inject.classify_silent_reason
+        self.assertEqual(classify([{"id": "candidate"}]), "below-bar")
+        self.assertEqual(classify([]), "empty-pool")
+
+
 class HookBodyBareListEnvelopeTest(unittest.TestCase):
     """A pre-v13 store.py that prints a BARE LIST (not the v13 envelope)
     classifies as empty-pool — omitted=0 because there was no envelope."""

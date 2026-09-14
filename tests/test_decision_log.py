@@ -518,6 +518,111 @@ class SplitPathResolutionTest(_SeededStore):
                          "an explicit bg_log_path beats both defaults")
 
 
+class DecisionLogAttributionTest(unittest.TestCase):
+    """Issue #153 executable contract for the shared decision writer."""
+
+    def _body_module(self):
+        spec = importlib.util.spec_from_file_location("zmem_153_body", BODY)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+    def test_five_lane_fixture(self):
+        expected_path = REPO_ROOT / "tests" / "fixtures" / "decisions" / "five-lanes.expected.json"
+        generator = REPO_ROOT / "tests" / "fixtures" / "decisions" / "generate_five_lanes.py"
+        self.assertTrue(generator.is_file(), "five-lane generator is required")
+        self.assertTrue(expected_path.is_file(), "five-lane expected JSON is required")
+        payload = json.loads(expected_path.read_text(encoding="utf-8"))
+        def find_rows(value):
+            if isinstance(value, list):
+                if len(value) == 20 and all(isinstance(item, dict) for item in value):
+                    return value
+                for item in value:
+                    found = find_rows(item)
+                    if found is not None:
+                        return found
+            elif isinstance(value, dict):
+                for item in value.values():
+                    found = find_rows(item)
+                    if found is not None:
+                        return found
+            return None
+        rows = find_rows(payload)
+        self.assertIsNotNone(rows, "expected JSON must expose a 20-row matrix")
+        self.assertEqual(len(rows), 20)
+        pairs = [(row.get("lane"), row.get("moment")) for row in rows]
+        self.assertEqual(pairs, sorted(pairs))
+        self.assertEqual(len(set(pairs)), 20)
+
+    def test_already_delivered_reason(self):
+        from storelib.inject import classify_silent_reason
+
+        ids = ["delivered-a", "delivered-b", "delivered-c"]
+        self.assertEqual(
+            classify_silent_reason([], candidate_ids=ids,
+                                  post_ledger_rows=[]),
+            "already-delivered")
+        with tempfile.TemporaryDirectory(prefix="zmem-153-writer-") as tmp:
+            body = self._body_module()
+            with mock.patch.dict(os.environ, {"ZMEM_DATA": tmp,
+                                              "ZMEM_STORE": os.path.join(tmp, "store.sqlite")},
+                                 clear=False):
+                version = json.loads((REPO_ROOT / "release-manifest.json").read_text(
+                    encoding="utf-8"))["version"]
+                body._log_inject_decision(
+                    [], [], "silent", "already-delivered", all_ids=ids,
+                    excluded_count=3, session_id="decision-test",
+                    moment="user_prompt", lane="claude", version=version,
+                    t_ms=1)
+            line = (Path(tmp) / "zmem-decisions.log").read_text(
+                encoding="utf-8").strip()
+            self.assertIn("status=silent", line)
+            self.assertIn("reason=already-delivered", line)
+            self.assertIn("exc=3", line)
+
+    def test_empty_pool_reason(self):
+        from storelib.inject import classify_silent_reason
+
+        self.assertEqual(
+            classify_silent_reason([], candidate_ids=[], post_ledger_rows=[]),
+            "empty-pool")
+
+    def test_writer_attribution_order_and_timing(self):
+        body = self._body_module()
+        with tempfile.TemporaryDirectory(prefix="zmem-153-order-") as tmp:
+            version = json.loads((REPO_ROOT / "release-manifest.json").read_text(
+                encoding="utf-8"))["version"]
+            with mock.patch.dict(os.environ, {"ZMEM_DATA": tmp}, clear=False):
+                body._log_inject_decision(
+                    [], [], "silent", "empty-pool", session_id="order",
+                    moment="user_prompt", lane="claude", version=version,
+                    t_ms=7, arms={"fts": {"post": 1, "cap": 2}},
+                    batch=True, tool_names=["Edit"],
+                    path_basenames=["notes.md"], margin=0.1)
+            line = (Path(tmp) / "zmem-decisions.log").read_text(
+                encoding="utf-8").strip()
+            positions = [line.index(token) for token in (
+                "moment=user_prompt", "lane=claude", "ver=" + version,
+                "t_ms=7", "arms=", "batch=1", "tools=", "paths=",
+                "margin=")]
+            self.assertEqual(positions, sorted(positions))
+
+    def test_writer_version_failure_degrades_to_legacy(self):
+        body = self._body_module()
+        with tempfile.TemporaryDirectory(prefix="zmem-153-legacy-") as tmp:
+            with mock.patch.dict(os.environ, {"ZMEM_DATA": tmp}, clear=False):
+                body._log_inject_decision(
+                    [], [], "silent", "empty-pool", session_id="legacy",
+                    moment="user_prompt", lane="claude", version=None,
+                    t_ms=7)
+            line = (Path(tmp) / "zmem-decisions.log").read_text(
+                encoding="utf-8").strip()
+            self.assertIn("status=silent", line)
+            self.assertIn("moment=user_prompt", line)
+            self.assertNotRegex(line, r"\b(?:lane|ver|t_ms)=")
+
+
 class MomentFieldBodyTest(_SeededStore):
     """The body writer stamps its mode as the moment (#129)."""
 
@@ -528,7 +633,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=injected", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: arms=\S+)?$")  # issue #136: additive trailing arms field
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?(?: arms=\S+)?$")  # issue #136/#153 additive tails
 
     def test_pretool_mode_moment(self):
         _run_body(self._tmp, "pretool",
@@ -536,7 +641,7 @@ class MomentFieldBodyTest(_SeededStore):
                    "tool_input": {"command": "git stash pop"}},
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
-        self.assertRegex(line, r" sid=\S+ moment=pretool(?: arms=\S+)?$")  # issue #136
+        self.assertRegex(line, r" sid=\S+ moment=pretool(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?(?: arms=\S+)?$")  # issue #136/#153
 
     def test_kill_switch_body_line_carries_mode_moment(self):
         _run_body(self._tmp, "user_prompt",
@@ -544,7 +649,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns, ZMEM_INJECT="0")
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=silent reason=disabled", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: arms=\S+)?$")  # issue #136: additive trailing arms field
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?(?: arms=\S+)?$")  # issue #136/#153
 
 
 class MomentFieldSessionStartTest(unittest.TestCase):
@@ -599,7 +704,7 @@ class MomentFieldSessionStartTest(unittest.TestCase):
         self.assertEqual(r.returncode == 0, True, r.stderr[-800:])
         lines = _decision_lines(self._tmp)
         self.assertTrue(lines, "session-start decision line missing")
-        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start(?: arms=\S+)?$")  # issue #136
+        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?(?: arms=\S+)?$")  # issue #136/#153
 
     def test_kill_switch_line_carries_session_start_moment(self):
         # The kill-switch block resolves the sid from the env chain (the
@@ -611,7 +716,7 @@ class MomentFieldSessionStartTest(unittest.TestCase):
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("status=silent reason=disabled", lines[0])
         self.assertIn(" sid=sess-ss129", lines[0])
-        self.assertRegex(lines[0], r" moment=session_start$")
+        self.assertRegex(lines[0], r" moment=session_start(?:(?: lane=\S+)? ver=\S+ t_ms=\d+)?$")
 
     def test_kill_switch_rotates_over_cap_decisions_log(self):
         # Review PRR-005 (session-start site): the kill-switch block used

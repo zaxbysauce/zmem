@@ -39,9 +39,33 @@ try:  # pragma: no cover - trivial import guard
     _PROTECTED_TYPES = tuple(
         getattr(_schema_meta, "PROTECTED_INJECT_TYPES", ("decision", "constraint"))
     )
+    # Keep the fallback values byte-identical to schema_meta.  This module is
+    # also loaded directly by partially-deployed hook/Hermes surfaces where
+    # schema_meta may be unavailable or from an older release.
+    INJECT_LANES = tuple(getattr(
+        _schema_meta, "INJECT_LANES",
+        ("claude", "codex", "zcode", "hermes-provider", "hermes-compat"),
+    ))
+    INJECT_MOMENTS = tuple(getattr(
+        _schema_meta, "INJECT_MOMENTS",
+        ("session_start", "user_prompt", "pretool", "subagent", "precompact"),
+    ))
+    INJECT_SILENT_REASONS = tuple(getattr(
+        _schema_meta, "INJECT_SILENT_REASONS",
+        ("empty-pool", "omitted", "below-bar", "budget-drop",
+         "below-relevance", "already-delivered", "expired"),
+    ))
 except Exception:  # noqa: BLE001 - partially-deployed tree: use the literals
     _schema_meta = None
     _PROTECTED_TYPES = ("decision", "constraint")
+    INJECT_LANES = ("claude", "codex", "zcode", "hermes-provider",
+                    "hermes-compat")
+    INJECT_MOMENTS = ("session_start", "user_prompt", "pretool", "subagent",
+                      "precompact")
+    INJECT_SILENT_REASONS = (
+        "empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance",
+        "already-delivered", "expired",
+    )
 
 DEFAULT_INJECT_TOKEN_BUDGET = 1500
 INJECT_TOKEN_BUDGET_ENV = "ZMEM_INJECT_TOKEN_BUDGET"
@@ -635,17 +659,24 @@ def selective_inject_filter(
     return selected, status
 
 
-def classify_silent_reason(rows: list, omitted: int = 0,
-                           budget_emptied: bool = False,
-                           lane_stats: Optional[dict] = None) -> str:
+def classify_silent_reason(
+    rows: list,
+    omitted: int = 0,
+    budget_emptied: bool = False,
+    lane_stats: Optional[dict] = None,
+    *,
+    candidate_ids: Optional[list[str]] = None,
+    post_ledger_rows: Optional[list] = None,
+) -> str:
     """Name WHY a silent inject is silent (issue #87; store-side twin).
 
-    Same precedence as the hook body's classifier: budget-drop wins over
-    below-bar (a budget wipe of a gate-passed set is a budget fact, not a
-    gate fact); empty rows with omitted==0 is empty-pool even if the prompt
-    was long — do not guess. The closed set comes from schema_meta
-    (INJECT_SILENT_REASONS); a drift/unknown value degrades to empty-pool
-    rather than inventing a reason.
+    Same precedence as the hook body's classifier: budget-drop wins first;
+    then a non-empty pre-ledger candidate set with an empty post-ledger pool
+    is already-delivered; then relevance, bar, omitted, and finally an empty
+    pool.  ``candidate_ids`` and ``post_ledger_rows`` are additive inputs, so
+    callers from older releases can continue passing only ``rows``.  The
+    closed set comes from schema_meta (``INJECT_SILENT_REASONS``); a
+    drift/unknown value degrades to empty-pool rather than inventing a reason.
 
     Issue #113: when the caller passes the gate's ``lane_stats`` (the
     ``with_stats=True`` third element), a silent decision where at least one
@@ -655,12 +686,20 @@ def classify_silent_reason(rows: list, omitted: int = 0,
     behavior is byte-identical.
     """
     allowed = tuple(getattr(
-        _schema_meta, "INJECT_SILENT_REASONS",
-        ("empty-pool", "omitted", "below-bar", "budget-drop",
-         "below-relevance"),
-    ))
+        _schema_meta, "INJECT_SILENT_REASONS", INJECT_SILENT_REASONS,
+    )) if _schema_meta is not None else INJECT_SILENT_REASONS
+    # Legacy callers used ``rows`` as both the candidate pool and the gate
+    # pool.  In the new contract ``candidate_ids`` is the pre-ledger set and
+    # ``post_ledger_rows`` is the post-ledger gate pool; normalize only when a
+    # caller supplies neither new value.
+    if candidate_ids is None:
+        candidate_ids = [r.get("id") for r in rows if isinstance(r, dict)]
+    if post_ledger_rows is None:
+        post_ledger_rows = rows
     if budget_emptied:
         reason = "budget-drop"
+    elif candidate_ids and not post_ledger_rows:
+        reason = "already-delivered"
     elif rows and lane_stats is not None \
             and lane_stats.get("trust_passed", 0) >= 1:
         reason = "below-relevance"

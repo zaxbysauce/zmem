@@ -30,6 +30,11 @@ Args (all optional beyond 1, IndexError-tolerant):
   7 namespace             8 ctx budget           9 host
  10 settings dir         11 nudge marker        12 session id
  13 drift JSON           14 session source (issue #118)
+ 15 validated host lane (issue #153, optional)
+
+Decision lines carry the optional issue #153 suffix ``lane``, ``ver``, and
+``t_ms`` after ``moment`` when the host lane and release manifest validate;
+otherwise the complete legacy line is retained.
 """
 
 import json
@@ -38,6 +43,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 _SENTINEL_START = "<<<ZMEM_JSON>>>"
 _SENTINEL_END = "<<<END>>>"
@@ -52,6 +58,60 @@ _NEUTRALIZE = (
     ("<<<ZMEM_UNTRUSTED_FENCE>>>", "<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>"),
     ("<<<END_ZMEM_UNTRUSTED_FENCE>>>", "<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>"),
 )
+
+_ATTR_LANES = ("claude", "codex", "zcode", "hermes-provider", "hermes-compat")
+_ATTR_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _validated_attribution_lane(host):
+    """Return a closed-set host lane, or ``None`` for legacy output."""
+    if not isinstance(host, str):
+        return None
+    value = host.strip()
+    return value if value in _ATTR_LANES else None
+
+
+def _release_version():
+    """Read the served tree semver; malformed manifests retain legacy lines."""
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        candidates = [os.path.join(root, "release-manifest.json")]
+        home = os.environ.get("ZMEM_HOME", "").strip()
+        if home:
+            candidates.append(os.path.join(os.path.expanduser(home),
+                                           "release-manifest.json"))
+        for path in candidates:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    value = json.load(fh).get("version")
+                if isinstance(value, str) and _ATTR_VERSION_RE.fullmatch(value):
+                    return value
+            except (OSError, ValueError, TypeError):
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _rounded_elapsed_ms(started):
+    """Return a nonnegative rounded duration for one store attempt."""
+    try:
+        return max(0, int(round((time.perf_counter() - started) * 1000)))
+    except Exception:
+        return 0
+
+
+def _format_attribution(lane, version, t_ms):
+    """Serialize validated issue #153 attribution fields, or nothing."""
+    if ((lane is None or lane in _ATTR_LANES)
+            and isinstance(version, str)
+            and _ATTR_VERSION_RE.fullmatch(version)
+            and isinstance(t_ms, int) and not isinstance(t_ms, bool)
+            and t_ms >= 0):
+        lane_field = " lane=%s" % lane if lane is not None else ""
+        return "%s ver=%s t_ms=%d" % (lane_field, version, t_ms)
+    return ""
 
 
 def _emit(payload):
@@ -309,7 +369,8 @@ def _unwrap_rows(raw_out):
     return rows, extras
 
 
-def _decision_line(rows, extras, moment, session_id, pull_ran):
+def _decision_line(rows, extras, moment, session_id, pull_ran,
+                  lane=None, version=None, t_ms=None):
     status = "injected" if rows else "silent"
     reason = extras["reason"] or ("injected" if rows else "empty-pool")
     tok = ""
@@ -335,9 +396,14 @@ def _decision_line(rows, extras, moment, session_id, pull_ran):
             for mid in extras["margin_pruned_ids"]
         ]
         margin_pruned_ss = " margin_pruned=%s" % safe_pruned
-    return ("[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=%s%s%s\n" % (
+    # Issue #153: attribution is emitted atomically only when the host lane,
+    # manifest semver, and nonnegative attempt duration are all valid.  Keep
+    # the exact insertion point after moment and before additive tails.
+    attr = ""
+    attr = _format_attribution(lane, version, t_ms)
+    return ("[%d] zmem-hook status=%s reason=%s ids=%s all=%s%s%s sid=%s moment=%s%s%s%s\n" % (
         int(__import__("time").time()), status, reason, ids, all_ids, tok, exc,
-        _safe_sid(session_id), moment, margin_ss, margin_pruned_ss)) if pull_ran else None
+        _safe_sid(session_id), moment, attr, margin_ss, margin_pruned_ss)) if pull_ran else None
 
 
 def _record_ledger(ledger, data_dir, session_id, rows, block, parts, moment):
@@ -357,7 +423,8 @@ def _record_ledger(ledger, data_dir, session_id, rows, block, parts, moment):
 
 
 def build_tier2_context(store_py, namespace, session_id, budget,
-                          context_parts=None):
+                          context_parts=None, attribution_lane=None,
+                          attribution_version=None):
     """ONE bounded `store.py recent` pull + fence + decision line + ledger.
 
     Issue #121: the pre-fix 30 s triple-retry loop is replaced by exactly one
@@ -391,6 +458,7 @@ def build_tier2_context(store_py, namespace, session_id, budget,
                 "--include-global", "--global-limit", "2",
                 "--no-bump", "--for-injection", "--json",
                 *exclude_argv]
+        attempt_started = time.perf_counter()
         try:
             out = subprocess.check_output(
                 argv, stderr=subprocess.DEVNULL,
@@ -403,9 +471,12 @@ def build_tier2_context(store_py, namespace, session_id, budget,
                 # fixed-order _BG_LINE_RE only tolerates additive fields
                 # after moment=).
                 "[%d] zmem-hook status=silent reason=omitted "
-                "ids=[] all=[] sid=%s moment=session_start store_timeout=1\n" % (
-                    int(__import__("time").time()), _safe_sid(session_id)))
+                "ids=[] all=[] sid=%s moment=session_start%s store_timeout=1\n" % (
+                    int(__import__("time").time()), _safe_sid(session_id),
+                    _format_attribution(attribution_lane, attribution_version,
+                                        _rounded_elapsed_ms(attempt_started))))
             return ""
+        attempt_t_ms = _rounded_elapsed_ms(attempt_started)
         # PRR-006 gate (pre-#121 coupling preserved): no renderer means no
         # Tier 2 AND no decision line — never log an injection that could
         # not render, never emit unfenced retrieved text.
@@ -413,7 +484,9 @@ def build_tier2_context(store_py, namespace, session_id, budget,
             return ""
         rows, extras = _unwrap_rows(out)
         pull_ran = bool(out and out.strip())
-        line = _decision_line(rows, extras, "session_start", session_id, pull_ran)
+        line = _decision_line(rows, extras, "session_start", session_id,
+                              pull_ran, attribution_lane, attribution_version,
+                              attempt_t_ms)
         if line:
             _write_decision_line(store_py, line)
         if rows:
@@ -432,7 +505,8 @@ def build_tier2_context(store_py, namespace, session_id, budget,
 
 
 def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
-                  recent_floor, context_parts=None):
+                  recent_floor, context_parts=None, attribution_lane=None,
+                  attribution_version=None):
     """Issue #118 SessionStart(source=compact): query-aware recall rebuilt
     from the compact sidecar. Retry structure and stash semantics are #118's
     owned surface, kept intact here; only the subprocess timeout moved to
@@ -466,7 +540,9 @@ def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
     timeout_s = _store_timeout_s()
     out = ""
     pull_ok = False
+    attempt_t_ms = 0
     for attempt in range(3):
+        attempt_started = time.perf_counter()
         try:
             argv = [sys.executable, store_py, "recall",
                     "--query", query,
@@ -478,17 +554,21 @@ def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
                 argv, stderr=subprocess.DEVNULL, timeout=timeout_s,
             ).decode("utf-8", "replace")
             pull_ok = True
+            attempt_t_ms = _rounded_elapsed_ms(attempt_started)
             break
         except subprocess.TimeoutExpired:
             out = ""
+            attempt_t_ms = _rounded_elapsed_ms(attempt_started)
             # F-008: a compact-lane timeout must land a decision line too,
             # symmetric with the cold-start lane (store_timeout=1 at line
             # END for reader parity).
             _write_decision_line(
                 store_py,
                 "[%d] zmem-hook status=silent reason=omitted "
-                "ids=[] all=[] sid=%s moment=session_start_compact store_timeout=1\n" % (
-                    int(__import__("time").time()), _safe_sid(session_id)))
+                 "ids=[] all=[] sid=%s moment=session_start_compact%s store_timeout=1\n" % (
+                    int(__import__("time").time()), _safe_sid(session_id),
+                    _format_attribution(attribution_lane, attribution_version,
+                                        attempt_t_ms)))
             break  # a hang is pathological — do not triple the stall
         except Exception:
             out = ""
@@ -505,7 +585,9 @@ def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
         pass
     rows, extras = _unwrap_rows(out)
     moment = "session_start_compact"
-    line = _decision_line(rows, extras, moment, session_id, bool(out and out.strip()))
+    line = _decision_line(rows, extras, moment, session_id,
+                          bool(out and out.strip()), attribution_lane,
+                          attribution_version, attempt_t_ms)
     if line:
         _write_decision_line(store_py, line)
     if rows:
@@ -523,6 +605,7 @@ def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
     # relevance gate may legitimately drop everything) — fall back to the
     # recency lane once, relabeling the moment to match the rendered rows.
     try:
+        fallback_started = time.perf_counter()
         out = subprocess.check_output(
             [sys.executable, store_py, "recent",
              "--namespace", namespace, "--limit", "3",
@@ -531,10 +614,12 @@ def _compact_lane(store_py, namespace, session_id, ledger, data_dir,
              "--no-bump", "--for-injection", "--json"],
             stderr=subprocess.DEVNULL, timeout=timeout_s,
         ).decode("utf-8", "replace")
+        attempt_t_ms = _rounded_elapsed_ms(fallback_started)
         rows, extras = _unwrap_rows(out)
         if rows:
             line = _decision_line(rows, extras, "session_start", session_id,
-                                  bool(out and out.strip()))
+                                  bool(out and out.strip()), attribution_lane,
+                                  attribution_version, attempt_t_ms)
             if line:
                 _write_decision_line(store_py, line)
             block = _render_fenced(
@@ -608,6 +693,19 @@ def main():
         source = ""
     if not isinstance(source, str):
         source = ""
+    try:
+        validated_host_lane = sys.argv[15]
+    except IndexError:
+        validated_host_lane = host
+    if not isinstance(validated_host_lane, str):
+        validated_host_lane = host
+
+    # Issue #153: the runtime host name is the local lane identity.  Keep the
+    # functional host value untouched (native-memory nudges still depend on
+    # it), but only a closed-set value with a valid release semver can opt into
+    # enriched decision lines.
+    attribution_lane = _validated_attribution_lane(validated_host_lane)
+    attribution_version = _release_version()
 
     # Issue #107: the operator-facing drift notice rides systemMessage.
     _drift_msg = ""
@@ -633,8 +731,10 @@ def main():
                           "a", encoding="utf-8") as lf:
                     lf.write(
                         "[%d] zmem-hook status=silent reason=disabled ids=[] all=[] "
-                        "sid=%s moment=session_start\n" % (
-                            int(__import__("time").time()), _safe_sid(session_id)))
+                        "sid=%s moment=session_start%s\n" % (
+                            int(__import__("time").time()), _safe_sid(session_id),
+                            _format_attribution(attribution_lane,
+                                                attribution_version, 0)))
         except Exception:
             pass  # fail-open: the audit log never blocks session start
         payload = {"systemMessage": _drift_msg} if _drift_msg else {}
@@ -736,11 +836,15 @@ def main():
             tier2_block, _ = _compact_lane(
                 store_py, ns, session_id, ledger, data_dir_known,
                 recent_floor,
-                context_parts=[p for p in [correction_note, tier0] if p])
+                context_parts=[p for p in [correction_note, tier0] if p],
+                attribution_lane=attribution_lane,
+                attribution_version=attribution_version)
         if not tier2_block:
             tier2_block = build_tier2_context(
                 store_py, ns, session_id, budget,
-                context_parts=[p for p in [correction_note, tier0] if p])
+                context_parts=[p for p in [correction_note, tier0] if p],
+                attribution_lane=attribution_lane,
+                attribution_version=attribution_version)
 
     # Promotion candidates (non-blocking, one-line suggestion) — a store
     # subprocess by design; it runs AFTER envelope 1 so Tier 0 is never

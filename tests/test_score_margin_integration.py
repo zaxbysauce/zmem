@@ -791,19 +791,21 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
         lines = self._decision_lines()
         self.assertEqual(len(lines), 2)
         normalized = [self._without_timestamp(line) for line in lines]
-        self.assertEqual(
+        attr = (r"(?:(?: lane=(?:claude|codex|zcode))? "
+                r"ver=\d+\.\d+\.\d+ t_ms=\d+)?")
+        self.assertRegex(
             normalized[0],
-            "[TIMESTAMP] zmem-hook status=injected reason=injected "
-            "ids=['m-top'] all=['m-top', 'm-second'] "
-            "tokens=96/1500 rendered_estimate=96 "
-            "sid=margin-injected moment=user_prompt margin=0.012500 "
-            "margin_pruned=['m-second']",
+            r"^\[TIMESTAMP\] zmem-hook status=injected reason=injected "
+            r"ids=\['m-top'\] all=\['m-top', 'm-second'\] "
+            r"tokens=96/1500 rendered_estimate=96 "
+            r"sid=margin-injected moment=user_prompt" + attr +
+            r" margin=0\.012500 margin_pruned=\['m-second'\]$",
         )
-        self.assertEqual(
+        self.assertRegex(
             normalized[1],
-            "[TIMESTAMP] zmem-hook status=silent reason=below-bar "
-            "ids=[] all=['m-top', 'm-second'] sid=margin-silent "
-            "moment=user_prompt margin=0.012500",
+            r"^\[TIMESTAMP\] zmem-hook status=silent reason=below-bar "
+            r"ids=\[\] all=\['m-top', 'm-second'\] sid=margin-silent "
+            r"moment=user_prompt" + attr + r" margin=0\.012500$",
         )
 
         self.assertEqual(len(self._body_calls), 2)
@@ -852,18 +854,20 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
         lines = self._decision_lines()
         self.assertEqual(len(lines), 2)
         normalized = [self._without_timestamp(line) for line in lines]
-        self.assertEqual(
+        attr = (r"(?:(?: lane=(?:claude|codex|zcode))? "
+                r"ver=\d+\.\d+\.\d+ t_ms=\d+)?")
+        self.assertRegex(
             normalized[0],
-            "[TIMESTAMP] zmem-hook status=injected reason=injected "
-            "ids=['m-top'] all=['m-top', 'm-second'] tokens=96/1500 "
-            "sid=session-start-injected moment=session_start "
-            "margin=0.012500 margin_pruned=['m-second']",
+            r"^\[TIMESTAMP\] zmem-hook status=injected reason=injected "
+            r"ids=\['m-top'\] all=\['m-top', 'm-second'\] tokens=96/1500 "
+            r"sid=session-start-injected moment=session_start" + attr +
+            r" margin=0\.012500 margin_pruned=\['m-second'\]$",
         )
-        self.assertEqual(
+        self.assertRegex(
             normalized[1],
-            "[TIMESTAMP] zmem-hook status=silent reason=below-bar "
-            "ids=[] all=['m-top', 'm-second'] sid=session-start-silent "
-            "moment=session_start margin=0.000000",
+            r"^\[TIMESTAMP\] zmem-hook status=silent reason=below-bar "
+            r"ids=\[\] all=\['m-top', 'm-second'\] sid=session-start-silent "
+            r"moment=session_start" + attr + r" margin=0\.000000$",
         )
 
     def test_session_start_consumer_validates_margin_fields_independently(self):
@@ -893,16 +897,18 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
         )
         lines = self._decision_lines()
         normalized = [self._without_timestamp(line) for line in lines]
-        self.assertIn(
-            "sid=session-start-invalid-margin moment=session_start "
-            "margin_pruned=['m-second']",
+        attr = (r"(?:(?: lane=(?:claude|codex|zcode))? "
+                r"ver=\d+\.\d+\.\d+ t_ms=\d+)?")
+        self.assertRegex(
             normalized[0],
+            r"sid=session-start-invalid-margin moment=session_start" + attr +
+            r" margin_pruned=\['m-second'\]",
         )
         self.assertNotIn("margin=", normalized[0])
-        self.assertIn(
-            "sid=session-start-invalid-pruned moment=session_start "
-            "margin=0.012500",
+        self.assertRegex(
             normalized[1],
+            r"sid=session-start-invalid-pruned moment=session_start" + attr +
+            r" margin=0\.012500",
         )
         self.assertNotIn("margin_pruned=", normalized[1])
 

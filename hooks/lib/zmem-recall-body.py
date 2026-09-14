@@ -75,6 +75,11 @@ INJECT_SILENT_REASONS tuple, plus ``injected`` on the success line) and
 issue #94 every line also carries ``sid=<sanitized session id>`` (the
 stdin event's ``session_id``; ``sid=unknown`` when the host sent none) —
 the session key the miss-rate report joins failures against.
+
+Issue #153 adds the optional suffix ``lane=<closed host lane> ver=<manifest
+semver> t_ms=<nonnegative rounded store-attempt milliseconds>`` after
+``moment=`` and before historical additive tails. A missing or invalid release
+manifest preserves the complete legacy line.
 """
 
 from __future__ import annotations
@@ -85,6 +90,59 @@ import os
 import subprocess
 import sys
 import time
+import re
+
+
+# Issue #153: decision-line attribution is deliberately small and
+# dependency-free.  The schema module is the canonical source for the
+# vocabulary, but this hook must still run from a partially served tree, so
+# imports and manifest reads fail closed to the pre-attribution line shape.
+_ATTR_LANES = ("claude", "codex", "zcode", "hermes-provider", "hermes-compat")
+_ATTR_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _validated_attribution_lane(host=None):
+    """Return a closed-set host lane, or ``None`` for legacy output."""
+    value = host if host is not None else os.environ.get("ZMEM_HOST", "")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if value in _ATTR_LANES else None
+
+
+def _release_version():
+    """Read the served tree's semver from its release manifest.
+
+    A malformed or absent manifest is a compatibility deployment.  Writers
+    must retain the complete audit line, but omit all attribution fields.
+    """
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        candidates = [os.path.join(root, "release-manifest.json")]
+        home = os.environ.get("ZMEM_HOME", "").strip()
+        if home:
+            candidates.append(os.path.join(os.path.expanduser(home),
+                                           "release-manifest.json"))
+        for path in candidates:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    value = json.load(fh).get("version")
+                if isinstance(value, str) and _ATTR_VERSION_RE.fullmatch(value):
+                    return value
+            except (OSError, ValueError, TypeError):
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _rounded_elapsed_ms(started):
+    """Return a nonnegative integer duration for one subprocess attempt."""
+    try:
+        return max(0, int(round((time.perf_counter() - started) * 1000)))
+    except Exception:
+        return 0
 
 
 # Selective-inject constants are imported from schema_meta (the documented
@@ -98,7 +156,10 @@ _FALLBACK_FLOOR_RECENT = 0.5
 # Issue #87 / #85 direction 1: import-failure fallbacks mirroring
 # schema_meta.INJECT_SILENT_REASONS / INJECT_REASON_INJECTED (a
 # partially-deployed tree still classifies with the documented set).
-_FALLBACK_SILENT_REASONS = ("empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance")
+_FALLBACK_SILENT_REASONS = (
+    "empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance",
+    "already-delivered", "expired",
+)
 _FALLBACK_REASON_INJECTED = "injected"
 # Issue #110 (P0-5): mirror of schema_meta.INJECT_REASON_DISABLED for the
 # passive-injection kill switch below.
@@ -247,18 +308,27 @@ def _inject_disabled() -> bool:
 
 
 def _classify_silent_reason(rows, omitted=0, budget_emptied=False,
-                            allowed=_FALLBACK_SILENT_REASONS):
+                            allowed=_FALLBACK_SILENT_REASONS,
+                            candidate_ids=None, post_ledger_rows=None):
     """Name WHY a silent inject is silent (issue #87 / #85 direction 1).
 
     Called only when nothing will be injected. Order matters and matches the
-    #87 spec: budget-drop wins over below-bar (a budget wipe of a gate-passed
-    set is a budget fact, not a gate fact); empty rows with omitted==0 is
-    empty-pool even if the prompt was long — do not guess. ``allowed`` is the
+    #87 spec: budget-drop wins first, followed by already-delivered when the
+    pre-ledger candidate set was nonempty but the post-ledger set is empty;
+    empty rows with omitted==0 are empty-pool even if the prompt was long —
+    do not guess. ``allowed`` is the
     closed set from schema_meta; a drift/unknown value degrades to empty-pool
     rather than inventing a reason.
     """
+    if candidate_ids is None:
+        candidate_ids = [r.get("id") for r in rows
+                         if isinstance(r, dict)]
+    if post_ledger_rows is None:
+        post_ledger_rows = rows
     if budget_emptied:
         reason = "budget-drop"
+    elif candidate_ids and not post_ledger_rows:
+        reason = "already-delivered"
     elif rows:
         reason = "below-bar"
     elif omitted > 0:
@@ -364,7 +434,8 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                          batch=False, tool_names=None,
                          path_basenames=None, margin=None,
                          margin_pruned_ids=None,
-                         store_timeout=False) -> None:
+                         store_timeout=False, lane=None, version=None,
+                         t_ms=None) -> None:
     """Append the injected|silent decision to the decision log (#129).
 
     Issue #129 split: decision lines go to ``zmem-decisions.log`` (rotated,
@@ -473,6 +544,19 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
             safe_moment = _re_sid.sub(r"[^A-Za-z0-9._-]", "_", moment)[:32]
             if safe_moment:
                 mom = " moment={0}".format(safe_moment)
+        # Issue #153: attribution is an all-or-nothing writer extension.  A
+        # valid lane and manifest semver are required before any of the three
+        # fields is emitted; this preserves complete legacy lines on mixed or
+        # partially served deployments.  The exact order is frozen after
+        # moment and before every historical additive tail.
+        attr = ""
+        if ((lane is None or lane in _ATTR_LANES)
+                and isinstance(version, str)
+                and _ATTR_VERSION_RE.fullmatch(version)
+                and isinstance(t_ms, int) and not isinstance(t_ms, bool)
+                and t_ms >= 0):
+            lane_field = " lane={0}".format(lane) if lane is not None else ""
+            attr = "{0} ver={1} t_ms={2}".format(lane_field, version, t_ms)
         # Issue #136: the additive arms attribution field — per-arm
         # post-cap/cap pairs (P/Q) from the recall envelope's ``arms`` dict,
         # so the B-1 report can see which arm carried a hit. Compact wire
@@ -550,7 +634,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
             f.write(
                 "[{ts}] zmem-hook status={status} reason={reason}{om} "
                 "ids={ids_sel} all={ids_all}{tok}{rend}{adm}{bcnt}{ops}{exc} "
-                "sid={safe_sid}{mom}{armf}{bat}{tns}{pths}{marginf}{marginpf}{stf}\n".format(
+                "sid={safe_sid}{mom}{attr}{armf}{bat}{tns}{pths}{marginf}{marginpf}{stf}\n".format(
                     ts=int(time.time()),
                     status=status,
                     reason=reason,
@@ -565,6 +649,7 @@ def _log_inject_decision(rows, selected, status: str, reason: str,
                     exc=exc,
                     safe_sid=safe_sid,
                     mom=mom,
+                    attr=attr,
                     armf=armf,
                     bat=bat,
                     tns=tns,
@@ -1034,6 +1119,10 @@ def main() -> int:
     except (IndexError, ValueError):
         budget = 25000
     mode = sys.argv[4] if len(sys.argv) > 4 else "user_prompt"
+    # Resolve attribution once per hook invocation.  A failed version read or
+    # invalid host lane intentionally selects the legacy line shape.
+    attribution_lane = _validated_attribution_lane()
+    attribution_version = _release_version()
     global _LEDGER_MOD
     _LEDGER_MOD = _ledger_helpers(store_py)
     # Optional per-mode limits (issue #58 final-critic round 2): callers
@@ -1129,6 +1218,7 @@ def main() -> int:
         _log_inject_decision(
             [], [], "silent", _reason_disabled(store_py),
             session_id=_sid, moment=_decision_moment(mode), store_py=store_py,
+            lane=attribution_lane, version=attribution_version, t_ms=0,
             **_disabled_batch_kwargs)
         print("{}")
         return 0
@@ -1152,6 +1242,10 @@ def main() -> int:
     ops_tokens = []
     session_id = ""
     pending_ctx = ""
+    # Duration of the exact store subprocess attempt used for this decision.
+    # Zero is also the intentional value for no-attempt paths (for example an
+    # empty PostToolBatch); the disabled path above is explicitly t_ms=0.
+    attribution_t_ms = 0
     # Issue #120: additive decision-log kwargs for the batch lane; empty on
     # every other mode so the shared log calls stay byte-identical.
     _batch_log_kwargs = {}
@@ -1350,6 +1444,8 @@ def main() -> int:
                     [], [], "silent", "empty-pool",
                     ops_count=0, session_id=session_id,
                     moment=_decision_moment(mode), store_py=store_py,
+                    lane=attribution_lane, version=attribution_version,
+                    t_ms=attribution_t_ms,
                     **_batch_log_kwargs)
                 print("{}")
                 return 0
@@ -1472,40 +1568,44 @@ def main() -> int:
         if mode == "precompact" and _sidecar_fallback_enabled():
             pending_ctx = _consume_pending(session_id)
 
-        if use_recent_pull:
-            out = subprocess.check_output(
-                [
-                    sys.executable, store_py, "recent",
-                    "--namespace", ns,
-                    "--limit", recent_limit,
-                    "--min-confidence", str(_recent_floor(store_py)),
-                    "--include-global",
-                    "--global-limit", recent_global_limit,
-                    "--no-bump",
-                    "--for-injection",
-                    "--json",
-                    *_exclude_argv,
-                ],
-                stderr=subprocess.DEVNULL,
-                timeout=_store_timeout_s(),
-            ).decode("utf-8", "replace")
-        else:
-            out = subprocess.check_output(
-                [
-                    sys.executable, store_py, "recall",
-                    "--query", query,
-                    "--namespace", ns,
-                    "--limit", "5",
-                    "--include-global",
-                    "--global-limit", "3",
-                    "--no-bump",
-                    "--for-injection",
-                    "--json",
-                    *_exclude_argv,
-                ],
-                stderr=subprocess.DEVNULL,
-                timeout=_store_timeout_s(),
-            ).decode("utf-8", "replace")
+        _attempt_started = time.perf_counter()
+        try:
+            if use_recent_pull:
+                out = subprocess.check_output(
+                    [
+                        sys.executable, store_py, "recent",
+                        "--namespace", ns,
+                        "--limit", recent_limit,
+                        "--min-confidence", str(_recent_floor(store_py)),
+                        "--include-global",
+                        "--global-limit", recent_global_limit,
+                        "--no-bump",
+                        "--for-injection",
+                        "--json",
+                        *_exclude_argv,
+                    ],
+                    stderr=subprocess.DEVNULL,
+                    timeout=_store_timeout_s(),
+                ).decode("utf-8", "replace")
+            else:
+                out = subprocess.check_output(
+                    [
+                        sys.executable, store_py, "recall",
+                        "--query", query,
+                        "--namespace", ns,
+                        "--limit", "5",
+                        "--include-global",
+                        "--global-limit", "3",
+                        "--no-bump",
+                        "--for-injection",
+                        "--json",
+                        *_exclude_argv,
+                    ],
+                    stderr=subprocess.DEVNULL,
+                    timeout=_store_timeout_s(),
+                ).decode("utf-8", "replace")
+        finally:
+            attribution_t_ms = _rounded_elapsed_ms(_attempt_started)
         rows = json.loads(out) if out.strip() else []
         # v13 (issue #65, 10.8): unwrap the read envelope ({"results": ...});
         # a bare list from a pre-v13 store.py still works. Issue #87: read the
@@ -1657,6 +1757,8 @@ def main() -> int:
             reason = envelope_reason or _classify_silent_reason(
                 rows, omitted=omitted, budget_emptied=False,
                 allowed=silent_reasons,
+                candidate_ids=envelope_candidates,
+                post_ledger_rows=rows,
             )
         except Exception:
             reason = "empty-pool"
@@ -1690,6 +1792,8 @@ def main() -> int:
             arms=envelope_arms,
             margin=envelope_margin,
             margin_pruned_ids=envelope_margin_pruned_ids,
+            lane=attribution_lane, version=attribution_version,
+            t_ms=attribution_t_ms,
             **_batch_log_kwargs,
         )
         if mode in ("pretool", "posttoolbatch"):
@@ -1766,6 +1870,8 @@ def main() -> int:
                          arms=envelope_arms,
                          margin=envelope_margin,
                          margin_pruned_ids=envelope_margin_pruned_ids,
+                         lane=attribution_lane, version=attribution_version,
+                         t_ms=attribution_t_ms,
                          **_batch_log_kwargs)
     if (_LEDGER_MOD is not None and session_id
             and mode not in ("precompact", "session_end")):
