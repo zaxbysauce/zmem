@@ -385,9 +385,14 @@ class L23DoctorOperationalHealth(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class L25SharedAssertLocalFs(unittest.TestCase):
     def test_all_three_hooks_import_shared_helper_not_define_locally(self):
+        # Issue #122: the reflect hook no longer opens the store at all, so
+        # the WAL guard does not apply to it — it must instead contain NO
+        # local-store access (pinned by
+        # test_hermes_correction_remote.test_correction_capture_uses_store_
+        # subprocess). The two hooks that still open SQLite keep the shared
+        # helper requirement.
         import ast
         for hook in ("zmem-hermes-convention.py",
-                     "zmem-hermes-reflect.py",
                      "zmem-hermes-verify.py"):
             with self.subTest(hook=hook):
                 src = (HOOKS_DIR / hook).read_text(encoding="utf-8")
@@ -400,6 +405,14 @@ class L25SharedAssertLocalFs(unittest.TestCase):
                 self.assertNotIn("_assert_local_fs", defs,
                                  f"{hook} still defines _assert_local_fs locally")
                 self.assertTrue(imps, f"{hook} does not import from _zmem_hook_common")
+
+    def test_reflect_hook_has_no_store_access_to_guard(self):
+        # Issue #122: the reflect hook's safety property is STRONGER than
+        # the WAL guard — it must not touch the local store in any form.
+        src = (HOOKS_DIR / "zmem-hermes-reflect.py").read_text(encoding="utf-8")
+        for banned in ("sqlite3", "storelib", "correction_queue"):
+            self.assertNotIn(banned, src,
+                             f"reflect hook must not reference {banned}")
 
     def test_shared_helper_rejects_unc_and_accepts_local(self):
         sys.path.insert(0, str(HOOKS_DIR))
