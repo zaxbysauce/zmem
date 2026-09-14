@@ -306,7 +306,7 @@ when the passive injection-risk filter dropped rows. The closed set lives in
 `schema_meta.py` (`INJECT_SILENT_REASONS`). Since issue #94 every line also
 ends with `sid=<sanitized session id>` (`[^A-Za-z0-9._-]` → `_`, cap 128;
 `sid=unknown` when the host sent none) — the session key doctor's
-`--miss-rate` join binds failures to injections with. The pre-attribution legacy order was `status`, `reason`, `omitted=`, `ids=`, `all=`, `tokens=`, `rendered_estimate=`, `admission_budget=`, `budget_dropped=`, `budget_truncated=`, `budget_dropped_protected=`, `ops=`, `sid=`. Current lines append `exc=`, `moment=`, optional `lane=`, `ver=`, `t_ms=`, then `arms=`, `batch=`, `tools=`, `paths=`, and margin fields (the budget fields are issue #116's distinct labeled numbers and ride only when budget accounting ran).
+`--miss-rate` join binds failures to injections with. The order is `status`, `reason`, `omitted=`, `ids=`, `all=`, `tokens=`, `rendered_estimate=`, `admission_budget=`, `budget_dropped=`, `budget_truncated=`, `budget_dropped_protected=`, `sid=` (the retired `ops=` ring count rode before `sid=` in releases <= 0.37; issue #158 moved operation context into the query, not the log). Current lines append `exc=`, `moment=`, optional `lane=`, `ver=`, `t_ms=`, then `arms=`, `batch=`, `tools=`, `paths=`, and margin fields (the budget fields are issue #116's distinct labeled numbers and ride only when budget accounting ran).
 
 #### Decision attribution and report projection (issue #153)
 
