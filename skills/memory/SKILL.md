@@ -1612,6 +1612,66 @@ contract-regression gate whose `--compare-baseline` pins stage keys,
 per-stage values, and a machine-independent `input_digest`; it does not
 measure wall-clock latency.
 
+## Store hygiene (read-only, issue #97)
+
+`store.py hygiene` audits a SNAPSHOT of the store — it never opens or writes
+the live store, and it never mutates a memory, vector row, namespace, or
+signal. Hermes-origin MUTATIONS remain owned by issue #168's explicit
+operator map; this command is strictly report-only.
+
+Operator workflow:
+
+1. **Snapshot copy first.** The live store runs in WAL journal mode, so a
+   bare `cp` of `store.sqlite` can miss commits still sitting in the `-wal`
+   file (or open malformed mid-checkpoint). Use a crash-consistent snapshot
+   instead — either the built-in verified backup or SQLite's own backup API:
+
+   ```bash
+   # Option A (preferred): the store's verified backup writes a
+   # crash-consistent store-<stamp>.sqlite snapshot.
+   python skills/memory/scripts/store.py backup
+   # Option B: SQLite's online backup API.
+   sqlite3 ~/.zmem/store.sqlite ".backup '/tmp/snapshot.sqlite'"
+   ```
+
+   Then run the report against that snapshot (the command opens it with
+   SQLite `mode=ro`, so even an accident cannot write):
+
+   ```bash
+   python skills/memory/scripts/store.py hygiene \
+     --store /tmp/snapshot.sqlite \
+     --origin-map origin-map.json --evidence-map evidence-map.json \
+     --out report.json --format json
+   ```
+
+2. **Review the report.** It contains the snapshot's SHA-256, row totals and
+   live counts, sorted namespaces/signals, the reviewed Hermes-origin ids,
+   the six known junk namespaces (`ns1`, `ns2`, `project:`, `test`,
+   `unfoldtest`, `user:t`), duplicate logical keys (live rows sharing a
+   `content_norm`), and a sorted `signal=none` upgrade action plan.
+
+3. **Verified backup** (`store.py backup`) before any remediation, then a
+   **dry-run rekey** (`rekey-namespace --dry-run`) if namespaces must move.
+
+4. **Mutation boundary.** The action plan emits `store.py update ...`
+   commands as REVIEW ARTIFACTS — verbatim and unquoted by contract, so read
+   them before running anything; it executes nothing. Every proposed upgrade
+   requires a live later grounded row, a live `supports`/`updates`/
+   `extends`/`derives` link, a non-empty proof source reference, and a
+   justification. A rerun omits a target whose current row is superseded.
+
+Invalid input (unreadable files, malformed JSON, duplicate or unknown mapped
+ids, SQLite errors) exits 2 with `[zmem] hygiene: invalid input` and creates
+no output file.
+
+Namespace resolution (host.py `resolve_namespace`) now distinguishes git
+`remote` / `absent` / `error`: a successful remote key is cached to disk
+(`<data-dir>/namespace-cache/`, TTL 3600 s), an absent checkout keeps its
+path key, and a git ERROR inside a checkout resolves to the cached remote
+key or `user:global` — never a path-shaped key. Cache failures fail open
+silently. (This is the host-layer disk cache, distinct from the hook's
+per-process namespace cache in the timeout budget above.)
+
 ## Hard rules
 - **Never put secrets/credentials/PII in the store.** It is a local plaintext sqlite
   file. The write-time filter is advisory only (regex heuristic), not a guarantee.

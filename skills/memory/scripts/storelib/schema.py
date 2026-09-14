@@ -1063,7 +1063,30 @@ def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces) -> dict[str, str
                 file=sys.stderr,
             )
             continue
-        new_ns = _host.resolve_namespace(checkout_path)
+        # A migration re-key is a PERMANENT bulk UPDATE (schema_version moves
+        # forward in the same batch, so it never re-runs). Only re-key when
+        # the checkout's origin is verifiably present RIGHT NOW: on a
+        # transient git error the resolver's capture-path fallback
+        # (cached key, then user:global) must never decide where a whole
+        # namespace's history lands — re-keying to user:global would merge
+        # unrelated projects' memories (PR #199 review, UR-1). Absent/unknown
+        # statuses follow the same refuse-and-retry contract as a missing
+        # checkout directory.
+        status_fn = getattr(_host, "_get_git_remote_status", None)
+        if status_fn is not None:
+            url, git_status = status_fn(checkout_path)
+            if git_status != "remote":
+                print(
+                    f"[zmem] ns migration WARNING: checkout for {old_ns} "
+                    f"git status is '{git_status}' (origin not verifiable) "
+                    f"— refusing to guess; namespace left unchanged "
+                    f"(will be retried on a later run)",
+                    file=sys.stderr,
+                )
+                continue
+            new_ns = f"project:{_host._normalize_remote(url)}"
+        else:  # older host.py without the status probe — behave as before
+            new_ns = _host.resolve_namespace(checkout_path)
         mapping[old_ns] = new_ns
         if new_ns != old_ns:
             conn.execute(

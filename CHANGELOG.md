@@ -10,6 +10,63 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.37.0] - 2026-09-13
+
+> Workstream E PR 1 of 7 (issue #97): a Git failure can no longer invent a
+> path-shaped project namespace, and a read-only hygiene report audits the
+> store's debris without ever touching it.
+
+### Added
+- **`store.py hygiene` (issue #97)**: read-only snapshot report for store
+  hygiene — totals and live counts, sorted namespaces/signals, the reviewed
+  Hermes-origin id map, the six known junk namespaces, duplicate logical
+  keys (live rows sharing a `content_norm`), and an evidence-gated
+  `signal=none` upgrade action plan. Every proposed upgrade requires a live
+  later grounded row, a live `supports`/`updates`/`extends`/`derives` link,
+  a non-empty proof reference, and a justification; the emitted
+  `store.py update` commands are review artifacts and are never executed.
+  Opens the snapshot with SQLite `mode=ro`; invalid input (unreadable
+  files, malformed JSON, duplicate or unknown mapped ids, SQLite errors)
+  exits 2 with `[zmem] hygiene: invalid input` and creates no output.
+  Hermes-origin mutations remain owned by issue #168.
+- **`storelib/namespace_cache.py` (issue #97)**: disk cache of successful
+  remote-derived namespaces (`<data-dir>/namespace-cache/`,
+  `NAMESPACE_CACHE_TTL_SECONDS = 3600`); read, write, and corruption
+  failures fail open silently.
+- **Operator documentation** in `skills/memory/SKILL.md`: the snapshot-copy
+  / report-review / verified-backup / dry-run rekey workflow and the #168
+  mutation boundary.
+
+### Fixed
+- **Migration re-key guard (PR #199 review)**: `_rekey_namespaces` re-keys a
+  namespace only when its checkout's origin is verifiably present right now
+  (git status `remote`); on a transient git error or missing origin it
+  follows the existing refuse-and-retry contract instead of writing rows
+  into `user:global`.
+- **Subdirectory resolution (PR #199 review)**: `resolve_namespace` runs the
+  git health probe first, so hook capture from a repo SUBDIRECTORY resolves
+  the project's remote key exactly like the repo root.
+- **Hygiene report safety (PR #199 review)**: `--out` may no longer alias the
+  snapshot or an input map (the read-only contract is enforced against
+  self-destruction), and an unwritable `--out` exits 2 as invalid input
+  instead of raising a traceback.
+- **Namespace cache hardening (PR #199 review)**: cache keys use
+  `os.path.normcase` (no cross-checkout collisions on case-sensitive
+  filesystems), non-finite timestamps never serve, each writer uses a unique
+  temporary file, and an `absent` checkout drops its cached remote key so a
+  removed origin can never resurface through a later error fallback.
+- **Docs**: the hygiene snapshot step now uses the WAL-safe
+  `store.py backup` / SQLite `.backup` path instead of a bare `cp`.
+
+### Changed
+- **Namespace resolution (issue #97)**: `host.py` now classifies each
+  lookup as git `remote`, `absent`, or `error`. A successful remote key is
+  cached; an `absent` checkout keeps its historical path key; a git ERROR
+  inside a checkout resolves to the cached remote key or exactly
+  `user:global` — never a path-shaped namespace, so a transient Git
+  failure can no longer strand captured memories under a path namespace
+  nothing resolves.
+
 ## [0.36.0] - 2026-09-13
 
 > Workstream N PR 1 of 6 (issue #184): fail-closed host-cache refresh from a
@@ -35,6 +92,7 @@ README.
   execution, fail-fast behavior, and nonzero exit propagation; installer steps
   are skipped when refresh fails. The updater remains operator-local and
   untracked, so existing copies must be reordered before use.
+
 
 ## [0.35.0] - 2026-09-13
 
