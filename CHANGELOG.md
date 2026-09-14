@@ -10,30 +10,55 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.38.0] - 2026-09-14
+## [0.39.0] - 2026-09-14
 
-> Workstream G PR 1 of 5 (issue #153) and Workstream H PR 1 of 8 (issue
-> #158): host-lane attribution with an already-delivered reason in the
-> decision log, and one store-owned passive-injection selector behind a
-> complete rendered envelope.
+> Issue #159: query-aware passive prefetch joins the CLI and the MCP server
+> — one selector call, one complete envelope everywhere.
 
 ### Added
-- **Closed decision attribution**: passive decision lines can identify the
-  host lane (`claude`, `codex`, `zcode`, `hermes-provider`, or
-  `hermes-compat`), runtime moment, release semver, and nonnegative
-  store-attempt duration while preserving the complete legacy line when a
-  manifest cannot be loaded.
-- **Already-delivered classification**: the classifier distinguishes a
-  nonempty pre-delivery candidate set emptied by the delivery ledger from a
-  genuinely empty pool, with the exact closed seven-reason vocabulary shared
-  by schema, hooks, Hermes, parser, and reports.
-- **Deterministic attribution reports**: miss-rate reporting parses enriched
-  and legacy lines, keeps compatibility values aggregate-visible, and emits
-  a sorted, zero-filled 20-row matrix for the five named lanes and four
-  report moments.
-- **Hermes compatibility attribution**: local provider and remote MCP paths
-  carry their lane identity, reject invalid explicit lanes before store work,
-  and omit the optional lane for legacy callers.
+- **`store.py prefetch` (issue #159, Workstream H-2)**: query-aware passive
+  prefetch as a single `select_and_budget_for_injection` call (limit 5,
+  global limit 3, the 1,500-token budget) that prints the complete selector
+  envelope as JSON — its only output mode. `--query`, `--namespace`,
+  `--session-id`, and `--moment` are required; `--lane`, repeatable
+  `--ops-token`, and repeatable `--exclude` are the additive attribution
+  options, and `--for-injection`/`--no-bump` are accepted as explicit
+  markers of the (only) passive lane the selector pins. A second turn for
+  the same session whose delivery ledger already holds the candidate rows
+  returns the silent `already-delivered` envelope.
+- **MCP `prefetch` tool**: the same one-call envelope over the network. The
+  tool validates the boundary (namespace, `session_id`, and `moment`
+  required; `lane` checked against the five-value tuple, never defaulted to
+  a host lane), enforces namespace scope for scoped tokens, honors the
+  `ZMEM_INJECT=0` kill switch before any store subprocess, and returns the
+  complete selector envelope plus the additive `context` alias equal to
+  `rendered`.
+- **CI mcp-requirements install + skipped=0 gate (issue #159)**: both CI
+  matrix jobs install `hermes-plugin/server/requirements.txt` so the
+  MCP-gated suites run instead of silently skipping, and the MCP suites
+  (`tests/test_session_tools.py`, `tests/test_mcp_server.py`) fail the
+  build on any skip (`skipped=[1-9]`).
+  `tests/test_passive_prefetch.py` freezes the contract: byte-identical
+  fences across the CLI, MCP, and Hermes provider against the frozen
+  `tests/fixtures/prefetch/` fixture, the no-bump guarantee, the
+  already-delivered ledger turn, lane validation, and scoped-token refusal.
+
+### Changed
+- **MCP `session_start` reworked onto the queryless selector path (issue
+  #159)**: the store-side selector (via `recent --for-injection --json
+  --session-id ... --moment session_start`) owns the gate, the budget, the
+  ledger, and the `rendered` fence; the tool's local renderer and second
+  budget run are deleted. `result`/`namespace`/`ids` remain additive
+  back-compat aliases and the response carries the additive `context` alias
+  equal to `rendered`; an empty `session_id` falls back to the legacy
+  for-injection envelope. No schema-version change.
+
+## [0.38.0] - 2026-09-13
+
+> Issue #158: passive injection now has one store-owned selector and one
+> complete rendered envelope shared by the hooks and Hermes adapters.
+
+### Added
 - **Store-owned passive injection**: `select_and_budget_for_injection` owns
   selection, delivery-ledger exclusion/recording, operation-token composition,
   token budgeting, and the canonical fenced rendering. The five attributed
@@ -114,26 +139,6 @@ README.
   `user:global` — never a path-shaped namespace, so a transient Git
   failure can no longer strand captured memories under a path namespace
   nothing resolves.
-
-> Workstream G PR 1 of 5 (issue #153): host-lane attribution and an
-> already-delivered reason in the decision log.
-
-### Added
-- **Closed decision attribution**: passive decision lines can identify the
-  host lane (`claude`, `codex`, `zcode`, `hermes-provider`, or `hermes-compat`),
-  runtime moment, release semver, and nonnegative store-attempt duration while
-  preserving the complete legacy line when a manifest cannot be loaded.
-- **Already-delivered classification**: the classifier distinguishes a
-  nonempty pre-delivery candidate set emptied by the delivery ledger from a
-  genuinely empty pool, with the exact closed seven-reason vocabulary shared
-  by schema, hooks, Hermes, parser, and reports.
-- **Deterministic attribution reports**: miss-rate reporting parses enriched and
-  legacy lines, keeps compatibility values aggregate-visible, and emits a
-  sorted, zero-filled 20-row matrix for the five named lanes and four report
-  moments.
-- **Hermes compatibility attribution**: local provider and remote MCP paths
-  carry their lane identity, reject invalid explicit lanes before store work,
-  and omit the optional lane for legacy callers.
 
 ## [0.36.0] - 2026-09-13
 
@@ -1267,8 +1272,7 @@ the ops-ring query-context lane it depends on, and the miss-rate measurement
   UserPromptSubmit body and the Hermes `prefetch` compose
   that ring into the query with the ops slice reserved INSIDE the 500-char
   cap. `ZMEM_QUERY_CONTEXT=0` kill switch (stops collection AND
-  composition); `ops=N` on the `zmem-bg.log`
-  line; `store.py sweep` collects stale rings; decision-point gold bucket
+  composition); `store.py sweep` collects stale rings; decision-point gold bucket
   (fixture rowids 65–70) asserts the #85-shaped prompts retrieve the
   hazard lessons WITH ops context and miss without it.
 - **Ops-lane dir resolution tail parity** (issue #88 follow-up): the hook

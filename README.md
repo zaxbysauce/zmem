@@ -64,9 +64,9 @@ that composes the store-side operation ring. Use
 `python <store.py> ledger-clear --session-id <id>` to reset delivery at a
 session lifecycle boundary; this command does not open SQLite. The former
 hook-owned pending, compact-summary, and task-text sidecars, plus the
-UserPromptSubmit operation tail, are intentionally retired. The remote MCP
-passive consumer is unchanged and remains the #159 follow-up. This release
-does not change the memory schema.
+UserPromptSubmit operation tail, are intentionally retired. The MCP server's
+passive surface now rides the same selector — see *Query-aware passive
+prefetch* below. This release does not change the memory schema.
 
 - **Live correction capture:** a `capture-correction` hook registered under
   `UserPromptSubmit` (Claude Code, ZCode, and Codex) silently queues mid-session
@@ -79,6 +79,35 @@ Signal tiers set how trustworthy a memory is: `test/compile/lint` (high, grounde
 in deterministic verification) > `reviewer/user` (medium) > `none` (low, below the
 retrieval floor by default). This follows the finding that intrinsic self-correction
 (lessons from the agent's own opinion, ungrounded) degrades accuracy.
+
+### Query-aware passive prefetch (issue #159)
+
+`prefetch` exposes the selector's query-aware passive lane on the CLI and the
+MCP server — one `select_and_budget_for_injection` call and one complete JSON
+envelope; no consumer-side renderer, no second budget run:
+
+```
+python <store.py> prefetch --query "<text>" --namespace <ns> \
+  --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
+  [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
+  [--ops-token <token>]... [--exclude <memory-id>]...
+```
+
+`--query`, `--namespace`, `--session-id`, and `--moment` are required; JSON is
+the command's only output mode. The MCP `prefetch` tool takes the same inputs
+(`query`, `namespace`, `session_id`, `moment` required; optional `lane` —
+validated against the five-value tuple, never defaulted — and `ops_tokens`),
+enforces namespace scope and the `ZMEM_INJECT=0` kill switch, and returns the
+complete selector envelope plus the additive `context` alias equal to
+`rendered`. The selector owns the relevance/trust gate and the 1,500-token
+budget on both surfaces; like every passive lane, prefetch never advances
+`retrieval_count`. Delivery is session-attributed: a second turn for the same
+session whose delivery ledger already holds the candidate rows returns the
+silent `already-delivered` envelope (`ledger-clear --session-id` resets it).
+The MCP `session_start` tool rides the same store-owned queryless selector
+path (`recent --for-injection --json --session-id ... --moment session_start`),
+returning that envelope with the same `context` alias plus the back-compat
+`result`/`namespace`/`ids` fields.
 
 ### Retrieval debugger, lineage unfold, and honest eval (issue #82)
 
