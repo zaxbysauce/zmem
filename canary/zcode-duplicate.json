@@ -8,7 +8,7 @@
   "command": [
     "C:\\Program Files\\nodejs\\node.EXE"
   ],
-  "timestamp": "2026-09-15T15:55:54Z",
+  "timestamp": "2026-09-15T16:10:07Z",
   "manifest_hook_ids": [
     "PostToolUse:zmem-launch.js",
     "PostToolUseFailure:zmem-launch.js",
@@ -1286,19 +1286,19 @@
       ],
       "after": [
         {
-          "path": ".drift-checked-zmem-canary-duplicate-a926bcf7-5e26cecc",
+          "path": ".drift-checked-zmem-canary-duplicate-01b229ec-59bc373b",
           "kind": "file",
           "size": 9,
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
         },
         {
-          "path": ".drift-checked-zmem-canary-duplicate-ad49ba58-9b32bcca",
+          "path": ".drift-checked-zmem-canary-duplicate-56909244-97846f42",
           "kind": "file",
           "size": 9,
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
         },
         {
-          "path": ".drift-checked-zmem-canary-duplicate-d7041244-011f73dd",
+          "path": ".drift-checked-zmem-canary-duplicate-c6558b8d-01ec782d",
           "kind": "file",
           "size": 9,
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
@@ -1462,46 +1462,6 @@
         {
           "path": "host-roots/zcode-plugin-a/skills/memory/scripts",
           "kind": "directory"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__",
-          "kind": "directory"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/correction_queue.cpython-311.pyc",
-          "kind": "file",
-          "size": 23840,
-          "sha256": "c62e776945bdb3d6dbed7525c27f460ce29ad2496ebcb6d630974b966564d112"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/corrections.cpython-311.pyc",
-          "kind": "file",
-          "size": 22233,
-          "sha256": "f39b78c7c614ec4b2edfe2609470ec6c145d0f024b4e063696914b28f56a8208"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/embed_profiles.cpython-311.pyc",
-          "kind": "file",
-          "size": 8956,
-          "sha256": "c3bb4790ecc2cae8f5e0a19f849c85dbda950038915c93e0696274b28f447965"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/embeddings.cpython-311.pyc",
-          "kind": "file",
-          "size": 29645,
-          "sha256": "996747560f3730bcff0bf48f94c415181216f4a0b27d0411b5484ec594231f94"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/host.cpython-311.pyc",
-          "kind": "file",
-          "size": 55628,
-          "sha256": "4fe777d67498cd32663c7171ef37c1150a75e1e8fac03a7760a5f4631a57cc03"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/schema_meta.cpython-311.pyc",
-          "kind": "file",
-          "size": 6312,
-          "sha256": "54ff6173f85be848d42ea9330b8500fd022ffe2e1ba10df50aa1c5288699bb0e"
         },
         {
           "path": "host-roots/zcode-plugin-a/skills/memory/scripts/correction_queue.py",
@@ -1830,130 +1790,6 @@
           "sha256": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757"
         },
         {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__",
-          "kind": "directory"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/__init__.cpython-311.pyc",
-          "kind": "file",
-          "size": 24281,
-          "sha256": "37d8aa8c5fe7f9b0a249bf6e6953c6e18af0ad189760585e00c4867fbcdf756f"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/backup.cpython-311.pyc",
-          "kind": "file",
-          "size": 45162,
-          "sha256": "a78808a6e7d6a440535d66465a0eb08723f1cac01a05b84d58202031df4ebba4"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/cli.cpython-311.pyc",
-          "kind": "file",
-          "size": 102216,
-          "sha256": "0575654f0a262acd99db1c715f82041697454451540881a9178306f7c36f362c"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/consolidate.cpython-311.pyc",
-          "kind": "file",
-          "size": 61899,
-          "sha256": "edcce8b530fe5492a609cd225e64effaf28db7af0e1fdfe852c9145d633bcb2b"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/cross_encoder.cpython-311.pyc",
-          "kind": "file",
-          "size": 10859,
-          "sha256": "ab702b28c744d0c9e12afe2c328880abe7e25f4d0777f9afab6823c1884e5995"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/entity.cpython-311.pyc",
-          "kind": "file",
-          "size": 29994,
-          "sha256": "1c55f4a117583d426b6367b5ab38836c23440f305274ad1da39149be97a767a0"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/episodes.cpython-311.pyc",
-          "kind": "file",
-          "size": 15260,
-          "sha256": "9f2ccd8e438605c0a0132826702a588288035b4d5add0dc2167c1d2f80e06a62"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/eval_gold.cpython-311.pyc",
-          "kind": "file",
-          "size": 46963,
-          "sha256": "30641e18001bc39504ee669cce5f575bb158a52461b39493c0275761874e7c64"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/inject.cpython-311.pyc",
-          "kind": "file",
-          "size": 48298,
-          "sha256": "d0ae79a88219bf4c7de0a30f59ad518336dfb421e05b096674ec365ca3aed840"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/links.cpython-311.pyc",
-          "kind": "file",
-          "size": 32809,
-          "sha256": "416a48da81e756efafeabacade6c46a3a3c1141359ca179fe62a0e54fec37afe"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/mine.cpython-311.pyc",
-          "kind": "file",
-          "size": 69604,
-          "sha256": "b02aa05c5d057f9db278275f1424acf9451423da8f47c7b62bd64dcebfd66d19"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/namespace_cache.cpython-311.pyc",
-          "kind": "file",
-          "size": 6144,
-          "sha256": "084c965b71a9b162a014e1359927b73cbd768765b5ea6435b431a79c33d3b859"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/ops_tokens.cpython-311.pyc",
-          "kind": "file",
-          "size": 24464,
-          "sha256": "9aea3e73b74a586a15904a4a6bc87ce50c676ffde428738269dd8b9ea22c3e68"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/organize.cpython-311.pyc",
-          "kind": "file",
-          "size": 49560,
-          "sha256": "bcac75bee8c306ec68d7dcc016c1d002b4b2fe14365af52c34189b24e1fba206"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/promote.cpython-311.pyc",
-          "kind": "file",
-          "size": 14592,
-          "sha256": "0e4ec95e9abd53e3b1b1b5c46c23143a9fdfb6624740e97c5f2f63adb93033de"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/recall.cpython-311.pyc",
-          "kind": "file",
-          "size": 164453,
-          "sha256": "105e22020423fbd49eab99c8db69addaac87490e183dcfc30d27bdd72fa7eb66"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/schema.cpython-311.pyc",
-          "kind": "file",
-          "size": 74757,
-          "sha256": "dabc7c680232e651cfd73586fed38f164728875cb15f22f541603328309f0fa6"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/sync.cpython-311.pyc",
-          "kind": "file",
-          "size": 52805,
-          "sha256": "b7703ca1cb667efc5bc3ad01b8a389adb6060c2bbd27aac046eecdc34f758d7d"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/tune.cpython-311.pyc",
-          "kind": "file",
-          "size": 6631,
-          "sha256": "403101e30282905930b540278269ae41c329d7f5920f89bf8847e2afbd9373c9"
-        },
-        {
-          "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/write.cpython-311.pyc",
-          "kind": "file",
-          "size": 66799,
-          "sha256": "bf5b3b011fd4038a1c0edcf6954602647e145abda4b87b8b8c81c82e3c60411d"
-        },
-        {
           "path": "host-roots/zcode-plugin-a/skills/memory/scripts/storelib/backup.py",
           "kind": "file",
           "size": 36783,
@@ -2252,46 +2088,6 @@
         {
           "path": "host-roots/zcode-plugin-b/skills/memory/scripts",
           "kind": "directory"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__",
-          "kind": "directory"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/correction_queue.cpython-311.pyc",
-          "kind": "file",
-          "size": 23840,
-          "sha256": "a66c8c5d74a9ef69a3f970f42053caa2211e16b81146044e2ac90c7afc5d7233"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/corrections.cpython-311.pyc",
-          "kind": "file",
-          "size": 22233,
-          "sha256": "9b42e04989df0662fbd1cf36d0b7d206afb613eb687f13767fb93d4a74064361"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/embed_profiles.cpython-311.pyc",
-          "kind": "file",
-          "size": 8956,
-          "sha256": "e49e9f3fd787c90baeaf670652f7f1d6451bfdb09cb693d54b1ebdcdd9da2b28"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/embeddings.cpython-311.pyc",
-          "kind": "file",
-          "size": 29645,
-          "sha256": "4c8258ae698a28fa87653f7150b1c61b6010569b726e257173421dff08216893"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/host.cpython-311.pyc",
-          "kind": "file",
-          "size": 55628,
-          "sha256": "839bcae1889d8cc22a46f085c0e226a6822e4250920efa2e73d0cec289a7b506"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/schema_meta.cpython-311.pyc",
-          "kind": "file",
-          "size": 6312,
-          "sha256": "ad74b8856dec4300d83fc849a7e80df259fb773efda370dbe7cf569d31fe2006"
         },
         {
           "path": "host-roots/zcode-plugin-b/skills/memory/scripts/correction_queue.py",
@@ -2620,130 +2416,6 @@
           "sha256": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757"
         },
         {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__",
-          "kind": "directory"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/__init__.cpython-311.pyc",
-          "kind": "file",
-          "size": 24281,
-          "sha256": "b321e0d499f5e702d9b0486221a1c73d6c2c5bbfe95732b3baa9a16e0885a702"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/backup.cpython-311.pyc",
-          "kind": "file",
-          "size": 45162,
-          "sha256": "e4fa12dd317e7a447f959adc80bf9e739b51d173750917a388758b4898cc6478"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/cli.cpython-311.pyc",
-          "kind": "file",
-          "size": 102216,
-          "sha256": "6f90bba2f59498aa6f0483a32aec1d31b9a94034170d7755354bd2f1ff087638"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/consolidate.cpython-311.pyc",
-          "kind": "file",
-          "size": 61899,
-          "sha256": "e04b881219790938ff4c48938a852937de1efb445a425ae65e5d00ba7b8f3fa8"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/cross_encoder.cpython-311.pyc",
-          "kind": "file",
-          "size": 10859,
-          "sha256": "fe57b2d7d7adb112408fd626cf8402cfadfd082ff5cefa1dc552502e10212fc8"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/entity.cpython-311.pyc",
-          "kind": "file",
-          "size": 29994,
-          "sha256": "cd2806522d13593f0ca4cf5e5ef0a192762066ab8b24255704b395b38b78ada6"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/episodes.cpython-311.pyc",
-          "kind": "file",
-          "size": 15260,
-          "sha256": "21679ebee12aa80db88f7ffeaf20a8ae65ca6727342d9a6360302ac46da779d9"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/eval_gold.cpython-311.pyc",
-          "kind": "file",
-          "size": 46963,
-          "sha256": "d9b91bb010feb97b88270a9999d3f5d258b77e662e7ac6d791afefb62bc8fc04"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/inject.cpython-311.pyc",
-          "kind": "file",
-          "size": 48298,
-          "sha256": "7e6e3cca88c4a53ff4a65e39aa71faca0fcd68fb371df9e277351cbdd429f57a"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/links.cpython-311.pyc",
-          "kind": "file",
-          "size": 32809,
-          "sha256": "5df71288df4ecfe6519260034afc90cd7f75a3b3038f850bb9b09e968d9ab3ed"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/mine.cpython-311.pyc",
-          "kind": "file",
-          "size": 69604,
-          "sha256": "f592d712de863d222e54b618c187ccc02673b49cd9b2caa0c7c19560b1be08f1"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/namespace_cache.cpython-311.pyc",
-          "kind": "file",
-          "size": 6144,
-          "sha256": "bbb3efdb1b383fffbfef93fee925ac522f5c9531226f57d5a1bff10defd90b8e"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/ops_tokens.cpython-311.pyc",
-          "kind": "file",
-          "size": 24464,
-          "sha256": "9f7472e4aa29efc2ffb21cdb24d4d576ad46c36fa718dbc07704aa3e8ebf517a"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/organize.cpython-311.pyc",
-          "kind": "file",
-          "size": 49560,
-          "sha256": "600e184352fbcafee6dd86e3e5c5dd20d619f6143c989eb7dd87a34c781cab53"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/promote.cpython-311.pyc",
-          "kind": "file",
-          "size": 14592,
-          "sha256": "5b29592e38f65edec2616f1431490640cc303de27499b2c3321ca6bc1f6aced1"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/recall.cpython-311.pyc",
-          "kind": "file",
-          "size": 164453,
-          "sha256": "6940f5a677d20f81cd787d3628055ad4b845a98df83b1216c2779363b65b43f7"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/schema.cpython-311.pyc",
-          "kind": "file",
-          "size": 74757,
-          "sha256": "1d39ce4e3e32f95fe96209be14dea9dd17cd34118577793dcc4c2029b1a72c76"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/sync.cpython-311.pyc",
-          "kind": "file",
-          "size": 52805,
-          "sha256": "fd974a9d239f7791ac08d31b170686a2748f0306e9ed78c47b78605a6cc7fd59"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/tune.cpython-311.pyc",
-          "kind": "file",
-          "size": 6631,
-          "sha256": "e35dd4b183ceef86157d21d2027c12bdb0ca4dcba2f051c74a1eaffea995613a"
-        },
-        {
-          "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/write.cpython-311.pyc",
-          "kind": "file",
-          "size": 66799,
-          "sha256": "281b4b295364d20e631ca79f08047fd0352aa4261d407d2c3e2e99e214da39a8"
-        },
-        {
           "path": "host-roots/zcode-plugin-b/skills/memory/scripts/storelib/backup.py",
           "kind": "file",
           "size": 36783,
@@ -2892,10 +2564,10 @@
           "kind": "directory"
         },
         {
-          "path": "namespace-cache/395babc63facbb69731cef2ffe8bba9fd9faca263edc709e740f62276774ced6.json",
+          "path": "namespace-cache/063d3f02a0f21f41d38454770e4562dee779af4f1071ab78524683d6b3897a27.json",
           "kind": "file",
           "size": 82,
-          "sha256": "c0be6d445bf87b7b53e868372c7dbdf3b750ffae9c8227e5d16f794de01fb6eb"
+          "sha256": "04d4be7789e127fc13fc5c4ea25cbdfbf322e1852afb124a7b6d6fe9caa7d84f"
         },
         {
           "path": "workdir",
@@ -2911,7 +2583,7 @@
           "path": "zmem-decisions.log",
           "kind": "file",
           "size": 390,
-          "sha256": "8b89ffbc1d6aebe15c7dab614f3d4dcf259de0475fb8824bd1ab5fee22dc361e"
+          "sha256": "43eec4efd631260fd2f934790ebcad981726bf0df7eacb8dce97eb8a1459d376"
         }
       ]
     },
@@ -4332,46 +4004,6 @@
           "kind": "directory"
         },
         {
-          "path": "zcode-plugin-a/skills/memory/scripts/__pycache__",
-          "kind": "directory"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/__pycache__/correction_queue.cpython-311.pyc",
-          "kind": "file",
-          "size": 23840,
-          "sha256": "c62e776945bdb3d6dbed7525c27f460ce29ad2496ebcb6d630974b966564d112"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/__pycache__/corrections.cpython-311.pyc",
-          "kind": "file",
-          "size": 22233,
-          "sha256": "f39b78c7c614ec4b2edfe2609470ec6c145d0f024b4e063696914b28f56a8208"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/__pycache__/embed_profiles.cpython-311.pyc",
-          "kind": "file",
-          "size": 8956,
-          "sha256": "c3bb4790ecc2cae8f5e0a19f849c85dbda950038915c93e0696274b28f447965"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/__pycache__/embeddings.cpython-311.pyc",
-          "kind": "file",
-          "size": 29645,
-          "sha256": "996747560f3730bcff0bf48f94c415181216f4a0b27d0411b5484ec594231f94"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/__pycache__/host.cpython-311.pyc",
-          "kind": "file",
-          "size": 55628,
-          "sha256": "4fe777d67498cd32663c7171ef37c1150a75e1e8fac03a7760a5f4631a57cc03"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/__pycache__/schema_meta.cpython-311.pyc",
-          "kind": "file",
-          "size": 6312,
-          "sha256": "54ff6173f85be848d42ea9330b8500fd022ffe2e1ba10df50aa1c5288699bb0e"
-        },
-        {
           "path": "zcode-plugin-a/skills/memory/scripts/correction_queue.py",
           "kind": "file",
           "size": 21694,
@@ -4698,130 +4330,6 @@
           "sha256": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757"
         },
         {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__",
-          "kind": "directory"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/__init__.cpython-311.pyc",
-          "kind": "file",
-          "size": 24281,
-          "sha256": "37d8aa8c5fe7f9b0a249bf6e6953c6e18af0ad189760585e00c4867fbcdf756f"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/backup.cpython-311.pyc",
-          "kind": "file",
-          "size": 45162,
-          "sha256": "a78808a6e7d6a440535d66465a0eb08723f1cac01a05b84d58202031df4ebba4"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/cli.cpython-311.pyc",
-          "kind": "file",
-          "size": 102216,
-          "sha256": "0575654f0a262acd99db1c715f82041697454451540881a9178306f7c36f362c"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/consolidate.cpython-311.pyc",
-          "kind": "file",
-          "size": 61899,
-          "sha256": "edcce8b530fe5492a609cd225e64effaf28db7af0e1fdfe852c9145d633bcb2b"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/cross_encoder.cpython-311.pyc",
-          "kind": "file",
-          "size": 10859,
-          "sha256": "ab702b28c744d0c9e12afe2c328880abe7e25f4d0777f9afab6823c1884e5995"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/entity.cpython-311.pyc",
-          "kind": "file",
-          "size": 29994,
-          "sha256": "1c55f4a117583d426b6367b5ab38836c23440f305274ad1da39149be97a767a0"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/episodes.cpython-311.pyc",
-          "kind": "file",
-          "size": 15260,
-          "sha256": "9f2ccd8e438605c0a0132826702a588288035b4d5add0dc2167c1d2f80e06a62"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/eval_gold.cpython-311.pyc",
-          "kind": "file",
-          "size": 46963,
-          "sha256": "30641e18001bc39504ee669cce5f575bb158a52461b39493c0275761874e7c64"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/inject.cpython-311.pyc",
-          "kind": "file",
-          "size": 48298,
-          "sha256": "d0ae79a88219bf4c7de0a30f59ad518336dfb421e05b096674ec365ca3aed840"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/links.cpython-311.pyc",
-          "kind": "file",
-          "size": 32809,
-          "sha256": "416a48da81e756efafeabacade6c46a3a3c1141359ca179fe62a0e54fec37afe"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/mine.cpython-311.pyc",
-          "kind": "file",
-          "size": 69604,
-          "sha256": "b02aa05c5d057f9db278275f1424acf9451423da8f47c7b62bd64dcebfd66d19"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/namespace_cache.cpython-311.pyc",
-          "kind": "file",
-          "size": 6144,
-          "sha256": "084c965b71a9b162a014e1359927b73cbd768765b5ea6435b431a79c33d3b859"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/ops_tokens.cpython-311.pyc",
-          "kind": "file",
-          "size": 24464,
-          "sha256": "9aea3e73b74a586a15904a4a6bc87ce50c676ffde428738269dd8b9ea22c3e68"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/organize.cpython-311.pyc",
-          "kind": "file",
-          "size": 49560,
-          "sha256": "bcac75bee8c306ec68d7dcc016c1d002b4b2fe14365af52c34189b24e1fba206"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/promote.cpython-311.pyc",
-          "kind": "file",
-          "size": 14592,
-          "sha256": "0e4ec95e9abd53e3b1b1b5c46c23143a9fdfb6624740e97c5f2f63adb93033de"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/recall.cpython-311.pyc",
-          "kind": "file",
-          "size": 164453,
-          "sha256": "105e22020423fbd49eab99c8db69addaac87490e183dcfc30d27bdd72fa7eb66"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/schema.cpython-311.pyc",
-          "kind": "file",
-          "size": 74757,
-          "sha256": "dabc7c680232e651cfd73586fed38f164728875cb15f22f541603328309f0fa6"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/sync.cpython-311.pyc",
-          "kind": "file",
-          "size": 52805,
-          "sha256": "b7703ca1cb667efc5bc3ad01b8a389adb6060c2bbd27aac046eecdc34f758d7d"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/tune.cpython-311.pyc",
-          "kind": "file",
-          "size": 6631,
-          "sha256": "403101e30282905930b540278269ae41c329d7f5920f89bf8847e2afbd9373c9"
-        },
-        {
-          "path": "zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/write.cpython-311.pyc",
-          "kind": "file",
-          "size": 66799,
-          "sha256": "bf5b3b011fd4038a1c0edcf6954602647e145abda4b87b8b8c81c82e3c60411d"
-        },
-        {
           "path": "zcode-plugin-a/skills/memory/scripts/storelib/backup.py",
           "kind": "file",
           "size": 36783,
@@ -5120,46 +4628,6 @@
         {
           "path": "zcode-plugin-b/skills/memory/scripts",
           "kind": "directory"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/__pycache__",
-          "kind": "directory"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/__pycache__/correction_queue.cpython-311.pyc",
-          "kind": "file",
-          "size": 23840,
-          "sha256": "a66c8c5d74a9ef69a3f970f42053caa2211e16b81146044e2ac90c7afc5d7233"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/__pycache__/corrections.cpython-311.pyc",
-          "kind": "file",
-          "size": 22233,
-          "sha256": "9b42e04989df0662fbd1cf36d0b7d206afb613eb687f13767fb93d4a74064361"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/__pycache__/embed_profiles.cpython-311.pyc",
-          "kind": "file",
-          "size": 8956,
-          "sha256": "e49e9f3fd787c90baeaf670652f7f1d6451bfdb09cb693d54b1ebdcdd9da2b28"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/__pycache__/embeddings.cpython-311.pyc",
-          "kind": "file",
-          "size": 29645,
-          "sha256": "4c8258ae698a28fa87653f7150b1c61b6010569b726e257173421dff08216893"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/__pycache__/host.cpython-311.pyc",
-          "kind": "file",
-          "size": 55628,
-          "sha256": "839bcae1889d8cc22a46f085c0e226a6822e4250920efa2e73d0cec289a7b506"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/__pycache__/schema_meta.cpython-311.pyc",
-          "kind": "file",
-          "size": 6312,
-          "sha256": "ad74b8856dec4300d83fc849a7e80df259fb773efda370dbe7cf569d31fe2006"
         },
         {
           "path": "zcode-plugin-b/skills/memory/scripts/correction_queue.py",
@@ -5488,130 +4956,6 @@
           "sha256": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757"
         },
         {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__",
-          "kind": "directory"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/__init__.cpython-311.pyc",
-          "kind": "file",
-          "size": 24281,
-          "sha256": "b321e0d499f5e702d9b0486221a1c73d6c2c5bbfe95732b3baa9a16e0885a702"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/backup.cpython-311.pyc",
-          "kind": "file",
-          "size": 45162,
-          "sha256": "e4fa12dd317e7a447f959adc80bf9e739b51d173750917a388758b4898cc6478"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/cli.cpython-311.pyc",
-          "kind": "file",
-          "size": 102216,
-          "sha256": "6f90bba2f59498aa6f0483a32aec1d31b9a94034170d7755354bd2f1ff087638"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/consolidate.cpython-311.pyc",
-          "kind": "file",
-          "size": 61899,
-          "sha256": "e04b881219790938ff4c48938a852937de1efb445a425ae65e5d00ba7b8f3fa8"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/cross_encoder.cpython-311.pyc",
-          "kind": "file",
-          "size": 10859,
-          "sha256": "fe57b2d7d7adb112408fd626cf8402cfadfd082ff5cefa1dc552502e10212fc8"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/entity.cpython-311.pyc",
-          "kind": "file",
-          "size": 29994,
-          "sha256": "cd2806522d13593f0ca4cf5e5ef0a192762066ab8b24255704b395b38b78ada6"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/episodes.cpython-311.pyc",
-          "kind": "file",
-          "size": 15260,
-          "sha256": "21679ebee12aa80db88f7ffeaf20a8ae65ca6727342d9a6360302ac46da779d9"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/eval_gold.cpython-311.pyc",
-          "kind": "file",
-          "size": 46963,
-          "sha256": "d9b91bb010feb97b88270a9999d3f5d258b77e662e7ac6d791afefb62bc8fc04"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/inject.cpython-311.pyc",
-          "kind": "file",
-          "size": 48298,
-          "sha256": "7e6e3cca88c4a53ff4a65e39aa71faca0fcd68fb371df9e277351cbdd429f57a"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/links.cpython-311.pyc",
-          "kind": "file",
-          "size": 32809,
-          "sha256": "5df71288df4ecfe6519260034afc90cd7f75a3b3038f850bb9b09e968d9ab3ed"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/mine.cpython-311.pyc",
-          "kind": "file",
-          "size": 69604,
-          "sha256": "f592d712de863d222e54b618c187ccc02673b49cd9b2caa0c7c19560b1be08f1"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/namespace_cache.cpython-311.pyc",
-          "kind": "file",
-          "size": 6144,
-          "sha256": "bbb3efdb1b383fffbfef93fee925ac522f5c9531226f57d5a1bff10defd90b8e"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/ops_tokens.cpython-311.pyc",
-          "kind": "file",
-          "size": 24464,
-          "sha256": "9f7472e4aa29efc2ffb21cdb24d4d576ad46c36fa718dbc07704aa3e8ebf517a"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/organize.cpython-311.pyc",
-          "kind": "file",
-          "size": 49560,
-          "sha256": "600e184352fbcafee6dd86e3e5c5dd20d619f6143c989eb7dd87a34c781cab53"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/promote.cpython-311.pyc",
-          "kind": "file",
-          "size": 14592,
-          "sha256": "5b29592e38f65edec2616f1431490640cc303de27499b2c3321ca6bc1f6aced1"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/recall.cpython-311.pyc",
-          "kind": "file",
-          "size": 164453,
-          "sha256": "6940f5a677d20f81cd787d3628055ad4b845a98df83b1216c2779363b65b43f7"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/schema.cpython-311.pyc",
-          "kind": "file",
-          "size": 74757,
-          "sha256": "1d39ce4e3e32f95fe96209be14dea9dd17cd34118577793dcc4c2029b1a72c76"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/sync.cpython-311.pyc",
-          "kind": "file",
-          "size": 52805,
-          "sha256": "fd974a9d239f7791ac08d31b170686a2748f0306e9ed78c47b78605a6cc7fd59"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/tune.cpython-311.pyc",
-          "kind": "file",
-          "size": 6631,
-          "sha256": "e35dd4b183ceef86157d21d2027c12bdb0ca4dcba2f051c74a1eaffea995613a"
-        },
-        {
-          "path": "zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/write.cpython-311.pyc",
-          "kind": "file",
-          "size": 66799,
-          "sha256": "281b4b295364d20e631ca79f08047fd0352aa4261d407d2c3e2e99e214da39a8"
-        },
-        {
           "path": "zcode-plugin-b/skills/memory/scripts/storelib/backup.py",
           "kind": "file",
           "size": 36783,
@@ -5762,7 +5106,7 @@
       "after": []
     }
   },
-  "notes": "two-copy roots fired: zcode-plugin-a,zcode-plugin-b; one-copy root re-fired: True; inventory-canary-data-wrote-.drift-checked-zmem-canary-duplicate-a926bcf7-5e26cecc; inventory-canary-data-wrote-.drift-checked-zmem-canary-duplicate-ad49ba58-9b32bcca; inventory-canary-data-wrote-.drift-checked-zmem-canary-duplicate-d7041244-011f73dd; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/correction_queue.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/corrections.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/embed_profiles.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/embeddings.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/host.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/__pycache__/schema_meta.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/__init__.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/backup.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/cli.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/consolidate.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/cross_encoder.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/entity.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/episodes.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/eval_gold.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/inject.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/links.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/mine.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/namespace_cache.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/ops_tokens.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/organize.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/promote.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/recall.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/schema.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/sync.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/tune.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-a/skills/memory/scripts/storelib/__pycache__/write.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/correction_queue.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/corrections.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/embed_profiles.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/embeddings.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/host.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/__pycache__/schema_meta.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/__init__.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/backup.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/cli.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/consolidate.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/cross_encoder.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/entity.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/episodes.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/eval_gold.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/inject.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/links.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/mine.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/namespace_cache.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/ops_tokens.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/organize.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/promote.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/recall.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/schema.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/sync.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/tune.cpython-311.pyc; inventory-canary-data-wrote-host-roots/zcode-plugin-b/skills/memory/scripts/storelib/__pycache__/write.cpython-311.pyc; inventory-canary-data-wrote-namespace-cache; inventory-canary-data-wrote-namespace-cache/395babc63facbb69731cef2ffe8bba9fd9faca263edc709e740f62276774ced6.json; inventory-host-roots-changed",
+  "notes": "two-copy roots fired: zcode-plugin-a,zcode-plugin-b; one-copy root re-fired: True",
   "one_copy": {
     "verdict": "pass",
     "reason": "single-copy-pass",

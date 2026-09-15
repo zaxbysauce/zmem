@@ -11,7 +11,7 @@
     "--skip-git-repo-check",
     "-"
   ],
-  "timestamp": "2026-09-15T15:55:50Z",
+  "timestamp": "2026-09-15T16:10:03Z",
   "manifest_hook_ids": [
     "PostToolUse:zmem-launch.js",
     "PreCompact:zmem-launch.js",
@@ -86,5 +86,5 @@
     }
   },
   "notes": "the supported exec invocation emitted no version line (rc=0; stdout tail: pong)",
-  "trust_state": "E:\\ZCode\\zmem\\tmp\\lane-final2\\codex-trust\\operator-config\\codex\\hooks.state"
+  "trust_state": "E:\\ZCode\\zmem\\tmp\\lane-final3\\codex-trust\\operator-config\\codex\\hooks.state"
 }

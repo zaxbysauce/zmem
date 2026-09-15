@@ -674,7 +674,9 @@ def inventory_violations(inventories, data_dir, session_id):
             sys.path.pop(0)
     except Exception:
         allowed_extra.add("ops/")
-    # SQLite's own ephemeral sidecars belong to the store file itself.
+    # SQLite's own ephemeral sidecars belong to the store file itself;
+    # the namespace cache and per-session drift marker are the isolated
+    # store's own operational caches (written by the driven hook chain).
     allowed_extra.update({"store.sqlite-wal", "store.sqlite-shm",
                           "store.sqlite-journal"})
     for name, _ in INVENTORY_ROOTS:
@@ -688,10 +690,10 @@ def inventory_violations(inventories, data_dir, session_id):
             for path in sorted(set(before_map) | set(after_map)):
                 if before_map.get(path) == after_map.get(path):
                     continue
-                if path in allowed_extra or path.startswith("ops/"):
+                if path in allowed_extra or path.startswith("ops/")                         or path.startswith("namespace-cache")                         or path.startswith(".drift-checked-"):
                     continue
                 top = path.split("/")[0]
-                if top in allowed_extra or top.startswith("ops"):
+                if top in allowed_extra or top.startswith("ops")                         or top == "namespace-cache":
                     continue
                 problems.append("inventory-canary-data-wrote-%s" % path)
     return problems
@@ -916,6 +918,7 @@ def _canary_env(host, plugin_root, data_dir):
     env["ZMEM_NAMESPACE"] = CANARY_NS
     env.setdefault("ZMEM_MODELS_DIR", str(Path(data_dir) / "missing-models"))
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 
@@ -926,6 +929,7 @@ def _canary_store_env(host, plugin_root, data_dir):
     env["ZMEM_NAMESPACE"] = CANARY_NS
     env.setdefault("ZMEM_MODELS_DIR", str(Path(data_dir) / "missing-models"))
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 

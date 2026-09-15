@@ -83,7 +83,9 @@
     "store.sqlite-journal",
     "zmem-decisions.log",
     "zmem-bg.log",
-    "ops/"
+    "ops/",
+    "namespace-cache/",
+    ".drift-checked-<session-id> drift-cache marker"
   ],
   "rules": [
     "lane must be one of lanes; host must equal lane_host[lane]",

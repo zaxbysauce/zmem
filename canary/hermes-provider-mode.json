@@ -9,7 +9,7 @@
     "E:\\ZCode\\hermes\\hermes",
     "--version"
   ],
-  "timestamp": "2026-09-15T15:55:40Z",
+  "timestamp": "2026-09-15T16:09:54Z",
   "manifest_hook_ids": [],
   "fired_hook_ids": [],
   "inventories": {
@@ -75,7 +75,7 @@
           "path": "hermes-home/plugins/memory/zmem/plugin.yaml",
           "kind": "file",
           "size": 559,
-          "sha256": "3d0a3c1945a8841d6a5d1acadddbde5f643863e9502419798304004141021f03"
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
         },
         {
           "path": "hermes-home/plugins/memory/zmem/server",
@@ -167,7 +167,7 @@
           "path": "host-roots/hermes-zmem/hermes-plugin/plugin.yaml",
           "kind": "file",
           "size": 559,
-          "sha256": "3d0a3c1945a8841d6a5d1acadddbde5f643863e9502419798304004141021f03"
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
         },
         {
           "path": "host-roots/hermes-zmem/hermes-plugin/server",
@@ -757,7 +757,7 @@
           "path": "hermes-home/plugins/memory/zmem/plugin.yaml",
           "kind": "file",
           "size": 559,
-          "sha256": "3d0a3c1945a8841d6a5d1acadddbde5f643863e9502419798304004141021f03"
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
         },
         {
           "path": "hermes-home/plugins/memory/zmem/server",
@@ -849,7 +849,7 @@
           "path": "host-roots/hermes-zmem/hermes-plugin/plugin.yaml",
           "kind": "file",
           "size": 559,
-          "sha256": "3d0a3c1945a8841d6a5d1acadddbde5f643863e9502419798304004141021f03"
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
         },
         {
           "path": "host-roots/hermes-zmem/hermes-plugin/server",
@@ -1431,7 +1431,7 @@
           "path": "hermes-zmem/hermes-plugin/plugin.yaml",
           "kind": "file",
           "size": 559,
-          "sha256": "3d0a3c1945a8841d6a5d1acadddbde5f643863e9502419798304004141021f03"
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
         },
         {
           "path": "hermes-zmem/hermes-plugin/server",
@@ -2003,7 +2003,7 @@
           "path": "hermes-zmem/hermes-plugin/plugin.yaml",
           "kind": "file",
           "size": 559,
-          "sha256": "3d0a3c1945a8841d6a5d1acadddbde5f643863e9502419798304004141021f03"
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
         },
         {
           "path": "hermes-zmem/hermes-plugin/server",

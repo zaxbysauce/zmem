@@ -8,7 +8,7 @@
   "command": [
     "codex"
   ],
-  "timestamp": "2026-09-15T15:56:17Z",
+  "timestamp": "2026-09-15T16:10:40Z",
   "manifest_hook_ids": [
     "PostToolUse:zmem-launch.js",
     "PreCompact:zmem-launch.js",
@@ -45,6 +45,16 @@
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
         },
         {
+          "path": "backups",
+          "kind": "directory"
+        },
+        {
+          "path": "backups/store-20260915T161037Z.sqlite",
+          "kind": "file",
+          "size": 208896,
+          "sha256": "a15f0d3fbac58f255324698dad8bef65b1984404f266ca8cf9a66df926491cca"
+        },
+        {
           "path": "core.md",
           "kind": "file",
           "size": 1977,
@@ -55,10 +65,16 @@
           "kind": "directory"
         },
         {
-          "path": "namespace-cache/242e8f4aa0e1397d857e2d7f17dd3e3f28cf225185e45fee3fadad66bb7e51f0.json",
+          "path": "namespace-cache/d8d526553a55006c9235d1c08e506a06e5448526884a42b0df23a9a12383600e.json",
           "kind": "file",
           "size": 82,
-          "sha256": "78c125c530990561772a4ef0bb28f7430c03fd9b18ccb2cdb73017f9196ba9f0"
+          "sha256": "654b078c4739b84ccac71168b114bad28f10dfc689e2efb0daff6b9b2ccc2770"
+        },
+        {
+          "path": "store.sqlite",
+          "kind": "file",
+          "size": 208896,
+          "sha256": "056926507514ea09a99e182194bb54b102073a76eff921cd545eb2f8cd24d325"
         },
         {
           "path": "workdir",
@@ -67,14 +83,14 @@
         {
           "path": "zmem-bg.log",
           "kind": "file",
-          "size": 67,
-          "sha256": "78a6353479999de773077a8ece24efe7a3dc4bdb79ad0449d7665ba0778881af"
+          "size": 526,
+          "sha256": "7bf398ef0cacfb3b81cca5861945cf3cf2550c36b2cf8277eb3c0e8ee1e16c29"
         },
         {
           "path": "zmem-decisions.log",
           "kind": "file",
           "size": 785,
-          "sha256": "90eb76298a87156a031a59de1d12c2618883d9176a43610d5e9c7c815120659a"
+          "sha256": "12b114dc393071f04e7f3dec88bf31a3cf81f007b18808e4c6270c457f2f90e1"
         }
       ]
     },
@@ -91,5 +107,5 @@
       "after": []
     }
   },
-  "notes": "per-event children validated rc=0 with JSON or bare object stdout; version measured from the documented session surface only; inventory-canary-data-wrote-.drift-checked-00000000-0000-4000-8000-000000000096-71ff1354; inventory-canary-data-wrote-core.md; inventory-canary-data-wrote-namespace-cache; inventory-canary-data-wrote-namespace-cache/242e8f4aa0e1397d857e2d7f17dd3e3f28cf225185e45fee3fadad66bb7e51f0.json"
+  "notes": "per-event children validated rc=0 with JSON or bare object stdout; version measured from the documented session surface only; inventory-canary-data-wrote-backups; inventory-canary-data-wrote-backups/store-20260915T161037Z.sqlite; inventory-canary-data-wrote-core.md"
 }

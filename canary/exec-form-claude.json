@@ -8,7 +8,7 @@
   "command": [
     "claude"
   ],
-  "timestamp": "2026-09-15T15:56:06Z",
+  "timestamp": "2026-09-15T16:10:20Z",
   "manifest_hook_ids": [
     "PostCompact:zmem-launch.js",
     "PostToolBatch:zmem-launch.js",
@@ -59,7 +59,7 @@
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
         },
         {
-          "path": ".drift-checked-f3213075-f3be-4935-9aa5-2c63e8cbbc7c-5988253e",
+          "path": ".drift-checked-e8fb7989-4c9d-4320-ba48-a3a7c9fde6fc-cfc12905",
           "kind": "file",
           "size": 9,
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
@@ -75,10 +75,10 @@
           "kind": "directory"
         },
         {
-          "path": "namespace-cache/9e99cabe4a759a657300b7db960178043c7e2629a590812d743040e155ad8f9c.json",
+          "path": "namespace-cache/a271a2c5891856c5eb57c07f0f922d4a2790305b96851627e7bb2fc306c4472b.json",
           "kind": "file",
-          "size": 81,
-          "sha256": "2ff7a534f0ee21fa4364849683b5cc9cf659932e78c57693408cb01a20654bb5"
+          "size": 82,
+          "sha256": "2b5f2886375e94f313c5f1be24d263c68019ce2071026a4609df7c84594ef383"
         },
         {
           "path": "workdir",
@@ -88,13 +88,13 @@
           "path": "zmem-bg.log",
           "kind": "file",
           "size": 67,
-          "sha256": "6b2a4869fa87ac8af5f7a95028da6b5638c7cfc101fe64a3ff8b5082fe2b6ede"
+          "sha256": "025c1670cd1025cf092727c3df6f306dcc7b5501e7cdb43e66f19737728183e4"
         },
         {
           "path": "zmem-decisions.log",
           "kind": "file",
           "size": 1268,
-          "sha256": "dbef12423d662e699f99153c590614a85dce3a480972521e7ca63cb58fab0685"
+          "sha256": "0e7a1dcaad887701ef230bcb204f7270eae288b3715d08266036b47ae4847afa"
         }
       ]
     },
@@ -111,5 +111,5 @@
       "after": []
     }
   },
-  "notes": "per-event children validated rc=0 with JSON or bare object stdout; version measured from the documented session surface only; inventory-canary-data-wrote-.capture-prompted-00000000-0000-4000-8000-000000000096; inventory-canary-data-wrote-.drift-checked-00000000-0000-4000-8000-000000000096-71ff1354; inventory-canary-data-wrote-.drift-checked-f3213075-f3be-4935-9aa5-2c63e8cbbc7c-5988253e; inventory-canary-data-wrote-core.md; inventory-canary-data-wrote-namespace-cache; inventory-canary-data-wrote-namespace-cache/9e99cabe4a759a657300b7db960178043c7e2629a590812d743040e155ad8f9c.json"
+  "notes": "per-event children validated rc=0 with JSON or bare object stdout; version measured from the documented session surface only; inventory-canary-data-wrote-.capture-prompted-00000000-0000-4000-8000-000000000096; inventory-canary-data-wrote-core.md"
 }
