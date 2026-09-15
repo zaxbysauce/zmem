@@ -719,9 +719,45 @@ with the per-session delivery ledger, and #158 completes that retirement for the
 remains only as a documented no-op for operators upgrading from the
 compatibility path. Precompact clears the ledger;
 the next SessionStart performs ordinary `session_start` selection. The MCP
-server's passive path is deliberately unchanged and is the existing #159
-follow-up. This ownership move is schema-free: neither schema-version
+server's passive surface (`prefetch`, the reworked `session_start` below, and
+the Hermes twins) now rides the same store-owned selector. This ownership move is schema-free: neither schema-version
 constant changes.
+
+#### Query-aware passive prefetch — issue #159
+
+`prefetch` is the query-aware passive lane: one
+`select_and_budget_for_injection` call and one complete JSON envelope — JSON
+is the command's only output mode, and there is no consumer-side renderer or
+second budget run.
+
+```
+python <store.py> prefetch --query "<text>" --namespace <ns> \
+  --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
+  [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
+  [--ops-token <token>]... [--exclude <memory-id>]...
+```
+
+`--query`, `--namespace`, `--session-id`, and `--moment` are required;
+`--exclude` (memory ids the caller already holds) is repeatable.
+`--for-injection`, `--no-bump`, and `--json` are accepted as explicit markers
+of the (only) passive mode the selector pins. The selector owns the
+relevance/trust gate and the 1,500-token budget; prefetch never advances
+`retrieval_count` (only `surfaced_count` and the delivery ledger may move).
+Delivery is session-attributed: a second turn for the same session whose
+ledger already holds the candidate rows returns the silent
+`already-delivered` envelope; `ledger-clear --session-id` resets it.
+
+The MCP server exposes the same one-call envelope as the `prefetch` tool
+(`query`, `namespace`, `session_id`, `moment` required; optional `lane` —
+validated against the five-value tuple, never defaulted to a host lane — and
+`ops_tokens`), enforcing namespace scope and the `ZMEM_INJECT=0` kill switch
+before any store subprocess, and returning the complete selector envelope
+plus the additive `context` alias equal to `rendered`. The MCP
+`session_start` tool rides the same store-owned queryless selector path via
+`recent --for-injection --json --session-id <id> --moment session_start`,
+returning that envelope (additive `context` alias; `result`/`namespace`/
+`ids` retained as back-compat aliases); an omitted `session_id` falls back
+to the legacy for-injection envelope without the ledger key.
 
 ### add — capture a memory
 ```
@@ -1007,13 +1043,18 @@ Both surfaces expose `session_start` / `session_end` (MCP tools) and
 `zmem_session_start` / `zmem_session_end` (Hermes tools) with the same
 contract:
 
-- **`session_start(namespace?, limit=3)`** — passive prefetch returning a
-  fenced, provenance-tagged context block (Phase 3 fence + selective-inject
-  rules, 0.5 recent floor). It runs `recent --no-bump`: `retrieval_count`
+- **`session_start(namespace?, limit=3, session_id?, lane?)`** — passive
+  prefetch returning a fenced, provenance-tagged context block (Phase 3
+  fence + selective-inject rules, 0.5 recent floor). It runs
+  `recent --for-injection --json`: with a `session_id` the store-side
+  selector (moment `session_start`) owns the gate, the budget, the delivery
+  ledger, and the `rendered` fence, and the tool returns that complete
+  envelope plus the additive `context` alias and the back-compat
+  `result`/`namespace`/`ids` fields (issue #159); an omitted `session_id`
+  takes the legacy for-injection envelope. `retrieval_count`
   NEVER advances (only the surface event is recorded — pinned by
   tests/test_session_tools.py), injection-risk and `untrusted_web` rows are
-  omitted, and `ZMEM_INJECT_TOKEN_BUDGET` is honored. The response reports
-  `ids`, `omitted`, `tokens_used`, `tokens_budget`. Namespace omitted
+  omitted, and `ZMEM_INJECT_TOKEN_BUDGET` is honored. Namespace omitted
   resolves to the surface's own default — `user:global` on MCP, the session
   namespace on Hermes (a deliberate divergence: the Hermes provider is
   session-scoped, the network server is not).

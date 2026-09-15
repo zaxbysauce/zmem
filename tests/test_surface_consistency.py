@@ -149,9 +149,10 @@ class AdapterScanTest(unittest.TestCase):
                 "--no-bump", bodies[explicit],
                 f"MCP {explicit} is EXPLICIT and must NOT pass --no-bump")
         self.assertIn(
-            "--no-bump", bodies.get("session_start", ""),
-            "MCP session_start is the D4 passive path and MUST pass --no-bump "
-            "(issue #65, 10.5)")
+            "--for-injection", bodies.get("session_start", ""),
+            "MCP session_start is the D4 passive path and MUST pass "
+            "--for-injection (issue #159: passivity is structural via the "
+            "selector)")
 
     def test_explicit_mcp_recall_docstring_documents_bump(self):
         # I2 (#38 / #56): the explicit-vs-passive bump rule is tested design,

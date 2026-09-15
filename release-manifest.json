@@ -1,17 +1,17 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "4dc2889fa40a8e57e2e452ca55847eea3fef88d2988fabd9da090663395a257c",
+  "digest": "0625e159130c3bc6dcc5e51f052427ecf6bb9ecd2169af5c92af77b8fb20f155",
   "files": {
-    "hermes-plugin/__init__.py": "94633311404b45fa6193ad46df2c552540853471b1522999baaaac12e672d83a",
+    "hermes-plugin/__init__.py": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "70338bcac85152e0d964fd70a6cea57cae06e93fe185ce5c1528f99c71e33c3b",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "e66fbe46c8a38eae893d8a3d6cb5a015739ce71f6280baa7cbff162597018c1f",
+    "hermes-plugin/plugin.yaml": "852eb563e4bbf91c5f3c1d91e32fb7d3cadc92aa11e549923d50f988431d16e1",
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "b4574d0caac1c1d863efef0fa7e5ebf6b9d1498a68330fc0f14e2b73ff56b399",
-    "hermes-plugin/server/mcp_server.py": "a0cae7ca221e1d028535cf5f8119e9a5caf38331ab6567ef0d1c206ca70cf679",
+    "hermes-plugin/server/mcp_server.py": "f97a7686812c70b0d671c43f8b9353d5d43ff13d956b548811cd27fe1fcf417c",
     "hermes-plugin/server/requirements-embeddings.txt": "437505a8ebb55933f5b50e9334849e88a9ce0b57ee534c5f6864a5cda1f8aca6",
     "hermes-plugin/server/requirements.txt": "799aad6ca2a111d8c21b746fae1a2770278b29554900f95b9241c686d7149189",
     "hooks/hooks.claude.json": "20b9b56a3e5f1683025f0ed67e9b254f48b86bf7f0bd0b962cb3a9029b85474d",
@@ -50,7 +50,7 @@
     "scripts/release_gate.py": "a9065f3d55df65dde1f6ed1be4694371543fcc1ab3b3c03b77c0aa86eacfd938",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "ac20e80713cf3ec05159ac0f609313cb094ed5515c387258fa5369faec963aa5",
-    "skills/memory/SKILL.md": "1549ad9b3ea67a901079f6b4b4af32eb3de5aebca377e86c13be2a3ad6cf1f31",
+    "skills/memory/SKILL.md": "ef2ef2335c14c870a5fa9ab8c1276cf7e27147a3cfc2a22135db6f1b35532b9f",
     "skills/memory/scripts/correction_queue.py": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
     "skills/memory/scripts/doctor.py": "ecd99026c5be6a85210cd87fe6e788defb730a8d67c8cfca55d6674fcf2f2602",
@@ -64,7 +64,7 @@
     "skills/memory/scripts/store.py": "99d721f53e8f8c2ba0df6bd60f839f44235f22d8a0dd751020cbad26b4543ffb",
     "skills/memory/scripts/storelib/__init__.py": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757",
     "skills/memory/scripts/storelib/backup.py": "d0a345f3eeb209d7946bd916492d35463f47c1840d9ac3194c8af6be84c150fc",
-    "skills/memory/scripts/storelib/cli.py": "89ea86b476351aa2cd856d93f88e2eaf27a4662ecb86a774b360541f76115719",
+    "skills/memory/scripts/storelib/cli.py": "a04941e7c0fe185f580adc6983108c58e7bcda8d635b35746f000a200ca391f0",
     "skills/memory/scripts/storelib/consolidate.py": "1e937fbfda27401057891c980b5e0c4f006035fc6c2d8bae8508697bf8157d58",
     "skills/memory/scripts/storelib/cross_encoder.py": "be9da0f236b28d38f5963a3bd1b48861c85039cee7b620543f74543fadbda4da",
     "skills/memory/scripts/storelib/delivery_ledger.py": "c3f1daa1cd2b2ae9cca2e260b2c40cad2e2fca6aa0b334ae3f0a94eb9b3d3dc2",
@@ -88,5 +88,5 @@
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
     "skills/memory/scripts/storelib/write.py": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
   },
-  "version": "0.38.0"
+  "version": "0.39.0"
 }
