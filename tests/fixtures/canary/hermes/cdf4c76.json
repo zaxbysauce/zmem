@@ -1,0 +1,33 @@
+{
+  "sha": "cdf4c76",
+  "version": "0.21.1",
+  "consent": true,
+  "commands": [
+    [
+      "hermes",
+      "gateway",
+      "run",
+      "--no-supervise",
+      "--accept-hooks"
+    ],
+    [
+      "hermes",
+      "chat",
+      "-q",
+      "canary provider prompt",
+      "--oneshot",
+      "--accept-hooks"
+    ],
+    [
+      "hermes",
+      "chat",
+      "-q",
+      "canary compatibility prompt",
+      "--oneshot",
+      "--accept-hooks"
+    ]
+  ],
+  "callback_evidence": [
+    "pre_llm_call"
+  ]
+}

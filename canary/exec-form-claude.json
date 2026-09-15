@@ -1,0 +1,115 @@
+{
+  "lane": "exec-form-claude",
+  "host": "claude",
+  "verdict": "fail",
+  "reason": "version-unavailable",
+  "sha": "cd8d8d33e549ba5973428bcf18310164227d68ca756925242c47d3b0d48bf4dc",
+  "version": null,
+  "command": [
+    "claude"
+  ],
+  "timestamp": "2026-09-15T15:56:06Z",
+  "manifest_hook_ids": [
+    "PostCompact:zmem-launch.js",
+    "PostToolBatch:zmem-launch.js",
+    "PostToolUse:zmem-launch.js",
+    "PostToolUseFailure:zmem-launch.js",
+    "PreCompact:zmem-launch.js",
+    "PreToolUse:zmem-launch.js",
+    "SessionEnd:zmem-launch.js",
+    "SessionStart:zmem-launch.js",
+    "Stop:zmem-launch.js",
+    "SubagentStart:zmem-launch.js",
+    "SubagentStop:zmem-launch.js",
+    "UserPromptSubmit:zmem-launch.js"
+  ],
+  "fired_hook_ids": [
+    "PostCompact:zmem-launch.js",
+    "PostToolBatch:zmem-launch.js",
+    "PostToolUse:zmem-launch.js",
+    "PostToolUseFailure:zmem-launch.js",
+    "PreCompact:zmem-launch.js",
+    "PreToolUse:zmem-launch.js",
+    "SessionEnd:zmem-launch.js",
+    "SessionStart:zmem-launch.js",
+    "Stop:zmem-launch.js",
+    "SubagentStart:zmem-launch.js",
+    "SubagentStop:zmem-launch.js",
+    "UserPromptSubmit:zmem-launch.js"
+  ],
+  "inventories": {
+    "canary-data": {
+      "before": [
+        {
+          "path": "workdir",
+          "kind": "directory"
+        }
+      ],
+      "after": [
+        {
+          "path": ".capture-prompted-00000000-0000-4000-8000-000000000096",
+          "kind": "file",
+          "size": 1,
+          "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+        },
+        {
+          "path": ".drift-checked-00000000-0000-4000-8000-000000000096-71ff1354",
+          "kind": "file",
+          "size": 9,
+          "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
+        },
+        {
+          "path": ".drift-checked-f3213075-f3be-4935-9aa5-2c63e8cbbc7c-5988253e",
+          "kind": "file",
+          "size": 9,
+          "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
+        },
+        {
+          "path": "core.md",
+          "kind": "file",
+          "size": 1977,
+          "sha256": "1378a81e1107b2d45b0392b3cb8b8fd75d328e411d4da0b3d741f94cc97b980f"
+        },
+        {
+          "path": "namespace-cache",
+          "kind": "directory"
+        },
+        {
+          "path": "namespace-cache/9e99cabe4a759a657300b7db960178043c7e2629a590812d743040e155ad8f9c.json",
+          "kind": "file",
+          "size": 81,
+          "sha256": "2ff7a534f0ee21fa4364849683b5cc9cf659932e78c57693408cb01a20654bb5"
+        },
+        {
+          "path": "workdir",
+          "kind": "directory"
+        },
+        {
+          "path": "zmem-bg.log",
+          "kind": "file",
+          "size": 67,
+          "sha256": "6b2a4869fa87ac8af5f7a95028da6b5638c7cfc101fe64a3ff8b5082fe2b6ede"
+        },
+        {
+          "path": "zmem-decisions.log",
+          "kind": "file",
+          "size": 1268,
+          "sha256": "dbef12423d662e699f99153c590614a85dce3a480972521e7ca63cb58fab0685"
+        }
+      ]
+    },
+    "codex-config": {
+      "before": [],
+      "after": []
+    },
+    "host-roots": {
+      "before": [],
+      "after": []
+    },
+    "operator-config": {
+      "before": [],
+      "after": []
+    }
+  },
+  "notes": "per-event children validated rc=0 with JSON or bare object stdout; version measured from the documented session surface only; inventory-canary-data-wrote-.capture-prompted-00000000-0000-4000-8000-000000000096; inventory-canary-data-wrote-.drift-checked-00000000-0000-4000-8000-000000000096-71ff1354; inventory-canary-data-wrote-.drift-checked-f3213075-f3be-4935-9aa5-2c63e8cbbc7c-5988253e; inventory-canary-data-wrote-core.md; inventory-canary-data-wrote-namespace-cache; inventory-canary-data-wrote-namespace-cache/9e99cabe4a759a657300b7db960178043c7e2629a590812d743040e155ad8f9c.json"
+}

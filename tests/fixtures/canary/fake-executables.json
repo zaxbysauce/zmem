@@ -1,0 +1,14 @@
+{
+  "claude": {
+    "image": "fake-claude-executable\n",
+    "version_stdout": "fake-claude 96.1\n"
+  },
+  "codex": {
+    "image": "fake-codex-executable\n",
+    "version_stdout": "fake-codex 96.1\n"
+  },
+  "zcode": {
+    "image": "fake-zcode-executable\n",
+    "version_stdout": "fake-zcode 96.1\n"
+  }
+}

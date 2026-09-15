@@ -10,6 +10,34 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.42.0] - 2026-09-15
+
+### Added
+- **Live host canary lanes (issue #96)**: `scripts/host_canary.py` now owns
+  nine live lanes (`hermes-gateway`, `hermes-provider-mode`,
+  `hermes-compat-mode`, `claude-compact`, `codex-trust`, `zcode-duplicate`,
+  `exec-form-claude`, `exec-form-codex`, `exec-form-zcode`). Each lane runs
+  against an isolated store, writes a schema-valid artifact
+  (`canary/<lane>.json`, contract in the new `scripts/canary-schema.json`,
+  enforced by the new `--validate-result` validator), records measured host
+  SHA/version values only from documented surfaces
+  (`version-unavailable` otherwise), derives `<event>:<command-basename>`
+  hook identifiers from the real host manifests, and proves via four-root
+  before/after inventory maps that only the isolated canary store changed.
+- **Deterministic fixtures**: `tests/fixtures/canary/*` and
+  `scripts/generate_canary_fixtures.py --write` produce
+  `expected-lanes.json` from committed fake-executable bytes; unit tests
+  inject fakes (`tests/support/fake_executor.py`), so the suite stays
+  hermetic on CI.
+
+### Changed
+- **Lane exit-code semantics**: lane mode (`--lane`) always exits 0 for a
+  completed run — the verdict lives in the artifact (pass / structured fail
+  / skip); only usage errors exit 2. A negative observation is a
+  schema-valid `fail` with the exact command outcome in `notes`, never a
+  crash and never a faked pass. The legacy `--self-test`,
+  `--compact-self-test`, and live modes are byte-unchanged.
+
 ## [0.41.0] - 2026-09-15
 
 > Issue #204: stop-time reflection nudges can no longer clobber a dispatched

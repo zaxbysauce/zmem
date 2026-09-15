@@ -32,6 +32,43 @@ for _v in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA", "ZMEM_INJECT", "ZMEM_NAMES
 
 UUID_RE = re.compile(r"row_id=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
+CANARY_LANES = (
+    "hermes-gateway", "hermes-provider-mode", "hermes-compat-mode",
+    "claude-compact", "codex-trust", "zcode-duplicate",
+    "exec-form-claude", "exec-form-codex", "exec-form-zcode",
+)
+CANARY_SCHEMA = REPO_ROOT / "scripts" / "canary-schema.json"
+CANARY_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "canary"
+EXPECTED_LANES = CANARY_FIXTURES / "expected-lanes.json"
+sys.path.insert(0, str(REPO_ROOT / "tests" / "support"))
+import fake_executor  # noqa: E402 - tests/support seam module
+
+
+class FakeExecutable:
+    """A committed-bytes fake host binary: real file bytes so sha256 is
+    calculated, never hard-coded (issue #96 contract)."""
+
+    def __init__(self, name, image, version):
+        self.name = name
+        self.image = image
+        self.version = version
+        self.path = Path(tempfile.mkdtemp(prefix="zmem-fakeexe-")) / name
+        self.path.write_bytes(image)
+        atexit.register(shutil.rmtree, str(self.path.parent), True)
+
+    @classmethod
+    def from_fixture(cls, host):
+        spec = json.loads(
+            (CANARY_FIXTURES / "fake-executables.json")
+            .read_text(encoding="utf-8"))[host]
+        return cls("fake-%s" % host,
+                   spec["image"].encode("utf-8"),
+                   spec["version_stdout"].encode("utf-8"))
+
+    def sha256(self):
+        import hashlib
+        return hashlib.sha256(self.path.read_bytes()).hexdigest()
+
 
 def load_canary_module():
     """Load scripts/host_canary.py in-process for helper-level unit tests.
@@ -316,6 +353,69 @@ class CanarySelfTestTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("verdict=pass", proc.stdout)
 
+    def test_result_schema_requires_sha_version_and_hook_ids(self):
+        """Issue #96 AC1: the strict result contract — exact key set,
+        enum/nullability rules, conditional Hermes callback evidence, and the
+        ``<event>:<command-basename>`` id rule, all enforced by the
+        standard-library validator against scripts/canary-schema.json and the
+        generated expected-lanes contract fixture."""
+        mod = load_canary_module()
+        schema = json.loads(CANARY_SCHEMA.read_text(encoding="utf-8"))
+        self.assertTrue(EXPECTED_LANES.is_file(),
+                        "expected-lanes.json must be generated and committed")
+        expected = json.loads(EXPECTED_LANES.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(expected["lanes"]), sorted(CANARY_LANES))
+        empty = {"path": "seed", "kind": "directory"}
+        inventories = {name: {"before": [dict(empty)], "after": [dict(empty)]}
+                       for name in schema["inventory_roots"]}
+
+        def golden(**over):
+            base = mod.build_result(
+                "exec-form-zcode", "zcode", "fail", "version-unavailable",
+                sha="a" * 64, version=None, command=["node"],
+                inventories=json.loads(json.dumps(inventories)),
+                manifest_hook_ids=["SessionStart:zmem-launch.js"],
+                fired_hook_ids=[])
+            base.update(over)
+            return base
+
+        # The golden result validates clean.
+        with unittest.mock.patch.object(mod, "CANARY_SCHEMA_PATH",
+                                        CANARY_SCHEMA):
+            self.assertEqual(mod._validate_result_object(golden(), schema),
+                             [])
+            # Extra keys are rejected (mode alone is optional; a truly
+            # unknown key is not).
+            extra = golden()
+            extra["surprise"] = "unexpected"
+            problems = mod._validate_result_object(extra, schema)
+            self.assertTrue(any("unexpected key" in p for p in problems),
+                             problems)
+            # Fixed nullability: a skip with a measured sha is invalid.
+            skip = golden(verdict="skip", reason="executable-absent")
+            problems = mod._validate_result_object(skip, schema)
+            self.assertTrue(any("skip requires" in p for p in problems),
+                             problems)
+            # version-unavailable must carry version null.
+            vu = golden(version="fake-zcode 96.1")
+            problems = mod._validate_result_object(vu, schema)
+            self.assertTrue(any("version-unavailable" in p for p in problems),
+                             problems)
+            # Conditional Hermes callback evidence: a hermes pass without it
+            # is invalid; with it, valid.
+            hermes = golden(lane="hermes-provider-mode", host="hermes",
+                            verdict="pass", reason="hermes-delivery-verified",
+                            mode="provider")
+            problems = mod._validate_result_object(hermes, schema)
+            self.assertTrue(any("callback_evidence" in p for p in problems),
+                             problems)
+            hermes["callback_evidence"] = ["pre_llm_call"]
+            self.assertEqual(mod._validate_result_object(hermes, schema), [])
+            # The <event>:<command-basename> id rule.
+            badid = golden(manifest_hook_ids=["SessionStart"])
+            problems = mod._validate_result_object(badid, schema)
+            self.assertTrue(any("hook-id" in p for p in problems), problems)
+
 
 class CanaryHelperUnitTest(unittest.TestCase):
     """Helper-level tests (in-process module load) for assertion logic that
@@ -323,6 +423,316 @@ class CanaryHelperUnitTest(unittest.TestCase):
 
     def _load(self):
         return load_canary_module()
+
+    def _data_dir(self, name):
+        d = Path(tempfile.mkdtemp(prefix="zmem-canary-%s-" % name))
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
+
+    @staticmethod
+    def _fake_runner(children_stdout=b"{}\n", version_stdout=b"", rc=0,
+                     on_launch=None):
+        """A hermetic CommandRunner for the lane tests: manifest children
+        (zmem-launch.js argv) get children_stdout; host version invocations
+        get version_stdout. on_launch observes every argv."""
+        def _run(argv, *, input_bytes, env, cwd, deadline_s, deadline=None):
+            if on_launch is not None:
+                on_launch([str(a) for a in argv])
+            joined = " ".join(str(a) for a in argv)
+            out = (children_stdout if "zmem-launch.js" in joined
+                   else version_stdout)
+            return subprocess.CompletedProcess([str(a) for a in argv], rc,
+                                               out, b"")
+        return _run
+
+    def test_claude_codex_zcode_exec_forms(self):
+        """Issue #96 AC2/AC5: the exec-form lanes with FakeExecutable +
+        FakeExecutor — every manifest-derived event id and exact child stdout
+        bytes, the Codex structural trust state, and the two-root/one-root
+        ZCode outcomes."""
+        mod = self._load()
+        # -- exec-form-claude: manifest children emit the translated object;
+        #    the documented live-session surface emits the fake's version.
+        fake = FakeExecutable.from_fixture("claude")
+        seen = []
+
+        def resolve(name):
+            return str(fake.path) if name == "claude" else None
+
+        result = mod.run_exec_form_lane(
+            "claude", REPO_ROOT, self._data_dir("exec-claude"), None,
+            resolve_executable=resolve,
+            command_runner=self._fake_runner(
+                children_stdout=b"{}\n",
+                version_stdout=fake.version,
+                on_launch=seen.append))
+        self.assertEqual(result["verdict"], "pass", result["notes"])
+        self.assertEqual(result["version"], "fake-claude 96.1")
+        self.assertEqual(result["sha"], fake.sha256())
+        manifest_ids = mod.derive_hook_ids("claude", REPO_ROOT)
+        self.assertTrue(manifest_ids)
+        self.assertEqual(result["manifest_hook_ids"], sorted(manifest_ids))
+        for hid in manifest_ids:
+            self.assertIn(hid, result["fired_hook_ids"])
+        launches = [argv for argv in seen if "zmem-launch.js"
+                    in " ".join(argv)]
+        self.assertTrue(launches)
+        for argv in launches:
+            self.assertTrue(
+                any(p.replace("\\", "/").endswith("hooks/zmem-launch.js")
+                    for p in argv),
+                "launcher path not substituted from the manifest: %r" % argv)
+        # -- exec-form-zcode (no documented version surface): children pass
+        #    but the lane records the schema-defined version-unavailable.
+        fake_z = FakeExecutable.from_fixture("zcode")
+        result = mod.run_exec_form_lane(
+            "zcode", REPO_ROOT, self._data_dir("exec-zcode"), None,
+            resolve_executable=lambda name: str(fake_z.path)
+            if name == "zcode" else None,
+            command_runner=self._fake_runner(children_stdout=b"{}\n"))
+        self.assertEqual(result["verdict"], "fail")
+        self.assertEqual(result["reason"], "version-unavailable")
+        self.assertIsNone(result["version"])
+        self.assertIsNotNone(result["sha"])
+        # -- codex-trust: the fake codex executable emits the deterministic
+        #    version token; the isolated hooks.state is operator-side consent
+        #    state and is written BEFORE the lane runs (a state appearing
+        #    mid-run is exactly what the inventory proof must flag).
+        fake_cx = FakeExecutable.from_fixture("codex")
+
+        def codex_runner():
+            def _run(argv, *, input_bytes, env, cwd, deadline_s,
+                     deadline=None):
+                argv = [str(a) for a in argv]
+                joined = " ".join(argv)
+                if "exec" in joined and "--skip-git-repo-check" in joined:
+                    return subprocess.CompletedProcess(argv, 0,
+                                                       fake_cx.version, b"")
+                return subprocess.CompletedProcess(argv, 0, b"{}\n", b"")
+            return _run
+
+        def write_state(data_dir, state_events):
+            state_dir = Path(data_dir) / "operator-config" / "codex"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / "hooks.state").write_text(
+                json.dumps({"hooks": state_events}), encoding="utf-8")
+
+        # A state carrying every manifest event => trusted.
+        events = {event: {"trusted": True}
+                  for event in mod._manifest_events(REPO_ROOT, "codex")}
+        ok_dir = self._data_dir("codex-trust-ok")
+        write_state(ok_dir, events)
+        result = mod.run_codex_trust_lane(
+            REPO_ROOT, ok_dir, None,
+            codex_executable=str(fake_cx.path),
+            command_runner=codex_runner())
+        self.assertEqual(result["verdict"], "pass", result["notes"])
+        self.assertEqual(result["fired_hook_ids"], [])
+        self.assertEqual(result["version"], "fake-codex 96.1")
+        # An absent state => untrusted-hook with derived missing ids.
+        result = mod.run_codex_trust_lane(
+            REPO_ROOT, self._data_dir("codex-trust-missing"), None,
+            codex_executable=str(fake_cx.path),
+            command_runner=codex_runner())
+        self.assertEqual(result["verdict"], "fail")
+        self.assertEqual(result["reason"], "untrusted-hook")
+        self.assertEqual(sorted(result["fired_hook_ids"]),
+                         sorted(mod.derive_hook_ids("codex", REPO_ROOT)))
+        # -- zcode-duplicate: the injected runner appends a decision line per
+        #    launcher drive; both roots firing is the duplicate condition and
+        #    the one-root re-fire is the single-copy pass.
+        def zdup_runner(fire):
+            def _run(argv, *, input_bytes, env, cwd, deadline_s,
+                     deadline=None):
+                joined = " ".join(str(a) for a in argv)
+                if "zmem-launch.js" in joined and fire:
+                    log = Path(env["ZMEM_DATA"]) / "zmem-decisions.log"
+                    with log.open("a", encoding="utf-8") as fh:
+                        fh.write("[1700000000] zmem-hook status=injected "
+                                 "reason=injected ids=['x'] all=['x'] "
+                                 "sid=s\n")
+                    return subprocess.CompletedProcess(
+                        [str(a) for a in argv], 0, b"{}\n", b"")
+                return subprocess.CompletedProcess(
+                    [str(a) for a in argv], 0, b"96.1\n", b"")
+            return _run
+
+        result = mod.run_zcode_duplicate_lane(
+            REPO_ROOT, self._data_dir("zdup"), None,
+            command_runner=zdup_runner(True))
+        self.assertEqual(result["verdict"], "fail", result["notes"])
+        self.assertEqual(result["reason"], "duplicate-install")
+        self.assertEqual(result["one_copy"]["reason"], "single-copy-pass")
+        self.assertEqual(result["one_copy"]["verdict"], "pass")
+        # Only one root firing => no duplicate condition.
+        result = mod.run_zcode_duplicate_lane(
+            REPO_ROOT, self._data_dir("zdup-one"), None,
+            command_runner=zdup_runner(False))
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(result["reason"], "single-copy-pass")
+
+    def test_pinned_sha_and_lane_names(self):
+        """Issue #96: the pinned Hermes sha default, the nine lane choices,
+        Hermes version measurement, and the argparse exit-2 usage rules."""
+        mod = self._load()
+        hermes = json.loads(
+            (CANARY_FIXTURES / "hermes" / "cdf4c76.json")
+            .read_text(encoding="utf-8"))
+        self.assertEqual(hermes["sha"], "cdf4c76")
+        self.assertEqual(hermes["version"], "0.21.1")
+        self.assertEqual(sorted(mod.LANE_HOSTS), sorted(CANARY_LANES))
+        self.assertEqual(len(mod.LANE_HOSTS), 9)
+        # Exit 2: a Hermes lane without --hermes-root.
+        with self.assertRaises(SystemExit) as ctx:
+            mod.main(["--host", "hermes", "--lane", "hermes-gateway"])
+        self.assertEqual(ctx.exception.code, 2)
+        # Exit 2: an incompatible host/lane pair.
+        with self.assertRaises(SystemExit) as ctx:
+            mod.main(["--host", "claude", "--lane", "hermes-gateway",
+                      "--hermes-root", str(REPO_ROOT)])
+        self.assertEqual(ctx.exception.code, 2)
+        # Exit 2: --result-json without --lane.
+        with self.assertRaises(SystemExit) as ctx:
+            mod.main(["--host", "claude",
+                      "--result-json", "x.json"])
+        self.assertEqual(ctx.exception.code, 2)
+        # Hermes version measurement: a fake hermes root whose --version
+        # output and git HEAD both measure; a sha mismatch is a structured
+        # fail carrying the MEASURED version.
+        fake_hermes = FakeExecutable("hermes", b"#!/bin/sh\n",
+                                     b"Hermes 0.21.1\n")
+        root = fake_hermes.path.parent
+
+        def hermes_runner(measured_head, version_stdout):
+            def _run(argv, *, input_bytes, env, cwd, deadline_s,
+                     deadline=None):
+                argv = [str(a) for a in argv]
+                if argv[-1] == "--version":
+                    return subprocess.CompletedProcess(argv, 0,
+                                                       version_stdout, b"")
+                if "rev-parse" in argv:
+                    return subprocess.CompletedProcess(argv, 0,
+                                                       measured_head, b"")
+                return subprocess.CompletedProcess(argv, 0, b"{}\n", b"")
+            return _run
+
+        result = mod.run_hermes_lane(
+            "hermes-gateway", root, self._data_dir("hermes-sha"), "cdf4c76",
+            None, command_runner=hermes_runner("cdf4c76" + "0" * 32,
+                                               fake_hermes.version))
+        self.assertNotEqual(result["verdict"], "skip")
+        self.assertEqual(result["hermes_version_measured"], "Hermes 0.21.1")
+        result = mod.run_hermes_lane(
+            "hermes-gateway", root, self._data_dir("hermes-sha-bad"),
+            "cdf4c76",
+            None, command_runner=hermes_runner("deadbeef" + "0" * 32,
+                                               fake_hermes.version))
+        self.assertEqual(result["verdict"], "fail")
+        self.assertEqual(result["reason"], "sha-mismatch")
+        self.assertEqual(result["hermes_version_measured"], "Hermes 0.21.1")
+
+    def test_provider_and_compatibility_are_distinct(self):
+        """Issue #96: the isolated provider config carries memory.provider:
+        zmem, the compatibility config carries the pre_llm_call shell hook +
+        hooks_auto_accept, the chat argv are the supported forms, and the
+        bare-fence / <memory-context> wrapper boundary holds."""
+        mod = self._load()
+        fake_hermes = FakeExecutable("hermes", b"#!/bin/sh\n",
+                                     b"Hermes 0.21.1\n")
+        root = fake_hermes.path.parent
+        head = "cdf4c76" + "0" * 32
+
+        def hermes_runner(argv, *, input_bytes, env, cwd, deadline_s,
+                          deadline=None):
+            argv = [str(a) for a in argv]
+            if argv[-1] == "--version":
+                return subprocess.CompletedProcess(argv, 0,
+                                                   fake_hermes.version, b"")
+            if "rev-parse" in argv:
+                return subprocess.CompletedProcess(argv, 0, head, b"")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        data_dir = self._data_dir("hermes-modes")
+        provider = mod.run_hermes_lane(
+            "hermes-provider-mode", root, data_dir / "prov", "cdf4c76", None,
+            command_runner=hermes_runner)
+        compat = mod.run_hermes_lane(
+            "hermes-compat-mode", root, data_dir / "compat", "cdf4c76", None,
+            command_runner=hermes_runner)
+        prov_cfg = (data_dir / "prov" / "hermes-home" / "config.yaml"
+                    ).read_text(encoding="utf-8")
+        compat_cfg = (data_dir / "compat" / "hermes-home" / "config.yaml"
+                      ).read_text(encoding="utf-8")
+        self.assertIn("memory:\n  provider: zmem\n", prov_cfg)
+        self.assertNotIn("hooks_auto_accept", prov_cfg)
+        self.assertNotIn("provider: zmem", compat_cfg)
+        self.assertIn("pre_llm_call:", compat_cfg)
+        self.assertIn("zmem-hermes-reflect.py", compat_cfg)
+        self.assertIn("hooks_auto_accept: true", compat_cfg)
+        self.assertEqual(provider["mode"], "provider")
+        self.assertEqual(compat["mode"], "compatibility")
+        self.assertIn("canary provider prompt", provider["command"])
+        self.assertIn("canary compatibility prompt", compat["command"])
+        for lane_result in (provider, compat):
+            self.assertEqual(lane_result["callback_evidence"],
+                             ["pre_llm_call"])
+        # The bare-fence boundary: the store-rendered fence itself never
+        # carries the Hermes wrapper — wrapping is Hermes' own act.
+        fence = ("<<<ZMEM_UNTRUSTED_FENCE>>>\n"
+                 "# canary\n"
+                 "<<<END_ZMEM_UNTRUSTED_FENCE>>>\n")
+        self.assertNotIn("<memory-context>", fence)
+        self.assertIn("<memory-context>",
+                      "<memory-context>\n%s\n</memory-context>" % fence)
+
+    def test_lane_changes_only_canary_inventory(self):
+        """Issue #96 AC6: only the allowed canary-data paths change across a
+        lane run; operator-config and host-roots stay byte-identical; a
+        symlink escaping its declared root fails the lane."""
+        mod = self._load()
+        fake_z = FakeExecutable.from_fixture("zcode")
+        data_dir = self._data_dir("inv")
+        # Pre-seed an operator config and a host-roots copy BEFORE the lane
+        # so the run must leave them untouched.
+        (data_dir / "operator-config" / "codex").mkdir(parents=True)
+        (data_dir / "operator-config" / "codex" / "hooks.state").write_text(
+            "{}", encoding="utf-8")
+        result = mod.run_exec_form_lane(
+            "zcode", REPO_ROOT, data_dir, None,
+            resolve_executable=lambda name: str(fake_z.path)
+            if name == "zcode" else None,
+            command_runner=self._fake_runner(children_stdout=b"{}\n"))
+        inventories = result["inventories"]
+        self.assertEqual(
+            inventories["operator-config"]["before"],
+            inventories["operator-config"]["after"])
+        self.assertEqual(inventories["host-roots"]["before"],
+                         inventories["host-roots"]["after"])
+        allowed = {"store.sqlite", "store.sqlite-wal", "store.sqlite-shm",
+                   "store.sqlite-journal", "zmem-decisions.log",
+                   "zmem-bg.log"}
+        before = {e["path"] for e in inventories["canary-data"]["before"]}
+        for entry in inventories["canary-data"]["after"]:
+            path = entry["path"]
+            if entry["path"] in before and \
+                    entry in inventories["canary-data"]["before"]:
+                continue
+            top = path.split("/")[0]
+            if path in allowed or top in allowed or top == "ops":
+                continue
+            self.fail("unexpected canary-data change: %s" % path)
+        # A symlink escaping its declared root fails the lane.
+        escape = self._data_dir("inv-escape")
+        (escape / "operator-config").mkdir(parents=True)
+        if os.name == "nt":
+            self.skipTest("symlink creation needs privileges on Windows")
+        target = Path(tempfile.mkdtemp(prefix="zmem-escape-"))
+        atexit.register(shutil.rmtree, target, True)
+        os.symlink(str(target), str(escape / "host-roots" / "escaped"))
+        result = mod.run_zcode_duplicate_lane(
+            REPO_ROOT, escape, None, command_runner=self._fake_runner())
+        notes = result["notes"]
+        self.assertIn("symlink-escape", notes, notes)
 
     def test_ids_grounding_is_field_scoped(self):
         """F-001: the seeded row must ground ONLY via the ids=[...] field —
@@ -521,6 +931,29 @@ class ReadmeCanaryDocTest(unittest.TestCase):
             ("verdict=skip" in text) or ("host-binary-absent" in text),
             "README must document the skip semantics of the canary",
         )
+
+    def test_negative_lane_is_structured_failure(self):
+        """Issue #96 AC1/AC7 (docs): README and skills/memory/SKILL.md
+        document the schema-valid structured fail semantics, the measured
+        SHA/version values, the lane exit-code contract, and the nine exact
+        artifact paths."""
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        skill = (REPO_ROOT / "skills" / "memory" / "SKILL.md").read_text(
+            encoding="utf-8")
+        for lane in CANARY_LANES:
+            artifact = "canary/%s.json" % lane
+            self.assertIn(artifact, readme,
+                          "README must document the exact artifact path %s"
+                          % artifact)
+        for needle in ("--lane", "--validate-result", "structured",
+                       "scripts/canary-schema.json"):
+            self.assertIn(needle, readme, "README missing %r" % needle)
+        self.assertIn("structured", skill,
+                      "SKILL.md must document schema-valid fail results")
+        self.assertIn("host_canary", skill)
+        for needle in ("measured", "verdict"):
+            self.assertIn(needle, readme,
+                          "README must document measured verdict values")
 
 
 if __name__ == "__main__":

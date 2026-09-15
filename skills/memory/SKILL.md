@@ -1691,6 +1691,27 @@ Always clamped to [0.0, 1.0]; visible in `get --json`, `export-jsonl`,
 and `doctor`. `confidence`/`signal` are never changed by linking — they
 are provenance inputs; trust_score is the contradiction ledger.
 
+## Live host canary lanes (issue #96)
+
+`scripts/host_canary.py` also owns nine LIVE host-canary lanes. Each lane
+runs against an isolated store, writes a schema-valid artifact
+(`canary/<lane>.json`, contract in `scripts/canary-schema.json`), and always
+exits 0 for a completed run — the verdict lives in the artifact, never in
+the exit code. A negative observation is a **structured fail** with the
+measured values and the exact command outcome in `notes`; it is never a
+crash and never a faked pass. Lanes: `hermes-gateway`,
+`hermes-provider-mode`, `hermes-compat-mode`, `claude-compact`,
+`codex-trust`, `zcode-duplicate`, `exec-form-claude`, `exec-form-codex`,
+`exec-form-zcode`. Validate any artifact with
+`python scripts/host_canary.py --validate-result canary/<lane>.json`.
+Measured SHA/version values are recorded only when the host's documented
+surface emits them (`version-unavailable` otherwise); hook identifiers are
+derived from the host's real manifest (`PreCompact:zmem-launch.js` shape),
+never invented; four before/after inventory maps prove the run only touched
+the isolated canary store. Canonical fence bytes come from the store's own
+`rendered` envelope (#158) — Hermes wraps them in `<memory-context>`, so no
+zmem fixture ever contains that wrapper.
+
 ## Timeout budget
 
 Issue #121: the hook path runs inside the host's hook timeout (the host
