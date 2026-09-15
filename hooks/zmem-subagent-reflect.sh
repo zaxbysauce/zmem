@@ -219,6 +219,10 @@ try:
     payload = json.loads(raw_stdin) if raw_stdin.strip() else {}
 except Exception:
     payload = {}
+if not isinstance(payload, dict):
+    # A non-object payload (list/string/number) has no hook fields; treat as
+    # empty (PR review PRR-009 — keeps .get() accesses safe).
+    payload = {}
 if payload.get("stop_hook_active"):
     emit({})
 
@@ -274,8 +278,10 @@ if lesson_exists:
 #    subagent turn. The sidecar is read + consumed + pruned by
 #    zmem-reflect.sh at the parent Stop hook.
 from collections import Counter
+import glob
 import hashlib
 import tempfile
+import time
 from datetime import datetime, timezone
 
 tool_counts = Counter(d.get("tool", "?") for d in details) if details else Counter()
@@ -304,13 +310,35 @@ sidecar = {
     "details": detail_lines,
     "rejections": rej_msg,
     "created": datetime.now(timezone.utc).isoformat(),
+    "version": 1,
 }
 
 try:
     ring_dir = os.path.join(data_dir, "subagent-reflections")
     os.makedirs(ring_dir, exist_ok=True)
+    # Opportunistic retention sweep on the WRITE path too (PR review PRR-006 /
+    # PRR-011): the parent-side prune only runs on a parent Stop, so sidecars
+    # (and interrupted .tmp files the parent glob never matches) would
+    # otherwise accumulate when the parent never Stops. Same 14-day rule.
+    try:
+        now_s = time.time()
+        for stale in glob.glob(os.path.join(ring_dir, "*")):
+            name = os.path.basename(stale)
+            if not (name.endswith(".json") or name.endswith(".tmp")):
+                continue
+            try:
+                if (now_s - os.stat(stale).st_mtime) / 86400.0 > 14.0:
+                    os.unlink(stale)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    # Collision-free key (PR review PRR-002): when a host sends no agent_id,
+    # fall back to the unique agent transcript basename so sibling subagents
+    # in one session never overwrite the hand-offs of siblings.
+    agent_key = agent_id or os.path.basename(agent_transcript or "") or ""
     key = hashlib.sha256(
-        (session_id + "\n" + (agent_id or "")).encode("utf-8")
+        (session_id + "\n" + agent_key).encode("utf-8")
     ).hexdigest()[:32]
     final_path = os.path.join(ring_dir, key + ".json")
     fd, tmp_path = tempfile.mkstemp(dir=ring_dir, prefix=".sidecar-", suffix=".tmp")

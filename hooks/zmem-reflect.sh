@@ -176,8 +176,8 @@ fi
 #   4. builds the prompt with untrusted failure details fenced as data,
 #   5. prints a bare {"additionalContext":…} (or {}).
 CTX_JSON="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
-import glob, json, os, shlex, sys, sqlite3, subprocess, time
-from datetime import datetime
+import glob, json, os, re, shlex, sys, sqlite3, subprocess, time
+from datetime import datetime, timezone
 
 raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
 store_py = sys.argv[1]
@@ -187,7 +187,8 @@ data_dir = sys.argv[4]
 transcript = sys.argv[5]
 db_path = sys.argv[6]
 
-# Consumed subagent hand-off sidecars: unlinked by emit() after the envelope
+# Consumed subagent hand-off sidecars (path, scan-mtime_ns): unlinked by
+# emit() after the envelope, only if unchanged since the scan
 # has been printed, so a render failure never silently drops a hand-off.
 consumed_sidecars = []
 
@@ -205,9 +206,14 @@ except Exception:
 
 def emit(obj):
     print(json.dumps(obj) if obj else "{}")
-    for sidecar_path in consumed_sidecars:
+    # Consume-on-render, guarded against the replace race (PR review PRR-008):
+    # unlink only when the file is unchanged since the scan (same mtime_ns).
+    # A sidecar replaced between scan and unlink carries fresh data and must
+    # survive for the next parent Stop.
+    for sidecar_path, scan_mtime_ns in consumed_sidecars:
         try:
-            os.unlink(sidecar_path)
+            if os.stat(sidecar_path).st_mtime_ns == scan_mtime_ns:
+                os.unlink(sidecar_path)
         except OSError:
             pass
     sys.exit(0)
@@ -217,6 +223,10 @@ def emit(obj):
 try:
     payload = json.loads(raw_stdin) if raw_stdin.strip() else {}
 except Exception:
+    payload = {}
+if not isinstance(payload, dict):
+    # A non-object payload (list/string/number) has no hook fields; treat as
+    # empty (PR review PRR-009 — keeps .get() accesses safe).
     payload = {}
 if payload.get("stop_hook_active"):
     emit({})
@@ -245,22 +255,47 @@ except Exception:
     count, details, rejections = 0, [], []
 
 # 2b. Parent-side subagent hand-off scan (#204): collect this session
-#     pending sidecars and opportunistically prune stale ones (> 14 days).
+#     pending sidecars and opportunistically prune stale ones (> 14 days;
+#     mtime fallback when `created` is missing or unparsable — PRR-010).
 #     Fail-open: any error degrades to "no pending hand-offs".
 pending_subagents = []
 try:
     ring_dir = os.path.join(data_dir, "subagent-reflections")
     for sidecar_path in sorted(glob.glob(os.path.join(ring_dir, "*.json"))):
         try:
+            scan_mtime_ns = os.stat(sidecar_path).st_mtime_ns
+        except OSError:
+            scan_mtime_ns = 0
+        try:
             with open(sidecar_path, "r", encoding="utf-8") as f:
                 sidecar = json.load(f)
         except Exception:
-            continue  # unparsable: skip, never delete what we cannot read
+            # Unparsable: prune by mtime (PRR-010) — never delete what we
+            # cannot read while it is fresh, but do not leak it forever.
+            try:
+                if (time.time() - os.stat(sidecar_path).st_mtime) / 86400.0 > 14.0:
+                    os.unlink(sidecar_path)
+            except OSError:
+                pass
+            continue
+        # Forward-compat gate (PRR-013): a future sidecar version this hook
+        # does not understand is left untouched for a newer consumer.
+        if isinstance(sidecar.get("version"), int) and sidecar.get("version") > 1:
+            continue
         created = sidecar.get("created") or ""
         try:
-            age_days = (time.time() - datetime.fromisoformat(created).timestamp()) / 86400.0
+            created_dt = datetime.fromisoformat(created)
+            if created_dt.tzinfo is None:
+                # A tz-naive timestamp would be read as LOCAL time by
+                # .timestamp(); the writer always emits aware UTC, so treat
+                # naive values as UTC (PRR-010).
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            age_days = (time.time() - created_dt.timestamp()) / 86400.0
         except Exception:
-            age_days = 0.0
+            try:
+                age_days = (time.time() - os.stat(sidecar_path).st_mtime) / 86400.0
+            except OSError:
+                age_days = 0.0
         if age_days > 14.0:
             try:
                 os.unlink(sidecar_path)
@@ -269,7 +304,7 @@ try:
             continue
         if sidecar.get("session") == session_id:
             pending_subagents.append(sidecar)
-            consumed_sidecars.append(sidecar_path)
+            consumed_sidecars.append((sidecar_path, scan_mtime_ns))
 except Exception:
     pending_subagents = []
     consumed_sidecars = []
@@ -312,15 +347,29 @@ source_ref_arg = shlex.quote("session:" + session_id)
 # since those substrates yield no rejection records).
 rej_msg = _render_rejs(rejections) if _render_rejs else ""
 
-# 4a-pre-2. Pending-subagent section (#204): one line per hand-off.
+# 4a-pre-2. Pending-subagent section (#204): one block per hand-off. Failure
+# counts AND rendered rejection reasons are both surfaced (PR review PRR-001:
+# a rejection-only sidecar used to render as "0 failure(s)" with the reason
+# dropped). Field values are whitespace-collapsed and capped (PRR-007) so a
+# hostile sidecar cannot spray unbounded or multiline content into the prompt.
+def _clean_field(text):
+    return re.sub(r"\s+", " ", str(text)).strip()[:200]
+
 def _subagent_lines():
     lines = []
     for sidecar in pending_subagents:
-        aid = str(sidecar.get("agent_id") or "unknown")
-        atype = str(sidecar.get("agent_type") or "subagent")
-        cnt = int(sidecar.get("count") or 0)
-        ts = str(sidecar.get("tool_summary") or ("%d failure(s)" % cnt))
-        lines.append("  - agent %s (%s): %d failure(s) (%s)" % (aid, atype, cnt, ts))
+        aid = _clean_field(sidecar.get("agent_id") or "unknown")
+        atype = _clean_field(sidecar.get("agent_type") or "subagent")
+        try:
+            cnt = int(sidecar.get("count") or 0)
+        except (TypeError, ValueError):
+            cnt = 0
+        ts = _clean_field(sidecar.get("tool_summary") or ("%d failure(s)" % cnt))
+        line = "  - agent %s (%s): %d failure(s) (%s)" % (aid, atype, cnt, ts)
+        rej = _clean_field(sidecar.get("rejections") or "")
+        if rej:
+            line = line + "\n    user rejections: " + rej
+        lines.append(line)
     return lines
 
 # 4a-pre-3. Subagent-only prompt: dispatched subagents reported failures the
@@ -333,7 +382,7 @@ if pending_subagents and (lesson_exists or (count == 0 and not rej_msg)):
     }))
     msg = (
         "ZMem reflection: %d dispatched subagent(s) reported failed tool "
-        "calls in this session:\n%s\n"
+        "calls or user rejections in this session:\n%s\n"
         "If a generalizable lesson can be derived from a subagent failure "
         "(grounded in a test/compile/lint/reviewer/user signal — not "
         "self-opinion), capture it with the memory skill: `%s add --namespace "
@@ -361,8 +410,8 @@ if count == 0:
         if pending_subagents:
             msg = msg + (
                 "\n\nAlso, %d dispatched subagent(s) reported failed tool "
-                "calls:\n%s (capture with the same command, --source-ref <one "
-                "of the subagent keys>)"
+                "calls or user rejections:\n%s (capture with the same command, "
+                "--source-ref <one of the subagent keys>)"
             ) % (len(pending_subagents), "\n".join(_subagent_lines()))
         emit({"additionalContext": msg})
     msg = (
@@ -429,7 +478,8 @@ if rej_msg:
 # 4d. Append the pending-subagent section when present (#204).
 if pending_subagents:
     msg = msg + (
-        "\n\nAlso, %d dispatched subagent(s) reported failed tool calls:\n%s"
+        "\n\nAlso, %d dispatched subagent(s) reported failed tool calls or "
+        "user rejections:\n%s"
     ) % (len(pending_subagents), "\n".join(_subagent_lines()))
 
 emit({"additionalContext": msg})

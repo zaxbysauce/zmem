@@ -38,14 +38,18 @@ README.
   subagent's own transcript and no lesson exists for
   `session:<sid>:agent:<aid>`, it writes a compact JSON sidecar under
   `<ZMEM_DATA>/subagent-reflections/<sha256(session+agent)[:32]>.json`
-  (atomic write, one file per agent, refreshed on re-fire). The PARENT's own
-  Stop hook scans that directory for the current session, prunes sidecars
-  older than 14 days, renders one reflection prompt covering every pending
-  subagent failure (pending sidecars alone are sufficient — a clean parent
-  transcript still prompts; at most one parent prompt per dispatched batch
-  because rendering consumes the sidecars), and shlex-quotes the per-agent
-  source refs it renders. Subagent failure signals no longer evaporate and
-  no longer reach the finishing subagent.
+  (atomic write, one file per agent, refreshed on re-fire; hosts that send
+  no `agent_id` fall back to the unique agent transcript basename so
+  siblings never overwrite each other). The PARENT's own Stop hook scans
+  that directory for the current session, prunes stale files (older than 14
+  days, by embedded timestamp or file mtime — including interrupted temp
+  files), renders one reflection prompt covering every pending subagent
+  failure AND its stored rejection reasons (pending sidecars alone are
+  sufficient — a clean parent transcript still prompts; at most one parent
+  prompt per dispatched batch because rendering consumes the sidecars, and
+  consumption skips files replaced mid-scan so a fresher hand-off survives),
+  and shlex-quotes the per-agent source refs it renders. Subagent failure
+  signals no longer evaporate and no longer reach the finishing subagent.
 - **Kill-switch parity (issue #204)**: `ZMEM_REFLECT=0` now disables
   `zmem-subagent-reflect.sh` too (empty envelope, no sidecar) — previously
   it only disabled the Stop hook (#194).

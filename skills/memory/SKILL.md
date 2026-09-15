@@ -2012,7 +2012,10 @@ consumed on read, refreshed per agent on re-fire, and pruned when older than
 `ZMEM_REFLECT=0` disables the subagent hook too (no sidecar). The Stop hook
 also no-ops on Stop payloads carrying Claude subagent markers
 (`agent_id`/`agent_transcript_path`) — defense-in-depth for hosts where Stop
-fires bare inside subagent contexts.
+fires bare inside subagent contexts. Retention note: a sidecar persists the
+subagent's failure details and rendered rejection reasons as plaintext JSON
+in this directory until the parent consumes it or the 14-day prune removes
+it (the prune runs from both the parent's Stop scan and each sidecar write).
 
 Capture a lesson only if it generalizes to a future session facing a similar
 situation. If the failure was a one-off (typo, transient), do nothing — the prompt
