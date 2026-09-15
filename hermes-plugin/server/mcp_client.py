@@ -178,6 +178,8 @@ def main() -> int:
             }
         elif args.namespace:
             arguments["namespace"] = args.namespace
+            if args.tool == "session_start" and args.lane:
+                arguments["lane"] = args.lane
         try:
             envelope = asyncio.run(_call(args.url, token, args.tool,
                                          arguments))
