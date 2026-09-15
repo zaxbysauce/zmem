@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "b859cd9d0536db8744e550e2bdc6a7511c54b8862f99de079b9c85e86428c85a",
+  "digest": "80880deba05f022383d093711eb192d66a64353b8a9f126e1efa94e196df85e6",
   "files": {
     "hermes-plugin/__init__.py": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -37,13 +37,13 @@
     "hooks/zmem-subagent-recall.sh": "aab144cf0b1723fe113200f22659cbba0aabcccdb18e1e3cc5e14660a25e9588",
     "hooks/zmem-subagent-reflect.sh": "59ad166945536270e9bac705a89a1957975ecd2130be3986c585d29599ef4f03",
     "scripts/bench_hook_latency.py": "ed77a76b54b97faab045c90a04acb3673651b3243967f1ebb6833c631e1b16be",
-    "scripts/canary-schema.json": "ef473d56cbe23dae4d598477a9ea131f47f464526de6dea8cd01814892b66181",
+    "scripts/canary-schema.json": "6c88d9d5d80b2c8dbaad425b0b62eb2ea8488171b8fb61bef352813830ee5f05",
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",
     "scripts/eval_inject_runner.py": "c3b68474f80500e36ae2c245431897c7c0e5a27a98781332e8e9e1b8cb5cc70a",
     "scripts/eval_runner.py": "6e9b355425644f38795068259a69bb9c1ca02cdd57509511824ac10ac721ce3a",
     "scripts/eval_self_corpus.py": "ead3aece0562da0fe588ea4d4994aa7ec8fece3ae4d0a7554766e9933e4e76e6",
     "scripts/generate_canary_fixtures.py": "3ee220946b159661e5147e01f4649a5bc691fc787c7b62d85f4ef7b94dbdd18b",
-    "scripts/host_canary.py": "c2439ca2334cfde58290a5e88d66f8e4bcf09bb4f414bba24f5200dc6e4e7d78",
+    "scripts/host_canary.py": "28fc71c29f281503978d58bd51a8ca91eb4a0d0ac95ac218f9cb721296216098",
     "scripts/host_registry.py": "f6beab143eeec65f7d16f0a3cac2bd2b6436656ab38e84175088e3051511dd8e",
     "scripts/ingest_harvest.py": "4deed83a20c9227afdc45c3ba89b9bd83beadbac1aa72049291dc502b7322e2f",
     "scripts/pattern_harness.py": "428b33978ee59b7c7bbc67f0849adfd750c9277e2e05b216721611741024652b",
