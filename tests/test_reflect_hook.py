@@ -353,6 +353,11 @@ class TestSubagentReflectMessaging(unittest.TestCase):
 
 class ReflectCompatibilityLaneTest(unittest.TestCase):
     def test_compatibility_request_has_explicit_lane(self):
+        """Issue #122 rework: the reflect hook is a thin adapter over ONE
+        query-aware selector call. The remote (compatibility) request is
+        built by ``_prefetch`` — mcp_client.py ``call prefetch`` carrying
+        the DERIVED namespace, ``user_prompt``/``hermes-compat``, the user
+        message as the query, and one ``--ops-token`` per ring token."""
         import importlib.util
 
         path = REPO_ROOT / "hermes-plugin" / "hooks" / "zmem-hermes-reflect.py"
@@ -365,14 +370,42 @@ class ReflectCompatibilityLaneTest(unittest.TestCase):
         try:
             os.environ["ZMEM_MCP_URL"] = "http://127.0.0.1:8765/mcp"
             os.environ["ZMEM_MCP_NAMESPACE"] = "project:compat"
-            completed = mock.Mock(returncode=0, stdout="compat-context\n", stderr="")
+            # A complete closed selector envelope (the #122 14-key set): a
+            # response missing any key is a failed prefetch, so the mock must
+            # carry all of them for the call to count as delivered.
+            envelope = {
+                "results": [], "count": 0, "omitted": 0, "reason": "ok",
+                "excluded": [], "candidate_ids": [], "tokens_used": 0,
+                "tokens_budget": 1500, "budget_dropped": 0,
+                "budget_admission": 0, "budget_truncated": 0,
+                "budget_dropped_protected": 0, "arms": {}, "rendered": "",
+            }
+            completed = mock.Mock(returncode=0,
+                                  stdout=json.dumps(envelope) + "\n",
+                                  stderr="")
+            namespace = mod._resolve_hook_namespace()
+            self.assertEqual(namespace, "project:compat")
             with mock.patch.object(mod.subprocess, "run", return_value=completed) as run:
-                self.assertEqual(mod._remote_context(), "compat-context")
+                got = mod._prefetch("compat query", namespace, "sess42",
+                                    ["ring-token-a"], (0.0, 0))
+            self.assertEqual(got, envelope)
             argv = run.call_args.args[0]
+            self.assertTrue(argv[1].endswith("mcp_client.py"), argv[:2])
+            self.assertIn("prefetch", argv)
             self.assertIn("--lane", argv)
             self.assertEqual(argv[argv.index("--lane") + 1], "hermes-compat")
             self.assertIn("--namespace", argv)
             self.assertEqual(argv[argv.index("--namespace") + 1], "project:compat")
+            self.assertIn("--moment", argv)
+            self.assertEqual(argv[argv.index("--moment") + 1], "user_prompt")
+            self.assertIn("--query", argv)
+            self.assertEqual(argv[argv.index("--query") + 1], "compat query")
+            self.assertIn("--session-id", argv)
+            self.assertEqual(argv[argv.index("--session-id") + 1], "sess42")
+            self.assertIn("--ops-token", argv)
+            self.assertEqual(argv[argv.index("--ops-token") + 1], "ring-token-a")
+            # Remote mode must NOT carry the local-mode markers.
+            self.assertNotIn("--for-injection", argv)
         finally:
             for key, value in saved.items():
                 if value is None:
