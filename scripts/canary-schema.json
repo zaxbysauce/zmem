@@ -1,0 +1,107 @@
+{
+  "schema": "zmem-canary-result",
+  "version": 1,
+  "comment": [
+    "Strict result contract for the nine live host-canary lanes (issue #96).",
+    "This file is DATA consumed by the standard-library validator in",
+    "scripts/host_canary.py --validate-result; the validator is the",
+    "executable form of every rule stated here. Artifacts are the committed",
+    "canary/<canary_lane>.json files. Verdict semantics: pass/fail/skip all",
+    "exit 0 in lane mode -- the verdict lives in the artifact."
+  ],
+  "lanes": [
+    "hermes-gateway",
+    "hermes-provider-mode",
+    "hermes-compat-mode",
+    "claude-compact",
+    "codex-trust",
+    "zcode-duplicate",
+    "exec-form-claude",
+    "exec-form-codex",
+    "exec-form-zcode"
+  ],
+  "lane_host": {
+    "hermes-gateway": "hermes",
+    "hermes-provider-mode": "hermes",
+    "hermes-compat-mode": "hermes",
+    "claude-compact": "claude",
+    "codex-trust": "codex",
+    "zcode-duplicate": "zcode",
+    "exec-form-claude": "claude",
+    "exec-form-codex": "codex",
+    "exec-form-zcode": "zcode"
+  },
+  "hermes_lanes": [
+    "hermes-gateway",
+    "hermes-provider-mode",
+    "hermes-compat-mode"
+  ],
+  "required_keys": [
+    "lane",
+    "host",
+    "verdict",
+    "reason",
+    "sha",
+    "version",
+    "command",
+    "timestamp",
+    "manifest_hook_ids",
+    "fired_hook_ids",
+    "inventories",
+    "notes"
+  ],
+  "optional_keys": [
+    "mode",
+    "row_id",
+    "store",
+    "callback_evidence",
+    "bare_fence_delivered",
+    "hermes_wrapped",
+    "compact_result",
+    "one_copy",
+    "missing_hook_ids",
+    "trust_state",
+    "hermes_sha",
+    "hermes_version_measured"
+  ],
+  "enums": {
+    "verdict": ["pass", "fail", "skip"],
+    "compact_result": ["survived", "dropped", "unknown"],
+    "hermes_mode": ["gateway", "provider", "compatibility"]
+  },
+  "patterns": {
+    "sha256": "^[0-9a-f]{64}$",
+    "hook_id": "^[^:]+:[^:]+$",
+    "timestamp": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}",
+    "uuid": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+  },
+  "inventory_roots": ["canary-data", "codex-config", "host-roots", "operator-config"],
+  "allowed_canary_data_changes": [
+    "store.sqlite",
+    "store.sqlite-wal",
+    "store.sqlite-shm",
+    "store.sqlite-journal",
+    "zmem-decisions.log",
+    "zmem-bg.log",
+    "ops/",
+    "namespace-cache/",
+    ".drift-checked-<session-id> drift-cache marker"
+  ],
+  "rules": [
+    "lane must be one of lanes; host must equal lane_host[lane]",
+    "verdict must be one of the verdict enum values",
+    "reason must be a nonempty slug string (a leading '-' is the legacy no-reason marker and is forbidden in lane artifacts)",
+    "verdict==skip requires sha==null and version==null",
+    "reason==version-unavailable requires version==null",
+    "sha, when non-null, must match the sha256 pattern (lowercase 64 hex)",
+    "version, when non-null, must be a nonempty string (the measured stdout line, verbatim)",
+    "manifest_hook_ids must be a nonempty list of hook_id-pattern strings derived from the host manifest",
+    "fired_hook_ids must be a list of hook_id-pattern strings (empty on complete trust per the codex lane contract)",
+    "inventories must contain exactly the four inventory_roots keys; every root maps to an object with sorted before and after lists",
+    "entry kind directory carries only kind; kind file carries size and sha256; kind symlink carries a POSIX-relative target",
+    "hermes lanes: verdict in (pass, fail) requires callback_evidence to be a nonempty list of nonempty strings; skip exempts it",
+    "hermes lanes: mode must be one of the hermes_mode enum values",
+    "claude-compact: compact_result is required and must be one of the compact_result enum values (unknown on every indeterminate path, including skip)",
+    "zcode-duplicate: one_copy is required and must record the single-copy probe (verdict plus reason single-copy-pass on success)"
+  ]
+}

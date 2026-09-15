@@ -1,0 +1,48 @@
+{
+  "lane": "exec-form-zcode",
+  "host": "zcode",
+  "verdict": "skip",
+  "reason": "executable-absent",
+  "sha": null,
+  "version": null,
+  "command": [],
+  "timestamp": "2026-09-15T16:10:40Z",
+  "manifest_hook_ids": [
+    "PostToolUse:zmem-launch.js",
+    "PostToolUseFailure:zmem-launch.js",
+    "PreToolUse:zmem-launch.js",
+    "SessionStart:zmem-launch.js",
+    "Stop:zmem-launch.js",
+    "UserPromptSubmit:zmem-launch.js"
+  ],
+  "fired_hook_ids": [],
+  "inventories": {
+    "canary-data": {
+      "before": [
+        {
+          "path": "workdir",
+          "kind": "directory"
+        }
+      ],
+      "after": [
+        {
+          "path": "workdir",
+          "kind": "directory"
+        }
+      ]
+    },
+    "codex-config": {
+      "before": [],
+      "after": []
+    },
+    "host-roots": {
+      "before": [],
+      "after": []
+    },
+    "operator-config": {
+      "before": [],
+      "after": []
+    }
+  },
+  "notes": "host binary not on PATH; skip per schema nullity"
+}

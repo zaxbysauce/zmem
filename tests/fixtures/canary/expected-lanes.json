@@ -1,0 +1,166 @@
+{
+  "lanes": {
+    "claude-compact": {
+      "fake_sha256": "994a8a58c9e09369090565b253ee528cefc0a6d8c7278aaf540449d9537e69c3",
+      "fake_version": "fake-claude 96.1",
+      "host": "claude",
+      "manifest_hook_ids": [
+        "PostCompact:zmem-launch.js",
+        "PostToolBatch:zmem-launch.js",
+        "PostToolUse:zmem-launch.js",
+        "PostToolUseFailure:zmem-launch.js",
+        "PreCompact:zmem-launch.js",
+        "PreToolUse:zmem-launch.js",
+        "SessionEnd:zmem-launch.js",
+        "SessionStart:zmem-launch.js",
+        "Stop:zmem-launch.js",
+        "SubagentStart:zmem-launch.js",
+        "SubagentStop:zmem-launch.js",
+        "UserPromptSubmit:zmem-launch.js"
+      ],
+      "mode": null
+    },
+    "codex-trust": {
+      "fake_sha256": "4542ece2c6549190f8a3e65f8ebc60488f3abf63ebcbd81da8069118f20f0a06",
+      "fake_version": "fake-codex 96.1",
+      "host": "codex",
+      "manifest_hook_ids": [
+        "PostToolUse:zmem-launch.js",
+        "PreCompact:zmem-launch.js",
+        "PreToolUse:zmem-launch.js",
+        "SessionStart:zmem-launch.js",
+        "Stop:zmem-launch.js",
+        "SubagentStart:zmem-launch.js",
+        "SubagentStop:zmem-launch.js",
+        "UserPromptSubmit:zmem-launch.js"
+      ],
+      "mode": null
+    },
+    "exec-form-claude": {
+      "fake_sha256": "994a8a58c9e09369090565b253ee528cefc0a6d8c7278aaf540449d9537e69c3",
+      "fake_version": "fake-claude 96.1",
+      "host": "claude",
+      "manifest_hook_ids": [
+        "PostCompact:zmem-launch.js",
+        "PostToolBatch:zmem-launch.js",
+        "PostToolUse:zmem-launch.js",
+        "PostToolUseFailure:zmem-launch.js",
+        "PreCompact:zmem-launch.js",
+        "PreToolUse:zmem-launch.js",
+        "SessionEnd:zmem-launch.js",
+        "SessionStart:zmem-launch.js",
+        "Stop:zmem-launch.js",
+        "SubagentStart:zmem-launch.js",
+        "SubagentStop:zmem-launch.js",
+        "UserPromptSubmit:zmem-launch.js"
+      ],
+      "mode": null
+    },
+    "exec-form-codex": {
+      "fake_sha256": "4542ece2c6549190f8a3e65f8ebc60488f3abf63ebcbd81da8069118f20f0a06",
+      "fake_version": "fake-codex 96.1",
+      "host": "codex",
+      "manifest_hook_ids": [
+        "PostToolUse:zmem-launch.js",
+        "PreCompact:zmem-launch.js",
+        "PreToolUse:zmem-launch.js",
+        "SessionStart:zmem-launch.js",
+        "Stop:zmem-launch.js",
+        "SubagentStart:zmem-launch.js",
+        "SubagentStop:zmem-launch.js",
+        "UserPromptSubmit:zmem-launch.js"
+      ],
+      "mode": null
+    },
+    "exec-form-zcode": {
+      "fake_sha256": "a5f2613a569d332d2e87ced9bb162bf400a9f07a77be64b34693fbddb9a5650c",
+      "fake_version": "fake-zcode 96.1",
+      "host": "zcode",
+      "manifest_hook_ids": [
+        "PostToolUse:zmem-launch.js",
+        "PostToolUseFailure:zmem-launch.js",
+        "PreToolUse:zmem-launch.js",
+        "SessionStart:zmem-launch.js",
+        "Stop:zmem-launch.js",
+        "UserPromptSubmit:zmem-launch.js"
+      ],
+      "mode": null
+    },
+    "hermes-compat-mode": {
+      "fake_sha256": null,
+      "fake_version": null,
+      "host": "hermes",
+      "manifest_hook_ids": [],
+      "mode": "compatibility"
+    },
+    "hermes-gateway": {
+      "callback_evidence": [
+        "pre_llm_call"
+      ],
+      "fake_sha256": null,
+      "fake_version": null,
+      "host": "hermes",
+      "manifest_hook_ids": [],
+      "mode": "gateway",
+      "pinned_commands": [
+        [
+          "hermes",
+          "gateway",
+          "run",
+          "--no-supervise",
+          "--accept-hooks"
+        ],
+        [
+          "hermes",
+          "chat",
+          "-q",
+          "canary provider prompt",
+          "--oneshot",
+          "--accept-hooks"
+        ],
+        [
+          "hermes",
+          "chat",
+          "-q",
+          "canary compatibility prompt",
+          "--oneshot",
+          "--accept-hooks"
+        ]
+      ],
+      "pinned_sha": "cdf4c76",
+      "pinned_version": "0.21.1"
+    },
+    "hermes-provider-mode": {
+      "fake_sha256": null,
+      "fake_version": null,
+      "host": "hermes",
+      "manifest_hook_ids": [],
+      "mode": "provider"
+    },
+    "zcode-duplicate": {
+      "duplicate_roots": [
+        "host-roots/zcode-plugin-a",
+        "host-roots/zcode-plugin-b"
+      ],
+      "expected_one_copy_reason": "single-copy-pass",
+      "expected_two_copy_reason": "duplicate-install",
+      "fake_sha256": "a5f2613a569d332d2e87ced9bb162bf400a9f07a77be64b34693fbddb9a5650c",
+      "fake_version": "fake-zcode 96.1",
+      "host": "zcode",
+      "manifest_hook_ids": [
+        "PostToolUse:zmem-launch.js",
+        "PostToolUseFailure:zmem-launch.js",
+        "PreToolUse:zmem-launch.js",
+        "SessionStart:zmem-launch.js",
+        "Stop:zmem-launch.js",
+        "UserPromptSubmit:zmem-launch.js"
+      ],
+      "mode": null,
+      "one_copy_root": "host-roots/zcode-plugin-a"
+    }
+  },
+  "namespace": "project:fixture-96",
+  "schema": "zmem-canary-expected-lanes",
+  "session_id": "00000000-0000-4000-8000-000000000096",
+  "timestamp": "2026-09-10T00:00:00Z"
+}

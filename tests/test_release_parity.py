@@ -65,6 +65,24 @@ class ManifestParityTest(unittest.TestCase):
             f"changelog section is a release violation",
         )
 
+    def test_canary_surface_in_release_manifest(self):
+        """Issue #96: the canary result schema joins the release surface
+        beside the canary script, and the committed live artifacts under
+        canary/ are NOT release-surface entries."""
+        manifest = json.loads(
+            (gate.REPO_ROOT / "release-manifest.json")
+            .read_text(encoding="utf-8"))
+        files = set(manifest["files"])
+        self.assertIn("scripts/host_canary.py", files)
+        self.assertIn("scripts/canary-schema.json", files,
+                      "the #96 canary result schema must be re-emitted into "
+                      "release-manifest.json")
+        self.assertEqual(
+            [f for f in files if f.startswith("canary/")], [],
+            "root canary/ artifacts are live measurements, never "
+            "release-surface entries",
+        )
+
 
 class ReleaseGateUnitTest(unittest.TestCase):
     """Pure-function coverage of the gate's parsing and extraction."""
