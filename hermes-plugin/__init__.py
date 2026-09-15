@@ -1361,6 +1361,10 @@ class ZmemMemoryProvider(MemoryProvider):
             "budget_dropped_protected": payload.get("budget_dropped_protected", 0),
             "reason": reason,
             "context": rendered,
+            # Twin parity with the MCP server's session_start (do not fork):
+            # the additive ``rendered`` member mirrors ``context`` on both
+            # surfaces; here both are the store-owned fence (#158).
+            "rendered": rendered,
             "tokens_used": payload.get("tokens_used"),
             "tokens_budget": payload.get("tokens_budget"),
         })
