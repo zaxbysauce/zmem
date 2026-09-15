@@ -720,10 +720,38 @@ def build_result(lane, host, verdict, reason, *, sha=None, version=None,
     return result
 
 
+def _redact_home(value):
+    """Replace the operator's home-directory prefix with ``~`` so committed
+    artifacts stay machine-portable (tracked-file hygiene: no absolute user
+    home paths in the repo)."""
+    home = str(Path.home())
+    if isinstance(value, str) and home in value:
+        return value.replace(home + "\\", "~/").replace(home + "/", "~/") \
+            .replace(home, "~")
+    return value
+
+
+def _redact_result(result):
+    for key, value in result.items():
+        if isinstance(value, str):
+            result[key] = _redact_home(value)
+        elif isinstance(value, list):
+            result[key] = [_redact_home(v) if isinstance(v, str) else v
+                           for v in value]
+        elif isinstance(value, dict):
+            result[key] = {k: _redact_result(v) if isinstance(v, dict)
+                           else (_redact_home(v) if isinstance(v, str)
+                                 else v)
+                           for k, v in value.items()}
+    return result
+
+
 def write_result(path, result):
-    """Atomic JSON artifact write (tmp + os.replace), UTF-8, one final LF."""
+    """Atomic JSON artifact write (tmp + os.replace), UTF-8, one final LF.
+    String fields are home-redacted before the write."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    result = _redact_result(result)
     payload = json.dumps(result, indent=2, ensure_ascii=False) + "\n"
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
