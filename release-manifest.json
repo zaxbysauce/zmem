@@ -1,8 +1,8 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "c2b9fd06c4c0e49d5559140f2201848c4aca3729e639da8211ef2251abda5c47",
+  "digest": "0625e159130c3bc6dcc5e51f052427ecf6bb9ecd2169af5c92af77b8fb20f155",
   "files": {
-    "hermes-plugin/__init__.py": "94633311404b45fa6193ad46df2c552540853471b1522999baaaac12e672d83a",
+    "hermes-plugin/__init__.py": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "70338bcac85152e0d964fd70a6cea57cae06e93fe185ce5c1528f99c71e33c3b",
