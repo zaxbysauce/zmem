@@ -290,7 +290,7 @@ class TrustBlocksInjectionButNotSearchTest(TrustRecallCliBase):
                               f"{rel}: a --no-bump builder lacks the "
                               f"--for-injection gate flag")
                 checked += 1
-        self.assertGreaterEqual(checked, 5, "expected every current passive builder")
+        self.assertGreaterEqual(checked, 4, "expected every current passive builder (reduced from 5 by the #158 selector centralization)")
 
         hermes = (REPO / "hermes-plugin/__init__.py").read_text(encoding="utf-8")
         helper_start = hermes.index("def _passive_store_args")
