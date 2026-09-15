@@ -571,6 +571,38 @@ class CanaryHelperUnitTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "pass")
         self.assertEqual(result["reason"], "single-copy-pass")
 
+    def test_fake_executor_deadline_cancels_without_late_write(self):
+        """Issue #96 seam contract: the injected FakeExecutor implements the
+        Scheduler surface (submit/advance/now) and the DeadlineExecutor
+        surface — at the deadline run_command returns None, the child call is
+        cancelled exactly once, and a cancelled call can never write late
+        (invoking it raises Cancelled)."""
+        mod = self._load()
+        executor = fake_executor.FakeExecutor(deadline_hits={1})
+        writes = []
+
+        # DeadlineExecutor surface: the first run hits its deadline.
+        out = mod.run_command(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            input_bytes=None, env=os.environ.copy(), cwd=".",
+            deadline_s=30, deadline=executor)
+        self.assertIsNone(out, "a deadline-hit child must yield None")
+        self.assertEqual(writes, [], "no late write after cancellation")
+        self.assertEqual(len(executor.cancellations), 1)
+        cancelled = executor.cancellations[0]
+        self.assertTrue(cancelled.cancelled)
+        with self.assertRaises(fake_executor.FakeCall.Cancelled):
+            cancelled()  # the no-late-write property: cancelled calls die
+
+        # Scheduler surface: submit/advance/now drive deterministic firing.
+        fired = []
+        executor.submit(lambda: fired.append("tick"), delay_s=5)
+        executor.advance(3)
+        self.assertEqual(executor.now(), 3)
+        self.assertEqual(fired, [], "nothing fires before its delay")
+        executor.advance(2)
+        self.assertEqual(fired, ["tick"], "work fires exactly at the delay")
+
     def test_pinned_sha_and_lane_names(self):
         """Issue #96: the pinned Hermes sha default, the nine lane choices,
         Hermes version measurement, and the argparse exit-2 usage rules."""
