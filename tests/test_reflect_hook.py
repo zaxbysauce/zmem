@@ -708,6 +708,33 @@ class TestSubagentReflectMessaging(unittest.TestCase):
             os.remove(tx_a)
             os.remove(tx_b)
 
+    def test_write_path_sweep_prunes_backdated_tmp_orphan(self):
+        # PRR-011 (final-critic round 1): the write-path retention sweep must
+        # prune dot-prefixed .sidecar-*.tmp orphans — glob "*" never matches
+        # dotfiles, so the sweep enumerates via os.listdir. A backdated orphan
+        # must be gone after the next sidecar write.
+        if not _BASH:
+            self.skipTest("no bash")
+        ring = Path(self.tmp) / "subagent-reflections"
+        ring.mkdir(parents=True, exist_ok=True)
+        orphan = ring / ".sidecar-interrupted.tmp"
+        orphan.write_text("{\"truncated\":", encoding="utf-8")
+        stale = time.time() - 20 * 86400
+        os.utime(orphan, (stale, stale))
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            rc, raw, ctx = self._run_checked(
+                {"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
+            self.assertEqual(rc, 0)
+            self.assertEqual(ctx, {}, ctx)
+            self.assertFalse(orphan.exists(),
+                             "backdated .tmp orphan must be swept on write")
+        finally:
+            os.remove(trans)
+
 
 class ReflectCompatibilityLaneTest(unittest.TestCase):
     def test_compatibility_request_has_explicit_lane(self):

@@ -278,7 +278,6 @@ if lesson_exists:
 #    subagent turn. The sidecar is read + consumed + pruned by
 #    zmem-reflect.sh at the parent Stop hook.
 from collections import Counter
-import glob
 import hashlib
 import tempfile
 import time
@@ -320,12 +319,15 @@ try:
     # PRR-011): the parent-side prune only runs on a parent Stop, so sidecars
     # (and interrupted .tmp files the parent glob never matches) would
     # otherwise accumulate when the parent never Stops. Same 14-day rule.
+    # os.listdir (not glob) so the dot-prefixed .sidecar-*.tmp orphans are
+    # actually enumerated — glob "*" never returns dotfiles (final-critic
+    # round 1: the glob form let backdated orphans survive).
     try:
         now_s = time.time()
-        for stale in glob.glob(os.path.join(ring_dir, "*")):
-            name = os.path.basename(stale)
-            if not (name.endswith(".json") or name.endswith(".tmp")):
+        for stale_name in os.listdir(ring_dir):
+            if not (stale_name.endswith(".json") or stale_name.endswith(".tmp")):
                 continue
+            stale = os.path.join(ring_dir, stale_name)
             try:
                 if (now_s - os.stat(stale).st_mtime) / 86400.0 > 14.0:
                     os.unlink(stale)

@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "e89e270695ed583db4291fb36daaf8d3184ee9b7f16fe2879ae975fb084340c0",
+  "digest": "13d394e47b9c3c943362e0234847658cc385994b7cddac64c6c7f01f101ccd8a",
   "files": {
     "hermes-plugin/__init__.py": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -35,7 +35,7 @@
     "hooks/zmem-session-end.sh": "8734408904c0382a94b55d0b1a4c39a49a2da797bd473050d2b2891c9a283cfe",
     "hooks/zmem-session-start.sh": "254deb6d60063a4a4b86f434b84ed1232c3f7071c67cdee4bbe63206dfe5ad22",
     "hooks/zmem-subagent-recall.sh": "aab144cf0b1723fe113200f22659cbba0aabcccdb18e1e3cc5e14660a25e9588",
-    "hooks/zmem-subagent-reflect.sh": "22f7da80d3db32134ead69764b3202919a59815f6eba8cbe457c005d10cc24a1",
+    "hooks/zmem-subagent-reflect.sh": "59ad166945536270e9bac705a89a1957975ecd2130be3986c585d29599ef4f03",
     "scripts/bench_hook_latency.py": "ed77a76b54b97faab045c90a04acb3673651b3243967f1ebb6833c631e1b16be",
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",
     "scripts/eval_inject_runner.py": "c3b68474f80500e36ae2c245431897c7c0e5a27a98781332e8e9e1b8cb5cc70a",
