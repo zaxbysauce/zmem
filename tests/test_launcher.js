@@ -631,21 +631,26 @@ console.log("\n[9] Phase 7: subagent-recall (SubagentStart) + subagent-reflect (
         agent_transcript_path: AGENT_TX,
     }, opts || {}));
 
-    // claude: subagent-reflect → SubagentStop envelope with a failure prompt
-    // sourced from agent_transcript_path.
+    // claude: subagent-reflect → SubagentStop envelope that is ALWAYS {} —
+    // the failure signal moves to a parent-side hand-off sidecar (#204);
+    // prompting a finishing subagent would replace its <result> deliverable.
+    const sidecarDir = path.join(SDATA, "subagent-reflections");
+    const readSidecars = () => fs.existsSync(sidecarDir)
+        ? fs.readdirSync(sidecarDir).filter((n) => n.endsWith(".json"))
+            .map((n) => fs.readFileSync(path.join(sidecarDir, n), "utf8"))
+        : [];
     {
         const r = runLauncher("subagent-reflect", stopPayload(), envWith({
             ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
         }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         ok("subagent-reflect/claude: valid JSON", obj !== null, r.stdout.slice(0, 200));
-        eq("subagent-reflect/claude: hookEventName == SubagentStop",
-            obj && obj.hookSpecificOutput && obj.hookSpecificOutput.hookEventName, "SubagentStop");
-        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
-        ok("subagent-reflect: detected the subagent's failed tool call",
-            /failed tool call/.test(ac) && /Bash/.test(ac));
-        ok("subagent-reflect: per-subagent source-ref (session+agent)",
-            /session:p7-sess:agent:agent777/.test(ac));
+        eq("subagent-reflect: never emits a prompt (#204)", r.stdout.trim(), "{}");
+        const cars = readSidecars().join("\n");
+        ok("subagent-reflect: hand-off sidecar records the failed tool call",
+            /agent777/.test(cars) && /Bash/.test(cars));
+        ok("subagent-reflect: per-subagent source-ref (session+agent) in sidecar",
+            /session:p7-sess:agent:agent777/.test(cars));
     }
 
     // loop guard: stop_hook_active true → {} (never contribute to a subagent stop loop).
@@ -663,26 +668,77 @@ console.log("\n[9] Phase 7: subagent-recall (SubagentStart) + subagent-reflect (
         eq("subagent-reflect: no agent transcript → {}", r.stdout.trim(), "{}");
     }
 
-    // per-subagent dedup: seed a lesson for agent777, re-fire → {} for agent777,
-    // but a sibling agent999 (same session, own transcript) still reflects.
+    // per-subagent dedup: seed a lesson for agent777, re-fire → {} AND no new
+    // sidecar for agent777, but a sibling agent999 (same session, own
+    // transcript) still hands off.
     {
         const NS2 = resolveNs(PROJ);
         execFileSync(PYTHON, [STORE_PY, "add", "--namespace", NS2, "--type", "lesson",
             "--content", "captured for agent777", "--source-ref", "session:p7-sess:agent:agent777"],
             { env: envWith({ ZMEM_DATA: SDATA }), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+        const before = readSidecars().join("\n");
         const r1 = runLauncher("subagent-reflect", stopPayload(), envWith({
             ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
         eq("subagent-reflect: dedup suppresses re-reflection for same agent", r1.stdout.trim(), "{}");
+        eq("subagent-reflect: dedup writes no new sidecar",
+            readSidecars().join("\n"), before);
 
         const siblingTx = path.join(TMP, "p7-agent999.jsonl");
         fs.copyFileSync(AGENT_TX, siblingTx);
         const r2 = runLauncher("subagent-reflect",
             stopPayload({ agent_id: "agent999", agent_transcript_path: siblingTx }),
             envWith({ ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
-        let obj = null; try { obj = JSON.parse(r2.stdout.trim()); } catch (e) { /* */ }
-        ok("subagent-reflect: sibling agent still reflects (per-subagent dedup)",
-            !!(obj && obj.hookSpecificOutput &&
-                /session:p7-sess:agent:agent999/.test(obj.hookSpecificOutput.additionalContext || "")));
+        eq("subagent-reflect: sibling output stays a bare no-op envelope",
+            r2.stdout.trim(), "{}");
+        ok("subagent-reflect: sibling agent still hands off (per-subagent dedup)",
+            /session:p7-sess:agent:agent999/.test(readSidecars().join("\n")));
+    }
+
+    // #204 parent-side wire: the parent's own Stop (reflect) consumes the
+    // pending hand-off sidecars and surfaces them through the host rewrap —
+    // claude gets hookSpecificOutput.additionalContext, zcode bare
+    // additionalContext. Proves the new prompt survives the host adapter.
+    {
+        const parentStop = JSON.stringify({
+            session_id: "p7-sess", transcript_path: PARENT_TX, cwd: PROJ,
+            hook_event_name: "Stop", stop_hook_active: false,
+        });
+        const r = runLauncher("reflect", parentStop, envWith({
+            ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+        }));
+        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
+        ok("reflect/claude consumes subagent hand-off through the rewrap",
+            /dispatched subagent/.test(ac) && /agent999/.test(ac), ac.slice(0, 200));
+        ok("reflect/claude sidecar prompt carries the per-agent source-ref",
+            /session:p7-sess:agent:agent999/.test(ac));
+        // The consumed sidecars are gone; a second stop has nothing pending.
+        eq("reflect/claude consumed all pending sidecars",
+            readSidecars().filter((s) => /p7-sess/.test(s)).length, 0);
+        const r2 = runLauncher("reflect", parentStop, envWith({
+            ZMEM_DATA: SDATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+        }));
+        let obj2 = null; try { obj2 = JSON.parse(r2.stdout.trim()); } catch (e) { /* */ }
+        const ac2 = (obj2 && obj2.hookSpecificOutput && obj2.hookSpecificOutput.additionalContext) || "";
+        ok("reflect/claude second stop carries no subagent section",
+            !/dispatched subagent/.test(ac2), ac2.slice(0, 200));
+
+        // zcode host: the same sidecar-derived prompt arrives as bare
+        // additionalContext. Re-seed one sidecar first (all were consumed).
+        fs.mkdirSync(sidecarDir, { recursive: true });
+        fs.writeFileSync(path.join(sidecarDir, "wiretest.json"), JSON.stringify({
+            session: "p7-sess", agent_id: "agentWire", agent_type: "coder",
+            source_ref: "session:p7-sess:agent:agentWire", count: 1,
+            tool_summary: "1=Bash", details: [], rejections: "",
+            created: new Date().toISOString(),
+        }) + "\n");
+        const rz = runLauncher("reflect", parentStop, envWith({
+            ZMEM_DATA: SDATA, ZCODE_PLUGIN_ROOT: REPO, ZCODE_PROJECT_DIR: PROJ,
+        }));
+        let objz = null; try { objz = JSON.parse(rz.stdout.trim()); } catch (e) { /* */ }
+        ok("reflect/zcode sidecar prompt is bare additionalContext",
+            !!(objz && objz.additionalContext && /agentWire/.test(objz.additionalContext) &&
+                !objz.hookSpecificOutput), rz.stdout.slice(0, 200));
     }
 }
 
@@ -1654,15 +1710,26 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
         fs.writeFileSync(PARENT_TX, JSON.stringify({ type: "assistant",
             message: { role: "assistant", content: [{ type: "text", text: "done" }] } }) + "\n");
 
-        const r = runLauncher("subagent-reflect", JSON.stringify({
-            session_id: "sr-hostile-" + Date.now(), transcript_path: PARENT_TX, cwd: GITPROJ,
+        const SR_SESS = "sr-hostile-" + Date.now();
+        const subR = runLauncher("subagent-reflect", JSON.stringify({
+            session_id: SR_SESS, transcript_path: PARENT_TX, cwd: GITPROJ,
             agent_id: "agentHostile", agent_type: "coder", hook_event_name: "SubagentStop",
             stop_hook_active: false, agent_transcript_path: AGENT_TX,
         }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO }));
-        let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
+        eq("injection[subagent-reflect]: #204 — no prompt, bare {} envelope",
+            subR.stdout.trim(), "{}");
+        // #204: the suggested-command surface moved to the PARENT reflect
+        // prompt consuming the sidecar this subagent just wrote. The hostile
+        // (git-remote-derived) namespace and the per-agent refs are rendered
+        // there; run the canary check on THAT prompt.
+        const parR = runLauncher("reflect", JSON.stringify({
+            session_id: SR_SESS, transcript_path: PARENT_TX, cwd: GITPROJ,
+            hook_event_name: "Stop", stop_hook_active: false,
+        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO }));
+        let obj = null; try { obj = JSON.parse(parR.stdout.trim()); } catch (e) { /* */ }
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
-        ok("injection[subagent-reflect]: hook still renders the subagent reflection prompt",
-            /subagent reflection/.test(ac), ac.slice(0, 300));
+        ok("injection[subagent-reflect]: parent prompt surfaces the hand-off",
+            /dispatched subagent/.test(ac) && /agentHostile/.test(ac), ac.slice(0, 300));
         assertNoDefaultStoreLeak("subagent-reflect", () => runSuggestedAndCheckCanary("subagent-reflect", ac, CANARY, HDATA));
     }
 }

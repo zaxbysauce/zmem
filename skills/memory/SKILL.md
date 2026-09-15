@@ -1994,6 +1994,26 @@ detector at a scratch copy without touching `~/.zcode`; empty/unset means the
 default `~/.zcode/cli/db/db.sqlite`); `ZMEM_REFLECT=0` (exactly `0`) disables
 the whole Stop hook — unset, empty, or any other value keeps it enabled.
 
+### Subagent reflection is parent-side (#204)
+The `zmem-subagent-reflect.sh` SubagentStop hook NEVER prompts the finishing
+subagent. Claude Code honors additionalContext on (Subagent)Stop by continuing
+the conversation, so a stop-time prompt would re-run the subagent turn and its
+reply ("Memory captured", "blocked by sandbox guard, skipping", …) would
+replace the deliverable the orchestrator receives as the subagent's `<result>`.
+Instead, when the subagent's own transcript shows failures (or rendered user
+rejections) and no lesson exists for `session:<sid>:agent:<aid>`, the hook
+writes a hand-off sidecar under `<ZMEM_DATA>/subagent-reflections/` and emits
+the empty envelope. The PARENT's own Stop hook scans that directory for this
+session's sidecars, renders one reflection prompt covering all pending
+subagent failures (pending sidecars alone are sufficient — a clean parent
+transcript still prompts), and deletes the sidecars it rendered. Sidecars are
+consumed on read, refreshed per agent on re-fire, and pruned when older than
+14 days, so at most one parent prompt surfaces per dispatched agent batch.
+`ZMEM_REFLECT=0` disables the subagent hook too (no sidecar). The Stop hook
+also no-ops on Stop payloads carrying Claude subagent markers
+(`agent_id`/`agent_transcript_path`) — defense-in-depth for hosts where Stop
+fires bare inside subagent contexts.
+
 Capture a lesson only if it generalizes to a future session facing a similar
 situation. If the failure was a one-off (typo, transient), do nothing — the prompt
 explicitly allows that. Do not capture in-trajectory refinement tweaks as durable

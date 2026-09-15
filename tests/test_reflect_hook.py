@@ -275,12 +275,86 @@ class TestReflectHookMessaging(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("1 failed tool call(s)", raw, raw)
 
+    def test_stop_marker_guard_agent_id_only(self):
+        # #204: EITHER Claude subagent marker alone makes a Stop payload a
+        # subagent-context stop — no injection (the clobber vector).
+        if not _BASH:
+            self.skipTest("no bash")
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            raw = self._run("zmem-reflect.sh",
+                            {"ZMEM_TRANSCRIPT": os.path.abspath(trans)},
+                            stdin='{"session_id":"hooktest","agent_id":"agent-9"}')
+            self.assertEqual(_extract_ctx(raw), {}, raw)
+        finally:
+            os.remove(trans)
+
+    def test_stop_marker_guard_agent_transcript_only(self):
+        # #204: OR-semantics — agent_transcript_path alone also suppresses.
+        if not _BASH:
+            self.skipTest("no bash")
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            raw = self._run(
+                "zmem-reflect.sh",
+                {"ZMEM_TRANSCRIPT": os.path.abspath(trans)},
+                stdin='{"session_id":"hooktest","agent_transcript_path":"/tmp/agent-9.jsonl"}')
+            self.assertEqual(_extract_ctx(raw), {}, raw)
+        finally:
+            os.remove(trans)
+
+    def test_stop_consumes_pending_subagent_sidecar(self):
+        # #204: the parent-side hand-off — a sidecar written by the
+        # SubagentStop hook for THIS session is surfaced in the parent's Stop
+        # prompt and consumed (deleted) once rendered; a second Stop with no
+        # sidecars carries no subagent section.
+        if not _BASH:
+            self.skipTest("no bash")
+        ring = Path(self.tmp) / "subagent-reflections"
+        ring.mkdir(parents=True, exist_ok=True)
+        sidecar = {
+            "session": "hooktest",
+            "agent_id": "agent-777",
+            "agent_type": "explorer",
+            "source_ref": "session:hooktest:agent:agent-777",
+            "count": 2,
+            "tool_summary": "2=Bash",
+            "details": ["  - Bash : boom"],
+            "rejections": "",
+            "created": "2026-09-15T00:00:00+00:00",
+        }
+        sidecar_path = ring / "deadbeef.json"
+        sidecar_path.write_text(json.dumps(sidecar) + "\n", encoding="utf-8")
+        raw = self._run("zmem-reflect.sh", {})  # clean main-agent transcript
+        ctx = _extract_ctx(raw)
+        msg = ctx.get("additionalContext", "")
+        self.assertIn("agent-777", msg, msg)
+        self.assertIn("session:hooktest:agent:agent-777", msg, msg)
+        self.assertIn("2 failure(s)", msg, msg)
+        self.assertFalse(sidecar_path.exists(), "sidecar must be consumed")
+        # Second stop: nothing pending, no subagent section.
+        raw2 = self._run("zmem-reflect.sh", {})
+        msg2 = _extract_ctx(raw2).get("additionalContext", "")
+        self.assertNotIn("agent-777", msg2, msg2)
+
 
 class TestSubagentReflectMessaging(unittest.TestCase):
+    """Issue #204 contract: the SubagentStop hook NEVER emits additionalContext
+    (a prompt into a finishing subagent replaces its <result> deliverable).
+    Its failure/rejection signal is handed to the parent via a sidecar under
+    <ZMEM_DATA>/subagent-reflections/, consumed by zmem-reflect.sh at the
+    parent's own Stop."""
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
 
-    def _run(self, env_extra):
+    def _env(self, env_extra):
         env = {
             "ZMEM_DATA": self.tmp,
             "ZMEM_SESSION": "hooktest",
@@ -289,21 +363,44 @@ class TestSubagentReflectMessaging(unittest.TestCase):
             "ZMEM_NAMESPACE": "project:hooktest",
         }
         env.update(env_extra)
-        return _extract_ctx(_run_hook(REPO_ROOT / "hooks" / "zmem-subagent-reflect.sh", env))
+        return env
 
-    def test_rejection_only_is_surfaced_not_noop(self):
+    def _run(self, env_extra, stdin="{}"):
+        return _extract_ctx(_run_hook(
+            REPO_ROOT / "hooks" / "zmem-subagent-reflect.sh",
+            self._env(env_extra), stdin=stdin))
+
+    def _sidecars(self):
+        ring = Path(self.tmp) / "subagent-reflections"
+        if not ring.is_dir():
+            return []
+        out = []
+        for p in sorted(ring.glob("*.json")):
+            try:
+                out.append((p, json.loads(p.read_text(encoding="utf-8"))))
+            except Exception:
+                out.append((p, None))
+        return out
+
+    def test_rejection_only_writes_sidecar_and_no_prompt(self):
         if not _BASH:
             self.skipTest("no bash")
         trans = _write_transcript(_rejection("t1", "Edit", "leave the schema alone"))
         try:
             ctx = self._run({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
-            msg = ctx.get("additionalContext", "")
-            self.assertIn("had tool rejections but no tool failures", msg, msg)
-            self.assertIn("leave the schema alone", msg, msg)
-            self.assertIn("--signal user", msg, msg)
+            self.assertEqual(ctx, {}, ctx)  # never prompt a finishing subagent
+            cars = self._sidecars()
+            self.assertEqual(len(cars), 1, cars)
+            _, obj = cars[0]
+            self.assertEqual(obj.get("session"), "hooktest")
+            self.assertEqual(obj.get("agent_id"), "agent-1")
+            self.assertEqual(obj.get("source_ref"), "session:hooktest:agent:agent-1")
+            self.assertEqual(obj.get("count"), 0)
+            self.assertIn("leave the schema alone", obj.get("rejections", ""))
         finally:
             os.remove(trans)
-    def test_failures_plus_rejection(self):
+
+    def test_failures_plus_rejection_sidecar_fields(self):
         if not _BASH:
             self.skipTest("no bash")
         trans = _write_transcript([
@@ -313,10 +410,16 @@ class TestSubagentReflectMessaging(unittest.TestCase):
         ])
         try:
             ctx = self._run({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
-            msg = ctx.get("additionalContext", "")
-            self.assertIn("1 failed tool call(s)", msg, msg)
-            self.assertIn("User rejected 1 tool call(s)", msg, msg)
-            self.assertIn("not that file", msg, msg)
+            self.assertEqual(ctx, {}, ctx)
+            cars = self._sidecars()
+            self.assertEqual(len(cars), 1, cars)
+            _, obj = cars[0]
+            self.assertEqual(obj.get("count"), 1)
+            self.assertEqual(obj.get("agent_type"), "explorer")
+            self.assertIn("1=Bash", obj.get("tool_summary", ""))
+            self.assertTrue(obj.get("details"), obj)
+            self.assertIn("not that file", obj.get("rejections", ""))
+            self.assertTrue(obj.get("created"), obj)
         finally:
             os.remove(trans)
 
@@ -330,6 +433,7 @@ class TestSubagentReflectMessaging(unittest.TestCase):
         try:
             ctx = self._run({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
             self.assertEqual(ctx, {}, ctx)
+            self.assertEqual(self._sidecars(), [])  # clean subagent: no hand-off
         finally:
             os.remove(trans)
 
@@ -338,15 +442,54 @@ class TestSubagentReflectMessaging(unittest.TestCase):
             self.skipTest("no bash")
         trans = _write_transcript(_rejection("t1", "Edit", "stop"))
         try:
-            env = {
-                "ZMEM_DATA": self.tmp,
-                "ZMEM_SESSION": "hooktest",
-                "ZMEM_AGENT_ID": "agent-1",
-                "ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans),
-            }
             raw = _run_hook(REPO_ROOT / "hooks" / "zmem-subagent-reflect.sh",
-                            env, stdin='{"stop_hook_active": true}')
+                            self._env({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)}),
+                            stdin='{"stop_hook_active": true}')
             self.assertEqual(_extract_ctx(raw), {}, raw)
+            self.assertEqual(self._sidecars(), [])  # re-fire writes nothing
+        finally:
+            os.remove(trans)
+
+    def test_kill_switch_emits_empty_and_no_sidecar(self):
+        # #204 parity with zmem-reflect.sh (#194): ZMEM_REFLECT=0 disables the
+        # hook entirely — empty envelope, exit 0, no sidecar.
+        if not _BASH:
+            self.skipTest("no bash")
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            env = self._env({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans),
+                             "ZMEM_REFLECT": "0"})
+            proc_env = dict(os.environ)
+            for key in ("ZMEM_REFLECT", "ZMEM_ZCODE_DB", "ZMEM_TRANSCRIPT",
+                        "ZMEM_AGENT_TRANSCRIPT", "ZMEM_AGENT_ID",
+                        "ZMEM_FAILURES_DB_TIMEOUT_S"):
+                proc_env.pop(key, None)
+            proc_env.update(env)
+            proc = subprocess.run(
+                [_BASH, str(REPO_ROOT / "hooks" / "zmem-subagent-reflect.sh")],
+                input="{}", text=True, capture_output=True,
+                encoding="utf-8", errors="replace", env=proc_env, timeout=60)
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", proc.stdout, proc.stdout)
+            self.assertEqual(self._sidecars(), [])
+        finally:
+            os.remove(trans)
+
+    def test_sidecar_filename_deterministic_across_fires(self):
+        if not _BASH:
+            self.skipTest("no bash")
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            self._run({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
+            self._run({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
+            cars = self._sidecars()
+            self.assertEqual(len(cars), 1, cars)  # one file, overwritten
         finally:
             os.remove(trans)
 
