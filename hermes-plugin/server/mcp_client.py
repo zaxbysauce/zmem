@@ -198,8 +198,9 @@ def main() -> int:
             print(f"mcp_client: {type(exc).__name__} during MCP call; "
                   "treating as failure", file=sys.stderr)
             return 1
-        if not isinstance(envelope, dict) \
-                or any(k not in envelope for k in _SELECTOR_ENVELOPE_KEYS):
+        if args.tool == "prefetch" and (
+                not isinstance(envelope, dict)
+                or any(k not in envelope for k in _SELECTOR_ENVELOPE_KEYS)):
             print("mcp_client: invalid prefetch envelope", file=sys.stderr)
             return 1
         sys.stdout.write(json.dumps(envelope, ensure_ascii=False,

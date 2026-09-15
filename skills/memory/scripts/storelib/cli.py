@@ -104,10 +104,17 @@ def _hermes_capture_correction(namespace: str, session_id: str,
     if ok:
         try:
             os.makedirs(os.path.dirname(marker), exist_ok=True)
-            with open(marker, "w", encoding="utf-8") as f:
+            tmp = marker + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.write(digest)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, marker)
         except OSError:
-            pass
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     return bool(ok)
 
 

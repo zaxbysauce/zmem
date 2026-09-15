@@ -208,13 +208,13 @@ def _run_hermes_context(args: list[str]) -> dict:
 # ---------------------------------------------------------------------------
 
 def _data_dir() -> Path:
+    store = os.environ.get("ZMEM_STORE", "").strip()
+    if store:
+        return Path(store).expanduser().parent
     for var in ("ZMEM_DATA",):
         d = os.environ.get(var, "").strip()
         if d:
             return Path(d).expanduser()
-    store = os.environ.get("ZMEM_STORE", "").strip()
-    if store:
-        return Path(store).expanduser().parent
     for var in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
         d = os.environ.get(var, "").strip()
         if d:

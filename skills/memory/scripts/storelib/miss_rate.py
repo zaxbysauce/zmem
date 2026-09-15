@@ -726,6 +726,11 @@ def _ring_events_before(data_dir, session_id, ts_s, max_events=8) -> list:
     ``max_events`` kept. [] on any problem."""
     if not data_dir or not session_id:
         return []
+    try:
+        from storelib.ops_tokens import _ring_path
+        return _ring_path(data_dir, session_id)
+    except Exception:
+        pass
     safe = _SID_SAFE_RE.sub("_", session_id)[:128] or "session"
     path = os.path.join(data_dir, "ops", safe + ".log")
     try:
