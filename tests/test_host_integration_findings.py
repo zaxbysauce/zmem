@@ -195,8 +195,12 @@ class M10HermesHooksResolveViaHost(unittest.TestCase):
         self.assertEqual(os.path.normcase(host_path),
                          os.path.normcase(explicit),
                          f"sanity: host resolved {host_path}, expected {explicit}")
-        for hook_name in ("zmem-hermes-convention.py", "zmem-hermes-reflect.py",
-                          "zmem-hermes-verify.py"):
+        # Issue #122: the reflect hook no longer resolves (or opens) the
+        # store at all — store-path work moved to the hermes-context bridge
+        # and the prefetch subprocesses. Its drift-prevention property is
+        # the STRONGER absence pin below; the two hooks that still touch the
+        # store keep the delegate-to-host requirement.
+        for hook_name in ("zmem-hermes-convention.py", "zmem-hermes-verify.py"):
             hook_file = HOOKS_DIR / hook_name
             spec = importlib.util.spec_from_file_location(
                 f"hook_drift_{hook_name}_{os.getpid()}", str(hook_file))
@@ -209,6 +213,15 @@ class M10HermesHooksResolveViaHost(unittest.TestCase):
                 os.path.normcase(hook_path), os.path.normcase(host_path),
                 f"{hook_name} resolved {hook_path} but host.resolve_store_path "
                 f"resolved {host_path} — drift!")
+
+    def test_reflect_hook_no_longer_resolves_the_store(self):
+        """Issue #122: the reflect hook must not carry _resolve_store_path —
+        it is a fail-open adapter whose store work lives in subprocesses."""
+        hook_file = HOOKS_DIR / "zmem-hermes-reflect.py"
+        src = hook_file.read_text(encoding="utf-8")
+        self.assertNotIn("_resolve_store_path", src,
+                         "the reflect hook must not resolve the store path "
+                         "itself (issue #122 moved that to the bridge)")
 
     def test_copy_install_hook_finds_host_via_zmem_home(self):
         """In a copy install (`cp -r hermes-plugin …`), the hook file has no

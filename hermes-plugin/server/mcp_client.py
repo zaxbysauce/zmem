@@ -1,25 +1,34 @@
 """zmem MCP client — call one zmem MCP tool over StreamableHTTP and print it.
 
-Issue #71 A: the remote passive-prefetch transport. A Hermes hook
-(``zmem-hermes-reflect.py`` on ``pre_llm_call``) runs this file as a
-SUBPROCESS when ``ZMEM_MCP_URL`` is set, so the hook itself stays sync and
-stdlib-only while the ``mcp`` client library and its asyncio event loop live
-(and die) in this child process. ``subprocess.run(timeout=...)`` in the hook
-is the wedge-proof backstop.
+Issue #122 (Hermes compatibility parity): the remote passive prefetch
+transport for the ``pre_llm_call`` reflect hook. The hook (stdlib-only,
+sync) runs this file as a SUBPROCESS with ONE selector call per hook
+invocation::
 
-No second protocol: this speaks the SAME StreamableHTTP MCP surface as
-``mcp_server.py`` (it is in the same directory and covered by the same
-``requirements.txt``), and by default calls the ``session_start`` tool — the
-passive ``--no-bump`` prefetch that inherits the fence, the token budget, and
-the silent-reason contract server-side.
+    python hermes-plugin/server/mcp_client.py --url <ZMEM_MCP_URL> \
+        call prefetch --query <user_message> --namespace <namespace> \
+        --session-id <session_id> --moment user_prompt \
+        --lane hermes-compat [--ops-token <token> ...]
+
+``moment=user_prompt`` and ``lane=hermes-compat`` are supplied by the
+compatibility caller every time. The server's #159 selector owns the gate,
+the one 1,500-token budget, the delivery ledger and the ``rendered`` fence;
+this client validates the envelope boundary and prints the COMPLETE
+selector envelope (all required keys, ``rendered`` included) as compact
+JSON + one final LF. The hook merges its pending local failure text ahead
+of ``rendered`` and commits the operation cursor only after a rendered
+response — fail-open: ANY client failure (missing ``mcp`` lib, bad token,
+refused connection, timeout, malformed envelope) is the hook's signal to
+proceed without injection.
 
 Usage:
     python mcp_client.py --url http://host:8765/mcp \
         [--token <secret> | --token-file <path>] \
-        call session_start [--namespace user:global]
+        call prefetch --query <text> --namespace <ns> --session-id <sid> \
+            --moment user_prompt --lane hermes-compat [--ops-token <t> ...]
 
-Output: the tool's text content on stdout (exit 0), or a diagnostic on
-stderr with a non-zero exit. ANY failure is the caller's fail-open signal.
+Exit codes: 0 success · 1 transport/empty/invalid-envelope (fail-open
+signal) · 2 usage or missing token · 3 the ``mcp`` package is absent.
 """
 
 from __future__ import annotations
@@ -31,20 +40,13 @@ import os
 import sys
 from pathlib import Path
 
-
-_INJECT_LANES = (
-    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+# The closed #158/#159 selector-envelope key set; every key must be present
+# or the response is a failed prefetch (issue #122).
+_SELECTOR_ENVELOPE_KEYS = (
+    "results", "count", "omitted", "reason", "excluded", "candidate_ids",
+    "tokens_used", "tokens_budget", "budget_dropped", "budget_admission",
+    "budget_truncated", "budget_dropped_protected", "arms", "rendered",
 )
-
-
-def _invalid_argument(field: str, value: object) -> str:
-    return json.dumps({
-        "error": "invalid argument",
-        "field": field,
-        "value": value,
-        "status": 2,
-        "exit_code": 2,
-    }, sort_keys=True)
 
 
 def _resolve_token(args: argparse.Namespace) -> str:
@@ -76,7 +78,10 @@ def _resolve_token(args: argparse.Namespace) -> str:
     return env_token.strip()
 
 
-async def _call(url: str, token: str, tool: str, arguments: dict) -> str:
+async def _call(url: str, token: str, tool: str, arguments: dict) -> dict:
+    """Call one MCP tool and return the parsed JSON object (the selector
+    envelope for ``prefetch``). Raises on transport/tool errors; envelope
+    key validation happens in ``main`` so its exit codes stay exact."""
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
@@ -97,22 +102,20 @@ async def _call(url: str, token: str, tool: str, arguments: dict) -> str:
         if isinstance(text, str) and text.strip():
             parts.append(text)
     joined = "\n".join(parts)
-    # PRR (final-critic): FastMCP serializes the server's dict return into a
-    # JSON text block — the hook must inject the ENVELOPE'S context field,
-    # not the whole envelope. Fall back to the raw text for non-dict tools.
+    # FastMCP serializes the tool's dict return into a JSON text block; the
+    # prefetch envelope must cross this boundary whole (never a bare context
+    # string — issue #122).
     stripped = joined.strip()
     if stripped.startswith("{"):
         try:
             obj = json.loads(stripped)
         except ValueError:
-            return joined
+            raise ValueError("prefetch response is not valid JSON")
         if isinstance(obj, dict):
             if obj.get("error"):
                 raise RuntimeError(str(obj["error"])[:200])
-            ctx = obj.get("context")
-            if isinstance(ctx, str):
-                return ctx
-    return joined
+            return obj
+    raise ValueError("prefetch response was not a JSON object")
 
 
 def main() -> int:
@@ -127,20 +130,28 @@ def main() -> int:
                              "(defaults to ZMEM_MCP_TOKEN_FILE)")
     sub = parser.add_subparsers(dest="action", required=True)
     call = sub.add_parser("call", help="call a tool")
-    call.add_argument("tool", help="tool name, e.g. session_start")
-    call.add_argument("--namespace", default="",
-                       help="namespace argument (tool-specific; empty omits it)")
-    call.add_argument("--lane", default=None,
-                      help="optional closed runtime lane for session_start")
+    call.add_argument("tool", help="tool name, e.g. prefetch")
+    call.add_argument("--query", dest="query", type=str, default="",
+                      help="query text for prefetch")
+    call.add_argument("--namespace", dest="namespace", type=str, default="",
+                      help="memory namespace for prefetch")
+    call.add_argument("--session-id", dest="session_id", type=str, default="",
+                      help="full session id for prefetch")
+    call.add_argument("--moment", dest="moment",
+                      choices=("session_start", "user_prompt", "pretool",
+                               "subagent", "precompact"),
+                      default=None,
+                      help="runtime injection moment")
+    call.add_argument("--lane", dest="lane",
+                      choices=("claude", "codex", "zcode", "hermes-provider",
+                               "hermes-compat"),
+                      default=None,
+                      help="runtime host lane")
+    call.add_argument("--ops-token", dest="ops_tokens", action="append",
+                      default=[],
+                      help="Operation token from the pretool ring "
+                           "(repeatable)")
     args = parser.parse_args()
-
-    # Refuse malformed explicit lanes before token resolution or any network
-    # activity, keeping the adapter's status-2 contract deterministic even
-    # when the caller also has missing credentials.
-    if args.action == "call" and args.lane is not None \
-            and args.lane not in _INJECT_LANES:
-        print(_invalid_argument("lane", args.lane))
-        return 2
 
     token = _resolve_token(args)
     if not token:
@@ -149,13 +160,29 @@ def main() -> int:
         return 2
 
     if args.action == "call":
+        if args.tool == "prefetch":
+            if not args.namespace or not args.session_id \
+                    or not args.moment or not args.lane:
+                print("mcp_client.py: error: prefetch requires --namespace, "
+                      "--session-id, --moment, and --lane", file=sys.stderr)
+                return 2
         arguments: dict = {}
-        if args.namespace:
+        if args.tool == "prefetch":
+            arguments = {
+                "query": args.query,
+                "namespace": args.namespace,
+                "session_id": args.session_id,
+                "moment": args.moment,
+                "lane": args.lane,
+                "ops_tokens": list(args.ops_tokens),
+            }
+        elif args.namespace:
             arguments["namespace"] = args.namespace
-        if args.tool == "session_start" and args.lane is not None:
-            arguments["lane"] = args.lane
+            if args.tool == "session_start" and args.lane:
+                arguments["lane"] = args.lane
         try:
-            text = asyncio.run(_call(args.url, token, args.tool, arguments))
+            envelope = asyncio.run(_call(args.url, token, args.tool,
+                                         arguments))
         except ImportError as exc:
             print(f"mcp_client: the 'mcp' package is required for remote "
                   f"prefetch ({exc}); install hermes-plugin/server/"
@@ -164,19 +191,22 @@ def main() -> int:
         except Exception as exc:
             print(f"mcp_client: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
-        except BaseException as exc:
-            # PRR-010 disposition: anyio cancellation surfaces a
-            # BaseExceptionGroup (a BaseException subclass) that the generic
-            # handler above cannot catch. This is still a subprocess whose
-            # only job is to die cleanly — map it to the same rc-1 fail-open
-            # signal instead of a raw traceback.
+        except BaseException as exc:  # noqa: BLE001 — see PRR-010 disposition
+            # anyio cancellation surfaces a BaseExceptionGroup (a
+            # BaseException subclass) that the generic handler above cannot
+            # catch. This is still a subprocess whose only job is to die
+            # cleanly — map it to the same rc-1 fail-open signal instead of
+            # a raw traceback.
             print(f"mcp_client: {type(exc).__name__} during MCP call; "
                   "treating as failure", file=sys.stderr)
             return 1
-        if not text.strip():
-            print("mcp_client: empty tool response", file=sys.stderr)
+        if args.tool == "prefetch" and (
+                not isinstance(envelope, dict)
+                or any(k not in envelope for k in _SELECTOR_ENVELOPE_KEYS)):
+            print("mcp_client: invalid prefetch envelope", file=sys.stderr)
             return 1
-        print(text)
+        sys.stdout.write(json.dumps(envelope, ensure_ascii=False,
+                                    separators=(",", ":")) + "\n")
         return 0
     return 2
 

@@ -24,6 +24,7 @@ python tests/test_hermes_correction_remote.py
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -86,12 +87,17 @@ CORRECTION = "No, use bun not npm for this project's installs from now on"
 
 
 class HermesCorrectionCaptureTest(unittest.TestCase):
-    """Issue #71 D: parity capture on the pre_llm_call path."""
+    """Issue #71 D: parity capture on the pre_llm_call path (since issue
+    #122 the queue write itself happens inside the store bridge)."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="zmem-hermes-corr-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.env = _clean_env(self.tmp, ZMEM_HOME=str(REPO_ROOT))
+        # Pin the namespace: issue #122 derives it from the project dir via
+        # host.resolve_namespace when unpinned, so an unpinned run on a git
+        # checkout would queue under the project namespace, not user:global.
+        self.env = _clean_env(self.tmp, ZMEM_HOME=str(REPO_ROOT),
+                              ZMEM_NAMESPACE="user:global")
 
     def test_user_message_captured_with_host_hermes(self):
         out, rc = _run_reflect(self.env, {"session_id": "s1",
@@ -198,21 +204,56 @@ class HookHelperUnitTest(unittest.TestCase):
                              "project:cfg")
 
     def test_namespace_chain_fallbacks(self):
+        # Issue #122: the chain is MCP_NAMESPACE → NAMESPACE → ZMEM_PROJECT →
+        # ZCODE_PROJECT_DIR → CLAUDE_PROJECT_DIR → cwd, with the project-dir
+        # sources resolved through host.resolve_namespace. With every
+        # project source pointing at a NONEXISTENT dir, git resolution fails
+        # and the documented fallback is exactly user:global.
         with mock.patch.dict(os.environ, {"ZMEM_NAMESPACE": "user:z"},
                              clear=False):
             os.environ.pop("ZMEM_MCP_NAMESPACE", None)
+            for k in ("ZMEM_PROJECT", "ZCODE_PROJECT_DIR",
+                      "CLAUDE_PROJECT_DIR"):
+                os.environ.pop(k, None)
             self.assertEqual(self.hook._resolve_hook_namespace(), "user:z")
         env_backup = {k: os.environ.get(k) for k in
-                      ("ZMEM_MCP_NAMESPACE", "ZMEM_NAMESPACE")}
+                      ("ZMEM_MCP_NAMESPACE", "ZMEM_NAMESPACE", "ZMEM_PROJECT",
+                       "ZCODE_PROJECT_DIR", "CLAUDE_PROJECT_DIR")}
         for k in env_backup:
             os.environ.pop(k, None)
         try:
-            self.assertEqual(self.hook._resolve_hook_namespace(),
-                             "user:global")
+            # Resolver FAILURE (host unimportable — e.g. a broken plugin
+            # copy): the documented fallback is exactly user:global. A real
+            # dir would derive a project:* key (see the test below); git
+            # failure paths are not deterministically arrangeable.
+            with mock.patch.dict(sys.modules, {"host": None}):
+                self.assertEqual(self.hook._resolve_hook_namespace(),
+                                 "user:global")
         finally:
             for k, v in env_backup.items():
                 if v is not None:
                     os.environ[k] = v
+
+    def test_namespace_chain_prefers_project_dir_sources(self):
+        # Issue #122: ZCODE_PROJECT_DIR feeds host.resolve_namespace — a
+        # real git checkout derives its project:* key instead of falling
+        # back to user:global. Assert the derivation THROUGH host (the sole
+        # producer of project:* keys) using this repo as the fixture.
+        repo_root = str(REPO_ROOT)
+        with mock.patch.dict(os.environ, {
+                "ZMEM_MCP_NAMESPACE": "",
+                "ZMEM_NAMESPACE": "",
+                "ZCODE_PROJECT_DIR": repo_root,
+        }, clear=False):
+            os.environ.pop("ZMEM_PROJECT", None)
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            derived = self.hook._resolve_hook_namespace()
+        self.assertTrue(derived.startswith("project:"), derived)
+        if str(SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(SCRIPTS))
+        import host as _host  # the sole producer — same derivation
+        self.assertEqual(derived,
+                         _host.resolve_namespace(repo_root))
 
 
 @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed")
@@ -336,11 +377,18 @@ class HermesRemotePrefetchTest(unittest.TestCase):
         out, rc = _run_reflect(env, {"session_id": "r5",
                                      "user_message": CORRECTION})
         self.assertEqual(rc, 0)
-        sidecar_q = Path(env["ZMEM_DATA"], "queue", "user_cglobal.json")
-        self.assertTrue(sidecar_q.is_file(),
+        # Issue #122: the namespace is DERIVED (project:* on a git
+        # checkout), so scan the REMOTE box's local queue dir rather than
+        # assuming user:global — the pinned intent is that the capture
+        # lands in the local SIDECAR, never on the remote store.
+        queue_dir = Path(env["ZMEM_DATA"], "queue")
+        self.assertTrue(queue_dir.is_dir(),
                         "capture must use the REMOTE box's local sidecar")
-        items = json.loads(sidecar_q.read_text(encoding="utf-8"))
-        self.assertEqual(items[0]["host"], "hermes")
+        hermed = []
+        for q in sorted(queue_dir.glob("*.json")):
+            items = json.loads(q.read_text(encoding="utf-8"))
+            hermed.extend(i for i in items if i.get("host") == "hermes")
+        self.assertEqual(len(hermed), 1)
 
 
     def test_remote_mode_ignores_stale_local_store(self):
@@ -412,6 +460,288 @@ class HermesRemotePrefetchTest(unittest.TestCase):
         self.assertIn("cfgnscanary", out,
                       "ZMEM_MCP_NAMESPACE must drive the prefetch query "
                       "(the session id must never be sent as the namespace)")
+
+    # ------------------------------------------------------------------
+    # Issue #122: compatibility-mode parity — fixture-driven, in-process
+    # hook runs where ONLY the mcp_client subprocess is faked; the
+    # hermes-context store bridge runs FOR REAL against a seeded scratch
+    # store, so the hashed sidecars, nudge bytes, and cursor ordering are
+    # exercised end to end.
+    # ------------------------------------------------------------------
+
+    _SID = "00000000-0000-4000-8000-000000000122"
+    _NS = "project:github.com/acme/demo"
+    _QUERY = "Please check the stash safety for this turn."
+    _OPS_STEM = hashlib.sha256(_SID.encode("utf-8")).hexdigest()[:32]
+    _COMPAT = REPO_ROOT / "tests" / "fixtures" / "hermes_compat"
+
+    def _compat_env(self, tmp: str, **extra: str) -> dict:
+        return _clean_env(
+            tmp,
+            ZMEM_HOME=str(REPO_ROOT),
+            ZMEM_MCP_URL="http://127.0.0.1:9/mcp",
+            ZMEM_MCP_TOKEN="compat-token",
+            ZMEM_MCP_NAMESPACE=self._NS,
+            **extra)
+
+    def _seed_compat_store(self, tmp: str, *, arm_failure: bool = False,
+                           seed_cursor: bool = False) -> None:
+        subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "init"],
+            capture_output=True, text=True, env=_clean_env(tmp), check=True,
+            timeout=120)
+        ops_dir = Path(tmp) / "ops"
+        ops_dir.mkdir(parents=True, exist_ok=True)
+        ring = (self._COMPAT / "ops" / f"{self._OPS_STEM}.log").read_bytes()
+        (ops_dir / f"{self._OPS_STEM}.log").write_bytes(ring)
+        if arm_failure:
+            conn = sqlite3.connect(str(Path(tmp) / "store.sqlite"))
+            try:
+                conn.executescript(
+                    (self._COMPAT / "meta-seed.sql").read_text(encoding="utf-8"))
+                conn.commit()
+            finally:
+                conn.close()
+        if seed_cursor:
+            (ops_dir / f"{self._OPS_STEM}.delivered").write_bytes(
+                (self._COMPAT / "cursor-before.txt").read_bytes())
+
+    def _drive_reflect_inprocess(self, tmp: str, payload: dict,
+                                 fake_client: "subprocess.CompletedProcess | None",
+                                 **env_extra: str):
+        """Run the reflect hook in-process; fake ONLY the mcp_client
+        subprocess (recorded), let the hermes-context bridge run for real
+        against the scratch store pinned into os.environ.
+        Returns (stdout, stderr, returncode, client_cmds)."""
+        import io as _io
+        mod = _load_reflect_module()
+        real_run = mod.subprocess.run
+        client_cmds: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            if any("mcp_client.py" in str(part) for part in cmd):
+                client_cmds.append([str(p) for p in cmd])
+                return fake_client
+            return real_run(cmd, **kwargs)
+
+        pinned = self._compat_env(tmp, **env_extra)
+        saved = {k: os.environ.get(k) for k in pinned}
+        for k, v in pinned.items():
+            os.environ[k] = v
+        out, err, rc = _io.StringIO(), _io.StringIO(), None
+        try:
+            with mock.patch.object(mod.subprocess, "run", fake_run), \
+                    mock.patch.object(sys, "stdin",
+                                      _io.StringIO(json.dumps(payload))), \
+                    mock.patch.object(sys, "stdout", out), \
+                    mock.patch.object(sys, "stderr", err):
+                rc = mod.main()
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return out.getvalue(), err.getvalue(), rc, client_cmds
+
+    def _fail_client(self, stderr: str = "boom"):
+        import types as _types
+        return _types.SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+
+    def test_compat_prefetch_forwards_exact_request(self):
+        """AC1: the remote request equals tests/fixtures/hermes_compat/
+        request.json field for field (namespace, UUID session id, query,
+        user_prompt, hermes-compat, git/stash/pop token order)."""
+        import types as _types
+        tmp = tempfile.mkdtemp(prefix="zmem-compat-c2-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self._seed_compat_store(tmp)
+        request = json.loads(
+            (self._COMPAT / "request.json").read_text(encoding="utf-8"))
+        envelope_txt = (self._COMPAT / "remote-response.json").read_text(
+            encoding="utf-8")
+        fake = _types.SimpleNamespace(returncode=0, stdout=envelope_txt,
+                                      stderr="")
+        out, err, rc, cmds = self._drive_reflect_inprocess(
+            tmp,
+            {"session_id": self._SID, "user_message": self._QUERY}, fake)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(cmds), 1, cmds)
+        cmd = cmds[0]
+        for flag, value in (
+                ("--url", "http://127.0.0.1:9/mcp"),
+                ("--query", request["query"]),
+                ("--namespace", request["namespace"]),
+                ("--session-id", request["session_id"]),
+                ("--moment", request["moment"]),
+                ("--lane", request["lane"]),
+        ):
+            self.assertIn(flag, cmd, cmd)
+            self.assertEqual(cmd[cmd.index(flag) + 1], value,
+                             f"{flag} value mismatch: {cmd}")
+        # repeated --ops-token flags preserve the ring order
+        ops_values = [cmd[i + 1] for i, part in enumerate(cmd)
+                      if part == "--ops-token"]
+        self.assertEqual(ops_values, request["ops_tokens"], cmd)
+        self.assertIn("call", cmd)
+        self.assertEqual(cmd[cmd.index("call") + 1], "prefetch")
+        # clean prepare (no armed failure): the emitted context is exactly
+        # the selector's rendered fence
+        emitted = json.loads(out)
+        self.assertEqual(
+            emitted.get("context"),
+            (self._COMPAT / "expected-rendered.txt").read_text(
+                encoding="utf-8"))
+
+    def test_success_merges_failure_and_rendered_context(self):
+        """AC2: context bytes equal expected-context.json (failure nudge
+        first, two-LF join, then the selector's rendered fence); the real
+        bridge commit moves the cursor before->after; no .tmp remains."""
+        import types as _types
+        tmp = tempfile.mkdtemp(prefix="zmem-compat-c3-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self._seed_compat_store(tmp, arm_failure=True)
+        fake = _types.SimpleNamespace(
+            returncode=0,
+            stdout=(self._COMPAT / "remote-response.json").read_text(
+                encoding="utf-8"),
+            stderr="")
+        out, err, rc, _cmds = self._drive_reflect_inprocess(
+            tmp,
+            {"session_id": self._SID, "user_message": self._QUERY}, fake)
+        self.assertEqual(rc, 0, (out, err))
+        emitted = json.loads(out)
+        expected = json.loads(
+            (self._COMPAT / "expected-context.json").read_text(
+                encoding="utf-8"))
+        self.assertEqual(emitted["context"], expected["context"])
+        rendered = (self._COMPAT / "expected-rendered.txt").read_text(
+            encoding="utf-8")
+        failure_text = expected["context"][:expected["context"].index(
+            "\n\n" + rendered)]
+        self.assertLess(emitted["context"].index(failure_text),
+                        emitted["context"].index("<<<ZMEM_UNTRUSTED_FENCE>>>"),
+                        "failure bytes must precede the rendered fence")
+        cursor = Path(tmp, "ops", f"{self._OPS_STEM}.delivered")
+        self.assertEqual(cursor.read_bytes(),
+                         (self._COMPAT / "cursor-after.txt").read_bytes())
+        residue = [p.name for p in Path(tmp, "ops").iterdir()
+                   if p.name.endswith(".tmp")]
+        self.assertEqual(residue, [])
+        # ack-failure really cleared the armed marker
+        conn = sqlite3.connect(str(Path(tmp) / "store.sqlite"))
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (f"hermes_pending_failure_{self._SID}",)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNone(row)
+
+    def test_two_failed_prefetch_attempts_keep_cursor(self):
+        """AC3: two deterministic failures — stdout {}, exit 0, cursor
+        byte-identical to `1726000000.0 0\\n`, attempts file
+        `1726000000.0 2\\n`, and the exact stderr line once."""
+        tmp = tempfile.mkdtemp(prefix="zmem-compat-c4-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self._seed_compat_store(tmp, seed_cursor=True)
+        out, err, rc, cmds = self._drive_reflect_inprocess(
+            tmp,
+            {"session_id": self._SID, "user_message": self._QUERY},
+            self._fail_client())
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), {})
+        self.assertEqual(len(cmds), 2, "exactly initial + one retry")
+        cursor = Path(tmp, "ops", f"{self._OPS_STEM}.delivered")
+        self.assertEqual(cursor.read_bytes(),
+                         (self._COMPAT / "cursor-before.txt").read_bytes())
+        attempts = Path(tmp, "ops", f"{self._OPS_STEM}.attempts")
+        self.assertEqual(
+            attempts.read_bytes(),
+            (self._COMPAT / "attempts-after-two-failures.txt").read_bytes())
+        self.assertEqual(
+            err, "zmem-reflect: prefetch failed after 2 attempts; "
+                 "cursor unchanged\n")
+
+    def test_malformed_envelope_fails_open(self):
+        """AC (client boundary): a response missing the selector-envelope
+        keys makes mcp_client exit 1 with the exact stderr line."""
+        import io as _io
+        client_path = REPO_ROOT / "hermes-plugin" / "server" / "mcp_client.py"
+        spec = importlib.util.spec_from_file_location(
+            "zmem_mcp_client_under_test", client_path)
+        client = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(client)
+        malformed = json.loads(
+            (self._COMPAT / "malformed-response.json").read_text(
+                encoding="utf-8"))
+
+        async def fake_call(url, token, tool, arguments):
+            return malformed
+
+        argv = ["mcp_client.py", "--url", "http://127.0.0.1:9/mcp",
+                "call", "prefetch",
+                "--query", self._QUERY,
+                "--namespace", self._NS,
+                "--session-id", self._SID,
+                "--moment", "user_prompt",
+                "--lane", "hermes-compat"]
+        err = _io.StringIO()
+        with mock.patch.dict(os.environ, {"ZMEM_MCP_TOKEN": "compat-token"}), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(client, "_call", fake_call):
+            rc = client.main()
+        self.assertEqual(rc, 1)
+        self.assertEqual(err.getvalue(),
+                         "mcp_client: invalid prefetch envelope\n")
+
+    def test_correction_capture_uses_store_subprocess(self):
+        """AC: the hook source contains no direct store access, and the
+        exact user message reaches the bridge's prepare action."""
+        src = REFLECT.read_text(encoding="utf-8")
+        for banned in ("import sqlite3", "sqlite3.", "from storelib",
+                       "import storelib", "import correction_queue",
+                       "from correction_queue"):
+            self.assertNotIn(banned, src, banned)
+        tmp = tempfile.mkdtemp(prefix="zmem-compat-c5-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        mod = _load_reflect_module()
+        recorded: list[list[str]] = []
+
+        def recorder(args):
+            recorded.append(list(args))
+            return {}
+
+        payload = {"session_id": self._SID, "user_message": self._QUERY}
+        out = _capture_main(mod, recorder, payload)
+        self.assertEqual(json.loads(out), {})
+        self.assertTrue(recorded, "the bridge must run at least once")
+        first = recorded[0]
+        self.assertEqual(first[first.index("--action") + 1], "prepare")
+        self.assertEqual(first[first.index("--user-message") + 1],
+                         self._QUERY)
+        self.assertEqual(first[first.index("--session-id") + 1], self._SID)
+
+
+def _load_reflect_module():
+    spec = importlib.util.spec_from_file_location(
+        "zmem_reflect_under_test", REFLECT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _capture_main(mod, recorder, payload):
+    """Drive mod.main() with a recorded bridge and captured std streams."""
+    import io as _io
+    out, err = _io.StringIO(), _io.StringIO()
+    with mock.patch.object(mod, "_run_hermes_context", recorder), \
+            mock.patch.object(sys, "stdin", _io.StringIO(json.dumps(payload))), \
+            mock.patch.object(sys, "stdout", out), \
+            mock.patch.object(sys, "stderr", err):
+        mod.main()
+    return out.getvalue()
 
 
 if __name__ == "__main__":

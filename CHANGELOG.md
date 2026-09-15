@@ -10,6 +10,53 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.40.0] - 2026-09-14
+
+> Issue #122: the Hermes compatibility hook reaches parity — query-aware
+> prefetch through the shared selector, a store-process bridge instead of
+> direct store access, and collision-free, atomically rotated sidecars.
+
+### Changed
+- **Hermes compatibility hook (`zmem-hermes-reflect.py`, issue #122)**: the
+  `pre_llm_call` hook no longer opens the store or imports store-side
+  modules. Each invocation performs ONE query-aware selector call — remote
+  via `mcp_client.py call prefetch`, local via `store.py prefetch
+  --for-injection --no-bump --json` — always with the current user message
+  as the query, `--moment user_prompt`, `--lane hermes-compat`, and the
+  operation-ring tokens in order. The selector's `rendered` fence is the
+  only injected memory text; the operation cursor is committed only AFTER a
+  rendered response; a pending failure nudge is merged ahead of the fence
+  and acknowledged only after it was delivered (remote failures still
+  deliver it). The hook stays fail-open end to end and registers no
+  `pre_tool_call`.
+- **`store.py hermes-context` bridge**: new store-process command
+  (`--action prepare|ack-failure|commit-cursor`) owning correction capture,
+  pending-failure state, and the operation-cursor commit, printing compact
+  JSON with exact exit codes and never creating a missing store file.
+- **Namespace derivation**: the hook derives its namespace through the full
+  `ZMEM_MCP_NAMESPACE` → `ZMEM_NAMESPACE` → `ZMEM_PROJECT` →
+  `ZCODE_PROJECT_DIR` → `CLAUDE_PROJECT_DIR` → cwd chain via
+  `host.resolve_namespace` (the sole `project:*` producer), falling back to
+  `user:global` on resolver failure.
+
+### Fixed
+- **Sidecar naming collisions**: session ring, delivered-cursor, attempts,
+  and correction markers are now named by the SHA-256 of the COMPLETE
+  session id (`sha256[:32]`), so ids sharing a 128-character sanitized
+  prefix can no longer share one ring or cursor.
+- **Ring rotation**: trimming an oversized ring is atomic (same-directory
+  temp file, flush + fsync, `os.replace`) — an interrupted rotation can no
+  longer leave partial JSONL behind.
+- **Prefetch retry budget**: a cursor gets exactly two prefetch attempts
+  (initial + one retry) recorded in a hashed `.attempts` sidecar; an
+  exhausted cursor is skipped until the ring cursor moves, with the exact
+  stderr line `zmem-reflect: prefetch failed after 2 attempts; cursor
+  unchanged`.
+- **MCP client envelope**: `mcp_client.py` validates the complete selector
+  envelope (all 14 keys) and prints it as compact JSON — a bare context
+  string or malformed envelope can no longer cross the client boundary
+  (exit 1, `mcp_client: invalid prefetch envelope`).
+
 ## [0.39.0] - 2026-09-14
 
 > Issue #159: query-aware passive prefetch joins the CLI and the MCP server

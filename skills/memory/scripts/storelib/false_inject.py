@@ -102,10 +102,17 @@ def _read_ring_events(data_dir, sid: str) -> list:
     """
     if not data_dir or not sid:
         return []
-    safe = _norm_sid(sid)
-    if not safe:
-        return []
-    path = os.path.join(str(data_dir), "ops", safe + ".log")
+    try:
+        from storelib.ops_tokens import _ring_path
+        hashed = _ring_path(str(data_dir), sid)
+        if os.path.isfile(hashed):
+            path = hashed
+        else:
+            safe = _norm_sid(sid)
+            path = os.path.join(str(data_dir), "ops", safe + ".log")
+    except Exception:
+        safe = _norm_sid(sid)
+        path = os.path.join(str(data_dir), "ops", safe + ".log")
     events = []
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:

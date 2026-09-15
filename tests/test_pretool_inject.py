@@ -292,11 +292,24 @@ class HermesReflectDeliveryTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.strip()
 
+    def _hashed_ring(self, tmp: str, sid: str) -> "Path":
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            import storelib.ops_tokens as ops
+            return Path(ops._ring_path(tmp, sid))
+        finally:
+            sys.path.pop(0)
+
     def test_fresh_ring_delivers_once_then_silent(self):
+        # Issue #122: the hook delivers through the selector, whose session
+        # ledger makes delivery at-most-once PER SESSION (not per ring
+        # cursor). A fresh ring delivers the canary once; the same row is
+        # ledger-suppressed afterwards even when new ring verbs arrive; a
+        # NEW row delivers.
         tmp = tempfile.mkdtemp(prefix="zmem-reflect-")
         try:
             _seed(_clean_env(tmp), "user:global", LESSON)
-            ring = Path(tmp, "ops", "s-reflect.log")
+            ring = self._hashed_ring(tmp, "s-reflect")
             ring.parent.mkdir(parents=True)
             ring.write_text(
                 json.dumps({"ts": 200, "tool": "Bash",
@@ -305,30 +318,41 @@ class HermesReflectDeliveryTest(unittest.TestCase):
             first = self._run_reflect(tmp)
             self.assertIn("pretoolcanary", first)
             self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", first)
-            # Same ring (no new verbs) → silent.
+            # Same ring → silent (the ledger already delivered the row).
             second = self._run_reflect(tmp)
             self.assertEqual(second, "{}")
-            # New verb timestamp → delivered again.
+            # New verb timestamp → still silent for the DELIVERED row...
             with open(ring, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"ts": 300, "tool": "Bash",
                                     "ops": "git push origin"}) + "\n")
             third = self._run_reflect(tmp)
-            self.assertIn("pretoolcanary", third)
+            self.assertEqual(third, "{}",
+                             "a ledger-delivered row must not re-deliver")
+            # ...but a NEW row reaches the fence.
+            _seed(_clean_env(tmp), "user:global",
+                  "pushcanary: force-push rebase recovery note for origin")
+            with open(ring, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": 400, "tool": "Bash",
+                                    "ops": "git push origin"}) + "\n")
+            fourth = self._run_reflect(tmp)
+            self.assertIn("pushcanary", fourth)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_kill_switch_disables_delivery(self):
+        # Issue #122: the delivery kill switch is ZMEM_INJECT=0 (the old
+        # local-path ZMEM_QUERY_CONTEXT switch died with the local path).
         tmp = tempfile.mkdtemp(prefix="zmem-reflect-ks-")
         try:
             _seed(_clean_env(tmp), "user:global", LESSON)
-            ring = Path(tmp, "ops", "s-reflect.log")
+            ring = self._hashed_ring(tmp, "s-reflect")
             ring.parent.mkdir(parents=True)
             ring.write_text(
                 json.dumps({"ts": 200, "tool": "Bash",
                             "ops": "git stash pop"}) + "\n",
                 encoding="utf-8")
             env = _clean_env(tmp, ZMEM_HOME=str(REPO_ROOT),
-                             ZMEM_QUERY_CONTEXT="0")
+                             ZMEM_INJECT="0")
             r = subprocess.run(
                 [sys.executable, str(REFLECT)],
                 input=json.dumps({"session_id": "s-reflect"}),
@@ -339,17 +363,17 @@ class HermesReflectDeliveryTest(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_same_second_event_still_delivers_and_no_meta_write(self):
-        """Final-critic findings: (1) a second event appended in the SAME
-        second (ring ts are int(time.time())) must still deliver — a
-        ts-only comparison suppressed it forever; (2) the delivery path
-        persists ONLY under the ops/ sidecar namespace — the store's meta
-        table must not grow."""
+        """Final-critic findings, restated for issue #122: (1) ring cursor
+        growth (same second, count tiebreak) still REACHES the selector; the
+        session ledger — not the ring cursor — decides re-delivery; (2) the
+        delivery path persists ONLY under the hashed ops/ sidecar namespace
+        — the store's meta table must not grow."""
         import sqlite3
 
         tmp = tempfile.mkdtemp(prefix="zmem-reflect-ss-")
         try:
             _seed(_clean_env(tmp), "user:global", LESSON)
-            ring = Path(tmp, "ops", "s-reflect.log")
+            ring = self._hashed_ring(tmp, "s-reflect")
             ring.parent.mkdir(parents=True)
             same_second = json.dumps({"ts": 200, "tool": "Bash",
                                       "ops": "git stash pop"}) + "\n"
@@ -363,20 +387,31 @@ class HermesReflectDeliveryTest(unittest.TestCase):
 
             first = self._run_reflect(tmp)
             self.assertIn("pretoolcanary", first)
-            # Same ring → silent (cursor (200,1) already delivered).
+            # Same ring → silent (ledger).
             self.assertEqual(self._run_reflect(tmp), "{}")
             # SECOND event in the SAME second: cursor (200,2) > (200,1)
-            # must deliver — the count half of the cursor exists for this.
+            # reaches the selector, but the delivered row stays
+            # ledger-suppressed; a fresh row still arrives.
             with open(ring, "a", encoding="utf-8") as f:
                 f.write(same_second)
             third = self._run_reflect(tmp)
-            self.assertIn("pretoolcanary", third,
-                          "same-second event must not be suppressed")
+            self.assertEqual(third, "{}",
+                             "the delivered row must not re-deliver")
+            _seed(_clean_env(tmp), "user:global",
+                  "same-second-new-row: stash recovery note for the reflog")
+            fourth = self._run_reflect(tmp)
+            self.assertIn("same-second-new-row", fourth,
+                          "a fresh row must deliver on cursor growth")
 
-            # Sidecar marker exists; the store's meta table did not grow
-            # from the delivery path (the nudge-flag keys predate this PR
-            # and no nudge fired in this fixture).
-            marker = Path(tmp, "ops", "s-reflect.delivered")
+            # Sidecar marker exists at the HASHED path; the store's meta
+            # table did not grow from the delivery path.
+            sys.path.insert(0, str(SCRIPTS))
+            try:
+                import storelib.ops_tokens as ops
+                marker = Path(ops._marker_path(tmp, "s-reflect",
+                                               ".delivered"))
+            finally:
+                sys.path.pop(0)
             self.assertTrue(marker.is_file())
             conn = sqlite3.connect(db)
             meta_after = conn.execute(
@@ -387,8 +422,6 @@ class HermesReflectDeliveryTest(unittest.TestCase):
                              "store's meta table (sidecar-only persistence)")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-
-
 class RegistrationAndContractTest(unittest.TestCase):
     """Where PreToolUse is registered (probed hosts); the wired Codex state
     (issue #95 flipped the former deferral pin in this PR); the E

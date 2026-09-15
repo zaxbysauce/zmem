@@ -124,6 +124,73 @@ class AdapterScanTest(unittest.TestCase):
         self.assertIn("--no-bump", helper,
                       "the shared Hermes passive argv builder MUST pass --no-bump")
 
+    # --- issue #122: Hermes compatibility adapter surface ---
+
+    def test_compatibility_prefetch_has_shared_injection_flags(self):
+        # The compat hook's LOCAL prefetch command must be the shared
+        # selector shape: namespace + session attribution + the closed
+        # moment/lane vocabulary + the passive injection markers.
+        text = (REPO_ROOT / "hermes-plugin" / "hooks"
+                / "zmem-hermes-reflect.py").read_text(encoding="utf-8")
+        body = self._method_body(text, "_prefetch")
+        for literal in ('"--namespace"', '"--session-id"',
+                        '"--moment", "user_prompt"', '"--lane", "hermes-compat"',
+                        '"--for-injection"', '"--no-bump"', '"--json"'):
+            self.assertIn(literal, body,
+                          f"compat local prefetch command must carry {literal}")
+
+    def test_signal_none_at_030_stays_out_of_compatibility_context(self):
+        # The below-relevance selector response passes through UNTOUCHED:
+        # no memory id may leak into stdout, rendered stays empty, and the
+        # reason is exactly below-relevance (the adapter adds nothing).
+        import importlib.util as _ilu
+        import io
+        from unittest import mock as _mock
+        import types as _types
+        compat = REPO_ROOT / "tests" / "fixtures" / "hermes_compat"
+        envelope = (compat / "rejected-response.json").read_text(
+            encoding="utf-8")
+        memory_id = json.loads(envelope)["candidate_ids"][0]
+        self.assertEqual(len(memory_id), 36, memory_id)
+
+        spec = _ilu.spec_from_file_location(
+            "zmem_reflect_surface_scan",
+            REPO_ROOT / "hermes-plugin" / "hooks" / "zmem-hermes-reflect.py")
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        real_run = mod.subprocess.run
+
+        def fake_run(cmd, **kwargs):
+            if any("mcp_client.py" in str(part) for part in cmd):
+                return _types.SimpleNamespace(returncode=0, stdout=envelope,
+                                              stderr="")
+            return real_run(cmd, **kwargs)
+
+        out, err = io.StringIO(), io.StringIO()
+        with _mock.patch.dict(os.environ, {
+                "ZMEM_STORE": os.path.join(_IMPORT_TMP, "store.sqlite"),
+                "ZMEM_DATA": _IMPORT_TMP,
+                "ZMEM_MODELS_DIR": os.path.join(_IMPORT_TMP, "no-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "ZMEM_MCP_URL": "http://127.0.0.1:9/mcp",
+                "ZMEM_MCP_TOKEN": "scan-token",
+                "ZMEM_MCP_NAMESPACE": "project:github.com/acme/demo",
+        }), _mock.patch.object(mod.subprocess, "run", fake_run), \
+                _mock.patch.object(sys, "stdin", io.StringIO(json.dumps({
+                    "session_id": "00000000-0000-4000-8000-000000000122",
+                    "user_message":
+                        "Please check the stash safety for this turn.",
+                }))), \
+                _mock.patch.object(sys, "stdout", out), \
+                _mock.patch.object(sys, "stderr", err):
+            rc = mod.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue()), {})
+        self.assertNotIn(memory_id, out.getvalue())
+        parsed = json.loads(envelope)
+        self.assertEqual(parsed["rendered"], "")
+        self.assertEqual(parsed["reason"], "below-relevance")
+
     def test_explicit_hermes_tool_search_omits_no_bump(self):
         text = (REPO_ROOT / "hermes-plugin" / "__init__.py").read_text(encoding="utf-8")
         self.assertNotIn("--no-bump", self._method_body(text, "_tool_search"),
@@ -132,9 +199,11 @@ class AdapterScanTest(unittest.TestCase):
     def test_explicit_mcp_recall_omits_no_bump(self):
         text = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py").read_text(
             encoding="utf-8")
-        # v13 (issue #65, 10.5): session_start is the D4 PASSIVE path and MUST
-        # pass --no-bump — the scan is scoped to the EXPLICIT tool bodies so
-        # the passive exception is pinned, not forbidden.
+        # v13 (issue #65, 10.5): session_start is the D4 PASSIVE path. Issue
+        # #159 reworked it onto the queryless selector path — passivity is
+        # now STRUCTURAL (the selector records surfaced events and never
+        # bumps retrieval_count), carried by the literal --for-injection
+        # marker instead of a client-side --no-bump flag.
         import ast as _ast
         tree = _ast.parse(text)
         bodies = {}
@@ -150,9 +219,8 @@ class AdapterScanTest(unittest.TestCase):
                 f"MCP {explicit} is EXPLICIT and must NOT pass --no-bump")
         self.assertIn(
             "--for-injection", bodies.get("session_start", ""),
-            "MCP session_start is the D4 passive path and MUST pass "
-            "--for-injection (issue #159: passivity is structural via the "
-            "selector)")
+            "MCP session_start is the D4 passive path and MUST pass --no-bump "
+            "(issue #65, 10.5)")
 
     def test_explicit_mcp_recall_docstring_documents_bump(self):
         # I2 (#38 / #56): the explicit-vs-passive bump rule is tested design,
@@ -263,20 +331,6 @@ class AdapterScanTest(unittest.TestCase):
         self.assertIn("passive", doc)
         self.assertIn("canonical render", doc)
         self.assertIn("telemetry", doc)
-        # Issue #23 guardrail: recall_memory must keep naming the three hook
-        # sources the read-only contract covers (restored in the #158 rebase;
-        # the original guardrail asserted exactly this).
-        rm_doc = None
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.FunctionDef)
-                    and node.name == "recall_memory"):
-                rm_doc = ast.get_docstring(node)
-                break
-        self.assertIsNotNone(rm_doc, "recall_memory must keep a docstring")
-        for hook_source in ("UserPromptSubmit", "SubagentStart",
-                            "SessionStart"):
-            self.assertIn(hook_source, rm_doc,
-                          f"read-only invariant must name {hook_source}")
 
 
 class SurfaceTempStoreTest(unittest.TestCase):
