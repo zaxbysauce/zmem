@@ -20,6 +20,24 @@
 # runs their OWN prompt-type Stop self-review hook. To never contribute to a
 # stop loop, this hook NO-OPs whenever stop_hook_active is set in the payload.
 #
+# SUBAGENT-MARKER GUARD (issue #204): a Stop payload carrying Claude subagent
+# markers (`agent_id` / `agent_transcript_path`) is a stop inside a subagent
+# context (Claude Code converts such Stop registrations to SubagentStop, but
+# older builds/hosts may fire Stop bare). Continuing a finishing subagent's
+# turn clobbers its final deliverable — the Agent tool reports only the LAST
+# assistant message — so this hook no-ops on those payloads. Payload parsing
+# reuses the loop guard's try/except posture: an empty or unparseable payload
+# reads as no markers and proceeds with main-agent behavior.
+#
+# PARENT-SIDE SUBAGENT HAND-OFF (issue #204): zmem-subagent-reflect.sh no
+# longer prompts finishing subagents; instead it writes hand-off sidecars
+# under <ZMEM_DATA>/subagent-reflections/. This hook scans that directory for
+# sidecars belonging to THIS session, prunes ones older than 14 days
+# (opportunistic, fail-open), renders a subagent-failure section in the
+# PARENT's reflection prompt (pending sidecars alone are sufficient — they
+# are real failures), and deletes the consumed sidecars after printing the
+# envelope. At most one parent prompt per dispatched subagent batch.
+#
 # Canonical env (from zmem-launch.js): ZMEM_SESSION, ZMEM_TRANSCRIPT, ZMEM_DATA,
 # ZMEM_ROOT, ZMEM_NAMESPACE. Legacy fallbacks kept for manual/back-compat runs.
 
@@ -158,7 +176,8 @@ fi
 #   4. builds the prompt with untrusted failure details fenced as data,
 #   5. prints a bare {"additionalContext":…} (or {}).
 CTX_JSON="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
-import json, os, shlex, sys, sqlite3, subprocess
+import glob, json, os, re, shlex, sys, sqlite3, subprocess, time
+from datetime import datetime, timezone
 
 raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
 store_py = sys.argv[1]
@@ -167,6 +186,11 @@ ns = sys.argv[3]
 data_dir = sys.argv[4]
 transcript = sys.argv[5]
 db_path = sys.argv[6]
+
+# Consumed subagent hand-off sidecars (path, scan-mtime_ns): unlinked by
+# emit() after the envelope, only if unchanged since the scan
+# has been printed, so a render failure never silently drops a hand-off.
+consumed_sidecars = []
 
 # Rejection rendering lives once in corrections.py and is shared by both
 # reflect hooks so they stay in lockstep (drift guard). Fail open: if the
@@ -182,6 +206,16 @@ except Exception:
 
 def emit(obj):
     print(json.dumps(obj) if obj else "{}")
+    # Consume-on-render, guarded against the replace race (PR review PRR-008):
+    # unlink only when the file is unchanged since the scan (same mtime_ns).
+    # A sidecar replaced between scan and unlink carries fresh data and must
+    # survive for the next parent Stop.
+    for sidecar_path, scan_mtime_ns in consumed_sidecars:
+        try:
+            if os.stat(sidecar_path).st_mtime_ns == scan_mtime_ns:
+                os.unlink(sidecar_path)
+        except OSError:
+            pass
     sys.exit(0)
 
 # 1. Loop guard: if this Stop was itself triggered by a prior hook block/inject
@@ -190,7 +224,17 @@ try:
     payload = json.loads(raw_stdin) if raw_stdin.strip() else {}
 except Exception:
     payload = {}
+if not isinstance(payload, dict):
+    # A non-object payload (list/string/number) has no hook fields; treat as
+    # empty (PR review PRR-009 — keeps .get() accesses safe).
+    payload = {}
 if payload.get("stop_hook_active"):
+    emit({})
+
+# 1b. Subagent-marker guard (#204): a Stop payload carrying Claude subagent
+#     fields is a stop inside a subagent context; continuing that turn would
+#     replace the subagent deliverable. Never inject there.
+if payload.get("agent_id") or payload.get("agent_transcript_path"):
     emit({})
 
 # 2. Unified failure detection (fail-open — failures prints an empty result on
@@ -210,7 +254,65 @@ try:
 except Exception:
     count, details, rejections = 0, [], []
 
-# 3. Skip if a lesson was already captured for this session (avoid nagging).
+# 2b. Parent-side subagent hand-off scan (#204): collect this session
+#     pending sidecars and opportunistically prune stale ones (> 14 days;
+#     mtime fallback when `created` is missing or unparsable — PRR-010).
+#     Fail-open: any error degrades to "no pending hand-offs".
+pending_subagents = []
+try:
+    ring_dir = os.path.join(data_dir, "subagent-reflections")
+    for sidecar_path in sorted(glob.glob(os.path.join(ring_dir, "*.json"))):
+        try:
+            scan_mtime_ns = os.stat(sidecar_path).st_mtime_ns
+        except OSError:
+            scan_mtime_ns = 0
+        try:
+            with open(sidecar_path, "r", encoding="utf-8") as f:
+                sidecar = json.load(f)
+        except Exception:
+            # Unparsable: prune by mtime (PRR-010) — never delete what we
+            # cannot read while it is fresh, but do not leak it forever.
+            try:
+                if (time.time() - os.stat(sidecar_path).st_mtime) / 86400.0 > 14.0:
+                    os.unlink(sidecar_path)
+            except OSError:
+                pass
+            continue
+        # Forward-compat gate (PRR-013): a future sidecar version this hook
+        # does not understand is left untouched for a newer consumer.
+        if isinstance(sidecar.get("version"), int) and sidecar.get("version") > 1:
+            continue
+        created = sidecar.get("created") or ""
+        try:
+            created_dt = datetime.fromisoformat(created)
+            if created_dt.tzinfo is None:
+                # A tz-naive timestamp would be read as LOCAL time by
+                # .timestamp(); the writer always emits aware UTC, so treat
+                # naive values as UTC (PRR-010).
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            age_days = (time.time() - created_dt.timestamp()) / 86400.0
+        except Exception:
+            try:
+                age_days = (time.time() - os.stat(sidecar_path).st_mtime) / 86400.0
+            except OSError:
+                age_days = 0.0
+        if age_days > 14.0:
+            try:
+                os.unlink(sidecar_path)
+            except OSError:
+                pass
+            continue
+        if sidecar.get("session") == session_id:
+            pending_subagents.append(sidecar)
+            consumed_sidecars.append((sidecar_path, scan_mtime_ns))
+except Exception:
+    pending_subagents = []
+    consumed_sidecars = []
+
+# 3. Skip if a lesson was already captured for this session (avoid nagging) —
+#    unless subagent hand-offs are pending (they are separate failures worth
+#    their own reflection; bounded to one prompt per dispatch because the
+#    render consumes the sidecars).
 lesson_exists = False
 store_db = os.path.join(data_dir, "store.sqlite")
 if os.path.isfile(store_db):
@@ -224,7 +326,7 @@ if os.path.isfile(store_db):
         sconn.close()
     except Exception:
         pass
-if lesson_exists:
+if lesson_exists and not pending_subagents:
     emit({})
 
 # store_py, ns (git-remote-derived, repository-controlled), and session_id
@@ -245,9 +347,55 @@ source_ref_arg = shlex.quote("session:" + session_id)
 # since those substrates yield no rejection records).
 rej_msg = _render_rejs(rejections) if _render_rejs else ""
 
+# 4a-pre-2. Pending-subagent section (#204): one block per hand-off. Failure
+# counts AND rendered rejection reasons are both surfaced (PR review PRR-001:
+# a rejection-only sidecar used to render as "0 failure(s)" with the reason
+# dropped). Field values are whitespace-collapsed and capped (PRR-007) so a
+# hostile sidecar cannot spray unbounded or multiline content into the prompt.
+def _clean_field(text):
+    return re.sub(r"\s+", " ", str(text)).strip()[:200]
+
+def _subagent_lines():
+    lines = []
+    for sidecar in pending_subagents:
+        aid = _clean_field(sidecar.get("agent_id") or "unknown")
+        atype = _clean_field(sidecar.get("agent_type") or "subagent")
+        try:
+            cnt = int(sidecar.get("count") or 0)
+        except (TypeError, ValueError):
+            cnt = 0
+        ts = _clean_field(sidecar.get("tool_summary") or ("%d failure(s)" % cnt))
+        line = "  - agent %s (%s): %d failure(s) (%s)" % (aid, atype, cnt, ts)
+        rej = _clean_field(sidecar.get("rejections") or "")
+        if rej:
+            line = line + "\n    user rejections: " + rej
+        lines.append(line)
+    return lines
+
+# 4a-pre-3. Subagent-only prompt: dispatched subagents reported failures the
+#     parent must reflect on, and either the parent transcript is clean
+#     or its lesson gate already closed — the hand-off alone is sufficient.
+if pending_subagents and (lesson_exists or (count == 0 and not rej_msg)):
+    refs = ", ".join(sorted({
+        shlex.quote(str(s.get("source_ref") or ("session:" + session_id)))
+        for s in pending_subagents
+    }))
+    msg = (
+        "ZMem reflection: %d dispatched subagent(s) reported failed tool "
+        "calls or user rejections in this session:\n%s\n"
+        "If a generalizable lesson can be derived from a subagent failure "
+        "(grounded in a test/compile/lint/reviewer/user signal — not "
+        "self-opinion), capture it with the memory skill: `%s add --namespace "
+        "%s --type lesson --content \"...\" --signal "
+        "<test|compile|lint|reviewer|user|none> --source-ref <one of: %s>`. "
+        "If no generalizable lesson applies, do nothing. "
+        "Only capture lessons that would help a future session facing a similar situation."
+    ) % (len(pending_subagents), "\n".join(_subagent_lines()), store_py_arg, ns_arg, refs)
+    emit({"additionalContext": msg})
+
 # 4a. No failures → lightweight nudge. With user rejections, surface them
-# specifically (a stated reason is the highest-signal correction in a
-# transcript); without rejections, keep the original success nudge unchanged.
+#     specifically (a stated reason is the highest-signal correction in a
+#     transcript); without rejections, keep the original success nudge unchanged.
 if count == 0:
     if rej_msg:
         msg = (
@@ -259,6 +407,12 @@ if count == 0:
             "--signal <test|compile|lint|reviewer|user|none> --source-ref %s`. "
             "If no generalizable lesson applies, do nothing."
         ) % (rej_msg, store_py_arg, ns_arg, source_ref_arg)
+        if pending_subagents:
+            msg = msg + (
+                "\n\nAlso, %d dispatched subagent(s) reported failed tool "
+                "calls or user rejections:\n%s (capture with the same command, "
+                "--source-ref <one of the subagent keys>)"
+            ) % (len(pending_subagents), "\n".join(_subagent_lines()))
         emit({"additionalContext": msg})
     msg = (
         "ZMem reflection: this session had no tool failures, but you may have "
@@ -320,6 +474,13 @@ if detail_block:
 # 4c. Append the user-rejection section (built above) when present.
 if rej_msg:
     msg = msg + "\n\n" + rej_msg
+
+# 4d. Append the pending-subagent section when present (#204).
+if pending_subagents:
+    msg = msg + (
+        "\n\nAlso, %d dispatched subagent(s) reported failed tool calls or "
+        "user rejections:\n%s"
+    ) % (len(pending_subagents), "\n".join(_subagent_lines()))
 
 emit({"additionalContext": msg})
 ' "$STORE_PY_PY" "$SESSION_ID" "$NS" "$DATA_DIR_PY" "$TRANSCRIPT_PY" "$DB_PATH_PY" 2>/dev/null || echo '{}')"

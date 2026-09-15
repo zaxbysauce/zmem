@@ -275,12 +275,241 @@ class TestReflectHookMessaging(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("1 failed tool call(s)", raw, raw)
 
+    def test_stop_marker_guard_agent_id_only(self):
+        # #204: EITHER Claude subagent marker alone makes a Stop payload a
+        # subagent-context stop — no injection (the clobber vector). Pinned
+        # with rc + sentinel so a crashing hook cannot masquerade as a clean
+        # no-op (PR review PRR-004).
+        if not _BASH:
+            self.skipTest("no bash")
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            rc, raw = self._run_rc(
+                "zmem-reflect.sh",
+                {"ZMEM_TRANSCRIPT": os.path.abspath(trans)},
+                stdin='{"session_id":"hooktest","agent_id":"agent-9"}')
+            self.assertEqual(rc, 0)
+            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", raw, raw)
+            self.assertEqual(_extract_ctx(raw), {}, raw)
+        finally:
+            os.remove(trans)
+
+    def test_stop_marker_guard_agent_transcript_only(self):
+        # #204: OR-semantics — agent_transcript_path alone also suppresses.
+        if not _BASH:
+            self.skipTest("no bash")
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            rc, raw = self._run_rc(
+                "zmem-reflect.sh",
+                {"ZMEM_TRANSCRIPT": os.path.abspath(trans)},
+                stdin='{"session_id":"hooktest","agent_transcript_path":"/tmp/agent-9.jsonl"}')
+            self.assertEqual(rc, 0)
+            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", raw, raw)
+            self.assertEqual(_extract_ctx(raw), {}, raw)
+        finally:
+            os.remove(trans)
+
+    def test_stop_marker_guard_non_json_payload(self):
+        # PRR-005: an unparseable payload must fail open to the main-agent
+        # path without crashing the hook (rc 0, sentinel emitted; no transcript
+        # here so the success nudge renders — the assertion is the healthy
+        # envelope, not silence).
+        if not _BASH:
+            self.skipTest("no bash")
+        rc, raw = self._run_rc("zmem-reflect.sh", {}, stdin="not json at all")
+        self.assertEqual(rc, 0)
+        self.assertIn("<<<ZMEM_JSON>>>", raw, raw)
+        self.assertIn("<<<END>>>", raw, raw)
+
+    def test_stop_consumes_pending_subagent_sidecar(self):
+        # #204: the parent-side hand-off — a sidecar written by the
+        # SubagentStop hook for THIS session is surfaced in the parent's Stop
+        # prompt and consumed (deleted) once rendered; a second Stop with no
+        # sidecars carries no subagent section. PRR-001: the stored rejection
+        # reason must render too, and a rejection-only sidecar (count=0) must
+        # not read as a false "0 failure(s)"-only line.
+        if not _BASH:
+            self.skipTest("no bash")
+        ring = Path(self.tmp) / "subagent-reflections"
+        ring.mkdir(parents=True, exist_ok=True)
+        sidecar = {
+            "session": "hooktest",
+            "agent_id": "agent-777",
+            "agent_type": "explorer",
+            "source_ref": "session:hooktest:agent:agent-777",
+            "count": 2,
+            "tool_summary": "2=Bash",
+            "details": ["  - Bash : boom"],
+            "rejections": "User rejected 1 tool call(s). Stated reasons: leave the schema alone",
+            "created": "2026-09-15T00:00:00+00:00",
+        }
+        sidecar_path = ring / "deadbeef.json"
+        sidecar_path.write_text(json.dumps(sidecar) + "\n", encoding="utf-8")
+        raw = self._run("zmem-reflect.sh", {})  # clean main-agent transcript
+        ctx = _extract_ctx(raw)
+        msg = ctx.get("additionalContext", "")
+        self.assertIn("agent-777", msg, msg)
+        self.assertIn("session:hooktest:agent:agent-777", msg, msg)
+        self.assertIn("2 failure(s)", msg, msg)
+        # PRR-001: the stored rejection reason surfaces in the parent prompt.
+        self.assertIn("leave the schema alone", msg, msg)
+        self.assertFalse(sidecar_path.exists(), "sidecar must be consumed")
+        # Second stop: nothing pending, no subagent section.
+        raw2 = self._run("zmem-reflect.sh", {})
+        msg2 = _extract_ctx(raw2).get("additionalContext", "")
+        self.assertNotIn("agent-777", msg2, msg2)
+
+    def test_stop_rejection_only_sidecar_states_rejections(self):
+        # PRR-001: a rejection-only sidecar (count=0) renders the reason and
+        # does NOT present a bare misleading "0 failure(s)" line without it.
+        if not _BASH:
+            self.skipTest("no bash")
+        ring = Path(self.tmp) / "subagent-reflections"
+        ring.mkdir(parents=True, exist_ok=True)
+        sidecar = {
+            "session": "hooktest",
+            "agent_id": "agent-rej",
+            "agent_type": "explorer",
+            "source_ref": "session:hooktest:agent:agent-rej",
+            "count": 0,
+            "tool_summary": "0 failure(s)",
+            "details": [],
+            "rejections": "User rejected 1 tool call(s). Stated reasons: not that file",
+            "created": "2026-09-15T00:00:00+00:00",
+        }
+        (ring / "rejonly.json").write_text(
+            json.dumps(sidecar) + "\n", encoding="utf-8")
+        msg = _extract_ctx(self._run("zmem-reflect.sh", {})).get("additionalContext", "")
+        self.assertIn("agent-rej", msg, msg)
+        self.assertIn("not that file", msg, msg)
+        self.assertIn("user rejections:", msg, msg)
+
+    def test_stop_prunes_stale_sidecar(self):
+        # PRR-005: a sidecar older than the 14-day retention window is pruned
+        # (never rendered, never left on disk).
+        if not _BASH:
+            self.skipTest("no bash")
+        ring = Path(self.tmp) / "subagent-reflections"
+        ring.mkdir(parents=True, exist_ok=True)
+        stale = {
+            "session": "hooktest",
+            "agent_id": "agent-stale",
+            "agent_type": "explorer",
+            "source_ref": "session:hooktest:agent:agent-stale",
+            "count": 1,
+            "tool_summary": "1=Bash",
+            "details": [],
+            "rejections": "",
+            "created": "2026-08-01T00:00:00+00:00",
+        }
+        stale_path = ring / "stale.json"
+        stale_path.write_text(json.dumps(stale) + "\n", encoding="utf-8")
+        msg = _extract_ctx(self._run("zmem-reflect.sh", {})).get("additionalContext", "")
+        self.assertNotIn("agent-stale", msg, msg)
+        self.assertFalse(stale_path.exists(), "stale sidecar must be pruned")
+
+    def test_stop_ignores_other_session_sidecar(self):
+        # PRR-005: sidecars belonging to a different session are neither
+        # rendered nor consumed.
+        if not _BASH:
+            self.skipTest("no bash")
+        ring = Path(self.tmp) / "subagent-reflections"
+        ring.mkdir(parents=True, exist_ok=True)
+        other = {
+            "session": "some-other-session",
+            "agent_id": "agent-other",
+            "agent_type": "explorer",
+            "source_ref": "session:some-other-session:agent:agent-other",
+            "count": 1,
+            "tool_summary": "1=Bash",
+            "details": [],
+            "rejections": "",
+            "created": "2026-09-15T00:00:00+00:00",
+        }
+        other_path = ring / "other.json"
+        other_path.write_text(json.dumps(other) + "\n", encoding="utf-8")
+        msg = _extract_ctx(self._run("zmem-reflect.sh", {})).get("additionalContext", "")
+        self.assertNotIn("agent-other", msg, msg)
+        self.assertTrue(other_path.exists(), "other session sidecar must survive")
+
+    def test_stop_treats_missing_created_as_pending(self):
+        # PRR-005 + PRR-010: a sidecar with no `created` field is treated as
+        # pending (age falls back to file mtime, which is fresh here), not
+        # silently pruned.
+        if not _BASH:
+            self.skipTest("no bash")
+        ring = Path(self.tmp) / "subagent-reflections"
+        ring.mkdir(parents=True, exist_ok=True)
+        bare = {
+            "session": "hooktest",
+            "agent_id": "agent-bare",
+            "agent_type": "explorer",
+            "source_ref": "session:hooktest:agent:agent-bare",
+            "count": 1,
+            "tool_summary": "1=Bash",
+            "details": [],
+            "rejections": "",
+        }
+        bare_path = ring / "bare.json"
+        bare_path.write_text(json.dumps(bare) + "\n", encoding="utf-8")
+        msg = _extract_ctx(self._run("zmem-reflect.sh", {})).get("additionalContext", "")
+        self.assertIn("agent-bare", msg, msg)
+        self.assertFalse(bare_path.exists(), "pending sidecar must be consumed")
+
+    def test_stop_append_branch_with_parent_failures(self):
+        # PRR-005: pending sidecars AND genuine parent failures coexist — the
+        # failure prompt renders AND the subagent section is appended AND the
+        # sidecars are consumed.
+        if not _BASH:
+            self.skipTest("no bash")
+        ring = Path(self.tmp) / "subagent-reflections"
+        ring.mkdir(parents=True, exist_ok=True)
+        sidecar = {
+            "session": "hooktest",
+            "agent_id": "agent-both",
+            "agent_type": "explorer",
+            "source_ref": "session:hooktest:agent:agent-both",
+            "count": 1,
+            "tool_summary": "1=Read",
+            "details": [],
+            "rejections": "",
+            "created": "2026-09-15T00:00:00+00:00",
+        }
+        both_path = ring / "both.json"
+        both_path.write_text(json.dumps(sidecar) + "\n", encoding="utf-8")
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            msg = _extract_ctx(self._run(
+                "zmem-reflect.sh",
+                {"ZMEM_TRANSCRIPT": os.path.abspath(trans)})).get("additionalContext", "")
+            self.assertIn("1 failed tool call(s)", msg, msg)   # parent failures
+            self.assertIn("agent-both", msg, msg)              # appended section
+            self.assertFalse(both_path.exists(), "sidecar must be consumed")
+        finally:
+            os.remove(trans)
+
 
 class TestSubagentReflectMessaging(unittest.TestCase):
+    """Issue #204 contract: the SubagentStop hook NEVER emits additionalContext
+    (a prompt into a finishing subagent replaces its <result> deliverable).
+    Its failure/rejection signal is handed to the parent via a sidecar under
+    <ZMEM_DATA>/subagent-reflections/, consumed by zmem-reflect.sh at the
+    parent's own Stop."""
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
 
-    def _run(self, env_extra):
+    def _env(self, env_extra):
         env = {
             "ZMEM_DATA": self.tmp,
             "ZMEM_SESSION": "hooktest",
@@ -289,21 +518,64 @@ class TestSubagentReflectMessaging(unittest.TestCase):
             "ZMEM_NAMESPACE": "project:hooktest",
         }
         env.update(env_extra)
-        return _extract_ctx(_run_hook(REPO_ROOT / "hooks" / "zmem-subagent-reflect.sh", env))
+        return env
 
-    def test_rejection_only_is_surfaced_not_noop(self):
+    def _run(self, env_extra, stdin="{}"):
+        return _extract_ctx(_run_hook(
+            REPO_ROOT / "hooks" / "zmem-subagent-reflect.sh",
+            self._env(env_extra), stdin=stdin))
+
+    def _run_checked(self, env_extra, stdin="{}"):
+        """PRR-004: run the hook and return (rc, raw, ctx) so callers can pin
+        rc==0 and the sentinel — a crashed hook must not masquerade as a
+        clean no-op."""
+        proc_env = dict(os.environ)
+        for key in ("ZMEM_REFLECT", "ZMEM_ZCODE_DB", "ZMEM_TRANSCRIPT",
+                    "ZMEM_AGENT_TRANSCRIPT", "ZMEM_AGENT_ID",
+                    "ZMEM_FAILURES_DB_TIMEOUT_S"):
+            proc_env.pop(key, None)
+        proc_env.update(self._env(env_extra))
+        proc = subprocess.run(
+            [_BASH, str(REPO_ROOT / "hooks" / "zmem-subagent-reflect.sh")],
+            input=stdin, text=True, capture_output=True,
+            encoding="utf-8", errors="replace", env=proc_env, timeout=60)
+        return proc.returncode, proc.stdout, _extract_ctx(proc.stdout)
+
+    def _sidecars(self):
+        ring = Path(self.tmp) / "subagent-reflections"
+        if not ring.is_dir():
+            return []
+        out = []
+        for p in sorted(ring.glob("*.json")):
+            try:
+                out.append((p, json.loads(p.read_text(encoding="utf-8"))))
+            except Exception:
+                out.append((p, None))
+        return out
+
+    def test_rejection_only_writes_sidecar_and_no_prompt(self):
         if not _BASH:
             self.skipTest("no bash")
         trans = _write_transcript(_rejection("t1", "Edit", "leave the schema alone"))
         try:
-            ctx = self._run({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
-            msg = ctx.get("additionalContext", "")
-            self.assertIn("had tool rejections but no tool failures", msg, msg)
-            self.assertIn("leave the schema alone", msg, msg)
-            self.assertIn("--signal user", msg, msg)
+            rc, raw, ctx = self._run_checked(
+                {"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
+            # PRR-004: a crash must not read as a clean no-op.
+            self.assertEqual(rc, 0)
+            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", raw, raw)
+            self.assertEqual(ctx, {}, ctx)  # never prompt a finishing subagent
+            cars = self._sidecars()
+            self.assertEqual(len(cars), 1, cars)
+            _, obj = cars[0]
+            self.assertEqual(obj.get("session"), "hooktest")
+            self.assertEqual(obj.get("agent_id"), "agent-1")
+            self.assertEqual(obj.get("source_ref"), "session:hooktest:agent:agent-1")
+            self.assertEqual(obj.get("count"), 0)
+            self.assertIn("leave the schema alone", obj.get("rejections", ""))
         finally:
             os.remove(trans)
-    def test_failures_plus_rejection(self):
+
+    def test_failures_plus_rejection_sidecar_fields(self):
         if not _BASH:
             self.skipTest("no bash")
         trans = _write_transcript([
@@ -312,11 +584,20 @@ class TestSubagentReflectMessaging(unittest.TestCase):
             *_rejection("t2", "Read", "not that file"),  # rejection
         ])
         try:
-            ctx = self._run({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
-            msg = ctx.get("additionalContext", "")
-            self.assertIn("1 failed tool call(s)", msg, msg)
-            self.assertIn("User rejected 1 tool call(s)", msg, msg)
-            self.assertIn("not that file", msg, msg)
+            rc, raw, ctx = self._run_checked(
+                {"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
+            self.assertEqual(rc, 0)
+            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", raw, raw)
+            self.assertEqual(ctx, {}, ctx)
+            cars = self._sidecars()
+            self.assertEqual(len(cars), 1, cars)
+            _, obj = cars[0]
+            self.assertEqual(obj.get("count"), 1)
+            self.assertEqual(obj.get("agent_type"), "explorer")
+            self.assertIn("1=Bash", obj.get("tool_summary", ""))
+            self.assertTrue(obj.get("details"), obj)
+            self.assertIn("not that file", obj.get("rejections", ""))
+            self.assertTrue(obj.get("created"), obj)
         finally:
             os.remove(trans)
 
@@ -328,8 +609,12 @@ class TestSubagentReflectMessaging(unittest.TestCase):
             _tool_result("t1", "all good", is_error=False),
         ])
         try:
-            ctx = self._run({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
+            rc, raw, ctx = self._run_checked(
+                {"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
+            self.assertEqual(rc, 0)
+            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", raw, raw)
             self.assertEqual(ctx, {}, ctx)
+            self.assertEqual(self._sidecars(), [])  # clean subagent: no hand-off
         finally:
             os.remove(trans)
 
@@ -338,15 +623,115 @@ class TestSubagentReflectMessaging(unittest.TestCase):
             self.skipTest("no bash")
         trans = _write_transcript(_rejection("t1", "Edit", "stop"))
         try:
-            env = {
-                "ZMEM_DATA": self.tmp,
-                "ZMEM_SESSION": "hooktest",
-                "ZMEM_AGENT_ID": "agent-1",
-                "ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans),
-            }
-            raw = _run_hook(REPO_ROOT / "hooks" / "zmem-subagent-reflect.sh",
-                            env, stdin='{"stop_hook_active": true}')
-            self.assertEqual(_extract_ctx(raw), {}, raw)
+            rc, raw, ctx = self._run_checked(
+                {"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)},
+                stdin='{"stop_hook_active": true}')
+            self.assertEqual(rc, 0)
+            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", raw, raw)
+            self.assertEqual(ctx, {}, raw)
+            self.assertEqual(self._sidecars(), [])  # re-fire writes nothing
+        finally:
+            os.remove(trans)
+
+    def test_kill_switch_emits_empty_and_no_sidecar(self):
+        # #204 parity with zmem-reflect.sh (#194): ZMEM_REFLECT=0 disables the
+        # hook entirely — empty envelope, exit 0, no sidecar.
+        if not _BASH:
+            self.skipTest("no bash")
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            env = self._env({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans),
+                             "ZMEM_REFLECT": "0"})
+            proc_env = dict(os.environ)
+            for key in ("ZMEM_REFLECT", "ZMEM_ZCODE_DB", "ZMEM_TRANSCRIPT",
+                        "ZMEM_AGENT_TRANSCRIPT", "ZMEM_AGENT_ID",
+                        "ZMEM_FAILURES_DB_TIMEOUT_S"):
+                proc_env.pop(key, None)
+            proc_env.update(env)
+            proc = subprocess.run(
+                [_BASH, str(REPO_ROOT / "hooks" / "zmem-subagent-reflect.sh")],
+                input="{}", text=True, capture_output=True,
+                encoding="utf-8", errors="replace", env=proc_env, timeout=60)
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("<<<ZMEM_JSON>>>{}<<<END>>>", proc.stdout, proc.stdout)
+            self.assertEqual(self._sidecars(), [])
+        finally:
+            os.remove(trans)
+
+    def test_sidecar_filename_deterministic_across_fires(self):
+        if not _BASH:
+            self.skipTest("no bash")
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            self._run({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
+            self._run({"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
+            cars = self._sidecars()
+            self.assertEqual(len(cars), 1, cars)  # one file, overwritten
+        finally:
+            os.remove(trans)
+
+    def test_no_agent_id_siblings_get_distinct_sidecars(self):
+        # PRR-002: when the host sends no agent_id, the sidecar key falls back
+        # to the unique transcript basename — siblings in one session must not
+        # overwrite each other's hand-offs.
+        if not _BASH:
+            self.skipTest("no bash")
+        tx_a = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1 from agent A"),
+        ])
+        tx_b = _write_transcript([
+            _tool_use("t2", "Read"),
+            _tool_result("t2", "different failure from agent B"),
+        ])
+        try:
+            # ZMEM_AGENT_ID explicitly blanked: the host sent no agent id, so
+            # the sidecar key must fall back to the transcript basename.
+            self._run({"ZMEM_AGENT_ID": "",
+                       "ZMEM_AGENT_TRANSCRIPT": os.path.abspath(tx_a)})
+            self._run({"ZMEM_AGENT_ID": "",
+                       "ZMEM_AGENT_TRANSCRIPT": os.path.abspath(tx_b)})
+            cars = self._sidecars()
+            self.assertEqual(len(cars), 2, cars)
+            refs = sorted(obj.get("source_ref", "") for _, obj in cars)
+            self.assertEqual(refs, ["session:hooktest", "session:hooktest"])
+            blobs = " ".join(json.dumps(obj) for _, obj in cars)
+            self.assertIn("agent A", blobs)
+            self.assertIn("agent B", blobs)
+        finally:
+            os.remove(tx_a)
+            os.remove(tx_b)
+
+    def test_write_path_sweep_prunes_backdated_tmp_orphan(self):
+        # PRR-011 (final-critic round 1): the write-path retention sweep must
+        # prune dot-prefixed .sidecar-*.tmp orphans — glob "*" never matches
+        # dotfiles, so the sweep enumerates via os.listdir. A backdated orphan
+        # must be gone after the next sidecar write.
+        if not _BASH:
+            self.skipTest("no bash")
+        ring = Path(self.tmp) / "subagent-reflections"
+        ring.mkdir(parents=True, exist_ok=True)
+        orphan = ring / ".sidecar-interrupted.tmp"
+        orphan.write_text("{\"truncated\":", encoding="utf-8")
+        stale = time.time() - 20 * 86400
+        os.utime(orphan, (stale, stale))
+        trans = _write_transcript([
+            _tool_use("t1", "Bash"),
+            _tool_result("t1", "Exit code 1"),
+        ])
+        try:
+            rc, raw, ctx = self._run_checked(
+                {"ZMEM_AGENT_TRANSCRIPT": os.path.abspath(trans)})
+            self.assertEqual(rc, 0)
+            self.assertEqual(ctx, {}, ctx)
+            self.assertFalse(orphan.exists(),
+                             "backdated .tmp orphan must be swept on write")
         finally:
             os.remove(trans)
 

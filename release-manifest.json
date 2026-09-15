@@ -1,13 +1,13 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "c96c4e1f4a9f2ca894529a499a3369bb9693d1aa9ed7fd97a520ddcb7c6be72d",
+  "digest": "13d394e47b9c3c943362e0234847658cc385994b7cddac64c6c7f01f101ccd8a",
   "files": {
     "hermes-plugin/__init__.py": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "4b59ab56e43245e1f01b4f529759bd75096797dd071cd3973e95c40a50d52226",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "73a41caf9b3579a5beed289749cbd4aae29147758a16d723d95b5d67f782d9a4",
+    "hermes-plugin/plugin.yaml": "3d0a3c1945a8841d6a5d1acadddbde5f643863e9502419798304004141021f03",
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
@@ -31,11 +31,11 @@
     "hooks/zmem-precompact.sh": "0b935644aa4c291d67ddfb2e16b69a5578dee113d4512ccaca5677de6a5a6673",
     "hooks/zmem-pretool-recall.sh": "65c824791fa6b2d7172a7a40e3a55f5882ca41ccf900ccb0246ff0e64c22c52e",
     "hooks/zmem-recall.sh": "cb4262b4ec0eb3dc6e89698bfdd684976746a9700b43c0970d14efa53f05d91a",
-    "hooks/zmem-reflect.sh": "a2169dc25ce131f1b6024ea8570536b3a523bb7bf2a7cef6af1d4f12e65a8953",
+    "hooks/zmem-reflect.sh": "3fd651732d4dedf0577bc8c2f3b6ef7fcc90a9bc555e31978c4e97cc7be8e45f",
     "hooks/zmem-session-end.sh": "8734408904c0382a94b55d0b1a4c39a49a2da797bd473050d2b2891c9a283cfe",
     "hooks/zmem-session-start.sh": "254deb6d60063a4a4b86f434b84ed1232c3f7071c67cdee4bbe63206dfe5ad22",
     "hooks/zmem-subagent-recall.sh": "aab144cf0b1723fe113200f22659cbba0aabcccdb18e1e3cc5e14660a25e9588",
-    "hooks/zmem-subagent-reflect.sh": "7dd0f5da6ad99fb50a20d072f19755a837ac53e16975c8e4e2ccd23053e3b775",
+    "hooks/zmem-subagent-reflect.sh": "59ad166945536270e9bac705a89a1957975ecd2130be3986c585d29599ef4f03",
     "scripts/bench_hook_latency.py": "ed77a76b54b97faab045c90a04acb3673651b3243967f1ebb6833c631e1b16be",
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",
     "scripts/eval_inject_runner.py": "c3b68474f80500e36ae2c245431897c7c0e5a27a98781332e8e9e1b8cb5cc70a",
@@ -50,7 +50,7 @@
     "scripts/release_gate.py": "a9065f3d55df65dde1f6ed1be4694371543fcc1ab3b3c03b77c0aa86eacfd938",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "ac20e80713cf3ec05159ac0f609313cb094ed5515c387258fa5369faec963aa5",
-    "skills/memory/SKILL.md": "ef2ef2335c14c870a5fa9ab8c1276cf7e27147a3cfc2a22135db6f1b35532b9f",
+    "skills/memory/SKILL.md": "085505d3a46b8bf80fe99b7b39fcffb954fc5fc31773efc2b904c9f42aabb17a",
     "skills/memory/scripts/correction_queue.py": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
     "skills/memory/scripts/doctor.py": "ecd99026c5be6a85210cd87fe6e788defb730a8d67c8cfca55d6674fcf2f2602",
@@ -88,5 +88,5 @@
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
     "skills/memory/scripts/storelib/write.py": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
   },
-  "version": "0.40.0"
+  "version": "0.41.0"
 }

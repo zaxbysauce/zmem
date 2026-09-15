@@ -802,7 +802,11 @@ Notes:
   `SubagentStart`/`SubagentStop` hook events); ZCode supports exactly seven hook
   events and does **not** emit subagent lifecycle hooks, so on ZCode
   subagent memory is scoped to the parent session rather than getting its own recall/reflect
-  cycle. Subagent recall uses task/query text present in the event when
+  cycle. Since #204 the subagent reflect cycle is parent-side: the SubagentStop
+  hook never prompts a finishing subagent (a stop-time prompt would replace
+  its `<result>` deliverable on Claude Code) — it writes a hand-off sidecar
+  under `<ZMEM_DATA>/subagent-reflections/` that the parent's Stop hook
+  surfaces and consumes. Subagent recall uses task/query text present in the event when
   available and otherwise falls back to the store-owned recent selector; the
   former hook-owned task-text stash is retired. Override with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
   userConfig option) if you want it elsewhere.
@@ -899,7 +903,9 @@ the live state) after setting the variable.
 capture, failure capture, the PostToolUse ops ring, convention counters, and
 the SessionStart maintenance dispatch (session-cadence). The capture-side
 PROMPT hooks also stay active by design — `zmem-reflect.sh` (Stop
-reflection), `zmem-subagent-reflect.sh`, `zmem-convention-capture.sh`, and
+reflection), `zmem-subagent-reflect.sh` (which since #204 writes a
+parent-side hand-off sidecar instead of prompting the finishing subagent),
+`zmem-convention-capture.sh`, and
 the capture-failure/correction prompts — because they prompt the agent to
 CAPTURE a lesson rather than inject recalled memory (issue #110 scopes the
 switch to recall surfaces and states "capture paths are unaffected"). The

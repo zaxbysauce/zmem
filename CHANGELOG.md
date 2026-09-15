@@ -10,6 +10,50 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.41.0] - 2026-09-15
+
+> Issue #204: stop-time reflection nudges can no longer clobber a dispatched
+> subagent's final deliverable on Claude Code — subagent reflection moves to
+> the parent side.
+
+### Fixed
+- **Subagent deliverable clobbering (issue #204)**: `zmem-subagent-reflect.sh`
+  (SubagentStop) never emits `additionalContext` anymore. Claude Code honors
+  Stop/SubagentStop `additionalContext` by continuing the conversation, which
+  re-runs the finishing subagent's turn — its reply to the nudge ("Memory
+  captured", "blocked by sandbox guard, skipping", "already exists,
+  refreshed") became the subagent's LAST assistant message and therefore the
+  `<result>` the dispatching orchestrator receives, silently replacing the
+  actual deliverable (observed: 6 of 12 parallel review lanes lost their
+  structured output this way).
+- **Stop hook in subagent contexts (issue #204)**: `zmem-reflect.sh` no-ops
+  (empty envelope) on Stop payloads carrying Claude subagent markers
+  (`agent_id`/`agent_transcript_path`) — defense-in-depth for hosts/builds
+  where Stop fires bare inside subagents instead of converting to
+  SubagentStop.
+
+### Changed
+- **Parent-side subagent reflection hand-off (issue #204)**: when the
+  SubagentStop hook detects failures (or rendered user rejections) in the
+  subagent's own transcript and no lesson exists for
+  `session:<sid>:agent:<aid>`, it writes a compact JSON sidecar under
+  `<ZMEM_DATA>/subagent-reflections/<sha256(session+agent)[:32]>.json`
+  (atomic write, one file per agent, refreshed on re-fire; hosts that send
+  no `agent_id` fall back to the unique agent transcript basename so
+  siblings never overwrite each other). The PARENT's own Stop hook scans
+  that directory for the current session, prunes stale files (older than 14
+  days, by embedded timestamp or file mtime — including interrupted temp
+  files), renders one reflection prompt covering every pending subagent
+  failure AND its stored rejection reasons (pending sidecars alone are
+  sufficient — a clean parent transcript still prompts; at most one parent
+  prompt per dispatched batch because rendering consumes the sidecars, and
+  consumption skips files replaced mid-scan so a fresher hand-off survives),
+  and shlex-quotes the per-agent source refs it renders. Subagent failure
+  signals no longer evaporate and no longer reach the finishing subagent.
+- **Kill-switch parity (issue #204)**: `ZMEM_REFLECT=0` now disables
+  `zmem-subagent-reflect.sh` too (empty envelope, no sidecar) — previously
+  it only disabled the Stop hook (#194).
+
 ## [0.40.0] - 2026-09-14
 
 > Issue #122: the Hermes compatibility hook reaches parity — query-aware
