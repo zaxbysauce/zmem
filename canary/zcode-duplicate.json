@@ -8,7 +8,7 @@
   "command": [
     "C:\\Program Files\\nodejs\\node.EXE"
   ],
-  "timestamp": "2026-09-15T16:10:07Z",
+  "timestamp": "2026-09-16T08:04:44Z",
   "manifest_hook_ids": [
     "PostToolUse:zmem-launch.js",
     "PostToolUseFailure:zmem-launch.js",
@@ -1286,19 +1286,19 @@
       ],
       "after": [
         {
-          "path": ".drift-checked-zmem-canary-duplicate-01b229ec-59bc373b",
+          "path": ".drift-checked-zmem-canary-duplicate-84163c8d-21c19ae4",
           "kind": "file",
           "size": 9,
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
         },
         {
-          "path": ".drift-checked-zmem-canary-duplicate-56909244-97846f42",
+          "path": ".drift-checked-zmem-canary-duplicate-9091f9bd-c3aa07c8",
           "kind": "file",
           "size": 9,
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
         },
         {
-          "path": ".drift-checked-zmem-canary-duplicate-c6558b8d-01ec782d",
+          "path": ".drift-checked-zmem-canary-duplicate-ba9175a4-cb74dffe",
           "kind": "file",
           "size": 9,
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
@@ -2564,10 +2564,10 @@
           "kind": "directory"
         },
         {
-          "path": "namespace-cache/063d3f02a0f21f41d38454770e4562dee779af4f1071ab78524683d6b3897a27.json",
+          "path": "namespace-cache/22665922870dfef22ba68cb5f9d329f7ca45076619033712cf843af8a85ace2d.json",
           "kind": "file",
           "size": 82,
-          "sha256": "04d4be7789e127fc13fc5c4ea25cbdfbf322e1852afb124a7b6d6fe9caa7d84f"
+          "sha256": "8a2d98ef264e7dc0791bd17c1f16013a7c50461c1ca988f9818826c677dce092"
         },
         {
           "path": "workdir",
@@ -2583,7 +2583,7 @@
           "path": "zmem-decisions.log",
           "kind": "file",
           "size": 390,
-          "sha256": "43eec4efd631260fd2f934790ebcad981726bf0df7eacb8dce97eb8a1459d376"
+          "sha256": "ba13f4a4a89dc0222cec85f463b1666097bf96c212065a2742680c66571bf7f6"
         }
       ]
     },

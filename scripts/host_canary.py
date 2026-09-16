@@ -110,6 +110,7 @@ STRIP_VARS = (
     "ZMEM_CORE_MD",
     "ZMEM_NAMESPACE",
     "ZMEM_HOST",
+    "HERMES_HOME",
     "PLUGIN_ROOT",
     "PLUGIN_DATA",
     "CLAUDE_PLUGIN_ROOT",
@@ -394,7 +395,8 @@ class SessionFactory(Protocol):
 class _ChildCall:
     """A blocking child wait wrapped as a cancellable callable for the
     deadline executor: ``cancel`` terminates the child so ``communicate``
-    unblocks (the deadline path never leaves an orphan behind)."""
+    unblocks, and ``reap`` waits for it so a deadline hit never leaves a
+    zombie or open pipe handles behind."""
 
     def __init__(self, proc):
         self._proc = proc
@@ -407,6 +409,12 @@ class _ChildCall:
         try:
             self._proc.kill()
         except OSError:
+            pass
+
+    def reap(self):
+        try:
+            self._proc.wait(timeout=10)
+        except Exception:
             pass
 
 
@@ -465,6 +473,7 @@ def run_command(argv, *, input_bytes, env, cwd, deadline_s, deadline=None):
             call.cancel()
     result = executor.run(call, deadline_s)
     if result is None:
+        call.reap()
         return None
     out, err, rc = result
     return subprocess.CompletedProcess(argv, rc, out, err)
@@ -655,30 +664,45 @@ def build_inventories(before, after):
             for name, _ in INVENTORY_ROOTS}
 
 
-def inventory_violations(inventories, data_dir, session_id):
-    """Contract violations of the four-root isolation proof, as slugs."""
-    problems = []
-    allowed_extra = {
-        "store.sqlite", "zmem-decisions.log", "zmem-bg.log",
-    }
+def _allowed_canary_paths():
+    """The schema-declared canary-data allowlist (single source of truth).
+
+    Entries ending in '/' or '-' are POSIX prefixes (``ops/``, ``backups/``,
+    ``.drift-checked-``); the rest are exact names. The delivery-ledger
+    artifacts live under ops/ and are covered by that prefix (the ledger
+    paths are data-dir/session specific, so the prefix — not a per-session
+    import — is the enforceable contract).
+    """
     try:
-        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
-        try:
-            from delivery_ledger import ledger_path, pending_path
-            for fn in (ledger_path, pending_path):
-                got = fn(str(data_dir), session_id)
-                if got:
-                    allowed_extra.add(
-                        str(Path(got).relative_to(Path(data_dir)).as_posix()))
-        finally:
-            sys.path.pop(0)
-    except Exception:
-        allowed_extra.add("ops/")
-    # SQLite's own ephemeral sidecars belong to the store file itself;
-    # the namespace cache and per-session drift marker are the isolated
-    # store's own operational caches (written by the driven hook chain).
-    allowed_extra.update({"store.sqlite-wal", "store.sqlite-shm",
-                          "store.sqlite-journal"})
+        schema = json.loads(CANARY_SCHEMA_PATH.read_text(encoding="utf-8"))
+        return list(schema.get("allowed_canary_data_changes") or [])
+    except (OSError, ValueError):
+        return []
+
+
+def _path_allowed(path, allowed):
+    for entry in allowed:
+        if entry.endswith("/"):
+            # The prefix covers the contents AND the root directory entry
+            # itself (inventories record the bare directory name too).
+            if path.startswith(entry) or path == entry.rstrip("/"):
+                return True
+        elif entry.endswith("-"):
+            if path.startswith(entry):
+                return True
+        elif path == entry:
+            return True
+    return False
+
+
+def inventory_violations(inventories, data_dir, session_id):
+    """Contract violations of the four-root isolation proof, as slugs.
+
+    The canary-data allowlist comes from scripts/canary-schema.json
+    (allowed_canary_data_changes) so the lane runtime and the
+    --validate-result artifact gate enforce the SAME set."""
+    problems = []
+    allowed = _allowed_canary_paths()
     for name, _ in INVENTORY_ROOTS:
         block = inventories.get(name) or {}
         if name in ("operator-config", "host-roots"):
@@ -690,12 +714,8 @@ def inventory_violations(inventories, data_dir, session_id):
             for path in sorted(set(before_map) | set(after_map)):
                 if before_map.get(path) == after_map.get(path):
                     continue
-                if path in allowed_extra or path.startswith("ops/")                         or path.startswith("namespace-cache")                         or path.startswith(".drift-checked-"):
-                    continue
-                top = path.split("/")[0]
-                if top in allowed_extra or top.startswith("ops")                         or top == "namespace-cache":
-                    continue
-                problems.append("inventory-canary-data-wrote-%s" % path)
+                if not _path_allowed(path, allowed):
+                    problems.append("inventory-canary-data-wrote-%s" % path)
     return problems
 
 
@@ -860,10 +880,31 @@ def _validate_result_object(result, schema):
                                              entry["sha256"])):
                             bad("file entry needs size + sha256")
                     elif kind == "symlink":
-                        if not isinstance(entry.get("target"), str):
+                        target = entry.get("target")
+                        if not isinstance(target, str) or not target:
                             bad("symlink entry needs a target")
+                        elif target.startswith(("/", "\\")) \
+                                or (len(target) >= 2 and target[1] == ":") \
+                                or target.split("/")[:1] == [".."] \
+                                or target.split("\\")[:1] == [".."]:
+                            bad("symlink target must be POSIX-relative")
                     else:
                         bad("unknown entry kind %r" % kind)
+            if name == "canary-data":
+                before_map = {e.get("path"): e
+                              for e in block.get("before", [])
+                              if isinstance(e, dict)}
+                after_map = {e.get("path"): e
+                             for e in block.get("after", [])
+                             if isinstance(e, dict)}
+                for path in sorted(set(before_map) | set(after_map)):
+                    if before_map.get(path) == after_map.get(path):
+                        continue
+                    if not _path_allowed(
+                            path, schema.get("allowed_canary_data_changes")
+                            or []):
+                        bad("canary-data change outside the allowed set: %s"
+                            % path)
     if lane in schema["hermes_lanes"]:
         if result.get("mode") not in schema["enums"]["hermes_mode"]:
             bad("hermes lanes require a valid mode")
@@ -881,6 +922,10 @@ def _validate_result_object(result, schema):
         if not isinstance(one, dict) or "verdict" not in one \
                 or "reason" not in one:
             bad("zcode-duplicate requires a one_copy probe record")
+        elif one.get("verdict") not in ("pass", "fail", "skip") \
+                or not isinstance(one.get("reason"), str) \
+                or not one.get("reason"):
+            bad("one_copy verdict/reason values invalid")
     return problems
 
 
@@ -1011,11 +1056,10 @@ def run_exec_form_lane(host, plugin_root, data_dir, result_path, *,
                 notes="host binary not on PATH; skip per schema nullity")
         else:
             sha = _exe_sha256(binpath)
-            verdict, reason, fired = "pass", "-", []
+            verdict, reason, fired = "pass", "exec-form-pass", []
+            extra_notes = []
             stop = False
             for event, command in _manifest_commands(host, plugin_root):
-                if stop:
-                    break
                 argv = _manifest_argv(command.get("command", ""),
                                       plugin_root)
                 payload = {
@@ -1036,20 +1080,27 @@ def run_exec_form_lane(host, plugin_root, data_dir, result_path, *,
                 hid = "%s:%s" % (event, _command_basename(
                     str(command.get("command", ""))))
                 if out is None:
-                    verdict, reason = "fail", "deadline"
-                    stop = True
-                    break
+                    if not stop:
+                        verdict, reason = "fail", "deadline"
+                        stop = True
+                    extra_notes.append("%s: deadline" % hid)
+                    continue
                 if hid not in fired:
                     fired.append(hid)
                 if out.returncode != 0:
-                    verdict, reason = "fail", "child-exit-%d" \
-                        % out.returncode
+                    fail_reason = "child-exit-%d" % out.returncode
+                elif not _accept_child_stdout(out.stdout):
+                    fail_reason = "unexpected-stdout"
+                else:
+                    continue
+                # Fast failures (nonzero exit / bad stdout) do not mask the
+                # remaining events: keep probing, remember the FIRST failure
+                # as the lane verdict, and attribute the rest in notes.
+                if not stop or verdict == "pass":
+                    verdict, reason = "fail", fail_reason
                     stop = True
-                    break
-                if not _accept_child_stdout(out.stdout):
-                    verdict, reason = "fail", "unexpected-stdout"
-                    stop = True
-                    break
+                else:
+                    extra_notes.append("%s: %s" % (hid, fail_reason))
             version = None
             if verdict == "pass" and not stop:
                 if host in LIVE_SESSIONS:
@@ -1068,13 +1119,16 @@ def run_exec_form_lane(host, plugin_root, data_dir, result_path, *,
                     pass
             if verdict == "pass" and version is None:
                 verdict, reason = "fail", "version-unavailable"
+            notes = ("per-event children validated rc=0 with JSON or bare "
+                     "object stdout; version measured from the documented "
+                     "session surface only")
+            if extra_notes:
+                notes += "; further failures: " + "; ".join(extra_notes)
             result = build_result(
                 lane, host, verdict, reason, sha=sha, version=version,
                 command=[HOST_BINARIES[host]],
                 manifest_hook_ids=manifest_ids, fired_hook_ids=fired,
-                notes=("per-event children validated rc=0 with JSON or bare "
-                       "object stdout; version measured from the documented "
-                       "session surface only"))
+                notes=notes)
     except Exception as exc:  # noqa: BLE001 - lane never crashes the CLI
         result = build_result(lane, host, "fail", "lane-error",
                               manifest_hook_ids=manifest_ids,
@@ -1153,6 +1207,10 @@ class HermesGatewayHarness:
             try:
                 self._proc.kill()
             except OSError:
+                pass
+            try:
+                self._proc.wait(timeout=10)
+            except Exception:
                 pass
             self._proc = None
         if self._log is not None:
@@ -1274,11 +1332,17 @@ def _run_hermes_probe(lane, mode, hermes_exe, env, workdir, data_dir,
                       plugin_root, runner, gateway_harness, deadline,
                       version, head, hook_ids):
     """The supported live probe for one hermes mode, with delivery evidence
-    read from the isolated store surfaces only."""
+    read from the isolated store surfaces only (baselined before the probe,
+    so a reused data dir's stale files never count as fresh delivery)."""
     base = dict(mode=mode, sha=_exe_sha256(hermes_exe), version=version,
                 manifest_hook_ids=hook_ids,
                 callback_evidence=["pre_llm_call"], hermes_sha=None,
                 hermes_version_measured=version)
+    decisions = Path(data_dir) / "zmem-decisions.log"
+    pre_size = decisions.stat().st_size if decisions.is_file() else 0
+    ops_dir = Path(data_dir) / "ops"
+    pre_ops = ({p.name for p in ops_dir.iterdir()}
+               if ops_dir.is_dir() else set())
     if mode == "gateway":
         harness = gateway_harness
         if harness is None:
@@ -1288,6 +1352,7 @@ def _run_hermes_probe(lane, mode, hermes_exe, env, workdir, data_dir,
                 "--accept-hooks"]
         started = False
         injected = False
+        delivered = False
         try:
             started = harness.start(argv, env, workdir)
             if not started:
@@ -1313,18 +1378,19 @@ def _run_hermes_probe(lane, mode, hermes_exe, env, workdir, data_dir,
                 notes="inject: %s: %s" % (type(exc).__name__, exc), **base)
         finally:
             harness.stop()
+        delivered = injected and _delivery_evidence(
+            data_dir, decisions, pre_size, pre_ops)
         return build_result(
-            lane, "hermes", "fail" if not injected else "pass",
-            "gateway-event-injected" if injected else "gateway-inject-failed",
-            command=argv, notes="gateway harness cycle completed", **base)
+            lane, "hermes", "pass" if delivered else "fail",
+            "gateway-delivery-verified" if delivered
+            else "gateway-delivery-unverified",
+            command=argv, bare_fence_delivered=bool(delivered),
+            notes="gateway harness cycle completed; delivery evidence from "
+                  "the isolated store surfaces only", **base)
     prompt = ("canary provider prompt" if mode == "provider"
               else "canary compatibility prompt")
     argv = [str(hermes_exe), "chat", "-q", prompt, "--oneshot",
             "--accept-hooks"]
-    pre_size = 0
-    decisions = Path(data_dir) / "zmem-decisions.log"
-    if decisions.is_file():
-        pre_size = decisions.stat().st_size
     out = runner(argv, input_bytes=None, env=env, cwd=workdir,
                  deadline_s=300, deadline=deadline)
     if out is None:
@@ -1332,7 +1398,7 @@ def _run_hermes_probe(lane, mode, hermes_exe, env, workdir, data_dir,
                             command=argv, **base)
     stdout_text = _as_bytes(out.stdout).decode("utf-8", errors="replace")
     delivered = out.returncode == 0 and _delivery_evidence(
-        data_dir, decisions, pre_size)
+        data_dir, decisions, pre_size, pre_ops)
     wrapped = "<memory-context>" in stdout_text or _hermes_log_wrapped(
         Path(data_dir) / "hermes-home")
     if out.returncode != 0:
@@ -1352,15 +1418,24 @@ def _run_hermes_probe(lane, mode, hermes_exe, env, workdir, data_dir,
               "surfaces only", **base)
 
 
-def _delivery_evidence(data_dir, decisions, pre_size):
+def _delivery_evidence(data_dir, decisions, pre_size, pre_ops=None):
     """Store-side proof the hermes probe reached zmem: a fresh decision line
-    or a delivery-ledger artifact under the isolated data dir."""
+    or a delivery-ledger artifact NEWLY written under the isolated data dir
+    (``pre_ops`` is the ops/ listing captured before the probe ran, so stale
+    files from a reused data dir never count as fresh evidence)."""
     try:
         if decisions.is_file() and decisions.stat().st_size > pre_size:
             return True
         ops = Path(data_dir) / "ops"
-        if ops.is_dir() and any(ops.iterdir()):
-            return True
+        if ops.is_dir():
+            current = {p.name for p in ops.iterdir()}
+            if pre_ops is None:
+                # No baseline captured (legacy caller): any content counts,
+                # but this branch is only used before the probe baselines.
+                if current:
+                    return True
+            elif current - pre_ops:
+                return True
     except OSError:
         pass
     return False
@@ -1424,6 +1499,10 @@ def open_interactive_session(executable, *, env, cwd, deadline_s):
             try:
                 proc.terminate()
             except OSError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except Exception:
                 pass
             try:
                 os.close(master)
@@ -1713,6 +1792,8 @@ def run_zcode_duplicate_lane(plugin_root, data_dir, result_path, *,
             result = build_result(
                 "zcode-duplicate", "zcode", "skip", "node-binary-absent",
                 manifest_hook_ids=manifest_ids,
+                one_copy={"verdict": "skip", "reason": "single-copy-skip",
+                          "root": "host-roots/zcode-plugin-a"},
                 notes="node not on PATH; the launcher drive is impossible")
         else:
             version_out = runner([str(node), "--version"],
@@ -1733,23 +1814,47 @@ def run_zcode_duplicate_lane(plugin_root, data_dir, result_path, *,
             one_copy_ok = _fire_zcode_session(node, roots[0], data_dir,
                                               plugin_root, runner, deadline)
             dup_detected = len(fired) == 2
-            result = build_result(
-                "zcode-duplicate", "zcode",
-                "fail" if dup_detected else "pass",
-                "duplicate-install" if dup_detected else "single-copy-pass",
-                sha=_exe_sha256(node), version=version, command=[str(node)],
-                manifest_hook_ids=manifest_ids,
-                fired_hook_ids=["SessionStart:zmem-launch.js"]
-                if (fired or one_copy_ok) else [],
-                one_copy={"verdict": "pass" if one_copy_ok else "fail",
-                          "reason": "single-copy-pass" if one_copy_ok
-                          else "single-copy-fire-failed",
-                          "root": "host-roots/zcode-plugin-a"},
-                notes="two-copy roots fired: %s; one-copy root re-fired: %s"
-                      % (",".join(fired) or "none", bool(one_copy_ok)))
+            if version is None:
+                # Same documented contract as the exec-form/codex lanes: a
+                # host binary that emits no version is the structured
+                # version-unavailable failure, never a silent pass.
+                result = build_result(
+                    "zcode-duplicate", "zcode", "fail", "version-unavailable",
+                    sha=_exe_sha256(node), version=None, command=[str(node)],
+                    manifest_hook_ids=manifest_ids,
+                    fired_hook_ids=["SessionStart:zmem-launch.js"]
+                    if (fired or one_copy_ok) else [],
+                    one_copy={"verdict": "pass" if one_copy_ok else "fail",
+                              "reason": "single-copy-pass" if one_copy_ok
+                              else "single-copy-fire-failed",
+                              "root": "host-roots/zcode-plugin-a"},
+                    notes="two-copy roots fired: %s; one-copy root re-fired: "
+                          "%s; node emitted no version line"
+                          % (",".join(fired) or "none", bool(one_copy_ok)))
+            else:
+                result = build_result(
+                    "zcode-duplicate", "zcode",
+                    "fail" if dup_detected else "pass",
+                    "duplicate-install" if dup_detected
+                    else "single-copy-pass",
+                    sha=_exe_sha256(node), version=version,
+                    command=[str(node)],
+                    manifest_hook_ids=manifest_ids,
+                    fired_hook_ids=["SessionStart:zmem-launch.js"]
+                    if (fired or one_copy_ok) else [],
+                    one_copy={"verdict": "pass" if one_copy_ok else "fail",
+                              "reason": "single-copy-pass" if one_copy_ok
+                              else "single-copy-fire-failed",
+                              "root": "host-roots/zcode-plugin-a"},
+                    notes="two-copy roots fired: %s; one-copy root re-fired: "
+                          "%s" % (",".join(fired) or "none",
+                                  bool(one_copy_ok)))
     except Exception as exc:  # noqa: BLE001
         result = build_result("zcode-duplicate", "zcode", "fail",
                               "lane-error", manifest_hook_ids=manifest_ids,
+                              one_copy={"verdict": "skip",
+                                        "reason": "single-copy-skip",
+                                        "root": "host-roots/zcode-plugin-a"},
                               notes="%s: %s" % (type(exc).__name__, exc))
     result = _lane_finalize("zcode-duplicate", "zcode", data_dir, result_path,
                             before, snapshot_inventories(data_dir), result)
@@ -1758,9 +1863,13 @@ def run_zcode_duplicate_lane(plugin_root, data_dir, result_path, *,
 
 def _fire_zcode_session(node, root, data_dir, plugin_root, runner, deadline):
     """One real launcher drive under ZCODE_PLUGIN_ROOT=<root>; True when a
-    fresh decision line lands in the isolated decisions log."""
+    fresh decision line lands in the isolated decisions log (the legacy
+    zmem-bg.log fallback is baselined the same way, so stale bytes from a
+    reused data dir never count as a fresh firing)."""
     decisions = Path(data_dir) / "zmem-decisions.log"
     pre = decisions.stat().st_size if decisions.is_file() else 0
+    legacy = Path(data_dir) / "zmem-bg.log"
+    legacy_pre = legacy.stat().st_size if legacy.is_file() else 0
     env = _canary_env("zcode", root, data_dir)
     env["ZCODE_PLUGIN_ROOT"] = str(root)
     payload = {
@@ -1776,9 +1885,8 @@ def _fire_zcode_session(node, root, data_dir, plugin_root, runner, deadline):
         return False
     if decisions.is_file() and decisions.stat().st_size > pre:
         return True
-    # Some writers prefer the legacy log; accept either.
-    legacy = Path(data_dir) / "zmem-bg.log"
-    return legacy.is_file() and legacy.stat().st_size > 0
+    # Some writers prefer the legacy log; accept either, growth-baselined.
+    return legacy.is_file() and legacy.stat().st_size > legacy_pre
 
 
 def probe_store_path(args, data_dir):

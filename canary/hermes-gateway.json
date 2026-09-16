@@ -9,7 +9,7 @@
     "E:\\ZCode\\hermes\\hermes",
     "--version"
   ],
-  "timestamp": "2026-09-15T16:09:54Z",
+  "timestamp": "2026-09-16T08:04:30Z",
   "manifest_hook_ids": [
     "pre_llm_call:zmem-hermes-reflect.py"
   ],
@@ -24,8 +24,8 @@
         {
           "path": "hermes-home/config.yaml",
           "kind": "file",
-          "size": 195,
-          "sha256": "8cdefee09b3e723c5d7d4ea35ef5c0c258181df7f9e2387551608bc6e022cab2"
+          "size": 197,
+          "sha256": "6d99d2682ab78fd4d1f09900397b349d2581c5ebabc831834d836b4a7fa20f2a"
         },
         {
           "path": "hermes-home/plugins",
@@ -706,8 +706,8 @@
         {
           "path": "hermes-home/config.yaml",
           "kind": "file",
-          "size": 195,
-          "sha256": "8cdefee09b3e723c5d7d4ea35ef5c0c258181df7f9e2387551608bc6e022cab2"
+          "size": 197,
+          "sha256": "6d99d2682ab78fd4d1f09900397b349d2581c5ebabc831834d836b4a7fa20f2a"
         },
         {
           "path": "hermes-home/plugins",

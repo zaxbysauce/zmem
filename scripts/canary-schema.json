@@ -72,10 +72,12 @@
   "patterns": {
     "sha256": "^[0-9a-f]{64}$",
     "hook_id": "^[^:]+:[^:]+$",
-    "timestamp": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}",
+    "timestamp": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
     "uuid": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
   },
+  "scope_note": "This contract governs RESULT ARTIFACTS (canary/<lane>.json). Files under tests/fixtures/canary/ are test FIXTURES (contract records, fake-executable bytes) and are intentionally not result artifacts.",
   "inventory_roots": ["canary-data", "codex-config", "host-roots", "operator-config"],
+  "allowlist_note": "Entries ending in '/' or '-' are POSIX prefixes; the rest are exact names.",
   "allowed_canary_data_changes": [
     "store.sqlite",
     "store.sqlite-wal",
@@ -85,7 +87,10 @@
     "zmem-bg.log",
     "ops/",
     "namespace-cache/",
-    ".drift-checked-<session-id> drift-cache marker"
+    ".drift-checked-",
+    "backups/",
+    ".capture-prompted-",
+    "core.md"
   ],
   "rules": [
     "lane must be one of lanes; host must equal lane_host[lane]",

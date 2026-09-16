@@ -254,8 +254,10 @@ Semantics every consumer should know:
 - **Measured values.** Each artifact records the executable's SHA-256 and a
   version line **only when the host's documented surface emitted one**
   (Hermes `--version`, the supported `codex exec` invocation, the lane's own
-  probe stdout). A host that emits no version produces the structured
-  `verdict=fail reason=version-unavailable` — the canary never appends an
+  probe stdout). On the exec-form, codex-trust, and zcode-duplicate lanes, a
+  host that emits no version produces the structured
+  `verdict=fail reason=version-unavailable` (the Hermes lanes record
+  `hermes-measure-failed` instead) — the canary never appends an
   undocumented `--version` flag. A missing executable produces
   `verdict=skip` with `sha: null` and `version: null`.
 - **Structured negative results.** A measured negative (sha mismatch,
@@ -272,8 +274,12 @@ Semantics every consumer should know:
   inventory maps (`canary-data`, `codex-config`, `host-roots`,
   `operator-config`). `operator-config` and `host-roots` must stay
   byte-identical across the run; `canary-data` changes are limited to the
-  isolated `store.sqlite` (+ SQLite sidecars), `zmem-decisions.log`, and the
-  delivery-ledger paths. A symlink escaping its declared root fails the lane.
+  schema's `allowed_canary_data_changes` set — the isolated store (+ SQLite
+  sidecars), `zmem-decisions.log` / `zmem-bg.log`, the delivery-ledger
+  `ops/` paths, and the driven hook chain's own operational caches
+  (`namespace-cache/`, `.drift-checked-*`, `backups/`, `.capture-prompted-*`,
+  `core.md`), enforced both at lane runtime and by `--validate-result`. A
+  symlink escaping its declared root fails the lane.
 - **Deterministic fixtures.** `tests/fixtures/canary/expected-lanes.json` is
   generated, never hand-edited: `python scripts/generate_canary_fixtures.py
   --write`. Committed `canary/*.json` artifacts are live measurements and

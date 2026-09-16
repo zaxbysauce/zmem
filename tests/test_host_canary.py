@@ -415,6 +415,55 @@ class CanarySelfTestTest(unittest.TestCase):
             badid = golden(manifest_hook_ids=["SessionStart"])
             problems = mod._validate_result_object(badid, schema)
             self.assertTrue(any("hook-id" in p for p in problems), problems)
+            # manifest_hook_ids must be non-empty outside hermes lanes.
+            noids = golden(manifest_hook_ids=[])
+            problems = mod._validate_result_object(noids, schema)
+            self.assertTrue(any("manifest_hook_ids must not be empty" in p
+                                for p in problems), problems)
+            # claude-compact requires compact_result in the enum.
+            cc = golden(lane="claude-compact", host="claude",
+                        verdict="fail", reason="compact-undetermined")
+            problems = mod._validate_result_object(cc, schema)
+            self.assertTrue(any("compact_result" in p for p in problems),
+                            problems)
+            cc["compact_result"] = "unknown"
+            self.assertEqual(mod._validate_result_object(cc, schema), [])
+            # zcode-duplicate requires one_copy with valid values.
+            zd = golden(lane="zcode-duplicate", host="zcode",
+                        verdict="fail", reason="duplicate-install")
+            problems = mod._validate_result_object(zd, schema)
+            self.assertTrue(any("one_copy" in p for p in problems), problems)
+            zd["one_copy"] = {"verdict": "banana", "reason": "x"}
+            problems = mod._validate_result_object(zd, schema)
+            self.assertTrue(any("one_copy verdict/reason" in p
+                                for p in problems), problems)
+            zd["one_copy"] = {"verdict": "pass",
+                              "reason": "single-copy-pass"}
+            self.assertEqual(mod._validate_result_object(zd, schema), [])
+            # Timestamp is end-anchored (malformed suffixes rejected).
+            ts = golden()
+            ts["timestamp"] = "2026-09-10T00:00:00Zextra"
+            problems = mod._validate_result_object(ts, schema)
+            self.assertTrue(any("timestamp" in p for p in problems),
+                            problems)
+            # Symlink targets must be POSIX-relative.
+            esc = golden()
+            esc["inventories"] = json.loads(json.dumps(inventories))
+            esc["inventories"]["host-roots"]["after"] = [
+                {"path": "escaped", "kind": "symlink",
+                 "target": "../../etc/passwd"}]
+            problems = mod._validate_result_object(esc, schema)
+            self.assertTrue(any("POSIX-relative" in p for p in problems),
+                            problems)
+            # canary-data changes outside the schema allowlist are rejected.
+            rogue = golden()
+            rogue["inventories"] = json.loads(json.dumps(inventories))
+            rogue["inventories"]["canary-data"]["after"] = [
+                {"path": "zzz-rogue.bin", "kind": "file", "size": 1,
+                 "sha256": "c" * 64}]
+            problems = mod._validate_result_object(rogue, schema)
+            self.assertTrue(any("outside the allowed set" in p
+                                for p in problems), problems)
 
 
 class CanaryHelperUnitTest(unittest.TestCase):
@@ -575,26 +624,40 @@ class CanaryHelperUnitTest(unittest.TestCase):
         """Issue #96 seam contract: the injected FakeExecutor implements the
         Scheduler surface (submit/advance/now) and the DeadlineExecutor
         surface — at the deadline run_command returns None, the child call is
-        cancelled exactly once, and a cancelled call can never write late
-        (invoking it raises Cancelled)."""
+        cancelled exactly once, cancelling the wrapper KILLS the real child
+        (delegated _ChildCall.cancel), and a cancelled call can never write
+        late (invoking it raises Cancelled)."""
         mod = self._load()
-        executor = fake_executor.FakeExecutor(deadline_hits={1})
-        writes = []
 
-        # DeadlineExecutor surface: the first run hits its deadline.
+        # DeadlineExecutor surface: the first run hits its deadline; the
+        # wrapped _ChildCall.cancel must fire, killing the real child.
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        self.addCleanup(lambda: (child.kill(), child.wait(timeout=5)))
+        executor = fake_executor.FakeExecutor(deadline_hits={1})
         out = mod.run_command(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             input_bytes=None, env=os.environ.copy(), cwd=".",
             deadline_s=30, deadline=executor)
         self.assertIsNone(out, "a deadline-hit child must yield None")
-        self.assertEqual(writes, [], "no late write after cancellation")
         self.assertEqual(len(executor.cancellations), 1)
-        cancelled = executor.cancellations[0]
-        self.assertTrue(cancelled.cancelled)
+        # The delegation proof: a real child handed through the SAME wrap
+        # path is dead after cancel — not an orphan sleeping on.
+        call = mod._ChildCall(child)
+        wrapped = fake_executor.FakeCall(call)
+        wrapped.cancel()
+        self.assertTrue(wrapped.cancelled)
+        rc = child.wait(timeout=5)
+        self.assertNotEqual(rc, 0, "the cancelled child must be killed")
+
+        # No-late-write: a cancelled FakeCall can never run again.
         with self.assertRaises(fake_executor.FakeCall.Cancelled):
-            cancelled()  # the no-late-write property: cancelled calls die
+            wrapped()
 
         # Scheduler surface: submit/advance/now drive deterministic firing.
+        executor = fake_executor.FakeExecutor()
         fired = []
         executor.submit(lambda: fired.append("tick"), delay_s=5)
         executor.advance(3)
@@ -708,6 +771,14 @@ class CanaryHelperUnitTest(unittest.TestCase):
         for lane_result in (provider, compat):
             self.assertEqual(lane_result["callback_evidence"],
                              ["pre_llm_call"])
+        # Verdict assertions: with the fake runner the chat runs cleanly but
+        # no isolated-store delivery evidence exists, so both lanes are the
+        # deterministic structured fail — not just "any verdict passes".
+        self.assertEqual(provider["verdict"], "fail",
+                         provider["notes"])
+        self.assertEqual(provider["reason"], "hermes-delivery-unverified")
+        self.assertEqual(compat["verdict"], "fail", compat["notes"])
+        self.assertEqual(compat["reason"], "hermes-delivery-unverified")
         # The bare-fence boundary: the store-rendered fence itself never
         # carries the Hermes wrapper — wrapping is Hermes' own act.
         fence = ("<<<ZMEM_UNTRUSTED_FENCE>>>\n"
@@ -756,6 +827,7 @@ class CanaryHelperUnitTest(unittest.TestCase):
         # A symlink escaping its declared root fails the lane.
         escape = self._data_dir("inv-escape")
         (escape / "operator-config").mkdir(parents=True)
+        (escape / "host-roots").mkdir(parents=True)
         if os.name == "nt":
             self.skipTest("symlink creation needs privileges on Windows")
         target = Path(tempfile.mkdtemp(prefix="zmem-escape-"))

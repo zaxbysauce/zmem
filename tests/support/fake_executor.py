@@ -15,7 +15,12 @@ contract demands of a timed-out child.
 
 
 class FakeCall:
-    """A cancellable callable wrapper the test can observe."""
+    """A cancellable callable wrapper the test can observe.
+
+    ``cancel`` mirrors the production executor contract: cancelling the
+    wrapper ALSO cancels the wrapped callable's own cancel hook (the
+    ``_ChildCall`` the lane hands to ``run_command``), so a deadline hit
+    really kills the child process instead of only marking a flag."""
 
     class Cancelled(RuntimeError):
         pass
@@ -28,6 +33,9 @@ class FakeCall:
 
     def cancel(self):
         self.cancelled = True
+        inner = getattr(self._fn, "cancel", None)
+        if inner is not None:
+            inner()
 
     def __call__(self, *args, **kwargs):
         if self.cancelled:
