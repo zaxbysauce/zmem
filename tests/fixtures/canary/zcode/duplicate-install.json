@@ -1,0 +1,15 @@
+{
+  "namespace": "project:fixture-96",
+  "timestamp": "2026-09-10T00:00:00Z",
+  "roots": [
+    "host-roots/zcode-plugin-a",
+    "host-roots/zcode-plugin-b"
+  ],
+  "ids": [
+    "00000000-0000-4000-8000-000000000961",
+    "00000000-0000-4000-8000-000000000962"
+  ],
+  "one_copy_root": "host-roots/zcode-plugin-a",
+  "expected_two_copy_reason": "duplicate-install",
+  "expected_one_copy_reason": "single-copy-pass"
+}

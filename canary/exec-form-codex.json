@@ -1,0 +1,95 @@
+{
+  "lane": "exec-form-codex",
+  "host": "codex",
+  "verdict": "fail",
+  "reason": "version-unavailable",
+  "sha": "00743f8084cbc1594683b33cfb8bf14d2ce40d46ca6ba9f7142de6ba31502a84",
+  "version": null,
+  "command": [
+    "codex"
+  ],
+  "timestamp": "2026-09-16T08:12:54Z",
+  "manifest_hook_ids": [
+    "PostToolUse:zmem-launch.js",
+    "PreCompact:zmem-launch.js",
+    "PreToolUse:zmem-launch.js",
+    "SessionStart:zmem-launch.js",
+    "Stop:zmem-launch.js",
+    "SubagentStart:zmem-launch.js",
+    "SubagentStop:zmem-launch.js",
+    "UserPromptSubmit:zmem-launch.js"
+  ],
+  "fired_hook_ids": [
+    "PostToolUse:zmem-launch.js",
+    "PreCompact:zmem-launch.js",
+    "PreToolUse:zmem-launch.js",
+    "SessionStart:zmem-launch.js",
+    "Stop:zmem-launch.js",
+    "SubagentStart:zmem-launch.js",
+    "SubagentStop:zmem-launch.js",
+    "UserPromptSubmit:zmem-launch.js"
+  ],
+  "inventories": {
+    "canary-data": {
+      "before": [
+        {
+          "path": "workdir",
+          "kind": "directory"
+        }
+      ],
+      "after": [
+        {
+          "path": ".drift-checked-00000000-0000-4000-8000-000000000096-71ff1354",
+          "kind": "file",
+          "size": 9,
+          "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
+        },
+        {
+          "path": "core.md",
+          "kind": "file",
+          "size": 1977,
+          "sha256": "1378a81e1107b2d45b0392b3cb8b8fd75d328e411d4da0b3d741f94cc97b980f"
+        },
+        {
+          "path": "namespace-cache",
+          "kind": "directory"
+        },
+        {
+          "path": "namespace-cache/fa585ef76ee921980e9329d497f88cef433e38ee2af60d88b12a1d669786f521.json",
+          "kind": "file",
+          "size": 80,
+          "sha256": "965fee6f175d3fdec34b3052a0ecada697580bade1968dd9cd46016885b1d02d"
+        },
+        {
+          "path": "workdir",
+          "kind": "directory"
+        },
+        {
+          "path": "zmem-bg.log",
+          "kind": "file",
+          "size": 67,
+          "sha256": "942878742e8a0902a43af5fb03a355efbc41dc3cc8d4801c54d7279a3195365c"
+        },
+        {
+          "path": "zmem-decisions.log",
+          "kind": "file",
+          "size": 785,
+          "sha256": "6266eaefd1fed202e84bcee3ce8ed8dd6f8f9a25f2b6f70a1c221bc26c22e080"
+        }
+      ]
+    },
+    "codex-config": {
+      "before": [],
+      "after": []
+    },
+    "host-roots": {
+      "before": [],
+      "after": []
+    },
+    "operator-config": {
+      "before": [],
+      "after": []
+    }
+  },
+  "notes": "per-event children validated rc=0 with JSON or bare object stdout; version measured from the documented session surface only"
+}

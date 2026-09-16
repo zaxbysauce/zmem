@@ -218,6 +218,81 @@ correctly reports `hook-not-fired` until you re-trust — that is the canary
 doing its job, not a canary bug. Hermes' `--self-test` exercises the shared hook machinery under
 hermes identity; hermes' adapter-based delivery lane is tracked in #122.
 
+### Live host canary lanes (issue #96)
+
+Beyond the deterministic self-test, nine **live host-canary lanes** probe the
+real hosts against an isolated store. Each lane is dispatched with `--lane`,
+writes a schema-valid result artifact, and — unlike the legacy modes —
+**always exits 0 for a completed run**: the verdict lives in the artifact,
+not in `$?` (only usage errors exit 2). Consumers (CI, tooling) must read the
+artifact and/or run `--validate-result`; a structured `fail` artifact is a
+measured negative observation, never a crash and never a silent green.
+
+```bash
+# every lane: python scripts/host_canary.py --host <host> --lane <lane> \
+#   --result-json canary/<lane>.json --data-dir <scratch>
+python scripts/host_canary.py --host hermes --lane hermes-gateway        --hermes-root "$HERMES_ROOT" --hermes-sha cdf4c76 --result-json canary/hermes-gateway.json        --data-dir "$SCRATCH/hermes-gateway"
+python scripts/host_canary.py --host hermes --lane hermes-provider-mode  --hermes-root "$HERMES_ROOT" --hermes-sha cdf4c76 --result-json canary/hermes-provider-mode.json --data-dir "$SCRATCH/hermes-provider"
+python scripts/host_canary.py --host hermes --lane hermes-compat-mode    --hermes-root "$HERMES_ROOT" --hermes-sha cdf4c76 --result-json canary/hermes-compat-mode.json   --data-dir "$SCRATCH/hermes-compat"
+python scripts/host_canary.py --host claude --lane claude-compact        --result-json canary/claude-compact.json        --data-dir "$SCRATCH/claude-compact"
+python scripts/host_canary.py --host codex --lane codex-trust            --result-json canary/codex-trust.json           --data-dir "$SCRATCH/codex-trust"
+python scripts/host_canary.py --host zcode --lane zcode-duplicate        --result-json canary/zcode-duplicate.json       --data-dir "$SCRATCH/zcode-duplicate"
+python scripts/host_canary.py --host claude --lane exec-form-claude      --result-json canary/exec-form-claude.json      --data-dir "$SCRATCH/exec-claude"
+python scripts/host_canary.py --host codex --lane exec-form-codex        --result-json canary/exec-form-codex.json       --data-dir "$SCRATCH/exec-codex"
+python scripts/host_canary.py --host zcode --lane exec-form-zcode        --result-json canary/exec-form-zcode.json       --data-dir "$SCRATCH/exec-zcode"
+```
+
+Every artifact validates against the strict result contract
+(`scripts/canary-schema.json`, enforced by the standard-library validator):
+
+```bash
+python scripts/host_canary.py --validate-result canary/hermes-gateway.json
+```
+
+Semantics every consumer should know:
+
+- **Measured values.** Each artifact records the executable's SHA-256 and a
+  version line **only when the host's documented surface emitted one**
+  (Hermes `--version`, the supported `codex exec` invocation, the lane's own
+  probe stdout). On the exec-form, codex-trust, and zcode-duplicate lanes, a
+  host that emits no version produces the structured
+  `verdict=fail reason=version-unavailable` (the Hermes lanes record
+  `hermes-measure-failed` instead) — the canary never appends an
+  undocumented `--version` flag. A missing executable produces
+  `verdict=skip` with `sha: null` and `version: null`.
+- **Structured negative results.** A measured negative (sha mismatch,
+  untrusted hook state, unverified delivery, compaction undetermined) is a
+  **schema-valid `fail` artifact with the exact command outcome in `notes`**
+  — never a traceback and never a faked pass. Hermes pass/fail artifacts
+  additionally carry nonempty `callback_evidence` (the asserted delivery
+  callback, e.g. `pre_llm_call`).
+- **Derived hook identifiers.** `manifest_hook_ids` (the full
+  `<event>:<command-basename>` set derived from the host's real manifest,
+  e.g. `PreCompact:zmem-launch.js`) and `fired_hook_ids` (the runtime-fired
+  subset) are always recorded; identifiers are derived, never invented.
+- **Isolation proof.** Every artifact carries four sorted before/after
+  inventory maps (`canary-data`, `codex-config`, `host-roots`,
+  `operator-config`). `operator-config` and `host-roots` must stay
+  byte-identical across the run; `canary-data` changes are limited to the
+  schema's `allowed_canary_data_changes` set — the isolated store (+ SQLite
+  sidecars), `zmem-decisions.log` / `zmem-bg.log`, the delivery-ledger
+  `ops/` paths, and the driven hook chain's own operational caches
+  (`namespace-cache/`, `.drift-checked-*`, `backups/`, `.capture-prompted-*`,
+  `core.md`), enforced both at lane runtime and by `--validate-result`. A
+  symlink escaping its declared root fails the lane.
+- **Deterministic fixtures.** `tests/fixtures/canary/expected-lanes.json` is
+  generated, never hand-edited: `python scripts/generate_canary_fixtures.py
+  --write`. Committed `canary/*.json` artifacts are live measurements and
+  are never compared to that fixture.
+
+`claude-compact` records `compact_result` as exactly one of `survived`
+(measured fence after `/compact`), `dropped` (clean exit without it), or
+`unknown` (indeterminate — timeout, missing capture, or a platform without a
+standard-library PTY); `unknown` is the structured
+`reason=compact-undetermined` fail. The ZCode duplicate-install lane
+demonstrates the two-copy condition (`reason=duplicate-install`) and proves
+the one-copy run (`single-copy-pass`) in the same artifact.
+
 ### ZCode — from this GitHub repo (recommended)
 
 1. In ZCode: **Settings → Plugin Management → Discover → `+`**

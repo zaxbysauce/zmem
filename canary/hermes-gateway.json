@@ -1,0 +1,2545 @@
+{
+  "lane": "hermes-gateway",
+  "host": "hermes",
+  "verdict": "fail",
+  "reason": "hermes-measure-failed",
+  "sha": "53580bf26f7edcc0cebb7bbc4107804a9e4465f1e85f4c6553c2320016e29dbc",
+  "version": null,
+  "command": [
+    "hermes",
+    "--version"
+  ],
+  "timestamp": "2026-09-16T08:12:15Z",
+  "manifest_hook_ids": [
+    "pre_llm_call:zmem-hermes-reflect.py"
+  ],
+  "fired_hook_ids": [],
+  "inventories": {
+    "canary-data": {
+      "before": [
+        {
+          "path": "hermes-home",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/config.yaml",
+          "kind": "file",
+          "size": 193,
+          "sha256": "4539c392ac8a30ab941dc761b7a52e4c7ad8c9da4bd42141897076b1e456f3f0"
+        },
+        {
+          "path": "hermes-home/plugins",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/plugins/memory",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/__init__.py",
+          "kind": "file",
+          "size": 66242,
+          "sha256": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/hooks",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/hooks/_zmem_hook_common.py",
+          "kind": "file",
+          "size": 3460,
+          "sha256": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/hooks/zmem-hermes-convention.py",
+          "kind": "file",
+          "size": 11141,
+          "sha256": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/hooks/zmem-hermes-reflect.py",
+          "kind": "file",
+          "size": 15951,
+          "sha256": "4b59ab56e43245e1f01b4f529759bd75096797dd071cd3973e95c40a50d52226"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/hooks/zmem-hermes-verify.py",
+          "kind": "file",
+          "size": 6651,
+          "sha256": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/plugin.yaml",
+          "kind": "file",
+          "size": 559,
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/auth.py",
+          "kind": "file",
+          "size": 9702,
+          "sha256": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/bind_guard.py",
+          "kind": "file",
+          "size": 5841,
+          "sha256": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/mcp_client.py",
+          "kind": "file",
+          "size": 9768,
+          "sha256": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/mcp_server.py",
+          "kind": "file",
+          "size": 87548,
+          "sha256": "f97a7686812c70b0d671c43f8b9353d5d43ff13d956b548811cd27fe1fcf417c"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/requirements-embeddings.txt",
+          "kind": "file",
+          "size": 1544,
+          "sha256": "6503b0fe5ab3e7aec2d1ecf5e3542cac29c0a3cd85f5cae8e2329141ca2ecedd"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/requirements.txt",
+          "kind": "file",
+          "size": 933,
+          "sha256": "603697b45ea30e609dd2651fdf1e136abe04e63368927e27b84d71f556bd7510"
+        },
+        {
+          "path": "host-roots",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/__init__.py",
+          "kind": "file",
+          "size": 66242,
+          "sha256": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/hooks",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/hooks/_zmem_hook_common.py",
+          "kind": "file",
+          "size": 3460,
+          "sha256": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/hooks/zmem-hermes-convention.py",
+          "kind": "file",
+          "size": 11141,
+          "sha256": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/hooks/zmem-hermes-reflect.py",
+          "kind": "file",
+          "size": 15951,
+          "sha256": "4b59ab56e43245e1f01b4f529759bd75096797dd071cd3973e95c40a50d52226"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/hooks/zmem-hermes-verify.py",
+          "kind": "file",
+          "size": 6651,
+          "sha256": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/plugin.yaml",
+          "kind": "file",
+          "size": 559,
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/auth.py",
+          "kind": "file",
+          "size": 9702,
+          "sha256": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/bind_guard.py",
+          "kind": "file",
+          "size": 5841,
+          "sha256": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/mcp_client.py",
+          "kind": "file",
+          "size": 9768,
+          "sha256": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/mcp_server.py",
+          "kind": "file",
+          "size": 87548,
+          "sha256": "f97a7686812c70b0d671c43f8b9353d5d43ff13d956b548811cd27fe1fcf417c"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/requirements-embeddings.txt",
+          "kind": "file",
+          "size": 1544,
+          "sha256": "6503b0fe5ab3e7aec2d1ecf5e3542cac29c0a3cd85f5cae8e2329141ca2ecedd"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/requirements.txt",
+          "kind": "file",
+          "size": 933,
+          "sha256": "603697b45ea30e609dd2651fdf1e136abe04e63368927e27b84d71f556bd7510"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/correction_queue.py",
+          "kind": "file",
+          "size": 21694,
+          "sha256": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/corrections.py",
+          "kind": "file",
+          "size": 27384,
+          "sha256": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/doctor.py",
+          "kind": "file",
+          "size": 129514,
+          "sha256": "ecd99026c5be6a85210cd87fe6e788defb730a8d67c8cfca55d6674fcf2f2602"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/drift.py",
+          "kind": "file",
+          "size": 17547,
+          "sha256": "c281946a92c5c0bdebef6df3ceaee460d76766c75e109566e81645fde823feee"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/embed_profiles.py",
+          "kind": "file",
+          "size": 7018,
+          "sha256": "0666878e7c4924bf8798fed0641bbdaf36b33edad1c7f7d16ecf5e984e06899c"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/embeddings.py",
+          "kind": "file",
+          "size": 30469,
+          "sha256": "5828b0a26701315f730ba383bc4545bffe9f64859ec7426161dde65acfa6cd0a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/.graphify_analysis.json",
+          "kind": "file",
+          "size": 45120,
+          "sha256": "de24f0b608d2c7067cf03b8b1722a885b793797c983cc2b5e05c77aaa70936c3"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/.graphify_root",
+          "kind": "file",
+          "size": 35,
+          "sha256": "df221dd5233bb5d71b1b53bf613ad96ab33ebec1fb028be8df1f087ba82e995d"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/07ba8cf105fef44476aa0f5caa7f4df83d8d6900fcb4122507cf5e08fd8dd112.json",
+          "kind": "file",
+          "size": 102427,
+          "sha256": "84d101949a61fc00ce8932d2dc11f4ac17a6f0002a13861581b893182a4e0658"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/0f31cee1c084d781ae94b9c34de7d7ff11426859a45cd23619f2c22ff2562b68.json",
+          "kind": "file",
+          "size": 42265,
+          "sha256": "e657f4a98be1383be07f5abf8a22d2de94caa3475e240f7c245a68e59f777d75"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/12042668d39b01fadff021fa6fa6f55d6f7c8f348c2e907c8ae72bdbd3491110.json",
+          "kind": "file",
+          "size": 67116,
+          "sha256": "caf0b1ec0a730a6e90d49690583b4b5a7728bfa8ccf57b6fee8305f5aa010c96"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/130d928936c078103745444112020928078efe1c80191f4a47751bf40e72068f.json",
+          "kind": "file",
+          "size": 91561,
+          "sha256": "f54fac4a32a1e0473420b2edd0922eccae698b8c10e7de6f33d4acc2848040ba"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/142dfd34c652f5ba6462c978d7afe71c5f13412a91a767236c631f2b40fdfcd8.json",
+          "kind": "file",
+          "size": 56069,
+          "sha256": "4aa3513fb2b6f4a8f4eefecb1b4df9bb53634e2b0cfed67ca86c819506d7a19a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/1ca5549b9e8a36d95c6aaa31bd10ca1b701053e94271c803d60e9ea1092de433.json",
+          "kind": "file",
+          "size": 89595,
+          "sha256": "6dd3538e92627e6bc6aa2bba9d6d6e5ee8dbea3aeaa2cef03930179ef43ca073"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/2c756cb69085a63cb290fa11273b3caf7066469c698a5d1a01bf93557bc22106.json",
+          "kind": "file",
+          "size": 34020,
+          "sha256": "6267564fa2b6585d82f816f0d02aaefa0f7974648b98e305398c64dc6fce1a39"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/2f0ba710a9a03277248289d7b2bf372346eb0ee2cf80ceb6934f97b3ac802a35.json",
+          "kind": "file",
+          "size": 62455,
+          "sha256": "d13174f2513bceaa0eff7b048586c8859059f43d4b71f7dc1bf3f5853bb0608e"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/330be0f5e2da980c0172dd3b31cea8a957e6a72d3950c580eb6bdf582bf0213a.json",
+          "kind": "file",
+          "size": 67955,
+          "sha256": "3dec241a16f7de743e7f606f9a023b5b4c3662e6b348b427417b029c06cf12ef"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/38392d3b10060bf33aa7423c0b85777bb9cca2e50ff438fa6ee71a18f7127a2f.json",
+          "kind": "file",
+          "size": 22058,
+          "sha256": "d5a664009a58260d2af5098fa7a1559281d10768e8947a534e8c56b7536a072f"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/4c583a86ce74a7a893efc9ea40210f5cc5b5edbe6d3f2ea5bbd704cffb484b68.json",
+          "kind": "file",
+          "size": 5025,
+          "sha256": "5f54ed8e97cf160ddf6ec442e9a42335b64ea828634a23339b4f19ba9aee243d"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/51652e5bd0dbaf3443ebf2fdc02bc18d07b06459fc4bc9154519d07db3b6528a.json",
+          "kind": "file",
+          "size": 64155,
+          "sha256": "4d9ce3992caf12adc5c65b569cfa5ebe436d69d436d685937692ef084785d276"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/576ae9cd2a1e898d354149672a9a50b7b280f79acc176798bf6dac19cf17c4e1.json",
+          "kind": "file",
+          "size": 27054,
+          "sha256": "430c6214d022ec69ab674f3b7d732c45773cf1422518a6db96d0fbcf117b460e"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/5d80a96c512c972b566a5f508c91e348f941e89ed50e64224d3197944d47e35f.json",
+          "kind": "file",
+          "size": 12305,
+          "sha256": "6ce8ae507be3bf0fd99ad8b2d8201b8593dbff6d45528ee958c1dec53e9a4b70"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7430ff5cfea270ba3b6df8292a54dbec0e3748dbee955166e39e015e113c28ed.json",
+          "kind": "file",
+          "size": 31890,
+          "sha256": "3c81959f544a32aceeccebca32ec0634474827789c488bec06a13cd8e9cb2369"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/778354b3dfd5e7d21a7cba4ace9f01f317ddd790aba69b3d6c7e58359e525b15.json",
+          "kind": "file",
+          "size": 36332,
+          "sha256": "0501db95e5bc1ef598f107919f800a9c180b0f22e34ddce21b2071a55e327e60"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7af7d06c55e55f5fc9868ef48fadf8518a0dd5170e0b1624ae56582a1d4df292.json",
+          "kind": "file",
+          "size": 201417,
+          "sha256": "b6b6de23e6cbd7b8db266f8c925b8fb157f5b40881663a156dafddc8c5586894"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7e3462851a138a73010a6eb688b770407627ac21e0509c7817ee67c015ca5cd3.json",
+          "kind": "file",
+          "size": 2620,
+          "sha256": "245840ce0eda68bb91207058ba1bebdd0752e3375ec8508aed3a835fb45f7179"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/8c7a87d3e85111678683b55184eae2c2557260fae5ce1934c4bf1991169439a3.json",
+          "kind": "file",
+          "size": 31491,
+          "sha256": "3560a7a4bb025caaa7755b6808c945150d6d91779407e7801fd032045128fe08"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/98c25051cd99b4ea94262228af3d6eb9f7e24355d9e0b6a33e57b81f8be09c2a.json",
+          "kind": "file",
+          "size": 50092,
+          "sha256": "b498fd209ab9c8f4cf33f427355f0bcf27b7de109dd35a7bf1f19d69386fd2f5"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/9c6d978a42dc97847a322385eb3acbe0ad4c4dc42c8a7632d8295a376b202737.json",
+          "kind": "file",
+          "size": 40977,
+          "sha256": "2d1df8976f0198daa5a29baeb1095f495c3c8cc001c44d8a06c9fc4d8df6f9a4"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/a53273da04aeba97147f8dd26e98556a0ba2f98bf78e0a2ee51f9eb4c42227e6.json",
+          "kind": "file",
+          "size": 86803,
+          "sha256": "cf07fa3ed1f79106ca0f0fea8415f7c119324e951b177a435321ea048b0f2f7a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/adfb51bfd44e06647761c2c7f97c42c582141341879f9b03883f2b7c00bf12fc.json",
+          "kind": "file",
+          "size": 18314,
+          "sha256": "a8c0ee053c41d0895b240c5ca98eced68e764a27853920def07fa9dfd1d98639"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/baa709e9b21eae484daa923bc4cab408a8caee027febaea7fefde412d142beb2.json",
+          "kind": "file",
+          "size": 14163,
+          "sha256": "662508979c2db18023514cd95122f06f06df8ef872891da870db553e812df641"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/c078c307b95009c46878caf6a003bf9ef8a5ff2678633992df0098a109b5ad64.json",
+          "kind": "file",
+          "size": 34846,
+          "sha256": "4476119e9979e944827673d9c8b839244f061e91518c3cf6d35ef0668bc7b3f1"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/c31075416a717e670941b75268c0cd94ed6105d4d5d393559220cb7c74d932f0.json",
+          "kind": "file",
+          "size": 24497,
+          "sha256": "f94a4df96d146ccac49cd2639b414797b2c12f95a88f653f4b53a487a042f4cc"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/cab816c98b6d3212eb51a40f70f22fb5f43375dbe5002d7e3031ae22b54e145c.json",
+          "kind": "file",
+          "size": 6185,
+          "sha256": "a0af0519d00f14437ef4324c99f30151511617405c89f352883bf1734cb13d13"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/cbe627df2b53348eeda540807ac221c345cf3f2f07f8bc3c975653fe0b398813.json",
+          "kind": "file",
+          "size": 15502,
+          "sha256": "a3abc0e7262fcdf0ec0627032f184d8d50be9f7396bc77117ba1294ef74dac2c"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/d164c05f3dd5290c1cbea1ccd6e096feb91c213f9a8d87e33a9ace1c4ae8ee31.json",
+          "kind": "file",
+          "size": 11478,
+          "sha256": "22e13f4e444d58c74c5a4d697aae17901c91ef19d9701c094f4464b94a5af293"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/e84cdbcc5bd0a5ef8b7ad4c2fad8390aaa4d298234607a265f526755eeaa7e7f.json",
+          "kind": "file",
+          "size": 141327,
+          "sha256": "4ad0931d47b2b6a9aa8b4cdee23b03a6cf7da45ad3e812fe8da82acf6054f29f"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/ed4a6a47353eb16b6485f400b356868ab54004ab8794939a5a3b3bff0ef0a799.json",
+          "kind": "file",
+          "size": 34942,
+          "sha256": "e13d6e852f89cb5ec4bb11d830006de761c6a1c78e91107333a06b342d6b2d1b"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/f351572c98574113e460bda14e8228056aad453f82665ec7b549f1c4ae309966.json",
+          "kind": "file",
+          "size": 20649,
+          "sha256": "7834d12f20eb10ce8e1b0002dfd10907298af3c337c2fcac72bf5546ea2026f8"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/fd0309cec71a9be900a297dc8d5d778e7edcaf344fa7c50bca9e1262d6f2c9f2.json",
+          "kind": "file",
+          "size": 18053,
+          "sha256": "7270ad2478d929d7efa8e24b72a370a1a87cf072c5ae2b16da5ae94ea1d8d49a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/last_query_stamp",
+          "kind": "file",
+          "size": 18,
+          "sha256": "52e7ef5f9bb9ec74267e0fa23f28558ac2437fe0bcdef2aa645692aa431fb1f8"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/stat-index.json",
+          "kind": "file",
+          "size": 7199,
+          "sha256": "600ce5cfffbc26647d6fe0f3a9a4a88950acff09cb50657ef8fcce895776efab"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/graph.json",
+          "kind": "file",
+          "size": 1240959,
+          "sha256": "b3173cdfc825d99a1c5fdd14e9219549d133b8be20bca78c8915103811a469bb"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/manifest.json",
+          "kind": "file",
+          "size": 6891,
+          "sha256": "2ac336c0f87f078f9da1353d2b86f38a35d117c5b79111ac3ad03de552839ac3"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/history_mining.py",
+          "kind": "file",
+          "size": 14365,
+          "sha256": "654ed03ab1a1d3a505f37d2a0840a1f286ad946b4c3559336fa944d749509881"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/host.py",
+          "kind": "file",
+          "size": 54494,
+          "sha256": "56740ddc866ed9b8e38ac3e42de34feb4f0f4329bedf4b2712c7767fde24c495"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/import-store.py",
+          "kind": "file",
+          "size": 11035,
+          "sha256": "75047ada65ad486b1acaa9ff13e38c316ca8dd586d567b3d78f2f9c189398b0d"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/schema_meta.py",
+          "kind": "file",
+          "size": 17166,
+          "sha256": "754df2815aa3888ca08cbc0f92cad8ecf15c3a348ecc35041f1f97255721ddd0"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/store.py",
+          "kind": "file",
+          "size": 2126,
+          "sha256": "99d721f53e8f8c2ba0df6bd60f839f44235f22d8a0dd751020cbad26b4543ffb"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/__init__.py",
+          "kind": "file",
+          "size": 16991,
+          "sha256": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/backup.py",
+          "kind": "file",
+          "size": 36783,
+          "sha256": "d0a345f3eeb209d7946bd916492d35463f47c1840d9ac3194c8af6be84c150fc"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/cli.py",
+          "kind": "file",
+          "size": 121658,
+          "sha256": "99fdbde6c8c5ce3abf987926f91b5612224bd57f8f5fcbd0fb998879483909d4"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/consolidate.py",
+          "kind": "file",
+          "size": 77745,
+          "sha256": "1e937fbfda27401057891c980b5e0c4f006035fc6c2d8bae8508697bf8157d58"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/cross_encoder.py",
+          "kind": "file",
+          "size": 8625,
+          "sha256": "be9da0f236b28d38f5963a3bd1b48861c85039cee7b620543f74543fadbda4da"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/delivery_ledger.py",
+          "kind": "file",
+          "size": 21365,
+          "sha256": "c3f1daa1cd2b2ae9cca2e260b2c40cad2e2fca6aa0b334ae3f0a94eb9b3d3dc2"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/entity.py",
+          "kind": "file",
+          "size": 24020,
+          "sha256": "915fdbafdbe79f1643af751a19ed366e3e2bec3beddcef42e881122310527949"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/episodes.py",
+          "kind": "file",
+          "size": 14828,
+          "sha256": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/eval_gold.py",
+          "kind": "file",
+          "size": 41156,
+          "sha256": "65d5e0ddb9245d9c7cf606455c208c5c3ce3c833cfbcdb78b97cd24f5833dcad"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/false_inject.py",
+          "kind": "file",
+          "size": 17822,
+          "sha256": "e5f3eba59335369acdacf5b77f9b780950b0bc6b3bb2839d8730f072483fb847"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/hygiene.py",
+          "kind": "file",
+          "size": 13150,
+          "sha256": "2aa58e727c6b0a96efeaf7ad103404b2a3916771b0a21d911ce935240be3662b"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/inject.py",
+          "kind": "file",
+          "size": 43686,
+          "sha256": "d7934eb63cd57ad83320039b79011921ad480d3e6bd1c88ca561c87ad90b74a3"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/links.py",
+          "kind": "file",
+          "size": 29109,
+          "sha256": "5bf96acb962728cfa77e2d826dd8d3f85cee979787a7cb1799940c1f68c0302d"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/log_rotate.py",
+          "kind": "file",
+          "size": 9758,
+          "sha256": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/mine.py",
+          "kind": "file",
+          "size": 57375,
+          "sha256": "532e1e042dad30710ff9379dddfac4a2638288ea9fa683f62db5163f29053568"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/miss_rate.py",
+          "kind": "file",
+          "size": 57455,
+          "sha256": "b0c32ea996032683d4f44ba8acbee95bb3094880b241407f63485b1f3a2f8b05"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/namespace_cache.py",
+          "kind": "file",
+          "size": 4214,
+          "sha256": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/ops_tokens.py",
+          "kind": "file",
+          "size": 19783,
+          "sha256": "63e6ddfa0b7339cfbb62b7567f0af4a7da51948afd556759e9265b593ff474c7"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/organize.py",
+          "kind": "file",
+          "size": 43927,
+          "sha256": "e47b1b7d347a840bb01101b2f843561834045daf50c99e51f7ea86a750de1173"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/promote.py",
+          "kind": "file",
+          "size": 11730,
+          "sha256": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/recall.py",
+          "kind": "file",
+          "size": 172961,
+          "sha256": "a5924004b4b3c5e4556693889356f4e637ba366980ec8705c98ca708888d8cc4"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/schema.py",
+          "kind": "file",
+          "size": 75205,
+          "sha256": "f1f2b96d939bb70597ccbe081c3e965639053a55b003697924672a2264b39744"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/sync.py",
+          "kind": "file",
+          "size": 69024,
+          "sha256": "0f4ec13847a83758852b33563273e840ab4ab741847e2dd0d307b7bf0e6fc8cd"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/tune.py",
+          "kind": "file",
+          "size": 6244,
+          "sha256": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/write.py",
+          "kind": "file",
+          "size": 74281,
+          "sha256": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
+        },
+        {
+          "path": "workdir",
+          "kind": "directory"
+        }
+      ],
+      "after": [
+        {
+          "path": "hermes-home",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/config.yaml",
+          "kind": "file",
+          "size": 193,
+          "sha256": "4539c392ac8a30ab941dc761b7a52e4c7ad8c9da4bd42141897076b1e456f3f0"
+        },
+        {
+          "path": "hermes-home/plugins",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/plugins/memory",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/__init__.py",
+          "kind": "file",
+          "size": 66242,
+          "sha256": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/hooks",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/hooks/_zmem_hook_common.py",
+          "kind": "file",
+          "size": 3460,
+          "sha256": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/hooks/zmem-hermes-convention.py",
+          "kind": "file",
+          "size": 11141,
+          "sha256": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/hooks/zmem-hermes-reflect.py",
+          "kind": "file",
+          "size": 15951,
+          "sha256": "4b59ab56e43245e1f01b4f529759bd75096797dd071cd3973e95c40a50d52226"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/hooks/zmem-hermes-verify.py",
+          "kind": "file",
+          "size": 6651,
+          "sha256": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/plugin.yaml",
+          "kind": "file",
+          "size": 559,
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/auth.py",
+          "kind": "file",
+          "size": 9702,
+          "sha256": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/bind_guard.py",
+          "kind": "file",
+          "size": 5841,
+          "sha256": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/mcp_client.py",
+          "kind": "file",
+          "size": 9768,
+          "sha256": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/mcp_server.py",
+          "kind": "file",
+          "size": 87548,
+          "sha256": "f97a7686812c70b0d671c43f8b9353d5d43ff13d956b548811cd27fe1fcf417c"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/requirements-embeddings.txt",
+          "kind": "file",
+          "size": 1544,
+          "sha256": "6503b0fe5ab3e7aec2d1ecf5e3542cac29c0a3cd85f5cae8e2329141ca2ecedd"
+        },
+        {
+          "path": "hermes-home/plugins/memory/zmem/server/requirements.txt",
+          "kind": "file",
+          "size": 933,
+          "sha256": "603697b45ea30e609dd2651fdf1e136abe04e63368927e27b84d71f556bd7510"
+        },
+        {
+          "path": "host-roots",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/__init__.py",
+          "kind": "file",
+          "size": 66242,
+          "sha256": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/hooks",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/hooks/_zmem_hook_common.py",
+          "kind": "file",
+          "size": 3460,
+          "sha256": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/hooks/zmem-hermes-convention.py",
+          "kind": "file",
+          "size": 11141,
+          "sha256": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/hooks/zmem-hermes-reflect.py",
+          "kind": "file",
+          "size": 15951,
+          "sha256": "4b59ab56e43245e1f01b4f529759bd75096797dd071cd3973e95c40a50d52226"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/hooks/zmem-hermes-verify.py",
+          "kind": "file",
+          "size": 6651,
+          "sha256": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/plugin.yaml",
+          "kind": "file",
+          "size": 559,
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/auth.py",
+          "kind": "file",
+          "size": 9702,
+          "sha256": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/bind_guard.py",
+          "kind": "file",
+          "size": 5841,
+          "sha256": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/mcp_client.py",
+          "kind": "file",
+          "size": 9768,
+          "sha256": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/mcp_server.py",
+          "kind": "file",
+          "size": 87548,
+          "sha256": "f97a7686812c70b0d671c43f8b9353d5d43ff13d956b548811cd27fe1fcf417c"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/requirements-embeddings.txt",
+          "kind": "file",
+          "size": 1544,
+          "sha256": "6503b0fe5ab3e7aec2d1ecf5e3542cac29c0a3cd85f5cae8e2329141ca2ecedd"
+        },
+        {
+          "path": "host-roots/hermes-zmem/hermes-plugin/server/requirements.txt",
+          "kind": "file",
+          "size": 933,
+          "sha256": "603697b45ea30e609dd2651fdf1e136abe04e63368927e27b84d71f556bd7510"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/correction_queue.py",
+          "kind": "file",
+          "size": 21694,
+          "sha256": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/corrections.py",
+          "kind": "file",
+          "size": 27384,
+          "sha256": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/doctor.py",
+          "kind": "file",
+          "size": 129514,
+          "sha256": "ecd99026c5be6a85210cd87fe6e788defb730a8d67c8cfca55d6674fcf2f2602"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/drift.py",
+          "kind": "file",
+          "size": 17547,
+          "sha256": "c281946a92c5c0bdebef6df3ceaee460d76766c75e109566e81645fde823feee"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/embed_profiles.py",
+          "kind": "file",
+          "size": 7018,
+          "sha256": "0666878e7c4924bf8798fed0641bbdaf36b33edad1c7f7d16ecf5e984e06899c"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/embeddings.py",
+          "kind": "file",
+          "size": 30469,
+          "sha256": "5828b0a26701315f730ba383bc4545bffe9f64859ec7426161dde65acfa6cd0a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/.graphify_analysis.json",
+          "kind": "file",
+          "size": 45120,
+          "sha256": "de24f0b608d2c7067cf03b8b1722a885b793797c983cc2b5e05c77aaa70936c3"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/.graphify_root",
+          "kind": "file",
+          "size": 35,
+          "sha256": "df221dd5233bb5d71b1b53bf613ad96ab33ebec1fb028be8df1f087ba82e995d"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/07ba8cf105fef44476aa0f5caa7f4df83d8d6900fcb4122507cf5e08fd8dd112.json",
+          "kind": "file",
+          "size": 102427,
+          "sha256": "84d101949a61fc00ce8932d2dc11f4ac17a6f0002a13861581b893182a4e0658"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/0f31cee1c084d781ae94b9c34de7d7ff11426859a45cd23619f2c22ff2562b68.json",
+          "kind": "file",
+          "size": 42265,
+          "sha256": "e657f4a98be1383be07f5abf8a22d2de94caa3475e240f7c245a68e59f777d75"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/12042668d39b01fadff021fa6fa6f55d6f7c8f348c2e907c8ae72bdbd3491110.json",
+          "kind": "file",
+          "size": 67116,
+          "sha256": "caf0b1ec0a730a6e90d49690583b4b5a7728bfa8ccf57b6fee8305f5aa010c96"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/130d928936c078103745444112020928078efe1c80191f4a47751bf40e72068f.json",
+          "kind": "file",
+          "size": 91561,
+          "sha256": "f54fac4a32a1e0473420b2edd0922eccae698b8c10e7de6f33d4acc2848040ba"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/142dfd34c652f5ba6462c978d7afe71c5f13412a91a767236c631f2b40fdfcd8.json",
+          "kind": "file",
+          "size": 56069,
+          "sha256": "4aa3513fb2b6f4a8f4eefecb1b4df9bb53634e2b0cfed67ca86c819506d7a19a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/1ca5549b9e8a36d95c6aaa31bd10ca1b701053e94271c803d60e9ea1092de433.json",
+          "kind": "file",
+          "size": 89595,
+          "sha256": "6dd3538e92627e6bc6aa2bba9d6d6e5ee8dbea3aeaa2cef03930179ef43ca073"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/2c756cb69085a63cb290fa11273b3caf7066469c698a5d1a01bf93557bc22106.json",
+          "kind": "file",
+          "size": 34020,
+          "sha256": "6267564fa2b6585d82f816f0d02aaefa0f7974648b98e305398c64dc6fce1a39"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/2f0ba710a9a03277248289d7b2bf372346eb0ee2cf80ceb6934f97b3ac802a35.json",
+          "kind": "file",
+          "size": 62455,
+          "sha256": "d13174f2513bceaa0eff7b048586c8859059f43d4b71f7dc1bf3f5853bb0608e"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/330be0f5e2da980c0172dd3b31cea8a957e6a72d3950c580eb6bdf582bf0213a.json",
+          "kind": "file",
+          "size": 67955,
+          "sha256": "3dec241a16f7de743e7f606f9a023b5b4c3662e6b348b427417b029c06cf12ef"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/38392d3b10060bf33aa7423c0b85777bb9cca2e50ff438fa6ee71a18f7127a2f.json",
+          "kind": "file",
+          "size": 22058,
+          "sha256": "d5a664009a58260d2af5098fa7a1559281d10768e8947a534e8c56b7536a072f"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/4c583a86ce74a7a893efc9ea40210f5cc5b5edbe6d3f2ea5bbd704cffb484b68.json",
+          "kind": "file",
+          "size": 5025,
+          "sha256": "5f54ed8e97cf160ddf6ec442e9a42335b64ea828634a23339b4f19ba9aee243d"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/51652e5bd0dbaf3443ebf2fdc02bc18d07b06459fc4bc9154519d07db3b6528a.json",
+          "kind": "file",
+          "size": 64155,
+          "sha256": "4d9ce3992caf12adc5c65b569cfa5ebe436d69d436d685937692ef084785d276"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/576ae9cd2a1e898d354149672a9a50b7b280f79acc176798bf6dac19cf17c4e1.json",
+          "kind": "file",
+          "size": 27054,
+          "sha256": "430c6214d022ec69ab674f3b7d732c45773cf1422518a6db96d0fbcf117b460e"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/5d80a96c512c972b566a5f508c91e348f941e89ed50e64224d3197944d47e35f.json",
+          "kind": "file",
+          "size": 12305,
+          "sha256": "6ce8ae507be3bf0fd99ad8b2d8201b8593dbff6d45528ee958c1dec53e9a4b70"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7430ff5cfea270ba3b6df8292a54dbec0e3748dbee955166e39e015e113c28ed.json",
+          "kind": "file",
+          "size": 31890,
+          "sha256": "3c81959f544a32aceeccebca32ec0634474827789c488bec06a13cd8e9cb2369"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/778354b3dfd5e7d21a7cba4ace9f01f317ddd790aba69b3d6c7e58359e525b15.json",
+          "kind": "file",
+          "size": 36332,
+          "sha256": "0501db95e5bc1ef598f107919f800a9c180b0f22e34ddce21b2071a55e327e60"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7af7d06c55e55f5fc9868ef48fadf8518a0dd5170e0b1624ae56582a1d4df292.json",
+          "kind": "file",
+          "size": 201417,
+          "sha256": "b6b6de23e6cbd7b8db266f8c925b8fb157f5b40881663a156dafddc8c5586894"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7e3462851a138a73010a6eb688b770407627ac21e0509c7817ee67c015ca5cd3.json",
+          "kind": "file",
+          "size": 2620,
+          "sha256": "245840ce0eda68bb91207058ba1bebdd0752e3375ec8508aed3a835fb45f7179"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/8c7a87d3e85111678683b55184eae2c2557260fae5ce1934c4bf1991169439a3.json",
+          "kind": "file",
+          "size": 31491,
+          "sha256": "3560a7a4bb025caaa7755b6808c945150d6d91779407e7801fd032045128fe08"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/98c25051cd99b4ea94262228af3d6eb9f7e24355d9e0b6a33e57b81f8be09c2a.json",
+          "kind": "file",
+          "size": 50092,
+          "sha256": "b498fd209ab9c8f4cf33f427355f0bcf27b7de109dd35a7bf1f19d69386fd2f5"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/9c6d978a42dc97847a322385eb3acbe0ad4c4dc42c8a7632d8295a376b202737.json",
+          "kind": "file",
+          "size": 40977,
+          "sha256": "2d1df8976f0198daa5a29baeb1095f495c3c8cc001c44d8a06c9fc4d8df6f9a4"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/a53273da04aeba97147f8dd26e98556a0ba2f98bf78e0a2ee51f9eb4c42227e6.json",
+          "kind": "file",
+          "size": 86803,
+          "sha256": "cf07fa3ed1f79106ca0f0fea8415f7c119324e951b177a435321ea048b0f2f7a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/adfb51bfd44e06647761c2c7f97c42c582141341879f9b03883f2b7c00bf12fc.json",
+          "kind": "file",
+          "size": 18314,
+          "sha256": "a8c0ee053c41d0895b240c5ca98eced68e764a27853920def07fa9dfd1d98639"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/baa709e9b21eae484daa923bc4cab408a8caee027febaea7fefde412d142beb2.json",
+          "kind": "file",
+          "size": 14163,
+          "sha256": "662508979c2db18023514cd95122f06f06df8ef872891da870db553e812df641"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/c078c307b95009c46878caf6a003bf9ef8a5ff2678633992df0098a109b5ad64.json",
+          "kind": "file",
+          "size": 34846,
+          "sha256": "4476119e9979e944827673d9c8b839244f061e91518c3cf6d35ef0668bc7b3f1"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/c31075416a717e670941b75268c0cd94ed6105d4d5d393559220cb7c74d932f0.json",
+          "kind": "file",
+          "size": 24497,
+          "sha256": "f94a4df96d146ccac49cd2639b414797b2c12f95a88f653f4b53a487a042f4cc"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/cab816c98b6d3212eb51a40f70f22fb5f43375dbe5002d7e3031ae22b54e145c.json",
+          "kind": "file",
+          "size": 6185,
+          "sha256": "a0af0519d00f14437ef4324c99f30151511617405c89f352883bf1734cb13d13"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/cbe627df2b53348eeda540807ac221c345cf3f2f07f8bc3c975653fe0b398813.json",
+          "kind": "file",
+          "size": 15502,
+          "sha256": "a3abc0e7262fcdf0ec0627032f184d8d50be9f7396bc77117ba1294ef74dac2c"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/d164c05f3dd5290c1cbea1ccd6e096feb91c213f9a8d87e33a9ace1c4ae8ee31.json",
+          "kind": "file",
+          "size": 11478,
+          "sha256": "22e13f4e444d58c74c5a4d697aae17901c91ef19d9701c094f4464b94a5af293"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/e84cdbcc5bd0a5ef8b7ad4c2fad8390aaa4d298234607a265f526755eeaa7e7f.json",
+          "kind": "file",
+          "size": 141327,
+          "sha256": "4ad0931d47b2b6a9aa8b4cdee23b03a6cf7da45ad3e812fe8da82acf6054f29f"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/ed4a6a47353eb16b6485f400b356868ab54004ab8794939a5a3b3bff0ef0a799.json",
+          "kind": "file",
+          "size": 34942,
+          "sha256": "e13d6e852f89cb5ec4bb11d830006de761c6a1c78e91107333a06b342d6b2d1b"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/f351572c98574113e460bda14e8228056aad453f82665ec7b549f1c4ae309966.json",
+          "kind": "file",
+          "size": 20649,
+          "sha256": "7834d12f20eb10ce8e1b0002dfd10907298af3c337c2fcac72bf5546ea2026f8"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/fd0309cec71a9be900a297dc8d5d778e7edcaf344fa7c50bca9e1262d6f2c9f2.json",
+          "kind": "file",
+          "size": 18053,
+          "sha256": "7270ad2478d929d7efa8e24b72a370a1a87cf072c5ae2b16da5ae94ea1d8d49a"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/last_query_stamp",
+          "kind": "file",
+          "size": 18,
+          "sha256": "52e7ef5f9bb9ec74267e0fa23f28558ac2437fe0bcdef2aa645692aa431fb1f8"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/cache/stat-index.json",
+          "kind": "file",
+          "size": 7199,
+          "sha256": "600ce5cfffbc26647d6fe0f3a9a4a88950acff09cb50657ef8fcce895776efab"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/graph.json",
+          "kind": "file",
+          "size": 1240959,
+          "sha256": "b3173cdfc825d99a1c5fdd14e9219549d133b8be20bca78c8915103811a469bb"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/graphify-out/manifest.json",
+          "kind": "file",
+          "size": 6891,
+          "sha256": "2ac336c0f87f078f9da1353d2b86f38a35d117c5b79111ac3ad03de552839ac3"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/history_mining.py",
+          "kind": "file",
+          "size": 14365,
+          "sha256": "654ed03ab1a1d3a505f37d2a0840a1f286ad946b4c3559336fa944d749509881"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/host.py",
+          "kind": "file",
+          "size": 54494,
+          "sha256": "56740ddc866ed9b8e38ac3e42de34feb4f0f4329bedf4b2712c7767fde24c495"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/import-store.py",
+          "kind": "file",
+          "size": 11035,
+          "sha256": "75047ada65ad486b1acaa9ff13e38c316ca8dd586d567b3d78f2f9c189398b0d"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/schema_meta.py",
+          "kind": "file",
+          "size": 17166,
+          "sha256": "754df2815aa3888ca08cbc0f92cad8ecf15c3a348ecc35041f1f97255721ddd0"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/store.py",
+          "kind": "file",
+          "size": 2126,
+          "sha256": "99d721f53e8f8c2ba0df6bd60f839f44235f22d8a0dd751020cbad26b4543ffb"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib",
+          "kind": "directory"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/__init__.py",
+          "kind": "file",
+          "size": 16991,
+          "sha256": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/backup.py",
+          "kind": "file",
+          "size": 36783,
+          "sha256": "d0a345f3eeb209d7946bd916492d35463f47c1840d9ac3194c8af6be84c150fc"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/cli.py",
+          "kind": "file",
+          "size": 121658,
+          "sha256": "99fdbde6c8c5ce3abf987926f91b5612224bd57f8f5fcbd0fb998879483909d4"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/consolidate.py",
+          "kind": "file",
+          "size": 77745,
+          "sha256": "1e937fbfda27401057891c980b5e0c4f006035fc6c2d8bae8508697bf8157d58"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/cross_encoder.py",
+          "kind": "file",
+          "size": 8625,
+          "sha256": "be9da0f236b28d38f5963a3bd1b48861c85039cee7b620543f74543fadbda4da"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/delivery_ledger.py",
+          "kind": "file",
+          "size": 21365,
+          "sha256": "c3f1daa1cd2b2ae9cca2e260b2c40cad2e2fca6aa0b334ae3f0a94eb9b3d3dc2"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/entity.py",
+          "kind": "file",
+          "size": 24020,
+          "sha256": "915fdbafdbe79f1643af751a19ed366e3e2bec3beddcef42e881122310527949"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/episodes.py",
+          "kind": "file",
+          "size": 14828,
+          "sha256": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/eval_gold.py",
+          "kind": "file",
+          "size": 41156,
+          "sha256": "65d5e0ddb9245d9c7cf606455c208c5c3ce3c833cfbcdb78b97cd24f5833dcad"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/false_inject.py",
+          "kind": "file",
+          "size": 17822,
+          "sha256": "e5f3eba59335369acdacf5b77f9b780950b0bc6b3bb2839d8730f072483fb847"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/hygiene.py",
+          "kind": "file",
+          "size": 13150,
+          "sha256": "2aa58e727c6b0a96efeaf7ad103404b2a3916771b0a21d911ce935240be3662b"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/inject.py",
+          "kind": "file",
+          "size": 43686,
+          "sha256": "d7934eb63cd57ad83320039b79011921ad480d3e6bd1c88ca561c87ad90b74a3"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/links.py",
+          "kind": "file",
+          "size": 29109,
+          "sha256": "5bf96acb962728cfa77e2d826dd8d3f85cee979787a7cb1799940c1f68c0302d"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/log_rotate.py",
+          "kind": "file",
+          "size": 9758,
+          "sha256": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/mine.py",
+          "kind": "file",
+          "size": 57375,
+          "sha256": "532e1e042dad30710ff9379dddfac4a2638288ea9fa683f62db5163f29053568"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/miss_rate.py",
+          "kind": "file",
+          "size": 57455,
+          "sha256": "b0c32ea996032683d4f44ba8acbee95bb3094880b241407f63485b1f3a2f8b05"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/namespace_cache.py",
+          "kind": "file",
+          "size": 4214,
+          "sha256": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/ops_tokens.py",
+          "kind": "file",
+          "size": 19783,
+          "sha256": "63e6ddfa0b7339cfbb62b7567f0af4a7da51948afd556759e9265b593ff474c7"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/organize.py",
+          "kind": "file",
+          "size": 43927,
+          "sha256": "e47b1b7d347a840bb01101b2f843561834045daf50c99e51f7ea86a750de1173"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/promote.py",
+          "kind": "file",
+          "size": 11730,
+          "sha256": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/recall.py",
+          "kind": "file",
+          "size": 172961,
+          "sha256": "a5924004b4b3c5e4556693889356f4e637ba366980ec8705c98ca708888d8cc4"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/schema.py",
+          "kind": "file",
+          "size": 75205,
+          "sha256": "f1f2b96d939bb70597ccbe081c3e965639053a55b003697924672a2264b39744"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/sync.py",
+          "kind": "file",
+          "size": 69024,
+          "sha256": "0f4ec13847a83758852b33563273e840ab4ab741847e2dd0d307b7bf0e6fc8cd"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/tune.py",
+          "kind": "file",
+          "size": 6244,
+          "sha256": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00"
+        },
+        {
+          "path": "host-roots/hermes-zmem/skills/memory/scripts/storelib/write.py",
+          "kind": "file",
+          "size": 74281,
+          "sha256": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
+        },
+        {
+          "path": "workdir",
+          "kind": "directory"
+        }
+      ]
+    },
+    "codex-config": {
+      "before": [],
+      "after": []
+    },
+    "host-roots": {
+      "before": [
+        {
+          "path": "hermes-zmem",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/__init__.py",
+          "kind": "file",
+          "size": 66242,
+          "sha256": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/hooks",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/hooks/_zmem_hook_common.py",
+          "kind": "file",
+          "size": 3460,
+          "sha256": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/hooks/zmem-hermes-convention.py",
+          "kind": "file",
+          "size": 11141,
+          "sha256": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/hooks/zmem-hermes-reflect.py",
+          "kind": "file",
+          "size": 15951,
+          "sha256": "4b59ab56e43245e1f01b4f529759bd75096797dd071cd3973e95c40a50d52226"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/hooks/zmem-hermes-verify.py",
+          "kind": "file",
+          "size": 6651,
+          "sha256": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/plugin.yaml",
+          "kind": "file",
+          "size": 559,
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/auth.py",
+          "kind": "file",
+          "size": 9702,
+          "sha256": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/bind_guard.py",
+          "kind": "file",
+          "size": 5841,
+          "sha256": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/mcp_client.py",
+          "kind": "file",
+          "size": 9768,
+          "sha256": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/mcp_server.py",
+          "kind": "file",
+          "size": 87548,
+          "sha256": "f97a7686812c70b0d671c43f8b9353d5d43ff13d956b548811cd27fe1fcf417c"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/requirements-embeddings.txt",
+          "kind": "file",
+          "size": 1544,
+          "sha256": "6503b0fe5ab3e7aec2d1ecf5e3542cac29c0a3cd85f5cae8e2329141ca2ecedd"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/requirements.txt",
+          "kind": "file",
+          "size": 933,
+          "sha256": "603697b45ea30e609dd2651fdf1e136abe04e63368927e27b84d71f556bd7510"
+        },
+        {
+          "path": "hermes-zmem/skills",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/correction_queue.py",
+          "kind": "file",
+          "size": 21694,
+          "sha256": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/corrections.py",
+          "kind": "file",
+          "size": 27384,
+          "sha256": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/doctor.py",
+          "kind": "file",
+          "size": 129514,
+          "sha256": "ecd99026c5be6a85210cd87fe6e788defb730a8d67c8cfca55d6674fcf2f2602"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/drift.py",
+          "kind": "file",
+          "size": 17547,
+          "sha256": "c281946a92c5c0bdebef6df3ceaee460d76766c75e109566e81645fde823feee"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/embed_profiles.py",
+          "kind": "file",
+          "size": 7018,
+          "sha256": "0666878e7c4924bf8798fed0641bbdaf36b33edad1c7f7d16ecf5e984e06899c"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/embeddings.py",
+          "kind": "file",
+          "size": 30469,
+          "sha256": "5828b0a26701315f730ba383bc4545bffe9f64859ec7426161dde65acfa6cd0a"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/.graphify_analysis.json",
+          "kind": "file",
+          "size": 45120,
+          "sha256": "de24f0b608d2c7067cf03b8b1722a885b793797c983cc2b5e05c77aaa70936c3"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/.graphify_root",
+          "kind": "file",
+          "size": 35,
+          "sha256": "df221dd5233bb5d71b1b53bf613ad96ab33ebec1fb028be8df1f087ba82e995d"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/07ba8cf105fef44476aa0f5caa7f4df83d8d6900fcb4122507cf5e08fd8dd112.json",
+          "kind": "file",
+          "size": 102427,
+          "sha256": "84d101949a61fc00ce8932d2dc11f4ac17a6f0002a13861581b893182a4e0658"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/0f31cee1c084d781ae94b9c34de7d7ff11426859a45cd23619f2c22ff2562b68.json",
+          "kind": "file",
+          "size": 42265,
+          "sha256": "e657f4a98be1383be07f5abf8a22d2de94caa3475e240f7c245a68e59f777d75"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/12042668d39b01fadff021fa6fa6f55d6f7c8f348c2e907c8ae72bdbd3491110.json",
+          "kind": "file",
+          "size": 67116,
+          "sha256": "caf0b1ec0a730a6e90d49690583b4b5a7728bfa8ccf57b6fee8305f5aa010c96"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/130d928936c078103745444112020928078efe1c80191f4a47751bf40e72068f.json",
+          "kind": "file",
+          "size": 91561,
+          "sha256": "f54fac4a32a1e0473420b2edd0922eccae698b8c10e7de6f33d4acc2848040ba"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/142dfd34c652f5ba6462c978d7afe71c5f13412a91a767236c631f2b40fdfcd8.json",
+          "kind": "file",
+          "size": 56069,
+          "sha256": "4aa3513fb2b6f4a8f4eefecb1b4df9bb53634e2b0cfed67ca86c819506d7a19a"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/1ca5549b9e8a36d95c6aaa31bd10ca1b701053e94271c803d60e9ea1092de433.json",
+          "kind": "file",
+          "size": 89595,
+          "sha256": "6dd3538e92627e6bc6aa2bba9d6d6e5ee8dbea3aeaa2cef03930179ef43ca073"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/2c756cb69085a63cb290fa11273b3caf7066469c698a5d1a01bf93557bc22106.json",
+          "kind": "file",
+          "size": 34020,
+          "sha256": "6267564fa2b6585d82f816f0d02aaefa0f7974648b98e305398c64dc6fce1a39"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/2f0ba710a9a03277248289d7b2bf372346eb0ee2cf80ceb6934f97b3ac802a35.json",
+          "kind": "file",
+          "size": 62455,
+          "sha256": "d13174f2513bceaa0eff7b048586c8859059f43d4b71f7dc1bf3f5853bb0608e"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/330be0f5e2da980c0172dd3b31cea8a957e6a72d3950c580eb6bdf582bf0213a.json",
+          "kind": "file",
+          "size": 67955,
+          "sha256": "3dec241a16f7de743e7f606f9a023b5b4c3662e6b348b427417b029c06cf12ef"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/38392d3b10060bf33aa7423c0b85777bb9cca2e50ff438fa6ee71a18f7127a2f.json",
+          "kind": "file",
+          "size": 22058,
+          "sha256": "d5a664009a58260d2af5098fa7a1559281d10768e8947a534e8c56b7536a072f"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/4c583a86ce74a7a893efc9ea40210f5cc5b5edbe6d3f2ea5bbd704cffb484b68.json",
+          "kind": "file",
+          "size": 5025,
+          "sha256": "5f54ed8e97cf160ddf6ec442e9a42335b64ea828634a23339b4f19ba9aee243d"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/51652e5bd0dbaf3443ebf2fdc02bc18d07b06459fc4bc9154519d07db3b6528a.json",
+          "kind": "file",
+          "size": 64155,
+          "sha256": "4d9ce3992caf12adc5c65b569cfa5ebe436d69d436d685937692ef084785d276"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/576ae9cd2a1e898d354149672a9a50b7b280f79acc176798bf6dac19cf17c4e1.json",
+          "kind": "file",
+          "size": 27054,
+          "sha256": "430c6214d022ec69ab674f3b7d732c45773cf1422518a6db96d0fbcf117b460e"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/5d80a96c512c972b566a5f508c91e348f941e89ed50e64224d3197944d47e35f.json",
+          "kind": "file",
+          "size": 12305,
+          "sha256": "6ce8ae507be3bf0fd99ad8b2d8201b8593dbff6d45528ee958c1dec53e9a4b70"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7430ff5cfea270ba3b6df8292a54dbec0e3748dbee955166e39e015e113c28ed.json",
+          "kind": "file",
+          "size": 31890,
+          "sha256": "3c81959f544a32aceeccebca32ec0634474827789c488bec06a13cd8e9cb2369"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/778354b3dfd5e7d21a7cba4ace9f01f317ddd790aba69b3d6c7e58359e525b15.json",
+          "kind": "file",
+          "size": 36332,
+          "sha256": "0501db95e5bc1ef598f107919f800a9c180b0f22e34ddce21b2071a55e327e60"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7af7d06c55e55f5fc9868ef48fadf8518a0dd5170e0b1624ae56582a1d4df292.json",
+          "kind": "file",
+          "size": 201417,
+          "sha256": "b6b6de23e6cbd7b8db266f8c925b8fb157f5b40881663a156dafddc8c5586894"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7e3462851a138a73010a6eb688b770407627ac21e0509c7817ee67c015ca5cd3.json",
+          "kind": "file",
+          "size": 2620,
+          "sha256": "245840ce0eda68bb91207058ba1bebdd0752e3375ec8508aed3a835fb45f7179"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/8c7a87d3e85111678683b55184eae2c2557260fae5ce1934c4bf1991169439a3.json",
+          "kind": "file",
+          "size": 31491,
+          "sha256": "3560a7a4bb025caaa7755b6808c945150d6d91779407e7801fd032045128fe08"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/98c25051cd99b4ea94262228af3d6eb9f7e24355d9e0b6a33e57b81f8be09c2a.json",
+          "kind": "file",
+          "size": 50092,
+          "sha256": "b498fd209ab9c8f4cf33f427355f0bcf27b7de109dd35a7bf1f19d69386fd2f5"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/9c6d978a42dc97847a322385eb3acbe0ad4c4dc42c8a7632d8295a376b202737.json",
+          "kind": "file",
+          "size": 40977,
+          "sha256": "2d1df8976f0198daa5a29baeb1095f495c3c8cc001c44d8a06c9fc4d8df6f9a4"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/a53273da04aeba97147f8dd26e98556a0ba2f98bf78e0a2ee51f9eb4c42227e6.json",
+          "kind": "file",
+          "size": 86803,
+          "sha256": "cf07fa3ed1f79106ca0f0fea8415f7c119324e951b177a435321ea048b0f2f7a"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/adfb51bfd44e06647761c2c7f97c42c582141341879f9b03883f2b7c00bf12fc.json",
+          "kind": "file",
+          "size": 18314,
+          "sha256": "a8c0ee053c41d0895b240c5ca98eced68e764a27853920def07fa9dfd1d98639"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/baa709e9b21eae484daa923bc4cab408a8caee027febaea7fefde412d142beb2.json",
+          "kind": "file",
+          "size": 14163,
+          "sha256": "662508979c2db18023514cd95122f06f06df8ef872891da870db553e812df641"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/c078c307b95009c46878caf6a003bf9ef8a5ff2678633992df0098a109b5ad64.json",
+          "kind": "file",
+          "size": 34846,
+          "sha256": "4476119e9979e944827673d9c8b839244f061e91518c3cf6d35ef0668bc7b3f1"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/c31075416a717e670941b75268c0cd94ed6105d4d5d393559220cb7c74d932f0.json",
+          "kind": "file",
+          "size": 24497,
+          "sha256": "f94a4df96d146ccac49cd2639b414797b2c12f95a88f653f4b53a487a042f4cc"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/cab816c98b6d3212eb51a40f70f22fb5f43375dbe5002d7e3031ae22b54e145c.json",
+          "kind": "file",
+          "size": 6185,
+          "sha256": "a0af0519d00f14437ef4324c99f30151511617405c89f352883bf1734cb13d13"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/cbe627df2b53348eeda540807ac221c345cf3f2f07f8bc3c975653fe0b398813.json",
+          "kind": "file",
+          "size": 15502,
+          "sha256": "a3abc0e7262fcdf0ec0627032f184d8d50be9f7396bc77117ba1294ef74dac2c"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/d164c05f3dd5290c1cbea1ccd6e096feb91c213f9a8d87e33a9ace1c4ae8ee31.json",
+          "kind": "file",
+          "size": 11478,
+          "sha256": "22e13f4e444d58c74c5a4d697aae17901c91ef19d9701c094f4464b94a5af293"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/e84cdbcc5bd0a5ef8b7ad4c2fad8390aaa4d298234607a265f526755eeaa7e7f.json",
+          "kind": "file",
+          "size": 141327,
+          "sha256": "4ad0931d47b2b6a9aa8b4cdee23b03a6cf7da45ad3e812fe8da82acf6054f29f"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/ed4a6a47353eb16b6485f400b356868ab54004ab8794939a5a3b3bff0ef0a799.json",
+          "kind": "file",
+          "size": 34942,
+          "sha256": "e13d6e852f89cb5ec4bb11d830006de761c6a1c78e91107333a06b342d6b2d1b"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/f351572c98574113e460bda14e8228056aad453f82665ec7b549f1c4ae309966.json",
+          "kind": "file",
+          "size": 20649,
+          "sha256": "7834d12f20eb10ce8e1b0002dfd10907298af3c337c2fcac72bf5546ea2026f8"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/fd0309cec71a9be900a297dc8d5d778e7edcaf344fa7c50bca9e1262d6f2c9f2.json",
+          "kind": "file",
+          "size": 18053,
+          "sha256": "7270ad2478d929d7efa8e24b72a370a1a87cf072c5ae2b16da5ae94ea1d8d49a"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/last_query_stamp",
+          "kind": "file",
+          "size": 18,
+          "sha256": "52e7ef5f9bb9ec74267e0fa23f28558ac2437fe0bcdef2aa645692aa431fb1f8"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/stat-index.json",
+          "kind": "file",
+          "size": 7199,
+          "sha256": "600ce5cfffbc26647d6fe0f3a9a4a88950acff09cb50657ef8fcce895776efab"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/graph.json",
+          "kind": "file",
+          "size": 1240959,
+          "sha256": "b3173cdfc825d99a1c5fdd14e9219549d133b8be20bca78c8915103811a469bb"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/manifest.json",
+          "kind": "file",
+          "size": 6891,
+          "sha256": "2ac336c0f87f078f9da1353d2b86f38a35d117c5b79111ac3ad03de552839ac3"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/history_mining.py",
+          "kind": "file",
+          "size": 14365,
+          "sha256": "654ed03ab1a1d3a505f37d2a0840a1f286ad946b4c3559336fa944d749509881"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/host.py",
+          "kind": "file",
+          "size": 54494,
+          "sha256": "56740ddc866ed9b8e38ac3e42de34feb4f0f4329bedf4b2712c7767fde24c495"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/import-store.py",
+          "kind": "file",
+          "size": 11035,
+          "sha256": "75047ada65ad486b1acaa9ff13e38c316ca8dd586d567b3d78f2f9c189398b0d"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/schema_meta.py",
+          "kind": "file",
+          "size": 17166,
+          "sha256": "754df2815aa3888ca08cbc0f92cad8ecf15c3a348ecc35041f1f97255721ddd0"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/store.py",
+          "kind": "file",
+          "size": 2126,
+          "sha256": "99d721f53e8f8c2ba0df6bd60f839f44235f22d8a0dd751020cbad26b4543ffb"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/__init__.py",
+          "kind": "file",
+          "size": 16991,
+          "sha256": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/backup.py",
+          "kind": "file",
+          "size": 36783,
+          "sha256": "d0a345f3eeb209d7946bd916492d35463f47c1840d9ac3194c8af6be84c150fc"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/cli.py",
+          "kind": "file",
+          "size": 121658,
+          "sha256": "99fdbde6c8c5ce3abf987926f91b5612224bd57f8f5fcbd0fb998879483909d4"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/consolidate.py",
+          "kind": "file",
+          "size": 77745,
+          "sha256": "1e937fbfda27401057891c980b5e0c4f006035fc6c2d8bae8508697bf8157d58"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/cross_encoder.py",
+          "kind": "file",
+          "size": 8625,
+          "sha256": "be9da0f236b28d38f5963a3bd1b48861c85039cee7b620543f74543fadbda4da"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/delivery_ledger.py",
+          "kind": "file",
+          "size": 21365,
+          "sha256": "c3f1daa1cd2b2ae9cca2e260b2c40cad2e2fca6aa0b334ae3f0a94eb9b3d3dc2"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/entity.py",
+          "kind": "file",
+          "size": 24020,
+          "sha256": "915fdbafdbe79f1643af751a19ed366e3e2bec3beddcef42e881122310527949"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/episodes.py",
+          "kind": "file",
+          "size": 14828,
+          "sha256": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/eval_gold.py",
+          "kind": "file",
+          "size": 41156,
+          "sha256": "65d5e0ddb9245d9c7cf606455c208c5c3ce3c833cfbcdb78b97cd24f5833dcad"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/false_inject.py",
+          "kind": "file",
+          "size": 17822,
+          "sha256": "e5f3eba59335369acdacf5b77f9b780950b0bc6b3bb2839d8730f072483fb847"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/hygiene.py",
+          "kind": "file",
+          "size": 13150,
+          "sha256": "2aa58e727c6b0a96efeaf7ad103404b2a3916771b0a21d911ce935240be3662b"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/inject.py",
+          "kind": "file",
+          "size": 43686,
+          "sha256": "d7934eb63cd57ad83320039b79011921ad480d3e6bd1c88ca561c87ad90b74a3"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/links.py",
+          "kind": "file",
+          "size": 29109,
+          "sha256": "5bf96acb962728cfa77e2d826dd8d3f85cee979787a7cb1799940c1f68c0302d"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/log_rotate.py",
+          "kind": "file",
+          "size": 9758,
+          "sha256": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/mine.py",
+          "kind": "file",
+          "size": 57375,
+          "sha256": "532e1e042dad30710ff9379dddfac4a2638288ea9fa683f62db5163f29053568"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/miss_rate.py",
+          "kind": "file",
+          "size": 57455,
+          "sha256": "b0c32ea996032683d4f44ba8acbee95bb3094880b241407f63485b1f3a2f8b05"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/namespace_cache.py",
+          "kind": "file",
+          "size": 4214,
+          "sha256": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/ops_tokens.py",
+          "kind": "file",
+          "size": 19783,
+          "sha256": "63e6ddfa0b7339cfbb62b7567f0af4a7da51948afd556759e9265b593ff474c7"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/organize.py",
+          "kind": "file",
+          "size": 43927,
+          "sha256": "e47b1b7d347a840bb01101b2f843561834045daf50c99e51f7ea86a750de1173"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/promote.py",
+          "kind": "file",
+          "size": 11730,
+          "sha256": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/recall.py",
+          "kind": "file",
+          "size": 172961,
+          "sha256": "a5924004b4b3c5e4556693889356f4e637ba366980ec8705c98ca708888d8cc4"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/schema.py",
+          "kind": "file",
+          "size": 75205,
+          "sha256": "f1f2b96d939bb70597ccbe081c3e965639053a55b003697924672a2264b39744"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/sync.py",
+          "kind": "file",
+          "size": 69024,
+          "sha256": "0f4ec13847a83758852b33563273e840ab4ab741847e2dd0d307b7bf0e6fc8cd"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/tune.py",
+          "kind": "file",
+          "size": 6244,
+          "sha256": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/write.py",
+          "kind": "file",
+          "size": 74281,
+          "sha256": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
+        }
+      ],
+      "after": [
+        {
+          "path": "hermes-zmem",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/__init__.py",
+          "kind": "file",
+          "size": 66242,
+          "sha256": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/hooks",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/hooks/_zmem_hook_common.py",
+          "kind": "file",
+          "size": 3460,
+          "sha256": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/hooks/zmem-hermes-convention.py",
+          "kind": "file",
+          "size": 11141,
+          "sha256": "55b8a3cf867394cc7b7706dfc01729674ab670e89c32ce4729129446d5913f60"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/hooks/zmem-hermes-reflect.py",
+          "kind": "file",
+          "size": 15951,
+          "sha256": "4b59ab56e43245e1f01b4f529759bd75096797dd071cd3973e95c40a50d52226"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/hooks/zmem-hermes-verify.py",
+          "kind": "file",
+          "size": 6651,
+          "sha256": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/plugin.yaml",
+          "kind": "file",
+          "size": 559,
+          "sha256": "3197c3f2a5b842ad349a47cafea170da150ad3b4f6a9ac2e10a4183c4d88175a"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/auth.py",
+          "kind": "file",
+          "size": 9702,
+          "sha256": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/bind_guard.py",
+          "kind": "file",
+          "size": 5841,
+          "sha256": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/mcp_client.py",
+          "kind": "file",
+          "size": 9768,
+          "sha256": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/mcp_server.py",
+          "kind": "file",
+          "size": 87548,
+          "sha256": "f97a7686812c70b0d671c43f8b9353d5d43ff13d956b548811cd27fe1fcf417c"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/requirements-embeddings.txt",
+          "kind": "file",
+          "size": 1544,
+          "sha256": "6503b0fe5ab3e7aec2d1ecf5e3542cac29c0a3cd85f5cae8e2329141ca2ecedd"
+        },
+        {
+          "path": "hermes-zmem/hermes-plugin/server/requirements.txt",
+          "kind": "file",
+          "size": 933,
+          "sha256": "603697b45ea30e609dd2651fdf1e136abe04e63368927e27b84d71f556bd7510"
+        },
+        {
+          "path": "hermes-zmem/skills",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/correction_queue.py",
+          "kind": "file",
+          "size": 21694,
+          "sha256": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/corrections.py",
+          "kind": "file",
+          "size": 27384,
+          "sha256": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/doctor.py",
+          "kind": "file",
+          "size": 129514,
+          "sha256": "ecd99026c5be6a85210cd87fe6e788defb730a8d67c8cfca55d6674fcf2f2602"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/drift.py",
+          "kind": "file",
+          "size": 17547,
+          "sha256": "c281946a92c5c0bdebef6df3ceaee460d76766c75e109566e81645fde823feee"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/embed_profiles.py",
+          "kind": "file",
+          "size": 7018,
+          "sha256": "0666878e7c4924bf8798fed0641bbdaf36b33edad1c7f7d16ecf5e984e06899c"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/embeddings.py",
+          "kind": "file",
+          "size": 30469,
+          "sha256": "5828b0a26701315f730ba383bc4545bffe9f64859ec7426161dde65acfa6cd0a"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/.graphify_analysis.json",
+          "kind": "file",
+          "size": 45120,
+          "sha256": "de24f0b608d2c7067cf03b8b1722a885b793797c983cc2b5e05c77aaa70936c3"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/.graphify_root",
+          "kind": "file",
+          "size": 35,
+          "sha256": "df221dd5233bb5d71b1b53bf613ad96ab33ebec1fb028be8df1f087ba82e995d"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/07ba8cf105fef44476aa0f5caa7f4df83d8d6900fcb4122507cf5e08fd8dd112.json",
+          "kind": "file",
+          "size": 102427,
+          "sha256": "84d101949a61fc00ce8932d2dc11f4ac17a6f0002a13861581b893182a4e0658"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/0f31cee1c084d781ae94b9c34de7d7ff11426859a45cd23619f2c22ff2562b68.json",
+          "kind": "file",
+          "size": 42265,
+          "sha256": "e657f4a98be1383be07f5abf8a22d2de94caa3475e240f7c245a68e59f777d75"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/12042668d39b01fadff021fa6fa6f55d6f7c8f348c2e907c8ae72bdbd3491110.json",
+          "kind": "file",
+          "size": 67116,
+          "sha256": "caf0b1ec0a730a6e90d49690583b4b5a7728bfa8ccf57b6fee8305f5aa010c96"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/130d928936c078103745444112020928078efe1c80191f4a47751bf40e72068f.json",
+          "kind": "file",
+          "size": 91561,
+          "sha256": "f54fac4a32a1e0473420b2edd0922eccae698b8c10e7de6f33d4acc2848040ba"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/142dfd34c652f5ba6462c978d7afe71c5f13412a91a767236c631f2b40fdfcd8.json",
+          "kind": "file",
+          "size": 56069,
+          "sha256": "4aa3513fb2b6f4a8f4eefecb1b4df9bb53634e2b0cfed67ca86c819506d7a19a"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/1ca5549b9e8a36d95c6aaa31bd10ca1b701053e94271c803d60e9ea1092de433.json",
+          "kind": "file",
+          "size": 89595,
+          "sha256": "6dd3538e92627e6bc6aa2bba9d6d6e5ee8dbea3aeaa2cef03930179ef43ca073"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/2c756cb69085a63cb290fa11273b3caf7066469c698a5d1a01bf93557bc22106.json",
+          "kind": "file",
+          "size": 34020,
+          "sha256": "6267564fa2b6585d82f816f0d02aaefa0f7974648b98e305398c64dc6fce1a39"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/2f0ba710a9a03277248289d7b2bf372346eb0ee2cf80ceb6934f97b3ac802a35.json",
+          "kind": "file",
+          "size": 62455,
+          "sha256": "d13174f2513bceaa0eff7b048586c8859059f43d4b71f7dc1bf3f5853bb0608e"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/330be0f5e2da980c0172dd3b31cea8a957e6a72d3950c580eb6bdf582bf0213a.json",
+          "kind": "file",
+          "size": 67955,
+          "sha256": "3dec241a16f7de743e7f606f9a023b5b4c3662e6b348b427417b029c06cf12ef"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/38392d3b10060bf33aa7423c0b85777bb9cca2e50ff438fa6ee71a18f7127a2f.json",
+          "kind": "file",
+          "size": 22058,
+          "sha256": "d5a664009a58260d2af5098fa7a1559281d10768e8947a534e8c56b7536a072f"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/4c583a86ce74a7a893efc9ea40210f5cc5b5edbe6d3f2ea5bbd704cffb484b68.json",
+          "kind": "file",
+          "size": 5025,
+          "sha256": "5f54ed8e97cf160ddf6ec442e9a42335b64ea828634a23339b4f19ba9aee243d"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/51652e5bd0dbaf3443ebf2fdc02bc18d07b06459fc4bc9154519d07db3b6528a.json",
+          "kind": "file",
+          "size": 64155,
+          "sha256": "4d9ce3992caf12adc5c65b569cfa5ebe436d69d436d685937692ef084785d276"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/576ae9cd2a1e898d354149672a9a50b7b280f79acc176798bf6dac19cf17c4e1.json",
+          "kind": "file",
+          "size": 27054,
+          "sha256": "430c6214d022ec69ab674f3b7d732c45773cf1422518a6db96d0fbcf117b460e"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/5d80a96c512c972b566a5f508c91e348f941e89ed50e64224d3197944d47e35f.json",
+          "kind": "file",
+          "size": 12305,
+          "sha256": "6ce8ae507be3bf0fd99ad8b2d8201b8593dbff6d45528ee958c1dec53e9a4b70"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7430ff5cfea270ba3b6df8292a54dbec0e3748dbee955166e39e015e113c28ed.json",
+          "kind": "file",
+          "size": 31890,
+          "sha256": "3c81959f544a32aceeccebca32ec0634474827789c488bec06a13cd8e9cb2369"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/778354b3dfd5e7d21a7cba4ace9f01f317ddd790aba69b3d6c7e58359e525b15.json",
+          "kind": "file",
+          "size": 36332,
+          "sha256": "0501db95e5bc1ef598f107919f800a9c180b0f22e34ddce21b2071a55e327e60"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7af7d06c55e55f5fc9868ef48fadf8518a0dd5170e0b1624ae56582a1d4df292.json",
+          "kind": "file",
+          "size": 201417,
+          "sha256": "b6b6de23e6cbd7b8db266f8c925b8fb157f5b40881663a156dafddc8c5586894"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/7e3462851a138a73010a6eb688b770407627ac21e0509c7817ee67c015ca5cd3.json",
+          "kind": "file",
+          "size": 2620,
+          "sha256": "245840ce0eda68bb91207058ba1bebdd0752e3375ec8508aed3a835fb45f7179"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/8c7a87d3e85111678683b55184eae2c2557260fae5ce1934c4bf1991169439a3.json",
+          "kind": "file",
+          "size": 31491,
+          "sha256": "3560a7a4bb025caaa7755b6808c945150d6d91779407e7801fd032045128fe08"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/98c25051cd99b4ea94262228af3d6eb9f7e24355d9e0b6a33e57b81f8be09c2a.json",
+          "kind": "file",
+          "size": 50092,
+          "sha256": "b498fd209ab9c8f4cf33f427355f0bcf27b7de109dd35a7bf1f19d69386fd2f5"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/9c6d978a42dc97847a322385eb3acbe0ad4c4dc42c8a7632d8295a376b202737.json",
+          "kind": "file",
+          "size": 40977,
+          "sha256": "2d1df8976f0198daa5a29baeb1095f495c3c8cc001c44d8a06c9fc4d8df6f9a4"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/a53273da04aeba97147f8dd26e98556a0ba2f98bf78e0a2ee51f9eb4c42227e6.json",
+          "kind": "file",
+          "size": 86803,
+          "sha256": "cf07fa3ed1f79106ca0f0fea8415f7c119324e951b177a435321ea048b0f2f7a"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/adfb51bfd44e06647761c2c7f97c42c582141341879f9b03883f2b7c00bf12fc.json",
+          "kind": "file",
+          "size": 18314,
+          "sha256": "a8c0ee053c41d0895b240c5ca98eced68e764a27853920def07fa9dfd1d98639"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/baa709e9b21eae484daa923bc4cab408a8caee027febaea7fefde412d142beb2.json",
+          "kind": "file",
+          "size": 14163,
+          "sha256": "662508979c2db18023514cd95122f06f06df8ef872891da870db553e812df641"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/c078c307b95009c46878caf6a003bf9ef8a5ff2678633992df0098a109b5ad64.json",
+          "kind": "file",
+          "size": 34846,
+          "sha256": "4476119e9979e944827673d9c8b839244f061e91518c3cf6d35ef0668bc7b3f1"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/c31075416a717e670941b75268c0cd94ed6105d4d5d393559220cb7c74d932f0.json",
+          "kind": "file",
+          "size": 24497,
+          "sha256": "f94a4df96d146ccac49cd2639b414797b2c12f95a88f653f4b53a487a042f4cc"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/cab816c98b6d3212eb51a40f70f22fb5f43375dbe5002d7e3031ae22b54e145c.json",
+          "kind": "file",
+          "size": 6185,
+          "sha256": "a0af0519d00f14437ef4324c99f30151511617405c89f352883bf1734cb13d13"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/cbe627df2b53348eeda540807ac221c345cf3f2f07f8bc3c975653fe0b398813.json",
+          "kind": "file",
+          "size": 15502,
+          "sha256": "a3abc0e7262fcdf0ec0627032f184d8d50be9f7396bc77117ba1294ef74dac2c"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/d164c05f3dd5290c1cbea1ccd6e096feb91c213f9a8d87e33a9ace1c4ae8ee31.json",
+          "kind": "file",
+          "size": 11478,
+          "sha256": "22e13f4e444d58c74c5a4d697aae17901c91ef19d9701c094f4464b94a5af293"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/e84cdbcc5bd0a5ef8b7ad4c2fad8390aaa4d298234607a265f526755eeaa7e7f.json",
+          "kind": "file",
+          "size": 141327,
+          "sha256": "4ad0931d47b2b6a9aa8b4cdee23b03a6cf7da45ad3e812fe8da82acf6054f29f"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/ed4a6a47353eb16b6485f400b356868ab54004ab8794939a5a3b3bff0ef0a799.json",
+          "kind": "file",
+          "size": 34942,
+          "sha256": "e13d6e852f89cb5ec4bb11d830006de761c6a1c78e91107333a06b342d6b2d1b"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/f351572c98574113e460bda14e8228056aad453f82665ec7b549f1c4ae309966.json",
+          "kind": "file",
+          "size": 20649,
+          "sha256": "7834d12f20eb10ce8e1b0002dfd10907298af3c337c2fcac72bf5546ea2026f8"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/ast/v0.9.54-s2/fd0309cec71a9be900a297dc8d5d778e7edcaf344fa7c50bca9e1262d6f2c9f2.json",
+          "kind": "file",
+          "size": 18053,
+          "sha256": "7270ad2478d929d7efa8e24b72a370a1a87cf072c5ae2b16da5ae94ea1d8d49a"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/last_query_stamp",
+          "kind": "file",
+          "size": 18,
+          "sha256": "52e7ef5f9bb9ec74267e0fa23f28558ac2437fe0bcdef2aa645692aa431fb1f8"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/cache/stat-index.json",
+          "kind": "file",
+          "size": 7199,
+          "sha256": "600ce5cfffbc26647d6fe0f3a9a4a88950acff09cb50657ef8fcce895776efab"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/graph.json",
+          "kind": "file",
+          "size": 1240959,
+          "sha256": "b3173cdfc825d99a1c5fdd14e9219549d133b8be20bca78c8915103811a469bb"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/graphify-out/manifest.json",
+          "kind": "file",
+          "size": 6891,
+          "sha256": "2ac336c0f87f078f9da1353d2b86f38a35d117c5b79111ac3ad03de552839ac3"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/history_mining.py",
+          "kind": "file",
+          "size": 14365,
+          "sha256": "654ed03ab1a1d3a505f37d2a0840a1f286ad946b4c3559336fa944d749509881"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/host.py",
+          "kind": "file",
+          "size": 54494,
+          "sha256": "56740ddc866ed9b8e38ac3e42de34feb4f0f4329bedf4b2712c7767fde24c495"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/import-store.py",
+          "kind": "file",
+          "size": 11035,
+          "sha256": "75047ada65ad486b1acaa9ff13e38c316ca8dd586d567b3d78f2f9c189398b0d"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/schema_meta.py",
+          "kind": "file",
+          "size": 17166,
+          "sha256": "754df2815aa3888ca08cbc0f92cad8ecf15c3a348ecc35041f1f97255721ddd0"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/store.py",
+          "kind": "file",
+          "size": 2126,
+          "sha256": "99d721f53e8f8c2ba0df6bd60f839f44235f22d8a0dd751020cbad26b4543ffb"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib",
+          "kind": "directory"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/__init__.py",
+          "kind": "file",
+          "size": 16991,
+          "sha256": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/backup.py",
+          "kind": "file",
+          "size": 36783,
+          "sha256": "d0a345f3eeb209d7946bd916492d35463f47c1840d9ac3194c8af6be84c150fc"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/cli.py",
+          "kind": "file",
+          "size": 121658,
+          "sha256": "99fdbde6c8c5ce3abf987926f91b5612224bd57f8f5fcbd0fb998879483909d4"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/consolidate.py",
+          "kind": "file",
+          "size": 77745,
+          "sha256": "1e937fbfda27401057891c980b5e0c4f006035fc6c2d8bae8508697bf8157d58"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/cross_encoder.py",
+          "kind": "file",
+          "size": 8625,
+          "sha256": "be9da0f236b28d38f5963a3bd1b48861c85039cee7b620543f74543fadbda4da"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/delivery_ledger.py",
+          "kind": "file",
+          "size": 21365,
+          "sha256": "c3f1daa1cd2b2ae9cca2e260b2c40cad2e2fca6aa0b334ae3f0a94eb9b3d3dc2"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/entity.py",
+          "kind": "file",
+          "size": 24020,
+          "sha256": "915fdbafdbe79f1643af751a19ed366e3e2bec3beddcef42e881122310527949"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/episodes.py",
+          "kind": "file",
+          "size": 14828,
+          "sha256": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/eval_gold.py",
+          "kind": "file",
+          "size": 41156,
+          "sha256": "65d5e0ddb9245d9c7cf606455c208c5c3ce3c833cfbcdb78b97cd24f5833dcad"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/false_inject.py",
+          "kind": "file",
+          "size": 17822,
+          "sha256": "e5f3eba59335369acdacf5b77f9b780950b0bc6b3bb2839d8730f072483fb847"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/hygiene.py",
+          "kind": "file",
+          "size": 13150,
+          "sha256": "2aa58e727c6b0a96efeaf7ad103404b2a3916771b0a21d911ce935240be3662b"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/inject.py",
+          "kind": "file",
+          "size": 43686,
+          "sha256": "d7934eb63cd57ad83320039b79011921ad480d3e6bd1c88ca561c87ad90b74a3"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/links.py",
+          "kind": "file",
+          "size": 29109,
+          "sha256": "5bf96acb962728cfa77e2d826dd8d3f85cee979787a7cb1799940c1f68c0302d"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/log_rotate.py",
+          "kind": "file",
+          "size": 9758,
+          "sha256": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/mine.py",
+          "kind": "file",
+          "size": 57375,
+          "sha256": "532e1e042dad30710ff9379dddfac4a2638288ea9fa683f62db5163f29053568"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/miss_rate.py",
+          "kind": "file",
+          "size": 57455,
+          "sha256": "b0c32ea996032683d4f44ba8acbee95bb3094880b241407f63485b1f3a2f8b05"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/namespace_cache.py",
+          "kind": "file",
+          "size": 4214,
+          "sha256": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/ops_tokens.py",
+          "kind": "file",
+          "size": 19783,
+          "sha256": "63e6ddfa0b7339cfbb62b7567f0af4a7da51948afd556759e9265b593ff474c7"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/organize.py",
+          "kind": "file",
+          "size": 43927,
+          "sha256": "e47b1b7d347a840bb01101b2f843561834045daf50c99e51f7ea86a750de1173"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/promote.py",
+          "kind": "file",
+          "size": 11730,
+          "sha256": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/recall.py",
+          "kind": "file",
+          "size": 172961,
+          "sha256": "a5924004b4b3c5e4556693889356f4e637ba366980ec8705c98ca708888d8cc4"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/schema.py",
+          "kind": "file",
+          "size": 75205,
+          "sha256": "f1f2b96d939bb70597ccbe081c3e965639053a55b003697924672a2264b39744"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/sync.py",
+          "kind": "file",
+          "size": 69024,
+          "sha256": "0f4ec13847a83758852b33563273e840ab4ab741847e2dd0d307b7bf0e6fc8cd"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/tune.py",
+          "kind": "file",
+          "size": 6244,
+          "sha256": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00"
+        },
+        {
+          "path": "hermes-zmem/skills/memory/scripts/storelib/write.py",
+          "kind": "file",
+          "size": 74281,
+          "sha256": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
+        }
+      ]
+    },
+    "operator-config": {
+      "before": [],
+      "after": []
+    }
+  },
+  "notes": "version/git measurement did not produce a usable outcome (deadline or nonzero exit)",
+  "mode": "gateway",
+  "callback_evidence": [
+    "pre_llm_call"
+  ],
+  "hermes_sha": "6e9dcc7"
+}

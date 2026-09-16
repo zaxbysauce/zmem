@@ -1,0 +1,90 @@
+{
+  "lane": "codex-trust",
+  "host": "codex",
+  "verdict": "fail",
+  "reason": "version-unavailable",
+  "sha": "00743f8084cbc1594683b33cfb8bf14d2ce40d46ca6ba9f7142de6ba31502a84",
+  "version": null,
+  "command": [
+    "codex.CMD",
+    "exec",
+    "--skip-git-repo-check",
+    "-"
+  ],
+  "timestamp": "2026-09-16T08:12:23Z",
+  "manifest_hook_ids": [
+    "PostToolUse:zmem-launch.js",
+    "PreCompact:zmem-launch.js",
+    "PreToolUse:zmem-launch.js",
+    "SessionStart:zmem-launch.js",
+    "Stop:zmem-launch.js",
+    "SubagentStart:zmem-launch.js",
+    "SubagentStop:zmem-launch.js",
+    "UserPromptSubmit:zmem-launch.js"
+  ],
+  "fired_hook_ids": [],
+  "inventories": {
+    "canary-data": {
+      "before": [
+        {
+          "path": "codex-config",
+          "kind": "directory"
+        },
+        {
+          "path": "codex-config/hooks.codex.json",
+          "kind": "file",
+          "size": 2458,
+          "sha256": "1eb67efe6d29e8d945b37dbdb59b1904d3ef876ff9a62ebecfac47b08cb80be1"
+        },
+        {
+          "path": "workdir",
+          "kind": "directory"
+        }
+      ],
+      "after": [
+        {
+          "path": "codex-config",
+          "kind": "directory"
+        },
+        {
+          "path": "codex-config/hooks.codex.json",
+          "kind": "file",
+          "size": 2458,
+          "sha256": "1eb67efe6d29e8d945b37dbdb59b1904d3ef876ff9a62ebecfac47b08cb80be1"
+        },
+        {
+          "path": "workdir",
+          "kind": "directory"
+        }
+      ]
+    },
+    "codex-config": {
+      "before": [
+        {
+          "path": "hooks.codex.json",
+          "kind": "file",
+          "size": 2458,
+          "sha256": "1eb67efe6d29e8d945b37dbdb59b1904d3ef876ff9a62ebecfac47b08cb80be1"
+        }
+      ],
+      "after": [
+        {
+          "path": "hooks.codex.json",
+          "kind": "file",
+          "size": 2458,
+          "sha256": "1eb67efe6d29e8d945b37dbdb59b1904d3ef876ff9a62ebecfac47b08cb80be1"
+        }
+      ]
+    },
+    "host-roots": {
+      "before": [],
+      "after": []
+    },
+    "operator-config": {
+      "before": [],
+      "after": []
+    }
+  },
+  "notes": "the supported exec invocation emitted no version line (rc=0; stdout tail: pong)",
+  "trust_state": "./tmp\\lane-gate\\codex-trust\\operator-config\\codex\\hooks.state"
+}

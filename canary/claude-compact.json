@@ -1,0 +1,97 @@
+{
+  "lane": "claude-compact",
+  "host": "claude",
+  "verdict": "fail",
+  "reason": "compact-undetermined",
+  "sha": "19654006672b6da7c945115eea99ca10051796016df563a65b3f0c7d72720ef0",
+  "version": null,
+  "command": [
+    "claude"
+  ],
+  "timestamp": "2026-09-16T08:12:16Z",
+  "manifest_hook_ids": [
+    "PostCompact:zmem-launch.js",
+    "PostToolBatch:zmem-launch.js",
+    "PostToolUse:zmem-launch.js",
+    "PostToolUseFailure:zmem-launch.js",
+    "PreCompact:zmem-launch.js",
+    "PreToolUse:zmem-launch.js",
+    "SessionEnd:zmem-launch.js",
+    "SessionStart:zmem-launch.js",
+    "Stop:zmem-launch.js",
+    "SubagentStart:zmem-launch.js",
+    "SubagentStop:zmem-launch.js",
+    "UserPromptSubmit:zmem-launch.js"
+  ],
+  "fired_hook_ids": [],
+  "inventories": {
+    "canary-data": {
+      "before": [
+        {
+          "path": ".zmem-writers",
+          "kind": "directory"
+        },
+        {
+          "path": "ops",
+          "kind": "directory"
+        },
+        {
+          "path": "ops/71ff135482fee741c33d798161a2f9ba.ledger",
+          "kind": "file",
+          "size": 283,
+          "sha256": "2e25bd1fa2abff66c7b701dc7e6fe9203b57b76b50ce9a7141efc1d91796f23e"
+        },
+        {
+          "path": "store.sqlite",
+          "kind": "file",
+          "size": 208896,
+          "sha256": "9355e4c9ad8e789f3cf4786723e5b4dba78ea67f2d610ca3812c1bc96a9e21f1"
+        },
+        {
+          "path": "workdir",
+          "kind": "directory"
+        }
+      ],
+      "after": [
+        {
+          "path": ".zmem-writers",
+          "kind": "directory"
+        },
+        {
+          "path": "ops",
+          "kind": "directory"
+        },
+        {
+          "path": "ops/71ff135482fee741c33d798161a2f9ba.ledger",
+          "kind": "file",
+          "size": 283,
+          "sha256": "2e25bd1fa2abff66c7b701dc7e6fe9203b57b76b50ce9a7141efc1d91796f23e"
+        },
+        {
+          "path": "store.sqlite",
+          "kind": "file",
+          "size": 208896,
+          "sha256": "9355e4c9ad8e789f3cf4786723e5b4dba78ea67f2d610ca3812c1bc96a9e21f1"
+        },
+        {
+          "path": "workdir",
+          "kind": "directory"
+        }
+      ]
+    },
+    "codex-config": {
+      "before": [],
+      "after": []
+    },
+    "host-roots": {
+      "before": [],
+      "after": []
+    },
+    "operator-config": {
+      "before": [],
+      "after": []
+    }
+  },
+  "notes": "interactive session unavailable on this platform (pty-unavailable: No module named 'termios')",
+  "compact_result": "unknown"
+}
