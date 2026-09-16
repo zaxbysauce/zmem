@@ -871,6 +871,27 @@ def select_and_budget_for_injection(
         except Exception:
             pass
 
+    # Issue #98: the cross-project tier's surface policy is store-side, so
+    # the selector derives the flag itself (the public #158 signature is
+    # frozen — no new parameter) and forwards the moment/ops context through
+    # the internal recall seam below. On an env-enabled user_prompt surface
+    # the tier is still hazard-gated, so derive the ops tokens from the
+    # prompt event here at the store boundary — the same reason pretool
+    # derivation lives in this file (adapters never import or duplicate the
+    # allowlist; the #158 boundary keeps the hook body storelib-free). The
+    # post-tool ring stays pretool-only by design.
+    try:
+        include_cross_project = bool(
+            recall_module.cross_project_surface_enabled(moment))
+    except Exception:
+        include_cross_project = False
+    if (include_cross_project and moment == "user_prompt"
+            and ops_tokens is None and effective_query.strip()):
+        try:
+            effective_ops = ops.derive_ops_tokens(effective_query)
+        except Exception:
+            effective_ops = []
+
     # Query-less passive pulls are the documented recent lane. Resolve its
     # env-tunable floor at the store boundary, while preserving an explicit
     # CLI/API floor (notably session-aware ``recent --min-confidence``).
@@ -911,6 +932,9 @@ def select_and_budget_for_injection(
             exclude_ids=exclusions, _capture=capture,
             _injection_budget_tokens=budget,
             min_confidence=effective_min_confidence,
+            include_cross_project=include_cross_project,
+            _cross_moment=moment,
+            _cross_ops_tokens=list(effective_ops) or None,
         )
         if effective_query.strip():
             kwargs["query"] = effective_query

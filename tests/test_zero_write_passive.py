@@ -257,6 +257,99 @@ class AcceptanceRecallTest(ForInjectionBase):
         self.assertTrue(all(c[0] == 0 for c in self._counts().values()),
                         "retrieval_count never written on the injection lane")
 
+    def test_cross_row_telemetry_once(self):
+        """Issue #98 telemetry law for the cross tier: a DELIVERED cross row
+        bumps surfaced_count exactly once (never retrieval_count); a
+        BUDGET-DROPPED cross row bumps nothing; and with no_telemetry the
+        store file is byte-identical pre/post while the cross row still
+        renders."""
+        r = self._run("add", "--namespace", "project:foreign-zw", "--type",
+                      "lesson", "--content",
+                      "crosscanary zw: git stash pop needs git stash list "
+                      "first", "--tags", "xcanary", "--signal", "test",
+                      "--confidence", "0.9", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        def foreign_counts():
+            conn = sqlite3.connect(self.store)
+            try:
+                return conn.execute(
+                    "SELECT id, retrieval_count, surfaced_count FROM memory "
+                    "WHERE namespace='project:foreign-zw'").fetchone()
+            finally:
+                conn.close()
+
+        def cross_recall(session, extra_env=None):
+            return self._run(
+                "recall", "--query", "git stash pop", "--namespace", NS,
+                "--limit", "5", "--no-bump", "--for-injection", "--json",
+                "--session-id", session, "--moment", "pretool",
+                "--lane", "zcode", "--ops-token", "git", "--ops-token",
+                "stash", "--ops-token", "pop", extra_env=extra_env)
+
+        # Delivered: the cross row rides the tier exactly once.
+        doc = json.loads(cross_recall("s-cross-zw").stdout)
+        cross_rows = [row for row in doc["results"]
+                      if row.get("tier") == "cross"]
+        self.assertEqual(len(cross_rows), 1,
+                         "one qualifying foreign row must ride the cross tier")
+        self.assertEqual(cross_rows[0]["namespace"], "project:foreign-zw")
+        _fid, retrieval, surfaced = foreign_counts()
+        self.assertEqual(surfaced, 1,
+                         "a delivered cross row records exactly one surface")
+        self.assertEqual(retrieval, 0,
+                         "the passive lane never writes retrieval_count")
+
+        # Budget-dropped: a cross row the budget rejects bumps nothing.
+        doc = json.loads(cross_recall(
+            "s-cross-zw-b",
+            extra_env={"ZMEM_INJECT_TOKEN_BUDGET": "1"}).stdout)
+        self.assertEqual(doc["results"], [])
+        self.assertEqual(doc["reason"], "budget-drop")
+        _fid, retrieval, surfaced = foreign_counts()
+        self.assertEqual(surfaced, 1,
+                         "a budget-dropped cross row must stay untouched")
+        self.assertEqual(retrieval, 0)
+
+        # no_telemetry: the cross row still renders, the store bytes are
+        # identical (the ZeroWriteTest in-process seam pattern).
+        before = Path(self.store).read_bytes()
+        saved_store = os.environ.get("ZMEM_STORE")
+        os.environ["ZMEM_STORE"] = self.store
+        storelib._refresh_env_state()
+        try:
+            import io
+            import contextlib
+            conn = sqlite3.connect(
+                "file:" + self.store.replace(os.sep, "/") + "?mode=ro",
+                uri=True)
+            conn.row_factory = sqlite3.Row  # storelib readers index by name
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rows = storelib.recall_memory(
+                        conn, query="git stash pop", namespace=NS, limit=5,
+                        as_json=False, no_bump=True, for_injection=True,
+                        no_telemetry=True, include_cross_project=True,
+                        _cross_moment="pretool",
+                        _cross_ops_tokens=["git", "stash", "pop"])
+                self.assertTrue(
+                    any(row.get("tier") == "cross" for row in rows),
+                    "filters ran; the cross row still renders")
+                self.assertIn("[tier=cross]", buf.getvalue())
+            finally:
+                conn.close()
+            self.assertEqual(
+                Path(self.store).read_bytes(), before,
+                "no_telemetry must keep the store byte-identical even when "
+                "the cross tier delivers")
+        finally:
+            if saved_store is None:
+                os.environ.pop("ZMEM_STORE", None)
+            else:
+                os.environ["ZMEM_STORE"] = saved_store
+            storelib._refresh_env_state()
+
 
 class AcceptanceRecentTest(ForInjectionBase):
     """AC1+AC2 on the recent lane (SessionStart/PreCompact/subagent)."""

@@ -133,6 +133,65 @@ class PreToolModeTest(unittest.TestCase):
         self.assertIn("reason=injected", line)
         self.assertNotRegex(line, r"(?:^|\s)ops=\d+")
 
+    def test_cross_hook_flag_env_matrix(self):
+        """Issue #98: the hook forwards --include-cross-project per the
+        ZMEM_CROSS_PROJECT surface matrix — pretool delivers cross rows,
+        user_prompt stays closed unless the env is exactly "1" (where the
+        hook also derives --ops-token values from the prompt), "0" is
+        enforced store-side, and posttoolbatch behaves as pretool via its
+        ops ring."""
+        CROSS_LESSON = ("crosscanary: git stash pop on a foreign project "
+                        "needs git stash list first")
+        _seed(_clean_env(self._tmp), "project:foreign-a", CROSS_LESSON)
+
+        def ctx_for(label, mode, event, ring=False, **extra):
+            if ring:
+                sys.path.insert(0, str(SCRIPTS))
+                try:
+                    import storelib.ops_tokens as ops
+                finally:
+                    sys.path.pop(0)
+                self.assertTrue(
+                    ops.append_ops_ring(self._tmp, f"mx-{label}", "Bash",
+                                        "git stash pop"),
+                    "ring write failed — the posttoolbatch cell cannot run")
+            event_full = dict(event)
+            event_full["session_id"] = f"mx-{label}"
+            out, rc = _run_body(self._tmp, mode, event_full,
+                                ns="project:pretool", **extra)
+            self.assertEqual(rc, 0)
+            return _ctx(out)
+
+        pretool_event = {"tool_name": "Bash",
+                         "tool_input": {"command": "git stash pop"}}
+        user_prompt_event = {"prompt":
+                             "git stash pop the stash before switching branches"}
+        marker = "[ns=project:foreign-a] [tier=cross]"
+
+        # unset -> pretool armed, user_prompt closed.
+        ctx = ctx_for("pretool-unset", "pretool", pretool_event)
+        self.assertIn("crosscanary", ctx)
+        self.assertIn(marker, ctx)
+        ctx = ctx_for("user-prompt-unset", "user_prompt", user_prompt_event)
+        self.assertNotIn("[tier=cross]", ctx)
+        # "0" -> the kill switch wins even though the hook still passes the
+        # flag on pretool (the store enforces the policy).
+        ctx = ctx_for("pretool-env0", "pretool", pretool_event,
+                      ZMEM_CROSS_PROJECT="0")
+        self.assertNotIn("[tier=cross]", ctx)
+        # "1" -> user_prompt arms; the store-side selector derives the ops
+        # tokens from the prompt event itself (#98: derivation lives at the
+        # store boundary — the #158 rule keeps the hook body storelib-free),
+        # and only those derived tokens can arm the hazard gate here.
+        ctx = ctx_for("user-prompt-env1", "user_prompt", user_prompt_event,
+                      ZMEM_CROSS_PROJECT="1")
+        self.assertIn(marker, ctx)
+        # posttoolbatch maps to the pretool moment; its ops context arrives
+        # via the per-session ring a PostToolUse hook wrote.
+        ctx = ctx_for("posttoolbatch-unset", "posttoolbatch", pretool_event,
+                      ring=True)
+        self.assertIn(marker, ctx)
+
     def test_edit_file_path_derives_basename_query(self):
         out, rc = _run_body(
             self._tmp, "pretool",
