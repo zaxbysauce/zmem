@@ -796,9 +796,20 @@ class CrossProjectReviewRound(CrossProjectLaneTest):
             capture_output=True, text=True, env=env, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         rows = json.loads(proc.stdout).get("results", [])
-        self.assertTrue([r for r in rows if r.get("tier") == "cross"],
+        self.assertTrue(rows,
                         "unscoped explicit recall must deliver the foreign "
                         "hazard row instead of crashing")
+        # PR #207 final critic: on the unscoped path the main pool has no
+        # namespace filter, so the foreign row already surfaces via the main
+        # pool — the splice must dedupe, delivering each id exactly once and
+        # never re-marking a main-pool row as tier=cross.
+        ids = [r["id"] for r in rows]
+        self.assertEqual(len(ids), len(set(ids)),
+                         "unscoped recall must not double-deliver a row "
+                         "that both the main pool and the cross tier match")
+        self.assertFalse([r for r in rows if r.get("tier") == "cross"],
+                         "a row already delivered by the unscoped main pool "
+                         "must not be re-spliced as tier=cross")
 
     def _seed_starve_row(self, conn, row_id: str, namespace: str,
                          content: str, *, signal: str,

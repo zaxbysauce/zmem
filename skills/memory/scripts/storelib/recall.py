@@ -1494,8 +1494,16 @@ def _splice_cross_rows(results: list, cross_scored: list) -> list:
         if row.get("namespace") == GLOBAL_NAMESPACE:
             insert_at = idx
             break
+    # PR #207 final critic: on an unscoped call the main pool has no
+    # namespace filter, so a foreign row can already be present in
+    # ``results`` — a cross splice must never deliver the same id twice
+    # (no-double-count merge contract).
+    seen = {r["id"] for r in results}
     for offset, (_score, item) in enumerate(cross_scored):
+        if item["id"] in seen:
+            continue
         results.insert(insert_at + offset, item)
+        seen.add(item["id"])
         spliced_ids.append(item["id"])
     return spliced_ids
 
