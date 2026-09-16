@@ -1683,7 +1683,8 @@ def main():
                                   args.moment,
                                   explicit=args.include_cross_project),
                               _cross_moment=args.moment,
-                              _cross_ops_tokens=list(args.ops_token) or None)
+                              _cross_ops_tokens=list(args.ops_token) or None,
+                              _cross_explicit=args.include_cross_project)
         elif args.cmd == "recent":
             if args.for_injection and args.json and args.session_id:
                 try:
@@ -1720,7 +1721,8 @@ def main():
                               args.moment,
                               explicit=args.include_cross_project),
                           _cross_moment=args.moment,
-                          _cross_ops_tokens=list(args.ops_token) or None)
+                          _cross_ops_tokens=list(args.ops_token) or None,
+                          _cross_explicit=args.include_cross_project)
         elif args.cmd == "prefetch":
             # Issue #159: one selector call, one envelope. Fixed limit/
             # global_limit/budget (the contract's exact dispatch values);

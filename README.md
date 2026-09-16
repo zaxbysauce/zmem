@@ -95,8 +95,9 @@ global slots.
 
 `ZMEM_CROSS_PROJECT` surface switch: **unset** → `pretool` only (PostToolBatch
 maps to `pretool`); **`0`** → off everywhere (wins even over an explicit flag);
-**`1`** → `pretool` and `user_prompt` (the hook then derives ops tokens from
-the prompt event); any other non-empty value → `pretool` only plus a one-shot
+**`1`** → `pretool` and `user_prompt` (the session selector then derives
+ops tokens from the prompt event store-side — the hook stays a thin flag
+forwarder); any other non-empty value → `pretool` only plus a one-shot
 warning. `ZMEM_CROSS_PROJECT_HAZARD_VERBS` overrides the hazard-verb set
 (comma-separated, trimmed, case-folded, de-duplicated; unknown verbs are
 dropped with the one-shot warning). `store.py recall|recent

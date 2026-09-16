@@ -613,8 +613,9 @@ exactly when you are about to repeat its incident. Admission requires ALL of:
 Surface policy (`ZMEM_CROSS_PROJECT`): unset → `pretool` only (PostToolBatch
 maps to the `pretool` moment); `0` → off everywhere (wins even over an
 explicit `--include-cross-project`); `1` → `pretool` and `user_prompt` (on an
-env-enabled `user_prompt` surface the hook derives ops tokens from the prompt
-event itself); any other non-empty value → `pretool` only plus a one-shot
+env-enabled `user_prompt` surface the store-side selector derives ops tokens
+from the prompt event itself — the #158 hook boundary keeps the hook a thin
+flag forwarder); any other non-empty value → `pretool` only plus a one-shot
 stderr warning. The tier is query-time — the queryless `recent` pull never
 admits cross rows.
 

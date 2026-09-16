@@ -1418,12 +1418,15 @@ def cross_project_admissions(
     now_epoch: float | None = None,
     as_of: str | None = None,
     weights: dict | None = None,
+    explicit: bool = False,
 ) -> list:
     """Evaluate the cross-project hazard tier (issue #98).
 
     Returns at most CROSS_PROJECT_MAX ``(score, row)`` pairs in
     deterministic score-descending, id-ascending order. Admission requires
-    ALL of: the surface policy enabled for ``moment``; the derived ops
+    ALL of: the surface policy enabled for ``moment`` (``explicit=True``
+    — the CLI --include-cross-project flag — forces the tier on for every
+    env state except "0"); the derived ops
     tokens whole-token-intersecting the hazard-verb set; a live row (the
     superseded_at filter below); the standard per-tier floors
     (confidence + issue #113 relevance); ``signal`` in
@@ -1433,7 +1436,7 @@ def cross_project_admissions(
     set returns []. The tier is deliberately NOT MMR-diversified: cap-2
     selection stays deterministic.
     """
-    if not cross_project_surface_enabled(moment):
+    if not cross_project_surface_enabled(moment, explicit=explicit):
         return []
     if not query or not query.strip():
         return []
@@ -1834,6 +1837,7 @@ def _recall_memory_impl(
     include_cross_project: bool = False,
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -1988,7 +1992,7 @@ def _recall_memory_impl(
             current_namespace=namespace, ops_tokens=_cross_ops_tokens,
             exclude_ids=exclude_ids, min_confidence=min_confidence,
             hybrid=hybrid, now_epoch=now_epoch, as_of=as_of,
-            weights=weights,
+            weights=weights, explicit=_cross_explicit,
         )
         for _score, item in cross_scored:
             item["prompt_injection_risk"] = _classify_injection(item)
@@ -3124,6 +3128,7 @@ def _recent_memory_impl(
     include_cross_project: bool = False,
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -3204,6 +3209,7 @@ def _recent_memory_impl(
             conn, query="", moment=_cross_moment,
             current_namespace=namespace, ops_tokens=_cross_ops_tokens,
             exclude_ids=exclude_ids, min_confidence=min_confidence,
+            explicit=_cross_explicit,
         )
         for _score, item in cross_scored:
             item["prompt_injection_risk"] = _classify_injection(item)
@@ -3312,6 +3318,7 @@ def _collect_injection_candidates(
     include_cross_project: bool = False,
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
 ) -> dict:
     """Run one passive retrieval and return its unrendered details object.
 
@@ -3337,6 +3344,7 @@ def _collect_injection_candidates(
         include_cross_project=include_cross_project,
         _cross_moment=_cross_moment,
         _cross_ops_tokens=_cross_ops_tokens,
+        _cross_explicit=_cross_explicit,
     )
     if query is None:
         _recent_memory_impl(
@@ -3389,6 +3397,7 @@ def recall_memory(
     include_cross_project: bool = False,
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
 ) -> list[dict]:
     """Explicit recall entry point (UserPromptSubmit, SubagentStart,
     and SessionStart hook surfaces share this path).
@@ -3430,6 +3439,7 @@ def recall_memory(
             include_cross_project=include_cross_project,
             _cross_moment=_cross_moment,
             _cross_ops_tokens=_cross_ops_tokens,
+            _cross_explicit=_cross_explicit,
         )
 
     details = _collect_injection_candidates(
@@ -3454,6 +3464,7 @@ def recall_memory(
         include_cross_project=include_cross_project,
         _cross_moment=_cross_moment,
         _cross_ops_tokens=_cross_ops_tokens,
+        _cross_explicit=_cross_explicit,
     )
     if _capture is not None:
         _capture.clear()
@@ -3496,6 +3507,7 @@ def recent_memory(
     include_cross_project: bool = False,
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
 ) -> list[dict]:
     # _recent_memory_impl performs the same emit-time _classify_injection
     # filtering before this public wrapper hands candidates to the shared
@@ -3516,6 +3528,7 @@ def recent_memory(
             include_cross_project=include_cross_project,
             _cross_moment=_cross_moment,
             _cross_ops_tokens=_cross_ops_tokens,
+            _cross_explicit=_cross_explicit,
         )
 
     details = _collect_injection_candidates(
@@ -3540,6 +3553,7 @@ def recent_memory(
         include_cross_project=include_cross_project,
         _cross_moment=_cross_moment,
         _cross_ops_tokens=_cross_ops_tokens,
+        _cross_explicit=_cross_explicit,
     )
     if _capture is not None:
         _capture.clear()

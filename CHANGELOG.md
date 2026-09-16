@@ -36,10 +36,13 @@ README.
   dropped with the one-shot warning; an override with no usable verb falls
   back to the default set.
 - **`store.py recall|recent --include-cross-project`**: explicit opt-in for
-  direct calls; the env switch still governs (`0` disables). The session
-  selector (`#158` envelope, unchanged shape) computes the same policy
-  store-side. `ZMEM_CROSS_PROJECT=0` with `--for-injection` remains a
-  byte-identical no-op lane.
+  direct calls; the env switch still governs (`0` disables). On an
+  env-enabled `user_prompt` surface the store-side selector derives ops
+  tokens from the prompt event itself (the hook forwards only the flag,
+  preserving the #158 storelib-free boundary). The session selector (`#158`
+  envelope, unchanged shape) computes the same policy store-side.
+  `ZMEM_CROSS_PROJECT=0` with `--for-injection` remains a byte-identical
+  no-op lane.
 
 ### Notes
 - The five-tier reserved-slot allocator (Workstream I, #167) is not on main

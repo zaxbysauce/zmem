@@ -477,6 +477,51 @@ class CrossProjectLaneTest(unittest.TestCase):
             self.assertIn(needle, cli_source,
                           f"cli.py must keep the #158+#98 dispatch seam "
                           f"({needle!r} missing)")
+        # R2 (final-critic): the explicit flag must reach the admission
+        # re-gate, so a direct CLI call WITHOUT --moment still delivers (env
+        # unset) and env=0 still kills it — the docstring's promise.
+        self.assertIn("_cross_explicit=args.include_cross_project",
+                      cli_source,
+                      "cli.py must thread the explicit flag into the "
+                      "admission re-gate")
+        recall_source = (SCRIPTS_DIR / "storelib" / "recall.py").read_text(
+            encoding="utf-8")
+        self.assertIn("explicit=_cross_explicit", recall_source,
+                      "recall.py admissions must honor the explicit flag")
+
+    def test_explicit_flag_direct_cli(self):
+        """--include-cross-project without --moment: env unset delivers the
+        cross row through the direct path; ZMEM_CROSS_PROJECT=0 kills it."""
+        import json as _json
+        import subprocess as _sp
+
+        def run_cli(store_py, **extra):
+            env = _clean_env(cell, **extra)
+            proc = _sp.run(
+                [sys.executable, str(store_py), "recall",
+                 "--query", QUERY, "--namespace", "project:current",
+                 "--include-cross-project",
+                 "--ops-token", "git", "--ops-token", "stash",
+                 "--ops-token", "pop", "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            return proc
+
+        store_py = STORE_PY
+        cell = tempfile.mkdtemp(prefix="zmem-crosslane-explicit-",
+                                dir=self.tmp)
+        self._seed_hook_store(cell)
+        proc = run_cli(store_py)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = _json.loads(proc.stdout).get("results", [])
+        self.assertIn("cross", [r.get("tier") for r in rows],
+                      "explicit flag without --moment must deliver the "
+                      "cross row (env unset)")
+        proc = run_cli(store_py, ZMEM_CROSS_PROJECT="0")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = _json.loads(proc.stdout).get("results", [])
+        self.assertNotIn("cross", [r.get("tier") for r in rows],
+                         "env=0 must kill the tier even with the explicit "
+                         "flag")
 
         # --- end-to-end through the REAL hook body -----------------------
         pretool_event = {"tool_name": "Bash",
