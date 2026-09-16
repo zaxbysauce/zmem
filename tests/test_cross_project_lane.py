@@ -811,6 +811,31 @@ class CrossProjectReviewRound(CrossProjectLaneTest):
                          "a row already delivered by the unscoped main pool "
                          "must not be re-spliced as tier=cross")
 
+    def test_splice_skips_dup_without_order_drift(self):
+        """PR #207 final critic round 2: a skipped duplicate must not shift
+        the insertion cursor — a later cross row lands BEFORE the global
+        tier, never splitting it."""
+        from storelib import recall as recall_mod
+
+        def row(rid, ns, tier=None):
+            r = {"id": rid, "namespace": ns}
+            if tier:
+                r["tier"] = tier
+            return r
+
+        results = [row("p1", "project:current"),
+                   row("dup", "project:foreign-a"),
+                   row("g1", "user:global"),
+                   row("g2", "user:global")]
+        cross_scored = [(0.9, row("dup", "project:foreign-a")),
+                        (0.8, row("new-cross", "project:foreign-b"))]
+        spliced = recall_mod._splice_cross_rows(results, cross_scored)
+        self.assertEqual(spliced, ["new-cross"])
+        self.assertEqual([r["id"] for r in results],
+                         ["p1", "dup", "new-cross", "g1", "g2"],
+                         "a skipped duplicate must not push a later cross "
+                         "row past the global tier")
+
     def _seed_starve_row(self, conn, row_id: str, namespace: str,
                          content: str, *, signal: str,
                          confidence: float) -> None:

@@ -1499,10 +1499,14 @@ def _splice_cross_rows(results: list, cross_scored: list) -> list:
     # ``results`` — a cross splice must never deliver the same id twice
     # (no-double-count merge contract).
     seen = {r["id"] for r in results}
-    for offset, (_score, item) in enumerate(cross_scored):
+    cursor = insert_at
+    for _score, item in cross_scored:
         if item["id"] in seen:
+            # A skipped duplicate must not shift the insertion cursor, or a
+            # later cross row lands past the global tier and splits it.
             continue
-        results.insert(insert_at + offset, item)
+        results.insert(cursor, item)
+        cursor += 1
         seen.add(item["id"])
         spliced_ids.append(item["id"])
     return spliced_ids
