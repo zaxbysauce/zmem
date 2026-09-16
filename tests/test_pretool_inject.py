@@ -137,7 +137,8 @@ class PreToolModeTest(unittest.TestCase):
         """Issue #98: the hook forwards --include-cross-project per the
         ZMEM_CROSS_PROJECT surface matrix — pretool delivers cross rows,
         user_prompt stays closed unless the env is exactly "1" (where the
-        hook also derives --ops-token values from the prompt), "0" is
+        store-side selector derives --ops-token values from the prompt at
+        the store boundary; the hook forwards only the flag), "0" is
         enforced store-side, and posttoolbatch behaves as pretool via its
         ops ring."""
         CROSS_LESSON = ("crosscanary: git stash pop on a foreign project "
