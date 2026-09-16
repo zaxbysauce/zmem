@@ -8,7 +8,7 @@
   "command": [
     "claude"
   ],
-  "timestamp": "2026-09-16T08:04:31Z",
+  "timestamp": "2026-09-16T08:12:16Z",
   "manifest_hook_ids": [
     "PostCompact:zmem-launch.js",
     "PostToolBatch:zmem-launch.js",
@@ -38,14 +38,14 @@
         {
           "path": "ops/71ff135482fee741c33d798161a2f9ba.ledger",
           "kind": "file",
-          "size": 281,
-          "sha256": "ece42b36dbb9bed61c88b29ef394b29cd4a88aed5199ca7e4edfe0ecef8678fa"
+          "size": 283,
+          "sha256": "2e25bd1fa2abff66c7b701dc7e6fe9203b57b76b50ce9a7141efc1d91796f23e"
         },
         {
           "path": "store.sqlite",
           "kind": "file",
           "size": 208896,
-          "sha256": "7022ea11d33a5bf4d24eb3fce2a1b1fc9167b0aa9d7a6147415185baa057655d"
+          "sha256": "9355e4c9ad8e789f3cf4786723e5b4dba78ea67f2d610ca3812c1bc96a9e21f1"
         },
         {
           "path": "workdir",
@@ -64,14 +64,14 @@
         {
           "path": "ops/71ff135482fee741c33d798161a2f9ba.ledger",
           "kind": "file",
-          "size": 281,
-          "sha256": "ece42b36dbb9bed61c88b29ef394b29cd4a88aed5199ca7e4edfe0ecef8678fa"
+          "size": 283,
+          "sha256": "2e25bd1fa2abff66c7b701dc7e6fe9203b57b76b50ce9a7141efc1d91796f23e"
         },
         {
           "path": "store.sqlite",
           "kind": "file",
           "size": 208896,
-          "sha256": "7022ea11d33a5bf4d24eb3fce2a1b1fc9167b0aa9d7a6147415185baa057655d"
+          "sha256": "9355e4c9ad8e789f3cf4786723e5b4dba78ea67f2d610ca3812c1bc96a9e21f1"
         },
         {
           "path": "workdir",

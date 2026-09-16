@@ -8,7 +8,7 @@
   "command": [
     "codex"
   ],
-  "timestamp": "2026-09-16T08:05:12Z",
+  "timestamp": "2026-09-16T08:12:54Z",
   "manifest_hook_ids": [
     "PostToolUse:zmem-launch.js",
     "PreCompact:zmem-launch.js",
@@ -55,10 +55,10 @@
           "kind": "directory"
         },
         {
-          "path": "namespace-cache/afc59f818862004304eb99bfda37a3bda48ad1fb181eaf5688e3469520a12a00.json",
+          "path": "namespace-cache/fa585ef76ee921980e9329d497f88cef433e38ee2af60d88b12a1d669786f521.json",
           "kind": "file",
-          "size": 82,
-          "sha256": "c35f2e577dd2c02405cccf5481afda445939b6aa8ca1f02d3ae9dab3375d6603"
+          "size": 80,
+          "sha256": "965fee6f175d3fdec34b3052a0ecada697580bade1968dd9cd46016885b1d02d"
         },
         {
           "path": "workdir",
@@ -68,13 +68,13 @@
           "path": "zmem-bg.log",
           "kind": "file",
           "size": 67,
-          "sha256": "5be7219c35d10761d84d1d31e1f32861a254d2d1de38c14cb30fe9a0ad49f70d"
+          "sha256": "942878742e8a0902a43af5fb03a355efbc41dc3cc8d4801c54d7279a3195365c"
         },
         {
           "path": "zmem-decisions.log",
           "kind": "file",
           "size": 785,
-          "sha256": "820cbe453bfbbba590be7cf246e427fc82efce3083ae90869f6d8af642031590"
+          "sha256": "6266eaefd1fed202e84bcee3ce8ed8dd6f8f9a25f2b6f70a1c221bc26c22e080"
         }
       ]
     },

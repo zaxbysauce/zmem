@@ -6,12 +6,12 @@
   "sha": "00743f8084cbc1594683b33cfb8bf14d2ce40d46ca6ba9f7142de6ba31502a84",
   "version": null,
   "command": [
-    "~/AppData\\Roaming\\npm\\codex.CMD",
+    "codex.CMD",
     "exec",
     "--skip-git-repo-check",
     "-"
   ],
-  "timestamp": "2026-09-16T08:04:41Z",
+  "timestamp": "2026-09-16T08:12:23Z",
   "manifest_hook_ids": [
     "PostToolUse:zmem-launch.js",
     "PreCompact:zmem-launch.js",
@@ -86,5 +86,5 @@
     }
   },
   "notes": "the supported exec invocation emitted no version line (rc=0; stdout tail: pong)",
-  "trust_state": "E:\\ZCode\\zmem\\tmp\\lane-feedback\\codex-trust\\operator-config\\codex\\hooks.state"
+  "trust_state": "./tmp\\lane-gate\\codex-trust\\operator-config\\codex\\hooks.state"
 }

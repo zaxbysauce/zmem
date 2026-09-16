@@ -729,7 +729,7 @@ def build_result(lane, host, verdict, reason, *, sha=None, version=None,
         "reason": reason,
         "sha": sha,
         "version": version,
-        "command": [str(a) for a in (command or [])],
+        "command": [_portable_arg(str(a)) for a in (command or [])],
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "manifest_hook_ids": sorted(manifest_hook_ids or []),
         "fired_hook_ids": sorted(fired_hook_ids or []),
@@ -741,14 +741,31 @@ def build_result(lane, host, verdict, reason, *, sha=None, version=None,
 
 
 def _redact_home(value):
-    """Replace the operator's home-directory prefix with ``~`` so committed
-    artifacts stay machine-portable (tracked-file hygiene: no absolute user
-    home paths in the repo)."""
+    """Make committed artifacts machine-portable: the operator's home
+    prefix becomes ``~`` and the repo checkout prefix becomes ``.`` (the
+    tracked-file hygiene rule bans absolute machine paths in the repo)."""
     home = str(Path.home())
-    if isinstance(value, str) and home in value:
-        return value.replace(home + "\\", "~/").replace(home + "/", "~/") \
-            .replace(home, "~")
+    repo = str(REPO_ROOT)
+    if isinstance(value, str):
+        for prefix, replacement in ((home, "~"), (repo, ".")):
+            if prefix in value:
+                value = value.replace(prefix + "\\", replacement + "/") \
+                             .replace(prefix + "/", replacement + "/") \
+                             .replace(prefix, replacement)
     return value
+
+
+def _portable_arg(arg):
+    """Collapse an existing absolute-path argv entry to its base name (the
+    executable's sha256 in the artifact carries the exact-binary identity,
+    so a machine-local directory prefix is pure disclosure)."""
+    try:
+        path = Path(arg)
+        if path.is_absolute() and path.exists():
+            return path.name
+    except (OSError, ValueError):
+        pass
+    return arg
 
 
 def _redact_result(result):

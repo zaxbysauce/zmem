@@ -6,10 +6,10 @@
   "sha": "53580bf26f7edcc0cebb7bbc4107804a9e4465f1e85f4c6553c2320016e29dbc",
   "version": null,
   "command": [
-    "E:\\ZCode\\hermes\\hermes",
+    "hermes",
     "--version"
   ],
-  "timestamp": "2026-09-16T08:04:30Z",
+  "timestamp": "2026-09-16T08:12:16Z",
   "manifest_hook_ids": [],
   "fired_hook_ids": [],
   "inventories": {

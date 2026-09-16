@@ -8,7 +8,7 @@
   "command": [
     "claude"
   ],
-  "timestamp": "2026-09-16T08:04:59Z",
+  "timestamp": "2026-09-16T08:12:40Z",
   "manifest_hook_ids": [
     "PostCompact:zmem-launch.js",
     "PostToolBatch:zmem-launch.js",
@@ -59,7 +59,7 @@
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
         },
         {
-          "path": ".drift-checked-e7d595c9-a814-4512-af5a-ddb70980dbdf-7caf9b94",
+          "path": ".drift-checked-fb20cdf8-8f23-47ac-a871-20292cc357b1-318726fc",
           "kind": "file",
           "size": 9,
           "sha256": "c7bce43a059d1f4079a5d3c32bb7b2acc1d4e4580ee3d2e8f4d2a6482ec22a9c"
@@ -75,10 +75,10 @@
           "kind": "directory"
         },
         {
-          "path": "namespace-cache/b70c74ea41c9a2312e544444bd5233fcb98fb8236ce95eed0d9e56f29a04fba2.json",
+          "path": "namespace-cache/b35a3a19034161978388b7949005e2fbe700dba70a0b2c03a76272af979d1c3b.json",
           "kind": "file",
           "size": 82,
-          "sha256": "4715ef4e0a779f110b07bfb50302f24fe22887031661f5916e8c6112638e9907"
+          "sha256": "1fb744ce5a117dcf67eba9f412468bd8d8eab8f3c0ec0fe7d15543d62f8147c8"
         },
         {
           "path": "workdir",
@@ -88,13 +88,13 @@
           "path": "zmem-bg.log",
           "kind": "file",
           "size": 67,
-          "sha256": "9293b1936552cec6ec1cf8e8425ad4dae155c7f9f4e05cf5d65268a6c1ff5073"
+          "sha256": "a050b7c812969451a14364d7c5553be5743672a95ba42c08a41c896b62438598"
         },
         {
           "path": "zmem-decisions.log",
           "kind": "file",
           "size": 1268,
-          "sha256": "2ee0e8956b462cfa2a352f23e5a6b3077cd4d0a6aa54caa3cf847bb727834bc5"
+          "sha256": "9273d7e106aaa57d51d73ca21c200563927f5f9f1f8e9a1c40630eabf17c5f94"
         }
       ]
     },
