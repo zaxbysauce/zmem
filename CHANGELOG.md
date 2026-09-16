@@ -10,6 +10,50 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.43.0] - 2026-09-16
+
+### Added
+- **Query-time cross-project hazard lane (issue #98, Workstream E PR 2 of 7)**:
+  a fourth, precision-gated recall tier that can deliver up to
+  `CROSS_PROJECT_MAX` (2) live, grounded rows from FOREIGN `project:*`
+  namespaces on the passive injection surface. Admission requires ALL of: the
+  running operation's derived ops tokens whole-token-intersecting the hazard
+  verb set (`ops_tokens._HAZARDOUS_SUBS` by default); row `signal` in
+  (`test`, `compile`, `lint`, `reviewer`); the standard score/confidence
+  floor; a live row; and a namespace in `project:*` outside the current
+  project's alias set (`user:global` rows stay in their own tier). The tier
+  ships NO data copy: admitted rows render in place, inside the untrusted
+  fence, tagged `[ns=<source namespace>] [tier=cross]` with `tier: "cross"`
+  on the JSON row, and never consume project or global slots.
+- **`ZMEM_CROSS_PROJECT` surface switch**: unset → `pretool` only (this
+  includes Claude's PostToolBatch, which maps to the `pretool` moment);
+  `0` → off everywhere (wins even over an explicit flag); `1` → `pretool`
+  and `user_prompt`; any other non-empty value → `pretool` only plus a
+  one-shot stderr warning. On an env-enabled `user_prompt` surface the
+  store-side selector derives ops tokens from the prompt event itself (the
+  hook forwards only the flag).
+- **`ZMEM_CROSS_PROJECT_HAZARD_VERBS`**: comma-separated override of the
+  hazard-verb set — trimmed, case-folded, de-duplicated, unknown verbs
+  dropped with the one-shot warning; an override with no usable verb falls
+  back to the default set.
+- **`store.py recall|recent --include-cross-project`**: explicit opt-in for
+  direct calls; the env switch still governs (`0` disables). On an
+  env-enabled `user_prompt` surface the store-side selector derives ops
+  tokens from the prompt event itself (the hook forwards only the flag,
+  preserving the #158 storelib-free boundary). The session selector (`#158`
+  envelope, unchanged shape) computes the same policy store-side.
+  `ZMEM_CROSS_PROJECT=0` with `--for-injection` remains a byte-identical
+  no-op lane.
+
+### Notes
+- The five-tier reserved-slot allocator (Workstream I, #167) is not on main
+  yet; the cross tier slots between project and global (its position 4 in
+  #167's `TIER_ORDER`) with the same cap semantics, so #167 re-slots it
+  without semantic change.
+- The #155 real-corpus replay baseline remains future work: this lane ships
+  conservatively (pretool-only by default, cap 2, four grounded signals) and
+  #155's measurement supersedes the initial calibration when it lands.
+
 ## [0.42.0] - 2026-09-15
 
 ### Added

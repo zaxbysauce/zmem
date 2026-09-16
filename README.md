@@ -80,6 +80,32 @@ in deterministic verification) > `reviewer/user` (medium) > `none` (low, below t
 retrieval floor by default). This follows the finding that intrinsic self-correction
 (lessons from the agent's own opinion, ungrounded) degrades accuracy.
 
+### Cross-project hazard lane (issue #98)
+
+A fourth, precision-gated recall tier can deliver up to **2** live, grounded rows
+from FOREIGN `project:*` namespaces on the passive injection surface — a lesson
+another project already paid for, surfaced exactly when you are about to repeat
+its incident. Admission requires ALL of: the running operation's derived ops
+tokens whole-token-intersect the hazard-verb set (`git push/reset/stash pop/
+rebase/...` by default), the row's `signal` is one of `test/compile/lint/
+reviewer`, the row passes the standard score floor, and the row is live. The
+tier ships **no data copy**: rows render in place inside the untrusted fence,
+tagged `[ns=<source namespace>] [tier=cross]`, and never consume project or
+global slots.
+
+`ZMEM_CROSS_PROJECT` surface switch: **unset** → `pretool` only (PostToolBatch
+maps to `pretool`); **`0`** → off everywhere (wins even over an explicit flag);
+**`1`** → `pretool` and `user_prompt` (the session selector then derives
+ops tokens from the prompt event store-side — the hook stays a thin flag
+forwarder); any other non-empty value → `pretool` only plus a one-shot
+warning. `ZMEM_CROSS_PROJECT_HAZARD_VERBS` overrides the hazard-verb set
+(comma-separated, trimmed, case-folded, de-duplicated; unknown verbs are
+dropped with the one-shot warning). `store.py recall|recent
+--include-cross-project` opts in for direct calls — the env switch still
+governs. The tier is query-time: the queryless `recent` pull never admits
+cross rows. The #155 real-corpus replay baseline supersedes the initial
+calibration when it lands.
+
 ### Query-aware passive prefetch (issue #159)
 
 `prefetch` exposes the selector's query-aware passive lane on the CLI and the

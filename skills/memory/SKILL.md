@@ -589,6 +589,47 @@ lessons reach project-scoped sessions. Without it, behaviour is strict-namespace
 want a per-tier budget, use `recall --namespace project:<x> --include-global`
 rather than going unscoped.
 
+#### Cross-project hazard tier (issue #98)
+
+A fourth, precision-gated tier (`--include-cross-project`, wired automatically
+on the passive injection surface) can deliver up to 2 live rows from FOREIGN
+`project:*` namespaces — a lesson another project already paid for, surfaced
+exactly when you are about to repeat its incident. Admission requires ALL of:
+
+- the running operation is hazardous: the derived ops tokens
+  (`derive_ops_tokens`, the `#88`/`#123` allowlist) whole-token-intersect the
+  hazard-verb set — `ops_tokens._HAZARDOUS_SUBS` (`git push/reset/stash pop/
+  rebase/...`) by default, overridable via `ZMEM_CROSS_PROJECT_HAZARD_VERBS`
+  (comma-separated, trimmed, case-folded, de-duplicated; unknown or empty
+  verbs are dropped with a one-shot stderr warning and an override with no
+  usable verb falls back to the default set);
+- the row's `signal` is grounded: one of `test`, `compile`, `lint`,
+  `reviewer`;
+- the row passes the standard score/confidence floor (#113) and is live
+  (`superseded_at IS NULL`);
+- the row's namespace matches `project:*` and is OUTSIDE the current
+  project's alias set (`user:global` rows stay in their own tier).
+
+Surface policy (`ZMEM_CROSS_PROJECT`): unset → `pretool` only (PostToolBatch
+maps to the `pretool` moment); `0` → off everywhere (wins even over an
+explicit `--include-cross-project`); `1` → `pretool` and `user_prompt` (on an
+env-enabled `user_prompt` surface the store-side selector derives ops tokens
+from the prompt event itself — the #158 hook boundary keeps the hook a thin
+flag forwarder); any other non-empty value → `pretool` only plus a one-shot
+stderr warning. The tier is query-time — the queryless `recent` pull never
+admits cross rows.
+
+No-copy rule: a cross row is never copied, rewritten, or mirrored — the
+store's own row renders in place, inside the untrusted fence, tagged
+`[ns=<source namespace>] [tier=cross]` (with `tier: "cross"` on the JSON
+row), and cross rows never consume project or global slots. Delivered cross
+rows count once in `surfaced_count` under the same telemetry law as every
+other tier. The #155 real-corpus replay baseline is future work: the lane
+ships with these conservative defaults and #155's measurement supersedes the
+calibration when it lands. `recall --explain`
+does not include the cross tier (the read-only debugger predates it and is
+not extended by #98).
+
 **Hybrid is the DEFAULT when embeddings are available** (issue #58 3.3): the
 query is embedded and matched against stored embeddings (sqlite-vec KNN),
 then both lanes' rankings are fused with Reciprocal Rank Fusion (RRF, k=60).
