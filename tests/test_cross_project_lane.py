@@ -562,10 +562,12 @@ class CrossProjectLaneTest(unittest.TestCase):
                   cross_marker_expected=False)
         hook_cell("pretool-env0", "pretool", pretool_event,
                   cross_marker_expected=False, ZMEM_CROSS_PROJECT="0")
-        # user_prompt + env "1": the hook derives --ops-token values from the
-        # prompt itself. Delivery here proves the tokens crossed — without
-        # them the store-side hazard gate cannot arm on this moment (the
-        # selector ring-derivation only runs on pretool).
+        # user_prompt + env "1": the store-side selector derives --ops-token
+        # values from the prompt itself (#98: derivation lives at the store
+        # boundary; the #158 hook boundary keeps the hook a flag forwarder).
+        # Delivery here proves the hazard gate armed on those store-derived
+        # tokens — without them it cannot arm on this moment (the ring
+        # derivation only runs on pretool).
         hook_cell("user-prompt-env1", "user_prompt", user_prompt_event,
                   cross_marker_expected=True, ZMEM_CROSS_PROJECT="1")
         # posttoolbatch maps to the pretool moment; its ops context arrives

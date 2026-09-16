@@ -29,8 +29,9 @@ README.
   includes Claude's PostToolBatch, which maps to the `pretool` moment);
   `0` → off everywhere (wins even over an explicit flag); `1` → `pretool`
   and `user_prompt`; any other non-empty value → `pretool` only plus a
-  one-shot stderr warning. On an env-enabled `user_prompt` surface the hook
-  derives ops tokens from the prompt event itself.
+  one-shot stderr warning. On an env-enabled `user_prompt` surface the
+  store-side selector derives ops tokens from the prompt event itself (the
+  hook forwards only the flag).
 - **`ZMEM_CROSS_PROJECT_HAZARD_VERBS`**: comma-separated override of the
   hazard-verb set — trimmed, case-folded, de-duplicated, unknown verbs
   dropped with the one-shot warning; an override with no usable verb falls
