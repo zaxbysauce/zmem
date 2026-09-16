@@ -313,6 +313,10 @@ class TestMergeContract(_StoreCase):
                              if n.startswith("project:foreign-")), 2)
         self.assertEqual(sum(1 for n in nss if n == "user:global"), 3)
         self.assertIn("[tier=cross]", envelope["rendered"])
+        delivered_ids = [r["id"] for r in results]
+        self.assertEqual(len(delivered_ids), len(set(delivered_ids)),
+                         "a cross row must never double-count with a "
+                         "project/global row (no-double-count merge contract)")
 
     def test_include_global_with_namespace_user_global_is_noop(self):
         """C-4: when namespace IS user:global, --include-global is a no-op (no

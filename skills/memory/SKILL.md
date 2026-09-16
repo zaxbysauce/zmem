@@ -626,7 +626,9 @@ row), and cross rows never consume project or global slots. Delivered cross
 rows count once in `surfaced_count` under the same telemetry law as every
 other tier. The #155 real-corpus replay baseline is future work: the lane
 ships with these conservative defaults and #155's measurement supersedes the
-calibration when it lands.
+calibration when it lands. `recall --explain`
+does not include the cross tier (the read-only debugger predates it and is
+not extended by #98).
 
 **Hybrid is the DEFAULT when embeddings are available** (issue #58 3.3): the
 query is embedded and matched against stored embeddings (sqlite-vec KNN),

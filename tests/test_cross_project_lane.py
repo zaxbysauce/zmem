@@ -447,6 +447,16 @@ class CrossProjectLaneTest(unittest.TestCase):
                 recall_mod.cross_project_surface_enabled("user_prompt"))
             self.assertGreaterEqual(len(recall_mod.cross_project_admissions(
                 self.conn, moment="user_prompt", **admissions_kwargs)), 1)
+        # PR #207 review (PRR-020): explicit=True forces the tier on for
+        # user_prompt under ANY non-"0" env value, including invalid ones.
+        with self._cross_env("yes"):
+            self.assertTrue(recall_mod.cross_project_surface_enabled(
+                "user_prompt", explicit=True))
+            self.assertGreaterEqual(len(recall_mod.cross_project_admissions(
+                self.conn, moment="user_prompt", explicit=True,
+                **admissions_kwargs)), 1,
+                "the explicit flag must arm user_prompt even under an "
+                "invalid env value (0 still kills it, covered above)")
 
         # Any other non-empty value -> pretool only + EXACTLY one warning.
         with self._cross_env("yes"):
@@ -513,9 +523,13 @@ class CrossProjectLaneTest(unittest.TestCase):
         proc = run_cli(store_py)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         rows = _json.loads(proc.stdout).get("results", [])
-        self.assertIn("cross", [r.get("tier") for r in rows],
-                      "explicit flag without --moment must deliver the "
-                      "cross row (env unset)")
+        delivered = [r for r in rows if r.get("tier") == "cross"]
+        self.assertTrue(delivered,
+                        "explicit flag without --moment must deliver the "
+                        "cross row (env unset)")
+        self.assertTrue(all(r.get("tier") == "cross" for r in delivered),
+                        "every delivered row in this cell must carry "
+                        'tier="cross"')
         proc = run_cli(store_py, ZMEM_CROSS_PROJECT="0")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         rows = _json.loads(proc.stdout).get("results", [])
@@ -701,6 +715,127 @@ class CrossProjectLaneTest(unittest.TestCase):
             else:
                 os.environ["ZMEM_CROSS_PROJECT_HAZARD_VERBS"] = saved
             recall_mod._CROSS_POLICY_WARNED = False
+
+
+class CrossProjectReviewRound(CrossProjectLaneTest):
+    """PR #207 swarm-review round: regressions for the confirmed findings
+    (PRR-001 unscoped TypeError, PRR-002 signal starvation) and the
+    fixture-driven selector contract (PRR-015). Inherits the hermetic store
+    and env handling from CrossProjectLaneTest."""
+
+    def setUp(self):
+        super().setUp()
+        self._case = json.loads(
+            (FIXTURE_DIR / "cases.json").read_text(encoding="utf-8"))
+        self._expected = json.loads(
+            (FIXTURE_DIR / "expected.json").read_text(encoding="utf-8"))
+
+    def _seed_fixture_rows(self, conn) -> None:
+        """Insert the committed cases.json rows with THEIR OWN field values
+        (ids, ingestion_ts, signals), not the helpers' constants."""
+        for row in self._case["rows"]:
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, source_hash, confidence, signal, valid_from, "
+                "ingestion_ts, superseded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row["id"], row["namespace"], row["type"], row["content"],
+                 row.get("tags", ""), row.get("source_ref", ""),
+                 row.get("source_hash", ""), row["confidence"],
+                 row["signal"], row["valid_from"], row["ingestion_ts"],
+                 row.get("superseded_at")),
+            )
+        conn.commit()
+
+    def test_fixture_rows_drive_the_selector(self):
+        """PRR-015: the committed fixture contract is exercised end to end —
+        cases.json rows through the real admissions path must admit exactly
+        expected.json's ids and source namespaces, and the rendered fence
+        must carry the pinned tier markers."""
+        from storelib.inject import select_and_budget_for_injection
+        self._seed_fixture_rows(self.conn)
+        case = self._case
+        envelope = select_and_budget_for_injection(
+            self.conn, query=case["query"], namespace=case["namespace"],
+            moment=case["moment"], session_id="fixture-drive",
+            lane="zcode", ops_tokens=list(case["ops_tokens"]))
+        cross_rows = [r for r in envelope["results"]
+                      if r.get("tier") == "cross"]
+        self.assertEqual(
+            [r["id"] for r in cross_rows],
+            self._expected["admitted_ids"],
+            "fixture-driven admissions must match expected.json")
+        self.assertEqual(
+            [r["namespace"] for r in cross_rows],
+            self._expected["admitted_source_namespaces"])
+        for marker in self._expected["tier_markers"]:
+            self.assertIn(marker, envelope["rendered"])
+        self.assertTrue(set(self._expected["envelope_keys"]) <= set(envelope),
+                        "fixture-driven envelope lost a required key")
+
+    def test_unscoped_explicit_direct_call(self):
+        """PRR-001: `recall --include-cross-project` with NO --namespace must
+        not crash (it used to raise TypeError: set(None)) and must treat
+        every foreign project:* namespace as cross-eligible."""
+        import subprocess as _sp
+        env = _clean_env(self.tmp)
+        env.pop("ZMEM_CROSS_PROJECT", None)
+        seed = _sp.run(
+            [sys.executable, str(STORE_PY), "add",
+             "--namespace", "project:foreign-a", "--type", "lesson",
+             "--content", "unscoped case: before git stash pop run git "
+             "stash list first", "--signal", "test",
+             "--confidence", "0.9"],
+            capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(seed.returncode, 0, seed.stderr)
+        proc = _sp.run(
+            [sys.executable, str(STORE_PY), "recall",
+             "--query", "git stash pop", "--include-cross-project",
+             "--ops-token", "git", "--ops-token", "stash",
+             "--ops-token", "pop", "--json"],
+            capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = json.loads(proc.stdout).get("results", [])
+        self.assertTrue([r for r in rows if r.get("tier") == "cross"],
+                        "unscoped explicit recall must deliver the foreign "
+                        "hazard row instead of crashing")
+
+    def _seed_starve_row(self, conn, row_id: str, namespace: str,
+                         content: str, *, signal: str,
+                         confidence: float) -> None:
+        conn.execute(
+            "INSERT INTO memory (id, namespace, type, content, tags, "
+            "source_ref, source_hash, confidence, signal, valid_from, "
+            "ingestion_ts, superseded_at) "
+            "VALUES (?, ?, 'lesson', ?, '', '', '', ?, ?, ?, ?, NULL)",
+            (row_id, namespace, content, confidence, signal, TS, TS),
+        )
+        conn.commit()
+
+    def test_signal_starvation_pool_depth(self):
+        """PRR-002: non-grounded foreign rows that outrank grounded ones must
+        not starve the tier — the retrieval pool is deeper than the cap so
+        the signal filter still finds grounded rows below the top slice."""
+        from storelib import recall as recall_mod
+        conn = self.conn
+        for i in range(8):
+            self._seed_starve_row(conn, f"starve-none-{i}",
+                                  "project:foreign-b",
+                                  f"starve case {i}: git stash pop needs git "
+                                  f"stash list first", signal="none",
+                                  confidence=0.95)
+        self._seed_starve_row(conn, "starve-grounded", "project:foreign-a",
+                              "starve grounded: before git stash pop run git "
+                              "stash list", signal="test", confidence=0.9)
+        admissions = recall_mod.cross_project_admissions(
+            conn, query="git stash pop needs stash list",
+            moment="pretool", current_namespace="project:current",
+            ops_tokens=["git", "stash", "pop"], min_confidence=None,
+            hybrid=False, now_epoch=None, as_of=None, weights=None)
+        self.assertEqual(
+            [i["id"] for _s, i in admissions], ["starve-grounded"],
+            "a grounded row ranked below non-grounded rows must still be "
+            "admitted (pool depth >= signal-filter window)")
 
 
 def conn_execute_snapshot(conn: sqlite3.Connection) -> list:

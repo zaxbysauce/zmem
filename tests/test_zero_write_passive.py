@@ -71,6 +71,14 @@ class ForInjectionBase(unittest.TestCase):
                     "ZMEM_AUTO_REKEY": "0", "ZMEM_INJECT": "1"}
         self.env.pop("ZMEM_TEST_NOW", None)
         self.env.pop("ZMEM_INJECT_TOKEN_BUDGET", None)
+        # PR #207 review: ambient cross-policy knobs must not flip the tier
+        # on/off under an operator's environment.
+        self._saved_cross = {k: os.environ.get(k)
+                             for k in ("ZMEM_CROSS_PROJECT",
+                                       "ZMEM_CROSS_PROJECT_HAZARD_VERBS")}
+        for k in self._saved_cross:
+            self.env.pop(k, None)
+            os.environ.pop(k, None)
         self._run("add", "--namespace", NS, "--type", "lesson",
                   "--content", "keep the flange calibrated before every launch",
                   "--tags", "flange", "--signal", "test",
@@ -84,6 +92,11 @@ class ForInjectionBase(unittest.TestCase):
                   "--confidence", "0.3", "--json")
 
     def tearDown(self):
+        for k, prior in getattr(self, "_saved_cross", {}).items():
+            if prior is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prior
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _run(self, *args, extra_env=None):

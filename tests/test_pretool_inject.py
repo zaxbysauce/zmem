@@ -188,8 +188,16 @@ class PreToolModeTest(unittest.TestCase):
                       ZMEM_CROSS_PROJECT="1")
         self.assertIn(marker, ctx)
         # posttoolbatch maps to the pretool moment; its ops context arrives
-        # via the per-session ring a PostToolUse hook wrote.
-        ctx = ctx_for("posttoolbatch-unset", "posttoolbatch", pretool_event,
+        # via the per-session ring a PostToolUse hook wrote. PR #207 review:
+        # the batch event's own command text is deliberately free of any
+        # runner/hazard wording ("echo reviewing the stash notes" derives no
+        # ops tokens), so query-derived fallback tokens cannot arm the gate —
+        # delivery here proves the RING tokens were consumed.
+        ctx = ctx_for("posttoolbatch-unset", "posttoolbatch",
+                      {"tool_uses": [{"name": "Bash",
+                                      "input": {"command":
+                                                "echo reviewing the stash "
+                                                "notes"}}]},
                       ring=True)
         self.assertIn(marker, ctx)
 

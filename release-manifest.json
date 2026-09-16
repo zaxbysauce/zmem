@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "41730d372a41162e7e09d08ed1a2d6d509630e1dabc25dc2f5368717862b29b5",
+  "digest": "389bc538f6b1c71890cbed68a169345e78077af759eaa34b67f711d249ccf12c",
   "files": {
     "hermes-plugin/__init__.py": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -52,7 +52,7 @@
     "scripts/release_gate.py": "a9065f3d55df65dde1f6ed1be4694371543fcc1ab3b3c03b77c0aa86eacfd938",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "ac20e80713cf3ec05159ac0f609313cb094ed5515c387258fa5369faec963aa5",
-    "skills/memory/SKILL.md": "a9730b0b2e6c3e24a9a02a2bfc2eb0ff7b9f6f3cd50e34bb1f17a97daddc2678",
+    "skills/memory/SKILL.md": "6d2c763bfbf221ecd59322440b8591107f5a6dd5fc2cbb667420fe7e619498d8",
     "skills/memory/scripts/correction_queue.py": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
     "skills/memory/scripts/doctor.py": "ecd99026c5be6a85210cd87fe6e788defb730a8d67c8cfca55d6674fcf2f2602",
@@ -84,7 +84,7 @@
     "skills/memory/scripts/storelib/ops_tokens.py": "63e6ddfa0b7339cfbb62b7567f0af4a7da51948afd556759e9265b593ff474c7",
     "skills/memory/scripts/storelib/organize.py": "e47b1b7d347a840bb01101b2f843561834045daf50c99e51f7ea86a750de1173",
     "skills/memory/scripts/storelib/promote.py": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022",
-    "skills/memory/scripts/storelib/recall.py": "8e714280d8e61c8f16a2dbb55d00694af8fd590e592ca5d99a3cc0500adc17ac",
+    "skills/memory/scripts/storelib/recall.py": "c33d90e1d4a036a667862258f7017bc07cb092597b44333283238bad45d3f210",
     "skills/memory/scripts/storelib/schema.py": "f1f2b96d939bb70597ccbe081c3e965639053a55b003697924672a2264b39744",
     "skills/memory/scripts/storelib/sync.py": "0f4ec13847a83758852b33563273e840ab4ab741847e2dd0d307b7bf0e6fc8cd",
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",

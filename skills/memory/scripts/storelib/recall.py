@@ -1442,7 +1442,12 @@ def cross_project_admissions(
         return []
     if not (set(ops_tokens or ()) & hazard_verbs()):
         return []
-    current_aliases = set(_expand_namespace_aliases(conn, current_namespace))
+    # PR #207 review: `_expand_namespace_aliases` returns None for a None
+    # namespace, and an unscoped explicit call (`recall --include-cross-
+    # project` with no --namespace) must not crash — an unscoped caller has
+    # no current project, so every live project:* namespace is foreign.
+    current_aliases = set(_expand_namespace_aliases(conn, current_namespace)
+                          or [])
     current_aliases.add(GLOBAL_NAMESPACE)
     rows = conn.execute(
         "SELECT DISTINCT namespace FROM memory "
@@ -1452,8 +1457,13 @@ def cross_project_admissions(
                if r["namespace"] not in current_aliases]
     if not foreign:
         return []
+    # PR #207 review: the grounded-signal filter runs AFTER scoring, so the
+    # retrieval pool must be deep enough that non-grounded rows cannot crowd
+    # every grounded row out of the window. 8x the cap keeps the bound
+    # generous while staying a single indexed pass.
     scored = _recall_one_tier(
-        conn, query=query, ns_list=foreign, limit=CROSS_PROJECT_MAX * 4,
+        conn, query=query, ns_list=foreign,
+        limit=CROSS_PROJECT_MAX * 16,
         min_confidence=min_confidence, hybrid=hybrid,
         now_epoch=now_epoch if now_epoch is not None else _now_epoch(),
         as_of=as_of, mmr=False, weights=weights,
@@ -3209,11 +3219,14 @@ def _recent_memory_impl(
             conn, query="", moment=_cross_moment,
             current_namespace=namespace, ops_tokens=_cross_ops_tokens,
             exclude_ids=exclude_ids, min_confidence=min_confidence,
-            explicit=_cross_explicit,
+            explicit=_cross_explicit, as_of=as_of,
         )
         for _score, item in cross_scored:
             item["prompt_injection_risk"] = _classify_injection(item)
-            results.append(item)
+        # PR #207 review: mirror the recall lane's project -> cross -> global
+        # tier order (and keep the mirror honest if this latent path ever
+        # gains a query) instead of appending past the global rows.
+        _splice_cross_rows(results, cross_scored)
     omitted = 0
     if no_bump:
         kept_rows = []

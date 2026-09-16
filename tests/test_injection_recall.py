@@ -297,6 +297,9 @@ class InjectionFilterBehaviorTests(unittest.TestCase):
 
             # Margin: with the opt-in margin at 1.0 only the top-scored row
             # survives — cross rows are NOT exempt from the margin gate.
+            # PR #207 review: restore the operator's prior value instead of
+            # unconditionally popping it.
+            prior_margin = os.environ.pop("ZMEM_INJECT_MARGIN", None)
             os.environ["ZMEM_INJECT_MARGIN"] = "1.0"
             try:
                 rows, capture = run_cross()
@@ -307,7 +310,10 @@ class InjectionFilterBehaviorTests(unittest.TestCase):
                     {"cross-gate-1", "cross-gate-2"} - {rows[0]["id"]},
                     "the non-top cross row must be margin-pruned")
             finally:
-                os.environ.pop("ZMEM_INJECT_MARGIN", None)
+                if prior_margin is None:
+                    os.environ.pop("ZMEM_INJECT_MARGIN", None)
+                else:
+                    os.environ["ZMEM_INJECT_MARGIN"] = prior_margin
         finally:
             for key, value in saved.items():
                 if value is None:
