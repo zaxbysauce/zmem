@@ -1459,7 +1459,7 @@ def cross_project_admissions(
         return []
     # PR #207 review: the grounded-signal filter runs AFTER scoring, so the
     # retrieval pool must be deep enough that non-grounded rows cannot crowd
-    # every grounded row out of the window. 8x the cap keeps the bound
+    # every grounded row out of the window. 16x the cap keeps the bound
     # generous while staying a single indexed pass.
     scored = _recall_one_tier(
         conn, query=query, ns_list=foreign,
