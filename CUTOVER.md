@@ -49,7 +49,9 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
   install (warn) (issue #185)
 - Codex manifest hook trust: registered manifest events (SessionStart,
   PreToolUse) missing from the config's trusted hook state warn
-  `untrusted-hook <ids>` (issue #185)
+  `untrusted-hook <ids>`; when no entry names this repo the box-wide
+  trusted union is used as inventory, so reapprove hooks manually anyway
+  (issue #185)
 - orphan-store inventory: non-canonical SQLite stores with schema and row
   counts; merge with `promote-store --from <path>`, never auto-deleted
   (issue #185)

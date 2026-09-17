@@ -389,7 +389,10 @@ store directory the plugin hosts use.
 - **`untrusted-hook`** — compares the pre-approval events the repo's
   Codex manifest registers (SessionStart, PreToolUse) with the hook-trust
   state recorded for your repo; missing events warn
-  `untrusted-hook <ids>`. Reapproval is always manual.
+  `untrusted-hook <ids>`. When no config entry names this repo, the
+  box-wide union of trusted events is used as a read-only inventory
+  fallback — on a multi-repo box another repo's approval can stand in, so
+  treat a pass as inventory rather than proof. Reapproval is always manual.
 - **`orphan-store`** — warns with `schema=`/`rows=` for each non-canonical
   SQLite store on the known host paths (plugin-data env dirs,
   `~/.zcode/memory/store.sqlite`). Inspect, then merge with
