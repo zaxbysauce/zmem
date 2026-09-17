@@ -449,6 +449,40 @@ class EvidenceRetentionTest(_StoreCase):
             ("00000000-0000-4000-8000-000000000502",),
         ).fetchone())
 
+    def test_year_one_zero_day_cutoff_is_zero_padded_and_valid(self):
+        os.environ["ZMEM_EVIDENCE_DAYS"] = "0"
+        self._write("00000000-0000-4000-8000-000000000503",
+                    "0001-01-01T00:00:00Z")
+        self.conn.commit()
+        result = evidence.sweep_evidence(
+            self.conn, now_ts="0001-01-01T00:00:00Z"
+        )
+        self.assertEqual(result["expired"], 0)
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM evidence WHERE id=?",
+            ("00000000-0000-4000-8000-000000000503",),
+        ).fetchone())
+
+    def test_cutoff_crossing_year_0999_remains_lexically_padded(self):
+        os.environ["ZMEM_EVIDENCE_DAYS"] = "1"
+        self._write("00000000-0000-4000-8000-000000000504",
+                    "0999-12-30T23:59:59Z")
+        self._write("00000000-0000-4000-8000-000000000505",
+                    "0999-12-31T00:00:00Z")
+        self.conn.commit()
+        result = evidence.sweep_evidence(
+            self.conn, now_ts="1000-01-01T00:00:00Z"
+        )
+        self.assertEqual(result["expired"], 1)
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM evidence WHERE id=?",
+            ("00000000-0000-4000-8000-000000000504",),
+        ).fetchone())
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM evidence WHERE id=?",
+            ("00000000-0000-4000-8000-000000000505",),
+        ).fetchone())
+
     def test_cap_orders_newest_then_id(self):
         os.environ["ZMEM_EVIDENCE_DAYS"] = "0"
         os.environ["ZMEM_EVIDENCE_CAP"] = "2"

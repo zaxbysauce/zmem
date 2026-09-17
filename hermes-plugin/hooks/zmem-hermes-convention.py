@@ -20,66 +20,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-
-# Keep the common resolver import available for the standalone hook layout and
-# its local-filesystem policy.  Store access itself is delegated to store.py.
-_HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
-if _HOOK_DIR not in sys.path:
-    sys.path.insert(0, _HOOK_DIR)
-try:
-    from _zmem_hook_common import assert_local_fs as _assert_local_fs  # noqa: E402,F401
-except ModuleNotFoundError:
-    # A documented copy install contains only ``hermes-plugin``.  Probe the
-    # configured checkout's hooks directory for the shared resolver helper;
-    # the hook still performs no store access itself.
-    _configured_root = Path(os.environ.get("ZMEM_HOME", "")).expanduser()
-    _configured_hook_dirs = (
-        _configured_root / "hermes-plugin" / "hooks",
-        _configured_root / "hooks",
-    )
-    for _configured_hooks in _configured_hook_dirs:
-        if (_configured_hooks / "_zmem_hook_common.py").is_file():
-            sys.path.insert(0, str(_configured_hooks))
-            break
-    try:
-        from _zmem_hook_common import assert_local_fs as _assert_local_fs  # type: ignore  # noqa: E402,F401
-    except ModuleNotFoundError:
-        def _assert_local_fs(path: Path) -> bool:
-            text = str(path)
-            return not (text.startswith("\\\\") or text.startswith("//"))
+from urllib.parse import quote
 
 _MAX_INPUT_BYTES = 64 * 1024
 _STORE_TIMEOUT_S = 5.0
-
-
-def _resolve_store_path() -> Path:
-    """Resolve the authoritative store path for compatibility callers.
-
-    This function remains a resolver only.  It deliberately does not open the
-    path; all reads/writes happen inside the internal CLI process.
-    """
-    rel = Path("skills") / "memory" / "scripts"
-    candidates = [
-        Path(__file__).resolve().parents[2] / rel,
-        Path(os.environ.get("ZMEM_HOME", "")).expanduser() / rel,
-    ]
-    for scripts_dir in candidates:
-        if (scripts_dir / "host.py").is_file():
-            sys.path.insert(0, str(scripts_dir))
-            try:
-                import host  # type: ignore  # noqa: F811
-
-                return host.resolve_store_path()
-            except Exception:
-                pass
-    explicit = os.environ.get("ZMEM_STORE", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    for var in ("ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
-        value = os.environ.get(var, "").strip()
-        if value:
-            return Path(value).expanduser() / "store.sqlite"
-    return Path.home() / ".zmem" / "store.sqlite"
 
 
 def _resolve_store_py() -> Path | None:
@@ -223,7 +167,9 @@ def _write_post_tool_evidence(
             "kind": kind,
             "ts": clock(),
             "excerpt": excerpt,
-            "ref_path": edit_path if kind == "edit" else f"hermes://{task_id}/{tool_call_id}",
+            "ref_path": edit_path if kind == "edit" else (
+                f"hermes://{quote(task_id, safe='')}/{quote(tool_call_id, safe='')}"
+            ),
             "ref_offset": None,
         }
         serialized = _compact_json(row).encode("utf-8")

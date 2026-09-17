@@ -8,7 +8,7 @@ Covers the behavior-changing fixes:
   L11 — missing `agent.memory_provider` raises a clear, actionable ImportError
   L21 — `stats` surfaces last_backup / last_consolidation operational health
   L23 — `doctor` reports backup/consolidation cadence health (never/stale/recent)
-  L25 — `_assert_local_fs` is a single shared import (3 hooks) and the fail-open
+  L25 — `_assert_local_fs` is shared by SQLite-owning hooks and the fail-open
         branch still protects against unexpected exceptions
 
 Run: python tests/test_low_findings.py
@@ -381,16 +381,15 @@ class L23DoctorOperationalHealth(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# L25 — shared _assert_local_fs (3 hooks import it; fail-open still protects)
+# L25 — shared _assert_local_fs (SQLite-owning hook imports it; compatibility
+# hook delegates all store work to the internal CLI)
 # ---------------------------------------------------------------------------
 class L25SharedAssertLocalFs(unittest.TestCase):
     def test_all_three_hooks_import_shared_helper_not_define_locally(self):
         # Issue #122: the reflect hook no longer opens the store at all, so
         # the WAL guard does not apply to it — it must instead contain NO
-        # local-store access (pinned by
-        # test_hermes_correction_remote.test_correction_capture_uses_store_
-        # subprocess). The two hooks that still open SQLite keep the shared
-        # helper requirement.
+        # local-store access (pinned by the compatibility hook's CLI boundary).
+        # The SQLite-owning verify hook keeps the shared helper requirement.
         import ast
         for hook in ("zmem-hermes-convention.py",
                      "zmem-hermes-verify.py"):
@@ -404,7 +403,12 @@ class L25SharedAssertLocalFs(unittest.TestCase):
                         and n.module == "_zmem_hook_common"]
                 self.assertNotIn("_assert_local_fs", defs,
                                  f"{hook} still defines _assert_local_fs locally")
-                self.assertTrue(imps, f"{hook} does not import from _zmem_hook_common")
+                if hook == "zmem-hermes-verify.py":
+                    self.assertTrue(imps,
+                                    f"{hook} does not import from _zmem_hook_common")
+                else:
+                    self.assertFalse(imps,
+                                     f"{hook} must not carry a store guard import")
 
     def test_reflect_hook_has_no_store_access_to_guard(self):
         # Issue #122: the reflect hook's safety property is STRONGER than

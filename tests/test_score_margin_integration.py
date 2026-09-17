@@ -812,8 +812,23 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
             r"moment=user_prompt" + attr + r" margin=0\.012500$",
         )
 
-        self.assertEqual(len(self._body_calls), 2)
-        for args, kwargs in self._body_calls:
+        # user_prompt now performs one bounded query-rewrite subprocess before
+        # the existing recall subprocess.  Each body invocation therefore has
+        # an exact rewrite/recall pair; retain the distinct timeout contracts.
+        self.assertEqual(len(self._body_calls), 4)
+        for offset in (0, 2):
+            rewrite_args, rewrite_kwargs = self._body_calls[offset]
+            rewrite_argv = rewrite_args[0]
+            self.assertEqual(
+                rewrite_argv[:3], [sys.executable, str(STORE_PY), "query-rewrite"]
+            )
+            self.assertIn("--prompt", rewrite_argv)
+            self.assertIn("--session-id", rewrite_argv)
+            self.assertIn("--namespace", rewrite_argv)
+            self.assertIn("--json", rewrite_argv)
+            self.assertEqual(rewrite_kwargs["timeout"], 1.0)
+
+            args, kwargs = self._body_calls[offset + 1]
             argv = args[0]
             self.assertEqual(argv[:3], [sys.executable, str(STORE_PY), "recall"])
             self.assertIn("--namespace", argv)

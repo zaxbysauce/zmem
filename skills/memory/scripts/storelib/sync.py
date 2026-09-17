@@ -1648,29 +1648,41 @@ def cmd_ingest_jsonl_strict(
 def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                      source_ref: str | None, allow_tombstones: bool = False,
                      capture_mode: str | None = None) -> int:
-    """Import a JSONL sync file written by export-jsonl. Returns a process
-    exit code: 2 if `in_path` cannot be read or contains no data lines at
-    all, 0 otherwise (malformed/skipped/deduped rows do not fail the run --
-    they are tallied and reported in the summary line).
+    """Import a JSONL sync file written by export-jsonl.
 
-    EVERY row is validated (_validate_sync_row) before it can touch the DB,
-    and every row's application is individually guarded: one bad row is
-    counted, reported with its line number, and the file keeps going. The
-    summary line always prints, so "the run finished" and "every row landed"
-    are never confused for each other.
+    Legacy row-oriented input keeps its historical best-effort behavior:
+    malformed or deduped rows are counted and skipped.  A staged input whose
+    top-level records advertise the evidence-aware table format is dispatched
+    to the strict all-or-nothing importer instead; ``--strict`` always forces
+    that path.  Legacy mode returns a process exit code of 2 if `in_path`
+    cannot be read or contains no data lines at all, and 0 otherwise
+    (malformed/skipped/deduped rows do not fail the run -- they are tallied and
+    reported in the summary line).  Strict mode instead returns 2 on any
+    rejected record, rolls back the full import transaction, and emits no
+    success summary.
+
+    Legacy behavior: EVERY row is validated (_validate_sync_row) before it can
+    touch the DB, and every row's application is individually guarded: one bad
+    row is counted, reported with its line number, and the file keeps going.
+    The legacy summary line always prints, so "the run finished" and "every
+    row landed" are never confused for each other.  Strict rejection is the
+    exception: it aborts and rolls back instead of continuing or printing that
+    legacy summary.
 
     `allow_tombstones` controls whether an incoming row may kill a LIVE local
     row (see the --allow-tombstones flag help). Default off: a sync file is
     remote-authored data, and deleting local memory is the one irreversible
     thing it could ask for.
 
-    Hostile input (nesting-bomb JSON, an oversized physical line, a bad
-    encoding) is contained per-row/per-file: it never aborts the whole run,
-    and the summary line is always printed regardless of how many rows were
-    rejected. A row that raises mid-apply has any partial DB work rolled back
-    via conn.rollback() before the file continues, so one row's failure
-    between an INSERT and its own commit can never bleed into the next row's
-    commit.
+    Legacy behavior contains hostile input (nesting-bomb JSON, an oversized
+    physical line, a bad encoding) per-row/per-file: it never aborts the whole
+    run, and the summary line is always printed regardless of how many rows
+    were rejected. A legacy row that raises mid-apply has any partial DB work
+    rolled back via conn.rollback() before the file continues, so one row's
+    failure between an INSERT and its own commit can never bleed into the next
+    row's commit.  The strict staged path validates the complete input first
+    and applies it atomically; a strict failure returns 2 with no success
+    summary.
     """
     try:
         staged_source, auto_strict = _stage_sync_source(in_path)

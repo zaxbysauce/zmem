@@ -1630,9 +1630,11 @@ python <store.py> evidence list --namespace NS [--session-id SID] [--lane LANE] 
 python <store.py> evidence show --namespace NS --id UUID [--json]
 ```
 
-The `--namespace` argument on list/show is a context selector because evidence
-rows have no namespace column; it is not an authorization boundary. The
-session-cadence maintenance transaction runs evidence retention after its
+The required `--namespace` argument on list/show is a compatibility/context
+marker and is ignored: evidence rows have no namespace column, so there is no
+namespace filter or authorization boundary. `evidence list` filters only by
+`--session-id`, `--lane`, and `--moment`; `evidence show` selects by `--id`.
+The session-cadence maintenance transaction runs evidence retention after its
 normal organize/backup work. `ZMEM_EVIDENCE_DAYS` defaults to 30 and removes
 rows strictly older than the supplied cadence clock minus that many days;
 `ZMEM_EVIDENCE_CAP`

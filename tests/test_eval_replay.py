@@ -15,6 +15,12 @@ import sqlite3
 import unittest
 from unittest.mock import patch
 
+# Direct-file CI invocation starts with ``tests/`` on sys.path.  Bootstrap the
+# repository root before importing the shared, independent fixture oracle.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from tests.test_issue183_acceptance_observations import (
     BASE_TS,
     _build_fixture,
@@ -23,7 +29,6 @@ from tests.test_issue183_acceptance_observations import (
 )
 
 
-ROOT = Path(__file__).resolve().parents[1]
 EVALUATOR = ROOT / "scripts" / "eval_replay.py"
 FIXTURES = ROOT / "tests" / "fixtures" / "replay"
 BASELINE = ROOT / "eval" / "baseline-replay.json"

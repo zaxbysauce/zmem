@@ -177,7 +177,9 @@ def sweep_evidence(
         tzinfo=timezone.utc
     )
     try:
-        cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cutoff = (now - timedelta(days=days)).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
     except (OverflowError, ValueError):
         print(
             "evidence retention disabled: invalid ZMEM_EVIDENCE_DAYS",

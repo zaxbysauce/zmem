@@ -90,6 +90,94 @@ function runLauncher(hook, payload, env) {
     });
 }
 
+// Evidence adapters receive both successful and failed PostToolUse-shaped
+// payloads.  Keep the fake writer local so these assertions exercise the real
+// exported adapter functions without creating a store or a detached process.
+function captureEvidence(payload, meta = payload) {
+    let data = "";
+    const child = {
+        stdin: { write(value) { data += value; }, end() {}, on() {} },
+        on() {}, unref() {},
+    };
+    const ok = launch.recordEvidence(
+        "codex", "convention-capture", payload, meta,
+        { ZMEM_ROOT: REPO }, () => "2026-09-17T00:00:00Z", () => child,
+    );
+    return { ok, row: data ? JSON.parse(data) : null };
+}
+
+{
+    const nestedFailure = {
+        tool_name: "Edit",
+        tool_input: { file_path: "src/conflict.py" },
+        session_id: "s-status",
+        status: "ok",
+        result: { status: "failed", message: "permission denied" },
+    };
+    const nested = captureEvidence(nestedFailure);
+    eq("evidence: nested failure beats successful top-level status", nested.ok, false);
+    eq("evidence: nested failure cannot create edit row", nested.row, null);
+    const normalized = launch.normalizeCodexFailurePayload(nestedFailure);
+    eq("codex failure: nested failure is normalized", normalized !== null, true);
+    eq("codex failure: nested message is actionable", normalized && normalized.error,
+        "permission denied");
+
+    const toolResultFailure = {
+        tool_name: "Write",
+        tool_input: { file_path: "src/tool-result.py" },
+        session_id: "s-status",
+        status: "success",
+        tool_result: { status: "error", message: "tool rejected" },
+    };
+    eq("evidence: tool_result failure beats success", captureEvidence(toolResultFailure).ok, false);
+    eq("codex failure: tool_result failure is normalized",
+        launch.normalizeCodexFailurePayload(toolResultFailure).error, "tool rejected");
+
+    const success = {
+        tool_name: "Edit",
+        tool_input: { file_path: "src/success.py" },
+        session_id: "s-status",
+        status: "success",
+        result: { status: "ok", message: "written" },
+    };
+    const successfulRow = captureEvidence(success);
+    eq("evidence: all-success payload remains admitted", successfulRow.ok, true);
+    eq("evidence: all-success payload remains edit", successfulRow.row && successfulRow.row.kind, "edit");
+    eq("codex failure: all-success payload remains absent", launch.normalizeCodexFailurePayload(success), null);
+
+    for (const [label, value] of [["false", false], ["zero", 0], ["empty", ""], ["null", null]]) {
+        const controlled = {
+            tool_name: "Edit",
+            tool_input: { file_path: `src/control-${label}.py` },
+            session_id: "s-status",
+            status: "success",
+            result: { status: "ok" },
+            error: value,
+        };
+        const controlledRow = captureEvidence(controlled);
+        eq(`evidence: ${label} error control remains successful`, controlledRow.ok, true);
+        eq(`codex failure: ${label} error control remains absent`,
+            launch.normalizeCodexFailurePayload(controlled), null);
+    }
+
+    const outputFailure = {
+        tool_name: "Edit",
+        tool_input: { file_path: "src/tool-output.py" },
+        session_id: "s-status",
+        status: "ok",
+        tool_output: { status: "error", error_type: "denied" },
+    };
+    eq("evidence: tool_output failure cannot create edit row", captureEvidence(outputFailure).ok, false);
+    eq("codex failure: tool_output type is actionable",
+        launch.normalizeCodexFailurePayload(outputFailure).error, "denied");
+
+    const splitFailure = captureEvidence(
+        { tool_name: "Edit", tool_input: { file_path: "src/meta-failure.py" }, session_id: "s-status" },
+        { status: "ok", result: { status: "failed", message: "meta refused" }, session_id: "s-status" },
+    );
+    eq("evidence: metadata failure cannot create edit row", splitFailure.ok, false);
+}
+
 function resolveNs(projectDir) {
     const code =
         "import sys; sys.path.insert(0, sys.argv[1]); import host; " +

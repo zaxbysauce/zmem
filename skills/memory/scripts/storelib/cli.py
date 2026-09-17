@@ -558,7 +558,12 @@ def cmd_evidence_list(
     limit: int,
     as_json: bool,
 ) -> int:
-    """List evidence; namespace is a required context selector, not auth."""
+    """List evidence for the required compatibility/context marker.
+
+    ``namespace`` is accepted only for compatibility: it is neither a row
+    filter nor authorization. Evidence rows are filtered by ``session_id``,
+    ``lane``, and ``moment``.
+    """
     del namespace  # evidence has no namespace column; filtering is session-based
     clauses: list[str] = []
     params: list[object] = []

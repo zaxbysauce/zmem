@@ -111,7 +111,7 @@ class AutoNearMissRekeyTest(unittest.TestCase):
         # every non-namespace column bit-identical.
         ver = self.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        self.assertEqual(ver["value"], "13")
+        self.assertEqual(ver["value"], "14")
         row = self.conn.execute(
             "SELECT * FROM memory WHERE id=?", (mid,)).fetchone()
         self.assertEqual(row["namespace"], "user:global")

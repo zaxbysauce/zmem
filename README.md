@@ -123,8 +123,11 @@ fails open on malformed or unavailable host data, and does not add the remote
 `pre_llm_call`/`pre_verify` transport promised by the larger #163 idea.
 
 Evidence can be inspected with `evidence list --namespace NS` and
-`evidence show --namespace NS --id UUID`; use `evidence write` for the
-validated JSON stdin writer. Retention is applied by
+`evidence show --namespace NS --id UUID`; `--namespace` is a required
+compatibility/context marker that is ignored — evidence has no namespace
+filter or authorization boundary. `evidence list` filters by `--session-id`,
+`--lane`, and `--moment`; `evidence show` selects by `--id` only. Use
+`evidence write` for the validated JSON stdin writer. Retention is applied by
 the existing session-cadence maintenance path: rows older than
 the supplied cadence time minus `ZMEM_EVIDENCE_DAYS` (default 30) expire, then the newest
 `ZMEM_EVIDENCE_CAP` rows (default 50,000) survive by stable `ts,id` order.
@@ -143,8 +146,6 @@ checks, and one all-or-nothing import transaction. The explicit
 source must be all-or-nothing even if its discriminator is damaged. Legacy
 memory-only JSONL keeps its historical best-effort, per-row behavior; a file
 that is entirely malformed cannot be classified automatically as either form.
-The `--namespace` argument on evidence list/show is a context selector, not an
-authorization boundary.
 
 For passive `user_prompt` recall only, the deterministic rewrite lane adds
 bounded local context when a prompt has fewer than the configured minimum of

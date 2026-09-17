@@ -31,6 +31,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -801,7 +802,9 @@ def _native_evidence_row(
             "kind": kind,
             "ts": (clock or _native_utc_now)(),
             "excerpt": excerpt,
-            "ref_path": ref_path if kind == "edit" else f"hermes://{task_id}/{tool_call_id}",
+            "ref_path": ref_path if kind == "edit" else (
+                f"hermes://{quote(task_id, safe='')}/{quote(tool_call_id, safe='')}"
+            ),
             "ref_offset": None,
         }
         serialized = json.dumps(row, ensure_ascii=False, separators=(",", ":"))

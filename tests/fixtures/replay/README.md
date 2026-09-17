@@ -28,7 +28,7 @@ zeroes in empty-denominator fields are not measured success or failure.
 Before importing store libraries, the evaluator derives its scoring clock from
 the latest valid decision-log timestamp and installs that value as
 `ZMEM_TEST_NOW`. It clears ambient `ZMEM_*`, Claude-plugin, and ZCode-plugin
-overrides, then installs explicit staged store/data/home/model paths, fake
+overrides, then installs explicit staged `<store>`, `<data>`, `<home>`, and `<model>` paths, fake
 embeddings, downloads-disabled behavior, and a pinned MMR default. Thus an
 operator's current date, recall knobs, model cache, or plugin routing cannot
 change a replay of the same bytes.
@@ -66,7 +66,7 @@ python tests/fixtures/replay/generate.py `
 The generator invokes the actual `tests/fixtures/eval_store.py` builder with
 `ZMEM_TEST_NOW=2026-06-01T00:00:00Z` before builder imports/subprocesses,
 `ZMEM_EMBED_PROFILE=fake`, model downloads disabled, and explicit scratch
-store/data/home/model paths. It then applies replay-fixture-only
+`<store>`, `<data>`, `<home>`, and `<model>` paths. It then applies replay-fixture-only
 canonicalization: stable UUID-shaped entity IDs and references, runtime-only
 timestamp pinning, preserved historical validity windows, full reference
 integrity checks, vector metadata rebuild, journal cleanup, checkpoint, and

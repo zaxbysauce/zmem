@@ -29,10 +29,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "memory" / "scripts"
 REPORT_LANES = ("claude", "hermes-provider")
 REPORT_MOMENTS = tuple(sorted(("session_start", "user_prompt", "pretool", "precompact")))
-REPORT_KEYS = (
-    "schema_version", "input_digest", "store_sha256", "days", "rows",
-    "aggregate", "input_metadata", "generated_at",
-)
 COUNT_KEYS = (
     "decisions", "candidates", "delivered", "reference_checked", "miss",
     "empty_pool", "already_delivered",
@@ -49,10 +45,6 @@ MAX_TRANSCRIPTS = 16
 MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024
 MAX_TRANSCRIPT_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_TRANSCRIPT_LINES = 100_000
-_OPERATOR_ENV = (
-    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "CLAUDE_PLUGIN_DATA",
-    "ZCODE_PLUGIN_DATA",
-)
 
 
 class ReplayError(ValueError):

@@ -4,9 +4,8 @@ critic flagged as missing plan-mandated coverage:
   M8  — consolidate reports truncation when a namespace exceeds the per-namespace
         row cap, and the cap is genuinely per-namespace (no cross-namespace
         starvation).
-  M10 — the Hermes hooks resolve the store via host.resolve_store_path under
-        CLAUDE_PLUGIN_DATA / ZCODE_PLUGIN_DATA (not just ~/.zmem), matching the
-        authoritative resolver.
+  M10 — the Hermes compatibility hook delegates store work to the internal
+        CLI, including path resolution and local-filesystem refusal.
   M13 — the convention-capture shell hook parses the tool name with the
         discovered $PYTHON_BIN, so it works when bare `python` is absent but
         `python3` exists (and emits empty when no interpreter is available).
@@ -18,11 +17,15 @@ No pytest / third-party harness required — matches the repo convention.
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -130,89 +133,213 @@ class M8ConsolidatePerNamespaceCap(unittest.TestCase):
                        f"expected truncation report, got:\n{out}")
 
 
-class M10HermesHooksResolveViaHost(unittest.TestCase):
-    """M10: the three Hermes shell hooks resolve the store via
-    host.resolve_store_path (the full env chain), not the truncated copy that
-    omitted CLAUDE/ZCODE_PLUGIN_DATA."""
+class M10HermesHooksUseStoreCli(unittest.TestCase):
+    """M10: the Hermes compatibility hook delegates store work to the CLI."""
 
-    def _hook_resolves_under(self, env_var, tmp_path):
-        """Import a hook module under a controlled env var and return its
-        resolved store path. ZMEM_STORE is set explicitly so the test is
-        deterministic regardless of whether a real ~/.zmem/store.sqlite exists
-        on the box (host.py's "box-wide store always wins" rule would otherwise
-        override CLAUDE/ZCODE_PLUGIN_DATA)."""
-        explicit = os.path.join(tmp_path, "store.sqlite")
-        env = {**os.environ}
-        for v in ("ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
-            env.pop(v, None)
-        env["ZMEM_STORE"] = explicit
-        env[env_var] = tmp_path
-        hook_file = HOOKS_DIR / "zmem-hermes-convention.py"
+    @staticmethod
+    def _isolated_env(root: Path, **overrides: str) -> dict[str, str]:
+        """Build a copied-hook environment without ambient ZMEM/host routing."""
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("ZMEM_")
+        }
+        for key in list(env):
+            if key.startswith(("CLAUDE_", "ZCODE_", "PLUGIN_")):
+                env.pop(key, None)
+        home = root / "home"
+        appdata = root / "appdata"
+        localappdata = root / "localappdata"
+        xdg_config = root / "xdg-config"
+        xdg_data = root / "xdg-data"
+        xdg_cache = root / "xdg-cache"
+        for directory in (home, appdata, localappdata, xdg_config, xdg_data, xdg_cache):
+            directory.mkdir(parents=True, exist_ok=True)
+        env.update({
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "APPDATA": str(appdata),
+            "LOCALAPPDATA": str(localappdata),
+            "XDG_CONFIG_HOME": str(xdg_config),
+            "XDG_DATA_HOME": str(xdg_data),
+            "XDG_CACHE_HOME": str(xdg_cache),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        env.update(overrides)
+        return env
+
+    def _load_convention(self, hook_file=None):
+        hook_file = hook_file or (HOOKS_DIR / "zmem-hermes-convention.py")
         spec = importlib.util.spec_from_file_location(
-            f"hook_test_{env_var}_{os.getpid()}", str(hook_file))
-        with mock.patch.dict(os.environ, env, clear=False):
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            # Resolve INSIDE the patched env (host.resolve_store_path reads
-            # os.environ at call time).
-            resolved = str(mod._resolve_store_path())
-        return resolved, explicit
+            f"hook_test_{os.getpid()}_{id(hook_file)}", str(hook_file))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
 
-    def test_convention_hook_resolves_claude_plugin_data(self):
-        tmp = tempfile.mkdtemp(prefix="zmem-m10-")
-        self.addCleanup(shutil.rmtree, tmp, True)
-        p, expected = self._hook_resolves_under("CLAUDE_PLUGIN_DATA", tmp)
-        # The hook must DELEGATE to host.resolve_store_path, which honors
-        # ZMEM_STORE. A truncated hand-rolled resolver that omitted the import
-        # would still work here, but the drift test below proves delegation.
-        self.assertEqual(os.path.normcase(p), os.path.normcase(expected),
-                         f"expected {expected}, got {p}")
+    def test_convention_hook_has_no_store_path_or_filesystem_access(self):
+        src = (HOOKS_DIR / "zmem-hermes-convention.py").read_text("utf-8")
+        self.assertNotIn("_resolve_store_path", src)
+        self.assertNotIn("_assert_local_fs", src)
+        self.assertNotIn("import host", src)
+        self.assertNotIn("sqlite3", src)
+        mod = self._load_convention()
+        self.assertTrue(callable(mod._resolve_store_py))
+        self.assertFalse(hasattr(mod, "_resolve_store_path"))
 
-    def test_convention_hook_resolves_zcode_plugin_data(self):
-        tmp = tempfile.mkdtemp(prefix="zmem-m10-")
-        self.addCleanup(shutil.rmtree, tmp, True)
-        p, expected = self._hook_resolves_under("ZCODE_PLUGIN_DATA", tmp)
-        self.assertEqual(os.path.normcase(p), os.path.normcase(expected),
-                         f"expected {expected}, got {p}")
+    def test_convention_hook_finds_in_tree_store_cli(self):
+        mod = self._load_convention()
+        self.assertEqual(mod._resolve_store_py().resolve(), STORE_PY.resolve())
 
-    def test_all_three_hooks_agree_with_host_resolver(self):
-        """Drift prevention: each hook's resolved path must match
-        host.resolve_store_path() under the same env. This is the core M10
-        proof — the hooks delegate to the authoritative resolver, so they can
-        never drift from it."""
-        sys.path.insert(0, str(SCRIPTS_DIR))
-        import host
-        tmp = tempfile.mkdtemp(prefix="zmem-m10-")
-        self.addCleanup(shutil.rmtree, tmp, True)
-        explicit = os.path.join(tmp, "store.sqlite")
-        env = {**os.environ}
-        for v in ("ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
-            env.pop(v, None)
-        env["ZMEM_STORE"] = explicit
-        env["CLAUDE_PLUGIN_DATA"] = tmp
-        with mock.patch.dict(os.environ, env, clear=False):
-            host_path = str(host.resolve_store_path())
-        self.assertEqual(os.path.normcase(host_path),
-                         os.path.normcase(explicit),
-                         f"sanity: host resolved {host_path}, expected {explicit}")
-        # Issue #122: the reflect hook no longer resolves (or opens) the
-        # store at all — store-path work moved to the hermes-context bridge
-        # and the prefetch subprocesses. Its drift-prevention property is
-        # the STRONGER absence pin below; the two hooks that still touch the
-        # store keep the delegate-to-host requirement.
-        for hook_name in ("zmem-hermes-convention.py", "zmem-hermes-verify.py"):
-            hook_file = HOOKS_DIR / hook_name
-            spec = importlib.util.spec_from_file_location(
-                f"hook_drift_{hook_name}_{os.getpid()}", str(hook_file))
-            with mock.patch.dict(os.environ, env, clear=False):
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                # Resolve INSIDE the patched env.
-                hook_path = str(mod._resolve_store_path())
+    def test_copy_install_hook_finds_store_cli_via_zmem_home(self):
+        """A copied plugin resolves and executes the CLI from ZMEM_HOME."""
+        plugin_root = Path(tempfile.mkdtemp(prefix="zmem-plugin-copy-"))
+        checkout_root = Path(tempfile.mkdtemp(prefix="zmem-cli-checkout-"))
+        self.addCleanup(shutil.rmtree, plugin_root, True)
+        self.addCleanup(shutil.rmtree, checkout_root, True)
+        copy_hooks = plugin_root / "deep" / "hooks"
+        copy_hooks.mkdir(parents=True)
+        hook_dst = copy_hooks / "zmem-hermes-convention.py"
+        shutil.copy(HOOKS_DIR / "zmem-hermes-convention.py", hook_dst)
+        copy_store_dir = checkout_root / "skills" / "memory" / "scripts"
+        shutil.copytree(SCRIPTS_DIR, copy_store_dir)
+        copy_store = copy_store_dir / "store.py"
+        explicit = checkout_root / "isolated-store.sqlite"
+        env = self._isolated_env(
+            checkout_root, ZMEM_HOME=str(checkout_root), ZMEM_STORE=str(explicit)
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            mod = self._load_convention(hook_dst)
+            self.assertEqual(mod._resolve_store_py().resolve(), copy_store.resolve())
+            result = subprocess.run(
+                [sys.executable, str(mod._resolve_store_py()), "path"],
+                capture_output=True, text=True, env=env, timeout=20,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()).resolve(), explicit.resolve())
+
+    def test_convention_hook_subprocess_reaches_cli_and_writes_observation(self):
+        """A copied hook must reach the copied CLI and write one observation."""
+        with tempfile.TemporaryDirectory(prefix="zmem-hook-boundary-") as raw:
+            root = Path(raw)
+            plugin_root = root / "plugin"
+            checkout_root = root / "checkout"
+            copy_hooks = plugin_root / "deep" / "hooks"
+            copy_hooks.mkdir(parents=True)
+            copied_hook = copy_hooks / "zmem-hermes-convention.py"
+            shutil.copy(HOOKS_DIR / "zmem-hermes-convention.py", copied_hook)
+            copy_store_dir = checkout_root / "skills" / "memory" / "scripts"
+            shutil.copytree(SCRIPTS_DIR, copy_store_dir)
+            copied_store = copy_store_dir / "store.py"
+            store = root / "store.sqlite"
+            data = root / "data"
+            data.mkdir()
+            env = self._isolated_env(
+                root,
+                ZMEM_HOME=str(checkout_root),
+                ZMEM_STORE=str(store),
+                ZMEM_DATA=str(data),
+                ZMEM_PYTHON=PYTHON,
+                ZMEM_MODELS_DIR=str(root / "no-models"),
+                ZMEM_CONVENTION_INTERVAL="10",
+            )
+            initialized = subprocess.run(
+                [PYTHON, str(copied_store), "init"],
+                capture_output=True, text=True, env=env, timeout=20,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            event = {
+                "tool_name": "Edit",
+                "args": {"file_path": "src/compat-boundary.py"},
+                "session_id": "s-hook-boundary",
+                "task_id": "task-boundary",
+                "tool_call_id": "call-boundary",
+                "result": {"status": "ok"},
+                "duration_ms": 1,
+            }
+            observed = subprocess.run(
+                [PYTHON, str(copied_hook)],
+                input=json.dumps(event) + "\n",
+                capture_output=True, text=True, env=env, timeout=20,
+            )
+            self.assertEqual(observed.returncode, 0, observed.stderr)
+            self.assertEqual(observed.stdout.strip(), "{}")
+
+            deadline = time.monotonic() + 5.0
+            evidence = None
+            convention_count = None
+            while time.monotonic() < deadline:
+                conn = None
+                try:
+                    conn = sqlite3.connect(store)
+                    try:
+                        evidence = conn.execute(
+                            "SELECT kind, lane, moment, ref_path FROM evidence "
+                            "WHERE session_id = ?",
+                            ("s-hook-boundary",),
+                        ).fetchone()
+                        convention_count = conn.execute(
+                            "SELECT value FROM meta WHERE key = ?",
+                            ("hermes_convention_count_s-hook-boundary",),
+                        ).fetchone()
+                    finally:
+                        conn.close()
+                except sqlite3.Error:
+                    evidence = None
+                    convention_count = None
+                if evidence and convention_count:
+                    break
+                time.sleep(0.05)
             self.assertEqual(
-                os.path.normcase(hook_path), os.path.normcase(host_path),
-                f"{hook_name} resolved {hook_path} but host.resolve_store_path "
-                f"resolved {host_path} — drift!")
+                evidence,
+                ("edit", "hermes-compat", "pretool", "src/compat-boundary.py"),
+            )
+            self.assertEqual(convention_count, ("1",))
+
+    def test_store_cli_guard_refusal_precedes_sqlite_connection(self):
+        """The no-create evidence path must refuse before opening SQLite."""
+        from contextlib import redirect_stdout
+        from storelib import cli
+
+        with tempfile.TemporaryDirectory(prefix="zmem-guard-boundary-") as raw:
+            store = Path(raw) / "store.sqlite"
+            original_bytes = b"guard must leave this file untouched\n"
+            store.write_bytes(original_bytes)
+            old_store_path = cli.STORE_PATH
+            cli.STORE_PATH = store
+            try:
+                output = io.StringIO()
+                payload = json.dumps({
+                    "session_id": "s-guard",
+                    "lane": "hermes-compat",
+                    "moment": "pretool",
+                    "kind": "edit",
+                    "ts": "2026-09-17T00:00:00Z",
+                    "excerpt": "guard",
+                    "ref_path": "src/guard.py",
+                    "ref_offset": None,
+                })
+                stdin_stream = io.TextIOWrapper(io.BytesIO((payload + "\n").encode("utf-8")))
+                try:
+                    with (
+                        mock.patch.dict(os.environ, {"ZMEM_EVIDENCE_NO_CREATE": "1"}, clear=False),
+                        mock.patch.object(cli._schema_host, "assert_local_fs",
+                                          side_effect=ValueError("network path refused")) as guard,
+                        mock.patch.object(cli.sqlite3, "connect",
+                                          side_effect=AssertionError("guard must precede connect")) as connect,
+                        mock.patch.object(sys, "argv", [str(STORE_PY), "evidence", "write"]),
+                        mock.patch.object(sys, "stdin", stdin_stream),
+                        redirect_stdout(output),
+                    ):
+                        with self.assertRaises(SystemExit) as exited:
+                            cli.main()
+                finally:
+                    stdin_stream.close()
+                self.assertEqual(exited.exception.code, 0)
+                self.assertEqual(output.getvalue().strip(), "{}")
+                guard.assert_called_once_with(store.parent)
+                connect.assert_not_called()
+                self.assertEqual(store.read_bytes(), original_bytes)
+            finally:
+                cli.STORE_PATH = old_store_path
 
     def test_reflect_hook_no_longer_resolves_the_store(self):
         """Issue #122: the reflect hook must not carry _resolve_store_path —
@@ -222,67 +349,6 @@ class M10HermesHooksResolveViaHost(unittest.TestCase):
         self.assertNotIn("_resolve_store_path", src,
                          "the reflect hook must not resolve the store path "
                          "itself (issue #122 moved that to the bridge)")
-
-    def test_copy_install_hook_finds_host_via_zmem_home(self):
-        """In a copy install (`cp -r hermes-plugin …`), the hook file has no
-        skills/ tree alongside it. The hook must locate host.py via the
-        $ZMEM_HOME probe (README requires copy users to set it) — otherwise it
-        silently no-ops against the wrong store (#36 M10 / cubic-3,5,8).
-
-        Discrimination: we verify (a) the in-tree candidate (parents[2]) does
-        NOT exist in the copied layout, AND (b) the hook's `_resolve_store_path`
-        actually imported `host` (presence in the module namespace + the
-        resolved path matches host.resolve_store_path). If the ZMEM_HOME probe
-        were absent/broken, `host` would not be importable and the hook would
-        fall to the inline fallback."""
-        sys.path.insert(0, str(SCRIPTS_DIR))
-        import host as _host_ref  # noqa: F401 — ensure importable
-        copy_root = tempfile.mkdtemp(prefix="zmem-copy-")
-        self.addCleanup(shutil.rmtree, copy_root, True)
-        copy_hooks = Path(copy_root) / "deep" / "hooks"
-        copy_hooks.mkdir(parents=True)
-        hook_dst = copy_hooks / "zmem-hermes-convention.py"
-        shutil.copy(HOOKS_DIR / "zmem-hermes-convention.py", hook_dst)
-        # Confirm the in-tree candidate does NOT exist (copy has no skills/).
-        in_tree = hook_dst.resolve().parents[2] / "skills" / "memory" / "scripts"
-        self.assertFalse((in_tree / "host.py").is_file(),
-                         "test setup: in-tree candidate must be absent in copy install")
-        explicit = os.path.join(copy_root, "store.sqlite")
-        env = {**os.environ}
-        for v in ("ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
-            env.pop(v, None)
-        env["ZMEM_STORE"] = explicit
-        env["ZMEM_HOME"] = str(REPO_ROOT)
-        spec = importlib.util.spec_from_file_location("hook_copy_disc", str(hook_dst))
-        zmem_home_scripts = str(Path(REPO_ROOT) / "skills" / "memory" / "scripts")
-        with mock.patch.dict(os.environ, env, clear=False):
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            # Count occurrences of the ZMEM_HOME scripts dir in sys.path BEFORE
-            # the hook runs. The probe does sys.path.insert(0, ...) which adds
-            # a DUPLICATE entry; the inline fallback never touches sys.path. So
-            # a count increase after _resolve_store_path is causal proof the
-            # probe fired (not vacuous like an existential any() check, which
-            # this test's own setUp pre-satisfies). (PRR-006 final-critic.)
-            before = sum(1 for p in sys.path
-                         if os.path.normcase(p) == os.path.normcase(zmem_home_scripts))
-            hook_path = str(mod._resolve_store_path())
-            after = sum(1 for p in sys.path
-                        if os.path.normcase(p) == os.path.normcase(zmem_home_scripts))
-            # host.py's resolution under the same env.
-            host_path = str(_host_ref.resolve_store_path())
-        # The hook must match host.py (delegation produced the same result).
-        self.assertEqual(os.path.normcase(hook_path), os.path.normcase(host_path),
-                         f"hook ({hook_path}) != host.py ({host_path}) — delegation failed")
-        # DISCRIMINATOR: the probe's sys.path.insert must have increased the
-        # occurrence count of the ZMEM_HOME scripts dir. Deleting the probe
-        # (falling to the inline fallback, which never touches sys.path) leaves
-        # after == before → this fails. (PRR-006 final-critic.)
-        self.assertGreater(after, before,
-                           f"ZMEM_HOME probe did not run (sys.path count "
-                           f"unchanged: before={before} after={after}) — inline "
-                           f"fallback was used instead")
-
 
 class M13ConventionCaptureInterpreterDiscovery(unittest.TestCase):
     """M13: the convention-capture shell hook must parse the tool name with the

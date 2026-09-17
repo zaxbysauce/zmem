@@ -128,7 +128,7 @@ class Issue183AcceptanceEvidenceTest(unittest.TestCase):
             capped = _record(
                 "00000000-0000-4000-8000-000000000802",
                 ts="2026-09-10T00:00:01Z",
-                excerpt="x" * 401,
+                excerpt="ordinary evidence " * 30,
             )
             self.assertEqual(_run(scratch, "evidence", "write", input_text=json.dumps(capped)).returncode, 0)
             capped_row = json.loads(
@@ -151,6 +151,7 @@ class Issue183AcceptanceEvidenceTest(unittest.TestCase):
                     (capped["id"],),
                 ).fetchone()
             capped_conn.close()
+            self.assertEqual(capped_stored[2], capped["excerpt"][:400])
             self.assertEqual(len(capped_stored[2]), 400)
             self.assertEqual(
                 capped_stored[3],

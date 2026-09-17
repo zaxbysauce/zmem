@@ -484,6 +484,53 @@ function firstNonEmpty(...values) {
     return "";
 }
 
+// Host adapters can expose a successful top-level status while a nested
+// result/tool_result reports the actual failure.  Inspect every supported
+// status/error carrier before deciding whether an event is successful; a
+// success must never erase a sibling or nested failure signal.
+function isMeaningfulFailureValue(value) {
+    if (value === true) return true;
+    if (typeof value === "string") return Boolean(value.trim());
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === "object") {
+        const message = typeof value.message === "string" ? value.message.trim() : "";
+        const type = typeof value.type === "string" ? value.type.trim() : "";
+        return Boolean(message || type || Object.keys(value).length);
+    }
+    return false;
+}
+
+function failureSignals(...values) {
+    const statuses = [];
+    const errors = [];
+    const visit = (value) => {
+        if (!value || typeof value !== "object") return;
+        for (const key of ["status", "tool_status", "toolStatus"]) {
+            if (typeof value[key] === "string" && value[key].trim()) {
+                statuses.push(value[key]);
+            }
+        }
+        for (const key of [
+            "error", "tool_error", "toolError", "error_message", "error_type", "failure",
+        ]) {
+            if (value[key] !== undefined && value[key] !== null && value[key] !== "") {
+                errors.push(value[key]);
+            }
+        }
+    };
+    for (const value of values) {
+        visit(value);
+        if (value && typeof value === "object") {
+            for (const key of ["result", "tool_result", "tool_output"]) {
+                visit(value[key]);
+            }
+        }
+    }
+    return {
+        failed: statuses.some(isFailureStatus) || errors.some(isMeaningfulFailureValue),
+    };
+}
+
 function normalizeErrorValue(value) {
     if (typeof value === "string") {
         const trimmed = value.trim();
@@ -502,6 +549,14 @@ function normalizeErrorValue(value) {
     return null;
 }
 
+function firstMeaningfulError(...values) {
+    for (const value of values) {
+        const normalized = normalizeErrorValue(value);
+        if (normalized) return normalized;
+    }
+    return null;
+}
+
 // Codex failure capture runs on PostToolUse because there is no dedicated
 // PostToolUseFailure event. Normalize the stable PostToolUse payload into the
 // shape the existing capture-failure hook script already understands. If the
@@ -509,32 +564,34 @@ function normalizeErrorValue(value) {
 function normalizeCodexFailurePayload(meta) {
     if (!meta || typeof meta !== "object") return null;
 
-    const status = firstNonEmpty(
-        meta.status,
-        meta.tool_status,
-        meta.toolStatus,
-        meta.result && meta.result.status,
-        meta.tool_result && meta.tool_result.status
-    );
-    const failed = isFailureStatus(status);
+    const signals = failureSignals(meta);
+    const failed = signals.failed;
 
-    const error = normalizeErrorValue(
-        meta.error ||
-            meta.tool_error ||
-            meta.toolError ||
-            (meta.result && meta.result.error) ||
-            (meta.tool_result && meta.tool_result.error) ||
-            (meta.tool_output && meta.tool_output.error) ||
-            (failed &&
-                firstNonEmpty(
-                    meta.stderr,
-                    meta.message,
-                    meta.failure,
-                    meta.tool_message,
-                    meta.toolMessage,
-                    meta.result && meta.result.message,
-                    meta.tool_result && meta.tool_result.message
-                ))
+    const error = firstMeaningfulError(
+        meta.error, meta.tool_error, meta.toolError, meta.error_message, meta.error_type,
+        meta.result && meta.result.error, meta.result && meta.result.error_message,
+        meta.result && meta.result.error_type, meta.tool_result && meta.tool_result.error,
+        meta.tool_result && meta.tool_result.error_message,
+        meta.tool_result && meta.tool_result.error_type,
+        meta.tool_output && meta.tool_output.error,
+        meta.tool_output && meta.tool_output.error_message,
+        meta.tool_output && meta.tool_output.error_type,
+        failed && firstNonEmpty(
+            meta.stderr,
+            meta.message,
+            meta.failure,
+            meta.tool_message,
+            meta.toolMessage,
+            meta.result && meta.result.message,
+            meta.result && meta.result.error_message,
+            meta.result && meta.result.error_type,
+            meta.tool_result && meta.tool_result.message,
+            meta.tool_result && meta.tool_result.error_message,
+            meta.tool_result && meta.tool_result.error_type,
+            meta.tool_output && meta.tool_output.message,
+            meta.tool_output && meta.tool_output.error_message,
+            meta.tool_output && meta.tool_output.error_type,
+        ),
     );
 
     if (!failed && !error) return null;
@@ -691,14 +748,11 @@ function recordEvidence(host, hookName, payload, meta, env = process.env,
         if (hookName === "reflect") kind = "turn";
         else if (hookName === "capture-failure") kind = "tool_failure";
         else {
-            const resultStatus = payload.result && typeof payload.result === "object"
-                ? payload.result.status : "";
-            const failed = isFailureStatus(payload.status || payload.tool_status ||
-                payload.toolStatus || resultStatus || payload.error || payload.failure);
+            const failed = failureSignals(payload, meta).failed;
             // Codex routes successful and failed PostToolUse events through the
             // same matcher.  The failure observer records the failure event;
             // convention-capture must not create a second successful edit row.
-            if (failed || payload.error || payload.error_message) return false;
+            if (failed) return false;
             kind = _isEditTool(toolName, toolInput) ? "edit" : "tool_call";
         }
 

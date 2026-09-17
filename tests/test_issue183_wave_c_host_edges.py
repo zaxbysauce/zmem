@@ -18,6 +18,7 @@ import types
 import unittest
 import uuid
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 from unittest import mock
 
 
@@ -274,6 +275,69 @@ process.stdout.write(JSON.stringify({
                 start.assert_not_called()
             values["task_id"] = "task/unsafe"
             self.assertIsNone(plugin._native_evidence_row(values))
+
+    def test_reserved_hermes_uri_components_are_encoded_for_native_and_compat(self) -> None:
+        """Task/call identifiers remain distinct URI path components."""
+        task_id = "task?x#fragment%&"
+        call_id = "call?y#tail%&"
+        expected = "hermes://task%3Fx%23fragment%25%26/call%3Fy%23tail%25%26"
+        agent = types.ModuleType("agent")
+        provider_api = types.ModuleType("agent.memory_provider")
+        provider_api.MemoryProvider = type("MemoryProvider", (), {})
+        agent.memory_provider = provider_api
+        with mock.patch.dict(sys.modules, {
+            "agent": agent,
+            "agent.memory_provider": provider_api,
+        }):
+            spec = importlib.util.spec_from_file_location(
+                f"issue183_uri_native_{uuid.uuid4().hex}",
+                ROOT / "hermes-plugin" / "__init__.py",
+            )
+            assert spec is not None and spec.loader is not None
+            native = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(native)
+            values = {
+                "tool_name": "Bash", "args": {"command": "true"},
+                "result": "ok", "duration_ms": 1, "task_id": task_id,
+                "tool_call_id": call_id, "session_id": "s-uri",
+            }
+            native_row = json.loads(native._native_evidence_row(values))
+            self.assertEqual(native_row["ref_path"], expected)
+            parsed = urlsplit(native_row["ref_path"])
+            self.assertEqual(
+                unquote(parsed.netloc) + "/" + unquote(parsed.path.lstrip("/")),
+                f"{task_id}/{call_id}",
+            )
+
+        compat_spec = importlib.util.spec_from_file_location(
+            f"issue183_uri_compat_{uuid.uuid4().hex}",
+            ROOT / "hermes-plugin" / "hooks" / "zmem-hermes-convention.py",
+        )
+        assert compat_spec is not None and compat_spec.loader is not None
+        compat = importlib.util.module_from_spec(compat_spec)
+        compat_spec.loader.exec_module(compat)
+        captured: dict[str, object] = {}
+
+        class _Child:
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(command, **kwargs):
+            captured["row"] = json.loads(kwargs["stdin"].read().decode("utf-8"))
+            return _Child()
+
+        payload = {
+            "tool_name": "Bash", "args": {"command": "true"},
+            "session_id": "s-uri", "task_id": task_id,
+            "tool_call_id": call_id, "result": "ok", "duration_ms": 1,
+        }
+        with mock.patch.object(compat, "_resolve_store_py", return_value=STORE):
+            with mock.patch.object(compat.subprocess, "Popen", fake_popen):
+                self.assertTrue(compat._write_post_tool_evidence(
+                    payload, {"status": "ok"},
+                    clock=lambda: "2026-09-17T00:00:00Z",
+                ))
+        self.assertEqual(captured["row"]["ref_path"], expected)
 
     def test_hermes_compat_real_writer_records_edit_without_blocking(self) -> None:
         with tempfile.TemporaryDirectory(prefix="zmem-183-hermes-real-") as raw:
