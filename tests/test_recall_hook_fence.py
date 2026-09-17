@@ -397,11 +397,13 @@ class PreCompactHookTests(unittest.TestCase):
             (REPO_ROOT / "hooks" / "hooks.claude.json").read_text(encoding="utf-8")
         )
         self.assertIn("PreCompact", config["hooks"])
-        # Verify it points at the right launcher verb.
+        # Verify it points at the right launcher verb (issue #186 exec form:
+        # the verb rides args[1]).
         events = config["hooks"]["PreCompact"]
         self.assertEqual(len(events), 1)
-        cmd = events[0]["hooks"][0]["command"]
-        self.assertIn("precompact", cmd)
+        self.assertEqual(events[0]["hooks"][0]["command"], "node")
+        self.assertIn(
+            "precompact", events[0]["hooks"][0]["args"])
 
     def test_zcode_json_does_not_have_precompact(self):
         import json

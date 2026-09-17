@@ -1045,9 +1045,10 @@ function buildCanonicalEnv(host, meta, hookName) {
     return env;
 }
 
-// --- Find bash --------------------------------------------------------------
+// --- Resolve shell (issue #186) ---------------------------------------------
 // Priority: explicit env > Git Bash at known locations > derive from git > bare 'bash'
-function findBash() {
+// Exported for tests; `ZMEM_BASH_PATH` is read at call time.
+function resolveShell() {
     const envBash = process.env.ZMEM_BASH_PATH;
     if (envBash && existsSync(envBash)) return envBash;
 
@@ -1086,6 +1087,26 @@ function findBash() {
     }
 
     return "bash";
+}
+
+// Convert a native wrapper-script path into the argument handed to bash
+// (issue #186). Narrow-contract helper for the launcher's fixed
+// `<plugin-root>/hooks/zmem-<verb>.sh` shape — NOT a general Windows→POSIX
+// path converter. On Windows, absolute drive, forward-slash, UNC, and
+// already-relative inputs all normalize to `hooks/<script>.sh`, which the
+// child resolves against its cwd (`cwd: getPluginRoot()` in main()). On
+// non-Windows the absolute input is returned unchanged. Pure: no fs access.
+function toBashPath(filePath) {
+    if (process.platform !== "win32") return filePath;
+    const normalized = String(filePath).split("\\").join("/");
+    if (!/^[A-Za-z]:\//.test(normalized) && !normalized.startsWith("//")) {
+        return normalized;
+    }
+    // Absolute: keep the final two segments (`hooks/<script>.sh`). The launcher
+    // only ever passes join(getPluginRoot(), "hooks", "zmem-<verb>.sh").
+    const baseSlash = normalized.lastIndexOf("/", normalized.length - 2);
+    const dirSlash = normalized.lastIndexOf("/", baseSlash - 1);
+    return normalized.slice(dirSlash + 1);
 }
 
 function buildChildEnv(env, bashPath) {
@@ -1440,7 +1461,8 @@ async function main() {
     } catch {
         // Observational evidence is fail-open by contract.
     }
-    const bashPath = findBash();
+    const bashPath = resolveShell();
+    const bashScriptPath = toBashPath(scriptPath);
 
     // Translated hooks: buffer child stdout so we can rewrap it. Pass-through
     // hooks: inherit stdout/stderr so their output reaches the runner
@@ -1458,36 +1480,33 @@ async function main() {
     // stdout) on this path.
     let child;
     try {
-        child = spawn(bashPath, [scriptPath], {
+        child = spawn(bashPath, [bashScriptPath], {
             stdio: ["pipe", translated ? "pipe" : "inherit", translated ? "pipe" : "inherit"],
             env: buildChildEnv(env, bashPath),
+            // Issue #186: bashScriptPath is plugin-root-relative on Windows, so
+            // the child must resolve it against the plugin root. The wrappers
+            // self-locate via $(dirname "$0")/BASH_SOURCE, so every downstream
+            // absolute recomputation still lands on the plugin tree.
+            cwd: getPluginRoot(),
         });
     } catch (spawnErr) {
         if (watchdog) watchdog.clear();
         process.stdout.write("{}\n");
         process.exit(0);
     }
-    child.on("error", () => {
-        if (watchdog) watchdog.clear();
-        process.stdout.write("{}\n");
-        process.exit(0);
-    });    if (translated && child.stderr) {
+    // Spawn failure (bash not found, ENOEXEC/EACCES): fail open — clear the
+    // watchdog, emit an empty envelope, exit 0 (the handler above). Final
+    // critic on the review round caught this handler being dropped in the
+    // F-001 restructure: an unhandled 'error' event crashed the launcher
+    // (exit 1, zero stdout), breaking the fail-open invariant on a real
+    // deployment shape (no Git Bash found → resolveShell falls back to bare
+    // "bash"). Issue #186 collapses the previously duplicated registration
+    // down to this single handler.
+    if (translated && child.stderr) {
         child.stderr.on("data", (c) => {
             try { process.stderr.write(c); } catch { /* host stderr gone */ }
         });
     }
-
-    // Spawn failure (bash not found, ENOEXEC/EACCES): fail open — clear the
-    // watchdog, emit an empty envelope, exit 0. Final critic on the review
-    // round caught this handler being dropped in the F-001 restructure: an
-    // unhandled 'error' event crashed the launcher (exit 1, zero stdout),
-    // breaking the fail-open invariant on a real deployment shape (no Git
-    // Bash found → findBash falls back to bare "bash").
-    child.on("error", () => {
-        if (watchdog) watchdog.clear();
-        process.stdout.write("{}\n");
-        process.exit(0);
-    });
 
     // The watchdog (armed above, before startup) now binds the child:
     // everything before this line already consumed its budget.
@@ -1554,6 +1573,8 @@ module.exports = {
     _terminateChildTree,
     buildCanonicalEnv,
     buildChildEnv,
+    resolveShell,
+    toBashPath,
     hookEventNameFor,
     normalizeCodexFailurePayload,
     prepareHookPayload,

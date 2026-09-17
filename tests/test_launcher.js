@@ -60,7 +60,7 @@ function envWith(overrides) {
         "CLAUDE_PLUGIN_ROOT", "ZCODE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR",
         "ZCODE_PROJECT_DIR", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
         "CLAUDE_SESSION_ID", "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
-        "ZMEM_CONVENTION_INTERVAL", "ZMEM_INJECT",
+        "ZMEM_CONVENTION_INTERVAL", "ZMEM_INJECT", "ZMEM_BASH_PATH",
     ]) {
         delete e[k];
     }
@@ -2155,6 +2155,223 @@ console.log("\n[18] SessionStart pending-candidate note (real session-start.sh)"
             && postbatch.hookSpecificOutput.additionalContext === "batch ctx",
         JSON.stringify(postbatch));
 }
+
+// --- issue #186: Claude exec-form + launcher-side shell resolution ----------
+
+// Every Claude manifest entry must be exec-form `node` + exactly two args:
+// the launcher placeholder path and the event's verb, with each entry's
+// existing matcher and timeout preserved and zero shell metacharacters
+// outside the required ${CLAUDE_PLUGIN_ROOT} placeholder.
+function testClaudeManifestUsesExecForm() {
+    console.log("\n[#186] Claude manifest exec-form");
+    const manifest = JSON.parse(fs.readFileSync(
+        path.join(REPO, "hooks", "hooks.claude.json"), "utf8"));
+    const LAUNCHER_ARG0 = "${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js";
+    const MATCHERS = {
+        "PreToolUse": "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task",
+        "PostToolUse": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+    };
+    const VERBS = {
+        "SessionStart": ["session-start"],
+        "UserPromptSubmit": ["recall", "capture-correction"],
+        "PreToolUse": ["pretool-recall"],
+        "PostToolUse": ["convention-capture"],
+        "PostToolBatch": ["posttoolbatch-recall"],
+        "PostToolUseFailure": ["capture-failure"],
+        "Stop": ["reflect"],
+        "SubagentStart": ["subagent-recall"],
+        "SubagentStop": ["subagent-reflect"],
+        "PreCompact": ["precompact"],
+        "PostCompact": ["postcompact"],
+        "SessionEnd": ["session-end"],
+    };
+    let count = 0;
+    for (const [event, entries] of Object.entries(manifest.hooks || {})) {
+        ok("#186: event key known: " + event, event in VERBS, event);
+        for (const entry of entries) {
+            if (event in MATCHERS) {
+                eq("#186: " + event + " matcher preserved", entry.matcher, MATCHERS[event]);
+            } else {
+                ok("#186: " + event + " has no matcher", entry.matcher === undefined,
+                    JSON.stringify(entry.matcher));
+            }
+            for (const h of entry.hooks || []) {
+                count++;
+                eq("#186: " + event + " type", h.type, "command");
+                eq("#186: " + event + " command", h.command, "node");
+                ok("#186: " + event + " has exactly two args",
+                    Array.isArray(h.args) && h.args.length === 2, JSON.stringify(h.args));
+                if (Array.isArray(h.args) && h.args.length === 2) {
+                    eq("#186: " + event + " args[0]", h.args[0], LAUNCHER_ARG0);
+                    ok("#186: " + event + " verb " + h.args[1] + " registered",
+                        VERBS[event].includes(h.args[1]), h.args[1]);
+                    const stripped = h.args.map((a) =>
+                        String(a).split("${CLAUDE_PLUGIN_ROOT}").join("")).join(" ");
+                    ok("#186: " + event + " args free of shell metacharacters",
+                        !/[|&;`><()]/.test(stripped) && !stripped.includes("&&")
+                        && !stripped.includes("$("), stripped);
+                }
+                eq("#186: " + event + " timeout", h.timeout, 15);
+            }
+        }
+    }
+    eq("#186: manifest command entry count", count, 13);
+}
+
+// All 13 verbs run the REAL launcher + wrapper chain with every Git directory
+// stripped from PATH (case-insensitive) and ZMEM_BASH_PATH unset — the host
+// shape the issue fixes. Each verb must emit exactly one JSON stdout record
+// byte-equal to its committed fixture, with no diagnostic bytes on stdout and
+// no bash "script never ran" signature on stderr. A launcher-level silent
+// fail-open (spawn ENOENT → {} with empty stderr) is excluded up front by
+// asserting the in-process resolveShell() returns an on-disk bash under the
+// same stripped-PATH environment.
+function testClaudeVerbsRunWithoutGitOnPath() {
+    console.log("\n[#186] 13 verbs without Git on PATH");
+    const VERBS = [
+        "session-start", "recall", "capture-correction", "pretool-recall",
+        "convention-capture", "posttoolbatch-recall", "capture-failure",
+        "reflect", "subagent-recall", "subagent-reflect", "precompact",
+        "postcompact", "session-end",
+    ];
+    const FIXDIR = path.join(REPO, "tests", "fixtures", "launcher", "claude");
+    const inputPath = path.join(FIXDIR, "input.json");
+    const missing = ["input.json", ...VERBS.map((v) => v + ".json")]
+        .filter((f) => !fs.existsSync(path.join(FIXDIR, f)));
+    ok("#186: fixture set present", missing.length === 0, missing.join(","));
+    if (missing.length > 0) return;
+
+    const stripGit = (p) => p.split(path.delimiter)
+        .filter((part) => !/git/i.test(part)).join(path.delimiter);
+
+    // Spawnability precondition under the exact stripped-PATH env (no Git on
+    // PATH must still resolve a real bash via the known-location probes).
+    {
+        const saved = process.env.PATH;
+        const savedBash = process.env.ZMEM_BASH_PATH;
+        process.env.PATH = stripGit(process.env.PATH || "");
+        delete process.env.ZMEM_BASH_PATH;
+        let resolved = null;
+        try { resolved = launch.resolveShell(); } catch (e) { resolved = "THREW: " + e.message; }
+        if (saved === undefined) delete process.env.PATH; else process.env.PATH = saved;
+        if (savedBash === undefined) delete process.env.ZMEM_BASH_PATH;
+        else process.env.ZMEM_BASH_PATH = savedBash;
+        ok("#186: resolveShell resolves an on-disk bash with Git stripped from PATH",
+            typeof resolved === "string" && resolved.length > 0 && fs.existsSync(resolved),
+            JSON.stringify(resolved));
+    }
+
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-186-verbs-"));
+    const verbEnv = envWith({
+        PATH: stripGit(process.env.PATH || ""),
+        ZMEM_INJECT: "0",
+        ZMEM_CAPTURE: "0",
+        ZMEM_AUTO_RETAIN: "0",
+        ZMEM_REFLECT: "0",
+        ZMEM_NAMESPACE: "project:fixture-186",
+        ZMEM_MODEL_AUTODOWNLOAD: "0",
+        ZMEM_STORE: path.join(scratch, "store.sqlite"),
+        ZMEM_DATA: path.join(scratch, "data"),
+        ZMEM_MODELS_DIR: path.join(scratch, "missing-models"),
+        CLAUDE_PLUGIN_ROOT: REPO,
+    });
+    fs.mkdirSync(verbEnv.ZMEM_DATA, { recursive: true });
+    const payload = fs.readFileSync(inputPath);
+    // Prime capture-failure's per-session prompt dedup (marker keyed by the
+    // fixture's fixed session_id): its FIRST run emits the auto-capture
+    // prompt by design, its second run emits {}. Priming keeps every verb's
+    // compared output on the deterministic {} path the fixtures pin.
+    spawnSync("node", [LAUNCHER, "capture-failure"], {
+        input: payload, env: verbEnv, encoding: "buffer", timeout: 60000,
+    });
+    const NOT_RUN_SIGNATURES = [
+        "No such file or directory",
+        "cannot access",
+        "command not found",
+        "bad interpreter",
+        "cannot execute binary file",
+    ];
+    try {
+        for (const verb of VERBS) {
+            const expected = fs.readFileSync(path.join(FIXDIR, verb + ".json"));
+            const r = spawnSync("node", [LAUNCHER, verb], {
+                input: payload, env: verbEnv, encoding: "buffer", timeout: 60000,
+            });
+            ok("#186: verb " + verb + " stdout fixture-equal",
+                !r.error && Buffer.from(expected).equals(r.stdout),
+                r.error ? String(r.error)
+                    : JSON.stringify((r.stdout || Buffer.alloc(0)).toString("utf8").slice(0, 120)));
+            let parsed = null;
+            try { parsed = JSON.parse((r.stdout || Buffer.alloc(0)).toString("utf8").trim()); } catch (e) { /* */ }
+            ok("#186: verb " + verb + " stdout is one JSON record",
+                parsed !== null && typeof parsed === "object" && !Array.isArray(parsed),
+                JSON.stringify(parsed));
+            const stderrText = (r.stderr || Buffer.alloc(0)).toString("utf8");
+            const sig = NOT_RUN_SIGNATURES.find((s) => stderrText.includes(s));
+            ok("#186: verb " + verb + " stderr free of not-run signatures",
+                sig === undefined, sig || "");
+        }
+    } finally {
+        try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (e) { /* */ }
+    }
+}
+
+// resolveShell honors an existing ZMEM_BASH_PATH verbatim, ignores a
+// nonexistent explicit path, and resolves non-empty when unset; toBashPath
+// normalizes Windows drive/forward-slash/UNC/relative inputs to the
+// hooks/<script>.sh form and leaves non-Windows absolute input unchanged.
+function testResolveShellHonorsZmemBashPath() {
+    console.log("\n[#186] resolveShell + toBashPath");
+    eq("#186: exports resolveShell", typeof launch.resolveShell, "function");
+    eq("#186: exports toBashPath", typeof launch.toBashPath, "function");
+    if (typeof launch.resolveShell !== "function" || typeof launch.toBashPath !== "function") return;
+
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-186-shell-"));
+    const savedBash = process.env.ZMEM_BASH_PATH;
+    try {
+        const real = path.join(scratch, "bash-exists.txt");
+        fs.writeFileSync(real, "");
+        process.env.ZMEM_BASH_PATH = real;
+        eq("#186: existing ZMEM_BASH_PATH wins", launch.resolveShell(), real);
+
+        const bogus = path.join(scratch, "no", "such", "bash");
+        process.env.ZMEM_BASH_PATH = bogus;
+        ok("#186: nonexistent ZMEM_BASH_PATH falls through",
+            launch.resolveShell() !== bogus, launch.resolveShell());
+
+        delete process.env.ZMEM_BASH_PATH;
+        ok("#186: unset ZMEM_BASH_PATH resolves non-empty",
+            typeof launch.resolveShell() === "string" && launch.resolveShell().length > 0,
+            launch.resolveShell());
+    } finally {
+        if (savedBash === undefined) delete process.env.ZMEM_BASH_PATH;
+        else process.env.ZMEM_BASH_PATH = savedBash;
+        try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (e) { /* */ }
+    }
+
+    if (process.platform === "win32") {
+        const cases = [
+            ["C:\\plugin\\hooks\\zmem-recall.sh", "hooks/zmem-recall.sh"],
+            ["C:/plugin/hooks/zmem-recall.sh", "hooks/zmem-recall.sh"],
+            ["hooks/zmem-recall.sh", "hooks/zmem-recall.sh"],
+            ["\\\\server\\share\\hooks\\zmem-recall.sh", "hooks/zmem-recall.sh"],
+            ["hooks\\zmem-recall.sh", "hooks/zmem-recall.sh"],
+        ];
+        for (const [inp, want] of cases) {
+            let got = null;
+            try { got = launch.toBashPath(inp); } catch (e) { got = "THREW: " + e.message; }
+            eq("#186: toBashPath(" + JSON.stringify(inp) + ")", got, want);
+        }
+    } else {
+        eq("#186: toBashPath POSIX passthrough",
+            launch.toBashPath("/abs/plugin/hooks/zmem-recall.sh"),
+            "/abs/plugin/hooks/zmem-recall.sh");
+    }
+}
+
+testClaudeManifestUsesExecForm();
+testClaudeVerbsRunWithoutGitOnPath();
+testResolveShellHonorsZmemBashPath();
 
 // --- cleanup + report ------------------------------------------------------
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }

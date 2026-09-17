@@ -5,7 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" session-start",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "session-start"],
             "timeout": 15
           }
         ]
@@ -16,7 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" recall",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "recall"],
             "timeout": 15
           }
         ]
@@ -25,7 +27,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" capture-correction",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "capture-correction"],
             "timeout": 15
           }
         ]
@@ -37,7 +40,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" pretool-recall",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "pretool-recall"],
             "timeout": 15
           }
         ]
@@ -49,7 +53,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" convention-capture",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "convention-capture"],
             "timeout": 15
           }
         ]
@@ -60,7 +65,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" posttoolbatch-recall",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "posttoolbatch-recall"],
             "timeout": 15
           }
         ]
@@ -71,7 +77,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" capture-failure",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "capture-failure"],
             "timeout": 15
           }
         ]
@@ -82,7 +89,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" reflect",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "reflect"],
             "timeout": 15
           }
         ]
@@ -93,7 +101,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" subagent-recall",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "subagent-recall"],
             "timeout": 15
           }
         ]
@@ -104,7 +113,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" subagent-reflect",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "subagent-reflect"],
             "timeout": 15
           }
         ]
@@ -115,7 +125,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" precompact",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "precompact"],
             "timeout": 15
           }
         ]
@@ -126,7 +137,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" postcompact",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "postcompact"],
             "timeout": 15
           }
         ]
@@ -137,7 +149,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js\" session-end",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "session-end"],
             "timeout": 15
           }
         ]

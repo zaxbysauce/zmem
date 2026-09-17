@@ -527,14 +527,34 @@ def _shell_tokens(command):
     return out
 
 
-def _command_basename(command):
-    parts = _shell_tokens(command)
-    if not parts:
+def _argv_basename(tokens):
+    if not tokens:
         return None
-    first = Path(parts[0])
-    if first.stem.lower() in INTERPRETER_STEMS and len(parts) > 1:
-        return Path(parts[1]).name
+    first = Path(tokens[0])
+    if first.stem.lower() in INTERPRETER_STEMS and len(tokens) > 1:
+        return Path(tokens[1]).name
     return first.name
+
+
+def _command_basename(command):
+    return _argv_basename(_shell_tokens(command))
+
+
+def _command_tokens(command):
+    """Full argv token list for a manifest command value (issue #186).
+
+    Exec-form entries carry ``command: "node"`` plus an ``args`` array; the
+    tokens are their concatenation. Shell-form entries (Codex/ZCode until
+    #187/#188 convert them) are shell-split as before. Accepts either the
+    raw command value or its args list alongside via the two-argument form.
+    """
+    if isinstance(command, dict):
+        tokens = _shell_tokens(str(command.get("command", "")))
+        args = command.get("args")
+        if isinstance(args, list):
+            tokens = tokens + [str(a) for a in args]
+        return tokens
+    return _shell_tokens(str(command))
 
 
 def _manifest_commands(host, plugin_root=None):
@@ -578,7 +598,7 @@ def derive_hook_ids(host, plugin_root=None):
         if isinstance(raw, list):
             base = Path(str(raw[0])).name if raw else None
         else:
-            base = _command_basename(str(raw))
+            base = _argv_basename(_command_tokens(command))
         if base:
             hid = "%s:%s" % (event, base)
             if hid not in ids:
@@ -1023,12 +1043,11 @@ def _canary_store_env(host, plugin_root, data_dir):
     return env
 
 
-def _manifest_argv(command, plugin_root):
-    """Manifest command string -> argv with the host plugin-root variable
+def _manifest_argv(tokens, plugin_root):
+    """Manifest command tokens -> argv with the host plugin-root variable
     substituted (CLAUDE_PLUGIN_ROOT / PLUGIN_ROOT / ZCODE_PLUGIN_ROOT)."""
-    argv = _shell_tokens(str(command))
     out = []
-    for part in argv:
+    for part in tokens:
         for var in ("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT", "ZCODE_PLUGIN_ROOT"):
             part = part.replace("${%s}" % var, str(plugin_root))
         out.append(part)
@@ -1077,7 +1096,7 @@ def run_exec_form_lane(host, plugin_root, data_dir, result_path, *,
             extra_notes = []
             stop = False
             for event, command in _manifest_commands(host, plugin_root):
-                argv = _manifest_argv(command.get("command", ""),
+                argv = _manifest_argv(_command_tokens(command),
                                       plugin_root)
                 payload = {
                     "hook_event_name": event,
@@ -1094,8 +1113,8 @@ def run_exec_form_lane(host, plugin_root, data_dir, result_path, *,
                 out = runner(argv, input_bytes=json.dumps(payload)
                              .encode("utf-8"), env=env, cwd=workdir,
                              deadline_s=timeout_s + 30, deadline=deadline)
-                hid = "%s:%s" % (event, _command_basename(
-                    str(command.get("command", ""))))
+                hid = "%s:%s" % (event, _argv_basename(
+                    _command_tokens(command)))
                 if out is None:
                     if not stop:
                         verdict, reason = "fail", "deadline"

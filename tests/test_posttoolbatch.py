@@ -445,12 +445,14 @@ class PostToolBatchTest(unittest.TestCase):
         self.assertNotIn("matcher", entries[0])
         hook = entries[0]["hooks"][0]
         self.assertEqual(hook["type"], "command")
+        # Issue #186: exec-form — command is bare node, the verb rides args.
+        self.assertEqual(hook["command"], "node")
         self.assertEqual(
-            hook["command"],
-            'node "${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js" '
-            'posttoolbatch-recall')
+            hook["args"],
+            ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js",
+             "posttoolbatch-recall"])
         self.assertEqual(hook["timeout"], 15)
-        self.assertEqual(len(hook), 3)
+        self.assertEqual(len(hook), 4)
         # Launcher routing: event map, translated set, namespace set.
         src = LAUNCHER.read_text(encoding="utf-8")
         self.assertIn('"posttoolbatch-recall": "PostToolBatch"', src)
