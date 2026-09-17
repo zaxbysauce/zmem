@@ -1,0 +1,9 @@
+[features]
+memories = false
+[memories]
+use_memories = false
+generate_memories = false
+[projects.'C:/fixture/project']
+trust_level = "trusted"
+[hooks.state.'C:/fixture/repo']
+session_start = "trusted"

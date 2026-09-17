@@ -656,13 +656,23 @@ class DecisionLogAttributionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="zmem-153-order-") as tmp:
             version = json.loads((REPO_ROOT / "release-manifest.json").read_text(
                 encoding="utf-8"))["version"]
-            with mock.patch.dict(os.environ, {"ZMEM_DATA": tmp}, clear=False):
-                body._log_inject_decision(
-                    [], [], "silent", "empty-pool", session_id="order",
-                    moment="user_prompt", lane="claude", version=version,
-                    t_ms=7, arms={"fts": {"post": 1, "cap": 2}},
-                    batch=True, tool_names=["Edit"],
-                    path_basenames=["notes.md"], margin=0.1)
+            # Issue #185 isolation: the store-chain vars outrank ZMEM_DATA in
+            # _data_dir(), so pop them for the duration (os.environ cannot be
+            # None-patched via patch.dict).
+            saved = {k: os.environ.pop(k) for k in
+                     ("ZMEM_STORE", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")
+                     if k in os.environ}
+            try:
+                with mock.patch.dict(os.environ, {"ZMEM_DATA": tmp},
+                                     clear=False):
+                    body._log_inject_decision(
+                        [], [], "silent", "empty-pool", session_id="order",
+                        moment="user_prompt", lane="claude", version=version,
+                        t_ms=7, arms={"fts": {"post": 1, "cap": 2}},
+                        batch=True, tool_names=["Edit"],
+                        path_basenames=["notes.md"], margin=0.1)
+            finally:
+                os.environ.update(saved)
             line = (Path(tmp) / "zmem-decisions.log").read_text(
                 encoding="utf-8").strip()
             positions = [line.index(token) for token in (
@@ -674,11 +684,18 @@ class DecisionLogAttributionTest(unittest.TestCase):
     def test_writer_version_failure_degrades_to_legacy(self):
         body = self._body_module()
         with tempfile.TemporaryDirectory(prefix="zmem-153-legacy-") as tmp:
-            with mock.patch.dict(os.environ, {"ZMEM_DATA": tmp}, clear=False):
-                body._log_inject_decision(
-                    [], [], "silent", "empty-pool", session_id="legacy",
-                    moment="user_prompt", lane="claude", version=None,
-                    t_ms=7)
+            saved = {k: os.environ.pop(k) for k in
+                     ("ZMEM_STORE", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")
+                     if k in os.environ}
+            try:
+                with mock.patch.dict(os.environ, {"ZMEM_DATA": tmp},
+                                     clear=False):
+                    body._log_inject_decision(
+                        [], [], "silent", "empty-pool", session_id="legacy",
+                        moment="user_prompt", lane="claude", version=None,
+                        t_ms=7)
+            finally:
+                os.environ.update(saved)
             line = (Path(tmp) / "zmem-decisions.log").read_text(
                 encoding="utf-8").strip()
             self.assertIn("status=silent", line)

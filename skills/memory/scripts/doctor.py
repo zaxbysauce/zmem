@@ -57,6 +57,30 @@ try:
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from schema_meta import SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION  # type: ignore # noqa: E501
+try:
+    import host_registry
+except ImportError:
+    # host_registry.py lives in the checkout's scripts/ directory (issue
+    # #184), not beside doctor.py. Degrade to skip — doctor must always
+    # produce its report, never crash on a partial deployment tree.
+    try:
+        _repo_scripts = Path(__file__).resolve().parents[3] / "scripts"
+        sys.path.insert(0, str(_repo_scripts))
+        import host_registry  # type: ignore
+    except ImportError:
+        host_registry = None  # type: ignore
+
+
+# Issue #185: host install-skew / native-memory / orphan-store surface.
+ZMEM_PLUGIN_NAME = "zmem"
+ORPHAN_STORE_FILENAME = "store.sqlite"
+ORPHAN_STORE_ENV_VARS = ("ZCODE_PLUGIN_DATA", "CLAUDE_PLUGIN_DATA")
+# Hook events Codex must approve before they can run in a session or before
+# a tool call: the pair the Codex manifest registers for pre-session/pre-tool
+# execution (SessionStart, PreToolUse). Comparing only this subset keeps the
+# trust verdict stable as the manifest registers more post-approval events.
+CODEX_PRE_APPROVAL_EVENTS = frozenset({"session_start", "pre_tool_use"})
+
 STATUS_ORDER = {"fail": 3, "warn": 2, "pass": 1, "skip": 0}
 WINDOWS_BASH_CANDIDATES = (
     Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
@@ -1686,6 +1710,608 @@ def _check_second_stores(resolved_store: Path,
                   **details)
 
 
+def _version_tuple(value) -> tuple | None:
+    """Strict major.minor.patch -> (int, int, int); None when nonconforming.
+
+    A nonconforming version is malformed registry data (issue #185) and
+    follows the WARN rule; pre-release/build suffixes are not accepted.
+    """
+    if not isinstance(value, str):
+        return None
+    parts = value.split(".")
+    if len(parts) != 3:
+        return None
+    out = []
+    for part in parts:
+        if not part.isdigit() or not part.isascii():
+            return None
+        try:
+            out.append(int(part))
+        except ValueError:
+            # CPython 3.11+ refuses int() conversion of very long digit
+            # strings; a hostile/corrupt registry must WARN, not abort.
+            return None
+    return tuple(out)
+
+
+def _snake_event(name: str) -> str:
+    """CamelCase hook event -> lower snake case (PreToolUse -> pre_tool_use).
+
+    An underscore is inserted only at a lowercase->uppercase boundary, so
+    digit-leading or digit-adjacent names stay stable ("2FA" -> "2fa",
+    "OAuth2" -> "oauth2"; issue #185 review PRR-013).
+    """
+    out = []
+    prev = ""
+    for ch in name:
+        if ch.isupper() and prev.islower():
+            out.append("_")
+        out.append(ch.lower())
+        prev = ch
+    return "".join(out)
+
+
+def _norm_key(path: str | Path) -> str:
+    """Platform-normalized comparison key for repo path strings.
+
+    normcase alone is a no-op on POSIX, so lowercase explicitly as well:
+    a mixed-case hooks.state key must match the same repo on Linux exactly
+    as the pre-existing _norm_path matcher would (review PRR-012).
+    """
+    return os.path.normcase(str(Path(path))).lower()
+
+
+def _host_registry_status(host: str, path: Path, detail_error=None,
+                          reason: str | None = None) -> dict:
+    if detail_error is not None:
+        error_text = _display_path(f"{detail_error}")
+        return _check(
+            "host-registry",
+            "warn",
+            f"host-registry {host} registry unreadable: {error_text}",
+            host=host,
+            path=_display_path(path),
+            error=error_text,
+        )
+    return _check(
+        "host-registry",
+        "skip",
+        f"host-registry {host} registry not present for inspection.",
+        host=host,
+        path=_display_path(path),
+        reason=reason or "missing",
+    )
+
+
+def _load_marketplace_version(raw_path, home: Path):
+    """Return (version_tuple, error) for a registry entry's marketplacePath.
+
+    Absolute paths are used as-is; relative paths resolve against home
+    (mirroring the fixture layout and host behavior). error is None on
+    success.
+    """
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None, f"marketplacePath is not a usable path: {raw_path!r}"
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = home / path
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        return None, f"cannot read marketplace entry {path}: {exc}"
+    version = data.get("version") if isinstance(data, dict) else None
+    if _version_tuple(version) is None:
+        return None, f"marketplace entry {path} has no valid version"
+    return _version_tuple(version), None
+
+
+def _host_install_checks(home: Path, project: Path, repo_root: Path) -> list[dict]:
+    """Issue #185: install-skew diagnostics across the Claude/ZCode hosts.
+
+    Reads the host plugin registries via #184's strict codecs, then reports:
+    - duplicate-install FAIL when more than one enabled user-scope zmem
+      install exists on a host (project-scope pins belong to project-pin);
+    - marketplace-skew WARN when an installed cache version differs from the
+      marketplace version it points at (ONE check per run; the first
+      detected pair names the summary tokens, details carry every pair);
+    - project-pin WARN when a project-scoped zmem version is behind the
+      enabled user-scope install.
+    Missing optional registries SKIP; malformed data WARNs; nothing here
+    ever raises or edits host state.
+    """
+    checks: list[dict] = []
+    registries: list[tuple[str, Path, object]] = []
+    targets = (
+        ("claude", home / ".claude" / "plugins" / "installed_plugins.json"),
+        ("zcode", home / ".zcode" / "cli" / "plugins" / "installed_plugins.json"),
+    )
+    if host_registry is None:
+        for host, path in targets:
+            checks.append(_host_registry_status(
+                host, path, detail_error="host_registry module unavailable"))
+        # Review PRR-004: the manifest-trust check does not depend on
+        # host_registry — a degraded deployment must still surface it.
+        checks.append(_check_codex_manifest_trust(home, repo_root))
+        return checks
+
+    for host, path in targets:
+        if not path.exists():
+            checks.append(_host_registry_status(host, path))
+            continue
+        try:
+            schema, document = host_registry.load_host_registry(path, host)
+        except host_registry.RegistrySchemaError as exc:
+            checks.append(_host_registry_status(host, path, detail_error=exc))
+            continue
+        except Exception as exc:  # never let host state crash the doctor
+            checks.append(_host_registry_status(host, path, detail_error=exc))
+            continue
+        registries.append((host, path, document))
+
+    host_records: list[tuple[str, Path, list[dict]]] = []
+    for host, path, document in registries:
+        records: list[dict] = []
+        plugins = document.get("plugins") if isinstance(document, dict) else None
+        malformed: list[str] = []
+        if host == "claude" and isinstance(plugins, dict):
+            for plugin_id, entries in plugins.items():
+                for entry in entries if isinstance(entries, list) else []:
+                    if isinstance(entry, dict):
+                        records.append(dict(entry, _id=str(plugin_id)))
+        elif host == "zcode" and isinstance(plugins, list):
+            for entry in plugins:
+                if isinstance(entry, dict):
+                    plugin_id = entry.get("id") or entry.get("name") or ""
+                    records.append(dict(entry, _id=str(plugin_id)))
+        # Issue #185 review PRR-001: only zmem records participate in the
+        # skew checks — a foreign enabled plugin in a real registry must not
+        # count as a zmem install (false duplicate-install) and its
+        # non-semver version must never reach the pin comparison.
+        zmem_records = [
+            record for record in records
+            if record.get("_id", "").startswith(ZMEM_PLUGIN_NAME)
+        ]
+        for record in zmem_records:
+            if not isinstance(record.get("enabled", True), bool):
+                malformed.append(f"{record.get('_id')!r} enabled is not a boolean")
+            if _version_tuple(record.get("version")) is None:
+                malformed.append(
+                    f"{record.get('_id')!r} version {record.get('version')!r} "
+                    "is not major.minor.patch")
+        if malformed:
+            checks.append(_host_registry_status(
+                host, path, detail_error="; ".join(malformed)))
+            continue
+        host_records.append((host, path, zmem_records))
+
+    skew_pairs: list[dict] = []
+    # Defense-in-depth (issue #185 review): the blocks below parse
+    # operator-owned registry/marketplace files, and this function's
+    # contract is "nothing here ever raises into build_report". Per-site
+    # guards cover the known malformed shapes; this backstop converts any
+    # future escape into a visible WARN row instead of aborting the report.
+    # It cannot fire on well-formed input, so the byte-pinned fixture
+    # report is unaffected.
+    try:
+        for host, path, records in host_records:
+            enabled_user: list[tuple[str, tuple]] = []
+            enabled_project: list[tuple[str, tuple]] = []
+            for record in records:
+                if not record.get("enabled", True):
+                    continue
+                record_id = record.get("_id", "")
+                version = _version_tuple(record.get("version"))
+                if (record.get("scope") or "user") == "user":
+                    enabled_user.append((record_id, version))
+                else:
+                    enabled_project.append((record_id, version))
+                raw_market = record.get("marketplacePath")
+                if raw_market is None:
+                    continue
+                market_version, market_error = _load_marketplace_version(
+                    raw_market, home)
+                if market_error is not None:
+                    checks.append(_host_registry_status(
+                        host, path, detail_error=market_error))
+                    continue
+                if market_version != version:
+                    skew_pairs.append({
+                        "host": host,
+                        "id": record_id,
+                        "installed": record.get("version"),
+                        "marketplace": ".".join(str(p) for p in market_version),
+                        "marketplace_path": _display_path(raw_market),
+                    })
+
+            if len(enabled_user) > 1:
+                ids = sorted({rid for rid, _ in enabled_user})
+                checks.append(_check(
+                    "duplicate-install",
+                    "fail",
+                    f"duplicate-install host={host} ids={','.join(ids)}",
+                    host=host,
+                    ids=ids,
+                    records=[_display_path(r.get("installPath") or r.get("_id"))
+                             for r in records
+                             if r.get("enabled", True)
+                             and (r.get("scope") or "user") == "user"],
+                ))
+            if enabled_project and enabled_user:
+                top_user = max(v for _, v in enabled_user)
+                pins = [(rid, v) for rid, v in enabled_project if v < top_user]
+                if pins:
+                    pin_id, pin_version = pins[0]
+                    checks.append(_check(
+                        "project-pin",
+                        "warn",
+                        f"project-pin project="
+                        f"{'.'.join(str(p) for p in pin_version)} "
+                        f"user={'.'.join(str(p) for p in top_user)}",
+                        host=host,
+                        project_version=".".join(str(p) for p in pin_version),
+                        user_version=".".join(str(p) for p in top_user),
+                        project_ids=sorted(rid for rid, _ in pins),
+                        user_ids=sorted(rid for rid, v in enabled_user
+                                        if v == top_user),
+                    ))
+
+        if skew_pairs:
+            first = skew_pairs[0]
+            checks.append(_check(
+                "marketplace-skew",
+                "warn",
+                f"marketplace-skew installed={first['installed']} "
+                f"marketplace={first['marketplace']}",
+                pairs=skew_pairs,
+            ))
+    except Exception as exc:
+        checks.append(_check(
+            "host-install",
+            "warn",
+            f"host-install inspection failed unexpectedly: "
+            f"{type(exc).__name__}: {exc}",
+            error=f"{type(exc).__name__}: {exc}",
+        ))
+    # Codex manifest-trust coverage rides with the host install checks so
+    # every host-state diagnostic shares one wiring point (issue #185).
+    checks.append(_check_codex_manifest_trust(home, repo_root))
+    return checks
+
+
+def _read_setting_json(path: Path) -> tuple[dict | None, str | None, str]:
+    """Read a host settings JSON file. Returns (data, error, disposition)
+    where disposition is 'ok', 'missing', or 'unreadable'."""
+    if not path.exists():
+        return None, None, "missing"
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, UnicodeError, ValueError) as exc:
+        return None, f"{type(exc).__name__}: {exc}", "unreadable"
+    if not isinstance(data, dict):
+        return None, "setting file is not a JSON object", "unreadable"
+    return data, None, "ok"
+
+
+def _check_zcode_native_memory(home: Path) -> dict:
+    """Issue #185: ZCode's native-memory switch, read-only.
+
+    ``~/.zcode/v2/setting.json`` ``memoryEnabled: true`` conflicts with ZMem
+    cutover the same way Claude's autoMemoryEnabled does. Everything except
+    an explicit true is non-fatal (warn for unreadable/absent state, pass
+    for explicit false).
+    """
+    setting_path = home / ".zcode" / "v2" / "setting.json"
+    data, error, disposition = _read_setting_json(setting_path)
+    if disposition == "missing":
+        return _check(
+            "zcode-native-memory",
+            "warn",
+            "ZCode native memory setting could not be inspected: "
+            "setting.json not found.",
+            path=_display_path(setting_path),
+            reason="missing",
+        )
+    if disposition == "unreadable":
+        return _check(
+            "zcode-native-memory",
+            "warn",
+            f"ZCode native memory setting could not be inspected: {error}",
+            path=_display_path(setting_path),
+            error=str(error),
+        )
+    value = data.get("memoryEnabled") if data else None
+    if value is True:
+        return _check(
+            "zcode-native-memory",
+            "fail",
+            "ZCode native memory is enabled in setting.json; disable it for "
+            "ZMem cutover.",
+            path=_display_path(setting_path),
+            value=True,
+        )
+    if value is False:
+        return _check(
+            "zcode-native-memory",
+            "pass",
+            "ZCode native memory is disabled.",
+            path=_display_path(setting_path),
+            value=False,
+        )
+    return _check(
+        "zcode-native-memory",
+        "warn",
+        "ZCode native memory setting could not be inspected: memoryEnabled "
+        "key is missing.",
+        path=_display_path(setting_path),
+        reason="missing_key",
+    )
+
+
+def _codex_manifest_hook_ids(path: Path) -> set[str]:
+    """Top-level event keys of a Codex hooks manifest, snake-cased.
+
+    Returns an empty set when the manifest is missing or unreadable; the
+    caller decides how to surface that. Never invents hook ids (issue #185).
+    """
+    try:
+        with Path(path).open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, UnicodeError, ValueError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    # The repo manifest wraps its events in a top-level "hooks" object; a
+    # missing "hooks" key tolerates an unwrapped document, but a PRESENT
+    # non-dict "hooks" value is malformed content (review PRR-005) — the
+    # caller validates shape and warns; here it contributes no ids.
+    hooks_obj = data.get("hooks")
+    if isinstance(hooks_obj, dict):
+        events = hooks_obj
+    elif "hooks" not in data:
+        events = data
+    else:
+        return set()
+    return {_snake_event(str(name)) for name in events.keys()}
+
+
+def _codex_trusted_events(cfg, repo_root: Path) -> set[str]:
+    """Snake-cased event names trusted for repo_root in the Codex config.
+
+    Repo-specific first (normalized exact match on the hooks.state key);
+    when no entry names this repo, fall back to the union across all
+    entries — read-only inventory so a path-spelling change does not mask
+    an otherwise-trusted surface. Documented trade-off: on a multi-repo box
+    the union can let another repo's approval stand in for this repo's.
+    """
+    hooks = cfg.get("hooks") if isinstance(cfg, dict) else None
+    state = hooks.get("state") if isinstance(hooks, dict) else None
+    if not isinstance(state, dict):
+        return set()
+    target = _norm_key(repo_root)
+    has_repo_entry = False
+    matched: set[str] = set()
+    union: set[str] = set()
+    for key, entry in state.items():
+        if not isinstance(entry, dict):
+            continue
+        events = {_snake_event(str(name)) for name in entry.keys()}
+        union |= events
+        if _norm_key(key) == target:
+            has_repo_entry = True
+            matched |= events
+    return matched if has_repo_entry else union
+
+
+def _check_codex_manifest_trust(home: Path, repo_root: Path) -> dict:
+    """Issue #185: compare the Codex manifest's registered pre-approval
+    events with the hook-trust state the config records.
+
+    The manifest resolves from repo_root first, then falls back to the
+    checkout this doctor ships from (the fixture unit case passes a
+    repo_root that does not exist on disk). Missing files SKIP, invalid
+    content WARNs, missing registered events WARN `untrusted-hook <ids>`.
+    """
+    manifest_path = repo_root / "hooks" / "hooks.codex.json"
+    if not manifest_path.exists():
+        manifest_path = (
+            Path(__file__).resolve().parents[3] / "hooks" / "hooks.codex.json")
+    config_path = home / ".codex" / "config.toml"
+    if not manifest_path.exists():
+        return _check(
+            "untrusted-hook",
+            "skip",
+            "No Codex hooks manifest was found; registered-event trust "
+            "could not be inspected.",
+            manifest_path=_display_path(manifest_path),
+            config_path=_display_path(config_path),
+            reason="missing_manifest",
+        )
+    if not config_path.exists():
+        return _check(
+            "untrusted-hook",
+            "skip",
+            "No Codex config.toml was found; registered-event trust could "
+            "not be inspected.",
+            manifest_path=_display_path(manifest_path),
+            config_path=_display_path(config_path),
+            reason="missing_config",
+        )
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            manifest_data = json.load(fh)
+    except (OSError, UnicodeError, ValueError) as exc:
+        return _check(
+            "untrusted-hook",
+            "warn",
+            f"Codex hooks manifest is unreadable: {exc}",
+            manifest_path=_display_path(manifest_path),
+            config_path=_display_path(config_path),
+            error=str(exc),
+        )
+    # Review PRR-005: valid JSON with the wrong shape must not read as
+    # "nothing registered" — that would PASS the trust check on a manifest
+    # that cannot be interpreted. WARN on malformed content instead.
+    if not isinstance(manifest_data, dict) or (
+        "hooks" in manifest_data
+        and not isinstance(manifest_data["hooks"], dict)
+    ):
+        return _check(
+            "untrusted-hook",
+            "warn",
+            "Codex hooks manifest is malformed: expected a top-level hooks "
+            "object of registered events.",
+            manifest_path=_display_path(manifest_path),
+            config_path=_display_path(config_path),
+            error="invalid manifest shape",
+        )
+    cfg = _load_toml(config_path)
+    if cfg is None:
+        return _check(
+            "untrusted-hook",
+            "warn",
+            "Codex config.toml is unreadable; registered-event trust could "
+            "not be compared.",
+            manifest_path=_display_path(manifest_path),
+            config_path=_display_path(config_path),
+            error="invalid TOML",
+        )
+    registered_all = _codex_manifest_hook_ids(manifest_path)
+    compared = sorted(CODEX_PRE_APPROVAL_EVENTS & registered_all)
+    trusted = _codex_trusted_events(cfg, repo_root)
+    missing = sorted(set(compared) - trusted)
+    if missing:
+        return _check(
+            "untrusted-hook",
+            "warn",
+            f"untrusted-hook {','.join(missing)}",
+            manifest_path=_display_path(manifest_path),
+            config_path=_display_path(config_path),
+            registered=compared,
+            trusted=sorted(trusted),
+            missing=missing,
+        )
+    return _check(
+        "untrusted-hook",
+        "pass",
+        "All registered Codex hook events are trusted.",
+        manifest_path=_display_path(manifest_path),
+        config_path=_display_path(config_path),
+        registered=compared,
+        trusted=sorted(trusted),
+        missing=[],
+    )
+
+
+def _orphan_store_candidates(resolved_store: Path, home: Path,
+                             extra_candidates: list[Path] | None = None
+                             ) -> list[Path]:
+    """Known non-canonical store paths (issue #185, read-only inventory).
+
+    Only these candidates are inspected — never a directory scan:
+    <value>/store.sqlite for each ORPHAN_STORE_ENV_VARS value,
+    <home>/.zcode/memory/store.sqlite, then injected extras. Paths dedupe
+    case-insensitively and the resolved canonical store is excluded.
+    """
+    candidates: list[Path] = []
+    for var in ORPHAN_STORE_ENV_VARS:
+        raw = os.environ.get(var, "").strip()
+        if raw:
+            candidates.append(Path(raw) / ORPHAN_STORE_FILENAME)
+    candidates.append(home / ".zcode" / "memory" / ORPHAN_STORE_FILENAME)
+    candidates.extend(extra_candidates or [])
+    seen: set[str] = set()
+    out: list[Path] = []
+    for p in candidates:
+        try:
+            key = os.path.normcase(
+                str(p.resolve() if p.exists() else Path(os.path.abspath(str(p)))))
+        except OSError:
+            key = os.path.normcase(str(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        # A path that does not exist is not an orphan (mirrors the
+        # second-stores semantics): only real files are inventoried.
+        if not p.exists():
+            continue
+        try:
+            if p.resolve() == Path(resolved_store).resolve():
+                continue
+        except OSError:
+            continue
+        out.append(p)
+    return out
+
+
+def _check_orphan_stores(resolved_store: Path,
+                         extra_candidates: list[Path] | None = None
+                         ) -> list[dict]:
+    """Issue #185: inventory non-canonical SQLite stores with schema and
+    row counts. WARN-only: an orphan never fails the report on its own;
+    inspection recommends promote-store --from <path> instead of deleting.
+    """
+    candidates = _orphan_store_candidates(
+        resolved_store, Path.home(), extra_candidates)
+    if not candidates:
+        return [_check(
+            "orphan-store",
+            "skip",
+            "No orphan store on the known host paths.",
+            resolved=_display_path(resolved_store),
+            candidates=[],
+        )]
+    checks: list[dict] = []
+    for candidate in candidates:
+        details: dict = {"path": _display_path(candidate)}
+        schema_version = None
+        rows = None
+        error = None
+        conn = None
+        try:
+            uri = candidate.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()
+                raw_version = row[0] if row else None
+                if raw_version is not None:
+                    try:
+                        schema_version = int(str(raw_version).strip())
+                    except (TypeError, ValueError):
+                        schema_version = str(raw_version)
+                count_row = conn.execute(
+                    "SELECT count(*) FROM memory").fetchone()
+                rows = int(count_row[0]) if count_row else 0
+            except sqlite3.Error as exc:
+                error = f"{type(exc).__name__}: {exc}"
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if conn is not None:
+                conn.close()
+        if error is not None:
+            details["error"] = error
+            checks.append(_check(
+                "orphan-store",
+                "warn",
+                f"orphan store at {details['path']} could not be inspected: "
+                f"{error}",
+                **details,
+            ))
+            continue
+        details["schema_version"] = schema_version
+        details["rows"] = rows
+        checks.append(_check(
+            "orphan-store",
+            "warn",
+            f"orphan-store schema={schema_version} rows={rows}",
+            **details,
+        ))
+    return checks
+
+
 def _check_hermes_plugin(repo_root: Path) -> dict:
     """Issue #71 B: Hermes plugin surface check (the issue's `hermes_plugin`
     doctor check, analogous to the OpenCode check in #66).
@@ -2285,6 +2911,48 @@ def _recommendations(checks: list[dict]) -> list[str]:
     if by_id.get("codex-hook-trust", {}).get("status") in ("warn", "fail"):
         notes.append(
             "After installing any Codex hook surface, trust the project and reapprove hooks so the new path is explicit and reviewable."
+        )
+    dup = by_id.get("duplicate-install", {})
+    if dup.get("status") == "fail":
+        ids = ", ".join(dup.get("details", {}).get("ids") or [])
+        notes.append(
+            f"Multiple enabled zmem installs are registered ({ids}); inspect "
+            "both registries and disable or uninstall one yourself — doctor "
+            "never edits host registries (issue #185)."
+        )
+    if by_id.get("marketplace-skew", {}).get("status") == "warn":
+        notes.append(
+            "An installed zmem cache version differs from its marketplace "
+            "entry: refresh that host's plugin cache per the README Upgrade "
+            "section, then re-run doctor to confirm the skew cleared "
+            "(issue #185)."
+        )
+    if by_id.get("project-pin", {}).get("status") == "warn":
+        notes.append(
+            "A project-scoped zmem pin is behind the enabled user-scope "
+            "install; inspect the pinned project and align it deliberately "
+            "(doctor never rewrites pins, issue #185)."
+        )
+    if by_id.get("untrusted-hook", {}).get("status") == "warn":
+        notes.append(
+            "Codex has not approved every registered hook event; reapprove "
+            "the listed events in Codex so each hook runs with explicit, "
+            "reviewable consent (issue #185)."
+        )
+    orphan = by_id.get("orphan-store", {})
+    if orphan.get("status") == "warn":
+        path = orphan.get("details", {}).get("path")
+        notes.append(
+            f"A non-canonical store exists ({path}); inspect it, then merge "
+            "it with `promote-store --from <path>` and retire it manually — "
+            "doctor only inventories orphan stores and never deletes or "
+            "migrates anything (issue #185)."
+        )
+    if by_id.get("zcode-native-memory", {}).get("status") == "fail":
+        notes.append(
+            "Disable ZCode native memory in ~/.zcode/v2/setting.json "
+            "(memoryEnabled) yourself; never let zmem auto-edit host "
+            "settings (issue #185)."
         )
     if by_id.get("inject-switch", {}).get("status") == "warn":
         notes.append(
@@ -2949,6 +3617,12 @@ def build_report(project: Path, repo_root: Path,
     checks: list[dict] = []
     checks.append(_check_store_resolution(repo_root, resolved_store))
     checks.append(_check_local_path(resolved_store))
+    # Issue #185: install-skew, ZCode native memory, and orphan-store
+    # inventory — immediately after store resolution, before second-stores
+    # (whose order relative to access/schema checks is unchanged).
+    checks.extend(_host_install_checks(Path.home(), project, repo_root))
+    checks.append(_check_zcode_native_memory(Path.home()))
+    checks.extend(_check_orphan_stores(resolved_store))
     # Issue #71 E: leftover second stores with live rows not in canonical.
     checks.append(_check_second_stores(resolved_store))
     checks.append(_check_python())

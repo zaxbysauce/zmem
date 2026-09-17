@@ -372,6 +372,33 @@ store directory the plugin hosts use.
    plugin surfaces are first-class now; repo-local Codex adapter files may lag
    behind and are treated as optional by `doctor.py`.
 
+#### Doctor install-skew and orphan-store checks (issue #185)
+
+`doctor.py` also inventories, read-only:
+
+- **install-skew** — `duplicate-install` (fail) when more than one enabled
+  user-scope zmem install is registered for a host; `marketplace-skew`
+  (warn) when an installed cache version differs from the marketplace
+  version its registry entry names; `project-pin` (warn) when a
+  project-scoped zmem pin is behind the enabled user-scope install.
+  Registries are read with the #184 strict codecs; a missing registry skips
+  and a malformed one warns. Doctor never edits host state.
+- **`zcode-native-memory`** — reads `~/.zcode/v2/setting.json`
+  `memoryEnabled`: explicit `true` fails cutover, explicit `false` passes,
+  anything unreadable warns. Disable it yourself; zmem never auto-edits it.
+- **`untrusted-hook`** — compares the pre-approval events the repo's
+  Codex manifest registers (SessionStart, PreToolUse) with the hook-trust
+  state recorded for your repo; missing events warn
+  `untrusted-hook <ids>`. When no config entry names this repo, the
+  box-wide union of trusted events is used as a read-only inventory
+  fallback — on a multi-repo box another repo's approval can stand in, so
+  treat a pass as inventory rather than proof. Reapproval is always manual.
+- **`orphan-store`** — warns with `schema=`/`rows=` for each non-canonical
+  SQLite store on the known host paths (plugin-data env dirs,
+  `~/.zcode/memory/store.sqlite`). Inspect, then merge with
+  `promote-store --from <path>` and retire it manually; doctor never
+  deletes or migrates anything.
+
 ### Hermes Agent — local (memory provider + reflection hooks)
 
 Hermes reads/writes the same canonical store via a `MemoryProvider` adapter.
