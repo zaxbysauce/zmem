@@ -42,6 +42,17 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
   (`mcp-token`: warns `unscoped_token: true` on full-access operator tokens,
   never reports the token value) (issue #65)
 - Claude and Codex native-memory conflicts
+- ZCode native memory (`memoryEnabled` in `~/.zcode/v2/setting.json`; true
+  fails cutover, false passes) (issue #185)
+- host install-skew: duplicate enabled zmem installs (fail), installed-cache
+  vs marketplace version skew (warn), project pins behind the user-scope
+  install (warn) (issue #185)
+- Codex manifest hook trust: registered manifest events (SessionStart,
+  PreToolUse) missing from the config's trusted hook state warn
+  `untrusted-hook <ids>` (issue #185)
+- orphan-store inventory: non-canonical SQLite stores with schema and row
+  counts; merge with `promote-store --from <path>`, never auto-deleted
+  (issue #185)
 - canonical namespace derivation for the target project
 - required host surfaces and optional Codex adapter files
 

@@ -10,6 +10,40 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.44.0] - 2026-09-16
+
+### Added
+- **Doctor install-skew diagnostics (issue #185, Workstream N PR 2 of 6)**:
+  the read-only doctor now inspects host plugin registries (through the #184
+  strict codecs) and reports `duplicate-install` (fail: more than one enabled
+  user-scope zmem install on a host), `marketplace-skew` (warn: installed
+  cache version differs from the marketplace version its registry entry
+  points at), and `project-pin` (warn: a project-scoped zmem pin behind the
+  enabled user-scope install). Missing registries skip; malformed registry
+  data warns; doctor never edits host state.
+- **`zcode-native-memory` doctor check (issue #185)**: reads
+  `~/.zcode/v2/setting.json` `memoryEnabled` — explicit `true` fails cutover,
+  explicit `false` passes, unreadable/missing state warns. Joins the existing
+  Claude and Codex native-memory inspections.
+- **Codex manifest hook-trust coverage (issue #185)**: the new
+  `untrusted-hook` check compares the pre-approval events the repo's
+  `hooks/hooks.codex.json` registers (SessionStart, PreToolUse) with the
+  hook-trust events recorded for the repo in `~/.codex/config.toml`; missing
+  registered events warn `untrusted-hook <ids>`. When no config entry names
+  the repo, the box-wide union of trusted events is used as a read-only
+  inventory fallback (documented trade-off for multi-repo boxes). Reapproval
+  is always manual.
+- **Orphan-store inventory (issue #185)**: `orphan-store` warns with
+  `schema=<n> rows=<n>` for every non-canonical SQLite store on the known
+  host paths (ZCode/Claude plugin-data env dirs and the legacy
+  `~/.zcode/memory/store.sqlite`), read-only (`mode=ro`). An orphan never
+  fails the report on its own; inspection plus `promote-store --from <path>`
+  is the remediation, never automatic deletion.
+- **Focused coverage**: `DoctorInstallSkewTest` (8 tests) with a
+  deterministic `tests/fixtures/doctor/install-skew/` fixture tree and a
+  byte-pinned `expected.json` report contract; the doctor check-list docs in
+  SKILL.md, README, and CUTOVER now name every new check id.
+
 ## [0.43.0] - 2026-09-16
 
 ### Added

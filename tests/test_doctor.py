@@ -9,6 +9,7 @@ Run: python tests/test_doctor.py
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -1236,6 +1237,14 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
         env["ZMEM_DATA"] = str(data)
         env.pop("ZMEM_EMBED_PROFILE", None)
         env.update(env_extra)
+        # Issue #185 isolation fix: ambient store vars outrank the fixture's
+        # ZMEM_DATA in host.resolve_store_path (ZMEM_STORE first, then the
+        # plugin-data vars), so drop them unless this test set them
+        # deliberately — otherwise the doctor subprocess resolves an
+        # ambient store and live_memories reads as None.
+        for var in ("ZMEM_STORE", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+            if var not in env_extra:
+                env.pop(var, None)
         r = _sub.run(
             [sys.executable, str(self.scripts / "doctor.py"),
              "--format", "json"],
@@ -1328,6 +1337,407 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
             active_profile="minilm", embeddings_available=False,
             matches_store=None, total_live=9, with_emb=0,
             store_is_temp=True), [])
+
+
+INSTALL_SKEW_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "doctor" / "install-skew"
+INSTALL_SKEW_CHECK_IDS = (
+    "duplicate-install",
+    "marketplace-skew",
+    "project-pin",
+    "untrusted-hook",
+    "zcode-native-memory",
+    "orphan-store",
+)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _fixture_tree_digest(root: Path) -> str:
+    """Issue #185 fixture-tree digest: SHA-256 over the sorted POSIX relative
+    paths of every regular file, each framed by NUL bytes. Symlinks fail the
+    fixture validation instead of being hashed through their target."""
+    root = Path(root)
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or os.path.islink(path):
+            raise ValueError(f"symlink found in fixture tree: {path}")
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        digest.update(rel.encode("utf-8") + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+class DoctorInstallSkewTest(unittest.TestCase):
+    """Issue #185: host install-skew diagnostics (duplicate installs,
+    marketplace skew, project pins), ZCode native memory, Codex manifest hook
+    trust, and the read-only orphan-store inventory. Unit calls import doctor
+    directly; every CLI run points HOME and the ZMEM_* store variables at
+    temp/scratch paths so the operator's real store is never resolved and
+    storelib is never imported through this class."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor185-"))
+        self.home = self.tmp / "home"
+        self.repo = self.tmp / "repo"
+        self.project = self.tmp / "project"
+        self.bin = self.tmp / "bin"
+        for d in (self.home, self.repo, self.project, self.bin):
+            d.mkdir()
+        self._write_fake_tools()
+        self._write_repo_surfaces()
+        if REAL_GIT:
+            subprocess.run([REAL_GIT, "init", "-q"], cwd=str(self.project), check=True)
+            subprocess.run(
+                [REAL_GIT, "remote", "add", "origin",
+                 "https://github.com/Example/Widget.git"],
+                cwd=str(self.project), check=True,
+            )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_fake_tools(self):
+        node = self.bin / "node.cmd"
+        git = self.bin / "git.cmd"
+        bash = self.bin / "Git" / "bin" / "bash.cmd"
+        _write_text(node, _cmd_script("echo v20.11.0"))
+        _write_text(git, _cmd_script("echo https://github.com/Example/Widget.git"))
+        _write_text(bash, _cmd_script("echo GNU bash, version 5.2.0"))
+
+    def _write_repo_surfaces(self):
+        _write_text(self.repo / ".claude-plugin" / "plugin.json", "{}\n")
+        _write_text(self.repo / "hooks" / "hooks.claude.json", "{}\n")
+        _write_text(self.repo / ".codex-plugin" / "plugin.json", "{}\n")
+        _write_text(self.repo / "hooks" / "hooks.codex.json", "{}\n")
+        _write_text(self.repo / ".zcode-plugin" / "plugin.json", "{}\n")
+        _write_text(self.repo / "hooks" / "hooks.zcode.json", "{}\n")
+        _write_text(self.repo / "skills" / "memory" / "SKILL.md", "# memory\n")
+
+    def _install_fixture_home(self):
+        """Copy the whole install-skew fixture tree into the temp HOME, then
+        map the claude/zcode/codex subtrees onto the dotted host directories
+        (.claude, .zcode, .codex) the doctor inspects."""
+        shutil.copytree(INSTALL_SKEW_FIXTURES, self.home, dirs_exist_ok=True)
+        for name in ("claude", "zcode", "codex"):
+            shutil.move(str(self.home / name), str(self.home / ("." + name)))
+
+    def _base_env(self):
+        env = {**os.environ}
+        env["HOME"] = str(self.home)
+        env["USERPROFILE"] = str(self.home)
+        env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
+        env["ZMEM_BASH_PATH"] = str(self.bin / "Git" / "bin" / "bash.cmd")
+        for key in (
+            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_CORE_MD",
+            "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+            "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+            "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+            "ZMEM_EMBED_PROFILE", "ZMEM_CROSS_ENCODER",
+            "ZMEM_CROSS_ENCODER_MODEL",
+            "OneDrive", "OneDriveConsumer", "OneDriveCommercial",
+        ):
+            env.pop(key, None)
+        return env
+
+    def _scratch_env(self):
+        """_base_env plus the four isolated-store variables pointing at a
+        scratch directory that never holds a real store."""
+        env = self._base_env()
+        scratch = self.tmp / "scratch"
+        env["ZMEM_STORE"] = str(scratch / "store.sqlite")
+        env["ZMEM_DATA"] = str(scratch / "data")
+        env["ZMEM_MODELS_DIR"] = str(scratch / "missing-models")
+        env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        return env
+
+    def _run(self, *args, env: dict | None = None):
+        return subprocess.run(
+            [PYTHON, str(DOCTOR_PY), *args],
+            env=env or self._scratch_env(),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def _doctor(self):
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        import doctor  # noqa: E402
+        return doctor
+
+    def _relative_to_home(self, raw) -> str:
+        text = str(raw).replace("\\", "/")
+        prefix = str(self.home).replace("\\", "/").rstrip("/") + "/"
+        if text.lower().startswith(prefix.lower()):
+            return text[len(prefix):]
+        return text.lstrip("/")
+
+    # --- _host_install_checks ----------------------------------------------
+
+    def test_duplicate_install_is_fail_duplicate_install(self):
+        doctor = self._doctor()
+        self._install_fixture_home()
+        checks = doctor._host_install_checks(self.home, self.project, self.repo)
+        dupes = [c for c in checks if c.get("id") == "duplicate-install"]
+        self.assertEqual(len(dupes), 1, checks)
+        check = dupes[0]
+        self.assertEqual(check["status"], "fail", check)
+        self.assertEqual(
+            check["summary"],
+            "duplicate-install host=claude ids=zmem@primary,zmem@secondary",
+            check,
+        )
+        # The project-scoped entry belongs to project-pin, not this check.
+        self.assertNotIn("zmem@project-pin", check["summary"])
+
+    def test_marketplace_skew_is_warn(self):
+        doctor = self._doctor()
+        self._install_fixture_home()
+        checks = doctor._host_install_checks(self.home, self.project, self.repo)
+        skew = [c for c in checks if c.get("id") == "marketplace-skew"]
+        self.assertEqual(len(skew), 1, checks)  # ONE check across both hosts
+        check = skew[0]
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(
+            check["summary"],
+            "marketplace-skew installed=0.27.0 marketplace=0.14.0",
+            check,
+        )
+        rendered = json.dumps(check.get("details", {})).replace("\\", "/")
+        self.assertIn("0.27.0", rendered)
+        self.assertIn("0.14.0", rendered)
+        self.assertIn("marketplace/claude/plugin.json", rendered)
+        self.assertIn("marketplace/zcode/plugin.json", rendered)
+
+    def test_project_pin_is_warn(self):
+        doctor = self._doctor()
+        self._install_fixture_home()
+        checks = doctor._host_install_checks(self.home, self.project, self.repo)
+        pins = [c for c in checks if c.get("id") == "project-pin"]
+        self.assertEqual(len(pins), 1, checks)
+        check = pins[0]
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(
+            check["summary"], "project-pin project=0.14.0 user=0.27.0", check)
+        rendered = json.dumps(check.get("details", {}))
+        self.assertIn("zmem@project-pin", rendered)
+        self.assertIn("project", rendered)
+        self.assertIn("user", rendered)
+
+    # --- codex manifest trust ----------------------------------------------
+
+    def test_codex_missing_manifest_hook_is_warn(self):
+        doctor = self._doctor()
+        self._install_fixture_home()
+        hook_ids = doctor._codex_manifest_hook_ids(
+            INSTALL_SKEW_FIXTURES / "hooks" / "hooks.codex.json")
+        self.assertIn("session_start", hook_ids, hook_ids)
+        self.assertIn("pre_tool_use", hook_ids, hook_ids)
+        # The fixture config trusts only session_start for C:/fixture/repo;
+        # matching is a string comparison and never requires that key to
+        # exist as a real directory.
+        check = doctor._check_codex_manifest_trust(
+            self.home, Path("C:/fixture/repo"))
+        self.assertEqual(check["id"], "untrusted-hook", check)
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["summary"], "untrusted-hook pre_tool_use", check)
+        rendered = json.dumps(check.get("details", {})).replace("\\", "/")
+        self.assertIn("hooks.codex.json", rendered)
+        self.assertIn("config.toml", rendered)
+
+    # --- zcode native memory -------------------------------------------------
+
+    def test_zcode_native_memory_false_is_pass(self):
+        doctor = self._doctor()
+        setting = self.home / ".zcode" / "v2" / "setting.json"
+        setting.parent.mkdir(parents=True, exist_ok=True)
+        setting.write_bytes(
+            (INSTALL_SKEW_FIXTURES / "zcode" / "v2" / "setting.json").read_bytes())
+        check = doctor._check_zcode_native_memory(self.home)
+        self.assertEqual(check["id"], "zcode-native-memory", check)
+        self.assertEqual(check["status"], "pass", check)
+        self.assertEqual(check["summary"], "ZCode native memory is disabled.", check)
+        rendered = json.dumps(check.get("details", {})).replace("\\", "/")
+        self.assertIn(".zcode", rendered)
+        self.assertIn("setting.json", rendered)
+
+    # --- orphan-store inventory ----------------------------------------------
+
+    def test_orphan_store_reports_schema_and_rows(self):
+        from unittest import mock
+
+        doctor = self._doctor()
+        orphan = INSTALL_SKEW_FIXTURES / "orphan" / "store.sqlite"
+        resolved = self.tmp / "scratch" / "store.sqlite"  # absent scratch store
+        decoy = self.tmp / "decoy" / "store.sqlite"
+        decoy.parent.mkdir(parents=True, exist_ok=True)
+        decoy.write_bytes(b"not a sqlite database")
+        env = {"HOME": str(self.home), "USERPROFILE": str(self.home)}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(Path, "home", return_value=self.home):
+            for key in ("ZCODE_PLUGIN_DATA", "CLAUDE_PLUGIN_DATA"):
+                os.environ.pop(key, None)
+            candidates = doctor._orphan_store_candidates(
+                resolved, self.home, extra_candidates=[orphan])
+            checks = doctor._check_orphan_stores(
+                resolved, extra_candidates=[orphan])
+        # Only the injected fixture is a candidate: no env vars point
+        # anywhere, home has no .zcode/memory store, and unrelated decoy
+        # directories are never scanned.
+        self.assertEqual(len(candidates), 1, candidates)
+        self.assertEqual(
+            os.path.normcase(str(Path(candidates[0]).resolve())),
+            os.path.normcase(str(orphan.resolve())),
+        )
+        found = [c for c in checks if c.get("id") == "orphan-store"]
+        self.assertEqual(len(found), 1, checks)
+        check = found[0]
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["summary"], "orphan-store schema=9 rows=362", check)
+        details = check.get("details", {})
+        self.assertEqual(details["schema_version"], 9, details)
+        self.assertEqual(details["rows"], 362, details)
+        self.assertIsInstance(details["schema_version"], int, details)
+        self.assertIsInstance(details["rows"], int, details)
+        self.assertIn("path", details, details)
+        self.assertTrue(
+            str(details["path"]).replace("\\", "/").endswith("orphan/store.sqlite"),
+            details,
+        )
+
+    # --- malformed registries never crash the report -------------------------
+
+    def test_malformed_registry_is_nonfatal(self):
+        doctor = self._doctor()
+        bad = self.home / ".claude" / "plugins" / "installed_plugins.json"
+        _write_text(bad, "{not json")
+        checks = doctor._host_install_checks(self.home, self.project, self.repo)
+        self.assertIsInstance(checks, list, checks)
+        self.assertFalse([c for c in checks if c["status"] == "fail"], checks)
+        warned = [
+            c for c in checks
+            if c["status"] == "warn"
+            and "installed_plugins.json" in json.dumps(c).replace("\\", "/")
+        ]
+        self.assertTrue(warned, checks)
+        result = self._run(
+            "--format", "json",
+            "--repo-root", str(self.repo),
+            "--project", str(self.project),
+        )
+        self.assertNotIn("Traceback", result.stderr, result.stderr)
+        self.assertTrue(result.stdout.strip(), result.stderr)
+        report = json.loads(result.stdout)
+        statuses = {}
+        for check in report["checks"]:
+            statuses.setdefault(check["id"], set()).add(check["status"])
+        for check_id in ("duplicate-install", "marketplace-skew", "project-pin"):
+            self.assertNotIn("fail", statuses.get(check_id, set()), report)
+
+    # --- fixture CLI end-to-end + read-only digests ---------------------------
+
+    def test_fixture_tree_sha256_is_unchanged(self):
+        if not REAL_GIT:
+            self.skipTest("git is required for the namespace fixture")
+        self._install_fixture_home()
+        (self.repo / "hooks" / "hooks.codex.json").write_bytes(
+            (INSTALL_SKEW_FIXTURES / "hooks" / "hooks.codex.json").read_bytes())
+        env = self._scratch_env()
+        env["CLAUDE_PLUGIN_DATA"] = str(self.home / "orphan")
+        scratch_store = Path(env["ZMEM_STORE"])
+
+        fixture_files = sorted(
+            p for p in INSTALL_SKEW_FIXTURES.rglob("*") if p.is_file())
+        before = {p: _sha256(p) for p in fixture_files}
+        digest_before = _fixture_tree_digest(INSTALL_SKEW_FIXTURES)
+        self.assertRegex(digest_before, r"^[0-9a-f]{64}$")
+        home_orphan = self.home / "orphan" / "store.sqlite"
+        repo_manifest = self.repo / "hooks" / "hooks.codex.json"
+        copies_before = {
+            "home-orphan": _sha256(home_orphan),
+            "repo-manifest": _sha256(repo_manifest),
+        }
+
+        json_run = self._run(
+            "--format", "json", "--repo-root", str(self.repo),
+            "--project", str(self.project), env=env)
+        human_run = self._run(
+            "--format", "human", "--repo-root", str(self.repo),
+            "--project", str(self.project), env=env)
+        self.assertEqual(json_run.returncode, 1, json_run.stdout + json_run.stderr)
+        self.assertEqual(human_run.returncode, 1, human_run.stdout + human_run.stderr)
+
+        report = json.loads(json_run.stdout)
+        picked = {}
+        for check in report["checks"]:
+            if check["id"] in INSTALL_SKEW_CHECK_IDS:
+                picked.setdefault(check["id"], []).append(check)
+        extracted = []
+        for check_id in INSTALL_SKEW_CHECK_IDS:
+            entries = picked.get(check_id, [])
+            self.assertEqual(len(entries), 1, (check_id, report["summary"]))
+            check = entries[0]
+            entry = {
+                "id": check["id"],
+                "status": check["status"],
+                "summary": check["summary"],
+            }
+            if check_id == "orphan-store":
+                details = check["details"]
+                entry["details"] = {
+                    "path": self._relative_to_home(details["path"]),
+                    "schema_version": details["schema_version"],
+                    "rows": details["rows"],
+                }
+                self.assertEqual(entry["details"]["schema_version"], 9, check)
+                self.assertEqual(entry["details"]["rows"], 362, check)
+            extracted.append(entry)
+        expected_line = (INSTALL_SKEW_FIXTURES / "expected.json").read_bytes().rstrip(b"\n")
+        self.assertEqual(
+            json.dumps({"checks": extracted}, separators=(",", ":")).encode("utf-8"),
+            expected_line,
+            "the extracted install-skew checks must byte-match expected.json",
+        )
+
+        # JSON/human parity: the same six ids render with the same tokens.
+        self.assertIn(
+            "[FAIL] duplicate-install: duplicate-install host=claude "
+            "ids=zmem@primary,zmem@secondary", human_run.stdout)
+        self.assertIn(
+            "[WARN] marketplace-skew: marketplace-skew "
+            "installed=0.27.0 marketplace=0.14.0", human_run.stdout)
+        self.assertIn(
+            "[WARN] project-pin: project-pin project=0.14.0 user=0.27.0",
+            human_run.stdout)
+        self.assertIn("[WARN] untrusted-hook: untrusted-hook pre_tool_use",
+                      human_run.stdout)
+        self.assertIn(
+            "[PASS] zcode-native-memory: ZCode native memory is disabled.",
+            human_run.stdout)
+        self.assertIn("[WARN] orphan-store: orphan-store schema=9 rows=362",
+                      human_run.stdout)
+
+        # Read-only proof: doctor never creates or rewrites a single byte.
+        self.assertFalse(scratch_store.exists(), "doctor must not create the store")
+        self.assertEqual(_fixture_tree_digest(INSTALL_SKEW_FIXTURES), digest_before)
+        for path, digest in before.items():
+            self.assertEqual(_sha256(path), digest, path)
+        self.assertEqual(_sha256(home_orphan), copies_before["home-orphan"])
+        self.assertEqual(_sha256(repo_manifest), copies_before["repo-manifest"])
+
+        # The digest contract rejects symlinks outright (platform permitting).
+        sym_root = self.tmp / "symtree"
+        sym_root.mkdir()
+        (sym_root / "real.txt").write_bytes(b"real")
+        try:
+            os.symlink(str(sym_root / "real.txt"), str(sym_root / "link.txt"))
+        except OSError:
+            self.skipTest("os.symlink is unavailable on this platform")
+        with self.assertRaises(ValueError):
+            _fixture_tree_digest(sym_root)
 
 
 if __name__ == "__main__":

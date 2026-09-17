@@ -68,6 +68,27 @@ store or host config. Checks:
   MCP token scope advisory (`mcp-token` check: warns `unscoped_token: true`
   on full-access operator tokens, never reports the token value)
 - Claude/Codex native-memory conflicts via read-only config inspection
+- ZCode native memory (`zcode-native-memory` check, issue #185):
+  `~/.zcode/v2/setting.json` `memoryEnabled: true` fails cutover, explicit
+  `false` passes; unreadable/missing setting warns — never auto-edited
+- host install-skew (issue #185): `duplicate-install` (fail) when more than
+  one enabled user-scope zmem install is registered for a host;
+  `marketplace-skew` (warn) when an installed cache version differs from the
+  marketplace version its registry entry points at; `project-pin` (warn)
+  when a project-scoped zmem pin is behind the enabled user-scope install.
+  Registries are read through the #184 strict codecs; missing registries
+  skip and malformed ones warn — doctor never edits host state
+- Codex manifest hook trust (`untrusted-hook` check, issue #185): compares
+  the pre-approval events the repo manifest registers (SessionStart,
+  PreToolUse) with the events the Codex config records trusted for the repo
+  (falling back to the box-wide union when no entry names this repo — on a
+  multi-repo box another repo's approval can stand in, so treat a pass as
+  inventory, not proof). Missing registered events warn
+  `untrusted-hook <ids>`; reapproval is always manual
+- orphan-store inventory (issue #185): warns with `schema=`/`rows=` for
+  every non-canonical SQLite store on the known host paths (plugin-data env
+  dirs, `~/.zcode/memory/store.sqlite`); inspect then merge with
+  `promote-store --from <path>` — doctor never deletes or migrates
 - canonical namespace for the provided project
 - host surface presence (Claude plugin, ZCode plugin, memory skill; repo-local
   Codex adapter files are optional until that lane exists)
