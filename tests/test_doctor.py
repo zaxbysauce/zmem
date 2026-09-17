@@ -1420,9 +1420,12 @@ class DoctorInstallSkewTest(unittest.TestCase):
         """Copy the whole install-skew fixture tree into the temp HOME, then
         map the claude/zcode/codex subtrees onto the dotted host directories
         (.claude, .zcode, .codex) the doctor inspects."""
-        shutil.copytree(INSTALL_SKEW_FIXTURES, self.home, dirs_exist_ok=True)
+        self._install_fixture_home_at(self.home)
+
+    def _install_fixture_home_at(self, home):
+        shutil.copytree(INSTALL_SKEW_FIXTURES, home, dirs_exist_ok=True)
         for name in ("claude", "zcode", "codex"):
-            shutil.move(str(self.home / name), str(self.home / ("." + name)))
+            shutil.move(str(home / name), str(home / ("." + name)))
 
     def _base_env(self):
         env = {**os.environ}
@@ -1492,6 +1495,36 @@ class DoctorInstallSkewTest(unittest.TestCase):
         )
         # The project-scoped entry belongs to project-pin, not this check.
         self.assertNotIn("zmem@project-pin", check["summary"])
+        # Issue #185 review PRR-001: a foreign enabled user-scope plugin in
+        # a real registry must NOT count as a zmem install (and a
+        # non-semver foreign version must not crash the pin comparison).
+        foreign_home = self.tmp / "foreign-home"
+        foreign_registry = (
+            foreign_home / ".claude" / "plugins" / "installed_plugins.json")
+        _write_text(foreign_registry, json.dumps({
+            "version": 2,
+            "plugins": {
+                "zmem@solo": [{
+                    "scope": "user",
+                    "version": "0.27.0",
+                    "enabled": True,
+                }],
+                "other-author@other-plugin": [{
+                    "scope": "user",
+                    "version": "1.2.3",
+                    "enabled": True,
+                }],
+            },
+        }) + "\n")
+        foreign_checks = doctor._host_install_checks(
+            foreign_home, self.project, self.repo)
+        foreign_dupes = [
+            c for c in foreign_checks if c.get("id") == "duplicate-install"]
+        self.assertEqual(
+            len(foreign_dupes), 0,
+            "non-zmem plugins must not produce duplicate-install: %r"
+            % (foreign_checks,),
+        )
 
     def test_marketplace_skew_is_warn(self):
         doctor = self._doctor()
@@ -1547,6 +1580,35 @@ class DoctorInstallSkewTest(unittest.TestCase):
         rendered = json.dumps(check.get("details", {})).replace("\\", "/")
         self.assertIn("hooks.codex.json", rendered)
         self.assertIn("config.toml", rendered)
+        # Issue #185 review PRR-005: valid JSON with the wrong shape must
+        # WARN, never read as "nothing registered" (silent PASS). The
+        # manifest resolves from repo_root when present, so point repo_root
+        # at a scratch repo holding each bad payload.
+        for payload in ("[]", "{\"hooks\": \"x\"}", "{}"):
+            shape_repo = self.tmp / "shape-repo"
+            shape_repo_hooks = shape_repo / "hooks"
+            if shape_repo_hooks.exists():
+                shutil.rmtree(shape_repo_hooks)
+            shape_repo_hooks.mkdir(parents=True)
+            (shape_repo_hooks / "hooks.codex.json").write_text(
+                payload, encoding="utf-8", newline="\n")
+            check = doctor._check_codex_manifest_trust(self.home, shape_repo)
+            if payload == "{}":
+                # An empty manifest registers nothing: PASS is correct.
+                self.assertEqual(check["status"], "pass", (payload, check))
+            else:
+                self.assertEqual(check["status"], "warn", (payload, check))
+            shutil.rmtree(shape_repo)
+        # Issue #185 review PRR-004: even with host_registry unavailable,
+        # the manifest-trust check must still run.
+        from unittest import mock
+        with mock.patch.object(doctor, "host_registry", None):
+            checks = doctor._host_install_checks(
+                self.home, self.project, self.repo)
+        self.assertTrue(
+            [c for c in checks if c.get("id") == "untrusted-hook"],
+            checks,
+        )
 
     # --- zcode native memory -------------------------------------------------
 
@@ -1563,6 +1625,18 @@ class DoctorInstallSkewTest(unittest.TestCase):
         rendered = json.dumps(check.get("details", {})).replace("\\", "/")
         self.assertIn(".zcode", rendered)
         self.assertIn("setting.json", rendered)
+        # Issue #185 review PRR-007: pin the remaining branches — explicit
+        # true FAILs, a missing key warns, and unreadable JSON warns.
+        setting.write_text("{\"memoryEnabled\": true}\n",
+                           encoding="utf-8", newline="\n")
+        check = doctor._check_zcode_native_memory(self.home)
+        self.assertEqual(check["status"], "fail", check)
+        setting.write_text("{}\n", encoding="utf-8", newline="\n")
+        check = doctor._check_zcode_native_memory(self.home)
+        self.assertEqual(check["status"], "warn", check)
+        setting.write_text("{broken\n", encoding="utf-8", newline="\n")
+        check = doctor._check_zcode_native_memory(self.home)
+        self.assertEqual(check["status"], "warn", check)
 
     # --- orphan-store inventory ----------------------------------------------
 
@@ -1636,12 +1710,43 @@ class DoctorInstallSkewTest(unittest.TestCase):
             statuses.setdefault(check["id"], set()).add(check["status"])
         for check_id in ("duplicate-install", "marketplace-skew", "project-pin"):
             self.assertNotIn("fail", statuses.get(check_id, set()), report)
+        # Issue #185 review PRR-002: an over-long digit version component
+        # must take the malformed-WARN path, never abort the doctor run
+        # (CPython 3.11+ int() raises beyond 4300 digits).
+        big_home = self.tmp / "big-version-home"
+        self._install_fixture_home_at(big_home)
+        big_registry = big_home / ".claude" / "plugins" / "installed_plugins.json"
+        registry = json.loads(big_registry.read_text(encoding="utf-8"))
+        registry["plugins"]["zmem@big"] = [{
+            "scope": "user",
+            "version": "1." + "9" * 5000 + ".3",
+            "enabled": True,
+        }]
+        big_registry.write_text(
+            json.dumps(registry) + "\n", encoding="utf-8", newline="\n")
+        big_checks = doctor._host_install_checks(
+            big_home, self.project, self.repo)
+        big_warned = [
+            c for c in big_checks
+            if c.get("id") == "host-registry" and c.get("status") == "warn"
+        ]
+        self.assertTrue(big_warned, big_checks)
 
     # --- fixture CLI end-to-end + read-only digests ---------------------------
 
     def test_fixture_tree_sha256_is_unchanged(self):
         if not REAL_GIT:
             self.skipTest("git is required for the namespace fixture")
+        # Issue #185 review PRR-009: the fixture manifest is a byte-copy of
+        # the shipped hooks/hooks.codex.json — assert the copy stays in
+        # sync, otherwise the install-skew tests silently diverge from real
+        # behavior when the shipped manifest changes.
+        self.assertEqual(
+            (INSTALL_SKEW_FIXTURES / "hooks" / "hooks.codex.json").read_bytes(),
+            (REPO_ROOT / "hooks" / "hooks.codex.json").read_bytes(),
+            "install-skew hooks fixture must stay a byte-copy of the "
+            "shipped hooks/hooks.codex.json",
+        )
         self._install_fixture_home()
         (self.repo / "hooks" / "hooks.codex.json").write_bytes(
             (INSTALL_SKEW_FIXTURES / "hooks" / "hooks.codex.json").read_bytes())

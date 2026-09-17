@@ -1725,38 +1725,53 @@ def _version_tuple(value) -> tuple | None:
     for part in parts:
         if not part.isdigit() or not part.isascii():
             return None
-        out.append(int(part))
+        try:
+            out.append(int(part))
+        except ValueError:
+            # CPython 3.11+ refuses int() conversion of very long digit
+            # strings; a hostile/corrupt registry must WARN, not abort.
+            return None
     return tuple(out)
 
 
 def _snake_event(name: str) -> str:
-    """CamelCase hook event -> lower snake case (PreToolUse -> pre_tool_use)."""
+    """CamelCase hook event -> lower snake case (PreToolUse -> pre_tool_use).
+
+    An underscore is inserted only at a lowercase->uppercase boundary, so
+    digit-leading or digit-adjacent names stay stable ("2FA" -> "2fa",
+    "OAuth2" -> "oauth2"; issue #185 review PRR-013).
+    """
     out = []
+    prev = ""
     for ch in name:
-        if ch.isupper():
-            if out:
-                out.append("_")
-            out.append(ch.lower())
-        else:
-            out.append(ch)
+        if ch.isupper() and prev.islower():
+            out.append("_")
+        out.append(ch.lower())
+        prev = ch
     return "".join(out)
 
 
 def _norm_key(path: str | Path) -> str:
-    """Platform-normalized comparison key for repo path strings."""
-    return os.path.normcase(str(Path(path)))
+    """Platform-normalized comparison key for repo path strings.
+
+    normcase alone is a no-op on POSIX, so lowercase explicitly as well:
+    a mixed-case hooks.state key must match the same repo on Linux exactly
+    as the pre-existing _norm_path matcher would (review PRR-012).
+    """
+    return os.path.normcase(str(Path(path))).lower()
 
 
 def _host_registry_status(host: str, path: Path, detail_error=None,
                           reason: str | None = None) -> dict:
     if detail_error is not None:
+        error_text = _display_path(f"{detail_error}")
         return _check(
             "host-registry",
             "warn",
-            f"host-registry {host} registry unreadable: {detail_error}",
+            f"host-registry {host} registry unreadable: {error_text}",
             host=host,
             path=_display_path(path),
-            error=str(detail_error),
+            error=error_text,
         )
     return _check(
         "host-registry",
@@ -1814,6 +1829,9 @@ def _host_install_checks(home: Path, project: Path, repo_root: Path) -> list[dic
         for host, path in targets:
             checks.append(_host_registry_status(
                 host, path, detail_error="host_registry module unavailable"))
+        # Review PRR-004: the manifest-trust check does not depend on
+        # host_registry — a degraded deployment must still surface it.
+        checks.append(_check_codex_manifest_trust(home, repo_root))
         return checks
 
     for host, path in targets:
@@ -1845,9 +1863,15 @@ def _host_install_checks(home: Path, project: Path, repo_root: Path) -> list[dic
                 if isinstance(entry, dict):
                     plugin_id = entry.get("id") or entry.get("name") or ""
                     records.append(dict(entry, _id=str(plugin_id)))
-        for record in records:
-            if not record.get("_id", "").startswith(ZMEM_PLUGIN_NAME):
-                continue
+        # Issue #185 review PRR-001: only zmem records participate in the
+        # skew checks — a foreign enabled plugin in a real registry must not
+        # count as a zmem install (false duplicate-install) and its
+        # non-semver version must never reach the pin comparison.
+        zmem_records = [
+            record for record in records
+            if record.get("_id", "").startswith(ZMEM_PLUGIN_NAME)
+        ]
+        for record in zmem_records:
             if not isinstance(record.get("enabled", True), bool):
                 malformed.append(f"{record.get('_id')!r} enabled is not a boolean")
             if _version_tuple(record.get("version")) is None:
@@ -1858,79 +1882,95 @@ def _host_install_checks(home: Path, project: Path, repo_root: Path) -> list[dic
             checks.append(_host_registry_status(
                 host, path, detail_error="; ".join(malformed)))
             continue
-        host_records.append((host, path, records))
+        host_records.append((host, path, zmem_records))
 
     skew_pairs: list[dict] = []
-    for host, path, records in host_records:
-        enabled_user: list[tuple[str, tuple]] = []
-        enabled_project: list[tuple[str, tuple]] = []
-        for record in records:
-            if not record.get("enabled", True):
-                continue
-            record_id = record.get("_id", "")
-            version = _version_tuple(record.get("version"))
-            if (record.get("scope") or "user") == "user":
-                enabled_user.append((record_id, version))
-            else:
-                enabled_project.append((record_id, version))
-            raw_market = record.get("marketplacePath")
-            if raw_market is None:
-                continue
-            market_version, market_error = _load_marketplace_version(
-                raw_market, home)
-            if market_error is not None:
-                checks.append(_host_registry_status(
-                    host, path, detail_error=market_error))
-                continue
-            if market_version != version:
-                skew_pairs.append({
-                    "host": host,
-                    "id": record_id,
-                    "installed": record.get("version"),
-                    "marketplace": ".".join(str(p) for p in market_version),
-                    "marketplace_path": str(raw_market),
-                })
+    # Defense-in-depth (issue #185 review): the blocks below parse
+    # operator-owned registry/marketplace files, and this function's
+    # contract is "nothing here ever raises into build_report". Per-site
+    # guards cover the known malformed shapes; this backstop converts any
+    # future escape into a visible WARN row instead of aborting the report.
+    # It cannot fire on well-formed input, so the byte-pinned fixture
+    # report is unaffected.
+    try:
+        for host, path, records in host_records:
+            enabled_user: list[tuple[str, tuple]] = []
+            enabled_project: list[tuple[str, tuple]] = []
+            for record in records:
+                if not record.get("enabled", True):
+                    continue
+                record_id = record.get("_id", "")
+                version = _version_tuple(record.get("version"))
+                if (record.get("scope") or "user") == "user":
+                    enabled_user.append((record_id, version))
+                else:
+                    enabled_project.append((record_id, version))
+                raw_market = record.get("marketplacePath")
+                if raw_market is None:
+                    continue
+                market_version, market_error = _load_marketplace_version(
+                    raw_market, home)
+                if market_error is not None:
+                    checks.append(_host_registry_status(
+                        host, path, detail_error=market_error))
+                    continue
+                if market_version != version:
+                    skew_pairs.append({
+                        "host": host,
+                        "id": record_id,
+                        "installed": record.get("version"),
+                        "marketplace": ".".join(str(p) for p in market_version),
+                        "marketplace_path": _display_path(raw_market),
+                    })
 
-        if len(enabled_user) > 1:
-            ids = sorted({rid for rid, _ in enabled_user})
-            checks.append(_check(
-                "duplicate-install",
-                "fail",
-                f"duplicate-install host={host} ids={','.join(ids)}",
-                host=host,
-                ids=ids,
-                records=[_display_path(r.get("installPath") or r.get("_id"))
-                         for r in records
-                         if r.get("enabled", True)
-                         and (r.get("scope") or "user") == "user"],
-            ))
-        if enabled_project and enabled_user:
-            top_user = max(v for _, v in enabled_user)
-            pins = [(rid, v) for rid, v in enabled_project if v < top_user]
-            if pins:
-                pin_id, pin_version = pins[0]
+            if len(enabled_user) > 1:
+                ids = sorted({rid for rid, _ in enabled_user})
                 checks.append(_check(
-                    "project-pin",
-                    "warn",
-                    f"project-pin project="
-                    f"{'.'.join(str(p) for p in pin_version)} "
-                    f"user={'.'.join(str(p) for p in top_user)}",
+                    "duplicate-install",
+                    "fail",
+                    f"duplicate-install host={host} ids={','.join(ids)}",
                     host=host,
-                    project_version=".".join(str(p) for p in pin_version),
-                    user_version=".".join(str(p) for p in top_user),
-                    project_ids=sorted(rid for rid, _ in pins),
-                    user_ids=sorted(rid for rid, v in enabled_user
-                                    if v == top_user),
+                    ids=ids,
+                    records=[_display_path(r.get("installPath") or r.get("_id"))
+                             for r in records
+                             if r.get("enabled", True)
+                             and (r.get("scope") or "user") == "user"],
                 ))
+            if enabled_project and enabled_user:
+                top_user = max(v for _, v in enabled_user)
+                pins = [(rid, v) for rid, v in enabled_project if v < top_user]
+                if pins:
+                    pin_id, pin_version = pins[0]
+                    checks.append(_check(
+                        "project-pin",
+                        "warn",
+                        f"project-pin project="
+                        f"{'.'.join(str(p) for p in pin_version)} "
+                        f"user={'.'.join(str(p) for p in top_user)}",
+                        host=host,
+                        project_version=".".join(str(p) for p in pin_version),
+                        user_version=".".join(str(p) for p in top_user),
+                        project_ids=sorted(rid for rid, _ in pins),
+                        user_ids=sorted(rid for rid, v in enabled_user
+                                        if v == top_user),
+                    ))
 
-    if skew_pairs:
-        first = skew_pairs[0]
+        if skew_pairs:
+            first = skew_pairs[0]
+            checks.append(_check(
+                "marketplace-skew",
+                "warn",
+                f"marketplace-skew installed={first['installed']} "
+                f"marketplace={first['marketplace']}",
+                pairs=skew_pairs,
+            ))
+    except Exception as exc:
         checks.append(_check(
-            "marketplace-skew",
+            "host-install",
             "warn",
-            f"marketplace-skew installed={first['installed']} "
-            f"marketplace={first['marketplace']}",
-            pairs=skew_pairs,
+            f"host-install inspection failed unexpectedly: "
+            f"{type(exc).__name__}: {exc}",
+            error=f"{type(exc).__name__}: {exc}",
         ))
     # Codex manifest-trust coverage rides with the host install checks so
     # every host-state diagnostic shares one wiring point (issue #185).
@@ -2021,9 +2061,17 @@ def _codex_manifest_hook_ids(path: Path) -> set[str]:
         return set()
     if not isinstance(data, dict):
         return set()
-    # The repo manifest wraps its events in a top-level "hooks" object;
-    # tolerate an unwrapped document for robustness.
-    events = data.get("hooks") if isinstance(data.get("hooks"), dict) else data
+    # The repo manifest wraps its events in a top-level "hooks" object; a
+    # missing "hooks" key tolerates an unwrapped document, but a PRESENT
+    # non-dict "hooks" value is malformed content (review PRR-005) — the
+    # caller validates shape and warns; here it contributes no ids.
+    hooks_obj = data.get("hooks")
+    if isinstance(hooks_obj, dict):
+        events = hooks_obj
+    elif "hooks" not in data:
+        events = data
+    else:
+        return set()
     return {_snake_event(str(name)) for name in events.keys()}
 
 
@@ -2091,7 +2139,7 @@ def _check_codex_manifest_trust(home: Path, repo_root: Path) -> dict:
         )
     try:
         with manifest_path.open("r", encoding="utf-8") as fh:
-            json.load(fh)
+            manifest_data = json.load(fh)
     except (OSError, UnicodeError, ValueError) as exc:
         return _check(
             "untrusted-hook",
@@ -2100,6 +2148,22 @@ def _check_codex_manifest_trust(home: Path, repo_root: Path) -> dict:
             manifest_path=_display_path(manifest_path),
             config_path=_display_path(config_path),
             error=str(exc),
+        )
+    # Review PRR-005: valid JSON with the wrong shape must not read as
+    # "nothing registered" — that would PASS the trust check on a manifest
+    # that cannot be interpreted. WARN on malformed content instead.
+    if not isinstance(manifest_data, dict) or (
+        "hooks" in manifest_data
+        and not isinstance(manifest_data["hooks"], dict)
+    ):
+        return _check(
+            "untrusted-hook",
+            "warn",
+            "Codex hooks manifest is malformed: expected a top-level hooks "
+            "object of registered events.",
+            manifest_path=_display_path(manifest_path),
+            config_path=_display_path(config_path),
+            error="invalid manifest shape",
         )
     cfg = _load_toml(config_path)
     if cfg is None:

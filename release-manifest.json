@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "c257a868c9f367f722f71852b71f86b0c73b09406b3a1b3f1f11033d3ff58018",
+  "digest": "e9737c4fa03df4143c16e78704e6cadcb8b99a10bd18432d058d7b98eec5bef5",
   "files": {
     "hermes-plugin/__init__.py": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -55,7 +55,7 @@
     "skills/memory/SKILL.md": "550201571dd6202de8f0eb2b1db32cdbb03b574ef492346b86ba9a3c9e7557f3",
     "skills/memory/scripts/correction_queue.py": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
-    "skills/memory/scripts/doctor.py": "a5cfcfabfc0b34d57ca4e9489c9456725702ded83e5870bd4f1a748b1dbc7891",
+    "skills/memory/scripts/doctor.py": "60d87f9800ab479283c8566989ccf5d61e55cee99b6a0a540bc894f6a9663b2f",
     "skills/memory/scripts/drift.py": "c281946a92c5c0bdebef6df3ceaee460d76766c75e109566e81645fde823feee",
     "skills/memory/scripts/embed_profiles.py": "0666878e7c4924bf8798fed0641bbdaf36b33edad1c7f7d16ecf5e984e06899c",
     "skills/memory/scripts/embeddings.py": "5828b0a26701315f730ba383bc4545bffe9f64859ec7426161dde65acfa6cd0a",
