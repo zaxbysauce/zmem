@@ -67,6 +67,7 @@ class SchemaCompatGateTest(unittest.TestCase):
     def test_additive_window_proceeds_with_notice(self):
         # Simulate an older client (SUPPORTED=12) on the additive v13 store.
         self.schema.SUPPORTED_SCHEMA_VERSION = 12
+        self.schema.FORWARD_COMPAT_SCHEMA_VERSION = 13
         self.schema._schema_compat._warned = False
         self.assertEqual(self._decide(13), "compat")
         # One-time NOTICE per process.
@@ -74,12 +75,14 @@ class SchemaCompatGateTest(unittest.TestCase):
 
     def test_above_ceiling_refuses_without_override(self):
         self.schema.SUPPORTED_SCHEMA_VERSION = 12
+        self.schema.FORWARD_COMPAT_SCHEMA_VERSION = 13
         self.schema._schema_compat._warned = False
         with self.assertRaises(RuntimeError):
             self._decide(14)
 
     def test_env_override_admits_above_ceiling(self):
         self.schema.SUPPORTED_SCHEMA_VERSION = 12
+        self.schema.FORWARD_COMPAT_SCHEMA_VERSION = 13
         self.schema._schema_compat._warned = False
         os.environ["ZMEM_ALLOW_NEWER_SCHEMA"] = "1"
         try:
@@ -112,7 +115,7 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
         assert str(schema.STORE_PATH) == os.path.abspath(os.environ["ZMEM_STORE"]) or \
             os.path.samefile(schema.STORE_PATH, os.environ["ZMEM_STORE"]), schema.STORE_PATH
         self._schema = schema
-        # Build the store with CURRENT code (v13).
+        # Build the store with CURRENT code (v14).
         self._run(["init"])
         self._run(["add", "--namespace", "project:fwd", "--type", "fact",
                    "--content", "v13-created row", "--signal", "test",
@@ -137,7 +140,7 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
             capture_output=True, text=True, timeout=120,
         )
 
-    def test_older_client_stores_and_recalls_on_v13_store(self):
+    def test_older_client_stores_and_recalls_on_v14_store(self):
         # Simulate the older client in-process: SUPPORTED pinned to 12 with
         # the forward-compat window at 13.
         from storelib.schema import connect, _prepare_store
@@ -161,10 +164,10 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
         row = conn.execute(
             "SELECT content FROM memory WHERE id=?", (str(res),)).fetchone()
         self.assertIn("simulated v12-lineage", row["content"])
-        # And the store stays at 13 (the older client must NOT downgrade it).
+        # And the store stays at 14 (the older client must NOT downgrade it).
         ver = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        self.assertEqual(ver, "13")
+        self.assertEqual(ver, "14")
         conn.close()
 
     def test_cli_refusal_message_is_actionable(self):

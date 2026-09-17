@@ -66,7 +66,8 @@ session lifecycle boundary; this command does not open SQLite. The former
 hook-owned pending, compact-summary, and task-text sidecars, plus the
 UserPromptSubmit operation tail, are intentionally retired. The MCP server's
 passive surface now rides the same selector — see *Query-aware passive
-prefetch* below. This release does not change the memory schema.
+prefetch* below. This selector path remains schema-neutral; schema-v14 evidence
+storage is documented below.
 
 - **Live correction capture:** a `capture-correction` hook registered under
   `UserPromptSubmit` (Claude Code, ZCode, and Codex) silently queues mid-session
@@ -108,6 +109,82 @@ The MCP `session_start` tool rides the same store-owned queryless selector
 path (`recent --for-injection --json --session-id ... --moment session_start`),
 returning that envelope with the same `context` alias plus the back-compat
 `result`/`namespace`/`ids` fields.
+
+### Evidence, query rewriting, and deterministic replay (0.43.0)
+
+Schema v14 adds three additive evidence tables: `evidence`,
+`episode_evidence`, and `memory_evidence`. Evidence is bounded, untrusted
+observation data rather than model instructions. The writer validates the
+closed lane/moment/kind sets, requires a second-precision UTC timestamp,
+redacts before capping the excerpt at 400 characters, and stores
+`SHA256(kind|ts|final_excerpt)`. When the zmem provider is active, its implemented native callback is
+`post_tool_call` only: it admits a bounded payload to a detached local writer,
+fails open on malformed or unavailable host data, and does not add the remote
+`pre_llm_call`/`pre_verify` transport promised by the larger #163 idea.
+
+Evidence can be inspected with `evidence list --namespace NS` and
+`evidence show --namespace NS --id UUID`; use `evidence write` for the
+validated JSON stdin writer. Retention is applied by
+the existing session-cadence maintenance path: rows older than
+the supplied cadence time minus `ZMEM_EVIDENCE_DAYS` (default 30) expire, then the newest
+`ZMEM_EVIDENCE_CAP` rows (default 50,000) survive by stable `ts,id` order.
+Association rows are removed in the same transaction, and stale associations
+are repaired. An invalid retention setting disables that sweep rather than
+guessing a limit.
+
+`export-jsonl` is one consistent read snapshot. An unscoped export includes all
+evidence rows and only associations whose parent rows are in that export. A
+namespace-scoped export includes only evidence reached through the exported
+memory/episode associations and omits unassociated evidence, because evidence
+has no namespace column. New records with a top-level `table` discriminator use
+a single staged read, duplicate-key and reference validation, redaction/hash
+checks, and one all-or-nothing import transaction. The explicit
+`ingest-jsonl --strict` form is the safe choice with bounded staging when the
+source must be all-or-nothing even if its discriminator is damaged. Legacy
+memory-only JSONL keeps its historical best-effort, per-row behavior; a file
+that is entirely malformed cannot be classified automatically as either form.
+The `--namespace` argument on evidence list/show is a context selector, not an
+authorization boundary.
+
+For passive `user_prompt` recall only, the deterministic rewrite lane adds
+bounded local context when a prompt has fewer than the configured minimum of
+content terms and no exact anchor. Exact slash/backslash/dot/underscore,
+namespace, flag, `Error`, and `Exception` tokens bypass rewriting. Context is
+source-order deduplicated from the first 12 safe operation tokens and newest
+three safe edit basenames, capped at 150 context characters and 500 total
+characters. The threshold defaults to 4 and is overridden by the positive
+integer `ZMEM_AMBIG_MIN_TERMS`. `ZMEM_QUERY_CONTEXT=0` bypasses the rewrite at every host/store
+boundary. Host consumers fail open silently on missing or malformed context,
+read errors, and timeouts; the standalone query-rewrite CLI preserves the
+original prompt with `rewrite=0` and emits one sanitized warning when its store
+or context is unavailable. Explicit search and other passive moments are
+unchanged. This is the bounded local capability needed here, not a claim to
+complete all of issue #163.
+
+The replay evaluator is a read-only decision audit over explicitly supplied
+offline inputs (CI uses the committed snapshot), not a live efficacy test:
+
+```bash
+python scripts/eval_replay.py \
+  --store tests/fixtures/replay/store.sqlite \
+  --log tests/fixtures/replay/decisions.log \
+  --days 30 \
+  --compare-baseline eval/baseline-replay.json \
+  --json-out replay-report.json
+```
+
+The report has exactly two lanes (`claude` and `hermes-provider`) crossed with
+`session_start`, `user_prompt`, `pretool`, and `precompact` (eight rows).
+Optional `--transcript PATH` inputs are repeatable but explicit, regular,
+bounded JSONL files (at most 16 files, 4 MiB per file, 32 MiB total, and
+100,000 physical lines per file); there is no glob, rotation, failure-database,
+ring, or ambient operator-store discovery. The evaluator pins its scoring clock from
+the latest valid decision-log timestamp and clears ambient `ZMEM_*` routing and
+recall knobs before imports. With no eligible later same-session observations,
+observation-dependent counts/rates are unavailable and represented by numeric
+zero compatibility values; those zeroes are not measured success, failure, or
+live efficacy. See [`tests/fixtures/replay/README.md`](tests/fixtures/replay/README.md)
+for the fixture and two-build reproducibility contract.
 
 ### Retrieval debugger, lineage unfold, and honest eval (issue #82)
 

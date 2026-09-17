@@ -1182,6 +1182,78 @@ def _retry_pending_ns_migration(conn: sqlite3.Connection) -> None:
               f"namespace(s): {', '.join(sorted(mapping))}", file=sys.stderr)
     conn.commit()
 
+
+_EVIDENCE_SCHEMA_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS evidence (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        lane TEXT,
+        moment TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN (
+            'turn','tool_call','tool_failure','edit','test_result',
+            'correction','delegation'
+        )),
+        ts TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        excerpt TEXT NOT NULL,
+        ref_path TEXT NOT NULL,
+        ref_offset INTEGER
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS episode_evidence (
+        episode_id TEXT NOT NULL REFERENCES episode(id),
+        evidence_id TEXT NOT NULL REFERENCES evidence(id),
+        PRIMARY KEY (episode_id, evidence_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_evidence (
+        memory_id TEXT NOT NULL REFERENCES memory(id),
+        evidence_id TEXT NOT NULL REFERENCES evidence(id),
+        PRIMARY KEY (memory_id, evidence_id)
+    )
+    """,
+)
+
+
+def _migrate_v14(conn: sqlite3.Connection) -> None:
+    """Create evidence side tables and advance the version atomically.
+
+    Unlike the historical migration blocks, v14 is intentionally one
+    transaction: a failure at any DDL boundary must leave both the table set
+    and the version marker byte-for-byte unchanged.  A savepoint preserves an
+    already-open caller transaction; normal migration owns and commits its
+    own transaction.
+    """
+    savepoint = "zmem_v14_evidence"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for ddl in _EVIDENCE_SCHEMA_DDL:
+            conn.execute(ddl)
+        conn.execute(
+            "UPDATE meta SET value='14' WHERE key=?",
+            (SCHEMA_VERSION_KEY,),
+        )
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Versioned migration. Runs after init_db(). Idempotent and crash-safe.
 
@@ -1560,6 +1632,12 @@ def migrate(conn: sqlite3.Connection) -> None:
         )
         conn.execute("UPDATE meta SET value='13' WHERE key='schema_version'")
         conn.commit()
+
+    if ver < 14:
+        # v14 (issue #169 / #183 Wave A): evidence is additive side storage.
+        # Keep its DDL out of init_db(): opening an existing v13 store must not
+        # pre-create any v14 table before this atomic versioned transaction.
+        _migrate_v14(conn)
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
     # skip. See _retry_pending_ns_migration for why this cannot live behind the

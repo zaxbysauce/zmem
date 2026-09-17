@@ -31,6 +31,7 @@
 "use strict";
 
 const { spawn, execFileSync } = require("child_process");
+const { randomUUID } = require("crypto");
 const { existsSync, mkdirSync, appendFileSync, readFileSync } = require("fs");
 const { join, dirname, basename, resolve, delimiter } = require("path");
 const { homedir } = require("os");
@@ -570,6 +571,200 @@ function prepareHookPayload(host, hookName, stdinBuf, meta) {
     };
 }
 
+// --- Detached evidence writer ------------------------------------------------
+// Evidence is observational and must never sit on the host delivery path.  The
+// launcher sends only the normalized, bounded row to the store CLI; the store
+// owns redaction, the final 400-character cap, hashing, and its writer lease.
+const EVIDENCE_HOSTS = new Set(["claude", "codex", "zcode"]);
+const EVIDENCE_RAW_MAX_BYTES = 64 * 1024;
+const EDIT_TOOL_NAMES = new Set([
+    "edit", "edit_file", "write", "write_file", "writefile", "notebookedit",
+    "notebook_edit", "multi_edit", "apply_patch", "patch_file", "str_replace_editor",
+]);
+
+function canonicalUtcNow(date = new Date()) {
+    return date.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function _firstNonEmptyString(...values) {
+    for (const value of values) {
+        if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return "";
+}
+
+function _compactJson(value) {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return null;
+    }
+}
+
+function _patchPath(value) {
+    if (typeof value !== "string" || !value.trim()) return "";
+    const text = value.replace(/\r/g, "");
+    const markers = [
+        /^[ \t]*\*\*\*[ \t]+(?:Update|Add|Delete)[ \t]+File:[ \t]*(\S.*?)[ \t]*$/m,
+        /^[ \t]*\+\+\+[ \t]+(?:b\/)?([^\s]+)[ \t]*$/m,
+        /^[ \t]*---[ \t]+(?:a\/)?([^\s]+)[ \t]*$/m,
+    ];
+    for (const marker of markers) {
+        const match = marker.exec(text);
+        if (match && match[1]) return match[1].trim();
+    }
+    return "";
+}
+
+function _editPath(toolInput) {
+    if (typeof toolInput === "string") return _patchPath(toolInput);
+    if (!toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) return "";
+    const direct = _firstNonEmptyString(
+        toolInput.file_path,
+        toolInput.path,
+        toolInput.notebook_path,
+        toolInput.target_file,
+        toolInput.filename,
+    );
+    if (direct) return direct;
+    for (const entry of [toolInput.edits, toolInput.files]) {
+        if (!Array.isArray(entry)) continue;
+        for (const item of entry) {
+            const nested = _editPath(item);
+            if (nested) return nested;
+        }
+    }
+    for (const value of [toolInput.patch, toolInput.patch_text, toolInput.patchText,
+        toolInput.diff, toolInput.input]) {
+        const patchPath = _patchPath(value);
+        if (patchPath) return patchPath;
+    }
+    return "";
+}
+
+function _isEditTool(toolName, toolInput) {
+    const normalized = String(toolName || "").toLowerCase().replace(/[\s-]+/g, "_");
+    return EDIT_TOOL_NAMES.has(normalized) && Boolean(_editPath(toolInput));
+}
+
+function _evidenceExcerpt(kind, hookName, payload, toolInput) {
+    if (kind === "turn") {
+        const result = _firstNonEmptyString(payload.result, payload.stop_reason, payload.status);
+        return result ? `turn=${result}` : `turn=${hookName}`;
+    }
+    if (kind === "tool_failure") {
+        const error = _firstNonEmptyString(
+            payload.error, payload.error_message, payload.message,
+            payload.failure, payload.tool_result && payload.tool_result.message,
+        );
+        return error ? `error=${error}` : "tool failure";
+    }
+    if (toolInput && typeof toolInput === "object") {
+        const command = _firstNonEmptyString(
+            toolInput.command, toolInput.cmd, toolInput.file_path,
+            toolInput.path, toolInput.notebook_path,
+        );
+        if (command) return command;
+        const compact = _compactJson(toolInput);
+        if (compact) return compact;
+    }
+    return _firstNonEmptyString(payload.excerpt, payload.result, hookName) || hookName;
+}
+
+function recordEvidence(host, hookName, payload, meta, env = process.env,
+                        clock = canonicalUtcNow, spawnFn = spawn) {
+    try {
+        if (!EVIDENCE_HOSTS.has(host) || !["convention-capture", "capture-failure", "reflect"].includes(hookName)) {
+            return false;
+        }
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+        if (!meta || typeof meta !== "object" || Array.isArray(meta)) meta = {};
+        const raw = _compactJson({ payload, meta });
+        if (!raw || Buffer.byteLength(raw, "utf8") > EVIDENCE_RAW_MAX_BYTES) return false;
+
+        const toolName = _firstNonEmptyString(
+            payload.tool_name, payload.toolName, meta.tool_name, meta.toolName,
+        );
+        const toolInput = payload.tool_input || payload.toolInput || payload.arguments
+            || (payload.tool && payload.tool.input) || {};
+        let kind;
+        if (hookName === "reflect") kind = "turn";
+        else if (hookName === "capture-failure") kind = "tool_failure";
+        else {
+            const resultStatus = payload.result && typeof payload.result === "object"
+                ? payload.result.status : "";
+            const failed = isFailureStatus(payload.status || payload.tool_status ||
+                payload.toolStatus || resultStatus || payload.error || payload.failure);
+            // Codex routes successful and failed PostToolUse events through the
+            // same matcher.  The failure observer records the failure event;
+            // convention-capture must not create a second successful edit row.
+            if (failed || payload.error || payload.error_message) return false;
+            kind = _isEditTool(toolName, toolInput) ? "edit" : "tool_call";
+        }
+
+        const sessionId = _firstNonEmptyString(
+            meta.session_id, meta.sessionId, payload.session_id, payload.sessionId,
+            env && env.ZMEM_SESSION,
+        );
+        if (!sessionId) return false;
+        let refPath = _firstNonEmptyString(
+            (kind === "edit" ? _editPath(toolInput) : ""),
+            (kind === "edit" ? _patchPath(payload.patch || payload.diff || "") : ""),
+            payload.ref_path, meta.ref_path,
+            payload.transcript_path, meta.transcript_path,
+            payload.transcriptPath, meta.transcriptPath,
+        );
+        if (!refPath) refPath = `host://${host}/${hookName}/unavailable`;
+        if (refPath.length > 4096 || refPath.includes("\u0000")) return false;
+        const excerpt = _evidenceExcerpt(kind, hookName, payload, toolInput);
+        if (!excerpt || Buffer.byteLength(excerpt, "utf8") > EVIDENCE_RAW_MAX_BYTES) return false;
+        const suppliedId = _firstNonEmptyString(meta.evidence_id, payload.evidence_id);
+        const id = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(suppliedId)
+            ? suppliedId : randomUUID();
+        const row = {
+            session_id: sessionId,
+            lane: host,
+            moment: kind === "turn" ? "session_start" : "pretool",
+            kind,
+            ts: typeof clock === "function" ? clock() : canonicalUtcNow(),
+            excerpt,
+            ref_path: refPath,
+            ref_offset: null,
+            id,
+        };
+        const input = _compactJson(row);
+        if (!input || Buffer.byteLength(input, "utf8") > EVIDENCE_RAW_MAX_BYTES) return false;
+        const root = (env && (env.ZMEM_ROOT || env.PLUGIN_ROOT ||
+            env.CLAUDE_PLUGIN_ROOT || env.ZCODE_PLUGIN_ROOT)) || getPluginRoot();
+        const storePy = join(root, "skills", "memory", "scripts", "store.py");
+        if (!existsSync(storePy) || typeof spawnFn !== "function") return false;
+        const childEnv = { ...(env || {}) };
+        childEnv.ZMEM_HOST = host;
+        childEnv.ZMEM_MODEL_AUTODOWNLOAD = "0";
+        // Observers must never initialize a missing store merely because a
+        // host event was delivered; the CLI turns this into a silent no-op.
+        childEnv.ZMEM_EVIDENCE_NO_CREATE = "1";
+        const py = process.platform === "win32" ? "python" : "python3";
+        const child = spawnFn(py, [storePy, "evidence", "write"], {
+            env: childEnv,
+            stdio: ["pipe", "ignore", "ignore"],
+            detached: true,
+        });
+        if (!child) return false;
+        try { if (typeof child.on === "function") child.on("error", () => {}); } catch { /* fail open */ }
+        const inputStream = child.stdin;
+        if (inputStream) {
+            try { if (typeof inputStream.on === "function") inputStream.on("error", () => {}); } catch { /* fail open */ }
+            try { inputStream.write(input); inputStream.end(); } catch { /* child failed */ }
+            try { if (typeof inputStream.unref === "function") inputStream.unref(); } catch { /* already gone */ }
+        }
+        try { if (typeof child.unref === "function") child.unref(); } catch { /* already gone */ }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 // --- Build the canonical ZMEM_* env for the child ---------------------------
 // hookName is optional (back-compat for direct callers/tests that don't care
 // about the namespace-skip): omitted/unrecognized names get the namespace
@@ -1044,6 +1239,15 @@ async function main() {
     // fitEnvelope but propagated unclamped to child shell scripts that read
     // $ZMEM_CTX_BUDGET directly.
     env.ZMEM_CTX_BUDGET = String(budget);
+
+    // Evidence is captured exactly once, after payload normalization and
+    // before the delivery child is spawned.  The detached writer never awaits
+    // or mutates the translated payload bytes.
+    try {
+        recordEvidence(host, hookName, prepared.meta, prepared.meta, env);
+    } catch {
+        // Observational evidence is fail-open by contract.
+    }
     const bashPath = findBash();
 
     // Translated hooks: buffer child stdout so we can rewrap it. Pass-through
@@ -1161,6 +1365,8 @@ module.exports = {
     hookEventNameFor,
     normalizeCodexFailurePayload,
     prepareHookPayload,
+    canonicalUtcNow,
+    recordEvidence,
     extractPayload,
     makeEnvelope,
     fitEnvelope,

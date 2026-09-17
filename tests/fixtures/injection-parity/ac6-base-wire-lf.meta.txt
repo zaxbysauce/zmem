@@ -1,0 +1,6 @@
+Source: immutable base 85acc9f2b17233d8499ed05c77dc2f28084bad16 AC6 fixed-clock replay
+Source raw SHA256: 79c597030b106f82b27b48bac6c89cc5dd49b81a4e43307a8c4f746b9d9fed23
+Source raw bytes: 3025 (109 CRLF sequences)
+Fixture normalization: CRLF -> LF only; no JSON parse, sort, or reserialization
+Fixture SHA256: 6ceb70a0914533d75c64ad46fef8b4c54a799abf40efa1346ec22004bce3522e
+Fixture bytes: 2916

@@ -63,7 +63,11 @@ def normalize_content(s: str) -> str:
 # `memory` (no column changes). `episode` is NOT a member of ALLOWED_TYPES —
 # it is a container, not a memory type. Round-tripped by export/ingest (kind
 # discriminator); doctor reports counts (episode-tables check).
-SUPPORTED_SCHEMA_VERSION = 13
+# v14 (issue #169 / #183 Wave A): additive evidence provenance side tables
+# (`evidence`, `episode_evidence`, and `memory_evidence`). Their migration
+# creates all three tables and advances the version in one transaction;
+# init_db() deliberately does not pre-create them on an existing v13 store.
+SUPPORTED_SCHEMA_VERSION = 14
 
 # Forward-compat window (issue #65 follow-up): a client refuses a store whose
 # schema_version exceeds its SUPPORTED_SCHEMA_VERSION. For ADDITIVE-ONLY bumps
@@ -75,7 +79,7 @@ SUPPORTED_SCHEMA_VERSION = 13
 # SUPPORTED and FORWARD_COMPAT the client prints a one-time stderr NOTICE and
 # proceeds; above FORWARD_COMPAT it still refuses (ZMEM_ALLOW_NEWER_SCHEMA=1
 # overrides, at the operator's own risk).
-FORWARD_COMPAT_SCHEMA_VERSION = 13
+FORWARD_COMPAT_SCHEMA_VERSION = 14
 
 # v12 (issue #64): one-time trust_score reduction applied when a row's
 # violated_count crosses to 2 (the promote ladder's "violated" tier). Clamped

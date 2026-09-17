@@ -1,279 +1,325 @@
 #!/usr/bin/env python3
-"""Hermes shell hook: convention + failure signal recorder (post_tool_call).
+"""Hermes ``post_tool_call`` compatibility hook.
 
-⚠️ IMPORTANT — ``post_tool_call`` results are OBSERVATIONAL in Hermes: the
-shell-hook bridge parses ``{"context": ...}`` for any event, but the sole
-emitter (``model_tools._emit_post_tool_call_hook``) **discards the return
-value**. ``post_tool_call`` is documented as observational
-(``model_tools.py`` ~line 1467: "post_tool_call which stays observational").
-
-So this hook does NOT emit a nudge — it would be a dead letter. Instead it
-**records signal** to zmem's ``meta`` table for the ``pre_llm_call`` reflect
-hook (``zmem-hermes-reflect.py``, whose results ARE consumed) to act on:
-  - increments the per-session convention counter (every successful matching call)
-  - sets a ``pending_convention_nudge`` flag every Nth call
-  - sets a ``pending_failure_nudge`` flag on the first failed tool call
-
-Always emits ``{}`` (silent). The reflect hook reads the pending flags and
-delivers the actual nudge on the next ``pre_llm_call``. This separation keeps
-the observation (post_tool_call) and delivery (pre_llm_call) on the right
-sides of Hermes' hook-consumption contract.
-
-Stdlib only. Store path mirrors zmem: ``ZMEM_STORE`` env → ``~/.zmem/store.sqlite``.
+Hermes treats this hook as observational, so it always emits ``{}``.  The
+hook keeps the legacy convention/failure signal behavior by handing the
+operation to zmem's internal store CLI.  Keeping SQLite and ring operations in
+that process is important: the host hook must not import the database helper
+package or access store state directly while another writer owns the database.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
+import subprocess
 import sys
+import tempfile
+import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable
 
-# Shared WAL-safety guard + store resolver (single copy across the three Hermes
-# hooks — #37 L25). The hook's own dir must be on sys.path for the sibling
-# import to resolve when run as a standalone script.
+# Keep the common resolver import available for the standalone hook layout and
+# its local-filesystem policy.  Store access itself is delegated to store.py.
 _HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
 if _HOOK_DIR not in sys.path:
     sys.path.insert(0, _HOOK_DIR)
-from _zmem_hook_common import assert_local_fs as _assert_local_fs  # noqa: E402
-
-# Fire a convention nudge every N successful tool calls.
 try:
-    _INTERVAL = max(1, int(os.environ.get("ZMEM_CONVENTION_INTERVAL", "10")))
-except ValueError:
-    _INTERVAL = 10
+    from _zmem_hook_common import assert_local_fs as _assert_local_fs  # noqa: E402,F401
+except ModuleNotFoundError:
+    # A documented copy install contains only ``hermes-plugin``.  Probe the
+    # configured checkout's hooks directory for the shared resolver helper;
+    # the hook still performs no store access itself.
+    _configured_root = Path(os.environ.get("ZMEM_HOME", "")).expanduser()
+    _configured_hook_dirs = (
+        _configured_root / "hermes-plugin" / "hooks",
+        _configured_root / "hooks",
+    )
+    for _configured_hooks in _configured_hook_dirs:
+        if (_configured_hooks / "_zmem_hook_common.py").is_file():
+            sys.path.insert(0, str(_configured_hooks))
+            break
+    try:
+        from _zmem_hook_common import assert_local_fs as _assert_local_fs  # type: ignore  # noqa: E402,F401
+    except ModuleNotFoundError:
+        def _assert_local_fs(path: Path) -> bool:
+            text = str(path)
+            return not (text.startswith("\\\\") or text.startswith("//"))
 
-# Counter key (monotonic per session).
-_CONVENTION_COUNT_KEY = "hermes_convention_count_{session}"
-# Pending-nudge flags the reflect hook (pre_llm_call) consumes.
-_PENDING_CONVENTION_KEY = "hermes_pending_convention_{session}"
-_PENDING_FAILURE_KEY = "hermes_pending_failure_{session}"
-# One-time-per-session markers so we don't re-arm after the reflect hook delivers.
-_FAILURE_CAPTURED_KEY = "hermes_failure_captured_{session}"
+_MAX_INPUT_BYTES = 64 * 1024
+_STORE_TIMEOUT_S = 5.0
 
 
 def _resolve_store_path() -> Path:
-    """Resolve the store path via the SAME authoritative resolver as the
-    provider and store.py (host.resolve_store_path). Previously this hook
-    hand-rolled a TRUNCATED copy that omitted CLAUDE/ZCODE_PLUGIN_DATA, so on
-    plugin-data-dir boxes it resolved a nonexistent ~/.zmem/store.sqlite and
-    silently no-op'd all session (#36 M10).
+    """Resolve the authoritative store path for compatibility callers.
 
-    Imports the real resolver when the scripts dir is reachable. In a
-    repo/symlink/junction install `__file__`'s `parents[2]` finds it; in a
-    COPY install (`cp -r hermes-plugin …`, README-documented) the copy has no
-    `skills/` tree, so we also probe `$ZMEM_HOME/skills/memory/scripts` (the
-    env var copy users MUST set) before giving up (#36 M10 / cubic-3,5,8).
-
-    The inline fallback below is a BEST-EFFORT subset (the env-var chain
-    + ~/.zmem) reached only if host.py itself is unimportable from any probe;
-    it does NOT include host.py's legacy probes (~/.zcode/memory,
-    _legacy_plugin_store)."""
-    _rel = Path("skills") / "memory" / "scripts"
+    This function remains a resolver only.  It deliberately does not open the
+    path; all reads/writes happen inside the internal CLI process.
+    """
+    rel = Path("skills") / "memory" / "scripts"
     candidates = [
-        Path(__file__).resolve().parents[2] / _rel,            # in-tree (repo/symlink/junction)
-        Path(os.environ.get("ZMEM_HOME", "")).expanduser() / _rel,  # copy install
+        Path(__file__).resolve().parents[2] / rel,
+        Path(os.environ.get("ZMEM_HOME", "")).expanduser() / rel,
     ]
-    for _scripts_dir in candidates:
-        if (_scripts_dir / "host.py").is_file():
-            sys.path.insert(0, str(_scripts_dir))
+    for scripts_dir in candidates:
+        if (scripts_dir / "host.py").is_file():
+            sys.path.insert(0, str(scripts_dir))
             try:
                 import host  # type: ignore  # noqa: F811
+
                 return host.resolve_store_path()
             except Exception:
                 pass
-    # Inline fallback: the env-var chain + ~/.zmem (host.py's legacy probes
-    # omitted — see docstring).
     explicit = os.environ.get("ZMEM_STORE", "").strip()
     if explicit:
         return Path(explicit).expanduser()
     for var in ("ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
-        d = os.environ.get(var, "").strip()
-        if d:
-            return Path(d).expanduser() / "store.sqlite"
+        value = os.environ.get(var, "").strip()
+        if value:
+            return Path(value).expanduser() / "store.sqlite"
     return Path.home() / ".zmem" / "store.sqlite"
 
 
-def _connect() -> sqlite3.Connection | None:
-    """Open the store. None if absent, missing the meta table, or on a
-    network-mounted path (WAL-safety guard).
-
-    Hooks never create the store — the memory provider's initialize() owns
-    that. If the store isn't there (or is on a network share), the hook
-    silently no-ops.
-    """
-    p = _resolve_store_path()
-    if not p.is_file():
-        return None
-    if not _assert_local_fs(p):
-        # Network/OneDrive path — refuse to open (WAL corruption risk).
-        return None
-    conn = sqlite3.connect(str(p), timeout=5.0)
-    conn.execute("PRAGMA busy_timeout=5000")
-    try:
-        conn.execute("SELECT 1 FROM meta LIMIT 1").fetchone()
-    except sqlite3.Error:
-        conn.close()
-        return None
-    return conn
+def _resolve_store_py() -> Path | None:
+    """Find the internal store CLI for in-tree and copied plugin installs."""
+    rel = Path("skills") / "memory" / "scripts" / "store.py"
+    candidates = [
+        Path(__file__).resolve().parents[2] / rel,
+        Path(os.environ.get("ZMEM_HOME", "")).expanduser() / rel,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
-def _counter_bump(conn: sqlite3.Connection, key: str) -> int:
-    """Atomically increment a counter, returning the new value.
-
-    INSERT ... ON CONFLICT ... DO UPDATE is race-safe across concurrent
-    writers. Initial value '1' (not '0') so the Nth nudge arms on call N.
-    """
-    conn.execute(
-        "INSERT INTO meta(key, value) VALUES(?, '1') "
-        "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-        (key,),
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
     )
-    conn.commit()
-    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-    return int(row[0]) if row else 0
 
 
-def _meta_set_if_absent(conn: sqlite3.Connection, key: str) -> bool:
-    """Set a flag key only if it doesn't already exist. Returns True if set.
-
-    Atomic: INSERT OR IGNORE leaves an existing row untouched.
-    """
-    cur = conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, '1')", (key,))
-    conn.commit()
-    return cur.rowcount > 0
+def _python_bin() -> str:
+    return os.environ.get("ZMEM_PYTHON", sys.executable or "python")
 
 
-def _read_payload() -> dict:
-    raw = sys.stdin.read()
-    if not raw:
-        return {}
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _read_payload() -> dict[str, Any]:
+    """Read one bounded JSON object, dropping malformed/oversized input."""
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+        raw = sys.stdin.buffer.read(_MAX_INPUT_BYTES + 1)
+        if len(raw) > _MAX_INPUT_BYTES:
+            return {}
+        if not raw:
+            return {}
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def _session_id(payload: dict) -> str:
-    sid = (payload.get("session_id") or "").strip()
-    return sid or "unknown"
+def _valid_id(value: Any) -> str:
+    try:
+        parsed = uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError):
+        return str(uuid.uuid4())
+    return str(parsed)
 
 
-def _op_descriptor(payload: dict, extra: dict) -> str:
-    """Best-effort operation descriptor for the query-context ring
-    (issue #88 / #85 direction 2). post_tool_call payload fields beyond
-    session_id / extra.status are gateway-defined (the emitter lives in the
-    Hermes gateway's model_tools, not in this repo), so probe the plausible
-    shapes defensively. append_ops_ring does the allowlisting — only the
-    allowlisted tokens ever reach disk (spec B)."""
-    for source in (extra, payload):
-        for key in ("command", "cmd"):
-            v = source.get(key)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        ti = source.get("tool_input")
-        if isinstance(ti, dict):
-            for key in ("command", "file_path", "notebook_path", "path"):
-                v = ti.get(key)
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
+def _edit_path(args: Any) -> str:
+    if not isinstance(args, dict):
+        return ""
+    for key in ("path", "file_path", "notebook_path", "target_file", "filename"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("edits", "files"):
+        entries = args.get(key)
+        if isinstance(entries, list):
+            for entry in entries:
+                path = _edit_path(entry)
+                if path:
+                    return path
     return ""
 
 
-def _append_query_context(store_path: Path, session: str,
-                          payload: dict, extra: dict) -> None:
-    """Record this tool event on the per-session ops ring (#85 spec B:
-    prior-turn operation context for the prefetch query). The ring is the
-    SAME one the coding hosts' convention-capture writes; the Hermes
-    provider's prefetch() composes it into the next turn's query.
-    Fail-open: ring health never affects this hook."""
+def _uri_id(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if not value or len(value) > 256 or any(char in value for char in "/\\\x00"):
+        return ""
+    return value
+
+
+def _write_post_tool_evidence(
+    payload: dict[str, Any],
+    extra: dict[str, Any],
+    clock: Callable[[], str] = _utc_now,
+) -> bool:
+    """Submit bounded post-tool evidence to the internal writer CLI.
+
+    This is intentionally detached and fail-open.  A broken pipe, unavailable
+    interpreter, or writer timeout must not affect the host turn.
+    """
+    if not isinstance(payload, dict) or not isinstance(extra, dict):
+        return False
+    required = ("tool_name", "args", "session_id", "task_id", "tool_call_id", "result", "duration_ms")
+    if any(key not in payload for key in required):
+        return False
+    session = payload.get("session_id")
+    task_id = _uri_id(payload.get("task_id"))
+    tool_call_id = _uri_id(payload.get("tool_call_id"))
+    tool_name = payload.get("tool_name")
+    if (
+        not isinstance(session, str) or not session.strip()
+        or not isinstance(tool_name, str) or not task_id or not tool_call_id
+    ):
+        return False
     try:
-        # Review PRR-91-004: the kill switch gates COLLECTION too.
-        if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
-            return
-        desc = _op_descriptor(payload, extra)
-        if not desc:
-            return
-        _rel = Path("skills") / "memory" / "scripts"
-        candidates = [
-            Path(__file__).resolve().parents[2] / _rel,
-            Path(os.environ.get("ZMEM_HOME", "")).expanduser() / _rel,
-        ]
-        scripts_dir = next((c for c in candidates if (c / "host.py").is_file()),
-                           None)
-        if scripts_dir is None:
-            return
-        sys.path.insert(0, str(scripts_dir / "storelib"))
-        import ops_tokens  # noqa: E402  (stdlib-only, like this hook)
-        ops_tokens.append_ops_ring(str(store_path.parent), session,
-                                   str(extra.get("tool") or payload.get(
-                                       "tool_name") or ""), desc)
+        args = payload.get("args")
+        result = payload.get("result")
+        raw = _compact_json({"payload": payload, "extra": extra}).encode("utf-8")
+        if len(raw) > _MAX_INPUT_BYTES:
+            return False
+        statuses = []
+        for source in (extra, payload, result if isinstance(result, dict) else {}):
+            value = source.get("status")
+            if isinstance(value, str):
+                statuses.append(value.strip().lower())
+        failed = any(status in {"error", "failed", "failure"}
+                     for status in statuses) or bool(
+            extra.get("error") or extra.get("error_message")
+            or payload.get("error") or payload.get("error_message")
+            or payload.get("error_type")
+        )
+        normalized_tool = tool_name.strip().lower().replace("-", "_").replace(" ", "_")
+        edit_names = {
+            "edit", "edit_file", "write", "write_file", "writefile", "multi_edit",
+            "notebookedit", "notebook_edit", "str_replace_editor",
+        }
+        edit_path = _edit_path(args)
+        kind = "tool_failure" if failed else (
+            "edit" if normalized_tool in edit_names and edit_path else "tool_call"
+        )
+        excerpt = _compact_json(
+            {
+                "tool_name": tool_name,
+                "args": args,
+                "result": result,
+                "duration_ms": payload.get("duration_ms"),
+            }
+        )
+        row = {
+            "id": _valid_id(extra.get("evidence_id") or payload.get("evidence_id")),
+            "session_id": session.strip(),
+            "lane": "hermes-compat",
+            "moment": "pretool",
+            "kind": kind,
+            "ts": clock(),
+            "excerpt": excerpt,
+            "ref_path": edit_path if kind == "edit" else f"hermes://{task_id}/{tool_call_id}",
+            "ref_offset": None,
+        }
+        serialized = _compact_json(row).encode("utf-8")
+        if len(serialized) > _MAX_INPUT_BYTES:
+            return False
+        store_py = _resolve_store_py()
+        if store_py is None:
+            return False
+        env = os.environ.copy()
+        env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        # Compatibility observation must retain the historical no-store/no-
+        # migration behavior; the internal writer honors this guard.
+        env["ZMEM_EVIDENCE_NO_CREATE"] = "1"
+        payload_file = tempfile.TemporaryFile()
+        payload_file.write(serialized + b"\n")
+        payload_file.seek(0)
+        kwargs: dict[str, Any] = {
+            "stdin": payload_file,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "env": env,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x00000008 | 0x00000200
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            child = subprocess.Popen(
+                [_python_bin(), str(store_py), "evidence", "write"], **kwargs
+            )
+        finally:
+            # Popen duplicates/inherits the file descriptor.  Closing this
+            # parent handle immediately avoids a persistent raw-payload file;
+            # the child owns its read handle for the bounded JSON only.
+            payload_file.close()
+
+        def _reap_child() -> None:
+            try:
+                child.wait(timeout=_STORE_TIMEOUT_S)
+            except Exception:
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+                try:
+                    child.wait(timeout=1.0)
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_reap_child, name="zmem-hermes-evidence-reaper", daemon=True
+        ).start()
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _run_convention(payload: dict[str, Any], extra: dict[str, Any]) -> None:
+    """Run the legacy convention operation through the store CLI."""
+    try:
+        store_py = _resolve_store_py()
+        if store_py is None:
+            return
+        request = _compact_json({"payload": payload, "extra": extra}).encode("utf-8")
+        if len(request) > _MAX_INPUT_BYTES:
+            return
+        env = os.environ.copy()
+        env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        env["ZMEM_HERMES_CONVENTION_EXISTING_ONLY"] = "1"
+        subprocess.run(
+            [_python_bin(), str(store_py), "hermes-convention"],
+            input=request + b"\n",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            timeout=_STORE_TIMEOUT_S,
+            check=False,
+        )
+    except Exception:
+        return
 
 
 def _emit_empty() -> None:
-    """Always silent — post_tool_call results are discarded by Hermes."""
     print("{}")
 
 
 def main() -> int:
-    payload = _read_payload()
-    session = _session_id(payload)
-    extra = payload.get("extra") or {}
-    if not isinstance(extra, dict):
-        extra = {}
-
-    # Issue #88 / #85 direction 2: record this tool event on the query-
-    # context ring BEFORE the store connect — the ring only needs the store
-    # PATH (its sibling ops/ dir), so a missing/unwritable store must not
-    # lose the verb. Fail-open either way.
-    try:
-        _append_query_context(_resolve_store_path(), session, payload, extra)
-    except Exception:
-        pass
-
-    conn = _connect()
-    if conn is None:
-        _emit_empty()
-        return 0
-
-    try:
-        status = (extra.get("status") or "").strip().lower()
-
-        if status == "error":
-            # Arm a failure nudge (once per session). The reflect hook delivers it.
-            captured = _meta_set_if_absent(
-                conn, _FAILURE_CAPTURED_KEY.format(session=session)
-            )
-            if captured:
-                _meta_set_if_absent(
-                    conn, _PENDING_FAILURE_KEY.format(session=session)
-                )
-            _emit_empty()
-            return 0
-
-        # Success: bump counter; every Nth call arms a convention nudge.
-        count_key = _CONVENTION_COUNT_KEY.format(session=session)
-        n = _counter_bump(conn, count_key)
-        if n > 0 and n % _INTERVAL == 0:
-            _meta_set_if_absent(
-                conn, _PENDING_CONVENTION_KEY.format(session=session)
-            )
-        _emit_empty()
-        return 0
-    except (sqlite3.Error, ValueError) as exc:
-        # Fail-open: lock contention past busy_timeout, disk errors, or a
-        # corrupted meta.value (CAST yields NULL → int(None) raises ValueError)
-        # must NOT crash the agent turn. Emit {} and exit 0, matching the
-        # sibling hooks (reflect.py, verify.py) which guard the same way.
-        sys.stderr.write(f"zmem-convention: sqlite/value error: {exc}\n")
-        _emit_empty()
-        return 0
-    finally:
-        conn.close()
+    envelope = _read_payload()
+    if envelope:
+        payload = envelope.get("payload", envelope)
+        extra = envelope.get("extra", {})
+        if isinstance(payload, dict) and isinstance(extra, dict):
+            _write_post_tool_evidence(payload, extra)
+            _run_convention(payload, extra)
+    _emit_empty()
+    return 0
 
 
 if __name__ == "__main__":

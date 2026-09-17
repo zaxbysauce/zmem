@@ -22,6 +22,13 @@ from storelib.backup import BACKUP_DEFAULT_RETENTION, CONSOLIDATE_LOCK_STALE_SEC
 from storelib.consolidate import CONSOLIDATE_DEFAULT_THRESHOLD, consolidate
 from storelib.organize import organize
 from storelib.entity import ENTITY_KINDS, cmd_entity_list, cmd_entity_merge
+from storelib.evidence import (
+    EVIDENCE_KINDS,
+    EVIDENCE_LANES,
+    EVIDENCE_MOMENTS,
+    sweep_evidence,
+    write_evidence,
+)
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
 from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_queue_clear, cmd_queue_list, cmd_promote_store
 from storelib.promote import promote_memory
@@ -35,11 +42,15 @@ from storelib.inject import (INJECTION_LANES, INJECTION_MOMENTS,
                              select_and_budget_for_injection)
 from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import reembed_embeddings
-from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect
-from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host
+from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
 from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory
 from storelib.tune import tune_weights
 from storelib import ops_tokens as _ops_tokens
+from storelib.query_ambiguity import (
+    rewrite_ambiguous_query,
+    read_recent_edit_basenames,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +303,438 @@ def _iso8601(value: str) -> str:
         from datetime import timezone
         dt = dt.astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+
+
+class DuplicateJSONKeyError(ValueError):
+    """Raised when a JSON object repeats a key at any nesting level."""
+
+
+EVIDENCE_STDIN_MAX_BYTES = 64 * 1024
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJSONKeyError(key)
+        result[key] = value
+    return result
+
+
+def _read_one_json_object() -> dict[str, object]:
+    """Read exactly one UTF-8 JSON object from stdin, with duplicate-key checks."""
+    raw = sys.stdin.buffer.read(EVIDENCE_STDIN_MAX_BYTES + 1)
+    if len(raw) > EVIDENCE_STDIN_MAX_BYTES:
+        raise ValueError("evidence payload exceeds input limit")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise json.JSONDecodeError("invalid JSON", "", 0) from exc
+    try:
+        value = json.loads(
+            text, object_pairs_hook=_reject_duplicate_json_keys
+        )
+    except DuplicateJSONKeyError:
+        raise
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise json.JSONDecodeError("invalid JSON", text, 0) from exc
+    if not isinstance(value, dict):
+        raise ValueError("evidence payload must be a JSON object")
+    return value
+
+
+def _evidence_row(row: sqlite3.Row | tuple) -> dict[str, object]:
+    values = dict(zip(
+        ("id", "session_id", "lane", "moment", "kind", "ts", "excerpt",
+         "ref_path", "ref_offset"),
+        row,
+    ))
+    return values
+
+
+def _display_field(value: object) -> str:
+    """Render one text result field without allowing physical row breaks."""
+    text = str(value)
+    rendered: list[str] = []
+    for char in text:
+        codepoint = ord(char)
+        if char == "\t":
+            rendered.append(r"\t")
+        elif char == "\r":
+            rendered.append(r"\r")
+        elif char == "\n":
+            rendered.append(r"\n")
+        elif codepoint < 0x20 or 0x7F <= codepoint <= 0x9F:
+            rendered.append(f"\\x{codepoint:02x}")
+        else:
+            rendered.append(char)
+    return "".join(rendered)
+
+
+def _connect_existing_store() -> sqlite3.Connection:
+    """Open an already-created store without init, migration, or parent mkdir."""
+    if not STORE_PATH.is_file():
+        raise FileNotFoundError(STORE_PATH)
+    uri = STORE_PATH.resolve().as_uri() + "?mode=rw"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def _query_rewrite_output(query: str, rewritten: bool) -> None:
+    """Emit the closed query-rewrite wire object in canonical key order."""
+    print(json.dumps({"query": query, "rewrite": int(bool(rewritten))},
+                     ensure_ascii=False, separators=(",", ":")))
+
+
+def _query_rewrite_context(
+    conn: sqlite3.Connection,
+    prompt: str,
+    session_id: str,
+    *,
+    explicit_ops: list[str] | None = None,
+) -> tuple[str, bool]:
+    """Rewrite one prompt using only the caller-owned, already-open store.
+
+    This helper is shared by the ``prefetch`` command and the early
+    read-only ``query-rewrite`` command.  It never mutates the connection;
+    callers that need a legacy/no-create boundary probe the evidence table
+    before invoking it.
+    """
+    original = prompt.strip()[:500] if isinstance(prompt, str) else ""
+    if os.environ.get("ZMEM_QUERY_CONTEXT") == "0":
+        return original, False
+    if not isinstance(session_id, str) or not session_id.strip():
+        return original, False
+    if explicit_ops is None:
+        events = _ops_tokens.read_ops_ring(
+            str(STORE_PATH.parent), session_id.strip(), max_events=8,
+            strict_errors=True,
+        )
+        ops_tokens = _ops_tokens.derive_ops_tokens(*events)
+    else:
+        ops_tokens = list(explicit_ops)[:12]
+    edited = read_recent_edit_basenames(
+        conn, session_id.strip(), limit=3, strict_errors=True
+    )
+    # The pure helper owns the 500-character output cap and must receive the
+    # complete prompt so an exact anchor beyond that cap still bypasses a
+    # rewrite.  ``original`` above remains the bounded fail-open fallback.
+    return rewrite_ambiguous_query(
+        prompt if isinstance(prompt, str) else "",
+        ops_tokens=ops_tokens, edited_basenames=edited
+    )
+
+
+def _query_rewrite_has_evidence(conn: sqlite3.Connection) -> bool:
+    """Return whether the new evidence table exists without migrating it."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence'"
+    ).fetchone()
+    if not row:
+        return False
+    columns = {
+        item[1] for item in conn.execute("PRAGMA table_info(evidence)")
+        if len(item) > 1
+    }
+    required = {"id", "session_id", "kind", "ts", "ref_path"}
+    if not required.issubset(columns):
+        raise RuntimeError("evidence table schema unavailable")
+    return True
+
+
+def cmd_query_rewrite(*, prompt: str, session_id: str, namespace: str) -> int:
+    """Run the deterministic query rewrite before any store initialization."""
+    del namespace  # Selection is session-based; namespace is an input marker only.
+    original = prompt.strip()[:500]
+    if os.environ.get("ZMEM_QUERY_CONTEXT") == "0":
+        _query_rewrite_output(original, False)
+        return 0
+    try:
+        store_exists = STORE_PATH.is_file()
+    except OSError:
+        store_exists = False
+    if not session_id.strip() or not store_exists:
+        print("[zmem] query-rewrite unavailable; using original query",
+              file=sys.stderr)
+        _query_rewrite_output(original, False)
+        return 0
+    conn: sqlite3.Connection | None = None
+    try:
+        if _schema_host is not None:
+            _schema_host.assert_local_fs(STORE_PATH.parent)
+        # URI mode=ro is deliberate: query-rewrite must not create, migrate,
+        # or checkpoint the application database.  A normal WAL-aware read is
+        # required so committed rows in a live WAL remain visible.
+        uri = STORE_PATH.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=0.25)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=250")
+        conn.execute("BEGIN")
+        if not _query_rewrite_has_evidence(conn):
+            raise RuntimeError("evidence table unavailable")
+        rewritten, applied = _query_rewrite_context(
+            conn, prompt, session_id.strip()
+        )
+        conn.execute("ROLLBACK")
+        _query_rewrite_output(rewritten, applied)
+        return 0
+    except Exception:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        print("[zmem] query-rewrite unavailable; using original query",
+              file=sys.stderr)
+        _query_rewrite_output(original, False)
+        return 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def cmd_evidence_write(
+    conn: sqlite3.Connection, *, payload: dict[str, object]
+) -> int:
+    """Insert one evidence row; the CLI command owns the single commit."""
+    required = {
+        "session_id", "lane", "moment", "kind", "ts", "excerpt",
+        "ref_path", "ref_offset",
+    }
+    allowed = required | {"id"}
+    if set(payload) - allowed or not required.issubset(payload):
+        raise ValueError("evidence payload keys are invalid")
+    for key in ("session_id", "moment", "kind", "ts", "excerpt", "ref_path"):
+        if not isinstance(payload[key], str) or not payload[key].strip():
+            raise ValueError(f"{key} must be a non-empty string")
+    lane = payload["lane"]
+    if lane is not None and not isinstance(lane, str):
+        raise ValueError("lane must be a string or null")
+    ref_offset = payload["ref_offset"]
+    if ref_offset is not None and (
+        isinstance(ref_offset, bool) or not isinstance(ref_offset, int) or ref_offset < 0
+    ):
+        raise ValueError("ref_offset must be a non-negative integer or null")
+    evidence_id = payload.get("id")
+    if evidence_id is not None and not isinstance(evidence_id, str):
+        raise ValueError("id must be a string")
+    try:
+        stored_id = write_evidence(
+            conn,
+            session_id=payload["session_id"],
+            lane=lane,
+            moment=payload["moment"],
+            kind=payload["kind"],
+            ts=payload["ts"],
+            excerpt=payload["excerpt"],
+            ref_path=payload["ref_path"],
+            ref_offset=ref_offset,
+            id=evidence_id,
+        )
+        conn.commit()
+    except OverflowError as exc:
+        conn.rollback()
+        raise ValueError("evidence ref_offset is outside SQLite integer range") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    print(stored_id)
+    return 0
+
+
+def cmd_evidence_list(
+    conn: sqlite3.Connection,
+    *,
+    namespace: str,
+    session_id: str | None,
+    lane: str | None,
+    moment: str | None,
+    limit: int,
+    as_json: bool,
+) -> int:
+    """List evidence; namespace is a required context selector, not auth."""
+    del namespace  # evidence has no namespace column; filtering is session-based
+    clauses: list[str] = []
+    params: list[object] = []
+    if session_id is not None:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    if lane is not None:
+        clauses.append("lane = ?")
+        params.append(lane)
+    if moment is not None:
+        clauses.append("moment = ?")
+        params.append(moment)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        "SELECT id, session_id, lane, moment, kind, ts, excerpt, ref_path, ref_offset "
+        f"FROM evidence{where} ORDER BY ts ASC, id ASC LIMIT ?",
+        (*params, limit),
+    ).fetchall()
+    values = [_evidence_row(row) for row in rows]
+    if as_json:
+        print(json.dumps(values, ensure_ascii=False, separators=(",", ":")))
+    else:
+        for value in values:
+            print("\t".join(_display_field(value[key]) for key in (
+                "id", "session_id", "lane", "moment", "kind", "ts",
+                "excerpt", "ref_path", "ref_offset",
+            )))
+    return 0
+
+
+def cmd_evidence_show(
+    conn: sqlite3.Connection,
+    *,
+    namespace: str,
+    evidence_id: str,
+    as_json: bool,
+) -> int:
+    """Show one evidence row without exposing its integrity hash."""
+    del namespace  # see cmd_evidence_list
+    row = conn.execute(
+        "SELECT id, session_id, lane, moment, kind, ts, excerpt, ref_path, ref_offset "
+        "FROM evidence WHERE id = ?",
+        (evidence_id,),
+    ).fetchone()
+    if row is None:
+        print("evidence id not found", file=sys.stderr)
+        return 1
+    value = _evidence_row(row)
+    if as_json:
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print("\t".join(_display_field(value[key]) for key in (
+            "id", "session_id", "lane", "moment", "kind", "ts",
+            "excerpt", "ref_path", "ref_offset",
+        )))
+    return 0
+
+
+def cmd_hermes_convention(
+    conn: sqlite3.Connection, *, payload: dict[str, object]
+) -> int:
+    """Run the compatibility ring/metadata operation inside the store process."""
+    try:
+        if not isinstance(payload, dict) or not payload:
+            print("{}")
+            return 0
+        event = payload.get("payload", payload)
+        extra = payload.get("extra", {})
+        if not isinstance(event, dict):
+            print("{}")
+            return 0
+        if not isinstance(extra, dict):
+            print("{}")
+            return 0
+        session = str(event.get("session_id") or "").strip()
+        if not session:
+            print("{}")
+            return 0
+        result = event.get("result")
+        statuses = []
+        for source in (extra, event, result if isinstance(result, dict) else {}):
+            value = source.get("status")
+            if isinstance(value, str):
+                statuses.append(value.strip().lower())
+        status = "error" if any(
+            value in {"error", "failed", "failure"} for value in statuses
+        ) else ""
+        if (event.get("error") or event.get("error_message")
+                or event.get("error_type") or extra.get("error")
+                or extra.get("error_message")):
+            status = "error"
+        if status in {"error", "failed", "failure"}:
+            captured = conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES (?, '1')",
+                (f"hermes_failure_captured_{session}",),
+            ).rowcount
+            if captured:
+                conn.execute(
+                    "INSERT OR IGNORE INTO meta(key, value) VALUES (?, '1')",
+                    (f"hermes_pending_failure_{session}",),
+                )
+        else:
+            key = f"hermes_convention_count_{session}"
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+                (key,),
+            )
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            try:
+                count = int(row[0]) if row else 0
+            except (TypeError, ValueError):
+                count = 0
+            try:
+                interval = max(1, int(os.environ.get("ZMEM_CONVENTION_INTERVAL", "10")))
+            except (TypeError, ValueError):
+                interval = 10
+            if count > 0 and count % interval == 0:
+                conn.execute(
+                    "INSERT OR IGNORE INTO meta(key, value) VALUES (?, '1')",
+                    (f"hermes_pending_convention_{session}",),
+                )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    print("{}")
+    return 0
+
+
+def _append_hermes_query_ring(payload: dict[str, object]) -> None:
+    """Append the legacy operation ring before any store-open guard.
+
+    The old hook recorded this sidecar even when the memory store had not yet
+    been initialized.  Keep that ordering in the internal CLI so the host
+    remains store-free without changing the observable kill-switch/no-store
+    behavior.
+    """
+    try:
+        if not isinstance(payload, dict) or not payload:
+            return
+        event = payload.get("payload", payload)
+        extra = payload.get("extra", {})
+        if not isinstance(event, dict) or not isinstance(extra, dict):
+            return
+        session = str(event.get("session_id") or "").strip()
+        if not session or os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
+            return
+        descriptor = ""
+        for source in (extra, event):
+            for key in ("command", "cmd"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    descriptor = value.strip()
+                    break
+            if descriptor:
+                break
+            tool_input = source.get("tool_input")
+            if isinstance(tool_input, dict):
+                for key in ("command", "file_path", "notebook_path", "path"):
+                    value = tool_input.get(key)
+                    if isinstance(value, str) and value.strip():
+                        descriptor = value.strip()
+                        break
+            if descriptor:
+                break
+        if descriptor:
+            _ops_tokens.append_ops_ring(
+                str(STORE_PATH.parent), session,
+                str(extra.get("tool") or event.get("tool_name") or ""),
+                descriptor,
+            )
+    except Exception:
+        pass
 
 def main():
     # Production-stream encoding hardening (issue #62 editorial round, Claude
@@ -550,6 +993,18 @@ def main():
                             help="print the selector envelope as JSON (the "
                                  "only output mode; issue #159)")
 
+    p_query_rewrite = _add_parser(
+        "query-rewrite", help="deterministically add recent passive context")
+    p_query_rewrite.add_argument(
+        "--prompt", required=True,
+        help="prompt text; option-looking values must use --prompt=<value>")
+    p_query_rewrite.add_argument("--session-id", required=True,
+                                 help="session whose evidence/ring is read")
+    p_query_rewrite.add_argument("--namespace", required=True,
+                                 help="selection namespace marker (not auth)")
+    p_query_rewrite.add_argument("--json", action="store_true",
+                                 help="emit the exact {query,rewrite} object")
+
     p_ledger_clear = _add_parser(
         "ledger-clear", help="clear one session's passive delivery ledger")
     p_ledger_clear.add_argument("--session-id", required=True,
@@ -678,6 +1133,34 @@ def main():
     p_list.add_argument("--limit", type=nonnegative_int, default=50)
     p_list.add_argument("--include-superseded", action="store_true")
 
+    # Evidence is session-scoped.  The required namespace is a context
+    # selector only; evidence rows intentionally do not carry a namespace.
+    p_evidence = _add_parser("evidence", help="write or inspect host evidence")
+    evidence_sub = p_evidence.add_subparsers(dest="evidence_cmd", required=True)
+    evidence_sub.add_parser("write", help="write one JSON evidence object from stdin")
+    p_evidence_list = evidence_sub.add_parser("list", help="list evidence rows")
+    p_evidence_list.add_argument("--namespace", dest="namespace", type=str,
+                                 required=True, help="namespace to inspect")
+    p_evidence_list.add_argument("--session-id", dest="session_id", type=str,
+                                 default=None, help="filter by session")
+    p_evidence_list.add_argument("--lane", dest="lane", type=str,
+                                 choices=EVIDENCE_LANES, default=None,
+                                 help="filter by lane")
+    p_evidence_list.add_argument("--moment", dest="moment", type=str,
+                                 choices=EVIDENCE_MOMENTS, default=None,
+                                 help="filter by moment")
+    p_evidence_list.add_argument("--limit", dest="limit", type=positive_int,
+                                 default=100, help="maximum rows")
+    p_evidence_list.add_argument("--json", dest="as_json", action="store_true",
+                                 default=False, help="emit JSON")
+    p_evidence_show = evidence_sub.add_parser("show", help="show one evidence row")
+    p_evidence_show.add_argument("--namespace", dest="namespace", type=str,
+                                 required=True, help="namespace to inspect")
+    p_evidence_show.add_argument("--id", dest="evidence_id", type=str,
+                                 required=True, help="evidence identifier")
+    p_evidence_show.add_argument("--json", dest="as_json", action="store_true",
+                                 default=False, help="emit JSON")
+
     _add_parser("stats", help="store statistics")
 
     # Print only the resolved store path (the 6-level ZMEM_STORE > ZMEM_DATA >
@@ -696,6 +1179,9 @@ def main():
     p_session_cadence.add_argument("--backup-retention", type=int,
                                    default=BACKUP_DEFAULT_RETENTION,
                                    help=f"backup retention in days (default {BACKUP_DEFAULT_RETENTION})")
+    p_session_cadence.add_argument("--json", dest="as_json", action="store_true",
+                                   default=False,
+                                   help="emit a machine-readable summary")
 
     _add_parser("rebuild-fts", help="rebuild the FTS5 index from scratch")
 
@@ -972,6 +1458,11 @@ def main():
                                      "like `add` (ZMEM_CAPTURE_MODE env or 'manual'): verbatim "
                                      "content with injection-risk tagging. Use 'auto' when "
                                      "ingesting an untrusted/remote sync file.")
+    p_ingest_jsonl.add_argument(
+        "--strict", action="store_true",
+        help="require all-or-nothing validation even without a parseable "
+             "evidence discriminator",
+    )
 
     p_fail = _add_parser(
         "failures",
@@ -1047,6 +1538,10 @@ def main():
     p_hermes_ctx.add_argument("--cursor-count", dest="cursor_count", type=int,
                               default=None,
                               help="delivered operation count")
+
+    # Internal compatibility hook bridge.  It intentionally has no selector
+    # flags: the hook supplies one bounded JSON object on stdin.
+    _add_parser("hermes-convention", help=argparse.SUPPRESS)
 
     p_mine = _add_parser(
         "mine-history",
@@ -1335,7 +1830,10 @@ def main():
     _cadence_sweep: tuple[str, bool] | None = None
     if args.cmd == "session-cadence":
         try:
-            rc_s = cmd_sweep()
+            with (contextlib.redirect_stdout(sys.stderr)
+                  if getattr(args, "as_json", False)
+                  else contextlib.nullcontext()):
+                rc_s = cmd_sweep()
             _cadence_sweep = (f"sweep: {'ok' if rc_s == 0 else f'exit {rc_s}'}", rc_s != 0)
         except Exception as exc:
             _cadence_sweep = (f"sweep: error - {type(exc).__name__}: {exc}", True)
@@ -1365,6 +1863,15 @@ def main():
             "--format", args.format,
         ]))
 
+    # Query rewriting is intentionally an early, read-only command.  Keeping
+    # this branch before every connect/_prepare/migration path is what makes a
+    # missing/legacy store a safe fail-open observation rather than a schema
+    # upgrade side effect.
+    if args.cmd == "query-rewrite":
+        sys.exit(cmd_query_rewrite(
+            prompt=args.prompt, session_id=args.session_id,
+            namespace=args.namespace))
+
     # Issue #122: the Hermes compatibility bridge runs inside the store
     # process (the hook stays stdlib-only and store-free) and must NEVER
     # create a missing store — it dispatches before connect(), in the same
@@ -1374,6 +1881,89 @@ def main():
             action=args.action, namespace=args.namespace,
             session_id=args.session_id, user_message=args.user_message,
             cursor_ts=args.cursor_ts, cursor_count=args.cursor_count))
+
+    hermes_payload: dict[str, object] | None = None
+    existing_only_evidence_write = (
+        args.cmd == "evidence"
+        and args.evidence_cmd == "write"
+        and os.environ.get("ZMEM_EVIDENCE_NO_CREATE") == "1"
+    )
+    if args.cmd == "evidence" and os.environ.get("ZMEM_EVIDENCE_NO_CREATE") == "1":
+        # The Hermes compatibility writer is observational: preserve its old
+        # no-op behavior when initialization has not created a usable store.
+        if not STORE_PATH.is_file():
+            print("{}")
+            sys.exit(0)
+        try:
+            if _schema_host is not None:
+                _schema_host.assert_local_fs(STORE_PATH.parent)
+            probe = sqlite3.connect(
+                STORE_PATH.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0
+            )
+            try:
+                probe.execute("SELECT 1 FROM meta LIMIT 1").fetchone()
+                if existing_only_evidence_write:
+                    # Do not let an observational hook initialize or migrate a
+                    # legacy store merely to discover the new side table.
+                    probe.execute("SELECT 1 FROM evidence LIMIT 0").fetchone()
+            finally:
+                probe.close()
+        except Exception:
+            print("{}")
+            sys.exit(0)
+    # The legacy Hermes convention hook was a no-op when the store was absent,
+    # on a network-managed path, or before the schema's meta table existed.  Do
+    # that guard inside the store CLI so the host hook remains SQLite-free and
+    # does not accidentally create/migrate a store merely by observing a tool.
+    if args.cmd == "hermes-convention":
+        try:
+            hermes_payload = _read_one_json_object()
+        except Exception:
+            hermes_payload = {}
+        _append_hermes_query_ring(hermes_payload)
+        if not STORE_PATH.is_file():
+            print("{}")
+            sys.exit(0)
+        try:
+            if _schema_host is not None:
+                _schema_host.assert_local_fs(STORE_PATH.parent)
+            probe = sqlite3.connect(
+                STORE_PATH.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0
+            )
+            try:
+                probe.execute("SELECT 1 FROM meta LIMIT 1").fetchone()
+            finally:
+                probe.close()
+        except Exception:
+            print("{}")
+            sys.exit(0)
+
+        if os.environ.get("ZMEM_HERMES_CONVENTION_EXISTING_ONLY") == "1":
+            # Compatibility metadata/ring writes must not run migrations or
+            # create a missing schema.  This is the store-owned equivalent of
+            # the old hook's connect-and-check-meta guard.
+            _hermes_conn = None
+            _hermes_lease = None
+            try:
+                _wait_for_maintenance_clear(args.cmd)
+                _hermes_lease = _acquire_writer_lease(args.cmd)
+                _hermes_conn = _connect_existing_store()
+                _hermes_conn.execute("SELECT 1 FROM meta LIMIT 1").fetchone()
+                cmd_hermes_convention(_hermes_conn, payload=hermes_payload or {})
+            except Exception:
+                print("{}")
+            finally:
+                if _hermes_lease is not None:
+                    try:
+                        _release_writer_lease(_hermes_lease)
+                    except Exception:
+                        pass
+                if _hermes_conn is not None:
+                    try:
+                        _hermes_conn.close()
+                    except Exception:
+                        pass
+            sys.exit(0)
 
     # PR-review PRR-P (issue #59 review round): `--content -` reads the content
     # from stdin. Windows argv caps near 32k chars while the content cap is
@@ -1385,8 +1975,9 @@ def main():
 
     try:
         _wait_for_maintenance_clear(args.cmd)
-        conn = connect()
-        _prepare_store(conn)
+        conn = _connect_existing_store() if existing_only_evidence_write else connect()
+        if not existing_only_evidence_write:
+            _prepare_store(conn)
     except RuntimeError as e:
         print(f"[zmem] {e}", file=sys.stderr)
         sys.exit(2)
@@ -1399,7 +1990,7 @@ def main():
     # remediation work, and the auto pass running first would consume the rows
     # their command targets — turning --dry-run into an empty preview and
     # --confirm into "no matching live rows found".
-    if args.cmd != "rekey-namespace":
+    if args.cmd != "rekey-namespace" and not existing_only_evidence_write:
         _auto_near_miss_rekey(conn, force_off=getattr(args, "no_auto_rekey", False))
 
     # Issue #63, 8.2: fail-closed embedding-profile gate. Applied ONLY to
@@ -1433,6 +2024,8 @@ def main():
     writer_lease = None
     if (
         args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl"}
+        or (args.cmd == "evidence" and args.evidence_cmd == "write")
+        or args.cmd == "hermes-convention"
         # v12 (issue #64, 9.4): feedback is a write surface — it takes the
         # lease so it serializes against restore/backup like every writer.
         or args.cmd == "feedback"
@@ -1477,6 +2070,44 @@ def main():
     try:
         if args.cmd == "init":
             print(f"[zmem] store ready at {STORE_PATH}")
+        elif args.cmd == "evidence":
+            if args.evidence_cmd == "write":
+                try:
+                    payload = _read_one_json_object()
+                    sys.exit(cmd_evidence_write(conn, payload=payload))
+                except DuplicateJSONKeyError:
+                    conn.rollback()
+                    print("evidence write failed: DuplicateJSONKeyError", file=sys.stderr)
+                    sys.exit(2)
+                except json.JSONDecodeError:
+                    conn.rollback()
+                    print("evidence write failed: JSONDecodeError", file=sys.stderr)
+                    sys.exit(2)
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                    print("evidence write failed: IntegrityError", file=sys.stderr)
+                    sys.exit(2)
+                except ValueError:
+                    conn.rollback()
+                    print("evidence write failed: ValueError", file=sys.stderr)
+                    sys.exit(2)
+                except sqlite3.Error:
+                    conn.rollback()
+                    print("evidence write failed: SQLiteError", file=sys.stderr)
+                    sys.exit(2)
+            if args.evidence_cmd == "list":
+                sys.exit(cmd_evidence_list(
+                    conn, namespace=args.namespace, session_id=args.session_id,
+                    lane=args.lane, moment=args.moment, limit=args.limit,
+                    as_json=args.as_json,
+                ))
+            sys.exit(cmd_evidence_show(
+                conn, namespace=args.namespace, evidence_id=args.evidence_id,
+                as_json=args.as_json,
+            ))
+        elif args.cmd == "hermes-convention":
+            payload = hermes_payload if hermes_payload is not None else {}
+            sys.exit(cmd_hermes_convention(conn, payload=payload))
         elif args.cmd == "add":
             try:
                 # Under --json the human progress lines ([zmem] added …,
@@ -1706,10 +2337,30 @@ def main():
             # global_limit/budget (the contract's exact dispatch values);
             # data_dir=None so the selector resolves the sidecar dir through
             # the canonical store precedence.
+            prefetch_query = args.query
+            if (args.moment == "user_prompt"
+                    and os.environ.get("ZMEM_QUERY_CONTEXT") != "0"):
+                # The store boundary owns this one rewrite for compat/MCP
+                # prefetch.  Native provider and hook paths call the dedicated
+                # command before recall and therefore do not pass here.
+                try:
+                    evidence_ready = _query_rewrite_has_evidence(conn)
+                except Exception:
+                    evidence_ready = False
+                if evidence_ready:
+                    try:
+                        prefetch_query, _ = _query_rewrite_context(
+                            conn, prefetch_query, args.session_id,
+                            explicit_ops=(args.ops_tokens or None),
+                        )
+                    except Exception:
+                        # Passive selection remains fail-open if a mixed-version
+                        # evidence table is observed after the schema probe.
+                        pass
             try:
                 payload = select_and_budget_for_injection(
                     conn,
-                    query=args.query,
+                    query=prefetch_query,
                     namespace=args.namespace,
                     moment=args.moment,
                     session_id=args.session_id,
@@ -1883,37 +2534,66 @@ def main():
             # — fold its result into the summary here.
             steps: list[str] = []
             failures = 0
-            # 1) organize (shares consolidate's lock + meta-key cadence gate via
-            # force=False; single-flighted on the shared "consolidate" lock)
-            o_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
-            if o_token is None:
-                steps.append("organize: already running - skipped")
-            else:
+            organized = False
+            backed_up = False
+            cadence_redirect = (
+                contextlib.redirect_stdout(sys.stderr)
+                if getattr(args, "as_json", False)
+                else contextlib.nullcontext()
+            )
+            with cadence_redirect:
+                # 1) organize (shares consolidate's lock + meta-key cadence gate)
+                o_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+                if o_token is None:
+                    steps.append("organize: already running - skipped")
+                else:
+                    try:
+                        organize(conn, force=False)
+                        organized = True
+                        steps.append("organize: ok")
+                    except Exception as exc:  # never abort the other cadence ops
+                        steps.append(f"organize: error - {type(exc).__name__}: {exc}")
+                        failures += 1
+                    finally:
+                        _release_lock("consolidate", o_token)
+                # 2) backup --if-due (cheap no-op almost every session)
                 try:
-                    organize(conn, force=False)
-                    steps.append("organize: ok")
-                except Exception as exc:  # never let one cadence op abort the batch
-                    steps.append(f"organize: error - {type(exc).__name__}: {exc}")
+                    rc_b = cmd_backup(conn, retention=args.backup_retention, if_due=True)
+                    backed_up = rc_b == 0
+                    steps.append(f"backup: {'ok' if rc_b == 0 else f'exit {rc_b}'}")
+                    if rc_b != 0:
+                        failures += 1
+                except Exception as exc:
+                    steps.append(f"backup: error - {type(exc).__name__}: {exc}")
                     failures += 1
-                finally:
-                    _release_lock("consolidate", o_token)
-            # 2) backup --if-due (cheap no-op almost every session)
-            try:
-                rc_b = cmd_backup(conn, retention=args.backup_retention, if_due=True)
-                steps.append(f"backup: {'ok' if rc_b == 0 else f'exit {rc_b}'}")
-                if rc_b != 0:
-                    failures += 1
-            except Exception as exc:
-                steps.append(f"backup: error - {type(exc).__name__}: {exc}")
-                failures += 1
-            # 3) sweep result (already computed pre-connect): fold the summary
-            # line in and count the failure from the stashed bool (not by
-            # substring-matching the display string — cubic-re #5).
-            if _cadence_sweep is not None:
-                steps.append(_cadence_sweep[0])
-                if _cadence_sweep[1]:
-                    failures += 1
-            print("[zmem] session-cadence: " + "; ".join(steps))
+                # 3) file sweep result (already computed pre-connect)
+                if _cadence_sweep is not None:
+                    steps.append(_cadence_sweep[0])
+                    if _cadence_sweep[1]:
+                        failures += 1
+
+            # Evidence retention runs after organize/backup on the connected
+            # store and owns one transaction.  Derive the clock once at command
+            # dispatch so every deletion in this cadence shares one boundary.
+            cadence_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            retention = sweep_evidence(conn, now_ts=cadence_now)
+            if getattr(args, "as_json", False):
+                print(json.dumps({
+                    "organized": organized,
+                    "backed_up": backed_up,
+                    "evidence_expired": retention["expired"],
+                    "evidence_capped": retention["capped"],
+                    "episode_links": retention["episode_links"],
+                    "memory_links": retention["memory_links"],
+                }, ensure_ascii=False, separators=(",", ":")))
+            else:
+                steps.extend([
+                    f"evidence_expired={retention['expired']}",
+                    f"evidence_capped={retention['capped']}",
+                    f"episode_links={retention['episode_links']}",
+                    f"memory_links={retention['memory_links']}",
+                ])
+                print("[zmem] session-cadence: " + "; ".join(steps))
             # Exit nonzero if any op failed (PRR-003): former separate processes
             # surfaced per-op exit codes; preserve that signal. The hook runs
             # this detached and does not check $?, so the impact is for direct
@@ -2003,9 +2683,10 @@ def main():
             )
             sys.exit(rc)
         elif args.cmd == "ingest-jsonl":
-            rc = cmd_ingest_jsonl(conn, in_path=args.in_path, source_ref=args.source_ref,
-                                  allow_tombstones=args.allow_tombstones,
-                                  capture_mode=args.capture_mode)
+            ingest = cmd_ingest_jsonl_strict if args.strict else cmd_ingest_jsonl
+            rc = ingest(conn, in_path=args.in_path, source_ref=args.source_ref,
+                        allow_tombstones=args.allow_tombstones,
+                        capture_mode=args.capture_mode)
             sys.exit(rc)
         elif args.cmd == "entity-list":
             sys.exit(cmd_entity_list(conn, kind=args.kind, as_json=args.json))

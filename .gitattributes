@@ -26,3 +26,9 @@ tests/fixtures/cross_encoder/tokenizer.json -filter -diff -merge -text
 
 # Issue #159 prefetch fixtures pin exact ledger bytes; keep them LF on checkout.
 tests/fixtures/prefetch/** text eol=lf
+
+# Replay and evidence JSONL/log fixtures are byte-contract inputs.  Keep
+# checkout bytes LF-stable under Windows autocrlf; SQLite fixtures remain
+# binary-safe by the default binary detection.
+tests/fixtures/replay/*.log text eol=lf
+tests/fixtures/evidence/*.jsonl text eol=lf

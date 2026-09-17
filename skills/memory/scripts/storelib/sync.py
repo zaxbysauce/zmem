@@ -4,6 +4,7 @@ import argparse
 import calendar
 import contextlib
 import hashlib
+import io
 import json
 import math
 import os
@@ -13,6 +14,7 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import glob
@@ -23,8 +25,16 @@ import embed_profiles as _profiles
 from storelib.entity import link_memory_entities, relink_memory
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
-from storelib.write import CapturePolicyRefusal, _GLOBAL_NEAR_MISS_STEMS, _apply_capture_policy, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory
+from storelib.write import CapturePolicyRefusal, _GLOBAL_NEAR_MISS_STEMS, _apply_capture_policy, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text
 from schema_meta import worse_taint  # noqa: F401
+from storelib.evidence import (
+    EVIDENCE_KINDS,
+    EVIDENCE_LANES,
+    EVIDENCE_MOMENTS,
+    EVIDENCE_MAX_EXCERPT_CHARS,
+    _SQLITE_INT_MAX,
+    _validate_ts,
+)
 
 EXPORT_PACK_DEFAULT_PROJECT_LIMIT = 50
 
@@ -155,7 +165,11 @@ def cmd_export_pack(
         sys.stdout.write(text)
     return 0
 
-def cmd_export_jsonl(
+class _PreV14Evidence(Exception):
+    """Internal sentinel for a genuinely absent pre-v14 table set."""
+
+
+def _cmd_export_jsonl_body(
     conn: sqlite3.Connection,
     *,
     out: str | None = None,
@@ -166,6 +180,44 @@ def cmd_export_jsonl(
     when include_superseded), sorted by ingestion_ts then id for deterministic
     diffs. No embedding fields -- bytes are not portable across machines;
     receivers rebuild via `reembed`."""
+    # The public wrapper owns the read snapshot and its rollback cleanup; this
+    # body keeps one snapshot across memory, episode, and evidence sections.
+    # Never silently downgrade a partial v14 schema to a legacy export.
+    schema_rows = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('evidence','episode_evidence','memory_evidence')"
+        ).fetchall()
+    }
+    evidence_schema = {
+        "evidence", "episode_evidence", "memory_evidence",
+    }
+    if schema_rows and schema_rows != evidence_schema:
+        raise sqlite3.DatabaseError(
+            "incomplete v14 evidence schema: " + ",".join(sorted(schema_rows))
+        )
+    if not schema_rows:
+        # A schema-14 store with all three evidence tables removed is a
+        # damaged v14 store, not a legitimate pre-v14 export. Use the marker
+        # only to distinguish that case; stores predating the marker retain
+        # the historical legacy-only export behavior.
+        try:
+            version_row = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            schema_version = int(version_row[0]) if version_row else None
+        except sqlite3.OperationalError:
+            schema_version = None
+        except (TypeError, ValueError) as exc:
+            raise sqlite3.DatabaseError(
+                "invalid schema_version while checking v14 evidence schema"
+            ) from exc
+        if schema_version is not None and schema_version >= 14:
+            raise sqlite3.DatabaseError(
+                "schema-14 store is missing the v14 evidence schema"
+            )
+    evidence_available = schema_rows == evidence_schema
+
     clauses = []
     params: list = []
     if namespace:
@@ -193,12 +245,16 @@ def cmd_export_jsonl(
     # are backward-compatible: a pre-v11 validator reads fields via obj.get()
     # and never rejects unknown keys, so an older client can still ingest this
     # file (it just drops trust_score/links).
+    exported_ids: set[str] = {r["id"] for r in rows}
     link_map: dict = {}
+    exported_eps: set[str] = set()
     try:
         for e in conn.execute(
             "SELECT src_id, dst_id, relation, score, created_at FROM memory_link "
             "ORDER BY src_id, relation, dst_id"
         ).fetchall():
+            if e["src_id"] not in exported_ids or e["dst_id"] not in exported_ids:
+                continue
             link_map.setdefault(e["src_id"], []).append({
                 "dst": e["dst_id"], "relation": e["relation"],
                 "score": e["score"], "created_at": e["created_at"],
@@ -208,18 +264,20 @@ def cmd_export_jsonl(
 
     lines = []
 
-    def _emit(obj: dict) -> None:
+    def _emit(obj: dict, *, compact: bool = False) -> None:
         """Serialize one JSONL record with the unicode line-separator
         escaping memory rows have always had (F11: episode and membership
         records now get the same protection — a U+2028/29/0085 inside a
         namespace would otherwise shatter the line on re-import)."""
-        line = json.dumps(obj, ensure_ascii=False)
+        line = json.dumps(
+            obj, ensure_ascii=False,
+            separators=((',', ':') if compact else None),
+        )
         line = (line.replace("\u2028", "\\u2028")
                     .replace("\u2029", "\\u2029")
                     .replace("\u0085", "\\u0085"))
         lines.append(line)
 
-    exported_ids: set[str] = set()
     for r in rows:
         exported_ids.add(r["id"])
         obj = {
@@ -304,6 +362,82 @@ def cmd_export_jsonl(
     except sqlite3.OperationalError:
         pass  # episode tables absent (pre-v13 store never migrated) — export without them
 
+    # v14 evidence transport.  The unscoped form is lossless.  A namespace
+    # scope has no evidence namespace column, so use the closure of parents
+    # already selected above and emit only associations whose two endpoints
+    # are in that closure; unassociated rows have no namespace attribution and
+    # are intentionally omitted from scoped exports.
+    try:
+        if not evidence_available:
+            raise _PreV14Evidence("pre-v14 store")
+        if namespace:
+            ep_associations = conn.execute(
+                "SELECT episode_id, evidence_id FROM episode_evidence "
+                "ORDER BY episode_id, evidence_id"
+            ).fetchall()
+            mem_associations = conn.execute(
+                "SELECT memory_id, evidence_id FROM memory_evidence "
+                "ORDER BY memory_id, evidence_id"
+            ).fetchall()
+            evidence_ids = {
+                a[1] for a in ep_associations if a[0] in exported_eps
+            }
+            evidence_ids.update(
+                a[1] for a in mem_associations if a[0] in exported_ids
+            )
+            evidence = [
+                row for row in conn.execute(
+                    "SELECT id, session_id, lane, moment, kind, ts, hash, excerpt, "
+                    "ref_path, ref_offset FROM evidence ORDER BY ts, id"
+                ).fetchall()
+                if row["id"] in evidence_ids
+            ]
+        else:
+            evidence = conn.execute(
+                "SELECT id, session_id, lane, moment, kind, ts, hash, excerpt, "
+                "ref_path, ref_offset FROM evidence ORDER BY ts, id"
+            ).fetchall()
+            evidence_ids = {row[0] for row in evidence}
+        for e in evidence:
+            _emit({
+                "table": "evidence",
+                "id": e["id"],
+                "session_id": e["session_id"],
+                "lane": e["lane"],
+                "moment": e["moment"],
+                "kind": e["kind"],
+                "ts": e["ts"],
+                "hash": e["hash"],
+                "excerpt": e["excerpt"],
+                "ref_path": e["ref_path"],
+                "ref_offset": e["ref_offset"],
+            }, compact=True)
+        if not namespace:
+            ep_associations = conn.execute(
+                "SELECT episode_id, evidence_id FROM episode_evidence "
+                "ORDER BY episode_id, evidence_id"
+            ).fetchall()
+            mem_associations = conn.execute(
+                "SELECT memory_id, evidence_id FROM memory_evidence "
+                "ORDER BY memory_id, evidence_id"
+            ).fetchall()
+        for a in ep_associations:
+            if a[1] in evidence_ids and a[0] in exported_eps:
+                _emit({
+                    "table": "episode_evidence",
+                    "episode_id": a[0],
+                    "evidence_id": a[1],
+                }, compact=True)
+        for a in mem_associations:
+            if a[1] in evidence_ids and a[0] in exported_ids:
+                _emit({
+                    "table": "memory_evidence",
+                    "memory_id": a[0],
+                    "evidence_id": a[1],
+                }, compact=True)
+    except _PreV14Evidence:
+        pass  # all v14 tables absent (pre-v14 store) — export legacy rows only
+
     text = "".join(line + "\n" for line in lines)
 
     if out:
@@ -315,6 +449,30 @@ def cmd_export_jsonl(
     else:
         sys.stdout.write(text)
     return 0
+
+
+def cmd_export_jsonl(
+    conn: sqlite3.Connection,
+    *,
+    out: str | None = None,
+    namespace: str | None = None,
+    include_superseded: bool = False,
+) -> int:
+    """Export one consistent snapshot, rolling back an owned read tx on error."""
+    read_snapshot = not conn.in_transaction
+    try:
+        if read_snapshot:
+            conn.execute("BEGIN")
+        result = _cmd_export_jsonl_body(
+            conn, out=out, namespace=namespace,
+            include_superseded=include_superseded,
+        )
+        if read_snapshot:
+            conn.commit()
+        return result
+    finally:
+        if read_snapshot and conn.in_transaction:
+            conn.rollback()
 
 INGEST_MAX_CONTENT_CHARS = MAX_CONTENT_CHARS
 
@@ -343,6 +501,12 @@ INGEST_MAX_FUTURE_SKEW_SECONDS = 86400
 # use per line.
 
 MAX_LINE_CHARS = 1_048_576
+
+# Strict evidence transfers are staged once in a private bounded spool.  The
+# cap prevents a remote path from turning validation into an unbounded memory
+# or disk sink while still allowing large real exports.
+STRICT_MAX_BYTES = 64 * 1024 * 1024
+STRICT_MAX_ROWS = 100_000
 
 
 def _validate_episode_row(obj: dict, lineno: int) -> None:
@@ -403,6 +567,110 @@ def _validate_membership_row(obj: dict, lineno: int) -> None:
             _time.strptime(str(added_at), "%Y-%m-%dT%H:%M:%SZ")
         except ValueError:
             raise ValueError("episode_memory added_at is not ISO-8601")
+
+
+def _strict_object_pairs(pairs: list[tuple[str, object]]) -> dict:
+    """Reject duplicate JSON object keys at every nesting level."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _strict_uuid(value: object, field: str) -> str:
+    if not isinstance(value, str) or not _INGEST_ID_RE.fullmatch(value):
+        raise ValueError(f"{field} is not UUID-shaped")
+    return value
+
+
+def _strict_required_text(value: object, field: str, *, max_chars: int = 4096) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    if len(value) > max_chars:
+        raise ValueError(f"{field} exceeds {max_chars} characters")
+    return value
+
+
+def _strict_evidence_row(obj: dict, lineno: int) -> dict:
+    required = {
+        "table", "id", "session_id", "lane", "moment", "kind", "ts",
+        "hash", "excerpt", "ref_path", "ref_offset",
+    }
+    if set(obj) != required:
+        missing = sorted(required - set(obj))
+        extra = sorted(set(obj) - required)
+        raise ValueError(
+            f"evidence line {lineno} has invalid fields"
+            + (f"; missing {','.join(missing)}" if missing else "")
+            + (f"; unknown {','.join(extra)}" if extra else "")
+        )
+    _strict_uuid(obj["id"], "evidence id")
+    _strict_required_text(obj["session_id"], "evidence session_id", max_chars=512)
+    lane = obj["lane"]
+    if lane is not None and lane not in EVIDENCE_LANES:
+        raise ValueError("evidence lane is not allowed")
+    if obj["moment"] not in EVIDENCE_MOMENTS:
+        raise ValueError("evidence moment is not allowed")
+    if obj["kind"] not in EVIDENCE_KINDS:
+        raise ValueError("evidence kind is not allowed")
+    ts = obj["ts"]
+    if not isinstance(ts, str):
+        raise ValueError("evidence ts must be a string")
+    try:
+        _validate_ts(ts, "evidence ts")
+    except ValueError:
+        raise ValueError("evidence ts is not second-precision UTC")
+    excerpt = obj["excerpt"]
+    if not isinstance(excerpt, str) or not excerpt:
+        raise ValueError("evidence excerpt must be non-empty text")
+    redacted, _ = redact_text(excerpt)
+    final_excerpt = redacted[:EVIDENCE_MAX_EXCERPT_CHARS]
+    if obj["ref_offset"] is not None and (
+        isinstance(obj["ref_offset"], bool)
+        or not isinstance(obj["ref_offset"], int)
+        or obj["ref_offset"] < 0
+        or obj["ref_offset"] > _SQLITE_INT_MAX
+    ):
+        raise ValueError(
+            "evidence ref_offset must be a non-negative signed 64-bit integer or null"
+        )
+    _strict_required_text(obj["ref_path"], "evidence ref_path")
+    digest = obj["hash"]
+    expected = hashlib.sha256(
+        f"{obj['kind']}|{ts}|{final_excerpt}".encode("utf-8")
+    ).hexdigest()
+    if not isinstance(digest, str) or digest != expected:
+        raise ValueError("evidence hash does not match the final excerpt")
+    # Apply the same redaction/cap at the import boundary.  A valid exported
+    # row is unchanged; a secret-bearing row cannot bypass the writer policy.
+    obj = dict(obj)
+    obj["excerpt"] = final_excerpt
+    obj["hash"] = expected
+    return obj
+
+
+def _strict_association_row(obj: dict, lineno: int, table: str) -> dict:
+    expected = {
+        "table", "episode_id", "evidence_id",
+    } if table == "episode_evidence" else {
+        "table", "memory_id", "evidence_id",
+    }
+    if set(obj) != expected:
+        raise ValueError(f"{table} line {lineno} has invalid fields")
+    for field in expected - {"table"}:
+        _strict_uuid(obj[field], f"{table} {field}")
+    return obj
+
+
+def _strict_table_for_object(obj: dict, lineno: int) -> dict:
+    table = obj.get("table")
+    if table == "evidence":
+        return _strict_evidence_row(obj, lineno)
+    if table in ("episode_evidence", "memory_evidence"):
+        return _strict_association_row(obj, lineno, table)
+    raise ValueError(f"unknown table discriminator {table!r}")
 
 
 
@@ -767,8 +1035,9 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     }
 
 def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
-                capture_mode: str | None = None,
-                dedup_cache: dict | None = None) -> str:
+                 capture_mode: str | None = None,
+                 dedup_cache: dict | None = None,
+                 preserve_ids: bool = False) -> str:
     """Apply one VALIDATED JSONL sync row (a _validate_sync_row result) to the
     local store.
 
@@ -934,8 +1203,14 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             _emb_sync.warn_fake_active()
         except Exception:
             pass  # banner must never break ingest (mirror write.py guard)
-        existing, _sim, emb = _detect_duplicate(conn, content, namespace,
-                                                 dedup_cache=dedup_cache)
+        if preserve_ids:
+            # Strict evidence transfers are identity-preserving.  Content
+            # dedup is a useful legacy best-effort policy, but it would drop a
+            # supplied memory UUID that an evidence association references.
+            existing, _sim, emb = None, None, None
+        else:
+            existing, _sim, emb = _detect_duplicate(conn, content, namespace,
+                                                     dedup_cache=dedup_cache)
         # v11 (issue #61, 6.2 — PR-review R1): the SAME write-time polarity
         # guard add_memory/update_memory apply. A remote row that contradicts
         # its dedup hit ("always X" vs "never X") must NOT be folded into the
@@ -1029,6 +1304,347 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             conn.rollback()
         raise
 
+def _stage_sync_source(
+    in_path: str, *, force_strict: bool = False,
+) -> tuple[tempfile.SpooledTemporaryFile, bool]:
+    """Read an input path once into a bounded private spool."""
+    spool = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    total = 0
+    try:
+        with open(in_path, "rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if force_strict and total > STRICT_MAX_BYTES:
+                    raise ValueError(
+                        f"input exceeds strict staging limit of {STRICT_MAX_BYTES} bytes"
+                    )
+                spool.write(chunk)
+    except Exception:
+        spool.close()
+        raise
+    spool.seek(0)
+    has_table = False
+    # Scan the same bounded *text* physical lines that the legacy reader uses.
+    # A binary readline(MAX_LINE_CHARS + 1) can split an oversized line and
+    # parse a JSON-looking tail as a second record, falsely selecting strict
+    # mode. Text decoding also makes the bound character-based for UTF-8 input.
+    text = io.TextIOWrapper(spool, encoding="utf-8", errors="replace", newline="\n")
+    try:
+        while True:
+            line = text.readline(MAX_LINE_CHARS + 1)
+            if line == "":
+                break
+            if len(line) > MAX_LINE_CHARS:
+                if not line.endswith("\n"):
+                    while True:
+                        chunk = text.readline(MAX_LINE_CHARS + 1)
+                        if chunk == "" or chunk.endswith("\n"):
+                            break
+                # An oversized physical line is a legacy malformed row, not a
+                # discriminator-bearing record. The legacy pass will report it.
+                continue
+            try:
+                obj = json.loads(line.rstrip("\r\n").strip())
+            except (json.JSONDecodeError, RecursionError, ValueError):
+                continue
+            if isinstance(obj, dict) and "table" in obj:
+                has_table = True
+                break
+    finally:
+        text.detach()
+    spool.seek(0)
+    if has_table and total > STRICT_MAX_BYTES:
+        spool.close()
+        raise ValueError(
+            f"input exceeds strict staging limit of {STRICT_MAX_BYTES} bytes"
+        )
+    return spool, has_table
+
+
+def _strict_staged_rows(spool: tempfile.SpooledTemporaryFile) -> list[tuple[str, dict]]:
+    """Parse and validate all staged rows before a strict import mutates DB."""
+    spool.seek(0)
+    text = io.TextIOWrapper(spool, encoding="utf-8", newline="\n")
+    rows: list[tuple[str, dict]] = []
+    try:
+        while True:
+            raw_line = text.readline(MAX_LINE_CHARS + 1)
+            if raw_line == "":
+                break
+            if len(raw_line) > MAX_LINE_CHARS:
+                if not raw_line.endswith("\n"):
+                    while True:
+                        chunk = text.readline(MAX_LINE_CHARS + 1)
+                        if chunk == "" or chunk.endswith("\n"):
+                            break
+                raise ValueError(f"line exceeds {MAX_LINE_CHARS} characters")
+            line = raw_line.rstrip("\r\n").strip()
+            if not line:
+                continue
+            if len(rows) >= STRICT_MAX_ROWS:
+                raise ValueError(
+                    f"input exceeds strict staging limit of {STRICT_MAX_ROWS} rows"
+                )
+            obj = json.loads(line, object_pairs_hook=_strict_object_pairs)
+            if not isinstance(obj, dict):
+                raise ValueError("line is not a JSON object")
+            lineno = len(rows) + 1
+            if "table" in obj:
+                table_obj = _strict_table_for_object(obj, lineno)
+                rows.append((str(table_obj["table"]), table_obj))
+                continue
+            kind = obj.get("kind", "memory")
+            if kind == "episode":
+                _validate_episode_row(obj, lineno)
+                rows.append(("episode", obj))
+            elif kind == "episode_memory":
+                _validate_membership_row(obj, lineno)
+                rows.append(("episode_memory", obj))
+            elif kind == "memory":
+                rows.append(("memory", _validate_sync_row(obj, lineno)))
+            else:
+                raise ValueError(f"unknown kind {kind!r}")
+    finally:
+        text.detach()
+    if not rows:
+        raise ValueError("input is empty -- nothing to ingest")
+    return rows
+
+
+def _strict_ingest_staged(
+    conn: sqlite3.Connection,
+    spool: tempfile.SpooledTemporaryFile,
+    *,
+    source_ref: str | None,
+    allow_tombstones: bool,
+    capture_mode: str | None,
+) -> int:
+    rows = _strict_staged_rows(spool)
+    seen: dict[str, set] = {
+        "memory": set(), "episode": set(), "evidence": set(),
+        "episode_memory": set(), "episode_evidence": set(),
+        "memory_evidence": set(),
+    }
+    memory_ids = {obj["id"] for table, obj in rows if table == "memory"}
+    episode_ids = {obj["id"] for table, obj in rows if table == "episode"}
+    evidence_ids = {obj["id"] for table, obj in rows if table == "evidence"}
+    for table, obj in rows:
+        if table == "memory":
+            key = obj["id"]
+        elif table == "episode":
+            key = obj["id"]
+        elif table == "evidence":
+            key = obj["id"]
+        elif table == "episode_memory":
+            key = (obj["episode_id"], obj["memory_id"])
+        elif table == "episode_evidence":
+            key = (obj["episode_id"], obj["evidence_id"])
+        elif table == "memory_evidence":
+            key = (obj["memory_id"], obj["evidence_id"])
+        else:
+            raise ValueError(f"unknown strict table {table!r}")
+        if key in seen[table]:
+            raise ValueError(f"duplicate {table} primary key")
+        seen[table].add(key)
+
+    existing_memory = {r[0] for r in conn.execute("SELECT id FROM memory")}
+    existing_episode = {r[0] for r in conn.execute("SELECT id FROM episode")}
+    existing_evidence = {r[0] for r in conn.execute("SELECT id FROM evidence")}
+    for table, obj in rows:
+        if table == "episode" and obj.get("summary_memory_id"):
+            if obj["summary_memory_id"] not in memory_ids | existing_memory:
+                raise ValueError("episode summary references an unknown memory")
+        elif table == "memory":
+            for entry in obj.get("_links", []):
+                if entry["dst"] not in memory_ids | existing_memory:
+                    raise ValueError("memory link references an unknown memory")
+        elif table == "episode_memory":
+            if obj["episode_id"] not in episode_ids | existing_episode:
+                raise ValueError("episode_memory references an unknown episode")
+            if obj["memory_id"] not in memory_ids | existing_memory:
+                raise ValueError("episode_memory references an unknown memory")
+        elif table == "episode_evidence":
+            if obj["episode_id"] not in episode_ids | existing_episode:
+                raise ValueError("episode_evidence references an unknown episode")
+            if obj["evidence_id"] not in evidence_ids | existing_evidence:
+                raise ValueError("episode_evidence references unknown evidence")
+        elif table == "memory_evidence":
+            if obj["memory_id"] not in memory_ids | existing_memory:
+                raise ValueError("memory_evidence references an unknown memory")
+            if obj["evidence_id"] not in evidence_ids | existing_evidence:
+                raise ValueError("memory_evidence references unknown evidence")
+
+    savepoint = "zmem_strict_ingest"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        strict_diagnostics: list[str] = []
+        pending_links: list[tuple[str, list[dict]]] = []
+        for table, obj in rows:
+            if table != "memory":
+                continue
+            obj = dict(obj)
+            if source_ref:
+                obj["source_ref"] = source_ref
+            diagnostic = io.StringIO()
+            with contextlib.redirect_stdout(diagnostic), contextlib.redirect_stderr(diagnostic):
+                outcome = _ingest_row(
+                    conn, obj, allow_tombstones=allow_tombstones,
+                    capture_mode=capture_mode, preserve_ids=True,
+                )
+            if diagnostic.getvalue():
+                strict_diagnostics.append(diagnostic.getvalue())
+            if outcome in ("tombstone_refused", "capture_refused"):
+                raise ValueError(f"strict import refused memory row {obj['id']}")
+            if obj.get("_links"):
+                pending_links.append((obj["id"], obj["_links"]))
+
+        for table, obj in rows:
+            if table == "episode":
+                if obj["summary_memory_id"] and conn.execute(
+                    "SELECT 1 FROM memory WHERE id=?",
+                    (obj["summary_memory_id"],),
+                ).fetchone() is None:
+                    raise ValueError("episode summary reference disappeared during import")
+                conn.execute(
+                    "INSERT OR IGNORE INTO episode "
+                    "(id, namespace, started_at, ended_at, summary_memory_id, token_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (obj["id"], obj["namespace"], obj["started_at"],
+                     obj["ended_at"], obj["summary_memory_id"], obj["token_count"]),
+                )
+
+        for table, obj in rows:
+            if table == "episode_memory":
+                if conn.execute(
+                    "SELECT 1 FROM episode WHERE id=?", (obj["episode_id"],)
+                ).fetchone() is None or conn.execute(
+                    "SELECT 1 FROM memory WHERE id=?", (obj["memory_id"],)
+                ).fetchone() is None:
+                    raise ValueError("episode_memory reference disappeared during import")
+                conn.execute(
+                    "INSERT OR IGNORE INTO episode_memory "
+                    "(episode_id, memory_id, added_at) VALUES (?, ?, ?)",
+                    (obj["episode_id"], obj["memory_id"], obj.get("added_at", "")),
+                )
+
+        for table, obj in rows:
+            if table != "evidence":
+                continue
+            existing = conn.execute(
+                "SELECT session_id, lane, moment, kind, ts, hash, excerpt, "
+                "ref_path, ref_offset FROM evidence WHERE id=?", (obj["id"],)
+            ).fetchone()
+            values = (
+                obj["session_id"], obj["lane"], obj["moment"], obj["kind"],
+                obj["ts"], obj["hash"], obj["excerpt"], obj["ref_path"],
+                obj["ref_offset"],
+            )
+            if existing is not None and tuple(existing) != values:
+                raise ValueError("existing evidence ID has different content")
+            conn.execute(
+                "INSERT OR IGNORE INTO evidence "
+                "(id, session_id, lane, moment, kind, ts, hash, excerpt, ref_path, ref_offset) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (obj["id"], *values),
+            )
+
+        if pending_links:
+            from storelib.links import add_link
+            for src, entries in pending_links:
+                for entry in entries:
+                    add_link(
+                        conn, src, entry["dst"], entry["relation"],
+                        entry["score"], created_at=entry["created_at"] or None,
+                    )
+
+        for table, obj in rows:
+            if table == "episode_evidence":
+                parent = conn.execute(
+                    "SELECT 1 FROM episode WHERE id=?", (obj["episode_id"],)
+                ).fetchone()
+                evidence = conn.execute(
+                    "SELECT 1 FROM evidence WHERE id=?", (obj["evidence_id"],)
+                ).fetchone()
+                if parent is None or evidence is None:
+                    raise ValueError("episode_evidence reference disappeared during import")
+                conn.execute(
+                    "INSERT OR IGNORE INTO episode_evidence "
+                    "(episode_id, evidence_id) VALUES (?, ?)",
+                    (obj["episode_id"], obj["evidence_id"]),
+                )
+            elif table == "memory_evidence":
+                parent = conn.execute(
+                    "SELECT 1 FROM memory WHERE id=?", (obj["memory_id"],)
+                ).fetchone()
+                evidence = conn.execute(
+                    "SELECT 1 FROM evidence WHERE id=?", (obj["evidence_id"],)
+                ).fetchone()
+                if parent is None or evidence is None:
+                    raise ValueError("memory_evidence reference disappeared during import")
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_evidence "
+                    "(memory_id, evidence_id) VALUES (?, ?)",
+                    (obj["memory_id"], obj["evidence_id"]),
+                )
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+    for diagnostic in strict_diagnostics:
+        sys.stderr.write(diagnostic)
+    print(f"[zmem] ingest-jsonl: strict rows={len(rows)} evidence={len(evidence_ids)}")
+    return 0
+
+
+def cmd_ingest_jsonl_strict(
+    conn: sqlite3.Connection,
+    *,
+    in_path: str,
+    source_ref: str | None,
+    allow_tombstones: bool = False,
+    capture_mode: str | None = None,
+) -> int:
+    """All-or-nothing JSONL import for evidence transfers."""
+    try:
+        spool, _ = _stage_sync_source(in_path, force_strict=True)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        print(
+            f"[zmem] ingest-jsonl: cannot stage input: "
+            f"{_sanitize_error_text(str(exc))}", file=sys.stderr,
+        )
+        return 2
+    try:
+        return _strict_ingest_staged(
+            conn, spool, source_ref=source_ref,
+            allow_tombstones=allow_tombstones, capture_mode=capture_mode,
+        )
+    except Exception as exc:
+        print(
+            f"[zmem] ingest-jsonl: strict import rejected: "
+            f"{type(exc).__name__}: {_sanitize_error_text(str(exc))}",
+            file=sys.stderr,
+        )
+        return 2
+    finally:
+        spool.close()
+
+
 def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                      source_ref: str | None, allow_tombstones: bool = False,
                      capture_mode: str | None = None) -> int:
@@ -1057,10 +1673,27 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     commit.
     """
     try:
-        f = open(in_path, encoding="utf-8", newline="\n")
-    except (OSError, UnicodeDecodeError) as e:
+        staged_source, auto_strict = _stage_sync_source(in_path)
+    except (OSError, UnicodeDecodeError, ValueError) as e:
         print(f"[zmem] ingest-jsonl: cannot read {in_path}: {e}", file=sys.stderr)
         return 2
+    if auto_strict:
+        try:
+            return _strict_ingest_staged(
+                conn, staged_source, source_ref=source_ref,
+                allow_tombstones=allow_tombstones,
+                capture_mode=capture_mode,
+            )
+        except Exception as e:
+            print(
+                f"[zmem] ingest-jsonl: strict import rejected: "
+                f"{type(e).__name__}: {_sanitize_error_text(str(e))}",
+                file=sys.stderr,
+            )
+            return 2
+        finally:
+            staged_source.close()
+    f = io.TextIOWrapper(staged_source, encoding="utf-8", newline="\n")
 
     added = tombstoned = tombstones_refused = deduped = skipped = malformed = 0
     capture_refused = 0

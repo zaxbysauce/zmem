@@ -1572,9 +1572,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 "arms": [], "rendered": "", "context": "",
             }
         safe_query = (query or "").strip()[:_MAX_QUERY_CHARS]
+        query_arg = (["--query=" + safe_query] if safe_query.startswith("-")
+                     else ["--query", safe_query])
         args = [
             "prefetch",
-            "--query", safe_query,
+            *query_arg,
             "--namespace", namespace,
             "--session-id", session_id,
             "--moment", moment,

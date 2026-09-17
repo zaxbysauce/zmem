@@ -1,0 +1,193 @@
+{
+  "schema_version": 1,
+  "input_digest": "8529a1210681f53b602ad32070a88c97d84402d419bf136a040f1842b3e367b0",
+  "store_sha256": "db7a289ed259f328ac2425381c726f0a082fa2e7dc6b134568a7a8b66a22e0de",
+  "days": 30,
+  "rows": [
+    {
+      "lane": "claude",
+      "moment": "precompact",
+      "counts": {
+        "decisions": 1,
+        "candidates": 1,
+        "delivered": 1,
+        "reference_checked": 0,
+        "miss": 0,
+        "empty_pool": 0,
+        "already_delivered": 0
+      },
+      "reference_precision": 0,
+      "false_injection_rate": 0,
+      "miss_rate": 0,
+      "empty_pool_rate": 0.0,
+      "already_delivered_rate": 0.0,
+      "t_ms": {
+        "p50": 40,
+        "p95": 40
+      }
+    },
+    {
+      "lane": "claude",
+      "moment": "pretool",
+      "counts": {
+        "decisions": 1,
+        "candidates": 0,
+        "delivered": 0,
+        "reference_checked": 0,
+        "miss": 0,
+        "empty_pool": 1,
+        "already_delivered": 0
+      },
+      "reference_precision": 0,
+      "false_injection_rate": 0,
+      "miss_rate": 0,
+      "empty_pool_rate": 1.0,
+      "already_delivered_rate": 0,
+      "t_ms": {
+        "p50": 30,
+        "p95": 30
+      }
+    },
+    {
+      "lane": "claude",
+      "moment": "session_start",
+      "counts": {
+        "decisions": 1,
+        "candidates": 1,
+        "delivered": 1,
+        "reference_checked": 0,
+        "miss": 0,
+        "empty_pool": 0,
+        "already_delivered": 0
+      },
+      "reference_precision": 0,
+      "false_injection_rate": 0,
+      "miss_rate": 0,
+      "empty_pool_rate": 0.0,
+      "already_delivered_rate": 0.0,
+      "t_ms": {
+        "p50": 10,
+        "p95": 10
+      }
+    },
+    {
+      "lane": "claude",
+      "moment": "user_prompt",
+      "counts": {
+        "decisions": 1,
+        "candidates": 1,
+        "delivered": 0,
+        "reference_checked": 0,
+        "miss": 0,
+        "empty_pool": 0,
+        "already_delivered": 1
+      },
+      "reference_precision": 0,
+      "false_injection_rate": 0,
+      "miss_rate": 0,
+      "empty_pool_rate": 0.0,
+      "already_delivered_rate": 1.0,
+      "t_ms": {
+        "p50": 20,
+        "p95": 20
+      }
+    },
+    {
+      "lane": "hermes-provider",
+      "moment": "precompact",
+      "counts": {
+        "decisions": 1,
+        "candidates": 1,
+        "delivered": 1,
+        "reference_checked": 0,
+        "miss": 0,
+        "empty_pool": 0,
+        "already_delivered": 0
+      },
+      "reference_precision": 0,
+      "false_injection_rate": 0,
+      "miss_rate": 0,
+      "empty_pool_rate": 0.0,
+      "already_delivered_rate": 0.0,
+      "t_ms": {
+        "p50": 40,
+        "p95": 40
+      }
+    },
+    {
+      "lane": "hermes-provider",
+      "moment": "pretool",
+      "counts": {
+        "decisions": 1,
+        "candidates": 0,
+        "delivered": 0,
+        "reference_checked": 0,
+        "miss": 0,
+        "empty_pool": 1,
+        "already_delivered": 0
+      },
+      "reference_precision": 0,
+      "false_injection_rate": 0,
+      "miss_rate": 0,
+      "empty_pool_rate": 1.0,
+      "already_delivered_rate": 0,
+      "t_ms": {
+        "p50": 30,
+        "p95": 30
+      }
+    },
+    {
+      "lane": "hermes-provider",
+      "moment": "session_start",
+      "counts": {
+        "decisions": 1,
+        "candidates": 1,
+        "delivered": 1,
+        "reference_checked": 0,
+        "miss": 0,
+        "empty_pool": 0,
+        "already_delivered": 0
+      },
+      "reference_precision": 0,
+      "false_injection_rate": 0,
+      "miss_rate": 0,
+      "empty_pool_rate": 0.0,
+      "already_delivered_rate": 0.0,
+      "t_ms": {
+        "p50": 10,
+        "p95": 10
+      }
+    },
+    {
+      "lane": "hermes-provider",
+      "moment": "user_prompt",
+      "counts": {
+        "decisions": 1,
+        "candidates": 1,
+        "delivered": 0,
+        "reference_checked": 0,
+        "miss": 0,
+        "empty_pool": 0,
+        "already_delivered": 1
+      },
+      "reference_precision": 0,
+      "false_injection_rate": 0,
+      "miss_rate": 0,
+      "empty_pool_rate": 0.0,
+      "already_delivered_rate": 1.0,
+      "t_ms": {
+        "p50": 20,
+        "p95": 20
+      }
+    }
+  ],
+  "aggregate": {
+    "reference_precision": 0,
+    "miss_rate": 0
+  },
+  "input_metadata": {
+    "version": "0.43.0",
+    "parsed_rows": 8
+  },
+  "generated_at": "2026-06-01T00:00:00Z"
+}
