@@ -33,6 +33,12 @@ embeddings, downloads-disabled behavior, and a pinned MMR default. Thus an
 operator's current date, recall knobs, model cache, or plugin routing cannot
 change a replay of the same bytes.
 
+The launcher's legacy `outer_timeout=1` watchdog diagnostic is recognized only
+in its exact writer shape and is reported as an explicit stderr exclusion, not
+as a decision row. It does not contribute to report counts, the latest valid
+decision timestamp, or `generated_at`; malformed or unknown `zmem-hook` rows
+still fail closed. The original diagnostic bytes remain part of `input_digest`.
+
 The closed report covers exactly these eight buckets:
 
 ```

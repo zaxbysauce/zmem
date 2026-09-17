@@ -489,6 +489,7 @@ function firstNonEmpty(...values) {
 // status/error carrier before deciding whether an event is successful; a
 // success must never erase a sibling or nested failure signal.
 function isMeaningfulFailureValue(value) {
+    if (typeof value === "number") return Number.isFinite(value) && value !== 0;
     if (value === true) return true;
     if (typeof value === "string") return Boolean(value.trim());
     if (Array.isArray(value)) return value.length > 0;

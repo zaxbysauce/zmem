@@ -145,7 +145,10 @@ function captureEvidence(payload, meta = payload) {
     eq("evidence: all-success payload remains edit", successfulRow.row && successfulRow.row.kind, "edit");
     eq("codex failure: all-success payload remains absent", launch.normalizeCodexFailurePayload(success), null);
 
-    for (const [label, value] of [["false", false], ["zero", 0], ["empty", ""], ["null", null]]) {
+    for (const [label, value] of [
+        ["false", false], ["zero", 0], ["empty", ""], ["whitespace", "   "],
+        ["null", null], ["empty-array", []], ["empty-object", {}],
+    ]) {
         const controlled = {
             tool_name: "Edit",
             tool_input: { file_path: `src/control-${label}.py` },
@@ -158,6 +161,49 @@ function captureEvidence(payload, meta = payload) {
         eq(`evidence: ${label} error control remains successful`, controlledRow.ok, true);
         eq(`codex failure: ${label} error control remains absent`,
             launch.normalizeCodexFailurePayload(controlled), null);
+    }
+
+    for (const [label, value] of [["one", 1], ["two", 2], ["negative-one", -1]]) {
+        for (const [carrier, wrapped] of [
+            ["top-level", { error: value }],
+            ["result", { result: { status: "ok", error: value } }],
+            ["tool-result", { tool_result: { status: "ok", error: value } }],
+            ["tool-output", { tool_output: { status: "ok", error: value } }],
+        ]) {
+            const numericFailure = {
+                tool_name: "Edit",
+                tool_input: { file_path: `src/numeric-${carrier}-${label}.py` },
+                session_id: "s-status",
+                status: "ok",
+                ...wrapped,
+            };
+            const numericRow = captureEvidence(numericFailure);
+            eq(`evidence: ${carrier} numeric ${label} is rejected`, numericRow.ok, false);
+            eq(`evidence: ${carrier} numeric ${label} has no row`, numericRow.row, null);
+            eq(`codex failure: ${carrier} numeric ${label} has no fabricated error`,
+                launch.normalizeCodexFailurePayload(numericFailure), null);
+        }
+    }
+
+    for (const [carrier, wrapped] of [
+        ["top-level", { error: 1 }],
+        ["result", { result: { status: "ok", error: 1 } }],
+        ["tool-result", { tool_result: { status: "ok", error: 1 } }],
+        ["tool-output", { tool_output: { status: "ok", error: 1 } }],
+    ]) {
+        const numericWithMessage = {
+            tool_name: "Edit",
+            tool_input: { file_path: `src/numeric-${carrier}-message.py` },
+            session_id: "s-status",
+            status: "ok",
+            stderr: "write refused",
+            ...wrapped,
+        };
+        eq(`evidence: ${carrier} numeric failure with stderr is rejected`,
+            captureEvidence(numericWithMessage).ok, false);
+        eq(`codex failure: ${carrier} numeric failure preserves stderr`,
+            launch.normalizeCodexFailurePayload(numericWithMessage).error,
+            "write refused");
     }
 
     const outputFailure = {

@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "f74ae9c6571c87f2f59630ea4bc23b4b5e12094cd712e5ba1f4dea63a8d1ff20",
+  "digest": "47dc28c406ec17a75411389b022b44a472efcd9a8e0a0b1ef3a0f03a3e38586e",
   "files": {
     "hermes-plugin/__init__.py": "5d1083aecd4b809d1bd9b4c63fb6f6fabf958d2f162f87873fcbb6a47b7e32c9",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -25,7 +25,7 @@
     "hooks/zmem-capture-correction.sh": "f71aef6f46825723e908dbdcd81cccc1299c45e78025f8011db50c02037c75b2",
     "hooks/zmem-capture-failure.sh": "8c1b45dd1f29a1ac502861ee3942e43e829123cbe7b67c17e8b910227a7af002",
     "hooks/zmem-convention-capture.sh": "3982e825c0f3c310d4a867edcf9551d7ccbbd036af53134378a9faff6beea257",
-    "hooks/zmem-launch.js": "4712af2958c3b9c8d03481f9d0dbb1200f27505bfd42430d3342e8007961533e",
+    "hooks/zmem-launch.js": "136fad8edf69eefc0de625d2f81141b90c49735f92acace713c98382225f170a",
     "hooks/zmem-postcompact.sh": "7425f2937508fe3b526395abcb5610b7ac18c33a610a53455b58d984d8647542",
     "hooks/zmem-posttoolbatch-recall.sh": "2a6e08eb58772e43392ff24b879e77dba21d72d414fefca946eff1a82c71caf7",
     "hooks/zmem-precompact.sh": "0b935644aa4c291d67ddfb2e16b69a5578dee113d4512ccaca5677de6a5a6673",
@@ -40,7 +40,7 @@
     "scripts/canary-schema.json": "ae41f4f6acc728d911ef38826eab51f2670dac63369c2e5f4ce30601be95deff",
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",
     "scripts/eval_inject_runner.py": "c3b68474f80500e36ae2c245431897c7c0e5a27a98781332e8e9e1b8cb5cc70a",
-    "scripts/eval_replay.py": "3aaba9b97daef3fead3ad011f6c7e2b37475d9d896b6c2832c6bd170a1ccc66c",
+    "scripts/eval_replay.py": "fba1dd1366cb13156502f9bf322b8bd40e3206056f2e80d69b38b17f868ccdeb",
     "scripts/eval_runner.py": "6e9b355425644f38795068259a69bb9c1ca02cdd57509511824ac10ac721ce3a",
     "scripts/eval_self_corpus.py": "ead3aece0562da0fe588ea4d4994aa7ec8fece3ae4d0a7554766e9933e4e76e6",
     "scripts/generate_canary_fixtures.py": "3ee220946b159661e5147e01f4649a5bc691fc787c7b62d85f4ef7b94dbdd18b",

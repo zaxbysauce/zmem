@@ -36,6 +36,19 @@ COUNT_KEYS = (
 _VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _ATTR_TOKEN_RE = re.compile(r"(?:^|\s)(?:lane|ver|t_ms)=")
 _TIMESTAMP_LINE_RE = re.compile(r"^\[(\d+)\] zmem-hook\b")
+# The launcher watchdog predates the canonical decision-row parser.  Keep its
+# diagnostic grammar separate from _BG_LINE_RE: it is an explicit exclusion,
+# never a decision row, and accepting it in the canonical regex would invent
+# report coverage for an event with no ids/all fields.  Values intentionally
+# use \S* (rather than a narrower identifier grammar) because the writer emits
+# environment/hook values verbatim, including '=' and empty values.
+_OUTER_TIMEOUT_DIAGNOSTIC_RE = re.compile(
+    r"^\[(?P<ts>\d+)\] zmem-hook status=silent reason=omitted "
+    r"outer_timeout=1 stage=launcher timeout_ms=(?P<timeout_ms>\d+) "
+    r"tier0_emitted=(?P<tier0_emitted>[01]) tier2_rows=0 "
+    r"hook=(?P<hook>\S*) ns=(?P<namespace>\S*) "
+    r"sid=(?P<sid>\S*) moment=(?P<moment>\S*)$"
+)
 _DOMAIN = b"zmem-replay-transcripts-v1\0"
 # Transcript inputs are explicit evidence, but they are still untrusted
 # process-boundary data.  Bound each read and the aggregate before decoding or
@@ -49,6 +62,49 @@ MAX_TRANSCRIPT_LINES = 100_000
 
 class ReplayError(ValueError):
     """An input or evaluation error suitable for the stable CLI surface."""
+
+
+def _parse_outer_timeout_diagnostic(raw: str) -> bool:
+    """Recognize the exact legacy launcher diagnostic, without imports.
+
+    This pure recognizer is shared by the pre-bootstrap replay clock and the
+    strict staged-log validator.  A line containing the marker but failing the
+    full grammar is deliberately *not* recognized; callers reject it instead
+    of silently dropping a malformed lookalike.
+    """
+    match = _OUTER_TIMEOUT_DIAGNOSTIC_RE.fullmatch(raw.strip())
+    if not match:
+        return False
+    # Matching is the only required operation.  Do not convert unbounded
+    # decimal fields here: the original bytes remain the audit input and the
+    # diagnostic is excluded from all numeric report calculations.
+    return True
+
+
+def _scan_log_surface(text: str) -> tuple[list[tuple[int, str]], int]:
+    """Classify hook lines before store-library imports or report parsing.
+
+    The first result contains non-diagnostic hook rows (they still require the
+    canonical parser); the second counts exact, intentionally excluded
+    launcher diagnostics. Non-hook maintenance lines retain the historical
+    tolerance. Other hook lines, including malformed lookalikes, are left for
+    canonical validation so valid IDs containing ``outer_timeout=`` remain
+    compatible.
+    """
+    decision_lines: list[tuple[int, str]] = []
+    exclusions = 0
+    for number, raw in enumerate(text.splitlines(), 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "zmem-hook" not in raw:
+            continue
+        diagnostic = _parse_outer_timeout_diagnostic(stripped)
+        if diagnostic:
+            exclusions += 1
+            continue
+        decision_lines.append((number, stripped))
+    return decision_lines, exclusions
 
 
 def _operator_store_candidates() -> set[Path]:
@@ -276,7 +332,12 @@ def _validate_transcript(path: Path, data: bytes) -> list[dict]:
 
 
 def _validate_log(staged: Path):
-    """Parse only the staged active log and fail closed on malformed rows."""
+    """Parse staged decisions and return ``(rows, excluded_diagnostics)``.
+
+    Exact launcher timeout diagnostics are retained as explicit exclusions;
+    every other ``zmem-hook`` line remains subject to the canonical parser and
+    fail-closed validation.
+    """
     sys.path.insert(0, str(SCRIPTS))
     try:
         from storelib.miss_rate import _BG_LINE_RE, parse_bg_log
@@ -289,14 +350,8 @@ def _validate_log(staged: Path):
         text = staged.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ReplayError(f"replay: cannot read decision log: {exc}\n") from exc
-    hook_lines = []
-    for number, raw in enumerate(text.splitlines(), 1):
-        if not raw.strip() or raw.lstrip().startswith("#"):
-            continue
-        if "zmem-hook" not in raw:
-            # Maintenance output is not a decision row.  Arbitrary non-hook
-            # lines are tolerated for compatibility with rotated logs.
-            continue
+    hook_lines, exclusions = _scan_log_surface(text)
+    for number, raw in hook_lines:
         match = _BG_LINE_RE.match(raw.strip())
         if not match:
             raise ReplayError(f"replay: malformed decision row line {number}\n")
@@ -319,24 +374,29 @@ def _validate_log(staged: Path):
         if (not isinstance(ids, list) or not isinstance(all_ids, list)
                 or any(not isinstance(item, str) for item in ids + all_ids)):
             raise ReplayError(f"replay: malformed decision row line {number}\n")
-        hook_lines.append(raw)
     # parse_bg_log uses the same staged path and cannot discover ambient
     # rotations because the private directory contains no sibling segments.
     parsed = parse_bg_log(str(staged))
     if len(parsed) != len(hook_lines):
         raise ReplayError("replay: malformed decision log row\n")
-    return parsed
+    return parsed, exclusions
 
 
 def _latest_log_timestamp(staged: Path) -> int:
-    """Read only the log timestamp prefix before importing store libraries."""
+    """Read decision timestamps before importing store libraries.
+
+    Recognized launcher diagnostics are excluded from the replay clock.  The
+    surface scan is intentionally shared with ``_validate_log`` so malformed
+    timeout lookalikes cannot be treated as harmless maintenance output.
+    """
     try:
         text = staged.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ReplayError(f"replay: cannot read decision log: {exc}\n") from exc
+    decision_lines, _exclusions = _scan_log_surface(text)
     timestamps = []
-    for raw in text.splitlines():
-        match = _TIMESTAMP_LINE_RE.match(raw.strip())
+    for _number, raw in decision_lines:
+        match = _TIMESTAMP_LINE_RE.match(raw)
         if match:
             try:
                 timestamps.append(int(match.group(1)))
@@ -674,6 +734,16 @@ def _build_report(
     return report, diagnostics
 
 
+def _excluded_diagnostic_messages(exclusions: int) -> list[str]:
+    """Render deterministic stderr diagnostics for non-decision rows."""
+    if not exclusions:
+        return []
+    return [
+        "replay: excluded diagnostics (not decisions): "
+        + f"outer_timeout=1 count={exclusions}\n"
+    ]
+
+
 def _parse_thresholds(values: list[str]) -> dict[str, float]:
     out: dict[str, float] = {}
     for value in values:
@@ -839,12 +909,13 @@ def main() -> int:
                 transcript_records.append(_validate_transcript(path, source_bytes[path]))
             replay_now = _latest_log_timestamp(staged_log)
             _bootstrap_env(staged_store, staging, replay_now)
-            lines = _validate_log(staged_log)
+            lines, exclusions = _validate_log(staged_log)
             version = _valid_version(lines)
             report, diagnostics = _build_report(
                 lines, staged_store, _sha(source_bytes[store]), args.days,
                 staged_transcripts, version, transcript_records,
             )
+            diagnostics = _excluded_diagnostic_messages(exclusions) + diagnostics
             report["input_digest"] = _digest(
                 source_bytes[store], source_bytes[log],
                 [source_bytes[path] for path in transcript_paths],
