@@ -332,6 +332,26 @@ class RingTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_ring_exact_boundary_trims_before_append(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-ring-boundary-")
+        previous = ops_tokens._RING_MAX_BYTES
+        try:
+            ring = Path(ops_tokens._ring_path(tmp, "boundary"))
+            ring.parent.mkdir(parents=True)
+            lines = [json.dumps({"ops": f"git push event-{i}"}) + "\n"
+                     for i in range(65)]
+            raw = "".join(lines)
+            ops_tokens._RING_MAX_BYTES = len(raw)
+            ring.write_text(raw, encoding="utf-8")
+            self.assertTrue(ops_tokens.append_ops_ring(
+                tmp, "boundary", "Bash", "git stash pop"))
+            rewritten = ring.read_text(encoding="utf-8")
+            self.assertNotIn("event-0", rewritten)
+            self.assertIn("git stash pop", rewritten.splitlines()[-1])
+        finally:
+            ops_tokens._RING_MAX_BYTES = previous
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class ConventionCaptureRingTest(unittest.TestCase):
     """The coding hosts' PostToolUse hook writes the ring (behavioral)."""
@@ -548,7 +568,7 @@ class HermesConventionRingTest(unittest.TestCase):
 
 
 class HookBodyComposeTest(unittest.TestCase):
-    """The UserPromptSubmit adapter never reads or composes the ops ring."""
+    """The UserPromptSubmit adapter composes the ops ring without logging ops."""
 
     LESSON = ("ringcanary hazard: a later blind git stash pop can apply a "
               "foreign pre-existing stash; verify git stash list before any "

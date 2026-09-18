@@ -31,7 +31,7 @@
 "use strict";
 
 const { spawn, execFileSync } = require("child_process");
-const { randomUUID } = require("crypto");
+const { createHash, randomUUID } = require("crypto");
 const { existsSync, mkdirSync, appendFileSync, readFileSync } = require("fs");
 const { join, dirname, basename, resolve, delimiter } = require("path");
 const { homedir } = require("os");
@@ -160,6 +160,7 @@ const DEFAULT_LAUNCHER_WATCHDOG_MS = 12000;
 const DEFAULT_NAMESPACE_RESOLVE_MS = 2000;
 const DEFAULT_NAMESPACE_CACHE_TTL_MS = 60000;
 const NAMESPACE_CACHE_MAX_ENTRIES = 128;
+const MAX_HOOK_INPUT_BYTES = 256 * 1024;
 
 // Read one positive-integer millisecond env override. Invalid (non-integer,
 // zero, negative) values fall back to the default and write exactly ONE
@@ -504,8 +505,10 @@ function isMeaningfulFailureValue(value) {
 function failureSignals(...values) {
     const statuses = [];
     const errors = [];
-    const visit = (value) => {
-        if (!value || typeof value !== "object") return;
+    const seen = new Set();
+    const visit = (value, depth = 0) => {
+        if (!value || typeof value !== "object" || depth > 8 || seen.has(value)) return;
+        seen.add(value);
         for (const key of ["status", "tool_status", "toolStatus"]) {
             if (typeof value[key] === "string" && value[key].trim()) {
                 statuses.push(value[key]);
@@ -518,15 +521,12 @@ function failureSignals(...values) {
                 errors.push(value[key]);
             }
         }
-    };
-    for (const value of values) {
-        visit(value);
-        if (value && typeof value === "object") {
-            for (const key of ["result", "tool_result", "tool_output"]) {
-                visit(value[key]);
-            }
+        for (const key of ["result", "tool_result", "tool_output", "cause", "details"]) {
+            visit(value[key], depth + 1);
         }
-    }
+        seen.delete(value);
+    };
+    for (const value of values) visit(value);
     return {
         failed: statuses.some(isFailureStatus) || errors.some(isMeaningfulFailureValue),
     };
@@ -635,9 +635,13 @@ function prepareHookPayload(host, hookName, stdinBuf, meta) {
 // owns redaction, the final 400-character cap, hashing, and its writer lease.
 const EVIDENCE_HOSTS = new Set(["claude", "codex", "zcode"]);
 const EVIDENCE_RAW_MAX_BYTES = 64 * 1024;
+const EVIDENCE_WRITER_MAX_INFLIGHT = 8;
+const EVIDENCE_WRITER_TIMEOUT_MS = 15000;
+let evidenceWritersInFlight = 0;
 const EDIT_TOOL_NAMES = new Set([
     "edit", "edit_file", "write", "write_file", "writefile", "notebookedit",
-    "notebook_edit", "multi_edit", "apply_patch", "patch_file", "str_replace_editor",
+    "notebook_edit", "multiedit", "multi_edit", "applypatch", "apply_patch",
+    "patchfile", "patch_file", "strreplaceeditor", "str_replace_editor",
 ]);
 
 function canonicalUtcNow(date = new Date()) {
@@ -653,10 +657,101 @@ function _firstNonEmptyString(...values) {
 
 function _compactJson(value) {
     try {
-        return JSON.stringify(value);
+        return safeJsonStringify(value, EVIDENCE_RAW_MAX_BYTES);
     } catch {
         return null;
     }
+}
+
+function _stableEvidenceId(meta, payload) {
+    const suppliedId = _firstNonEmptyString(meta.evidence_id, payload.evidence_id);
+    if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(suppliedId)) {
+        return suppliedId;
+    }
+    const taskId = _firstNonEmptyString(
+        meta.task_id, meta.taskId, payload.task_id, payload.taskId,
+    );
+    const callId = _firstNonEmptyString(
+        meta.tool_call_id, meta.toolCallId, payload.tool_call_id, payload.toolCallId,
+    );
+    if (!taskId || !callId) return randomUUID();
+    // Match Python's uuid.uuid5(uuid.NAMESPACE_URL, name) so the host hooks
+    // converge on one evidence identity when the same tool call is observed.
+    const namespace = Buffer.from("6ba7b8119dad11d180b400c04fd430c8", "hex");
+    const digest = createHash("sha1")
+        .update(namespace)
+        .update(`zmem-hermes:${taskId}:${callId}`, "utf8")
+        .digest();
+    digest[6] = (digest[6] & 0x0f) | 0x50;
+    digest[8] = (digest[8] & 0x3f) | 0x80;
+    const hex = digest.subarray(0, 16).toString("hex");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+// Refuse hostile/cyclic JSON-shaped values before JSON.stringify can walk a
+// giant object graph or invoke surprising coercions.  This is an admission
+// check, not a truncator: observational evidence is dropped when it cannot be
+// represented safely within the transport bound.
+function _boundedJsonShape(value, budget, depth = 0, seen = new Set()) {
+    if (budget < 0 || depth > 32) return false;
+    if (value === null || typeof value === "boolean") return 4 <= budget;
+    if (typeof value === "number") return Number.isFinite(value) && String(value).length <= budget;
+    if (typeof value === "string") return value.length <= budget && !/[\ud800-\udfff]/.test(value);
+    if (!value || typeof value !== "object" || seen.has(value)) return false;
+    seen.add(value);
+    try {
+        const entries = Array.isArray(value) ? value : Object.entries(value);
+        if (entries.length > 256) return false;
+        let used = 2;
+        for (const entry of entries) {
+            const key = Array.isArray(value) ? null : entry[0];
+            const item = Array.isArray(value) ? entry : entry[1];
+            if (key !== null && (typeof key !== "string" || key.length > budget)) return false;
+            if (!_boundedJsonShape(item, budget - used, depth + 1, seen)) return false;
+            used += (key === null ? 0 : key.length + 3) + 4;
+            if (used > budget) return false;
+        }
+        return true;
+    } finally {
+        seen.delete(value);
+    }
+}
+
+function safeJsonStringify(value, maxBytes = Number.POSITIVE_INFINITY) {
+    if (Number.isFinite(maxBytes) && !_boundedJsonShape(value, maxBytes)) return null;
+    try {
+        const json = JSON.stringify(value);
+        if (typeof json !== "string") return null;
+        const safe = json.replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+        return Number.isFinite(maxBytes) && Buffer.byteLength(safe, "utf8") > maxBytes
+            ? null : safe;
+    } catch {
+        return null;
+    }
+}
+
+function _sanitizeRefPath(value) {
+    if (typeof value !== "string") return "";
+    let clean = value.replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, " ").trim();
+    if (!clean.includes("://") && (/^[\\/]/.test(clean) || /^[A-Za-z]:[\\/]/.test(clean))) {
+        clean = basename(clean.replaceAll("\\", "/"));
+    }
+    return clean.slice(0, 4096);
+}
+
+function resolvePython(env = process.env) {
+    const explicit = env && typeof env.ZMEM_PYTHON === "string" ? env.ZMEM_PYTHON.trim() : "";
+    if (explicit) return explicit;
+    const candidates = process.platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+    for (const candidate of candidates) {
+        try {
+            execFileSync("where", [candidate], { stdio: "ignore" });
+            return candidate;
+        } catch {
+            // Try the next interpreter name; the caller remains fail-open.
+        }
+    }
+    return candidates[0];
 }
 
 function _patchPath(value) {
@@ -679,13 +774,16 @@ function _editPath(toolInput) {
     if (!toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) return "";
     const direct = _firstNonEmptyString(
         toolInput.file_path,
+        toolInput.filePath,
         toolInput.path,
         toolInput.notebook_path,
+        toolInput.notebookPath,
         toolInput.target_file,
+        toolInput.targetFile,
         toolInput.filename,
     );
     if (direct) return direct;
-    for (const entry of [toolInput.edits, toolInput.files]) {
+    for (const entry of [toolInput.edits, toolInput.files, toolInput.changes]) {
         if (!Array.isArray(entry)) continue;
         for (const item of entry) {
             const nested = _editPath(item);
@@ -693,7 +791,7 @@ function _editPath(toolInput) {
         }
     }
     for (const value of [toolInput.patch, toolInput.patch_text, toolInput.patchText,
-        toolInput.diff, toolInput.input]) {
+        toolInput.diff, toolInput.input, toolInput.content]) {
         const patchPath = _patchPath(value);
         if (patchPath) return patchPath;
     }
@@ -711,11 +809,16 @@ function _evidenceExcerpt(kind, hookName, payload, toolInput) {
         return result ? `turn=${result}` : `turn=${hookName}`;
     }
     if (kind === "tool_failure") {
-        const error = _firstNonEmptyString(
+        const error = firstMeaningfulError(
             payload.error, payload.error_message, payload.message,
             payload.failure, payload.tool_result && payload.tool_result.message,
         );
-        return error ? `error=${error}` : "tool failure";
+        if (typeof error === "string") return `error=${error}`;
+        if (error && typeof error === "object") {
+            const detail = firstNonEmpty(error.message, error.type);
+            return detail ? `error=${detail}` : "tool failure";
+        }
+        return "tool failure";
     }
     if (toolInput && typeof toolInput === "object") {
         const command = _firstNonEmptyString(
@@ -770,16 +873,17 @@ function recordEvidence(host, hookName, payload, meta, env = process.env,
             payload.transcriptPath, meta.transcriptPath,
         );
         if (!refPath) refPath = `host://${host}/${hookName}/unavailable`;
-        if (refPath.length > 4096 || refPath.includes("\u0000")) return false;
+        refPath = _sanitizeRefPath(refPath);
+        if (!refPath) return false;
         const excerpt = _evidenceExcerpt(kind, hookName, payload, toolInput);
         if (!excerpt || Buffer.byteLength(excerpt, "utf8") > EVIDENCE_RAW_MAX_BYTES) return false;
-        const suppliedId = _firstNonEmptyString(meta.evidence_id, payload.evidence_id);
-        const id = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(suppliedId)
-            ? suppliedId : randomUUID();
+        const id = _stableEvidenceId(meta, payload);
         const row = {
             session_id: sessionId,
             lane: host,
-            moment: kind === "turn" ? "session_start" : "pretool",
+            // A Stop/reflect row belongs to the completed user turn, not the
+            // beginning of a session.
+            moment: kind === "turn" ? "user_prompt" : "pretool",
             kind,
             ts: typeof clock === "function" ? clock() : canonicalUtcNow(),
             excerpt,
@@ -799,14 +903,32 @@ function recordEvidence(host, hookName, payload, meta, env = process.env,
         // Observers must never initialize a missing store merely because a
         // host event was delivered; the CLI turns this into a silent no-op.
         childEnv.ZMEM_EVIDENCE_NO_CREATE = "1";
-        const py = process.platform === "win32" ? "python" : "python3";
+        const py = resolvePython(env);
+        if (evidenceWritersInFlight >= EVIDENCE_WRITER_MAX_INFLIGHT) return false;
         const child = spawnFn(py, [storePy, "evidence", "write"], {
             env: childEnv,
             stdio: ["pipe", "ignore", "ignore"],
             detached: true,
         });
         if (!child) return false;
-        try { if (typeof child.on === "function") child.on("error", () => {}); } catch { /* fail open */ }
+        evidenceWritersInFlight += 1;
+        let released = false;
+        const release = () => {
+            if (released) return;
+            released = true;
+            evidenceWritersInFlight = Math.max(0, evidenceWritersInFlight - 1);
+        };
+        try {
+            if (typeof child.on === "function") {
+                child.on("error", release);
+                child.on("close", release);
+            }
+        } catch { /* fail open */ }
+        const reaper = setTimeout(() => {
+            try { if (typeof child.kill === "function") child.kill(); } catch { /* fail open */ }
+            release();
+        }, EVIDENCE_WRITER_TIMEOUT_MS);
+        try { if (typeof reaper.unref === "function") reaper.unref(); } catch { /* already gone */ }
         const inputStream = child.stdin;
         if (inputStream) {
             try { if (typeof inputStream.on === "function") inputStream.on("error", () => {}); } catch { /* fail open */ }
@@ -1184,9 +1306,19 @@ function readStdin() {
             return;
         }
         const chunks = [];
-        process.stdin.on("data", (c) => chunks.push(c));
-        process.stdin.on("end", () => resolve(Buffer.concat(chunks)));
-        process.stdin.on("error", () => resolve(Buffer.concat(chunks)));
+        let total = 0;
+        let overflow = false;
+        process.stdin.on("data", (c) => {
+            if (overflow) return;
+            total += c.length;
+            if (total > MAX_HOOK_INPUT_BYTES) {
+                overflow = true;
+                return;
+            }
+            chunks.push(c);
+        });
+        process.stdin.on("end", () => resolve(overflow ? null : Buffer.concat(chunks)));
+        process.stdin.on("error", () => resolve(overflow ? null : Buffer.concat(chunks)));
     });
 }
 
@@ -1233,7 +1365,7 @@ async function main() {
             } catch {
                 envelope = {};
             }
-            process.stdout.write(JSON.stringify(envelope) + "\n");
+            process.stdout.write((safeJsonStringify(envelope) || "{}") + "\n");
             appendOuterTimeoutDecision(fireState.env || process.env, hookName, "launcher", {
                 tier0_emitted: hookName === "session-start" && extractPayload(raw) !== null,
                 timeout_ms: watchdogMs,
@@ -1258,6 +1390,11 @@ async function main() {
     }
 
     const stdinBuf = await readStdin();
+    if (!Buffer.isBuffer(stdinBuf)) {
+        process.stdout.write("{}\n");
+        process.exit(0);
+        return;
+    }
 
     // Parse a COPY of stdin to extract fields (tolerate missing / non-JSON).
     let meta = {};
@@ -1385,7 +1522,7 @@ async function main() {
             } catch {
                 envelope = {};
             }
-            process.stdout.write(JSON.stringify(envelope) + "\n");
+            process.stdout.write((safeJsonStringify(envelope) || "{}") + "\n");
             // Translated hooks are always fail-open: exit 0 regardless of child.
             process.exit(0);
         });
@@ -1420,6 +1557,9 @@ module.exports = {
     hookEventNameFor,
     normalizeCodexFailurePayload,
     prepareHookPayload,
+    failureSignals,
+    safeJsonStringify,
+    resolvePython,
     canonicalUtcNow,
     recordEvidence,
     extractPayload,

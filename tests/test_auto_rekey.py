@@ -8,8 +8,8 @@ The issue requires the existing guarded remediation
 What is pinned here:
 - a store-opening command (stats — read-only) rekeys ONLY global-near-miss
   rows to user:global; project:* splits are never touched (#97 territory);
-- the rekeyed row keeps every non-namespace column BIT-IDENTICAL and the
-  store's schema_version is unchanged (old-client compatibility contract);
+  - the rekeyed row keeps every non-namespace column BIT-IDENTICAL and leaves
+  the store's schema_version at the current supported baseline;
 - the entity relink runs (moved rows re-derive their project entity from the
   NEW namespace, per the v10 extraction contract);
 - kill switches: ZMEM_AUTO_REKEY=0 and the --no-auto-rekey flag (present on
@@ -41,6 +41,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STORE_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
 PYTHON = sys.executable
+sys.path.insert(0, str(STORE_PY.parent))
+from schema_meta import SUPPORTED_SCHEMA_VERSION  # noqa: E402
 
 
 def _base_env(tmp: str) -> dict:
@@ -111,7 +113,7 @@ class AutoNearMissRekeyTest(unittest.TestCase):
         # every non-namespace column bit-identical.
         ver = self.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        self.assertEqual(ver["value"], "14")
+        self.assertEqual(ver["value"], str(SUPPORTED_SCHEMA_VERSION))
         row = self.conn.execute(
             "SELECT * FROM memory WHERE id=?", (mid,)).fetchone()
         self.assertEqual(row["namespace"], "user:global")

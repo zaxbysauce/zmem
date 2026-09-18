@@ -58,6 +58,11 @@ MAX_TRANSCRIPTS = 16
 MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024
 MAX_TRANSCRIPT_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_TRANSCRIPT_LINES = 100_000
+# The store snapshot and decision log are explicit untrusted inputs too. Keep
+# their one-shot reads bounded before staging or parsing (transcripts have
+# separate, smaller limits above).
+MAX_STORE_BYTES = 512 * 1024 * 1024
+MAX_LOG_BYTES = 64 * 1024 * 1024
 
 
 class ReplayError(ValueError):
@@ -724,6 +729,7 @@ def _build_report(
             "miss_rate": miss_num_total / miss_den_total if miss_den_total else 0,
         },
         "input_metadata": {"version": version, "parsed_rows": len(lines)},
+        "usable_observation": usable_observation,
         "generated_at": _iso_epoch(latest),
     }
     if not usable_observation:
@@ -793,7 +799,13 @@ def _check_baseline(report: dict, baseline_path: Path, thresholds: dict[str, flo
         raise ReplayError("replay: invalid baseline\n")
     if baseline.get("schema_version") != report.get("schema_version"):
         raise ReplayError("replay: baseline schema mismatch\n")
-    if baseline.get("input_metadata", {}).get("version") != report.get("input_metadata", {}).get("version"):
+    baseline_metadata = baseline.get("input_metadata")
+    if not isinstance(baseline_metadata, dict):
+        raise ReplayError("replay: baseline input_metadata must be an object\n")
+    report_metadata = report.get("input_metadata")
+    if not isinstance(report_metadata, dict):
+        raise ReplayError("replay: report input_metadata must be an object\n")
+    if baseline_metadata.get("version") != report_metadata.get("version"):
         raise ReplayError("replay: baseline version mismatch\n")
     try:
         baseline_precision = float(baseline["aggregate"]["reference_precision"])
@@ -878,8 +890,8 @@ def main() -> int:
                 f"replay: at most {MAX_TRANSCRIPTS} transcript inputs are allowed\n"
             )
         source_bytes = {
-            store: store.read_bytes(),
-            log: log.read_bytes(),
+            store: _read_bounded(store, "store", MAX_STORE_BYTES),
+            log: _read_bounded(log, "decision log", MAX_LOG_BYTES),
         }
         transcript_total = 0
         for path in transcript_paths:
@@ -920,10 +932,11 @@ def main() -> int:
                 source_bytes[store], source_bytes[log],
                 [source_bytes[path] for path in transcript_paths],
             )
-            if _sha(store.read_bytes()) != _sha(source_bytes[store]):
+            if _read_bounded(store, "store", MAX_STORE_BYTES) != source_bytes[store]:
                 raise ReplayError("replay: store changed during read-only evaluation\n")
             for path, before in source_bytes.items():
-                if path.read_bytes() != before:
+                label = "store" if path == store else "decision log" if path == log else f"transcript {path.name}"
+                if _read_bounded(path, label, MAX_STORE_BYTES if path == store else MAX_LOG_BYTES if path == log else MAX_TRANSCRIPT_BYTES) != before:
                     raise ReplayError(f"replay: input changed during evaluation: {path.name}\n")
             report_bytes = _json_bytes(report)
             breached = _check_baseline(report, baseline, thresholds) if baseline else False

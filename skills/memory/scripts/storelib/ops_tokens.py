@@ -98,6 +98,13 @@ def _clean_token(tok: str) -> str:
     tok = tok.strip().strip("\"'`;,(){}[]<>|&$").lower()
     if not tok:
         return ""
+    # Keep file-shaped context useful without persisting absolute or nested
+    # paths from host commands.  The basename is sufficient for recall and
+    # prevents usernames/project roots leaking into the ops ring.
+    if ("/" in tok or "\\" in tok) and not tok.startswith(("origin/", "refs/")):
+        tok = tok.replace("\\", "/").rsplit("/", 1)[-1]
+        if not tok:
+            return ""
     if not _TOKEN_RE.match(tok):
         return ""
     return tok
@@ -456,7 +463,10 @@ def append_ops_ring(data_dir: str, session_id: str, tool: str, op: str) -> bool:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
-            if os.path.getsize(path) > _RING_MAX_BYTES:
+            # Trim at the exact boundary too: appending one more event to a
+            # file already at the cap must not leave an over-cap ring until a
+            # later, unrelated append happens.
+            if os.path.getsize(path) >= _RING_MAX_BYTES:
                 # Issue #122: rotate atomically — the retained tail is
                 # written to a same-directory temp file (flush + fsync) and
                 # renamed over the live ring, so an interrupted trim can

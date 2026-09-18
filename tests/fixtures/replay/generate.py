@@ -34,11 +34,9 @@ MOMENTS = ("session_start", "user_prompt", "pretool", "precompact")
 
 def _env(store: Path, scratch: Path) -> dict[str, str]:
     env = os.environ.copy()
-    for key in (
-        "ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_NAMESPACE",
-        "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA", "ZMEM_HOST", "ZMEM_SESSION",
-    ):
-        env.pop(key, None)
+    for key in list(env):
+        if key.startswith("ZMEM_") or key in {"CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"}:
+            env.pop(key, None)
     env.update({
         "ZMEM_STORE": str(store),
         "ZMEM_DATA": str(scratch / "data"),

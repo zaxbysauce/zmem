@@ -32,6 +32,7 @@ from storelib.evidence import (
     EVIDENCE_LANES,
     EVIDENCE_MOMENTS,
     EVIDENCE_MAX_EXCERPT_CHARS,
+    EVIDENCE_INPUT_MAX_EXCERPT_CHARS,
     _SQLITE_INT_MAX,
     _validate_ts,
 )
@@ -507,6 +508,10 @@ MAX_LINE_CHARS = 1_048_576
 # or disk sink while still allowing large real exports.
 STRICT_MAX_BYTES = 64 * 1024 * 1024
 STRICT_MAX_ROWS = 100_000
+# Legacy imports remain best-effort/streamed row-by-row, but the private staging
+# spool itself must not grow without bound. Keep this above the strict transport
+# cap so strict table-bearing inputs retain their existing 64 MiB refusal.
+LEGACY_MAX_BYTES = 256 * 1024 * 1024
 
 
 def _validate_episode_row(obj: dict, lineno: int) -> None:
@@ -552,6 +557,12 @@ def _validate_episode_row(obj: dict, lineno: int) -> None:
         # OverflowError at INSERT — outside the malformed-line accounting.
         raise ValueError("episode token_count must be a non-negative "
                          "64-bit integer")
+    # Strict exports may omit these optional episode fields. Normalize them at
+    # validation time because the apply phase intentionally uses direct access
+    # and must not turn a valid open episode into a KeyError.
+    obj["ended_at"] = str(ended)
+    obj["summary_memory_id"] = str(summary)
+    obj["token_count"] = tc
 
 
 def _validate_membership_row(obj: dict, lineno: int) -> None:
@@ -625,6 +636,9 @@ def _strict_evidence_row(obj: dict, lineno: int) -> dict:
     excerpt = obj["excerpt"]
     if not isinstance(excerpt, str) or not excerpt:
         raise ValueError("evidence excerpt must be non-empty text")
+    # Apply the same pre-redaction bound as the writer. Strict transport must
+    # never hand an arbitrarily large remote excerpt to the redactor.
+    excerpt = excerpt[:EVIDENCE_INPUT_MAX_EXCERPT_CHARS]
     redacted, _ = redact_text(excerpt)
     final_excerpt = redacted[:EVIDENCE_MAX_EXCERPT_CHARS]
     if obj["ref_offset"] is not None and (
@@ -1320,6 +1334,10 @@ def _stage_sync_source(
                 if force_strict and total > STRICT_MAX_BYTES:
                     raise ValueError(
                         f"input exceeds strict staging limit of {STRICT_MAX_BYTES} bytes"
+                    )
+                if total > LEGACY_MAX_BYTES:
+                    raise ValueError(
+                        f"input exceeds legacy staging limit of {LEGACY_MAX_BYTES} bytes"
                     )
                 spool.write(chunk)
     except Exception:

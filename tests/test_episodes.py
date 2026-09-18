@@ -96,6 +96,11 @@ class EpisodeIsolationTest(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertIn("episode", names)
             self.assertIn("episode_memory", names)
+            # Evidence is part of the same v14 fresh-store contract; checking
+            # only episode tables would let a partial migration appear healthy.
+            self.assertIn("evidence", names)
+            self.assertIn("episode_evidence", names)
+            self.assertIn("memory_evidence", names)
             cols = {r[1] for r in conn.execute("PRAGMA table_info(episode)")}
             self.assertEqual(
                 cols, {"id", "namespace", "started_at", "ended_at",

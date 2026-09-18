@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,12 +25,9 @@ _ROUTE_ENV_KEYS = (
     "ZMEM_EMBED_PROFILE", "ZMEM_CROSS_ENCODER_MODEL", "HOME", "USERPROFILE",
     "APPDATA", "LOCALAPPDATA",
 )
-_IMPORT_ENV = {key: os.environ.get(key) for key in _ROUTE_ENV_KEYS}
 _IMPORT_SANDBOX = Path(tempfile.mkdtemp(prefix="zmem-evidence-import-"))
 atexit.register(shutil.rmtree, _IMPORT_SANDBOX, ignore_errors=True)
-for _key in _ROUTE_ENV_KEYS:
-    os.environ.pop(_key, None)
-os.environ.update({
+_IMPORT_VALUES = {
     "ZMEM_STORE": str(_IMPORT_SANDBOX / "store.sqlite"),
     "ZMEM_DATA": str(_IMPORT_SANDBOX / "data"),
     "ZMEM_MODELS_DIR": str(_IMPORT_SANDBOX / "models"),
@@ -38,15 +36,9 @@ os.environ.update({
     "USERPROFILE": str(_IMPORT_SANDBOX / "home"),
     "APPDATA": str(_IMPORT_SANDBOX / "appdata"),
     "LOCALAPPDATA": str(_IMPORT_SANDBOX / "localappdata"),
-})
-try:
+}
+with patch.dict(os.environ, _IMPORT_VALUES, clear=False):
     from storelib import evidence, schema, sync  # noqa: E402
-finally:
-    for _key, _value in _IMPORT_ENV.items():
-        if _value is None:
-            os.environ.pop(_key, None)
-        else:
-            os.environ[_key] = _value
 
 
 class _StoreCase(unittest.TestCase):
@@ -502,7 +494,7 @@ class EvidenceRetentionTest(_StoreCase):
             ],
         )
 
-    def test_invalid_env_disables_only_sweep(self):
+    def test_invalid_env_uses_documented_default(self):
         os.environ["ZMEM_EVIDENCE_DAYS"] = "abc"
         with contextlib.redirect_stderr(__import__("io").StringIO()) as err:
             result = evidence.sweep_evidence(
@@ -513,7 +505,7 @@ class EvidenceRetentionTest(_StoreCase):
         })
         self.assertEqual(
             err.getvalue(),
-            "evidence retention disabled: invalid ZMEM_EVIDENCE_DAYS\n",
+            "evidence retention: invalid ZMEM_EVIDENCE_DAYS; using default 30\n",
         )
 
     def test_sql_failure_rolls_back_evidence_and_links(self):
@@ -570,17 +562,17 @@ class EvidenceRetentionTest(_StoreCase):
             (
                 "ZMEM_EVIDENCE_DAYS", str(2**63),
                 "2026-09-10T00:00:00Z",
-                "evidence retention disabled: invalid ZMEM_EVIDENCE_DAYS\n",
+                "evidence retention: invalid ZMEM_EVIDENCE_DAYS; using default 30\n",
             ),
             (
                 "ZMEM_EVIDENCE_DAYS", None,
                 "0001-01-01T00:00:00Z",
-                "evidence retention disabled: invalid ZMEM_EVIDENCE_DAYS\n",
+                "",
             ),
             (
                 "ZMEM_EVIDENCE_CAP", str(2**63),
                 "2026-09-10T00:00:00Z",
-                "evidence retention disabled: invalid ZMEM_EVIDENCE_CAP\n",
+                "evidence retention: invalid ZMEM_EVIDENCE_CAP; using default 50000\n",
             ),
         ):
             with self.subTest(env_name=env_name, env_value=env_value):

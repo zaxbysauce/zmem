@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -214,18 +215,22 @@ class Issue183QueryAcceptance(unittest.TestCase):
                     hook_calls.append(list(args))
                     if args[0] == "query-rewrite":
                         return subprocess.CompletedProcess(args, 0, '{"query":"continue from yesterday git status","rewrite":1}\n', "")
-                    return subprocess.CompletedProcess(args, 0, '{"rendered":"hook-bytes","results":[],"reason":"injected"}\n', "")
+                    return subprocess.CompletedProcess(args, 0, '{"rendered":"shared-bytes","results":[],"reason":"injected"}\n', "")
 
                 body._run_store = hook_store
                 old_argv = sys.argv[:]
                 try:
                     sys.argv = [str(BODY_PY), str(STORE_PY), "project:ambiguity", "1500", "user_prompt"]
-                    with _stdin(json.dumps({"prompt": "continue from yesterday", "session_id": "s"})), contextlib.redirect_stdout(io.StringIO()):
+                    hook_output = io.StringIO()
+                    with _stdin(json.dumps({"prompt": "continue from yesterday", "session_id": "s"})), contextlib.redirect_stdout(hook_output):
                         body.main()
                 finally:
                     sys.argv = old_argv
                 hook_query = next(a[a.index("--query") + 1] for a in hook_calls if a[0] == "recall")
                 self.assertEqual(hook_query, "continue from yesterday git status")
+                hook_envelope = json.loads(hook_output.getvalue())
+                hook_rendered = hook_envelope.get("additionalContext", "")
+                self.assertEqual(hook_rendered, "shared-bytes")
 
                 provider_mod = _load_provider()
                 provider_calls: list[list[str]] = []
@@ -234,12 +239,13 @@ class Issue183QueryAcceptance(unittest.TestCase):
                     provider_calls.append(list(args))
                     if args[0] == "query-rewrite":
                         return {"ok": True, "stdout": '{"query":"continue from yesterday git status","rewrite":1}\n'}
-                    return {"ok": True, "stdout": '{"rendered":"provider-bytes"}\n'}
+                    return {"ok": True, "stdout": '{"rendered":"shared-bytes"}\n'}
 
                 provider_mod._run_store = provider_store
                 provider = provider_mod.ZmemMemoryProvider()
                 provider._namespace = "project:ambiguity"
-                self.assertEqual(provider.prefetch("continue from yesterday", session_id="s"), "provider-bytes")
+                provider_rendered = provider.prefetch("continue from yesterday", session_id="s")
+                self.assertEqual(provider_rendered, hook_rendered)
                 provider_query = next(a[a.index("--query") + 1] for a in provider_calls if a[0] == "recall")
                 self.assertEqual(provider_query, hook_query)
 
@@ -258,7 +264,7 @@ class Issue183QueryAcceptance(unittest.TestCase):
                 self.assertFalse(any(a[0] == "query-rewrite" for a in hook_calls))
 
                 provider_calls.clear()
-                self.assertEqual(provider.prefetch("continue from yesterday", session_id="s"), "provider-bytes")
+                self.assertEqual(provider.prefetch("continue from yesterday", session_id="s"), hook_rendered)
                 provider_disabled_recalls = [a for a in provider_calls if a[0] == "recall"]
                 self.assertTrue(provider_disabled_recalls)
                 provider_disabled_query = provider_disabled_recalls[-1][provider_disabled_recalls[-1].index("--query") + 1]
@@ -289,7 +295,7 @@ class Issue183QueryAcceptance(unittest.TestCase):
                 self.assertEqual(result.stdout.encode(), AC6_BASE_WIRE.read_bytes())
                 self.assertEqual(json.loads(result.stdout), json.loads(EXPECTED_NEGATIVE.read_bytes()))
 
-    def test_ac7_release_parity_is_exact_0430(self):
+    def test_ac7_release_parity_is_exact_current_version(self):
         manifests = [
             "marketplace.json", ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
             ".codex-plugin/plugin.json", ".zcode-plugin/plugin.json",
@@ -303,11 +309,12 @@ class Issue183QueryAcceptance(unittest.TestCase):
                 values.append(obj.get("version") or obj.get("plugins", [{}])[0].get("version"))
             else:
                 values.append(next(line.split(":", 1)[1].strip() for line in text.splitlines() if line.startswith("version:")))
-        self.assertEqual(values, ["0.43.0"] * len(manifests))
-        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertRegex(changelog, r"(?m)^## \[0\.43\.0\](?:\s|$)")
         manifest = json.loads((ROOT / "release-manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest.get("version"), "0.43.0")
+        expected_version = manifest.get("version")
+        self.assertTrue(isinstance(expected_version, str) and expected_version)
+        self.assertEqual(values, [expected_version] * len(manifests))
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertRegex(changelog, rf"(?m)^## \[{re.escape(expected_version)}\](?:\s|$)")
         gate = subprocess.run([sys.executable, str(ROOT / "scripts" / "release_gate.py")], cwd=ROOT, capture_output=True, text=True, timeout=30)
         self.assertEqual(gate.returncode, 0, gate.stderr + gate.stdout)
 

@@ -197,9 +197,9 @@ def parse_bg_log(path) -> list:
 
     Returns rows with the historical fields ``ts, status, reason, omitted,
     ids, all, ops, sid, moment, arms``; rows carrying the canonical rewrite
-    tail additionally contain ``rewrite=True``.
-    where ``reason``/``ops``/``sid``/``moment``/``arms``/``margin`` are None
-    when the line lacks them (writer B omits ``reason=``; pre-#94 lines lack
+    tail additionally contain ``rewrite=True``, while
+    ``reason``/``ops``/``sid``/``moment``/``arms``/``margin`` are None when
+    the line lacks them (writer B omits ``reason=``; pre-#94 lines lack
     ``sid=``; pre-#129 lines lack ``moment=``; pre-#136 lines lack ``arms=``;
     pre-#182 lines lack ``margin=``). ``margin_pruned`` is None when its
     bracketed tail is absent, otherwise a list of memory id strings. The

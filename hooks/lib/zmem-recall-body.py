@@ -29,6 +29,7 @@ _POSTTOOLBATCH_QUERY_CAP = 500
 _USER_PROMPT_REWRITE_INPUT_CAP = 4096
 _POSTTOOLBATCH_FIELD_CAP = 150
 _POSTTOOLBATCH_SUMMARY_CAP = 12
+_HOOK_INPUT_MAX_BYTES = 256 * 1024
 
 # Issue #153: decision-line attribution is deliberately small and
 # dependency-free.  The schema module is the canonical source for the
@@ -464,7 +465,7 @@ def _rewrite_query(store_py: str, namespace: str, session_id: str,
     if len(query) > _USER_PROMPT_REWRITE_INPUT_CAP:
         return original, False
     rewrite_input = query[:_USER_PROMPT_REWRITE_INPUT_CAP]
-    if os.environ.get("ZMEM_QUERY_CONTEXT") == "0":
+    if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
         return original, False
     args = ["query-rewrite"]
     args.extend(_free_text_arg("--prompt", rewrite_input))
@@ -519,8 +520,14 @@ def _query_for(mode: str, event: dict) -> str:
 
 
 def _emit(rendered: str) -> None:
-    print(json.dumps({"additionalContext": rendered}, ensure_ascii=False)
-          if isinstance(rendered, str) and rendered else "{}")
+    if not isinstance(rendered, str) or not rendered:
+        print("{}")
+        return
+    encoded = json.dumps({"additionalContext": rendered}, ensure_ascii=False,
+                         separators=(",", ":"))
+    # U+2028/U+2029 are valid JSON but remain line separators in some host
+    # transports; keep the output one physical line for hook runners.
+    print(encoded.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
 
 def main() -> int:
@@ -572,7 +579,13 @@ def main() -> int:
         _emit("")
         return 0
     try:
-        event = json.load(sys.stdin)
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        raw_event = stream.read(_HOOK_INPUT_MAX_BYTES + 1)
+        if isinstance(raw_event, str):
+            raw_event = raw_event.encode("utf-8")
+        if len(raw_event) > _HOOK_INPUT_MAX_BYTES:
+            raise ValueError("hook input too large")
+        event = json.loads(raw_event.decode("utf-8")) if raw_event else {}
     except Exception:
         event = {}
     if not isinstance(event, dict):

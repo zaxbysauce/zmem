@@ -3,7 +3,10 @@
 Evidence is intentionally a small side store.  Producers call the writer
 inside their own transaction; the writer never commits.  A retention sweep
 uses a savepoint inside a caller transaction, or owns and commits a transaction
-when called outside one.
+when called outside one.  Evidence hashes intentionally cover the stable
+semantic payload ``kind|ts|final_excerpt`` only; session/lane/moment/path are
+provenance columns and remain queryable/exported separately without changing
+content identity.
 """
 
 from __future__ import annotations
@@ -20,6 +23,10 @@ from storelib.write import redact_text
 
 
 EVIDENCE_MAX_EXCERPT_CHARS = 400
+# Bound untrusted input before redact_text runs. The stored value remains capped
+# at EVIDENCE_MAX_EXCERPT_CHARS, while ordinary callers can still submit modest
+# over-cap excerpts that are deterministically truncated.
+EVIDENCE_INPUT_MAX_EXCERPT_CHARS = 4096
 EVIDENCE_DEFAULT_RETENTION_DAYS = 30
 EVIDENCE_DEFAULT_CAP = 50_000
 EVIDENCE_LANES = (
@@ -60,17 +67,17 @@ def _required_text(value: object, field: str, *, max_chars: int | None = None) -
     return value
 
 
-def _validated_limit(raw: str | None, field: str, default: int, *, minimum: int) -> int | None:
+def _validated_limit(raw: str | None, field: str, default: int, *, minimum: int) -> tuple[int, bool]:
     value = default if raw is None or raw == "" else raw
     if isinstance(value, bool):
-        return None
+        return default, raw not in (None, "")
     try:
         parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        return None
+    except (TypeError, ValueError):
+        return default, raw not in (None, "")
     if parsed < minimum or parsed > _SQLITE_INT_MAX:
-        return None
-    return parsed
+        return default, raw not in (None, "")
+    return parsed, False
 
 
 def write_evidence(
@@ -122,6 +129,7 @@ def write_evidence(
     ):
         raise ValueError("id must be a 36-character UUID-shaped string")
 
+    excerpt = excerpt[:EVIDENCE_INPUT_MAX_EXCERPT_CHARS]
     final_excerpt, _ = redact_text(excerpt)
     final_excerpt = final_excerpt[:EVIDENCE_MAX_EXCERPT_CHARS]
     digest = hashlib.sha256(
@@ -153,26 +161,25 @@ def sweep_evidence(
     attribution and remains part of unscoped exports.
     """
     now_ts = _validate_ts(now_ts, "now_ts")
-    days = _validated_limit(
+    days, days_invalid = _validated_limit(
         os.environ.get("ZMEM_EVIDENCE_DAYS"), "retention_days",
         EVIDENCE_DEFAULT_RETENTION_DAYS, minimum=0,
     )
-    cap_value = _validated_limit(
+    cap_value, cap_invalid = _validated_limit(
         os.environ.get("ZMEM_EVIDENCE_CAP"), "cap",
         EVIDENCE_DEFAULT_CAP, minimum=1,
     )
-    if days is None:
+    if days_invalid:
         print(
-            "evidence retention disabled: invalid ZMEM_EVIDENCE_DAYS",
+            f"evidence retention: invalid ZMEM_EVIDENCE_DAYS; using default {EVIDENCE_DEFAULT_RETENTION_DAYS}",
             file=sys.stderr,
         )
-        return {"expired": 0, "capped": 0, "episode_links": 0, "memory_links": 0}
-    if cap_value is None:
+    if cap_invalid:
         print(
-            "evidence retention disabled: invalid ZMEM_EVIDENCE_CAP",
+            f"evidence retention: invalid ZMEM_EVIDENCE_CAP; using default {EVIDENCE_DEFAULT_CAP}",
             file=sys.stderr,
         )
-        return {"expired": 0, "capped": 0, "episode_links": 0, "memory_links": 0}
+    zero = {"expired": 0, "capped": 0, "episode_links": 0, "memory_links": 0}
     now = datetime.strptime(now_ts, "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=timezone.utc
     )
@@ -181,15 +188,12 @@ def sweep_evidence(
             timespec="seconds"
         ).replace("+00:00", "Z")
     except (OverflowError, ValueError):
-        print(
-            "evidence retention disabled: invalid ZMEM_EVIDENCE_DAYS",
-            file=sys.stderr,
-        )
-        return {
-            "expired": 0, "capped": 0, "episode_links": 0, "memory_links": 0,
-        }
-
-    zero = {"expired": 0, "capped": 0, "episode_links": 0, "memory_links": 0}
+        # A valid year-one clock cannot represent even the documented default
+        # retention window. Treat the lower representable bound as "nothing
+        # expires" rather than disabling the sweep or raising from a cadence.
+        cutoff = datetime.min.replace(tzinfo=timezone.utc).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
     savepoint = "zmem_evidence_sweep"
     own_transaction = not conn.in_transaction
     try:

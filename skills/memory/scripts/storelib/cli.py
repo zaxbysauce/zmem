@@ -77,6 +77,45 @@ def _hermes_failure_nudge(session_id: str) -> str:
     )
 
 
+def _hermes_failure_carrier(value: object, *, max_depth: int = 6,
+                            max_nodes: int = 128) -> bool:
+    """Find a bounded failure marker in a Hermes result envelope.
+
+    Hermes integrations have used several nested result/tool-result shapes over
+    time.  Inspect only failure-shaped keys/statuses, with explicit depth and
+    node caps so an untrusted payload cannot turn this compatibility path into
+    an unbounded recursive walk.
+    """
+    failure_statuses = {"error", "failed", "failure"}
+    failure_keys = {
+        "error", "error_message", "error_type", "tool_error", "toolError",
+        "failure",
+    }
+    seen = 0
+
+    def visit(node: object, depth: int) -> bool:
+        nonlocal seen
+        if seen >= max_nodes or depth > max_depth:
+            return False
+        seen += 1
+        if isinstance(node, dict):
+            status = node.get("status")
+            if isinstance(status, str) and status.strip().lower() in failure_statuses:
+                return True
+            for key, child in node.items():
+                if key in failure_keys and child not in (None, False, 0, ""):
+                    return True
+                if visit(child, depth + 1):
+                    return True
+        elif isinstance(node, list):
+            for child in node:
+                if visit(child, depth + 1):
+                    return True
+        return False
+
+    return visit(value, 0)
+
+
 def _hermes_capture_correction(namespace: str, session_id: str,
                                user_message: str, data_dir: str) -> bool:
     """Classify and queue the current user turn with the SAME
@@ -406,7 +445,7 @@ def _query_rewrite_context(
     before invoking it.
     """
     original = prompt.strip()[:500] if isinstance(prompt, str) else ""
-    if os.environ.get("ZMEM_QUERY_CONTEXT") == "0":
+    if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
         return original, False
     if not isinstance(session_id, str) or not session_id.strip():
         return original, False
@@ -451,7 +490,7 @@ def cmd_query_rewrite(*, prompt: str, session_id: str, namespace: str) -> int:
     """Run the deterministic query rewrite before any store initialization."""
     del namespace  # Selection is session-based; namespace is an input marker only.
     original = prompt.strip()[:500]
-    if os.environ.get("ZMEM_QUERY_CONTEXT") == "0":
+    if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
         _query_rewrite_output(original, False)
         return 0
     try:
@@ -653,9 +692,7 @@ def cmd_hermes_convention(
         status = "error" if any(
             value in {"error", "failed", "failure"} for value in statuses
         ) else ""
-        if (event.get("error") or event.get("error_message")
-                or event.get("error_type") or extra.get("error")
-                or extra.get("error_message")):
+        if _hermes_failure_carrier(payload):
             status = "error"
         if status in {"error", "failed", "failure"}:
             captured = conn.execute(
@@ -2079,6 +2116,10 @@ def main():
         # _ingest_row, so a real run serializes against restore/backup like
         # every other writer; --dry-run is read-only and never takes it.
         or (args.cmd == "promote-store" and not args.dry_run)
+        # Session cadence performs evidence retention after organize/backup;
+        # keep its writer lease until that final transaction is complete so a
+        # concurrent restore cannot interleave between cadence steps.
+        or args.cmd == "session-cadence"
     ):
         writer_lease = _acquire_writer_lease(args.cmd)
 
@@ -2366,7 +2407,7 @@ def main():
             # the canonical store precedence.
             prefetch_query = args.query
             if (args.moment == "user_prompt"
-                    and os.environ.get("ZMEM_QUERY_CONTEXT") != "0"):
+                    and os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() != "0"):
                 # The store boundary owns this one rewrite for compat/MCP
                 # prefetch.  Native provider and hook paths call the dedicated
                 # command before recall and therefore do not pass here.

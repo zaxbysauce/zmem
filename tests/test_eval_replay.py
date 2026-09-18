@@ -78,6 +78,7 @@ class ReplayFixtureTest(unittest.TestCase):
         store = FIXTURES / "store.sqlite"
         log = FIXTURES / "decisions.log"
         before = store.read_bytes()
+        log_before = log.read_bytes()
         with tempfile.TemporaryDirectory(prefix="zmem-replay-test-") as raw:
             out = Path(raw) / "report.json"
             run = self._run(Path(raw), "--json-out", str(out))
@@ -86,9 +87,10 @@ class ReplayFixtureTest(unittest.TestCase):
             self.assertEqual(report["store_sha256"], hashlib.sha256(before).hexdigest())
             self.assertEqual(
                 report["input_digest"],
-                hashlib.sha256(before + log.read_bytes()).hexdigest(),
+                hashlib.sha256(before + log_before).hexdigest(),
             )
             self.assertEqual(before, store.read_bytes())
+            self.assertEqual(log_before, log.read_bytes())
             self.assertEqual(len(report["rows"]), 8)
             self.assertEqual(
                 [(row["lane"], row["moment"]) for row in report["rows"]],
@@ -222,7 +224,9 @@ class ReplayInputContractTest(unittest.TestCase):
             try:
                 os.link(fixture["store"], alias)
             except OSError as exc:
-                self.skipTest(f"hard links unavailable: {exc}")
+                if os.name == "nt":
+                    self.fail(f"Windows CI must support hard-link alias coverage: {exc}")
+                self.skipTest(f"hard links unavailable on this POSIX runner: {exc}")
             run = self._run(
                 scratch,
                 fixture["store"],
@@ -276,6 +280,29 @@ class ReplayInputContractTest(unittest.TestCase):
             )
             self.assertEqual(run.returncode, 2)
             self.assertIn("invalid baseline metrics", run.stderr)
+            self.assertEqual(out.read_bytes(), sentinel)
+
+    def test_baseline_input_metadata_must_be_a_mapping(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-baseline-shape-") as raw:
+            scratch = Path(raw)
+            fixture = _build_fixture(scratch)
+            baseline = scratch / "bad-shape-baseline.json"
+            baseline.write_text(json.dumps({
+                "schema_version": 1,
+                "input_metadata": [],
+                "aggregate": {"reference_precision": 0, "miss_rate": 0},
+            }), encoding="utf-8")
+            out = scratch / "baseline-shape-output.json"
+            sentinel = b"preserve on baseline shape refusal\n"
+            out.write_bytes(sentinel)
+            run = self._run(
+                scratch, fixture["store"], fixture["log"],
+                "--compare-baseline", str(baseline),
+                "--fail-under", "precision_delta=-0.01",
+                "--json-out", str(out),
+            )
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("baseline input_metadata must be an object", run.stderr)
             self.assertEqual(out.read_bytes(), sentinel)
 
     def test_noncovered_lane_is_diagnosed_without_contaminating_eight_rows(self):
@@ -495,6 +522,7 @@ class ReplayObservationInputTest(unittest.TestCase):
             )
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn("no usable miss/reference observations", run.stderr)
+            self.assertFalse(json.loads(out.read_text(encoding="utf-8"))["usable_observation"])
 
     def test_oversized_transcript_rejects_without_overwriting_output(self):
         with tempfile.TemporaryDirectory(prefix="zmem-replay-transcript-limit-") as raw:
@@ -588,7 +616,7 @@ class ReplaySchemaTest(unittest.TestCase):
         self.assertEqual(
             list(report),
             ["schema_version", "input_digest", "store_sha256", "days", "rows",
-             "aggregate", "input_metadata", "generated_at"],
+             "aggregate", "input_metadata", "usable_observation", "generated_at"],
         )
         self.assertEqual(len(report["rows"]), 8)
         self.assertEqual(report["input_metadata"]["parsed_rows"], 8)

@@ -47,9 +47,11 @@ hermes-provider × session_start, user_prompt, pretool, precompact
 ```
 
 Rows are stably sorted. `input_metadata` contains only `version` and
-`parsed_rows`; all valid parsed rows participate in mixed nonempty-version
-validation before time-window or lane projection. Other valid lanes/moments
-are excluded from the eight rows with deterministic stderr diagnostics.
+`parsed_rows`; the top-level `usable_observation` marker records whether a
+validated transcript/failure observation could support measurement. All valid
+parsed rows participate in mixed nonempty-version validation before time-window
+or lane projection. Other valid lanes/moments are excluded from the eight rows
+with deterministic stderr diagnostics.
 Timing uses nearest-rank p50/p95. Baseline ratchets validate finite aggregate
 metrics and emit a valid breached report before exit 1; malformed inputs,
 measurement errors, and invalid ratchets exit 2 without replacing an existing

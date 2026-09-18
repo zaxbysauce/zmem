@@ -23,7 +23,7 @@ from scripts.eval_replay import _latest_log_timestamp, _parse_outer_timeout_diag
 EVALUATOR = ROOT / "scripts" / "eval_replay.py"
 FIXTURES = ROOT / "tests" / "fixtures" / "replay"
 PYTHON = sys.executable
-NODE = shutil.which("node") or "node"
+NODE = shutil.which("node")
 
 
 def _env(scratch: Path) -> dict[str, str]:
@@ -33,6 +33,8 @@ def _env(scratch: Path) -> dict[str, str]:
         "ZMEM_HOST", "ZMEM_SESSION", "ZMEM_QUERY_CONTEXT",
         "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA", "ZMEM_MODELS_DIR",
         "ZMEM_PLUGIN_ROOT", "ZMEM_PROJECT_DIR", "ZMEM_ROOT", "ZMEM_TEST_NOW",
+        "ZMEM_STORE_RECALL_TIMEOUT_S", "ZMEM_FAILURES_DB_TIMEOUT_S",
+        "ZMEM_LAUNCHER_WATCHDOG_MS", "ZMEM_MCP_TIMEOUT",
     ):
         env.pop(key, None)
     env.update({
@@ -91,6 +93,7 @@ def _writer_line(data_dir: Path) -> str:
 
 
 class OuterTimeoutDiagnosticTest(unittest.TestCase):
+    @unittest.skipUnless(NODE, "Node.js is required to exercise the launcher writer")
     def test_exact_writer_line_is_excluded_but_digest_and_report_rows_remain(self):
         with tempfile.TemporaryDirectory(prefix="zmem-replay-timeout-") as raw:
             scratch = Path(raw)
@@ -100,6 +103,7 @@ class OuterTimeoutDiagnosticTest(unittest.TestCase):
             canonical = (FIXTURES / "decisions.log").read_text(encoding="utf-8")
             log = scratch / "combined.log"
             log.write_text(canonical + diagnostic, encoding="utf-8", newline="\n")
+            before = log.read_bytes()
             out = scratch / "report.json"
 
             run = _run(scratch, log, "--json-out", str(out))
@@ -125,6 +129,8 @@ class OuterTimeoutDiagnosticTest(unittest.TestCase):
                     (FIXTURES / "store.sqlite").read_bytes() + log.read_bytes()
                 ).hexdigest(),
             )
+            self.assertEqual(log.read_bytes(), before,
+                             "replay must not rewrite its decision log")
 
     def test_empty_and_equals_values_are_writer_compatible(self):
         line = (
@@ -156,6 +162,7 @@ class OuterTimeoutDiagnosticTest(unittest.TestCase):
             report = json.loads(out.read_text(encoding="utf-8"))
             self.assertEqual(report["input_metadata"]["parsed_rows"], 8)
 
+    @unittest.skipUnless(NODE, "Node.js is required to exercise the launcher writer")
     def test_newer_diagnostic_does_not_change_replay_window(self):
         with tempfile.TemporaryDirectory(prefix="zmem-replay-timeout-clock-") as raw:
             scratch = Path(raw)
@@ -181,6 +188,7 @@ class OuterTimeoutDiagnosticTest(unittest.TestCase):
             self.assertEqual(combined_report["generated_at"], baseline_report["generated_at"])
             self.assertNotEqual(combined_report["input_digest"], baseline_report["input_digest"])
 
+    @unittest.skipUnless(NODE, "Node.js is required to exercise the launcher writer")
     def test_diagnostic_only_log_fails_without_clobbering_output(self):
         with tempfile.TemporaryDirectory(prefix="zmem-replay-timeout-empty-") as raw:
             scratch = Path(raw)

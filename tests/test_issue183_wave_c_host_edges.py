@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import importlib.util
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -88,6 +89,9 @@ class WaveCHostEdges(unittest.TestCase):
             )
 
     def test_launcher_drops_oversize_and_failed_events_and_extracts_patch(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is required for launcher boundary coverage")
         node_code = r"""
 const launcher = require(process.argv[1]);
 let data = "";
@@ -118,7 +122,7 @@ process.stdout.write(JSON.stringify({
 }));
 """
         result = subprocess.run(
-            ["node", "-e", node_code, str(LAUNCHER)],
+            [node, "-e", node_code, str(LAUNCHER)],
             cwd=ROOT, capture_output=True, text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

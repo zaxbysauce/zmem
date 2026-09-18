@@ -67,6 +67,10 @@ _PREFETCH_LIMIT = 5
 # Max chars of a query passed to store.py recall.
 _MAX_QUERY_CHARS = 500
 _QUERY_REWRITE_INPUT_MAX_CHARS = 4096
+_QUERY_REWRITE_CACHE_TTL_S = 2.0
+_QUERY_REWRITE_CACHE_MAX = 32
+_QUERY_REWRITE_CACHE: Dict[tuple[str, str, str], tuple[float, str, bool]] = {}
+_QUERY_REWRITE_CACHE_LOCK = threading.Lock()
 _NATIVE_EVIDENCE_MAX_BYTES = 64 * 1024
 _NATIVE_EVIDENCE_QUEUE_MAX = 8
 _NATIVE_EVIDENCE_WORKERS = 2
@@ -363,6 +367,18 @@ def _python_bin() -> str:
     return sys.executable or "python"
 
 
+def _safe_json_dumps(value: Any, *, max_bytes: Optional[int] = None) -> Optional[str]:
+    """Serialize host data without line-separator or unbounded output hazards."""
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        text = text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+        if max_bytes is not None and len(text.encode("utf-8")) > max_bytes:
+            return None
+        return text
+    except (TypeError, ValueError, RecursionError, UnicodeError):
+        return None
+
+
 def _inject_disabled() -> bool:
     """Issue #110 (P0-5): ZMEM_INJECT=0 disables every passive-injection
     surface of this provider (prefetch, the session_start tool twin, and the
@@ -468,16 +484,33 @@ def _rewrite_provider_query(
     # output cap and incorrectly trigger a rewrite.  Oversized input fails
     # open rather than being truncated into a different classification.
     original = raw_query.strip()[:_MAX_QUERY_CHARS]
-    if not session_id or os.environ.get("ZMEM_QUERY_CONTEXT") == "0":
+    if not session_id or os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
         return original, False
     if len(raw_query) > _QUERY_REWRITE_INPUT_MAX_CHARS:
         return original, False
+    cache_key = (namespace, session_id, raw_query)
+    now = time.monotonic()
+    with _QUERY_REWRITE_CACHE_LOCK:
+        cached = _QUERY_REWRITE_CACHE.get(cache_key)
+        if cached and now - cached[0] < _QUERY_REWRITE_CACHE_TTL_S:
+            return cached[1], cached[2]
+        if cached:
+            _QUERY_REWRITE_CACHE.pop(cache_key, None)
     args = ["query-rewrite"]
     args.extend(_free_text_arg("--prompt", raw_query))
     args.extend(("--session-id", session_id, "--namespace", namespace, "--json"))
     try:
         result = _run_store(args)
-        return _decode_query_rewrite(result, original)
+        decoded = _decode_query_rewrite(result, original)
+        # Cache only an applied rewrite.  A negative result can become stale as
+        # soon as a new evidence event lands, so retaining it would suppress a
+        # later valid context expansion within the same session.
+        if decoded[1]:
+            with _QUERY_REWRITE_CACHE_LOCK:
+                _QUERY_REWRITE_CACHE[cache_key] = (now, decoded[0], decoded[1])
+                while len(_QUERY_REWRITE_CACHE) > _QUERY_REWRITE_CACHE_MAX:
+                    _QUERY_REWRITE_CACHE.pop(next(iter(_QUERY_REWRITE_CACHE)))
+        return decoded
     except Exception as exc:  # provider adapters must remain fail-open
         logger.debug("zmem query rewrite failed: %s", exc)
         return original, False
@@ -596,19 +629,41 @@ def _run_store(
 
 
 def _native_edit_path(args: Any) -> str:
+    if isinstance(args, str):
+        return _native_patch_path(args)
     if not isinstance(args, dict):
         return ""
     for key in ("path", "file_path", "notebook_path", "target_file", "filename"):
         value = args.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    for key in ("edits", "files"):
+    for key in ("edits", "files", "changes"):
         entries = args.get(key)
         if isinstance(entries, list):
             for entry in entries:
                 path = _native_edit_path(entry)
                 if path:
                     return path
+    for key in ("patch", "patch_text", "patchText", "diff", "input", "content"):
+        path = _native_patch_path(args.get(key))
+        if path:
+            return path
+    return ""
+
+
+def _native_patch_path(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    text = value.replace("\r", "")
+    patterns = (
+        r"^\s*\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(\S.*?)\s*$",
+        r"^\s*\+\+\+\s+(?:b/)?([^\s]+)\s*$",
+        r"^\s*---\s+(?:a/)?([^\s]+)\s*$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.MULTILINE)
+        if match:
+            return match.group(1).strip()
     return ""
 
 
@@ -631,6 +686,65 @@ def _native_bounded_text(value: Any, *, limit: int) -> str:
     if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
         return ""
     return value.strip()
+
+
+def _native_ref_path(value: Any, *, limit: int = 4096) -> str:
+    if not isinstance(value, str):
+        return ""
+    clean = re.sub(r"[\x00-\x1f\x7f\u2028\u2029]", " ", value).strip()
+    if "://" not in clean and (clean.startswith(("/", "\\\\"))
+                              or re.match(r"^[A-Za-z]:[\\\\/]", clean)):
+        clean = clean.replace("\\", "/").rsplit("/", 1)[-1]
+    return clean[:limit]
+
+
+def _native_failure(value: Any, *, depth: int = 0, seen: Optional[set[int]] = None) -> bool:
+    if depth > 8 or value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {
+            "", "ok", "success", "succeeded", "completed", "complete"
+        }
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, list):
+        return bool(value)
+    if not isinstance(value, dict):
+        return False
+    seen = seen or set()
+    marker = id(value)
+    if marker in seen:
+        return False
+    seen.add(marker)
+    try:
+        for key in ("status", "error", "error_message", "error_type", "failure"):
+            candidate = value.get(key)
+            if key == "status":
+                if isinstance(candidate, str) and candidate.strip().lower() not in {
+                    "", "ok", "success", "succeeded", "completed", "complete"
+                }:
+                    return True
+            elif candidate not in (None, "", False, 0, [], {}):
+                if _native_failure(candidate, depth=depth + 1, seen=seen):
+                    return True
+        return any(_native_failure(value.get(key), depth=depth + 1, seen=seen)
+                   for key in ("result", "tool_result", "tool_output", "details", "cause"))
+    finally:
+        seen.remove(marker)
+
+
+def _stable_evidence_id(values: Dict[str, Any]) -> str:
+    supplied = values.get("evidence_id")
+    try:
+        if isinstance(supplied, str):
+            return str(uuid.UUID(supplied))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    task_id = _native_uri_id(values.get("task_id"))
+    call_id = _native_uri_id(values.get("tool_call_id"))
+    if task_id and call_id:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"zmem-hermes:{task_id}:{call_id}"))
+    return str(uuid.uuid4())
 
 
 def _native_utc_now() -> str:
@@ -762,20 +876,25 @@ def _native_evidence_row(
             return None
     status_value = _native_bounded_text(values.get("status"), limit=256)
     status = status_value.lower()
+    raw_error = values.get("error")
     error_message = _native_bounded_text(values.get("error_message"), limit=512)
     error_type = _native_bounded_text(values.get("error_type"), limit=256)
+    if isinstance(raw_error, dict):
+        error_message = error_message or _native_bounded_text(raw_error.get("message"), limit=512)
+        error_type = error_type or _native_bounded_text(raw_error.get("type"), limit=256)
     explicit_failed = status in {"error", "failed", "failure"}
     if isinstance(result, dict):
         result_status = result.get("status")
         result_status_text = _native_bounded_text(result_status, limit=256)
         if result_status_text.lower() in {"error", "failed", "failure"}:
             explicit_failed = True
-    failed = explicit_failed or bool(error_message) or bool(error_type)
-    ref_path = _native_edit_path(args)
+    failed = explicit_failed or bool(error_message) or bool(error_type) or _native_failure(result)
+    ref_path = _native_ref_path(_native_edit_path(args))
     normalized = tool_name.strip().lower().replace("-", "_").replace(" ", "_")
     edit_names = {
         "edit", "edit_file", "write", "write_file", "writefile", "multi_edit",
-        "notebookedit", "notebook_edit", "str_replace_editor",
+        "multiedit", "apply_patch", "applypatch", "patch_file", "patchfile",
+        "notebookedit", "notebook_edit", "str_replace_editor", "strreplaceeditor",
     }
     kind = "tool_failure" if failed else ("edit" if normalized in edit_names and ref_path else "tool_call")
     excerpt_value = {
@@ -785,15 +904,10 @@ def _native_evidence_row(
         "duration_ms": values.get("duration_ms"),
     }
     try:
-        excerpt = json.dumps(excerpt_value, ensure_ascii=False, separators=(",", ":"))
-        evidence_id = values.get("evidence_id")
-        if isinstance(evidence_id, str):
-            try:
-                evidence_id = str(uuid.UUID(evidence_id))
-            except (AttributeError, TypeError, ValueError):
-                evidence_id = str(uuid.uuid4())
-        else:
-            evidence_id = str(uuid.uuid4())
+        excerpt = _safe_json_dumps(excerpt_value, max_bytes=_NATIVE_EVIDENCE_MAX_BYTES - 2048)
+        if excerpt is None:
+            return None
+        evidence_id = _stable_evidence_id(values)
         row = {
             "id": evidence_id,
             "session_id": session_id.strip(),
@@ -807,7 +921,9 @@ def _native_evidence_row(
             ),
             "ref_offset": None,
         }
-        serialized = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        serialized = _safe_json_dumps(row, max_bytes=_NATIVE_EVIDENCE_MAX_BYTES)
+        if serialized is None:
+            return None
     except (TypeError, ValueError, RecursionError):
         return None
     if len(serialized.encode("utf-8")) > _NATIVE_EVIDENCE_MAX_BYTES:
@@ -1133,7 +1249,7 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
 
 def _tool_error(msg: str) -> str:
     """JSON error string for tool-call failures (mirrors tools.registry.tool_error)."""
-    return json.dumps({"error": msg})
+    return _safe_json_dumps({"error": msg}) or "{}"
 
 
 def _structured_write_response(r: Dict[str, Any], *, ok_result: str) -> str:
@@ -1160,8 +1276,8 @@ def _structured_write_response(r: Dict[str, Any], *, ok_result: str) -> str:
             resp["created_new"] = parsed.get("created_new")
         if parsed.get("warnings"):
             resp["warnings"] = parsed.get("warnings")
-        return json.dumps(resp)
-    return json.dumps({"result": ok_result, "raw": stdout})
+        return _safe_json_dumps(resp) or "{}"
+    return _safe_json_dumps({"result": ok_result, "raw": stdout}) or "{}"
 
 
 # -- provider ----------------------------------------------------------------

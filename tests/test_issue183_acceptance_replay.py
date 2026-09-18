@@ -50,6 +50,10 @@ class Issue183AcceptanceReplayTest(unittest.TestCase):
             run = subprocess.run(command, cwd=ROOT, env=env, text=True, capture_output=True)
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(before, hashlib.sha256((FIXTURES / "store.sqlite").read_bytes()).hexdigest())
+            self.assertEqual(
+                hashlib.sha256(log_bytes).hexdigest(),
+                hashlib.sha256((FIXTURES / "decisions.log").read_bytes()).hexdigest(),
+            )
             expected = (FIXTURES / "expected.json").read_bytes()
             self.assertEqual(out.read_bytes(), expected)
             report = json.loads(expected)

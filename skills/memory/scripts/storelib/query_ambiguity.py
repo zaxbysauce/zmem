@@ -29,6 +29,7 @@ _ERROR_IDENTIFIER_RE = re.compile(
     r"^(?:[A-Za-z_][A-Za-z0-9_]*)?(?:Error|Exception)$"
 )
 _SAFE_OP_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/+-]+$")
+_NAMESPACE_ANCHOR_RE = re.compile(r"^(?:project|user):[A-Za-z0-9._-]+$", re.IGNORECASE)
 _TERM_EDGE_PUNCT = "\"'`;,:(){}[]<>|&$!?*+=\u201c\u201d\u2018\u2019\u201a\u201e\u2013\u2014\u2026"
 
 
@@ -72,6 +73,7 @@ def _has_exact_token(tokens: Iterable[str]) -> bool:
         candidate = token.strip(_TERM_EDGE_PUNCT)
         if (
             candidate.startswith("-")
+            or _NAMESPACE_ANCHOR_RE.fullmatch(candidate) is not None
             or any(marker in candidate for marker in ("/", "\\", ".", "_"))
             or _ERROR_IDENTIFIER_RE.fullmatch(candidate) is not None
         ):
@@ -129,11 +131,15 @@ def read_recent_edit_basenames(
         return []
     limit = min(limit, EDIT_BASENAME_LIMIT)
     try:
+        # Fetch beyond the output cap before filtering unsafe/duplicate paths.
+        # A recent duplicate or malformed ref_path must not crowd a valid edit
+        # basename out of the bounded context.
+        fetch_limit = min(max(limit * 4, limit), 100)
         rows = conn.execute(
             "SELECT ref_path FROM evidence "
             "WHERE session_id=? AND kind='edit' "
             "ORDER BY ts DESC, id DESC LIMIT ?",
-            (session_id, limit),
+            (session_id, fetch_limit),
         ).fetchall()
     except sqlite3.Error:
         if strict_errors:

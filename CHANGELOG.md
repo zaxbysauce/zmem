@@ -10,6 +10,21 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.45.0] - 2026-09-18
+
+### Added
+- **Deterministic passive query context (issue #183)**: ambiguous
+  `user_prompt` queries use bounded operation/edit context with exact-token
+  namespace bypass, fail-open behavior, and a whitespace-tolerant
+  `ZMEM_QUERY_CONTEXT=0` kill switch.
+- **Bounded evidence and replay hardening**: retention holds the writer lease,
+  evidence input and replay files are bounded, nested host failures are
+  classified, and detached writers use stable identities and admission caps.
+
+### Changed
+- **Release and CI surfaces**: all host manifests target 0.45.0; cross-project
+  query forwarding from 0.44.0 remains preserved.
+
 ## [0.44.0] - 2026-09-16
 
 ### Added

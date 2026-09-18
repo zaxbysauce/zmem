@@ -156,7 +156,7 @@ def _host_fixture_candidates(out: Path) -> list[Path]:
                     "result": command, "evidence_id": evidence_id,
                     "ref_path": ref_path,
                 }
-                moment = "session_start"
+                moment = "user_prompt"
                 excerpt = f"turn={command}"
             else:
                 payload = {
@@ -164,6 +164,8 @@ def _host_fixture_candidates(out: Path) -> list[Path]:
                     "tool_input": {"command": command},
                     "evidence_id": evidence_id, "ref_path": ref_path,
                 }
+                if kind == "tool_failure":
+                    payload["error"] = "permission denied"
                 moment = "pretool"
                 excerpt = ("error=permission denied" if kind == "tool_failure" else command)
             inputs.append({"hook": hook, "payload": payload})

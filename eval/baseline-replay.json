@@ -189,5 +189,6 @@
     "version": "0.43.0",
     "parsed_rows": 8
   },
+  "usable_observation": false,
   "generated_at": "2026-06-01T00:00:00Z"
 }

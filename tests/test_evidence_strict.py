@@ -180,6 +180,28 @@ class StrictDuplicateKeyTest(_StrictEvidenceCase):
 
 
 class StrictStagingAndLegacyTest(_StrictEvidenceCase):
+    def test_strict_episode_optional_fields_default_before_apply(self):
+        path = self.root / "open-episode.jsonl"
+        _write_rows(path, [{
+            "kind": "episode",
+            "id": _uuid(1099),
+            "namespace": "project:p",
+            "started_at": "2026-09-10T00:00:00Z",
+        }])
+        self.assertEqual(
+            sync.cmd_ingest_jsonl_strict(
+                self.conn, in_path=str(path), source_ref=None,
+            ),
+            0,
+        )
+        self.assertEqual(
+            tuple(self.conn.execute(
+                "SELECT ended_at, summary_memory_id, token_count FROM episode WHERE id=?",
+                (_uuid(1099),),
+            ).fetchone()),
+            ("", "", 0),
+        )
+
     def test_replacement_after_staging_does_not_change_imported_bytes(self):
         old_path = self.root / "staged.jsonl"
         old_memory = _memory_row(_uuid(1101), content="staged old")

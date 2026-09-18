@@ -8,8 +8,10 @@ behavior (FORWARD_COMPAT == SUPPORTED -> anything newer refuses), so the
 window only opens when a maintenance release of an older line extends it.
 
 Also pins the real-world scenario that motivated this: an OLDER client
-(patch its SUPPORTED constant to 12, FORWARD_COMPAT at 13) must be able to
-store and recall memories on a v13 store, because v13 is additive-only.
+(patch its SUPPORTED constant to 12) must still be able to store and recall
+ordinary memories on the current v14 store.  The test does not claim that
+every v14 surface is usable by that older client; it covers the additive
+memory-table path only.
 
 Runs standalone: python tests/test_schema_forward_compat.py
 """
@@ -92,8 +94,8 @@ class SchemaCompatGateTest(unittest.TestCase):
 
 
 class OlderClientOnNewerStoreTest(unittest.TestCase):
-    """The motivating scenario: a v12-lineage client (SUPPORTED=12) stores
-    and recalls on a v13 store, because v13 is additive-only."""
+    """A v12-lineage client (SUPPORTED=12) uses the current v14 store's
+    additive memory-table path without downgrading the store."""
 
     def setUp(self):
         import importlib
@@ -118,7 +120,7 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
         # Build the store with CURRENT code (v14).
         self._run(["init"])
         self._run(["add", "--namespace", "project:fwd", "--type", "fact",
-                   "--content", "v13-created row", "--signal", "test",
+                   "--content", "current-schema-created row", "--signal", "test",
                    "--json"])
 
     def tearDown(self):

@@ -127,6 +127,9 @@ class RewriteFixtureTest(unittest.TestCase):
                     ),
                     (prompt, False),
                 )
+        for prompt in ("project:alpha", "user:global", "(project:alpha)"):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(is_ambiguous_prompt(prompt))
         self.assertEqual(
             rewrite_ambiguous_query(
                 "continue from yesterday", ops_tokens=[], edited_basenames=[]
@@ -262,6 +265,25 @@ class EvidenceReadTest(unittest.TestCase):
         finally:
             locked.rollback()
             locked.close()
+
+    def test_recent_edit_overfetches_before_deduping_and_truncating(self):
+        self.conn.execute(
+            "CREATE TABLE evidence(id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, "
+            "ts TEXT, ref_path TEXT)"
+        )
+        rows = [
+            ("a", "session-183", "edit", "2026-09-10T00:00:05Z", "bad\nname.py"),
+            ("b", "session-183", "edit", "2026-09-10T00:00:04Z", "/work/recall.py"),
+            ("c", "session-183", "edit", "2026-09-10T00:00:03Z", "/other/RECALL.py"),
+            ("d", "session-183", "edit", "2026-09-10T00:00:02Z", "/work/ops_tokens.py"),
+            ("e", "session-183", "edit", "2026-09-10T00:00:01Z", "/work/schema.py"),
+        ]
+        self.conn.executemany("INSERT INTO evidence VALUES (?, ?, ?, ?, ?)", rows)
+        self.conn.commit()
+        self.assertEqual(
+            read_recent_edit_basenames(self.conn, "session-183", limit=3),
+            ["recall.py", "ops_tokens.py", "schema.py"],
+        )
 
     def test_strict_sql_failure_can_be_audited_without_changing_default(self):
         self.assertEqual(
