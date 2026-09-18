@@ -153,13 +153,21 @@ def derive_ops_tokens(*events: str) -> List[str]:
             # land on disk or in a query.
             _push(head)
             for i, w in enumerate(words[1:5]):
+                # Preserve the shape of the raw argv token before
+                # ``_clean_token`` strips a path to its basename.  A path
+                # such as ``../check`` is structural context even though the
+                # sanitized token is only ``check``; dropping that distinction
+                # loses useful worktree/checkout recall.  Keep the secret
+                # check below after sanitization so a path-shaped credential
+                # is still rejected.
+                raw_structural = any(c in w for c in "./_-\\")
                 t = _clean_token(w)
                 if not t or t.startswith("-"):
                     continue
                 if _SECRET_SHAPE_RE.match(t):
                     continue
                 if i == 0 or t in _HAZARDOUS_SUBS or any(
-                        c in t for c in "./_-"):
+                        c in t for c in "./_-") or raw_structural:
                     _push(t)
         else:
             # Non-runner event: file paths / test names — keep the basename

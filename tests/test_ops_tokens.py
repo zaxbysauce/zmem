@@ -153,6 +153,18 @@ class DeriveTokensTest(unittest.TestCase):
             ops_tokens.derive_ops_tokens("src/lib/pr-workflow-gate.ts"),
             ["pr-workflow-gate.ts"])
 
+    def test_path_shape_survives_runner_cleaning(self):
+        # A structural path argument loses its slash when sanitized, but must
+        # remain eligible for recall (for example, a worktree destination).
+        self.assertEqual(
+            ops_tokens.derive_ops_tokens("git worktree add ../check main"),
+            ["git", "worktree", "check"])
+        # Secret-shaped basenames remain rejected even when they came from a
+        # path, so preserving the raw shape cannot widen the leak surface.
+        self.assertEqual(
+            ops_tokens.derive_ops_tokens("git worktree add ../sk-secret main"),
+            ["git", "worktree"])
+
     def test_operators_and_garbage_yield_nothing(self):
         # FTS syntax characters, NEAR/AND operators, parens, quotes: none can
         # survive the allowlist.
