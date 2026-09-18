@@ -29,27 +29,20 @@ README.
   unchanged: fail-open `{}`, pass-through exit codes, stdin replay, and
   diagnostics on stderr only.
 
-## [0.45.0] - 2026-09-17
+## [0.45.0] - 2026-09-18
+
+### Added
+- **Deterministic passive query context (issue #183)**: ambiguous
+  `user_prompt` queries use bounded operation/edit context with exact-token
+  namespace bypass, fail-open behavior, and a whitespace-tolerant
+  `ZMEM_QUERY_CONTEXT=0` kill switch.
+- **Bounded evidence and replay hardening**: retention holds the writer lease,
+  evidence input and replay files are bounded, nested host failures are
+  classified, and detached writers use stable identities and admission caps.
 
 ### Changed
-- **Claude hooks register in exec form (issue #186, Workstream N PR 3 of 6)**:
-  every command entry in `hooks/hooks.claude.json` is now
-  `{"command":"node","args":["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js","<verb>"]}`
-  instead of a shell command string, so the host no longer needs a shell to
-  parse quoting before Node starts. Events, matchers, and 15 s timeouts are
-  unchanged.
-- **Launcher-side shell resolution (issue #186)**: the Git Bash resolver is
-  exported as `resolveShell()` (same order: explicit `ZMEM_BASH_PATH`, then
-  known locations, then `where git`-derived roots, then `bash`) and a new pure
-  `toBashPath()` converts the wrapper path to the bash-relative
-  `hooks/<script>.sh` form on Windows (non-Windows input passes through
-  unchanged); the launcher spawns bash with the converted path
-  and pins the child working directory to the plugin root (the wrappers
-  self-locate, so behavior is otherwise unchanged). Failure behavior is
-  unchanged: fail-open `{}` on spawn failure (synchronous throw and async
-  `error` event both covered), pass-through exit codes, stdin replay, and
-  diagnostics on stderr only.
-
+- **Release and CI surfaces**: all host manifests target 0.45.0; cross-project
+  query forwarding from 0.44.0 remains preserved.
 
 ## [0.44.0] - 2026-09-16
 
