@@ -453,11 +453,6 @@ console.log(JSON.stringify(out));
             self.assertIn(expect, proc.stderr)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
 class SpawnFailureFailOpenTest(unittest.TestCase):
     """Final critic: the F-001 restructure dropped the spawn-error
     fail-open handler — an unhandled error event crashed the launcher
@@ -523,3 +518,12 @@ class SpawnFailureFailOpenTest(unittest.TestCase):
                 mod._store_timeout_s(), 8.0,
                 "an unreadable budget table must fall back to seconds, "
                 "never milliseconds")
+
+
+if __name__ == "__main__":
+    # Issue #210 review (PRR-003): this MUST stay after every class —
+    # unittest.main() exits, so a class defined below it is silently
+    # never collected under CI's `python tests/test_*.py` loop (pytest
+    # collects it, CI does not — the exact shape that hid
+    # SpawnFailureFailOpenTest from every matrix leg).
+    unittest.main()

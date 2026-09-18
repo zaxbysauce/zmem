@@ -536,9 +536,6 @@ def _argv_basename(tokens):
     return first.name
 
 
-def _command_basename(command):
-    return _argv_basename(_shell_tokens(command))
-
 
 def _command_tokens(command):
     """Full argv token list for a manifest command value (issue #186).

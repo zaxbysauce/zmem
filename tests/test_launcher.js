@@ -2245,7 +2245,11 @@ function testClaudeVerbsRunWithoutGitOnPath() {
         .filter((part) => !/git/i.test(part)).join(path.delimiter);
 
     // Spawnability precondition under the exact stripped-PATH env (no Git on
-    // PATH must still resolve a real bash via the known-location probes).
+    // PATH must still resolve a usable bash — POSIX resolves the bare command
+    // name "bash" via the remaining PATH, Windows resolves an on-disk
+    // absolute path via the known-location probes). Prove the resolved shell
+    // can actually spawn, so a launcher-level silent fail-open (spawn ENOENT
+    // → {} with empty stderr) cannot masquerade as a verb run below.
     {
         const saved = process.env.PATH;
         const savedBash = process.env.ZMEM_BASH_PATH;
@@ -2253,12 +2257,19 @@ function testClaudeVerbsRunWithoutGitOnPath() {
         delete process.env.ZMEM_BASH_PATH;
         let resolved = null;
         try { resolved = launch.resolveShell(); } catch (e) { resolved = "THREW: " + e.message; }
+        let spawnable = false;
+        try {
+            const probe = spawnSync(resolved, ["-c", "true"], { encoding: "utf8", timeout: 15000 });
+            spawnable = !probe.error && probe.status === 0;
+        } catch (e) { spawnable = false; }
         if (saved === undefined) delete process.env.PATH; else process.env.PATH = saved;
         if (savedBash === undefined) delete process.env.ZMEM_BASH_PATH;
         else process.env.ZMEM_BASH_PATH = savedBash;
-        ok("#186: resolveShell resolves an on-disk bash with Git stripped from PATH",
-            typeof resolved === "string" && resolved.length > 0 && fs.existsSync(resolved),
-            JSON.stringify(resolved));
+        ok("#186: resolveShell resolves a spawnable bash with Git stripped from PATH",
+            typeof resolved === "string" && resolved.length > 0
+            && (process.platform === "win32" ? fs.existsSync(resolved) : resolved === "bash")
+            && spawnable,
+            JSON.stringify(resolved) + " spawnable=" + spawnable);
     }
 
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-186-verbs-"));

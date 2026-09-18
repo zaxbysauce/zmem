@@ -1495,13 +1495,21 @@ async function main() {
         process.exit(0);
     }
     // Spawn failure (bash not found, ENOEXEC/EACCES): fail open — clear the
-    // watchdog, emit an empty envelope, exit 0 (the handler above). Final
-    // critic on the review round caught this handler being dropped in the
-    // F-001 restructure: an unhandled 'error' event crashed the launcher
-    // (exit 1, zero stdout), breaking the fail-open invariant on a real
-    // deployment shape (no Git Bash found → resolveShell falls back to bare
-    // "bash"). Issue #186 collapses the previously duplicated registration
-    // down to this single handler.
+    // watchdog, emit an empty envelope, exit 0. spawn() delivers these as an
+    // ASYNC 'error' event on POSIX (ENOENT) and a synchronous throw on
+    // Windows (EFTYPE for a non-executable bash path); the try/catch above
+    // covers only the sync leg, this handler the async one. History: the
+    // F-001 restructure dropped the handler once before (unhandled 'error'
+    // crashed the launcher, exit 1, zero stdout) and PR #210's exec-form
+    // restructure dropped both registrations again — caught by the PR
+    // review (cubic P1 / Copilot / swarm-pr-review PRR-001) because the
+    // spawn-failure fail-open pin in tests/test_timeout_budget.py was
+    // dormant in CI. Exactly ONE handler lives here.
+    child.on("error", () => {
+        if (watchdog) watchdog.clear();
+        process.stdout.write("{}\n");
+        process.exit(0);
+    });
     if (translated && child.stderr) {
         child.stderr.on("data", (c) => {
             try { process.stderr.write(c); } catch { /* host stderr gone */ }

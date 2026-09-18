@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "3cf8cfc359443e410f144332f6d721fc3bdb4c71d1593684de501dad02853a54",
+  "digest": "afb3f939119fe659c56b3a81a4ab5b5b192ad16a22863641500fcca7b2a238fa",
   "files": {
     "hermes-plugin/__init__.py": "da8804edc315f37c43c23e6ae7e815359f1a29c543c68f97b62632f4f2d26da8",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -25,7 +25,7 @@
     "hooks/zmem-capture-correction.sh": "f71aef6f46825723e908dbdcd81cccc1299c45e78025f8011db50c02037c75b2",
     "hooks/zmem-capture-failure.sh": "8c1b45dd1f29a1ac502861ee3942e43e829123cbe7b67c17e8b910227a7af002",
     "hooks/zmem-convention-capture.sh": "3982e825c0f3c310d4a867edcf9551d7ccbbd036af53134378a9faff6beea257",
-    "hooks/zmem-launch.js": "00893d2417ad20020f3cc7206e511a2dbdb1e70782cdc955b002a151260053b8",
+    "hooks/zmem-launch.js": "914b703c9aaac2da2408e7d4c853672894568696b2c8790b9737090bf0938614",
     "hooks/zmem-postcompact.sh": "7425f2937508fe3b526395abcb5610b7ac18c33a610a53455b58d984d8647542",
     "hooks/zmem-posttoolbatch-recall.sh": "2a6e08eb58772e43392ff24b879e77dba21d72d414fefca946eff1a82c71caf7",
     "hooks/zmem-precompact.sh": "0b935644aa4c291d67ddfb2e16b69a5578dee113d4512ccaca5677de6a5a6673",
@@ -42,8 +42,8 @@
     "scripts/eval_inject_runner.py": "c3b68474f80500e36ae2c245431897c7c0e5a27a98781332e8e9e1b8cb5cc70a",
     "scripts/eval_runner.py": "6e9b355425644f38795068259a69bb9c1ca02cdd57509511824ac10ac721ce3a",
     "scripts/eval_self_corpus.py": "ead3aece0562da0fe588ea4d4994aa7ec8fece3ae4d0a7554766e9933e4e76e6",
-    "scripts/generate_canary_fixtures.py": "12c6f9d16040ca8738778d6788da1840434857ed3aa688773bd988094228d10d",
-    "scripts/host_canary.py": "459d649dd430504a8d32ac7e91c8f1d18e923027380d1770b384506eccb418ca",
+    "scripts/generate_canary_fixtures.py": "382467197fdb868ae31f982980750c45103e8b873a897083388f5231427e1b22",
+    "scripts/host_canary.py": "7c989d508beaa76bc424ceaa517f42e075c5c7de40d10a7e08ec7714f43221a3",
     "scripts/host_registry.py": "f6beab143eeec65f7d16f0a3cac2bd2b6436656ab38e84175088e3051511dd8e",
     "scripts/ingest_harvest.py": "4deed83a20c9227afdc45c3ba89b9bd83beadbac1aa72049291dc502b7322e2f",
     "scripts/pattern_harness.py": "428b33978ee59b7c7bbc67f0849adfd750c9277e2e05b216721611741024652b",

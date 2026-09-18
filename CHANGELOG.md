@@ -42,10 +42,12 @@ README.
   exported as `resolveShell()` (same order: explicit `ZMEM_BASH_PATH`, then
   known locations, then `where git`-derived roots, then `bash`) and a new pure
   `toBashPath()` converts the wrapper path to the bash-relative
-  `hooks/<script>.sh` form; the launcher spawns bash with the converted path
+  `hooks/<script>.sh` form on Windows (non-Windows input passes through
+  unchanged); the launcher spawns bash with the converted path
   and pins the child working directory to the plugin root (the wrappers
   self-locate, so behavior is otherwise unchanged). Failure behavior is
-  unchanged: fail-open `{}`, pass-through exit codes, stdin replay, and
+  unchanged: fail-open `{}` on spawn failure (synchronous throw and async
+  `error` event both covered), pass-through exit codes, stdin replay, and
   diagnostics on stderr only.
 
 

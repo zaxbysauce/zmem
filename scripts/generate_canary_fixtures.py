@@ -65,9 +65,6 @@ def _argv_basename(parts):
     return parts[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
 
 
-def _command_basename(command):
-    return _argv_basename(_shell_tokens(command))
-
 
 def _command_tokens(command):
     """Issue #186: exec-form entries concatenate command + args."""
