@@ -153,6 +153,18 @@ class DeriveTokensTest(unittest.TestCase):
             ops_tokens.derive_ops_tokens("src/lib/pr-workflow-gate.ts"),
             ["pr-workflow-gate.ts"])
 
+    def test_path_shape_survives_runner_cleaning(self):
+        # A structural path argument loses its slash when sanitized, but must
+        # remain eligible for recall (for example, a worktree destination).
+        self.assertEqual(
+            ops_tokens.derive_ops_tokens("git worktree add ../check main"),
+            ["git", "worktree", "check"])
+        # Secret-shaped basenames remain rejected even when they came from a
+        # path, so preserving the raw shape cannot widen the leak surface.
+        self.assertEqual(
+            ops_tokens.derive_ops_tokens("git worktree add ../sk-secret main"),
+            ["git", "worktree"])
+
     def test_operators_and_garbage_yield_nothing(self):
         # FTS syntax characters, NEAR/AND operators, parens, quotes: none can
         # survive the allowlist.
@@ -330,6 +342,26 @@ class RingTest(unittest.TestCase):
                                  ops_tokens._RING_TRIM_TO_LINES + 1)
             self.assertIn("git stash pop", lines[-1])
         finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ring_exact_boundary_trims_before_append(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-ring-boundary-")
+        previous = ops_tokens._RING_MAX_BYTES
+        try:
+            ring = Path(ops_tokens._ring_path(tmp, "boundary"))
+            ring.parent.mkdir(parents=True)
+            lines = [json.dumps({"ops": f"git push event-{i}"}) + "\n"
+                     for i in range(65)]
+            raw = "".join(lines)
+            ops_tokens._RING_MAX_BYTES = len(raw)
+            ring.write_text(raw, encoding="utf-8")
+            self.assertTrue(ops_tokens.append_ops_ring(
+                tmp, "boundary", "Bash", "git stash pop"))
+            rewritten = ring.read_text(encoding="utf-8")
+            self.assertNotIn("event-0", rewritten)
+            self.assertIn("git stash pop", rewritten.splitlines()[-1])
+        finally:
+            ops_tokens._RING_MAX_BYTES = previous
             shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -548,7 +580,7 @@ class HermesConventionRingTest(unittest.TestCase):
 
 
 class HookBodyComposeTest(unittest.TestCase):
-    """The UserPromptSubmit adapter never reads or composes the ops ring."""
+    """The UserPromptSubmit adapter composes the ops ring without logging ops."""
 
     LESSON = ("ringcanary hazard: a later blind git stash pop can apply a "
               "foreign pre-existing stash; verify git stash list before any "
@@ -566,7 +598,7 @@ class HookBodyComposeTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stdout)
         return r.stdout
 
-    def test_user_prompt_does_not_compose_ring_or_log_ops(self):
+    def test_user_prompt_composes_ring_without_logging_ops(self):
         tmp = tempfile.mkdtemp(prefix="zmem-ops-e2e-")
         try:
             env = _clean_env(tmp)
@@ -585,17 +617,17 @@ class HookBodyComposeTest(unittest.TestCase):
             ctx = json.loads(out.strip()).get("additionalContext", "")
             self.assertEqual(ctx, "")
 
-            # The same prose WITH a ring remains silent: only store-side
-            # moment=pretool selection may compose the ring.
+            # A user prompt with a session ring now uses the approved
+            # ambiguity rewrite boundary; it may compose matching memories,
+            # but the adapter still does not report a hook-owned ops count.
             out = self._run_body(tmp, "keep finalizing this work", "sess-e2e")
             ctx = json.loads(out.strip()).get("additionalContext", "")
-            self.assertEqual(ctx, "")
+            self.assertIn("ringcanary", ctx)
             line = [l for l in log.read_text(encoding="utf-8").splitlines()
                     if "zmem-hook" in l][-1]
             self.assertNotRegex(line, r"(?:^|\s)ops=\d+")
 
-            # The query-context kill switch cannot make a user-prompt adapter
-            # consult the ring either.
+            # The exact query-context kill switch bypasses user-prompt rewrite.
             out = self._run_body(tmp, "keep finalizing this work", "sess-e2e",
                                  ZMEM_QUERY_CONTEXT="0")
             ctx = json.loads(out.strip()).get("additionalContext", "")
@@ -623,8 +655,8 @@ class HookBodyComposeTest(unittest.TestCase):
 class DataDirPrecedenceTest(unittest.TestCase):
     """Convention-capture writers resolve one consistent ring data directory.
 
-    Passive user-prompt adapters deliberately ignore that ring; pretool
-    composition is store-owned and is covered by the passive-injection tests.
+    User-prompt adapters use the same store-owned rewrite boundary as passive
+    injection; these cases pin the writer/reader data-directory agreement.
     """
 
     def _plugin_data_env(self, tmp: str) -> dict:
@@ -700,10 +732,9 @@ class DataDirPrecedenceTest(unittest.TestCase):
                 (Path(env["HOME"]) / ".zmem" / "ops").exists(),
                 "writer must not fall through to the home fallback")
             ctx = self._run_reader(env, "project:prec-plug", "sess-q")
-            self.assertNotIn("ringcanary", ctx,
-                             "user-prompt adapter must not read the ring")
+            self.assertIn("ringcanary", ctx)
             line = self._last_hook_line(plugdata)
-            self.assertIn("status=silent", line)
+            self.assertIn("status=injected", line)
             # The writer's descriptor remains allowlisted and persisted, while
             # the passive adapter does not expose a hook-owned ops count.
             self.assertNotRegex(line, r"(?:^|\s)ops=\d+")
@@ -730,10 +761,9 @@ class DataDirPrecedenceTest(unittest.TestCase):
                 "writer must prefer CLAUDE_PLUGIN_DATA")
             self.assertFalse((zcode_loc / "ops").exists())
             ctx = self._run_reader(env, "project:prec-order", "sess-o")
-            self.assertNotIn("ringcanary", ctx,
-                             "user-prompt adapter must not read the ring")
+            self.assertIn("ringcanary", ctx)
             line = self._last_hook_line(claude_loc)
-            self.assertIn("status=silent", line)
+            self.assertIn("status=injected", line)
             self.assertNotRegex(line, r"(?:^|\s)ops=\d+")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -760,8 +790,7 @@ class DataDirPrecedenceTest(unittest.TestCase):
                 "writer must prefer ZMEM_DATA over plugin-data")
             self.assertFalse((zcode_loc / "ops").exists())
             ctx = self._run_reader(env, "project:prec-zdata", "sess-z")
-            self.assertNotIn("ringcanary", ctx,
-                             "user-prompt adapter must not read the ring")
+            self.assertIn("ringcanary", ctx)
             self._last_hook_line(data_loc)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -788,10 +817,9 @@ class DataDirPrecedenceTest(unittest.TestCase):
                              "in the process cwd")
             ctx = self._run_reader(env, "project:prec-tilde", "sess-t",
                                    cwd=tmp)
-            self.assertNotIn("ringcanary", ctx,
-                             "user-prompt adapter must not read the ring")
+            self.assertIn("ringcanary", ctx)
             line = self._last_hook_line(pd_dir)
-            self.assertIn("status=silent", line)
+            self.assertIn("status=injected", line)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -815,8 +843,7 @@ class DataDirPrecedenceTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "~").exists())
             ctx = self._run_reader(env, "project:prec-tilde-zd", "sess-zd",
                                    cwd=tmp)
-            self.assertNotIn("ringcanary", ctx,
-                             "user-prompt adapter must not read the ring")
+            self.assertIn("ringcanary", ctx)
             self._last_hook_line(zd_dir)
 
             # Session-start's inline Tier-2 block must expand too: the outer
@@ -865,8 +892,7 @@ class DataDirPrecedenceTest(unittest.TestCase):
                 "writer must expand a tilde-valued ZMEM_STORE")
             ctx = self._run_reader(env, "project:prec-tilde-zs", "sess-zs",
                                    cwd=tmp)
-            self.assertNotIn("ringcanary", ctx,
-                             "user-prompt adapter must not read the ring")
+            self.assertIn("ringcanary", ctx)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1018,7 +1044,8 @@ class DataDirPrecedenceTest(unittest.TestCase):
                 Path(ops_tokens._ring_path(str(store_dir), "sess-p")).is_file(),
                 "writer must resolve ZMEM_STORE-first")
             self.assertFalse((data_dir / "ops").exists())
-            # The user-prompt adapter deliberately does not read the ring.
+            # The user-prompt rewrite reads the same ring location as the
+            # convention writer.
             r = subprocess.run(
                 [sys.executable, str(BODY), str(SCRIPTS / "store.py"),
                  "project:prec", "25000", "user_prompt"],
@@ -1027,14 +1054,13 @@ class DataDirPrecedenceTest(unittest.TestCase):
                 capture_output=True, text=True, env=env, timeout=120)
             self.assertEqual(r.returncode, 0, r.stderr)
             ctx = json.loads(r.stdout.strip()).get("additionalContext", "")
-            self.assertNotIn("ringcanary", ctx,
-                             "user-prompt adapter must not read the ring")
+            self.assertIn("ringcanary", ctx)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
 class HermesPrefetchComposeTest(unittest.TestCase):
-    def test_prefetch_does_not_compose_ring(self):
+    def test_prefetch_composes_ring_for_session(self):
         tmp = tempfile.mkdtemp(prefix="zmem-ops-prefetch-")
         saved = {k: os.environ.get(k) for k in _STRIP_ENV}
         try:
@@ -1073,7 +1099,7 @@ class HermesPrefetchComposeTest(unittest.TestCase):
             provider._namespace = "project:prefetch-compose"
             out = provider.prefetch("keep finalizing this work",
                                     session_id="sess-pf")
-            self.assertNotIn("prefetchcanary", out)
+            self.assertIn("prefetchcanary", out)
             out_nosid = provider.prefetch("keep finalizing this work")
             self.assertNotIn("prefetchcanary", out_nosid)
 

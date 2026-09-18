@@ -143,6 +143,9 @@ _BG_LINE_RE = re.compile(
     # store_timeout=1) must stay parseable — a writer-only field would
     # silently drop every timeout decision from the miss-rate join.
     r"(?: store_timeout=(\S+))?"
+    # Issue #183: canonical query rewrites append only rewrite=1; omission
+    # remains the closed false representation and preserves every old shape.
+    r"(?: rewrite=(\S+))?"
     r"\s*$"
 )
 
@@ -192,14 +195,16 @@ def parse_bg_log(path) -> list:
     (``# zmem-seq=...``) and maintenance output (``[zmem] backup: ...``)
     never match the line regex and are skipped.
 
-    Returns ``[{ts, status, reason, omitted, ids, all, ops, sid, moment,
-    arms}]``
-    where ``reason``/``ops``/``sid``/``moment``/``arms``/``margin`` are None
-    when the line lacks them (writer B omits ``reason=``; pre-#94 lines lack
+    Returns rows with the historical fields ``ts, status, reason, omitted,
+    ids, all, ops, sid, moment, arms``; rows carrying the canonical rewrite
+    tail additionally contain ``rewrite=True``, while
+    ``reason``/``ops``/``sid``/``moment``/``arms``/``margin`` are None when
+    the line lacks them (writer B omits ``reason=``; pre-#94 lines lack
     ``sid=``; pre-#129 lines lack ``moment=``; pre-#136 lines lack ``arms=``;
     pre-#182 lines lack ``margin=``). ``margin_pruned`` is None when its
     bracketed tail is absent, otherwise a list of memory id strings. The
-    ``ids``/``all`` fields are also lists of memory id strings. Torn lines are
+    ``ids``/``all`` fields are also lists of memory id strings. ``rewrite`` is
+    true only for the canonical ``rewrite=1`` tail. Torn lines are
     skipped — the log is appended concurrently, so a torn final line is
     normal. Never raises.
     """
@@ -232,7 +237,8 @@ def parse_bg_log(path) -> list:
                 continue
             (ts, status, reason, omitted, ids_raw, all_raw, _tok, ops,
              exc, sid, moment, lane, version, t_ms_raw, arms, _batch,
-             _tools, _paths, margin, margin_pruned_raw, _store_timeout) = m.groups()
+             _tools, _paths, margin, margin_pruned_raw, _store_timeout,
+             rewrite_raw) = m.groups()
             try:
                 ts = int(ts)
             except ValueError:
@@ -265,6 +271,9 @@ def parse_bg_log(path) -> list:
                 # shape explicit for callers and future regex edits.
                 lane = version = None
                 t_ms = None
+            if rewrite_raw is not None and rewrite_raw != "1":
+                continue
+            rewrite = rewrite_raw == "1"
             # Issue #116 (AC3): keep the tokens=a/b field as numbers so the
             # report can count over-budget decisions. Non-numeric shapes
             # (legacy "-", garbage) stay None and never count.
@@ -274,7 +283,7 @@ def parse_bg_log(path) -> list:
                 if used_s.isdigit() and budget_s.isdigit():
                     tok_used = int(used_s)
                     tok_budget = int(budget_s)
-            out.append({
+            parsed_row = {
                 "ts": ts,
                 "status": status,
                 "reason": reason,
@@ -303,7 +312,10 @@ def parse_bg_log(path) -> list:
                 "margin": margin,
                 "margin_pruned": (_parse_id_list(margin_pruned_raw)
                                    if margin_pruned_raw else None),
-            })
+            }
+            if rewrite:
+                parsed_row["rewrite"] = True
+            out.append(parsed_row)
     return out
 
 
@@ -838,7 +850,8 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
                     bg_log_path=None, data_dir=None,
                     window_before_s=1800, window_after_s=300,
                     limit=200, verbose=False,
-                    min_token_overlap=2) -> dict:
+                    min_token_overlap=2, decision_lines=None,
+                    failure_rows_override=None) -> dict:
     """Join mined failures × store recall × decision-log injections
     (read-only), plus the false-injection counter (issue #129).
 
@@ -850,7 +863,11 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     missed id. ``min_token_overlap`` is the false-injection reference
     threshold (distinct ops tokens shared between an injected row and a
     later same-session reference event); the value used is echoed in
-    ``report["false_injection"]["min_token_overlap"]``.
+    ``report["false_injection"]["min_token_overlap"]``. ``decision_lines``
+    and ``failure_rows_override`` are optional replay seams: callers that
+    have already validated and scope-filtered those inputs can provide them
+    without changing the historical parser/database discovery path when
+    omitted.
     """
     try:
         store = Path(store_path).expanduser()
@@ -917,7 +934,11 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
             bg_log_path = legacy_path
         else:
             bg_log_path = decisions_path
-    lines = parse_bg_log(bg_log_path)
+    # Replay evaluators may provide an already validated, bucket-scoped list
+    # from a private staged input.  The default path remains byte-for-byte
+    # compatible: it still parses the active log (and its rotations) here.
+    lines = (list(decision_lines) if decision_lines is not None
+             else parse_bg_log(bg_log_path))
     # An injection line is EITHER writer A's explicit reason=injected OR
     # writer B's legacy shape (status=injected with no reason field — the
     # session-start writer's pre-#114 form; it now emits reason= too, but
@@ -982,7 +1003,9 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     unmatched_globs = []
     transcript_files = []
     db_error = None
-    if db_path:
+    if failure_rows_override is not None:
+        failures.extend(failure_rows_override)
+    elif db_path:
         try:
             failures.extend(failures_from_db_rich(db_path, limit=limit))
         except Exception as exc:
@@ -995,7 +1018,13 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
             unmatched_globs.append(str(pattern))
         for path in matches:
             transcript_files.append(path)
-            failures.extend(failures_from_transcript_rich(path))
+            # A replay caller may have supplied an already staged and
+            # window/session-filtered failure list.  Keep the transcript path
+            # for the false-injection reference reader, but do not mine its
+            # failures a second time.  The historical default still mines
+            # every explicit transcript exactly as before.
+            if failure_rows_override is None:
+                failures.extend(failures_from_transcript_rich(path))
     # Fair merge before the limit truncates (broad-review M4): db-first
     # concatenation would starve every transcript failure whenever the db
     # alone fills the limit. Sort ALL failures newest-first (timestamp-less

@@ -10,6 +10,21 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.45.0] - 2026-09-18
+
+### Added
+- **Deterministic passive query context (issue #183)**: ambiguous
+  `user_prompt` queries use bounded operation/edit context with exact-token
+  namespace bypass, fail-open behavior, and a whitespace-tolerant
+  `ZMEM_QUERY_CONTEXT=0` kill switch.
+- **Bounded evidence and replay hardening**: retention holds the writer lease,
+  evidence input and replay files are bounded, nested host failures are
+  classified, and detached writers use stable identities and admission caps.
+
+### Changed
+- **Release and CI surfaces**: all host manifests target 0.45.0; cross-project
+  query forwarding from 0.44.0 remains preserved.
+
 ## [0.44.0] - 2026-09-16
 
 ### Added
@@ -87,6 +102,29 @@ README.
 - The #155 real-corpus replay baseline remains future work: this lane ships
   conservatively (pretool-only by default, cap 2, four grounded signals) and
   #155's measurement supersedes the initial calibration when it lands.
+
+## [0.43.0] - 2026-09-17
+
+### Added
+- **Bounded evidence storage and transport (issues #169/#170)**: schema v14
+  adds the evidence side tables, redaction/hash validation, native Hermes
+  `post_tool_call` observation, strict evidence-aware JSONL transport, and
+  bounded retention. The implemented callback is evidence-only; this release
+  does not claim the broader #163 pre-LLM/pre-verify transport.
+- **Deterministic passive query context (issue #183)**: ambiguous
+  `user_prompt` queries can use bounded operation/edit context with exact-token
+  bypass, fail-open behavior, and the exact `ZMEM_QUERY_CONTEXT=0` kill switch.
+  Explicit search and other passive moments remain unchanged.
+- **Read-only replay audit (issue #155)**: the committed evaluator covers the
+  exact two lanes crossed with four report moments, bounded explicit transcript
+  inputs, fixed-log scoring time, digest checks, and baseline ratchets. Empty
+  observation denominators are reported as unavailable zero compatibility
+  values, not as live efficacy measurements.
+
+### Changed
+- **Release and CI surfaces**: all host manifests target 0.43.0, and both
+  matrix platform jobs run the canonical replay command against the committed
+  fixture and baseline.
 
 ## [0.42.0] - 2026-09-15
 

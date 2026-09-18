@@ -1,8 +1,8 @@
 """Episode storage tests (issue #65, 10.7).
 
 Covers:
-- Fresh-store creation at v13 with both tables
-- v12 → v13 migration from a HAND-PLANTED legacy store (lossless, idempotent)
+- Fresh-store creation at v14 with both episode tables
+- v12 → v14 migration from a HAND-PLANTED legacy store (lossless, idempotent)
 - episode-open / episode-add / episode-close --summary / episode-list flows
 - Refusals: tombstoned member, closed episode re-close, unknown ids
 - `episode` is NOT an ALLOWED_TYPES member
@@ -86,16 +86,21 @@ class EpisodeIsolationTest(unittest.TestCase):
 
     # -- schema ---------------------------------------------------------------
 
-    def test_fresh_store_is_v13_with_episode_tables(self):
+    def test_fresh_store_is_v14_with_episode_tables(self):
         self._init()
         self.assertEqual(self._schema_version(), str(SUPPORTED_SCHEMA_VERSION))
-        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 13)
+        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 14)
         conn = sqlite3.connect(self.store)
         try:
             names = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertIn("episode", names)
             self.assertIn("episode_memory", names)
+            # Evidence is part of the same v14 fresh-store contract; checking
+            # only episode tables would let a partial migration appear healthy.
+            self.assertIn("evidence", names)
+            self.assertIn("episode_evidence", names)
+            self.assertIn("memory_evidence", names)
             cols = {r[1] for r in conn.execute("PRAGMA table_info(episode)")}
             self.assertEqual(
                 cols, {"id", "namespace", "started_at", "ended_at",
@@ -103,9 +108,9 @@ class EpisodeIsolationTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_v12_to_v13_migration_lossless_and_idempotent(self):
+    def test_v12_to_v14_migration_lossless_and_idempotent(self):
         # Build a faithful v12 store: initialize with current code (the full
-        # real schema), then REMOVE the v13 artifacts and pin the version back
+        # real schema), then REMOVE the episode artifacts and pin the version back
         # — exactly what a pre-upgrade operator store looks like.
         self._init()
         m = self._add("legacy v12 row. one sentence.")
@@ -115,16 +120,19 @@ class EpisodeIsolationTest(unittest.TestCase):
             DROP TABLE IF EXISTS episode_memory;
             DROP TABLE IF EXISTS episode;
             DROP INDEX IF EXISTS idx_episode_ns;
+            DROP TABLE IF EXISTS memory_evidence;
+            DROP TABLE IF EXISTS episode_evidence;
+            DROP TABLE IF EXISTS evidence;
             UPDATE meta SET value='12' WHERE key='schema_version';
             """
         )
         conn.commit()
         conn.close()
-        # First writable command migrates (additive: two CREATE TABLE IF NOT
-        # EXIST + one index; no memory column changes, no data rewrite).
+        # First writable command migrates through v13 and v14 (additive episode
+        # and evidence DDL; no memory data rewrite).
         r = _run(["stats"])
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self._schema_version(), "13")
+        self.assertEqual(self._schema_version(), "14")
         conn = sqlite3.connect(self.store)
         try:
             row = conn.execute(
@@ -134,12 +142,15 @@ class EpisodeIsolationTest(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertIn("episode", names)
             self.assertIn("episode_memory", names)
+            self.assertIn("evidence", names)
+            self.assertIn("episode_evidence", names)
+            self.assertIn("memory_evidence", names)
         finally:
             conn.close()
         # Idempotent re-run: same version, no error.
         r = _run(["stats"])
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self._schema_version(), "13")
+        self.assertEqual(self._schema_version(), "14")
 
     def test_episode_add_cross_namespace_warns_but_attaches(self):
         # A-02 (review round 2): cross-namespace attach is allowed but

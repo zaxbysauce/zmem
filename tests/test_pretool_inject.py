@@ -39,6 +39,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
+STORE_PY = SCRIPTS / "store.py"
 BODY = REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py"
 REFLECT = REPO_ROOT / "hermes-plugin" / "hooks" / "zmem-hermes-reflect.py"
 
@@ -351,8 +352,8 @@ class SubagentModeTest(unittest.TestCase):
 
 
 class HermesReflectDeliveryTest(unittest.TestCase):
-    def _run_reflect(self, tmp: str) -> str:
-        env = _clean_env(tmp, ZMEM_HOME=str(REPO_ROOT))
+    def _run_reflect(self, tmp: str, **extra: str) -> str:
+        env = _clean_env(tmp, ZMEM_HOME=str(REPO_ROOT), **extra)
         r = subprocess.run(
             [sys.executable, str(REFLECT)],
             input=json.dumps({"session_id": "s-reflect"}),
@@ -367,6 +368,16 @@ class HermesReflectDeliveryTest(unittest.TestCase):
             return Path(ops._ring_path(tmp, sid))
         finally:
             sys.path.pop(0)
+
+    def _query_rewrite(self, tmp: str, **extra: str) -> dict:
+        env = _clean_env(tmp, ZMEM_HOME=str(REPO_ROOT), **extra)
+        r = subprocess.run(
+            [sys.executable, str(STORE_PY), "query-rewrite", "--prompt", "",
+             "--session-id", "s-reflect", "--namespace", "user:global", "--json"],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
 
     def test_fresh_ring_delivers_once_then_silent(self):
         # Issue #122: the hook delivers through the selector, whose session
@@ -383,6 +394,12 @@ class HermesReflectDeliveryTest(unittest.TestCase):
                 json.dumps({"ts": 200, "tool": "Bash",
                             "ops": "git stash pop"}) + "\n",
                 encoding="utf-8")
+            # The enabled blank prompt is intentionally rewritten from the
+            # bounded ring context before the compatibility selector runs.
+            self.assertEqual(
+                self._query_rewrite(tmp),
+                {"query": "git stash pop", "rewrite": 1},
+            )
             first = self._run_reflect(tmp)
             self.assertIn("pretoolcanary", first)
             self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", first)
@@ -398,12 +415,38 @@ class HermesReflectDeliveryTest(unittest.TestCase):
                              "a ledger-delivered row must not re-deliver")
             # ...but a NEW row reaches the fence.
             _seed(_clean_env(tmp), "user:global",
-                  "pushcanary: force-push rebase recovery note for origin")
+                  "pushcanary: force-push stash recovery note for origin")
             with open(ring, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"ts": 400, "tool": "Bash",
                                     "ops": "git push origin"}) + "\n")
             fourth = self._run_reflect(tmp)
             self.assertIn("pushcanary", fourth)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_query_context_zero_preserves_recent_path(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-reflect-ks-context-")
+        try:
+            _seed(_clean_env(tmp), "user:global", LESSON)
+            ring = self._hashed_ring(tmp, "s-reflect")
+            ring.parent.mkdir(parents=True)
+            ring.write_text(
+                json.dumps({"ts": 200, "tool": "Bash",
+                            "ops": "git stash pop"}) + "\n",
+                encoding="utf-8")
+            self.assertEqual(
+                self._query_rewrite(tmp, ZMEM_QUERY_CONTEXT="0"),
+                {"query": "", "rewrite": 0},
+            )
+            output = self._run_reflect(tmp, ZMEM_QUERY_CONTEXT="0")
+            self.assertIn("pretoolcanary", output)
+            self.assertEqual(self._run_reflect(tmp, ZMEM_QUERY_CONTEXT="0"), "{}")
+            _seed(_clean_env(tmp), "user:global",
+                  "context-zero-fresh-recent-only: unrelated recovery note")
+            self.assertIn(
+                "context-zero-fresh-recent-only",
+                self._run_reflect(tmp, ZMEM_QUERY_CONTEXT="0"),
+            )
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -466,7 +509,7 @@ class HermesReflectDeliveryTest(unittest.TestCase):
             self.assertEqual(third, "{}",
                              "the delivered row must not re-deliver")
             _seed(_clean_env(tmp), "user:global",
-                  "same-second-new-row: stash recovery note for the reflog")
+                  "same-second-new-row: stash pop recovery note for the reflog")
             fourth = self._run_reflect(tmp)
             self.assertIn("same-second-new-row", fourth,
                           "a fresh row must deliver on cursor growth")
@@ -499,13 +542,14 @@ class RegistrationAndContractTest(unittest.TestCase):
         # Issue #119 (2026-09-10): Claude Code gains the delegation tool
         # `Agent` in the PreToolUse matcher — the delegating call's
         # tool_input.prompt is the ONLY observable carrying the child task
-        # text (SubagentStart has none on any probed host). ZCode keeps the
-        # plain matcher: it has no SubagentStart event, so a parked task
-        # text would have no consumer (documented host gap in SKILL.md).
+        # text (SubagentStart has none on any probed host). Both host
+        # manifests include apply_patch because it is a real edit tool; Claude
+        # additionally includes its Agent/Task delegation names.
         for name, matcher in (
-            ("hooks.zcode.json", "Edit|Write|MultiEdit|NotebookEdit|Bash"),
+            ("hooks.zcode.json",
+             "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch"),
             ("hooks.claude.json",
-             "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task"),
+             "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch|Agent|Task"),
         ):
             cfg = json.loads(
                 (REPO_ROOT / "hooks" / name).read_text(encoding="utf-8"))

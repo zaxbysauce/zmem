@@ -98,6 +98,13 @@ def _clean_token(tok: str) -> str:
     tok = tok.strip().strip("\"'`;,(){}[]<>|&$").lower()
     if not tok:
         return ""
+    # Keep file-shaped context useful without persisting absolute or nested
+    # paths from host commands.  The basename is sufficient for recall and
+    # prevents usernames/project roots leaking into the ops ring.
+    if ("/" in tok or "\\" in tok) and not tok.startswith(("origin/", "refs/")):
+        tok = tok.replace("\\", "/").rsplit("/", 1)[-1]
+        if not tok:
+            return ""
     if not _TOKEN_RE.match(tok):
         return ""
     return tok
@@ -146,13 +153,21 @@ def derive_ops_tokens(*events: str) -> List[str]:
             # land on disk or in a query.
             _push(head)
             for i, w in enumerate(words[1:5]):
+                # Preserve the shape of the raw argv token before
+                # ``_clean_token`` strips a path to its basename.  A path
+                # such as ``../check`` is structural context even though the
+                # sanitized token is only ``check``; dropping that distinction
+                # loses useful worktree/checkout recall.  Keep the secret
+                # check below after sanitization so a path-shaped credential
+                # is still rejected.
+                raw_structural = any(c in w for c in "./_-\\")
                 t = _clean_token(w)
                 if not t or t.startswith("-"):
                     continue
                 if _SECRET_SHAPE_RE.match(t):
                     continue
                 if i == 0 or t in _HAZARDOUS_SUBS or any(
-                        c in t for c in "./_-"):
+                        c in t for c in "./_-") or raw_structural:
                     _push(t)
         else:
             # Non-runner event: file paths / test names — keep the basename
@@ -369,21 +384,43 @@ def clear_retry_state(data_dir: str, session_id: str) -> None:
         pass
 
 
-def read_ops_ring(data_dir: str, session_id: str, max_events: int = 8) -> List[str]:
+def read_ops_ring(
+    data_dir: str, session_id: str, max_events: int = 8, *,
+    strict_errors: bool = False,
+) -> List[str]:
     """Read the newest ``max_events`` operation descriptors from the
     per-session ring at ``<data_dir>/ops/<session>.log``.
 
-    Fail-open: missing dir/file, torn lines (concurrent append), or any IO
-    error degrade to []. Returns oldest-first within the returned window so
-    callers (and tests) see the same order the events happened in.
+    Fail-open legacy behavior remains the default: missing dir/file, torn lines
+    (concurrent append), or any IO error degrade to [].  Query-rewrite opts into
+    ``strict_errors`` so a permission/IO failure cannot be mistaken for a
+    normal empty ring; a missing ring is still normal in strict mode. Returns
+    oldest-first within the returned window so callers see the same order the
+    events happened in.
     """
     if not data_dir or not session_id:
         return []
     path = _ring_path(data_dir, session_id)
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        # The writer trims to _RING_MAX_BYTES, but a concurrent append or a
+        # hand-created legacy sidecar must not turn a passive read into an
+        # unbounded allocation.  Read a bounded tail and discard its first
+        # partial physical line; malformed/torn entries already fail open
+        # below.
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - _RING_MAX_BYTES))
+            raw = f.read(_RING_MAX_BYTES)
+        text = raw.decode("utf-8", "replace")
+        if size > _RING_MAX_BYTES:
+            text = text.split("\n", 1)[1] if "\n" in text else ""
+        lines = text.splitlines()
+    except FileNotFoundError:
+        return []
     except OSError:
+        if strict_errors:
+            raise
         return []
     events: List[str] = []
     for line in lines:
@@ -434,7 +471,10 @@ def append_ops_ring(data_dir: str, session_id: str, tool: str, op: str) -> bool:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
-            if os.path.getsize(path) > _RING_MAX_BYTES:
+            # Trim at the exact boundary too: appending one more event to a
+            # file already at the cap must not leave an over-cap ring until a
+            # later, unrelated append happens.
+            if os.path.getsize(path) >= _RING_MAX_BYTES:
                 # Issue #122: rotate atomically — the retained tail is
                 # written to a same-directory temp file (flush + fsync) and
                 # renamed over the live ring, so an interrupted trim can

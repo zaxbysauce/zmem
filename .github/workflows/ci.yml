@@ -169,6 +169,31 @@ jobs:
           path: .eval-tmp/eval-results.json
           if-no-files-found: warn
 
+      # Issue #155/#183: replay the committed, read-only decision snapshot on
+      # every platform leg.  This is a measurement/audit gate, not a live
+      # efficacy claim; empty observation denominators remain explicit zero
+      # compatibility values in the report.
+      - name: Run deterministic replay audit
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          mkdir -p .eval-tmp
+          python scripts/eval_replay.py \
+            --store tests/fixtures/replay/store.sqlite \
+            --log tests/fixtures/replay/decisions.log \
+            --days 30 \
+            --compare-baseline eval/baseline-replay.json \
+            --json-out .eval-tmp/replay-results.json
+
+      - name: Upload replay report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-results-${{ matrix.os }}
+          path: .eval-tmp/replay-results.json
+          if-no-files-found: warn
+
       # Issue #111: the injection-direction precision gold — the REAL
       # for-injection lane (gate + token budget) scored on the rendered set,
       # with negative controls. Record-only, same as the eval above: the

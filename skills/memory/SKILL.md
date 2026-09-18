@@ -58,13 +58,13 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v13
+- schema compatibility against current v14
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity`); inspect deeper with `store.py entity-list`
 - v11 link surface present (`memory_link` table + `memory.trust_score` in
   range [0,1]); inspect deeper with `store.py links --id <uuid>`
-- v13 episode storage present with counts (`episode-tables` check) and the
+- v13 episode storage present with counts (`episode-tables` check), and the
   MCP token scope advisory (`mcp-token` check: warns `unscoped_token: true`
   on full-access operator tokens, never reports the token value)
 - Claude/Codex native-memory conflicts via read-only config inspection
@@ -1218,11 +1218,11 @@ pre-compaction). Refuses (exit 2) if the gate or budget is stubbed out.
 log) without code changes. Record-only by default; the ratchet flags are
 the one-switch CI gate.
 
-The score-margin replay/baseline gate belongs to the future #155 workstream.
-That workstream owns `scripts/eval_replay.py` and
-`eval/baseline-replay.json`; they are not available in this release and remain
-unchanged here. Its publication contract requires the exact
-`--fail-under miss_delta=0` flag when those artifacts are introduced.
+The score-margin replay/baseline evaluator is available for the #155/#183
+read-only audit. CI runs the committed `scripts/eval_replay.py` snapshot with
+`eval/baseline-replay.json` on both platform legs. The evaluator is
+record-only unless an explicit `--fail-under` ratchet is supplied; it never
+resolves the operator store or claims live-host efficacy.
 Runs every gold item through the REAL recall pipeline and prints one JSON
 report: `hit_at_k`, `mrr`, `as_of_accuracy`, `injection_omit_rate` (+ per-bucket
 and per-item detail). `--store` is REQUIRED — the runner never resolves the
@@ -1671,6 +1671,100 @@ Every ingested row ALSO runs the deterministic entity extractor (the same
 one `add` uses), so entity identity is rebuilt locally instead of carried
 (v10, issue #60): two stores ingesting the same rows derive the same
 entities, keyed by normalized alias, with no cross-store id collisions.
+
+### Evidence (schema v14, issues #169/#170)
+
+Evidence is bounded observation data, not instructions for the model. The
+additive `evidence`, `episode_evidence`, and `memory_evidence` tables use the
+closed lane/moment/kind sets and second-precision UTC timestamps.
+`evidence write` validates the payload before insert; it redacts first, caps the
+final excerpt at 400 Unicode characters, hashes `kind|ts|final_excerpt`, and
+leaves the transaction commit to its caller. The CLI writer commits its own
+one-row transaction. When the zmem provider is active, the native Hermes writer is the registered
+`post_tool_call` callback only. It sends a bounded private payload through the
+existing local store bridge and fails open on malformed input, unavailable
+host support, queue saturation, or writer failure. This is one evidence
+capability, not completion of the larger #163 pre-LLM/pre-verify transport.
+
+```text
+python <store.py> evidence write < payload.json
+python <store.py> evidence list --namespace NS [--session-id SID] [--lane LANE] [--moment MOMENT] [--json]
+python <store.py> evidence show --namespace NS --id UUID [--json]
+```
+
+The required `--namespace` argument on list/show is a compatibility/context
+marker and is ignored: evidence rows have no namespace column, so there is no
+namespace filter or authorization boundary. `evidence list` filters only by
+`--session-id`, `--lane`, and `--moment`; `evidence show` selects by `--id`.
+The session-cadence maintenance transaction runs evidence retention after its
+normal organize/backup work. `ZMEM_EVIDENCE_DAYS` defaults to 30 and removes
+rows strictly older than the supplied cadence clock minus that many days;
+`ZMEM_EVIDENCE_CAP`
+defaults to 50,000 and keeps the newest rows by stable `ts,id` order.
+Associations are deleted with their evidence and stale associations are swept.
+Invalid retention settings disable the evidence sweep rather than selecting a
+surprising limit.
+
+`export-jsonl` reads one consistent snapshot. An unscoped export includes all
+evidence rows and only associations whose parent rows are in that export. A
+namespace-scoped export includes only evidence
+reachable through the memory/episode rows selected for that namespace and
+omits unassociated evidence, since it cannot be attributed to a namespace.
+Records with the new top-level `table` discriminator use one staged read,
+duplicate-key/hash/reference validation, and one outer transaction. Use the
+explicit all-or-nothing form with bounded staging for evidence transfers:
+
+```text
+python <store.py> ingest-jsonl --in evidence.jsonl --strict
+```
+
+The automatic discriminator path also chooses strict staging when it can parse
+a table record. Legacy memory-only JSONL retains its best-effort per-row
+behavior; a wholly malformed source cannot be classified automatically.
+Strict staging parses and applies the same captured bytes, never reopens a
+mutable source between validation and mutation.
+
+#### Deterministic passive-query rewrite (issue #183)
+
+The 0.43 passive `user_prompt` path may append bounded local context before
+calling the existing selector. A prompt is ambiguous only when it has fewer
+than the positive configured minimum of case-folded content terms and no exact
+anchor. The default minimum is 4 and the positive override is
+`ZMEM_AMBIG_MIN_TERMS`. Slash/backslash/dot/underscore, namespace, flag, `Error`, and
+`Exception` tokens are exact anchors and bypass the rewrite. Context is
+deduplicated in source order from the first 12 safe operation tokens and the
+newest three safe edit basenames; it is capped at 150 context characters and
+the total query at 500 characters. Host consumers fail open silently on
+missing/invalid sessions or evidence, read/timeout failures, and malformed
+output. The standalone query-rewrite CLI preserves the original query with
+`rewrite=0` and emits one sanitized warning when its store or context is
+unavailable. `ZMEM_QUERY_CONTEXT=0` is an exact kill switch at each host/store
+boundary. Explicit search and non-`user_prompt` moments are unchanged, and
+this bounded capability is not a claim to implement all of issue #163.
+
+#### Read-only replay evaluator (issue #155/#183)
+
+Replay uses explicitly supplied offline inputs (the CI invocation uses the
+committed fixture) and is not a live efficacy test:
+
+```text
+python scripts/eval_replay.py --store tests/fixtures/replay/store.sqlite \
+  --log tests/fixtures/replay/decisions.log --days 30 \
+  --compare-baseline eval/baseline-replay.json --json-out replay-report.json
+```
+
+The closed report is exactly two lanes (`claude`, `hermes-provider`) crossed
+with `session_start`, `user_prompt`, `pretool`, and `precompact` (eight rows).
+Repeatable `--transcript PATH` inputs are explicit regular bounded JSONL files
+(at most 16 files, 4 MiB per file, 32 MiB total, and 100,000 physical lines per
+file); there is no glob, rotation, failure-database, ring, or ambient
+operator-store discovery. The evaluator derives its clock from the latest valid decision-log
+timestamp, clears ambient routing/recall `ZMEM_*` values before store imports,
+and verifies input digests before publication. If no eligible later same-session
+observation exists, observation-dependent zero fields are empty-denominator
+compatibility values and stderr says metrics are unavailable; they are not a
+measured success, failure, or efficacy claim. See
+`tests/fixtures/replay/README.md` for bounds and reproducibility details.
 
 ### entity-list — inspect entity identity (v10, issue #60)
 ```

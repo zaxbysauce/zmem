@@ -26,8 +26,10 @@ import time
 
 
 _POSTTOOLBATCH_QUERY_CAP = 500
+_USER_PROMPT_REWRITE_INPUT_CAP = 4096
 _POSTTOOLBATCH_FIELD_CAP = 150
 _POSTTOOLBATCH_SUMMARY_CAP = 12
+_HOOK_INPUT_MAX_BYTES = 256 * 1024
 
 # Issue #153: decision-line attribution is deliberately small and
 # dependency-free.  The schema module is the canonical source for the
@@ -189,7 +191,7 @@ def _log_inject_decision(
     budget_dropped_protected=None, arms=None, excluded_count=0, batch=False,
     tool_names=None, path_basenames=None, margin=None,
     margin_pruned_ids=None, store_timeout=False,
-    lane=None, version=None, t_ms=None,
+    lane=None, version=None, t_ms=None, rewrite=False,
 ) -> None:
     """Append a sanitized decision line; sid and moment are audit joins.
 
@@ -291,6 +293,8 @@ def _log_inject_decision(
                                                    if isinstance(x, str)]))
         if store_timeout:
             fields.append("store_timeout=1")
+        if rewrite is True or (type(rewrite) is int and rewrite == 1):
+            fields.append("rewrite=1")
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(" ".join(fields) + "\n")
     except Exception:
@@ -440,6 +444,52 @@ def _run_store(store_py: str, args: list[str], timeout=None):
         return None
 
 
+def _free_text_arg(option: str, value: str) -> list[str]:
+    """Keep option-looking free text attached to its option name."""
+    return [option + "=" + value] if value.startswith("-") else [option, value]
+
+
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _rewrite_query(store_py: str, namespace: str, session_id: str,
+                   query: str) -> tuple[str, bool]:
+    """Best-effort user-prompt rewrite with a dedicated one-second budget."""
+    original = query[:_POSTTOOLBATCH_QUERY_CAP]
+    if len(query) > _USER_PROMPT_REWRITE_INPUT_CAP:
+        return original, False
+    rewrite_input = query[:_USER_PROMPT_REWRITE_INPUT_CAP]
+    if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
+        return original, False
+    args = ["query-rewrite"]
+    args.extend(_free_text_arg("--prompt", rewrite_input))
+    args.extend(("--session-id", session_id, "--namespace", namespace, "--json"))
+    try:
+        result = _run_store(
+            store_py, args, timeout=min(1.0, _store_timeout_s())
+        )
+        if result is None or result.returncode != 0:
+            return original, False
+        parsed = json.loads(result.stdout, object_pairs_hook=_strict_json_object)
+        if not isinstance(parsed, dict) or set(parsed) != {"query", "rewrite"}:
+            return original, False
+        rewritten = parsed["query"]
+        flag = parsed["rewrite"]
+        if (not isinstance(rewritten, str)
+                or len(rewritten) > _POSTTOOLBATCH_QUERY_CAP
+                or type(flag) is not int or flag not in (0, 1)):
+            return original, False
+        return rewritten, flag == 1
+    except Exception:
+        return original, False
+
+
 def _query_for(mode: str, event: dict) -> str:
     if mode == "posttoolbatch":
         return build_posttoolbatch_query(event)
@@ -461,12 +511,23 @@ def _query_for(mode: str, event: dict) -> str:
         return _event_text(event, "prompt", "task", "task_text", "description")[:500]
     if mode == "precompact":
         return ""
-    return _event_text(event, "prompt", "query")[:500]
+    value = _event_text(event, "prompt", "query")
+    if mode == "user_prompt":
+        # Keep one sentinel character so _rewrite_query can fail open for an
+        # overlong prompt without passing an unbounded string to the store.
+        return value[:_USER_PROMPT_REWRITE_INPUT_CAP + 1]
+    return value[:_POSTTOOLBATCH_QUERY_CAP]
 
 
 def _emit(rendered: str) -> None:
-    print(json.dumps({"additionalContext": rendered}, ensure_ascii=False)
-          if isinstance(rendered, str) and rendered else "{}")
+    if not isinstance(rendered, str) or not rendered:
+        print("{}")
+        return
+    encoded = json.dumps({"additionalContext": rendered}, ensure_ascii=False,
+                         separators=(",", ":"))
+    # U+2028/U+2029 are valid JSON but remain line separators in some host
+    # transports; keep the output one physical line for hook runners.
+    print(encoded.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
 
 def main() -> int:
@@ -518,7 +579,13 @@ def main() -> int:
         _emit("")
         return 0
     try:
-        event = json.load(sys.stdin)
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        raw_event = stream.read(_HOOK_INPUT_MAX_BYTES + 1)
+        if isinstance(raw_event, str):
+            raw_event = raw_event.encode("utf-8")
+        if len(raw_event) > _HOOK_INPUT_MAX_BYTES:
+            raise ValueError("hook input too large")
+        event = json.loads(raw_event.decode("utf-8")) if raw_event else {}
     except Exception:
         event = {}
     if not isinstance(event, dict):
@@ -539,6 +606,11 @@ def main() -> int:
         _emit("")
         return 0
     query = _query_for(mode, event)
+    rewrite_applied = False
+    if mode == "user_prompt":
+        query, rewrite_applied = _rewrite_query(
+            store_py, namespace, session_id, query
+        )
     command = "recent" if not query else "recall"
     args = [command, "--namespace", namespace,
             "--limit", recent_limit if command == "recent" else "5",
@@ -547,7 +619,7 @@ def main() -> int:
             "--no-bump", "--for-injection", "--json",
             "--session-id", session_id, "--moment", moment, "--lane", lane]
     if command == "recall":
-        args[1:1] = ["--query", query]
+        args[1:1] = _free_text_arg("--query", query)
     # Issue #98: forward the cross-project tier flag per its surface matrix.
     # ZMEM_CROSS_PROJECT unset arms pretool only (posttoolbatch included —
     # _decision_moment maps it to pretool); "0" disables every surface (the
@@ -611,6 +683,7 @@ def main() -> int:
         store_timeout=result is None,
         lane=attribution_lane, version=attribution_version,
         t_ms=attribution_t_ms,
+        rewrite=rewrite_applied,
     )
     _emit(rendered)
     if mode == "precompact":

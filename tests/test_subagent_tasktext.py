@@ -343,13 +343,13 @@ class RegistrationNeedleTest(unittest.TestCase):
         # 0.31.0: "Task" accepted as the pre-rename delegation tool name
         # (community issue 29677, closed stale — not vendor-confirmed).
         self.assertEqual(hooks["hooks"]["PreToolUse"][0]["matcher"],
-                         "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task")
+                         "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch|Agent|Task")
 
     def test_zcode_matcher_excludes_agent(self):
         hooks = json.loads(
             (REPO_ROOT / "hooks" / "hooks.zcode.json").read_text("utf-8"))
         self.assertEqual(hooks["hooks"]["PreToolUse"][0]["matcher"],
-                         "Edit|Write|MultiEdit|NotebookEdit|Bash")
+                         "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch")
 
     def test_codex_matcher_unchanged(self):
         hooks = json.loads(

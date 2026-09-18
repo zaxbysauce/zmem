@@ -1545,6 +1545,7 @@ def _check_served_drift(repo_root: Path) -> dict:
 _HERMES_PROVIDER_HOOKS = {
     "prefetch", "queue_prefetch", "sync_turn",
     "on_session_end", "on_pre_compress", "on_memory_write",
+    "post_tool_call",
 }
 
 

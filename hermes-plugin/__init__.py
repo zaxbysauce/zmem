@@ -21,12 +21,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -61,6 +66,17 @@ _STORE_TIMEOUT_S = 20
 _PREFETCH_LIMIT = 5
 # Max chars of a query passed to store.py recall.
 _MAX_QUERY_CHARS = 500
+_QUERY_REWRITE_INPUT_MAX_CHARS = 4096
+_QUERY_REWRITE_CACHE_TTL_S = 2.0
+_QUERY_REWRITE_CACHE_MAX = 32
+_QUERY_REWRITE_CACHE: Dict[tuple[str, str, str], tuple[float, str, bool]] = {}
+_QUERY_REWRITE_CACHE_LOCK = threading.Lock()
+_NATIVE_EVIDENCE_MAX_BYTES = 64 * 1024
+_NATIVE_EVIDENCE_QUEUE_MAX = 8
+_NATIVE_EVIDENCE_WORKERS = 2
+_NATIVE_EVIDENCE_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=_NATIVE_EVIDENCE_QUEUE_MAX)
+_NATIVE_EVIDENCE_START_LOCK = threading.Lock()
+_NATIVE_EVIDENCE_STARTED = False
 
 
 def _resolve_zmem_home() -> Optional[Path]:
@@ -351,6 +367,18 @@ def _python_bin() -> str:
     return sys.executable or "python"
 
 
+def _safe_json_dumps(value: Any, *, max_bytes: Optional[int] = None) -> Optional[str]:
+    """Serialize host data without line-separator or unbounded output hazards."""
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        text = text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+        if max_bytes is not None and len(text.encode("utf-8")) > max_bytes:
+            return None
+        return text
+    except (TypeError, ValueError, RecursionError, UnicodeError):
+        return None
+
+
 def _inject_disabled() -> bool:
     """Issue #110 (P0-5): ZMEM_INJECT=0 disables every passive-injection
     surface of this provider (prefetch, the session_start tool twin, and the
@@ -396,7 +424,10 @@ def _passive_store_args(
     """Build one store-owned passive-injection subprocess invocation."""
     args = [command]
     if command == "recall":
-        args.extend(["--query", query])
+        # argparse treats a leading-dash free-text value as another option;
+        # attach only that value to preserve ordinary argv shapes.
+        args.extend(["--query=" + query] if query.startswith("-")
+                    else ["--query", query])
     args.extend([
         "--limit", str(limit),
         "--include-global", "--global-limit", str(global_limit),
@@ -407,6 +438,82 @@ def _passive_store_args(
         "--namespace", namespace,
     ])
     return args
+
+
+def _free_text_arg(option: str, value: str) -> list[str]:
+    """Encode an option-looking free-text value without changing normal argv."""
+    return [option + "=" + value] if value.startswith("-") else [option, value]
+
+
+def _decode_query_rewrite(result: Dict[str, Any], original: str) -> tuple[str, bool]:
+    """Validate the exact store-owned query-rewrite wire object."""
+    try:
+        if not isinstance(result, dict) or not result.get("ok"):
+            return original, False
+
+        def _pairs(pairs):
+            out = {}
+            for key, value in pairs:
+                if key in out:
+                    raise ValueError("duplicate key")
+                out[key] = value
+            return out
+
+        payload = json.loads((result.get("stdout") or "").strip(),
+                             object_pairs_hook=_pairs)
+        if not isinstance(payload, dict) or set(payload) != {"query", "rewrite"}:
+            return original, False
+        rewritten = payload["query"]
+        flag = payload["rewrite"]
+        if (not isinstance(rewritten, str) or len(rewritten) > _MAX_QUERY_CHARS
+                or type(flag) is not int or flag not in (0, 1)):
+            return original, False
+        return rewritten, flag == 1
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
+        return original, False
+
+
+def _rewrite_provider_query(
+    query: str, *, namespace: str, session_id: str,
+) -> tuple[str, bool]:
+    """Best-effort one-second rewrite before the provider's recall command."""
+    raw_query = query if isinstance(query, str) else ""
+    # Keep the provider's historical 500-character fallback/output boundary,
+    # but let the deterministic classifier see the complete bounded prompt.
+    # Truncating before classification could hide an exact anchor after the
+    # output cap and incorrectly trigger a rewrite.  Oversized input fails
+    # open rather than being truncated into a different classification.
+    original = raw_query.strip()[:_MAX_QUERY_CHARS]
+    if not session_id or os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
+        return original, False
+    if len(raw_query) > _QUERY_REWRITE_INPUT_MAX_CHARS:
+        return original, False
+    cache_key = (namespace, session_id, raw_query)
+    now = time.monotonic()
+    with _QUERY_REWRITE_CACHE_LOCK:
+        cached = _QUERY_REWRITE_CACHE.get(cache_key)
+        if cached and now - cached[0] < _QUERY_REWRITE_CACHE_TTL_S:
+            return cached[1], cached[2]
+        if cached:
+            _QUERY_REWRITE_CACHE.pop(cache_key, None)
+    args = ["query-rewrite"]
+    args.extend(_free_text_arg("--prompt", raw_query))
+    args.extend(("--session-id", session_id, "--namespace", namespace, "--json"))
+    try:
+        result = _run_store(args)
+        decoded = _decode_query_rewrite(result, original)
+        # Cache only an applied rewrite.  A negative result can become stale as
+        # soon as a new evidence event lands, so retaining it would suppress a
+        # later valid context expansion within the same session.
+        if decoded[1]:
+            with _QUERY_REWRITE_CACHE_LOCK:
+                _QUERY_REWRITE_CACHE[cache_key] = (now, decoded[0], decoded[1])
+                while len(_QUERY_REWRITE_CACHE) > _QUERY_REWRITE_CACHE_MAX:
+                    _QUERY_REWRITE_CACHE.pop(next(iter(_QUERY_REWRITE_CACHE)))
+        return decoded
+    except Exception as exc:  # provider adapters must remain fail-open
+        logger.debug("zmem query rewrite failed: %s", exc)
+        return original, False
 
 
 def _run_passive_store(
@@ -482,6 +589,10 @@ def _run_store(
         if timing is not None:
             timing["t_ms"] = _elapsed_ms(started)
 
+    # Context lookup is optional work on the passive path.  Keep its dedicated
+    # budget at one second while retaining the existing longer cap for all
+    # historical store commands.
+    command_timeout = min(_STORE_TIMEOUT_S, 1.0) if args and args[0] == "query-rewrite" else _STORE_TIMEOUT_S
     try:
         proc = subprocess.run(  # noqa: S603 — argv is constructed, not shell
             cmd,
@@ -490,7 +601,7 @@ def _run_store(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=_STORE_TIMEOUT_S,
+            timeout=command_timeout,
         )
         _record_timing()
         return {
@@ -504,7 +615,7 @@ def _run_store(
         return {
             "ok": False,
             "stdout": "",
-            "stderr": f"store.py timed out after {_STORE_TIMEOUT_S}s",
+            "stderr": f"store.py timed out after {command_timeout}s",
             "returncode": 124,
         }
     except Exception as exc:  # pragma: no cover — defensive
@@ -515,6 +626,356 @@ def _run_store(
             "stderr": f"store.py failed: {exc}",
             "returncode": 1,
         }
+
+
+def _native_edit_path(args: Any) -> str:
+    if isinstance(args, str):
+        return _native_patch_path(args)
+    if not isinstance(args, dict):
+        return ""
+    for key in ("path", "file_path", "notebook_path", "target_file", "filename"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("edits", "files", "changes"):
+        entries = args.get(key)
+        if isinstance(entries, list):
+            for entry in entries:
+                path = _native_edit_path(entry)
+                if path:
+                    return path
+    for key in ("patch", "patch_text", "patchText", "diff", "input", "content"):
+        path = _native_patch_path(args.get(key))
+        if path:
+            return path
+    return ""
+
+
+def _native_patch_path(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    text = value.replace("\r", "")
+    patterns = (
+        r"^\s*\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(\S.*?)\s*$",
+        r"^\s*\+\+\+\s+(?:b/)?([^\s]+)\s*$",
+        r"^\s*---\s+(?:a/)?([^\s]+)\s*$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.MULTILINE)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _native_uri_id(value: Any) -> str:
+    """Validate an identifier used in the stable Hermes evidence URI."""
+    if not isinstance(value, str):
+        return ""
+    if len(value) > 256 or any(0xD800 <= ord(char) <= 0xDFFF for char in value[:256]):
+        return ""
+    value = value.strip()
+    if not value or len(value) > 256 or any(char in value for char in ("/", "\\", "\x00")):
+        return ""
+    return value
+
+
+def _native_bounded_text(value: Any, *, limit: int) -> str:
+    """Bound scalar observer text before strip/case-fold/serialization."""
+    if not isinstance(value, str) or len(value) > limit:
+        return ""
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        return ""
+    return value.strip()
+
+
+def _native_ref_path(value: Any, *, limit: int = 4096) -> str:
+    if not isinstance(value, str):
+        return ""
+    clean = re.sub(r"[\x00-\x1f\x7f\u2028\u2029]", " ", value).strip()
+    if "://" not in clean and (clean.startswith(("/", "\\\\"))
+                              or re.match(r"^[A-Za-z]:[\\\\/]", clean)):
+        clean = clean.replace("\\", "/").rsplit("/", 1)[-1]
+    return clean[:limit]
+
+
+def _native_failure(value: Any, *, depth: int = 0, seen: Optional[set[int]] = None) -> bool:
+    if depth > 8 or value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {
+            "", "ok", "success", "succeeded", "completed", "complete"
+        }
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, list):
+        return bool(value)
+    if not isinstance(value, dict):
+        return False
+    seen = seen or set()
+    marker = id(value)
+    if marker in seen:
+        return False
+    seen.add(marker)
+    try:
+        for key in ("status", "error", "error_message", "error_type", "failure"):
+            candidate = value.get(key)
+            if key == "status":
+                if isinstance(candidate, str) and candidate.strip().lower() not in {
+                    "", "ok", "success", "succeeded", "completed", "complete"
+                }:
+                    return True
+            elif candidate not in (None, "", False, 0, [], {}):
+                if _native_failure(candidate, depth=depth + 1, seen=seen):
+                    return True
+        return any(_native_failure(value.get(key), depth=depth + 1, seen=seen)
+                   for key in ("result", "tool_result", "tool_output", "details", "cause"))
+    finally:
+        seen.remove(marker)
+
+
+def _stable_evidence_id(values: Dict[str, Any]) -> str:
+    supplied = values.get("evidence_id")
+    try:
+        if isinstance(supplied, str):
+            return str(uuid.UUID(supplied))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    task_id = _native_uri_id(values.get("task_id"))
+    call_id = _native_uri_id(values.get("tool_call_id"))
+    if task_id and call_id:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"zmem-hermes:{task_id}:{call_id}"))
+    return str(uuid.uuid4())
+
+
+def _native_utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _native_json_size(
+    value: Any, *, budget: int, depth: int = 0, seen: Optional[set[int]] = None,
+) -> Optional[int]:
+    """Bound JSON-shaped observer values before compact serialization.
+
+    Hermes supplies JSON-compatible payloads.  Rejecting other objects avoids
+    invoking arbitrary ``__str__`` implementations in the synchronous host
+    callback.  The estimate is conservative and bounded by depth/container
+    limits; it is only an admission check, never a truncation operation.
+    """
+    if budget < 0 or depth > 32:
+        return None
+    if value is None:
+        return 4
+    if isinstance(value, bool):
+        return 4 if value else 5
+    if isinstance(value, int):
+        try:
+            size = len(str(value))
+        except (ValueError, OverflowError):
+            return None
+        return size if size <= budget else None
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        size = len(repr(value))
+        return size if size <= budget else None
+    if isinstance(value, str):
+        # Refuse huge strings before any UTF-8 allocation or escaping pass.
+        if len(value) > budget:
+            return None
+        size = 2
+        for char in value:
+            codepoint = ord(char)
+            if 0xD800 <= codepoint <= 0xDFFF:
+                return None
+            if char in {'"', "\\"} or char in {"\b", "\f", "\n", "\r", "\t"}:
+                size += 2
+            elif codepoint < 0x20:
+                size += 6
+            else:
+                try:
+                    size += len(char.encode("utf-8"))
+                except UnicodeEncodeError:
+                    return None
+            if size > budget:
+                return None
+        return size
+    if not isinstance(value, (dict, list, tuple)):
+        return None
+    if seen is None:
+        seen = set()
+    object_id = id(value)
+    if object_id in seen:
+        return None
+    seen.add(object_id)
+    try:
+        if isinstance(value, dict):
+            if len(value) > 256:
+                return None
+            size = 2
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    return None
+                key_size = _native_json_size(key, budget=budget - size, depth=depth + 1, seen=seen)
+                item_size = _native_json_size(item, budget=budget - size, depth=depth + 1, seen=seen)
+                if key_size is None or item_size is None:
+                    return None
+                size += key_size + 1 + item_size
+                if size > budget:
+                    return None
+            return size
+        if len(value) > 256:
+            return None
+        size = 2
+        for item in value:
+            item_size = _native_json_size(item, budget=budget - size, depth=depth + 1, seen=seen)
+            if item_size is None:
+                return None
+            size += item_size + 1
+            if size > budget:
+                return None
+        return size
+    finally:
+        seen.remove(object_id)
+
+
+def _native_evidence_row(
+    values: Dict[str, Any], *, clock: Optional[Any] = None
+) -> Optional[str]:
+    """Build one bounded row from Hermes' keyword-only observer payload."""
+    tool_name = _native_bounded_text(values.get("tool_name"), limit=256)
+    session_id = _native_bounded_text(values.get("session_id"), limit=256)
+    task_id = _native_uri_id(values.get("task_id"))
+    tool_call_id = _native_uri_id(values.get("tool_call_id"))
+    if not tool_name or not session_id:
+        return None
+    # These are part of the active post_tool_call payload contract.  Presence
+    # is checked separately from truthiness so a host can explicitly report a
+    # null result while still satisfying the observer shape.
+    if not task_id or not tool_call_id or any(
+        key not in values for key in ("args", "result", "duration_ms")
+    ):
+        return None
+    args = values.get("args")
+    result = values.get("result")
+    try:
+        args_size = _native_json_size(args, budget=_NATIVE_EVIDENCE_MAX_BYTES - 2048)
+        result_size = _native_json_size(result, budget=_NATIVE_EVIDENCE_MAX_BYTES - 2048)
+        duration_size = _native_json_size(
+            values.get("duration_ms"), budget=_NATIVE_EVIDENCE_MAX_BYTES - 2048
+        )
+    except (RecursionError, TypeError, ValueError, UnicodeError):
+        return None
+    if args_size is None or result_size is None or duration_size is None or (
+        args_size + result_size + duration_size > _NATIVE_EVIDENCE_MAX_BYTES - 2048
+    ):
+        return None
+    for key, limit in (("status", 256), ("error_message", 512),
+                       ("error_type", 256)):
+        raw_text = values.get(key)
+        if isinstance(raw_text, str) and len(raw_text) > limit:
+            return None
+    status_value = _native_bounded_text(values.get("status"), limit=256)
+    status = status_value.lower()
+    raw_error = values.get("error")
+    error_message = _native_bounded_text(values.get("error_message"), limit=512)
+    error_type = _native_bounded_text(values.get("error_type"), limit=256)
+    if isinstance(raw_error, dict):
+        error_message = error_message or _native_bounded_text(raw_error.get("message"), limit=512)
+        error_type = error_type or _native_bounded_text(raw_error.get("type"), limit=256)
+    explicit_failed = status in {"error", "failed", "failure"}
+    if isinstance(result, dict):
+        result_status = result.get("status")
+        result_status_text = _native_bounded_text(result_status, limit=256)
+        if result_status_text.lower() in {"error", "failed", "failure"}:
+            explicit_failed = True
+    failed = explicit_failed or bool(error_message) or bool(error_type) or _native_failure(result)
+    ref_path = _native_ref_path(_native_edit_path(args))
+    normalized = tool_name.strip().lower().replace("-", "_").replace(" ", "_")
+    edit_names = {
+        "edit", "edit_file", "write", "write_file", "writefile", "multi_edit",
+        "multiedit", "apply_patch", "applypatch", "patch_file", "patchfile",
+        "notebookedit", "notebook_edit", "str_replace_editor", "strreplaceeditor",
+    }
+    kind = "tool_failure" if failed else ("edit" if normalized in edit_names and ref_path else "tool_call")
+    excerpt_value = {
+        "tool_name": tool_name,
+        "args": args,
+        "result": result,
+        "duration_ms": values.get("duration_ms"),
+    }
+    try:
+        excerpt = _safe_json_dumps(excerpt_value, max_bytes=_NATIVE_EVIDENCE_MAX_BYTES - 2048)
+        if excerpt is None:
+            return None
+        evidence_id = _stable_evidence_id(values)
+        row = {
+            "id": evidence_id,
+            "session_id": session_id.strip(),
+            "lane": "hermes-provider",
+            "moment": "pretool",
+            "kind": kind,
+            "ts": (clock or _native_utc_now)(),
+            "excerpt": excerpt,
+            "ref_path": ref_path if kind == "edit" else (
+                f"hermes://{quote(task_id, safe='')}/{quote(tool_call_id, safe='')}"
+            ),
+            "ref_offset": None,
+        }
+        serialized = _safe_json_dumps(row, max_bytes=_NATIVE_EVIDENCE_MAX_BYTES)
+        if serialized is None:
+            return None
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if len(serialized.encode("utf-8")) > _NATIVE_EVIDENCE_MAX_BYTES:
+        return None
+    return serialized
+
+
+def _native_evidence_worker() -> None:
+    while True:
+        serialized = _NATIVE_EVIDENCE_QUEUE.get()
+        try:
+            _run_store(["evidence", "write"], input_text=serialized)
+        except Exception:
+            pass
+        finally:
+            _NATIVE_EVIDENCE_QUEUE.task_done()
+
+
+def _ensure_native_evidence_workers() -> None:
+    global _NATIVE_EVIDENCE_STARTED
+    if _NATIVE_EVIDENCE_STARTED:
+        return
+    with _NATIVE_EVIDENCE_START_LOCK:
+        if _NATIVE_EVIDENCE_STARTED:
+            return
+        # Mark admission initialized before starting threads.  If the host
+        # refuses a later thread.start(), repeated callbacks must not keep
+        # creating more first workers; one successfully started daemon is
+        # sufficient for best-effort evidence delivery.
+        _NATIVE_EVIDENCE_STARTED = True
+        for index in range(_NATIVE_EVIDENCE_WORKERS):
+            thread = threading.Thread(
+                target=_native_evidence_worker,
+                name=f"zmem-evidence-{index}",
+                daemon=True,
+            )
+            try:
+                thread.start()
+            except Exception:
+                break
+
+
+def _enqueue_native_evidence(values: Dict[str, Any], *, clock: Optional[Any] = None) -> None:
+    serialized = _native_evidence_row(values, clock=clock)
+    if serialized is None:
+        return
+    _ensure_native_evidence_workers()
+    try:
+        _NATIVE_EVIDENCE_QUEUE.put_nowait(serialized)
+    except queue.Full:
+        # Observer admission is bounded and never delays a host callback.
+        return
 
 
 # -- tool schemas ------------------------------------------------------------
@@ -788,7 +1249,7 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
 
 def _tool_error(msg: str) -> str:
     """JSON error string for tool-call failures (mirrors tools.registry.tool_error)."""
-    return json.dumps({"error": msg})
+    return _safe_json_dumps({"error": msg}) or "{}"
 
 
 def _structured_write_response(r: Dict[str, Any], *, ok_result: str) -> str:
@@ -815,8 +1276,8 @@ def _structured_write_response(r: Dict[str, Any], *, ok_result: str) -> str:
             resp["created_new"] = parsed.get("created_new")
         if parsed.get("warnings"):
             resp["warnings"] = parsed.get("warnings")
-        return json.dumps(resp)
-    return json.dumps({"result": ok_result, "raw": stdout})
+        return _safe_json_dumps(resp) or "{}"
+    return _safe_json_dumps({"result": ok_result, "raw": stdout}) or "{}"
 
 
 # -- provider ----------------------------------------------------------------
@@ -908,9 +1369,21 @@ class ZmemMemoryProvider(MemoryProvider):
             logger.info(
                 "zmem prefetch: status=silent reason=disabled (ZMEM_INJECT=0)")
             return ""
-        q = (query or "").strip()[:_MAX_QUERY_CHARS]
-        command = "recall" if q else "recent"
+        raw_query = query if isinstance(query, str) else ""
         sid = (session_id or self._session_id or "").strip()
+        rewrite_applied = False
+        if sid:
+            q, rewrite_applied = _rewrite_provider_query(
+                raw_query, namespace=self._namespace, session_id=sid
+            )
+        else:
+            q = raw_query.strip()[:_MAX_QUERY_CHARS]
+        if rewrite_applied:
+            # The canonical decision-file writer belongs to the hook.  Native
+            # provider prefetch has no second decision producer; this diagnostic
+            # is intentionally emitted only for a real rewrite.
+            logger.info("zmem prefetch: rewrite=1")
+        command = "recall" if q else "recent"
         result = _run_passive_store(_passive_store_args(
             command,
             query=q,
@@ -932,6 +1405,19 @@ class ZmemMemoryProvider(MemoryProvider):
         return None
 
     # -- tools --------------------------------------------------------------
+
+    def post_tool_call(self, **kwargs: Any) -> Dict[str, Any]:
+        """Observe one Hermes tool call without delaying the host turn.
+
+        Hermes dispatches this observer with keyword arguments.  The callback
+        only copies bounded evidence into a daemon queue; the queue worker
+        uses the existing ``_run_store`` CLI seam and drops on overflow.
+        """
+        try:
+            _enqueue_native_evidence(dict(kwargs))
+        except Exception:
+            pass
+        return {}
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return list(_TOOL_SCHEMAS)
@@ -1512,7 +1998,7 @@ class ZmemMemoryProvider(MemoryProvider):
             return []
 
     def shutdown(self) -> None:
-        """No background threads to drain in this provider."""
+        """Daemon evidence workers are best-effort and intentionally not drained."""
         return None
 
 
@@ -1531,6 +2017,34 @@ def _clamp_limit(raw: Any, default: int = 5, hard_max: int = 50) -> int:
 
 # -- registration ------------------------------------------------------------
 
+def _active_memory_provider_name() -> str:
+    """Return Hermes' active provider name when the current SDK exposes it."""
+    try:
+        from plugins.memory import _get_active_memory_provider
+
+        active = _get_active_memory_provider()
+        if isinstance(active, str):
+            return active.strip().lower()
+        name = getattr(active, "name", "")
+        return name.strip().lower() if isinstance(name, str) else ""
+    except Exception:
+        return ""
+
+
 def register(ctx) -> None:
     """Register ZMem as a memory provider plugin."""
-    ctx.register_memory_provider(ZmemMemoryProvider())
+    provider = ZmemMemoryProvider()
+    ctx.register_memory_provider(provider)
+    # New Hermes SDKs expose the observational collector only when zmem is the
+    # active provider.  Older SDKs have no register_hook; that context remains
+    # fully usable with provider registration alone.
+    if _active_memory_provider_name() != "zmem":
+        return
+    register_hook = getattr(ctx, "register_hook", None)
+    if not callable(register_hook):
+        return
+    try:
+        register_hook("post_tool_call", provider.post_tool_call)
+    except Exception:
+        # A host-side collector is optional and must never break startup.
+        return

@@ -575,8 +575,8 @@ class ExplainSafetyTests(ExplainFixtureBase):
     def test_no_schema_bump_rode_along(self):
         sys.path.insert(0, str(SCRIPTS_DIR))
         import schema_meta  # noqa: E402
-        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 13)
-        self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 13)
+        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 14)
+        self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 14)
 
 
 if __name__ == "__main__":
