@@ -54,8 +54,7 @@ def _shell_tokens(command):
     return out
 
 
-def _command_basename(command):
-    parts = _shell_tokens(command)
+def _argv_basename(parts):
     if not parts:
         return None
     stem = parts[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
@@ -64,6 +63,18 @@ def _command_basename(command):
         nxt = parts[1].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
         return nxt
     return parts[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+
+
+def _command_tokens(command):
+    """Issue #186: exec-form entries concatenate command + args."""
+    if isinstance(command, dict):
+        tokens = _shell_tokens(str(command.get("command", "")))
+        args = command.get("args")
+        if isinstance(args, list):
+            tokens = tokens + [str(a) for a in args]
+        return tokens
+    return _shell_tokens(str(command))
 
 
 def _manifest_ids(host):
@@ -88,7 +99,7 @@ def _manifest_ids(host):
                 if isinstance(raw, list):
                     base = str(raw[0]).rsplit("/", 1)[-1] if raw else None
                 else:
-                    base = _command_basename(str(raw))
+                    base = _argv_basename(_command_tokens(command))
                 if base:
                     hid = "%s:%s" % (event, base)
                     if hid not in ids:

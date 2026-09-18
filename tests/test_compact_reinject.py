@@ -519,8 +519,12 @@ class RegistrationNeedleTest(unittest.TestCase):
         hooks = json.loads(
             (REPO_ROOT / "hooks" / "hooks.claude.json").read_text("utf-8"))
         self.assertIn("PostCompact", hooks["hooks"])
-        cmd = hooks["hooks"]["PostCompact"][0]["hooks"][0]["command"]
-        self.assertIn("postcompact", cmd)
+        # Issue #186: Claude entries are exec-form — the verb rides args[1].
+        hook = hooks["hooks"]["PostCompact"][0]["hooks"][0]
+        self.assertEqual(hook["command"], "node")
+        self.assertEqual(
+            hook["args"],
+            ["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js", "postcompact"])
 
     def test_codex_does_not_register_postcompact(self):
         hooks = json.loads(

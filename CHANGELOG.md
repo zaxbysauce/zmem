@@ -10,6 +10,25 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.46.0] - 2026-09-18
+
+### Changed
+- **Claude hooks register in exec form (issue #186, Workstream N PR 3 of 6)**:
+  every command entry in `hooks/hooks.claude.json` is now
+  `{"command":"node","args":["${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js","<verb>"]}`
+  instead of a shell command string, so the host no longer needs a shell to
+  parse quoting before Node starts. Events, matchers, and 15 s timeouts are
+  unchanged.
+- **Launcher-side shell resolution (issue #186)**: the Git Bash resolver is
+  exported as `resolveShell()` (same order: explicit `ZMEM_BASH_PATH`, then
+  known locations, then `where git`-derived roots, then `bash`) and a new pure
+  `toBashPath()` converts the wrapper path to the bash-relative
+  `hooks/<script>.sh` form; the launcher spawns bash with the converted path
+  and pins the child working directory to the plugin root (the wrappers
+  self-locate, so behavior is otherwise unchanged). Failure behavior is
+  unchanged: fail-open `{}`, pass-through exit codes, stdin replay, and
+  diagnostics on stderr only.
+
 ## [0.45.0] - 2026-09-18
 
 ### Added
