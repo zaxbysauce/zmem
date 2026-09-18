@@ -89,6 +89,65 @@ class DeriveTokensTest(unittest.TestCase):
             ops_tokens.derive_ops_tokens("git reset --soft origin/main"),
             ["git", "reset", "origin/main"])
 
+    def test_hazard_verb_override_semantics(self):
+        """Issue #98: ZMEM_CROSS_PROJECT_HAZARD_VERBS overrides the hazard
+        gate — trimmed, case-folded, deduped; unknown verbs dropped with ONE
+        warning; an override with no usable verb falls back to the default
+        set (never a silent empty gate). Pins storelib.recall module globals
+        (the one-shot warning owner) and the process env around each case."""
+        saved_env = {key: os.environ.pop(key, None)
+                     for key in ("ZMEM_CROSS_PROJECT_HAZARD_VERBS",
+                                 "ZMEM_STORE", "ZMEM_DATA")}
+        boot = None
+        try:
+            import tempfile
+            # Pin an isolated store before the first storelib import in this
+            # process (STORE_PATH freezes at import; see
+            # tests/test_zero_write_passive.py's module docstring).
+            boot = tempfile.mkdtemp(prefix="zmem-hazard-override-")
+            os.environ["ZMEM_STORE"] = os.path.join(boot, "store.sqlite")
+            os.environ["ZMEM_DATA"] = boot
+            import storelib.recall as recall_mod
+
+            default = recall_mod._DEFAULT_HAZARD_VERBS
+            cases = (
+                # (env value, expected frozenset, warning substring). The
+                # one-shot owner prints the FIRST cause: unknown verbs are
+                # named for a mixed/all-unknown list; the no-usable-verbs
+                # fallback only fires when nothing survived to dedupe.
+                (" push , PULL,push,unknownverb",
+                 frozenset({"push", "pull"}), "unknownverb"),
+                ("  , , ", default, "no usable verbs"),
+                ("zzz,yyy", default, "zzz"),
+            )
+            for raw, expected_set, warning_needle in cases:
+                with self.subTest(raw=raw):
+                    recall_mod._CROSS_POLICY_WARNED = False
+                    os.environ["ZMEM_CROSS_PROJECT_HAZARD_VERBS"] = raw
+                    import contextlib
+                    import io
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr):
+                        verbs = recall_mod.hazard_verbs()
+                    self.assertEqual(verbs, expected_set)
+                    warnings = [line for line
+                                in stderr.getvalue().splitlines()
+                                if "[zmem] warning:" in line]
+                    self.assertEqual(
+                        len(warnings), 1,
+                        f"exactly one hazard-override warning expected, "
+                        f"got {warnings!r}")
+                    self.assertIn(warning_needle, warnings[0])
+                    recall_mod._CROSS_POLICY_WARNED = False
+        finally:
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            if boot:
+                shutil.rmtree(boot, ignore_errors=True)
+
     def test_edited_path_becomes_basename(self):
         self.assertEqual(
             ops_tokens.derive_ops_tokens("src/lib/pr-workflow-gate.ts"),

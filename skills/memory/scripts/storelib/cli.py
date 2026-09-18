@@ -35,7 +35,9 @@ from storelib.promote import promote_memory
 # _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
 # this module's re-export surface for `storelib/__init__.py` and legacy
 # importers — removing it broke that chain.
-from storelib.recall import _reembed, explain_recall, get_memory, list_memory, recall_memory, recent_memory, stats
+from storelib.recall import (_reembed, cross_project_surface_enabled,
+                             explain_recall, get_memory, list_memory,
+                             recall_memory, recent_memory, stats)
 from storelib.inject import (INJECTION_LANES, INJECTION_MOMENTS,
                              _injection_data_dir, inject_recent_floor,
                              inject_token_budget,
@@ -907,6 +909,10 @@ def main():
                           type=str, default=[],
                           help="Operation token from the pretool ring "
                                "(repeatable)")
+    p_recall.add_argument("--include-cross-project",
+                          dest="include_cross_project", action="store_true",
+                          default=False,
+                          help="Include the precision-gated cross-project tier.")
 
     p_recent = _add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
@@ -958,6 +964,10 @@ def main():
                           type=str, default=[],
                           help="Operation token from the pretool ring "
                                "(repeatable)")
+    p_recent.add_argument("--include-cross-project",
+                          dest="include_cross_project", action="store_true",
+                          default=False,
+                          help="Include the precision-gated cross-project tier.")
 
     # Issue #159 (Workstream H-2): query-aware passive prefetch. One selector
     # call, one envelope; --for-injection/--no-bump/--json are accepted as
@@ -2304,7 +2314,13 @@ def main():
                               cross_rerank=rerank_flag,
                               no_unfold=args.no_unfold,
                               for_injection=args.for_injection,
-                              exclude_ids=args.exclude)
+                              exclude_ids=args.exclude,
+                              include_cross_project=cross_project_surface_enabled(
+                                  args.moment,
+                                  explicit=args.include_cross_project),
+                              _cross_moment=args.moment,
+                              _cross_ops_tokens=list(args.ops_token) or None,
+                              _cross_explicit=args.include_cross_project)
         elif args.cmd == "recent":
             if args.for_injection and args.json and args.session_id:
                 try:
@@ -2336,7 +2352,13 @@ def main():
                           no_bump=args.no_bump, include_global=args.include_global,
                           global_limit=args.global_limit, as_of=args.as_of,
                           for_injection=args.for_injection,
-                          exclude_ids=args.exclude)
+                          exclude_ids=args.exclude,
+                          include_cross_project=cross_project_surface_enabled(
+                              args.moment,
+                              explicit=args.include_cross_project),
+                          _cross_moment=args.moment,
+                          _cross_ops_tokens=list(args.ops_token) or None,
+                          _cross_explicit=args.include_cross_project)
         elif args.cmd == "prefetch":
             # Issue #159: one selector call, one envelope. Fixed limit/
             # global_limit/budget (the contract's exact dispatch values);

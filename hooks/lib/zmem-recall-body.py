@@ -607,6 +607,19 @@ def main() -> int:
             "--session-id", session_id, "--moment", moment, "--lane", lane]
     if command == "recall":
         args[1:1] = _free_text_arg("--query", query)
+    # Issue #98: forward the cross-project tier flag per its surface matrix.
+    # ZMEM_CROSS_PROJECT unset arms pretool only (posttoolbatch included —
+    # _decision_moment maps it to pretool); "0" disables every surface (the
+    # store enforces this even when the flag is present); "1" arms
+    # user_prompt as well. No ops tokens are forwarded from here on any
+    # surface: the #158 boundary keeps this adapter free of storelib imports,
+    # and the store-side selector owns all operation-token derivation — for
+    # an env-enabled user_prompt surface it derives the tokens from the
+    # prompt event itself (inject.py), so the hazard gate still arms without
+    # this file ever touching the allowlist.
+    _cross_env = os.environ.get("ZMEM_CROSS_PROJECT", "").strip()
+    if moment == "pretool" or (_cross_env == "1" and moment == "user_prompt"):
+        args.append("--include-cross-project")
     _attempt_started = time.perf_counter()
     result = _run_store(store_py, args)
     attribution_t_ms = _rounded_elapsed_ms(_attempt_started)

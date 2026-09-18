@@ -68,6 +68,27 @@ store or host config. Checks:
   MCP token scope advisory (`mcp-token` check: warns `unscoped_token: true`
   on full-access operator tokens, never reports the token value)
 - Claude/Codex native-memory conflicts via read-only config inspection
+- ZCode native memory (`zcode-native-memory` check, issue #185):
+  `~/.zcode/v2/setting.json` `memoryEnabled: true` fails cutover, explicit
+  `false` passes; unreadable/missing setting warns — never auto-edited
+- host install-skew (issue #185): `duplicate-install` (fail) when more than
+  one enabled user-scope zmem install is registered for a host;
+  `marketplace-skew` (warn) when an installed cache version differs from the
+  marketplace version its registry entry points at; `project-pin` (warn)
+  when a project-scoped zmem pin is behind the enabled user-scope install.
+  Registries are read through the #184 strict codecs; missing registries
+  skip and malformed ones warn — doctor never edits host state
+- Codex manifest hook trust (`untrusted-hook` check, issue #185): compares
+  the pre-approval events the repo manifest registers (SessionStart,
+  PreToolUse) with the events the Codex config records trusted for the repo
+  (falling back to the box-wide union when no entry names this repo — on a
+  multi-repo box another repo's approval can stand in, so treat a pass as
+  inventory, not proof). Missing registered events warn
+  `untrusted-hook <ids>`; reapproval is always manual
+- orphan-store inventory (issue #185): warns with `schema=`/`rows=` for
+  every non-canonical SQLite store on the known host paths (plugin-data env
+  dirs, `~/.zcode/memory/store.sqlite`); inspect then merge with
+  `promote-store --from <path>` — doctor never deletes or migrates
 - canonical namespace for the provided project
 - host surface presence (Claude plugin, ZCode plugin, memory skill; repo-local
   Codex adapter files are optional until that lane exists)
@@ -588,6 +609,47 @@ lessons reach project-scoped sessions. Without it, behaviour is strict-namespace
 (byte-identical to before). When you want the global tier unioned in but still
 want a per-tier budget, use `recall --namespace project:<x> --include-global`
 rather than going unscoped.
+
+#### Cross-project hazard tier (issue #98)
+
+A fourth, precision-gated tier (`--include-cross-project`, wired automatically
+on the passive injection surface) can deliver up to 2 live rows from FOREIGN
+`project:*` namespaces — a lesson another project already paid for, surfaced
+exactly when you are about to repeat its incident. Admission requires ALL of:
+
+- the running operation is hazardous: the derived ops tokens
+  (`derive_ops_tokens`, the `#88`/`#123` allowlist) whole-token-intersect the
+  hazard-verb set — `ops_tokens._HAZARDOUS_SUBS` (`git push/reset/stash pop/
+  rebase/...`) by default, overridable via `ZMEM_CROSS_PROJECT_HAZARD_VERBS`
+  (comma-separated, trimmed, case-folded, de-duplicated; unknown or empty
+  verbs are dropped with a one-shot stderr warning and an override with no
+  usable verb falls back to the default set);
+- the row's `signal` is grounded: one of `test`, `compile`, `lint`,
+  `reviewer`;
+- the row passes the standard score/confidence floor (#113) and is live
+  (`superseded_at IS NULL`);
+- the row's namespace matches `project:*` and is OUTSIDE the current
+  project's alias set (`user:global` rows stay in their own tier).
+
+Surface policy (`ZMEM_CROSS_PROJECT`): unset → `pretool` only (PostToolBatch
+maps to the `pretool` moment); `0` → off everywhere (wins even over an
+explicit `--include-cross-project`); `1` → `pretool` and `user_prompt` (on an
+env-enabled `user_prompt` surface the store-side selector derives ops tokens
+from the prompt event itself — the #158 hook boundary keeps the hook a thin
+flag forwarder); any other non-empty value → `pretool` only plus a one-shot
+stderr warning. The tier is query-time — the queryless `recent` pull never
+admits cross rows.
+
+No-copy rule: a cross row is never copied, rewritten, or mirrored — the
+store's own row renders in place, inside the untrusted fence, tagged
+`[ns=<source namespace>] [tier=cross]` (with `tier: "cross"` on the JSON
+row), and cross rows never consume project or global slots. Delivered cross
+rows count once in `surfaced_count` under the same telemetry law as every
+other tier. The #155 real-corpus replay baseline is future work: the lane
+ships with these conservative defaults and #155's measurement supersedes the
+calibration when it lands. `recall --explain`
+does not include the cross tier (the read-only debugger predates it and is
+not extended by #98).
 
 **Hybrid is the DEFAULT when embeddings are available** (issue #58 3.3): the
 query is embedded and matched against stored embeddings (sqlite-vec KNN),

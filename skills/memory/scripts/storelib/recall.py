@@ -28,8 +28,11 @@ from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
                              fence_row_cost, inject_score_margin,
                              inject_token_budget,
                              selective_inject_filter)
-from schema_meta import (PROTECTED_INJECT_TYPES,
+from schema_meta import (CROSS_PROJECT_ENV, CROSS_PROJECT_HAZARD_VERBS_ENV,
+                         CROSS_PROJECT_MAX, CROSS_PROJECT_SIGNALS,
+                         PROTECTED_INJECT_TYPES,
                          ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
+from storelib.ops_tokens import _HAZARDOUS_SUBS as _DEFAULT_HAZARD_VERBS
 import embed_profiles as _profiles
 from storelib.cross_encoder import maybe_rerank as _cross_maybe_rerank
 
@@ -1318,6 +1321,196 @@ def _merge_tiers(
         results.append(item)
     return results
 
+
+# ---- Issue #98: query-time cross-project hazard tier ----------------------
+#
+# A fourth, precision-gated tier: live, grounded rows from FOREIGN project:*
+# namespaces may be delivered when the RUNNING OPERATION is itself hazardous
+# (its derived ops tokens intersect the hazard-verb set). The tier ships no
+# data copy — admitted rows are the store's own recall dicts enriched with a
+# "tier" marker, rendered under their true source namespace inside the
+# untrusted fence. Cross rows never consume project or global slots.
+
+# Single owner of every cross-policy stderr warning (surface matrix "other"
+# value AND hazard-override fallback) so one process prints at most one line.
+_CROSS_POLICY_WARNED = False
+
+
+def _warn_cross_policy(message: str) -> None:
+    global _CROSS_POLICY_WARNED
+    if _CROSS_POLICY_WARNED:
+        return
+    _CROSS_POLICY_WARNED = True
+    print(f"[zmem] warning: {message}", file=sys.stderr)
+
+
+def cross_project_surface_enabled(moment: str | None = None,
+                                  explicit: bool = False) -> bool:
+    """Surface policy for the cross-project tier (issue #98).
+
+    ZMEM_CROSS_PROJECT: unset -> ``pretool`` only; "0" -> off everywhere
+    (the operator kill switch wins even over an explicit
+    --include-cross-project); "1" -> on everywhere; any other non-empty
+    value -> ``pretool`` only plus the one-shot stderr warning.
+    ``explicit=True`` (the CLI flag was passed) forces the tier on for
+    every other env state.
+    """
+    raw = (os.environ.get(CROSS_PROJECT_ENV) or "").strip()
+    if raw == "0":
+        return False
+    if explicit or raw == "1":
+        return True
+    if raw:
+        _warn_cross_policy(
+            f"{CROSS_PROJECT_ENV}={raw!r} is not 0/1; treating as unset "
+            "(pretool only)")
+        return moment == "pretool"
+    return moment == "pretool"
+
+
+def hazard_verbs() -> frozenset:
+    """Hazard-verb set gating the cross tier (issue #98).
+
+    Default: ops_tokens._HAZARDOUS_SUBS. An override is a comma-separated,
+    trimmed, case-folded, de-duplicated list of known verbs in input order;
+    unknown verbs are dropped with the one-shot warning, and an override
+    that yields no usable verb (empty, commas/whitespace only, or
+    all-unknown) falls back to the default set — never a silent empty gate.
+    """
+    raw = os.environ.get(CROSS_PROJECT_HAZARD_VERBS_ENV)
+    if raw is None:
+        return _DEFAULT_HAZARD_VERBS
+    ordered: list[str] = []
+    unknown: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        token = part.strip().lower()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        if token in _DEFAULT_HAZARD_VERBS:
+            ordered.append(token)
+        else:
+            unknown.append(token)
+    if unknown:
+        _warn_cross_policy(
+            f"{CROSS_PROJECT_HAZARD_VERBS_ENV} unknown verbs ignored: "
+            + ", ".join(unknown))
+    if not ordered:
+        if not seen:
+            _warn_cross_policy(
+                f"{CROSS_PROJECT_HAZARD_VERBS_ENV} has no usable verbs; "
+                "using the default hazard set")
+        return _DEFAULT_HAZARD_VERBS
+    return frozenset(ordered)
+
+
+def cross_project_admissions(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    moment: str | None,
+    current_namespace: str | None,
+    ops_tokens: list[str] | None,
+    exclude_ids: list[str] | None = None,
+    min_confidence: float | None = None,
+    hybrid: bool = False,
+    now_epoch: float | None = None,
+    as_of: str | None = None,
+    weights: dict | None = None,
+    explicit: bool = False,
+) -> list:
+    """Evaluate the cross-project hazard tier (issue #98).
+
+    Returns at most CROSS_PROJECT_MAX ``(score, row)`` pairs in
+    deterministic score-descending, id-ascending order. Admission requires
+    ALL of: the surface policy enabled for ``moment`` (``explicit=True``
+    — the CLI --include-cross-project flag — forces the tier on for every
+    env state except "0"); the derived ops
+    tokens whole-token-intersecting the hazard-verb set; a live row (the
+    superseded_at filter below); the standard per-tier floors
+    (confidence + issue #113 relevance); ``signal`` in
+    CROSS_PROJECT_SIGNALS; and a namespace in ``project:%`` outside the
+    current project's alias set and outside ``user:global``. A disabled
+    surface, an empty query (the tier is query-time), or an empty foreign
+    set returns []. The tier is deliberately NOT MMR-diversified: cap-2
+    selection stays deterministic.
+    """
+    if not cross_project_surface_enabled(moment, explicit=explicit):
+        return []
+    if not query or not query.strip():
+        return []
+    if not (set(ops_tokens or ()) & hazard_verbs()):
+        return []
+    # PR #207 review: `_expand_namespace_aliases` returns None for a None
+    # namespace, and an unscoped explicit call (`recall --include-cross-
+    # project` with no --namespace) must not crash — an unscoped caller has
+    # no current project, so every live project:* namespace is foreign.
+    current_aliases = set(_expand_namespace_aliases(conn, current_namespace)
+                          or [])
+    current_aliases.add(GLOBAL_NAMESPACE)
+    rows = conn.execute(
+        "SELECT DISTINCT namespace FROM memory "
+        "WHERE superseded_at IS NULL AND namespace LIKE 'project:%'"
+    ).fetchall()
+    foreign = [r["namespace"] for r in rows
+               if r["namespace"] not in current_aliases]
+    if not foreign:
+        return []
+    # PR #207 review: the grounded-signal filter runs AFTER scoring, so the
+    # retrieval pool must be deep enough that non-grounded rows cannot crowd
+    # every grounded row out of the window. 16x the cap keeps the bound
+    # generous while staying a single indexed pass.
+    scored = _recall_one_tier(
+        conn, query=query, ns_list=foreign,
+        limit=CROSS_PROJECT_MAX * 16,
+        min_confidence=min_confidence, hybrid=hybrid,
+        now_epoch=now_epoch if now_epoch is not None else _now_epoch(),
+        as_of=as_of, mmr=False, weights=weights,
+    )
+    excluded = set(exclude_ids or [])
+    admitted: list = []
+    for score, item in scored:
+        if item.get("signal") not in CROSS_PROJECT_SIGNALS:
+            continue
+        if item.get("id") in excluded:
+            continue
+        item["tier"] = "cross"
+        admitted.append((score, item))
+    admitted.sort(key=lambda pair: (-pair[0], pair[1]["id"]))
+    return admitted[:CROSS_PROJECT_MAX]
+
+
+def _splice_cross_rows(results: list, cross_scored: list) -> list:
+    """Insert admitted cross rows before the first user:global row.
+
+    Tier order mirrors the future five-tier allocator (issue #167):
+    project rows first, then cross, then global. Returns the ids of the
+    spliced rows so the caller can extend the query-matched telemetry set.
+    """
+    spliced_ids: list = []
+    insert_at = len(results)
+    for idx, row in enumerate(results):
+        if row.get("namespace") == GLOBAL_NAMESPACE:
+            insert_at = idx
+            break
+    # PR #207 final critic: on an unscoped call the main pool has no
+    # namespace filter, so a foreign row can already be present in
+    # ``results`` — a cross splice must never deliver the same id twice
+    # (no-double-count merge contract).
+    seen = {r["id"] for r in results}
+    cursor = insert_at
+    for _score, item in cross_scored:
+        if item["id"] in seen:
+            # A skipped duplicate must not shift the insertion cursor, or a
+            # later cross row lands past the global tier and splits it.
+            continue
+        results.insert(cursor, item)
+        cursor += 1
+        seen.add(item["id"])
+        spliced_ids.append(item["id"])
+    return spliced_ids
+
 # Hook-text fence constants (issue #58, 3.5). The fence markers
 # travel through the JSON envelope as ordinary content; the bash
 # scripts neutralize any literal occurrences inside stored memories
@@ -1390,9 +1583,14 @@ def _format_fenced_recall(rows: list[dict], header: str,
         if r.get("contested_link"):
             _markers.append("[CONTESTED LINK]")
         inj_prefix = (" " + " ".join(_markers)) if _markers else ""
+        # Issue #98: only cross-project rows carry the tier marker, right
+        # after the source-namespace token, so the reader sees the row came
+        # from a foreign project. Rows without a "tier" key — every project
+        # and global row today — render byte-identically to before.
+        _tier_token = " [tier=cross]" if r.get("tier") == "cross" else ""
         lines.append(
             f"{inj_prefix}- [{r['id']}] [conf={r['confidence']}] [signal={r['signal']}] "
-            f"[ns={r['namespace']}] [type={r['type']}]"
+            f"[ns={r['namespace']}]{_tier_token} [type={r['type']}]"
             f"{r.get('_stale_note', '')}"
         )
         lines.append(f"    {r['content']}")
@@ -1658,6 +1856,10 @@ def _recall_memory_impl(
     exclude_ids: list[str] | None = None,
     _capture: dict | None = None,
     _injection_budget_tokens: int | None = None,
+    include_cross_project: bool = False,
+    _cross_moment: str | None = None,
+    _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -1800,6 +2002,23 @@ def _recall_memory_impl(
     for _score, item in global_scored:
         item["prompt_injection_risk"] = _classify_injection(item)
 
+    # Issue #98: evaluate the cross-project hazard tier once, up front, and
+    # hold the admitted rows aside. They join `results` only AFTER the
+    # expansion passes below (a cross row is never reranked, link-expanded,
+    # unfolded, or entity-carded — the tier cap is its only size) and BEFORE
+    # the injection-risk count / gate+budget pass so the same gates apply.
+    cross_scored: list = []
+    if include_cross_project:
+        cross_scored = cross_project_admissions(
+            conn, query=query, moment=_cross_moment,
+            current_namespace=namespace, ops_tokens=_cross_ops_tokens,
+            exclude_ids=exclude_ids, min_confidence=min_confidence,
+            hybrid=hybrid, now_epoch=now_epoch, as_of=as_of,
+            weights=weights, explicit=_cross_explicit,
+        )
+        for _score, item in cross_scored:
+            item["prompt_injection_risk"] = _classify_injection(item)
+
     if do_global:
         results = _merge_tiers(project_scored, global_scored, limit, global_limit)
     else:
@@ -1910,6 +2129,23 @@ def _recall_memory_impl(
         cards = entities_for_memories(conn, [r["id"] for r in results])
         for r in results:
             r["entities"] = cards.get(r["id"], [])
+
+    # Issue #98: splice the held-aside cross rows into the delivered stream
+    # here — after every expansion pass, before the risk count and the
+    # gate/budget pass. The passive omit mirrors the no_bump filter above so
+    # a risky foreign row can never ride the new tier past the same fence
+    # the project/global rows face; drops count in `omitted` like any other.
+    cross_bump_ids: list = []
+    if cross_scored:
+        kept_cross: list = []
+        for _score, item in cross_scored:
+            if no_bump and (item.get("prompt_injection_risk")
+                            or item.get("taint") == "untrusted_web"):
+                omitted += 1
+                continue
+            kept_cross.append((_score, item))
+        cross_bump_ids = _splice_cross_rows(results, kept_cross)
+        bump_ids = bump_ids + cross_bump_ids
 
     # F13 (PR #81 round 2): count flagged rows AFTER link expansion —
     # expand_recall_links sets prompt_injection_risk on expansion rows,
@@ -2911,6 +3147,10 @@ def _recent_memory_impl(
     exclude_ids: list[str] | None = None,
     _capture: dict | None = None,
     _injection_budget_tokens: int | None = None,
+    include_cross_project: bool = False,
+    _cross_moment: str | None = None,
+    _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -2980,6 +3220,25 @@ def _recent_memory_impl(
     for r in project_rows:
         r["prompt_injection_risk"] = _classify_injection(r)
     results = project_rows
+    # Issue #98: the cross tier joins BEFORE the shared omit/exclusion
+    # filters so the recent lane's gates treat it identically (this lane has
+    # no expansion passes, so an early splice is safe). The tier is
+    # query-time: the queryless recent pull yields an empty admission set by
+    # construction, so this only fires for direct library callers that pass
+    # the cross context anyway.
+    if include_cross_project:
+        cross_scored = cross_project_admissions(
+            conn, query="", moment=_cross_moment,
+            current_namespace=namespace, ops_tokens=_cross_ops_tokens,
+            exclude_ids=exclude_ids, min_confidence=min_confidence,
+            explicit=_cross_explicit, as_of=as_of,
+        )
+        for _score, item in cross_scored:
+            item["prompt_injection_risk"] = _classify_injection(item)
+        # PR #207 review: mirror the recall lane's project -> cross -> global
+        # tier order (and keep the mirror honest if this latent path ever
+        # gains a query) instead of appending past the global rows.
+        _splice_cross_rows(results, cross_scored)
     omitted = 0
     if no_bump:
         kept_rows = []
@@ -3081,6 +3340,10 @@ def _collect_injection_candidates(
     no_unfold: bool,
     exclude_ids: list[str],
     budget_tokens: int | None,
+    include_cross_project: bool = False,
+    _cross_moment: str | None = None,
+    _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
 ) -> dict:
     """Run one passive retrieval and return its unrendered details object.
 
@@ -3103,6 +3366,10 @@ def _collect_injection_candidates(
         exclude_ids=exclude_ids,
         _capture=details,
         _injection_budget_tokens=budget_tokens,
+        include_cross_project=include_cross_project,
+        _cross_moment=_cross_moment,
+        _cross_ops_tokens=_cross_ops_tokens,
+        _cross_explicit=_cross_explicit,
     )
     if query is None:
         _recent_memory_impl(
@@ -3152,6 +3419,10 @@ def recall_memory(
     exclude_ids: list[str] | None = None,
     _capture: dict | None = None,
     _injection_budget_tokens: int | None = None,
+    include_cross_project: bool = False,
+    _cross_moment: str | None = None,
+    _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
 ) -> list[dict]:
     """Explicit recall entry point (UserPromptSubmit, SubagentStart,
     and SessionStart hook surfaces share this path).
@@ -3159,6 +3430,12 @@ def recall_memory(
     Issue #23 read-only invariant: this docstring names the hook
     sources so a guardrail can pin the read-only contract to all of
     them; passive delivery is owned by the selector, not here.
+
+    ``include_cross_project`` (issue #98): admit the precision-gated
+    cross-project hazard tier. ``_cross_moment``/``_cross_ops_tokens``
+    are the internal seam the session-aware selector uses to forward
+    the surface policy inputs; the CLI direct path passes the user's
+    ``--moment``/``--ops-token`` values.
     """
     # Candidate acquisition below retains the emit-time _classify_injection
     # pass in _recall_memory_impl; the shared passive details builder runs only
@@ -3184,6 +3461,10 @@ def recall_memory(
             no_telemetry=no_telemetry,
             no_unfold=no_unfold,
             exclude_ids=exclude_ids,
+            include_cross_project=include_cross_project,
+            _cross_moment=_cross_moment,
+            _cross_ops_tokens=_cross_ops_tokens,
+            _cross_explicit=_cross_explicit,
         )
 
     details = _collect_injection_candidates(
@@ -3205,6 +3486,10 @@ def recall_memory(
         no_unfold=no_unfold,
         exclude_ids=list(exclude_ids or []),
         budget_tokens=_injection_budget_tokens,
+        include_cross_project=include_cross_project,
+        _cross_moment=_cross_moment,
+        _cross_ops_tokens=_cross_ops_tokens,
+        _cross_explicit=_cross_explicit,
     )
     if _capture is not None:
         _capture.clear()
@@ -3244,6 +3529,10 @@ def recent_memory(
     exclude_ids: list[str] | None = None,
     _capture: dict | None = None,
     _injection_budget_tokens: int | None = None,
+    include_cross_project: bool = False,
+    _cross_moment: str | None = None,
+    _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
 ) -> list[dict]:
     # _recent_memory_impl performs the same emit-time _classify_injection
     # filtering before this public wrapper hands candidates to the shared
@@ -3261,6 +3550,10 @@ def recent_memory(
             as_of=as_of,
             no_telemetry=no_telemetry,
             exclude_ids=exclude_ids,
+            include_cross_project=include_cross_project,
+            _cross_moment=_cross_moment,
+            _cross_ops_tokens=_cross_ops_tokens,
+            _cross_explicit=_cross_explicit,
         )
 
     details = _collect_injection_candidates(
@@ -3282,6 +3575,10 @@ def recent_memory(
         no_unfold=True,
         exclude_ids=list(exclude_ids or []),
         budget_tokens=_injection_budget_tokens,
+        include_cross_project=include_cross_project,
+        _cross_moment=_cross_moment,
+        _cross_ops_tokens=_cross_ops_tokens,
+        _cross_explicit=_cross_explicit,
     )
     if _capture is not None:
         _capture.clear()

@@ -174,6 +174,11 @@ class TrustRecallCliBase(unittest.TestCase):
         self.env = dict(os.environ)
         self.env["ZMEM_DATA"] = str(self.data).replace("\\", "/")
         self.env.pop("ZMEM_TEST_NOW", None)
+        # Issue #185 isolation: the store chain outranks ZMEM_DATA in
+        # host.resolve_store_path, so ambient ZMEM_STORE / plugin-data vars
+        # would route the CLI's writes away from the fixture dir.
+        for _k in ("ZMEM_STORE", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+            self.env.pop(_k, None)
         # Review round (PRR): floor env overrides must not leak from the
         # operator environment into these fixtures — the boundary tests pin
         # exact floor semantics at the 0.2 default.

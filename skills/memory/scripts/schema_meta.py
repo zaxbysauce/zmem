@@ -96,6 +96,19 @@ SCHEMA_VERSION_KEY = "schema_version"
 # path enforce it). Edit HERE and every consumer stays in sync.
 MAX_CONTENT_CHARS = 65536
 
+# Issue #98 cross-project hazard tier. The tier is precision-gated: a foreign
+# project:* row is admitted only when its grounded signal is one of these four
+# (signals that saw the lesson actually work or actually fail), and the running
+# operation's derived ops tokens whole-token-intersect the hazard-verb set
+# (ops_tokens._HAZARDOUS_SUBS by default; override via CROSS_PROJECT_HAZARD_VERBS_ENV).
+# CROSS_PROJECT_MAX is the hard per-call cap — cross rows never consume project or
+# global slots and the tier ships NO data copy (the store row is rendered in place
+# with its source namespace). Surface policy lives in recall.cross_project_surface_enabled.
+CROSS_PROJECT_SIGNALS = ("test", "compile", "lint", "reviewer")
+CROSS_PROJECT_MAX = 2
+CROSS_PROJECT_ENV = "ZMEM_CROSS_PROJECT"
+CROSS_PROJECT_HAZARD_VERBS_ENV = "ZMEM_CROSS_PROJECT_HAZARD_VERBS"
+
 # Memory `type` enum. All write surfaces validate against this tuple.
 # v9 (#59): `decision` and `constraint` are first-class shipped types.
 ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint")

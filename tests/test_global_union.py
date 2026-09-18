@@ -255,6 +255,69 @@ class TestMergeContract(_StoreCase):
         self.assertEqual(len(global_results), 2,
                          "global tier must be truncated to global_limit when more rows exist")
 
+    def test_cross_tier_between_project_and_global(self):
+        """Issue #98: the cross-project hazard tier splices BETWEEN the
+        project and global tiers — merge order project -> cross -> global,
+        5/2/3 slot counts through the selector with explicit ops tokens."""
+        # A copy of the fixture env with the #98 knob explicitly unset so an
+        # ambient operator value can never skew the matrix.
+        env = dict(self.env)
+        env.pop("ZMEM_CROSS_PROJECT", None)
+        env.pop("ZMEM_CROSS_PROJECT_HAZARD_VERBS", None)
+        for i in range(6):
+            ns = ("project:foreign-union-a" if i % 2 == 0
+                  else "project:foreign-union-b")
+            self.add(ns, f"foreign union case {i}: git stash pop needs "
+                         f"git stash list first", signal="test")
+        for i in range(6):
+            self.add(PROJECT_NS, f"project union case {i}: git stash pop "
+                                 f"flakes the suite", signal="test")
+        for i in range(6):
+            self.add("user:global", f"global union case {i}: git stash pop "
+                                    f"guidance applies across projects",
+                     signal="test")
+        r = self.run_store(
+            "recall", "--query", "git stash pop", "--namespace", PROJECT_NS,
+            "--limit", "5", "--include-global", "--global-limit", "3",
+            "--no-bump", "--for-injection", "--json",
+            "--session-id", "s-cross-merge", "--moment", "pretool",
+            "--lane", "zcode",
+            "--ops-token", "git", "--ops-token", "stash",
+            "--ops-token", "pop", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        envelope = json.loads(r.stdout)
+        # Expansion arrivals (link_relation / graph-arm rows) render but ride
+        # AFTER the three tiers; the cross-tier order pin excludes them.
+        results = [row for row in envelope["results"]
+                   if not row.get("link_relation")
+                   and not row.get("_graph_arrival_only")]
+        self.assertEqual(envelope["reason"], "injected", envelope["reason"])
+        # Order: the 5 project slots first, then the 2 capped cross rows,
+        # then the 3 global slots.
+        self.assertEqual(
+            [row["namespace"] for row in results[:5]], [PROJECT_NS] * 5,
+            "project tier occupies the first 5 slots")
+        cross_rows = results[5:7]
+        self.assertEqual([row.get("tier") for row in cross_rows],
+                         ["cross", "cross"],
+                         "the cross tier splices between project and global")
+        self.assertTrue(all(row["namespace"].startswith("project:foreign-")
+                            for row in cross_rows))
+        self.assertEqual(
+            [row["namespace"] for row in results[7:]], ["user:global"] * 3,
+            "global tier fills the last 3 slots")
+        # Counts: 5/2/3 (cross rows never consume project or global slots).
+        nss = [row["namespace"] for row in results]
+        self.assertEqual(sum(1 for n in nss if n == PROJECT_NS), 5)
+        self.assertEqual(sum(1 for n in nss
+                             if n.startswith("project:foreign-")), 2)
+        self.assertEqual(sum(1 for n in nss if n == "user:global"), 3)
+        self.assertIn("[tier=cross]", envelope["rendered"])
+        delivered_ids = [r["id"] for r in results]
+        self.assertEqual(len(delivered_ids), len(set(delivered_ids)),
+                         "a cross row must never double-count with a "
+                         "project/global row (no-double-count merge contract)")
+
     def test_include_global_with_namespace_user_global_is_noop(self):
         """C-4: when namespace IS user:global, --include-global is a no-op (no
         double-count). The project tier already covers global."""

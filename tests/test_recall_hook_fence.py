@@ -76,6 +76,71 @@ class FenceConstantsTests(unittest.TestCase):
         # Disclaimer text present (the "untrusted notes" line).
         self.assertIn("untrusted", out.lower())
 
+    def test_cross_marker_bytes_and_fence(self):
+        """Issue #98: a cross-project row renders the EXACT
+        ``[ns=<source>] [tier=cross]`` bytes right after the source-namespace
+        token, project/global rows render WITHOUT any tier token, and the
+        cross bullet sits INSIDE the fence."""
+        import storelib
+        rows = [
+            {   # project row — no tier key anywhere
+                "id": "proj-row",
+                "namespace": "project:demo",
+                "type": "fact",
+                "content": "same-project lesson body",
+                "tags": "",
+                "confidence": 0.9,
+                "signal": "test",
+                "source_ref": "",
+                "stale": False,
+                "_stale_note": "",
+            },
+            {   # cross row — the issue #98 tier marker
+                "id": "cross-row",
+                "namespace": "project:foreign-a",
+                "type": "lesson",
+                "content": "foreign hazard lesson body",
+                "tags": "",
+                "confidence": 0.9,
+                "signal": "test",
+                "source_ref": "",
+                "stale": False,
+                "_stale_note": "",
+                "tier": "cross",
+            },
+            {   # global row — no tier key anywhere
+                "id": "glob-row",
+                "namespace": "user:global",
+                "type": "fact",
+                "content": "global lesson body",
+                "tags": "",
+                "confidence": 0.9,
+                "signal": "reviewer",
+                "source_ref": "",
+                "stale": False,
+                "_stale_note": "",
+            },
+        ]
+        out = storelib._format_fenced_recall(rows, header="cross marker h")
+        # Exact bytes, immediately after the source-namespace token.
+        self.assertIn("[ns=project:foreign-a] [tier=cross]", out)
+        self.assertIn("[ns=project:foreign-a] [tier=cross] [type=lesson]", out)
+        # Non-cross rows render the ns followed DIRECTLY by [type=...] — no
+        # tier token may leak onto project or global rows.
+        self.assertIn("[ns=project:demo] [type=fact]", out)
+        self.assertIn("[ns=user:global] [type=fact]", out)
+        self.assertEqual(out.count("[tier=cross]"), 1)
+        # The cross bullet sits inside the fence like every other row.
+        open_idx = out.find(storelib.ZMEM_FENCE_OPEN)
+        close_idx = out.find(storelib.ZMEM_FENCE_CLOSE)
+        cross_idx = out.find("[ns=project:foreign-a] [tier=cross]")
+        self.assertGreater(open_idx, -1)
+        self.assertGreater(close_idx, open_idx)
+        self.assertGreater(cross_idx, open_idx,
+                           "the cross bullet must render INSIDE the fence")
+        self.assertLess(cross_idx, close_idx,
+                        "the cross bullet must render INSIDE the fence close")
+
     def test_fence_wraps_injection_text(self):
         """If the content itself contains a prompt-injection phrase,
         the fence must wrap it (not let it escape outside)."""

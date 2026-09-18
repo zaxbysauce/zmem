@@ -10,6 +10,84 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.44.0] - 2026-09-16
+
+### Added
+- **Doctor install-skew diagnostics (issue #185, Workstream N PR 2 of 6)**:
+  the read-only doctor now inspects host plugin registries (through the #184
+  strict codecs) and reports `duplicate-install` (fail: more than one enabled
+  user-scope zmem install on a host), `marketplace-skew` (warn: installed
+  cache version differs from the marketplace version its registry entry
+  points at), and `project-pin` (warn: a project-scoped zmem pin behind the
+  enabled user-scope install). Missing registries skip; malformed registry
+  data warns; doctor never edits host state.
+- **`zcode-native-memory` doctor check (issue #185)**: reads
+  `~/.zcode/v2/setting.json` `memoryEnabled` — explicit `true` fails cutover,
+  explicit `false` passes, unreadable/missing state warns. Joins the existing
+  Claude and Codex native-memory inspections.
+- **Codex manifest hook-trust coverage (issue #185)**: the new
+  `untrusted-hook` check compares the pre-approval events the repo's
+  `hooks/hooks.codex.json` registers (SessionStart, PreToolUse) with the
+  hook-trust events recorded for the repo in `~/.codex/config.toml`; missing
+  registered events warn `untrusted-hook <ids>`. When no config entry names
+  the repo, the box-wide union of trusted events is used as a read-only
+  inventory fallback (documented trade-off for multi-repo boxes). Reapproval
+  is always manual.
+- **Orphan-store inventory (issue #185)**: `orphan-store` warns with
+  `schema=<n> rows=<n>` for every non-canonical SQLite store on the known
+  host paths (ZCode/Claude plugin-data env dirs and the legacy
+  `~/.zcode/memory/store.sqlite`), read-only (`mode=ro`). An orphan never
+  fails the report on its own; inspection plus `promote-store --from <path>`
+  is the remediation, never automatic deletion.
+- **Focused coverage**: `DoctorInstallSkewTest` (8 tests) with a
+  deterministic `tests/fixtures/doctor/install-skew/` fixture tree and a
+  byte-pinned `expected.json` report contract; the doctor check-list docs in
+  SKILL.md, README, and CUTOVER now name every new check id.
+
+## [0.43.0] - 2026-09-16
+
+### Added
+- **Query-time cross-project hazard lane (issue #98, Workstream E PR 2 of 7)**:
+  a fourth, precision-gated recall tier that can deliver up to
+  `CROSS_PROJECT_MAX` (2) live, grounded rows from FOREIGN `project:*`
+  namespaces on the passive injection surface. Admission requires ALL of: the
+  running operation's derived ops tokens whole-token-intersecting the hazard
+  verb set (`ops_tokens._HAZARDOUS_SUBS` by default); row `signal` in
+  (`test`, `compile`, `lint`, `reviewer`); the standard score/confidence
+  floor; a live row; and a namespace in `project:*` outside the current
+  project's alias set (`user:global` rows stay in their own tier). The tier
+  ships NO data copy: admitted rows render in place, inside the untrusted
+  fence, tagged `[ns=<source namespace>] [tier=cross]` with `tier: "cross"`
+  on the JSON row, and never consume project or global slots.
+- **`ZMEM_CROSS_PROJECT` surface switch**: unset → `pretool` only (this
+  includes Claude's PostToolBatch, which maps to the `pretool` moment);
+  `0` → off everywhere (wins even over an explicit flag); `1` → `pretool`
+  and `user_prompt`; any other non-empty value → `pretool` only plus a
+  one-shot stderr warning. On an env-enabled `user_prompt` surface the
+  store-side selector derives ops tokens from the prompt event itself (the
+  hook forwards only the flag).
+- **`ZMEM_CROSS_PROJECT_HAZARD_VERBS`**: comma-separated override of the
+  hazard-verb set — trimmed, case-folded, de-duplicated, unknown verbs
+  dropped with the one-shot warning; an override with no usable verb falls
+  back to the default set.
+- **`store.py recall|recent --include-cross-project`**: explicit opt-in for
+  direct calls; the env switch still governs (`0` disables). On an
+  env-enabled `user_prompt` surface the store-side selector derives ops
+  tokens from the prompt event itself (the hook forwards only the flag,
+  preserving the #158 storelib-free boundary). The session selector (`#158`
+  envelope, unchanged shape) computes the same policy store-side.
+  `ZMEM_CROSS_PROJECT=0` with `--for-injection` remains a byte-identical
+  no-op lane.
+
+### Notes
+- The five-tier reserved-slot allocator (Workstream I, #167) is not on main
+  yet; the cross tier slots between project and global (its position 4 in
+  #167's `TIER_ORDER`) with the same cap semantics, so #167 re-slots it
+  without semantic change.
+- The #155 real-corpus replay baseline remains future work: this lane ships
+  conservatively (pretool-only by default, cap 2, four grounded signals) and
+  #155's measurement supersedes the initial calibration when it lands.
+
 ## [0.43.0] - 2026-09-17
 
 ### Added

@@ -81,6 +81,32 @@ in deterministic verification) > `reviewer/user` (medium) > `none` (low, below t
 retrieval floor by default). This follows the finding that intrinsic self-correction
 (lessons from the agent's own opinion, ungrounded) degrades accuracy.
 
+### Cross-project hazard lane (issue #98)
+
+A fourth, precision-gated recall tier can deliver up to **2** live, grounded rows
+from FOREIGN `project:*` namespaces on the passive injection surface — a lesson
+another project already paid for, surfaced exactly when you are about to repeat
+its incident. Admission requires ALL of: the running operation's derived ops
+tokens whole-token-intersect the hazard-verb set (`git push/reset/stash pop/
+rebase/...` by default), the row's `signal` is one of `test/compile/lint/
+reviewer`, the row passes the standard score floor, and the row is live. The
+tier ships **no data copy**: rows render in place inside the untrusted fence,
+tagged `[ns=<source namespace>] [tier=cross]`, and never consume project or
+global slots.
+
+`ZMEM_CROSS_PROJECT` surface switch: **unset** → `pretool` only (PostToolBatch
+maps to `pretool`); **`0`** → off everywhere (wins even over an explicit flag);
+**`1`** → `pretool` and `user_prompt` (the session selector then derives
+ops tokens from the prompt event store-side — the hook stays a thin flag
+forwarder); any other non-empty value → `pretool` only plus a one-shot
+warning. `ZMEM_CROSS_PROJECT_HAZARD_VERBS` overrides the hazard-verb set
+(comma-separated, trimmed, case-folded, de-duplicated; unknown verbs are
+dropped with the one-shot warning). `store.py recall|recent
+--include-cross-project` opts in for direct calls — the env switch still
+governs. The tier is query-time: the queryless `recent` pull never admits
+cross rows. The #155 real-corpus replay baseline supersedes the initial
+calibration when it lands.
+
 ### Query-aware passive prefetch (issue #159)
 
 `prefetch` exposes the selector's query-aware passive lane on the CLI and the
@@ -423,6 +449,33 @@ store directory the plugin hosts use.
    reapprove hooks after the cutover change. The current repo's Claude/ZCode
    plugin surfaces are first-class now; repo-local Codex adapter files may lag
    behind and are treated as optional by `doctor.py`.
+
+#### Doctor install-skew and orphan-store checks (issue #185)
+
+`doctor.py` also inventories, read-only:
+
+- **install-skew** — `duplicate-install` (fail) when more than one enabled
+  user-scope zmem install is registered for a host; `marketplace-skew`
+  (warn) when an installed cache version differs from the marketplace
+  version its registry entry names; `project-pin` (warn) when a
+  project-scoped zmem pin is behind the enabled user-scope install.
+  Registries are read with the #184 strict codecs; a missing registry skips
+  and a malformed one warns. Doctor never edits host state.
+- **`zcode-native-memory`** — reads `~/.zcode/v2/setting.json`
+  `memoryEnabled`: explicit `true` fails cutover, explicit `false` passes,
+  anything unreadable warns. Disable it yourself; zmem never auto-edits it.
+- **`untrusted-hook`** — compares the pre-approval events the repo's
+  Codex manifest registers (SessionStart, PreToolUse) with the hook-trust
+  state recorded for your repo; missing events warn
+  `untrusted-hook <ids>`. When no config entry names this repo, the
+  box-wide union of trusted events is used as a read-only inventory
+  fallback — on a multi-repo box another repo's approval can stand in, so
+  treat a pass as inventory rather than proof. Reapproval is always manual.
+- **`orphan-store`** — warns with `schema=`/`rows=` for each non-canonical
+  SQLite store on the known host paths (plugin-data env dirs,
+  `~/.zcode/memory/store.sqlite`). Inspect, then merge with
+  `promote-store --from <path>` and retire it manually; doctor never
+  deletes or migrates anything.
 
 ### Hermes Agent — local (memory provider + reflection hooks)
 

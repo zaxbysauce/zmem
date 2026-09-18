@@ -221,6 +221,107 @@ class InjectionFilterBehaviorTests(unittest.TestCase):
         )
 
 
+    def test_cross_rows_survive_injection_gates(self):
+        """Issue #98: cross-project rows flow through the SAME passive
+        injection gates (exclude / selective / margin / budget) as every
+        other row — delivered with the tier key set, excluded ids honored,
+        tiny budgets dropping them identically, and the opt-in score margin
+        pruning them like any non-exempt row."""
+        import contextlib
+        import io
+        # Defensive: the #98 knobs must be unset for the pretool policy to
+        # arm (saved/restored so ambient operator settings never leak).
+        saved = {key: os.environ.pop(key, None)
+                 for key in ("ZMEM_CROSS_PROJECT",
+                             "ZMEM_CROSS_PROJECT_HAZARD_VERBS")}
+        try:
+            # Two qualifying foreign hazard rows (the class setUp already
+            # seeded project:inj-test rows; the foreign tier is what #98 adds).
+            conn = sqlite3.connect(str(self.store_path))
+            try:
+                for row_id, ns in (("cross-gate-1", "project:foreign-inj-a"),
+                                   ("cross-gate-2", "project:foreign-inj-b")):
+                    conn.execute(
+                        "INSERT INTO memory (id, namespace, type, content, "
+                        "tags, source_ref, source_hash, confidence, signal, "
+                        "valid_from, ingestion_ts) VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (row_id, ns, "fact",
+                         f"{row_id} git stash pop foreign lesson",
+                         "", "", "", 0.9, "test",
+                         "2026-02-03T04:05:06Z", "2026-02-03T04:05:06Z"),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            from storelib import recall_memory, connect
+
+            def run_cross(**overrides):
+                capture: dict = {}
+                kwargs = dict(
+                    query="git stash pop", namespace="project:inj-test",
+                    limit=5, no_bump=True, for_injection=True, as_json=True,
+                    no_telemetry=True, include_cross_project=True,
+                    _cross_moment="pretool",
+                    _cross_ops_tokens=["git", "stash", "pop"],
+                    _capture=capture,
+                )
+                kwargs.update(overrides)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rows = recall_memory(connect(), **kwargs)
+                return rows, capture
+
+            # Selective gate + delivery: both cross rows pass and carry the
+            # tier key; nothing else matched the query in this namespace.
+            rows, capture = run_cross()
+            self.assertEqual([r["id"] for r in rows],
+                             ["cross-gate-1", "cross-gate-2"])
+            self.assertEqual([r.get("tier") for r in rows],
+                             ["cross", "cross"])
+            self.assertEqual(capture["reason"], "injected")
+
+            # Exclusion: an excluded cross id never delivers (the admission
+            # path drops it before candidate capture, so the envelope's
+            # numeric `excluded` stays 0 — the absence is the contract).
+            rows, capture = run_cross(exclude_ids=["cross-gate-1"])
+            self.assertEqual([r["id"] for r in rows], ["cross-gate-2"])
+            self.assertEqual(capture["excluded"], 0)
+
+            # Budget: a no-row-fits budget drops the cross rows identically
+            # (same reason + drop accounting as the project/global tiers).
+            rows, capture = run_cross(_injection_budget_tokens=1)
+            self.assertEqual(rows, [])
+            self.assertEqual(capture["reason"], "budget-drop")
+            self.assertEqual(capture["budget_dropped"], 2)
+
+            # Margin: with the opt-in margin at 1.0 only the top-scored row
+            # survives — cross rows are NOT exempt from the margin gate.
+            # PR #207 review: restore the operator's prior value instead of
+            # unconditionally popping it.
+            prior_margin = os.environ.pop("ZMEM_INJECT_MARGIN", None)
+            os.environ["ZMEM_INJECT_MARGIN"] = "1.0"
+            try:
+                rows, capture = run_cross()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0].get("tier"), "cross")
+                self.assertEqual(
+                    set(capture["margin_pruned_ids"]),
+                    {"cross-gate-1", "cross-gate-2"} - {rows[0]["id"]},
+                    "the non-top cross row must be margin-pruned")
+            finally:
+                if prior_margin is None:
+                    os.environ.pop("ZMEM_INJECT_MARGIN", None)
+                else:
+                    os.environ["ZMEM_INJECT_MARGIN"] = prior_margin
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
 class Issue82PatternTests(unittest.TestCase):
     """Issue #82: the four added high-precision instruction-to-the-model
     patterns. Pure regex-level pins through `_has_prompt_injection_risk` (the
