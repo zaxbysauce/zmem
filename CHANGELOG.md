@@ -10,6 +10,24 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.47.0] - 2026-09-18
+
+### Changed
+- **ZCode hooks register as `process` executor entries (issue #187, Workstream
+  N PR 4 of 6)**: every entry in `hooks/hooks.zcode.json` is now
+  `{"type":"process","command":"node","args":["${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js","<verb>"],"timeout":15}`
+  instead of a shell command string, so ZCode starts Node directly — the host
+  no longer owns shell parsing for a launcher and verb that are already fully
+  known. Events, matchers, verbs, and 15 s timeouts are unchanged, and the
+  launcher consumes the #186 `resolveShell()` export exactly as before.
+- **ZCode launcher contract pinned by tests and fixtures (issue #187)**:
+  `ZcodeManifestProcessTest` asserts the seven-entry process shape and the
+  preserved verb list, and `tests/test_launcher.js` drives each manifest entry
+  against committed `tests/fixtures/launcher/zcode-*` fixtures: exit 0, stdout
+  byte-identical to `{}\n` (one JSON object, one newline, no sentinel or
+  diagnostic text), and the exact `ZMEM_CTX_BUDGET` warning line on stderr for
+  an invalid budget.
+
 ## [0.46.0] - 2026-09-18
 
 ### Changed

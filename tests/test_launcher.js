@@ -2384,6 +2384,137 @@ testClaudeManifestUsesExecForm();
 testClaudeVerbsRunWithoutGitOnPath();
 testResolveShellHonorsZmemBashPath();
 
+// --- issue #187: ZCode `process` executor entries ---------------------------
+
+// Execute one manifest entry directly with spawnSync and NO shell: expand the
+// ${ZCODE_PLUGIN_ROOT} placeholder the host would expand, then run
+// `node <launcher> <verb>` with the entry's own args. This is the runtime
+// shape a `type: "process"` entry hands to ZCode's process executor.
+function runZcodeProcess(entry, payload, env) {
+    const expandedArgs = entry.args.map((arg) =>
+        arg.replace("${ZCODE_PLUGIN_ROOT}", env.ZCODE_PLUGIN_ROOT));
+    return spawnSync(entry.command, expandedArgs, {
+        input: payload, env, encoding: "utf8",
+    });
+}
+
+// Load the seven nested entries from hooks/hooks.zcode.json (no duplicated
+// event traversal in the test) and drive each one against the committed
+// fixture pair. Every verb must exit 0 with stdout byte-identical to its
+// expected fixture (`{}` + one LF), i.e. one JSON object, one newline, no
+// sentinel or diagnostic text. Isolation env is pinned BEFORE any hook
+// subprocess starts; the priming spawn keeps capture-failure's first-run
+// auto-capture prompt off the compared path (per-session marker, same
+// pattern as the #186 Claude leg), and ZMEM_REFLECT=0 keeps reflect's
+// empty-store prompt off it too (hooks/zmem-reflect.sh kill switch).
+function testZcodeProcessEntriesRunFixtureContract() {
+    console.log("\n[#187] ZCode process entries — manifest-driven fixture contract");
+    const manifestPath = path.join(REPO, "hooks", "hooks.zcode.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    const entries = [];
+    for (const [event, groups] of Object.entries(manifest.hooks || {})) {
+        for (const group of groups) {
+            for (const hook of group.hooks || []) {
+                entries.push({ event, hook });
+            }
+        }
+    }
+    eq("#187: manifest nested entry count", entries.length, 7);
+
+    const FIXDIR = path.join(REPO, "tests", "fixtures", "launcher");
+    const inputPath = path.join(FIXDIR, "zcode-input.json");
+    const payload = fs.readFileSync(inputPath);
+
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-187-verbs-"));
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-187-project-"));
+    const verbEnv = envWith({
+        ZMEM_STORE: path.join(scratch, "store.sqlite"),
+        ZMEM_DATA: scratch,
+        ZMEM_MODELS_DIR: path.join(scratch, "missing-models"),
+        ZMEM_MODEL_AUTODOWNLOAD: "0",
+        ZMEM_HOST: "zcode",
+        ZMEM_NAMESPACE: "project:fixture-187",
+        ZMEM_INJECT: "0",
+        ZMEM_CAPTURE: "0",
+        ZMEM_AUTO_RETAIN: "0",
+        ZMEM_REFLECT: "0",
+        ZCODE_PLUGIN_ROOT: REPO,
+        ZCODE_PROJECT_DIR: projectDir,
+    });
+    try {
+        // Prime capture-failure's per-session prompt dedup: its FIRST run
+        // emits the auto-capture prompt by design (marker keyed by the
+        // fixture's fixed session_id); this discarded run writes the marker
+        // so every compared output below stays on the deterministic {} path.
+        const primeEntry = entries.find((e) => e.hook.args && e.hook.args[1] === "capture-failure");
+        runZcodeProcess(primeEntry.hook, payload, verbEnv);
+
+        for (const { event, hook } of entries) {
+            const verb = hook.args[1];
+            const expectedPath = path.join(FIXDIR, "zcode-" + verb + "-expected.json");
+            const expected = fs.readFileSync(expectedPath).toString("utf8");
+            const r = runZcodeProcess(hook, payload, verbEnv);
+            // Node's spawnSync leaves `error` UNDEFINED on a successful spawn
+            // (null is never produced), so the no-spawn-error assertion is the
+            // loose == null (covers both).
+            ok("#187: " + verb + " (" + event + ") exits 0 with no spawn error",
+                r.status === 0 && r.error == null,
+                "status=" + r.status + " error=" + String(r.error));
+            ok("#187: " + verb + " stdout fixture-byte-equal",
+                r.stdout === expected,
+                JSON.stringify((r.stdout || "").slice(0, 120)));
+            ok("#187: " + verb + " final stdout byte is one newline",
+                (r.stdout || "").slice(-1) === "\n",
+                JSON.stringify((r.stdout || "").slice(-3)));
+            let parsed = null;
+            try { parsed = JSON.parse(r.stdout.slice(0, -1)); } catch (e) { /* */ }
+            ok("#187: " + verb + " stdout is one JSON object",
+                parsed !== null && typeof parsed === "object" && !Array.isArray(parsed),
+                JSON.stringify(parsed));
+            ok("#187: " + verb + " stdout free of sentinel/diagnostic text",
+                !r.stdout.includes("<<<ZMEM_") && !r.stdout.includes("zmem:"),
+                JSON.stringify((r.stdout || "").slice(0, 120)));
+        }
+
+        // Invalid-budget leg: an operator-set non-numeric budget must keep the
+        // fail-open stdout contract AND warn exactly once on stderr.
+        const budgetEnv = envWith({
+            ZMEM_STORE: path.join(scratch, "store.sqlite"),
+            ZMEM_DATA: scratch,
+            ZMEM_MODELS_DIR: path.join(scratch, "missing-models"),
+            ZMEM_MODEL_AUTODOWNLOAD: "0",
+            ZMEM_HOST: "zcode",
+            ZMEM_NAMESPACE: "project:fixture-187",
+            ZMEM_INJECT: "0",
+            ZMEM_CAPTURE: "0",
+            ZMEM_AUTO_RETAIN: "0",
+            ZMEM_REFLECT: "0",
+            ZCODE_PLUGIN_ROOT: REPO,
+            ZCODE_PROJECT_DIR: projectDir,
+            ZMEM_CTX_BUDGET: "abc",
+        });
+        const recallEntry = entries.find((e) => e.hook.args && e.hook.args[1] === "recall");
+        const expectedRecall = fs.readFileSync(
+            path.join(FIXDIR, "zcode-recall-expected.json")).toString("utf8");
+        const rb = runZcodeProcess(recallEntry.hook, payload, budgetEnv);
+        ok("#187: invalid-budget leg exits 0 with no spawn error",
+            rb.status === 0 && rb.error == null,
+            "status=" + rb.status + " error=" + String(rb.error));
+        ok("#187: invalid-budget stdout byte-identical",
+            rb.stdout === expectedRecall,
+            JSON.stringify((rb.stdout || "").slice(0, 120)));
+        eq("#187: invalid-budget stderr is exactly the warning line",
+            rb.stderr,
+            "zmem: invalid ZMEM_CTX_BUDGET=\"abc\" (must be a positive integer); "
+            + "using default 9000\n");
+    } finally {
+        try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (e) { /* */ }
+        try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch (e) { /* */ }
+    }
+}
+
+testZcodeProcessEntriesRunFixtureContract();
+
 // --- cleanup + report ------------------------------------------------------
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }
 

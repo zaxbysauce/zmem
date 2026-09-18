@@ -556,17 +556,14 @@ class RegistrationAndContractTest(unittest.TestCase):
             self.assertIn("PreToolUse", cfg["hooks"], name)
             entries = cfg["hooks"]["PreToolUse"]
             self.assertEqual(entries[0]["matcher"], matcher, name)
-            if name == "hooks.claude.json":
-                # Issue #186: Claude entries are exec-form — the verb is
-                # args[1], not part of the command string.
-                self.assertEqual(entries[0]["hooks"][0]["command"], "node",
-                                 name)
-                self.assertIn(
-                    "pretool-recall",
-                    entries[0]["hooks"][0]["args"], name)
-            else:
-                self.assertIn("pretool-recall",
-                              entries[0]["hooks"][0]["command"], name)
+            # Issues #186 (Claude exec-form) and #187 (ZCode process form):
+            # on both hosts the verb is args[1], not part of a shell command
+            # string.
+            self.assertEqual(entries[0]["hooks"][0]["command"], "node",
+                             name)
+            self.assertIn(
+                "pretool-recall",
+                entries[0]["hooks"][0]["args"], name)
         codex = json.loads(
             (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8"))
         # Issue #95 flip (this PR): the former assertNotIn deferral pin is

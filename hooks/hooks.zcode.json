@@ -5,8 +5,12 @@
         "matcher": ".*",
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" session-start",
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js",
+              "session-start"
+            ],
             "timeout": 15
           }
         ]
@@ -16,8 +20,12 @@
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" recall",
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js",
+              "recall"
+            ],
             "timeout": 15
           }
         ]
@@ -25,8 +33,12 @@
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" capture-correction",
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js",
+              "capture-correction"
+            ],
             "timeout": 15
           }
         ]
@@ -36,8 +48,12 @@
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" capture-failure",
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js",
+              "capture-failure"
+            ],
             "timeout": 15
           }
         ]
@@ -48,8 +64,12 @@
         "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch",
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" pretool-recall",
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js",
+              "pretool-recall"
+            ],
             "timeout": 15
           }
         ]
@@ -60,8 +80,12 @@
         "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch",
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" convention-capture",
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js",
+              "convention-capture"
+            ],
             "timeout": 15
           }
         ]
@@ -71,8 +95,12 @@
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js\" reflect",
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js",
+              "reflect"
+            ],
             "timeout": 15
           }
         ]
