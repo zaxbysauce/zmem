@@ -2168,8 +2168,8 @@ function testClaudeManifestUsesExecForm() {
         path.join(REPO, "hooks", "hooks.claude.json"), "utf8"));
     const LAUNCHER_ARG0 = "${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js";
     const MATCHERS = {
-        "PreToolUse": "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task",
-        "PostToolUse": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "PreToolUse": "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch|Agent|Task",
+        "PostToolUse": "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch",
     };
     const VERBS = {
         "SessionStart": ["session-start"],
