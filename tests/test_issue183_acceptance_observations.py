@@ -339,6 +339,7 @@ class Issue183AcceptanceObservationsTest(unittest.TestCase):
                     "rows",
                     "aggregate",
                     "input_metadata",
+                    "usable_observation",
                     "generated_at",
                 ],
             )
