@@ -61,7 +61,7 @@ class Issue183AcceptanceReplayTest(unittest.TestCase):
             self.assertEqual(report["input_digest"], input_digest)
             self.assertEqual(
                 list(report),
-                ["schema_version", "input_digest", "store_sha256", "days", "rows", "aggregate", "input_metadata", "generated_at"],
+                ["schema_version", "input_digest", "store_sha256", "days", "rows", "aggregate", "input_metadata", "usable_observation", "generated_at"],
             )
             self.assertEqual(len(report["rows"]), 8)
             self.assertEqual(
