@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "69f9a1a1971bb865765304402c6820fbb619fd2b3811886161091bf51c87ba97",
+  "digest": "98099a88cd6a57c3870da10712ae4ed5d353000e0c0c264ca0b96078a93c0544",
   "files": {
     "hermes-plugin/__init__.py": "c584903ad0a6a68838c637e6b21191fcab149e4e116546f2b4919e897f0f9c16",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -83,7 +83,7 @@
     "skills/memory/scripts/storelib/mine.py": "532e1e042dad30710ff9379dddfac4a2638288ea9fa683f62db5163f29053568",
     "skills/memory/scripts/storelib/miss_rate.py": "e17fe34a931675e9638dddbd0eb9734da32c7bb5f73974f4986a58664f54204b",
     "skills/memory/scripts/storelib/namespace_cache.py": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc",
-    "skills/memory/scripts/storelib/ops_tokens.py": "727077bc13fa3fbed8c91da0d90af8c1b7adf38efb4b92fe0d9f680aa318aa70",
+    "skills/memory/scripts/storelib/ops_tokens.py": "1986c923b003ac0839d4bf8ab85fe1fabea3a7a640d62a20ab8342af63d0a424",
     "skills/memory/scripts/storelib/organize.py": "e47b1b7d347a840bb01101b2f843561834045daf50c99e51f7ea86a750de1173",
     "skills/memory/scripts/storelib/promote.py": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022",
     "skills/memory/scripts/storelib/query_ambiguity.py": "7c22244534e72977a05de600b7601a0652a471c705f29fcde27b47dcc65aa325",
