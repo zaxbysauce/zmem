@@ -252,7 +252,7 @@ class QueryRewriteStoreIntegrationTest(unittest.TestCase):
                 conn.commit()
             finally:
                 conn.close()
-            for value, expected in (("0", 0), (" 0 ", 1), ("false", 1), ("00", 1)):
+            for value, expected in (("0", 0), (" 0 ", 0), ("false", 1), ("00", 1)):
                 with self.subTest(value=value):
                     result = _run_store(
                         tmp, "query-rewrite", "--prompt=continue", "--session-id",
