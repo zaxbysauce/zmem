@@ -155,7 +155,8 @@ try:
     tokens = shlex.split(command, posix=True)
 except (TypeError, ValueError):
     tokens = []
-is_commit = len(tokens) >= 2 and tokens[:2] == ["git", "commit"] and "--amend" not in tokens
+is_commit = (tool == "Bash" and len(tokens) >= 2
+             and tokens[:2] == ["git", "commit"] and "--amend" not in tokens)
 op = descriptor["command"] or path
 print(json.dumps({"tool": tool, "op": op, "is_commit": is_commit,
                   "descriptor": descriptor}, ensure_ascii=False,
@@ -214,7 +215,8 @@ print(json.dumps({"additionalContext": msg}, ensure_ascii=False, separators=(","
 [ -n "$CTX_JSON" ] || emit_empty
 
 # The marker follows successful prompt rendering. It is a best-effort cooldown.
-if ! mkdir -p "$(dirname "$MARKER")" 2>/dev/null; then emit_empty; fi
+MARKER_DIR="$(dirname "$MARKER")"
+if [ ! -d "$MARKER_DIR" ] && ! mkdir -p "$MARKER_DIR" 2>/dev/null; then emit_empty; fi
 if ! printf '1\n' > "$MARKER" 2>/dev/null; then emit_empty; fi
 
 CTX_JSON="$(printf '%s' "$CTX_JSON" | sed 's/<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>/g; s/<<<END>>>/<<<END_NEUTRALIZED>>>/g')"

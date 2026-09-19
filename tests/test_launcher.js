@@ -15,6 +15,7 @@
 "use strict";
 
 const { spawnSync, execFileSync } = require("child_process");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -658,8 +659,9 @@ console.log("\n[7] Phase 5: reflect (Stop) + capture-failure (PostToolUseFailure
     {
         const r = runLauncher("capture-failure",
             JSON.stringify({ session_id: "p5-cf-" + Date.now(), tool_name: "Bash",
-                tool_input: { command: "false" }, error: "Exit code 1" }),
-            envWith({ ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ }));
+                tool_input: { command: "pytest tests/test_example.py" }, error: "Exit code 1" }),
+            envWith({ ZMEM_DATA: DATA, CLAUDE_PLUGIN_ROOT: REPO, CLAUDE_PROJECT_DIR: PROJ,
+                ZMEM_LAUNCHER_WATCHDOG_MS: "25000" }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         eq("capture-failure/claude: hookEventName == PostToolUseFailure",
             obj && obj.hookSpecificOutput && obj.hookSpecificOutput.hookEventName, "PostToolUseFailure");
@@ -1222,11 +1224,11 @@ console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was si
 
     const ccPayload = (sid) => JSON.stringify({
         session_id: sid, cwd: PROJ, hook_event_name: "PostToolUse",
-        tool_name: "Edit", tool_input: { file_path: "a.txt" },
+        tool_name: "Bash", tool_input: { command: "git commit -m capture" },
     });
-    // INTERVAL=1 → fires on the first call instead of the tenth.
     const ccEnv = (extra) => envWith(Object.assign({
-        ZMEM_DATA: CDATA, ZMEM_CONVENTION_INTERVAL: "1", CLAUDE_PROJECT_DIR: PROJ,
+        ZMEM_DATA: CDATA, CLAUDE_PROJECT_DIR: PROJ,
+        ZMEM_LAUNCHER_WATCHDOG_MS: "25000",
     }, extra));
 
     // --- claude host -------------------------------------------------------
@@ -1313,37 +1315,27 @@ console.log("\n[12] convention-capture is TRANSLATED and namespace-aware (was si
         const r = runLauncher("convention-capture",
             JSON.stringify({
                 session_id: "cc-hostile-" + Date.now(), cwd: GITPROJ,
-                hook_event_name: "PostToolUse", tool_name: "Edit", tool_input: { file_path: "a.txt" },
+                hook_event_name: "PostToolUse", tool_name: "Bash",
+                tool_input: { command: "git commit -m hostile" },
             }),
             envWith({
-                ZMEM_DATA: HDATA, ZMEM_CONVENTION_INTERVAL: "1",
+                ZMEM_DATA: HDATA,
                 CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO,
+                ZMEM_LAUNCHER_WATCHDOG_MS: "25000",
             }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("injection: hook still renders a well-formed capture prompt",
             /ZMem convention capture/.test(ac), ac.slice(0, 200));
 
-        // Pull the suggested command out of its backtick fence and actually
-        // run it through bash, exactly as an agent copy-pasting the suggestion
-        // would. Fixed: the malicious content is shlex.quote()'d, so it is
-        // inert single-quoted text as far as bash is concerned. Broken (pre-fix):
-        // bash would expand $(touch ...) while parsing the command line, and
-        // the canary file would exist BEFORE python ever saw an argument.
+        // The hostile namespace must be shell-quoted in the rendered command.
+        // Do not execute the capture suggestion: the contract is advisory and
+        // the sandbox-isolation helper below verifies no default-store write.
         assertNoDefaultStoreLeak("hostile-git-proj", () => {
-            const m = /`([^`]*)`/.exec(ac);
-            ok("injection: rendered a backtick-fenced suggested command", m !== null, ac);
-            if (m) {
-                const suggested = m[1];
-                const runDir = path.join(TMP, "hostile-run-cwd");
-                fs.mkdirSync(runDir, { recursive: true });
-                const br = spawnSync("bash", ["-c", suggested], {
-                    cwd: runDir, encoding: "utf8", timeout: 15000,
-                    env: envWith({ ZMEM_DATA: HDATA }),
-                });
-                ok("injection: canary file was NOT created (no command injection)",
-                    !fs.existsSync(CANARY), "bash stderr: " + (br.stderr || "").slice(0, 300));
-            }
+            ok("injection: rendered namespace is shlex-quoted",
+                ac.indexOf("--namespace " + shquote(hostileNs)) !== -1, ac);
+            ok("injection: canary file was NOT created (no command injection)",
+                !fs.existsSync(CANARY));
         });
     }
 }
@@ -1361,30 +1353,6 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
     seed(NDATA, "user:global", "fact", "seed row to create the store schema.", 0.9);
     const NNS = resolveNs(PROJ);
 
-    // Correction_queue.encode_namespace, invoked via a python one-shot so the
-    // seeded queue file can NEVER drift from the encoding the real hook uses
-    // (PR feedback PRR-009: the previous JS replica omitted the _xNN escapes,
-    // so a namespace containing spaces/non-ASCII would have seeded the wrong
-    // path and made the queue assertions pass or fail for the wrong reason).
-    function encodeNs(ns) {
-        return execFileSync(
-            PYTHON,
-            ["-c",
-             "import sys; sys.path.insert(0, sys.argv[1]); "
-             + "import correction_queue; "
-             + "sys.stdout.write(correction_queue.encode_namespace(sys.argv[2]))",
-             path.dirname(STORE_PY), ns],
-            { encoding: "utf8" }
-        );
-    }
-    function seedQueue(items) {
-        const qdir = path.join(NDATA, "queue");
-        fs.mkdirSync(qdir, { recursive: true });
-        fs.writeFileSync(path.join(qdir, encodeNs(NNS) + ".json"), JSON.stringify(items));
-    }
-    const isoNow = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-    const isoStale = new Date(Date.now() - 40 * 86400 * 1000).toISOString().replace(/\.\d+Z$/, "Z");
-
     const commitPayload = (sid) => JSON.stringify({
         session_id: sid, cwd: PROJ, hook_event_name: "PostToolUse",
         tool_name: "Bash", tool_input: { command: "git commit -m 'finish the thing'" },
@@ -1397,6 +1365,7 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
     // within these short sessions — isolating the commit branch.
     const nudgeEnv = (extra) => envWith(Object.assign({
         ZMEM_DATA: NDATA, CLAUDE_PROJECT_DIR: PROJ, CLAUDE_PLUGIN_ROOT: REPO,
+        ZMEM_LAUNCHER_WATCHDOG_MS: "25000",
     }, extra));
     const acOf = (r) => {
         try {
@@ -1409,16 +1378,16 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
     let r = runLauncher("convention-capture", commitPayload("cc-commit-1"), nudgeEnv());
     let ac = acOf(r);
     ok("commit-nudge: first git commit nudges the closeout skill",
-        /commit detected/.test(ac) && /closeout skill/.test(ac), r.stdout.slice(0, 300));
+        /non-amend git commit completed/.test(ac) && /project-bound or box-wide/.test(ac), r.stdout.slice(0, 300));
 
-    // Commit branch with an unreachable store must fail open to {} (PR
-    // feedback PRR-027: the counter connection cannot even be opened).
+    // The ring is a sidecar and can initialize a missing data directory; no
+    // SQLite store is required for the commit prompt.
     {
         const dead = path.join(TMP, "no-such-data-dir");
         const rd = runLauncher("convention-capture", commitPayload("cc-commit-dead"),
             envWith({ ZMEM_DATA: dead, CLAUDE_PROJECT_DIR: PROJ, CLAUDE_PLUGIN_ROOT: REPO }));
-        eq("commit-nudge: unreachable store degrades to {} (fail-open)",
-            rd.stdout.trim(), "{}");
+        ok("commit-nudge: missing store still permits sidecar-backed prompt",
+            /non-amend git commit completed/.test(rd.stdout), rd.stdout.slice(0, 300));
     }
 
     // ZCode host leg of AC2: the same commit nudge through the zcode envelope
@@ -1429,7 +1398,7 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
         let objz = null; try { objz = JSON.parse(rz.stdout.trim()); } catch (e) { /* */ }
         const acz = (objz && objz.additionalContext) || "";
         ok("commit-nudge: zcode host envelope carries the nudge",
-            /commit detected/.test(acz) && /closeout skill/.test(acz)
+            /non-amend git commit completed/.test(acz) && /project-bound or box-wide/.test(acz)
                 && !objz.hookSpecificOutput,
             rz.stdout.slice(0, 300));
     }
@@ -1457,57 +1426,20 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
     }), nudgeEnv());
     eq("commit-nudge: Edit tool carrying a command key is silent (Bash gate)", r.stdout.trim(), "{}");
 
-    // Independence from the cadence nudge, both directions:
-    //   (a) cadence fired first (marker written) → commit nudge still fires;
-    //   (b) commit marker present → cadence can still fire on a later call.
+    // Cadence prompting was removed by Issue #123. Eligible non-commit events
+    // remain silent while still feeding the operation ring.
     {
-        const env1 = nudgeEnv({ ZMEM_CONVENTION_INTERVAL: "1" });
+        const before = fs.existsSync(path.join(NDATA, "ops"))
+            ? fs.readdirSync(path.join(NDATA, "ops")).length : 0;
         r = runLauncher("convention-capture", JSON.stringify({
             session_id: "cc-mix", cwd: PROJ, hook_event_name: "PostToolUse",
             tool_name: "Edit", tool_input: { file_path: "a.txt" },
-        }), env1);
-        ok("commit-nudge: cadence nudge still fires at interval=1 (unchanged)",
-            /ZMem convention capture/.test(acOf(r)), r.stdout.slice(0, 200));
-        r = runLauncher("convention-capture", commitPayload("cc-mix"), env1);
-        ok("commit-nudge: commit fires even after the cadence nudge fired",
-            /commit detected/.test(acOf(r)), r.stdout.slice(0, 300));
-        r = runLauncher("convention-capture", JSON.stringify({
-            session_id: "cc-mix2", cwd: PROJ, hook_event_name: "PostToolUse",
-            tool_name: "Bash", tool_input: { command: "git commit -m once" },
-        }), env1);
-        ok("commit-nudge: commit marker alone does not satisfy the cadence marker",
-            /commit detected/.test(acOf(r)));
-        // Same session as cc-mix2's commit; cadence marker for cc-mix2 was
-        // never written (the commit branch exits before writing it), but the
-        // counter did increment — prove the counter counted the commit call:
-        // interval=2 means the NEXT call must fire the cadence nudge.
-        r = runLauncher("convention-capture", JSON.stringify({
-            session_id: "cc-mix2", cwd: PROJ, hook_event_name: "PostToolUse",
-            tool_name: "Edit", tool_input: { file_path: "b.txt" },
-        }), nudgeEnv({ ZMEM_CONVENTION_INTERVAL: "2" }));
-        ok("commit-nudge: the commit call still incremented the cadence counter",
-            /ZMem convention capture/.test(acOf(r)), r.stdout.slice(0, 200));
+        }), nudgeEnv());
+        eq("commit-nudge: non-commit event is prompt-silent", r.stdout.trim(), "{}");
+        const after = fs.readdirSync(path.join(NDATA, "ops")).length;
+        ok("commit-nudge: non-commit event still appends to the operation ring",
+            after === before + 1, `ops files before/after: ${before}/${after}`);
     }
-
-    // Queue enrichment: non-stale pending items append a count; stale-only or
-    // absent queue degrades to no count (never an error, never a dependency).
-    // (encodeNs now shells out to the real encoder, so the seeded path is
-    // authoritative regardless of namespace character content.)
-    seedQueue([{ id: "q1", timestamp: isoNow, decay_days: 7, message: "x" }]);
-    r = runLauncher("convention-capture", commitPayload("cc-queue-1"), nudgeEnv());
-    ac = acOf(r);
-    ok("commit-nudge: pending correction-queue count enriches the nudge",
-        /1 correction-queue item\(s\) pending review/.test(ac), ac.slice(0, 300));
-    seedQueue([{ id: "q2", timestamp: isoStale, decay_days: 7, message: "x" }]);
-    r = runLauncher("convention-capture", commitPayload("cc-queue-2"), nudgeEnv());
-    ac = acOf(r);
-    ok("commit-nudge: stale-only queue adds no count",
-        /commit detected/.test(ac) && !/correction-queue/.test(ac), ac.slice(0, 300));
-    fs.rmSync(path.join(NDATA, "queue", encodeNs(NNS) + ".json"));
-    r = runLauncher("convention-capture", commitPayload("cc-queue-3"), nudgeEnv());
-    ac = acOf(r);
-    ok("commit-nudge: absent queue degrades gracefully (nudge still fires)",
-        /commit detected/.test(ac) && !/correction-queue/.test(ac), ac.slice(0, 300));
 
     // Codex host path (AC2's third host): the codex PostToolUse entry routes
     // convention-capture the same way; the nudge must survive the codex
@@ -1518,7 +1450,7 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
         });
         r = runLauncher("convention-capture", commitPayload("cc-commit-codex"), codexEnv);
         ok("commit-nudge: codex host envelope carries the nudge",
-            /commit detected/.test(r.stdout) && /closeout skill/.test(r.stdout),
+            /non-amend git commit completed/.test(r.stdout) && /project-bound or box-wide/.test(r.stdout),
             r.stdout.slice(0, 300));
         // The codex hooks.json keeps TWO PostToolUse entries — the second
         // (capture-failure) must stay independently registered (no matcher,
@@ -1545,8 +1477,10 @@ console.log("\n[12b] convention-capture commit-boundary nudge (issue #49 B)");
             path.join(REPO, "skills", "memory", "scripts", "storelib", "backup.py"), "utf8");
         ok("commit-nudge: SENTINEL_PREFIXES covers the commit marker prefix",
             storeSrc.indexOf('".convention-commit-prompted-"') !== -1);
+        const digest = crypto.createHash("sha256").update("cc-commit-1", "utf8")
+            .digest("hex").slice(0, 32);
         ok("commit-nudge: commit marker was actually written for the nudged session",
-            fs.existsSync(path.join(NDATA, ".convention-commit-prompted-cc-commit-1")));
+            fs.existsSync(path.join(NDATA, ".convention-commit-prompted-" + digest)));
     }
 }
 
@@ -1764,7 +1698,8 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
         const r = runLauncher("reflect", JSON.stringify({
             session_id: "reflect-hostile-fail-" + Date.now(), transcript_path: TRANSCRIPT,
             cwd: GITPROJ, hook_event_name: "Stop", stop_hook_active: false,
-        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO }));
+        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO,
+            ZMEM_LAUNCHER_WATCHDOG_MS: "25000" }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("injection[reflect-fail]: hook still renders the failure reflection prompt",
@@ -1786,7 +1721,8 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
         const r = runLauncher("reflect", JSON.stringify({
             session_id: "reflect-hostile-nofail-" + Date.now(), transcript_path: TRANSCRIPT,
             cwd: GITPROJ, hook_event_name: "Stop", stop_hook_active: false,
-        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO }));
+        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO,
+            ZMEM_LAUNCHER_WATCHDOG_MS: "25000" }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("injection[reflect-nofail]: hook still renders the success-reflection nudge",
@@ -1802,8 +1738,9 @@ console.log("\n[16] injection: hostile origin remote must not escape reflect / c
 
         const r = runLauncher("capture-failure", JSON.stringify({
             session_id: "cf-hostile-" + Date.now(), cwd: GITPROJ, tool_name: "Bash",
-            tool_input: { command: "false" }, error: "Exit code 1",
-        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO }));
+            tool_input: { command: "pytest tests/test_example.py" }, error: "Exit code 1",
+        }), envWith({ ZMEM_DATA: HDATA, CLAUDE_PROJECT_DIR: GITPROJ, CLAUDE_PLUGIN_ROOT: REPO,
+            ZMEM_LAUNCHER_WATCHDOG_MS: "25000" }));
         let obj = null; try { obj = JSON.parse(r.stdout.trim()); } catch (e) { /* */ }
         const ac = (obj && obj.hookSpecificOutput && obj.hookSpecificOutput.additionalContext) || "";
         ok("injection[capture-failure]: hook still renders the auto-capture prompt",
@@ -2455,18 +2392,13 @@ function testZcodeProcessEntriesRunFixtureContract() {
         ZCODE_PROJECT_DIR: projectDir,
     });
     try {
-        // Prime capture-failure's per-session prompt dedup: its FIRST run
-        // emits the auto-capture prompt by design and writes the dedup
-        // marker (ZMEM_DATA/.capture-prompted-<session_id>); this discarded
-        // run moves every compared output below onto the deterministic {}
-        // path. The marker assertion makes the mechanism observable — it
-        // can only pass if the fixture's session_id actually parsed.
+        // Capture is disabled for the fixture contract. Even a priming run
+        // must remain state-free and return the deterministic empty envelope.
         const primeEntry = entries.find((e) => e.hook.args && e.hook.args[1] === "capture-failure");
         runZcodeProcess(primeEntry.hook, payload, verbEnv);
-        ok("#187: capture-failure priming wrote the per-session dedup marker",
-            fs.existsSync(path.join(scratch,
-                ".capture-prompted-00000000-0000-4000-8000-000000000187")),
-            "marker missing under " + scratch);
+        ok("#187: disabled capture writes no prompt marker",
+            !fs.readdirSync(scratch).some((name) => name.startsWith(".capture-prompted-")),
+            "unexpected marker under " + scratch);
 
         for (const { event, hook } of entries) {
             const verb = hook.args[1];
