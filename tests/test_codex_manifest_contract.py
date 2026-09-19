@@ -16,6 +16,7 @@ Runs standalone: python tests/test_codex_manifest_contract.py
 """
 
 import json
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -78,6 +79,117 @@ class CodexManifestContractTest(unittest.TestCase):
                     spec.get("hooks", {}),
                     "%s hooks file must declare a SessionStart entry" % host,
                 )
+
+    # Issue #188 (Workstream N PR 5 of 6): every Codex entry carries a literal
+    # quote-free Windows command (no shell wrapper, no nested quotes) and the
+    # seven context-bearing event families declare the 2,000-token
+    # additionalContextLimit — PreCompact is omitted because upstream Codex
+    # drops additionalContext on PreCompact.
+    CONTEXT_FAMILIES = {
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "SubagentStart",
+        "SubagentStop",
+    }
+    EXPECTED_VERBS = [
+        "session-start",
+        "recall",
+        "capture-correction",
+        "pretool-recall",
+        "convention-capture",
+        "capture-failure",
+        "reflect",
+        "subagent-recall",
+        "subagent-reflect",
+        "precompact",
+    ]
+
+    @staticmethod
+    def _codex_entries():
+        spec = json.loads(
+            (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8")
+        )
+        entries = []
+        for event, groups in spec.get("hooks", {}).items():
+            for group in groups:
+                for hook in group.get("hooks", []):
+                    entries.append((event, hook))
+        return entries
+
+    def test_codex_entries_have_windows_commands_and_context_limits(self):
+        entries = self._codex_entries()
+        self.assertEqual(
+            len(entries), 10,
+            "hooks.codex.json must declare exactly ten hook entries, got %d"
+            % len(entries),
+        )
+        verbs = []
+        for event, entry in entries:
+            command = entry.get("command", "")
+            verb = command.rsplit(" ", 1)[-1] if command else ""
+            verbs.append(verb)
+            with self.subTest(verb=verb):
+                expected = "node ${PLUGIN_ROOT}/hooks/zmem-launch.js %s" % verb
+                self.assertEqual(
+                    entry.get("commandWindows"), expected,
+                    "entry %r commandWindows must be the exact quote-free "
+                    "launcher invocation %r" % (verb, expected),
+                )
+                self.assertNotIn(
+                    '"', entry.get("commandWindows", ""),
+                    "commandWindows must contain no nested double quotes",
+                )
+                if event in self.CONTEXT_FAMILIES:
+                    self.assertEqual(
+                        entry.get("additionalContextLimit"), 2000,
+                        "entry %r under event family %s must declare "
+                        "additionalContextLimit 2000" % (verb, event),
+                    )
+                else:
+                    self.assertNotIn(
+                        "additionalContextLimit", entry,
+                        "entry %r under event family %s (not a context-bearing "
+                        "family) must omit additionalContextLimit — upstream "
+                        "Codex drops additionalContext there" % (verb, event),
+                    )
+        self.assertEqual(
+            verbs, self.EXPECTED_VERBS,
+            "the ten entries must keep their existing verbs in manifest order",
+        )
+
+    def test_codex_limit_matches_launcher_constant(self):
+        probe = (
+            'const l=require("./hooks/zmem-launch.js"); '
+            "process.stdout.write(JSON.stringify(["
+            "l.CODEX_ENVELOPE_CAP_BYTES, l.CHARS_PER_TOKEN, "
+            "l.CODEX_ADDITIONAL_CONTEXT_LIMIT]));"
+        )
+        result = subprocess.run(
+            ["node", "-e", probe],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            "launcher constant probe failed: %s" % result.stderr[-400:],
+        )
+        values = json.loads(result.stdout)
+        self.assertEqual(
+            values, [8000, 4, 2000],
+            "launcher must export [CODEX_ENVELOPE_CAP_BYTES, "
+            "CHARS_PER_TOKEN, CODEX_ADDITIONAL_CONTEXT_LIMIT] = "
+            "[8000, 4, 2000]",
+        )
+        self.assertEqual(
+            values[2], values[0] // values[1],
+            "CODEX_ADDITIONAL_CONTEXT_LIMIT must equal "
+            "floor(CODEX_ENVELOPE_CAP_BYTES / CHARS_PER_TOKEN)",
+        )
 
 
 # Issue #187: every ZCode hook entry must be a direct `process` executor entry —

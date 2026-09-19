@@ -644,7 +644,7 @@ console.log("\n[7] Codex registered pre-tool path (issue #95)");
         !/(permissionDecision|"decision")/.test(JSON.stringify(envelope || {})));
     ok("pretool: encoded envelope within the codex cap",
         Buffer.byteLength(JSON.stringify(envelope || {}), "utf8")
-            <= launch.CODEX_ENVELOPE_CAP_CHARS);
+            <= launch.CODEX_ENVELOPE_CAP_BYTES);
 
     // PreCompact leg: the ledger for the session must be cleared by the drive
     // (upstream drops additionalContext on PreCompact, so the clear IS the
@@ -817,6 +817,140 @@ testContentWinsWhenMessageMarginalSizeIs7990();
 testCodexEnvelopeCapAliases();
 testDegenerateBudgetFailsOpen();
 testInvalidRawFailsOpen();
+
+// --- issue #188: execute the manifest's real Windows command strings --------
+// Each of the ten hooks.codex.json entries carries a quote-free
+// `commandWindows` string. This section expands ${PLUGIN_ROOT} against a
+// throwaway plugin tree (launcher + generated stub scripts), runs the
+// command through cmd.exe exactly as the Codex Windows host would, and
+// compares the parsed envelope byte-for-byte (canonical JSON) with the
+// committed expected map. No envelope may exceed CODEX_ENVELOPE_CAP_BYTES
+// and none may carry a decision field — the hooks surface context only.
+
+function runWindowsManifestCase(manifestEntry, caseRecord, pluginRoot, env) {
+    const expanded = String(manifestEntry.commandWindows).replace(
+        /\$\{PLUGIN_ROOT\}/g, pluginRoot
+    );
+    const proc = spawnSync(process.env.ComSpec || "cmd.exe",
+        ["/d", "/s", "/c", expanded], {
+            input: JSON.stringify(caseRecord.stdin),
+            env,
+            encoding: "utf8",
+            timeout: 60000,
+            cwd: pluginRoot,
+        });
+    let parsed = null;
+    try { parsed = JSON.parse(String(proc.stdout).trim()); } catch (e) { /* */ }
+    return { status: proc.status, error: proc.error, stderr: proc.stderr || "",
+             stdout: String(proc.stdout || ""), parsed };
+}
+
+function stubScriptBody(childStdout) {
+    // The stub prints the fixture's sentinel output verbatim; childStdout
+    // never contains a single quote (generated fixture contract).
+    if (!childStdout) return "#!/usr/bin/env bash\nexit 0\n";
+    return "#!/usr/bin/env bash\nprintf '%s' '" + childStdout + "'\n";
+}
+
+function testWindowsManifestCommandExecution() {
+    const tree = fs.mkdtempSync(path.join(TMP_ROOT, "winmanifest-"));
+    try {
+        buildAndRunCases(tree);
+    } finally {
+        fs.rmSync(tree, { recursive: true, force: true });
+    }
+}
+
+function buildAndRunCases(tree) {
+    const casesPath = path.join(REPO, "tests", "fixtures", "launcher",
+        "codex-cases.json");
+    const expectedPath = path.join(REPO, "tests", "fixtures", "launcher",
+        "codex-expected.json");
+    const manifest = JSON.parse(fs.readFileSync(
+        path.join(REPO, "hooks", "hooks.codex.json"), "utf8"));
+    const casesDoc = JSON.parse(fs.readFileSync(casesPath, "utf8"));
+    const expected = JSON.parse(fs.readFileSync(expectedPath, "utf8"));
+    const manifestEntries = [];
+    for (const groups of Object.values(manifest.hooks)) {
+        for (const group of groups) {
+            for (const hook of group.hooks || []) manifestEntries.push(hook);
+        }
+    }
+
+    eq("windows-manifest: ten fixture cases match ten manifest entries",
+        casesDoc.cases.length, manifestEntries.length);
+
+    const pluginRoot = path.join(tree, "plugin");
+    fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
+    fs.copyFileSync(LAUNCHER, path.join(pluginRoot, "hooks", "zmem-launch.js"));
+    for (const caseRecord of casesDoc.cases) {
+        fs.writeFileSync(
+            path.join(pluginRoot, "hooks", `zmem-${caseRecord.verb}.sh`),
+            stubScriptBody(caseRecord.child_stdout));
+    }
+
+    const dataDir = path.join(tree, "data");
+    fs.mkdirSync(dataDir, { recursive: true });
+    const childEnv = { ...process.env };
+    delete childEnv.ZMEM_STORE;
+    Object.assign(childEnv, {
+        PLUGIN_ROOT: pluginRoot,
+        ZMEM_HOST: "codex",
+        ZMEM_DATA: dataDir,
+        ZMEM_STORE: path.join(dataDir, "store.sqlite"),
+        ZMEM_MODELS_DIR: path.join(tree, "nonexistent-models"),
+        ZMEM_MODEL_AUTODOWNLOAD: "0",
+        ZMEM_BASH_PATH: launch.resolveShell(),
+    });
+
+    if (process.platform !== "win32") {
+        ok("windows-manifest: win32-gated execution skipped on this platform",
+            true);
+    } else {
+        eq("windows-manifest: derived token limit relation",
+            launch.CODEX_ADDITIONAL_CONTEXT_LIMIT,
+            Math.floor(launch.CODEX_ENVELOPE_CAP_BYTES / launch.CHARS_PER_TOKEN));
+        eq("windows-manifest: token limit value", launch.CODEX_ADDITIONAL_CONTEXT_LIMIT, 2000);
+
+        let allWithinCap = true;
+        let noDecisionFields = true;
+        manifestEntries.forEach((manifestEntry, index) => {
+            const caseRecord = casesDoc.cases[index];
+            const result = runWindowsManifestCase(manifestEntry, caseRecord,
+                pluginRoot, childEnv);
+            const label = `windows-manifest[${caseRecord.verb}]`;
+            ok(`${label}: launcher exits 0`, result.status === 0,
+                `status=${result.status} stderr=${result.stderr.slice(0, 200)}`);
+            ok(`${label}: stdout parses as JSON`, result.parsed !== null,
+                result.stdout.slice(0, 200));
+            const want = expected[caseRecord.verb];
+            eq(`${label}: envelope equals committed expected (canonical bytes)`,
+                JSON.stringify(result.parsed), JSON.stringify(want));
+            if (caseRecord.expected_event) {
+                eq(`${label}: hookEventName matches fixture expected_event`,
+                    result.parsed && result.parsed.hookSpecificOutput &&
+                    result.parsed.hookSpecificOutput.hookEventName,
+                    caseRecord.expected_event);
+            }
+            if (result.parsed && Object.prototype.hasOwnProperty.call(
+                    result.parsed, "permissionDecision")) {
+                noDecisionFields = false;
+            }
+            if (Buffer.byteLength(JSON.stringify(result.parsed || {}), "utf8")
+                    > launch.CODEX_ENVELOPE_CAP_BYTES) {
+                allWithinCap = false;
+            }
+        });
+        ok("windows-manifest: every envelope within CODEX_ENVELOPE_CAP_BYTES",
+            allWithinCap);
+        ok("windows-manifest: no permissionDecision key in any envelope",
+            noDecisionFields);
+    }
+}
+
+console.log("\n[9] Windows manifest command execution (issue #188)");
+
+testWindowsManifestCommandExecution();
 
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }
 
