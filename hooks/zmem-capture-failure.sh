@@ -235,7 +235,8 @@ print(json.dumps({"additionalContext": msg}, ensure_ascii=False, separators=(","
 [ -n "$CTX_JSON" ] || emit_empty
 
 # Only the successful render path writes the prompt marker.
-if ! mkdir -p "$(dirname "$MARKER")" 2>/dev/null; then emit_empty; fi
+MARKER_DIR="$(dirname "$MARKER")"
+if [ ! -d "$MARKER_DIR" ] && ! mkdir -p "$MARKER_DIR" 2>/dev/null; then emit_empty; fi
 if ! printf '1\n' > "$MARKER" 2>/dev/null; then emit_empty; fi
 
 CTX_JSON="$(printf '%s' "$CTX_JSON" | sed 's/<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>/g; s/<<<END>>>/<<<END_NEUTRALIZED>>>/g')"

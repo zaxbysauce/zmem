@@ -10,6 +10,16 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.53.0] - 2026-09-19
+
+### Added
+- **Capture-quality policy and suffix-only history mining (issue #123)**:
+  capture surfaces now share an explicit fail-open `ZMEM_CAPTURE=0` gate,
+  command-derived evidence signals, hashed recurrence/commit markers, bounded
+  operation descriptors, and store-owned state bridges. History mining keeps
+  atomic per-transcript suffix checkpoints, strips complete untrusted-memory
+  fences before projection, and advances only after successful queue writes.
+
 ## [0.52.0] - 2026-09-19
 
 ### Added
