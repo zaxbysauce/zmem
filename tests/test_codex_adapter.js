@@ -773,6 +773,20 @@ function testCodexEnvelopeCapAliases() {
         launch.CODEX_ENVELOPE_CAP_CHARS, launch.CODEX_ENVELOPE_CAP_BYTES);
 }
 
+function testDegenerateBudgetFailsOpen() {
+    // Final-critic round 1 (issue #154 trace): budgets below the 2-byte
+    // serialized {} floor admit no envelope at all. The documented fail-open
+    // outcome is {} (fitEnvelope's existing ladder) — pin it so the scoped
+    // budget post-condition stays honest about this boundary.
+    const msg = exactSystemMessage("codex", "recall", 8001);
+    const out = launch.translate(sentinelPayload({ systemMessage: msg }), "codex", "recall", 1);
+    eq("154/tiny-budget: fail-open empty object", JSON.stringify(out), "{}");
+    const withContent = launch.translate(
+        sentinelPayload({ additionalContext: "c".repeat(500) }), "codex", "recall", 1
+    );
+    eq("154/tiny-budget: content case also fails open", JSON.stringify(withContent), "{}");
+}
+
 console.log("\n[8] Completed-envelope byte cap (issue #154)");
 
 testSystemMessageOnlyAt7999Bytes();
@@ -781,6 +795,7 @@ testSystemMessageOnlyAt8001Bytes();
 testFourByteEmojiUsesUtf8Bytes();
 testContentWinsWhenMessageMarginalSizeIs7990();
 testCodexEnvelopeCapAliases();
+testDegenerateBudgetFailsOpen();
 
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }
 

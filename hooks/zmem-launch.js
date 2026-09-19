@@ -1245,8 +1245,12 @@ function fitEnvelope(host, hookName, content, budget) {
 // operator message that cannot co-fit with the content is dropped entirely
 // (fail-open) rather than guaranteed to spill; a message-only payload that
 // alone cannot fit emits the empty-content envelope (the notice could not be
-// delivered either way). Every return after a valid payload satisfies
-// encodedSize(result) <= budget.
+// delivered either way). Budget post-condition (issue #154): for every
+// budget in which any JSON envelope is representable (>= 2 bytes — the
+// serialized {} floor; below that fitEnvelope's documented fail-open ladder
+// bottoms out at {} regardless of input), every return after a valid
+// payload satisfies encodedSize(result) <= budget — in particular at the
+// codex cap this issue enforces (8000).
 function translate(raw, host, hookName, budget) {
     const payload = extractPayload(raw);
     if (payload === null) return {}; // missing/invalid sentinel → fail open
