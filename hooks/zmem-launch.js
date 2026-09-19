@@ -1233,43 +1233,52 @@ function fitEnvelope(host, hookName, content, budget) {
 // Issue #107: the operator-facing systemMessage is read BEFORE the
 // empty-content early-return — a kill-switch session emits no
 // additionalContext, but its served-tree drift notice must still reach the
-// user. systemMessage is not content-trimmed by fitEnvelope (it is an
-// operator string, never model context), but it DOES consume budget: its
-// exact encoded marginal size is reserved from the budget before the
-// content is fitted, so the ASSEMBLED envelope stays within the host cap
-// (issue #95 PRR-001 — the pre-#95 code appended sysMsg post-fit, which a
-// child-script regression could push over the codex spill threshold). An
-// operator message that alone cannot fit is dropped entirely (fail-open)
-// rather than guaranteed to spill.
+// user. Issue #154: the budget is a property of the COMPLETED envelope, so
+// every branch measures the finished candidate with encodedSize() instead of
+// a projection of it (the pre-#154 code reserved only the message's encoded
+// marginal size, which ignored the base envelope overhead on the
+// message-only branch and squeezed content into a degenerate budget when the
+// marginal was near the cap). Preference order when both channels are
+// present: completed envelope with message → content-only re-fit at the
+// full budget → fitEnvelope's existing marker result → {}. fitEnvelope
+// remains responsible for the marker and final empty-object fallbacks. An
+// operator message that cannot co-fit with the content is dropped entirely
+// (fail-open) rather than guaranteed to spill; a message-only payload that
+// alone cannot fit emits the empty-content envelope (the notice could not be
+// delivered either way). Every return after a valid payload satisfies
+// encodedSize(result) <= budget.
 function translate(raw, host, hookName, budget) {
     const payload = extractPayload(raw);
     if (payload === null) return {}; // missing/invalid sentinel → fail open
     const content = payload.additionalContext;
-    let sysMsg =
+    const sysMsg =
         typeof payload.systemMessage === "string" && payload.systemMessage.trim()
             ? payload.systemMessage
             : null;
     const hasContent = !(content === undefined || content === null || content === "");
     if (!hasContent && !sysMsg) return {};
-    let contentBudget = budget;
-    if (sysMsg) {
-        const sysBytes = encodedSize(_withSystemMessage(makeEnvelope(host, hookName, ""), sysMsg))
-            - encodedSize(makeEnvelope(host, hookName, ""));
-        if (sysBytes >= budget) {
-            sysMsg = null;
-        } else {
-            contentBudget = budget - sysBytes;
-        }
+
+    if (!hasContent) {
+        // Message-only: the completed envelope IS the candidate — measure it.
+        const candidate = makeEnvelope(host, hookName, "", sysMsg);
+        if (encodedSize(candidate) <= budget) return candidate;
+        return fitEnvelope(host, hookName, "", budget);
     }
-    const envelope = hasContent
-        ? fitEnvelope(host, hookName, String(content), contentBudget)
-        : makeEnvelope(host, hookName, "");
-    if (sysMsg) envelope.systemMessage = sysMsg;
-    return envelope;
+
+    const contentOnly = fitEnvelope(host, hookName, String(content), budget);
+    if (!sysMsg) return contentOnly;
+    // Shallow copy is mandatory: _withSystemMessage attaches the key to the
+    // object passed in, and the drop path below returns the untouched
+    // contentOnly envelope.
+    const candidate = _withSystemMessage(Object.assign({}, contentOnly), sysMsg);
+    if (encodedSize(candidate) <= budget) return candidate;
+    return contentOnly;
 }
 
-// Shallow-copy helper: an envelope with ONLY the operator message attached,
-// used to measure systemMessage's exact encoded marginal size.
+// Attach the operator message key onto an envelope (mutates and returns the
+// envelope passed in). Callers building a measured candidate must pass a
+// shallow copy whenever the original envelope is also returned on another
+// path (issue #154 translate()).
 function _withSystemMessage(envelope, sysMsg) {
     envelope.systemMessage = sysMsg;
     return envelope;
@@ -1280,17 +1289,21 @@ function _withSystemMessage(envelope, sysMsg) {
 // output_spill.rs; verified 2026-09-09 against tag rust-v0.153.0 == main):
 // the text is written to a temp file and the model sees only a head/tail
 // preview — a spilled fence is effectively lost. At the plugin's 4-chars-
-// per-token estimator, 8000 chars ≈ 2000 tokens = 20% margin under the
-// spill point (the former 9000-char default sat within ~10% of it, issue
-// #95's units trap). Caveat (PRR-003): the estimator is per-CHARACTER —
-// dense multi-byte content (CJK) tokenizes at fewer chars per token, so
-// such fences have less real headroom than the 20% figure suggests. The
-// clamp is applied in main() AFTER resolveBudget, so it binds the host
-// default AND any operator-set ZMEM_CTX_BUDGET on codex (an override that
-// exceeds the cap is clamped WITH a stderr warning) — an override must not
-// reintroduce the spill risk. Claude/ZCode are unaffected (BUDGET_DEFAULT
-// stays 9000 there).
-const CODEX_ENVELOPE_CAP_CHARS = 8000;
+// per-token estimator, 8000 encoded UTF-8 bytes ≈ 2000 tokens = 20% margin
+// under the spill point (the former 9000-char default sat within ~10% of
+// it, issue #95's units trap). Caveat (PRR-003): the estimator is per-
+// CHARACTER — dense multi-byte content (CJK) tokenizes at fewer chars per
+// token, so such fences have less real headroom than the 20% figure
+// suggests. The cap is encoded BYTES (issue #154 — the completed-envelope
+// check and every budget comparison measure Buffer.byteLength(…, "utf8"));
+// the _CHARS name under-described that contract and is retained for one
+// release as a numeric alias. The clamp is applied in main() AFTER
+// resolveBudget, so it binds the host default AND any operator-set
+// ZMEM_CTX_BUDGET on codex (an override that exceeds the cap is clamped
+// WITH a stderr warning) — an override must not reintroduce the spill risk.
+// Claude/ZCode are unaffected (BUDGET_DEFAULT stays 9000 there).
+const CODEX_ENVELOPE_CAP_BYTES = 8000;
+const CODEX_ENVELOPE_CAP_CHARS = CODEX_ENVELOPE_CAP_BYTES;
 
 // Resolve and VALIDATE the context budget (issue #39 E3). A negative value is
 // truthy after parseInt (e.g. parseInt("-5") === -5), so the former
@@ -1435,16 +1448,16 @@ async function main() {
 
     const env = buildCanonicalEnv(host, prepared.meta, hookName);
     let budget = resolveBudget(env);
-    if (host === "codex" && budget > CODEX_ENVELOPE_CAP_CHARS) {
+    if (host === "codex" && budget > CODEX_ENVELOPE_CAP_BYTES) {
         // PRR-002 (#95): an explicitly-set operator budget above the codex
         // host cap gets clamped — say so on stderr instead of shrinking it
         // silently. The 9000 host DEFAULT also exceeds the cap but is not
         // operator-set, so it must not warn on every codex run.
         if (process.env.ZMEM_CTX_BUDGET) {
             process.stderr.write(`zmem: ZMEM_CTX_BUDGET=${budget} exceeds the `
-                + `codex envelope cap ${CODEX_ENVELOPE_CAP_CHARS}; clamping\n`);
+                + `codex envelope cap ${CODEX_ENVELOPE_CAP_BYTES}; clamping\n`);
         }
-        budget = CODEX_ENVELOPE_CAP_CHARS;
+        budget = CODEX_ENVELOPE_CAP_BYTES;
     }
     // Export the validated/clamped budget so spawned hook scripts see the same
     // effective value the launcher uses internally (#39 E3 / cubic-re #1).
@@ -1593,9 +1606,11 @@ module.exports = {
     recordEvidence,
     extractPayload,
     makeEnvelope,
+    encodedSize,
     fitEnvelope,
     translate,
     resolveBudget,
+    CODEX_ENVELOPE_CAP_BYTES,
     CODEX_ENVELOPE_CAP_CHARS,
     DEFAULT_LAUNCHER_WATCHDOG_MS,
     DEFAULT_NAMESPACE_RESOLVE_MS,

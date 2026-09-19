@@ -10,6 +10,24 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.48.0] - 2026-09-19
+
+### Fixed
+- **Codex launcher: the 8,000 envelope cap is enforced against the completed
+  JSON envelope on every `translate()` branch (issue #154)**. A
+  system-message-only payload (e.g. a #107 kill-switch drift notice) whose
+  completed envelope sat within the base-envelope overhead of the cap was
+  returned over the cap and spilled by codex-rs, and a near-cap operator
+  message silently destroyed the recalled memory content by squeezing it
+  into a degenerate budget. `translate()` now measures the finished
+  candidate on every branch: the message rides only when the completed
+  envelope fits the budget; otherwise it is dropped and the content is
+  re-fit at the full budget (`fitEnvelope`'s marker and empty-object
+  fallbacks unchanged). The cap constant is renamed
+  `CODEX_ENVELOPE_CAP_BYTES` (the contract is encoded UTF-8 bytes);
+  `CODEX_ENVELOPE_CAP_CHARS` stays as a one-release numeric alias, and
+  `encodedSize` is exported for deterministic tests.
+
 ## [0.47.0] - 2026-09-18
 
 ### Changed
