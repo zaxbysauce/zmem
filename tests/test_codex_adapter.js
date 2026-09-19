@@ -303,14 +303,16 @@ console.log("\n[4] Codex e2e: noise preservation, stable failure capture, loop g
         "SessionStart");
     ok("noise: no stray stdout leaked", noisy.stdout.indexOf("[zmem] merged") === -1, noisy.stdout);
 
-    // Stable failure capture: Codex PostToolUse failures normalize into the
-    // existing capture-failure hook and rewrap back to PostToolUse.
+    // Stable recognized-signal capture: Codex PostToolUse failures normalize
+    // into the capture-failure hook and rewrap back to PostToolUse. Issue #123
+    // deliberately leaves an arbitrary first failure silent, so this fixture
+    // uses a recognized test-runner command.
     const failPayload = JSON.stringify({
         session_id: "codex-failure",
         cwd: TMP,
         hook_event_name: "PostToolUse",
         tool_name: "Bash",
-        tool_input: { command: "false" },
+        tool_input: { command: "pytest tests/test_example.py" },
         status: "error",
         error: "Exit code 1",
     });
