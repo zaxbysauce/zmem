@@ -55,12 +55,10 @@ NO_SENTINEL = {"session-start", "precompact"}
 # no failure signal — with the literal no-failure stdin the capture-failure
 # case could never produce the PostToolUse envelope the same issue mandates
 # in codex-expected.json and AC2. The capture-failure case therefore carries
-# the four canonical keys PLUS the minimal failure fields the normalizer
-# requires; every other case keeps the exact canonical stdin.
+# the four canonical keys PLUS the single field the normalizer requires (a
+# meaningful `error`; tool_name/tool_input default and no status is needed —
+# final-critic round 1); every other case keeps the exact canonical stdin.
 FAILURE_SIGNAL_FIELDS = {
-    "tool_name": "Bash",
-    "tool_input": {"command": "git stash pop"},
-    "status": "error",
     "error": "Exit code 1",
 }
 
