@@ -48,7 +48,10 @@ hermes-provider × session_start, user_prompt, pretool, precompact
 
 Rows are stably sorted. `input_metadata` contains only `version` and
 `parsed_rows`; the top-level `usable_observation` marker records whether a
-validated transcript/failure observation could support measurement. All valid
+validated transcript/failure observation overlaps a selected report's
+same-session miss-attribution window; reference-precision deliberately accepts
+later observations outside that window. It is an availability marker, not a
+claim that every reference-precision row has matching evidence. All valid
 parsed rows participate in mixed nonempty-version validation before time-window
 or lane projection. Other valid lanes/moments are excluded from the eight rows
 with deterministic stderr diagnostics.

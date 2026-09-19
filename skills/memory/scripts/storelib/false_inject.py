@@ -249,7 +249,8 @@ def _read_prompt_events(transcripts) -> list:
 
 def build_false_injection_report(decision_lines, conn=None, data_dir=None,
                                  failure_rows=(), transcripts=(),
-                                 min_token_overlap: int = 2) -> dict:
+                                 min_token_overlap: int = 2, *,
+                                 prompt_events_override=None) -> dict:
     """Counter over parsed decision lines (see module docstring).
 
     ``decision_lines``: the list ``parse_bg_log`` returns (with ``moment``).
@@ -257,7 +258,10 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
     ``failure_rows``: the join's mined failures (dicts with session_id,
     ts_s, tool, operation, error). ``transcripts``: resolved transcript
     JSONL paths whose user prompts are mined as reference events (review
-    PRR-007). Never raises.
+    PRR-007). ``prompt_events_override`` is an optional caller-owned sequence
+    of already parsed ``(timestamp, text, normalized_session_id)`` prompt
+    events.  It replaces only transcript prompt parsing; failure-derived and
+    ops-ring references are still merged.  Never raises.
     """
     try:
         threshold = max(1, int(min_token_overlap))
@@ -281,7 +285,10 @@ def build_false_injection_report(decision_lines, conn=None, data_dir=None,
         except (TypeError, ValueError):
             ts_val = 0
         references.append((ts_val, text, _norm_sid(f.get("session_id"))))
-    references.extend(_read_prompt_events(transcripts))
+    prompt_events = (_read_prompt_events(transcripts)
+                     if prompt_events_override is None
+                     else prompt_events_override)
+    references.extend(prompt_events or ())
     ring_sids = {_norm_sid(ln.get("sid")) for ln in decision_lines
                  if isinstance(ln, dict) and ln.get("sid")}
     for sid in sorted(ring_sids):

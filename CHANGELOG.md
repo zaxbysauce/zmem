@@ -10,6 +10,18 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.49.0] - 2026-09-19
+
+### Fixed
+- **Replay measurements now attribute observations only to eligible decision
+  windows (issue #155)**. Miss-rate joins discard failures outside the exact
+  same-session, lane-and-moment inverse window instead of counting unrelated
+  events as misses; non-injected decision rows still contribute to the window
+  union. Replay parses transcript prompts once, memoizes identical read-only
+  recall queries across its eight report buckets, and reports observation
+  availability only from same-session events inside selected report windows.
+  The report schema and committed baseline bytes remain unchanged.
+
 ## [0.48.0] - 2026-09-19
 
 ### Fixed

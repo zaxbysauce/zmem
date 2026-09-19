@@ -84,6 +84,12 @@ _REPORT_LANES = tuple(sorted(_ATTR_LANES))
 _REPORT_MOMENTS = tuple(sorted(
     ("session_start", "user_prompt", "pretool", "precompact")))
 
+# Replay and miss-rate attribution must share one window contract. Keep the
+# symbols in this dependency-light module so callers cannot silently drift by
+# duplicating numeric defaults.
+MEASUREMENT_WINDOW_BEFORE_S = 1800
+MEASUREMENT_WINDOW_AFTER_S = 300
+
 # One bg-log decision line, either current or historical writer shape:
 #   historical writer A: [ts] zmem-hook status=.. reason=.. [omitted=N] ids=[..] all=[..] [tokens=a/b] [ops=N] [sid=..] [moment=..]
 #   writer B: [ts] zmem-hook status=.. ids=[..] all=[..] [tokens=a/b] [sid=..]
@@ -848,10 +854,12 @@ def _pct(numerator: int, denominator: int):
 
 def run_miss_report(store_path, db_path=None, transcripts=(),
                     bg_log_path=None, data_dir=None,
-                    window_before_s=1800, window_after_s=300,
+                    window_before_s=MEASUREMENT_WINDOW_BEFORE_S,
+                    window_after_s=MEASUREMENT_WINDOW_AFTER_S,
                     limit=200, verbose=False,
                     min_token_overlap=2, decision_lines=None,
-                    failure_rows_override=None) -> dict:
+                    failure_rows_override=None, *,
+                    prompt_events_override=None, recall_cache=None) -> dict:
     """Join mined failures × store recall × decision-log injections
     (read-only), plus the false-injection counter (issue #129).
 
@@ -867,7 +875,12 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     and ``failure_rows_override`` are optional replay seams: callers that
     have already validated and scope-filtered those inputs can provide them
     without changing the historical parser/database discovery path when
-    omitted.
+    omitted.  ``prompt_events_override`` replaces only transcript prompt
+    parsing in the nested false-injection counter; failure-derived and
+    ops-ring references remain active.  ``recall_cache`` is an optional
+    caller-owned cache for read-only recall results, allowing a replay to
+    share memoized queries across bounded report buckets while preserving the
+    historical per-call cache when omitted.
     """
     try:
         store = Path(store_path).expanduser()
@@ -1059,7 +1072,8 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     missed_id_counts: dict = {}
     id_meta: dict = {}
     missed_shapes: dict = {}
-    recall_cache: dict = {}
+    if recall_cache is None:
+        recall_cache = {}
 
     def _recall(query: str):
         """Zero-write recall; returns the row list, or None when the recall
@@ -1171,7 +1185,8 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         false_injection = build_false_injection_report(
             lines, conn=conn, data_dir=data_dir,
             failure_rows=counter_failures, transcripts=transcript_files,
-            min_token_overlap=min_token_overlap)
+            min_token_overlap=min_token_overlap,
+            prompt_events_override=prompt_events_override)
     except Exception as exc:
         false_injection = {
             "degraded": True,
