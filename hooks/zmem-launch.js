@@ -1309,6 +1309,14 @@ function _withSystemMessage(envelope, sysMsg) {
 // Claude/ZCode are unaffected (BUDGET_DEFAULT stays 9000 there).
 const CODEX_ENVELOPE_CAP_BYTES = 8000;
 const CODEX_ENVELOPE_CAP_CHARS = CODEX_ENVELOPE_CAP_BYTES;
+// Issue #188: the manifest's `additionalContextLimit` is the token projection
+// of the byte cap under the plugin's shared 4-chars-per-token estimator
+// (skills/memory/scripts/storelib/inject.py CHARS_PER_TOKEN). Exported so the
+// manifest contract test can prove floor(8000 / 4) == 2000 against the live
+// launcher constants instead of a duplicated literal.
+const CHARS_PER_TOKEN = 4;
+const CODEX_ADDITIONAL_CONTEXT_LIMIT =
+    Math.floor(CODEX_ENVELOPE_CAP_BYTES / CHARS_PER_TOKEN);
 
 // Resolve and VALIDATE the context budget (issue #39 E3). A negative value is
 // truthy after parseInt (e.g. parseInt("-5") === -5), so the former
@@ -1617,6 +1625,8 @@ module.exports = {
     resolveBudget,
     CODEX_ENVELOPE_CAP_BYTES,
     CODEX_ENVELOPE_CAP_CHARS,
+    CHARS_PER_TOKEN,
+    CODEX_ADDITIONAL_CONTEXT_LIMIT,
     DEFAULT_LAUNCHER_WATCHDOG_MS,
     DEFAULT_NAMESPACE_RESOLVE_MS,
     DEFAULT_NAMESPACE_CACHE_TTL_MS,

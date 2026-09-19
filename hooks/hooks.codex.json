@@ -6,6 +6,8 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" session-start",
+            "commandWindows": "node ${PLUGIN_ROOT}/hooks/zmem-launch.js session-start",
+            "additionalContextLimit": 2000,
             "timeout": 15
           }
         ]
@@ -17,6 +19,8 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" recall",
+            "commandWindows": "node ${PLUGIN_ROOT}/hooks/zmem-launch.js recall",
+            "additionalContextLimit": 2000,
             "timeout": 15
           }
         ]
@@ -26,6 +30,8 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" capture-correction",
+            "commandWindows": "node ${PLUGIN_ROOT}/hooks/zmem-launch.js capture-correction",
+            "additionalContextLimit": 2000,
             "timeout": 15
           }
         ]
@@ -38,6 +44,8 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" pretool-recall",
+            "commandWindows": "node ${PLUGIN_ROOT}/hooks/zmem-launch.js pretool-recall",
+            "additionalContextLimit": 2000,
             "timeout": 15
           }
         ]
@@ -50,6 +58,8 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" convention-capture",
+            "commandWindows": "node ${PLUGIN_ROOT}/hooks/zmem-launch.js convention-capture",
+            "additionalContextLimit": 2000,
             "timeout": 15
           }
         ]
@@ -59,6 +69,8 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" capture-failure",
+            "commandWindows": "node ${PLUGIN_ROOT}/hooks/zmem-launch.js capture-failure",
+            "additionalContextLimit": 2000,
             "timeout": 15
           }
         ]
@@ -70,6 +82,8 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" reflect",
+            "commandWindows": "node ${PLUGIN_ROOT}/hooks/zmem-launch.js reflect",
+            "additionalContextLimit": 2000,
             "timeout": 15
           }
         ]
@@ -81,6 +95,8 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" subagent-recall",
+            "commandWindows": "node ${PLUGIN_ROOT}/hooks/zmem-launch.js subagent-recall",
+            "additionalContextLimit": 2000,
             "timeout": 15
           }
         ]
@@ -92,6 +108,8 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" subagent-reflect",
+            "commandWindows": "node ${PLUGIN_ROOT}/hooks/zmem-launch.js subagent-reflect",
+            "additionalContextLimit": 2000,
             "timeout": 15
           }
         ]
@@ -103,6 +121,7 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/hooks/zmem-launch.js\" precompact",
+            "commandWindows": "node ${PLUGIN_ROOT}/hooks/zmem-launch.js precompact",
             "timeout": 15
           }
         ]
