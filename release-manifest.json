@@ -1,13 +1,13 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "3c07a186243b0b5d3756a881f2fe4745c8ef1299165d2f74f05628c06612522e",
+  "digest": "3a4877cbfb71a087b70ccdb9dcd1699b33c71736535585172741c6ac69639a26",
   "files": {
     "hermes-plugin/__init__.py": "c584903ad0a6a68838c637e6b21191fcab149e4e116546f2b4919e897f0f9c16",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "3d85bcfe63f601c0ecc93faa0765fe9435c0124fe416ac1f4ae43643e4cacf1b",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "4b59ab56e43245e1f01b4f529759bd75096797dd071cd3973e95c40a50d52226",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "b5c431c505067b406a953a33fcbdda2bdf9ce5405f6cf0a37584bb4740801673",
+    "hermes-plugin/plugin.yaml": "2044ddb0a6ee8110f819e4823365c42dfcad02259556d78c53a13a0b74e1f582",
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
@@ -16,7 +16,7 @@
     "hermes-plugin/server/requirements.txt": "799aad6ca2a111d8c21b746fae1a2770278b29554900f95b9241c686d7149189",
     "hooks/hooks.claude.json": "f926d43f08d3a18abb3754d25628ef467a79fb856ca8963b2f9b11573f0a2d62",
     "hooks/hooks.codex.json": "5fae6b47a06f1fcad69d4e96be3591d5c21ad55b0e0aa2bb50f0f43f8632e2e5",
-    "hooks/hooks.zcode.json": "237d436c45dc6863f233de510626d1f7b736d9083fd47bad975cf90f50bedc62",
+    "hooks/hooks.zcode.json": "8c1f63f4f8be8cd1bf28fe1cb36f5aaf316cb9c293d2db941e6b25b9cf63134c",
     "hooks/lib/zmem-log-rotate.py": "d39b64d4b38856771fc91b6a2060ae585028baea6dc2415a9060cc96364f72d0",
     "hooks/lib/zmem-recall-body.py": "6d952186b70083c02ea72557793f98d37e30b9a80484681cd7f27a25cdc98d26",
     "hooks/lib/zmem-session-start-payload.py": "5245839a7dc401cea102136857cc2011ae62ef484b72246195488310dbfa2e9c",
@@ -93,5 +93,5 @@
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
     "skills/memory/scripts/storelib/write.py": "ae0caf034f8ca55eba0cee447ab9dccc5a8bac673f93dd100a0111032b053a2d"
   },
-  "version": "0.46.0"
+  "version": "0.47.0"
 }
