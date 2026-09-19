@@ -154,6 +154,10 @@ class ZcodeManifestProcessTest(unittest.TestCase):
                     )
                 self.assertNotIn("sh ", stripped,
                                  "%s entry must not wrap a shell" % event)
+                self.assertIsInstance(
+                    hook.get("timeout"), int,
+                    "%s entry timeout must be a JSON integer" % event,
+                )
                 self.assertEqual(
                     hook.get("timeout"), 15,
                     "%s entry must keep its timeout of 15" % event,

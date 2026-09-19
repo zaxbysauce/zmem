@@ -61,6 +61,7 @@ function envWith(overrides) {
         "ZCODE_PROJECT_DIR", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
         "CLAUDE_SESSION_ID", "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
         "ZMEM_CONVENTION_INTERVAL", "ZMEM_INJECT", "ZMEM_BASH_PATH",
+        "ZCODE_SESSION_ID", "ZMEM_LAUNCHER_WATCHDOG_MS",
     ]) {
         delete e[k];
     }
@@ -2394,7 +2395,7 @@ function runZcodeProcess(entry, payload, env) {
     const expandedArgs = entry.args.map((arg) =>
         arg.replace("${ZCODE_PLUGIN_ROOT}", env.ZCODE_PLUGIN_ROOT));
     return spawnSync(entry.command, expandedArgs, {
-        input: payload, env, encoding: "utf8",
+        input: payload, env, encoding: "utf8", timeout: 60000,
     });
 }
 
@@ -2424,6 +2425,13 @@ function testZcodeProcessEntriesRunFixtureContract() {
     const FIXDIR = path.join(REPO, "tests", "fixtures", "launcher");
     const inputPath = path.join(FIXDIR, "zcode-input.json");
     const payload = fs.readFileSync(inputPath);
+    // The fixture MUST round-trip as JSON: the launcher fail-opens to meta={}
+    // on unparseable input, which would silently turn every leg below into a
+    // vacuous pass (review finding F-001, PR #211 round 2).
+    const fixtureMeta = JSON.parse(payload.toString("utf8"));
+    ok("#187: input fixture round-trips as JSON with the pinned session id",
+        fixtureMeta && fixtureMeta.session_id === "00000000-0000-4000-8000-000000000187",
+        JSON.stringify(fixtureMeta).slice(0, 120));
 
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-187-verbs-"));
     const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-187-project-"));
@@ -2433,6 +2441,11 @@ function testZcodeProcessEntriesRunFixtureContract() {
         ZMEM_MODELS_DIR: path.join(scratch, "missing-models"),
         ZMEM_MODEL_AUTODOWNLOAD: "0",
         ZMEM_HOST: "zcode",
+        // buildCanonicalEnv OVERWRITES ZMEM_NAMESPACE via resolveNamespace()
+        // for every hook in NEEDS_NAMESPACE (hooks/zmem-launch.js NEEDS_
+        // NAMESPACE set), so this pin documents the issue's env contract;
+        // the hooks under test actually run with resolveNamespace()'s value
+        // for ZCODE_PROJECT_DIR. Do not add namespace-dependent assertions.
         ZMEM_NAMESPACE: "project:fixture-187",
         ZMEM_INJECT: "0",
         ZMEM_CAPTURE: "0",
@@ -2443,11 +2456,17 @@ function testZcodeProcessEntriesRunFixtureContract() {
     });
     try {
         // Prime capture-failure's per-session prompt dedup: its FIRST run
-        // emits the auto-capture prompt by design (marker keyed by the
-        // fixture's fixed session_id); this discarded run writes the marker
-        // so every compared output below stays on the deterministic {} path.
+        // emits the auto-capture prompt by design and writes the dedup
+        // marker (ZMEM_DATA/.capture-prompted-<session_id>); this discarded
+        // run moves every compared output below onto the deterministic {}
+        // path. The marker assertion makes the mechanism observable — it
+        // can only pass if the fixture's session_id actually parsed.
         const primeEntry = entries.find((e) => e.hook.args && e.hook.args[1] === "capture-failure");
         runZcodeProcess(primeEntry.hook, payload, verbEnv);
+        ok("#187: capture-failure priming wrote the per-session dedup marker",
+            fs.existsSync(path.join(scratch,
+                ".capture-prompted-00000000-0000-4000-8000-000000000187")),
+            "marker missing under " + scratch);
 
         for (const { event, hook } of entries) {
             const verb = hook.args[1];
