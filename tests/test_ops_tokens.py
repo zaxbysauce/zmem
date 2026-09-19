@@ -199,6 +199,15 @@ class DeriveTokensTest(unittest.TestCase):
 
 
 class ComposeQueryTest(unittest.TestCase):
+    def test_checkpoint_phrase_is_complete_beside_reserved_ops_tail(self):
+        tokens, checkpoint = ops_tokens.compose_pretool_query(
+            {"command": "git push --force-with-lease origin topic"})
+        composed = ops_tokens.compose_inject_query(
+            "p" * 1000, " ".join(tokens), checkpoint)
+        self.assertEqual(len(composed), 500)
+        self.assertTrue(composed.endswith("git push " + checkpoint))
+        self.assertIn(checkpoint, composed)
+
     def test_identity_without_ops_is_byte_exact(self):
         # The legacy-neutrality pin: every gold item without an ops field runs
         # the byte-identical query, so committed eval scores cannot move.

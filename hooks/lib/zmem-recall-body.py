@@ -30,6 +30,12 @@ _USER_PROMPT_REWRITE_INPUT_CAP = 4096
 _POSTTOOLBATCH_FIELD_CAP = 150
 _POSTTOOLBATCH_SUMMARY_CAP = 12
 _HOOK_INPUT_MAX_BYTES = 256 * 1024
+# The private pretool payload is a strict subset of the already bounded hook
+# event.  Keep its independent cap at that envelope ceiling: this protects an
+# older store process that never consumes stdin while avoiding an argv or log
+# transport for raw tool input.
+_PRETOOL_INPUT_MAX_BYTES = _HOOK_INPUT_MAX_BYTES
+_PRIVATE_PRETOOL_STDIN_MARKER = "ZMEM_PRIVATE_PRETOOL_STDIN"
 
 # Issue #153: decision-line attribution is deliberately small and
 # dependency-free.  The schema module is the canonical source for the
@@ -328,9 +334,11 @@ def _clear_delivery_state(store_py: str, session_id: str) -> None:
     if not session_id or not store_py or not os.path.isfile(store_py):
         return
     try:
+        child_env = os.environ.copy()
+        child_env.pop(_PRIVATE_PRETOOL_STDIN_MARKER, None)
         subprocess.run([sys.executable, store_py, "ledger-clear", "--session-id", session_id],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=5, check=False)
+                       timeout=5, check=False, env=child_env)
     except Exception:
         pass
 
@@ -425,12 +433,37 @@ def posttoolbatch_tool_summary(payload: dict) -> dict:
             "basenames": paths[:_POSTTOOLBATCH_SUMMARY_CAP]}
 
 
-def _run_store(store_py: str, args: list[str], timeout=None):
+def _run_store(store_py: str, args: list[str], timeout=None, *,
+               stdin_bytes: bytes | None = None,
+               env_overrides: dict[str, str | None] | None = None):
     command = [sys.executable, store_py, *args]
     try:
         effective_timeout = _store_timeout_s() if timeout is None else timeout
-        output = subprocess.check_output(command, stderr=subprocess.DEVNULL,
-                                         timeout=effective_timeout)
+        kwargs = {
+            "stderr": subprocess.DEVNULL,
+            "timeout": effective_timeout,
+        }
+        # The marker is private to one pretool recall child.  Start every
+        # store subprocess with it removed so an ambient host/test value
+        # cannot accidentally reach query-rewrite, ledger-clear, or another
+        # command; the pretool caller below explicitly restores it alongside
+        # the matching stdin bytes.
+        child_env = os.environ.copy()
+        child_env.pop(_PRIVATE_PRETOOL_STDIN_MARKER, None)
+        if env_overrides is not None:
+            for key, value in env_overrides.items():
+                if value is None:
+                    child_env.pop(key, None)
+                else:
+                    child_env[key] = value
+        kwargs["env"] = child_env
+        # Supplying ``input`` makes check_output use communicate(), avoiding a
+        # pipe-buffer deadlock if a version-skewed child exits before reading
+        # this optional private payload.  Leave legacy subprocess construction
+        # untouched when there is no payload.
+        if stdin_bytes is not None:
+            kwargs["input"] = stdin_bytes
+        output = subprocess.check_output(command, **kwargs)
         if isinstance(output, bytes):
             output = output.decode("utf-8", "replace")
         return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
@@ -634,7 +667,33 @@ def main() -> int:
     if moment == "pretool" or (_cross_env == "1" and moment == "user_prompt"):
         args.append("--include-cross-project")
     _attempt_started = time.perf_counter()
-    result = _run_store(store_py, args)
+    # Current raw pretool input is private, transient enrichment only.  Its
+    # flattened query still travels on the stable argv surface; raw JSON is
+    # handed solely to this marked child on stdin and never reaches logs,
+    # envelopes, storage, or other store commands.  Always remove a possible
+    # ambient marker for every child, then set it atomically with bytes below.
+    private_stdin = None
+    private_env = {_PRIVATE_PRETOOL_STDIN_MARKER: None}
+    if mode == "pretool" and command == "recall":
+        tool_input = event.get("tool_input")
+        if isinstance(tool_input, dict):
+            try:
+                encoded_input = json.dumps(
+                    tool_input, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                if len(encoded_input) <= _PRETOOL_INPUT_MAX_BYTES:
+                    private_stdin = encoded_input
+                    private_env[_PRIVATE_PRETOOL_STDIN_MARKER] = "1"
+            except (TypeError, ValueError, UnicodeError):
+                pass
+    if private_stdin is None:
+        # Preserve the established call shape for every legacy path and for
+        # version-skew/fail-open cases with no bounded payload.  `_run_store`
+        # still scrubs an ambient private marker from its child environment.
+        result = _run_store(store_py, args)
+    else:
+        result = _run_store(store_py, args, stdin_bytes=private_stdin,
+                            env_overrides=private_env)
     attribution_t_ms = _rounded_elapsed_ms(_attempt_started)
     envelope = {}
     if result is not None and result.returncode == 0:

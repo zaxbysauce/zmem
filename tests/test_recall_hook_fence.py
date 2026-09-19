@@ -18,13 +18,17 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import inspect
+import json
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
+RECALL_BODY = REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py"
 
 # Make ``storelib`` and ``hooks.lib.zmem_recall_body`` importable when
 # this test runs from the repo root (the CI loop invokes each test
@@ -36,6 +40,38 @@ sys.path.insert(0, str(SCRIPTS_DIR / "storelib"))
 # from the repo root. Without this, the selective-inject gate tests
 # below would fail with ModuleNotFoundError.
 sys.path.insert(0, str(REPO_ROOT / "hooks"))
+
+
+class PrivatePretoolMarkerBoundaryTests(unittest.TestCase):
+    def test_ledger_clear_children_never_inherit_private_marker(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-marker-boundary-") as tmp:
+            capture = Path(tmp) / "children.jsonl"
+            fake = Path(tmp) / "fake-store.py"
+            fake.write_text(
+                "import json, os, sys\n"
+                "with open(os.environ['CAPTURE'], 'a', encoding='utf-8') as f:\n"
+                " f.write(json.dumps({'argv': sys.argv[1:], 'marker': "
+                "os.environ.get('ZMEM_PRIVATE_PRETOOL_STDIN')}) + '\\n')\n"
+                "print(json.dumps({'rendered': '', 'reason': 'empty-pool'}))\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update({"CAPTURE": str(capture), "ZMEM_DATA": tmp,
+                        "ZMEM_SESSION": "marker-boundary",
+                        "ZMEM_PRIVATE_PRETOOL_STDIN": "1", "ZMEM_HOST": "claude"})
+            for mode in ("session_end", "precompact"):
+                result = subprocess.run(
+                    [sys.executable, str(RECALL_BODY), str(fake),
+                     "project:fixture", "25000", mode],
+                    input=json.dumps({"session_id": "marker-boundary"}),
+                    capture_output=True, text=True, env=env, timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+            rows = [json.loads(line) for line in capture.read_text(
+                encoding="utf-8").splitlines()]
+            clears = [row for row in rows if row["argv"][:1] == ["ledger-clear"]]
+            self.assertEqual(len(clears), 2)
+            self.assertTrue(all(row["marker"] is None for row in rows), rows)
 
 
 class FenceConstantsTests(unittest.TestCase):

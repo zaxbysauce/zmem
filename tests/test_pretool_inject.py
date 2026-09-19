@@ -67,6 +67,7 @@ _STRIP_ENV = (
     # Issue #151 review (CUBIC-killsw-251): the #117 knobs - an ambient
     # ZMEM_PENDING_SIDECAR=1 flips the retired-by-default premise.
     "ZMEM_PENDING_SIDECAR", "ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP",
+    "ZMEM_PRIVATE_PRETOOL_STDIN",
 )
 
 
@@ -103,6 +104,17 @@ def _run_body(tmp: str, mode: str, event: dict, ns: str = "user:global",
     return r.stdout, r.returncode
 
 
+def _run_body_with_store(tmp: str, mode: str, event: dict, store_py: Path,
+                         ns: str = "user:global", **extra: str) -> tuple[str, int]:
+    """Run the real adapter against a deliberately tiny store child."""
+    env = _clean_env(tmp, **extra)
+    r = subprocess.run(
+        [sys.executable, str(BODY), str(store_py), ns, "25000", mode],
+        input=json.dumps(event), capture_output=True, text=True, env=env,
+        timeout=120)
+    return r.stdout, r.returncode
+
+
 def _ctx(stdout: str) -> str:
     text = stdout.strip()
     # Silent adapters now emit the canonical empty envelope ``{}``; the old
@@ -133,6 +145,221 @@ class PreToolModeTest(unittest.TestCase):
                 if "zmem-hook" in l][-1]
         self.assertIn("reason=injected", line)
         self.assertNotRegex(line, r"(?:^|\s)ops=\d+")
+
+    def test_reset_checkpoint_retrieves_phrase_only_lesson_through_real_store(self):
+        """The private payload reaches store-side #99 composition end to end."""
+        _seed(
+            _clean_env(self._tmp), "project:pretool",
+            "reset-checkpoint-only stale tree fetch main rebase verify diff",
+        )
+        out, rc = _run_body(
+            self._tmp, "pretool",
+            {"tool_name": "Bash", "tool_input": {"command": "git reset --hard"},
+             "session_id": "reset-checkpoint"},
+            ns="project:pretool",
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("reset-checkpoint-only", _ctx(out))
+
+    def test_path_checkpoint_retrieves_phrase_only_lesson_through_real_store(self):
+        _seed(
+            _clean_env(self._tmp), "project:pretool",
+            "path-checkpoint-only basename ratchet citation re-pin local battery",
+        )
+        out, rc = _run_body(
+            self._tmp, "pretool",
+            {"tool_name": "Edit",
+             "tool_input": {"description": "run tests/test_checkpoint_queries.py"},
+             "session_id": "path-checkpoint"},
+            ns="project:pretool",
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("path-checkpoint-only", _ctx(out))
+
+    def test_current_pretool_input_wins_over_nonempty_stale_ring(self):
+        """#99 corrects stale-ring precedence without changing ring fallback."""
+        import storelib.ops_tokens as ops
+
+        _seed(
+            _clean_env(self._tmp), "project:pretool",
+            "current-reset-only stale tree fetch main rebase verify diff",
+        )
+        self.assertTrue(ops.append_ops_ring(self._tmp, "current-wins", "Bash",
+                                            "git stash pop"))
+        out, rc = _run_body(
+            self._tmp, "pretool",
+            {"tool_name": "Bash", "tool_input": {"command": "git reset --hard"},
+             "session_id": "current-wins"},
+            ns="project:pretool",
+        )
+        self.assertEqual(rc, 0)
+        ctx = _ctx(out)
+        self.assertIn("current-reset-only", ctx)
+        self.assertNotIn("pretoolcanary", ctx,
+                         "stale stash-ring tokens must not survive current reset input")
+
+    def test_real_store_does_not_persist_private_transport_value(self):
+        secret = "private-transport-must-not-persist-99"
+        out, rc = _run_body(
+            self._tmp, "pretool",
+            {"tool_name": "Bash",
+             "tool_input": {"command": "git stash pop", "private_note": secret},
+             "session_id": "private-no-persist"},
+            ns="project:pretool",
+        )
+        self.assertEqual(rc, 0)
+        self.assertNotIn(secret, out)
+        for path in (Path(self._tmp) / "store.sqlite",
+                     Path(self._tmp) / "zmem-decisions.log"):
+            self.assertNotIn(secret, path.read_bytes().decode("utf-8", "replace"),
+                             str(path))
+        for ledger in Path(self._tmp).rglob("*.ledger"):
+            self.assertNotIn(secret, ledger.read_text(encoding="utf-8"),
+                             str(ledger))
+
+    def test_pretool_raw_input_uses_private_stdin_not_argv_or_log(self):
+        """#99 keeps current raw input transient and child-private."""
+        capture = Path(self._tmp) / "private-transport.json"
+        fake = Path(self._tmp) / "fake-store.py"
+        fake.write_text(
+            "import json, os, sys\n"
+            "p = os.path.join(os.environ['ZMEM_DATA'], 'private-transport.json')\n"
+            "with open(p, 'w', encoding='utf-8') as f:\n"
+            "    json.dump({'argv': sys.argv[1:], "
+            "'marker': os.environ.get('ZMEM_PRIVATE_PRETOOL_STDIN'), "
+            "'stdin': sys.stdin.buffer.read().decode('utf-8')}, f)\n"
+            "print(json.dumps({'rendered': '', 'reason': 'empty-pool'}))\n",
+            encoding="utf-8",
+        )
+        raw = {"command": "git reset --hard", "private_secret": "raw-only-99"}
+        _, rc = _run_body_with_store(
+            self._tmp, "pretool", {"tool_name": "Bash", "tool_input": raw,
+                                     "session_id": "private-transport"}, fake,
+            ns="project:pretool")
+        self.assertEqual(rc, 0)
+        observed = json.loads(capture.read_text(encoding="utf-8"))
+        self.assertEqual(observed["marker"], "1")
+        self.assertEqual(json.loads(observed["stdin"]), raw)
+        self.assertNotIn("raw-only-99", " ".join(observed["argv"]))
+        decision = (Path(self._tmp) / "zmem-decisions.log").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("raw-only-99", decision)
+
+    def test_private_marker_is_removed_for_nonpretool_selector_child(self):
+        capture = Path(self._tmp) / "private-marker-nonpretool.json"
+        fake = Path(self._tmp) / "fake-store-nonpretool.py"
+        fake.write_text(
+            "import json, os, sys\n"
+            "p = os.path.join(os.environ['ZMEM_DATA'], 'private-marker-nonpretool.json')\n"
+            "with open(p, 'w', encoding='utf-8') as f:\n"
+            "    json.dump({'marker': os.environ.get('ZMEM_PRIVATE_PRETOOL_STDIN'), "
+            "'stdin': sys.stdin.buffer.read().decode('utf-8')}, f)\n"
+            "print(json.dumps({'rendered': '', 'reason': 'empty-pool'}))\n",
+            encoding="utf-8",
+        )
+        _, rc = _run_body_with_store(
+            self._tmp, "subagent", {"prompt": "review marker isolation",
+                                      "session_id": "marker-nonpretool"}, fake,
+            ns="project:pretool", ZMEM_PRIVATE_PRETOOL_STDIN="1")
+        self.assertEqual(rc, 0)
+        observed = json.loads(capture.read_text(encoding="utf-8"))
+        self.assertIsNone(observed["marker"])
+        self.assertEqual(observed["stdin"], "")
+
+    def test_large_private_payload_does_not_block_nonreading_old_store(self):
+        """check_output(input=...) must communicate even with version skew."""
+        fake = Path(self._tmp) / "fake-old-store.py"
+        # Deliberately do not read stdin: this models a served old store.py.
+        fake.write_text(
+            "import json\nprint(json.dumps({'rendered': '', 'reason': 'empty-pool'}))\n",
+            encoding="utf-8",
+        )
+        _, rc = _run_body_with_store(
+            self._tmp, "pretool",
+            {"tool_name": "Bash", "session_id": "old-store",
+             "tool_input": {"command": "git reset --hard", "padding": "x" * 70000}},
+            fake, ns="project:pretool")
+        self.assertEqual(rc, 0)
+
+    def test_private_cli_payload_failures_preserve_primary_recall(self):
+        """Malformed/unsupported private input is optional enrichment only."""
+        canary = "transport fallback canary ordinary query"
+        _seed(_clean_env(self._tmp), "project:pretool", canary)
+        reset_only = "private-shape-reset-only stale tree fetch main rebase verify diff"
+        _seed(_clean_env(self._tmp), "project:pretool", reset_only)
+        base = [
+            sys.executable, str(STORE_PY), "recall", "--query", canary,
+            "--namespace", "project:pretool", "--limit", "5",
+            "--for-injection", "--no-bump", "--json",
+            "--session-id", "private-cli", "--moment", "pretool",
+        ]
+        env = _clean_env(self._tmp, ZMEM_PRIVATE_PRETOOL_STDIN="1")
+        for label, payload in (
+            ("malformed", b"{"),
+            ("non-object", b"[]"),
+            ("oversized", b"{" + b" " * (256 * 1024) + b"}"),
+        ):
+            with self.subTest(label=label):
+                argv = list(base)
+                argv[argv.index("private-cli")] = "private-cli-" + label
+                result = subprocess.run(argv, input=payload, capture_output=True,
+                                        env=env, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(b"transport fallback canary", result.stdout)
+                self.assertNotIn(b"private-shape-reset-only", result.stdout)
+
+        # The same ambient marker is inert for direct/non-passive or
+        # non-pretool invocations: those shapes must not consume stdin.
+        for label, removed, moment in (
+            ("manual", {"--no-bump"}, "pretool"),
+            ("user-prompt", set(), "user_prompt"),
+            ("subagent", set(), "subagent"),
+            ("precompact", set(), "precompact"),
+            ("session-start", set(), "session_start"),
+        ):
+            with self.subTest(label=label):
+                argv = [arg for arg in base if arg not in removed]
+                argv[argv.index("private-cli")] = "private-shape-" + label
+                argv[argv.index("pretool")] = moment
+                result = subprocess.run(
+                    argv, input=b'{"command":"git reset --hard"}',
+                    capture_output=True, env=env, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(b"transport fallback canary", result.stdout)
+                self.assertNotIn(b"private-shape-reset-only", result.stdout)
+
+    def test_stash_list_does_not_gain_consume_checkpoint(self):
+        """A real store must not retrieve a phrase-only consume lesson."""
+        _seed(_clean_env(self._tmp), "project:pretool",
+              "stash-negative-only foreign-stash conflict verify")
+        out, rc = _run_body(
+            self._tmp, "pretool",
+            {"tool_name": "Bash", "tool_input": {"command": "git stash list"},
+             "session_id": "stash-list-negative"},
+            ns="project:pretool")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("stash-negative-only", _ctx(out))
+
+    def test_real_path_depends_on_production_checkpoint_matcher(self):
+        """A mutated served store changes E2E recall; fixtures are not echoed."""
+        served = Path(self._tmp) / "served-scripts"
+        shutil.copytree(SCRIPTS, served)
+        policy = served / "storelib" / "ops_tokens.py"
+        original = "stale tree fetch main rebase verify diff"
+        mutated = "mutation-checkpoint-only alpha beta gamma"
+        text = policy.read_text(encoding="utf-8")
+        self.assertIn(original, text)
+        policy.write_text(text.replace(original, mutated, 1), encoding="utf-8")
+        _seed(_clean_env(self._tmp), "project:pretool",
+              "mutation-result " + mutated)
+        out, rc = _run_body_with_store(
+            self._tmp, "pretool",
+            {"tool_name": "Bash", "tool_input": {"command": "git reset --hard"},
+             "session_id": "mutated-policy"},
+            served / "store.py", ns="project:pretool")
+        self.assertEqual(rc, 0)
+        self.assertIn("mutation-result", _ctx(out))
 
     def test_cross_hook_flag_env_matrix(self):
         """Issue #98: the hook forwards --include-cross-project per the
