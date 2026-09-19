@@ -800,6 +800,7 @@ def select_and_budget_for_injection(
     budget_tokens: int = 1500,
     data_dir: str | None = None,
     min_confidence: float | None = None,
+    pretool_input: dict | None = None,
 ) -> dict:
     """Select, render, account, and record one passive injection event.
 
@@ -839,17 +840,38 @@ def select_and_budget_for_injection(
     from storelib import ops_tokens as ops  # type: ignore
     from storelib import recall as recall_module  # type: ignore
 
-    # Resolve/derive operation context only on the pretool lane.  Explicitly
-    # supplied [] intentionally suppresses ring reads.
+    # Resolve/derive operation context only on the pretool lane.  The current
+    # raw event is a private hook-to-store input, not a public selector
+    # surface: when it yields operation tokens those outrank the older ring.
+    # Explicitly supplied [] otherwise intentionally suppresses ring reads.
     effective_query = query or ""
     effective_ops = list(ops_tokens) if ops_tokens is not None else []
+    checkpoint = ""
     query_context_enabled = True
     if moment == "pretool":
         try:
             query_context_enabled = bool(ops.query_context_enabled())
         except Exception:
             query_context_enabled = False
-    if moment == "pretool" and ops_tokens is None and query_context_enabled:
+    current_ops = []
+    if (moment == "pretool" and query_context_enabled
+            and isinstance(pretool_input, dict)):
+        try:
+            composed = ops.compose_pretool_query(pretool_input)
+            if (isinstance(composed, tuple) and len(composed) == 2
+                    and isinstance(composed[0], (list, tuple))
+                    and isinstance(composed[1], str)):
+                current_ops = [token for token in composed[0]
+                               if isinstance(token, str)]
+                checkpoint = composed[1]
+        except Exception:
+            # Raw transport is optional enrichment.  A version-skewed or
+            # malformed matcher must retain the established query/ring path.
+            current_ops = []
+            checkpoint = ""
+    if moment == "pretool" and current_ops:
+        effective_ops = current_ops
+    elif moment == "pretool" and ops_tokens is None and query_context_enabled:
         try:
             events = ops.read_ops_ring(resolved_data, session_id)
             effective_ops = ops.derive_ops_tokens(*events)
@@ -864,10 +886,12 @@ def select_and_budget_for_injection(
                 effective_ops = ops.derive_ops_tokens(effective_query)
             except Exception:
                 effective_ops = []
-    if moment == "pretool" and effective_ops and query_context_enabled:
+    if (moment == "pretool" and query_context_enabled
+            and (effective_ops or checkpoint)):
         try:
             effective_query = ops.compose_inject_query(effective_query,
-                                                       " ".join(effective_ops))
+                                                       " ".join(effective_ops),
+                                                       checkpoint)
         except Exception:
             pass
 

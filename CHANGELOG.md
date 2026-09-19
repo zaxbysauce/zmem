@@ -10,6 +10,19 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.51.0] - 2026-09-19
+
+### Added
+- **Checkpoint-verbs-as-data enrich pre-tool passive recall (issue #99)**:
+  the store now classifies the current bounded raw `tool_input` against six
+  ordered hazard forms and appends one exact checkpoint phrase while keeping
+  the existing operation-token reservation and 500-character query bound.
+  Current-event tokens take precedence over a stale session ring; `git stash
+  list` remains non-consuming, the legacy two-argument composer is byte-stable,
+  and raw tool input uses a private bounded hook-to-store stdin channel that is
+  never logged or persisted. This release follows the published issue #155
+  measurement decision without claiming its replay-efficacy criterion passed.
+
 ## [0.50.0] - 2026-09-19
 
 ### Added

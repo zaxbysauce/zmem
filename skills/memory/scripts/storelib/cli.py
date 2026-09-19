@@ -351,6 +351,12 @@ class DuplicateJSONKeyError(ValueError):
 
 
 EVIDENCE_STDIN_MAX_BYTES = 64 * 1024
+# Matches the hook's bounded event ceiling.  This is intentionally distinct
+# from evidence stdin: a current tool-input object may legitimately exceed
+# 64KiB, and a mismatched/older child must still be safe because the hook uses
+# communicate-based stdin delivery.
+PRIVATE_PRETOOL_STDIN_MAX_BYTES = 256 * 1024
+_PRIVATE_PRETOOL_STDIN_MARKER = "ZMEM_PRIVATE_PRETOOL_STDIN"
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -382,6 +388,26 @@ def _read_one_json_object() -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("evidence payload must be a JSON object")
     return value
+
+
+def _read_private_pretool_object() -> dict[str, object] | None:
+    """Best-effort private hook payload; never make recall fail for it.
+
+    The marker is child-local and this function is reached only for the
+    passive pretool recall shape below.  Object-only parsing avoids turning a
+    scalar/list into an unreviewed selector input; malformed, oversized, or
+    duplicate-key JSON simply disables the optional enrichment.
+    """
+    try:
+        raw = sys.stdin.buffer.read(PRIVATE_PRETOOL_STDIN_MAX_BYTES + 1)
+        if len(raw) > PRIVATE_PRETOOL_STDIN_MAX_BYTES:
+            return None
+        value = json.loads(raw.decode("utf-8"),
+                           object_pairs_hook=_reject_duplicate_json_keys)
+        return value if isinstance(value, dict) else None
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError,
+            DuplicateJSONKeyError, RecursionError, ValueError, OSError):
+        return None
 
 
 def _evidence_row(row: sqlite3.Row | tuple) -> dict[str, object]:
@@ -1781,6 +1807,30 @@ def main():
 
     args = ap.parse_args()
 
+    # Issue #99's raw tool input crosses only this private, child-marked
+    # channel.  Keep the public CLI grammar unchanged and refuse to consume
+    # stdin for every other command/moment (including an ambient marker).
+    # The hook sets the marker only with bounded bytes and only for this exact
+    # passive shape; parse failure is optional-enrichment failure, never a
+    # command failure.
+    private_pretool_input = None
+    private_pretool_shape = (
+        args.cmd == "recall"
+        and getattr(args, "for_injection", False)
+        and getattr(args, "no_bump", False)
+        and getattr(args, "json", False)
+        and getattr(args, "session_id", None)
+        and getattr(args, "moment", None) == "pretool"
+    )
+    if (os.environ.get(_PRIVATE_PRETOOL_STDIN_MARKER) == "1"
+            and private_pretool_shape):
+        try:
+            stdin_is_tty = sys.stdin.isatty()
+        except (AttributeError, OSError):
+            stdin_is_tty = True
+        if not stdin_is_tty:
+            private_pretool_input = _read_private_pretool_object()
+
     # Session attribution is an all-or-nothing pair.  Refuse before any store
     # preparation so a malformed passive invocation cannot create/open SQLite.
     if args.cmd in {"recall", "recent"}:
@@ -2290,6 +2340,7 @@ def main():
                         exclude_ids=args.exclude,
                         global_limit=args.global_limit,
                         min_confidence=args.min_confidence,
+                        pretool_input=private_pretool_input,
                     )
                 except ValueError as exc:
                     print(f"[zmem] {exc}", file=sys.stderr)

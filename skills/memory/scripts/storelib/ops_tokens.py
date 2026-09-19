@@ -91,6 +91,79 @@ _RESERVED_TAIL_CHARS = 150
 _RING_TRIM_TO_LINES = 64
 _RING_MAX_BYTES = 65536
 
+# Checkpoint phrases are deliberately immutable and ordered.  Several command
+# shapes overlap (a forced push is also a push), so table order is the
+# precedence contract for the matcher below.  Keep this data in the storelib
+# boundary: passive hooks transport input but never duplicate this policy.
+CHECKPOINT_PHRASES = (
+    ("stash-consume", "foreign-stash conflict verify stash list"),
+    ("reset", "stale tree fetch main rebase verify diff"),
+    ("force-push", "stale tree fetched base force-with-lease"),
+    ("branch-publication", "stale tree fetched base force-with-lease"),
+    ("base-rewrite", "base drift citation re-pin"),
+    ("path-test", "basename ratchet citation re-pin local battery"),
+)
+
+_PRETOOL_FIELDS = (
+    "command", "cmd", "file_path", "notebook_path", "path", "description",
+)
+_CHECKPOINT_INPUT_CHARS = 150
+
+
+def checkpoint_query_expansion(tool_input: object) -> str:
+    """Return the one bounded checkpoint phrase selected from ``tool_input``.
+
+    Matching is over compact, sorted-key JSON and only the first 150 Unicode
+    characters.  The full object is canonicalized so the slice is independent
+    of insertion order; callers still use only ``_PRETOOL_FIELDS`` when
+    deriving operation tokens.  Invalid/non-object input and unknown command
+    shapes fail closed.
+    """
+    if not isinstance(tool_input, dict):
+        return ""
+    try:
+        canonical = json.dumps(
+            tool_input, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    text = canonical[:_CHECKPOINT_INPUT_CHARS].lower()
+
+    # Ordered predicates are intentionally explicit.  In particular, ``list``
+    # is not a consuming stash operation, and ordinary push is checked only
+    # after its force-specific form.
+    if re.search(r"git stash\s+(?:pop|apply|drop)(?:\b|\W)", text):
+        return CHECKPOINT_PHRASES[0][1]
+    if re.search(r"git reset\s+--(?:soft|hard)(?:\b|\W)", text):
+        return CHECKPOINT_PHRASES[1][1]
+    if re.search(
+            r'git push\s+[^"}]*?(?:--force-with-lease|--force|-f)(?:\b|\W)',
+            text):
+        return CHECKPOINT_PHRASES[2][1]
+    if re.search(r"git push(?:\b|\W)", text):
+        return CHECKPOINT_PHRASES[3][1]
+    if re.search(r"git merge\s+--squash(?:\b|\W)", text):
+        return CHECKPOINT_PHRASES[4][1]
+
+    if re.search(
+            r'"(?:description|file_path|notebook_path|path)":"[^"}]*'
+            r'(?:test|citation)', text):
+        return CHECKPOINT_PHRASES[5][1]
+    return ""
+
+
+def compose_pretool_query(tool_input: object) -> tuple[List[str], str]:
+    """Derive current pre-tool operation tokens and one checkpoint phrase."""
+    if not query_context_enabled() or not isinstance(tool_input, dict):
+        return [], ""
+    events = [
+        value.strip() for key in _PRETOOL_FIELDS
+        if isinstance(value := tool_input.get(key), str) and value.strip()
+    ]
+    # Flatten exactly as the existing pretool path does, keeping the matcher
+    # and token derivation separate so checkpoint-only events remain useful.
+    tokens = derive_ops_tokens(" ".join(events)) if events else []
+    return tokens, checkpoint_query_expansion(tool_input)
+
 
 def _clean_token(tok: str) -> str:
     """Lowercase, strip surrounding punctuation noise, and allowlist-check
@@ -195,7 +268,7 @@ def derive_ops_tokens(*events: str) -> List[str]:
     return tail
 
 
-def compose_inject_query(prompt: str, ops: str) -> str:
+def compose_inject_query(prompt: str, ops: str, checkpoint: str = "") -> str:
     """Compose the passive inject query: prose + derived ops tokens, with
     the ops tail occupying a fixed reserved slice INSIDE the 500-char cap
     (never appended after it — #85 spec B: concatenating then capping keeps
@@ -211,15 +284,29 @@ def compose_inject_query(prompt: str, ops: str) -> str:
     scores, identical when no ops context exists. Pinned by unit test.
     """
     base = (prompt or "").strip()[:_PROMPT_KEEP_CHARS]
+    valid_checkpoints = {phrase for _, phrase in CHECKPOINT_PHRASES}
+    checkpoint = checkpoint if checkpoint in valid_checkpoints else ""
     tokens = derive_ops_tokens(ops) if ops else []
     if not tokens:
-        return base
+        if not checkpoint:
+            return base
+        tail = checkpoint.strip()
+        prose_budget = max(0, _PROMPT_KEEP_CHARS - len(tail) - 1)
+        return (base[:prose_budget].rstrip() + " " + tail).strip()[:
+            _PROMPT_KEEP_CHARS]
     tail = " ".join(tokens)
     if len(tail) > _RESERVED_TAIL_CHARS:
         # Cut at the last complete token (tokens are each ≤ the slice, so a
         # space boundary always exists within the cut for multi-token tails).
         tail = tail[:_RESERVED_TAIL_CHARS].rsplit(" ", 1)[0]
-    prose_budget = max(0, _PROMPT_KEEP_CHARS - _RESERVED_TAIL_CHARS - 1)
+    if checkpoint:
+        # The operation tail keeps its historical 150-character reservation;
+        # the phrase is additive and consumes only the prose share.  Both are
+        # joined once so neither can be split at the final 500-character cap.
+        tail = (tail + " " + checkpoint.strip()).strip()
+        prose_budget = max(0, _PROMPT_KEEP_CHARS - len(tail) - 1)
+    else:
+        prose_budget = max(0, _PROMPT_KEEP_CHARS - _RESERVED_TAIL_CHARS - 1)
     prose = base[:prose_budget].rstrip()
     return (prose + " " + tail).strip()[:_PROMPT_KEEP_CHARS]
 

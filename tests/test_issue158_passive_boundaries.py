@@ -189,6 +189,28 @@ class ProcessBoundaryTest(unittest.TestCase):
                 r"(?m)(open\(|sqlite3|subprocess|read_text\(|write_text\(|unlink\()",
             )
 
+    def test_checkpoint_policy_stays_out_of_hook_adapter(self):
+        """#99 enriches only at the centralized store selector boundary."""
+        hook = (REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py").read_text(
+            encoding="utf-8"
+        )
+        for needle in (
+            "CHECKPOINT_PHRASES", "checkpoint_query_expansion",
+            "compose_pretool_query",
+            "foreign-stash conflict verify stash list",
+            "stale tree fetch main rebase verify diff",
+            "stale tree fetched base force-with-lease",
+            "base drift citation re-pin",
+            "basename ratchet citation re-pin local battery",
+        ):
+            self.assertNotIn(needle, hook, needle)
+        policy = (REPO_ROOT / "skills" / "memory" / "scripts" / "storelib" /
+                  "ops_tokens.py").read_text(encoding="utf-8")
+        for needle in ("CHECKPOINT_PHRASES", "checkpoint_query_expansion",
+                       "compose_pretool_query"):
+            self.assertIn("def " + needle if needle != "CHECKPOINT_PHRASES"
+                          else needle, policy)
+
 
 class SelectorCliTest(unittest.TestCase):
     def test_session_aware_recent_honors_min_confidence(self):

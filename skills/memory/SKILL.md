@@ -390,6 +390,38 @@ collides. The eval composer ignores `ZMEM_QUERY_CONTEXT` by design (#93 B6):
 evals must stay deterministic and immune to ambient env, so the kill switch
 does not change their queries.
 
+#### Pre-tool checkpoint phrases — issue #99
+
+PreToolUse passive recall also enriches the query from the current raw
+`tool_input` object before the tool runs. The store serializes that object as
+sorted compact JSON (`sort_keys=True`, separators `,` and `:`), examines
+exactly its first 150 Unicode characters, and selects at most one entry from
+this immutable ordered table:
+
+| Event | Checkpoint phrase |
+|---|---|
+| stash-consume | `foreign-stash conflict verify stash list` |
+| reset | `stale tree fetch main rebase verify diff` |
+| force-push | `stale tree fetched base force-with-lease` |
+| branch-publication | `stale tree fetched base force-with-lease` |
+| base-rewrite | `base drift citation re-pin` |
+| path-test | `basename ratchet citation re-pin local battery` |
+
+The recognized forms are `git stash pop|apply|drop`, `git reset --soft|--hard`,
+`git push --force|--force-with-lease|-f`, ordinary `git push`, `git merge
+--squash`, and test/citation paths. `git stash list`, unknown operations,
+non-object input, and matches beyond character 150 add no phrase. Current-event
+operation tokens take precedence over an older session ring; the ring remains
+the fallback. The operation-token tail retains its 150-character reservation,
+the checkpoint phrase is never split, and the final query remains bounded to
+500 Unicode characters. Raw tool input crosses only the private bounded
+hook-to-store stdin channel and is neither logged nor persisted. The
+`ZMEM_QUERY_CONTEXT=0` kill switch disables both token and phrase enrichment.
+
+[Issue #155's published measurement/decision](https://github.com/zaxbysauce/zmem/issues/155#issuecomment-5743322000)
+gates this feature's release; that decision does not establish that #155's AC6
+or replay efficacy passed.
+
 #### Passive-injection kill switch (ZMEM_INJECT=0) — issue #110 / P0-5
 
 `ZMEM_INJECT=0` disables every passive recall-injection surface: the shared
