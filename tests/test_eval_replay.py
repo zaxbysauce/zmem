@@ -26,6 +26,7 @@ from tests.test_issue183_acceptance_observations import (
     _build_fixture,
     _decision,
     _failure,
+    _prompt,
 )
 
 
@@ -608,6 +609,287 @@ class ReplayMeasurementErrorTest(unittest.TestCase):
                     _bucket_observations(bucket, [], conn, [], Path(tempfile.gettempdir()))
         finally:
             conn.close()
+
+
+class ReplayRemediationTest(unittest.TestCase):
+    """Deterministic AC1--AC5 regressions for the #155 remediation."""
+
+    @staticmethod
+    def _miss_rate_module():
+        scripts = str(ROOT / "skills" / "memory" / "scripts")
+        saved = sys.path[:]
+        try:
+            sys.path.insert(0, scripts)
+            import storelib.miss_rate as miss_rate
+            return miss_rate
+        finally:
+            sys.path[:] = saved
+
+    @staticmethod
+    def _miss_report_probe(captured):
+        def probe(*_args, **kwargs):
+            captured.extend(kwargs["failure_rows_override"])
+            return {
+                "counts": {"missed": 0, "surfaced_sid": 0,
+                           "surfaced_legacy": 0},
+                "recall_errors": 0,
+                "failures_truncated": False,
+            }
+        return probe
+
+    def test_irrelevant_failures_are_not_recalled(self):
+        from scripts.eval_replay import _bucket_observations
+        miss_rate = self._miss_rate_module()
+
+        captured = []
+        bucket = [{"sid": "session-a", "ts": 1000, "ids": [], "all": []}]
+        failures = [
+            {"session_id": "session-a", "ts_s": 699, "operation": "early"},
+            {"session_id": "session-a", "ts_s": 700, "operation": "lower"},
+            {"session_id": "session-a", "ts_s": 2800, "operation": "upper"},
+            {"session_id": "session-a", "ts_s": 2801, "operation": "late"},
+        ]
+        conn = sqlite3.connect(":memory:")
+        try:
+            with patch.object(
+                miss_rate, "run_miss_report",
+                side_effect=self._miss_report_probe(captured),
+            ):
+                _bucket_observations(bucket, failures, conn, [], Path.cwd())
+        finally:
+            conn.close()
+        self.assertEqual([row["ts_s"] for row in captured], [700, 2800])
+
+    def test_non_injected_decision_contributes_to_window_union(self):
+        from scripts.eval_replay import _bucket_observations
+        miss_rate = self._miss_rate_module()
+
+        captured = []
+        bucket = [
+            {"sid": "session-a", "ts": 1000, "ids": ["row"],
+             "all": ["row"], "reason": "injected"},
+            {"sid": "session-a", "ts": 5000, "ids": [], "all": [],
+             "reason": "empty-pool"},
+        ]
+        # 4700 is outside the injected row's [700, 2800] inverse window but
+        # exactly the lower boundary of the non-injected row's [4700, 6800].
+        failures = [{"session_id": "session-a", "ts_s": 4700,
+                     "operation": "empty-pool-window"}]
+        conn = sqlite3.connect(":memory:")
+        try:
+            with patch.object(
+                miss_rate, "run_miss_report",
+                side_effect=self._miss_report_probe(captured),
+            ):
+                _bucket_observations(bucket, failures, conn, [], Path.cwd())
+        finally:
+            conn.close()
+        self.assertEqual([row["ts_s"] for row in captured], [4700])
+
+    def test_cross_bucket_failure_does_not_inflate_unrelated_bucket(self):
+        from scripts.eval_replay import _build_report
+        miss_rate = self._miss_rate_module()
+
+        lines = [
+            {
+                "ts": BASE_TS, "sid": "same-session", "lane": "claude",
+                "moment": "user_prompt", "status": "silent",
+                "reason": "empty-pool", "ids": [], "all": [], "t_ms": 1,
+            },
+            {
+                "ts": BASE_TS + 4000, "sid": "same-session",
+                "lane": "claude", "moment": "pretool", "status": "silent",
+                "reason": "empty-pool", "ids": [], "all": [], "t_ms": 1,
+            },
+        ]
+        failure = _failure("same-session", 3700, "cross-bucket", "same query")
+        received = {}
+
+        def probe(*_args, **kwargs):
+            decision_lines = kwargs["decision_lines"]
+            if decision_lines:
+                received[decision_lines[0]["moment"]] = list(
+                    kwargs["failure_rows_override"]
+                )
+            return {
+                "counts": {"missed": 0, "surfaced_sid": 0,
+                           "surfaced_legacy": 0},
+                "recall_errors": 0,
+                "failures_truncated": False,
+            }
+
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-cross-bucket-") as raw:
+            scratch = Path(raw)
+            store = Path(_build_fixture(scratch)["store"])
+            transcript = scratch / "cross-bucket.jsonl"
+            transcript.write_text(json.dumps(failure) + "\n", encoding="utf-8")
+            with patch.object(miss_rate, "run_miss_report", side_effect=probe):
+                report, _ = _build_report(
+                    lines, store, "digest", 1, [transcript], "0.47.0",
+                    [[failure]],
+                )
+
+        self.assertEqual(received["user_prompt"], [])
+        self.assertEqual(
+            [row["ts_s"] for row in received["pretool"]],
+            [BASE_TS + 3700],
+        )
+        self.assertTrue(report["usable_observation"])
+
+    def _build_marker_report(self, session: str, offset: int, extra_lines=()):
+        from scripts.eval_replay import _build_report
+
+        line = {
+            "ts": BASE_TS,
+            "sid": "selected-session",
+            "lane": "claude",
+            "moment": "user_prompt",
+            "status": "silent",
+            "reason": "empty-pool",
+            "ids": [],
+            "all": [],
+            "t_ms": 1,
+        }
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-marker-") as raw:
+            scratch = Path(raw)
+            store = scratch / "store.sqlite"
+            store.write_bytes(b"placeholder")
+            transcript = scratch / "marker.jsonl"
+            record = _failure(session, offset, "marker-call", "git status")
+            transcript.write_text(
+                json.dumps(record) + "\n", encoding="utf-8", newline="\n"
+            )
+
+            class DummyConnection:
+                def close(self) -> None:
+                    pass
+
+            with patch("scripts.eval_replay._read_only_connection",
+                       return_value=DummyConnection()), patch(
+                "scripts.eval_replay._bucket_observations",
+                return_value=(0, 0, 0, 0),
+            ):
+                report, _ = _build_report(
+                    [line, *extra_lines], store, "digest", 1,
+                    [transcript], "0.47.0",
+                    [[record]],
+                )
+        return report
+
+    def test_unrelated_session_is_not_usable_observation(self):
+        report = self._build_marker_report("unrelated-session", -100)
+        self.assertFalse(report["usable_observation"])
+
+    def test_in_window_before_decision_is_usable_observation(self):
+        report = self._build_marker_report("selected-session", -100)
+        self.assertTrue(report["usable_observation"])
+
+    def test_unsupported_lane_does_not_enlarge_observation_union(self):
+        unsupported = {
+            "ts": BASE_TS + 5000,
+            "sid": "selected-session",
+            "lane": "unsupported-lane",
+            "moment": "user_prompt",
+            "status": "silent",
+            "reason": "empty-pool",
+            "ids": [],
+            "all": [],
+            "t_ms": 1,
+        }
+        report = self._build_marker_report(
+            "selected-session", 4700, [unsupported]
+        )
+        self.assertFalse(report["usable_observation"])
+
+    def test_transcripts_parsed_once_and_unique_queries_recalled_once(self):
+        from scripts.eval_replay import _build_report
+        scripts = str(ROOT / "skills" / "memory" / "scripts")
+        saved = sys.path[:]
+        try:
+            sys.path.insert(0, scripts)
+            import storelib.false_inject as false_inject
+            import storelib.recall as recall
+        finally:
+            sys.path[:] = saved
+
+        lines = []
+        for lane in ("claude", "hermes-provider"):
+            for moment in ("session_start", "user_prompt", "pretool", "precompact"):
+                lines.append({
+                    "ts": BASE_TS + 10, "sid": "same-session", "lane": lane,
+                    "moment": moment, "status": "silent",
+                    "reason": "empty-pool", "ids": [], "all": [], "t_ms": 1,
+                })
+        prompt = _prompt("same-session", 1, "git status")
+        failure = _failure("same-session", 1, "cache-call", "git status")
+        real_read_prompts = false_inject._read_prompt_events
+
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-cache-") as raw:
+            scratch = Path(raw)
+            store = Path(_build_fixture(scratch)["store"])
+            transcript = scratch / "prompt.jsonl"
+            transcript.write_text(
+                json.dumps(prompt) + "\n" + json.dumps(failure) + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                false_inject, "_read_prompt_events", wraps=real_read_prompts,
+            ) as prompt_reader, patch.object(
+                recall, "recall_memory",
+                return_value=[{"id": "row", "namespace": "", "content": ""}],
+            ) as recall_memory:
+                report, _ = _build_report(
+                    lines, store, "digest", 1, [transcript], "0.47.0",
+                    [[prompt, failure]],
+                )
+        self.assertEqual(prompt_reader.call_count, 1)
+        self.assertEqual(recall_memory.call_count, 1, report)
+
+    def test_default_helper_calls_remain_compatible(self):
+        scripts = str(ROOT / "skills" / "memory" / "scripts")
+        saved = sys.path[:]
+        try:
+            sys.path.insert(0, scripts)
+            import storelib.false_inject as false_inject
+            import storelib.miss_rate as miss_rate
+        finally:
+            sys.path[:] = saved
+
+        line = {
+            "ts": 100, "status": "injected", "reason": "injected",
+            "ids": ["row"], "all": ["row"], "sid": "session-a",
+            "moment": "user_prompt",
+        }
+        baseline = false_inject.build_false_injection_report(
+            [line], failure_rows=[]
+        )
+        explicit_default = false_inject.build_false_injection_report(
+            [line], failure_rows=[], prompt_events_override=None
+        )
+        self.assertEqual(explicit_default, baseline)
+
+        real_read_prompts = false_inject._read_prompt_events
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-defaults-") as raw:
+            scratch = Path(raw)
+            store = Path(_build_fixture(scratch)["store"])
+            transcript = scratch / "default-prompt.jsonl"
+            transcript.write_text(
+                json.dumps(_prompt("session-a", 1, "default prompt")) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(
+                false_inject, "_read_prompt_events", wraps=real_read_prompts,
+            ) as prompt_reader:
+                report = miss_rate.run_miss_report(
+                    store,
+                    transcripts=[str(transcript)],
+                    data_dir=str(scratch),
+                    decision_lines=[],
+                    failure_rows_override=[],
+                )
+        self.assertNotIn("error", report)
+        prompt_reader.assert_called_once_with([str(transcript)])
 
 
 class ReplaySchemaTest(unittest.TestCase):

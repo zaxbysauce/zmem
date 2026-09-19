@@ -424,6 +424,55 @@ def _empty_counts() -> dict[str, int]:
     return {key: 0 for key in COUNT_KEYS}
 
 
+def _measurement_windows(lines: list[dict], norm_sid, *,
+                        before_s: int = 1800,
+                        after_s: int = 300) -> dict[str, list[tuple[int, int]]]:
+    """Build the inclusive same-session inverse join-window union.
+
+    ``run_miss_report`` attributes a failure at ``f`` to a decision ``d``
+    when ``f-before_s <= d <= f+after_s``.  The exact inverse is therefore
+    ``d-after_s <= f <= d+before_s``.  Keep this helper shared by the failure
+    prefilter and the global observation marker so those two predicates cannot
+    drift.  Lines without a real normalized session or usable timestamp are
+    intentionally not evidence for a named session.
+    """
+    windows: dict[str, list[tuple[int, int]]] = {}
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        sid = norm_sid(line.get("sid"))
+        if not sid or sid == "unknown":
+            continue
+        try:
+            ts = int(line.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts <= 0:
+            continue
+        windows.setdefault(sid, []).append((ts - after_s, ts + before_s))
+    return windows
+
+
+def _failure_in_measurement_union(
+    failure: dict,
+    windows: dict[str, list[tuple[int, int]]],
+    norm_sid,
+) -> bool:
+    """Return whether one failure is inside any named-session window."""
+    if not isinstance(failure, dict):
+        return False
+    sid = norm_sid(failure.get("session_id"))
+    if not sid or sid == "unknown":
+        return False
+    try:
+        ts = int(failure.get("ts_s") or 0)
+    except (TypeError, ValueError):
+        return False
+    if ts <= 0:
+        return False
+    return any(lo <= ts <= hi for lo, hi in windows.get(sid, ()))
+
+
 def _valid_version(lines: list[dict]) -> str | None:
     versions = {
         line.get("ver") for line in lines
@@ -465,6 +514,9 @@ def _bucket_observations(
     conn: sqlite3.Connection,
     staged_transcripts: list[Path],
     isolated_data_dir: Path,
+    *,
+    prompt_events_override=None,
+    recall_cache=None,
 ) -> tuple[int, int, int, int]:
     """Return (reference_checked, used, missed, surfaced) for one bucket.
 
@@ -503,7 +555,10 @@ def _bucket_observations(
                 failure if failure.get("session_id") == sid
                 else {**failure, "session_id": sid}
             )
-    reference_events = list(_read_prompt_events([str(p) for p in staged_transcripts]))
+    reference_events = list(
+        _read_prompt_events([str(p) for p in staged_transcripts])
+        if prompt_events_override is None else prompt_events_override
+    )
     for failure in relevant_failures:
         text = " ".join(str(failure.get(key) or "") for key in ("operation", "error", "tool")).strip()
         if text:
@@ -514,6 +569,20 @@ def _bucket_observations(
             sid = _norm_sid(failure.get("session_id"))
             if timestamp and sid:
                 reference_events.append((timestamp, text, sid))
+    # The join substrate is deliberately narrower than the reference side:
+    # out-of-window failures are not evidence for this measurement.  Build a
+    # conservative union over every decision line in this lane×moment bucket
+    # (including silent, empty-pool, and already-delivered rows).  These are
+    # exactly the lines ``run_miss_report`` receives below; using another
+    # bucket's window would admit a failure that this join cannot attribute
+    # and would therefore misclassify as missed.  The unfiltered ``failures``
+    # length remains the limit basis so prefiltering cannot change truncation
+    # semantics.
+    windows = _measurement_windows(real_lines, _norm_sid)
+    filtered_failures = [
+        failure for failure in relevant_failures
+        if _failure_in_measurement_union(failure, windows, _norm_sid)
+    ]
     eligible = []
     for line in real_lines:
         sid = str(line.get("sid"))
@@ -534,6 +603,7 @@ def _bucket_observations(
             data_dir=str(isolated_data_dir),
             failure_rows=relevant_failures,
             transcripts=[str(p) for p in staged_transcripts],
+            prompt_events_override=prompt_events_override,
         )
         if (not isinstance(false_report, dict)
                 or false_report.get("degraded")
@@ -564,7 +634,9 @@ def _bucket_observations(
         # to this decision's real session before invoking the shared join;
         # otherwise unrelated transcript sessions would be counted as misses
         # for every selected row.
-        failure_rows_override=relevant_failures,
+        failure_rows_override=filtered_failures,
+        prompt_events_override=prompt_events_override,
+        recall_cache=recall_cache,
     )
     if (not isinstance(report, dict)
             or report.get("error") or report.get("db_error") or report.get("recall_errors")
@@ -600,6 +672,14 @@ def _build_report(
     latest = max(int(line["ts"]) for line in lines)
     cutoff = latest - days * 86400
     selected = [line for line in lines if cutoff <= int(line["ts"]) <= latest]
+    # Only rows projected into the fixed eight-bucket report can contribute
+    # measurement coverage.  Keep this exact set as the basis for the global
+    # observation marker; each miss join uses its own lane×moment bucket.
+    report_lines = [
+        line for line in selected
+        if line.get("lane") in REPORT_LANES
+        and line.get("moment") in REPORT_MOMENTS
+    ]
     # Observation inputs obey the same fixed replay window as decisions.  Make
     # private, exact JSONL projections so the shared helpers cannot read an
     # out-of-window prompt/failure or any original path/rotation sibling.
@@ -659,18 +739,21 @@ def _build_report(
         if sys.path and sys.path[0] == str(SCRIPTS):
             sys.path.pop(0)
     prompt_events = _read_prompt_events([str(path) for path in filtered_transcripts])
+    measurement_windows = _measurement_windows(report_lines, _norm_sid)
     usable_observation = any(
         isinstance(ts, int) and ts > 0
         and isinstance(text, str) and bool(text.strip())
-        and isinstance(sid, str) and sid not in ("", "unknown")
+        and _failure_in_measurement_union(
+            {"session_id": sid, "ts_s": ts}, measurement_windows, _norm_sid
+        )
         for ts, text, sid in prompt_events
     )
     usable_observation = usable_observation or any(
         isinstance(failure, dict)
-        and _norm_sid(failure.get("session_id")) not in ("", "unknown")
         and _parse_failure_timestamp(failure) > 0
         and bool(" ".join(str(failure.get(key) or "") for key in (
             "operation", "error", "tool")).strip())
+        and _failure_in_measurement_union(failure, measurement_windows, _norm_sid)
         for failure in failures
     )
     isolated_data_dir = store.parent / "isolated-data"
@@ -679,6 +762,10 @@ def _build_report(
     try:
         rows: list[dict] = []
         miss_num_total = miss_den_total = ref_ok_total = ref_checked_total = 0
+        # Recall is pure for a pinned read-only store and query.  Keep one
+        # caller-owned cache for the eight bucket joins; shared-helper callers
+        # that omit it retain the historical per-report cache.
+        recall_cache: dict = {}
         for lane in REPORT_LANES:
             for moment in REPORT_MOMENTS:
                 bucket = [line for line in selected if line.get("lane") == lane and line.get("moment") == moment]
@@ -695,6 +782,8 @@ def _build_report(
                 ref_checked, ref_ok, miss, surfaced = _bucket_observations(
                     bucket, failures, conn, filtered_transcripts,
                     isolated_data_dir,
+                    prompt_events_override=prompt_events,
+                    recall_cache=recall_cache,
                 )
                 counts["reference_checked"] = ref_checked
                 counts["miss"] = miss
@@ -732,7 +821,7 @@ def _build_report(
         "usable_observation": usable_observation,
         "generated_at": _iso_epoch(latest),
     }
-    if not usable_observation:
+    if not (miss_den_total or ref_checked_total):
         diagnostics.append(
             "replay: no usable miss/reference observations; observations unavailable; numeric zero fields "
             "are empty-denominator compatibility values, not measured success or failure\n"
