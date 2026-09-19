@@ -10,6 +10,28 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.50.0] - 2026-09-19
+
+### Added
+- **Codex hooks register deterministic Windows commands (issue #188,
+  Workstream N PR 5 of 6)**: every entry in `hooks/hooks.codex.json` now
+  carries a `commandWindows` value — the literal, quote-free
+  `node ${PLUGIN_ROOT}/hooks/zmem-launch.js <verb>` — alongside its
+  unchanged non-Windows `command`, so the Windows execution path no longer
+  depends on host-side shell quoting. Events, matchers, verbs, and 15 s
+  timeouts are unchanged.
+- **Codex context-bearing hooks declare `additionalContextLimit: 2000`**
+  (issue #188): the nine entries across the seven context-bearing event
+  families declare the 2,000-token limit; PreCompact omits it (upstream
+  Codex drops `additionalContext` there). The launcher exports
+  `CHARS_PER_TOKEN = 4` and `CODEX_ADDITIONAL_CONTEXT_LIMIT =
+  floor(CODEX_ENVELOPE_CAP_BYTES / CHARS_PER_TOKEN)` so the manifest value
+  and the 8,000-encoded-byte cap provably describe the same budget; the
+  committed fixtures (`tests/fixtures/launcher/codex-cases.json` +
+  `codex-expected.json`) pin all ten verbs, and the adapter suite executes
+  every manifest `commandWindows` string through cmd.exe and compares exact
+  envelopes.
+
 ## [0.49.0] - 2026-09-19
 
 ### Fixed
