@@ -439,25 +439,25 @@ console.log("\n[5] Three-host shared-store round trip");
     }
 }
 
-console.log("\n[6] Codex envelope clamp (issue #95: upstream spills above 2,500 tokens)");
+console.log("\n[6] Codex envelope clamp (issues #95 + #154: upstream spills above 2,500 tokens)");
 
 {
     // Upstream codex-rs spills hook output over DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT
     // = 2,500 tokens (verified 2026-09-09, tag rust-v0.153.0). The launcher must
-    // clamp the codex envelope to 8000 encoded chars (~2000 tokens at the
+    // clamp the codex envelope to 8000 encoded bytes (~2000 tokens at the
     // plugin's 4-chars/token estimator) EVEN WHEN the operator sets a huge
-    // ZMEM_CTX_BUDGET — and the clamp must be codex-specific. PRR-001: a
-    // large systemMessage must consume budget too (it is appended to the same
-    // envelope), and a systemMessage that alone cannot fit is dropped
-    // (fail-open) instead of guaranteed to spill. PRR-002: an operator budget
-    // above the cap produces a stderr warning on codex.
-    function runClampCase(host, sysMsgLen) {
+    // ZMEM_CTX_BUDGET — and the clamp must be codex-specific. #154: the cap
+    // binds the COMPLETED envelope on every translate() branch, and content
+    // wins over the operator message — a message that cannot co-fit with the
+    // content is dropped instead of squeezing the content out. PRR-002: an
+    // operator budget above the cap produces a stderr warning on codex.
+    function runClampCase(host, sysMsgLen, contentLen) {
+        const content = "A".repeat(contentLen === undefined ? 30000 : contentLen);
         const tree = fs.mkdtempSync(path.join(TMP_ROOT, "clamp-"));
         const pluginRoot = path.join(tree, "plugin");
         fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
-        const giant = "A".repeat(30000);
         const sysMsg = sysMsgLen > 0 ? "S".repeat(sysMsgLen) : "";
-        const payloadObj = { additionalContext: giant };
+        const payloadObj = { additionalContext: content };
         if (sysMsg) payloadObj.systemMessage = sysMsg;
         fs.writeFileSync(path.join(pluginRoot, "hooks", "zmem-recall.sh"),
             "#!/usr/bin/env bash\n" +
@@ -477,6 +477,8 @@ console.log("\n[6] Codex envelope clamp (issue #95: upstream spills above 2,500 
         const result = {
             encoded: envelope ? Buffer.byteLength(JSON.stringify(envelope), "utf8") : -1,
             sysMsgPresent: !!(envelope && envelope.systemMessage),
+            ctxPresent: !!(envelope && envelope.hookSpecificOutput
+                && envelope.hookSpecificOutput.additionalContext),
             stderr: proc.stderr || "",
         };
         fs.rmSync(tree, { recursive: true, force: true });
@@ -487,26 +489,43 @@ console.log("\n[6] Codex envelope clamp (issue #95: upstream spills above 2,500 
     }
 
     const codexPlain = runClampCase("codex", 0);
-    ok("clamp: codex envelope stays <= CODEX_ENVELOPE_CAP_CHARS",
-        codexPlain.encoded >= 0 && codexPlain.encoded <= launch.CODEX_ENVELOPE_CAP_CHARS,
-        "encoded=" + codexPlain.encoded + " cap=" + launch.CODEX_ENVELOPE_CAP_CHARS);
+    ok("clamp: codex envelope stays <= CODEX_ENVELOPE_CAP_BYTES",
+        codexPlain.encoded >= 0 && codexPlain.encoded <= launch.CODEX_ENVELOPE_CAP_BYTES,
+        "encoded=" + codexPlain.encoded + " cap=" + launch.CODEX_ENVELOPE_CAP_BYTES);
     const claudePlain = runClampCase("claude", 0);
     ok("clamp: claude control is NOT clamped by the codex cap",
-        claudePlain.encoded > launch.CODEX_ENVELOPE_CAP_CHARS,
+        claudePlain.encoded > launch.CODEX_ENVELOPE_CAP_BYTES,
         "encoded=" + claudePlain.encoded);
 
-    // PRR-001: a modest systemMessage is PRESERVED and the total stays in cap.
+    // #154: with giant content, a modest systemMessage is DROPPED (content
+    // wins) and the content is retained within the cap. (The pre-#154 code
+    // handled THIS exact parameterization without loss — marginal 219
+    // reserved, both channels at exactly 8000 — but degenerated when the
+    // message's marginal size approached the budget: content squeezed to
+    // fitEnvelope's {} fallback and the message riding on it. Section [8]'s
+    // 7990-marginal and 8001-byte cases pin those failure modes; this case
+    // pins the new contract at a parameterization where the old code
+    // happened to survive.)
     const codexSmallSys = runClampCase("codex", 200);
     ok("clamp: codex envelope with systemMessage stays <= cap",
-        codexSmallSys.encoded >= 0 && codexSmallSys.encoded <= launch.CODEX_ENVELOPE_CAP_CHARS,
+        codexSmallSys.encoded >= 0 && codexSmallSys.encoded <= launch.CODEX_ENVELOPE_CAP_BYTES,
         "encoded=" + codexSmallSys.encoded);
-    ok("clamp: modest systemMessage is preserved",
-        codexSmallSys.sysMsgPresent, "systemMessage was dropped");
+    ok("clamp: systemMessage dropped when content fills the cap (content wins, #154)",
+        !codexSmallSys.sysMsgPresent, "systemMessage was retained");
+    ok("clamp: content retained when the message is dropped (#154)",
+        codexSmallSys.ctxPresent, "additionalContext was lost");
+
+    // #154 co-fit leg: when content and message fit together, both survive.
+    const codexCoFit = runClampCase("codex", 200, 200);
+    ok("clamp: co-fit message and content both preserved",
+        codexCoFit.sysMsgPresent && codexCoFit.ctxPresent
+            && codexCoFit.encoded <= launch.CODEX_ENVELOPE_CAP_BYTES,
+        "encoded=" + codexCoFit.encoded + " sysMsgPresent=" + codexCoFit.sysMsgPresent);
 
     // PRR-001: a systemMessage that alone cannot fit is DROPPED (fail-open).
     const codexGiantSys = runClampCase("codex", 30000);
     ok("clamp: un-fittable systemMessage is dropped, envelope <= cap",
-        codexGiantSys.encoded >= 0 && codexGiantSys.encoded <= launch.CODEX_ENVELOPE_CAP_CHARS
+        codexGiantSys.encoded >= 0 && codexGiantSys.encoded <= launch.CODEX_ENVELOPE_CAP_BYTES
             && !codexGiantSys.sysMsgPresent,
         "encoded=" + codexGiantSys.encoded + " sysMsgPresent=" + codexGiantSys.sysMsgPresent);
 
@@ -672,6 +691,132 @@ console.log("\n[7] Codex registered pre-tool path (issue #95)");
     ok("precompact: session delivery ledger cleared by the drive", cleared,
         "ledger still present at " + ledgerName);
 }
+
+// --- issue #154: completed-envelope byte cap --------------------------------
+// Named test functions registered in the runner below (section [8]). The
+// helpers construct exact completed-envelope sizes through the exported
+// makeEnvelope/encodedSize pair — no guessed raw string lengths.
+
+function sentinelPayload(payload) {
+    return "<<<ZMEM_JSON>>>" + JSON.stringify(payload) + "<<<END>>>";
+}
+
+function exactSystemMessage(host, hookName, targetBytes) {
+    for (let n = 0; n < targetBytes; n++) {
+        const msg = "x".repeat(n);
+        const bytes = launch.encodedSize(launch.makeEnvelope(host, hookName, "", msg));
+        if (bytes === targetBytes) return msg;
+    }
+    throw new Error("no exact system-message length");
+}
+
+function exactMarginalSystemMessage(host, hookName, marginalBytes) {
+    const base = launch.encodedSize(launch.makeEnvelope(host, hookName, ""));
+    for (let n = 0; n < marginalBytes; n++) {
+        const msg = "x".repeat(n);
+        const bytes = launch.encodedSize(launch.makeEnvelope(host, hookName, "", msg));
+        if (bytes - base === marginalBytes) return msg;
+    }
+    throw new Error("no exact system-message marginal");
+}
+
+function encodedEnvelopeSize(envelope) {
+    return Buffer.byteLength(JSON.stringify(envelope), "utf8");
+}
+
+function testSystemMessageOnlyAt7999Bytes() {
+    const msg = exactSystemMessage("codex", "recall", 7999);
+    const env = launch.translate(sentinelPayload({ systemMessage: msg }), "codex", "recall", 8000);
+    ok("154/7999: systemMessage retained", !!env.systemMessage);
+    eq("154/7999: exact completed envelope size", encodedEnvelopeSize(env), 7999);
+}
+
+function testSystemMessageOnlyAt8000Bytes() {
+    const msg = exactSystemMessage("codex", "recall", 8000);
+    const env = launch.translate(sentinelPayload({ systemMessage: msg }), "codex", "recall", 8000);
+    ok("154/8000: systemMessage retained", !!env.systemMessage);
+    eq("154/8000: exact completed envelope size", encodedEnvelopeSize(env), 8000);
+}
+
+function testSystemMessageOnlyAt8001Bytes() {
+    const msg = exactSystemMessage("codex", "recall", 8001);
+    const env = launch.translate(sentinelPayload({ systemMessage: msg }), "codex", "recall", 8000);
+    ok("154/8001: systemMessage dropped", !env.systemMessage,
+        "systemMessage was retained");
+    ok("154/8001: final envelope within cap", encodedEnvelopeSize(env) <= 8000,
+        "encoded=" + encodedEnvelopeSize(env));
+}
+
+function testFourByteEmojiUsesUtf8Bytes() {
+    const emoji = "\u{1F600}";
+    eq("154/emoji: UTF-8 byte count", Buffer.byteLength(emoji, "utf8"), 4);
+    const env = launch.translate(sentinelPayload({ systemMessage: emoji }), "codex", "recall", 8000);
+    eq("154/emoji: systemMessage retained verbatim", env.systemMessage, emoji);
+    ok("154/emoji: final envelope within cap", encodedEnvelopeSize(env) <= 8000,
+        "encoded=" + encodedEnvelopeSize(env));
+}
+
+function testContentWinsWhenMessageMarginalSizeIs7990() {
+    const msg = exactMarginalSystemMessage("codex", "recall", 7990);
+    // 50,000 chars forces fitEnvelope's truncation-marker branch, so the
+    // content-wins path is exercised WITH an already-truncated envelope
+    // competing against the message (PR #212 review coverage gap).
+    const content = "c".repeat(50000);
+    const env = launch.translate(
+        sentinelPayload({ additionalContext: content, systemMessage: msg }),
+        "codex", "recall", 8000
+    );
+    const ctx = env.hookSpecificOutput ? env.hookSpecificOutput.additionalContext : undefined;
+    ok("154/7990: nonempty additionalContext retained", typeof ctx === "string" && ctx.length > 0,
+        "additionalContext was lost");
+    ok("154/7990: systemMessage omitted", !env.systemMessage,
+        "systemMessage was retained");
+    ok("154/7990: final envelope within cap", encodedEnvelopeSize(env) <= 8000,
+        "encoded=" + encodedEnvelopeSize(env));
+}
+
+function testCodexEnvelopeCapAliases() {
+    eq("154/alias: CODEX_ENVELOPE_CAP_BYTES", launch.CODEX_ENVELOPE_CAP_BYTES, 8000);
+    eq("154/alias: CODEX_ENVELOPE_CAP_CHARS numeric alias",
+        launch.CODEX_ENVELOPE_CAP_CHARS, launch.CODEX_ENVELOPE_CAP_BYTES);
+}
+
+function testDegenerateBudgetFailsOpen() {
+    // Final-critic round 1 (issue #154 trace): budgets below the 2-byte
+    // serialized {} floor admit no envelope at all. The documented fail-open
+    // outcome is {} (fitEnvelope's existing ladder) — pin it so the scoped
+    // budget post-condition stays honest about this boundary.
+    const msg = exactSystemMessage("codex", "recall", 8001);
+    const out = launch.translate(sentinelPayload({ systemMessage: msg }), "codex", "recall", 1);
+    eq("154/tiny-budget: fail-open empty object", JSON.stringify(out), "{}");
+    const withContent = launch.translate(
+        sentinelPayload({ additionalContext: "c".repeat(500) }), "codex", "recall", 1
+    );
+    eq("154/tiny-budget: content case also fails open", JSON.stringify(withContent), "{}");
+}
+
+function testInvalidRawFailsOpen() {
+    // PR #212 review: translate() docblocks "never throws", but a null or
+    // undefined raw reached extractPayload's lastIndexOf and threw. The
+    // production caller always passes a Buffer string, and the close handler
+    // catches anyway — pin the guard so the docblock stays true for every
+    // input, not just the ones production happens to send.
+    for (const bad of [null, undefined]) {
+        const out = launch.translate(bad, "codex", "recall", 8000);
+        eq("154/null-raw (" + bad + "): fail-open empty object", JSON.stringify(out), "{}");
+    }
+}
+
+console.log("\n[8] Completed-envelope byte cap (issue #154)");
+
+testSystemMessageOnlyAt7999Bytes();
+testSystemMessageOnlyAt8000Bytes();
+testSystemMessageOnlyAt8001Bytes();
+testFourByteEmojiUsesUtf8Bytes();
+testContentWinsWhenMessageMarginalSizeIs7990();
+testCodexEnvelopeCapAliases();
+testDegenerateBudgetFailsOpen();
+testInvalidRawFailsOpen();
 
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }
 
