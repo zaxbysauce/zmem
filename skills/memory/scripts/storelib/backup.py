@@ -561,8 +561,6 @@ def cmd_sweep(marker_dir: str | None = None,
                 try:
                     if not cp.is_file() or cp.stat().st_mtime >= cutoff:
                         continue
-                    if cp.stat().st_mtime >= cutoff:
-                        continue
                 except OSError:
                     continue
                 if not dry_run:

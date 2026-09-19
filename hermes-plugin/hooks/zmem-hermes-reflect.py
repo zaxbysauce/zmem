@@ -143,6 +143,32 @@ def _scripts_dir() -> Path | None:
     return next((c for c in candidates if (c / "store.py").is_file()), None)
 
 
+def _capture_enabled() -> bool:
+    """Apply the canonical pure capture switch at the Hermes boundary.
+
+    Installed-tree damage must not turn capture back on when the operator set
+    the kill switch, so the exact local comparison remains the fail-open
+    fallback when the helper cannot be imported.
+    """
+    fallback = os.environ.get("ZMEM_CAPTURE", "1").strip() != "0"
+    scripts = _scripts_dir()
+    if scripts is None:
+        return fallback
+    inserted = str(scripts)
+    try:
+        sys.path.insert(0, inserted)
+        from capture_quality import capture_enabled
+
+        return capture_enabled()
+    except Exception:
+        return fallback
+    finally:
+        try:
+            sys.path.remove(inserted)
+        except ValueError:
+            pass
+
+
 def _resolve_hook_namespace() -> str:
     """ONE namespace chain for everything this hook does (issue #122):
     ``ZMEM_MCP_NAMESPACE`` → ``ZMEM_NAMESPACE`` → ``ZMEM_PROJECT`` →
@@ -363,7 +389,7 @@ def main() -> int:
     # Capture is separately parent-controlled and deliberately independent of
     # ZMEM_INJECT. Check it before payload parsing, namespace resolution, or a
     # subprocess so the disabled path cannot write or inspect any state.
-    if os.environ.get("ZMEM_CAPTURE", "1").strip() == "0":
+    if not _capture_enabled():
         _emit_empty()
         return 0
 

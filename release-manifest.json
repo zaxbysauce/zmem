@@ -1,11 +1,11 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "b8b65d660c417d5966517dd1efb911f12240f64b4b219872ce62d53708dd8bbb",
+  "digest": "3285747a759f8d0b18cbce5f67a475256bd8f6a54f530d34d62752cee1b8f952",
   "files": {
     "hermes-plugin/__init__.py": "c584903ad0a6a68838c637e6b21191fcab149e4e116546f2b4919e897f0f9c16",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "3d85bcfe63f601c0ecc93faa0765fe9435c0124fe416ac1f4ae43643e4cacf1b",
-    "hermes-plugin/hooks/zmem-hermes-reflect.py": "5c6d59a188dbff2161188b276a7f41a6343192b2abc992b1826176e546ece176",
+    "hermes-plugin/hooks/zmem-hermes-reflect.py": "fb4362d885142bf743c3a5c4aa12ae92c9a1274ca445f307e4b4dc699b4f69bd",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
     "hermes-plugin/plugin.yaml": "450b0ad23cf398a0916ae8b30ae77f2559269ce90c0a8ada7681ef4021a0fbd4",
     "hermes-plugin/server/auth.py": "08f9b71c21abd72efa3196e93f3befe031d7bbf539326a741f10e0e34166c20a",
@@ -67,7 +67,7 @@
     "skills/memory/scripts/schema_meta.py": "806e953ea1e8a641959c50e373822132492cccd8b0772c3a2bf508f4d4fe219c",
     "skills/memory/scripts/store.py": "99d721f53e8f8c2ba0df6bd60f839f44235f22d8a0dd751020cbad26b4543ffb",
     "skills/memory/scripts/storelib/__init__.py": "aa3e8118754909435e9b79a11bd5df8a74683c506588e49b0311718bd5534757",
-    "skills/memory/scripts/storelib/backup.py": "dff5aa9cdfb1802c1008caa17ea552cc80248767ab08a494e6c69b2d4eb34855",
+    "skills/memory/scripts/storelib/backup.py": "a504e6943c69f923ceee1f8696a3e1e7779012afd0463920c2ce3fa491de8d80",
     "skills/memory/scripts/storelib/cli.py": "b988ca25932de3d025ed4e607216863e7c78c6cd4d3ec9a483c6b70e5b95d459",
     "skills/memory/scripts/storelib/consolidate.py": "1e937fbfda27401057891c980b5e0c4f006035fc6c2d8bae8508697bf8157d58",
     "skills/memory/scripts/storelib/cross_encoder.py": "be9da0f236b28d38f5963a3bd1b48861c85039cee7b620543f74543fadbda4da",
