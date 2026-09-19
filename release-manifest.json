@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "66c3ac4d82f3f2613c31940b7f752b135da28bc375901c0d7202dc8d396e402a",
+  "digest": "0178bf1e34585303b267a69c5bf54b5d24fb7c6310a4eefcbd77b1e5b075788e",
   "files": {
     "hermes-plugin/__init__.py": "c584903ad0a6a68838c637e6b21191fcab149e4e116546f2b4919e897f0f9c16",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -40,7 +40,7 @@
     "scripts/canary-schema.json": "ae41f4f6acc728d911ef38826eab51f2670dac63369c2e5f4ce30601be95deff",
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",
     "scripts/eval_inject_runner.py": "c3b68474f80500e36ae2c245431897c7c0e5a27a98781332e8e9e1b8cb5cc70a",
-    "scripts/eval_replay.py": "2d70e7f08a781341130680705c92efaaef09cb44877e3213fdcf3f4a138f9a7c",
+    "scripts/eval_replay.py": "33cde1abcf78fa0245a885dc911b177d1be6d44584fe0ed89920a736fe43aacd",
     "scripts/eval_runner.py": "6e9b355425644f38795068259a69bb9c1ca02cdd57509511824ac10ac721ce3a",
     "scripts/eval_self_corpus.py": "ead3aece0562da0fe588ea4d4994aa7ec8fece3ae4d0a7554766e9933e4e76e6",
     "scripts/generate_canary_fixtures.py": "382467197fdb868ae31f982980750c45103e8b873a897083388f5231427e1b22",
@@ -81,7 +81,7 @@
     "skills/memory/scripts/storelib/links.py": "5bf96acb962728cfa77e2d826dd8d3f85cee979787a7cb1799940c1f68c0302d",
     "skills/memory/scripts/storelib/log_rotate.py": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055",
     "skills/memory/scripts/storelib/mine.py": "532e1e042dad30710ff9379dddfac4a2638288ea9fa683f62db5163f29053568",
-    "skills/memory/scripts/storelib/miss_rate.py": "c9ab2ddfe3453aadd439292b9193bda66d424465a7ace5906da0e5f784087bd0",
+    "skills/memory/scripts/storelib/miss_rate.py": "d689bea37b754e5593ba6bca60a1d6f4dabaefcea3db6c68425d13f2d7907fc7",
     "skills/memory/scripts/storelib/namespace_cache.py": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc",
     "skills/memory/scripts/storelib/ops_tokens.py": "1986c923b003ac0839d4bf8ab85fe1fabea3a7a640d62a20ab8342af63d0a424",
     "skills/memory/scripts/storelib/organize.py": "e47b1b7d347a840bb01101b2f843561834045daf50c99e51f7ea86a750de1173",

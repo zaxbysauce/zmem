@@ -84,6 +84,12 @@ _REPORT_LANES = tuple(sorted(_ATTR_LANES))
 _REPORT_MOMENTS = tuple(sorted(
     ("session_start", "user_prompt", "pretool", "precompact")))
 
+# Replay and miss-rate attribution must share one window contract. Keep the
+# symbols in this dependency-light module so callers cannot silently drift by
+# duplicating numeric defaults.
+MEASUREMENT_WINDOW_BEFORE_S = 1800
+MEASUREMENT_WINDOW_AFTER_S = 300
+
 # One bg-log decision line, either current or historical writer shape:
 #   historical writer A: [ts] zmem-hook status=.. reason=.. [omitted=N] ids=[..] all=[..] [tokens=a/b] [ops=N] [sid=..] [moment=..]
 #   writer B: [ts] zmem-hook status=.. ids=[..] all=[..] [tokens=a/b] [sid=..]
@@ -848,7 +854,8 @@ def _pct(numerator: int, denominator: int):
 
 def run_miss_report(store_path, db_path=None, transcripts=(),
                     bg_log_path=None, data_dir=None,
-                    window_before_s=1800, window_after_s=300,
+                    window_before_s=MEASUREMENT_WINDOW_BEFORE_S,
+                    window_after_s=MEASUREMENT_WINDOW_AFTER_S,
                     limit=200, verbose=False,
                     min_token_overlap=2, decision_lines=None,
                     failure_rows_override=None, *,

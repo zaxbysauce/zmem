@@ -100,6 +100,20 @@ class ReplayFixtureTest(unittest.TestCase):
 
 
 class ReplayRefusalTest(unittest.TestCase):
+    def test_import_does_not_preload_storelib_before_bootstrap(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-import-") as raw:
+            run = subprocess.run(
+                [PYTHON, "-c", "import sys; import scripts.eval_replay; "
+                 "print('storelib' in sys.modules)"],
+                cwd=ROOT,
+                env=_env(Path(raw)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.strip(), "False")
+
     def test_home_store_returns_exit_two(self):
         with tempfile.TemporaryDirectory(prefix="zmem-replay-test-") as raw:
             scratch = Path(raw)
@@ -660,6 +674,54 @@ class ReplayRemediationTest(unittest.TestCase):
             conn.close()
         self.assertEqual([row["ts_s"] for row in captured], [700, 2800])
 
+    def test_reference_arm_keeps_broad_later_observations(self):
+        from scripts.eval_replay import _bucket_observations
+        scripts = str(ROOT / "skills" / "memory" / "scripts")
+        saved = sys.path[:]
+        try:
+            sys.path.insert(0, scripts)
+            import storelib.false_inject as false_inject
+        finally:
+            sys.path[:] = saved
+        miss_rate = self._miss_rate_module()
+
+        bucket = [{
+            "sid": "session-a", "ts": 1000, "ids": ["row"],
+            "all": ["row"], "reason": "injected",
+        }]
+        late_failure = {
+            "session_id": "session-a", "ts_s": 4000,
+            "operation": "later-reference",
+        }
+        reference_rows = []
+        miss_rows = []
+
+        def reference_probe(*_args, **kwargs):
+            reference_rows.extend(kwargs["failure_rows"])
+            return {"overall": {"used": 0}}
+
+        def miss_probe(*_args, **kwargs):
+            miss_rows.extend(kwargs["failure_rows_override"])
+            return {
+                "counts": {"missed": 0, "surfaced_sid": 0,
+                            "surfaced_legacy": 0},
+                "recall_errors": 0, "failures_truncated": False,
+            }
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            with patch.object(
+                false_inject, "build_false_injection_report",
+                side_effect=reference_probe,
+            ), patch.object(miss_rate, "run_miss_report", side_effect=miss_probe):
+                _bucket_observations(
+                    bucket, [late_failure], conn, [], Path.cwd()
+                )
+        finally:
+            conn.close()
+        self.assertEqual(reference_rows, [late_failure])
+        self.assertEqual(miss_rows, [])
+
     def test_non_injected_decision_contributes_to_window_union(self):
         from scripts.eval_replay import _bucket_observations
         miss_rate = self._miss_rate_module()
@@ -685,6 +747,30 @@ class ReplayRemediationTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual([row["ts_s"] for row in captured], [4700])
+
+    def test_measurement_window_union_is_indexed_and_inclusive(self):
+        from scripts.eval_replay import (
+            _failure_in_measurement_union,
+            _measurement_windows,
+        )
+
+        norm_sid = lambda value: str(value or "").strip()
+        windows = _measurement_windows(
+            [{"sid": "session-a", "ts": 1000},
+             {"sid": "session-a", "ts": 1100},
+             {"sid": "session-a", "ts": 5000}],
+            norm_sid,
+        )
+        self.assertEqual(windows["session-a"], [(700, 2900), (4700, 6800)])
+        self.assertTrue(_failure_in_measurement_union(
+            {"session_id": "session-a", "ts_s": 700}, windows, norm_sid
+        ))
+        self.assertTrue(_failure_in_measurement_union(
+            {"session_id": "session-a", "ts_s": 6800}, windows, norm_sid
+        ))
+        self.assertFalse(_failure_in_measurement_union(
+            {"session_id": "session-a", "ts_s": 699}, windows, norm_sid
+        ))
 
     def test_cross_bucket_failure_does_not_inflate_unrelated_bucket(self):
         from scripts.eval_replay import _build_report
@@ -845,6 +931,120 @@ class ReplayRemediationTest(unittest.TestCase):
                 )
         self.assertEqual(prompt_reader.call_count, 1)
         self.assertEqual(recall_memory.call_count, 1, report)
+
+    def test_shared_recall_cache_preserves_helper_values(self):
+        scripts = str(ROOT / "skills" / "memory" / "scripts")
+        saved = sys.path[:]
+        try:
+            sys.path.insert(0, scripts)
+            import storelib.miss_rate as miss_rate
+            import storelib.recall as recall
+        finally:
+            sys.path[:] = saved
+
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-cache-values-") as raw:
+            scratch = Path(raw)
+            store = Path(_build_fixture(scratch)["store"])
+            decision = {
+                "ts": BASE_TS, "sid": "same-session", "lane": "claude",
+                "moment": "user_prompt", "status": "injected",
+                "reason": "injected", "ids": ["row"], "all": ["row"],
+            }
+            failure = {
+                "session_id": "same-session", "ts_s": BASE_TS + 1,
+                "operation": "git status",
+            }
+            with patch.object(
+                recall, "recall_memory",
+                return_value=[{"id": "row", "namespace": "", "content": ""}],
+            ):
+                shared = {}
+                shared_first = miss_rate.run_miss_report(
+                    store, data_dir=str(scratch), decision_lines=[decision],
+                    failure_rows_override=[failure], recall_cache=shared,
+                )
+                shared_second = miss_rate.run_miss_report(
+                    store, data_dir=str(scratch), decision_lines=[decision],
+                    failure_rows_override=[failure], recall_cache=shared,
+                )
+                fresh = miss_rate.run_miss_report(
+                    store, data_dir=str(scratch), decision_lines=[decision],
+                    failure_rows_override=[failure], recall_cache={},
+                )
+
+        self.assertEqual(shared_first, shared_second)
+        self.assertEqual(shared_second, fresh)
+
+    def test_shared_recall_cache_matches_fresh_eight_bucket_run(self):
+        from scripts import eval_replay
+        scripts = str(ROOT / "skills" / "memory" / "scripts")
+        saved = sys.path[:]
+        try:
+            sys.path.insert(0, scripts)
+            import storelib.false_inject as false_inject
+            import storelib.recall as recall
+        finally:
+            sys.path[:] = saved
+
+        lines = [{
+            "ts": BASE_TS + 10, "sid": "same-session", "lane": lane,
+            "moment": moment, "status": "silent", "reason": "empty-pool",
+            "ids": [], "all": [], "t_ms": 1,
+        } for lane in ("claude", "hermes-provider")
+          for moment in ("session_start", "user_prompt", "pretool", "precompact")]
+        prompt_a = _prompt("same-session", 1, "git status")
+        failure_a = _failure("same-session", 1, "cache-a", "git status")
+        prompt_b = _prompt("same-session", 2, "git diff")
+        failure_b = _failure("same-session", 2, "cache-b", "git diff")
+        records = [prompt_a, failure_a, prompt_b, failure_b]
+
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-cache-buckets-") as raw:
+            root = Path(raw)
+            shared_dir = root / "shared"
+            fresh_dir = root / "fresh"
+            shared_dir.mkdir()
+            fresh_dir.mkdir()
+            shared_store = Path(_build_fixture(shared_dir)["store"])
+            fresh_store = Path(_build_fixture(fresh_dir)["store"])
+            shared_transcript = shared_dir / "bucket-prompts.jsonl"
+            fresh_transcript = fresh_dir / "bucket-prompts.jsonl"
+            transcript_bytes = "".join(
+                json.dumps(record) + "\n" for record in records
+            )
+            shared_transcript.write_text(transcript_bytes, encoding="utf-8")
+            fresh_transcript.write_text(transcript_bytes, encoding="utf-8")
+            with patch.object(
+                false_inject, "_read_prompt_events",
+                wraps=false_inject._read_prompt_events,
+            ), patch.object(
+                recall, "recall_memory",
+                return_value=[{"id": "row", "namespace": "", "content": ""}],
+            ):
+                shared_report, _ = eval_replay._build_report(
+                    lines, shared_store, "digest", 1, [shared_transcript], "0.47.0",
+                    [records],
+                )
+                original_bucket = eval_replay._bucket_observations
+
+                def fresh_bucket(*args, **kwargs):
+                    kwargs["recall_cache"] = {}
+                    return original_bucket(*args, **kwargs)
+
+                with patch.object(
+                    eval_replay, "_bucket_observations",
+                    side_effect=fresh_bucket,
+                ):
+                    fresh_report, _ = eval_replay._build_report(
+                        lines, fresh_store, "digest", 1, [fresh_transcript], "0.47.0",
+                        [records],
+                    )
+
+        self.assertEqual(shared_report["rows"], fresh_report["rows"])
+        self.assertEqual(shared_report["aggregate"], fresh_report["aggregate"])
+        self.assertEqual(
+            shared_report["usable_observation"],
+            fresh_report["usable_observation"],
+        )
 
     def test_default_helper_calls_remain_compatible(self):
         scripts = str(ROOT / "skills" / "memory" / "scripts")

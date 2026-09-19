@@ -22,6 +22,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+from bisect import bisect_right
 from datetime import datetime, timezone
 
 
@@ -425,8 +426,8 @@ def _empty_counts() -> dict[str, int]:
 
 
 def _measurement_windows(lines: list[dict], norm_sid, *,
-                        before_s: int = 1800,
-                        after_s: int = 300) -> dict[str, list[tuple[int, int]]]:
+                        before_s: int | None = None,
+                        after_s: int | None = None) -> dict[str, list[tuple[int, int]]]:
     """Build the inclusive same-session inverse join-window union.
 
     ``run_miss_report`` attributes a failure at ``f`` to a decision ``d``
@@ -436,6 +437,23 @@ def _measurement_windows(lines: list[dict], norm_sid, *,
     drift.  Lines without a real normalized session or usable timestamp are
     intentionally not evidence for a named session.
     """
+    if before_s is None or after_s is None:
+        # Resolve the shared symbols only after the caller's bootstrap has
+        # pinned ambient replay settings. A module-level import would execute
+        # storelib/__init__.py too early and freeze ZMEM_* knobs.
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            from storelib.miss_rate import (
+                MEASUREMENT_WINDOW_AFTER_S,
+                MEASUREMENT_WINDOW_BEFORE_S,
+            )
+        finally:
+            if sys.path and sys.path[0] == str(SCRIPTS):
+                sys.path.pop(0)
+        if before_s is None:
+            before_s = MEASUREMENT_WINDOW_BEFORE_S
+        if after_s is None:
+            after_s = MEASUREMENT_WINDOW_AFTER_S
     windows: dict[str, list[tuple[int, int]]] = {}
     for line in lines:
         if not isinstance(line, dict):
@@ -450,6 +468,17 @@ def _measurement_windows(lines: list[dict], norm_sid, *,
         if ts <= 0:
             continue
         windows.setdefault(sid, []).append((ts - after_s, ts + before_s))
+    # Merge overlapping/adjacent intervals once per session. Membership then
+    # uses binary search instead of scanning every decision window for every
+    # failure, preserving union semantics while bounding replay cost.
+    for sid, intervals in windows.items():
+        merged: list[list[int]] = []
+        for lo, hi in sorted(intervals):
+            if merged and lo <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        windows[sid] = [tuple(interval) for interval in merged]
     return windows
 
 
@@ -470,7 +499,11 @@ def _failure_in_measurement_union(
         return False
     if ts <= 0:
         return False
-    return any(lo <= ts <= hi for lo, hi in windows.get(sid, ()))
+    intervals = windows.get(sid, ())
+    if not intervals:
+        return False
+    index = bisect_right(intervals, (ts, float("inf"))) - 1
+    return index >= 0 and ts <= intervals[index][1]
 
 
 def _valid_version(lines: list[dict]) -> str | None:
@@ -529,7 +562,11 @@ def _bucket_observations(
     sys.path.insert(0, str(SCRIPTS))
     try:
         from storelib.false_inject import _norm_sid, _read_prompt_events
-        from storelib.miss_rate import run_miss_report
+        from storelib.miss_rate import (
+            MEASUREMENT_WINDOW_AFTER_S,
+            MEASUREMENT_WINDOW_BEFORE_S,
+            run_miss_report,
+        )
     finally:
         if sys.path and sys.path[0] == str(SCRIPTS):
             sys.path.pop(0)
@@ -622,8 +659,8 @@ def _bucket_observations(
         transcripts=[str(p) for p in staged_transcripts],
         bg_log_path=None,
         data_dir=str(isolated_data_dir),
-        window_before_s=1800,
-        window_after_s=300,
+        window_before_s=MEASUREMENT_WINDOW_BEFORE_S,
+        window_after_s=MEASUREMENT_WINDOW_AFTER_S,
         limit=max(200, len(failures) + 1),
         # Keep all real-session decisions, including all=[], in the join.  A
         # failure may be recalled while the decision's candidate list is empty;
