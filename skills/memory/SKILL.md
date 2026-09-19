@@ -1798,6 +1798,16 @@ compatibility values and stderr says metrics are unavailable; they are not a
 measured success, failure, or efficacy claim. See
 `tests/fixtures/replay/README.md` for bounds and reproducibility details.
 
+The predeclared private real-corpus measurement of record for issue #155 is
+committed at `eval/real-corpus-2026-09-19.json`: a cohort frozen at
+declaration time (standalone store snapshot, `ver=0.49.0` projection of the
+frozen decision log, and the cohort's one Claude-shaped transcript), declared
+with SHA-256 digests on the issue before the evaluation ran. The file carries
+aggregates and digests only; `tests/test_eval_real_corpus_record.py` pins its
+digests, schema, and privacy boundary. Future real-corpus replays must freeze
+the store snapshot and declare its SHA-256 before the measurement — replays
+over live, undeclared, or outcome-selected inputs are not baselines.
+
 ### entity-list — inspect entity identity (v10, issue #60)
 ```
 python <store.py> entity-list [--kind person|project|tool|preference|other] [--json]
