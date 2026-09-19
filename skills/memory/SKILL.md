@@ -418,9 +418,11 @@ the checkpoint phrase is never split, and the final query remains bounded to
 hook-to-store stdin channel and is neither logged nor persisted. The
 `ZMEM_QUERY_CONTEXT=0` kill switch disables both token and phrase enrichment.
 
-[Issue #155's published measurement/decision](https://github.com/zaxbysauce/zmem/issues/155#issuecomment-5743322000)
-gates this feature's release; that decision does not establish that #155's AC6
-or replay efficacy passed.
+This feature shipped under issue #155's published measurement decision (the
+2026-09-19 fail-closed INSUFFICIENT outcome); #155's predeclared measurement
+of record has since landed (`eval/real-corpus-2026-09-19.json` — an audit
+over a frozen cohort, not a live efficacy claim), so the gate is satisfied
+without an efficacy claim by this feature.
 
 #### Passive-injection kill switch (ZMEM_INJECT=0) — issue #110 / P0-5
 
