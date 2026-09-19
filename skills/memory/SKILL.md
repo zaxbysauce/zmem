@@ -466,7 +466,7 @@ recall derives its query from shell/file-patch inputs, not arbitrary MCP
 arguments. Upstream accepts `hookSpecificOutput.additionalContext` on
 PreToolUse (model-visible, non-blocking); Codex hooks reference:
 https://learn.chatgpt.com/docs/hooks. Codex envelopes are additionally
-capped at 8000 chars (≈2000 tokens at the plugin's 4-chars/token
+capped at 8000 encoded bytes (≈2000 tokens at the plugin's 4-chars/token
 estimator; dense multi-byte (CJK) content has less real headroom) — 20% margin under upstream's 2,500-token hook-output spill
 limit (`DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT`, codex-rs output_spill.rs,
 verified against tag rust-v0.153.0); the cap applies even when an operator

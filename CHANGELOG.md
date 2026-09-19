@@ -13,7 +13,7 @@ README.
 ## [0.48.0] - 2026-09-19
 
 ### Fixed
-- **Codex launcher: the 8,000 envelope cap is enforced against the completed
+- **Launcher: the 8,000 envelope cap is enforced against the completed
   JSON envelope on every `translate()` branch (issue #154)**. A
   system-message-only payload (e.g. a #107 kill-switch drift notice) whose
   completed envelope sat within the base-envelope overhead of the cap was
@@ -23,7 +23,12 @@ README.
   candidate on every branch: the message rides only when the completed
   envelope fits the budget; otherwise it is dropped and the content is
   re-fit at the full budget (`fitEnvelope`'s marker and empty-object
-  fallbacks unchanged). The cap constant is renamed
+  fallbacks unchanged). **Host scope of the trade-off:** the
+  content-wins preference applies at every host's budget — on claude/zcode
+  (9,000) as well as codex (8,000) — so an operator notice riding on
+  memory-saturated content is dropped wherever the two cannot co-fit; the
+  drift text itself is still appended to `zmem-bg.log` and visible via
+  `zmem doctor`. The cap constant is renamed
   `CODEX_ENVELOPE_CAP_BYTES` (the contract is encoded UTF-8 bytes);
   `CODEX_ENVELOPE_CAP_CHARS` stays as a one-release numeric alias, and
   `encodedSize` is exported for deterministic tests.
@@ -814,7 +819,7 @@ README.
   unregistered pending #118 (upstream PostCompact carries only
   `trigger: manual|auto`).
 - **Codex envelope cap (issue #95 addendum)**: hook envelopes on Codex are
-  clamped to 8000 encoded chars (≈2000 tokens at the plugin's
+  clamped to 8000 encoded bytes (≈2000 tokens at the plugin's
   4-chars/token estimator) — a 20% margin under upstream's
   `DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT = 2_500` tokens, above which Codex
   spills the text to a file and the model sees only a head/tail preview.

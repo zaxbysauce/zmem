@@ -498,9 +498,14 @@ console.log("\n[6] Codex envelope clamp (issues #95 + #154: upstream spills abov
         "encoded=" + claudePlain.encoded);
 
     // #154: with giant content, a modest systemMessage is DROPPED (content
-    // wins) and the content is retained within the cap. The pre-#154 code
-    // squeezed content into a degenerate budget, lost it, and kept the
-    // message on an over-cap envelope.
+    // wins) and the content is retained within the cap. (The pre-#154 code
+    // handled THIS exact parameterization without loss — marginal 219
+    // reserved, both channels at exactly 8000 — but degenerated when the
+    // message's marginal size approached the budget: content squeezed to
+    // fitEnvelope's {} fallback and the message riding on it. Section [8]'s
+    // 7990-marginal and 8001-byte cases pin those failure modes; this case
+    // pins the new contract at a parameterization where the old code
+    // happened to survive.)
     const codexSmallSys = runClampCase("codex", 200);
     ok("clamp: codex envelope with systemMessage stays <= cap",
         codexSmallSys.encoded >= 0 && codexSmallSys.encoded <= launch.CODEX_ENVELOPE_CAP_BYTES,
@@ -753,7 +758,10 @@ function testFourByteEmojiUsesUtf8Bytes() {
 
 function testContentWinsWhenMessageMarginalSizeIs7990() {
     const msg = exactMarginalSystemMessage("codex", "recall", 7990);
-    const content = "c".repeat(500);
+    // 50,000 chars forces fitEnvelope's truncation-marker branch, so the
+    // content-wins path is exercised WITH an already-truncated envelope
+    // competing against the message (PR #212 review coverage gap).
+    const content = "c".repeat(50000);
     const env = launch.translate(
         sentinelPayload({ additionalContext: content, systemMessage: msg }),
         "codex", "recall", 8000
@@ -787,6 +795,18 @@ function testDegenerateBudgetFailsOpen() {
     eq("154/tiny-budget: content case also fails open", JSON.stringify(withContent), "{}");
 }
 
+function testInvalidRawFailsOpen() {
+    // PR #212 review: translate() docblocks "never throws", but a null or
+    // undefined raw reached extractPayload's lastIndexOf and threw. The
+    // production caller always passes a Buffer string, and the close handler
+    // catches anyway — pin the guard so the docblock stays true for every
+    // input, not just the ones production happens to send.
+    for (const bad of [null, undefined]) {
+        const out = launch.translate(bad, "codex", "recall", 8000);
+        eq("154/null-raw (" + bad + "): fail-open empty object", JSON.stringify(out), "{}");
+    }
+}
+
 console.log("\n[8] Completed-envelope byte cap (issue #154)");
 
 testSystemMessageOnlyAt7999Bytes();
@@ -796,6 +816,7 @@ testFourByteEmojiUsesUtf8Bytes();
 testContentWinsWhenMessageMarginalSizeIs7990();
 testCodexEnvelopeCapAliases();
 testDegenerateBudgetFailsOpen();
+testInvalidRawFailsOpen();
 
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }
 

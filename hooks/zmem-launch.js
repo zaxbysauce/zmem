@@ -1252,6 +1252,7 @@ function fitEnvelope(host, hookName, content, budget) {
 // payload satisfies encodedSize(result) <= budget — in particular at the
 // codex cap this issue enforces (8000).
 function translate(raw, host, hookName, budget) {
+    if (raw === null || raw === undefined) return {}; // null/undefined raw (never-throws docblock hardening) → fail open
     const payload = extractPayload(raw);
     if (payload === null) return {}; // missing/invalid sentinel → fail open
     const content = payload.additionalContext;
