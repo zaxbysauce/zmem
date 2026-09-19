@@ -30,7 +30,7 @@ from storelib.evidence import (
     write_evidence,
 )
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
-from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_queue_clear, cmd_queue_list, cmd_promote_store
+from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_ops_append, cmd_queue_clear, cmd_queue_list, cmd_promote_store, source_exists
 from storelib.promote import promote_memory
 # _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
 # this module's re-export surface for `storelib/__init__.py` and legacy
@@ -170,12 +170,74 @@ def _hermes_capture_correction(namespace: str, session_id: str,
     return bool(ok)
 
 
+def _hermes_prepare(*, namespace: str, session_id: str) -> dict[str, object]:
+    """Read the existing Hermes delivery state without mutating it."""
+    data_dir = os.path.dirname(STORE_PATH)
+    cursor = _ops_tokens.ring_cursor(data_dir, session_id)
+    events = _ops_tokens.read_ops_ring(data_dir, session_id)
+    tokens = _ops_tokens.derive_ops_tokens(*events)
+    failure_nudge = ""
+    if os.path.isfile(STORE_PATH):
+        conn = connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (f"hermes_pending_failure_{session_id}",),
+            ).fetchone()
+            if row and str(row[0] or "").strip():
+                failure_nudge = _hermes_failure_nudge(session_id)
+        finally:
+            conn.close()
+    return {
+        "cursor": [float(cursor[0]), int(cursor[1])],
+        "ops_tokens": list(tokens),
+        "failure_nudge": failure_nudge,
+    }
+
+
+def cmd_hermes_reflect(*, payload: object) -> int:
+    """Capture one Hermes payload and return one prepare result as JSON.
+
+    This is intentionally the sole production call site of
+    :func:`_hermes_capture_correction`; the hook remains stdlib-only and the
+    older ``hermes-context`` command is now limited to post-stdout actions.
+    """
+    def _emit(obj: dict) -> None:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False,
+                                    separators=(",", ":")) + "\n")
+
+    if not isinstance(payload, dict):
+        _emit({"error": "hermes-reflect unavailable"})
+        return 1
+    namespace = payload.get("namespace")
+    session_id = payload.get("session_id")
+    user_message = payload.get("user_message", "")
+    if not isinstance(namespace, str) or not namespace.strip() or \
+            not isinstance(session_id, str) or not session_id.strip() or \
+            not isinstance(user_message, str):
+        _emit({"error": "hermes-reflect unavailable"})
+        return 1
+    try:
+        correction_captured = _hermes_capture_correction(
+            namespace, session_id, user_message, os.path.dirname(STORE_PATH))
+        result = _hermes_prepare(namespace=namespace, session_id=session_id)
+        result["correction_captured"] = bool(correction_captured)
+        _emit(result)
+        return 0
+    except Exception:
+        _emit({"error": "hermes-reflect unavailable"})
+        return 1
+
+
 def cmd_hermes_context(*, action: str, namespace: str, session_id: str,
-                       user_message: str, cursor_ts: float | None,
+                       cursor_ts: float | None,
                        cursor_count: int | None) -> int:
-    """`store.py hermes-context` — prepare / ack-failure / commit-cursor
-    (issue #122). Always prints UTF-8 compact JSON with one final LF; never
-    creates a missing SQLite file (dispatch happens before connect())."""
+    """`store.py hermes-context` post-stdout acknowledge/cursor actions.
+
+    It deliberately does not prepare or capture corrections.  Keeping the
+    small command preserves #122's render-before-ack/cursor ordering without
+    permitting a second capture path.
+    """
     def _emit(obj: dict) -> None:
         sys.stdout.write(json.dumps(obj, ensure_ascii=False,
                                     separators=(",", ":")) + "\n")
@@ -215,35 +277,8 @@ def cmd_hermes_context(*, action: str, namespace: str, session_id: str,
         _emit({"acknowledged": True})
         return 0
 
-    # prepare
-    try:
-        correction_captured = _hermes_capture_correction(
-            namespace, session_id, user_message, data_dir)
-        cursor = _ops_tokens.ring_cursor(data_dir, session_id)
-        events = _ops_tokens.read_ops_ring(data_dir, session_id)
-        tokens = _ops_tokens.derive_ops_tokens(*events)
-        failure_nudge = ""
-        if os.path.isfile(STORE_PATH):
-            conn = connect()
-            try:
-                row = conn.execute(
-                    "SELECT value FROM meta WHERE key = ?",
-                    (f"hermes_pending_failure_{session_id}",),
-                ).fetchone()
-                if row and str(row[0] or "").strip():
-                    failure_nudge = _hermes_failure_nudge(session_id)
-            finally:
-                conn.close()
-        _emit({
-            "cursor": [float(cursor[0]), int(cursor[1])],
-            "ops_tokens": list(tokens),
-            "failure_nudge": failure_nudge,
-            "correction_captured": bool(correction_captured),
-        })
-        return 0
-    except Exception:
-        _emit({"error": "hermes-context unavailable"})
-        return 1
+    _emit({"error": "hermes-context unavailable"})
+    return 1
 
 
 def _auto_near_miss_rekey(conn: sqlite3.Connection, force_off: bool = False) -> None:
@@ -1591,14 +1626,36 @@ def main():
     _qc_grp.add_argument("--drop-stale", action="store_true",
                          help="remove stale items with confidence < 0.6")
 
+    p_source_exists = _add_parser(
+        "source-exists", help="check whether a live source reference exists")
+    p_source_exists.add_argument("--namespace", dest="namespace", required=True,
+                                 help="namespace to inspect")
+    p_source_exists.add_argument("--source-ref", dest="source_ref", required=True,
+                                 help="source reference to inspect")
+    p_source_exists.add_argument("--json", dest="json", action="store_true",
+                                 default=False, help="emit a machine-readable result")
+
+    p_ops_append = _add_parser(
+        "ops-append", help="append one normalized operation-ring event")
+    p_ops_append.add_argument("--session", dest="session", required=True,
+                              help="session id")
+    p_ops_append.add_argument("--tool", dest="tool", required=True,
+                              help="tool name")
+    p_ops_append.add_argument("--op", dest="op", required=True,
+                              help="operation descriptor")
+    p_ops_append.add_argument("--json", dest="json", action="store_true",
+                              default=False, help="emit a machine-readable result")
+
+    p_hermes_reflect = _add_parser(
+        "hermes-reflect", help=argparse.SUPPRESS)
+    p_hermes_reflect.add_argument("--json", dest="json", action="store_true",
+                                  default=False, help=argparse.SUPPRESS)
+
     p_hermes_ctx = _add_parser(
         "hermes-context",
-        help="Hermes compatibility bridge: correction capture, pending-failure "
-             "state and operation-cursor commit inside the store process "
-             "(issue #122; the hook subprocess-calls this)")
+        help="Hermes compatibility bridge post-output acknowledge/cursor actions")
     p_hermes_ctx.add_argument("--action", dest="action", type=str,
-                              choices=("prepare", "ack-failure",
-                                       "commit-cursor"),
+                              choices=("ack-failure", "commit-cursor"),
                               required=True,
                               help="action to perform")
     p_hermes_ctx.add_argument("--namespace", dest="namespace", type=str,
@@ -1607,9 +1664,6 @@ def main():
     p_hermes_ctx.add_argument("--session-id", dest="session_id", type=str,
                               required=True,
                               help="full session identifier")
-    p_hermes_ctx.add_argument("--user-message", dest="user_message",
-                              type=str, default="",
-                              help="current user message")
     p_hermes_ctx.add_argument("--cursor-ts", dest="cursor_ts", type=float,
                               default=None,
                               help="delivered cursor timestamp")
@@ -1974,14 +2028,57 @@ def main():
             prompt=args.prompt, session_id=args.session_id,
             namespace=args.namespace))
 
-    # Issue #122: the Hermes compatibility bridge runs inside the store
-    # process (the hook stays stdlib-only and store-free) and must NEVER
-    # create a missing store — it dispatches before connect(), in the same
-    # store-independent family as hygiene/path/failures.
+    # Capture adapters use this read through the public store boundary instead
+    # of opening SQLite in hook processes.  It is deliberately read-only and
+    # early: an absent, locked, or legacy store must not be created/migrated
+    # merely to answer "no lesson for this source yet".
+    if args.cmd == "source-exists":
+        try:
+            if not STORE_PATH.is_file():
+                print('{"exists":false}')
+                sys.exit(0)
+            if _schema_host is not None:
+                _schema_host.assert_local_fs(STORE_PATH.parent)
+            probe = sqlite3.connect(
+                STORE_PATH.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0
+            )
+            try:
+                probe.execute("PRAGMA query_only=1")
+                exists = source_exists(
+                    probe, namespace=args.namespace, source_ref=args.source_ref)
+            finally:
+                probe.close()
+        except Exception:
+            print("[zmem] source-exists failed", file=sys.stderr)
+            sys.exit(1)
+        print('{"exists":%s}' % ("true" if exists else "false"))
+        sys.exit(0)
+
+    # The operation ring is a sidecar, never a SQLite write.  Its owning
+    # normalizer remains storelib.ops_tokens; this CLI is the only bridge used
+    # by capture hooks that cannot import store internals.
+    if args.cmd == "ops-append":
+        sys.exit(cmd_ops_append(
+            data_dir=str(STORE_PATH.parent), session=args.session,
+            tool=args.tool, op=args.op))
+
+    # One JSON payload crosses from the stdlib-only Hermes hook into the store
+    # process.  It is parsed before any stateful work; malformed input is a
+    # fail-open bridge error and never reaches correction capture.
+    if args.cmd == "hermes-reflect":
+        try:
+            payload = json.loads(sys.stdin.read())
+        except (json.JSONDecodeError, OSError, ValueError):
+            payload = None
+        sys.exit(cmd_hermes_reflect(payload=payload))
+
+    # Hermes post-output bridge: do not move it below connect()/migration.
+    # It must never create a missing store when acknowledging or committing a
+    # delivery cursor.
     if args.cmd == "hermes-context":
         sys.exit(cmd_hermes_context(
             action=args.action, namespace=args.namespace,
-            session_id=args.session_id, user_message=args.user_message,
+            session_id=args.session_id,
             cursor_ts=args.cursor_ts, cursor_count=args.cursor_count))
 
     hermes_payload: dict[str, object] | None = None

@@ -43,6 +43,16 @@
 
 set -u
 
+# Capture policy is checked before stdin parsing and all state access.
+emit_empty() {
+  printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' '{}'
+  exit 0
+}
+CAPTURE_VALUE=1
+if CAPTURE_VALUE="$(printenv ZMEM_CAPTURE 2>/dev/null)"; then :; else CAPTURE_VALUE=1; fi
+CAPTURE_VALUE="$(printf '%s' "$CAPTURE_VALUE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+if [ "$CAPTURE_VALUE" = "0" ]; then emit_empty; fi
+
 # Read the full hook payload (needed for the stop_hook_active loop guard).
 INPUT="$(cat)"
 
@@ -176,7 +186,7 @@ fi
 #   4. builds the prompt with untrusted failure details fenced as data,
 #   5. prints a bare {"additionalContext":…} (or {}).
 CTX_JSON="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
-import glob, json, os, re, shlex, sys, sqlite3, subprocess, time
+import glob, json, os, re, shlex, sys, subprocess, time
 from datetime import datetime, timezone
 
 raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
@@ -310,22 +320,25 @@ except Exception:
     consumed_sidecars = []
 
 # 3. Skip if a lesson was already captured for this session (avoid nagging) —
-#    unless subagent hand-offs are pending (they are separate failures worth
-#    their own reflection; bounded to one prompt per dispatch because the
-#    render consumes the sidecars).
-lesson_exists = False
-store_db = os.path.join(data_dir, "store.sqlite")
-if os.path.isfile(store_db):
+#    unless subagent hand-offs are pending. The query stays behind store.py so
+#    this hook never opens the memory database itself.
+def source_exists():
     try:
-        sconn = sqlite3.connect(store_db)
-        row = sconn.execute(
-            "SELECT 1 FROM memory WHERE source_ref=? AND superseded_at IS NULL LIMIT 1",
-            ("session:" + session_id,),
-        ).fetchone()
-        lesson_exists = row is not None
-        sconn.close()
+        result = subprocess.run(
+            [sys.executable, store_py, "source-exists",
+             "--namespace", ns, "--source-ref", "session:" + session_id,
+             "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10, check=False,
+        )
+        if result.returncode != 0:
+            return False
+        obj = json.loads(result.stdout.decode("utf-8", "replace"))
+        return obj.get("exists") if isinstance(obj, dict) and isinstance(obj.get("exists"), bool) else False
     except Exception:
-        pass
+        return False
+
+lesson_exists = source_exists()
 if lesson_exists and not pending_subagents:
     emit({})
 

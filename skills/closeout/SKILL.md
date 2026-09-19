@@ -167,6 +167,12 @@ FIRST and treat a hit as blocking review (see the memory skill's
 
 ## Step 2 — Capture, with a hard bar
 
+Before choosing a namespace, ask exactly: **Is this project-bound or box-wide?**
+Project-bound knowledge names repository paths, build commands, or repository
+policy and uses the derived project namespace. Box-wide knowledge remains true
+outside the repository and requires an explicit `user:global` choice.
+The only reversal command is `store.py invalidate --id <uuid> --reason "<why the fact is no longer true>"`; `--reason` is required.
+
 A lesson earns a row only if **all** of these hold:
 
 1. A future session facing a *different but similar* task would act differently

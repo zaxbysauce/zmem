@@ -39,7 +39,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # The hooks are bash scripts (they use bash-only constructs). Require `bash`
 # specifically; falling back to `sh` (usually dash on Debian/Ubuntu) would make
 # the tests fail spuriously instead of skipping. Test bodies skip when unset.
-_BASH = shutil.which("bash")
+_GIT_BASHES = (
+    Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
+    Path(r"C:\Program Files\Git\bin\bash.exe"),
+)
+_BASH = next((str(path) for path in _GIT_BASHES if path.is_file()),
+             shutil.which("bash"))
 
 
 def _write_transcript(records) -> str:
@@ -83,8 +88,8 @@ def _run_hook_rc(hook, env_extra, stdin="{}"):
     ZMEM_* vars from the ambient environment first (PRR-005): an operator's
     exported ZMEM_REFLECT=0 or ZMEM_ZCODE_DB must not flip test outcomes."""
     env = dict(os.environ)
-    for key in ("ZMEM_REFLECT", "ZMEM_ZCODE_DB", "ZMEM_TRANSCRIPT",
-                "ZMEM_FAILURES_DB_TIMEOUT_S"):
+    for key in ("ZMEM_REFLECT", "ZMEM_CAPTURE", "ZMEM_ZCODE_DB",
+                "ZMEM_TRANSCRIPT", "ZMEM_FAILURES_DB_TIMEOUT_S"):
         env.pop(key, None)
     env.update(env_extra)
     proc = subprocess.run(
@@ -530,7 +535,7 @@ class TestSubagentReflectMessaging(unittest.TestCase):
         rc==0 and the sentinel — a crashed hook must not masquerade as a
         clean no-op."""
         proc_env = dict(os.environ)
-        for key in ("ZMEM_REFLECT", "ZMEM_ZCODE_DB", "ZMEM_TRANSCRIPT",
+        for key in ("ZMEM_REFLECT", "ZMEM_CAPTURE", "ZMEM_ZCODE_DB", "ZMEM_TRANSCRIPT",
                     "ZMEM_AGENT_TRANSCRIPT", "ZMEM_AGENT_ID",
                     "ZMEM_FAILURES_DB_TIMEOUT_S"):
             proc_env.pop(key, None)
@@ -734,6 +739,133 @@ class TestSubagentReflectMessaging(unittest.TestCase):
                              "backdated .tmp orphan must be swept on write")
         finally:
             os.remove(trans)
+
+
+class CaptureSurfaceTest(unittest.TestCase):
+    def test_capture_switch_silences_all_surfaces(self):
+        if not _BASH:
+            self.skipTest("no bash")
+        for name in (
+            "zmem-capture-failure.sh",
+            "zmem-convention-capture.sh",
+            "zmem-reflect.sh",
+            "zmem-subagent-reflect.sh",
+        ):
+            with self.subTest(hook=name):
+                tmp = tempfile.mkdtemp(prefix="zmem-capture-disabled-")
+                env = dict(os.environ)
+                for key in ("ZMEM_CAPTURE", "ZMEM_DATA", "ZMEM_SESSION",
+                            "ZMEM_AGENT_TRANSCRIPT", "ZMEM_NAMESPACE"):
+                    env.pop(key, None)
+                env.update({
+                    "ZMEM_CAPTURE": " 0 ",
+                    "ZMEM_DATA": tmp,
+                    "ZMEM_SESSION": "capture-disabled",
+                    "ZMEM_NAMESPACE": "project:capture-disabled",
+                })
+                proc = subprocess.run(
+                    [_BASH, str(REPO_ROOT / "hooks" / name)],
+                    input="not json at all", text=True,
+                    capture_output=True, encoding="utf-8", errors="replace",
+                    env=env, timeout=30)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, "<<<ZMEM_JSON>>>{}<<<END>>>\n")
+                self.assertEqual(proc.stderr, "")
+                self.assertEqual(list(Path(tmp).rglob("*")), [])
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_nudge_contains_descriptor_and_tags(self):
+        if not _BASH:
+            self.skipTest("no bash")
+        tmp = tempfile.mkdtemp(prefix="zmem-capture-descriptor-")
+        try:
+            env = dict(os.environ)
+            for key in ("ZMEM_CAPTURE", "ZMEM_DATA", "ZMEM_SESSION",
+                        "ZMEM_NAMESPACE", "ZMEM_ROOT"):
+                env.pop(key, None)
+            env.update({
+                "ZMEM_CAPTURE": "1",
+                "ZMEM_DATA": tmp,
+                "ZMEM_SESSION": "capture-descriptor",
+                "ZMEM_NAMESPACE": "project:capture-descriptor",
+                "ZMEM_ROOT": str(REPO_ROOT),
+                "ZMEM_MODELS_DIR": str(Path(tmp) / "missing-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            })
+            payload = json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest tests/test_example.py",
+                               "path": "tests/test_example.py"},
+                "error": {"message": "failed", "type": "process"},
+                "exit_code": 1,
+            })
+            proc = subprocess.run(
+                [_BASH, str(REPO_ROOT / "hooks" / "zmem-capture-failure.sh")],
+                input=payload, text=True, capture_output=True,
+                encoding="utf-8", errors="replace", env=env, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            message = _extract_ctx(proc.stdout).get("additionalContext", "")
+            self.assertIn('"tool":"bash"', message)
+            self.assertIn("tool:bash", message)
+            self.assertIn("verb:run", message)
+            self.assertIn("basename:test_example.py", message)
+            self.assertIn("error:process", message)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_commit_nudge_excludes_amend(self):
+        if not _BASH:
+            self.skipTest("no bash")
+        tmp = tempfile.mkdtemp(prefix="zmem-convention-commit-")
+        try:
+            def run(session, command):
+                env = dict(os.environ)
+                for key in ("ZMEM_CAPTURE", "ZMEM_DATA", "ZMEM_SESSION",
+                            "ZMEM_NAMESPACE", "ZMEM_ROOT"):
+                    env.pop(key, None)
+                env.update({
+                    "ZMEM_CAPTURE": "1",
+                    "ZMEM_DATA": tmp,
+                    "ZMEM_SESSION": session,
+                    "ZMEM_NAMESPACE": "project:convention-commit",
+                    "ZMEM_ROOT": str(REPO_ROOT),
+                })
+                payload = json.dumps({
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                })
+                return subprocess.run(
+                    [_BASH, str(REPO_ROOT / "hooks" /
+                                "zmem-convention-capture.sh")],
+                    input=payload, text=True, capture_output=True,
+                    encoding="utf-8", errors="replace", env=env, timeout=60)
+
+            good = run("convention-commit-good", "git commit -m finish")
+            self.assertEqual(good.returncode, 0, good.stderr)
+            context = _extract_ctx(good.stdout).get("additionalContext", "")
+            self.assertIn("non-amend git commit", context)
+            self.assertIn('"tool":"bash"', context)
+            self.assertIn("tool:bash", context)
+
+            amend = run("convention-commit-amend", "git commit --amend -m finish")
+            self.assertEqual(amend.returncode, 0, amend.stderr)
+            self.assertEqual(_extract_ctx(amend.stdout), {})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_hooks_use_store_subprocess_only(self):
+        forbidden = ("sqlite3", "storelib", "correction_queue",
+                     "ops_tokens", "_LEDGER_MOD")
+        for name in (
+            "zmem-capture-failure.sh",
+            "zmem-convention-capture.sh",
+            "zmem-reflect.sh",
+            "zmem-subagent-reflect.sh",
+        ):
+            text = (REPO_ROOT / "hooks" / name).read_text(encoding="utf-8")
+            for token in forbidden:
+                with self.subTest(hook=name, token=token):
+                    self.assertNotIn(token, text)
 
 
 class ReflectCompatibilityLaneTest(unittest.TestCase):

@@ -35,6 +35,37 @@ except ImportError:
 from storelib.schema import _host
 from storelib.write import _normalize_capture_mode, redact_text
 
+
+def source_exists(conn: sqlite3.Connection, *, namespace: str,
+                  source_ref: str) -> bool:
+    """Return whether a live memory has this source in ``namespace``.
+
+    The five capture adapters use this narrow read through ``store.py`` rather
+    than opening SQLite themselves.  Namespace is deliberately part of the
+    predicate: a lesson recorded in another project must not suppress a local
+    session reflection.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM memory WHERE namespace = ? AND source_ref = ? "
+        "AND superseded_at IS NULL LIMIT 1",
+        (namespace, source_ref),
+    ).fetchone()
+    return row is not None
+
+
+def cmd_ops_append(*, data_dir: str, session: str, tool: str, op: str) -> int:
+    """Append one normalized operation-ring event through the store boundary."""
+    try:
+        from storelib import ops_tokens
+
+        if not ops_tokens.append_ops_ring(data_dir, session, tool, op):
+            raise RuntimeError("operation ring append rejected")
+    except Exception:
+        print("[zmem] ops-append failed", file=sys.stderr)
+        return 1
+    print('{"ok":true}')
+    return 0
+
 def _collapse_line_breaks(text) -> str:
     """Collapse every CR/LF (and Unicode line separator) in `text` to a
     single space.
@@ -151,7 +182,7 @@ def _result_text(content) -> str:
         return " ".join(p for p in parts if p)
     return ""
 
-def _failures_from_transcript(path: str):
+def _failures_from_transcript(path: str, text: str | None = None):
     """Scan a Claude Code transcript JSONL for failed tool calls and user
     rejections. Returns ``(details, rejections)`` where each is a list of dicts
     (details: one {tool, error} per distinct failed tool_use_id; rejections: one
@@ -171,11 +202,14 @@ def _failures_from_transcript(path: str):
     ``details[:K]`` is truthful on both substrates. ``rejections`` are kept
     CHRONOLOGICAL (oldest-first) because ``render_rejection_section`` keeps the
     chronological tail (``rejections[-K:]``) as the most recent."""
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            raw_lines = [ln for ln in f if ln.strip()]
-    except OSError:
-        return [], []
+    if text is None:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                raw_lines = [ln for ln in f if ln.strip()]
+        except OSError:
+            return [], []
+    else:
+        raw_lines = [ln for ln in text.splitlines() if ln.strip()]
 
     records = []
     for ln in raw_lines:
@@ -523,7 +557,39 @@ def _transcript_mtime_iso(path) -> str:
     except OSError:
         return ""
 
-def _mine_corrections_from_transcript(transcript, project_folder: str) -> list:
+def _user_messages_from_jsonl_text(text: str) -> list[str]:
+    """Extract includable CC user text from a strict-decoded JSONL suffix."""
+    try:
+        import corrections as _corrections
+    except Exception:
+        return []
+    messages: list[str] = []
+    for line in text.splitlines():
+        try:
+            entry = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "user" \
+                or entry.get("isMeta"):
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", [])
+        values = [content] if isinstance(content, str) else [
+            item.get("text", "") for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ] if isinstance(content, list) else []
+        for value in values:
+            if isinstance(value, str) and value \
+                    and _corrections.should_include_message(value):
+                messages.append(value)
+    return messages
+
+
+def _mine_corrections_from_transcript(
+    transcript, project_folder: str, text: str | None = None
+) -> list:
     """Mine correction candidates from a single CC transcript, tagged with
     transcript-side provenance (project_folder/transcript/timestamp). Mirrors
     cmd_corrections' per-message pipeline per message: classify -> sanitize ->
@@ -531,7 +597,8 @@ def _mine_corrections_from_transcript(transcript, project_folder: str) -> list:
     items = []
     mode = _normalize_capture_mode(None)
     try:
-        raw_texts = _extract_user_messages(transcript)
+        raw_texts = (_extract_user_messages(transcript) if text is None
+                     else _user_messages_from_jsonl_text(text))
     except Exception:
         raw_texts = []
     for text in raw_texts:
@@ -848,6 +915,7 @@ def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int
     """
     try:
         import history_mining as _hm
+        import capture_quality as _capture_quality
     except Exception:
         _fail = {
             "corrections": [], "rejections": [], "error_patterns": [],
@@ -883,15 +951,24 @@ def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int
     rejections = []
     errors = []  # raw classified errors awaiting aggregation
     skipped = 0
+    pending_checkpoints = []
     for path, folder in files:
         if not _hm.is_cc_transcript(path):
             skipped += 1
             continue
-        corrections.extend(_mine_corrections_from_transcript(path, folder))
         try:
-            details, rejs = _failures_from_transcript(str(path))
-        except Exception:
-            details, rejs = [], []
+            session = path.stem
+            checkpoint = _hm.read_suffix_checkpoint(root, path, session)
+            suffix, next_checkpoint = _hm.mine_transcript_suffix(path, checkpoint)
+        except (OSError, UnicodeDecodeError, ValueError):
+            skipped += 1
+            continue
+        cleaned_suffix = _capture_quality.strip_zmem_fence(suffix)
+        corrections.extend(_mine_corrections_from_transcript(
+            path, folder, text=cleaned_suffix))
+        details, rejs = _failures_from_transcript(
+            str(path), text=cleaned_suffix)
+        pending_checkpoints.append((path, session, next_checkpoint))
         for r in rejs:
             r["project_folder"] = folder
             r["transcript"] = str(path)
@@ -951,8 +1028,18 @@ def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int
                      e.get("project_folder"), (e.get("suggested_guideline") or "")))
 
     if queue:
-        return _queue_mined(report, host=os.environ.get("ZMEM_HOST") or "cli",
-                            as_json=as_json)
+        queue_result = _queue_mined(
+            report, host=os.environ.get("ZMEM_HOST") or "cli",
+            as_json=as_json)
+        if queue_result != 0:
+            return queue_result
+        try:
+            for path, session, checkpoint in pending_checkpoints:
+                _hm.write_suffix_checkpoint(root, path, session, checkpoint)
+        except (OSError, TimeoutError, ValueError):
+            print("[zmem] mine-history: checkpoint update failed; progress not advanced",
+                  file=sys.stderr)
+            return 2
     return 0
 
 def cmd_queue_list(*, namespace: str, as_json: bool) -> int:

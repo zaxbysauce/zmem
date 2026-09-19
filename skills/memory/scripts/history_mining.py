@@ -23,6 +23,7 @@ transcript text is sanitized/truncated by the caller before queue synthesis.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import time
@@ -32,6 +33,185 @@ from typing import List, Optional, Tuple
 
 # Claude Code's transcript root (only host with a CC-shape substrate we read).
 DEFAULT_TRANSCRIPT_DIR = "~/.claude/projects"
+
+
+def _checkpoint_identity(transcript: Path, session: str) -> tuple[str, str, Path]:
+    normalized = Path(transcript).resolve().as_posix()
+    session_hash = hashlib.sha256(str(session).encode("utf-8")).hexdigest()[:32]
+    path_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return normalized, str(session), Path(
+        f"{session_hash}-{path_hash}.json"
+    )
+
+
+def _empty_checkpoint(transcript: Path, session: str) -> dict:
+    normalized, session_value, _ = _checkpoint_identity(transcript, session)
+    return {
+        "session": session_value,
+        "transcript": normalized,
+        "offset": 0,
+        "prefix_sha256": hashlib.sha256(b"").hexdigest(),
+        "chunk_id": "0",
+    }
+
+
+def read_suffix_checkpoint(root: Path, transcript: Path, session: str) -> dict:
+    """Return the validated incremental-mining checkpoint for one transcript.
+
+    Missing, malformed, mismatched, or negative-offset state is treated as an
+    initial read. The returned dict always has the stable key order required by
+    the on-disk contract.
+    """
+    fallback = _empty_checkpoint(transcript, session)
+    normalized, session_value, filename = _checkpoint_identity(transcript, session)
+    path = Path(root) / "history-checkpoints" / filename
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return fallback
+        offset = raw.get("offset")
+        if (
+            raw.get("session") != session_value
+            or raw.get("transcript") != normalized
+            or not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+            or not isinstance(raw.get("prefix_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", raw["prefix_sha256"])
+            or not isinstance(raw.get("chunk_id"), str)
+        ):
+            return fallback
+        return {
+            "session": session_value,
+            "transcript": normalized,
+            "offset": offset,
+            "prefix_sha256": raw["prefix_sha256"],
+            "chunk_id": raw["chunk_id"] or "0",
+        }
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        return fallback
+
+
+def _latest_chunk(text: str) -> tuple[str, int]:
+    latest = "0"
+    start = 0
+    position = 0
+    for line in text.splitlines(keepends=True):
+        try:
+            obj = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            obj = None
+        chunk = obj.get("chunk_id") if isinstance(obj, dict) else None
+        if chunk not in (None, ""):
+            chunk = str(chunk)
+            if chunk != latest:
+                latest = chunk
+                start = position
+        position += len(line.encode("utf-8"))
+    return latest, start
+
+
+def mine_transcript_suffix(transcript: Path, checkpoint: dict) -> tuple[str, dict]:
+    """Read only bytes not safely covered by ``checkpoint``.
+
+    UTF-8 is intentionally strict. Shrink, prefix mutation, and a new top-level
+    chunk reset the read boundary; a chunk reset starts at the first record of
+    the newest chunk rather than replaying older compacted chunks.
+    """
+    path = Path(transcript)
+    data = path.read_bytes()
+    text = data.decode("utf-8")
+    latest_chunk, chunk_start = _latest_chunk(text)
+    try:
+        offset = int(checkpoint.get("offset", 0))
+    except (AttributeError, TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+    stored_digest = checkpoint.get("prefix_sha256", "") \
+        if isinstance(checkpoint, dict) else ""
+    stored_chunk = checkpoint.get("chunk_id", "0") \
+        if isinstance(checkpoint, dict) else "0"
+
+    if len(data) < offset:
+        start = 0
+    elif hashlib.sha256(data[:offset]).hexdigest() != stored_digest:
+        start = 0
+    else:
+        start = offset
+    if str(stored_chunk or "0") != latest_chunk:
+        start = chunk_start
+
+    suffix = data[start:].decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    next_state = {
+        "session": str(checkpoint.get("session", "")) if isinstance(checkpoint, dict) else "",
+        "transcript": str(checkpoint.get("transcript", path.resolve().as_posix()))
+        if isinstance(checkpoint, dict) else path.resolve().as_posix(),
+        "offset": len(data),
+        "prefix_sha256": hashlib.sha256(data).hexdigest(),
+        "chunk_id": latest_chunk,
+    }
+    return suffix, next_state
+
+
+def _acquire_checkpoint_lock(lock: Path, timeout: float = 3.0) -> int:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > 60:
+                    lock.unlink()
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError("history checkpoint lock unavailable")
+            time.sleep(0.01)
+
+
+def write_suffix_checkpoint(
+    root: Path, transcript: Path, session: str, state: dict
+) -> None:
+    """Atomically persist one checkpoint without moving progress backward."""
+    normalized, session_value, filename = _checkpoint_identity(transcript, session)
+    directory = Path(root) / "history-checkpoints"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / filename
+    lock = target.with_suffix(target.suffix + ".lock")
+    fd = _acquire_checkpoint_lock(lock)
+    try:
+        os.close(fd)
+        current = read_suffix_checkpoint(root, transcript, session)
+        requested = int(state.get("offset", 0))
+        if current["offset"] > requested:
+            return
+        payload = {
+            "session": session_value,
+            "transcript": normalized,
+            "offset": requested,
+            "prefix_sha256": str(state.get("prefix_sha256", "")),
+            "chunk_id": str(state.get("chunk_id", "0") or "0"),
+        }
+        encoded = (json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                   + "\n").encode("utf-8")
+        tmp = target.with_name(target.name + f".{os.getpid()}.tmp")
+        try:
+            with open(tmp, "wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, target)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
 
 
 def resolve_transcript_root(transcript_dir: Optional[str] = None) -> Path:
