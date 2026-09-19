@@ -113,10 +113,10 @@ class CodexManifestContractTest(unittest.TestCase):
             (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8")
         )
         entries = []
-        for _event, groups in spec.get("hooks", {}).items():
+        for event, groups in spec.get("hooks", {}).items():
             for group in groups:
                 for hook in group.get("hooks", []):
-                    entries.append(hook)
+                    entries.append((event, hook))
         return entries
 
     def test_codex_entries_have_windows_commands_and_context_limits(self):
@@ -127,7 +127,7 @@ class CodexManifestContractTest(unittest.TestCase):
             % len(entries),
         )
         verbs = []
-        for entry in entries:
+        for event, entry in entries:
             command = entry.get("command", "")
             verb = command.rsplit(" ", 1)[-1] if command else ""
             verbs.append(verb)
@@ -142,16 +142,18 @@ class CodexManifestContractTest(unittest.TestCase):
                     '"', entry.get("commandWindows", ""),
                     "commandWindows must contain no nested double quotes",
                 )
-                if verb == "precompact":
-                    self.assertNotIn(
-                        "additionalContextLimit", entry,
-                        "the PreCompact entry must omit additionalContextLimit "
-                        "(upstream Codex drops additionalContext there)",
-                    )
-                else:
+                if event in self.CONTEXT_FAMILIES:
                     self.assertEqual(
                         entry.get("additionalContextLimit"), 2000,
-                        "entry %r must declare additionalContextLimit 2000" % verb,
+                        "entry %r under event family %s must declare "
+                        "additionalContextLimit 2000" % (verb, event),
+                    )
+                else:
+                    self.assertNotIn(
+                        "additionalContextLimit", entry,
+                        "entry %r under event family %s (not a context-bearing "
+                        "family) must omit additionalContextLimit — upstream "
+                        "Codex drops additionalContext there" % (verb, event),
                     )
         self.assertEqual(
             verbs, self.EXPECTED_VERBS,

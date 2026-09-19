@@ -853,6 +853,15 @@ function stubScriptBody(childStdout) {
 }
 
 function testWindowsManifestCommandExecution() {
+    const tree = fs.mkdtempSync(path.join(TMP_ROOT, "winmanifest-"));
+    try {
+        buildAndRunCases(tree);
+    } finally {
+        fs.rmSync(tree, { recursive: true, force: true });
+    }
+}
+
+function buildAndRunCases(tree) {
     const casesPath = path.join(REPO, "tests", "fixtures", "launcher",
         "codex-cases.json");
     const expectedPath = path.join(REPO, "tests", "fixtures", "launcher",
@@ -871,7 +880,6 @@ function testWindowsManifestCommandExecution() {
     eq("windows-manifest: ten fixture cases match ten manifest entries",
         casesDoc.cases.length, manifestEntries.length);
 
-    const tree = fs.mkdtempSync(path.join(TMP_ROOT, "winmanifest-"));
     const pluginRoot = path.join(tree, "plugin");
     fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
     fs.copyFileSync(LAUNCHER, path.join(pluginRoot, "hooks", "zmem-launch.js"));
@@ -888,7 +896,6 @@ function testWindowsManifestCommandExecution() {
     Object.assign(childEnv, {
         PLUGIN_ROOT: pluginRoot,
         ZMEM_HOST: "codex",
-        ZMEM_NAMESPACE: "project:fixture-188",
         ZMEM_DATA: dataDir,
         ZMEM_STORE: path.join(dataDir, "store.sqlite"),
         ZMEM_MODELS_DIR: path.join(tree, "nonexistent-models"),
