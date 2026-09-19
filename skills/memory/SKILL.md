@@ -451,6 +451,23 @@ disabled). Near-miss spellings (`0.0`, `00`, `False`, `off`) do NOT disable
 — the parser matches the exact literal `0`; verify with `doctor` after
 setting.
 
+#### Capture kill switch (ZMEM_CAPTURE=0) — issue #123
+
+`ZMEM_CAPTURE` is a string environment variable with default `"1"`. The
+failure, convention, Stop, SubagentStop, and Hermes compatibility surfaces
+read it before payload parsing, marker/queue writes, lesson queries, operation
+appends, or other stateful work. Only a trimmed literal `0` disables capture;
+undefined, empty, whitespace, `false`, and `00` stay enabled. Disabled shell
+surfaces emit their exact empty sentinel and Hermes emits `{}`. Audits and
+probes set `ZMEM_CAPTURE=0` so observation cannot teach the system.
+
+This is independent of `ZMEM_INJECT` (delivery) and `ZMEM_QUERY_CONTEXT`
+(operation-ring collection). Under `ZMEM_INJECT=0`, capture can still run;
+under `ZMEM_CAPTURE=0`, no capture subprocess or state mutation runs. Complete
+`<<<ZMEM_UNTRUSTED_FENCE>>>` through `<<<END_ZMEM_UNTRUSTED_FENCE>>>` blocks
+are removed before transcript-derived content reaches deduplication, queue
+synthesis, or closeout review.
+
 #### Pre-tool inject — issue #90 / #85 direction C
 
 On hosts whose pre-tool contract was probed and confirmed (ZCode: documented;

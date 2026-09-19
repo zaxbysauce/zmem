@@ -14,11 +14,13 @@ Run: python tests/test_mine_history.py   (no pytest required — repo convention
 from __future__ import annotations
 
 import json
+import atexit
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -28,6 +30,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 STORE_PY = SCRIPTS_DIR / "store.py"
 PYTHON = sys.executable
+
+# Pin every store path before the in-process store shim is imported. Without
+# this module-level isolation, STORE_PATH freezes to the operator's live store
+# and a later helper that calls connect() can migrate or mutate it.
+_MODULE_DATA = tempfile.mkdtemp(prefix="zmem-mine-history-module-")
+os.environ["ZMEM_STORE"] = str(Path(_MODULE_DATA) / "store.sqlite")
+os.environ["ZMEM_DATA"] = _MODULE_DATA
+os.environ["ZMEM_MODELS_DIR"] = str(Path(_MODULE_DATA) / "missing-models")
+os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+atexit.register(shutil.rmtree, _MODULE_DATA, True)
 
 
 def _load(module_file, modname):
@@ -43,6 +55,7 @@ store_mod = _load(STORE_PY, "zmem_store_minetest")
 import correction_queue as cq  # noqa: E402
 import corrections as cmod  # noqa: E402
 import history_mining as hm  # noqa: E402
+import capture_quality as capture_quality  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +507,8 @@ class TestMineHistorySubcommand(unittest.TestCase):
         queue_dir = os.path.join(self.tmp, "queue")
         self.assertFalse(os.path.exists(queue_dir) and
                          list(Path(queue_dir).glob("*.json")))
+        self.assertFalse((Path(self.root) / "history-checkpoints").exists(),
+                         "report-only mining must never advance progress")
 
     def test_queue_mode_writes_valid_items_and_is_idempotent(self):
         self._write_fixture()
@@ -522,6 +537,36 @@ class TestMineHistorySubcommand(unittest.TestCase):
         items2 = json.loads(qfiles[0].read_text(encoding="utf-8"))
         self.assertEqual(len(items2), 2)
         self.assertIn("already present", r2.stdout)
+        checkpoints = list((Path(self.root) / "history-checkpoints").glob("*.json"))
+        self.assertEqual(len(checkpoints), 4)
+
+    def test_failed_queue_keeps_checkpoint(self):
+        self._write_fixture()
+        with mock.patch("storelib.mine._queue_mined", return_value=2), \
+                mock.patch.object(hm, "write_suffix_checkpoint") as write:
+            rc = store_mod.cmd_mine_history(
+                transcript_dir=self.root, all_projects=True, days=None,
+                min_count=2, limit=None, queue=True, as_json=True)
+        self.assertEqual(rc, 2)
+        write.assert_not_called()
+        self.assertFalse((Path(self.root) / "history-checkpoints").exists())
+
+    def test_fence_is_removed_before_projection(self):
+        fenced = (
+            "no, use uv "
+            "<<<ZMEM_UNTRUSTED_FENCE>>>secret recalled text"
+            "<<<END_ZMEM_UNTRUSTED_FENCE>>> not pip"
+        )
+        _write_jsonl(Path(self.proj) / "fenced.jsonl", [_user_text(fenced)])
+        r = self._run(self._env(), "mine-history", "--transcript-dir", self.root,
+                      "--all-projects", "--queue")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        qfiles = list((Path(self.tmp) / "queue").glob("*.json"))
+        self.assertEqual(len(qfiles), 1)
+        items = json.loads(qfiles[0].read_text(encoding="utf-8"))
+        self.assertEqual(len(items), 1)
+        self.assertNotIn("secret recalled text", items[0]["message"])
+        self.assertNotIn("<<<ZMEM_", items[0]["message"])
 
 
     def test_limit_zero_emits_no_corrections_negative_rejected(self):
@@ -706,6 +751,219 @@ class TestQueueMinedAppendFailure(unittest.TestCase):
                 sys.modules["correction_queue"] = saved
         self.assertEqual(rc, 2)
         self.assertEqual(fake_cq.append_queue.call_count, 1)
+
+
+class HistorySuffixTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp_obj = tempfile.TemporaryDirectory(prefix="zmem-history-suffix-")
+        self.root = Path(self.tmp_obj.name)
+        self.transcript = self.root / "session.jsonl"
+        self.session = "00000000-0000-4000-8000-000000000001"
+
+    def tearDown(self):
+        self.tmp_obj.cleanup()
+
+    def _write(self, *records):
+        self.transcript.write_text(
+            "".join(json.dumps(record, separators=(",", ":")) + "\n"
+                    for record in records),
+            encoding="utf-8",
+        )
+
+    def test_first_read_consumes_complete_fixture(self):
+        self._write({"chunk_id": "1", "type": "user"},
+                    {"chunk_id": "1", "type": "assistant"})
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        suffix, state = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        self.assertEqual(suffix, self.transcript.read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint["offset"], 0)
+        self.assertEqual(state["offset"], self.transcript.stat().st_size)
+
+    def test_malformed_mismatched_or_negative_checkpoint_resets(self):
+        self._write({"chunk_id": "1", "type": "user"})
+        _, _, filename = hm._checkpoint_identity(self.transcript, self.session)
+        directory = self.root / "history-checkpoints"
+        directory.mkdir()
+        target = directory / filename
+        fallback = hm._empty_checkpoint(self.transcript, self.session)
+        for body in (
+            "not-json\n",
+            json.dumps(dict(fallback, session="other")) + "\n",
+            json.dumps(dict(fallback, offset=-1)) + "\n",
+        ):
+            target.write_text(body, encoding="utf-8")
+            self.assertEqual(
+                hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
+                fallback,
+            )
+
+    def test_growing_file_returns_only_suffix(self):
+        self._write({"chunk_id": "1", "text": "one"})
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        _, state = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, state)
+        appended = json.dumps(
+            {"chunk_id": "1", "text": "two"}, separators=(",", ":")) + "\n"
+        with self.transcript.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(appended)
+        suffix, _ = hm.mine_transcript_suffix(
+            self.transcript,
+            hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
+        )
+        self.assertEqual(suffix, appended)
+
+    def test_failed_queue_keeps_checkpoint(self):
+        self._write({"chunk_id": "1", "type": "user", "message": {
+            "content": "no, use uv not pip"}})
+        _, _, filename = hm._checkpoint_identity(self.transcript, self.session)
+        directory = self.root / "history-checkpoints"
+        directory.mkdir()
+        target = directory / filename
+        original = b"existing-checkpoint-bytes\n"
+        target.write_bytes(original)
+
+        discovered = ([(self.transcript, "project:example")], False)
+        with mock.patch.object(hm, "discover_transcripts", return_value=discovered), \
+                mock.patch("storelib.mine._queue_mined", return_value=2):
+            rc = store_mod.cmd_mine_history(
+                transcript_dir=str(self.root), all_projects=True, days=None,
+                min_count=2, limit=None, queue=True, as_json=True)
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_shrink_resets_offset(self):
+        self._write({"chunk_id": "1", "text": "one"},
+                    {"chunk_id": "1", "text": "two"})
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        _, state = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, state)
+        self._write({"chunk_id": "1", "text": "new"})
+        suffix, _ = hm.mine_transcript_suffix(
+            self.transcript,
+            hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
+        )
+        self.assertEqual(suffix, self.transcript.read_text(encoding="utf-8"))
+
+    def test_prefix_digest_mismatch_resets_offset(self):
+        self._write({"chunk_id": "1", "text": "one"})
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        _, state = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, state)
+        original = self.transcript.read_bytes()
+        self.transcript.write_bytes(original.replace(b"one", b"two"))
+        suffix, _ = hm.mine_transcript_suffix(
+            self.transcript,
+            hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
+        )
+        self.assertEqual(suffix, self.transcript.read_text(encoding="utf-8"))
+
+    def test_compaction_chunk_resets_offset(self):
+        self._write({"chunk_id": "1", "text": "old"})
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        _, state = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, state)
+        first_new = json.dumps(
+            {"chunk_id": "2", "text": "new-a"}, separators=(",", ":")) + "\n"
+        second_new = json.dumps(
+            {"chunk_id": "2", "text": "new-b"}, separators=(",", ":")) + "\n"
+        with self.transcript.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(first_new + second_new)
+        suffix, next_state = hm.mine_transcript_suffix(
+            self.transcript,
+            hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
+        )
+        self.assertEqual(suffix, first_new + second_new)
+        self.assertEqual(next_state["chunk_id"], "2")
+
+    def test_invalid_utf8_raises_without_advancing(self):
+        self.transcript.write_bytes(b'{"chunk_id":"1"}\n\xff')
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        with self.assertRaises(UnicodeDecodeError):
+            hm.mine_transcript_suffix(self.transcript, checkpoint)
+        self.assertEqual(
+            hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
+            checkpoint,
+        )
+
+    def test_fence_is_removed_before_projection(self):
+        transcript = REPO_ROOT / "tests" / "fixtures" / "capture_transcript.jsonl"
+        expected = REPO_ROOT / "tests" / "fixtures" / "capture_expected.json"
+        records = []
+        session = ""
+        namespace = ""
+        for line in transcript.read_text(encoding="utf-8").splitlines():
+            raw = json.loads(line)
+            session = raw["session"]
+            namespace = raw["namespace"]
+            descriptor = capture_quality.operation_descriptor(
+                raw["tool"], raw["command"], raw["path"], raw["error_type"])
+            records.append({
+                "timestamp": raw["timestamp"],
+                "tool": descriptor["tool"] if raw["status"] == "failure" else raw["tool"],
+                "command": descriptor["command"],
+                "path": raw["path"],
+                "status": raw["status"],
+                "error": descriptor["error"],
+                "text": capture_quality.strip_zmem_fence(raw["text"]),
+            })
+        projected = (json.dumps(
+            {"session": session, "namespace": namespace, "records": records},
+            ensure_ascii=False, separators=(",", ":"),
+        ) + "\n").encode("utf-8")
+        self.assertEqual(projected, expected.read_bytes())
+
+    def test_replace_failure_keeps_checkpoint_bytes(self):
+        self._write({"chunk_id": "1", "text": "one"})
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        _, first = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, first)
+        _, _, filename = hm._checkpoint_identity(self.transcript, self.session)
+        target = self.root / "history-checkpoints" / filename
+        before = target.read_bytes()
+        later = dict(first, offset=first["offset"] + 1)
+        with mock.patch.object(hm.os, "replace", side_effect=OSError("denied")):
+            with self.assertRaises(OSError):
+                hm.write_suffix_checkpoint(
+                    self.root, self.transcript, self.session, later)
+        self.assertEqual(target.read_bytes(), before)
+
+    def test_concurrent_writers_keep_valid_furthest_progress(self):
+        self._write({"chunk_id": "1", "text": "one"})
+        base = hm.read_suffix_checkpoint(self.root, self.transcript, self.session)
+        _, complete = hm.mine_transcript_suffix(self.transcript, base)
+        shorter = dict(complete, offset=max(0, complete["offset"] - 1))
+        errors = []
+
+        def write(state):
+            try:
+                hm.write_suffix_checkpoint(
+                    self.root, self.transcript, self.session, state)
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write, args=(state,))
+                   for state in (shorter, complete)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        saved = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        self.assertEqual(saved["offset"], complete["offset"])
 
 
 if __name__ == "__main__":

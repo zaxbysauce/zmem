@@ -110,6 +110,26 @@ class SweepSingleDirTest(SweepBase):
         self.assertFalse(a.exists())
         self.assertFalse(b.exists())
 
+    def test_issue123_stale_recurrence_and_history_checkpoint_reaped(self):
+        ops = self.tmp / "ops"
+        checkpoints = self.tmp / "history-checkpoints"
+        ops.mkdir()
+        checkpoints.mkdir()
+        stale_recurrence = self._mk(
+            ops, "a.capture-failure.json", 8)
+        fresh_recurrence = self._mk(
+            ops, "b.capture-failure.json", 1)
+        stale_checkpoint = self._mk(checkpoints, "a-b.json", 8)
+        fresh_checkpoint = self._mk(checkpoints, "c-d.json", 1)
+        live_lock = self._mk(checkpoints, "c-d.json.lock", 8)
+        r = self._sweep(max_age_days=7)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(stale_recurrence.exists())
+        self.assertFalse(stale_checkpoint.exists())
+        self.assertTrue(fresh_recurrence.exists())
+        self.assertTrue(fresh_checkpoint.exists())
+        self.assertTrue(live_lock.exists(), "active lock files are never swept")
+
     def test_unrelated_files_untouched(self):
         sentinel = self._mk(self.tmp, ".capture-prompted-old", 8)
         keep = [

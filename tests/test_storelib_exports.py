@@ -13,6 +13,7 @@ import importlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -140,6 +141,69 @@ class ExportSurfaceTests(unittest.TestCase):
             1.0, places=6,
         )
         self.assertGreaterEqual(store.CONFIDENCE_FLOOR, 0.0)
+
+
+class CaptureCliBoundaryTest(unittest.TestCase):
+    """Issue #123 capture state must cross hooks only through store.py."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-capture-cli-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store = Path(self.tmp, "store.sqlite")
+        self.env = {
+            **os.environ,
+            "ZMEM_STORE": str(self.store),
+            "ZMEM_DATA": self.tmp,
+            "ZMEM_MODELS_DIR": str(Path(self.tmp, "missing-models")),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "PYTHONUTF8": "1",
+        }
+        for key in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+            self.env.pop(key, None)
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "store.py"), *args],
+            capture_output=True, text=True, encoding="utf-8", env=self.env,
+            timeout=120,
+        )
+
+    def test_source_exists_json_contract(self):
+        missing = self._run("source-exists", "--namespace", "project:test",
+                            "--source-ref", "session:one", "--json")
+        self.assertEqual(missing.returncode, 0)
+        self.assertEqual(missing.stdout, '{"exists":false}\n')
+        self.assertEqual(missing.stderr, "")
+        self.assertFalse(self.store.exists())
+
+        self.assertEqual(self._run("init").returncode, 0)
+        inserted = self._run(
+            "add", "--namespace", "project:test", "--type", "lesson",
+            "--content", "capture boundary source oracle", "--signal", "test",
+            "--source-ref", "session:one",
+        )
+        self.assertEqual(inserted.returncode, 0, inserted.stderr)
+        found = self._run("source-exists", "--namespace", "project:test",
+                          "--source-ref", "session:one", "--json")
+        self.assertEqual(found.returncode, 0)
+        self.assertEqual(found.stdout, '{"exists":true}\n')
+        self.assertEqual(found.stderr, "")
+
+    def test_ops_append_json_contract(self):
+        result = self._run("ops-append", "--session", "capture-cli-session",
+                           "--tool", "Bash", "--op", "git status", "--json")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '{"ok":true}\n')
+        self.assertEqual(result.stderr, "")
+        stem = __import__("hashlib").sha256(
+            b"capture-cli-session").hexdigest()[:32]
+        records = Path(self.tmp, "ops", stem + ".log").read_text(
+            encoding="utf-8").splitlines()
+        self.assertEqual(len(records), 1)
+        event = json.loads(records[0])
+        self.assertEqual(event["tool"], "Bash")
+        self.assertEqual(event["ops"], "git status")
+        self.assertIsInstance(event["ts"], int)
 
 
 class EnvelopeContractTest(unittest.TestCase):

@@ -16,7 +16,9 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -27,6 +29,17 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
+
+from capture_quality import (  # noqa: E402  (path is pinned above)
+    FENCE_BEGIN,
+    FENCE_END,
+    MAX_COMMAND_CHARS,
+    MAX_DESCRIPTOR_CHARS,
+    capture_enabled,
+    infer_signal,
+    operation_descriptor,
+    strip_zmem_fence,
+)
 
 
 def _load_store():
@@ -48,6 +61,155 @@ def _load_store():
 
 
 store = _load_store()
+
+
+class FailureSignalTest(unittest.TestCase):
+    """Pure command-to-signal policy checks for failure capture."""
+
+    def test_signal_matrix(self):
+        expected = {
+            "curl https://example.test": "none",
+            "ls": "none",
+            "git push": "none",
+            "pytest tests/test_example.py": "test",
+            "python -m unittest tests/test_example.py": "test",
+            "python -m pytest tests/test_example.py": "test",
+            "python -m compileall zmem": "compile",
+            "ruff check zmem": "lint",
+            "biome check .": "lint",
+        }
+        actual = {
+            command: infer_signal(command, exit_code=1)
+            for command in expected
+        }
+        self.assertEqual(actual, expected)
+
+    def test_curl_failure_suggests_none(self):
+        self.assertEqual(
+            f"--signal {infer_signal('curl https://example.test', exit_code=7)}",
+            "--signal none",
+        )
+
+    def _run_failure_hook(self, data: Path, session: str, command: str):
+        bash = shutil.which("bash")
+        if os.name == "nt":
+            bash = next((str(path) for path in (
+                Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
+                Path(r"C:\Program Files\Git\bin\bash.exe"),
+            ) if path.is_file()), bash)
+        if not bash:
+            self.skipTest("bash is required for capture-hook integration")
+        payload = json.dumps({
+            "session_id": session,
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "error": "Exit code 1",
+        })
+        env = dict(os.environ)
+        env.update({
+            "ZMEM_CAPTURE": "1",
+            "ZMEM_ROOT": str(REPO_ROOT),
+            "ZMEM_DATA": str(data),
+            "ZMEM_STORE": str(data / "store.sqlite"),
+            "ZMEM_SESSION": session,
+            "ZMEM_NAMESPACE": "project:example",
+            "ZMEM_MODELS_DIR": str(data / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        return subprocess.run(
+            [bash, str(REPO_ROOT / "hooks" / "zmem-capture-failure.sh")],
+            input=payload, text=True, capture_output=True, env=env, timeout=30,
+        )
+
+    def test_arbitrary_failure_requires_recurrence(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-failure-recurrence-") as tmp:
+            data = Path(tmp)
+            first = self._run_failure_hook(data, "arbitrary-session", "curl https://example.test")
+            second = self._run_failure_hook(data, "arbitrary-session", "curl https://example.test")
+        self.assertEqual((first.returncode, first.stderr, first.stdout),
+                         (0, "", "<<<ZMEM_JSON>>>{}<<<END>>>\n"))
+        self.assertEqual(second.returncode, 0)
+        self.assertEqual(second.stderr, "")
+        self.assertIn('"additionalContext"', second.stdout)
+        self.assertIn("--signal none", second.stdout)
+
+    def test_runner_failure_is_single_attempt(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-failure-runner-") as tmp:
+            result = self._run_failure_hook(
+                Path(tmp), "runner-session", "pytest tests/test_example.py")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        self.assertIn('"additionalContext"', result.stdout)
+        self.assertIn("--signal test", result.stdout)
+
+
+class CaptureQualityTest(unittest.TestCase):
+    """Descriptor, fence, and switch contracts independent of the store."""
+
+    def test_capture_switch_only_zero_disables(self):
+        self.assertFalse(capture_enabled({"ZMEM_CAPTURE": "0"}))
+        self.assertFalse(capture_enabled({"ZMEM_CAPTURE": " 0 "}))
+        for value in (None, "", " ", "00", "false"):
+            env = {} if value is None else {"ZMEM_CAPTURE": value}
+            self.assertTrue(capture_enabled(env), value)
+
+    def test_operation_descriptor_contract(self):
+        descriptor = operation_descriptor(
+            "Bash",
+            "pytest tests/test_example.py",
+            r"repo\\tests/test_example.py",
+            "process",
+        )
+        self.assertEqual(
+            descriptor,
+            {
+                "tool": "bash",
+                "verb": "run",
+                "basename": "test_example.py",
+                "command": "pytest tests/test_example.py",
+                "error": "process",
+            },
+        )
+        self.assertEqual(
+            set(descriptor), {"tool", "verb", "basename", "command", "error"}
+        )
+
+    def test_operation_descriptor_normalizes_and_bounds(self):
+        descriptor = operation_descriptor(
+            "Write\r\nTool",
+            "  A\r\n  command   with   spaces " + "x" * 300,
+            "",
+            "\r\n",
+        )
+        self.assertEqual(descriptor["tool"], "write tool")
+        self.assertEqual(descriptor["verb"], "call")
+        self.assertEqual(descriptor["basename"], "unknown")
+        self.assertEqual(len(descriptor["command"]), MAX_COMMAND_CHARS)
+        self.assertEqual(descriptor["error"], "none")
+        self.assertLessEqual(len(descriptor["tool"]), MAX_DESCRIPTOR_CHARS)
+        long_path = "root/" + "a" * 120 + "/actual_test.py"
+        self.assertEqual(
+            operation_descriptor("Edit", "", long_path, "")["basename"],
+            "actual_test.py",
+        )
+
+    def test_strip_complete_fences_preserves_unmatched_markers(self):
+        complete = (
+            "before"
+            + FENCE_BEGIN
+            + "secret\n"
+            + FENCE_END
+            + "middle"
+            + FENCE_BEGIN
+            + "second"
+            + FENCE_END
+            + "after"
+        )
+        self.assertEqual(strip_zmem_fence(complete), "beforemiddleafter")
+        unmatched = "left" + FENCE_BEGIN + "still visible"
+        self.assertEqual(strip_zmem_fence(unmatched), unmatched)
+        unmatched_end = "left" + FENCE_END + "still visible"
+        self.assertEqual(strip_zmem_fence(unmatched_end), unmatched_end)
 
 
 def _make_failures_db(with_enrichment=True):

@@ -54,6 +54,16 @@
 
 set -u
 
+# Capture policy is checked before stdin parsing and all state access.
+emit_empty() {
+  printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' '{}'
+  exit 0
+}
+CAPTURE_VALUE=1
+if CAPTURE_VALUE="$(printenv ZMEM_CAPTURE 2>/dev/null)"; then :; else CAPTURE_VALUE=1; fi
+CAPTURE_VALUE="$(printf '%s' "$CAPTURE_VALUE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+if [ "$CAPTURE_VALUE" = "0" ]; then emit_empty; fi
+
 # Read the full hook payload (needed for the stop_hook_active loop guard).
 INPUT="$(cat)"
 
@@ -185,7 +195,7 @@ fi
 
 # Build the reflection payload.
 CTX_JSON="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
-import json, os, shlex, sys, sqlite3, subprocess
+import json, os, shlex, sys, subprocess
 
 raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
 store_py = sys.argv[1]
@@ -257,19 +267,23 @@ if count == 0 and not rej_msg:
     emit({})
 
 # 3. Skip if a lesson was already captured for THIS subagent (per-subagent key).
-lesson_exists = False
-store_db = os.path.join(data_dir, "store.sqlite")
-if os.path.isfile(store_db):
+#    The query stays behind store.py; this adapter never opens the memory DB.
+def source_exists():
     try:
-        sconn = sqlite3.connect(store_db)
-        row = sconn.execute(
-            "SELECT 1 FROM memory WHERE source_ref=? AND superseded_at IS NULL LIMIT 1",
-            (source_ref,),
-        ).fetchone()
-        lesson_exists = row is not None
-        sconn.close()
+        result = subprocess.run(
+            [sys.executable, store_py, "source-exists",
+             "--namespace", ns, "--source-ref", source_ref, "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10, check=False,
+        )
+        if result.returncode != 0:
+            return False
+        obj = json.loads(result.stdout.decode("utf-8", "replace"))
+        return obj.get("exists") if isinstance(obj, dict) and isinstance(obj.get("exists"), bool) else False
     except Exception:
-        pass
+        return False
+
+lesson_exists = source_exists()
 if lesson_exists:
     emit({})
 
