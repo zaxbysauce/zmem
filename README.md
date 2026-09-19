@@ -104,8 +104,9 @@ warning. `ZMEM_CROSS_PROJECT_HAZARD_VERBS` overrides the hazard-verb set
 dropped with the one-shot warning). `store.py recall|recent
 --include-cross-project` opts in for direct calls — the env switch still
 governs. The tier is query-time: the queryless `recent` pull never admits
-cross rows. The #155 real-corpus replay baseline supersedes the initial
-calibration when it lands.
+cross rows. The #155 real-corpus replay baseline has landed: the predeclared
+measurement record `eval/real-corpus-2026-09-19.json` is the calibration
+reference for this tier.
 
 ### Query-aware passive prefetch (issue #159)
 

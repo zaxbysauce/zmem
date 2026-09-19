@@ -677,9 +677,11 @@ store's own row renders in place, inside the untrusted fence, tagged
 `[ns=<source namespace>] [tier=cross]` (with `tier: "cross"` on the JSON
 row), and cross rows never consume project or global slots. Delivered cross
 rows count once in `surfaced_count` under the same telemetry law as every
-other tier. The #155 real-corpus replay baseline is future work: the lane
-ships with these conservative defaults and #155's measurement supersedes the
-calibration when it lands. `recall --explain`
+other tier. The #155 real-corpus replay baseline has landed: the lane ships
+with these conservative defaults, and the predeclared measurement record
+`eval/real-corpus-2026-09-19.json` (see the read-only replay evaluator section)
+is the calibration reference — an audit over a frozen cohort, not a live
+efficacy claim. `recall --explain`
 does not include the cross tier (the read-only debugger predates it and is
 not extended by #98).
 
