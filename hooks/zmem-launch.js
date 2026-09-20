@@ -1032,6 +1032,11 @@ function buildCanonicalEnv(host, meta, hookName) {
     env.ZMEM_AGENT_TYPE = agentType;
     env.ZMEM_AGENT_ID = agentId;
     env.ZMEM_SESSION_SOURCE = sessionSource;
+    // Capture policy is parent-owned. Default only an undefined value so an
+    // operator's empty or whitespace value reaches every child byte-for-byte.
+    env.ZMEM_CAPTURE = Object.prototype.hasOwnProperty.call(process.env, "ZMEM_CAPTURE")
+        ? process.env.ZMEM_CAPTURE
+        : "1";
     // PERF (Phase 8): only resolve the namespace (python + git subprocess,
     // ~100ms cold-start) for hooks that actually consume ZMEM_NAMESPACE. An
     // unrecognized/omitted hookName resolves anyway (fail safe toward

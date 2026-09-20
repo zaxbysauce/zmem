@@ -713,12 +713,12 @@ Consolidate / recall / dedup tuning:
 | `ZMEM_DEDUP_THRESHOLD` | Cosine similarity above which an incoming memory is deduped against an existing one. | `0.85` |
 | `ZMEM_CTX_BUDGET` | Approx byte budget for the Tier-1 pack / context payload. Host-dependent when unset: `25000` (ZCode) vs `9000` (Claude Code). On Codex the envelope is capped at `8000` (approx 2000 tokens, a 20% margin under Codex's 2,500-token hook-output spill limit; dense multi-byte content such as CJK tokenizes at fewer chars/token, so it has less real headroom); an operator-set value on Codex is clamped to the cap with a stderr warning. | `25000` / `9000` / codex cap `8000` |
 | `ZMEM_INJECT_TOKEN_BUDGET` | Token budget (default 1500, 4 chars/token heuristic) for hook/session_start memory injection: bullet admission stops at the budget, `decision`/`constraint` rows are never dropped, lowest-score `signal=none` rows drop first (issue #65, 10.9). | `1500` |
-| `ZMEM_CONVENTION_INTERVAL` | Fire the convention nudge every N successful tool calls. | `10` |
 
 Capture:
 
 | Var | Purpose | Default |
 |-----|---------|---------|
+| `ZMEM_CAPTURE` | Global fail-open capture switch. Only a trimmed `0` disables the failure, convention, Stop, SubagentStop, and Hermes compatibility surfaces before payload parsing or state access. Audits and probes set `ZMEM_CAPTURE=0`; empty, whitespace, `false`, and `00` remain enabled. | `1` |
 | `ZMEM_CAPTURE_MODE` | Capture policy for writes: `manual` (advisory secret warnings only, trusted local use) or `auto` (redact secret-like content, refuse secret-like provenance — the MCP/network default). | `manual` |
 
 Embedding model (the model file is gitignored; these control how/whether it is obtained):
@@ -1068,6 +1068,11 @@ Notes:
   surface is `post_tool_call` (observational, results discarded) + `pre_llm_call`
   (context injected), so a Hermes correction-capture would use that flag pattern
   and is a separate follow-up.
+- **Capture recurrence + history progress:**
+  `<store-data-dir>/ops/<session-hash>.capture-failure.json` and
+  `<store-data-dir>/history-checkpoints/<session-hash>-<path-hash>.json` are
+  compact atomic session state. `store.py sweep` prunes stale final files after
+  `ZMEM_SENTINEL_SWEEP_DAYS` while retaining fresh state and active lock files.
 
 ## Cloud sessions
 
@@ -1137,6 +1142,17 @@ query-context rides the same delivery path there. Parked pre-tool fences and
 armed nudge markers stay on disk and deliver on the first enabled run —
 nothing is lost. `doctor` shows the state on its `inject-switch` line (WARN
 when disabled), so a confused operator sees the reason immediately.
+
+**Capture switch.** `ZMEM_CAPTURE=0` is separate from `ZMEM_INJECT` and
+`ZMEM_QUERY_CONTEXT`. It disables the five capture surfaces before payload
+parsing, store subprocesses, or marker/queue/ring/checkpoint writes. Only a
+trimmed literal `0` disables; undefined defaults to `"1"`, while defined empty
+and whitespace values are preserved by the launcher and remain enabled.
+Recognized test/compile/lint runners receive their honest signal; arbitrary
+failures use `none` and prompt only after recurrence. Convention prompts fire
+once on an exact non-amend `git commit`, while eligible tool events continue
+feeding the operation ring. Complete `<<<ZMEM_UNTRUSTED_FENCE>>>` through
+`<<<END_ZMEM_UNTRUSTED_FENCE>>>` blocks are stripped before history projection.
 
 **Rolling a host back to a previous version.** Plugin caches pin a version
 directory and never overwrite older ones (see [Upgrade](#upgrade)), so a

@@ -526,7 +526,7 @@ def cmd_sweep(marker_dir: str | None = None,
             except OSError:
                 ring_names = []
             for rname in ring_names:
-                if not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext")):
+                if not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".capture-failure.json")):
                     continue
                 rp = ops_dir / rname
                 try:
@@ -540,6 +540,32 @@ def cmd_sweep(marker_dir: str | None = None,
                 if not dry_run:
                     try:
                         rp.unlink()
+                    except OSError:
+                        continue
+                removed += 1
+        # Issue #123: incremental history mining writes one compact checkpoint
+        # per session/transcript pair. They are session evidence, not durable
+        # memory, so apply the same bounded-age policy. Only final `.json`
+        # checkpoints are eligible; live `.lock` and `.tmp` files are never
+        # touched by this pass.
+        checkpoints_dir = d / "history-checkpoints"
+        if checkpoints_dir.is_dir():
+            try:
+                checkpoint_names = os.listdir(checkpoints_dir)
+            except OSError:
+                checkpoint_names = []
+            for cname in checkpoint_names:
+                if not cname.endswith(".json"):
+                    continue
+                cp = checkpoints_dir / cname
+                try:
+                    if not cp.is_file() or cp.stat().st_mtime >= cutoff:
+                        continue
+                except OSError:
+                    continue
+                if not dry_run:
+                    try:
+                        cp.unlink()
                     except OSError:
                         continue
                 removed += 1

@@ -47,7 +47,7 @@ MCP_SERVER = REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py"
 MCP_AVAILABLE = importlib.util.find_spec("mcp") is not None
 
 STRIP = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_NAMESPACE",
-         "ZMEM_HOST", "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT",
+         "ZMEM_HOST", "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT", "ZMEM_CAPTURE",
          "ZMEM_HERMES_CORRECTIONS",
          "ZMEM_MCP_URL", "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE",
          "ZMEM_MCP_NAMESPACE", "ZMEM_MCP_TIMEOUT",
@@ -697,8 +697,7 @@ class HermesRemotePrefetchTest(unittest.TestCase):
                          "mcp_client: invalid prefetch envelope\n")
 
     def test_correction_capture_uses_store_subprocess(self):
-        """AC: the hook source contains no direct store access, and the
-        exact user message reaches the bridge's prepare action."""
+        """The hook has no direct store access and sends one JSON payload."""
         src = REFLECT.read_text(encoding="utf-8")
         for banned in ("import sqlite3", "sqlite3.", "from storelib",
                        "import storelib", "import correction_queue",
@@ -709,19 +708,76 @@ class HermesRemotePrefetchTest(unittest.TestCase):
         mod = _load_reflect_module()
         recorded: list[list[str]] = []
 
-        def recorder(args):
-            recorded.append(list(args))
+        def recorder(value):
+            recorded.append(dict(value))
             return {}
 
         payload = {"session_id": self._SID, "user_message": self._QUERY}
-        out = _capture_main(mod, recorder, payload)
+        env = _clean_env(tmp, ZMEM_HOME=str(REPO_ROOT), ZMEM_INJECT="0")
+        with mock.patch.dict(os.environ, env, clear=True):
+            out = _capture_main(mod, recorder, payload)
         self.assertEqual(json.loads(out), {})
-        self.assertTrue(recorded, "the bridge must run at least once")
+        self.assertEqual(len(recorded), 1, "one capture/prepare bridge call")
         first = recorded[0]
-        self.assertEqual(first[first.index("--action") + 1], "prepare")
-        self.assertEqual(first[first.index("--user-message") + 1],
-                         self._QUERY)
-        self.assertEqual(first[first.index("--session-id") + 1], self._SID)
+        self.assertEqual(first["user_message"], self._QUERY)
+        self.assertEqual(first["session_id"], self._SID)
+        self.assertIsInstance(first["namespace"], str)
+        self.assertTrue(first["namespace"])
+
+
+class HermesCaptureSwitchTest(unittest.TestCase):
+    """Issue #123: capture policy precedes all Hermes bridge work."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-hermes-capture-switch-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_capture_switch_precedes_hermes_work(self):
+        """A recording failing executable proves disabled capture spawns none."""
+        import io as _io
+
+        fake_store = Path(self.tmp, "store.py")
+        marker = Path(self.tmp, "invoked")
+        fake_store.write_text(
+            "import os\nfrom pathlib import Path\n"
+            "Path(os.environ['ZMEM_INVOCATION_MARKER']).write_text('invoked')\n"
+            "raise SystemExit(17)\n",
+            encoding="utf-8",
+        )
+        mod = _load_reflect_module()
+        out, err = _io.StringIO(), _io.StringIO()
+        env = {
+            "ZMEM_CAPTURE": "0",
+            "ZMEM_INVOCATION_MARKER": str(marker),
+            "ZMEM_HOME": self.tmp,
+        }
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(mod, "_scripts_dir", return_value=Path(self.tmp)), \
+                mock.patch.object(sys, "stdin", _io.StringIO("not-json")), \
+                mock.patch.object(sys, "stdout", out), \
+                mock.patch.object(sys, "stderr", err):
+            rc = mod.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue(), "{}\n")
+        self.assertEqual(err.getvalue(), "")
+        self.assertFalse(marker.exists(), "disabled capture must invoke no subprocess")
+
+    def test_inject_switch_keeps_one_capture_call(self):
+        """ZMEM_INJECT controls delivery only, not capture opportunity."""
+        import io as _io
+
+        mod = _load_reflect_module()
+        calls: list[dict] = []
+        with mock.patch.dict(os.environ, {"ZMEM_CAPTURE": "1", "ZMEM_INJECT": "0"},
+                             clear=False), \
+                mock.patch.object(mod, "_run_hermes_reflect",
+                                  side_effect=lambda payload: calls.append(payload) or {}), \
+                mock.patch.object(sys, "stdin", _io.StringIO(json.dumps({
+                    "session_id": "capture-once", "user_message": CORRECTION}))), \
+                mock.patch.object(sys, "stdout", _io.StringIO()), \
+                mock.patch.object(sys, "stderr", _io.StringIO()):
+            self.assertEqual(mod.main(), 0)
+        self.assertEqual(len(calls), 1)
 
 
 def _load_reflect_module():
@@ -736,7 +792,7 @@ def _capture_main(mod, recorder, payload):
     """Drive mod.main() with a recorded bridge and captured std streams."""
     import io as _io
     out, err = _io.StringIO(), _io.StringIO()
-    with mock.patch.object(mod, "_run_hermes_context", recorder), \
+    with mock.patch.object(mod, "_run_hermes_reflect", recorder), \
             mock.patch.object(sys, "stdin", _io.StringIO(json.dumps(payload))), \
             mock.patch.object(sys, "stdout", out), \
             mock.patch.object(sys, "stderr", err):

@@ -1,57 +1,32 @@
 #!/usr/bin/env bash
-# zmem-convention-capture.sh — ZCode PostToolUse hook for continuous reflection.
+# zmem-convention-capture.sh — PostToolUse convention adapter.
 #
-# Fires on successful tool calls (PostToolUse event). Uses a turn counter
-# stored in the meta table to fire every N successful Edit/Write/Bash calls
-# (default N=10, matching Hermes background_review cadence). Only fires once
-# per session (cooldown via marker file, same pattern as capture-failure).
-#
-# Reads JSON from stdin: {"tool_name":"...", "tool_input":{...}, ...}
-#
-# Envelope: emits a bare {"additionalContext": …} wrapped in the
-# <<<ZMEM_JSON>>>…<<<END>>> sentinel, exactly like the other injecting hooks.
-# The host adapter (zmem-launch.js) extracts it and rewraps per host (Claude
-# Code: hookSpecificOutput.additionalContext for PostToolUse — CC only honors
-# that shape, so the previous bare passthrough was never injected at all; ZCode:
-# bare additionalContext) and enforces the encoded context budget.
-#
-# Canonical env (from zmem-launch.js): ZMEM_ROOT, ZMEM_DATA, ZMEM_SESSION,
-# ZMEM_PROJECT, ZMEM_NAMESPACE. Legacy vars kept as fallbacks for manual /
-# pre-adapter runs. The suggested `store.py add --namespace …` command uses the
-# canonical git-remote-derived $ZMEM_NAMESPACE — the old basename-derived
-# NS_HINT pointed captured conventions at a namespace the unified recall path
-# never queries, making them invisible to the shared store.
-#
-# Non-blocking: always exits 0. Fail-open on any error.
+# Every eligible tool event is offered to the operation ring through store.py.
+# Only a non-amend git commit emits a convention prompt, once per session.
 
 set -u
 
-# Every exit path must emit the sentinel: the launcher now buffers this hook's
-# stdout, so a bare `exit 0` yields no payload at all.
+# Keep the artifact resolver in lockstep with SessionStart: explicit store,
+# canonical data, Claude/ZCode plugin data, then the box-wide default.
+. "$(dirname "$0")/lib/zmem-tilde-expand.sh"
+
 emit_empty() {
   printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' '{}'
   exit 0
 }
 
+# The capture switch is deliberately before stdin and all state/subprocess work.
+CAPTURE_VALUE=1
+if CAPTURE_VALUE="$(printenv ZMEM_CAPTURE 2>/dev/null)"; then :; else CAPTURE_VALUE=1; fi
+CAPTURE_VALUE="$(printf '%s' "$CAPTURE_VALUE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+if [ "$CAPTURE_VALUE" = "0" ]; then emit_empty; fi
+
 INPUT="$(cat)"
 
-# --- Cross-platform setup (same pattern as other hooks) ---
-# Resolved BEFORE the tool-name parse below: the parse needs a working Python
-# interpreter, and on systems where bare `python` is an MS-Store stub or absent
-# (only `python3` exists), using bare `python` left TOOL_NAME empty → the case
-# below fell through to emit_empty and the convention capture silently never
-# fired (#36 M13).
 IS_WINDOWS=0
-if [[ "$(uname -s 2>/dev/null)" == MINGW* ]] || [[ "$(uname -s 2>/dev/null)" == CYGWIN* ]] || [[ "$(uname -s 2>/dev/null)" == MSYS* ]]; then
-  IS_WINDOWS=1
-fi
-
-# Shared tilde expansion for the DATA_DIR resolvers (one implementation for
-# every bash resolver of the lane — zmem-session-start.sh sources it too).
-# Sourced before DATA_DIR is resolved so zmem_tilde_expand is defined at the
-# call site.
-. "$(dirname "$0")/lib/zmem-tilde-expand.sh"
-
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|CYGWIN*|MSYS*) IS_WINDOWS=1 ;;
+esac
 PYTHON_BIN=""
 if [ "$IS_WINDOWS" -eq 1 ]; then
   if python --version >/dev/null 2>&1; then PYTHON_BIN="python"
@@ -60,350 +35,190 @@ else
   if python3 --version >/dev/null 2>&1; then PYTHON_BIN="python3"
   elif python --version >/dev/null 2>&1; then PYTHON_BIN="python"; fi
 fi
-
-# Only fire for convention-revealing tools (Edit/Write/Bash), not Read/Glob/Grep.
-# PostToolUse provides tool_name on stdin. Run the parse with "$PYTHON_BIN"
-# (quoted for paths containing spaces). If no interpreter is available, emit
-# empty rather than failing — the convention capture is best-effort.
-#
-# Line 2 of the parse is commit detection (issue #49 B): 1 when this call is
-# tool_name=Bash with a `git commit` command (and not `--amend`) — the
-# semantically strongest "unit of work finished" moment for a capture nudge.
-# Concept ported from MIT claude-reflect scripts/post_commit_reminder.py
-# (commit detection incl. --amend exclusion, queue-count enrichment).
-# The Bash gate is explicit (not implied by payload shape) so a future
-# Edit/Write payload that happens to carry a `command` subkey cannot fire the
-# nudge. Substring semantics are the issue's literal spec; a non-dict
-# tool_input or non-string command degrades to 0. Windows Python emits \r\n
-# per line even piped and $() strips only the trailing pair, so normalize \r
-# BEFORE the split or TOOL_NAME would carry a trailing \r and silently fail
-# the case gate.
-if [ -z "$PYTHON_BIN" ]; then
-  emit_empty
-fi
-TOOL_META="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c "
-import json, sys
-try:
-    obj = json.load(sys.stdin)
-    name = obj.get('tool_name', '')
-    name = name if isinstance(name, str) else ''
-    ti = obj.get('tool_input')
-    cmd = ti.get('command') if isinstance(ti, dict) else None
-    # Issue #88 / #85 direction 2: the operation descriptor (Bash command or
-    # edited file path) rides line 3 as a JSON dict so multiline commands
-    # cannot break the line-split below (json.dumps escapes newlines).
-    desc = ''
-    if isinstance(ti, dict):
-        if isinstance(cmd, str) and cmd:
-            desc = cmd
-        else:
-            fp = ti.get('file_path') or ti.get('notebook_path') or ti.get('path') or ''
-            if isinstance(fp, str):
-                desc = fp
-    print(name)
-    print(int(name == 'Bash' and isinstance(cmd, str)
-              and 'git commit' in cmd and '--amend' not in cmd))
-    print(json.dumps({'tool': name, 'op': desc}))
-except Exception:
-    print('')
-    print(0)
-    print(json.dumps({'tool': '', 'op': ''}))
-" 2>/dev/null)"
-TOOL_META="${TOOL_META//$'\r'/}"
-TOOL_NAME="${TOOL_META%%$'\n'*}"
-TOOL_META_REST="${TOOL_META#*$'\n'}"
-IS_COMMIT="${TOOL_META_REST%%$'\n'*}"
-OP_EVENT_JSON="${TOOL_META_REST#*$'\n'}"
-
-case "$TOOL_NAME" in
-  Edit|Write|MultiEdit|NotebookEdit|Bash) ;;
-  *) emit_empty ;;  # Skip non-convention-revealing tools
-esac
+[ -n "$PYTHON_BIN" ] || emit_empty
 
 to_py_path() {
   if [ "$IS_WINDOWS" -eq 0 ]; then printf '%s' "$1"; return; fi
-  if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"
+  if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi
+}
+to_shell_path() {
+  if [ "$IS_WINDOWS" -eq 1 ] && command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$1"
   else
-    local p="$1"
-    if [[ "$p" =~ ^/([a-zA-Z])/(.*)$ ]]; then
-      printf '%s:\\%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]//\//\\}"
-    else printf '%s' "$p"; fi
+    printf '%s' "$1"
   fi
 }
-
 join_path() {
   local base="$1"; shift
-  local sep; if [ "$IS_WINDOWS" -eq 1 ]; then sep='\'; else sep='/'; fi
+  local sep='/'; [ "$IS_WINDOWS" -eq 1 ] && sep='\'
   printf '%s' "$base"
   for part in "$@"; do printf '%s%s' "$sep" "$part"; done
 }
+join_shell_path() {
+  local base="$1"; shift
+  printf '%s' "$base"
+  for part in "$@"; do printf '/%s' "$part"; done
+}
+env_value() { printenv "$1" 2>/dev/null || true; }
 
-# Canonical env from the host adapter first; legacy vars as fallback. The
-# launcher derives ZMEM_SESSION from the stdin payload's session_id, which is
-# the only session value guaranteed to be present under Claude Code —
-# CLAUDE_SESSION_ID is not exported to the hook process.
-SESSION_ID="${ZMEM_SESSION:-${CLAUDE_SESSION_ID:-${ZCODE_SESSION_ID:-}}}"
-
-if [ -z "$SESSION_ID" ]; then emit_empty; fi
-
-# --- Resolve plugin root (needed below: the DATA_DIR fallback may shell out
-# to host.py, which lives under it) ---
-PLUGIN_ROOT="${ZMEM_ROOT:-${ZCODE_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}}"
-if [ -z "$PLUGIN_ROOT" ]; then
-  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SESSION_ID="$(env_value ZMEM_SESSION)"
+[ -n "$SESSION_ID" ] || SESSION_ID="$(env_value CLAUDE_SESSION_ID)"
+[ -n "$SESSION_ID" ] || SESSION_ID="$(env_value ZCODE_SESSION_ID)"
+[ -n "$SESSION_ID" ] || emit_empty
+PROJECT="$(env_value ZMEM_PROJECT)"
+[ -n "$PROJECT" ] || PROJECT="$(env_value ZCODE_PROJECT_DIR)"
+[ -n "$PROJECT" ] || PROJECT="$(env_value CLAUDE_PROJECT_DIR)"
+PLUGIN_ROOT="$(env_value ZMEM_ROOT)"
+[ -n "$PLUGIN_ROOT" ] || PLUGIN_ROOT="$(env_value ZCODE_PLUGIN_ROOT)"
+[ -n "$PLUGIN_ROOT" ] || PLUGIN_ROOT="$(env_value CLAUDE_PLUGIN_ROOT)"
+DATA_DIR="$(env_value ZMEM_DATA)"
+[ -n "$DATA_DIR" ] || DATA_DIR="$(env_value CLAUDE_PLUGIN_DATA)"
+[ -n "$DATA_DIR" ] || DATA_DIR="$(env_value ZCODE_PLUGIN_DATA)"
+STORE_PATH="$(env_value ZMEM_STORE)"
+if [ -n "$STORE_PATH" ]; then
+  if [ "$IS_WINDOWS" -eq 1 ]; then STORE_PATH="$(printf '%s' "$STORE_PATH" | tr '\134' '/')"; fi
+  DATA_DIR="$(dirname "$STORE_PATH")"
 fi
-STORE_PY_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts store.py)"
-
-# --- Resolve DATA_DIR ---
-# Must match host.py:resolve_store_path()'s precedence chain exactly:
-#   ZMEM_STORE > ZMEM_DATA > CLAUDE_PLUGIN_DATA > ZCODE_PLUGIN_DATA >
-#   ~/.zmem > ~/.zcode/memory > newest ~/.zcode/cli/plugins/data/*zmem*/
-# so a manual/pre-adapter invocation of this hook targets the same store
-# store.py itself would open. The four explicit-env cases below are cheap
-# checks with no subprocess (the common case, since the host adapter always
-# exports ZMEM_DATA). Only the filesystem-dependent tail of the chain — which
-# of ~/.zmem / ~/.zcode/memory / the legacy per-plugin scan applies — is
-# genuinely ambiguous without re-walking the disk, so that (and only that) is
-# delegated to host.py itself via a tiny subprocess, rather than reimplemented
-# in bash where it would inevitably drift from host.py again.
-DATA_DIR=""
 DATA_DIR_IS_NATIVE=0
-if [ -n "${ZMEM_STORE:-}" ]; then
-  # Normalize Windows separators before dirname. MSYS2/Git Bash coreutils does
-  # treat `\` as a separator, so this is a no-op on the launcher's normal
-  # Windows path — but zmem-launch.js's LAST-RESORT bash fallback is bare
-  # `bash`, which on Windows is WSL, whose coreutils is Linux-native: there
-  # `dirname 'C:\...\store.sqlite'` finds no `/`, returns ".", and the
-  # convention counter would land in ./store.sqlite — a file with no zmem
-  # schema, so capture would silently never fire. Windows-only, so a POSIX
-  # filename legitimately containing a backslash is left untouched.
-  # `tr '\134'` (octal backslash), not a ${//} parameter expansion: the
-  # expansion forms silently fail to substitute here (verified — the value
-  # comes back unchanged), and `tr '\\'` warns about a trailing unescaped
-  # backslash. Octal is unambiguous and quiet.
-  if [ "$IS_WINDOWS" -eq 1 ]; then
-    DATA_DIR="$(dirname "$(printf '%s' "$ZMEM_STORE" | tr '\134' '/')")"
+if [ -z "$DATA_DIR" ]; then
+  # Ask the canonical resolver for host-specific fallback selection. This is
+  # especially important when a pre-migration legacy store already exists.
+  if [ -n "$PLUGIN_ROOT" ]; then
+    HOST_ROOT="$PLUGIN_ROOT"
   else
-    DATA_DIR="$(dirname "$ZMEM_STORE")"
+    HOST_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
   fi
-elif [ -n "${ZMEM_DATA:-}" ]; then
-  DATA_DIR="$ZMEM_DATA"
-elif [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
-  DATA_DIR="$CLAUDE_PLUGIN_DATA"
-elif [ -n "${ZCODE_PLUGIN_DATA:-}" ]; then
-  DATA_DIR="$ZCODE_PLUGIN_DATA"
-elif [ -n "$PYTHON_BIN" ]; then
-  HOST_PY_DIR_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts)"
-  RESOLVED="$("$PYTHON_BIN" -c '
-import sys
-sys.path.insert(0, sys.argv[1])
-try:
-    import host
-    print(host.resolve_store_path().parent)
-except Exception:
-    pass
-' "$HOST_PY_DIR_PY" 2>/dev/null)"
-  if [ -n "$RESOLVED" ]; then
-    # host.py ran under $PYTHON_BIN and returned an already-native path for
-    # this platform (e.g. a Windows path under python.exe) — do not run it
-    # back through to_py_path, which would attempt a Cygwin-path conversion
-    # on a string that is not one.
-    DATA_DIR="$RESOLVED"
+  HOST_DIR_PY="$(join_path "$(to_py_path "$HOST_ROOT")" skills memory scripts)"
+  RESOLVED_DATA="$($PYTHON_BIN -c 'import sys; sys.path.insert(0, sys.argv[1]); import host; print(host.resolve_store_path().parent)' "$HOST_DIR_PY" 2>/dev/null)"
+  if [ -n "$RESOLVED_DATA" ]; then
+    DATA_DIR="$RESOLVED_DATA"
     DATA_DIR_IS_NATIVE=1
   fi
 fi
-if [ -z "$DATA_DIR" ]; then
-  # host.py unavailable/failed (e.g. no python) — last-resort default,
-  # matching host.py's own ultimate fallback.
-  DATA_DIR="$HOME/.zmem"
-fi
-
-# Tilde-valued dirs (degenerate operator input — hosts send absolute paths)
-# must expand the same way on both sides of the lane: the python readers
-# (host.py, recall-body._data_dir) os.path.expanduser every branch, so the
-# writer expands the resolved DATA_DIR too via the SHARED helper (sourced at
-# the top of this script — one implementation for every bash resolver). On
-# success DATA_DIR_IS_NATIVE=1 (python output is native) and to_py_path is
-# skipped below.
+if [ -z "$DATA_DIR" ]; then DATA_DIR="$(join_path "$(to_py_path "$HOME")" .zmem)"; fi
 zmem_tilde_expand
+if [ "$DATA_DIR_IS_NATIVE" -eq 1 ]; then DATA_DIR_PY="$DATA_DIR"; else DATA_DIR_PY="$(to_py_path "$DATA_DIR")"; fi
+DATA_DIR_SH="$(to_shell_path "$DATA_DIR_PY")"
 
-if [ "$DATA_DIR_IS_NATIVE" -eq 1 ]; then
-  DATA_DIR_PY="$DATA_DIR"
+if [ -n "$PLUGIN_ROOT" ]; then
+  STORE_PY_PY="$(join_path "$(to_py_path "$PLUGIN_ROOT")" skills memory scripts store.py)"
 else
-  DATA_DIR_PY="$(to_py_path "$DATA_DIR")"
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  STORE_PY_PY="$(join_path "$(to_py_path "$SCRIPT_DIR/..")" skills memory scripts store.py)"
+fi
+NS="$(env_value ZMEM_NAMESPACE)"
+if [ -z "$NS" ]; then
+  if [ -n "$PROJECT" ]; then NS="project:$(basename "$PROJECT")"; else NS="user:global"; fi
 fi
 
-# Keep store.py resolving the same store (full chain documented above).
-export ZMEM_DATA="${ZMEM_DATA:-$DATA_DIR}"
-export ZCODE_PLUGIN_DATA="${ZCODE_PLUGIN_DATA:-}"
+SESSION_HASH="$("$PYTHON_BIN" -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode("utf-8")).hexdigest()[:32])' "$SESSION_ID" 2>/dev/null)" || emit_empty
+MARKER="$(join_shell_path "$DATA_DIR_SH" ".convention-commit-prompted-$SESSION_HASH")"
 
-PROJECT="${ZMEM_PROJECT:-${ZCODE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-}}}"
+# Parse the host payload and apply the shared descriptor/commit policy. The
+# commit check is token-exact: only [git, commit] at the beginning qualifies.
+META_JSON="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
+import json, os, shlex, sys
+store_py = sys.argv[1]
+sys.path.insert(0, os.path.dirname(store_py))
+try:
+    from capture_quality import operation_descriptor
+except Exception:
+    print("{}")
+    raise SystemExit(0)
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print("{}")
+    raise SystemExit(0)
+if not isinstance(payload, dict):
+    print("{}")
+    raise SystemExit(0)
+tool = payload.get("tool_name", "")
+tool = tool if isinstance(tool, str) else ""
+if tool not in ("Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"):
+    print("{}")
+    raise SystemExit(0)
+ti = payload.get("tool_input")
+if not isinstance(ti, dict): ti = {}
+command = ti.get("command", "")
+command = command if isinstance(command, str) else ""
+path = ""
+for key in ("file_path", "notebook_path", "path"):
+    value = ti.get(key, "")
+    if isinstance(value, str) and value:
+        path = value
+        break
+error_type = payload.get("error_type", "")
+if not isinstance(error_type, str): error_type = str(error_type)
+descriptor = operation_descriptor(tool, command, path, error_type)
+try:
+    tokens = shlex.split(command, posix=True)
+except (TypeError, ValueError):
+    tokens = []
+is_commit = (tool == "Bash" and len(tokens) >= 2
+             and tokens[:2] == ["git", "commit"] and "--amend" not in tokens)
+op = descriptor["command"] or path
+print(json.dumps({"tool": tool, "op": op, "is_commit": is_commit,
+                  "descriptor": descriptor}, ensure_ascii=False,
+                 separators=(",", ":")))
+' "$STORE_PY_PY" 2>/dev/null)" || emit_empty
 
-# Canonical namespace from the host adapter (git-remote-derived, the same key
-# every recall path queries). The legacy basename fallback only applies when
-# the adapter did not run at all.
-NS_HINT="${ZMEM_NAMESPACE:-}"
-if [ -z "$NS_HINT" ]; then
-  if [ -n "$PROJECT" ]; then
-    NS_HINT="project:$(basename "$PROJECT")"
-  else
-    NS_HINT="user:global"
-  fi
+META_OK="$("$PYTHON_BIN" -c '
+import json,sys
+try:
+    obj=json.loads(sys.argv[1])
+    print("1" if obj.get("tool") else "0")
+except Exception:
+    print("0")
+' "$META_JSON" 2>/dev/null)" || emit_empty
+[ "$META_OK" = "1" ] || emit_empty
+
+TOOL="$("$PYTHON_BIN" -c 'import json,sys; print(json.loads(sys.argv[1])["tool"])' "$META_JSON" 2>/dev/null)" || emit_empty
+OP="$("$PYTHON_BIN" -c 'import json,sys; print(json.loads(sys.argv[1])["op"])' "$META_JSON" 2>/dev/null)" || emit_empty
+
+# Ring collection is independent from prompt eligibility. The existing query
+# context switch gates collection only; it does not disable commit prompts.
+QUERY_CONTEXT="$(env_value ZMEM_QUERY_CONTEXT)"
+[ -n "$QUERY_CONTEXT" ] || QUERY_CONTEXT=1
+QUERY_CONTEXT="$(printf '%s' "$QUERY_CONTEXT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+if [ "$QUERY_CONTEXT" != "0" ]; then
+  [ -n "$OP" ] || emit_empty
+  OPS_RESULT="$("$PYTHON_BIN" "$STORE_PY_PY" ops-append --session "$SESSION_ID" --tool "$TOOL" --op "$OP" --json 2>/dev/null)" || emit_empty
+  "$PYTHON_BIN" -c 'import json,sys; o=json.loads(sys.argv[1]); raise SystemExit(0 if o.get("ok") is True else 1)' "$OPS_RESULT" 2>/dev/null || emit_empty
 fi
 
-# --- Per-session cooldown markers (same pattern as capture-failure) ---
-MARKER="$(join_path "$DATA_DIR_PY" ".convention-prompted-${SESSION_ID}")"
-# Commit-nudge cooldown (issue #49 B): OWN marker key, deliberately separate
-# from the cadence marker so the two nudges never suppress each other — a
-# commit nudge must fire even if the cadence nudge already did (and vice
-# versa), but at most once per session itself. Reaped by `sweep` via
-# SENTINEL_PREFIXES in store.py.
-COMMIT_MARKER="$(join_path "$DATA_DIR_PY" ".convention-commit-prompted-${SESSION_ID}")"
+IS_COMMIT="$("$PYTHON_BIN" -c 'import json,sys; print("1" if json.loads(sys.argv[1]).get("is_commit") else "0")' "$META_JSON" 2>/dev/null)" || emit_empty
+[ "$IS_COMMIT" = "1" ] || emit_empty
+[ -e "$MARKER" ] && emit_empty
 
-# No python → cannot count turns; fail open (no injection).
-if [ -z "$PYTHON_BIN" ]; then emit_empty; fi
-
-# --- Turn counter + nudges via Python (atomic meta table update) ---
 CTX_JSON="$("$PYTHON_BIN" -c '
-import json, os, shlex, sys, sqlite3
+import json, shlex, sys
+obj = json.loads(sys.argv[1])
+d = obj["descriptor"]
+store = shlex.quote(sys.argv[2])
+namespace = shlex.quote(sys.argv[3])
+source_ref = shlex.quote("session:" + sys.argv[4])
+claim = "when X happens, do Y, because Z"
+tags = "tool:%s,verb:%s,basename:%s,error:%s" % (
+    d["tool"], d["verb"], d["basename"], d["error"])
+add = ("%s add --namespace %s --type convention --content %s --tags %s "
+       "--signal none --source-ref %s" %
+       (store, namespace, shlex.quote(claim), shlex.quote(tags), source_ref))
+msg = ("ZMem convention capture: a non-amend git commit completed. Operation "
+       "descriptor: %s. Tags: %s. If this is a reusable convention, use the "
+       "claim shape %s and choose whether it is project-bound or box-wide, "
+       "then run: %s. If not, do nothing.") % (
+           json.dumps(d, ensure_ascii=False, separators=(",", ":")),
+           tags, claim, add)
+print(json.dumps({"additionalContext": msg}, ensure_ascii=False, separators=(",", ":")))
+' "$META_JSON" "$STORE_PY_PY" "$NS" "$SESSION_ID" 2>/dev/null)" || emit_empty
+[ -n "$CTX_JSON" ] || emit_empty
 
-session_id = sys.argv[1]
-data_dir = sys.argv[2]
-marker = sys.argv[3]
-store_py_hint = sys.argv[4]
-ns_hint = sys.argv[5]
-is_commit = sys.argv[6]
-commit_marker = sys.argv[7]
+# The marker follows successful prompt rendering. It is a best-effort cooldown.
+MARKER_DIR="$(dirname "$MARKER")"
+if [ ! -d "$MARKER_DIR" ] && ! mkdir -p "$MARKER_DIR" 2>/dev/null; then emit_empty; fi
+if ! printf '1\n' > "$MARKER" 2>/dev/null; then emit_empty; fi
 
-# Issue #88 / #85 direction 2: append this tool event to the per-session
-# ops ring BEFORE anything else — the ring must grow on every call,
-# independent of the marker cooldowns and the cadence counter below. The
-# ring feeds the UserPromptSubmit inject query (storelib/ops_tokens is the
-# single source for the ring format). Best-effort: ring health never
-# affects this hook'"'"'s nudge behavior.
-try:
-    # Review PRR-91-004: the kill switch gates COLLECTION too — an operator
-    # disabling the query-context lane expects no sidecar writes at all.
-    if os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() != "0":
-        _op_event = json.loads(sys.argv[8]) if len(sys.argv) > 8 else {}
-        if isinstance(_op_event, dict) and _op_event.get("op"):
-            sys.path.insert(0, os.path.join(os.path.dirname(store_py_hint), "storelib"))
-            import ops_tokens as _ot
-            _ot.append_ops_ring(data_dir, session_id,
-                                str(_op_event.get("tool", "")),
-                                str(_op_event.get("op", "")))
-except Exception:
-    pass
-
-# Turn counter in the meta table — atomic increment via UPDATE. Runs FIRST
-# (issue #49 B) so a commit-firing Bash call still counts toward the cadence
-# interval. The counter now counts every convention-tool call of the session;
-# previously it froze once the cadence marker existed, but nothing ever read
-# the frozen value, so only the (still marker-gated) nudge behavior matters.
-# A successful increment also proves data_dir exists, so the commit-marker
-# write below cannot fail on a missing directory.
-store_db = os.path.join(data_dir, "store.sqlite")
-try:
-    conn = sqlite3.connect(store_db, timeout=3)
-    # Atomic increment: INSERT OR IGNORE seeds the row, UPDATE increments it.
-    key = "convention_count_" + session_id
-    conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES (?, '"'"'0'"'"')", (key,))
-    conn.execute("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = ?", (key,))
-    conn.commit()
-    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-    conn.close()
-    count = int(row[0]) if row else 0
-except Exception:
-    print("{}")
-    sys.exit(0)
-
-# Commit-boundary nudge (issue #49 B): a `git commit` (not `--amend`) is the
-# strongest natural "unit of work finished" moment. At most once per session
-# via its OWN marker, checked BEFORE the cadence marker below so an
-# already-fired cadence nudge never suppresses it — and the commit marker
-# never suppresses the cadence nudge (independent keys, independent checks).
-if is_commit == "1" and not os.path.isfile(commit_marker):
-    try:
-        with open(commit_marker, "w") as f:
-            f.write("1")
-    except OSError:
-        pass  # best-effort; worst case the nudge can re-fire this session
-    # Enrich with the pending #47 correction-queue count when the module and
-    # a non-empty queue are available; degrade silently (no count) otherwise —
-    # the nudge must not depend on the queue existing.
-    pending = None
-    try:
-        sys.path.insert(0, os.path.dirname(store_py_hint))
-        import correction_queue as _cq
-        pending = sum(1 for _it in _cq.load_queue(ns_hint) if not _it.get("stale"))
-    except Exception:
-        pending = None
-    queue_note = ""
-    if pending:
-        queue_note = " %d correction-queue item(s) pending review." % pending
-    msg = (
-        "zmem: commit detected — if this completes a unit of work, consider "
-        "running the closeout skill to capture lessons.%s "
-        "(fires at most once per session)"
-    ) % queue_note
-    print(json.dumps({"additionalContext": msg}))
-    sys.exit(0)
-
-# Cooldown: one convention prompt per session.
-if os.path.isfile(marker):
-    print("{}")
-    sys.exit(0)
-
-# Fire every N=10 successful Edit/Write/Bash calls.
-INTERVAL = int(os.environ.get("ZMEM_CONVENTION_INTERVAL", "10"))
-if count < INTERVAL:
-    print("{}")
-    sys.exit(0)
-
-# Write the marker so subsequent calls in this session do not re-prompt.
-try:
-    with open(marker, "w") as f:
-        f.write("1")
-except OSError:
-    pass
-
-# ns_hint is git-remote-derived (repo-controlled: a hostile origin URL can
-# embed quotes / $(...) / backticks) and store_py_hint / session_id are
-# interpolated the same way, so shell-quote all three before rendering them
-# into the suggested command. shlex.quote wraps in single quotes (and escapes
-# any embedded single quote) only when needed, so ordinary values still read
-# as a plain, copy-pasteable command while a hostile value cannot break out of
-# its argument position.
-store_py_arg = shlex.quote(store_py_hint)
-namespace_arg = shlex.quote(ns_hint)
-source_ref_arg = shlex.quote("session:" + session_id)
-
-msg = (
-    "ZMem convention capture: you just completed several successful code edits. "
-    "If you discovered a reusable convention, pattern, or workaround during this "
-    "session — something that would help a future session facing a similar task — "
-    "capture it now: `%s add --namespace %s --type convention --content \"...\" "
-    "--signal <test|compile|lint|reviewer|user|none> --source-ref %s`. "
-    "If nothing generalizable applies, do nothing. "
-    "(This prompt fires at most once per session.)"
-) % (store_py_arg, namespace_arg, source_ref_arg)
-print(json.dumps({"additionalContext": msg}))
-' "$SESSION_ID" "$DATA_DIR_PY" "$MARKER" "$STORE_PY_PY" "$NS_HINT" "$IS_COMMIT" "$COMMIT_MARKER" "$OP_EVENT_JSON" 2>/dev/null || echo '{}')"
-
-if [ -z "$CTX_JSON" ]; then
-  CTX_JSON='{}'
-fi
-
-# Neutralize any sentinel token the payload happens to contain before wrapping
-# (same defense as zmem-recall.sh): the launcher locates the payload by scanning
-# stdout for the literal markers, so an embedded marker would move the
-# extraction boundary and silently degrade this hook to {}. Both replacements
-# are safe inside the serialized JSON string: neither introduces a quote or a
-# backslash.
-CTX_JSON="${CTX_JSON//<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>}"
-CTX_JSON="${CTX_JSON//<<<END>>>/<<<END_NEUTRALIZED>>>}"
-
-# Wrap the payload in the sentinel so the host adapter can extract + rewrap it.
+CTX_JSON="$(printf '%s' "$CTX_JSON" | sed 's/<<<ZMEM_JSON>>>/<<<ZMEM_JSON_NEUTRALIZED>>>/g; s/<<<END>>>/<<<END_NEUTRALIZED>>>/g')"
 printf '<<<ZMEM_JSON>>>%s<<<END>>>\n' "$CTX_JSON"
 exit 0

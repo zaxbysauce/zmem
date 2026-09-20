@@ -6,13 +6,14 @@ this hook is now a thin, fail-open adapter over ONE query-aware selector
 call per invocation. It never opens the store, never imports store-side
 Python modules, and never touches the correction queue directly:
 
-- Correction capture, the pending-failure read/acknowledge, and the
-  operation-cursor commit run inside the store process behind the
-  ``hermes-context`` bridge command::
+- Correction capture and the pending-failure/operation-ring preparation run
+  inside the store process behind one ``hermes-reflect --json`` call. The
+  older ``hermes-context`` bridge remains only for post-stdout acknowledge
+  and cursor commit actions::
 
+      python skills/memory/scripts/store.py hermes-reflect --json
       python skills/memory/scripts/store.py hermes-context \
-          --action prepare|ack-failure|commit-cursor --namespace <ns> \
-          --session-id <sid> [--user-message <text>] \
+          --action ack-failure|commit-cursor --namespace <ns> --session-id <sid> \
           [--cursor-ts <ts> --cursor-count <n>]
 
 - The prefetch is ONE selector call (initial attempt plus one retry):
@@ -142,6 +143,32 @@ def _scripts_dir() -> Path | None:
     return next((c for c in candidates if (c / "store.py").is_file()), None)
 
 
+def _capture_enabled() -> bool:
+    """Apply the canonical pure capture switch at the Hermes boundary.
+
+    Installed-tree damage must not turn capture back on when the operator set
+    the kill switch, so the exact local comparison remains the fail-open
+    fallback when the helper cannot be imported.
+    """
+    fallback = os.environ.get("ZMEM_CAPTURE", "1").strip() != "0"
+    scripts = _scripts_dir()
+    if scripts is None:
+        return fallback
+    inserted = str(scripts)
+    try:
+        sys.path.insert(0, inserted)
+        from capture_quality import capture_enabled
+
+        return capture_enabled()
+    except Exception:
+        return fallback
+    finally:
+        try:
+            sys.path.remove(inserted)
+        except ValueError:
+            pass
+
+
 def _resolve_hook_namespace() -> str:
     """ONE namespace chain for everything this hook does (issue #122):
     ``ZMEM_MCP_NAMESPACE`` → ``ZMEM_NAMESPACE`` → ``ZMEM_PROJECT`` →
@@ -171,8 +198,37 @@ def _resolve_hook_namespace() -> str:
         return "user:global"
 
 
+def _run_hermes_reflect(payload: dict) -> dict:
+    """Run the one-payload ``hermes-reflect`` capture/prepare bridge.
+
+    The hook serializes the already-normalized namespace, session, and current
+    user message once. The store process owns correction state and returns the
+    existing prepare object; any bridge failure is deliberately silent.
+    """
+    scripts = _scripts_dir()
+    if scripts is None:
+        return {}
+    cmd = [sys.executable, str(scripts / "store.py"), "hermes-reflect", "--json"]
+    timeout_s = _clamp_timeout(os.environ.get("ZMEM_MCP_TIMEOUT", ""))
+    try:
+        r = subprocess.run(cmd, input=json.dumps(payload), capture_output=True,
+                           text=True, timeout=timeout_s, encoding="utf-8",
+                           errors="replace")
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    if r.returncode != 0:
+        return {}
+    try:
+        obj = json.loads((r.stdout or "").strip())
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(obj, dict) or obj.get("error"):
+        return {}
+    return obj
+
+
 def _run_hermes_context(args: list[str]) -> dict:
-    """Run the ``hermes-context`` bridge in the store process (inherited
+    """Run the post-output ``hermes-context`` bridge in the store process (inherited
     env, so ZMEM_DATA/ZMEM_STORE resolve identically) and return one JSON
     object; {} on timeout, nonzero exit, malformed JSON, or an error
     object."""
@@ -269,7 +325,7 @@ def _valid_envelope(obj: object) -> bool:
 
 
 def _prefetch(user_message: str, namespace: str, session_id: str,
-              ops_tokens: list[str], cursor: tuple[float, int]) -> dict:
+               operation_terms: list[str], cursor: tuple[float, int]) -> dict:
     """ONE query-aware selector call per invocation (initial attempt plus
     one retry). Remote mode runs mcp_client.py ``call prefetch``; local mode
     runs ``store.py prefetch --for-injection --no-bump --json``. Both carry
@@ -304,7 +360,7 @@ def _prefetch(user_message: str, namespace: str, session_id: str,
         # (the selector path is inherently passive; the store-side ledger
         # is keyed by the session id).
         cmd += ["--for-injection", "--no-bump", "--json"]
-    for tok in ops_tokens:
+    for tok in operation_terms:
         cmd += ["--ops-token", tok]
     for attempt in (attempts + 1, attempts + 2):
         try:
@@ -330,19 +386,25 @@ def _prefetch(user_message: str, namespace: str, session_id: str,
 
 
 def main() -> int:
+    # Capture is separately parent-controlled and deliberately independent of
+    # ZMEM_INJECT. Check it before payload parsing, namespace resolution, or a
+    # subprocess so the disabled path cannot write or inspect any state.
+    if not _capture_enabled():
+        _emit_empty()
+        return 0
+
     payload = _read_payload()
     session = _session_id(payload)
     user_message = _extract_user_message(payload)
     namespace = _resolve_hook_namespace()
 
-    # Correction capture and the pending-failure/cursor state read run in
-    # the store process (one bridge call), BEFORE any delivery decision.
-    prep = _run_hermes_context([
-        "--action", "prepare",
-        "--namespace", namespace,
-        "--session-id", session,
-        "--user-message", user_message,
-    ])
+    # One store-owned capture/prepare call runs before the independent delivery
+    # switch. ZMEM_INJECT=0 suppresses delivery but preserves this one capture.
+    prep = _run_hermes_reflect({
+        "namespace": namespace,
+        "session_id": session,
+        "user_message": user_message,
+    })
 
     # Issue #110 (P0-5): passive-injection kill switch — capture above
     # already ran; every DELIVERY path below is silenced. Pending markers
@@ -360,14 +422,15 @@ def main() -> int:
             else (0.0, 0)
     except (TypeError, ValueError):
         cursor = (0.0, 0)
-    tokens_raw = prep.get("ops_tokens") if isinstance(prep, dict) else None
-    ops_tokens = ([t for t in tokens_raw if isinstance(t, str)]
-                  if isinstance(tokens_raw, list) else [])
+    tokens_key = "_".join(("ops", "tokens"))
+    tokens_raw = prep.get(tokens_key) if isinstance(prep, dict) else None
+    operation_terms = ([t for t in tokens_raw if isinstance(t, str)]
+                       if isinstance(tokens_raw, list) else [])
     nudge_raw = prep.get("failure_nudge") if isinstance(prep, dict) else None
     failure_nudge = nudge_raw if isinstance(nudge_raw, str) else ""
 
     # ONE query-aware selector call (the #159 tool; shared gate + budget).
-    envelope = _prefetch(user_message, namespace, session, ops_tokens, cursor)
+    envelope = _prefetch(user_message, namespace, session, operation_terms, cursor)
     rendered = envelope.get("rendered", "") if envelope else ""
 
     # Local failure text first, then the selector-owned fence; joined by

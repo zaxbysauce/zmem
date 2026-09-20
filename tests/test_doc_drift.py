@@ -90,6 +90,25 @@ def _read(rel):
     return (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
 
 
+class CaptureDocumentationTest(unittest.TestCase):
+    """Issue #123 capture and portability claims stay exact across docs."""
+
+    def test_capture_policy_documentation(self):
+        readme = _read("README.md")
+        memory = _read("skills/memory/SKILL.md")
+        closeout = _read("skills/closeout/SKILL.md")
+
+        for text in (readme, memory):
+            self.assertIn("ZMEM_CAPTURE=0", text)
+            self.assertIn("ZMEM_INJECT", text)
+            self.assertIn("ZMEM_QUERY_CONTEXT", text)
+            self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", text)
+            self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", text)
+        self.assertNotIn("ZMEM_CONVENTION_INTERVAL", readme)
+        self.assertIn("Is this project-bound or box-wide?", closeout)
+        self.assertIn("store.py invalidate --id <uuid> --reason", closeout)
+
+
 class SidecarRetirementDocPinTest(unittest.TestCase):
     """Issue #117 ceiling pins (doc-rot convention): PRESENCE needles only.
 
