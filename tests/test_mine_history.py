@@ -507,8 +507,10 @@ class TestMineHistorySubcommand(unittest.TestCase):
         queue_dir = os.path.join(self.tmp, "queue")
         self.assertFalse(os.path.exists(queue_dir) and
                          list(Path(queue_dir).glob("*.json")))
-        self.assertFalse((Path(self.root) / "history-checkpoints").exists(),
+        self.assertFalse((Path(self.tmp) / "history-checkpoints").exists(),
                          "report-only mining must never advance progress")
+        self.assertFalse((Path(self.root) / "history-checkpoints").exists(),
+                         "transcript roots never own progress state")
 
     def test_queue_mode_writes_valid_items_and_is_idempotent(self):
         self._write_fixture()
@@ -537,8 +539,9 @@ class TestMineHistorySubcommand(unittest.TestCase):
         items2 = json.loads(qfiles[0].read_text(encoding="utf-8"))
         self.assertEqual(len(items2), 2)
         self.assertIn("already present", r2.stdout)
-        checkpoints = list((Path(self.root) / "history-checkpoints").glob("*.json"))
+        checkpoints = list((Path(self.tmp) / "history-checkpoints").glob("*.json"))
         self.assertEqual(len(checkpoints), 4)
+        self.assertFalse((Path(self.root) / "history-checkpoints").exists())
 
     def test_failed_queue_keeps_checkpoint(self):
         self._write_fixture()
@@ -549,7 +552,38 @@ class TestMineHistorySubcommand(unittest.TestCase):
                 min_count=2, limit=None, queue=True, as_json=True)
         self.assertEqual(rc, 2)
         write.assert_not_called()
+        self.assertFalse((Path(self.tmp) / "history-checkpoints").exists())
         self.assertFalse((Path(self.root) / "history-checkpoints").exists())
+
+    def test_split_transcript_and_data_roots_place_and_sweep_checkpoints(self):
+        self._write_fixture()
+        data_dir = Path(self.tmp) / "store-data"
+        data_dir.mkdir()
+        fake_home = Path(self.tmp) / "fake-home"
+        fake_home.mkdir()
+        env = self._env(str(data_dir))
+        env["HOME"] = str(fake_home)
+        env["USERPROFILE"] = str(fake_home)
+        queued = self._run(
+            env, "mine-history", "--transcript-dir", self.root,
+            "--all-projects", "--queue")
+        self.assertEqual(queued.returncode, 0, queued.stderr)
+
+        checkpoint_dir = data_dir / "history-checkpoints"
+        checkpoints = list(checkpoint_dir.glob("*.json"))
+        self.assertEqual(len(checkpoints), 4)
+        self.assertFalse((Path(self.root) / "history-checkpoints").exists(),
+                         "checkpoint state must not leak into transcript storage")
+
+        stale = checkpoints[0]
+        stale_time = time.time() - 8 * 86400
+        os.utime(stale, (stale_time, stale_time))
+        swept = self._run(
+            env, "sweep", "--max-age-days", "7")
+        self.assertEqual(swept.returncode, 0, swept.stderr)
+        self.assertFalse(stale.exists(),
+                         "sweep must reap history state from the store data dir")
+        self.assertEqual(len(list(checkpoint_dir.glob("*.json"))), 3)
 
     def test_fence_is_removed_before_projection(self):
         fenced = (
@@ -827,7 +861,9 @@ class HistorySuffixTest(unittest.TestCase):
 
         discovered = ([(self.transcript, "project:example")], False)
         with mock.patch.object(hm, "discover_transcripts", return_value=discovered), \
-                mock.patch("storelib.mine._queue_mined", return_value=2):
+                mock.patch("storelib.mine._queue_mined", return_value=2), \
+                mock.patch("storelib.mine._schema.STORE_PATH",
+                           self.root / "store.sqlite"):
             rc = store_mod.cmd_mine_history(
                 transcript_dir=str(self.root), all_projects=True, days=None,
                 min_count=2, limit=None, queue=True, as_json=True)

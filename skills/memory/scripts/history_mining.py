@@ -6,7 +6,8 @@ Walks a box's existing Claude Code transcripts (~/.claude/projects/**/*.jsonl)
 so store.py's `mine-history` subcommand can produce a single merged candidate
 report (corrections + rejections + error_patterns) for an agent to REVIEW
 before anything enters the store. Read-only against transcripts AND the store;
-the only write surface is the #47 sidecar review queue under `--queue`.
+under `--queue`, the caller writes the #47 review queue and compact progress
+checkpoints in the store data directory.
 
 This module owns DISCOVERY + FOLDERING + DEDUP + QUEUE-SYNTHESIS. It never
 imports store.py (avoids a cycle: store.py imports this module). The concrete
