@@ -93,8 +93,8 @@ def read_suffix_checkpoint(root: Path, transcript: Path, session: str) -> dict:
         return fallback
 
 
-def _latest_chunk(text: str) -> tuple[str, int]:
-    latest = "0"
+def _latest_chunk(text: str, initial_chunk: str = "0") -> tuple[str, int]:
+    latest = str(initial_chunk or "0")
     start = 0
     position = 0
     for line in text.splitlines(keepends=True):
@@ -120,9 +120,6 @@ def mine_transcript_suffix(transcript: Path, checkpoint: dict) -> tuple[str, dic
     the newest chunk rather than replaying older compacted chunks.
     """
     path = Path(transcript)
-    data = path.read_bytes()
-    text = data.decode("utf-8")
-    latest_chunk, chunk_start = _latest_chunk(text)
     try:
         offset = int(checkpoint.get("offset", 0))
     except (AttributeError, TypeError, ValueError):
@@ -133,22 +130,83 @@ def mine_transcript_suffix(transcript: Path, checkpoint: dict) -> tuple[str, dic
     stored_chunk = checkpoint.get("chunk_id", "0") \
         if isinstance(checkpoint, dict) else "0"
 
-    if len(data) < offset:
-        start = 0
-    elif hashlib.sha256(data[:offset]).hexdigest() != stored_digest:
-        start = 0
+    # A valid checkpoint is the normal append path. Hash the covered prefix in
+    # bounded chunks, retaining only its unfinished final JSONL record and the
+    # appended bytes. The stored digest proves the prefix is the same strict
+    # UTF-8 content accepted previously, so only the append boundary/suffix
+    # needs decoding and JSON scanning on this path.
+    total_size = 0
+    full_digest = ""
+    if path.stat().st_size >= offset:
+        prefix_digest = hashlib.sha256()
+        transcript_digest = hashlib.sha256()
+        # Keep only the unfinished final JSONL record. It is needed when an
+        # append completes a record that crossed the checkpoint boundary.
+        prefix_tail = bytearray()
+        suffix_bytes = bytearray()
+        with path.open("rb") as handle:
+            while True:
+                block = handle.read(64 * 1024)
+                if not block:
+                    break
+                transcript_digest.update(block)
+                block_start = total_size
+                block_end = total_size + len(block)
+                if block_start < offset:
+                    prefix_end = min(len(block), offset - block_start)
+                    prefix = block[:prefix_end]
+                    prefix_digest.update(prefix)
+                    newline = prefix.rfind(b"\n")
+                    if newline >= 0:
+                        prefix_tail[:] = prefix[newline + 1:]
+                    else:
+                        prefix_tail.extend(prefix)
+                if block_end > offset:
+                    suffix_bytes.extend(block[max(0, offset - block_start):])
+                total_size = block_end
+        full_digest = transcript_digest.hexdigest()
+        checkpoint_valid = prefix_digest.hexdigest() == stored_digest
     else:
-        start = offset
-    if str(stored_chunk or "0") != latest_chunk:
-        start = chunk_start
+        checkpoint_valid = False
 
-    suffix = data[start:].decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    if checkpoint_valid:
+        suffix_data = bytes(suffix_bytes)
+        scan_data = bytes(prefix_tail) + suffix_data
+        scan_text = scan_data.decode("utf-8")
+        latest_chunk, chunk_start = _latest_chunk(
+            scan_text, initial_chunk=str(stored_chunk or "0"))
+        if latest_chunk != str(stored_chunk or "0"):
+            # A newly completed chunk record may begin in prefix_tail, so
+            # replay that one record when necessary; otherwise retain only the
+            # true append bytes.
+            suffix = scan_data[chunk_start:].decode("utf-8")
+        else:
+            suffix = suffix_data.decode("utf-8")
+    else:
+        # Shrink or prefix mutation invalidates the checkpoint. Reset paths may
+        # read the whole transcript because the returned suffix is the full
+        # strict-decoded transcript and chunk state must be reconstructed.
+        data = path.read_bytes()
+        text = data.decode("utf-8")
+        latest_chunk, chunk_start = _latest_chunk(text)
+        start = 0
+        if str(stored_chunk or "0") != latest_chunk:
+            start = chunk_start
+        # ``_latest_chunk`` reports byte offsets so both paths must slice the
+        # original bytes before strict decoding. Slicing ``text`` here would
+        # treat the offset as characters and truncate the first new record
+        # whenever an older chunk contains multibyte UTF-8.
+        suffix = data[start:].decode("utf-8")
+        total_size = len(data)
+        full_digest = hashlib.sha256(data).hexdigest()
+
+    suffix = suffix.replace("\r\n", "\n").replace("\r", "\n")
     next_state = {
         "session": str(checkpoint.get("session", "")) if isinstance(checkpoint, dict) else "",
         "transcript": str(checkpoint.get("transcript", path.resolve().as_posix()))
         if isinstance(checkpoint, dict) else path.resolve().as_posix(),
-        "offset": len(data),
-        "prefix_sha256": hashlib.sha256(data).hexdigest(),
+        "offset": total_size,
+        "prefix_sha256": full_digest,
         "chunk_id": latest_chunk,
     }
     return suffix, next_state

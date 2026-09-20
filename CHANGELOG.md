@@ -13,7 +13,7 @@ README.
 ## [0.53.0] - 2026-09-19
 
 ### Added
-- **Capture-quality policy and suffix-only history mining (issue #123)**:
+- **Capture-quality policy and checkpointed history mining (issue #123)**:
   capture surfaces now share an explicit fail-open `ZMEM_CAPTURE=0` gate,
   command-derived evidence signals, hashed recurrence/commit markers, bounded
   operation descriptors, and store-owned state bridges. History mining keeps

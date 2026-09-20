@@ -948,6 +948,16 @@ def init_db(conn: sqlite3.Connection) -> None:
     # + add idempotently so the index (referenced by the dedup read path) is
     # always available regardless of migration ordering.
     cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+    # Capture adapters probe this exact live provenance key through
+    # storelib.mine.source_exists(). Keep the liveness predicate in the partial
+    # index so tombstoned history does not dilute the lookup. Some migration
+    # characterization fixtures intentionally model reduced legacy tables, so
+    # guard this derived index like the later versioned-column indexes.
+    if "source_ref" in cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_namespace_source_live "
+            "ON memory(namespace, source_ref) WHERE superseded_at IS NULL"
+        )
     if "content_norm" not in cols:
         conn.execute("ALTER TABLE memory ADD COLUMN content_norm TEXT")
     conn.execute(

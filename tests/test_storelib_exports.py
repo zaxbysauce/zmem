@@ -13,6 +13,7 @@ import importlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -188,6 +189,66 @@ class CaptureCliBoundaryTest(unittest.TestCase):
         self.assertEqual(found.returncode, 0)
         self.assertEqual(found.stdout, '{"exists":true}\n')
         self.assertEqual(found.stderr, "")
+
+    def test_source_exists_index_is_added_without_schema_bump(self):
+        """Existing stores get the live provenance index idempotently."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        self.addCleanup(sys.path.remove, str(SCRIPTS_DIR))
+        from storelib import schema  # noqa: PLC0415
+        from storelib.mine import source_exists  # noqa: PLC0415
+
+        conn = sqlite3.connect(self.store)
+        conn.row_factory = sqlite3.Row
+        try:
+            schema.init_db(conn)
+            schema.migrate(conn)
+            conn.execute(
+                "DROP INDEX idx_memory_namespace_source_live"
+            )
+            conn.commit()
+
+            before = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()["value"]
+            self.assertEqual(before, "14")
+
+            # Re-opening an already-migrated store must recreate only the
+            # derived index, never advance the data schema.
+            schema.init_db(conn)
+            after = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()["value"]
+            self.assertEqual(after, before)
+
+            index = conn.execute(
+                "SELECT name, partial FROM pragma_index_list('memory') "
+                "WHERE name='idx_memory_namespace_source_live'"
+            ).fetchone()
+            self.assertIsNotNone(index)
+            self.assertEqual(index["partial"], 1)
+
+            conn.execute(
+                "INSERT INTO memory "
+                "(id, namespace, type, content, source_ref, ingestion_ts) "
+                "VALUES (?, ?, 'lesson', ?, ?, ?)",
+                ("source-index-live", "project:test", "indexed", "session:one",
+                 "2026-06-01T00:00:00Z"),
+            )
+            conn.commit()
+            self.assertTrue(source_exists(
+                conn, namespace="project:test", source_ref="session:one"
+            ))
+
+            plan = conn.execute(
+                "EXPLAIN QUERY PLAN "
+                "SELECT 1 FROM memory WHERE namespace = ? AND source_ref = ? "
+                "AND superseded_at IS NULL LIMIT 1",
+                ("project:test", "session:one"),
+            ).fetchall()
+            details = " ".join(row["detail"] for row in plan)
+            self.assertIn("USING INDEX idx_memory_namespace_source_live", details)
+        finally:
+            conn.close()
 
     def test_ops_append_json_contract(self):
         result = self._run("ops-append", "--session", "capture-cli-session",

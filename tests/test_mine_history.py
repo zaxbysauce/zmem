@@ -599,6 +599,29 @@ class TestMineHistorySubcommand(unittest.TestCase):
         self.assertEqual(len(qfiles), 1)
         items = json.loads(qfiles[0].read_text(encoding="utf-8"))
         self.assertEqual(len(items), 1)
+        # Assert the production mine-history -> queue projection against an
+        # independently authored payload.  The fence assertions alone could
+        # pass while the candidate's classification or provenance drifted.
+        self.assertEqual(
+            {key: items[0][key] for key in (
+                "message", "type", "patterns", "confidence", "sentiment",
+                "decay_days", "source", "kind", "project_folder",
+                "occurrences", "dedup_key",
+            )},
+            {
+                "message": "no, use uv  not pip",
+                "type": "auto",
+                "patterns": "no, use-X-not-Y",
+                "confidence": 0.85,
+                "sentiment": "correction",
+                "decay_days": 90,
+                "source": "history-mine",
+                "kind": "correction",
+                "project_folder": "proj_foo",
+                "occurrences": 1,
+                "dedup_key": "cor|proj_foo|no use uv not pip",
+            },
+        )
         self.assertNotIn("secret recalled text", items[0]["message"])
         self.assertNotIn("<<<ZMEM_", items[0]["message"])
 
@@ -849,6 +872,57 @@ class HistorySuffixTest(unittest.TestCase):
         )
         self.assertEqual(suffix, appended)
 
+    def test_valid_checkpoint_scans_only_appended_suffix(self):
+        self._write({"chunk_id": "1", "text": "x" * 200_000})
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        _, state = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, state)
+        appended = json.dumps(
+            {"chunk_id": "1", "text": "new"}, separators=(",", ":")) + "\n"
+        with self.transcript.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(appended)
+
+        observed = []
+        original_latest_chunk = hm._latest_chunk
+
+        def observe(text, initial_chunk="0"):
+            observed.append((text, initial_chunk))
+            return original_latest_chunk(text, initial_chunk)
+
+        with mock.patch.object(hm, "_latest_chunk", side_effect=observe):
+            suffix, _ = hm.mine_transcript_suffix(
+                self.transcript,
+                hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
+            )
+
+        self.assertEqual(suffix, appended)
+        self.assertEqual(observed, [(appended, "1")])
+        self.assertLess(len(observed[0][0]), self.transcript.stat().st_size)
+
+    def test_append_can_complete_chunk_record_across_checkpoint(self):
+        complete = json.dumps(
+            {"chunk_id": "1", "text": "old"}, separators=(",", ":")) + "\n"
+        partial = '{"chunk_id":"2","text":"new'
+        self.transcript.write_text(complete + partial, encoding="utf-8")
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        _, state = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, state)
+
+        ending = '"}\n'
+        with self.transcript.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(ending)
+        suffix, next_state = hm.mine_transcript_suffix(
+            self.transcript,
+            hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
+        )
+
+        self.assertEqual(suffix, partial + ending)
+        self.assertEqual(next_state["chunk_id"], "2")
+
     def test_failed_queue_keeps_checkpoint(self):
         self._write({"chunk_id": "1", "type": "user", "message": {
             "content": "no, use uv not pip"}})
@@ -900,6 +974,54 @@ class HistorySuffixTest(unittest.TestCase):
             hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
         )
         self.assertEqual(suffix, self.transcript.read_text(encoding="utf-8"))
+
+    def test_prefix_mismatch_preserves_multibyte_chunk_boundary(self):
+        first = json.dumps(
+            {"chunk_id": "1", "text": "é"},
+            separators=(",", ":"), ensure_ascii=False) + "\n"
+        self.transcript.write_text(first, encoding="utf-8")
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        _, state = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, state)
+
+        changed_first = first.replace("é", "ø")
+        newest = json.dumps(
+            {"chunk_id": "2", "text": "second"},
+            separators=(",", ":")) + "\n"
+        self.transcript.write_text(changed_first + newest, encoding="utf-8")
+        suffix, next_state = hm.mine_transcript_suffix(
+            self.transcript,
+            hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
+        )
+
+        self.assertEqual(suffix, newest)
+        self.assertEqual(next_state["chunk_id"], "2")
+
+    def test_shrink_preserves_multibyte_chunk_boundary(self):
+        self._write({"chunk_id": "1", "text": "é" * 100})
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        _, state = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, state)
+
+        older = json.dumps(
+            {"chunk_id": "1", "text": "é"},
+            separators=(",", ":"), ensure_ascii=False) + "\n"
+        newest = json.dumps(
+            {"chunk_id": "2", "text": "second"},
+            separators=(",", ":")) + "\n"
+        self.transcript.write_text(older + newest, encoding="utf-8")
+        self.assertLess(self.transcript.stat().st_size, state["offset"])
+        suffix, next_state = hm.mine_transcript_suffix(
+            self.transcript,
+            hm.read_suffix_checkpoint(self.root, self.transcript, self.session),
+        )
+
+        self.assertEqual(suffix, newest)
+        self.assertEqual(next_state["chunk_id"], "2")
 
     def test_compaction_chunk_resets_offset(self):
         self._write({"chunk_id": "1", "text": "old"})
