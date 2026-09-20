@@ -1339,6 +1339,24 @@ class ActionMatcherTest(unittest.TestCase):
             self.assertEqual(run.returncode, 2, run.stderr)
             self.assertIn("replay: actions-input is not valid JSON", run.stderr or "")
             self.assertNotIn("Traceback", run.stderr or "")
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-oversize-") as raw:
+            scratch = Path(raw)
+            oversize = scratch / "oversize-actions.json"
+            oversize.write_bytes(b" " * (4 * 1024 * 1024 + 1))
+            run = subprocess.run(
+                [PYTHON, str(EVALUATOR),
+                 "--store", str(store), "--log", str(FIXTURES / "decisions.log"),
+                 "--days", "30", "--actions", "--actions-input", str(oversize),
+                 "--json-out", str(scratch / "oversize-report.json")],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(run.returncode, 2, run.stderr)
+            self.assertIn("exceeds the", run.stderr or "")
+            self.assertIn("byte limit", run.stderr or "")
+            # The bounded-read diagnostic must not be re-wrapped as a JSON error.
+            self.assertNotIn("not valid JSON", run.stderr or "")
+            self.assertEqual((run.stderr or "").count("replay:"), 1)
         self.assertEqual(hashlib.sha256(store.read_bytes()).hexdigest(), before)
 
 

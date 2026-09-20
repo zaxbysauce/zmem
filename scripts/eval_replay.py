@@ -1009,9 +1009,13 @@ def _validated_action_rows(rows: object, *, kind: str) -> list[dict]:
 
 def _load_action_rows(path: Path) -> tuple[list[dict], list[dict]]:
     """Load and structurally validate the recorded action observation rows."""
+    # _read_bounded raises ReplayError (a ValueError subclass) for oversize
+    # or unreadable inputs; keep it OUTSIDE the decode/parse guard so those
+    # stable diagnostics are not re-wrapped into a JSON-parse message.
+    blob = _read_bounded(path, "actions input", MAX_ACTIONS_BYTES)
     try:
-        payload = json.loads(_read_bounded(path, "actions input", MAX_ACTIONS_BYTES).decode("utf-8"))
-    except ValueError as exc:
+        payload = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ReplayError(f"replay: actions-input is not valid JSON: {exc}\n") from exc
     if not isinstance(payload, dict):
         raise ReplayError("replay: actions-input must be a JSON object\n")
