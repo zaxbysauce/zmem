@@ -120,6 +120,25 @@ class StoreCliReservedPrefixTest(unittest.TestCase):
         self.assertIsNotNone(row,
                              "ingested row must land with its own ref")
 
+    def test_override_does_not_silence_row_carried_reserved_ref(self):
+        """PRR-004: a non-reserved --source-ref override must not silently
+        swallow a row-carried reserved ref — the row's original ref warns
+        before the override replaces it."""
+        rowfile = Path(self.tmp) / "rows-override.jsonl"
+        row = ("{\"id\": \"00000000-0000-4000-8000-000000000780\", "
+               "\"namespace\": \"project:storecli-77\", \"type\": \"fact\", "
+               "\"content\": \"ingested row with reserved ref plus override\", "
+               "\"source_ref\": \"organize:forged-then-overridden\", "
+               "\"timestamp\": \"2026-09-10T00:00:00Z\"}")
+        rowfile.write_text(row + chr(10), encoding="utf-8")
+        r = self._run("ingest-jsonl", "--in", str(rowfile),
+                      "--source-ref", "user:batch-override")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(WARNING, r.stderr,
+                      "row-carried reserved ref must warn even under an override")
+        self.assertNotIn(WARNING, r.stdout)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

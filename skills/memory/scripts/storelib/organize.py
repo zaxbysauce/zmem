@@ -78,6 +78,7 @@ import contextlib
 import os
 import re
 import sqlite3
+import sys
 import time
 
 from storelib.consolidate import (
@@ -110,7 +111,7 @@ from storelib.schema import (
     _parse_iso_to_epoch,
     now_iso,
 )
-from storelib.write import add_memory, update_memory
+from storelib.write import AutoCaptureRuntimeError, CapturePolicyRefusal, add_memory, update_memory
 
 # Summaries are real rows. A signal=none row inherits SIGNAL_CONFIDENCE["none"]
 # (0.2) which sits BELOW the CONFIDENCE_FLOOR (0.25) — such a row is invisible
@@ -821,25 +822,36 @@ def organize(
         if dry_run:
             comp["would_count"] += 1
             continue
-        with _scoped_tx(conn):
-            result_id, created_new = update_memory(
-                conn, mid=mid, content=compressed,
-                tags=keeper["tags"], source_ref=keeper["source_ref"],
-                signal=keeper["signal"], confidence=keeper["confidence"],
-                # Issue #77: synthesized rows declare their policy — auto
-                # (redact secret-like content, refuse credential-shaped refs)
-                # rather than inheriting the manual default / ambient env.
-                capture_mode="auto",
-            )
-            if created_new:
-                _copy_merged_from(conn, mid, result_id)
-                comp["count"] += 1
-                print(f"[zmem] organize: compressed keeper {result_id[:8]} "
-                      f"({len(keeper['content'] or '')} -> {len(compressed)} chars)")
-            else:
-                comp["skipped"] += 1
-                print(f"[zmem] organize: compression of {mid[:8]} folded into "
-                      f"{result_id[:8]} (dedup); skipping this run")
+        try:
+            with _scoped_tx(conn):
+                result_id, created_new = update_memory(
+                    conn, mid=mid, content=compressed,
+                    tags=keeper["tags"], source_ref=keeper["source_ref"],
+                    signal=keeper["signal"], confidence=keeper["confidence"],
+                    # Issue #77: synthesized rows declare their policy — auto
+                    # (redact secret-like content, refuse credential-shaped refs)
+                    # rather than inheriting the manual default / ambient env.
+                    capture_mode="auto",
+                )
+                if created_new:
+                    _copy_merged_from(conn, mid, result_id)
+                    comp["count"] += 1
+                    print(f"[zmem] organize: compressed keeper {result_id[:8]} "
+                          f"({len(keeper['content'] or '')} -> {len(compressed)} chars)")
+                else:
+                    comp["skipped"] += 1
+                    print(f"[zmem] organize: compression of {mid[:8]} folded into "
+                          f"{result_id[:8]} (dedup); skipping this run")
+        except (AutoCaptureRuntimeError, CapturePolicyRefusal) as exc:
+            # PRR-001: a user row's inherited provenance can be credential-
+            # shaped or hex/base64-like (manual/advisory adds allow storing
+            # it), and write.py's unredactable-secrets guard raises a bare
+            # RuntimeError. Skip THIS row — one refusal must not abort the
+            # whole organize run.
+            comp["capture_refused"] = comp.get("capture_refused", 0) + 1
+            print(f"[zmem] organize: skipped capture-refused row {mid[:8]}: {exc}",
+                  file=sys.stderr)
+            continue
 
     # --- 8) Topics + summaries over the POST-COMPRESSION live working rows ---
     # live_work re-derives the episode INCLUDING any compression-replacement
@@ -887,60 +899,74 @@ def organize(
                 sm["would_create"] += 1
             continue
         if existing:
-            with _scoped_tx(conn):
-                result_id, created_new = update_memory(
-                    conn, mid=existing["id"], content=bullets, type_="fact",
-                    tags=SUMMARY_TAGS, source_ref=src_ref, signal="none",
-                    confidence=SUMMARY_CONFIDENCE,
-                    # Issue #77: synthesized summary rows declare auto policy.
-                    capture_mode="auto",
-                    # F-004: a summary's tags are a structural marker, not
-                    # content tags — never evolve them onto user neighbors.
-                    link_attr_propagate=False,
-                )
-                if created_new:
-                    # Pin the 7.3 EXACT-tags contract back (capture policy may
-                    # have appended a marker), restore provenance, and retire
-                    # any stale overlapping lineage (F-002 residual guard).
-                    conn.execute(
-                        "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
-                        (SUMMARY_TAGS, topic_key, result_id),
+            try:
+                with _scoped_tx(conn):
+                    result_id, created_new = update_memory(
+                        conn, mid=existing["id"], content=bullets, type_="fact",
+                        tags=SUMMARY_TAGS, source_ref=src_ref, signal="none",
+                        confidence=SUMMARY_CONFIDENCE,
+                        # Issue #77: synthesized summary rows declare auto policy.
+                        capture_mode="auto",
+                        # F-004: a summary's tags are a structural marker, not
+                        # content tags — never evolve them onto user neighbors.
+                        link_attr_propagate=False,
                     )
-                    _supersede_stale_summaries(conn, topic_key, result_id)
-                    sm["updated"] += 1
-                    print(f"[zmem] organize: summary {result_id[:8]} updated for "
-                          f"topic [{topic['members'][0][:8]} (n={len(topic['members'])})]")
-                else:
-                    sm["skipped"] += 1
-                    print(f"[zmem] organize: summary update folded into "
-                          f"{result_id[:8]} (dedup); skipping this run")
+                    if created_new:
+                        # Pin the 7.3 EXACT-tags contract back (capture policy may
+                        # have appended a marker), restore provenance, and retire
+                        # any stale overlapping lineage (F-002 residual guard).
+                        conn.execute(
+                            "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
+                            (SUMMARY_TAGS, topic_key, result_id),
+                        )
+                        _supersede_stale_summaries(conn, topic_key, result_id)
+                        sm["updated"] += 1
+                        print(f"[zmem] organize: summary {result_id[:8]} updated for "
+                              f"topic [{topic['members'][0][:8]} (n={len(topic['members'])})]")
+                    else:
+                        sm["skipped"] += 1
+                        print(f"[zmem] organize: summary update folded into "
+                              f"{result_id[:8]} (dedup); skipping this run")
+            except (AutoCaptureRuntimeError, CapturePolicyRefusal) as exc:
+                # PRR-001: skip this row — one refusal must not abort the run.
+                sm["capture_refused"] = sm.get("capture_refused", 0) + 1
+                print(f"[zmem] organize: skipped capture-refused summary update: {exc}",
+                      file=sys.stderr)
+                continue
         else:
-            with _scoped_tx(conn):
-                new_id = add_memory(
-                    conn, namespace=ns, type_="fact", content=bullets,
-                    tags=SUMMARY_TAGS, source_ref=src_ref, signal="none",
-                    confidence=SUMMARY_CONFIDENCE,
-                    # Issue #77: synthesized summary rows declare auto policy.
-                    capture_mode="auto",
-                    link_attr_propagate=False,
-                )
-                row = conn.execute(
-                    "SELECT content FROM memory WHERE id=?", (new_id,)
-                ).fetchone()
-                if row and row["content"] == bullets:
-                    conn.execute(
-                        "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
-                        (SUMMARY_TAGS, topic_key, new_id),
+            try:
+                with _scoped_tx(conn):
+                    new_id = add_memory(
+                        conn, namespace=ns, type_="fact", content=bullets,
+                        tags=SUMMARY_TAGS, source_ref=src_ref, signal="none",
+                        confidence=SUMMARY_CONFIDENCE,
+                        # Issue #77: synthesized summary rows declare auto policy.
+                        capture_mode="auto",
+                        link_attr_propagate=False,
                     )
-                    _supersede_stale_summaries(conn, topic_key, new_id)
-                    sm["created"] += 1
-                    print(f"[zmem] organize: summary {new_id[:8]} created for "
-                          f"topic [{topic['members'][0][:8]} (n={len(topic['members'])})] "
-                          f"in ns={ns or 'user:global'}")
-                else:
-                    sm["skipped"] += 1
-                    print(f"[zmem] organize: summary create folded into "
-                          f"{new_id[:8]} (dedup); skipping this run")
+                    row = conn.execute(
+                        "SELECT content FROM memory WHERE id=?", (new_id,)
+                    ).fetchone()
+                    if row and row["content"] == bullets:
+                        conn.execute(
+                            "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
+                            (SUMMARY_TAGS, topic_key, new_id),
+                        )
+                        _supersede_stale_summaries(conn, topic_key, new_id)
+                        sm["created"] += 1
+                        print(f"[zmem] organize: summary {new_id[:8]} created for "
+                              f"topic [{topic['members'][0][:8]} (n={len(topic['members'])})] "
+                              f"in ns={ns or 'user:global'}")
+                    else:
+                        sm["skipped"] += 1
+                        print(f"[zmem] organize: summary create folded into "
+                              f"{new_id[:8]} (dedup); skipping this run")
+            except (AutoCaptureRuntimeError, CapturePolicyRefusal) as exc:
+                # PRR-001: skip this row — one refusal must not abort the run.
+                sm["capture_refused"] = sm.get("capture_refused", 0) + 1
+                print(f"[zmem] organize: skipped capture-refused summary create: {exc}",
+                      file=sys.stderr)
+                continue
 
     # --- 9) Human-readable summary (all JSON goes via the CLI's --json path) ---
     if dry_run:

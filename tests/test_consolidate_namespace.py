@@ -26,6 +26,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import json
 import sqlite3
 import struct
 import subprocess
@@ -171,6 +172,13 @@ class LexicalNamespaceContainmentTest(unittest.TestCase):
         and the ranked candidate set — consolidate must never absorb the
         organize pipeline's own output even when it near-duplicates an
         ordinary row."""
+        # PRR-006: the committed fixture's byte contract is exercised here —
+        # its two rows (ordinary + organize:) must reproduce exactly one
+        # candidate after the exclusion.
+        fixture = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "consolidate"
+             / "organize-summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(fixture["expected_candidate_count"], 1)
         self._add(NS_A, "deploy pipeline pytest lint build", "0.9")
         raw_id = self._add_raw(NS_A, "deploy pipeline pytest lint build merge",
                                source_ref="organize:deploy-pipeline")
@@ -191,7 +199,7 @@ class LexicalNamespaceContainmentTest(unittest.TestCase):
         self.assertIsNone(row[0])
 
     def _add_raw(self, namespace: str, content: str, source_ref: str = "",
-                 confidence: str = "0.7"):
+                 confidence: str = "0.7"):  # noqa: ARG002 — bound below (PRR-007)
         """Direct INSERT (house pattern) so the summary row bypasses
         write-time dedup and lands with its structural source_ref intact."""
         mid = str(uuid.uuid4())
@@ -203,8 +211,9 @@ class LexicalNamespaceContainmentTest(unittest.TestCase):
                    (id, namespace, type, content, tags, source_ref, source_hash,
                     confidence, signal, valid_from, superseded_at, ingestion_ts,
                     retrieval_count, last_retrieved)
-                   VALUES (?,?,?,?,?,?, '', 0.7, 'none', '', NULL, ?, 0, NULL)""",
-                (mid, namespace, "fact", content, "", source_ref, ts))
+                   VALUES (?,?,?,?,?,?, '', ?, 'none', '', NULL, ?, 0, NULL)""",
+                (mid, namespace, "fact", content, "", source_ref,
+                 float(confidence), ts))
             conn.commit()
         finally:
             conn.close()

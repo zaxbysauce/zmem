@@ -750,7 +750,9 @@ def _nli_env_limit(name: str, default: float | int, cast=int) -> float | int:
 
     Missing, non-numeric, non-finite, or non-positive values fall back to the
     module default — a typo'd env var must never turn the budget into a
-    zero-cap (which would deny every judge call) or a crash.
+    zero-cap (which would deny every judge call) or a crash. Float strings
+    for the integer knob are TRUNCATED toward zero ("3.7" -> 3); only
+    non-numeric, non-finite, and non-positive values select the default.
     """
     raw = os.environ.get(name)
     if raw is None or not str(raw).strip():
@@ -1282,15 +1284,28 @@ def consolidate(
                     # line via contested_excluded).
                     contested_override = True
                 else:
-                    verb = "would NOT merge (contested)" if dry_run else "NOT merged (contested)"
-                    print(f"[zmem] consolidate: CONTESTED cluster around [{seed['id'][:8]}] — "
-                          f"negation polarity differs; {verb}:")
-                    for mid, mcontent, mpol in member_pols:
-                        print(f"    [{mid[:8]}] {'neg' if mpol else 'pos'}: "
-                              f"{(mcontent or '')[:60]}")
-                    print("    one side likely needs `supersede --id <full-uuid> --reason ...` "
-                          "(Step 3 of closeout), not merging; pass --merge-contested only for a "
-                          "confirmed heuristic false positive")
+                    budget_denied = nli_budget.exhausted()
+                    verb = ("would NOT merge (contested)" if dry_run
+                            else "NOT merged (contested)")
+                    if budget_denied:
+                        # PRR-002: a budget-denied park must NOT print the
+                        # content-bearing member listing — the id-only stdout
+                        # invariant this PR establishes covers it too.
+                        print(f"[zmem] consolidate: CONTESTED cluster around "
+                              f"[{seed['id'][:8]}] — negation polarity differs; "
+                              f"{verb} (NLI judge budget exhausted)")
+                        print("    members: "
+                              + ", ".join(mid[:8] for mid, _, _ in member_pols))
+                    else:
+                        print(f"[zmem] consolidate: CONTESTED cluster around "
+                              f"[{seed['id'][:8]}] — negation polarity differs; "
+                              f"{verb}:")
+                        for mid, mcontent, mpol in member_pols:
+                            print(f"    [{mid[:8]}] {'neg' if mpol else 'pos'}: "
+                                  f"{(mcontent or '')[:60]}")
+                        print("    one side likely needs `supersede --id <full-uuid> --reason ...` "
+                              "(Step 3 of closeout), not merging; pass --merge-contested only for a "
+                              "confirmed heuristic false positive")
                     report["contested_clusters"].append({
                         "keeper": seed["id"],
                         "namespace": seed["namespace"],

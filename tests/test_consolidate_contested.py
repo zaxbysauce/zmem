@@ -808,7 +808,7 @@ class NliJudgeExtensionTest(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=False):
             with redirect_stdout(buf), redirect_stderr(err):
                 report = self.mod.consolidate(self.conn, force=True)
-        self.assertLessEqual(_seq_judge_calls(self.tmp_path, "budget1"), 1)
+        self.assertEqual(_seq_judge_calls(self.tmp_path, "budget1"), 1)  # PRR-009: exactly one call
         self.assertEqual(report["merged"], 0, report)
         self.assertEqual(len(report["contested_clusters"]), 1)
         self.assertFalse(report["contested_clusters"][0]["merged"])
@@ -888,6 +888,12 @@ class NliJudgeExtensionTest(unittest.TestCase):
                                               merge_contested=True)
         self.assertEqual(err.getvalue().count("budget exhausted"), 1,
                          f"warning must be once per run; stderr={err.getvalue()!r}")
+        # PRR-002: budget-denied parks are id-only on stdout — no content
+        # previews (the 'neg:'/'pos:' content listing is reserved for genuine
+        # contested parks where the judge ran out of budget was NOT the cause).
+        self.assertNotIn("always run migrations before deploy", buf.getvalue())
+        self.assertNotIn("never run migrations before deploy", buf.getvalue())
+        self.assertIn("NLI judge budget exhausted", buf.getvalue())
         # Exactly ONE cluster gets the single budgeted call (entailment ->
         # merged); the other two are denied by the exhausted budget and stay
         # parked despite --merge-contested. WHICH cluster merges depends on

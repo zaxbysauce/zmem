@@ -271,3 +271,8 @@ jobs:
         run: |
           set -e
           python -m unittest -v tests/test_embeddings_ci.py
+      - name: Run vec-gated suites under sqlite-vec (issue #77)
+        shell: bash
+        run: |
+          set -e
+          python -m unittest -v tests/test_consolidate_namespace.py tests/test_consolidate_contested.py tests/test_reembed.py

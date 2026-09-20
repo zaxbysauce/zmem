@@ -723,6 +723,45 @@ class OrganizeIntegrationTest(unittest.TestCase):
         self.assertEqual(quiet.returncode, 0, quiet.stderr)
         self.assertNotIn("reserved", quiet.stderr)
 
+    def test_capture_refused_row_skips_not_aborts(self):
+        """PRR-001: a keeper whose inherited source_ref trips the auto
+        capture-policy refusal is SKIPPED (stderr line + run completes with
+        exit 0), never aborting organize with a traceback."""
+        long_body = ("the deploy gateway rotates its staging credentials on "
+                     "a schedule that the pipeline enforces before every "
+                     "merge to the protected release branch")
+        # Two near-duplicate long rows: the AKIA-ref row wins the keeper rule
+        # (higher confidence), consolidate absorbs the other into it, and the
+        # grown keeper then exceeds the compression threshold — so the
+        # compression write inherits the credential-shaped source_ref under
+        # capture_mode="auto" and _apply_capture_policy refuses it.
+        self._add(long_body + " alpha variant", confidence="0.95")
+        self._add(long_body + " beta variant", confidence="0.6")
+        c = self._conn()
+        try:
+            c.execute("UPDATE memory SET source_ref=? WHERE content LIKE ?",
+                      ("AKIAIOSFODNN7EXAMPLE", "%alpha variant%"))
+            c.commit()
+        finally:
+            c.close()
+        r = self._run("organize", "--force",
+                      env_extra={"ZMEM_KEEPER_COMPRESS_CHARS": "40"})
+        self.assertEqual(r.returncode, 0,
+                         f"organize must not abort on a capture refusal; "
+                         f"stderr tail={r.stderr[-400:]!r}")
+        self.assertIn("capture-refused", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        # The refusing row stays live and untouched (fail-closed, not deleted).
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT superseded_at FROM memory WHERE "
+                "source_ref='AKIAIOSFODNN7EXAMPLE'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[0])
+
 
 class OrganizeFoldGuardTest(unittest.TestCase):
     """Issue #62, 7.3/7.4 fold guards: when update_memory/add_memory FOLDS the

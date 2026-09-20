@@ -135,6 +135,14 @@ def _warn_fake_active_once() -> None:
 
 
 
+class AutoCaptureRuntimeError(RuntimeError):
+    """PRR-001 (issue #77 round 2): secret-like content that capture_mode=
+    auto could NOT safely redact — raised instead of a bare RuntimeError so
+    synthesized-write callers (organize) can skip-and-log precisely this
+    case without catching unrelated RuntimeErrors. Subclasses RuntimeError
+    for backward compatibility with existing ``except RuntimeError`` guards."""
+
+
 class CapturePolicyRefusal(ValueError):
     """Automatic capture could not safely preserve the record contract."""
 
@@ -372,7 +380,7 @@ def _apply_capture_policy(
         out_tags, tag_redactions = _redact_secret_like_text(tags)
         total = content_redactions + tag_redactions
         if total <= 0:
-            raise RuntimeError(
+            raise AutoCaptureRuntimeError(
                 "zmem: refusing automatic capture with likely secrets that could "
                 "not be safely redacted"
             )

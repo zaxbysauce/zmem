@@ -1513,6 +1513,10 @@ def _strict_ingest_staged(
                 continue
             obj = dict(obj)
             if source_ref:
+                # PRR-004: the override REPLACES the row-carried ref — warn on
+                # the row's original ref first or a reserved ref is lost
+                # silently before _ingest_row's effective-ref warning.
+                warn_reserved_source_ref(obj.get("source_ref"))
                 obj["source_ref"] = source_ref
             diagnostic = io.StringIO()
             with contextlib.redirect_stdout(diagnostic), contextlib.redirect_stderr(diagnostic):
@@ -1875,6 +1879,9 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 # origin, overriding whatever source_ref the row carried in --
                 # the original almost always points at a path that does not
                 # exist on this machine.
+                # PRR-004: warn on the row's ORIGINAL ref before the override
+                # replaces it, or a reserved row-carried ref is lost silently.
+                warn_reserved_source_ref(obj.get("source_ref"))
                 obj["source_ref"] = source_ref
 
             try:
