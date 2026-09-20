@@ -720,6 +720,7 @@ Capture:
 |-----|---------|---------|
 | `ZMEM_CAPTURE` | Global fail-open capture switch. Only a trimmed `0` disables the failure, convention, Stop, SubagentStop, and Hermes compatibility surfaces before payload parsing or state access. Audits and probes set `ZMEM_CAPTURE=0`; empty, whitespace, `false`, and `00` remain enabled. | `1` |
 | `ZMEM_CAPTURE_MODE` | Capture policy for writes: `manual` (advisory secret warnings only, trusted local use) or `auto` (redact secret-like content, refuse secret-like provenance — the MCP/network default). | `manual` |
+| `ZMEM_CONVENTION_INTERVAL` | Legacy cadence for the Hermes convention-compatibility hook only. It does not control the commit-only `zmem-convention-capture.sh` prompt. | `10` |
 
 Embedding model (the model file is gitignored; these control how/whether it is obtained):
 
@@ -1153,6 +1154,25 @@ failures use `none` and prompt only after recurrence. Convention prompts fire
 once on an exact non-amend `git commit`, while eligible tool events continue
 feeding the operation ring. Complete `<<<ZMEM_UNTRUSTED_FENCE>>>` through
 `<<<END_ZMEM_UNTRUSTED_FENCE>>>` blocks are stripped before history projection.
+
+The global switch covers those five named capture surfaces. The pre-existing
+UserPromptSubmit correction queue and Hermes convention-compatibility cadence
+are separate legacy paths; use their own capture-mode/interval controls when
+auditing them.
+
+Capture adapters use two public, machine-readable bridge commands rather than
+importing store internals:
+
+```text
+python <store.py> source-exists --namespace NS --source-ref REF --json
+python <store.py> ops-append --session SESSION --tool TOOL --op OP --json
+```
+
+`source-exists` prints `{"exists":false}` and exits 0 when the store is absent;
+it opens an existing store read-only and never creates or migrates one.
+`ops-append` prints `{"ok":true}` after appending the bounded operation-ring
+record. Invalid input or unavailable state returns a nonzero status so hook
+adapters can preserve their documented fail-open envelope.
 
 **Rolling a host back to a previous version.** Plugin caches pin a version
 directory and never overwrite older ones (see [Upgrade](#upgrade)), so a

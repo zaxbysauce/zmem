@@ -459,11 +459,15 @@ read it before payload parsing, marker/queue writes, lesson queries, operation
 appends, or other stateful work. Only a trimmed literal `0` disables capture;
 undefined, empty, whitespace, `false`, and `00` stay enabled. Disabled shell
 surfaces emit their exact empty sentinel and Hermes emits `{}`. Audits and
-probes set `ZMEM_CAPTURE=0` so observation cannot teach the system.
+probes set `ZMEM_CAPTURE=0` so those five covered surfaces cannot teach the
+system.
 
 This is independent of `ZMEM_INJECT` (delivery) and `ZMEM_QUERY_CONTEXT`
 (operation-ring collection). Under `ZMEM_INJECT=0`, capture can still run;
-under `ZMEM_CAPTURE=0`, no capture subprocess or state mutation runs. Complete
+under `ZMEM_CAPTURE=0`, no capture subprocess or state mutation runs on those
+five surfaces. The pre-existing UserPromptSubmit correction queue and Hermes
+convention-compatibility cadence are separate legacy paths with their own
+capture-mode/interval controls. Complete
 `<<<ZMEM_UNTRUSTED_FENCE>>>` through `<<<END_ZMEM_UNTRUSTED_FENCE>>>` blocks
 are removed before transcript-derived content reaches deduplication, queue
 synthesis, or closeout review.
@@ -1613,6 +1617,22 @@ only**; other hosts' histories are out of scope. In `ZMEM_CAPTURE_MODE=auto`
 likely-secret text is redacted; in `manual` matching items are annotated
 `"secret_warning": true` but kept verbatim for review. (`--json` is accepted for
 parity with the issue's syntax; output is always JSON.)
+
+### source-exists / ops-append — capture adapter bridges
+```
+python <store.py> source-exists --namespace NS --source-ref REF --json
+python <store.py> ops-append --session SESSION --tool TOOL --op OP --json
+```
+`source-exists` prints `{"exists":false}` with exit 0 for a missing store and
+otherwise opens the store read-only without creation or migration. `ops-append`
+prints `{"ok":true}` after appending the bounded operation-ring record. Invalid
+arguments or unavailable state return nonzero; adapters translate that through
+their documented fail-open envelopes. Neither command authorizes a hook to
+import store internals directly.
+
+`ZMEM_CONVENTION_INTERVAL` remains the legacy cadence for the Hermes
+convention-compatibility hook only. It does not control the commit-only
+`zmem-convention-capture.sh` prompt.
 
 ### queue-list / queue-clear — review live-captured corrections (read-only / clear)
 ```
