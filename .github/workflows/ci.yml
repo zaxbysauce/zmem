@@ -272,6 +272,11 @@ jobs:
           set -e
           python -m unittest -v tests/test_embeddings_ci.py
       - name: Run vec-gated suites under sqlite-vec (issue #77)
+        # These suites hand-craft minilm-shaped (384-dim) vectors, so they
+        # need the DEFAULT embed profile's column dimension — the job-level
+        # ZMEM_EMBED_PROFILE=fake (16-dim) is scoped to the smoke step above.
+        env:
+          ZMEM_EMBED_PROFILE: ""
         shell: bash
         run: |
           set -e
