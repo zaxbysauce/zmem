@@ -1,0 +1,54 @@
+{
+  "tasks": [
+    {
+      "memory_row_id": "f0000000-0000-4000-8000-000000000001",
+      "namespace": "project:counterfactual",
+      "prompt": "counterfactual-alpha: stage the canary and watch the error budget, then record the outcome",
+      "recorded_no_memory_action": "counterfactual-alpha rollout failed",
+      "recorded_successful_action": "counterfactual-alpha rollout completed",
+      "timestamp": "2026-06-01T00:00:00Z",
+      "tool_input": "run counterfactual-alpha rollout --check",
+      "tool_output": "counterfactual-alpha rollout verified: ok"
+    },
+    {
+      "memory_row_id": "f0000000-0000-4000-8000-000000000002",
+      "namespace": "project:counterfactual",
+      "prompt": "counterfactual-bravo: freeze the queue and snapshot the ledger tables, then record the outcome",
+      "recorded_no_memory_action": "counterfactual-bravo rollout failed",
+      "recorded_successful_action": "counterfactual-bravo rollout completed",
+      "timestamp": "2026-06-01T00:00:00Z",
+      "tool_input": "run counterfactual-bravo rollout --check",
+      "tool_output": "counterfactual-bravo rollout verified: ok"
+    },
+    {
+      "memory_row_id": "f0000000-0000-4000-8000-000000000003",
+      "namespace": "project:counterfactual",
+      "prompt": "counterfactual-charlie: drain the background workers before the schema patch, then record the outcome",
+      "recorded_no_memory_action": "counterfactual-charlie rollout failed",
+      "recorded_successful_action": "counterfactual-charlie rollout completed",
+      "timestamp": "2026-06-01T00:00:00Z",
+      "tool_input": "run counterfactual-charlie rollout --check",
+      "tool_output": "counterfactual-charlie rollout verified: ok"
+    },
+    {
+      "memory_row_id": "f0000000-0000-4000-8000-000000000004",
+      "namespace": "project:counterfactual",
+      "prompt": "counterfactual-delta: warm the cache from the secondary while the primary stays read-only, then record the outcome",
+      "recorded_no_memory_action": "counterfactual-delta rollout failed",
+      "recorded_successful_action": "counterfactual-delta rollout completed",
+      "timestamp": "2026-06-01T00:00:00Z",
+      "tool_input": "run counterfactual-delta rollout --check",
+      "tool_output": "counterfactual-delta rollout verified: ok"
+    },
+    {
+      "memory_row_id": "f0000000-0000-4000-8000-000000000005",
+      "namespace": "project:counterfactual",
+      "prompt": "counterfactual-echo: triple-check the checksum manifest and sign the artifact, then record the outcome",
+      "recorded_no_memory_action": "counterfactual-echo rollout failed",
+      "recorded_successful_action": "counterfactual-echo rollout completed",
+      "timestamp": "2026-06-01T00:00:00Z",
+      "tool_input": "run counterfactual-echo rollout --check",
+      "tool_output": "counterfactual-echo rollout verified: ok"
+    }
+  ]
+}

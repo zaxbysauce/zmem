@@ -233,6 +233,26 @@ only by `tests/fixtures/replay/generate_actions.py`, which refuses to replace
 committed bytes on drift. Malformed rows or non-UTC timestamps exit 2 before
 any output file is written.
 
+Counterfactual replay (issue #157) measures with/without-memory divergence on
+a recorded five-session task set. `scripts/eval_counterfactual.py` replays the
+committed tasks twice — `ZMEM_INJECT=1` through the real passive injection
+lane (delivery ledger redirected to a scratch directory) and `ZMEM_INJECT=0`
+with delivery disabled — through the pinned `recorded-stub-v1` model path,
+which returns each task's recorded successful action exactly when the
+delivered fence contains that task's `memory_row_id`. It reports
+`repeated_failure_rate` and `first_action_agreement` per condition against
+the Draft 2020-12 contract
+[`eval/counterfactual-schema.json`](eval/counterfactual-schema.json) (on the
+committed fixture: 0.0/1.0 with memory, 1.0/0.0 without). The evaluator is
+read-only (read-only store URI, store SHA-256 verified before and after) and
+refuses the operator home store before opening anything. A real model id is
+only ever resolved with `--allow-model-calls`; without it the evaluator
+prints exactly `SKIPPED: model calls disabled` and exits 0 without importing
+or downloading any adapter. The oracle pair
+`tests/fixtures/counterfactual/tasks.json`/`expected.json` (+ `store.sqlite`)
+is written only by `tests/fixtures/counterfactual/generate.py`, a
+developer-side generator CI never runs.
+
 The predeclared private real-corpus measurement of record (issue #155) is
 committed at [`eval/real-corpus-2026-09-19.json`](eval/real-corpus-2026-09-19.json).
 It was produced by replaying a cohort frozen at declaration time — a standalone
