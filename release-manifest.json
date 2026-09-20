@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "b2c790fa7590aad21c29c177d83c414b4a20a30b3ea1f3579e1d4ae064582997",
+  "digest": "cf25cb4436d2df7f30c932a4ac069cea50f4729d78492fc0bf854c2cb5b9bf51",
   "files": {
     "hermes-plugin/__init__.py": "c584903ad0a6a68838c637e6b21191fcab149e4e116546f2b4919e897f0f9c16",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -53,7 +53,7 @@
     "scripts/release_gate.py": "a9065f3d55df65dde1f6ed1be4694371543fcc1ab3b3c03b77c0aa86eacfd938",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "2c395a4c770035c53db83ad8f3b06fa9be79b4a929d3c44ecde4cbc856f5f653",
-    "skills/memory/SKILL.md": "ee92a23b6d733e4f09275a69b2a6665e973bf48145f3303d5d52ae2a34e063c0",
+    "skills/memory/SKILL.md": "fcd215a0b8b796acbd010470f87bab10abc684e74d84c2e37462939802c95f91",
     "skills/memory/scripts/capture_quality.py": "20dffa9e32f8d97545f1aed27cdd124ee13811bbf5ce54783d0e04bba682b3a9",
     "skills/memory/scripts/correction_queue.py": "10988dc983a35579014612ca8b1be863daa5064e15f81367e7275f8a42ee5825",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
