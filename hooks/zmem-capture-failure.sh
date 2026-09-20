@@ -104,7 +104,7 @@ RECURRENCE="$(join_path "$DATA_DIR_PY" ops "$SESSION_HASH.capture-failure.json")
 # Parse one failed call and atomically advance its recurrence record. The
 # subprocess emits only bounded, normalized fields for the renderer.
 META_JSON="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
-import json, os, re, sys, tempfile, time
+import json, os, re, sys, tempfile, time, uuid
 
 store_py = sys.argv[1]
 session = sys.argv[2]
@@ -152,17 +152,42 @@ signal = infer_signal(command, exit_code=payload.get("exit_code"))
 
 directory = os.path.dirname(recurrence)
 lock = recurrence + ".lock"
+owner = "%s:%s" % (os.getpid(), uuid.uuid4().hex)
+
+def lock_is_owned():
+    try:
+        with open(lock, "r", encoding="ascii") as handle:
+            return handle.read() == owner
+    except (OSError, UnicodeError):
+        return False
+
+def lock_owner_alive():
+    try:
+        with open(lock, "r", encoding="ascii") as handle:
+            token = handle.read()
+        pid_text, token_uuid = token.split(":", 1)
+        if not pid_text.isdigit() or not token_uuid:
+            return False
+        os.kill(int(pid_text), 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError, UnicodeError):
+        return False
+
 try:
     os.makedirs(directory, exist_ok=True)
     deadline = time.monotonic() + 3.0
     while True:
         try:
             lock_fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.close(lock_fd)
+            with os.fdopen(lock_fd, "w", encoding="ascii", newline="") as handle:
+                handle.write(owner)
             break
         except FileExistsError:
             try:
-                if time.time() - os.stat(lock).st_mtime > 60:
+                if (time.time() - os.stat(lock).st_mtime > 60
+                        and not lock_owner_alive()):
                     os.unlink(lock)
                     continue
             except OSError:
@@ -183,6 +208,9 @@ try:
             pass
         count += 1
         state = {"session": session, "count": count, "last_error": error_text}
+        if not lock_is_owned():
+            print("{}")
+            raise SystemExit(0)
         fd, tmp = tempfile.mkstemp(prefix=".capture-failure-", suffix=".tmp", dir=directory)
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
@@ -195,8 +223,9 @@ try:
             print("{}")
             raise SystemExit(0)
     finally:
-        try: os.unlink(lock)
-        except OSError: pass
+        if lock_is_owned():
+            try: os.unlink(lock)
+            except OSError: pass
 except Exception:
     print("{}")
     raise SystemExit(0)
