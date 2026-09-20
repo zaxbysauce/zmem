@@ -713,7 +713,9 @@ class HermesRemotePrefetchTest(unittest.TestCase):
             return {}
 
         payload = {"session_id": self._SID, "user_message": self._QUERY}
-        out = _capture_main(mod, recorder, payload)
+        env = _clean_env(tmp, ZMEM_HOME=str(REPO_ROOT), ZMEM_INJECT="0")
+        with mock.patch.dict(os.environ, env, clear=True):
+            out = _capture_main(mod, recorder, payload)
         self.assertEqual(json.loads(out), {})
         self.assertEqual(len(recorded), 1, "one capture/prepare bridge call")
         first = recorded[0]
