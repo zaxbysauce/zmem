@@ -308,6 +308,45 @@ def _build_bullets(members: list[str], rows_by_id: dict) -> str:
     return "".join(out)
 
 
+def _components_from_edges(ids: list[str],
+                           edges: list[tuple[str, str]]) -> list[list[str]]:
+    """Issue #77: the ONE deterministic connected-components helper.
+
+    Organize previously carried two private union-find closures (one in
+    ``_entity_groups``, one in ``_cluster_topics``) with byte-identical
+    semantics; both now call this helper, which seeds parents in sorted id
+    order, ignores edge endpoints outside ``ids``, unions deterministically
+    (the lexicographically smaller root always wins, so the component root is
+    its minimum id regardless of edge order), and returns sorted member lists
+    ordered by each component's first id. Callers keep their own SQL,
+    similarity, and post-sort policies.
+    """
+    parent = {i: i for i in sorted(set(ids))}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            lo, hi = (ra, rb) if ra < rb else (rb, ra)
+            parent[hi] = lo
+
+    for a, b in edges:
+        if a in parent and b in parent:
+            union(a, b)
+
+    comps: dict[str, list[str]] = {}
+    for i in sorted(parent):
+        comps.setdefault(find(i), []).append(i)
+    groups = [sorted(m) for m in comps.values()]
+    groups.sort(key=lambda m: m[0])
+    return groups
+
+
 def _entity_groups(conn: sqlite3.Connection, ids: list[str]) -> list[list[str]]:
     """Group leftover singleton rows by SHARED entity (7.3, A-MEM lite).
 
@@ -330,30 +369,15 @@ def _entity_groups(conn: sqlite3.Connection, ids: list[str]) -> list[list[str]]:
     for lr in links:
         by_entity.setdefault(lr["entity_id"], []).append(lr["memory_id"])
 
-    parent = {i: i for i in ids}
-
-    def find(x: str) -> str:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            lo, hi = (ra, rb) if ra < rb else (rb, ra)
-            parent[hi] = lo
-
+    edges: list[tuple[str, str]] = []
     for entity_id, members in by_entity.items():
         if len(members) >= 2:
             base = members[0]
             for other in members[1:]:
-                union(base, other)
+                edges.append((base, other))
 
-    comps: dict[str, list[str]] = {}
-    for i in ids:
-        comps.setdefault(find(i), []).append(i)
-    groups = [sorted(m) for m in comps.values() if len(m) >= 2]
+    comps = _components_from_edges(ids, edges)
+    groups = [sorted(m) for m in comps if len(m) >= 2]
     groups.sort(key=lambda m: (-len(m), m))
     return groups
 
@@ -458,21 +482,8 @@ def _cluster_topics(
         else _consolidate_mod.CONSOLIDATE_DEFAULT_THRESHOLD
     )
 
-    parent = {r["id"]: r["id"] for r in ordered}
-
-    def find(x: str) -> str:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            lo, hi = (ra, rb) if ra < rb else (rb, ra)
-            parent[hi] = lo
-
     work_ids = {r["id"] for r in ordered}
+    edges: list[tuple[str, str]] = []
     for seed in ordered:
         neighbors, _knn = _gather_neighbors(
             conn, seed, ordered,
@@ -485,17 +496,17 @@ def _cluster_topics(
             restrict_ids=work_ids,
         )
         for nb, _sim in neighbors:
-            if nb["id"] not in parent:
+            if nb["id"] not in work_ids:
                 # Defensive backstop (Claude Code F-001): a neighbor id with no
-                # union-find entry would KeyError in find() below. Restrict_ids
-                # makes this unreachable today — it is a guard, not a path.
+                # episode membership would silently perturb the partition.
+                # Restrict_ids makes this unreachable today — it is a guard,
+                # not a path (and _components_from_edges ignores unknown
+                # endpoints as a second layer).
                 continue
-            union(seed["id"], nb["id"])
+            edges.append((seed["id"], nb["id"]))
 
-    comps: dict[str, list[str]] = {}
-    for r in ordered:
-        comps.setdefault(find(r["id"]), []).append(r["id"])
-    groups = sorted((sorted(m) for m in comps.values()), key=lambda m: (-len(m), m))
+    comps = _components_from_edges([r["id"] for r in ordered], edges)
+    groups = sorted((sorted(m) for m in comps), key=lambda m: (-len(m), m))
 
     topics: list[list[str]] = [g for g in groups if len(g) >= 2]
     singletons = [m for g in groups if len(g) == 1 for m in g]
@@ -815,6 +826,10 @@ def organize(
                 conn, mid=mid, content=compressed,
                 tags=keeper["tags"], source_ref=keeper["source_ref"],
                 signal=keeper["signal"], confidence=keeper["confidence"],
+                # Issue #77: synthesized rows declare their policy — auto
+                # (redact secret-like content, refuse credential-shaped refs)
+                # rather than inheriting the manual default / ambient env.
+                capture_mode="auto",
             )
             if created_new:
                 _copy_merged_from(conn, mid, result_id)
@@ -877,6 +892,8 @@ def organize(
                     conn, mid=existing["id"], content=bullets, type_="fact",
                     tags=SUMMARY_TAGS, source_ref=src_ref, signal="none",
                     confidence=SUMMARY_CONFIDENCE,
+                    # Issue #77: synthesized summary rows declare auto policy.
+                    capture_mode="auto",
                     # F-004: a summary's tags are a structural marker, not
                     # content tags — never evolve them onto user neighbors.
                     link_attr_propagate=False,
@@ -903,6 +920,8 @@ def organize(
                     conn, namespace=ns, type_="fact", content=bullets,
                     tags=SUMMARY_TAGS, source_ref=src_ref, signal="none",
                     confidence=SUMMARY_CONFIDENCE,
+                    # Issue #77: synthesized summary rows declare auto policy.
+                    capture_mode="auto",
                     link_attr_propagate=False,
                 )
                 row = conn.execute(

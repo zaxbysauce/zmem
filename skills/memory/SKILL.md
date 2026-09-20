@@ -1440,7 +1440,14 @@ Pipeline (in order):
    summaries are the pipeline's OUTPUT and never its input. The `organize:`
    prefix is therefore RESERVED for summary rows: a manually-added row whose
    `--source-ref` begins with `organize:` is excluded from episodes the same
-   way.
+   way, and consolidate additionally EXCLUDES every live `organize:%` row
+   from its candidate set so the pipeline's output can never become its input
+   (issue #77). Every CLI write surface (`add`, `update`, `ingest-jsonl`,
+   including per-row `source_ref` fields in ingested JSONL) warns when a
+   non-empty source_ref carries the reserved prefix —
+   `[zmem] WARNING: source_ref prefix organize: is reserved for organize
+   summaries` on stderr; the write is NOT rejected and stdout (including
+   `--json` output) is untouched.
 4. **Entity backfill** — every working row missing `memory_entity` links gets
    them via the deterministic extractor (idempotent; rows with nothing
    extractable are counted as candidates but link nothing).
@@ -1449,7 +1456,16 @@ Pipeline (in order):
    `ZMEM_LINK_THRESHOLD`).
 6. **Episodic consolidation** — `consolidate` on EXACTLY the working set
    (keeper selection, absorb, contested guard + optional NLI judge, bounded by
-   the same per-namespace cap). The vector neighbor lookup is bounded to the
+   the same per-namespace cap). The optional NLI judge is bounded by a
+   RUN-WIDE budget (issue #77): `ZMEM_NLI_MAX_CALLS` (default 64) judge
+   subprocess invocations and `ZMEM_NLI_MAX_SECONDS` (default 30.0) seconds
+   of wall time per run; invalid, non-finite, or non-positive values fall
+   back to the defaults. When the budget is exhausted the judge stops, one
+   `[zmem] consolidate: NLI judge budget exhausted (...)` warning names the
+   reason, and affected contested clusters stay unmerged — even under
+   `--merge-contested`. Judge diagnostics carry member ids, pair indexes, and
+   the verdict only, never memory content. organize's synthesized writes
+   (compression replacements and summaries) declare `capture_mode="auto"`. The vector neighbor lookup is bounded to the
    episode too — an out-of-episode near-duplicate in the global vec0 index is
    never pulled in. See the consolidate section for semantics.
 7. **Compression** — the keepers consolidation actually GREW, when their

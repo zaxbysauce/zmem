@@ -26,11 +26,13 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import sqlite3
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -161,6 +163,53 @@ class LexicalNamespaceContainmentTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("merged 1 memories", r.stdout, r.stdout)
         self.assertEqual(len(self._live(NS_A)), 2)
+
+
+    def test_consolidate_excludes_organize_summary_rows(self):
+        """Issue #77: a live row whose source_ref starts with the reserved
+        `organize:` structural prefix is absent from BOTH the eligible count
+        and the ranked candidate set — consolidate must never absorb the
+        organize pipeline's own output even when it near-duplicates an
+        ordinary row."""
+        self._add(NS_A, "deploy pipeline pytest lint build", "0.9")
+        raw_id = self._add_raw(NS_A, "deploy pipeline pytest lint build merge",
+                               source_ref="organize:deploy-pipeline")
+        self._add(NS_B, "completely unrelated namespace row about rust", "0.5")
+        r = self._run("consolidate")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("merged 0 memories", r.stdout, r.stdout)
+        live_a = self._live(NS_A)
+        self.assertEqual(len(live_a), 2, live_a)
+        conn = sqlite3.connect(os.path.join(self.tmp, "store.sqlite"))
+        try:
+            row = conn.execute(
+                "SELECT superseded_at FROM memory WHERE id=?", (raw_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[0])
+
+    def _add_raw(self, namespace: str, content: str, source_ref: str = "",
+                 confidence: str = "0.7"):
+        """Direct INSERT (house pattern) so the summary row bypasses
+        write-time dedup and lands with its structural source_ref intact."""
+        mid = str(uuid.uuid4())
+        conn = sqlite3.connect(os.path.join(self.tmp, "store.sqlite"))
+        try:
+            ts = "2026-09-10T00:00:00Z"
+            conn.execute(
+                """INSERT INTO memory
+                   (id, namespace, type, content, tags, source_ref, source_hash,
+                    confidence, signal, valid_from, superseded_at, ingestion_ts,
+                    retrieval_count, last_retrieved)
+                   VALUES (?,?,?,?,?,?, '', 0.7, 'none', '', NULL, ?, 0, NULL)""",
+                (mid, namespace, "fact", content, "", source_ref, ts))
+            conn.commit()
+        finally:
+            conn.close()
+        return mid
+
 
 
 # ---------------------------------------------------------------------------

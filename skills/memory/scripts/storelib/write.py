@@ -205,6 +205,25 @@ def _normalize_capture_mode(mode: str | None) -> str:
     value = (mode or os.environ.get("ZMEM_CAPTURE_MODE") or "manual").strip().lower()
     return value if value in CAPTURE_MODES else "manual"
 
+
+# Issue #77: `organize:` is a RESERVED structural source_ref prefix — organize
+# keys its summary identity on it and consolidate/organize exclude it from
+# candidate sets. A manually written `organize:` row can masquerade as a
+# structural summary, so every CLI write surface warns (stderr only, never
+# rejects, never touches JSON stdout). Canonical definition lives here because
+# both storelib.cli and storelib.sync (the JSONL ingest row loop) need the
+# exact same bytes.
+RESERVED_SOURCE_REF_PREFIX = "organize:"
+RESERVED_SOURCE_REF_WARNING = (
+    "[zmem] WARNING: source_ref prefix organize: is reserved for organize summaries"
+)
+
+
+def warn_reserved_source_ref(source_ref: str | None) -> None:
+    """Emit the reserved-prefix warning for `organize:` source_refs."""
+    if source_ref and source_ref.startswith(RESERVED_SOURCE_REF_PREFIX):
+        print(RESERVED_SOURCE_REF_WARNING, file=sys.stderr)
+
 def _redact_secret_like_text(text: str) -> tuple[str, int]:
     return _shared_redact_secret_like_text(text)
 

@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 import glob
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.entity import relink_memory
@@ -25,6 +26,20 @@ from storelib.sync import INGEST_MAX_CONTENT_CHARS
 from storelib.write import _merge_on_dedup, supersede_memory
 
 CONSOLIDATE_DEFAULT_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_THRESHOLD", 0.80)
+
+# Issue #77: run-wide NLI judge budget defaults. The judge costs one 5-second-
+# timeout subprocess per polarity-flagged pair, and a large contested cluster
+# can flag O(n^2) pairs — these caps bound the damage. Both are env-overridable
+# (ZMEM_NLI_MAX_CALLS / ZMEM_NLI_MAX_SECONDS); invalid, non-finite, or
+# non-positive values fall back to these defaults.
+NLI_DEFAULT_MAX_CALLS = 64
+NLI_DEFAULT_MAX_SECONDS = 30.0
+
+# Issue #77: consolidate must never ingest organize's own output. organize
+# marks its summary/compression rows with this structural source_ref prefix and
+# already excludes it from its own working set (organize.SUMMARY_SOURCE_REF_PREFIX);
+# the same exclusion applies to consolidate's candidate set here.
+SUMMARY_SOURCE_REF_PREFIX = "organize:"
 # Cadence gate knobs (env-overridable for parity with the thresholds above):
 # how much time must elapse and how much the live set must have grown since the
 # last automatic run before consolidate() proceeds.
@@ -730,7 +745,68 @@ def _nli_judge_pair(argv: list[str], a: str, b: str) -> str:
     return proc.stdout.strip().lower()
 
 
-def _nli_judge_all_entail(member_pols: list[tuple]) -> bool | None:
+def _nli_env_limit(name: str, default: float | int, cast=int) -> float | int:
+    """Issue #77: resolve an NLI budget env knob with fail-safe defaults.
+
+    Missing, non-numeric, non-finite, or non-positive values fall back to the
+    module default — a typo'd env var must never turn the budget into a
+    zero-cap (which would deny every judge call) or a crash.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value) or value <= 0:
+        return default
+    return cast(value)
+
+
+class _NliBudget:
+    """Issue #77: run-wide call/time budget for the optional NLI judge.
+
+    Created once per consolidate() run and shared across every contested
+    cluster, so an O(n^2) flagged-pair list can no longer issue an unbounded
+    number of 5-second subprocess invocations. ``allow()`` gates each judge
+    call; ``record()`` counts one attempt; ``exhausted()`` reports whether a
+    denial already happened (the caller parks the cluster instead of letting
+    ``--merge-contested`` override it). ``denial_reason`` carries the first
+    denial's reason for the one-per-run stderr warning.
+    """
+
+    def __init__(self, max_calls: int = NLI_DEFAULT_MAX_CALLS,
+                 max_seconds: float = NLI_DEFAULT_MAX_SECONDS,
+                 clock: Callable[[], float] | None = None) -> None:
+        self.max_calls = int(max_calls)
+        self.max_seconds = float(max_seconds)
+        self._clock = clock or time.monotonic
+        self._start = self._clock()
+        self.calls = 0
+        self.denial_reason: str | None = None
+
+    def allow(self) -> bool:
+        if self.calls >= self.max_calls:
+            if self.denial_reason is None:
+                self.denial_reason = f"call limit reached (ZMEM_NLI_MAX_CALLS={self.max_calls})"
+            return False
+        if self._clock() - self._start >= self.max_seconds:
+            if self.denial_reason is None:
+                self.denial_reason = f"time limit reached (ZMEM_NLI_MAX_SECONDS={self.max_seconds})"
+            return False
+        return True
+
+    def record(self) -> None:
+        self.calls += 1
+
+    def exhausted(self) -> bool:
+        return self.denial_reason is not None
+
+
+def _nli_judge_all_entail(member_pols: list[tuple],
+                          budget: _NliBudget | None = None,
+                          clock: Callable[[], float] | None = None) -> bool | None:
     """Issue #62, 7.5: does the optional local NLI judge resolve EVERY
     polarity-FLAGGED pair (differing ``_polarity_signature``) in this cluster
     as entailment?
@@ -742,6 +818,15 @@ def _nli_judge_all_entail(member_pols: list[tuple]) -> bool | None:
     back to polarity, never auto-merge). All-entailment semantics: one
     non-entailing flagged pair parks the whole cluster. Env var read lazily
     each call.
+
+    Issue #77: ``budget`` (created once by ``consolidate()``) bounds the
+    run-wide number of judge calls and their wall time — before each call the
+    budget is consulted and a denial stops the loop with ``False`` (the
+    cluster parks; it never auto-merges on a partial verdict). ``budget=None``
+    resolves the same limits from the environment so direct callers get the
+    identical gating; ``clock`` injects a fake ``time.monotonic`` for tests.
+    Pair diagnostics carry member IDS, pair indexes, and the verdict only —
+    never member content.
 
     A "polarity-flagged pair" is ANY pair of members whose negation-polarity
     signatures differ — not only the pair anchored on the keeper (PRR-004): a
@@ -766,18 +851,36 @@ def _nli_judge_all_entail(member_pols: list[tuple]) -> bool | None:
         argv = []
     if not argv:
         return None
+    if budget is None:
+        budget = _NliBudget(
+            _nli_env_limit("ZMEM_NLI_MAX_CALLS", NLI_DEFAULT_MAX_CALLS, cast=int),
+            _nli_env_limit("ZMEM_NLI_MAX_SECONDS", NLI_DEFAULT_MAX_SECONDS, cast=float),
+            clock=clock,
+        )
     flagged = []
     for i in range(len(member_pols)):
         for j in range(i + 1, len(member_pols)):
             if member_pols[i][2] != member_pols[j][2]:
                 # Deterministic order: earlier member index first.
                 a, b = member_pols[i][1], member_pols[j][1]
-                flagged.append((a, b))
+                flagged.append((member_pols[i][0], member_pols[j][0], a, b))
     if not flagged:
         return False
-    for a, b in flagged:
+    warned = False
+    for pair_index, (id_a, id_b, a, b) in enumerate(flagged):
+        if not budget.allow():
+            if not warned:
+                reason = budget.denial_reason or "budget exhausted"
+                print(f"[zmem] consolidate: NLI judge budget exhausted ({reason}); "
+                      f"stopping after {budget.calls} call(s) with "
+                      f"{len(flagged) - pair_index} pair(s) unjudged — "
+                      f"affected clusters stay unmerged", file=sys.stderr)
+                warned = True
+            return False
+        budget.record()
         verdict = _nli_judge_pair(argv, a, b)
-        print(f"[zmem] consolidate: NLI judge: [{a[:40]!r} vs {b[:40]!r}] -> {verdict}")
+        print(f"[zmem] consolidate: NLI judge: pair {pair_index} "
+              f"[{id_a} vs {id_b}] -> {verdict}")
         if verdict != "entailment":
             return False
     return True
@@ -918,6 +1021,13 @@ def consolidate(
     }
     consolidated_ids: list[str] = []
 
+    # Issue #77: one run-wide NLI budget, created before any cluster work so
+    # the call count and the wall clock bound the WHOLE run, not per-cluster.
+    nli_budget = _NliBudget(
+        _nli_env_limit("ZMEM_NLI_MAX_CALLS", NLI_DEFAULT_MAX_CALLS, cast=int),
+        _nli_env_limit("ZMEM_NLI_MAX_SECONDS", NLI_DEFAULT_MAX_SECONDS, cast=float),
+    )
+
     # Optional working-set narrowing (issue #62, 7.1): ``working_ids`` bounds
     # the candidate rows to a native episode (organize passes the N most recent
     # live rows). Sorted for a deterministic IN-list. Empty/None -> unchanged.
@@ -981,10 +1091,18 @@ def consolidate(
     ns_clause = "AND namespace = ?" if namespace else ""
     ns_params = [namespace] if namespace else []
     embed_clause = "" if use_lexical else "AND embedding IS NOT NULL"
+    # Issue #77: organize's summary rows (structural `organize:` source_ref
+    # prefix) are the pipeline's OUTPUT — they must never become consolidate
+    # INPUT, or consolidate can absorb/tombstone the very rows organize
+    # produced (the same F-003/PRR-008 rule organize applies to its own
+    # working set). The predicate guards BOTH the eligible count and the
+    # ranked candidate query below.
+    summary_clause = "AND (source_ref IS NULL OR source_ref NOT LIKE ?)"
+    summary_params = [SUMMARY_SOURCE_REF_PREFIX + "%"]
     total_eligible = conn.execute(
         f"""SELECT count(*) AS c FROM memory
-           WHERE superseded_at IS NULL {embed_clause} {ns_clause}{ids_clause}""",
-        [*ns_params, *ids_params],
+           WHERE superseded_at IS NULL {embed_clause} {summary_clause} {ns_clause}{ids_clause}""",
+        [*summary_params, *ns_params, *ids_params],
     ).fetchone()["c"]
     # The cap is PER NAMESPACE (the constant is CONSOLIDATE_MAX_ROWS_PER_NAMESPACE):
     # a window function ranks rows within each namespace by the priority ORDER BY,
@@ -995,22 +1113,23 @@ def consolidate(
         f"""WITH ranked AS (
                SELECT id, namespace, content, tags, confidence, signal,
                       retrieval_count, surfaced_count, embedding,
-                      embedding_model, ingestion_ts, taint,
+                      embedding_model, ingestion_ts, taint, source_ref,
                       ROW_NUMBER() OVER (
                           PARTITION BY namespace
                           ORDER BY confidence * (retrieval_count + surfaced_count) DESC,
                                    confidence DESC, ingestion_ts ASC, id ASC
                       ) AS rn
                FROM memory
-               WHERE superseded_at IS NULL {embed_clause} {ns_clause}{ids_clause}
+               WHERE superseded_at IS NULL {embed_clause} {summary_clause} {ns_clause}{ids_clause}
            )
            SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
-                  surfaced_count, embedding, embedding_model, ingestion_ts, taint
+                  surfaced_count, embedding, embedding_model, ingestion_ts, taint,
+                  source_ref
            FROM ranked
            WHERE rn <= ?
            ORDER BY confidence * (retrieval_count + surfaced_count) DESC, confidence DESC,
                     ingestion_ts ASC, id ASC""",
-        [*ns_params, *ids_params, CONSOLIDATE_MAX_ROWS_PER_NAMESPACE],
+        [*summary_params, *ns_params, *ids_params, CONSOLIDATE_MAX_ROWS_PER_NAMESPACE],
     ).fetchall()
     truncated = total_eligible > len(rows)
     # Set True if any seed's vec0 KNN escalation hit the k cap with all-returned
@@ -1137,14 +1256,18 @@ def consolidate(
                 # judged ENTAILMENT is a heuristic false positive and un-parks
                 # (merges). Unset -> _nli_judge_all_entail returns None and this
                 # branch is byte-identical to the pre-judge path; --merge-contested
-                # remains the explicit override and still wins over a park verdict.
-                _nli_unpark = _nli_judge_all_entail(member_pols)
+                # remains the explicit override and still wins over a park verdict
+                # — EXCEPT when the issue #77 run-wide budget denied the judge
+                # (nli_budget.exhausted()): a budget-denied cluster parks
+                # regardless of the override, because the override must never
+                # complete a merge whose contradiction check was never run.
+                _nli_unpark = _nli_judge_all_entail(member_pols, budget=nli_budget)
                 if _nli_unpark:
                     print(f"[zmem] consolidate: NLI judge: entailment resolves the "
                           f"contested cluster around [{seed['id'][:8]}] - merging "
                           f"(contradiction judged false)")
                     contested_override = True
-                elif merge_contested:
+                elif merge_contested and not nli_budget.exhausted():
                     # Explicit override for a confirmed heuristic false positive:
                     # merge like any other cluster. The report entry is appended
                     # only AFTER the outcome is known (dry run → merged: False —

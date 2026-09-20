@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -793,6 +793,102 @@ class NliJudgeExtensionTest(unittest.TestCase):
         self.assertEqual(report["merged"], 2, report)
         self.assertEqual(len(report["contested_clusters"]), 1)
         self.assertTrue(report["contested_clusters"][0]["merged"])
+
+
+    def test_nli_call_budget_stops_pair_loop(self):
+        """Issue #77: ZMEM_NLI_MAX_CALLS=1 stops the flagged-pair loop after
+        one judge invocation and leaves the contested cluster unmerged."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        _add_raw(self.mod, self.conn, MIX_C, 0.8)
+        cmd = _write_seq_judge(self.tmp_path, "budget1", ["entailment"])
+        env = {"ZMEM_NLI_CMD": cmd, "ZMEM_NLI_MAX_CALLS": "1"}
+        buf = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf), redirect_stderr(err):
+                report = self.mod.consolidate(self.conn, force=True)
+        self.assertLessEqual(_seq_judge_calls(self.tmp_path, "budget1"), 1)
+        self.assertEqual(report["merged"], 0, report)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        live = self.conn.execute(
+            "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
+        ).fetchone()[0]
+        self.assertEqual(live, 3)
+        self.assertIn("budget exhausted", err.getvalue())
+
+    def test_nli_call_budget_invalid_value_falls_back_to_default(self):
+        """Issue #77: ZMEM_NLI_MAX_CALLS=not-an-integer falls back to
+        NLI_DEFAULT_MAX_CALLS=64 — the judge still runs (no accidental
+        zero-cap), the constants exist with the contract values, and the
+        all-entailment cluster merges exactly as without the knob."""
+        self.assertEqual(self.mod.NLI_DEFAULT_MAX_CALLS, 64)
+        self.assertEqual(self.mod.NLI_DEFAULT_MAX_SECONDS, 30.0)
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        _add_raw(self.mod, self.conn, MIX_C, 0.8)
+        cmd = _write_seq_judge(self.tmp_path, "budgetbad", ["entailment"])
+        env = {"ZMEM_NLI_CMD": cmd, "ZMEM_NLI_MAX_CALLS": "not-an-integer"}
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf):
+                report = self.mod.consolidate(self.conn, force=True)
+        self.assertGreaterEqual(_seq_judge_calls(self.tmp_path, "budgetbad"), 2)
+        self.assertEqual(report["merged"], 2, report)
+
+    def test_nli_time_budget_uses_fake_clock(self):
+        """Issue #77: the injected clock drives the run-wide time budget — a
+        clock past the deadline denies every judge call and the cluster parks
+        with the time-limit reason on stderr."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        _add_raw(self.mod, self.conn, MIX_C, 0.8)
+        cmd = _write_seq_judge(self.tmp_path, "timebudget", ["entailment"])
+        env = {"ZMEM_NLI_CMD": cmd}
+        fake_now = [0.0]
+
+        def fake_clock():
+            fake_now[0] += 1000.0
+            return fake_now[0]
+
+        buf = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch.object(self.mod.time, "monotonic", fake_clock):
+                with redirect_stdout(buf), redirect_stderr(err):
+                    report = self.mod.consolidate(self.conn, force=True)
+        self.assertEqual(_seq_judge_calls(self.tmp_path, "timebudget"), 0)
+        self.assertEqual(report["merged"], 0, report)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        self.assertIn("time limit", err.getvalue())
+
+    def test_nli_diagnostics_contain_ids_not_content(self):
+        """Issue #77: judge diagnostics carry member ids, pair indexes, and
+        the verdict — never member content, on either stream."""
+        pos_id = _add_raw(self.mod, self.conn,
+                          "release train always deploys after staging canary "
+                          "passes checks NLI_SECRET_7f2b", 0.9)
+        neg_id = _add_raw(self.mod, self.conn,
+                          "release train never deploys after staging canary "
+                          "passes checks", 0.9)
+        cmd = _write_judge(self.tmp_path, "entailment")
+        env = {"ZMEM_NLI_CMD": cmd}
+        buf = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf), redirect_stderr(err):
+                report = self.mod.consolidate(self.conn, force=True)
+        out = buf.getvalue()
+        self.assertEqual(report["merged"], 1, report)
+        self.assertNotIn("always deploys after the staging", out)
+        self.assertNotIn("never deploys after the staging", out)
+        self.assertNotIn("NLI_SECRET_7f2b", out)
+        self.assertNotIn("NLI_SECRET_7f2b", err.getvalue())
+        self.assertIn(pos_id, out)
+        self.assertIn(neg_id, out)
+        self.assertIn("pair 0", out)
 
 
 class ConsolidatedIdsGrowthTest(unittest.TestCase):

@@ -25,7 +25,7 @@ import embed_profiles as _profiles
 from storelib.entity import link_memory_entities, relink_memory
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
-from storelib.write import CapturePolicyRefusal, _GLOBAL_NEAR_MISS_STEMS, _apply_capture_policy, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text
+from storelib.write import CapturePolicyRefusal, _GLOBAL_NEAR_MISS_STEMS, _apply_capture_policy, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref
 from schema_meta import worse_taint  # noqa: F401
 from storelib.evidence import (
     EVIDENCE_KINDS,
@@ -1158,6 +1158,10 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         # separate (redacted) row -- acceptable, since a redacted memory is by
         # definition a different memory.
         try:
+            # Issue #77: row-carried reserved-prefix refs warn here (the CLI
+            # dispatch only sees its own --source-ref override); same bytes as
+            # storelib.write.warn_reserved_source_ref via the shared printer.
+            warn_reserved_source_ref(source_ref)
             content, source_ref, tags, cap_warns = _apply_capture_policy(
                 content=content,
                 source_ref=source_ref,

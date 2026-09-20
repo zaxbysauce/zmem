@@ -10,6 +10,46 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.54.0] - 2026-09-20
+
+### Added
+- **Embeddings-on-CI lane (issue #77)**: a required `test-embeddings` matrix job
+  installs `hermes-plugin/server/requirements-embeddings.txt` and runs the new
+  NON-skipping sqlite-vec / fake-profile smoke test
+  (`tests/test_embeddings_ci.py`) on Windows and Ubuntu; the model-absent
+  `test` job excludes that file from its loop, so a missing or broken vector
+  dependency now fails CI instead of silently degrading recall.
+
+### Changed
+- **Consolidate never ingests organize output (issue #77)**: live rows whose
+  structural `source_ref` carries the reserved `organize:` prefix are excluded
+  from BOTH the eligible count and the ranked candidate query, closing the
+  summary-as-input path.
+- **Run-wide NLI judge budget (issue #77)**: the optional local contradiction
+  judge is bounded per run by `ZMEM_NLI_MAX_CALLS` (default 64) and
+  `ZMEM_NLI_MAX_SECONDS` (default 30.0; invalid values fall back to the
+  defaults). An exhausted budget stops the judge with one stderr warning and
+  leaves the affected contested clusters unmerged — even under
+  `--merge-contested`.
+- **Id-only NLI diagnostics (issue #77)**: judge pair diagnostics now carry
+  member ids, pair indexes, and the verdict — memory content (including
+  secret-like content) no longer appears in any diagnostic stream.
+- **organize declares auto capture policy (issue #77)**: compression
+  replacements and summary writes pass `capture_mode="auto"` explicitly, so
+  synthesized rows are redaction/refusal-policy declared instead of inheriting
+  the manual default.
+- **One deterministic component helper (issue #77)**: organize's two private
+  union-find closures are replaced by the shared `_components_from_edges`
+  helper with identical semantics.
+
+### Fixed
+- **Reserved `organize:` source_ref writes now warn (issue #77)**: `add`,
+  `update`, and `ingest-jsonl` (override and per-row refs) print
+  `[zmem] WARNING: source_ref prefix organize: is reserved for organize
+  summaries` to stderr; the write is not rejected and JSON stdout stays
+  parseable. `skills/memory/SKILL.md` documents the warning and the NLI
+  budget knobs.
+
 ## [0.53.0] - 2026-09-19
 
 ### Added
