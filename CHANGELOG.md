@@ -10,6 +10,27 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.52.0] - 2026-09-19
+
+### Added
+- **Predeclared real-corpus replay record (issue #155, Workstream G PR 3 of
+  5)**: committed `eval/real-corpus-2026-09-19.json`, the private real-corpus
+  measurement of record produced under the new predeclaration protocol — the
+  cohort (standalone store snapshot, `ver=0.49.0` release-availability
+  projection of the frozen decision log, and the cohort's one Claude-shaped
+  transcript) was frozen with SHA-256 digests and declared on the issue
+  BEFORE the evaluation ran. The committed report carries aggregates and
+  digests only; the private cohort is never committed.
+- **Guardrail test for the real-corpus record**:
+  `tests/test_eval_real_corpus_record.py` pins the record's digest binding
+  (snapshot SHA-256 from the predeclaration, measured input digest), schema
+  shape, eight sorted lane/moment rows, and privacy boundary (no
+  memory-content keys, no absolute paths).
+- **Documentation**: `README.md` and `skills/memory/SKILL.md` name the
+  committed record and the snapshot-digest requirement — any future
+  real-corpus replay must freeze its store snapshot and declare the SHA-256
+  before the measurement runs.
+
 ## [0.51.0] - 2026-09-19
 
 ### Added

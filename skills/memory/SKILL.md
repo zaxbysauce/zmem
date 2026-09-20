@@ -418,9 +418,11 @@ the checkpoint phrase is never split, and the final query remains bounded to
 hook-to-store stdin channel and is neither logged nor persisted. The
 `ZMEM_QUERY_CONTEXT=0` kill switch disables both token and phrase enrichment.
 
-[Issue #155's published measurement/decision](https://github.com/zaxbysauce/zmem/issues/155#issuecomment-5743322000)
-gates this feature's release; that decision does not establish that #155's AC6
-or replay efficacy passed.
+This feature shipped under issue #155's published measurement decision (the
+2026-09-19 fail-closed INSUFFICIENT outcome); #155's predeclared measurement
+of record has since landed (`eval/real-corpus-2026-09-19.json` — an audit
+over a frozen cohort, not a live efficacy claim), so the gate is satisfied
+without an efficacy claim by this feature.
 
 #### Passive-injection kill switch (ZMEM_INJECT=0) — issue #110 / P0-5
 
@@ -677,9 +679,11 @@ store's own row renders in place, inside the untrusted fence, tagged
 `[ns=<source namespace>] [tier=cross]` (with `tier: "cross"` on the JSON
 row), and cross rows never consume project or global slots. Delivered cross
 rows count once in `surfaced_count` under the same telemetry law as every
-other tier. The #155 real-corpus replay baseline is future work: the lane
-ships with these conservative defaults and #155's measurement supersedes the
-calibration when it lands. `recall --explain`
+other tier. The #155 real-corpus replay baseline has landed: the lane ships
+with these conservative defaults, and the predeclared measurement record
+`eval/real-corpus-2026-09-19.json` (see the read-only replay evaluator section)
+is the calibration reference — an audit over a frozen cohort, not a live
+efficacy claim. `recall --explain`
 does not include the cross tier (the read-only debugger predates it and is
 not extended by #98).
 
@@ -1797,6 +1801,16 @@ observation exists, observation-dependent zero fields are empty-denominator
 compatibility values and stderr says metrics are unavailable; they are not a
 measured success, failure, or efficacy claim. See
 `tests/fixtures/replay/README.md` for bounds and reproducibility details.
+
+The predeclared private real-corpus measurement of record for issue #155 is
+committed at `eval/real-corpus-2026-09-19.json`: a cohort frozen at
+declaration time (standalone store snapshot, `ver=0.49.0` projection of the
+frozen decision log, and the cohort's one Claude-shaped transcript), declared
+with SHA-256 digests on the issue before the evaluation ran. The file carries
+aggregates and digests only; `tests/test_eval_real_corpus_record.py` pins its
+digests, schema, and privacy boundary. Future real-corpus replays must freeze
+the store snapshot and declare its SHA-256 before the measurement — replays
+over live, undeclared, or outcome-selected inputs are not baselines.
 
 ### entity-list — inspect entity identity (v10, issue #60)
 ```

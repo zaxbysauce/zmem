@@ -104,8 +104,9 @@ warning. `ZMEM_CROSS_PROJECT_HAZARD_VERBS` overrides the hazard-verb set
 dropped with the one-shot warning). `store.py recall|recent
 --include-cross-project` opts in for direct calls — the env switch still
 governs. The tier is query-time: the queryless `recent` pull never admits
-cross rows. The #155 real-corpus replay baseline supersedes the initial
-calibration when it lands.
+cross rows. The #155 real-corpus replay baseline has landed: the predeclared
+measurement record `eval/real-corpus-2026-09-19.json` is the calibration
+reference for this tier.
 
 ### Query-aware passive prefetch (issue #159)
 
@@ -212,6 +213,21 @@ observation-dependent counts/rates are unavailable and represented by numeric
 zero compatibility values; those zeroes are not measured success, failure, or
 live efficacy. See [`tests/fixtures/replay/README.md`](tests/fixtures/replay/README.md)
 for the fixture and two-build reproducibility contract.
+
+The predeclared private real-corpus measurement of record (issue #155) is
+committed at [`eval/real-corpus-2026-09-19.json`](eval/real-corpus-2026-09-19.json).
+It was produced by replaying a cohort frozen at declaration time — a standalone
+store snapshot (SHA-256 recorded in the predeclaration on the issue and pinned
+by the report's `store_sha256`), the `ver=0.49.0` release-availability
+projection of the frozen decision log, and the cohort's one Claude-shaped
+transcript — after the declaration and its addendum were published on the
+issue and before any evaluation ran. The committed file carries aggregates and
+digests only; the private cohort is never committed, and
+`tests/test_eval_real_corpus_record.py` pins its digests, schema, and privacy
+boundary. Any future real-corpus replay must follow the same rule: freeze the
+store snapshot and declare its SHA-256 before the measurement runs — a
+measurement over undeclared, live, or outcome-selected inputs is not a
+baseline.
 
 ### Retrieval debugger, lineage unfold, and honest eval (issue #82)
 
