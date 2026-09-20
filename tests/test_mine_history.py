@@ -960,6 +960,35 @@ class HistorySuffixTest(unittest.TestCase):
         )
         self.assertEqual(suffix, self.transcript.read_text(encoding="utf-8"))
 
+    def test_shrink_persists_reset_and_regrowth_is_incremental(self):
+        self._write({"chunk_id": "1", "text": "old" * 200})
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        _, large_state = hm.mine_transcript_suffix(self.transcript, checkpoint)
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, large_state)
+
+        self._write({"chunk_id": "1", "text": "new"})
+        checkpoint = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        suffix, shrunk_state = hm.mine_transcript_suffix(
+            self.transcript, checkpoint)
+        self.assertEqual(suffix, self.transcript.read_text(encoding="utf-8"))
+        self.assertLess(shrunk_state["offset"], large_state["offset"])
+        hm.write_suffix_checkpoint(
+            self.root, self.transcript, self.session, shrunk_state)
+        persisted = hm.read_suffix_checkpoint(
+            self.root, self.transcript, self.session)
+        self.assertEqual(persisted["offset"], self.transcript.stat().st_size)
+        self.assertEqual(persisted["prefix_sha256"], shrunk_state["prefix_sha256"])
+
+        appended = json.dumps(
+            {"chunk_id": "1", "text": "after"}, separators=(",", ":")) + "\n"
+        with self.transcript.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(appended)
+        suffix, _ = hm.mine_transcript_suffix(self.transcript, persisted)
+        self.assertEqual(suffix, appended)
+
     def test_prefix_digest_mismatch_resets_offset(self):
         self._write({"chunk_id": "1", "text": "one"})
         checkpoint = hm.read_suffix_checkpoint(

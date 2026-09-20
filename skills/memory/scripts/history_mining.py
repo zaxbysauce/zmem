@@ -229,6 +229,31 @@ def _acquire_checkpoint_lock(lock: Path, timeout: float = 3.0) -> int:
             time.sleep(0.01)
 
 
+def _state_matches_transcript(transcript: Path, state: dict) -> bool:
+    """Return whether *state* describes the transcript's current bytes.
+
+    A confirmed shrink may move a persisted checkpoint backward. Ordinary
+    stale concurrent writers may not: they fail this size+digest comparison
+    against the current transcript and remain subject to monotonic progress.
+    """
+
+    try:
+        expected_size = int(state.get("offset", -1))
+        expected_digest = str(state.get("prefix_sha256", ""))
+        if expected_size < 0 or Path(transcript).stat().st_size != expected_size:
+            return False
+        digest = hashlib.sha256()
+        with Path(transcript).open("rb") as handle:
+            while True:
+                block = handle.read(64 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+        return digest.hexdigest() == expected_digest
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def write_suffix_checkpoint(
     root: Path, transcript: Path, session: str, state: dict
 ) -> None:
@@ -243,7 +268,8 @@ def write_suffix_checkpoint(
         os.close(fd)
         current = read_suffix_checkpoint(root, transcript, session)
         requested = int(state.get("offset", 0))
-        if current["offset"] > requested:
+        if (current["offset"] > requested
+                and not _state_matches_transcript(transcript, state)):
             return
         payload = {
             "session": session_value,

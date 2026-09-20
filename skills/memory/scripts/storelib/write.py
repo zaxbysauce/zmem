@@ -25,11 +25,6 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     import embed_profiles as _profiles  # type: ignore
 
-try:
-    from correction_queue import SECRET_PATTERNS  # noqa: F401
-except ImportError:
-    sys.path.insert(0, os.path.dirname(__file__))
-    from correction_queue import SECRET_PATTERNS  # type: ignore # noqa: F401
 from storelib.entity import link_memory_entities, relink_memory
 from storelib.links import TRUST_DELTA_SUPPORTS, adjust_trust, generate_links_on_write
 
@@ -109,15 +104,21 @@ except ImportError:
     from corrections import aggregate_errors as _aggregate_errors  # type: ignore # noqa: F401
     from corrections import SAMPLE_EXTRACT_LIMIT as _SAMPLE_EXTRACT_LIMIT  # type: ignore # noqa: F401
 
-# Live-correction queue (issue #47). `SECRET_PATTERNS` lives here as the single
-# source of truth shared by the store's capture-policy helpers AND the queue's
-# write-time redaction (so they can never drift). Stdlib-only, resolved like
-# `corrections`.
+# Dependency-free secret policy shared by store writes, capture sidecars, and
+# the live-correction queue.
 try:
-    from correction_queue import SECRET_CREDENTIAL_PATTERNS, SECRET_PATTERNS  # noqa: F401
+    from redaction import (  # noqa: F401
+        SECRET_CREDENTIAL_PATTERNS,
+        SECRET_PATTERNS,
+        redact_secret_like_text as _shared_redact_secret_like_text,
+    )
 except ImportError:
-    sys.path.insert(0, os.path.dirname(__file__))
-    from correction_queue import SECRET_CREDENTIAL_PATTERNS, SECRET_PATTERNS  # type: ignore # noqa: F401
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    from redaction import (  # type: ignore # noqa: F401
+        SECRET_CREDENTIAL_PATTERNS,
+        SECRET_PATTERNS,
+        redact_secret_like_text as _shared_redact_secret_like_text,
+    )
 
 
 def _warn_fake_active_once() -> None:
@@ -205,12 +206,7 @@ def _normalize_capture_mode(mode: str | None) -> str:
     return value if value in CAPTURE_MODES else "manual"
 
 def _redact_secret_like_text(text: str) -> tuple[str, int]:
-    redacted = text or ""
-    count = 0
-    for pat in SECRET_PATTERNS:
-        redacted, changed = pat.subn("[REDACTED_SECRET]", redacted)
-        count += changed
-    return redacted, count
+    return _shared_redact_secret_like_text(text)
 
 def _has_prompt_injection_risk(*values: str) -> bool:
     combined = " ".join(v for v in values if v)

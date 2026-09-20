@@ -104,14 +104,14 @@ RECURRENCE="$(join_path "$DATA_DIR_PY" ops "$SESSION_HASH.capture-failure.json")
 # Parse one failed call and atomically advance its recurrence record. The
 # subprocess emits only bounded, normalized fields for the renderer.
 META_JSON="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
-import json, os, re, sys, tempfile
+import json, os, re, sys, tempfile, time
 
 store_py = sys.argv[1]
 session = sys.argv[2]
 recurrence = sys.argv[3]
 sys.path.insert(0, os.path.dirname(store_py))
 try:
-    from capture_quality import infer_signal, operation_descriptor
+    from capture_quality import infer_signal, operation_descriptor, redact_secret_like_text
 except Exception:
     print("{}")
     raise SystemExit(0)
@@ -146,32 +146,57 @@ else:
     error_type = payload.get("error_type", "") or ""
 if not isinstance(error_type, str): error_type = str(error_type)
 error_text = re.sub(r"\s+", " ", str(error_text).replace("\r", " ").replace("\n", " ")).strip()[:240]
+error_text, _ = redact_secret_like_text(error_text)
 descriptor = operation_descriptor(tool, command, path, error_type)
 signal = infer_signal(command, exit_code=payload.get("exit_code"))
 
-count = 0
+directory = os.path.dirname(recurrence)
+lock = recurrence + ".lock"
 try:
-    with open(recurrence, "r", encoding="utf-8") as f:
-        old = json.load(f)
-    if isinstance(old, dict) and old.get("session") == session:
-        count = int(old.get("count", 0) or 0)
-except Exception:
-    pass
-count += 1
-state = {"session": session, "count": count, "last_error": error_text}
-try:
-    os.makedirs(os.path.dirname(recurrence), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".capture-failure-", suffix=".tmp", dir=os.path.dirname(recurrence))
+    os.makedirs(directory, exist_ok=True)
+    deadline = time.monotonic() + 3.0
+    while True:
+        try:
+            lock_fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(lock_fd)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > 60:
+                    os.unlink(lock)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                print("{}")
+                raise SystemExit(0)
+            time.sleep(0.01)
+
+    count = 0
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(state, f, ensure_ascii=False, separators=(",", ":"))
-            f.write("\n")
-        os.replace(tmp, recurrence)
-    except BaseException:
-        try: os.unlink(tmp)
+        try:
+            with open(recurrence, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            if isinstance(old, dict) and old.get("session") == session:
+                count = int(old.get("count", 0) or 0)
+        except Exception:
+            pass
+        count += 1
+        state = {"session": session, "count": count, "last_error": error_text}
+        fd, tmp = tempfile.mkstemp(prefix=".capture-failure-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(state, f, ensure_ascii=False, separators=(",", ":"))
+                f.write("\n")
+            os.replace(tmp, recurrence)
+        except BaseException:
+            try: os.unlink(tmp)
+            except OSError: pass
+            print("{}")
+            raise SystemExit(0)
+    finally:
+        try: os.unlink(lock)
         except OSError: pass
-        print("{}")
-        raise SystemExit(0)
 except Exception:
     print("{}")
     raise SystemExit(0)

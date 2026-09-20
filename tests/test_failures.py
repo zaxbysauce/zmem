@@ -90,7 +90,9 @@ class FailureSignalTest(unittest.TestCase):
             "--signal none",
         )
 
-    def _run_failure_hook(self, data: Path, session: str, command: str):
+    def _run_failure_hook(
+        self, data: Path, session: str, command: str, error: str = "Exit code 1"
+    ):
         bash = shutil.which("bash")
         if os.name == "nt":
             bash = next((str(path) for path in (
@@ -103,7 +105,7 @@ class FailureSignalTest(unittest.TestCase):
             "session_id": session,
             "tool_name": "Bash",
             "tool_input": {"command": command},
-            "error": "Exit code 1",
+            "error": error,
         })
         env = dict(os.environ)
         env.update({
@@ -141,6 +143,36 @@ class FailureSignalTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertIn('"additionalContext"', result.stdout)
         self.assertIn("--signal test", result.stdout)
+
+    def test_recurrence_sidecar_redacts_secret_like_error(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-failure-redaction-") as tmp:
+            data = Path(tmp)
+            secret = "api_key=0123456789abcdef42"
+            result = self._run_failure_hook(
+                data, "redaction-session", "curl https://example.test", secret
+            )
+            sidecars = list((data / "ops").glob("*.capture-failure.json"))
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(len(sidecars), 1)
+            state = json.loads(sidecars[0].read_text(encoding="utf-8"))
+            self.assertNotIn(secret, state["last_error"])
+            self.assertIn("[REDACTED_SECRET]", state["last_error"])
+
+    def test_stale_recurrence_lock_is_reaped(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-failure-stale-lock-") as tmp:
+            data = Path(tmp)
+            session = "stale-lock-session"
+            first = self._run_failure_hook(data, session, "curl https://example.test")
+            sidecar = next((data / "ops").glob("*.capture-failure.json"))
+            lock = Path(str(sidecar) + ".lock")
+            lock.write_text("stale\n", encoding="utf-8")
+            stale = lock.stat().st_mtime - 120
+            os.utime(lock, (stale, stale))
+            second = self._run_failure_hook(data, session, "curl https://example.test")
+            state = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertEqual((first.returncode, second.returncode), (0, 0))
+            self.assertEqual(state["count"], 2)
+            self.assertFalse(lock.exists())
 
 
 class CaptureQualityTest(unittest.TestCase):

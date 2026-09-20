@@ -13,6 +13,8 @@ import re
 import shlex
 from typing import Mapping
 
+from redaction import redact_secret_like_text
+
 
 FENCE_BEGIN = "<<<ZMEM_UNTRUSTED_FENCE>>>"
 FENCE_END = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
