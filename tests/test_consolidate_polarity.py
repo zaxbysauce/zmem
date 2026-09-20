@@ -401,7 +401,7 @@ class NliJudgeInteractionTest(unittest.TestCase):
         from storelib.consolidate import consolidate as consolidate_fn
         src = inspect.getsource(consolidate_fn)
         restatement_pos = src.find("pair_relations")
-        judge_pos = src.find("_nli_judge_all_entail(member_pols)")
+        judge_pos = src.find("_nli_judge_all_entail(member_pols")
         self.assertGreater(restatement_pos, 0)
         self.assertGreater(judge_pos, 0)
         self.assertLess(restatement_pos, judge_pos,

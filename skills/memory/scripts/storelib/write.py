@@ -135,6 +135,14 @@ def _warn_fake_active_once() -> None:
 
 
 
+class AutoCaptureRuntimeError(RuntimeError):
+    """PRR-001 (issue #77 round 2): secret-like content that capture_mode=
+    auto could NOT safely redact — raised instead of a bare RuntimeError so
+    synthesized-write callers (organize) can skip-and-log precisely this
+    case without catching unrelated RuntimeErrors. Subclasses RuntimeError
+    for backward compatibility with existing ``except RuntimeError`` guards."""
+
+
 class CapturePolicyRefusal(ValueError):
     """Automatic capture could not safely preserve the record contract."""
 
@@ -204,6 +212,25 @@ def _has_injection_risk_tag(tags: str) -> bool:
 def _normalize_capture_mode(mode: str | None) -> str:
     value = (mode or os.environ.get("ZMEM_CAPTURE_MODE") or "manual").strip().lower()
     return value if value in CAPTURE_MODES else "manual"
+
+
+# Issue #77: `organize:` is a RESERVED structural source_ref prefix — organize
+# keys its summary identity on it and consolidate/organize exclude it from
+# candidate sets. A manually written `organize:` row can masquerade as a
+# structural summary, so every CLI write surface warns (stderr only, never
+# rejects, never touches JSON stdout). Canonical definition lives here because
+# both storelib.cli and storelib.sync (the JSONL ingest row loop) need the
+# exact same bytes.
+RESERVED_SOURCE_REF_PREFIX = "organize:"
+RESERVED_SOURCE_REF_WARNING = (
+    "[zmem] WARNING: source_ref prefix organize: is reserved for organize summaries"
+)
+
+
+def warn_reserved_source_ref(source_ref: str | None) -> None:
+    """Emit the reserved-prefix warning for `organize:` source_refs."""
+    if source_ref and source_ref.startswith(RESERVED_SOURCE_REF_PREFIX):
+        print(RESERVED_SOURCE_REF_WARNING, file=sys.stderr)
 
 def _redact_secret_like_text(text: str) -> tuple[str, int]:
     return _shared_redact_secret_like_text(text)
@@ -353,7 +380,7 @@ def _apply_capture_policy(
         out_tags, tag_redactions = _redact_secret_like_text(tags)
         total = content_redactions + tag_redactions
         if total <= 0:
-            raise RuntimeError(
+            raise AutoCaptureRuntimeError(
                 "zmem: refusing automatic capture with likely secrets that could "
                 "not be safely redacted"
             )

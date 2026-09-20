@@ -78,6 +78,7 @@ import contextlib
 import os
 import re
 import sqlite3
+import sys
 import time
 
 from storelib.consolidate import (
@@ -110,7 +111,7 @@ from storelib.schema import (
     _parse_iso_to_epoch,
     now_iso,
 )
-from storelib.write import add_memory, update_memory
+from storelib.write import AutoCaptureRuntimeError, CapturePolicyRefusal, add_memory, update_memory
 
 # Summaries are real rows. A signal=none row inherits SIGNAL_CONFIDENCE["none"]
 # (0.2) which sits BELOW the CONFIDENCE_FLOOR (0.25) — such a row is invisible
@@ -308,6 +309,45 @@ def _build_bullets(members: list[str], rows_by_id: dict) -> str:
     return "".join(out)
 
 
+def _components_from_edges(ids: list[str],
+                           edges: list[tuple[str, str]]) -> list[list[str]]:
+    """Issue #77: the ONE deterministic connected-components helper.
+
+    Organize previously carried two private union-find closures (one in
+    ``_entity_groups``, one in ``_cluster_topics``) with byte-identical
+    semantics; both now call this helper, which seeds parents in sorted id
+    order, ignores edge endpoints outside ``ids``, unions deterministically
+    (the lexicographically smaller root always wins, so the component root is
+    its minimum id regardless of edge order), and returns sorted member lists
+    ordered by each component's first id. Callers keep their own SQL,
+    similarity, and post-sort policies.
+    """
+    parent = {i: i for i in sorted(set(ids))}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            lo, hi = (ra, rb) if ra < rb else (rb, ra)
+            parent[hi] = lo
+
+    for a, b in edges:
+        if a in parent and b in parent:
+            union(a, b)
+
+    comps: dict[str, list[str]] = {}
+    for i in sorted(parent):
+        comps.setdefault(find(i), []).append(i)
+    groups = [sorted(m) for m in comps.values()]
+    groups.sort(key=lambda m: m[0])
+    return groups
+
+
 def _entity_groups(conn: sqlite3.Connection, ids: list[str]) -> list[list[str]]:
     """Group leftover singleton rows by SHARED entity (7.3, A-MEM lite).
 
@@ -330,30 +370,15 @@ def _entity_groups(conn: sqlite3.Connection, ids: list[str]) -> list[list[str]]:
     for lr in links:
         by_entity.setdefault(lr["entity_id"], []).append(lr["memory_id"])
 
-    parent = {i: i for i in ids}
-
-    def find(x: str) -> str:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            lo, hi = (ra, rb) if ra < rb else (rb, ra)
-            parent[hi] = lo
-
+    edges: list[tuple[str, str]] = []
     for entity_id, members in by_entity.items():
         if len(members) >= 2:
             base = members[0]
             for other in members[1:]:
-                union(base, other)
+                edges.append((base, other))
 
-    comps: dict[str, list[str]] = {}
-    for i in ids:
-        comps.setdefault(find(i), []).append(i)
-    groups = [sorted(m) for m in comps.values() if len(m) >= 2]
+    comps = _components_from_edges(ids, edges)
+    groups = [sorted(m) for m in comps if len(m) >= 2]
     groups.sort(key=lambda m: (-len(m), m))
     return groups
 
@@ -458,21 +483,8 @@ def _cluster_topics(
         else _consolidate_mod.CONSOLIDATE_DEFAULT_THRESHOLD
     )
 
-    parent = {r["id"]: r["id"] for r in ordered}
-
-    def find(x: str) -> str:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            lo, hi = (ra, rb) if ra < rb else (rb, ra)
-            parent[hi] = lo
-
     work_ids = {r["id"] for r in ordered}
+    edges: list[tuple[str, str]] = []
     for seed in ordered:
         neighbors, _knn = _gather_neighbors(
             conn, seed, ordered,
@@ -485,17 +497,17 @@ def _cluster_topics(
             restrict_ids=work_ids,
         )
         for nb, _sim in neighbors:
-            if nb["id"] not in parent:
+            if nb["id"] not in work_ids:
                 # Defensive backstop (Claude Code F-001): a neighbor id with no
-                # union-find entry would KeyError in find() below. Restrict_ids
-                # makes this unreachable today — it is a guard, not a path.
+                # episode membership would silently perturb the partition.
+                # Restrict_ids makes this unreachable today — it is a guard,
+                # not a path (and _components_from_edges ignores unknown
+                # endpoints as a second layer).
                 continue
-            union(seed["id"], nb["id"])
+            edges.append((seed["id"], nb["id"]))
 
-    comps: dict[str, list[str]] = {}
-    for r in ordered:
-        comps.setdefault(find(r["id"]), []).append(r["id"])
-    groups = sorted((sorted(m) for m in comps.values()), key=lambda m: (-len(m), m))
+    comps = _components_from_edges([r["id"] for r in ordered], edges)
+    groups = sorted((sorted(m) for m in comps), key=lambda m: (-len(m), m))
 
     topics: list[list[str]] = [g for g in groups if len(g) >= 2]
     singletons = [m for g in groups if len(g) == 1 for m in g]
@@ -810,21 +822,36 @@ def organize(
         if dry_run:
             comp["would_count"] += 1
             continue
-        with _scoped_tx(conn):
-            result_id, created_new = update_memory(
-                conn, mid=mid, content=compressed,
-                tags=keeper["tags"], source_ref=keeper["source_ref"],
-                signal=keeper["signal"], confidence=keeper["confidence"],
-            )
-            if created_new:
-                _copy_merged_from(conn, mid, result_id)
-                comp["count"] += 1
-                print(f"[zmem] organize: compressed keeper {result_id[:8]} "
-                      f"({len(keeper['content'] or '')} -> {len(compressed)} chars)")
-            else:
-                comp["skipped"] += 1
-                print(f"[zmem] organize: compression of {mid[:8]} folded into "
-                      f"{result_id[:8]} (dedup); skipping this run")
+        try:
+            with _scoped_tx(conn):
+                result_id, created_new = update_memory(
+                    conn, mid=mid, content=compressed,
+                    tags=keeper["tags"], source_ref=keeper["source_ref"],
+                    signal=keeper["signal"], confidence=keeper["confidence"],
+                    # Issue #77: synthesized rows declare their policy — auto
+                    # (redact secret-like content, refuse credential-shaped refs)
+                    # rather than inheriting the manual default / ambient env.
+                    capture_mode="auto",
+                )
+                if created_new:
+                    _copy_merged_from(conn, mid, result_id)
+                    comp["count"] += 1
+                    print(f"[zmem] organize: compressed keeper {result_id[:8]} "
+                          f"({len(keeper['content'] or '')} -> {len(compressed)} chars)")
+                else:
+                    comp["skipped"] += 1
+                    print(f"[zmem] organize: compression of {mid[:8]} folded into "
+                          f"{result_id[:8]} (dedup); skipping this run")
+        except (AutoCaptureRuntimeError, CapturePolicyRefusal) as exc:
+            # PRR-001: a user row's inherited provenance can be credential-
+            # shaped or hex/base64-like (manual/advisory adds allow storing
+            # it), and write.py's unredactable-secrets guard raises a bare
+            # RuntimeError. Skip THIS row — one refusal must not abort the
+            # whole organize run.
+            comp["capture_refused"] = comp.get("capture_refused", 0) + 1
+            print(f"[zmem] organize: skipped capture-refused row {mid[:8]}: {exc}",
+                  file=sys.stderr)
+            continue
 
     # --- 8) Topics + summaries over the POST-COMPRESSION live working rows ---
     # live_work re-derives the episode INCLUDING any compression-replacement
@@ -872,56 +899,74 @@ def organize(
                 sm["would_create"] += 1
             continue
         if existing:
-            with _scoped_tx(conn):
-                result_id, created_new = update_memory(
-                    conn, mid=existing["id"], content=bullets, type_="fact",
-                    tags=SUMMARY_TAGS, source_ref=src_ref, signal="none",
-                    confidence=SUMMARY_CONFIDENCE,
-                    # F-004: a summary's tags are a structural marker, not
-                    # content tags — never evolve them onto user neighbors.
-                    link_attr_propagate=False,
-                )
-                if created_new:
-                    # Pin the 7.3 EXACT-tags contract back (capture policy may
-                    # have appended a marker), restore provenance, and retire
-                    # any stale overlapping lineage (F-002 residual guard).
-                    conn.execute(
-                        "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
-                        (SUMMARY_TAGS, topic_key, result_id),
+            try:
+                with _scoped_tx(conn):
+                    result_id, created_new = update_memory(
+                        conn, mid=existing["id"], content=bullets, type_="fact",
+                        tags=SUMMARY_TAGS, source_ref=src_ref, signal="none",
+                        confidence=SUMMARY_CONFIDENCE,
+                        # Issue #77: synthesized summary rows declare auto policy.
+                        capture_mode="auto",
+                        # F-004: a summary's tags are a structural marker, not
+                        # content tags — never evolve them onto user neighbors.
+                        link_attr_propagate=False,
                     )
-                    _supersede_stale_summaries(conn, topic_key, result_id)
-                    sm["updated"] += 1
-                    print(f"[zmem] organize: summary {result_id[:8]} updated for "
-                          f"topic [{topic['members'][0][:8]} (n={len(topic['members'])})]")
-                else:
-                    sm["skipped"] += 1
-                    print(f"[zmem] organize: summary update folded into "
-                          f"{result_id[:8]} (dedup); skipping this run")
+                    if created_new:
+                        # Pin the 7.3 EXACT-tags contract back (capture policy may
+                        # have appended a marker), restore provenance, and retire
+                        # any stale overlapping lineage (F-002 residual guard).
+                        conn.execute(
+                            "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
+                            (SUMMARY_TAGS, topic_key, result_id),
+                        )
+                        _supersede_stale_summaries(conn, topic_key, result_id)
+                        sm["updated"] += 1
+                        print(f"[zmem] organize: summary {result_id[:8]} updated for "
+                              f"topic [{topic['members'][0][:8]} (n={len(topic['members'])})]")
+                    else:
+                        sm["skipped"] += 1
+                        print(f"[zmem] organize: summary update folded into "
+                              f"{result_id[:8]} (dedup); skipping this run")
+            except (AutoCaptureRuntimeError, CapturePolicyRefusal) as exc:
+                # PRR-001: skip this row — one refusal must not abort the run.
+                sm["capture_refused"] = sm.get("capture_refused", 0) + 1
+                print(f"[zmem] organize: skipped capture-refused summary update: {exc}",
+                      file=sys.stderr)
+                continue
         else:
-            with _scoped_tx(conn):
-                new_id = add_memory(
-                    conn, namespace=ns, type_="fact", content=bullets,
-                    tags=SUMMARY_TAGS, source_ref=src_ref, signal="none",
-                    confidence=SUMMARY_CONFIDENCE,
-                    link_attr_propagate=False,
-                )
-                row = conn.execute(
-                    "SELECT content FROM memory WHERE id=?", (new_id,)
-                ).fetchone()
-                if row and row["content"] == bullets:
-                    conn.execute(
-                        "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
-                        (SUMMARY_TAGS, topic_key, new_id),
+            try:
+                with _scoped_tx(conn):
+                    new_id = add_memory(
+                        conn, namespace=ns, type_="fact", content=bullets,
+                        tags=SUMMARY_TAGS, source_ref=src_ref, signal="none",
+                        confidence=SUMMARY_CONFIDENCE,
+                        # Issue #77: synthesized summary rows declare auto policy.
+                        capture_mode="auto",
+                        link_attr_propagate=False,
                     )
-                    _supersede_stale_summaries(conn, topic_key, new_id)
-                    sm["created"] += 1
-                    print(f"[zmem] organize: summary {new_id[:8]} created for "
-                          f"topic [{topic['members'][0][:8]} (n={len(topic['members'])})] "
-                          f"in ns={ns or 'user:global'}")
-                else:
-                    sm["skipped"] += 1
-                    print(f"[zmem] organize: summary create folded into "
-                          f"{new_id[:8]} (dedup); skipping this run")
+                    row = conn.execute(
+                        "SELECT content FROM memory WHERE id=?", (new_id,)
+                    ).fetchone()
+                    if row and row["content"] == bullets:
+                        conn.execute(
+                            "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
+                            (SUMMARY_TAGS, topic_key, new_id),
+                        )
+                        _supersede_stale_summaries(conn, topic_key, new_id)
+                        sm["created"] += 1
+                        print(f"[zmem] organize: summary {new_id[:8]} created for "
+                              f"topic [{topic['members'][0][:8]} (n={len(topic['members'])})] "
+                              f"in ns={ns or 'user:global'}")
+                    else:
+                        sm["skipped"] += 1
+                        print(f"[zmem] organize: summary create folded into "
+                              f"{new_id[:8]} (dedup); skipping this run")
+            except (AutoCaptureRuntimeError, CapturePolicyRefusal) as exc:
+                # PRR-001: skip this row — one refusal must not abort the run.
+                sm["capture_refused"] = sm.get("capture_refused", 0) + 1
+                print(f"[zmem] organize: skipped capture-refused summary create: {exc}",
+                      file=sys.stderr)
+                continue
 
     # --- 9) Human-readable summary (all JSON goes via the CLI's --json path) ---
     if dry_run:

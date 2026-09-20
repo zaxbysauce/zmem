@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -793,6 +793,182 @@ class NliJudgeExtensionTest(unittest.TestCase):
         self.assertEqual(report["merged"], 2, report)
         self.assertEqual(len(report["contested_clusters"]), 1)
         self.assertTrue(report["contested_clusters"][0]["merged"])
+
+
+    def test_nli_call_budget_stops_pair_loop(self):
+        """Issue #77: ZMEM_NLI_MAX_CALLS=1 stops the flagged-pair loop after
+        one judge invocation and leaves the contested cluster unmerged."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        _add_raw(self.mod, self.conn, MIX_C, 0.8)
+        cmd = _write_seq_judge(self.tmp_path, "budget1", ["entailment"])
+        env = {"ZMEM_NLI_CMD": cmd, "ZMEM_NLI_MAX_CALLS": "1"}
+        buf = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf), redirect_stderr(err):
+                report = self.mod.consolidate(self.conn, force=True)
+        self.assertEqual(_seq_judge_calls(self.tmp_path, "budget1"), 1)  # PRR-009: exactly one call
+        self.assertEqual(report["merged"], 0, report)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        live = self.conn.execute(
+            "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
+        ).fetchone()[0]
+        self.assertEqual(live, 3)
+        self.assertIn("budget exhausted", err.getvalue())
+
+    def test_nli_call_budget_invalid_value_falls_back_to_default(self):
+        """Issue #77: ZMEM_NLI_MAX_CALLS=not-an-integer falls back to
+        NLI_DEFAULT_MAX_CALLS=64 — the judge still runs (no accidental
+        zero-cap), the constants exist with the contract values, and the
+        all-entailment cluster merges exactly as without the knob."""
+        self.assertEqual(self.mod.NLI_DEFAULT_MAX_CALLS, 64)
+        self.assertEqual(self.mod.NLI_DEFAULT_MAX_SECONDS, 30.0)
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        _add_raw(self.mod, self.conn, MIX_C, 0.8)
+        cmd = _write_seq_judge(self.tmp_path, "budgetbad", ["entailment"])
+        env = {"ZMEM_NLI_CMD": cmd, "ZMEM_NLI_MAX_CALLS": "not-an-integer"}
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf):
+                report = self.mod.consolidate(self.conn, force=True)
+        self.assertGreaterEqual(_seq_judge_calls(self.tmp_path, "budgetbad"), 2)
+        self.assertEqual(report["merged"], 2, report)
+
+    def test_nli_time_budget_uses_fake_clock(self):
+        """Issue #77: the injected clock drives the run-wide time budget — a
+        clock past the deadline denies every judge call and the cluster parks
+        with the time-limit reason on stderr."""
+        _add_raw(self.mod, self.conn, POS, 0.9)
+        _add_raw(self.mod, self.conn, NEG, 0.9)
+        _add_raw(self.mod, self.conn, MIX_C, 0.8)
+        cmd = _write_seq_judge(self.tmp_path, "timebudget", ["entailment"])
+        env = {"ZMEM_NLI_CMD": cmd}
+        fake_now = [0.0]
+
+        def fake_clock():
+            fake_now[0] += 1000.0
+            return fake_now[0]
+
+        buf = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch.object(self.mod.time, "monotonic", fake_clock):
+                with redirect_stdout(buf), redirect_stderr(err):
+                    report = self.mod.consolidate(self.conn, force=True)
+        self.assertEqual(_seq_judge_calls(self.tmp_path, "timebudget"), 0)
+        self.assertEqual(report["merged"], 0, report)
+        self.assertEqual(len(report["contested_clusters"]), 1)
+        self.assertFalse(report["contested_clusters"][0]["merged"])
+        self.assertIn("time limit", err.getvalue())
+
+    def test_nli_budget_warning_emitted_once_per_run(self):
+        """Issue #77 (final-critic round): the exhaustion warning is ONE PER
+        consolidate() RUN — a run-wide budget shared across several contested
+        clusters prints the reason exactly once, and every post-exhaustion
+        cluster stays parked even under --merge-contested."""
+        clusters = []
+        for i, ns in enumerate(("project:budget-warn-1",
+                                "project:budget-warn-2",
+                                "project:budget-warn-3")):
+            pos_id = _add_raw(self.mod, self.conn,
+                              POS + f" variant {i}", 0.9, namespace=ns)
+            neg_id = _add_raw(self.mod, self.conn,
+                              NEG + f" variant {i}", 0.9, namespace=ns)
+            clusters.append((ns, pos_id, neg_id))
+        cmd = _write_seq_judge(self.tmp_path, "warnonce", ["entailment"])
+        env = {"ZMEM_NLI_CMD": cmd, "ZMEM_NLI_MAX_CALLS": "1"}
+        buf = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf), redirect_stderr(err):
+                report = self.mod.consolidate(self.conn, force=True,
+                                              merge_contested=True)
+        self.assertEqual(err.getvalue().count("budget exhausted"), 1,
+                         f"warning must be once per run; stderr={err.getvalue()!r}")
+        # PRR-002: budget-denied parks are id-only on stdout — no content
+        # previews (the 'neg:'/'pos:' content listing is reserved for genuine
+        # contested parks where the judge ran out of budget was NOT the cause).
+        self.assertNotIn("always run migrations before deploy", buf.getvalue())
+        self.assertNotIn("never run migrations before deploy", buf.getvalue())
+        self.assertIn("NLI judge budget exhausted", buf.getvalue())
+        # Exactly ONE cluster gets the single budgeted call (entailment ->
+        # merged); the other two are denied by the exhausted budget and stay
+        # parked despite --merge-contested. WHICH cluster merges depends on
+        # consolidate's row ordering, so assert the aggregate shape: one
+        # merged entry, two parked entries, and within every cluster both
+        # members share the same fate (merged cluster: one absorbed; parked
+        # clusters: both live).
+        merged = [c for c in report["contested_clusters"] if c["merged"]]
+        parked = [c for c in report["contested_clusters"] if not c["merged"]]
+        self.assertEqual(len(merged), 1, report)
+        self.assertEqual(len(parked), 2, report)
+        absorbed = [mid for ns, pos_id, neg_id in clusters
+                    for mid in (pos_id, neg_id)
+                    if _live_rows(self.conn, mid)[mid] is not None]
+        self.assertEqual(len(absorbed), 1,
+                         "exactly the merged cluster's absorbed member is "
+                         "superseded; parked clusters keep both members live")
+
+    def test_nli_diagnostics_contain_ids_not_content(self):
+        """Issue #77: judge diagnostics carry member ids, pair indexes, and
+        the verdict — never member content, on either stream."""
+        pos_id = _add_raw(self.mod, self.conn,
+                          "release train always deploys after staging canary "
+                          "passes checks NLI_SECRET_7f2b", 0.9)
+        neg_id = _add_raw(self.mod, self.conn,
+                          "release train never deploys after staging canary "
+                          "passes checks", 0.9)
+        cmd = _write_judge(self.tmp_path, "entailment")
+        env = {"ZMEM_NLI_CMD": cmd}
+        buf = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf), redirect_stderr(err):
+                report = self.mod.consolidate(self.conn, force=True)
+        out = buf.getvalue()
+        self.assertEqual(report["merged"], 1, report)
+        self.assertNotIn("always deploys after the staging", out)
+        self.assertNotIn("never deploys after the staging", out)
+        self.assertNotIn("NLI_SECRET_7f2b", out)
+        self.assertNotIn("NLI_SECRET_7f2b", err.getvalue())
+        self.assertIn(pos_id, out)
+        self.assertIn(neg_id, out)
+        self.assertIn("pair 0", out)
+        # PRR-006: the committed nli-sensitive fixture drives the same
+        # matcher — its secret-like rows must appear by ID only, and the
+        # expected-ids/content-present contract must hold.
+        fixture = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "consolidate"
+             / "nli-sensitive.json").read_text(encoding="utf-8"))
+        expected = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "consolidate"
+             / "nli-sensitive.expected.json").read_text(encoding="utf-8"))
+        self.assertEqual(expected["content_present"], False)
+        import importlib as _ii
+        _cmod = _ii.import_module("storelib.consolidate")
+        fx_members = [
+            (fixture["left"]["id"], fixture["left"]["text"],
+             _cmod._polarity_signature(fixture["left"]["text"])),
+            (fixture["right"]["id"], fixture["right"]["text"],
+             _cmod._polarity_signature(fixture["right"]["text"])),
+        ]
+        if fx_members[0][2] == fx_members[1][2]:
+            flipped = "never " + fx_members[1][1]
+            fx_members[1] = (fx_members[1][0], flipped,
+                             _cmod._polarity_signature(flipped))
+        buf2, err2 = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf2), redirect_stderr(err2):
+                fx_verdict = _cmod._nli_judge_all_entail(fx_members)
+        fx_out = buf2.getvalue() + err2.getvalue()
+        self.assertEqual(fx_verdict, True)
+        for mid in expected["expected_ids"]:
+            self.assertIn(mid, fx_out)
+        self.assertNotIn("NLI_SECRET_LEFT_7f2b", fx_out)
+        self.assertNotIn("NLI_SECRET_RIGHT_91ac", fx_out)
 
 
 class ConsolidatedIdsGrowthTest(unittest.TestCase):

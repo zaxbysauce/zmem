@@ -103,6 +103,13 @@ jobs:
         run: |
           set -e
           for f in tests/test_*.py; do
+            # Issue #77: the sqlite-vec smoke test has NO skip guard — it needs
+            # the embedding requirements and is exercised by the dedicated
+            # test-embeddings job, not this model-absent loop.
+            if [ "$f" = "tests/test_embeddings_ci.py" ]; then
+              echo "=== $f (skipped here: dependency-enforcing smoke test runs in test-embeddings) ==="
+              continue
+            fi
             echo "=== $f ==="
             python "$f"
           done
@@ -229,3 +236,48 @@ jobs:
             echo "=== $f ==="
             node "$f"
           done
+
+  # Issue #77: dependency-enforcing vector lane. This job installs the
+  # embedding requirements (sqlite-vec included) and runs the NON-SKIPPING
+  # smoke test, so a missing or broken vector dependency fails CI instead of
+  # silently degrading to FTS5-only recall. The model-absent `test` job
+  # excludes tests/test_embeddings_ci.py from its loop for the same reason.
+  test-embeddings:
+    name: test-embeddings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    env:
+      # No model download here either — the smoke test uses the deterministic
+      # fake profile embedder, so this lane proves the sqlite-vec dependency,
+      # not the ONNX model.
+      ZMEM_MODEL_AUTODOWNLOAD: "0"
+      ZMEM_EMBED_PROFILE: "fake"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install embedding requirements (declares sqlite-vec)
+        shell: bash
+        run: python -m pip install --disable-pip-version-check -r hermes-plugin/server/requirements-embeddings.txt
+      - name: Run sqlite-vec / fake-profile smoke test (no skip)
+        shell: bash
+        run: |
+          set -e
+          python -m unittest -v tests/test_embeddings_ci.py
+      - name: Run vec-gated suites under sqlite-vec (issue #77)
+        # These suites hand-craft minilm-shaped (384-dim) vectors, so they
+        # need the DEFAULT embed profile's column dimension — the job-level
+        # ZMEM_EMBED_PROFILE=fake (16-dim) is scoped to the smoke step above.
+        env:
+          ZMEM_EMBED_PROFILE: ""
+        shell: bash
+        run: |
+          set -e
+          python -m unittest -v tests/test_consolidate_namespace.py tests/test_consolidate_contested.py tests/test_reembed.py

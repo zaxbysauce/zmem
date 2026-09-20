@@ -603,6 +603,166 @@ class OrganizeIntegrationTest(unittest.TestCase):
             mod._release_lock("consolidate", token)
 
 
+    def test_components_helper_is_shared(self):
+        """Issue #77: _entity_groups and _cluster_topics both route their
+        partition through _components_from_edges — the module must carry
+        exactly one union-find implementation."""
+        import inspect
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import importlib as _ii
+        mod = _ii.import_module("storelib.organize")
+        self.assertTrue(hasattr(mod, "_components_from_edges"))
+        for fn in (mod._entity_groups, mod._cluster_topics):
+            src = inspect.getsource(fn)
+            self.assertIn("_components_from_edges(", src,
+                          f"{fn.__name__} must call the shared helper")
+            self.assertNotIn("def find(", src,
+                             f"{fn.__name__} still carries a private union-find")
+        helper_src = inspect.getsource(mod._components_from_edges)
+        self.assertIn("def find(", helper_src)
+
+    def test_organize_writes_auto_capture_mode(self):
+        """Issue #77: every organize-generated write (compression update,
+        summary update, summary add) declares capture_mode='auto'."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import importlib as _ii
+        from storelib.organize import organize as _organize
+        organize_mod = _ii.import_module("storelib.organize")
+        tmp = tempfile.mkdtemp(prefix="zmem-organize-77-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        # Save/restore the env pin: storelib freezes STORE_PATH at first
+        # import and a leaked pin would redirect SIBLING subprocess tests
+        # whose setUp copies os.environ (observed as class-order failures).
+        saved = {k: os.environ.get(k) for k in
+                 ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+                  "ZMEM_MODEL_AUTODOWNLOAD")}
+        self.addCleanup(lambda: [os.environ.pop(k, None) if v is None
+                                 else os.environ.__setitem__(k, v)
+                                 for k, v in saved.items()])
+        os.environ["ZMEM_STORE"] = os.path.join(tmp, "store.sqlite")
+        os.environ["ZMEM_DATA"] = tmp
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(tmp, "no-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        # Purge any storelib modules an earlier in-process test cached with
+        # ITS env — a cached package froze the wrong STORE_PATH and my seeds
+        # silently landed elsewhere (0 writer calls, class-run-only failure).
+        for name in [n for n in sys.modules if n == "storelib"
+                     or n.startswith("storelib.")]:
+            del sys.modules[name]
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import storelib
+        from storelib.schema import connect, init_db, migrate
+        from storelib.write import add_memory as real_add, update_memory as real_upd
+        from storelib.organize import organize as _organize
+        organize_mod = sys.modules["storelib.organize"]
+        conn = connect()
+        init_db(conn)
+        migrate(conn)
+        # Low compress knob so the long keeper row definitely triggers the
+        # compression update (default is 4000 — nothing shorter would fire).
+        os.environ["ZMEM_KEEPER_COMPRESS_CHARS"] = "120"
+        saved["ZMEM_KEEPER_COMPRESS_CHARS"] = None
+        NS77 = "project:organize-77"
+        # Three rows sharing the Atlas entity with mutually-DISSIMILAR content
+        # (house shaping from test_summary_created_for_entity_*): similarity
+        # far below the lexical merge threshold, so consolidate (which runs
+        # inside organize) cannot absorb them and the entity topic keeps all
+        # three members — enough for a summary row.
+        for content in ("Atlas boot pins the kernel before any fleet upgrade",
+                        "Atlas maintenance timeouts page the on-call engineer",
+                        "Atlas backup window opens on the first weekend monthly"):
+            storelib.write.add_memory(
+                conn, namespace=NS77, type_="fact", confidence=0.6,
+                content=content)
+        # One over-long keeper row so the compression pass also fires.
+        storelib.write.add_memory(
+            conn, namespace=NS77, type_="fact", confidence=0.95,
+            content=("Compression candidate row with a long body that the "
+                     "organize compression pass must truncate. " * 8).strip(),
+            source_ref="user:long-row")
+        recorded = []
+
+        def wrap(real):
+            def inner(conn_arg, *a, **kw):
+                recorded.append(kw.get("capture_mode"))
+                return real(conn_arg, *a, **kw)
+            return inner
+
+        with mock.patch.object(organize_mod, "add_memory", wrap(real_add)), \
+                mock.patch.object(organize_mod, "update_memory", wrap(real_upd)):
+            _organize(conn, force=True)
+        self.assertGreaterEqual(len(recorded), 1,
+                                "organize must have invoked a writer")
+        for mode in recorded:
+            self.assertEqual(mode, "auto",
+                             f"organize write recorded capture_mode={mode!r}")
+
+    def test_reserved_source_ref_warning_is_non_mutating(self):
+        """Issue #77: the CLI warns on a reserved `organize:` source_ref,
+        still writes the row, keeps the warning off stdout, and a missing
+        source_ref stays silent."""
+        r = self._run("add", "--namespace", NS, "--type", "fact",
+                      "--content", "forged structural row probe",
+                      "--source-ref", "organize:forged-topic")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        warning = ("[zmem] WARNING: source_ref prefix organize: is reserved "
+                   "for organize summaries")
+        self.assertIn(warning, r.stderr)
+        self.assertNotIn(warning, r.stdout)
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT superseded_at FROM memory WHERE source_ref=?",
+                ("organize:forged-topic",)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[0])
+        quiet = self._run("add", "--namespace", NS, "--type", "fact",
+                          "--content", "plain row without source ref")
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertNotIn("reserved", quiet.stderr)
+
+    def test_capture_refused_row_skips_not_aborts(self):
+        """PRR-001: a keeper whose inherited source_ref trips the auto
+        capture-policy refusal is SKIPPED (stderr line + run completes with
+        exit 0), never aborting organize with a traceback."""
+        long_body = ("the deploy gateway rotates its staging credentials on "
+                     "a schedule that the pipeline enforces before every "
+                     "merge to the protected release branch")
+        # Two near-duplicate long rows: the AKIA-ref row wins the keeper rule
+        # (higher confidence), consolidate absorbs the other into it, and the
+        # grown keeper then exceeds the compression threshold — so the
+        # compression write inherits the credential-shaped source_ref under
+        # capture_mode="auto" and _apply_capture_policy refuses it.
+        self._add(long_body + " alpha variant", confidence="0.95")
+        self._add(long_body + " beta variant", confidence="0.6")
+        c = self._conn()
+        try:
+            c.execute("UPDATE memory SET source_ref=? WHERE content LIKE ?",
+                      ("AKIAIOSFODNN7EXAMPLE", "%alpha variant%"))
+            c.commit()
+        finally:
+            c.close()
+        r = self._run("organize", "--force",
+                      env_extra={"ZMEM_KEEPER_COMPRESS_CHARS": "40"})
+        self.assertEqual(r.returncode, 0,
+                         f"organize must not abort on a capture refusal; "
+                         f"stderr tail={r.stderr[-400:]!r}")
+        self.assertIn("capture-refused", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        # The refusing row stays live and untouched (fail-closed, not deleted).
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT superseded_at FROM memory WHERE "
+                "source_ref='AKIAIOSFODNN7EXAMPLE'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[0])
+
+
 class OrganizeFoldGuardTest(unittest.TestCase):
     """Issue #62, 7.3/7.4 fold guards: when update_memory/add_memory FOLDS the
     new row into a dedup target (created_new=False), organize must log + skip

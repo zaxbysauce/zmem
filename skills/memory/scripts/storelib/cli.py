@@ -46,13 +46,22 @@ from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import reembed_embeddings
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
-from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory
+from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory, warn_reserved_source_ref
 from storelib.tune import tune_weights
 from storelib import ops_tokens as _ops_tokens
 from storelib.query_ambiguity import (
     rewrite_ambiguous_query,
     read_recent_edit_basenames,
 )
+
+
+def _warn_reserved_source_ref(source_ref: str | None) -> None:
+    """Issue #77: warn (stderr only) when a caller manually writes the
+    reserved `organize:` structural source_ref prefix. Never rejects the
+    write, never touches stdout (JSON parseability is a contract). The
+    canonical message bytes live in storelib.write so the CLI paths and the
+    JSONL ingest row loop cannot drift apart."""
+    warn_reserved_source_ref(source_ref)
 
 
 # ---------------------------------------------------------------------------
@@ -2321,6 +2330,7 @@ def main():
                 else:
                     _human_out = None
                 try:
+                    _warn_reserved_source_ref(args.source_ref)
                     res = add_memory(
                         conn,
                         namespace=args.namespace,
@@ -2384,6 +2394,7 @@ def main():
                 else:
                     _human_out = None
                 try:
+                    _warn_reserved_source_ref(args.source_ref)
                     res, created_new = update_memory(
                         conn,
                         mid=args.id,
@@ -2899,6 +2910,7 @@ def main():
             )
             sys.exit(rc)
         elif args.cmd == "ingest-jsonl":
+            _warn_reserved_source_ref(args.source_ref)
             ingest = cmd_ingest_jsonl_strict if args.strict else cmd_ingest_jsonl
             rc = ingest(conn, in_path=args.in_path, source_ref=args.source_ref,
                         allow_tombstones=args.allow_tombstones,
