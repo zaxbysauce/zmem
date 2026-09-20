@@ -1176,5 +1176,182 @@ class ReplaySchemaTest(unittest.TestCase):
             self.assertEqual(counts["miss"], 0)
 
 
+class ActionMatcherTest(unittest.TestCase):
+    """Issue #156 matcher contract: classification, window, overlap, selection.
+
+    These tests call ``match_observational_actions`` directly with the
+    committed fixture rows (or inline rows) and perform no store access.
+    """
+
+    @staticmethod
+    def _module():
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("eval_replay_actions", EVALUATOR)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _fixture_rows():
+        payload = json.loads((FIXTURES / "actions.json").read_text(encoding="utf-8"))
+        return payload["delivered_rows"], payload["evidence_rows"]
+
+    @staticmethod
+    def _result_for(results, suffix):
+        hits = [row for row in results if row["delivered_id"].endswith(suffix)]
+        assert len(hits) == 1, f"expected exactly one row ending {suffix}, got {hits}"
+        return hits[0]
+
+    def test_success_is_applied(self):
+        module = self._module()
+        delivered, evidence = self._fixture_rows()
+        results = module.match_observational_actions(delivered, evidence)
+        row = self._result_for(results, "0101")
+        self.assertEqual(row["action"], "applied")
+        self.assertEqual(row["event_kind"], "success")
+        self.assertEqual(row["elapsed_s"], 60.0)
+        self.assertEqual(row["overlap_count"], 3)
+        self.assertEqual(
+            sorted(row.keys()),
+            ["action", "delivered_id", "elapsed_s", "event_kind", "overlap_count", "session_id"],
+        )
+
+    def test_failure_is_violated(self):
+        module = self._module()
+        delivered, evidence = self._fixture_rows()
+        row = self._result_for(module.match_observational_actions(delivered, evidence), "0102")
+        self.assertEqual(row["action"], "violated")
+        self.assertEqual(row["event_kind"], "failure")
+        self.assertEqual(row["elapsed_s"], 60.0)
+
+    def test_unrelated_operation_is_ignored(self):
+        module = self._module()
+        delivered, evidence = self._fixture_rows()
+        row = self._result_for(module.match_observational_actions(delivered, evidence), "0103")
+        self.assertEqual(row["action"], "ignored")
+        self.assertIsNone(row["event_kind"])
+        self.assertIsNone(row["elapsed_s"])
+        self.assertEqual(row["overlap_count"], 0)
+
+    def test_event_outside_window_is_ignored(self):
+        module = self._module()
+        self.assertEqual(module.ZMEM_MATCH_WINDOW_S, 1800)
+        self.assertEqual(module.ZMEM_MATCH_MIN_OVERLAP, 2)
+        delivered, evidence = self._fixture_rows()
+        row = self._result_for(module.match_observational_actions(delivered, evidence), "0104")
+        self.assertEqual(row["action"], "ignored")
+        self.assertIsNone(row["event_kind"])
+        self.assertIsNone(row["elapsed_s"])
+        self.assertEqual(row["overlap_count"], 0)
+
+    def test_first_matching_event_wins(self):
+        module = self._module()
+        base = {"id": "d0000000-0000-4000-8000-000000000d01", "session_id": "s-order",
+                "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"}
+        late = {"session_id": "s-order", "timestamp": "2026-06-01T00:02:00Z",
+                "event_kind": "failure", "operation": "git stash pop"}
+        early = {"session_id": "s-order", "timestamp": "2026-06-01T00:01:00Z",
+                 "event_kind": "success", "operation": "git stash pop"}
+        row = self._result_for(module.match_observational_actions([base], [late, early]), "0d01")
+        self.assertEqual(row["elapsed_s"], 60.0)
+        self.assertEqual(row["event_kind"], "success")
+        tie_a = {"session_id": "s-tie", "timestamp": "2026-06-01T00:01:00Z",
+                 "event_kind": "failure", "operation": "git stash pop"}
+        tie_b = {"session_id": "s-tie", "timestamp": "2026-06-01T00:01:00Z",
+                 "event_kind": "success", "operation": "git stash pop"}
+        tie_base = {"id": "d0000000-0000-4000-8000-000000000d02", "session_id": "s-tie",
+                    "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"}
+        tie_row = self._result_for(module.match_observational_actions([tie_base], [tie_a, tie_b]), "0d02")
+        self.assertEqual(tie_row["event_kind"], "failure")
+        single = module.match_observational_actions(
+            [base],
+            [{"session_id": "s-order", "timestamp": "2026-06-01T00:01:00Z",
+              "event_kind": "success", "operation": "git check"}],
+        )
+        self.assertEqual(single[0]["action"], "ignored")
+        before = module.match_observational_actions(
+            [base],
+            [{"session_id": "s-order", "timestamp": "2026-05-31T23:00:00Z",
+              "event_kind": "success", "operation": "git stash pop"}],
+        )
+        self.assertEqual(before[0]["action"], "ignored")
+
+    def test_invalid_evidence_fails_closed(self):
+        store = FIXTURES / "store.sqlite"
+        before = hashlib.sha256(store.read_bytes()).hexdigest()
+        payload = json.loads((FIXTURES / "actions.json").read_text(encoding="utf-8"))
+        for missing in ("session_id", "timestamp", "event_kind", "operation"):
+            with tempfile.TemporaryDirectory(prefix="zmem-actions-invalid-") as raw:
+                scratch = Path(raw)
+                broken = json.loads(json.dumps(payload))
+                del broken["evidence_rows"][0][missing]
+                broken_path = scratch / "broken-actions.json"
+                broken_path.write_text(json.dumps(broken), encoding="utf-8")
+                out_path = scratch / "malformed-report.json"
+                run = subprocess.run(
+                    [PYTHON, str(EVALUATOR),
+                     "--store", str(store), "--log", str(FIXTURES / "decisions.log"),
+                     "--days", "30", "--actions", "--actions-input", str(broken_path),
+                     "--json-out", str(out_path)],
+                    cwd=str(ROOT), env=_env(scratch),
+                    capture_output=True, text=True, timeout=120,
+                )
+                self.assertEqual(run.returncode, 2, f"missing {missing}: {run.stderr}")
+                combined = (run.stderr or "") + (run.stdout or "")
+                self.assertIn("evidence row 0", combined, f"missing {missing}: {combined}")
+                self.assertIn(missing, combined)
+                self.assertFalse(out_path.exists(), "malformed run must not write --json-out")
+        self.assertEqual(hashlib.sha256(store.read_bytes()).hexdigest(), before)
+
+
+class ReplayReportTest(unittest.TestCase):
+    """Issue #156 report contract: byte-identical action output, read-only run.
+
+    "No test file is deleted" is enforced by review/diff scope, not by a
+    runtime probe here.
+    """
+
+    def test_actions_output_matches_expected(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-report-") as raw:
+            scratch = Path(raw)
+            out_path = scratch / "actions.json"
+            run = subprocess.run(
+                [PYTHON, str(EVALUATOR),
+                 "--store", str(FIXTURES / "store.sqlite"),
+                 "--log", str(FIXTURES / "decisions.log"),
+                 "--days", "30", "--actions",
+                 "--actions-input", str(FIXTURES / "actions.json"),
+                 "--json-out", str(out_path)],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(
+                out_path.read_bytes(),
+                (FIXTURES / "actions-expected.json").read_bytes(),
+            )
+
+    def test_actions_preserves_store_sha(self):
+        store = FIXTURES / "store.sqlite"
+        before = hashlib.sha256(store.read_bytes()).hexdigest()
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-sha-") as raw:
+            scratch = Path(raw)
+            run = subprocess.run(
+                [PYTHON, str(EVALUATOR),
+                 "--store", str(store), "--log", str(FIXTURES / "decisions.log"),
+                 "--days", "30", "--actions",
+                 "--actions-input", str(FIXTURES / "actions.json"),
+                 "--json-out", str(scratch / "actions.json")],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(hashlib.sha256(store.read_bytes()).hexdigest(), before)
+        report = json.loads((FIXTURES / "actions-expected.json").read_text(encoding="utf-8"))
+        self.assertNotIn("applied_count", json.dumps(report))
+        self.assertNotIn("violated_count", json.dumps(report))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

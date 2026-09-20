@@ -10,6 +10,24 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.55.0] - 2026-09-20
+
+### Added
+- **Observational action matching, `--actions` mode (issue #156)**: the
+  read-only replay evaluator gains a report-only `--actions --actions-input
+  PATH` mode. For each delivered row it selects the first later same-session
+  evidence event inside the fixed `ZMEM_MATCH_WINDOW_S = 1800` second window
+  whose `derive_ops_tokens` normalization shares at least
+  `ZMEM_MATCH_MIN_OVERLAP = 2` tokens with the delivered trigger, and
+  classifies the row `applied` (success), `violated` (failure), or `ignored`
+  (no qualifying event). The mode writes no counter, opens no write
+  transaction, and leaves store bytes unchanged; the default report is
+  byte-identical when the flag is absent. Adds the deterministic oracle pair
+  `tests/fixtures/replay/actions.json` / `actions-expected.json` with the
+  refuse-on-drift generator `tests/fixtures/replay/generate_actions.py`,
+  eight pinned tests (`ActionMatcherTest`, `ReplayReportTest`), and
+  documentation of the report-only boundary in README and the memory skill.
+
 ## [0.54.0] - 2026-09-20
 
 ### Added

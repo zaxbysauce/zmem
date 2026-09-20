@@ -214,6 +214,25 @@ zero compatibility values; those zeroes are not measured success, failure, or
 live efficacy. See [`tests/fixtures/replay/README.md`](tests/fixtures/replay/README.md)
 for the fixture and two-build reproducibility contract.
 
+Observational action matching (issue #156) is a report-only `--actions` mode
+on the same evaluator. Pass `--actions --actions-input PATH`, where the input
+is an explicit JSON file of recorded `delivered_rows` and `evidence_rows`
+(each row carries `session_id`, `timestamp`, and `operation`; evidence rows
+add `event_kind`). For each delivered row the matcher selects the first later
+same-session evidence event inside the fixed `ZMEM_MATCH_WINDOW_S = 1800`
+second window whose `derive_ops_tokens` normalization shares at least
+`ZMEM_MATCH_MIN_OVERLAP = 2` tokens with the delivered trigger, and classifies
+it `applied` (success), `violated` (failure), or `ignored` (no qualifying
+event). Both constants are fixed — there are no environment overrides — and
+the report records them next to the sorted `results`. The mode is strictly
+observational: it writes no action counter, opens no write transaction, and
+leaves the store bytes unchanged; durable usefulness counters belong to
+issue #124. The committed oracle pair
+`tests/fixtures/replay/actions.json` / `actions-expected.json` is generated
+only by `tests/fixtures/replay/generate_actions.py`, which refuses to replace
+committed bytes on drift. Malformed rows or non-UTC timestamps exit 2 before
+any output file is written.
+
 The predeclared private real-corpus measurement of record (issue #155) is
 committed at [`eval/real-corpus-2026-09-19.json`](eval/real-corpus-2026-09-19.json).
 It was produced by replaying a cohort frozen at declaration time — a standalone

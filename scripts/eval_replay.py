@@ -64,6 +64,15 @@ MAX_TRANSCRIPT_LINES = 100_000
 # separate, smaller limits above).
 MAX_STORE_BYTES = 512 * 1024 * 1024
 MAX_LOG_BYTES = 64 * 1024 * 1024
+# Observational action matching (issue #156). The window and overlap are a
+# fixed contract, deliberately not environment-overridable: the report
+# records both values so a consumer can identify the matching contract from
+# the output alone.
+ZMEM_MATCH_WINDOW_S = 1800
+ZMEM_MATCH_MIN_OVERLAP = 2
+MAX_ACTIONS_BYTES = 4 * 1024 * 1024
+_ACTIONS_DELIVERED_FIELDS = ("id", "session_id", "timestamp", "operation")
+_ACTIONS_EVIDENCE_FIELDS = ("session_id", "timestamp", "event_kind", "operation")
 
 
 class ReplayError(ValueError):
@@ -898,6 +907,10 @@ def _json_bytes(report: dict) -> bytes:
     return (json.dumps(report, ensure_ascii=False, indent=2, separators=(",", ": ")) + "\n").encode("utf-8")
 
 
+def _json_bytes_sorted(report: dict) -> bytes:
+    return (json.dumps(report, ensure_ascii=False, indent=2, separators=(",", ": "), sort_keys=True) + "\n").encode("utf-8")
+
+
 def _write_atomic(path: Path, data: bytes) -> None:
     if path.parent and not path.parent.is_dir():
         raise ReplayError("replay: --json-out parent directory does not exist\n")
@@ -949,6 +962,148 @@ def _check_baseline(report: dict, baseline_path: Path, thresholds: dict[str, flo
     return False
 
 
+def _parse_action_instant(raw: object, *, kind: str, index: int) -> datetime:
+    """Strictly parse one action-row timestamp into a UTC instant.
+
+    Unlike the lenient log parser, action rows reject naive timestamps and
+    non-UTC offsets: the matcher compares instants, so a silent local-time
+    assumption would misplace the window boundary.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ReplayError(f"replay: actions-input {kind} row {index}: invalid timestamp\n")
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ReplayError(f"replay: actions-input {kind} row {index}: invalid timestamp\n") from exc
+    if moment.tzinfo is None or moment.utcoffset() != timezone.utc.utcoffset(None):
+        raise ReplayError(f"replay: actions-input {kind} row {index}: timestamp must be UTC\n")
+    return moment
+
+
+def _validated_action_rows(rows: object, *, kind: str) -> list[dict]:
+    if not isinstance(rows, list):
+        raise ReplayError(f"replay: actions-input {kind}_rows must be a list\n")
+    fields = _ACTIONS_DELIVERED_FIELDS if kind == "delivered" else _ACTIONS_EVIDENCE_FIELDS
+    validated: list[dict] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ReplayError(f"replay: actions-input {kind} row {index}: must be an object\n")
+        for name in fields:
+            if name not in row:
+                raise ReplayError(f"replay: actions-input {kind} row {index}: missing field '{name}'\n")
+            if not isinstance(row[name], str) or not row[name].strip():
+                raise ReplayError(f"replay: actions-input {kind} row {index}: field '{name}' must be a non-empty string\n")
+        validated.append({
+            "id": row.get("id"),
+            "session_id": row["session_id"],
+            "event_kind": row.get("event_kind"),
+            "operation": row["operation"],
+            "instant": _parse_action_instant(row["timestamp"], kind=kind, index=index),
+            "order": index,
+        })
+    return validated
+
+
+def _load_action_rows(path: Path) -> tuple[list[dict], list[dict]]:
+    """Load and structurally validate the recorded action observation rows."""
+    payload = json.loads(_read_bounded(path, "actions input", MAX_ACTIONS_BYTES).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ReplayError("replay: actions-input must be a JSON object\n")
+    for key in ("delivered_rows", "evidence_rows"):
+        if key not in payload:
+            raise ReplayError(f"replay: actions-input missing '{key}'\n")
+    return payload["delivered_rows"], payload["evidence_rows"]
+
+
+def _derive_ops_tokens():
+    saved = sys.path[:]
+    try:
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib.ops_tokens import derive_ops_tokens  # type: ignore[import-not-found]
+        return derive_ops_tokens
+    except Exception as exc:
+        raise ReplayError(f"replay: cannot import ops tokenizer: {type(exc).__name__}\n") from exc
+    finally:
+        sys.path[:] = saved
+
+
+def match_observational_actions(
+    delivered_rows: list[dict],
+    evidence_rows: list[dict],
+    *,
+    window_s: int = ZMEM_MATCH_WINDOW_S,
+    min_overlap: int = ZMEM_MATCH_MIN_OVERLAP,
+) -> list[dict]:
+    """Classify each delivered row by the first later same-session evidence event.
+
+    Report-only by contract (issue #156): this function never opens a store,
+    writes a counter, or mutates a delivery ledger. A matching event is the
+    earliest same-session evidence strictly after the delivered timestamp and
+    within ``window_s`` whose ``derive_ops_tokens`` normalization shares at
+    least ``min_overlap`` tokens with the delivered operation; original
+    evidence order breaks equal-timestamp ties. ``success`` maps to
+    ``applied``, ``failure`` to ``violated``, and everything else (including
+    no match) to ``ignored``.
+    """
+    delivered = _validated_action_rows(delivered_rows, kind="delivered")
+    evidence = _validated_action_rows(evidence_rows, kind="evidence")
+    derive = _derive_ops_tokens()
+    by_session: dict[str, list[dict]] = {}
+    for event in evidence:
+        by_session.setdefault(event["session_id"], []).append(event)
+    results: list[dict] = []
+    for row in delivered:
+        trigger = set(derive(row["operation"]))
+        selected: tuple[datetime, int, int, dict] | None = None
+        for event in by_session.get(row["session_id"], []):
+            elapsed = (event["instant"] - row["instant"]).total_seconds()
+            if elapsed <= 0 or elapsed > window_s:
+                continue
+            overlap = len(trigger & set(derive(event["operation"])))
+            if overlap < min_overlap:
+                continue
+            if selected is None or (event["instant"], event["order"]) < (selected[0], selected[1]):
+                selected = (event["instant"], event["order"], overlap, event)
+        if selected is None:
+            results.append({
+                "delivered_id": row["id"],
+                "session_id": row["session_id"],
+                "action": "ignored",
+                "event_kind": None,
+                "elapsed_s": None,
+                "overlap_count": 0,
+                "_sort_instant": None,
+                "_order": row["order"],
+            })
+            continue
+        _, _, overlap, event = selected
+        kind = event["event_kind"]
+        action = "applied" if kind == "success" else "violated" if kind == "failure" else "ignored"
+        results.append({
+            "delivered_id": row["id"],
+            "session_id": row["session_id"],
+            "action": action,
+            "event_kind": kind,
+            "elapsed_s": float((event["instant"] - row["instant"]).total_seconds()),
+            "overlap_count": overlap,
+            "_sort_instant": event["instant"],
+            "_order": row["order"],
+        })
+    results.sort(key=lambda item: (
+        item["session_id"],
+        item["delivered_id"],
+        item["_sort_instant"].timestamp() if item["_sort_instant"] is not None else float("inf"),
+        item["_order"],
+    ))
+    for item in results:
+        del item["_sort_instant"]
+        del item["_order"]
+    return results
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="eval_replay.py")
     parser.add_argument("--store", dest="store", type=str, required=True, help="read-only store snapshot")
@@ -957,6 +1112,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--compare-baseline", dest="compare_baseline", type=str, default=None, help="baseline JSON to compare")
     parser.add_argument("--fail-under", dest="fail_under", type=str, nargs="+", default=[], help="ratchets such as precision_delta=-0.01 miss_delta=0.01")
     parser.add_argument("--transcript", dest="transcripts", type=str, action="append", default=[], help="explicit transcript JSONL observation (repeatable)")
+    parser.add_argument("--actions", dest="actions", action="store_true", default=False, help="report first same-session evidence action for each delivered row")
+    parser.add_argument("--actions-input", dest="actions_input", type=str, default=None, help="recorded action observation rows (JSON) consumed by --actions")
     parser.add_argument("--json-out", dest="json_out", type=str, default=None, help="write the report JSON")
     return parser
 
@@ -987,13 +1144,18 @@ def main() -> int:
         store = _resolved_regular(args.store, "store")
         log = _resolved_regular(args.log, "log")
         _refuse_operator_store(store, candidates)
+        if args.actions and not args.actions_input:
+            raise ReplayError("replay: --actions requires --actions-input\n")
+        if args.actions_input and not args.actions:
+            raise ReplayError("replay: --actions-input requires --actions\n")
         transcript_paths = [_resolved_regular(value, "transcript") for value in args.transcripts]
-        all_inputs = [store, log, *transcript_paths]
+        actions_path = _resolved_regular(args.actions_input, "actions-input") if args.actions_input else None
+        all_inputs = [store, log, *transcript_paths, *([actions_path] if actions_path else [])]
         if any(_same_existing_file(all_inputs[i], all_inputs[j])
                for i in range(len(all_inputs)) for j in range(i)):
             raise ReplayError("replay: input files must be distinct\n")
         out = Path(args.json_out).expanduser().resolve() if args.json_out else None
-        if any(_is_operator_alias(path, candidates) for path in [log, *transcript_paths]):
+        if any(_is_operator_alias(path, candidates) for path in [log, *transcript_paths, *([actions_path] if actions_path else [])]):
             raise ReplayError("replay: input file is inside the operator store\n")
         if out is not None and (_is_operator_alias(out, candidates)
                                 or any(_same_existing_file(out, path) for path in all_inputs)):
@@ -1058,13 +1220,27 @@ def main() -> int:
                 source_bytes[store], source_bytes[log],
                 [source_bytes[path] for path in transcript_paths],
             )
+            if args.actions:
+                # Validate and match strictly BEFORE any output bytes are
+                # written: a malformed actions input must exit 2 without
+                # replacing --json-out (frozen check C6).
+                delivered_raw, evidence_raw = _load_action_rows(actions_path)
+                report["actions"] = {
+                    "window_s": ZMEM_MATCH_WINDOW_S,
+                    "min_overlap": ZMEM_MATCH_MIN_OVERLAP,
+                    "results": match_observational_actions(
+                        delivered_raw, evidence_raw,
+                        window_s=ZMEM_MATCH_WINDOW_S,
+                        min_overlap=ZMEM_MATCH_MIN_OVERLAP,
+                    ),
+                }
             if _read_bounded(store, "store", MAX_STORE_BYTES) != source_bytes[store]:
                 raise ReplayError("replay: store changed during read-only evaluation\n")
             for path, before in source_bytes.items():
                 label = "store" if path == store else "decision log" if path == log else f"transcript {path.name}"
                 if _read_bounded(path, label, MAX_STORE_BYTES if path == store else MAX_LOG_BYTES if path == log else MAX_TRANSCRIPT_BYTES) != before:
                     raise ReplayError(f"replay: input changed during evaluation: {path.name}\n")
-            report_bytes = _json_bytes(report)
+            report_bytes = _json_bytes_sorted(report) if args.actions else _json_bytes(report)
             breached = _check_baseline(report, baseline, thresholds) if baseline else False
             if out is not None:
                 _write_atomic(out, report_bytes)
