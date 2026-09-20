@@ -174,6 +174,24 @@ class FailureSignalTest(unittest.TestCase):
             self.assertEqual(state["count"], 2)
             self.assertFalse(lock.exists())
 
+    def test_aged_live_recurrence_lock_is_not_reaped(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-failure-live-lock-") as tmp:
+            data = Path(tmp)
+            session = "live-lock-session"
+            first = self._run_failure_hook(data, session, "curl https://example.test")
+            sidecar = next((data / "ops").glob("*.capture-failure.json"))
+            lock = Path(str(sidecar) + ".lock")
+            lock.write_text(f"{os.getpid()}:live-owner", encoding="ascii")
+            stale = lock.stat().st_mtime - 120
+            os.utime(lock, (stale, stale))
+            second = self._run_failure_hook(data, session, "curl https://example.test")
+            state = json.loads(sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(first.returncode, 0)
+            self.assertEqual(second.returncode, 0)
+            self.assertEqual(second.stdout, "<<<ZMEM_JSON>>>{}<<<END>>>\n")
+            self.assertEqual(state["count"], 1)
+            self.assertTrue(lock.exists())
+
 
 class CaptureQualityTest(unittest.TestCase):
     """Descriptor, fence, and switch contracts independent of the store."""

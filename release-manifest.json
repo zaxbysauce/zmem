@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "fefd0dc471d47b095f090cada7d8999afc0873d1b6fef0846855e11e1902055e",
+  "digest": "df9575537d612cb1ddf0fbeeec1db207742b2c257644e415a6aa6b21857cf4b2",
   "files": {
     "hermes-plugin/__init__.py": "c584903ad0a6a68838c637e6b21191fcab149e4e116546f2b4919e897f0f9c16",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -23,7 +23,7 @@
     "hooks/lib/zmem-tilde-expand.sh": "c026ac5d29070a25bfb46aec140b1487908a51d70e8f413934d0265a7e4cbe88",
     "hooks/timeout-budget.json": "00b170e99e7dd626b20c6b27e2d53dff77db6bb509587d52ab72155561ad11c5",
     "hooks/zmem-capture-correction.sh": "f71aef6f46825723e908dbdcd81cccc1299c45e78025f8011db50c02037c75b2",
-    "hooks/zmem-capture-failure.sh": "075ea01337fb5d105f523c19ea319b2741556e9071256f595548f3026c16ab88",
+    "hooks/zmem-capture-failure.sh": "ec9070fcb44c92243d8f5bec75a56a05d0de5da3713e6f0c76360acd12d71840",
     "hooks/zmem-convention-capture.sh": "b586993de852b63de44a2f13a5b402b3a7d647f557be12637004feef6ad3cf6b",
     "hooks/zmem-launch.js": "fc33f1e8ec6428c079a3923a84af8ecada339c786fec1a3dd7c5594cdc3e501d",
     "hooks/zmem-postcompact.sh": "7425f2937508fe3b526395abcb5610b7ac18c33a610a53455b58d984d8647542",
