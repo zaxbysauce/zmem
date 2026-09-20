@@ -152,6 +152,7 @@ signal = infer_signal(command, exit_code=payload.get("exit_code"))
 
 directory = os.path.dirname(recurrence)
 lock = recurrence + ".lock"
+reclaim = lock + ".reclaim"
 owner = "%s:%s" % (os.getpid(), uuid.uuid4().hex)
 
 def lock_is_owned():
@@ -179,17 +180,37 @@ try:
     os.makedirs(directory, exist_ok=True)
     deadline = time.monotonic() + 3.0
     while True:
+        if os.path.exists(reclaim):
+            if time.monotonic() >= deadline:
+                print("{}")
+                raise SystemExit(0)
+            time.sleep(0.01)
+            continue
         try:
             lock_fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             with os.fdopen(lock_fd, "w", encoding="ascii", newline="") as handle:
                 handle.write(owner)
             break
         except FileExistsError:
+            reclaim_fd = None
             try:
-                if (time.time() - os.stat(lock).st_mtime > 60
-                        and not lock_owner_alive()):
-                    os.unlink(lock)
-                    continue
+                if time.time() - os.stat(lock).st_mtime > 60:
+                    try:
+                        reclaim_fd = os.open(
+                            reclaim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                        os.close(reclaim_fd)
+                        reclaim_fd = None
+                    except FileExistsError:
+                        reclaim_fd = None
+                    else:
+                        try:
+                            if (time.time() - os.stat(lock).st_mtime > 60
+                                    and not lock_owner_alive()):
+                                os.unlink(lock)
+                                continue
+                        finally:
+                            try: os.unlink(reclaim)
+                            except OSError: pass
             except OSError:
                 pass
             if time.monotonic() >= deadline:
