@@ -1009,7 +1009,10 @@ def _validated_action_rows(rows: object, *, kind: str) -> list[dict]:
 
 def _load_action_rows(path: Path) -> tuple[list[dict], list[dict]]:
     """Load and structurally validate the recorded action observation rows."""
-    payload = json.loads(_read_bounded(path, "actions input", MAX_ACTIONS_BYTES).decode("utf-8"))
+    try:
+        payload = json.loads(_read_bounded(path, "actions input", MAX_ACTIONS_BYTES).decode("utf-8"))
+    except ValueError as exc:
+        raise ReplayError(f"replay: actions-input is not valid JSON: {exc}\n") from exc
     if not isinstance(payload, dict):
         raise ReplayError("replay: actions-input must be a JSON object\n")
     for key in ("delivered_rows", "evidence_rows"):

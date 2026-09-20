@@ -1302,6 +1302,43 @@ class ActionMatcherTest(unittest.TestCase):
                 self.assertIn("evidence row 0", combined, f"missing {missing}: {combined}")
                 self.assertIn(missing, combined)
                 self.assertFalse(out_path.exists(), "malformed run must not write --json-out")
+        # Later evidence rows and delivered rows carry their own indexed
+        # diagnostics on the same exit-2 surface, and invalid JSON gets the
+        # stable ReplayError diagnostic instead of a traceback.
+        later = json.loads(json.dumps(payload))
+        del later["evidence_rows"][2]["operation"]
+        delivered = json.loads(json.dumps(payload))
+        del delivered["delivered_rows"][0]["id"]
+        for broken_rows, needle in ((later, "evidence row 2"), (delivered, "delivered row 0")):
+            with tempfile.TemporaryDirectory(prefix="zmem-actions-invalid-") as raw:
+                scratch = Path(raw)
+                broken_path = scratch / "broken-actions.json"
+                broken_path.write_text(json.dumps(broken_rows), encoding="utf-8")
+                run = subprocess.run(
+                    [PYTHON, str(EVALUATOR),
+                     "--store", str(store), "--log", str(FIXTURES / "decisions.log"),
+                     "--days", "30", "--actions", "--actions-input", str(broken_path),
+                     "--json-out", str(scratch / "malformed-report.json")],
+                    cwd=str(ROOT), env=_env(scratch),
+                    capture_output=True, text=True, timeout=120,
+                )
+                self.assertEqual(run.returncode, 2, needle)
+                self.assertIn(needle, (run.stderr or "") + (run.stdout or ""))
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-invalid-") as raw:
+            scratch = Path(raw)
+            bad_json = scratch / "bad-actions.json"
+            bad_json.write_text("{not json", encoding="utf-8")
+            run = subprocess.run(
+                [PYTHON, str(EVALUATOR),
+                 "--store", str(store), "--log", str(FIXTURES / "decisions.log"),
+                 "--days", "30", "--actions", "--actions-input", str(bad_json),
+                 "--json-out", str(scratch / "malformed-report.json")],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(run.returncode, 2, run.stderr)
+            self.assertIn("replay: actions-input is not valid JSON", run.stderr or "")
+            self.assertNotIn("Traceback", run.stderr or "")
         self.assertEqual(hashlib.sha256(store.read_bytes()).hexdigest(), before)
 
 
