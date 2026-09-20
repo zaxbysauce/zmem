@@ -937,6 +937,38 @@ class NliJudgeExtensionTest(unittest.TestCase):
         self.assertIn(pos_id, out)
         self.assertIn(neg_id, out)
         self.assertIn("pair 0", out)
+        # PRR-006: the committed nli-sensitive fixture drives the same
+        # matcher — its secret-like rows must appear by ID only, and the
+        # expected-ids/content-present contract must hold.
+        fixture = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "consolidate"
+             / "nli-sensitive.json").read_text(encoding="utf-8"))
+        expected = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "consolidate"
+             / "nli-sensitive.expected.json").read_text(encoding="utf-8"))
+        self.assertEqual(expected["content_present"], False)
+        import importlib as _ii
+        _cmod = _ii.import_module("storelib.consolidate")
+        fx_members = [
+            (fixture["left"]["id"], fixture["left"]["text"],
+             _cmod._polarity_signature(fixture["left"]["text"])),
+            (fixture["right"]["id"], fixture["right"]["text"],
+             _cmod._polarity_signature(fixture["right"]["text"])),
+        ]
+        if fx_members[0][2] == fx_members[1][2]:
+            flipped = "never " + fx_members[1][1]
+            fx_members[1] = (fx_members[1][0], flipped,
+                             _cmod._polarity_signature(flipped))
+        buf2, err2 = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf2), redirect_stderr(err2):
+                fx_verdict = _cmod._nli_judge_all_entail(fx_members)
+        fx_out = buf2.getvalue() + err2.getvalue()
+        self.assertEqual(fx_verdict, True)
+        for mid in expected["expected_ids"]:
+            self.assertIn(mid, fx_out)
+        self.assertNotIn("NLI_SECRET_LEFT_7f2b", fx_out)
+        self.assertNotIn("NLI_SECRET_RIGHT_91ac", fx_out)
 
 
 class ConsolidatedIdsGrowthTest(unittest.TestCase):

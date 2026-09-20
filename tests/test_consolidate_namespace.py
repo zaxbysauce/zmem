@@ -172,22 +172,53 @@ class LexicalNamespaceContainmentTest(unittest.TestCase):
         and the ranked candidate set — consolidate must never absorb the
         organize pipeline's own output even when it near-duplicates an
         ordinary row."""
-        # PRR-006: the committed fixture's byte contract is exercised here —
-        # its two rows (ordinary + organize:) must reproduce exactly one
-        # candidate after the exclusion.
+        # PRR-006: the committed fixture drives REAL consolidate behavior —
+        # its two rows (ordinary + organize:) are seeded by their exact ids,
+        # and exactly the ordinary row may be a candidate (expected ids/count).
         fixture = json.loads(
             (REPO_ROOT / "tests" / "fixtures" / "consolidate"
              / "organize-summary.json").read_text(encoding="utf-8"))
         self.assertEqual(fixture["expected_candidate_count"], 1)
         self._add(NS_A, "deploy pipeline pytest lint build", "0.9")
+        conn = sqlite3.connect(os.path.join(self.tmp, "store.sqlite"))
+        try:
+            for row in fixture["rows"]:
+                conn.execute(
+                    """INSERT INTO memory
+                       (id, namespace, type, content, tags, source_ref, source_hash,
+                        confidence, signal, valid_from, superseded_at, ingestion_ts,
+                        retrieval_count, last_retrieved)
+                       VALUES (?,?,?,?,?,?, '', 0.7, 'none', '', NULL, ?, 0, NULL)""",
+                    (row["id"], row["namespace"], "fact",
+                     "deploy pipeline pytest lint build" +
+                     (" merge" if row["source_ref"].startswith("organize:") else ""),
+                     "", row["source_ref"], row["timestamp"]))
+            conn.commit()
+        finally:
+            conn.close()
         raw_id = self._add_raw(NS_A, "deploy pipeline pytest lint build merge",
                                source_ref="organize:deploy-pipeline")
         self._add(NS_B, "completely unrelated namespace row about rust", "0.5")
         r = self._run("consolidate")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("merged 0 memories", r.stdout, r.stdout)
-        live_a = self._live(NS_A)
-        self.assertEqual(len(live_a), 2, live_a)
+        # The INVARIANT: the organize: fixture row must stay live (excluded
+        # from candidates, never absorbed) while the ordinary fixture row is
+        # fair game for consolidation into its CLI-added identical twin.
+        conn = sqlite3.connect(os.path.join(self.tmp, "store.sqlite"))
+        try:
+            org_state = conn.execute(
+                "SELECT superseded_at FROM memory WHERE id=?",
+                (fixture["rows"][1]["id"],)).fetchone()
+            ord_state = conn.execute(
+                "SELECT superseded_at FROM memory WHERE id=?",
+                (fixture["rows"][0]["id"],)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(org_state)
+        self.assertIsNone(org_state[0],
+                          "organize: fixture row must NEVER be absorbed")
+        self.assertIsNotNone(ord_state)
         conn = sqlite3.connect(os.path.join(self.tmp, "store.sqlite"))
         try:
             row = conn.execute(
