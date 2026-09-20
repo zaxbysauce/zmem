@@ -32,6 +32,7 @@ except ImportError:
     from corrections import classify_error_type as _classify_error_type  # type: ignore
     from corrections import aggregate_errors as _aggregate_errors  # type: ignore
     from corrections import SAMPLE_EXTRACT_LIMIT as _SAMPLE_EXTRACT_LIMIT  # type: ignore
+import storelib.schema as _schema
 from storelib.schema import _host
 from storelib.write import _normalize_capture_mode, redact_text
 
@@ -902,10 +903,10 @@ def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int
     from HISTORICAL Claude Code transcripts (issue #48; PR 3/4 claude-reflect).
 
     READ-ONLY against transcripts AND the store: this command NEVER opens the
-    ZMem store (it is dispatched before connect()), and the only write surface
-    is the #47 sidecar review queue when ``--queue`` is given. Candidates are
-    REVIEWED by an agent before any row enters the store (signal honesty per
-    skills/closeout/SKILL.md).
+    ZMem store (it is dispatched before connect()). Under ``--queue`` its only
+    writes are the #47 review queue and compact progress checkpoints beside the
+    resolved store; candidates remain REVIEWED by an agent before any row enters
+    the store (signal honesty per skills/closeout/SKILL.md).
 
     Host input surface is Claude Code transcripts only (host matrix; ZCode /
     Codex / Hermes out of scope by design — see README Bootstrap section).
@@ -927,6 +928,12 @@ def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int
         return 2
 
     root = _hm.resolve_transcript_root(transcript_dir)
+    # Checkpoints are shared mutable zmem state, not transcript content. Keep
+    # them beside the resolved store so SessionStart's existing sweep reaches
+    # them even when --transcript-dir points somewhere entirely different.
+    # Read through the module (not a from-import snapshot) because store.py
+    # refreshes schema.STORE_PATH from ZMEM_STORE/ZMEM_DATA on every load.
+    checkpoint_root = _schema.STORE_PATH.parent
     files, missing = _hm.discover_transcripts(
         root, all_projects=bool(all_projects), project_dir=os.getcwd(), days=days)
 
@@ -958,7 +965,8 @@ def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int
             continue
         try:
             session = path.stem
-            checkpoint = _hm.read_suffix_checkpoint(root, path, session)
+            checkpoint = _hm.read_suffix_checkpoint(
+                checkpoint_root, path, session)
             suffix, next_checkpoint = _hm.mine_transcript_suffix(path, checkpoint)
         except (OSError, UnicodeDecodeError, ValueError):
             skipped += 1
@@ -1035,7 +1043,8 @@ def cmd_mine_history(*, transcript_dir, all_projects: bool, days, min_count: int
             return queue_result
         try:
             for path, session, checkpoint in pending_checkpoints:
-                _hm.write_suffix_checkpoint(root, path, session, checkpoint)
+                _hm.write_suffix_checkpoint(
+                    checkpoint_root, path, session, checkpoint)
         except (OSError, TimeoutError, ValueError):
             print("[zmem] mine-history: checkpoint update failed; progress not advanced",
                   file=sys.stderr)
