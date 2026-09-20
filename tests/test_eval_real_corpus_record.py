@@ -193,8 +193,8 @@ class GuardrailRejectBehaviorTests(unittest.TestCase):
             lambda r: r["rows"][0].update({"prompt": "private text"}),
             lambda r: r["rows"][0].update({"content": "private text"}),
             lambda r: r["input_metadata"].update({"message": "ses"}),
-            lambda r: r.update({"notes": "C:/Users/brett/store.sqlite"}),
-            lambda r: r.update({"notes": "/home/brett/store.sqlite"}),
+            lambda r: r.update({"notes": "C:/data/private/store.sqlite"}),
+            lambda r: r.update({"notes": "/srv/private/store.sqlite"}),
         ):
             tampered = copy.deepcopy(report)
             mutate(tampered)
