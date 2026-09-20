@@ -43,7 +43,7 @@
   },
   "days": 30,
   "generated_at": "2026-06-01T00:00:00Z",
-  "input_digest": "8529a1210681f53b602ad32070a88c97d84402d419bf136a040f1842b3e367b0",
+  "input_digest": "f3b97238f38955a5d89d8d151f86b4d61835cdb4ce5428329002e2312d219958",
   "input_metadata": {
     "parsed_rows": 8,
     "version": "0.43.0"

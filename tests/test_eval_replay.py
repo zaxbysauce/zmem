@@ -1408,5 +1408,32 @@ class ReplayReportTest(unittest.TestCase):
         self.assertNotIn("violated_count", json.dumps(report))
 
 
+    def test_actions_input_participates_in_digest(self):
+        # The actions input is a report-affecting explicit input: changing
+        # only its bytes must change the report's input_digest.
+        payload = json.loads((FIXTURES / "actions.json").read_text(encoding="utf-8"))
+        modified = json.loads(json.dumps(payload))
+        modified["evidence_rows"][0]["event_kind"] = "failure"
+        digests = []
+        for rows in (payload, modified):
+            with tempfile.TemporaryDirectory(prefix="zmem-actions-digest-") as raw:
+                scratch = Path(raw)
+                src = scratch / "actions.json"
+                src.write_text(json.dumps(rows), encoding="utf-8")
+                out_path = scratch / "report.json"
+                run = subprocess.run(
+                    [PYTHON, str(EVALUATOR),
+                     "--store", str(FIXTURES / "store.sqlite"),
+                     "--log", str(FIXTURES / "decisions.log"),
+                     "--days", "30", "--actions", "--actions-input", str(src),
+                     "--json-out", str(out_path)],
+                    cwd=str(ROOT), env=_env(scratch),
+                    capture_output=True, text=True, timeout=120,
+                )
+                self.assertEqual(run.returncode, 0, run.stderr)
+                digests.append(json.loads(out_path.read_text(encoding="utf-8"))["input_digest"])
+        self.assertNotEqual(digests[0], digests[1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

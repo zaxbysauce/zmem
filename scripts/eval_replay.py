@@ -261,8 +261,8 @@ def _read_bounded(path: Path, label: str, maximum: int) -> bytes:
     return b"".join(chunks)
 
 
-def _digest(store: bytes, log: bytes, transcripts: list[bytes]) -> str:
-    if not transcripts:
+def _digest(store: bytes, log: bytes, transcripts: list[bytes], actions: bytes | None = None) -> str:
+    if not transcripts and actions is None:
         return _sha(store + log)
     h = hashlib.sha256()
     h.update(store)
@@ -271,6 +271,12 @@ def _digest(store: bytes, log: bytes, transcripts: list[bytes]) -> str:
     for data in transcripts:
         h.update(len(data).to_bytes(8, "big"))
         h.update(data)
+    if actions is not None:
+        # Domain-separate the actions contribution so a transcript whose
+        # bytes equal an actions file can never produce a colliding digest.
+        h.update(b"zmem-replay-actions-v1\0")
+        h.update(len(actions).to_bytes(8, "big"))
+        h.update(actions)
     return h.hexdigest()
 
 
@@ -1007,12 +1013,16 @@ def _validated_action_rows(rows: object, *, kind: str) -> list[dict]:
     return validated
 
 
-def _load_action_rows(path: Path) -> tuple[list[dict], list[dict]]:
-    """Load and structurally validate the recorded action observation rows."""
-    # _read_bounded raises ReplayError (a ValueError subclass) for oversize
-    # or unreadable inputs; keep it OUTSIDE the decode/parse guard so those
-    # stable diagnostics are not re-wrapped into a JSON-parse message.
-    blob = _read_bounded(path, "actions input", MAX_ACTIONS_BYTES)
+def _load_action_rows(blob: bytes) -> tuple[list[dict], list[dict]]:
+    """Validate captured action-observation bytes into delivered/evidence rows.
+
+    The bytes arrive from the initial bounded snapshot in ``main`` so the
+    matching result is derived from exactly the bytes the report digest
+    covers; a file replaced mid-run is caught by the final re-verification.
+    """
+    # ``_read_bounded`` (the caller) raises ReplayError for oversize or
+    # unreadable inputs; only decode/parse failures are re-wrapped here so
+    # those stable diagnostics are not converted into a JSON-parse message.
     try:
         payload = json.loads(blob.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1198,6 +1208,13 @@ def main() -> int:
                     f"{MAX_TRANSCRIPT_TOTAL_BYTES}-byte total limit\n"
                 )
             source_bytes[path] = data
+        # Snapshot the actions input with the same one-shot bounded read so
+        # the matching result is derived from exactly the bytes the report
+        # digest covers.
+        actions_bytes = (
+            _read_bounded(actions_path, "actions input", MAX_ACTIONS_BYTES)
+            if actions_path is not None else None
+        )
         with tempfile.TemporaryDirectory(prefix="zmem-replay-") as raw:
             staging = Path(raw)
             staged_store = staging / "store.sqlite"
@@ -1226,12 +1243,13 @@ def main() -> int:
             report["input_digest"] = _digest(
                 source_bytes[store], source_bytes[log],
                 [source_bytes[path] for path in transcript_paths],
+                actions_bytes,
             )
             if args.actions:
                 # Validate and match strictly BEFORE any output bytes are
                 # written: a malformed actions input must exit 2 without
                 # replacing --json-out (frozen check C6).
-                delivered_raw, evidence_raw = _load_action_rows(actions_path)
+                delivered_raw, evidence_raw = _load_action_rows(actions_bytes)
                 report["actions"] = {
                     "window_s": ZMEM_MATCH_WINDOW_S,
                     "min_overlap": ZMEM_MATCH_MIN_OVERLAP,
@@ -1247,6 +1265,10 @@ def main() -> int:
                 label = "store" if path == store else "decision log" if path == log else f"transcript {path.name}"
                 if _read_bounded(path, label, MAX_STORE_BYTES if path == store else MAX_LOG_BYTES if path == log else MAX_TRANSCRIPT_BYTES) != before:
                     raise ReplayError(f"replay: input changed during evaluation: {path.name}\n")
+            if actions_bytes is not None and _read_bounded(
+                actions_path, "actions input", MAX_ACTIONS_BYTES
+            ) != actions_bytes:
+                raise ReplayError("replay: input changed during evaluation: actions input\n")
             report_bytes = _json_bytes_sorted(report) if args.actions else _json_bytes(report)
             breached = _check_baseline(report, baseline, thresholds) if baseline else False
             if out is not None:
