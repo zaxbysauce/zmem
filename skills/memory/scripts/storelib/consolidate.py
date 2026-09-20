@@ -785,6 +785,10 @@ class _NliBudget:
         self._start = self._clock()
         self.calls = 0
         self.denial_reason: str | None = None
+        # Issue #77 (final-critic round): the exhaustion warning is ONE PER
+        # RUN, so the once-flag lives on the run-wide budget object, not in
+        # the judge loop (which runs once per contested cluster).
+        self.warning_emitted = False
 
     def allow(self) -> bool:
         if self.calls >= self.max_calls:
@@ -866,16 +870,15 @@ def _nli_judge_all_entail(member_pols: list[tuple],
                 flagged.append((member_pols[i][0], member_pols[j][0], a, b))
     if not flagged:
         return False
-    warned = False
     for pair_index, (id_a, id_b, a, b) in enumerate(flagged):
         if not budget.allow():
-            if not warned:
+            if not budget.warning_emitted:
+                budget.warning_emitted = True
                 reason = budget.denial_reason or "budget exhausted"
                 print(f"[zmem] consolidate: NLI judge budget exhausted ({reason}); "
                       f"stopping after {budget.calls} call(s) with "
                       f"{len(flagged) - pair_index} pair(s) unjudged — "
                       f"affected clusters stay unmerged", file=sys.stderr)
-                warned = True
             return False
         budget.record()
         verdict = _nli_judge_pair(argv, a, b)

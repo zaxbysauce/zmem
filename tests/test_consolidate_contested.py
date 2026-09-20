@@ -864,6 +864,48 @@ class NliJudgeExtensionTest(unittest.TestCase):
         self.assertFalse(report["contested_clusters"][0]["merged"])
         self.assertIn("time limit", err.getvalue())
 
+    def test_nli_budget_warning_emitted_once_per_run(self):
+        """Issue #77 (final-critic round): the exhaustion warning is ONE PER
+        consolidate() RUN — a run-wide budget shared across several contested
+        clusters prints the reason exactly once, and every post-exhaustion
+        cluster stays parked even under --merge-contested."""
+        clusters = []
+        for i, ns in enumerate(("project:budget-warn-1",
+                                "project:budget-warn-2",
+                                "project:budget-warn-3")):
+            pos_id = _add_raw(self.mod, self.conn,
+                              POS + f" variant {i}", 0.9, namespace=ns)
+            neg_id = _add_raw(self.mod, self.conn,
+                              NEG + f" variant {i}", 0.9, namespace=ns)
+            clusters.append((ns, pos_id, neg_id))
+        cmd = _write_seq_judge(self.tmp_path, "warnonce", ["entailment"])
+        env = {"ZMEM_NLI_CMD": cmd, "ZMEM_NLI_MAX_CALLS": "1"}
+        buf = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with redirect_stdout(buf), redirect_stderr(err):
+                report = self.mod.consolidate(self.conn, force=True,
+                                              merge_contested=True)
+        self.assertEqual(err.getvalue().count("budget exhausted"), 1,
+                         f"warning must be once per run; stderr={err.getvalue()!r}")
+        # Exactly ONE cluster gets the single budgeted call (entailment ->
+        # merged); the other two are denied by the exhausted budget and stay
+        # parked despite --merge-contested. WHICH cluster merges depends on
+        # consolidate's row ordering, so assert the aggregate shape: one
+        # merged entry, two parked entries, and within every cluster both
+        # members share the same fate (merged cluster: one absorbed; parked
+        # clusters: both live).
+        merged = [c for c in report["contested_clusters"] if c["merged"]]
+        parked = [c for c in report["contested_clusters"] if not c["merged"]]
+        self.assertEqual(len(merged), 1, report)
+        self.assertEqual(len(parked), 2, report)
+        absorbed = [mid for ns, pos_id, neg_id in clusters
+                    for mid in (pos_id, neg_id)
+                    if _live_rows(self.conn, mid)[mid] is not None]
+        self.assertEqual(len(absorbed), 1,
+                         "exactly the merged cluster's absorbed member is "
+                         "superseded; parked clusters keep both members live")
+
     def test_nli_diagnostics_contain_ids_not_content(self):
         """Issue #77: judge diagnostics carry member ids, pair indexes, and
         the verdict — never member content, on either stream."""
