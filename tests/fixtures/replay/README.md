@@ -2,7 +2,8 @@
 
 The committed replay snapshot, decision log, expected report, and
 `eval/baseline-replay.json` are immutable test inputs. Tests consume those
-bytes; they do not run the generator or replace the expected report. The
+bytes and may invoke the generator only with scratch destinations to exercise
+its safety checks; they never replace committed artifacts or the expected report. The
 report is a bounded measurement artifact and is not a live-host efficacy
 claim.
 

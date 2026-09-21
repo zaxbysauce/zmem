@@ -1447,6 +1447,24 @@ class ActionMatcherTest(unittest.TestCase):
         with self.assertRaisesRegex(module.ReplayError, "candidate work"):
             module.match_observational_actions(delivered, evidence)
 
+    def test_candidate_work_budget_counts_out_of_window_pairs(self):
+        module = self._module()
+        module.MAX_ACTION_CANDIDATE_WORK = 0
+        delivered = [{
+            "id": "d0000000-0000-4000-8000-000000000m04",
+            "session_id": "s-budget-outside-window",
+            "timestamp": "2026-06-01T00:00:00Z",
+            "operation": "git stash pop",
+        }]
+        evidence = [{
+            "session_id": "s-budget-outside-window",
+            "timestamp": "2026-06-01T04:00:00Z",
+            "event_kind": "success",
+            "operation": "git stash pop",
+        }]
+        with self.assertRaisesRegex(module.ReplayError, "candidate work"):
+            module.match_observational_actions(delivered, evidence)
+
     def test_first_matching_event_wins(self):
         module = self._module()
         base = {"id": "d0000000-0000-4000-8000-000000000d01", "session_id": "s-order",

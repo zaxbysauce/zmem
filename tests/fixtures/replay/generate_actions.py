@@ -10,7 +10,8 @@ drift between the implementation and the committed oracle is a hard error.
 ``ZMEM_TEST_NOW`` pins the documented fixture epoch (2026-06-01T00:00:00Z)
 per the issue contract; the evaluator's own report clock derives from the
 committed decision log, so the pin documents the epoch rather than driving
-it. Tests consume committed bytes and never invoke this module.
+    it. Tests may invoke this module only with scratch destinations to exercise
+    the maintainer-tool safety checks; they never replace committed artifacts.
 """
 
 from __future__ import annotations

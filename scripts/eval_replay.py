@@ -1078,20 +1078,17 @@ def match_observational_actions(
     for event in evidence:
         by_session.setdefault(event["session_id"], []).append(event)
 
-    # Count timestamp-window candidates before deriving any operation tokens.
-    # This keeps dense same-session inputs from silently expanding the nested
-    # matcher beyond the explicit work budget.
+    # Count every same-session pair the nested matcher will inspect before
+    # deriving any operation tokens. This keeps dense inputs, including rows
+    # outside the timestamp window, within the explicit work budget.
     potential_work = 0
     for row in delivered:
-        for event in by_session.get(row["session_id"], []):
-            elapsed = (event["instant"] - row["instant"]).total_seconds()
-            if elapsed > 0 and elapsed <= window_s:
-                potential_work += 1
-                if potential_work > MAX_ACTION_CANDIDATE_WORK:
-                    raise ReplayError(
-                        "replay: action match potential candidate work exceeds the "
-                        f"{MAX_ACTION_CANDIDATE_WORK}-candidate limit\n"
-                    )
+        potential_work += len(by_session.get(row["session_id"], []))
+        if potential_work > MAX_ACTION_CANDIDATE_WORK:
+            raise ReplayError(
+                "replay: action match potential candidate work exceeds the "
+                f"{MAX_ACTION_CANDIDATE_WORK}-candidate limit\n"
+            )
 
     results: list[dict] = []
     for row in delivered:
