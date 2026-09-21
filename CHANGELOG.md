@@ -10,6 +10,38 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.57.0] - 2026-09-21
+
+### Added
+- **Deterministic belief heads (issue #137)**: `organize --belief-heads` and
+  `consolidate --belief-heads` maintain three additive side tables
+  (`belief_head`, `belief_head_source`, `belief_head_evidence`) that aggregate
+  live rows into stable, provenance-preserving heads keyed by
+  `sha256(namespace + sorted member ids)`, with support/evidence provenance
+  from `memory_evidence`, weakest-source floors (confidence, signal, taint,
+  trust), contested state from in-topic `contradicts` edges, correction quotes
+  from the newest `updates` edge, refresh watermarks, and a sorted
+  retracted-source version record when tombstoned sources drop out. Recall
+  surfaces heads as virtual `belief:<id>` rows carrying
+  `source_ids`/`evidence_ids`/`represented_ids` through the normal injection
+  gate and token budget, and an admitted ACTIVE head suppresses its
+  represented source rows within the same namespace and delivered fence only
+  (contested, filtered, and budget-dropped heads suppress zero rows). The
+  tables are created additively from `migrate()` — `SUPPORTED_SCHEMA_VERSION`
+  and `FORWARD_COMPAT_SCHEMA_VERSION` are unchanged — and no head ever enters
+  the canonical `memory` table. Optional maintenance-only local adapter:
+  `--llm-local` (requires `--belief-heads`) applies validated
+  `replace_quote`/`add_source`/`mark_contested`/`retract_source` actions
+  atomically with full rollback on any invalid target, citation, transition,
+  or adapter failure; no recall path can reach it. The `observation` type
+  follows the recorded #172 taxonomy gate
+  (`evidence/gates/172-observation.json`, currently `reject`): the type joins
+  `allowed_types()` only on `accept`. Shipped with
+  `tests/test_belief_heads.py` (16 tests), deterministic fixture generator
+  `tests/fixtures/beliefs/build_fixtures.py`, extensions to the organize,
+  fence, schema-compat, and characterization suites, and a belief-heads
+  section in `docs/CLOUD.md`.
+
 ## [0.56.0] - 2026-09-20
 
 ### Added

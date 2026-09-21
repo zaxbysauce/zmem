@@ -762,6 +762,112 @@ class OrganizeIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertIsNone(row[0])
 
+    # --- issue #137: deterministic belief heads (opt-in refresh) ---
+    def _dump_beliefs(self):
+        """Canonical, watermark-normalized dump of the belief side tables.
+
+        refresh_watermark is stamped with the wall clock at each refresh
+        (``now=None`` => schema.now_iso()), so it is deliberately normalized
+        out of the determinism comparison — everything else must be
+        byte-identical across refreshes of identical inputs."""
+        import json as _json
+        c = self._conn()
+        c.row_factory = sqlite3.Row
+        try:
+            def rows(sql):
+                out = []
+                for r in c.execute(sql):
+                    d = dict(r)
+                    if "refresh_watermark" in d:
+                        d["refresh_watermark"] = "<watermark>"
+                    out.append(d)
+                return out
+            dump = {
+                "belief_head": rows(
+                    "SELECT * FROM belief_head ORDER BY id"),
+                "belief_head_source": rows(
+                    "SELECT * FROM belief_head_source "
+                    "ORDER BY head_id, source_id"),
+                "belief_head_evidence": rows(
+                    "SELECT * FROM belief_head_evidence "
+                    "ORDER BY head_id, source_id, evidence_id"),
+            }
+        finally:
+            c.close()
+        return _json.dumps(dump, sort_keys=True)
+
+    def test_belief_head_refresh_is_deterministic(self):
+        """Issue #137 AC: two `organize --belief-heads` runs over the same
+        inputs produce byte-identical belief side-table rows (modulo the
+        wall-clock watermark) and a stable head id == the recomputed topic
+        identity."""
+        import hashlib as _hashlib
+        contents = (
+            "The fixture topic cache warms on the first query of each day.",
+            "The fixture topic index rebuilds whenever the store migrates.",
+            "The fixture topic head quotes the newest grounded member row.",
+        )
+        for content in contents:
+            self._add(content, tags="fixture-topic")
+        c = self._conn()
+        try:
+            member_ids = [r[0] for r in c.execute(
+                "SELECT id FROM memory WHERE namespace=? ORDER BY ingestion_ts",
+                (NS,))]
+        finally:
+            c.close()
+        self.assertEqual(len(member_ids), 3)
+        first = self._run("organize", "--force", "--belief-heads")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        dump1 = self._dump_beliefs()
+        second = self._run("organize", "--force", "--belief-heads")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        dump2 = self._dump_beliefs()
+        self.assertEqual(dump1, dump2,
+                         "belief refresh of identical inputs must be "
+                         "byte-identical (watermark normalized)")
+        parsed = json.loads(dump1)
+        self.assertEqual(len(parsed["belief_head"]), 1)
+        head_id = parsed["belief_head"][0]["id"]
+        expected_id = _hashlib.sha256(
+            (NS.lower() + "\0"
+             + "\0".join(sorted(member_ids))).encode("utf-8")).hexdigest()
+        self.assertEqual(head_id, expected_id,
+                         "head id must be the stable topic identity")
+
+    def test_belief_head_default_is_opt_in(self):
+        """Issue #137 AC: belief heads never appear without --belief-heads;
+        the flag populates them; and --llm-local without --belief-heads is
+        an argparse error (exit 2, exact message, before any lock)."""
+        for content in ("opt-in probe row one about the fixture topic",
+                        "opt-in probe row two about the fixture topic",
+                        "opt-in probe row three about the fixture topic"):
+            self._add(content, tags="fixture-topic")
+        bare = self._run("organize", "--force")
+        self.assertEqual(bare.returncode, 0, bare.stderr)
+        c = self._conn()
+        try:
+            self.assertEqual(c.execute(
+                "SELECT COUNT(*) FROM belief_head").fetchone()[0], 0,
+                "organize WITHOUT --belief-heads must leave belief_head empty")
+        finally:
+            c.close()
+        flagged = self._run("organize", "--force", "--belief-heads")
+        self.assertEqual(flagged.returncode, 0, flagged.stderr)
+        c = self._conn()
+        try:
+            self.assertEqual(c.execute(
+                "SELECT COUNT(*) FROM belief_head").fetchone()[0], 1,
+                "organize --belief-heads must populate the head")
+        finally:
+            c.close()
+        # --llm-local is a modifier, never a standalone mode (issue #137):
+        # argparse refuses it BEFORE any maintenance lock is taken.
+        for cmd in ("organize", "consolidate"):
+            r = self._run(cmd, "--llm-local")
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--llm-local requires --belief-heads", r.stderr)
+
 
 class OrganizeFoldGuardTest(unittest.TestCase):
     """Issue #62, 7.3/7.4 fold guards: when update_memory/add_memory FOLDS the

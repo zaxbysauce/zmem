@@ -1,0 +1,1 @@
+{"actions":[{"op":"replace_quote","head_id":"belief:missing","source_ids":["missing"],"evidence_ids":["ev-missing"],"markdown":"bad"},{"op":"add_source","head_id":"belief:fixture","source_ids":["outside"],"evidence_ids":["ev-outside"],"markdown":"bad"}]}

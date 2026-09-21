@@ -1,0 +1,6 @@
+{
+  "exit_code": 1,
+  "stderr_line": "[zmem] belief-heads: invalid action",
+  "prior_head_checksum": "27ce8b5639672813b2ea7d0a626e6c5ccff01581390527f4b987f7edddaef58d",
+  "prior_watermark": "2026-09-10T00:00:00Z"
+}

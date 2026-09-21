@@ -901,6 +901,9 @@ def consolidate(
     merge_contested: bool = False,
     working_ids: set[str] | None = None,
     collect_run_ids: bool = False,
+    belief_heads: bool = False,
+    llm_local: bool = False,
+    adapter=None,
 ) -> dict:
     """Merge near-duplicate memories via embedding similarity (or a lexical
     token-overlap fallback when embeddings are unavailable — Phase 10).
@@ -1598,4 +1601,16 @@ def consolidate(
     report["knn_truncated"] = knn_truncated
     if collect_run_ids:
         report["consolidated_ids"] = consolidated_ids
+
+    # Belief heads (issue #137): opt-in deterministic side tables, refreshed
+    # AFTER the merge pass so heads derive from the post-consolidation live
+    # set. organize() calls consolidate WITHOUT these flags and refreshes
+    # BEFORE its own consolidate pass — the two entry points must not
+    # double-refresh, and the atomicity/adapter contract lives in
+    # beliefs.run_belief_maintenance (shared, so they cannot drift).
+    if belief_heads and not dry_run:
+        from storelib import beliefs as _beliefs
+        report["belief_heads"] = _beliefs.run_belief_maintenance(
+            conn, namespace=namespace, llm_local=llm_local, adapter=adapter,
+            now=now_iso())
     return report

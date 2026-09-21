@@ -959,6 +959,9 @@ def select_and_budget_for_injection(
             include_cross_project=include_cross_project,
             _cross_moment=moment,
             _cross_ops_tokens=list(effective_ops) or None,
+            # Issue #137: the fence identity is the session id plus the
+            # runtime moment — represented-row suppression never crosses it.
+            _fence_id="%s:%s" % (session_id, moment),
         )
         if effective_query.strip():
             kwargs["query"] = effective_query

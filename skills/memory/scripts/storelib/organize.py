@@ -615,6 +615,9 @@ def organize(
     dry_run: bool = False,
     force: bool = False,
     prune: bool = False,
+    belief_heads: bool = False,
+    llm_local: bool = False,
+    adapter=None,
 ) -> dict:
     """Run the sleep-time organization pipeline (issue #62, 7.1-7.6).
 
@@ -631,7 +634,7 @@ def organize(
     exists. Treat ``would_*`` as "what a full run would attempt", never as a
     promise of exactly-N inserts.
 
-    Pipeline order (1-8):
+    Pipeline order (1-9):
       1. Cadence gate — the SHARED consolidate meta-key gate (7-day / 20%
          growth), modeled under dry-run, bypassed only by ``force``. Implemented
          ONCE in ``consolidate._cadence_gate_skipped`` and called by both entry
@@ -777,6 +780,19 @@ def organize(
             )
             if link_rep["neighbors"] > 0:
                 lb["backfilled"] += 1
+
+    # --- 5b) Belief heads (issue #137): opt-in deterministic side tables ---
+    # Runs BEFORE consolidation: heads ground on the episode's pre-merge
+    # live set (consolidation absorbs members and supersedes their ids, so a
+    # post-merge refresh would find nothing to aggregate). The atomicity/
+    # adapter contract lives in beliefs.run_belief_maintenance — shared with
+    # consolidate so the two entry points cannot drift; that helper applies
+    # validated adapter actions via beliefs.apply_belief_actions inside one
+    # savepoint, so a failure rolls the refresh watermark back.
+    if belief_heads and not dry_run:
+        from storelib import beliefs as _beliefs
+        report["belief_heads"] = _beliefs.run_belief_maintenance(
+            conn, llm_local=llm_local, adapter=adapter, now=now_iso())
 
     # --- 6) Consolidation on the bounded episode (7.1) ---
     # force=True: the cadence gate above already passed (organize reached here

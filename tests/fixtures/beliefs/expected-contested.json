@@ -1,0 +1,11 @@
+{
+  "head_state": "contested",
+  "content": "Correction: the fixture topic cache warms itself on the first query of each day.",
+  "suppression_count": 0,
+  "source_ids": [
+    "00000000-0000-4000-8000-000000000404",
+    "00000000-0000-4000-8000-000000000405",
+    "00000000-0000-4000-8000-000000000406"
+  ],
+  "evidence_ids": []
+}

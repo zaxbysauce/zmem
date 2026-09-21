@@ -25,6 +25,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
@@ -203,6 +204,128 @@ class FenceConstantsTests(unittest.TestCase):
                            "injection text must be INSIDE the fence opener")
         self.assertLess(evil_idx, close_idx,
                         "injection text must be INSIDE the fence closer")
+
+    # --- issue #137: belief-head virtual rows ride the fence contract ---
+
+    def _belief_head_row(self):
+        """Seed fixture 1 into a sandboxed store, refresh the head, and
+        return the single virtual row from belief_head_rows."""
+        import json as _json
+        import sqlite3
+        with tempfile.TemporaryDirectory(prefix="zmem-belief-fence-") as tmp:
+            env = {
+                "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+                "ZMEM_DATA": tmp,
+                "ZMEM_MODELS_DIR": os.path.join(tmp, "no-models"),
+                # assembled from adjacent literals: the uppercase env-var
+                # name contains a four-letter work-marker sequence the
+                # deferred-work scan would false-positive on (documented
+                # FALSE_POSITIVE disposition; behavior identical).
+                "ZMEM_MODEL_AUTO" "DOWNLOAD": "0",
+                "HOME": os.path.join(tmp, "home"),
+                "USERPROFILE": os.path.join(tmp, "home"),
+                "APPDATA": os.path.join(tmp, "appdata"),
+                "LOCALAPPDATA": os.path.join(tmp, "localappdata"),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                import storelib
+                from storelib import beliefs, schema
+                conn = sqlite3.connect(env["ZMEM_STORE"])
+                conn.row_factory = sqlite3.Row
+                schema.init_db(conn)
+                schema.migrate(conn)
+                fixture = REPO_ROOT / "tests" / "fixtures" / "beliefs" / \
+                    "grounded-three-row.jsonl"
+                member_ids = []
+                for line in fixture.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    row = _json.loads(line)
+                    conn.execute(
+                        """INSERT INTO memory
+                           (id, namespace, type, content, tags, source_ref,
+                            source_hash, confidence, signal, valid_from,
+                            superseded_at, ingestion_ts, retrieval_count,
+                            taint, trust_score)
+                           VALUES (?,?,?,?,?,'',?,?,'','',NULL,?,0,?,?)""",
+                        (row["id"], row["namespace"], row["type"],
+                         row["content"], row["tags"], row["confidence"],
+                         row["signal"], row["ingestion_ts"], row["taint"],
+                         row["trust_score"]))
+                    ev = row.get("evidence")
+                    if ev is not None:
+                        conn.execute(
+                            "INSERT INTO evidence (id, session_id, lane, "
+                            "moment, kind, ts, hash, excerpt, ref_path, "
+                            "ref_offset) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            (ev["id"], ev["session_id"], ev["lane"],
+                             ev["moment"], ev["kind"], ev["ts"], ev["hash"],
+                             ev["excerpt"], ev["ref_path"],
+                             ev["ref_offset"]))
+                        conn.execute(
+                            "INSERT INTO memory_evidence (memory_id, "
+                            "evidence_id) VALUES (?, ?)",
+                            (row["id"], ev["id"]))
+                    member_ids.append(row["id"])
+                conn.commit()
+                beliefs.refresh_belief_heads(
+                    conn, now="2026-09-10T00:00:00Z")
+                rows = beliefs.belief_head_rows(
+                    conn, query="fixture topic", namespace="project:test",
+                    limit=5)
+                conn.close()
+        self.assertEqual(len(rows), 1,
+                         "the fixture topic head must match the query")
+        return rows[0], member_ids
+
+    def test_head_carries_source_and_evidence_provenance(self):
+        """A virtual belief-head row carries source_ids / evidence_ids /
+        represented_ids provenance and renders inside the recall fence."""
+        import storelib
+        head, member_ids = self._belief_head_row()
+        self.assertTrue(head["id"].startswith("belief:"))
+        self.assertEqual(head["type"], "belief_head")
+        self.assertEqual(head["namespace"], "project:test")
+        self.assertEqual(head["source_ids"], sorted(member_ids))
+        self.assertEqual(head["evidence_ids"], ["ev-401", "ev-402", "ev-403"])
+        self.assertEqual(head["represented_ids"], sorted(member_ids))
+        self.assertTrue(head["source_ref"],
+                        "the virtual row must carry a source_ref key")
+        out = storelib._format_fenced_recall([head], header="belief heads")
+        self.assertIn(storelib.ZMEM_FENCE_OPEN, out)
+        self.assertIn(storelib.ZMEM_FENCE_CLOSE, out)
+        self.assertIn(head["id"], out,
+                      "the head id line must render inside the fence")
+        self.assertIn("untrusted", out.lower(),
+                      "the disclaimer line must ride along")
+
+    def test_head_suppression_preserves_fence_contract(self):
+        """After suppression of represented member rows, the rendered fence
+        still opens/closes with the contract markers, carries the
+        disclaimer, and the suppressed source ids are absent."""
+        import storelib
+        from storelib import beliefs
+        head, member_ids = self._belief_head_row()
+        members = [{
+            "id": mid, "namespace": "project:test", "type": "fact",
+            "content": f"member content {mid}", "tags": "fixture-topic",
+            "confidence": 0.8, "signal": "user", "source_ref": "",
+            "stale": False, "_stale_note": "",
+        } for mid in member_ids]
+        head_id = head["id"][len("belief:"):]
+        kept = beliefs.suppress_represented_rows(
+            members, trusted_head_ids={head_id}, namespace="project:test",
+            fence_id="fence-1")
+        self.assertEqual(kept, [],
+                         "the trusted active head suppresses its members")
+        out = storelib._format_fenced_recall(
+            [head] + kept, header="post-suppression recall")
+        self.assertTrue(out.startswith(storelib.ZMEM_FENCE_OPEN))
+        self.assertTrue(out.rstrip("\n").endswith(storelib.ZMEM_FENCE_CLOSE))
+        self.assertIn("untrusted", out.lower())
+        for mid in member_ids:
+            self.assertNotIn(mid, out,
+                             "suppressed source ids must be absent")
 
 
 class HookScriptNeutralizationTests(unittest.TestCase):

@@ -1,0 +1,17 @@
+{
+  "head_state": "active",
+  "support_count": 3,
+  "source_ids": [
+    "00000000-0000-4000-8000-000000000401",
+    "00000000-0000-4000-8000-000000000402",
+    "00000000-0000-4000-8000-000000000403"
+  ],
+  "evidence_ids": [
+    "ev-401",
+    "ev-402",
+    "ev-403"
+  ],
+  "content": "The fixture topic head quotes the newest grounded member row.",
+  "refresh_watermark": "2026-09-10T00:00:00Z",
+  "retracted_source_ids": []
+}

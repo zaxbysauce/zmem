@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from storelib.entity import entities_for_memory, entities_for_memories, entity_match_ids
 from storelib.links import expand_recall_links, graph_seed_ids
+from storelib import beliefs as _beliefs
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
@@ -1719,6 +1720,24 @@ def _stable_score_desc(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=key)
 
 
+
+def _suppress_represented_by_head_ns(rows: list[dict],
+                                     fence_id: str) -> list[dict]:
+    """Issue #137: admission-gated represented-row suppression, grouped by
+    each admitted ACTIVE head's OWN namespace — unscoped recall (namespace
+    None) suppresses against the head's namespace, never against a None
+    match. Contested/retracted heads are delivered but never trusted."""
+    by_ns: dict = {}
+    for r in rows:
+        if r.get("type") == "belief_head" and r.get("head_state") == "active":
+            by_ns.setdefault(r.get("namespace"), set()).add(
+                _beliefs.strip_belief_prefix(r["id"]))
+    for ns in sorted(by_ns, key=str):
+        rows = _beliefs.suppress_represented_rows(
+            rows, trusted_head_ids=by_ns[ns], namespace=ns, fence_id=fence_id)
+    return rows
+
+
 def _recall_injection_details(
     rows: list[dict],
     *,
@@ -1728,6 +1747,8 @@ def _recall_injection_details(
     injection_risk: int,
     budget_tokens: int | None,
     surfaced_ids: list[str] | None = None,
+    namespace: str | None = None,
+    fence_id: str | None = None,
 ) -> tuple[dict, list[dict]]:
     """Apply the one passive post-retrieval decision pipeline.
 
@@ -1783,6 +1804,14 @@ def _recall_injection_details(
         budget_dropped_protected = budget_stats["dropped_protected"]
         injection_budget_note = budget_note(budget_stats)
         budget_emptied = not selected_rows
+
+    # Issue #137 (injection lane): admission-gated represented-row
+    # suppression. Only heads that SURVIVED the gate + budget suppress, and
+    # only within the same namespace + delivered fence. Contested heads are
+    # delivered but NEVER trusted for suppression (AC4).
+    if selected_rows:
+        selected_rows = _suppress_represented_by_head_ns(
+            selected_rows, fence_id or "")
 
     if selected_rows:
         reason = "injected"
@@ -1860,6 +1889,7 @@ def _recall_memory_impl(
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
+    _fence_id: str | None = None,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -2153,6 +2183,49 @@ def _recall_memory_impl(
     # own 'flagged rows are counted too' contract).
     injection_risk_count = sum(1 for r in results if r.get("prompt_injection_risk"))
 
+    # Belief heads (issue #137): virtual rows from the belief side tables join
+    # AFTER canonical candidate selection/expansion and BEFORE selective
+    # injection, token admission, telemetry, and delivery-ledger recording —
+    # they then flow through the same gate + single token budget as any row.
+    fence_id = _fence_id or ("plain:" + uuid.uuid4().hex)
+    try:
+        belief_rows = _beliefs.belief_head_rows(
+            conn, query=query, namespace=namespace,
+            limit=_beliefs.RECALL_HEAD_LIMIT, as_of=as_of)
+    except sqlite3.Error:
+        belief_rows = []
+    if belief_rows:
+        # F-002 (PR review): virtual heads are classified with the SAME
+        # injection-risk classifier as canonical rows, and the passive
+        # (no_bump) lane applies the SAME omission filter to them that
+        # canonical rows get at 2041-2048 — an untrusted_web or
+        # injection-flagged head must never ride into a delivered fence
+        # just because it merged after the canonical filter pass.
+        for _b in belief_rows:
+            _b["prompt_injection_risk"] = _classify_injection(_b)
+        seen_ids = {r["id"] for r in results}
+        _excl_set = set(exclude_ids or [])
+        _merged = []
+        for _b in belief_rows:
+            if _b["id"] in seen_ids:
+                continue
+            if _b["id"] in _excl_set:
+                # Issue #137 critic round: an excluded virtual head must not
+                # re-enter after the plain path's exclusion pass, and an
+                # excluded head can never be admitted (so it can never
+                # suppress).
+                excluded += 1
+                continue
+            if no_bump and (_b.get("prompt_injection_risk")
+                            or _b.get("taint") == "untrusted_web"):
+                omitted += 1
+                continue
+            _merged.append(_b)
+        results = results + _merged
+        # Keep the flagged-row telemetry honest after the merge (F-002).
+        injection_risk_count += sum(
+            1 for r in _merged if r.get("prompt_injection_risk"))
+
     injection_details = None
     if for_injection:
         injection_details, surface_rows = _recall_injection_details(
@@ -2160,6 +2233,7 @@ def _recall_memory_impl(
             injection_risk=injection_risk_count,
             budget_tokens=_injection_budget_tokens,
             surfaced_ids=bump_ids,
+            namespace=namespace, fence_id=fence_id,
         )
         results = injection_details["results"]
         # Issue #114: surfaced telemetry covers ONLY the rendered rows that
@@ -2178,6 +2252,12 @@ def _recall_memory_impl(
         # v12 (issue #64): no_telemetry (the eval harness) records nothing.
         _bump_telemetry(conn, bump_ids, no_bump=no_bump,
                         disabled=no_telemetry)
+
+    if not for_injection:
+        # Issue #137 (plain lane): suppression runs on the final admitted set,
+        # so a head that never reached the fence suppresses zero rows.
+        # Contested heads are delivered but never trusted for suppression.
+        results = _suppress_represented_by_head_ns(results, fence_id)
 
     if as_json:
         # v13 (issue #65, 10.8/10.9): reads emit an ENVELOPE, not a bare list,
@@ -3151,6 +3231,7 @@ def _recent_memory_impl(
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
+    _fence_id: str | None = None,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -3262,6 +3343,7 @@ def _recent_memory_impl(
             results, omitted=omitted, exclude_ids=exclude_ids, arms={},
             injection_risk=injection_risk_count,
             budget_tokens=_injection_budget_tokens,
+            namespace=namespace, fence_id=_fence_id or "",
         )
         results = injection_details["results"]
         if results:
@@ -3344,6 +3426,7 @@ def _collect_injection_candidates(
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
+    _fence_id: str | None = None,
 ) -> dict:
     """Run one passive retrieval and return its unrendered details object.
 
@@ -3370,6 +3453,7 @@ def _collect_injection_candidates(
         _cross_moment=_cross_moment,
         _cross_ops_tokens=_cross_ops_tokens,
         _cross_explicit=_cross_explicit,
+        _fence_id=_fence_id,
     )
     if query is None:
         _recent_memory_impl(
@@ -3423,6 +3507,7 @@ def recall_memory(
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
+    _fence_id: str | None = None,
 ) -> list[dict]:
     """Explicit recall entry point (UserPromptSubmit, SubagentStart,
     and SessionStart hook surfaces share this path).
@@ -3465,6 +3550,7 @@ def recall_memory(
             _cross_moment=_cross_moment,
             _cross_ops_tokens=_cross_ops_tokens,
             _cross_explicit=_cross_explicit,
+            _fence_id=_fence_id,
         )
 
     details = _collect_injection_candidates(
@@ -3490,6 +3576,7 @@ def recall_memory(
         _cross_moment=_cross_moment,
         _cross_ops_tokens=_cross_ops_tokens,
         _cross_explicit=_cross_explicit,
+        _fence_id=_fence_id,
     )
     if _capture is not None:
         _capture.clear()
@@ -3533,6 +3620,7 @@ def recent_memory(
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
+    _fence_id: str | None = None,
 ) -> list[dict]:
     # _recent_memory_impl performs the same emit-time _classify_injection
     # filtering before this public wrapper hands candidates to the shared
@@ -3554,6 +3642,7 @@ def recent_memory(
             _cross_moment=_cross_moment,
             _cross_ops_tokens=_cross_ops_tokens,
             _cross_explicit=_cross_explicit,
+            _fence_id=_fence_id,
         )
 
     details = _collect_injection_candidates(
@@ -3579,6 +3668,7 @@ def recent_memory(
         _cross_moment=_cross_moment,
         _cross_ops_tokens=_cross_ops_tokens,
         _cross_explicit=_cross_explicit,
+        _fence_id=_fence_id,
     )
     if _capture is not None:
         _capture.clear()

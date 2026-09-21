@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from storelib.backup import BACKUP_DEFAULT_RETENTION, CONSOLIDATE_LOCK_STALE_SECONDS, SENTINEL_SWEEP_DAYS_DEFAULT, SNAPSHOT_GLOB, _acquire_lock, _release_lock, cmd_backup, cmd_restore, cmd_sweep
 from storelib.consolidate import CONSOLIDATE_DEFAULT_THRESHOLD, consolidate
+from storelib import beliefs as _beliefs
 from storelib.organize import organize
 from storelib.entity import ENTITY_KINDS, cmd_entity_list, cmd_entity_merge
 from storelib.evidence import (
@@ -1361,6 +1362,15 @@ def main():
                                help="print a machine-readable run report (contested clusters "
                                     "included) as the ONLY stdout content; human output goes "
                                     "to stderr")
+    # Issue #137: opt-in deterministic belief heads (+ maintenance-only local
+    # action adapter). --llm-local without --belief-heads is refused at parse
+    # time, before any lock is taken.
+    p_consolidate.add_argument("--belief-heads", dest="belief_heads",
+                               action="store_true", default=False,
+                               help="refresh deterministic belief heads")
+    p_consolidate.add_argument("--llm-local", dest="llm_local",
+                               action="store_true", default=False,
+                               help="run the local maintenance action adapter")
 
     # Sleep-time organize (issue #62). NOT flagless: it deliberately exposes
     # --prune/--dry-run/--force/--json (each wired to a real behavior below —
@@ -1380,6 +1390,15 @@ def main():
     p_organize.add_argument("--json", action="store_true",
                             help="print a machine-readable run report as the ONLY stdout "
                                  "content; human output goes to stderr")
+    # Issue #137: opt-in deterministic belief heads (+ maintenance-only local
+    # action adapter). --llm-local without --belief-heads is refused at parse
+    # time, before any lock is taken.
+    p_organize.add_argument("--belief-heads", dest="belief_heads",
+                            action="store_true", default=False,
+                            help="refresh deterministic belief heads")
+    p_organize.add_argument("--llm-local", dest="llm_local",
+                            action="store_true", default=False,
+                            help="run the local maintenance action adapter")
 
     p_promote = _add_parser("promote", help="promote high-confidence lessons to SKILL.md files")
     # Issue #71 E: merge a leftover second store into this (canonical) one.
@@ -1869,6 +1888,12 @@ def main():
                        default="json", help="Report format")
 
     args = ap.parse_args()
+
+    # Issue #137: --llm-local drives the maintenance action adapter and has no
+    # meaning without --belief-heads; refused at parse time, before any
+    # maintenance lock or store work.
+    if getattr(args, "llm_local", False) and not getattr(args, "belief_heads", False):
+        ap.error("--llm-local requires --belief-heads")
 
     # Issue #99's raw tool input crosses only this private, child-marked
     # channel.  Keep the public CLI grammar unchanged and refuse to consume
@@ -2689,7 +2714,18 @@ def main():
                         c_report = consolidate(
                             conn, threshold=args.threshold, prune=args.prune,
                             dry_run=args.dry_run, namespace=args.namespace,
-                            force=args.force, merge_contested=args.merge_contested)
+                            force=args.force, merge_contested=args.merge_contested,
+                            belief_heads=args.belief_heads,
+                            llm_local=args.llm_local)
+                    except (_beliefs.BeliefActionError,
+                            _beliefs.BeliefAdapterError) as _bexc:
+                        _release_lock("consolidate", c_token)
+                        c_token = None
+                        print("[zmem] belief-heads: %s" % (
+                            "invalid action" if isinstance(
+                                _bexc, _beliefs.BeliefActionError)
+                            else "adapter failed"), file=sys.stderr)
+                        sys.exit(1)
                     finally:
                         _release_lock("consolidate", c_token)
             if lock_busy:
@@ -2733,7 +2769,17 @@ def main():
                     try:
                         o_report = organize(
                             conn, dry_run=args.dry_run, force=args.force,
-                            prune=args.prune)
+                            prune=args.prune, belief_heads=args.belief_heads,
+                            llm_local=args.llm_local)
+                    except (_beliefs.BeliefActionError,
+                            _beliefs.BeliefAdapterError) as _bexc:
+                        _release_lock("consolidate", o_token)
+                        o_token = None
+                        print("[zmem] belief-heads: %s" % (
+                            "invalid action" if isinstance(
+                                _bexc, _beliefs.BeliefActionError)
+                            else "adapter failed"), file=sys.stderr)
+                        sys.exit(1)
                     finally:
                         _release_lock("consolidate", o_token)
             if lock_busy:
