@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import ast
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -1174,6 +1175,439 @@ class ReplaySchemaTest(unittest.TestCase):
             self.assertEqual(row["t_ms"], {"p50": expected_latency[moment], "p95": expected_latency[moment]})
             self.assertEqual(counts["reference_checked"], 0)
             self.assertEqual(counts["miss"], 0)
+
+
+class ActionMatcherTest(unittest.TestCase):
+    """Issue #156 matcher contract: classification, window, overlap, selection.
+
+    These tests call ``match_observational_actions`` directly with the
+    committed fixture rows (or inline rows) and perform no store access.
+    """
+
+    @staticmethod
+    def _module():
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("eval_replay_actions", EVALUATOR)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _fixture_rows():
+        payload = json.loads((FIXTURES / "actions.json").read_text(encoding="utf-8"))
+        return payload["delivered_rows"], payload["evidence_rows"]
+
+    @staticmethod
+    def _result_for(results, suffix):
+        hits = [row for row in results if row["delivered_id"].endswith(suffix)]
+        assert len(hits) == 1, f"expected exactly one row ending {suffix}, got {hits}"
+        return hits[0]
+
+    def test_success_is_applied(self):
+        module = self._module()
+        delivered, evidence = self._fixture_rows()
+        results = module.match_observational_actions(delivered, evidence)
+        row = self._result_for(results, "0101")
+        self.assertEqual(row["action"], "applied")
+        self.assertEqual(row["event_kind"], "success")
+        self.assertEqual(row["elapsed_s"], 60.0)
+        self.assertEqual(row["overlap_count"], 3)
+        self.assertEqual(
+            sorted(row.keys()),
+            ["action", "delivered_id", "elapsed_s", "event_kind", "overlap_count", "session_id"],
+        )
+
+    def test_failure_is_violated(self):
+        module = self._module()
+        delivered, evidence = self._fixture_rows()
+        row = self._result_for(module.match_observational_actions(delivered, evidence), "0102")
+        self.assertEqual(row["action"], "violated")
+        self.assertEqual(row["event_kind"], "failure")
+        self.assertEqual(row["elapsed_s"], 60.0)
+        self.assertEqual(row["overlap_count"], 3)
+
+    def test_unrelated_operation_is_ignored(self):
+        module = self._module()
+        delivered, evidence = self._fixture_rows()
+        row = self._result_for(module.match_observational_actions(delivered, evidence), "0103")
+        self.assertEqual(row["action"], "ignored")
+        self.assertIsNone(row["event_kind"])
+        self.assertIsNone(row["elapsed_s"])
+        self.assertEqual(row["overlap_count"], 0)
+
+    def test_event_outside_window_is_ignored(self):
+        module = self._module()
+        self.assertEqual(module.ZMEM_MATCH_WINDOW_S, 1800)
+        self.assertEqual(module.ZMEM_MATCH_MIN_OVERLAP, 2)
+        delivered, evidence = self._fixture_rows()
+        row = self._result_for(module.match_observational_actions(delivered, evidence), "0104")
+        self.assertEqual(row["action"], "ignored")
+        self.assertIsNone(row["event_kind"])
+        self.assertIsNone(row["elapsed_s"])
+        self.assertEqual(row["overlap_count"], 0)
+
+    def test_first_matching_event_wins(self):
+        module = self._module()
+        base = {"id": "d0000000-0000-4000-8000-000000000d01", "session_id": "s-order",
+                "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"}
+        late = {"session_id": "s-order", "timestamp": "2026-06-01T00:02:00Z",
+                "event_kind": "failure", "operation": "git stash pop"}
+        early = {"session_id": "s-order", "timestamp": "2026-06-01T00:01:00Z",
+                 "event_kind": "success", "operation": "git stash pop"}
+        row = self._result_for(module.match_observational_actions([base], [late, early]), "0d01")
+        self.assertEqual(row["elapsed_s"], 60.0)
+        self.assertEqual(row["event_kind"], "success")
+        tie_a = {"session_id": "s-tie", "timestamp": "2026-06-01T00:01:00Z",
+                 "event_kind": "failure", "operation": "git stash pop"}
+        tie_b = {"session_id": "s-tie", "timestamp": "2026-06-01T00:01:00Z",
+                 "event_kind": "success", "operation": "git stash pop"}
+        tie_base = {"id": "d0000000-0000-4000-8000-000000000d02", "session_id": "s-tie",
+                    "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"}
+        tie_row = self._result_for(module.match_observational_actions([tie_base], [tie_a, tie_b]), "0d02")
+        self.assertEqual(tie_row["event_kind"], "failure")
+        single = module.match_observational_actions(
+            [base],
+            [{"session_id": "s-order", "timestamp": "2026-06-01T00:01:00Z",
+              "event_kind": "success", "operation": "git check"}],
+        )
+        self.assertEqual(single[0]["action"], "ignored")
+        before = module.match_observational_actions(
+            [base],
+            [{"session_id": "s-order", "timestamp": "2026-05-31T23:00:00Z",
+              "event_kind": "success", "operation": "git stash pop"}],
+        )
+        self.assertEqual(before[0]["action"], "ignored")
+
+    def test_invalid_evidence_fails_closed(self):
+        store = FIXTURES / "store.sqlite"
+        before = hashlib.sha256(store.read_bytes()).hexdigest()
+        payload = json.loads((FIXTURES / "actions.json").read_text(encoding="utf-8"))
+        for missing in ("session_id", "timestamp", "event_kind", "operation"):
+            with tempfile.TemporaryDirectory(prefix="zmem-actions-invalid-") as raw:
+                scratch = Path(raw)
+                broken = json.loads(json.dumps(payload))
+                del broken["evidence_rows"][0][missing]
+                broken_path = scratch / "broken-actions.json"
+                broken_path.write_text(json.dumps(broken), encoding="utf-8")
+                out_path = scratch / "malformed-report.json"
+                run = subprocess.run(
+                    [PYTHON, str(EVALUATOR),
+                     "--store", str(store), "--log", str(FIXTURES / "decisions.log"),
+                     "--days", "30", "--actions", "--actions-input", str(broken_path),
+                     "--json-out", str(out_path)],
+                    cwd=str(ROOT), env=_env(scratch),
+                    capture_output=True, text=True, timeout=120,
+                )
+                self.assertEqual(run.returncode, 2, f"missing {missing}: {run.stderr}")
+                combined = (run.stderr or "") + (run.stdout or "")
+                self.assertIn("evidence row 0", combined, f"missing {missing}: {combined}")
+                self.assertIn(missing, combined)
+                self.assertFalse(out_path.exists(), "malformed run must not write --json-out")
+        # Later evidence rows and delivered rows carry their own indexed
+        # diagnostics on the same exit-2 surface, and invalid JSON gets the
+        # stable ReplayError diagnostic instead of a traceback.
+        later = json.loads(json.dumps(payload))
+        del later["evidence_rows"][2]["operation"]
+        delivered = json.loads(json.dumps(payload))
+        del delivered["delivered_rows"][0]["id"]
+        for broken_rows, needle in ((later, "evidence row 2"), (delivered, "delivered row 0")):
+            with tempfile.TemporaryDirectory(prefix="zmem-actions-invalid-") as raw:
+                scratch = Path(raw)
+                broken_path = scratch / "broken-actions.json"
+                broken_path.write_text(json.dumps(broken_rows), encoding="utf-8")
+                run = subprocess.run(
+                    [PYTHON, str(EVALUATOR),
+                     "--store", str(store), "--log", str(FIXTURES / "decisions.log"),
+                     "--days", "30", "--actions", "--actions-input", str(broken_path),
+                     "--json-out", str(scratch / "malformed-report.json")],
+                    cwd=str(ROOT), env=_env(scratch),
+                    capture_output=True, text=True, timeout=120,
+                )
+                self.assertEqual(run.returncode, 2, needle)
+                self.assertIn(needle, (run.stderr or "") + (run.stdout or ""))
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-invalid-") as raw:
+            scratch = Path(raw)
+            bad_json = scratch / "bad-actions.json"
+            bad_json.write_text("{not json", encoding="utf-8")
+            run = subprocess.run(
+                [PYTHON, str(EVALUATOR),
+                 "--store", str(store), "--log", str(FIXTURES / "decisions.log"),
+                 "--days", "30", "--actions", "--actions-input", str(bad_json),
+                 "--json-out", str(scratch / "malformed-report.json")],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(run.returncode, 2, run.stderr)
+            self.assertIn("replay: actions-input is not valid JSON", run.stderr or "")
+            self.assertNotIn("Traceback", run.stderr or "")
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-oversize-") as raw:
+            scratch = Path(raw)
+            oversize = scratch / "oversize-actions.json"
+            oversize.write_bytes(b" " * (4 * 1024 * 1024 + 1))
+            run = subprocess.run(
+                [PYTHON, str(EVALUATOR),
+                 "--store", str(store), "--log", str(FIXTURES / "decisions.log"),
+                 "--days", "30", "--actions", "--actions-input", str(oversize),
+                 "--json-out", str(scratch / "oversize-report.json")],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(run.returncode, 2, run.stderr)
+            self.assertIn("exceeds the", run.stderr or "")
+            self.assertIn("byte limit", run.stderr or "")
+            # The bounded-read diagnostic must not be re-wrapped as a JSON error.
+            self.assertNotIn("not valid JSON", run.stderr or "")
+            self.assertEqual((run.stderr or "").count("replay:"), 1)
+        self.assertEqual(hashlib.sha256(store.read_bytes()).hexdigest(), before)
+
+
+    def test_window_boundary_is_inclusive_at_1800_seconds(self):
+        # PRR-005: the window is inclusive (elapsed <= window_s); pin both edges.
+        module = self._module()
+        base = {"id": "d0000000-0000-4000-8000-000000000b01", "session_id": "s-edge",
+                "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"}
+        at_edge = module.match_observational_actions(
+            [base],
+            [{"session_id": "s-edge", "timestamp": "2026-06-01T00:30:00Z",
+              "event_kind": "success", "operation": "git stash pop"}],
+        )
+        self.assertEqual(at_edge[0]["action"], "applied")
+        self.assertEqual(at_edge[0]["elapsed_s"], 1800.0)
+        past_edge = module.match_observational_actions(
+            [base],
+            [{"session_id": "s-edge", "timestamp": "2026-06-01T00:30:01Z",
+              "event_kind": "success", "operation": "git stash pop"}],
+        )
+        self.assertEqual(past_edge[0]["action"], "ignored")
+
+    def test_same_session_multiple_delivered_rows_match_independently(self):
+        # PRR-006: two delivered rows in one session match evidence independently.
+        module = self._module()
+        delivered = [
+            {"id": "d0000000-0000-4000-8000-000000000c01", "session_id": "s-multi",
+             "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"},
+            {"id": "d0000000-0000-4000-8000-000000000c02", "session_id": "s-multi",
+             "timestamp": "2026-06-01T00:10:00Z", "operation": "bun test suite"},
+        ]
+        evidence = [
+            {"session_id": "s-multi", "timestamp": "2026-06-01T00:01:00Z",
+             "event_kind": "success", "operation": "git stash pop"},
+            {"session_id": "s-multi", "timestamp": "2026-06-01T00:11:00Z",
+             "event_kind": "failure", "operation": "bun test suite"},
+        ]
+        results = module.match_observational_actions(delivered, evidence)
+        first = self._result_for(results, "0c01")
+        second = self._result_for(results, "0c02")
+        self.assertEqual(first["action"], "applied")
+        self.assertEqual(second["action"], "violated")
+
+    def test_results_order_across_sessions_by_session_id(self):
+        # PRR-007: cross-session ordering is by session_id, delivered input
+        # order breaks ties only inside a session.
+        module = self._module()
+        delivered = [
+            {"id": "d0000000-0000-4000-8000-000000000d11", "session_id": "session-zzz",
+             "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"},
+            {"id": "d0000000-0000-4000-8000-000000000d12", "session_id": "session-aaa",
+             "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"},
+        ]
+        evidence = [
+            {"session_id": "session-zzz", "timestamp": "2026-06-01T00:01:00Z",
+             "event_kind": "success", "operation": "git stash pop"},
+            {"session_id": "session-aaa", "timestamp": "2026-06-01T00:01:00Z",
+             "event_kind": "success", "operation": "git stash pop"},
+        ]
+        results = module.match_observational_actions(delivered, evidence)
+        self.assertEqual([row["session_id"] for row in results], ["session-aaa", "session-zzz"])
+        self.assertEqual([row["delivered_id"][-4:] for row in results], ["0d12", "0d11"])
+
+    def test_unrecognized_event_kind_is_ignored_with_observation_fields(self):
+        # PRR-018: an overlapping event with an unrecognized kind is ignored but
+        # keeps its observed event_kind/elapsed_s (only the no-match branch is null).
+        module = self._module()
+        base = {"id": "d0000000-0000-4000-8000-000000000e01", "session_id": "s-kind",
+                "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"}
+        results = module.match_observational_actions(
+            [base],
+            [{"session_id": "s-kind", "timestamp": "2026-06-01T00:01:00Z",
+              "event_kind": "warning", "operation": "git stash pop"}],
+        )
+        self.assertEqual(results[0]["action"], "ignored")
+        self.assertEqual(results[0]["event_kind"], "warning")
+        self.assertEqual(results[0]["elapsed_s"], 60.0)
+
+    def test_duplicate_delivered_ids_produce_one_result_per_row(self):
+        # PRR-018: the matcher does not deduplicate delivered ids.
+        module = self._module()
+        delivered = [
+            {"id": "d0000000-0000-4000-8000-000000000f01", "session_id": "s-dup",
+             "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"},
+            {"id": "d0000000-0000-4000-8000-000000000f01", "session_id": "s-dup",
+             "timestamp": "2026-06-01T00:05:00Z", "operation": "git stash pop"},
+        ]
+        results = module.match_observational_actions(
+            delivered,
+            [{"session_id": "s-dup", "timestamp": "2026-06-01T00:06:00Z",
+              "event_kind": "success", "operation": "git stash pop"}],
+        )
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(row["delivered_id"].endswith("0f01") for row in results))
+
+    def test_empty_row_lists_yield_no_results(self):
+        # PRR-018: empty inputs are valid and produce no results.
+        module = self._module()
+        self.assertEqual(module.match_observational_actions([], []), [])
+
+    def test_non_string_field_types_fail_closed(self):
+        # PRR-018: non-string field values are rejected, not coerced.
+        module = self._module()
+        bad_timestamp = [{"id": "d1", "session_id": "s",
+                          "timestamp": 1800, "operation": "git stash pop"}]
+        with self.assertRaises(module.ReplayError):
+            module.match_observational_actions(bad_timestamp, [])
+        bad_operation = [{"id": "d1", "session_id": "s",
+                          "timestamp": "2026-06-01T00:00:00Z", "operation": None}]
+        with self.assertRaises(module.ReplayError):
+            module.match_observational_actions(bad_operation, [])
+
+
+class ReplayReportTest(unittest.TestCase):
+    """Issue #156 report contract: byte-identical action output, read-only run.
+
+    "No test file is deleted" is enforced by review/diff scope, not by a
+    runtime probe here.
+    """
+
+    def test_actions_output_matches_expected(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-report-") as raw:
+            scratch = Path(raw)
+            out_path = scratch / "actions.json"
+            run = subprocess.run(
+                [PYTHON, str(EVALUATOR),
+                 "--store", str(FIXTURES / "store.sqlite"),
+                 "--log", str(FIXTURES / "decisions.log"),
+                 "--days", "30", "--actions",
+                 "--actions-input", str(FIXTURES / "actions.json"),
+                 "--json-out", str(out_path)],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(
+                out_path.read_bytes(),
+                (FIXTURES / "actions-expected.json").read_bytes(),
+            )
+
+    def test_actions_preserves_store_sha(self):
+        store = FIXTURES / "store.sqlite"
+        before = hashlib.sha256(store.read_bytes()).hexdigest()
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-sha-") as raw:
+            scratch = Path(raw)
+            run = subprocess.run(
+                [PYTHON, str(EVALUATOR),
+                 "--store", str(store), "--log", str(FIXTURES / "decisions.log"),
+                 "--days", "30", "--actions",
+                 "--actions-input", str(FIXTURES / "actions.json"),
+                 "--json-out", str(scratch / "actions.json")],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(hashlib.sha256(store.read_bytes()).hexdigest(), before)
+        report = json.loads((FIXTURES / "actions-expected.json").read_text(encoding="utf-8"))
+        self.assertNotIn("applied_count", json.dumps(report))
+        self.assertNotIn("violated_count", json.dumps(report))
+
+
+    def test_actions_input_participates_in_digest(self):
+        # The actions input is a report-affecting explicit input: changing
+        # only its bytes must change the report's input_digest.
+        payload = json.loads((FIXTURES / "actions.json").read_text(encoding="utf-8"))
+        modified = json.loads(json.dumps(payload))
+        modified["evidence_rows"][0]["event_kind"] = "failure"
+        digests = []
+        for rows in (payload, modified):
+            with tempfile.TemporaryDirectory(prefix="zmem-actions-digest-") as raw:
+                scratch = Path(raw)
+                src = scratch / "actions.json"
+                src.write_text(json.dumps(rows), encoding="utf-8")
+                out_path = scratch / "report.json"
+                run = subprocess.run(
+                    [PYTHON, str(EVALUATOR),
+                     "--store", str(FIXTURES / "store.sqlite"),
+                     "--log", str(FIXTURES / "decisions.log"),
+                     "--days", "30", "--actions", "--actions-input", str(src),
+                     "--json-out", str(out_path)],
+                    cwd=str(ROOT), env=_env(scratch),
+                    capture_output=True, text=True, timeout=120,
+                )
+                self.assertEqual(run.returncode, 0, run.stderr)
+                digests.append(json.loads(out_path.read_text(encoding="utf-8"))["input_digest"])
+        self.assertNotEqual(digests[0], digests[1])
+
+
+    def test_actions_input_operator_alias_is_rejected(self):
+        # PRR-008: --actions-input is refused like every other input when it
+        # aliases the operator store. The env-pinned ZMEM_STORE scratch path
+        # is an operator candidate; materialize it so the regular-file probe
+        # passes and the alias refusal (not the file-shape error) fires.
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-alias-") as raw:
+            scratch = Path(raw)
+            alias = scratch / "ambient.sqlite"
+            alias.write_bytes(b"not-a-real-store")
+            run = subprocess.run(
+                [PYTHON, str(EVALUATOR),
+                 "--store", str(FIXTURES / "store.sqlite"),
+                 "--log", str(FIXTURES / "decisions.log"),
+                 "--days", "30", "--actions",
+                 "--actions-input", str(alias),
+                 "--json-out", str(scratch / "out.json")],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("operator store", run.stderr or "")
+
+    def test_changed_actions_input_aborts_before_output(self):
+        # PRR-009: the actions input is re-verified after evaluation; a
+        # mid-run mutation must exit 2 WITHOUT writing --json-out, so the
+        # snapshot-verify-write ordering cannot be silently reordered.
+        module = ActionMatcherTest._module()
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-toctou-") as raw:
+            scratch = Path(raw)
+            src = scratch / "actions.json"
+            src.write_bytes((FIXTURES / "actions.json").read_bytes())
+            out_path = scratch / "report.json"
+            real_read_bounded = module._read_bounded
+            calls = {"count": 0}
+
+            def flaky_read_bounded(path, label, maximum):
+                data = real_read_bounded(path, label, maximum)
+                if label == "actions input":
+                    calls["count"] += 1
+                    if calls["count"] >= 2:
+                        return data + b" "
+                return data
+
+            module._read_bounded = flaky_read_bounded
+            stderr = io.StringIO()
+            try:
+                argv = [
+                    "eval_replay.py",
+                    "--store", str(FIXTURES / "store.sqlite"),
+                    "--log", str(FIXTURES / "decisions.log"),
+                    "--days", "30", "--actions", "--actions-input", str(src),
+                    "--json-out", str(out_path),
+                ]
+                with patch.object(sys, "argv", argv):
+                    with patch.object(sys, "stderr", stderr):
+                        exit_code = module.main()
+            finally:
+                module._read_bounded = real_read_bounded
+            self.assertEqual(exit_code, 2)
+            self.assertIn("actions input", stderr.getvalue())
+            self.assertFalse(out_path.exists())
 
 
 if __name__ == "__main__":

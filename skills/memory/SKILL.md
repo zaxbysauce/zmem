@@ -1855,6 +1855,34 @@ compatibility values and stderr says metrics are unavailable; they are not a
 measured success, failure, or efficacy claim. See
 `tests/fixtures/replay/README.md` for bounds and reproducibility details.
 
+Observational action matching (issue #156) adds a report-only `--actions` mode
+to the same evaluator:
+
+```text
+python scripts/eval_replay.py --store tests/fixtures/replay/store.sqlite \
+  --log tests/fixtures/replay/decisions.log --days 30 \
+  --actions --actions-input tests/fixtures/replay/actions.json \
+  --json-out actions-report.json
+```
+
+`--actions-input` is an explicit JSON file of recorded `delivered_rows` and
+`evidence_rows` (delivered rows carry `id`, `session_id`, `timestamp`, and `operation`;
+evidence rows carry `session_id`, `timestamp`, `event_kind`, and
+`operation`). For each delivered row the matcher selects the first
+later same-session evidence event inside the fixed `ZMEM_MATCH_WINDOW_S =
+1800` second window whose `derive_ops_tokens` normalization shares at least
+`ZMEM_MATCH_MIN_OVERLAP = 2` tokens with the delivered trigger, then labels
+the row `applied` (success), `violated` (failure), or `ignored` (no
+qualifying event). Both constants are fixed with no environment overrides and
+are recorded in the report next to the sorted `results`. The boundary is
+strictly report-only: no action counter is written, no write transaction is
+opened, and the store SHA-256 is unchanged (durable counters belong to
+issue #124). The oracle pair `tests/fixtures/replay/actions.json` /
+`actions-expected.json` is written only by
+`tests/fixtures/replay/generate_actions.py`, which refuses to replace
+committed bytes when they drift; malformed rows or non-UTC timestamps exit 2
+before any output file is replaced.
+
 The predeclared private real-corpus measurement of record for issue #155 is
 committed at `eval/real-corpus-2026-09-19.json`: a cohort frozen at
 declaration time (standalone store snapshot, `ver=0.49.0` projection of the

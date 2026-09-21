@@ -1,0 +1,54 @@
+{
+  "delivered_rows": [
+    {
+      "id": "e0000000-0000-4000-8000-000000000101",
+      "operation": "git stash pop",
+      "session_id": "session-R-applied",
+      "timestamp": "2026-06-01T00:00:00Z"
+    },
+    {
+      "id": "e0000000-0000-4000-8000-000000000102",
+      "operation": "git stash pop",
+      "session_id": "session-R-violated",
+      "timestamp": "2026-06-01T00:00:00Z"
+    },
+    {
+      "id": "e0000000-0000-4000-8000-000000000103",
+      "operation": "git stash pop",
+      "session_id": "session-R-unrelated",
+      "timestamp": "2026-06-01T00:00:00Z"
+    },
+    {
+      "id": "e0000000-0000-4000-8000-000000000104",
+      "operation": "git stash pop",
+      "session_id": "session-R-late",
+      "timestamp": "2026-06-01T00:00:00Z"
+    }
+  ],
+  "evidence_rows": [
+    {
+      "event_kind": "success",
+      "operation": "git stash pop",
+      "session_id": "session-R-applied",
+      "timestamp": "2026-06-01T00:01:00Z"
+    },
+    {
+      "event_kind": "failure",
+      "operation": "git stash pop",
+      "session_id": "session-R-violated",
+      "timestamp": "2026-06-01T00:01:00Z"
+    },
+    {
+      "event_kind": "success",
+      "operation": "bun test",
+      "session_id": "session-R-unrelated",
+      "timestamp": "2026-06-01T00:01:00Z"
+    },
+    {
+      "event_kind": "success",
+      "operation": "git stash pop",
+      "session_id": "session-R-late",
+      "timestamp": "2026-06-01T01:00:00Z"
+    }
+  ]
+}
