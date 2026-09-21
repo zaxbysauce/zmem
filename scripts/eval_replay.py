@@ -71,6 +71,7 @@ MAX_LOG_BYTES = 64 * 1024 * 1024
 ZMEM_MATCH_WINDOW_S = 1800
 ZMEM_MATCH_MIN_OVERLAP = 2
 MAX_ACTIONS_BYTES = 4 * 1024 * 1024
+MAX_ACTION_CANDIDATE_WORK = 100_000
 _ACTIONS_DELIVERED_FIELDS = ("id", "session_id", "timestamp", "operation")
 _ACTIONS_EVIDENCE_FIELDS = ("session_id", "timestamp", "event_kind", "operation")
 
@@ -1065,12 +1066,33 @@ def match_observational_actions(
     ``applied``, ``failure`` to ``violated``, and everything else (including
     no match) to ``ignored``.
     """
+    if isinstance(window_s, bool) or not isinstance(window_s, int) or window_s < 0:
+        raise ReplayError("replay: invalid action match window\n")
+    if (isinstance(min_overlap, bool) or not isinstance(min_overlap, int)
+            or min_overlap < 1):
+        raise ReplayError("replay: invalid action match overlap\n")
     delivered = _validated_action_rows(delivered_rows, kind="delivered")
     evidence = _validated_action_rows(evidence_rows, kind="evidence")
     derive = _derive_ops_tokens()
     by_session: dict[str, list[dict]] = {}
     for event in evidence:
         by_session.setdefault(event["session_id"], []).append(event)
+
+    # Count timestamp-window candidates before deriving any operation tokens.
+    # This keeps dense same-session inputs from silently expanding the nested
+    # matcher beyond the explicit work budget.
+    potential_work = 0
+    for row in delivered:
+        for event in by_session.get(row["session_id"], []):
+            elapsed = (event["instant"] - row["instant"]).total_seconds()
+            if elapsed > 0 and elapsed <= window_s:
+                potential_work += 1
+                if potential_work > MAX_ACTION_CANDIDATE_WORK:
+                    raise ReplayError(
+                        "replay: action match potential candidate work exceeds the "
+                        f"{MAX_ACTION_CANDIDATE_WORK}-candidate limit\n"
+                    )
+
     results: list[dict] = []
     for row in delivered:
         trigger = set(derive(row["operation"]))

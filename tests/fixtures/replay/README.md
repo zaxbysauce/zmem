@@ -62,6 +62,18 @@ output.
 
 ## Maintainer regeneration and review
 
+The action-fixture generator (`generate_actions.py`) accepts only destinations
+under the repository root or the process temp root. Before evaluator execution,
+after the evaluator returns, after parent-directory creation, and immediately
+before publication it walks the original lexical path and rejects `..`,
+symlinks, Windows junctions, and other reparse-point components. Existing
+artifacts are compared byte-for-byte and never clobbered. Missing artifacts are
+written through a fully fsynced temporary file and an exclusive hard-link
+publication, so a concurrent creator wins or is compared rather than replaced.
+This is a local maintainer-tool preflight; defending the final system call
+against an adversary that swaps an ancestor requires descriptor-relative POSIX
+or handle-relative Windows APIs beyond this portable helper.
+
 Regenerate candidates only in fresh scratch directories after the selected
 release manifest is finalized:
 
