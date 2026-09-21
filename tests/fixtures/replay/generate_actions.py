@@ -10,7 +10,8 @@ drift between the implementation and the committed oracle is a hard error.
 ``ZMEM_TEST_NOW`` pins the documented fixture epoch (2026-06-01T00:00:00Z)
 per the issue contract; the evaluator's own report clock derives from the
 committed decision log, so the pin documents the epoch rather than driving
-it. Tests consume committed bytes and never invoke this module.
+    it. Tests may invoke this module only with scratch destinations to exercise
+    the maintainer-tool safety checks; they never replace committed artifacts.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -97,13 +99,72 @@ def _json_bytes(payload: object) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, indent=2, separators=(",", ": "), sort_keys=True) + "\n").encode("utf-8")
 
 
-def _write_checked(path: Path, data: bytes) -> None:
-    """Replace ``path`` only when its committed bytes equal ``data`` or it is absent.
+def _reject_unsafe_destination(path: Path) -> None:
+    """Reject traversal, links, and reparse points in a trusted output tree.
 
-    The replacement itself is atomic (temp file + os.replace) so a crash
-    mid-write can never leave a half-written committed fixture behind.
+    The generator is a local maintainer tool. Its supported destinations are
+    repository paths and fresh paths below the process temp directory; keeping
+    that trust floor explicit avoids system-link false positives and prevents
+    a nested existing junction from hiding an unsafe ancestor. The lexical
+    walk is a preflight check, not descriptor-relative protection against an
+    attacker replacing an ancestor during the final publication system call.
     """
+    if ".." in Path(str(path)).parts:
+        raise RuntimeError(f"unsafe fixture destination contains parent traversal: {path}")
+
+    candidate = Path(os.path.abspath(str(path)))
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    candidate_text = os.path.normcase(str(candidate))
+    trusted_roots = (
+        Path(os.path.abspath(str(ROOT))),
+        Path(os.path.abspath(tempfile.gettempdir())),
+    )
+    floor = None
+    for root in trusted_roots:
+        root_text = os.path.normcase(str(root))
+        try:
+            if os.path.commonpath((candidate_text, root_text)) == root_text:
+                floor = root
+                break
+        except ValueError:
+            continue
+    if floor is None:
+        raise RuntimeError(
+            f"fixture destination must be under the repository or temp root: {path}"
+        )
+
+    while candidate != floor:
+        if os.path.lexists(str(candidate)):
+            try:
+                info = os.lstat(str(candidate))
+            except OSError as exc:
+                raise RuntimeError(
+                    f"cannot inspect fixture destination component: {candidate}"
+                ) from exc
+            if stat.S_ISLNK(info.st_mode) or bool(
+                getattr(info, "st_file_attributes", 0) & reparse_flag
+            ):
+                raise RuntimeError(
+                    f"fixture destination contains a symlink or reparse point: {candidate}"
+                )
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+
+
+def _write_checked(path: Path, data: bytes) -> None:
+    """Publish atomically without clobbering a concurrent creator.
+
+    The temporary file is fully written and fsynced before an exclusive hard
+    link publishes it. A concurrent creator therefore either wins first (and
+    must contain identical bytes) or cannot be overwritten. This remains a
+    local maintainer-tool preflight; descriptor-relative final-system-call
+    protection is outside this standard-library helper's portability boundary.
+    """
+    _reject_unsafe_destination(path)
     if path.exists():
+        _reject_unsafe_destination(path)
         existing = path.read_bytes()
         if existing == data:
             return
@@ -113,19 +174,36 @@ def _write_checked(path: Path, data: bytes) -> None:
             "deliberately after reviewing the drift"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_unsafe_destination(path)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), suffix=".tmp")
+    temporary_path = Path(temporary)
     try:
+        _reject_unsafe_destination(temporary_path)
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(temporary, path)
-    except OSError as exc:
+        _reject_unsafe_destination(path)
         try:
-            os.unlink(temporary)
+            os.link(str(temporary_path), str(path))
+        except FileExistsError:
+            _reject_unsafe_destination(path)
+            existing = path.read_bytes()
+            if existing != data:
+                raise RuntimeError(
+                    f"refusing to replace {path}: committed bytes differ from generated "
+                    f"(existing {len(existing)}B, generated {len(data)}B); regenerate "
+                    "deliberately after reviewing the drift"
+                )
+        except OSError as exc:
+            raise RuntimeError(f"cannot publish fixture {path} exclusively: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"cannot write fixture {path}: {exc}") from exc
+    finally:
+        try:
+            temporary_path.unlink()
         except OSError:
             pass
-        raise RuntimeError(f"cannot write fixture {path}: {exc}") from exc
 
 
 def _env(scratch: Path) -> dict[str, str]:
@@ -148,6 +226,8 @@ def _env(scratch: Path) -> dict[str, str]:
 
 
 def generate(actions_out: Path, expected_out: Path) -> dict[str, str]:
+    _reject_unsafe_destination(actions_out)
+    _reject_unsafe_destination(expected_out)
     actions_bytes = _json_bytes(_actions_payload())
     with tempfile.TemporaryDirectory(prefix="zmem-actions-build-") as raw:
         scratch = Path(raw)
@@ -171,6 +251,8 @@ def generate(actions_out: Path, expected_out: Path) -> dict[str, str]:
         if result.returncode:
             raise RuntimeError(f"--actions evaluator failed ({result.returncode}): {result.stderr}")
         expected_bytes = report_candidate.read_bytes()
+    _reject_unsafe_destination(actions_out)
+    _reject_unsafe_destination(expected_out)
     _write_checked(actions_out, actions_bytes)
     _write_checked(expected_out, expected_bytes)
     return {

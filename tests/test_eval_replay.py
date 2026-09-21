@@ -1093,6 +1093,146 @@ class ReplayRemediationTest(unittest.TestCase):
         prompt_reader.assert_called_once_with([str(transcript)])
 
 
+class ReplayActionGeneratorTest(unittest.TestCase):
+    @staticmethod
+    def _generator():
+        from tests.fixtures.replay import generate_actions
+
+        return generate_actions
+
+    def test_generator_verifies_existing_bytes_without_replacement(self):
+        generator = self._generator()
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-action-generator-") as raw:
+            scratch = Path(raw)
+            actions = scratch / "actions.json"
+            expected = scratch / "actions-expected.json"
+            generator.generate(actions, expected)
+            self.assertEqual(actions.read_bytes(), (FIXTURES / "actions.json").read_bytes())
+            self.assertEqual(expected.read_bytes(), (FIXTURES / "actions-expected.json").read_bytes())
+            generator.generate(actions, expected)
+            action_before = actions.read_bytes()
+            expected.write_bytes(b"reviewed sentinel\n")
+            with self.assertRaisesRegex(RuntimeError, "refusing to replace"):
+                generator.generate(actions, expected)
+            self.assertEqual(actions.read_bytes(), action_before)
+            self.assertEqual(expected.read_bytes(), b"reviewed sentinel\n")
+
+    def test_generator_rejects_raw_parent_reference_before_touching_outputs(self):
+        generator = self._generator()
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-action-generator-") as raw:
+            scratch = Path(raw)
+            actions = scratch / "trusted" / ".." / "escaped-actions.json"
+            expected = scratch / "actions-expected.json"
+            with self.assertRaisesRegex(RuntimeError, "parent traversal"):
+                generator.generate(actions, expected)
+            self.assertFalse((scratch / "escaped-actions.json").exists())
+            self.assertFalse(expected.exists())
+
+    def test_generator_rejects_destination_outside_trusted_roots(self):
+        generator = self._generator()
+        outside = ROOT.parent / "zmem-action-generator-untrusted" / "actions.json"
+        with self.assertRaisesRegex(RuntimeError, "repository or temp root"):
+            generator._reject_unsafe_destination(outside)
+
+    @unittest.skipUnless(os.name != "nt", "POSIX symlinks are exercised separately")
+    def test_generator_rejects_symlink_parent_and_leaves_outside_untouched(self):
+        generator = self._generator()
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-action-generator-") as raw:
+            scratch = Path(raw)
+            outside = scratch / "outside"
+            outside.mkdir()
+            parent_link = scratch / "linked-parent"
+            try:
+                parent_link.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+            actions = parent_link / "actions.json"
+            expected = scratch / "actions-expected.json"
+            with self.assertRaisesRegex(RuntimeError, "symlink or reparse point"):
+                generator.generate(actions, expected)
+            self.assertFalse((outside / "actions.json").exists())
+            self.assertFalse(expected.exists())
+
+    @unittest.skipUnless(os.name != "nt", "POSIX symlinks are platform-specific")
+    def test_generator_rejects_dangling_leaf_symlink_before_writing(self):
+        generator = self._generator()
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-action-generator-") as raw:
+            scratch = Path(raw)
+            link = scratch / "actions.json"
+            try:
+                link.symlink_to(scratch / "missing-target")
+            except OSError as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+            expected = scratch / "actions-expected.json"
+            with self.assertRaisesRegex(RuntimeError, "symlink or reparse point"):
+                generator.generate(link, expected)
+            self.assertTrue(os.path.lexists(str(link)))
+            self.assertFalse(expected.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junctions are platform-specific")
+    def test_generator_rejects_nested_existing_leaf_below_junction(self):
+        generator = self._generator()
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-action-generator-") as raw:
+            scratch = Path(raw)
+            outside = scratch / "outside"
+            (outside / "nested").mkdir(parents=True)
+            existing = outside / "nested" / "actions.json"
+            existing.write_bytes((FIXTURES / "actions.json").read_bytes())
+            junction = scratch / "junction"
+            result = subprocess.run(
+                ["cmd.exe", "/c", "mklink", "/J", str(junction), str(outside)],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                self.skipTest(f"junction creation unavailable: {result.stderr.strip()}")
+            self.addCleanup(lambda: subprocess.run(
+                ["cmd.exe", "/c", "rmdir", str(junction)],
+                capture_output=True, check=False,
+            ))
+            with self.assertRaisesRegex(RuntimeError, "symlink or reparse point"):
+                generator._reject_unsafe_destination(junction / "nested" / "actions.json")
+            self.assertEqual(existing.read_bytes(), (FIXTURES / "actions.json").read_bytes())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junctions are platform-specific")
+    def test_generator_rechecks_parent_after_validation_before_publication(self):
+        generator = self._generator()
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-action-generator-") as raw:
+            scratch = Path(raw)
+            safe = scratch / "safe"
+            outside = scratch / "outside"
+            safe.mkdir()
+            outside.mkdir()
+            (outside / "actions.json").write_bytes((FIXTURES / "actions.json").read_bytes())
+            actions = safe / "actions.json"
+            original_guard = generator._reject_unsafe_destination
+            calls = 0
+
+            def swap_parent_after_first_guard(path):
+                nonlocal calls
+                original_guard(path)
+                calls += 1
+                if calls == 1:
+                    safe.rmdir()
+                    result = subprocess.run(
+                        ["cmd.exe", "/c", "mklink", "/J", str(safe), str(outside)],
+                        capture_output=True, text=True,
+                    )
+                    if result.returncode != 0:
+                        raise unittest.SkipTest(f"junction creation unavailable: {result.stderr.strip()}")
+
+            generator._reject_unsafe_destination = swap_parent_after_first_guard
+            try:
+                with self.assertRaisesRegex(RuntimeError, "symlink or reparse point"):
+                    generator._write_checked(actions, (FIXTURES / "actions.json").read_bytes())
+            finally:
+                generator._reject_unsafe_destination = original_guard
+                subprocess.run(["cmd.exe", "/c", "rmdir", str(safe)], capture_output=True, check=False)
+            self.assertEqual(
+                (outside / "actions.json").read_bytes(),
+                (FIXTURES / "actions.json").read_bytes(),
+            )
+
+
 class ReplaySchemaTest(unittest.TestCase):
     def test_baseline_has_required_keys(self):
         report = json.loads(BASELINE.read_text(encoding="utf-8"))
@@ -1246,6 +1386,84 @@ class ActionMatcherTest(unittest.TestCase):
         self.assertIsNone(row["event_kind"])
         self.assertIsNone(row["elapsed_s"])
         self.assertEqual(row["overlap_count"], 0)
+
+    def test_exact_minimum_overlap_is_applied(self):
+        # Pin the shipped two-token threshold: a one-character <= regression
+        # would otherwise survive the complete action matcher suite.
+        module = self._module()
+        delivered = [{
+            "id": "d0000000-0000-4000-8000-000000000m01",
+            "session_id": "s-min-overlap",
+            "timestamp": "2026-06-01T00:00:00Z",
+            "operation": "git push --force",
+        }]
+        evidence = [{
+            "session_id": "s-min-overlap",
+            "timestamp": "2026-06-01T00:00:01Z",
+            "event_kind": "success",
+            "operation": "git push origin",
+        }]
+        row = module.match_observational_actions(delivered, evidence)[0]
+        self.assertEqual(row["action"], "applied")
+        self.assertEqual(row["overlap_count"], 2)
+
+    def test_zero_window_excludes_later_evidence(self):
+        module = self._module()
+        delivered = [{
+            "id": "d0000000-0000-4000-8000-000000000m02",
+            "session_id": "s-zero-window",
+            "timestamp": "2026-06-01T00:00:00Z",
+            "operation": "git stash pop",
+        }]
+        evidence = [{
+            "session_id": "s-zero-window",
+            "timestamp": "2026-06-01T00:00:01Z",
+            "event_kind": "success",
+            "operation": "git stash pop",
+        }]
+        row = module.match_observational_actions(
+            delivered, evidence, window_s=0,
+        )[0]
+        self.assertEqual(row["action"], "ignored")
+        self.assertIsNone(row["event_kind"])
+        self.assertIsNone(row["elapsed_s"])
+        self.assertEqual(row["overlap_count"], 0)
+
+    def test_candidate_work_budget_fails_closed(self):
+        module = self._module()
+        module.MAX_ACTION_CANDIDATE_WORK = 0
+        delivered = [{
+            "id": "d0000000-0000-4000-8000-000000000m03",
+            "session_id": "s-budget",
+            "timestamp": "2026-06-01T00:00:00Z",
+            "operation": "git stash pop",
+        }]
+        evidence = [{
+            "session_id": "s-budget",
+            "timestamp": "2026-06-01T00:00:01Z",
+            "event_kind": "success",
+            "operation": "git stash pop",
+        }]
+        with self.assertRaisesRegex(module.ReplayError, "candidate work"):
+            module.match_observational_actions(delivered, evidence)
+
+    def test_candidate_work_budget_counts_out_of_window_pairs(self):
+        module = self._module()
+        module.MAX_ACTION_CANDIDATE_WORK = 0
+        delivered = [{
+            "id": "d0000000-0000-4000-8000-000000000m04",
+            "session_id": "s-budget-outside-window",
+            "timestamp": "2026-06-01T00:00:00Z",
+            "operation": "git stash pop",
+        }]
+        evidence = [{
+            "session_id": "s-budget-outside-window",
+            "timestamp": "2026-06-01T04:00:00Z",
+            "event_kind": "success",
+            "operation": "git stash pop",
+        }]
+        with self.assertRaisesRegex(module.ReplayError, "candidate work"):
+            module.match_observational_actions(delivered, evidence)
 
     def test_first_matching_event_wins(self):
         module = self._module()
