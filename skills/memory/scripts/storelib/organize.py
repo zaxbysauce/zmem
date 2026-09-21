@@ -615,6 +615,9 @@ def organize(
     dry_run: bool = False,
     force: bool = False,
     prune: bool = False,
+    belief_heads: bool = False,
+    llm_local: bool = False,
+    adapter=None,
 ) -> dict:
     """Run the sleep-time organization pipeline (issue #62, 7.1-7.6).
 
@@ -777,6 +780,38 @@ def organize(
             )
             if link_rep["neighbors"] > 0:
                 lb["backfilled"] += 1
+
+    # --- 5b) Belief heads (issue #137): opt-in deterministic side tables ---
+    # Runs BEFORE consolidation: heads ground on the episode's pre-merge
+    # live set (consolidation absorbs members and supersedes their ids, so a
+    # post-merge refresh would find nothing to aggregate). The adapter path
+    # is maintenance-only and mutates ONLY via apply_belief_actions.
+    if belief_heads and not dry_run:
+        from storelib import beliefs as _beliefs
+        br = _beliefs.refresh_belief_heads(conn, now=now_iso())
+        report["belief_heads"] = {
+            "refreshed": br["refreshed"],
+            "created": br["created"],
+            "updated": br["updated"],
+            "actions_applied": 0,
+        }
+        if llm_local:
+            if adapter is None:
+                raise ValueError("--llm-local requires an adapter callable")
+            actions_applied = 0
+            for summary in br["heads"]:
+                payload = _beliefs.build_adapter_payload(conn, summary)
+                try:
+                    result = adapter(payload)
+                except Exception as exc:
+                    raise _beliefs.BeliefAdapterError(
+                        "local belief adapter failed: %s" % exc) from exc
+                actions = (result or {}).get("actions", [])
+                if actions:
+                    applied = _beliefs.apply_belief_actions(
+                        conn, head_id=summary["head_id"], actions=actions)
+                    actions_applied += applied["applied"]
+            report["belief_heads"]["actions_applied"] = actions_applied
 
     # --- 6) Consolidation on the bounded episode (7.1) ---
     # force=True: the cadence gate above already passed (organize reached here

@@ -318,3 +318,53 @@ INJECT_REASON_DISABLED = "disabled"
 # own escalation loop with a 500-row cap and is unaffected by this knob.
 ZMEM_VEC_NS_OVERFETCH_DEFAULT = 8
 ZMEM_VEC_NS_OVERFETCH_ENV = "ZMEM_VEC_NS_OVERFETCH"
+
+# ---------------------------------------------------------------------------
+# #172 observation-type gate (consumed by issue #137's belief heads).
+# ---------------------------------------------------------------------------
+# The recorded #172 decision lives in evidence/gates/172-observation.json as
+# EXACTLY one of these two byte strings. Any other content — missing file,
+# malformed JSON, an unknown value — reads as "reject", the conservative
+# branch: virtual belief heads exist, ALLOWED_TYPES is unchanged. The
+# decision itself belongs to the #172 taxonomy RFC; flipping it is a one-line
+# artifact edit plus this module's accept branch, both covered by
+# tests/test_belief_heads.py::test_observation_type_follows_gate_decision.
+OBSERVATION_GATE_ACCEPT = b'{"observation":"accept"}\n'
+OBSERVATION_GATE_REJECT = b'{"observation":"reject"}\n'
+OBSERVATION_GATE_PATH = ("evidence", "gates", "172-observation.json")
+
+
+def _observation_gate_default_path():
+    from pathlib import Path
+
+    return Path(__file__).resolve().parents[2].joinpath(*OBSERVATION_GATE_PATH)
+
+
+def observation_gate_decision(path=None) -> str:
+    """Read the recorded #172 decision: "accept" or "reject".
+
+    The reader is a PURE per-call function (no caching) so tests can patch
+    the decision seam. The committed artifact carries exact LF bytes; the
+    reader also tolerates a CRLF-terminated copy (any file written through a
+    Windows text-mode translation) — anything that is not exactly this
+    decision payload is "reject".
+    """
+    gate = path if path is not None else _observation_gate_default_path()
+    try:
+        data = gate.read_bytes()
+    except OSError:
+        return "reject"
+    text = data.decode("utf-8", errors="replace").strip()
+    if text == '{"observation":"accept"}':
+        return "accept"
+    return "reject"
+
+
+def allowed_types() -> tuple:
+    """Effective memory-type vocabulary: ALLOWED_TYPES plus `observation`
+    ONLY when the recorded #172 decision is accept. ALLOWED_TYPES itself is
+    never mutated, so the reject branch (the recorded decision) keeps every
+    sync/write surface byte-identical to pre-#137 behavior."""
+    if observation_gate_decision() == "accept":
+        return ALLOWED_TYPES + ("observation",)
+    return ALLOWED_TYPES

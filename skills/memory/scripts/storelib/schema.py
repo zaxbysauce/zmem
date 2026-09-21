@@ -1217,6 +1217,76 @@ _EVIDENCE_SCHEMA_DDL = (
     """,
 )
 
+# Issue #137: additive belief-head side tables.  Like the v14 evidence
+# tables, this DDL is version-independent — it runs on every open from
+# migrate() (never init_db, so an existing store never pre-creates the
+# tables outside the atomic transaction), uses IF NOT EXISTS, changes no
+# schema-version constant, and carries no ON DELETE CASCADE: parent
+# lifecycle is handled by storelib.beliefs._delete_head_children inside the
+# writer's transaction.
+_BELIEF_SCHEMA_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS belief_head (
+      id TEXT PRIMARY KEY, namespace TEXT NOT NULL, topic_identity TEXT NOT NULL,
+      content TEXT NOT NULL, head_state TEXT NOT NULL,
+      head_source_id TEXT NOT NULL, support_count INTEGER NOT NULL,
+      refresh_watermark TEXT NOT NULL, generator_revision TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5, signal TEXT NOT NULL DEFAULT 'none',
+      taint TEXT NOT NULL DEFAULT 'trusted_internal',
+      trust_score REAL NOT NULL DEFAULT 1.0,
+      UNIQUE(namespace, topic_identity)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS belief_head_source (
+      head_id TEXT NOT NULL, source_id TEXT NOT NULL, role TEXT NOT NULL,
+      source_ingestion_ts TEXT NOT NULL, source_checksum TEXT NOT NULL,
+      PRIMARY KEY(head_id, source_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS belief_head_evidence (
+      head_id TEXT NOT NULL, source_id TEXT NOT NULL, evidence_id TEXT NOT NULL,
+      PRIMARY KEY(head_id, source_id, evidence_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS belief_head_namespace_idx ON belief_head(namespace)",
+    "CREATE INDEX IF NOT EXISTS belief_head_source_source_idx "
+    "ON belief_head_source(source_id)",
+    "CREATE INDEX IF NOT EXISTS belief_head_evidence_evidence_idx "
+    "ON belief_head_evidence(evidence_id)",
+)
+
+
+def _ensure_belief_tables(conn: sqlite3.Connection) -> None:
+    """Create the additive belief-head side tables atomically (issue #137).
+
+    A failure at any DDL boundary must leave both the table set and the
+    version marker byte-for-byte unchanged, so the whole block runs inside
+    one transaction (or savepoint, when a caller transaction is open)."""
+    savepoint = "zmem_belief_ddl"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for ddl in _BELIEF_SCHEMA_DDL:
+            conn.execute(ddl)
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
 
 def _migrate_v14(conn: sqlite3.Connection) -> None:
     """Create evidence side tables and advance the version atomically.
@@ -1638,6 +1708,12 @@ def migrate(conn: sqlite3.Connection) -> None:
         # Keep its DDL out of init_db(): opening an existing v13 store must not
         # pre-create any v14 table before this atomic versioned transaction.
         _migrate_v14(conn)
+
+    # Version-INDEPENDENT (issue #137): additive belief-head side tables.
+    # Version-independent on purpose — SUPPORTED_SCHEMA_VERSION does not move,
+    # so older clients keep their additive-window contract; the IF NOT EXISTS
+    # block is idempotent and atomic (see _ensure_belief_tables).
+    _ensure_belief_tables(conn)
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
     # skip. See _retry_pending_ns_migration for why this cannot live behind the

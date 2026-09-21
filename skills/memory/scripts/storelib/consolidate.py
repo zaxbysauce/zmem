@@ -901,6 +901,9 @@ def consolidate(
     merge_contested: bool = False,
     working_ids: set[str] | None = None,
     collect_run_ids: bool = False,
+    belief_heads: bool = False,
+    llm_local: bool = False,
+    adapter=None,
 ) -> dict:
     """Merge near-duplicate memories via embedding similarity (or a lexical
     token-overlap fallback when embeddings are unavailable — Phase 10).
@@ -1598,4 +1601,36 @@ def consolidate(
     report["knn_truncated"] = knn_truncated
     if collect_run_ids:
         report["consolidated_ids"] = consolidated_ids
+
+    # Belief heads (issue #137): opt-in deterministic side tables, refreshed
+    # AFTER the merge pass so heads derive from the post-consolidation live
+    # set. organize() calls consolidate WITHOUT these flags and runs its own
+    # refresh afterwards — two entry points must not double-refresh.
+    if belief_heads and not dry_run:
+        from storelib import beliefs as _beliefs
+        br = _beliefs.refresh_belief_heads(
+            conn, namespace=namespace, now=now_iso())
+        report["belief_heads"] = {
+            "refreshed": br["refreshed"],
+            "created": br["created"],
+            "updated": br["updated"],
+            "actions_applied": 0,
+        }
+        if llm_local:
+            if adapter is None:
+                raise ValueError("--llm-local requires an adapter callable")
+            actions_applied = 0
+            for summary in br["heads"]:
+                payload = _beliefs.build_adapter_payload(conn, summary)
+                try:
+                    result = adapter(payload)
+                except Exception as exc:
+                    raise _beliefs.BeliefAdapterError(
+                        "local belief adapter failed: %s" % exc) from exc
+                actions = (result or {}).get("actions", [])
+                if actions:
+                    applied = _beliefs.apply_belief_actions(
+                        conn, head_id=summary["head_id"], actions=actions)
+                    actions_applied += applied["applied"]
+            report["belief_heads"]["actions_applied"] = actions_applied
     return report

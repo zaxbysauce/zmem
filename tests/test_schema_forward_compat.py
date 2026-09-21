@@ -92,6 +92,56 @@ class SchemaCompatGateTest(unittest.TestCase):
         finally:
             os.environ.pop("ZMEM_ALLOW_NEWER_SCHEMA", None)
 
+    def test_additive_window_resets_notice_guard(self):
+        """Issue #137/#172: the additive-window NOTICE stays once-per-process
+        (explicit reset-before AND reset-after, per the issue), and the
+        belief side tables being present changes NEITHER schema constant —
+        SUPPORTED and FORWARD_COMPAT both stay 14 (the belief DDL is an
+        additive, version-neutral migration)."""
+        import importlib
+        import io
+        from contextlib import redirect_stderr
+        import schema_meta as meta
+        importlib.reload(meta)
+        # reset-BEFORE: isolate this test's NOTICE from any prior fire.
+        self.schema._schema_compat._warned = False
+        self.schema.SUPPORTED_SCHEMA_VERSION = 12
+        self.schema.FORWARD_COMPAT_SCHEMA_VERSION = 13
+        first, second = io.StringIO(), io.StringIO()
+        with redirect_stderr(first):
+            self.assertEqual(self._decide(13), "compat")
+        with redirect_stderr(second):
+            self.assertEqual(self._decide(13), "compat")
+        self.assertEqual(first.getvalue().count("NOTICE"), 1,
+                         "the additive-window NOTICE must print exactly once")
+        self.assertEqual(second.getvalue(), "",
+                         "a second decide must not re-notice in-process")
+        # reset-AFTER: leave the shared guard clean for sibling tests.
+        self.schema._schema_compat._warned = False
+        # A migrated store (belief tables present) must still be a v14 store
+        # with both constants pinned at 14.
+        with tempfile.TemporaryDirectory(prefix="zmem-additive-137-") as tmp:
+            conn = sqlite3.connect(os.path.join(tmp, "store.sqlite"))
+            try:
+                self.schema.init_db(conn)
+                self.schema.migrate(conn)
+                tables = {r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                self.assertIn("belief_head", tables,
+                              "additive belief tables exist without a "
+                              "version bump")
+                version = conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()[0]
+                self.assertEqual(version, "14")
+            finally:
+                conn.close()
+        importlib.reload(self.schema)
+        self.assertEqual(self.schema.SUPPORTED_SCHEMA_VERSION, 14)
+        self.assertEqual(self.schema.FORWARD_COMPAT_SCHEMA_VERSION, 14)
+        self.assertEqual(meta.SUPPORTED_SCHEMA_VERSION, 14)
+        self.assertEqual(meta.FORWARD_COMPAT_SCHEMA_VERSION, 14)
+
 
 class OlderClientOnNewerStoreTest(unittest.TestCase):
     """A v12-lineage client (SUPPORTED=12) uses the current v14 store's

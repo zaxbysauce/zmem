@@ -425,6 +425,18 @@ class CharacterizationTests(unittest.TestCase):
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
+    def test_organize_and_consolidate_expose_belief_flags(self):
+        # Issue #137: --belief-heads and --llm-local are FLAGS on the two
+        # maintenance subcommands (never new subcommands — KNOWN_SUBCMDS
+        # stays frozen at 37).
+        for cmd in ("organize", "consolidate"):
+            r = _run_cli({}, cmd, "--help")
+            self.assertEqual(r.returncode, 0, f"{cmd} --help rc={r.returncode}")
+            for flag in ("--belief-heads", "--llm-local"):
+                self.assertIn(flag, r.stdout,
+                              f"{cmd} --help must expose {flag} (issue #137)")
+        self.assertEqual(len(KNOWN_SUBCMDS), 37)
+
     def test_recall_clock_seam_is_honored_and_deterministic(self):
         """ZMEM_TEST_NOW pins the scoring clock (see _run_env). Two pins of
         the seam contract: (1) HONORED — a different pinned clock changes

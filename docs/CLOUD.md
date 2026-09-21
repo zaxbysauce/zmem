@@ -509,3 +509,42 @@ Set `ZMEM_PROXY_FORGE_HOST=` (empty) in that environment.
   before they count, gate the local-side `ingest-jsonl` step behind that
   review (a PR against the sync repo, not a direct push) rather than
   auto-ingesting every outbox on arrival.
+
+## Belief heads (issue #137)
+
+`organize --belief-heads` (and `consolidate --belief-heads`) maintains three
+additive side tables — `belief_head`, `belief_head_source`,
+`belief_head_evidence` — that aggregate live memory rows into deterministic
+"belief heads". A head is keyed by a stable topic identity
+(`sha256(lowercase namespace + NUL + sorted member ids)`) and carries its
+full provenance: every source id with its role, ingestion timestamp, and
+content checksum, plus every evidence id inherited from `memory_evidence`.
+Heads inherit the WEAKEST source floor (numeric minimum for confidence and
+trust, lowest signal rank, worst taint rank) and one of the states `active`,
+`contested` (an in-topic `contradicts` edge exists), or `retracted` (no live
+source remains). Refreshing updates heads in place — head identity never
+changes when membership shrinks; a tombstoned source is dropped and its id
+recorded in a sorted `belief_retracted:<head_id>` version record.
+
+At recall time heads surface as VIRTUAL rows with ids `belief:<head_id>` (type
+`belief_head`) carrying `source_ids`, `evidence_ids`, and `represented_ids`.
+They never enter the canonical `memory` table. A trusted, admitted, ACTIVE
+head suppresses its represented source rows — but only within the same
+namespace and the same delivered fence (the fence identity is the session id
+plus the runtime moment). Contested, filtered, budget-dropped, and
+not-admitted heads suppress zero rows.
+
+The optional local-LLM action path (`--llm-local`, only together with
+`--belief-heads`) runs a local adapter during the explicit maintenance
+command and may only mutate heads through validated, all-or-nothing actions
+(`replace_quote`, `add_source`, `mark_contested`, `retract_source`); any
+invalid target, unresolved citation, over-400-byte text, illegal state
+transition, or adapter failure rolls the whole action set back and preserves
+the prior head content, source set, and watermark. No recall, hook, provider,
+or capture path ever invokes the adapter.
+
+The `observation` memory type is governed by the recorded #172 taxonomy
+decision (`evidence/gates/172-observation.json`): the type is added to the
+effective vocabulary only when that artifact records `accept`; `reject`
+(default and currently recorded) leaves the type vocabulary unchanged and
+ships virtual heads only.
