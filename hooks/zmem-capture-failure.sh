@@ -286,11 +286,12 @@ case "$SOURCE_EXISTS" in
 esac
 
 # Issue #124: report the failed operation to the observational feedback loop
-# before rendering the nudge. The event/evidence ids are derived
-# deterministically from the payload bytes (the payload's evidence_id or
-# tool_use_id wins when present), so a replayed event can never double-count.
-# The helper is stdlib-only and the call is fail-open: a store problem never
-# blocks the nudge (ZMEM_STORE/ZMEM_DATA are inherited from the launcher).
+# before rendering the nudge. The event id is derived deterministically from
+# the payload bytes, so a replayed event can never double-count. The payload's
+# evidence_id is forwarded when present; the association gate is the store's
+# business. The helper is stdlib-only and the call is fail-open: a store
+# problem never blocks the nudge (ZMEM_STORE/ZMEM_DATA are inherited from the
+# launcher).
 "$PYTHON_BIN" -c '
 import hashlib, json, subprocess, sys
 store, session, raw = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -316,12 +317,16 @@ if not tokens:
 if not tokens:
     raise SystemExit(0)
 event = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
-ev = payload.get("evidence_id") or payload.get("tool_use_id") or event
-if not isinstance(ev, str) or not ev:
-    ev = event
 args = [sys.executable, store, "operation-feedback",
         "--session-id", session, "--event-id", event,
-        "--outcome", "failure", "--evidence-id", ev]
+        "--outcome", "failure"]
+# Issue #124 + final-critic round 1: pass --evidence-id ONLY when the host
+# payload supplies one (until #171 ships, payloads carry none and the store
+# association gate is vacuous -- a synthetic id here could never be
+# associated and would dead-end every counter).
+ev = payload.get("evidence_id")
+if isinstance(ev, str) and ev:
+    args.extend(["--evidence-id", ev])
 for tok in tokens:
     args.extend(["--operation-token", tok])
 subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

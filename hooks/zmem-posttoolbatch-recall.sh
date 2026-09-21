@@ -152,12 +152,15 @@ for tok in tokens:
     if tok not in seen:
         seen.append(tok)
 event = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
-ev = payload.get("evidence_id") or payload.get("tool_use_id") or event
-if not isinstance(ev, str) or not ev:
-    ev = event
 args = [sys.executable, store, "operation-feedback",
         "--session-id", session, "--event-id", event,
-        "--outcome", "success", "--evidence-id", ev]
+        "--outcome", "success"]
+# Same evidence-id rule as the capture-failure hook: forward the evidence_id
+# supplied by the payload when present, omit the flag otherwise (final-critic
+# round 1).
+ev = payload.get("evidence_id")
+if isinstance(ev, str) and ev:
+    args.extend(["--evidence-id", ev])
 for tok in seen[:8]:
     args.extend(["--operation-token", tok])
 subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

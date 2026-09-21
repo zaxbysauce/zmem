@@ -266,6 +266,29 @@ class PostToolBatchFeedbackTest(unittest.TestCase):
         self.assertEqual(records[0]["memory_id"], FB_M126)
         self.assertEqual(records[0]["evidence_id"], FB_EV131)
 
+    def test_batch_without_payload_evidence_id_increments(self):
+        # Final-critic round 1 (production-liveness proof): a real batch
+        # payload carries no evidence_id (that association-write API is
+        # issue #171, unshipped). The hook must OMIT --evidence-id so the
+        # store association gate is vacuous, and the matched counter must
+        # still move -- the pre-fix always-synthetic-id behavior dead-ended
+        # every production event at applied_count=0.
+        r = self._run_hook(BATCH_HOOK, {
+            "session_id": FB_SESS,
+            "tool_uses": [{"name": "Bash",
+                           "input": {"command": "git stash pop"}}],
+        })
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = self._operation_feedback_argv()
+        self.assertEqual(argv[0], "operation-feedback", argv)
+        self.assertIn(FB_SESS, argv, argv)
+        self.assertNotIn("--evidence-id", argv, argv)
+        self.assertEqual(argv[argv.index("--outcome") + 1], "success")
+        self.assertEqual(self._counters(), {FB_M125: (0, 0), FB_M126: (1, 0)})
+        records = self._sidecar_records()
+        self.assertEqual([rec["verdict"] for rec in records], ["applied"])
+        self.assertIsNone(records[0]["evidence_id"])
+
     def test_failed_event_violates_only_matching_memory(self):
         # The capture-failure lane works: its tokens come from the tool
         # INPUT only (no tool-name prefix), so a runner-head command derives
