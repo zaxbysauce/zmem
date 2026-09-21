@@ -1883,6 +1883,38 @@ issue #124). The oracle pair `tests/fixtures/replay/actions.json` /
 committed bytes when they drift; malformed rows or non-UTC timestamps exit 2
 before any output file is replaced.
 
+Counterfactual replay (issue #157) measures with/without-memory divergence:
+
+```text
+python scripts/eval_counterfactual.py \
+  --tasks tests/fixtures/counterfactual/tasks.json \
+  --store tests/fixtures/counterfactual/store.sqlite \
+  --model-id recorded-stub-v1 \
+  --json-out counterfactual-report.json
+```
+
+(`--allow-model-calls` exists to opt a non-stub model id into real adapter
+resolution; without it the run takes the skip path described below.)
+
+Each recorded session replays twice — `ZMEM_INJECT=1` through the real
+passive injection lane (delivery ledger redirected to a scratch directory;
+read-only store URI; store SHA-256 verified before and after) and
+`ZMEM_INJECT=0` with delivery disabled — through the pinned
+`recorded-stub-v1` model path, which returns the task's recorded successful
+action exactly when the delivered fence contains that task's `memory_row_id`
+and the recorded no-memory action otherwise. The report carries
+`repeated_failure_rate` and `first_action_agreement` per condition (0.0/1.0
+with memory, 1.0/0.0 without on the committed fixture) against the Draft
+2020-12 contract `eval/counterfactual-schema.json`. The evaluator refuses the
+operator home store before opening anything. A real model id is only resolved
+with `--allow-model-calls`; without it the run prints exactly
+`SKIPPED: model calls disabled` and exits 0 with `skipped: true` (writing the
+skipped report when `--json-out` is given) — no adapter
+import, no download, no network. The committed task/store/expected fixture
+trio is written only by `tests/fixtures/counterfactual/generate.py`
+(developer-side; CI compares against the committed bytes and never
+regenerates).
+
 The predeclared private real-corpus measurement of record for issue #155 is
 committed at `eval/real-corpus-2026-09-19.json`: a cohort frozen at
 declaration time (standalone store snapshot, `ver=0.49.0` projection of the

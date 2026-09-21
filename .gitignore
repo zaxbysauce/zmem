@@ -66,3 +66,7 @@ self-corpus-results.json
 !/tests/fixtures/hosts/home/.zcode/**
 !/tests/fixtures/hosts/checkout/scripts/ignored.pyc
 !/tests/fixtures/hosts/checkout/scripts/ignored.pyo
+
+# Issue #157: the counterfactual store fixture must commit despite the
+# blanket *.sqlite rule (tests run against the committed bytes in CI).
+!/tests/fixtures/counterfactual/store.sqlite

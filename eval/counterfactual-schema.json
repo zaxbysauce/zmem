@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zaxbysauce.github.io/zmem/eval/counterfactual-schema.json",
+  "title": "Counterfactual replay report (issue #157)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "model_id",
+    "task_count",
+    "tool_call_count",
+    "conditions",
+    "generated_at",
+    "skipped"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "model_id": { "type": "string", "minLength": 1 },
+    "task_count": { "type": "integer", "minimum": 0 },
+    "tool_call_count": { "type": "integer", "minimum": 0 },
+    "generated_at": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "skipped": { "type": "boolean" },
+    "conditions": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "required": [
+          "inject",
+          "repeated_failure_rate",
+          "first_action_agreement",
+          "task_count",
+          "tool_call_count",
+          "sessions",
+          "skipped"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "inject": { "enum": [0, 1] },
+          "repeated_failure_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+          "first_action_agreement": { "type": "number", "minimum": 0, "maximum": 1 },
+          "task_count": { "type": "integer", "minimum": 0 },
+          "tool_call_count": { "type": "integer", "minimum": 0 },
+          "skipped": { "type": "boolean" },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["session_id", "task_count", "tool_call_count"],
+              "additionalProperties": false,
+              "properties": {
+                "session_id": { "type": "string", "minLength": 1 },
+                "task_count": { "type": "integer", "minimum": 0 },
+                "tool_call_count": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

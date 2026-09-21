@@ -217,6 +217,57 @@ jobs:
           set -e
           python scripts/eval_inject_runner.py --store .eval-tmp/store.sqlite --gold eval/injection_gold.jsonl --json-out .eval-tmp/eval-inject-results.json
 
+      # Issue #157: the counterfactual A/B replay — the committed five-session
+      # task set with and without memory through the pinned recorded-stub-v1
+      # path. The stub report must be byte-identical to the committed oracle,
+      # the report must validate against eval/counterfactual-schema.json, and
+      # a real-model id must take the exact skip path without any model call.
+      # The generator is a developer-side tool; CI never regenerates.
+      - name: Run counterfactual stub replay and verify oracle bytes
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          scratch="$(mktemp -d)"
+          export ZMEM_STORE="$scratch/ambient.sqlite" ZMEM_DATA="$scratch" \
+            ZMEM_MODELS_DIR="$scratch/missing-models" ZMEM_MODEL_AUTODOWNLOAD=0 \
+            ZMEM_EMBED_PROFILE=fake ZMEM_TEST_NOW=2026-06-01T00:00:00Z PYTHONUTF8=1
+          python scripts/eval_counterfactual.py \
+            --tasks tests/fixtures/counterfactual/tasks.json \
+            --store tests/fixtures/counterfactual/store.sqlite \
+            --model-id recorded-stub-v1 \
+            --json-out "$scratch/counterfactual.json"
+          cmp tests/fixtures/counterfactual/expected.json "$scratch/counterfactual.json"
+
+      - name: Validate counterfactual schema (Draft 2020-12)
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          python -m json.tool eval/counterfactual-schema.json > /dev/null
+          python - <<'PY'
+          import json
+          import jsonschema
+          schema = json.load(open("eval/counterfactual-schema.json", encoding="utf-8"))
+          report = json.load(open("tests/fixtures/counterfactual/expected.json", encoding="utf-8"))
+          jsonschema.validate(report, schema)
+          print("counterfactual schema: OK")
+          PY
+
+      - name: Assert counterfactual real-model skip path
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          scratch="$(mktemp -d)"
+          export ZMEM_STORE="$scratch/ambient.sqlite" ZMEM_DATA="$scratch" \
+            ZMEM_MODELS_DIR="$scratch/missing-models" ZMEM_MODEL_AUTODOWNLOAD=0 PYTHONUTF8=1
+          output="$(python scripts/eval_counterfactual.py \
+            --tasks tests/fixtures/counterfactual/tasks.json \
+            --store tests/fixtures/counterfactual/store.sqlite \
+            --model-id real-model-v1)"
+          printf '%s\n' "$output" | grep -Fx "SKIPPED: model calls disabled"
+
       - name: Upload injection eval report artifact
         if: always()
         uses: actions/upload-artifact@v4

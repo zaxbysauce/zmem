@@ -10,6 +10,29 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.56.0] - 2026-09-20
+
+### Added
+- **Counterfactual replay evaluator (issue #157)**: new read-only
+  `scripts/eval_counterfactual.py` replays the recorded five-session task set
+  twice — `ZMEM_INJECT=1` through the real passive injection lane (delivery
+  ledger redirected to scratch; read-only store URI; store SHA-256 verified
+  before and after) and `ZMEM_INJECT=0` with delivery disabled — through the
+  pinned `recorded-stub-v1` model path, reporting `repeated_failure_rate`
+  and `first_action_agreement` per condition (0.0/1.0 with memory, 1.0/0.0
+  without on the fixture). Ships the Draft 2020-12 report contract
+  `eval/counterfactual-schema.json`, the fixture trio
+  `tests/fixtures/counterfactual/{tasks.json,store.sqlite,expected.json}`
+  with the refuse-on-drift developer-side generator `generate.py`, seven
+  named tests across `CounterfactualFixtureTest`, `CounterfactualSchemaTest`,
+  and `CounterfactualSafetyTest`, three CI steps on both runners (stub
+  byte-oracle compare, schema validation, exact real-model skip line), and
+  documentation of the evaluator and the `--allow-model-calls` gate. The
+  evaluator refuses the operator home store before opening anything and a
+  real model id without the opt-in prints exactly
+  `SKIPPED: model calls disabled` and exits 0. Version 0.56.0 (not 0.55.0)
+  because sibling PR #223 (issue #156) already claims 0.55.0.
+
 ## [0.55.0] - 2026-09-20
 
 ### Added
