@@ -9,6 +9,11 @@ three files: committed copies are compared first and never silently
 replaced, so drift between the implementation and the committed oracle is a
 hard error.
 
+Regeneration note: tasks.json and expected.json reproduce byte-identically;
+store.sqlite carries SQLite build nondeterminism, so regenerating it
+requires deleting the committed file first (the refuse-on-drift guard then
+becomes the deliberate-replacement step). CI never regenerates.
+
 The five sessions are fixture-defined (issue #157 assumed the #170 evidence
 surface, which does not exist on main in this shape): each prompt carries a
 distinctive token shared only with its own memory row, so under
@@ -115,13 +120,25 @@ def _env(store: Path, scratch: Path) -> dict[str, str]:
     return env
 
 
-def _run_cli(store: Path, env: dict[str, str], *argv: str) -> None:
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "skills" / "memory" / "scripts" / "store.py"), *argv],
-        cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=180,
-    )
+def _run_checked(cmd: list[str], env: dict[str, str], *, timeout: int, what: str) -> subprocess.CompletedProcess:
+    """Run one generator subprocess, translating every failure mode into RuntimeError."""
+    try:
+        result = subprocess.run(cmd, cwd=str(ROOT), env=env,
+                                capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{what} timed out after {exc.timeout}s") from exc
+    except OSError as exc:
+        raise RuntimeError(f"{what} could not start: {exc}") from exc
     if result.returncode:
-        raise RuntimeError(f"store.py {argv[0]} failed ({result.returncode}): {result.stderr}")
+        raise RuntimeError(f"{what} failed ({result.returncode}): {result.stderr}")
+    return result
+
+
+def _run_cli(store: Path, env: dict[str, str], *argv: str) -> None:
+    _run_checked(
+        [sys.executable, str(ROOT / "skills" / "memory" / "scripts" / "store.py"), *argv],
+        env, timeout=180, what=f"store.py {argv[0]}",
+    )
 
 
 def _pin_row_ids(store: Path) -> None:
@@ -165,12 +182,10 @@ def _canonicalize(store: Path) -> None:
 
 def _build_store(candidate: Path, scratch: Path) -> None:
     env = _env(candidate, scratch)
-    result = subprocess.run(
+    _run_checked(
         [sys.executable, str(EVAL_STORE), str(candidate)],
-        cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=300,
+        env, timeout=300, what="eval store builder",
     )
-    if result.returncode:
-        raise RuntimeError(f"eval store builder failed ({result.returncode}): {result.stderr}")
     for index in range(1, 6):
         session = SESSIONS[index - 1]
         token = session["token"]
@@ -212,7 +227,7 @@ def generate(tasks_out: Path, store_out: Path, expected_out: Path) -> dict[str, 
         staged_tasks = scratch / "tasks.json"
         staged_tasks.write_bytes(tasks_bytes)
         report_candidate = scratch / "expected.json"
-        result = subprocess.run(
+        _run_checked(
             [sys.executable, str(EVALUATOR),
              "--tasks", str(staged_tasks),
              "--store", str(candidate),
@@ -221,12 +236,9 @@ def generate(tasks_out: Path, store_out: Path, expected_out: Path) -> dict[str, 
             # Keep the builder's explicit store env out of the evaluator's
             # operator-alias refusal check: the candidate is a disposable
             # snapshot (same shape as the replay generator's evaluator call).
-            cwd=str(ROOT),
-            env={**_env(candidate, scratch), "ZMEM_STORE": str(scratch / "ambient.sqlite")},
-            capture_output=True, text=True, timeout=300,
+            {**_env(candidate, scratch), "ZMEM_STORE": str(scratch / "ambient.sqlite")},
+            timeout=300, what="counterfactual evaluator",
         )
-        if result.returncode:
-            raise RuntimeError(f"counterfactual evaluator failed ({result.returncode}): {result.stderr}")
         expected_bytes = report_candidate.read_bytes()
         store_bytes = candidate.read_bytes()
     _write_checked(tasks_out, tasks_bytes)

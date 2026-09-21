@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -40,7 +41,14 @@ class EvalError(ValueError):
 
 
 def _operator_store_candidates() -> set[Path]:
-    """Resolve operator-store aliases before the environment is isolated."""
+    """Resolve every operator-store alias before the environment is isolated.
+
+    This is a REFUSAL check, not a which-store resolver, so every alias is
+    unioned (no precedence picking) and each file candidate contributes its
+    parent directory as an anchor: a descendant path such as
+    ``<home>/.zmem/sub/store.sqlite`` must be refused even though it is not
+    equal to the store file itself.
+    """
     env = os.environ
     candidates: set[Path] = set()
 
@@ -48,17 +56,18 @@ def _operator_store_candidates() -> set[Path]:
         if not raw:
             return
         try:
-            candidates.add(Path(raw).expanduser().resolve())
+            resolved = Path(raw).expanduser().resolve()
         except (OSError, RuntimeError, TypeError, ValueError):
             return
+        candidates.add(resolved)
+        candidates.add(resolved.parent)
 
-    if env.get("ZMEM_STORE"):
-        add(env.get("ZMEM_STORE"))
-    elif env.get("ZMEM_DATA"):
+    add(env.get("ZMEM_STORE"))
+    if env.get("ZMEM_DATA"):
         add(Path(env["ZMEM_DATA"]).expanduser() / "store.sqlite")
-    elif env.get("CLAUDE_PLUGIN_DATA"):
+    if env.get("CLAUDE_PLUGIN_DATA"):
         add(Path(env["CLAUDE_PLUGIN_DATA"]).expanduser() / "store.sqlite")
-    elif env.get("ZCODE_PLUGIN_DATA"):
+    if env.get("ZCODE_PLUGIN_DATA"):
         add(Path(env["ZCODE_PLUGIN_DATA"]).expanduser() / "store.sqlite")
     home = Path(os.path.expanduser("~"))
     add(home / ".zmem" / "store.sqlite")
@@ -67,7 +76,12 @@ def _operator_store_candidates() -> set[Path]:
 
 
 def _is_operator_store(store: Path, candidates: set[Path]) -> bool:
-    resolved = store.expanduser().resolve()
+    try:
+        resolved = store.expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        # If the path cannot even be resolved, refuse conservatively: the
+        # refusal gate must never fail open on an unreadable path.
+        return True
     for candidate in candidates:
         try:
             resolved.relative_to(candidate)
@@ -116,6 +130,10 @@ class RecordedToolExecutor:
         self._outputs: dict[str, str] = {}
         self._memory_row_ids: dict[str, str] = {}
         for task in tasks:
+            if task["tool_input"] in self._outputs:
+                raise EvalError(
+                    "[eval] invalid tasks set: duplicate recorded tool input\n"
+                )
             self._outputs[task["tool_input"]] = task["tool_output"]
             self._memory_row_ids[task["tool_input"]] = task["memory_row_id"]
         self.calls = 0
@@ -153,7 +171,6 @@ def run_condition(
         os.environ["ZMEM_INJECT"] = "1" if inject else "0"
         executor = RecordedToolExecutor(tasks)
         actions: list[str] = []
-        fences = 0
         sessions: list[dict] = []
         if inject:
             scratch = tempfile.mkdtemp(prefix="zmem-counterfactual-ledger-")
@@ -188,7 +205,6 @@ def run_condition(
                 rendered = envelope.get("rendered") or ""
                 if rendered.strip():
                     fence = rendered
-                    fences += 1
             # The stub consumes the fence text exactly as delivered; the
             # recorded tool exchange is answered from tasks.json bytes.
             actions.append(_stub_action(task, fence))
@@ -221,6 +237,8 @@ def run_condition(
     finally:
         if conn is not None:
             conn.close()
+        if scratch_dir is not None:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
         if saved is None:
             os.environ.pop("ZMEM_INJECT", None)
         else:

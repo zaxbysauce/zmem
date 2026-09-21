@@ -112,6 +112,102 @@ class CounterfactualFixtureTest(unittest.TestCase):
             )
 
 
+class CounterfactualMatcherBranchTest(unittest.TestCase):
+    """Feedback-round coverage: fence-membership, empty-pool, session pins."""
+
+    @staticmethod
+    def _module():
+        spec = importlib.util.spec_from_file_location("eval_counterfact_branch", EVALUATOR)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_stub_action_fence_membership_matrix(self):
+        # P2-006a: the stub succeeds ONLY when THIS task's row id is in the
+        # fence; foreign ids or no fence yield the no-memory action.
+        module = self._module()
+        task = {"memory_row_id": "f0000000-0000-4000-8000-000000000001",
+                "recorded_successful_action": "ok-1",
+                "recorded_no_memory_action": "nomem-1"}
+        own = "fence with - [f0000000-0000-4000-8000-000000000001] bullet"
+        foreign = "fence with - [f0000000-0000-4000-8000-000000000002] bullet"
+        self.assertEqual(module._stub_action(task, own), "ok-1")
+        self.assertEqual(module._stub_action(task, foreign), "nomem-1")
+        self.assertEqual(module._stub_action(task, None), "nomem-1")
+
+    def test_empty_pool_prompt_still_counts_as_no_memory(self):
+        # P2-006b: a prompt matching zero rows renders no fence; the A/B
+        # still bookkeeps and scores the no-memory action as a failure.
+        module = self._module()
+        tasks = [{
+            "prompt": "zzz unmatched counterfactual probe about nothing at all",
+            "tool_input": "probe unmatched-zz --run",
+            "tool_output": "probe done",
+            "memory_row_id": "f0000000-0000-4000-8000-000000000099",
+            "recorded_successful_action": "probe success-99",
+            "recorded_no_memory_action": "probe failure-99",
+            "namespace": "project:counterfactual",
+            "timestamp": "2026-06-01T00:00:00Z",
+        }]
+        store_copy = _SCRATCH_MODULE / "cf-empty-pool.sqlite"
+        store_copy.write_bytes((FIXTURES / "store.sqlite").read_bytes())
+        os.environ["ZMEM_STORE"] = str(store_copy)
+        os.environ["ZMEM_TEST_NOW"] = "2026-06-01T00:00:00Z"
+        os.environ["ZMEM_EMBED_PROFILE"] = "fake"
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ["ZMEM_MODELS_DIR"] = str(_SCRATCH_MODULE / "missing-models")
+        os.environ["ZMEM_DATA"] = str(_SCRATCH_MODULE)
+        os.environ["ZMEM_HOME"] = str(_SCRATCH_MODULE / "home")
+        condition = module.run_condition(
+            tasks, inject=True, model_id="recorded-stub-v1", allow_model_calls=False
+        )
+        self.assertEqual(condition["repeated_failure_rate"], 1.0)
+        self.assertEqual(condition["first_action_agreement"], 0.0)
+        self.assertEqual(condition["tool_call_count"], 1)
+
+    def test_session_ids_are_pinned_per_task_index(self):
+        # P2-006c: the evaluator pins one session per task, in task order
+        # (the documented five-session shape; multi-task sessions are not a
+        # representable input today).
+        module = self._module()
+        tasks = json.loads((FIXTURES / "tasks.json").read_text(encoding="utf-8"))["tasks"]
+        store_copy = _SCRATCH_MODULE / "cf-sessions.sqlite"
+        store_copy.write_bytes((FIXTURES / "store.sqlite").read_bytes())
+        os.environ["ZMEM_STORE"] = str(store_copy)
+        os.environ["ZMEM_TEST_NOW"] = "2026-06-01T00:00:00Z"
+        os.environ["ZMEM_EMBED_PROFILE"] = "fake"
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ["ZMEM_MODELS_DIR"] = str(_SCRATCH_MODULE / "missing-models")
+        os.environ["ZMEM_DATA"] = str(_SCRATCH_MODULE)
+        os.environ["ZMEM_HOME"] = str(_SCRATCH_MODULE / "home")
+        condition = module.run_condition(
+            tasks[:2], inject=True, model_id="recorded-stub-v1", allow_model_calls=False
+        )
+        self.assertEqual(
+            [s["session_id"] for s in condition["sessions"]], ["session-01", "session-02"]
+        )
+        self.assertEqual([s["task_count"] for s in condition["sessions"]], [1, 1])
+
+    def test_executor_returns_recorded_tool_output(self):
+        # P2-017: the executor returns the recorded tool_output bytes from
+        # tasks.json, not fabricated content.
+        module = self._module()
+        tasks = json.loads((FIXTURES / "tasks.json").read_text(encoding="utf-8"))["tasks"]
+        executor = module.RecordedToolExecutor(tasks)
+        for task in tasks:
+            self.assertEqual(executor.execute(task["tool_input"]), task["tool_output"])
+        self.assertEqual(executor.calls, len(tasks))
+
+    def test_duplicate_tool_input_is_rejected(self):
+        module = self._module()
+        duplicated = [json.loads(json.dumps(task)) for task in
+                      json.loads((FIXTURES / "tasks.json").read_text(encoding="utf-8"))["tasks"][:1]]
+        duplicate = json.loads(json.dumps(duplicated[0]))
+        duplicate["memory_row_id"] = "f0000000-0000-4000-8000-000000000099"
+        with self.assertRaises(module.EvalError):
+            module.RecordedToolExecutor(duplicated + [duplicate])
+
+
 class CounterfactualSchemaTest(unittest.TestCase):
     """eval/counterfactual-schema.json validates the committed report."""
 
@@ -213,6 +309,33 @@ class CounterfactualSafetyTest(unittest.TestCase):
             self.assertTrue(report["skipped"])
             for condition in report["conditions"]:
                 self.assertTrue(condition["skipped"])
+            # Direct no-adapter-import proof: run the skip path in a fresh
+            # interpreter via runpy, then inspect THAT interpreter's
+            # sys.modules for the injection machinery.
+            wrapper = scratch / "skip_probe.py"
+            wrapper.write_text(
+                "import runpy, sys\n"
+                "evaluator, tasks, store = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+                "sys.argv = ['eval_counterfactual.py', '--tasks', tasks,"
+                " '--store', store, '--model-id', 'real-model-v1']\n"
+                "try:\n"
+                "    runpy.run_path(evaluator, run_name='__main__')\n"
+                "except SystemExit:\n"
+                "    pass\n"
+                "print('IMPORTED' if 'storelib.inject' in sys.modules else 'CLEAN')\n",
+                encoding="utf-8",
+            )
+            probe = subprocess.run(
+                [PYTHON, str(wrapper),
+                 str(FIXTURES / "tasks.json"),
+                 str(FIXTURES / "store.sqlite"),
+                 str(EVALUATOR)],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            self.assertIn("CLEAN", probe.stdout)
+            self.assertNotIn("IMPORTED", probe.stdout)
             before = hashlib.sha256((FIXTURES / "store.sqlite").read_bytes()).hexdigest()
             stub = _run(
                 scratch,

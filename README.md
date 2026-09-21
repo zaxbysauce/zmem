@@ -247,7 +247,8 @@ committed fixture: 0.0/1.0 with memory, 1.0/0.0 without). The evaluator is
 read-only (read-only store URI, store SHA-256 verified before and after) and
 refuses the operator home store before opening anything. A real model id is
 only ever resolved with `--allow-model-calls`; without it the evaluator
-prints exactly `SKIPPED: model calls disabled` and exits 0 without importing
+prints exactly `SKIPPED: model calls disabled` and exits 0 (writing the
+skipped report when `--json-out` is given) without importing
 or downloading any adapter. The oracle pair
 `tests/fixtures/counterfactual/tasks.json`/`expected.json` (+ `store.sqlite`)
 is written only by `tests/fixtures/counterfactual/generate.py`, a

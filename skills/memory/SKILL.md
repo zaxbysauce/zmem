@@ -1893,6 +1893,9 @@ python scripts/eval_counterfactual.py \
   --json-out counterfactual-report.json
 ```
 
+(`--allow-model-calls` exists to opt a non-stub model id into real adapter
+resolution; without it the run takes the skip path described below.)
+
 Each recorded session replays twice — `ZMEM_INJECT=1` through the real
 passive injection lane (delivery ledger redirected to a scratch directory;
 read-only store URI; store SHA-256 verified before and after) and
@@ -1905,7 +1908,8 @@ with memory, 1.0/0.0 without on the committed fixture) against the Draft
 2020-12 contract `eval/counterfactual-schema.json`. The evaluator refuses the
 operator home store before opening anything. A real model id is only resolved
 with `--allow-model-calls`; without it the run prints exactly
-`SKIPPED: model calls disabled` and exits 0 with `skipped: true` — no adapter
+`SKIPPED: model calls disabled` and exits 0 with `skipped: true` (writing the
+skipped report when `--json-out` is given) — no adapter
 import, no download, no network. The committed task/store/expected fixture
 trio is written only by `tests/fixtures/counterfactual/generate.py`
 (developer-side; CI compares against the committed bytes and never
