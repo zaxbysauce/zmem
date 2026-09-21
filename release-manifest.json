@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "5c99eb8f802b243d05637fbd7843abed54ed20d155b2971853cca1f5fa2d7602",
+  "digest": "1853e73920d09b3bc40b5c6a8767b6ffe8067a5f77997df9033ce5cbf225339d",
   "files": {
     "hermes-plugin/__init__.py": "c584903ad0a6a68838c637e6b21191fcab149e4e116546f2b4919e897f0f9c16",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -41,7 +41,7 @@
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",
     "scripts/eval_counterfactual.py": "8a3d30350c294c17cdc617efe40f390f39e8d213a665ff7aaeb88f67c3dd1860",
     "scripts/eval_inject_runner.py": "c3b68474f80500e36ae2c245431897c7c0e5a27a98781332e8e9e1b8cb5cc70a",
-    "scripts/eval_replay.py": "2eaf1f0e531a1c814251e06c617b76d7404f814f3d70df7e3fdd048dc00216b7",
+    "scripts/eval_replay.py": "32158485403175d276c56b8ca944e36981b5560efb2bc39495b8c07045feab79",
     "scripts/eval_runner.py": "6e9b355425644f38795068259a69bb9c1ca02cdd57509511824ac10ac721ce3a",
     "scripts/eval_self_corpus.py": "ead3aece0562da0fe588ea4d4994aa7ec8fece3ae4d0a7554766e9933e4e76e6",
     "scripts/generate_canary_fixtures.py": "382467197fdb868ae31f982980750c45103e8b873a897083388f5231427e1b22",
