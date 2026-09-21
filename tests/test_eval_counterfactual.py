@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -207,6 +208,35 @@ class CounterfactualMatcherBranchTest(unittest.TestCase):
         with self.assertRaises(module.EvalError):
             module.RecordedToolExecutor(duplicated + [duplicate])
 
+    def test_tasks_size_and_count_limits_are_enforced(self):
+        # Feedback P2-001: the tasks file is bounded (4 MiB) and the replay
+        # fan-out is capped (1000 tasks), mirroring the sibling evaluators.
+        module = self._module()
+        with tempfile.TemporaryDirectory(prefix="zmem-cf-bounds-") as raw:
+            scratch = Path(raw)
+            oversize = scratch / "oversize-tasks.json"
+            oversize.write_bytes(b" " * (4 * 1024 * 1024 + 1))
+            with self.assertRaises(module.EvalError):
+                module._load_tasks(oversize)
+
+            def fake_task(index):
+                return {
+                    "prompt": f"task {index}", "tool_input": f"cmd {index}",
+                    "tool_output": "ok", "memory_row_id": f"f0000000-0000-4000-8000-{index:012d}",
+                    "recorded_successful_action": f"ok {index}",
+                    "recorded_no_memory_action": f"fail {index}",
+                    "namespace": "project:counterfactual",
+                    "timestamp": "2026-06-01T00:00:00Z",
+                }
+
+            over_count = scratch / "over-count-tasks.json"
+            over_count.write_text(
+                json.dumps({"tasks": [fake_task(index) for index in range(1001)]}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(module.EvalError):
+                module._load_tasks(over_count)
+
 
 class CounterfactualSchemaTest(unittest.TestCase):
     """eval/counterfactual-schema.json validates the committed report."""
@@ -246,6 +276,43 @@ class CounterfactualSafetyTest(unittest.TestCase):
                 "[eval] refusing operator home store; pass an isolated --store path",
                 run.stderr or "",
             )
+
+    def test_home_store_descendants_are_refused(self):
+        # The descendant clause: anything under the operator home store's
+        # directory is operator territory, not just the store file itself.
+        module = CounterfactualMatcherBranchTest._module()
+        candidates = module._operator_store_candidates()
+        home_store = (Path.home() / ".zmem" / "store.sqlite").resolve()
+        descendant = home_store.parent / "sub" / "store.sqlite"
+        self.assertTrue(module._is_operator_store(home_store, candidates))
+        self.assertTrue(module._is_operator_store(descendant, candidates))
+        outside = (Path.home() / ".zcode" / "plugins" / "store.sqlite").resolve()
+        self.assertFalse(module._is_operator_store(outside, candidates))
+
+    def test_plugin_data_aliases_are_equality_anchored(self):
+        # Env-provided aliases (including plugin-data dirs) refuse the exact
+        # configured store but must NOT refuse isolated snapshots under the
+        # same tree — only the fixed home defaults get directory anchors.
+        module = CounterfactualMatcherBranchTest._module()
+        with tempfile.TemporaryDirectory(prefix="zmem-cf-plugin-") as raw:
+            scratch = Path(raw)
+            for env_key in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+                env_patch = patch.dict(os.environ, {env_key: str(scratch / env_key)})
+                with env_patch:
+                    candidates = module._operator_store_candidates()
+                self.assertTrue(
+                    module._is_operator_store(
+                        (scratch / env_key / "store.sqlite").resolve(), candidates
+                    ),
+                    env_key,
+                )
+                self.assertFalse(
+                    module._is_operator_store(
+                        (scratch / env_key / "isolated" / "store.sqlite").resolve(), candidates
+                    ),
+                    env_key,
+                )
+
 
     def test_environment_is_restored(self):
         module = _load_module()

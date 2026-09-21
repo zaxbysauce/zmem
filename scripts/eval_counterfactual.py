@@ -44,15 +44,24 @@ def _operator_store_candidates() -> set[Path]:
     """Resolve every operator-store alias before the environment is isolated.
 
     This is a REFUSAL check, not a which-store resolver, so every alias is
-    unioned (no precedence picking) and each file candidate contributes its
-    parent directory as an anchor: a descendant path such as
-    ``<home>/.zmem/sub/store.sqlite`` must be refused even though it is not
-    equal to the store file itself.
+    unioned (no precedence picking). The fixed operator defaults contribute
+    their PARENT directories as anchors so a descendant path such as
+    ``<home>/.zmem/sub/store.sqlite`` is refused too; env-provided aliases
+    are equality anchors only, because callers deliberately point them at
+    scratch locations (the evaluator family's own isolation convention).
     """
     env = os.environ
     candidates: set[Path] = set()
 
-    def add(raw: str | os.PathLike[str] | None) -> None:
+    def add_file(raw: str | os.PathLike[str] | None) -> None:
+        if not raw:
+            return
+        try:
+            candidates.add(Path(raw).expanduser().resolve())
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return
+
+    def add_tree(raw: str | os.PathLike[str] | None) -> None:
         if not raw:
             return
         try:
@@ -62,16 +71,16 @@ def _operator_store_candidates() -> set[Path]:
         candidates.add(resolved)
         candidates.add(resolved.parent)
 
-    add(env.get("ZMEM_STORE"))
+    add_file(env.get("ZMEM_STORE"))
     if env.get("ZMEM_DATA"):
-        add(Path(env["ZMEM_DATA"]).expanduser() / "store.sqlite")
+        add_file(Path(env["ZMEM_DATA"]).expanduser() / "store.sqlite")
     if env.get("CLAUDE_PLUGIN_DATA"):
-        add(Path(env["CLAUDE_PLUGIN_DATA"]).expanduser() / "store.sqlite")
+        add_file(Path(env["CLAUDE_PLUGIN_DATA"]).expanduser() / "store.sqlite")
     if env.get("ZCODE_PLUGIN_DATA"):
-        add(Path(env["ZCODE_PLUGIN_DATA"]).expanduser() / "store.sqlite")
+        add_file(Path(env["ZCODE_PLUGIN_DATA"]).expanduser() / "store.sqlite")
     home = Path(os.path.expanduser("~"))
-    add(home / ".zmem" / "store.sqlite")
-    add(home / ".zcode" / "memory" / "store.sqlite")
+    add_tree(home / ".zmem" / "store.sqlite")
+    add_tree(home / ".zcode" / "memory" / "store.sqlite")
     return candidates
 
 
@@ -106,14 +115,33 @@ def _bootstrap_env(store: str) -> None:
     os.environ["PYTHONUTF8"] = "1"
 
 
+MAX_TASKS_BYTES = 4 * 1024 * 1024
+MAX_TASK_COUNT = 1000
+
+
 def _load_tasks(path: Path) -> list[dict]:
+    # Same bounded-read discipline as the sibling evaluators: the tasks file
+    # is untrusted process-boundary input, so cap the read before parsing
+    # and cap the replay fan-out before running.
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        blob = path.read_bytes()
+    except OSError as exc:
+        raise EvalError(f"[eval] invalid tasks set: {exc}\n") from exc
+    if len(blob) > MAX_TASKS_BYTES:
+        raise EvalError(
+            f"[eval] invalid tasks set: exceeds the {MAX_TASKS_BYTES}-byte limit\n"
+        )
+    try:
+        payload = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
         raise EvalError(f"[eval] invalid tasks set: {exc}\n") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
         raise EvalError("[eval] invalid tasks set: top-level 'tasks' list required\n")
     tasks = payload["tasks"]
+    if len(tasks) > MAX_TASK_COUNT:
+        raise EvalError(
+            f"[eval] invalid tasks set: at most {MAX_TASK_COUNT} tasks are allowed\n"
+        )
     for index, task in enumerate(tasks):
         if not isinstance(task, dict) or sorted(task.keys()) != sorted(TASK_FIELDS):
             raise EvalError(
