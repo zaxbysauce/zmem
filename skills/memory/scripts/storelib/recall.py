@@ -3197,6 +3197,7 @@ def _recent_memory_impl(
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
+    _fence_id: str | None = None,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -3308,6 +3309,7 @@ def _recent_memory_impl(
             results, omitted=omitted, exclude_ids=exclude_ids, arms={},
             injection_risk=injection_risk_count,
             budget_tokens=_injection_budget_tokens,
+            namespace=namespace, fence_id=_fence_id or "",
         )
         results = injection_details["results"]
         if results:
@@ -3584,6 +3586,7 @@ def recent_memory(
     _cross_moment: str | None = None,
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
+    _fence_id: str | None = None,
 ) -> list[dict]:
     # _recent_memory_impl performs the same emit-time _classify_injection
     # filtering before this public wrapper hands candidates to the shared
@@ -3605,6 +3608,7 @@ def recent_memory(
             _cross_moment=_cross_moment,
             _cross_ops_tokens=_cross_ops_tokens,
             _cross_explicit=_cross_explicit,
+            _fence_id=_fence_id,
         )
 
     details = _collect_injection_candidates(
@@ -3630,6 +3634,7 @@ def recent_memory(
         _cross_moment=_cross_moment,
         _cross_ops_tokens=_cross_ops_tokens,
         _cross_explicit=_cross_explicit,
+        _fence_id=_fence_id,
     )
     if _capture is not None:
         _capture.clear()
