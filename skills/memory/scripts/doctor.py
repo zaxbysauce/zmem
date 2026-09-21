@@ -2721,12 +2721,53 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
             "store was hand-edited; inspect with `store.py get --json`.",
             applied_min=lo_applied, violated_min=lo_violated,
         )
-    return _check(
-        "voyager-counters", "pass",
+    # Issue #124: report the observational feedback totals (live-row SQL
+    # aggregates + sidecar record counts from the store's parent data dir)
+    # with the seven stable labels, in contract order, in both the details
+    # and the human summary.
+    feedback_values = {key: 0 for key in (
+        "total_applied", "total_violated", "nonzero_applied",
+        "nonzero_violated", "matched_applied", "matched_violated",
+        "unmatched_operations")}
+    feedback_note = ""
+    try:
+        from storelib.miss_rate import feedback_surface
+        data_dir = str(resolved_store.parent)
+        probe = _open_store_ro(resolved_store)
+        if probe is not None:
+            try:
+                feedback_values, _assoc, malformed = feedback_surface(
+                    probe, data_dir)
+            finally:
+                probe.close()
+            if malformed:
+                feedback_note = (f" malformed feedback sidecar ignored: "
+                                 f"{malformed}")
+    except Exception:
+        feedback_note = " feedback totals unavailable"
+    summary = (
         f"usage counters present and sane (applied_max={hi_applied}, "
-        f"violated_max={hi_violated}); written only by "
-        "`store.py feedback` — hooks never advance them.",
+        f"violated_max={hi_violated}); written by `store.py feedback` and "
+        "matched operation feedback."
+        f" feedback: total_applied={feedback_values['total_applied']}"
+        f" total_violated={feedback_values['total_violated']}"
+        f" nonzero_applied={feedback_values['nonzero_applied']}"
+        f" nonzero_violated={feedback_values['nonzero_violated']}"
+        f" matched_applied={feedback_values['matched_applied']}"
+        f" matched_violated={feedback_values['matched_violated']}"
+        f" unmatched_operations={feedback_values['unmatched_operations']}."
+        f"{feedback_note}"
+    )
+    return _check(
+        "voyager-counters", "pass", summary,
         applied_max=hi_applied, violated_max=hi_violated,
+        total_applied=feedback_values["total_applied"],
+        total_violated=feedback_values["total_violated"],
+        nonzero_applied=feedback_values["nonzero_applied"],
+        nonzero_violated=feedback_values["nonzero_violated"],
+        matched_applied=feedback_values["matched_applied"],
+        matched_violated=feedback_values["matched_violated"],
+        unmatched_operations=feedback_values["unmatched_operations"],
     )
 
 

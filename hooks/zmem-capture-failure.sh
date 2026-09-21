@@ -285,6 +285,49 @@ case "$SOURCE_EXISTS" in
   *) emit_empty ;;
 esac
 
+# Issue #124: report the failed operation to the observational feedback loop
+# before rendering the nudge. The event/evidence ids are derived
+# deterministically from the payload bytes (the payload's evidence_id or
+# tool_use_id wins when present), so a replayed event can never double-count.
+# The helper is stdlib-only and the call is fail-open: a store problem never
+# blocks the nudge (ZMEM_STORE/ZMEM_DATA are inherited from the launcher).
+"$PYTHON_BIN" -c '
+import hashlib, json, subprocess, sys
+store, session, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    payload = json.loads(raw)
+except Exception:
+    raise SystemExit(0)
+if not isinstance(payload, dict):
+    raise SystemExit(0)
+tool_input = payload.get("tool_input")
+if not isinstance(tool_input, dict):
+    tool_input = {}
+text = " ".join(str(tool_input.get(k) or "")
+                for k in ("command", "file_path", "notebook_path", "path"))
+tokens = [w for w in text.lower().split() if w][:12]
+import re as _re
+_SECRET = _re.compile(r"(ghp_|gho_|github_pat_|sk-[A-Za-z0-9]|AKIA|glpat_|xox[bap]-|AIza)", _re.I)
+tokens = [w for w in tokens
+          if not w.startswith("-") and not _SECRET.search(w)][:6]
+if not tokens:
+    tool = str(payload.get("tool_name") or "").lower()
+    tokens = [tool] if tool and not tool.startswith("-") else []
+if not tokens:
+    raise SystemExit(0)
+event = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
+ev = payload.get("evidence_id") or payload.get("tool_use_id") or event
+if not isinstance(ev, str) or not ev:
+    ev = event
+args = [sys.executable, store, "operation-feedback",
+        "--session-id", session, "--event-id", event,
+        "--outcome", "failure", "--evidence-id", ev]
+for tok in tokens:
+    args.extend(["--operation-token", tok])
+subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+raise SystemExit(0)
+' "$STORE_PY_PY" "$SESSION_ID" "$INPUT" 2>/dev/null || true
+
 CTX_JSON="$("$PYTHON_BIN" -c '
 import json, shlex, sys
 obj = json.loads(sys.argv[1])

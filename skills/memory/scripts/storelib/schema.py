@@ -812,9 +812,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             -- contradiction ledger, and linking never rewrites those columns.
             trust_score     REAL NOT NULL DEFAULT 1.0,
             -- v12 (issue #64): Voyager-style usage-feedback counters. Written
-            -- ONLY by the explicit `store.py feedback --id --applied|--violated`
-            -- CLI (storelib/write.py::feedback_memory). Hooks, --no-bump
-            -- recall, PreCompact, and Hermes prefetch NEVER advance them
+            -- ONLY by storelib/write.py::feedback_memory, whose callers are
+            -- the explicit `store.py feedback --id --applied|--violated` CLI
+            -- AND (issue #124) matched operation feedback via
+            -- storelib/feedback.py::apply_operation_feedback — the #156
+            -- matcher + #171 association read decide which memories a host
+            -- operation outcome applies to; the per-session sidecar keeps one
+            -- event from counting a memory twice. Plain recall, ledger
+            -- writes, and every other store.py command NEVER advance them
             -- (retrieval_count/surfaced_count remain the passive telemetry);
             -- ingest carries them verbatim and never applies their side
             -- effects. Ladder: applied_count >= 3 with violated_count == 0

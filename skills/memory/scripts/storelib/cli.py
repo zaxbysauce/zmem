@@ -48,6 +48,8 @@ from storelib.recall import reembed_embeddings
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
 from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory, warn_reserved_source_ref
+from storelib.delivery_ledger import FeedbackSidecarError
+from storelib.feedback import apply_operation_feedback
 from storelib.tune import tune_weights
 from storelib import ops_tokens as _ops_tokens
 from storelib.query_ambiguity import (
@@ -1452,6 +1454,31 @@ def main():
                                        "2nd violation applies a ONE-TIME -0.15 trust_score "
                                        "drop (signal is never changed); any violation makes "
                                        "the row promote-ineligible.")
+
+    # Issue #124 (Workstream E): observational operation-feedback. The
+    # matcher, association check, sidecar, and counter writer all live in
+    # storelib.feedback / storelib.delivery_ledger; this parser only carries
+    # the host event's data.
+    p_opfb = _add_parser(
+        "operation-feedback",
+        help="apply one host operation event's outcome to the delivered "
+             "memories it observationally matches (Voyager counters)")
+    p_opfb.add_argument("--session-id", dest="session_id", type=str,
+                        required=True,
+                        help="session id owning the delivered rows")
+    p_opfb.add_argument("--event-id", dest="event_id", type=str,
+                        required=True,
+                        help="stable host operation event id")
+    p_opfb.add_argument("--operation-token", dest="operation_tokens",
+                        action="append", default=[],
+                        help="normalized operation token (repeatable)")
+    p_opfb.add_argument("--outcome", dest="outcome",
+                        choices=("success", "failure"), required=True,
+                        help="completed operation outcome")
+    p_opfb.add_argument("--evidence-id", dest="evidence_id", type=str,
+                        default=None, help="associated evidence id")
+    p_opfb.add_argument("--now", dest="now", type=str, default=None,
+                        help="fixed ISO-8601 UTC time for tests")
 
     # v12 (issue #64, 9.6): offline weight tuning. Dry-run ONLY — suggested
     # W_* weights are computed in memory from the gold set; nothing is ever
@@ -2929,6 +2956,23 @@ def main():
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(1)
             print(json.dumps(result, ensure_ascii=False))
+        elif args.cmd == "operation-feedback":
+            # Issue #124: operational failures exit 1 with the stable
+            # envelope and NO stdout; argparse owns usage errors (exit 2).
+            # Success writes one compact sorted-key JSON list plus LF.
+            try:
+                rows = apply_operation_feedback(
+                    conn, data_dir=os.environ["ZMEM_DATA"],
+                    session_id=args.session_id, event_id=args.event_id,
+                    operation_tokens=list(args.operation_tokens),
+                    outcome=args.outcome, evidence_id=args.evidence_id,
+                    now=args.now)
+            except (FeedbackTargetError, FeedbackSidecarError, ValueError,
+                    KeyError, RuntimeError, sqlite3.Error) as exc:
+                print(f"[zmem] operation-feedback: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(json.dumps(rows, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False))
         elif args.cmd == "tune-weights":
             # v12 (issue #64, 9.6): dry-run only. A missing --dry-run is a
             # usage refusal (exit 2) — it keeps the door visibly closed on an

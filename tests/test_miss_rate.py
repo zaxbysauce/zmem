@@ -315,7 +315,7 @@ class DecisionReportBucketsTest(unittest.TestCase):
         self.assertEqual(expected_obj["fixture"], {
             "generated_at": "2026-06-01T00:00:00Z",
             "namespace": "project:fixture",
-            "version": "0.57.0",
+            "version": "0.58.0",
         })
         fixed_uuids = {
             "00000000-0000-4000-8000-000000000001",
@@ -1489,6 +1489,63 @@ class SilentLinesWithIdsExcludedTest(_JoinFixture, unittest.TestCase):
                          "a silent line with ids must not enter the "
                          "false-injection denominator (injected lines "
                          "only); fix the counter, never weaken this pin")
+
+
+class FeedbackReportTest(unittest.TestCase):
+    """Issue #124: the miss report carries the seven feedback totals in
+    contract order plus the matched-association projection (fixture
+    semantics: one violated + one applied counter, the committed sidecar)."""
+
+    FB_SESS = "00000000-0000-4000-8000-000000000124"
+    FB_M125 = "00000000-0000-4000-8000-000000000125"
+    FB_M126 = "00000000-0000-4000-8000-000000000126"
+    FB_E127 = "00000000-0000-4000-8000-000000000127"
+    FB_E128 = "00000000-0000-4000-8000-000000000128"
+    FB_EV130 = "00000000-0000-4000-8000-000000000130"
+    FB_EV131 = "00000000-0000-4000-8000-000000000131"
+
+    def test_report_includes_feedback_associations(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-fbreport-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ns = "project:feedback-124"
+        _seed_and_get_id(tmp, ns, "python tests/test_feedback_promote.py guard")
+        _seed_and_get_id(tmp, ns, "git status --short advice")
+        conn = sqlite3.connect(os.path.join(tmp, "store.sqlite"))
+        try:
+            conn.execute(
+                "UPDATE memory SET violated_count=1 "
+                "WHERE content LIKE 'python tests/%'")
+            conn.execute(
+                "UPDATE memory SET applied_count=1 "
+                "WHERE content LIKE 'git status%'")
+            conn.commit()
+        finally:
+            conn.close()
+        # The committed sidecar fixture verbatim: one violated, one applied,
+        # one unmatched record for the session.
+        ops = os.path.join(tmp, "ops")
+        os.makedirs(ops, exist_ok=True)
+        sidecar = os.path.join(
+            ops, hashlib.sha256(self.FB_SESS.encode("utf-8")).hexdigest()[:32]
+            + ".feedback.jsonl")
+        Path(sidecar).write_bytes(
+            (REPO_ROOT / "tests" / "fixtures"
+             / "feedback_sidecar_expected.jsonl").read_bytes())
+
+        report = miss_rate.run_miss_report(
+            os.path.join(tmp, "store.sqlite"), data_dir=tmp)
+        self.assertNotIn("error", report)
+        self.assertEqual([report[key] for key in miss_rate.FEEDBACK_KEYS],
+                         [1, 1, 1, 1, 1, 1, 1],
+                         "the seven totals in contract order")
+        self.assertEqual(report["feedback_associations"], [
+            {"session_id": self.FB_SESS, "event_id": self.FB_E127,
+             "memory_id": self.FB_M125, "overlap": 2,
+             "evidence_id": self.FB_EV130},
+            {"session_id": self.FB_SESS, "event_id": self.FB_E128,
+             "memory_id": self.FB_M126, "overlap": 2,
+             "evidence_id": self.FB_EV131},
+        ], "exactly five fields per row, sorted by session/event/memory")
 
 
 if __name__ == "__main__":

@@ -2006,6 +2006,28 @@ Always clamped to [0.0, 1.0]; visible in `get --json`, `export-jsonl`,
 and `doctor`. `confidence`/`signal` are never changed by linking — they
 are provenance inputs; trust_score is the contradiction ledger.
 
+## Operation feedback counters (issue #124)
+
+`applied_count`/`violated_count` have ONE writer
+(`storelib/write.py::feedback_memory`) with TWO callers: the explicit
+`store.py feedback --id --applied|--violated` CLI and the observational
+`store.py operation-feedback` command that the capture-failure and
+posttoolbatch hooks invoke after each operation outcome. The command matches
+the event against the session's delivered rows (1,800 s window, >= 2 token
+overlap), requires the event's evidence id to be associated with the memory,
+and records every verdict in a per-session sidecar
+(`<data>/ops/<sha256(session)[:32]>.feedback.jsonl`, one compact sorted-key
+JSON line with exactly `event_id`, `evidence_id`, `memory_id`, `overlap`,
+`session_id`, `timestamp`, `verdict` — verdict is applied, violated, or
+unmatched). Ranking popularity is usefulness only:
+`0.15*sqrt(applied_count) - 0.25*sqrt(violated_count)` clamped to
+[0.0, 1.0]; retrieval/surfaced telemetry never feed ranking. `stats`,
+doctor's voyager-counters check, and the miss-rate report expose seven keys
+in this order: `total_applied`, `total_violated`, `nonzero_applied`,
+`nonzero_violated`, `matched_applied`, `matched_violated`,
+`unmatched_operations`; the miss-rate JSON adds `feedback_associations`
+(session_id, event_id, memory_id, overlap, evidence_id per row).
+
 ## Live host canary lanes (issue #96)
 
 `scripts/host_canary.py` also owns nine LIVE host-canary lanes. Each lane

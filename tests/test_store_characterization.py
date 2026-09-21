@@ -96,7 +96,12 @@ _RE_EMBED_STATUS = __import__("re").compile(r"embeddings=[^\n]+")
 # recall/export-jsonl) ARE stable across platforms with the normalizers in
 # this file and keep their hash freeze.
 DATA_SHA = {
-    "stats": "11ac804ebd82da80a80772814b5507f233d58e259b4c9c3498fa1311500630c8",
+    # RE-FROZEN 2026-09-21 for issue #124 (release 0.58.0): stats gains the
+    # "feedback (live):" section (AC8) and recall --json row dicts gain
+    # integer applied_count/violated_count (AC7). Dual-tree strip-compare
+    # proved SHAPE_ONLY_DRIFT (base 7923101 sha 641ee074/11ac804e anchors
+    # reproduced; bodies equal after stripping the two new keys).
+    "stats": "c6f8667fe53dbbc851e2bfccbd1de3b2d92a37b31e2db1b65a56e50ea416bc8b",
     "list": "c2e285928d3ee75154a12e4a61947d6793d3bc8f55edb0b3319e73ff4b75a598",
     # RE-CAPTURED for v10 (issue #60): recall rows gained the `entities`
     # card key (see freeze note above). RE-CAPTURED AGAIN on 2026-08-25 for
@@ -135,7 +140,7 @@ DATA_SHA = {
     # no `_score`, ordering, or content change on this link-free fixture
     # (the graph lane joins the lane-max at None, which max() ignores).
     # stats/list/export_jsonl are byte-identical to their prior freezes.
-    "recall": "641ee074f45cba623cdffe70970fabcb670886732d3d31fe0f0274ccdd8d6e05",
+    "recall": "2b2b7cfbccc161bff74f8eb8aec87bb2950f5088d5340383c755fd0abc33a19c",
     # v11 (issue #61): export-jsonl re-captured ONLY for the two new row keys
     # (`trust_score`, `links`) — stripping exactly those keys from the new
     # output reproduces the v10 freeze 8552767c… byte-for-byte (verified at

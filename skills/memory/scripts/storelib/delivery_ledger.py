@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -572,3 +573,153 @@ def _boundary_pattern(token: str) -> "re.Pattern":
             r"(?<![A-Za-z0-9])" + _re.escape(token) + r"(?![A-Za-z0-9])")
         _BOUNDARY_CACHE[token] = pat
     return pat
+
+
+# ---------------------------------------------------------------------------
+# Issue #124 (Workstream E): per-session operation-feedback sidecar.
+# ``<data>/ops/<sha256(session_id)[:32]>.feedback.jsonl`` — one compact
+# sorted-key JSON object per line, LF-terminated. The sidecar makes one host
+# operation event count at most once per memory: the command-level loader
+# checks the (event_id, memory_id, session_id) tuple before a verdict is
+# applied again, regardless of verdict. Like every write in this module it
+# is atomic (tmp + fsync + os.replace); unlike the delivery ledger it is
+# NOT fail-open on read — a sidecar failure is a correctness signal for the
+# feedback loop and raises FeedbackSidecarError (the orchestration rolls the
+# counter transaction back).
+# ---------------------------------------------------------------------------
+
+
+class FeedbackSidecarError(RuntimeError):
+    """Raised when the operation-feedback sidecar cannot be read as needed or
+    written. The CLI maps this to exit 1 — an operational failure, not a
+    usage error."""
+
+
+_FEEDBACK_VERDICTS = ("applied", "violated", "unmatched")
+# One malformed-sidecar warning per path per command (process): a long
+# session replaying many events must not spam the same diagnostic.
+_MALFORMED_SIDECAR_WARNED: set = set()
+
+
+def feedback_event_path(data_dir: str, session_id: str) -> str:
+    """Sidecar path for one session's operation-feedback records."""
+    if not session_id:
+        raise ValueError("session_id must be non-empty")
+    name = _hashed_name(session_id, ".feedback.jsonl")
+    if not name:
+        raise ValueError("session_id must be non-empty")
+    return os.path.join(data_dir, "ops", name)
+
+
+def _load_feedback_records(path: str) -> list:
+    """Read feedback sidecar records. A malformed file is treated as empty
+    with exactly one stderr warning per path per command (issue #124)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise FeedbackSidecarError(f"feedback sidecar unreadable: {exc}") from exc
+    records = []
+    ok = True
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            ok = False
+            break
+        if isinstance(rec, dict):
+            records.append(rec)
+        else:
+            ok = False
+            break
+    if not ok and path not in _MALFORMED_SIDECAR_WARNED:
+        _MALFORMED_SIDECAR_WARNED.add(path)
+        print(f"[zmem] WARNING: malformed feedback sidecar ignored: {path}",
+              file=sys.stderr)
+        records = []
+    return records
+
+
+def _feedback_record_tuple(rec: dict) -> tuple:
+    return (rec.get("session_id"), rec.get("event_id"),
+            rec.get("memory_id"), rec.get("verdict"))
+
+
+def feedback_seen(data_dir: str, session_id: str, event_id: str,
+                  memory_id: str, verdict: str) -> bool:
+    """True when the full (session_id, event_id, memory_id, verdict) tuple is
+    already recorded. Never reads another session's hashed file."""
+    path = feedback_event_path(data_dir, session_id)
+    records = _load_feedback_records(path)
+    wanted = (session_id, event_id, memory_id, verdict)
+    return any(_feedback_record_tuple(r) == wanted for r in records)
+
+
+def record_feedback_event(data_dir: str, session_id: str, event_id: str,
+                          memory_id: str, verdict: str, overlap: int,
+                          evidence_id: str | None,
+                          now: str | None = None) -> None:
+    """Append one feedback record atomically (tmp + fsync + os.replace).
+
+    The record has exactly seven keys, serialized with sort_keys=True and
+    compact separators so line bytes are deterministic (issue #124 fixture
+    contract). memory_id may be "" only for verdict "unmatched".
+    """
+    if not session_id:
+        raise ValueError("session_id must be non-empty")
+    if not event_id:
+        raise ValueError("event_id must be non-empty")
+    if verdict not in _FEEDBACK_VERDICTS:
+        raise ValueError("verdict must be one of 'applied', 'violated', "
+                         "'unmatched'")
+    if verdict == "unmatched":
+        if memory_id:
+            raise ValueError("unmatched records carry no memory id")
+    elif not memory_id:
+        raise ValueError("memory_id must be non-empty")
+    if isinstance(overlap, bool) or not isinstance(overlap, int) or overlap < 0:
+        raise ValueError("overlap must be a non-negative integer")
+    if evidence_id is not None and (not isinstance(evidence_id, str)
+                                    or not evidence_id):
+        raise ValueError("evidence_id must be None or a non-empty string")
+    if now is None:
+        from storelib.schema import now_iso
+        now = now_iso()
+    path = feedback_event_path(data_dir, session_id)
+    record = {
+        "event_id": event_id,
+        "evidence_id": evidence_id,
+        "memory_id": memory_id,
+        "overlap": int(overlap),
+        "session_id": session_id,
+        "timestamp": now,
+        "verdict": verdict,
+    }
+    line = json.dumps(record, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp." + uuid.uuid4().hex
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            existing = _load_feedback_records(path)
+            for rec in existing:
+                f.write(json.dumps(rec, sort_keys=True,
+                                   separators=(",", ":"),
+                                   ensure_ascii=False) + "\n")
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise FeedbackSidecarError(f"feedback sidecar write failed: {exc}") from exc

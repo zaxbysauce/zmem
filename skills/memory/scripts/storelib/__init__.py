@@ -38,6 +38,11 @@ from storelib.inject import (CHARS_PER_TOKEN, DEFAULT_INJECT_TOKEN_BUDGET,
                              select_and_budget_for_injection,
                              selective_inject_filter)
 from storelib.episodes import EPISODE_SUMMARY_TAGS, EpisodeError, build_extractive_summary, episode_add, episode_close, episode_get, episode_list, episode_open
+# Issue #124 (Workstream E): observational operation-feedback surface.
+from storelib.delivery_ledger import FeedbackSidecarError, feedback_event_path, feedback_seen, record_feedback_event
+from storelib.evidence import evidence_ids_for_memory
+from storelib.feedback import apply_operation_feedback
+from storelib.recall import APPLIED_FEEDBACK_FACTOR, VIOLATED_FEEDBACK_FACTOR
 from storelib.cli import ALLOWED_SIGNALS, ALLOWED_TYPES, BACKUP_DEFAULT_RETENTION, CAPTURE_MODES, CONSOLIDATE_DEFAULT_THRESHOLD, CONSOLIDATE_LOCK_STALE_SECONDS, CapturePolicyRefusal, ContentTooLarge, EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, GLOBAL_NAMESPACE, Path, SENTINEL_SWEEP_DAYS_DEFAULT, SNAPSHOT_GLOB, STORE_PATH, _acquire_lock, _acquire_writer_lease, _prepare_store, _reembed, _release_lock, _release_writer_lease, _wait_for_maintenance_clear, add_memory, annotations, argparse, calendar, cmd_backup, cmd_corrections, cmd_export_jsonl, cmd_export_pack, cmd_failures, cmd_ingest_jsonl, cmd_mine_history, cmd_queue_clear, cmd_queue_list, cmd_restore, cmd_sweep, connect, consolidate, contextlib, datetime, get_memory, glob, hashlib, json, list_memory, main, math, nonnegative_int, os, promote_memory, re, recall_memory, recent_memory, rekey_namespace, shutil, sqlite3, stats, struct, subprocess, supersede_memory, sys, time, timezone, uuid
 
 ## ---- live forwarded mutable globals (issue #57) ----

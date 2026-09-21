@@ -298,6 +298,27 @@ baseline.
 - Every public capability claim is audited in `docs/CLAIMS-AUDIT.md`; scores
   never gate CI.
 
+### Operation feedback (issue #124)
+
+Passive recall alone can't tell a helpful memory from a harmful one, so the
+Voyager counters stayed at zero and the promotion ladder was unreachable.
+`operation-feedback` closes that loop: after a `PostToolUseFailure` or a
+successful `PostToolBatch`, the host hooks report the operation outcome to
+`store.py operation-feedback`, which matches the event against the memories
+that session actually received (the #156 observational action matcher, 1,800
+second window, two-token overlap), checks the evidence association, and
+increments `applied_count` (the memory helped) or `violated_count` (it
+misled) through the same writer as the explicit `feedback` command. One
+session event can never count the same memory twice, and ranking popularity
+is now usefulness feedback rather than read exposure:
+`0.15 * sqrt(applied_count) - 0.25 * sqrt(violated_count)`, clamped to
+[0.0, 1.0]. `stats`, `doctor`, and the miss-rate report expose the totals as
+`total_applied`, `total_violated`, `nonzero_applied`, `nonzero_violated`,
+`matched_applied`, `matched_violated`, and `unmatched_operations`, with the
+per-event `feedback_associations` in the miss-rate JSON. Each event is
+recorded in a per-session sidecar (`<data>/ops/<sha256(session)[:32]>.feedback.jsonl`)
+so replays stay idempotent.
+
 ## Requirements
 
 - ZCode and/or Claude Code (the plugin registers hooks + a skill via each

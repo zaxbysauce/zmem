@@ -142,6 +142,28 @@ class ExportSurfaceTests(unittest.TestCase):
         )
         self.assertGreaterEqual(store.CONFIDENCE_FLOOR, 0.0)
 
+    def test_feedback_exports(self):
+        # Issue #124 (Workstream E): the eight new public exports resolve from
+        # the storelib package surface with the prescribed shapes.
+        from storelib import (  # noqa: PLC0415
+            APPLIED_FEEDBACK_FACTOR,
+            VIOLATED_FEEDBACK_FACTOR,
+            FeedbackSidecarError,
+            FeedbackTargetError,
+            apply_operation_feedback,
+            feedback_event_path,
+            feedback_seen,
+            record_feedback_event,
+        )
+        for fn in (apply_operation_feedback, feedback_event_path,
+                   feedback_seen, record_feedback_event):
+            self.assertTrue(callable(fn), f"{getattr(fn, '__name__', fn)} "
+                                           f"is not callable")
+        self.assertAlmostEqual(APPLIED_FEEDBACK_FACTOR, 0.15, places=12)
+        self.assertAlmostEqual(VIOLATED_FEEDBACK_FACTOR, 0.25, places=12)
+        self.assertTrue(issubclass(FeedbackSidecarError, RuntimeError))
+        self.assertTrue(issubclass(FeedbackTargetError, ValueError))
+
 
 class CaptureCliBoundaryTest(unittest.TestCase):
     """Issue #123 capture state must cross hooks only through store.py."""

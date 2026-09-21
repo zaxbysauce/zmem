@@ -44,6 +44,13 @@ W_CONFIDENCE = 0.20
 W_RECENCY = 0.15
 
 W_POPULARITY = 0.10
+
+# Issue #124 (Workstream E): usefulness feedback replaces retrieval exposure
+# as the popularity input — matched operation outcomes (the counters the
+# explicit CLI and the operation-feedback command write), never read counts.
+APPLIED_FEEDBACK_FACTOR = 0.15
+
+VIOLATED_FEEDBACK_FACTOR = 0.25
 # Recency half-life: a memory from RECENCY_HALF_LIFE_DAYS ago contributes half.
 
 RECENCY_HALF_LIFE_DAYS = 90
@@ -262,18 +269,23 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
     else:
         recency = 0.5  # unknown age — neutral
 
-    # Popularity component (issue #114): EXPLICIT reads only —
-    # retrieval_count, never surfaced_count. Passive surfaces used to feed
-    # this term, so every hook pull inflated the score of rows the model
-    # never saw (measured: five identical passive recalls raised scores
-    # monotonically). surfaced_count is still recorded per #21 (promote/
-    # prune/consolidate consume it) but stays out of ranking until #124
-    # lands applied/violated counters; the weight itself is unchanged.
+    # Popularity component (issue #124): usefulness feedback only — the
+    # matched-operation counters. This closes the #114 placeholder that read
+    # retrieval_count: exposure is not endorsement, so read telemetry no
+    # longer feeds ranking at all (surfaced_count stays recorded for
+    # promote/prune/consolidate). Missing keys read as zero; the term is
+    # clamped to [0, 1]; the weight itself is unchanged.
     try:
-        rc = int(row["retrieval_count"] or 0)
+        applied_count = int(row["applied_count"] or 0)
     except (KeyError, IndexError, TypeError):
-        rc = 0
-    popularity = min(1.0, 0.15 * (rc ** 0.5))
+        applied_count = 0
+    try:
+        violated_count = int(row["violated_count"] or 0)
+    except (KeyError, IndexError, TypeError):
+        violated_count = 0
+    popularity = max(0.0, min(1.0,
+        APPLIED_FEEDBACK_FACTOR * (applied_count ** 0.5)
+        - VIOLATED_FEEDBACK_FACTOR * (violated_count ** 0.5)))
 
     # Trust discount (issue #115): the composite is multiplied by the row's
     # trust_score — identity at the schema default 1.0, so every
@@ -601,7 +613,7 @@ def _fetch_lineage_rows(
     sql = f"""
         SELECT id, namespace, type, content, tags, source_ref,
                confidence, signal, valid_from, valid_until,
-               update_of, taint, trust_score
+               update_of, taint, trust_score, applied_count, violated_count
         FROM memory
         WHERE id IN ({placeholders})
           {ns_clause}
@@ -1231,6 +1243,8 @@ def _recall_one_tier(
             "valid_until": r["valid_until"],
             "update_of": r["update_of"],
             "taint": r["taint"],
+            "applied_count": int(r["applied_count"] or 0),
+            "violated_count": int(r["violated_count"] or 0),
             "stale": bool(stale_note),
             "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
             "_stale_note": stale_note,
@@ -2318,7 +2332,8 @@ def _explain_target_row(conn: sqlite3.Connection, mid: str) -> sqlite3.Row | Non
     return conn.execute(
         """SELECT id, namespace, type, content, tags, source_ref, source_hash,
                   confidence, signal, valid_from, valid_until, update_of,
-                  taint, superseded_at, content_norm, embedding
+                  taint, superseded_at, content_norm, embedding,
+                  applied_count, violated_count
            FROM memory WHERE id = ?""",
         (mid,),
     ).fetchone()
@@ -3174,7 +3189,8 @@ def _recent_one_tier(
     rows = conn.execute(
         f"""SELECT id, namespace, type, content, tags, source_ref, source_hash,
                   confidence, signal, valid_from, ingestion_ts, last_retrieved,
-                  valid_until, update_of, taint, trust_score
+                  valid_until, update_of, taint, trust_score,
+                  applied_count, violated_count
             FROM memory
             WHERE {live_clause} confidence >= ?
             {ns_clause}
@@ -3205,6 +3221,8 @@ def _recent_one_tier(
             "update_of": r["update_of"],
             "taint": r["taint"],
             "trust_score": _row_trust(r),
+            "applied_count": int(r["applied_count"] or 0),
+            "violated_count": int(r["violated_count"] or 0),
             "stale": bool(stale_note),
             "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
             "_stale_note": stale_note,
@@ -3758,6 +3776,23 @@ def stats(conn):
             print("  embeddings=unknown (availability probe failed)")
     else:
         print("  embeddings=unavailable (embeddings module not importable)")
+
+    # Issue #124: observational feedback totals — live-row SQL aggregates and
+    # the per-session sidecar record counts under ZMEM_DATA, printed with the
+    # seven stable labels in the contract order.
+    try:
+        from storelib.miss_rate import feedback_surface
+        data_dir = os.environ.get("ZMEM_DATA")
+        feedback_values, _assoc, malformed = feedback_surface(conn, data_dir)
+        print("feedback (live):")
+        for key in ("total_applied", "total_violated", "nonzero_applied",
+                    "nonzero_violated", "matched_applied", "matched_violated",
+                    "unmatched_operations"):
+            print(f"  {key}={feedback_values[key]}")
+        if malformed:
+            print(f"  [zmem] WARNING: malformed feedback sidecar ignored: {malformed}")
+    except Exception:
+        print("feedback (live): unavailable")
 
     # Operational health: surface when maintenance last ran so an operator can
     # tell from one command whether backup/consolidation are healthy (#37 L21).

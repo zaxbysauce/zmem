@@ -499,5 +499,97 @@ class HookBodyDeliveryTest(unittest.TestCase):
         self.assertNotIn(" rendered_estimate=", lines[-1])
 
 
+class FeedbackLedgerTest(unittest.TestCase):
+    """Issue #124: the per-session operation-feedback sidecar primitives
+    (atomic write, loader-guarded idempotence, session attribution)."""
+
+    def setUp(self):
+        os.environ.pop("ZMEM_DELIVER_WINDOW_S", None)
+        os.environ.pop("ZMEM_LEDGER_CAP", None)
+        self.tmp = tempfile.mkdtemp(prefix="zmem-fbledger-")
+        import storelib.delivery_ledger as dl
+        self.dl = dl
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_feedback_event_is_atomic_and_idempotent(self):
+        now = "2026-09-10T10:01:00Z"
+        # Empty session ids are refused loudly (never a silent fallback
+        # path that would collide every session on one file).
+        with self.assertRaises(ValueError):
+            self.dl.feedback_event_path(self.tmp, "")
+
+        self.dl.record_feedback_event(
+            self.tmp, "sess-1", "ev-1", "mem-1", "violated", 2, "ev-1",
+            now=now)
+        path = self.dl.feedback_event_path(self.tmp, "sess-1")
+        record = {"event_id": "ev-1", "evidence_id": "ev-1",
+                  "memory_id": "mem-1", "overlap": 2,
+                  "session_id": "sess-1", "timestamp": now,
+                  "verdict": "violated"}
+        expected = (json.dumps(record, sort_keys=True,
+                               separators=(",", ":"),
+                               ensure_ascii=False) + "\n").encode("utf-8")
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), expected,
+                             "the sidecar line must be exact sorted compact "
+                             "JSON + LF (the #124 fixture byte contract)")
+        # Atomicity: only the final file exists in ops — no tmp residue.
+        ops = Path(self.tmp, "ops")
+        self.assertEqual(sorted(p.name for p in ops.iterdir()),
+                         [Path(path).name])
+
+        # Idempotence at the event level: record_feedback_event is the raw
+        # append primitive — tuple dedup is the LOADER's job (the exact
+        # feedback_seen guard apply_operation_feedback runs before every
+        # record), per the frozen #124 design. The guarded re-record of the
+        # same tuple therefore appends nothing: still exactly one line.
+        if not self.dl.feedback_seen(self.tmp, "sess-1", "ev-1", "mem-1",
+                                     "violated"):
+            self.dl.record_feedback_event(
+                self.tmp, "sess-1", "ev-1", "mem-1", "violated", 2, "ev-1",
+                now=now)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), expected)
+        self.assertTrue(self.dl.feedback_seen(self.tmp, "sess-1", "ev-1",
+                                              "mem-1", "violated"))
+        # the verdict is part of the 4-tuple: a different verdict is unseen
+        self.assertFalse(self.dl.feedback_seen(self.tmp, "sess-1", "ev-1",
+                                               "mem-1", "applied"))
+
+        # Forced append failure: FeedbackSidecarError, prior bytes unchanged,
+        # still no tmp residue.
+        before = Path(path).read_bytes()
+        from unittest import mock
+        with mock.patch("os.replace", side_effect=OSError("disk gone")):
+            with self.assertRaises(self.dl.FeedbackSidecarError):
+                self.dl.record_feedback_event(
+                    self.tmp, "sess-1", "ev-2", "mem-1", "applied", 1, None,
+                    now=now)
+        self.assertEqual(Path(path).read_bytes(), before)
+        self.assertEqual(sorted(p.name for p in ops.iterdir()),
+                         [Path(path).name])
+
+    def test_feedback_is_session_attributed(self):
+        sess_a = "00000000-0000-4000-8000-000000000124"
+        sess_b = "00000000-0000-4000-8000-000000000134"
+        self.dl.record_feedback_event(
+            self.tmp, sess_a, "ev-1", "mem-1", "violated", 2, None,
+            now="2026-09-10T10:01:00Z")
+        # session A's hashed sidecar exists and carries the tuple...
+        self.assertTrue(self.dl.feedback_seen(self.tmp, sess_a, "ev-1",
+                                              "mem-1", "violated"))
+        # ...while session B's sidecar was never created and reports nothing
+        # (a per-session file may never answer for another session).
+        path_b = self.dl.feedback_event_path(self.tmp, sess_b)
+        self.assertFalse(os.path.exists(path_b))
+        self.assertFalse(self.dl.feedback_seen(self.tmp, sess_b, "ev-1",
+                                               "mem-1", "violated"))
+        # and the two sessions never share one file (full-id hash key).
+        self.assertNotEqual(self.dl.feedback_event_path(self.tmp, sess_a),
+                            path_b)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

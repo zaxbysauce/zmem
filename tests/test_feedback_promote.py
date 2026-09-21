@@ -28,13 +28,17 @@ Run: python tests/test_feedback_promote.py   (no pytest — repo convention)
 
 from __future__ import annotations
 
+import calendar
+import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -496,6 +500,426 @@ class TestFeedbackSync(FeedbackTestBase):
                 finally:
                     conn.close()
                 self.assertEqual(n, 0, f"{field}={bad!r} row must NOT be stored")
+
+
+# ---------------------------------------------------------------------------
+# Issue #124 (Workstream E): observational operation feedback — the fixture
+# semantics shared by the classes below (ids, namespace, and the seeded
+# delivery ledger match tests/fixtures/feedback_session.json exactly).
+# ---------------------------------------------------------------------------
+
+SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
+FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
+
+FB_NS = "project:feedback-124"
+FB_SESS = "00000000-0000-4000-8000-000000000124"
+FB_M125 = "00000000-0000-4000-8000-000000000125"
+FB_M126 = "00000000-0000-4000-8000-000000000126"
+FB_E127 = "00000000-0000-4000-8000-000000000127"
+FB_E128 = "00000000-0000-4000-8000-000000000128"
+FB_E129 = "00000000-0000-4000-8000-000000000129"
+FB_EV130 = "00000000-0000-4000-8000-000000000130"
+FB_EV131 = "00000000-0000-4000-8000-000000000131"
+FB_EV132 = "00000000-0000-4000-8000-000000000132"
+# The pinned digest of tests/fixtures/feedback_expected.json (issue #124).
+FB_EXPECTED_SHA256 = ("0bda442e0363e484be95e2a46d95e22c"
+                      "17f6a9e5afe3042fb2b12f6e0e2d0e24")
+
+
+def _fb_epoch(ts: str) -> float:
+    return float(calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
+
+
+def _fb_sidecar_path(data_dir: str, session_id: str = FB_SESS) -> str:
+    stem = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    return os.path.join(data_dir, "ops", stem + ".feedback.jsonl")
+
+
+class OperationFeedbackTest(FeedbackTestBase):
+    """Issue #124: one host operation event increments exactly the counters
+    of the delivered memories it observationally matches, at most once per
+    (session, event, memory), through the real store.py CLI."""
+
+    def setUp(self):
+        super().setUp()
+        # `operation-feedback` reads its data_dir (ledger + sidecar) from
+        # ZMEM_DATA; FeedbackTestBase strips that key, so re-pin it to the
+        # throwaway store's own directory.
+        self.env["ZMEM_DATA"] = self.tmp
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._seed_feedback_fixture()
+
+    def _seed_feedback_fixture(self):
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.executemany(
+                "INSERT INTO memory (id, namespace, type, content, tags,"
+                " signal, confidence, ingestion_ts, source_ref, content_norm)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [(FB_M125, FB_NS, "lesson",
+                  "python tests/test_feedback_promote.py guard",
+                  "tests,python", "test", 0.9, "2026-09-10T09:00:00Z", "", "a"),
+                 (FB_M126, FB_NS, "lesson", "git status --short advice",
+                  "git", "test", 0.9, "2026-09-10T09:00:00Z", "", "b")])
+            conn.executemany(
+                "INSERT INTO memory_evidence (memory_id, evidence_id)"
+                " VALUES (?,?)",
+                [(FB_M125, FB_EV130), (FB_M126, FB_EV131)])
+            conn.commit()
+        finally:
+            conn.close()
+        ops = os.path.join(self.tmp, "ops")
+        os.makedirs(ops, exist_ok=True)
+        ledger = os.path.join(
+            ops, hashlib.sha256(FB_SESS.encode("utf-8")).hexdigest()[:32]
+            + ".ledger")
+        with open(ledger, "w", encoding="utf-8") as f:
+            json.dump({"entries": [
+                {"id": FB_M125, "moment": "pretool",
+                 "ts": _fb_epoch("2026-09-10T10:00:00Z"),
+                 "text": "python tests/test_feedback_promote.py"},
+                {"id": FB_M126, "moment": "pretool",
+                 "ts": _fb_epoch("2026-09-10T10:01:00Z"),
+                 "text": "git status --short"}]}, f)
+
+    def _opfb(self, *args):
+        return self._run("operation-feedback", *args)
+
+    def _counters(self, memory_id):
+        conn = sqlite3.connect(self.store)
+        try:
+            return conn.execute(
+                "SELECT applied_count, violated_count FROM memory WHERE id=?",
+                (memory_id,)).fetchone()
+        finally:
+            conn.close()
+
+    def _sidecar_bytes(self):
+        with open(_fb_sidecar_path(self.tmp), "rb") as f:
+            return f.read()
+
+    def test_injected_matching_failure_increments_violated(self):
+        r = self._opfb(
+            "--session-id", FB_SESS, "--event-id", FB_E127,
+            "--operation-token", "python",
+            "--operation-token", "tests/test_feedback_promote.py",
+            "--outcome", "failure", "--evidence-id", FB_EV130,
+            "--now", "2026-09-10T10:01:00Z")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "")
+        rows = json.loads(r.stdout)
+        self.assertEqual(rows, [{
+            "memory_id": FB_M125, "verdict": "violated", "overlap": 2,
+            "evidence_id": FB_EV130, "event_id": FB_E127, "session_id": FB_SESS,
+        }])
+        self.assertEqual(sorted(rows[0]),
+                         ["event_id", "evidence_id", "memory_id",
+                          "overlap", "session_id", "verdict"],
+                         "the returned row carries EXACTLY the six keys")
+        self.assertEqual(self._counters(FB_M125), (0, 1))
+        self.assertEqual(self._counters(FB_M126), (0, 0))
+
+    def test_injected_matching_success_increments_applied(self):
+        r = self._opfb(
+            "--session-id", FB_SESS, "--event-id", FB_E128,
+            "--operation-token", "git", "--operation-token", "status",
+            "--operation-token=--short",
+            "--outcome", "success", "--evidence-id", FB_EV131,
+            "--now", "2026-09-10T10:02:00Z")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = json.loads(r.stdout)
+        self.assertEqual(rows, [{
+            "memory_id": FB_M126, "verdict": "applied", "overlap": 2,
+            "evidence_id": FB_EV131, "event_id": FB_E128, "session_id": FB_SESS,
+        }])
+        self.assertEqual(self._counters(FB_M126), (1, 0))
+        self.assertEqual(self._counters(FB_M125), (0, 0))
+
+    def test_unrelated_operation_does_not_increment(self):
+        r = self._opfb(
+            "--session-id", FB_SESS, "--event-id", FB_E129,
+            "--operation-token", "bun", "--operation-token", "test",
+            "--operation-token", "unrelated",
+            "--outcome", "success", "--evidence-id", FB_EV132,
+            "--now", "2026-09-10T10:03:00Z")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), [])
+        self.assertEqual(self._counters(FB_M125), (0, 0))
+        self.assertEqual(self._counters(FB_M126), (0, 0))
+        # The in-window non-match writes exactly ONE unmatched sidecar line,
+        # byte-identical to the committed fixture's third line.
+        expected_lines = (FIXTURES_DIR / "feedback_sidecar_expected.jsonl") \
+            .read_bytes().splitlines(keepends=True)
+        self.assertEqual(self._sidecar_bytes(), expected_lines[2])
+
+    def test_mismatched_evidence_id_drops_match(self):
+        # Phase 4.5 reviewer-flagged coverage gap: an event whose evidence id
+        # is NOT associated with the matched memory must not move the counter
+        # -- the association gate drops the row and the event is recorded
+        # unmatched, so deleting the association read cannot pass silently.
+        r = self._opfb(
+            "--session-id", FB_SESS, "--event-id", FB_E127,
+            "--operation-token", "python",
+            "--operation-token", "tests/test_feedback_promote.py",
+            "--outcome", "failure", "--evidence-id", FB_EV132,
+            "--now", "2026-09-10T10:01:00Z")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), [])
+        self.assertEqual(self._counters(FB_M125), (0, 0))
+        sidecar = os.path.join(
+            self.tmp, "ops",
+            hashlib.sha256(FB_SESS.encode("utf-8")).hexdigest()[:32]
+            + ".feedback.jsonl")
+        lines = Path(sidecar).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertEqual((record["memory_id"], record["overlap"],
+                          record["verdict"], record["evidence_id"]),
+                         ("", 0, "unmatched", FB_EV132))
+
+    def test_same_session_event_cannot_double_count(self):
+        args = (
+            "--session-id", FB_SESS, "--event-id", FB_E127,
+            "--operation-token", "python",
+            "--operation-token", "tests/test_feedback_promote.py",
+            "--outcome", "failure", "--evidence-id", FB_EV130,
+            "--now", "2026-09-10T10:01:00Z")
+        first = self._opfb(*args)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self._opfb(*args)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout), [],
+                         "a replayed event returns no new rows")
+        self.assertEqual(self._counters(FB_M125), (0, 1),
+                         "violated_count must stay at 1 across the repeat")
+        lines = self._sidecar_bytes().splitlines(keepends=True)
+        self.assertEqual(len(lines), 1,
+                         "the sidecar must hold exactly one matching line")
+        self.assertEqual(json.loads(lines[0])["verdict"], "violated")
+        self.assertEqual(json.loads(lines[0])["memory_id"], FB_M125)
+
+    def test_cli_parser_flags_and_exit_codes(self):
+        # --help names every flag with the exact prescribed help strings.
+        h = self._run("operation-feedback", "--help")
+        self.assertEqual(h.returncode, 0, h.stderr)
+        for flag in ("--session-id", "--event-id", "--operation-token",
+                     "--outcome", "--evidence-id", "--now"):
+            self.assertIn(flag, h.stdout, f"--help lacks {flag}")
+        for text in ("session id owning the delivered rows",
+                     "stable host operation event id",
+                     "normalized operation token (repeatable)",
+                     "completed operation outcome",
+                     "associated evidence id",
+                     "fixed ISO-8601 UTC time for tests"):
+            self.assertIn(text, h.stdout, f"--help lacks help text {text!r}")
+        self.assertIn("{success,failure}", h.stdout)
+        # Argparse usage errors exit 2: missing required flag, bad --outcome.
+        missing = self._opfb("--session-id", FB_SESS, "--outcome", "success")
+        self.assertEqual(missing.returncode, 2, missing.stdout + missing.stderr)
+        bad = self._opfb("--session-id", FB_SESS, "--event-id", FB_E128,
+                         "--outcome", "bogus")
+        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
+        # Success path with --now: exit 0, one-row compact sorted-key list.
+        r = self._opfb(
+            "--session-id", FB_SESS, "--event-id", FB_E128,
+            "--operation-token", "git", "--operation-token", "status",
+            "--operation-token=--short",
+            "--outcome", "success", "--evidence-id", FB_EV131,
+            "--now", "2026-09-10T10:02:00Z")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(r.stdout.endswith("\n"))
+        self.assertEqual(json.loads(r.stdout), [{
+            "memory_id": FB_M126, "verdict": "applied", "overlap": 2,
+            "evidence_id": FB_EV131, "event_id": FB_E128, "session_id": FB_SESS,
+        }])
+        # Operational failure: exit 1, no stdout, stable stderr envelope.
+        op = self._opfb("--session-id", FB_SESS, "--event-id", FB_E127,
+                        "--operation-token", "python",
+                        "--outcome", "failure", "--now", "not-a-timestamp")
+        self.assertEqual(op.returncode, 1, op.stdout + op.stderr)
+        self.assertEqual(op.stdout, "")
+        self.assertTrue(op.stderr.startswith("[zmem] operation-feedback:"),
+                        f"stderr was {op.stderr!r}")
+
+
+class FeedbackFixtureBytesTest(unittest.TestCase):
+    """The committed expected-fixture bytes are reproducible from the session
+    fixture through the REAL #156 matcher (issue #124 AC11)."""
+
+    def test_fixture_generator_matches_expected_bytes(self):
+        expected = (FIXTURES_DIR / "feedback_expected.json").read_bytes()
+        self.assertEqual(hashlib.sha256(expected).hexdigest(),
+                         FB_EXPECTED_SHA256,
+                         "the committed fixture itself drifted")
+        with tempfile.TemporaryDirectory(prefix="zmem-fbgen-") as scratch:
+            gen = os.path.join(scratch, "gen.json")
+            r = subprocess.run(
+                [PYTHON, str(FIXTURES_DIR / "make_feedback_expected.py"),
+                 "--input", str(FIXTURES_DIR / "feedback_session.json"),
+                 "--output", gen],
+                capture_output=True, text=True, timeout=180)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            produced = Path(gen).read_bytes()
+        self.assertEqual(
+            produced, expected,
+            "generator drift: produced sha256="
+            f"{hashlib.sha256(produced).hexdigest()} expected sha256="
+            f"{hashlib.sha256(expected).hexdigest()}")
+
+
+class FeedbackRecallProjectionTest(unittest.TestCase):
+    """Issue #124: recall / recent / injection row dicts project the counters
+    as integers while the human fenced renderer never shows them (or any
+    evidence id).
+
+    Driven in a SUBPROCESS with the env pinned before the storelib import
+    (the STORE_PATH-freeze rule) — this file's every other class drives the
+    real store.py the same way, and an in-process import here would evict a
+    storelib singleton that co-run modules may still be using.
+    """
+
+    PROJ_NS = "project:feedback-124"
+
+    _DRIVER = r"""
+import calendar, contextlib, io, json, os, sys
+
+tmp, scripts_dir, evidence_id = sys.argv[1], sys.argv[2], sys.argv[3]
+os.environ["ZMEM_STORE"] = os.path.join(tmp, "store.sqlite")
+os.environ["ZMEM_DATA"] = tmp
+os.environ["ZMEM_MODELS_DIR"] = os.path.join(tmp, "missing-models")
+os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+for key in ("ZMEM_BACKUP_DIR", "CLAUDE_PLUGIN_DATA",
+            "ZCODE_PLUGIN_DATA", "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW"):
+    os.environ.pop(key, None)
+sys.path.insert(0, scripts_dir)
+
+from storelib.inject import select_and_budget_for_injection
+from storelib.recall import recall_memory, recent_memory
+from storelib.schema import connect, init_db, migrate
+from storelib.write import add_memory
+
+NS = "project:feedback-124"
+conn = connect()
+init_db(conn)
+migrate(conn)
+with contextlib.redirect_stdout(io.StringIO()):
+    mid_py = add_memory(
+        conn, namespace=NS, type_="lesson",
+        content="python tests/test_feedback_promote.py guard",
+        tags="tests,python", signal="test", confidence=0.9,
+        source_ref="session:fb-proj")
+    mid_git = add_memory(
+        conn, namespace=NS, type_="lesson",
+        content="git status --short advice", tags="git", signal="test",
+        confidence=0.9, source_ref="session:fb-proj")
+conn.execute("UPDATE memory SET applied_count=3, violated_count=1 "
+             "WHERE id=?", (mid_py,))
+conn.execute("INSERT INTO memory_evidence (memory_id, evidence_id) "
+             "VALUES (?,?)", (mid_py, evidence_id))
+conn.commit()
+
+with contextlib.redirect_stdout(io.StringIO()):
+    rows = recall_memory(conn, query="python tests guard", namespace=NS,
+                         limit=5, no_bump=True, no_telemetry=True)
+    recent = recent_memory(conn, namespace=NS, limit=5, no_bump=True,
+                           no_telemetry=True)
+    envelope = select_and_budget_for_injection(
+        conn, query="python tests guard", namespace=NS,
+        moment="user_prompt", session_id="fb-proj-session", data_dir=tmp)
+conn.close()
+
+
+def pick(seq, mid):
+    return next((r for r in seq if r.get("id") == mid), None)
+
+
+def shape(row):
+    if row is None:
+        return None
+    return {"applied": row.get("applied_count"),
+            "violated": row.get("violated_count"),
+            "types": [type(row.get("applied_count")).__name__,
+                      type(row.get("violated_count")).__name__],
+            "keys": sorted(row)}
+
+
+out = {
+    "mid_py": mid_py,
+    "mid_git": mid_git,
+    "recall": shape(pick(rows, mid_py)),
+    "recent": shape(pick(recent, mid_py)),
+    "injection": shape(pick(envelope.get("results", []), mid_py)),
+}
+rendered = envelope.get("rendered") or ""
+out["rendered"] = {
+    "empty": not rendered.strip(),
+    "names_applied_count": "applied_count" in rendered,
+    "names_violated_count": "violated_count" in rendered,
+    "names_evidence_id": "evidence_id" in rendered,
+    "carries_the_evidence_uuid": evidence_id in rendered,
+}
+print(json.dumps(out))
+"""
+
+    def test_recall_and_recent_and_injection_project_counters(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-fbproj-") as tmp:
+            driver = os.path.join(tmp, "driver.py")
+            with open(driver, "w", encoding="utf-8") as f:
+                f.write(self._DRIVER)
+            r = subprocess.run(
+                [PYTHON, driver, tmp, str(SCRIPTS_DIR), FB_EV130],
+                capture_output=True, text=True, timeout=180)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = json.loads(r.stdout.strip().splitlines()[-1])
+        for surface in ("recall", "recent", "injection"):
+            shape = out[surface]
+            self.assertIsNotNone(
+                shape, f"the seeded python lesson must surface via {surface}")
+            self.assertEqual(shape["applied"], 3, f"{surface}: {shape}")
+            self.assertEqual(shape["violated"], 1, f"{surface}: {shape}")
+            self.assertEqual(shape["types"], ["int", "int"],
+                             f"{surface} counters must be ints, never "
+                             f"bools/strings: {shape}")
+        rendered = out["rendered"]
+        self.assertFalse(rendered["empty"],
+                         "the fenced renderer must have output")
+        self.assertFalse(rendered["names_applied_count"], rendered)
+        self.assertFalse(rendered["names_violated_count"], rendered)
+        self.assertFalse(rendered["names_evidence_id"], rendered)
+        self.assertFalse(rendered["carries_the_evidence_uuid"], rendered)
+
+
+class TestFeedbackWriterExclusivity(unittest.TestCase):
+    """Guardrail (issue #124): storelib/write.py feedback_memory stays the
+    ONLY counter writer. Every SQL ``UPDATE memory`` whose statement region
+    touches applied_count / violated_count must live in write.py."""
+
+    # The "statement region": the UPDATE plus its immediate assignment /
+    # read-back context. 400 chars is tight enough that schema.py's distant
+    # ALTER-column commentary and sync.py's ingest prose cannot bleed into a
+    # counter-writing statement, while write.py's feedback_memory UPDATE (the
+    # ``{column} = {column} + 1`` increment followed by its counter SELECT)
+    # is fully covered.
+    _STATEMENT_WINDOW = 400
+
+    def test_only_feedback_memory_writes_counters(self):
+        storelib_dir = REPO_ROOT / "skills" / "memory" / "scripts" / "storelib"
+        update_re = re.compile(r"UPDATE\s+memory", re.IGNORECASE)
+        offenders = {}
+        for path in sorted(storelib_dir.glob("*.py")):
+            src = path.read_text(encoding="utf-8")
+            for m in update_re.finditer(src):
+                region = src[max(0, m.start() - self._STATEMENT_WINDOW):
+                             m.end() + self._STATEMENT_WINDOW]
+                if re.search(r"applied_count|violated_count", region):
+                    offenders.setdefault(path.name, 0)
+                    offenders[path.name] += 1
+        self.assertEqual(
+            set(offenders), {"write.py"},
+            f"counter-writing UPDATE memory statements escaped write.py "
+            f"(the sole feedback_memory writer): {offenders}. Fix the "
+            f"offending module, never weaken this pin.")
+        self.assertGreaterEqual(offenders.get("write.py", 0), 1)
 
 
 if __name__ == "__main__":

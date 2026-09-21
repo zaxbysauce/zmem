@@ -460,5 +460,54 @@ class GatePrecedenceTest(unittest.TestCase):
         self.assertEqual(stats["relevance_failed"], 0)
 
 
+# ---------------------------------------------------------------------------
+# Issue #124 (Workstream E): usefulness feedback replaces read telemetry as
+# compute_score's popularity input.
+# ---------------------------------------------------------------------------
+
+class FeedbackPopularityTest(unittest.TestCase):
+    """Popularity reads ONLY the matched-operation counters: 0.15*sqrt(applied)
+    - 0.25*sqrt(violated), clamped to [0,1], riding the unchanged 0.10 weight.
+    Retrieval/surfaced telemetry moves the score by exactly nothing."""
+
+    ROW = {"confidence": 0.9, "retrieval_count": 7, "surfaced_count": 3,
+           "ingestion_ts": PIN_TS, "applied_count": 0, "violated_count": 0}
+
+    def _score(self, **over) -> float:
+        row = dict(self.ROW)
+        row.update(over)
+        return recall_mod.compute_score(row, None, FIXED_NOW)
+
+    def test_feedback_popularity_replaces_retrieval_count(self):
+        base = self._score()
+        applied = self._score(applied_count=4)
+        violated = self._score(violated_count=4)
+        # Endorsement outranks violation at equal magnitude.
+        self.assertGreater(applied, violated,
+                           "applied=4 must score above violated=4")
+        # applied=4 => popularity 0.15*sqrt(4) = 0.30 => exactly
+        # W_POPULARITY * 0.30 over the zero-counter baseline.
+        self.assertAlmostEqual(applied - base, 0.10 * 0.30, places=12)
+        # Read telemetry no longer feeds ranking AT ALL: equal counters with
+        # wildly different retrieval/surfaced exposure score identically.
+        hi_tel = self._score(retrieval_count=50, surfaced_count=20)
+        lo_tel = self._score(retrieval_count=0, surfaced_count=0)
+        self.assertEqual(hi_tel, lo_tel,
+                         "exposure is not endorsement (#114/#124)")
+
+    def test_feedback_popularity_is_clamped(self):
+        base = self._score()
+        # (0, 4): 0.15*0 - 0.25*2 = -0.5 clamps to 0.0 — the popularity term
+        # can never SUBTRACT from the score.
+        neg = self._score(applied_count=0, violated_count=4)
+        self.assertEqual(neg, base,
+                         "a violations-only row must not score below the "
+                         "zero-counter baseline (floor at 0.0)")
+        # (100, 0): 0.15*10 = 1.5 clamps to 1.0 — exactly W_POPULARITY * 1.0.
+        big = self._score(applied_count=100)
+        self.assertAlmostEqual(big - base, 0.10 * 1.0, places=12,
+                               msg="popularity must clamp at 1.0")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

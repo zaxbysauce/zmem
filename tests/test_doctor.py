@@ -1845,5 +1845,87 @@ class DoctorInstallSkewTest(unittest.TestCase):
             _fixture_tree_digest(sym_root)
 
 
+class FeedbackDoctorTest(unittest.TestCase):
+    """Issue #124: the voyager-counters check reports the observational
+    feedback totals (SQL aggregates + sidecar counts) with the seven stable
+    labels, in order, in details and human summary."""
+
+    FB_SESS = "00000000-0000-4000-8000-000000000124"
+    FB_M125 = "00000000-0000-4000-8000-000000000125"
+    FB_M126 = "00000000-0000-4000-8000-000000000126"
+    _LABELS = ("total_applied", "total_violated", "nonzero_applied",
+               "nonzero_violated", "matched_applied", "matched_violated",
+               "unmatched_operations")
+
+    def test_counter_totals_and_ranges(self):
+        import doctor
+        from unittest import mock
+
+        tmp = tempfile.mkdtemp(prefix="zmem-fbdoctor-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        store = Path(tmp) / "store.sqlite"
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.execute(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
+                (str(CURRENT_SCHEMA_VERSION),))
+            conn.execute(
+                "CREATE TABLE memory(id TEXT PRIMARY KEY, superseded_at TEXT,"
+                " applied_count INTEGER NOT NULL DEFAULT 0,"
+                " violated_count INTEGER NOT NULL DEFAULT 0)")
+            # Fixture semantics: one row violated once, one row applied once
+            # (both live — the totals aggregate over live rows only).
+            conn.executemany(
+                "INSERT INTO memory(id, superseded_at, applied_count,"
+                " violated_count) VALUES (?, NULL, ?, ?)",
+                [(self.FB_M125, 0, 1), (self.FB_M126, 1, 0)])
+            conn.commit()
+        finally:
+            conn.close()
+        # The committed sidecar fixture verbatim, in the store's parent dir
+        # (the data dir doctor derives from resolved_store.parent): one
+        # violated + one applied + one unmatched record.
+        ops = Path(tmp) / "ops"
+        ops.mkdir()
+        sidecar = ops / (hashlib.sha256(
+            self.FB_SESS.encode("utf-8")).hexdigest()[:32]
+            + ".feedback.jsonl")
+        sidecar.write_bytes(
+            (REPO_ROOT / "tests" / "fixtures"
+             / "feedback_sidecar_expected.jsonl").read_bytes())
+
+        env = {k: v for k, v in os.environ.items() if k not in (
+            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_BACKUP_DIR",
+            "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")}
+        env.update({"ZMEM_STORE": str(store), "ZMEM_DATA": tmp,
+                    "ZMEM_MODELS_DIR": os.path.join(tmp, "missing-models"),
+                    "ZMEM_MODEL_AUTODOWNLOAD": "0"})
+        with mock.patch.dict(os.environ, env):
+            check = doctor._check_voyager_counters(store)
+        self.assertEqual(check["status"], "pass", check)
+        details = check["details"]
+        self.assertEqual(details["total_applied"], 1, check)
+        self.assertEqual(details["total_violated"], 1, check)
+        self.assertEqual(details["nonzero_applied"], 1, check)
+        self.assertEqual(details["nonzero_violated"], 1, check)
+        self.assertEqual(details["matched_applied"], 1, check)
+        self.assertEqual(details["matched_violated"], 1, check)
+        self.assertEqual(details["unmatched_operations"], 1, check)
+        self.assertEqual(details["applied_max"], 1, check)
+        self.assertEqual(details["violated_max"], 1, check)
+        # The human summary names the same seven labels, in contract order.
+        summary = check["summary"]
+        positions = []
+        for label in self._LABELS:
+            self.assertIn(label + "=", summary,
+                          f"summary must name {label} (got: {summary!r})")
+            positions.append(summary.index(label + "="))
+        self.assertEqual(positions, sorted(positions),
+                         f"labels out of order in summary: {summary!r}")
+        self.assertEqual(len(set(positions)), 7)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
