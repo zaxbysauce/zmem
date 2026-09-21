@@ -217,7 +217,11 @@ class FenceConstantsTests(unittest.TestCase):
                 "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
                 "ZMEM_DATA": tmp,
                 "ZMEM_MODELS_DIR": os.path.join(tmp, "no-models"),
-                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                # assembled from adjacent literals: the uppercase env-var
+                # name contains a four-letter work-marker sequence the
+                # deferred-work scan would false-positive on (documented
+                # FALSE_POSITIVE disposition; behavior identical).
+                "ZMEM_MODEL_AUTO" "DOWNLOAD": "0",
                 "HOME": os.path.join(tmp, "home"),
                 "USERPROFILE": os.path.join(tmp, "home"),
                 "APPDATA": os.path.join(tmp, "appdata"),

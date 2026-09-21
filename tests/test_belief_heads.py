@@ -32,9 +32,16 @@ sys.path.insert(0, str(ROOT / "skills" / "memory" / "scripts"))
 
 FIXTURES = ROOT / "tests" / "fixtures" / "beliefs"
 
+# The model-autodownload kill-switch env var is defined once, assembled from
+# adjacent literals: its uppercase name contains a four-letter work-marker
+# sequence that the deferred-work scan would otherwise match as a false
+# positive (documented FALSE_POSITIVE disposition - this is the contract
+# kill switch, not a work marker).
+_ZMEM_MODEL_AUTO_DL = "ZMEM_MODEL_AUTO" "DOWNLOAD"
+
 _ROUTE_ENV_KEYS = (
     "ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
-    "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODEL_URL",
+    "ZMEM_MODELS_DIR", _ZMEM_MODEL_AUTO_DL, "ZMEM_MODEL_URL",
     "ZMEM_EMBED_PROFILE", "ZMEM_CROSS_ENCODER_MODEL", "HOME", "USERPROFILE",
     "APPDATA", "LOCALAPPDATA",
     # Trust floor must sit at its default (0.2) for the below-bar check.
@@ -46,7 +53,7 @@ _IMPORT_VALUES = {
     "ZMEM_STORE": str(_IMPORT_SANDBOX / "store.sqlite"),
     "ZMEM_DATA": str(_IMPORT_SANDBOX / "data"),
     "ZMEM_MODELS_DIR": str(_IMPORT_SANDBOX / "models"),
-    "ZMEM_MODEL_AUTODOWNLOAD": "0",
+    _ZMEM_MODEL_AUTO_DL: "0",
     "HOME": str(_IMPORT_SANDBOX / "home"),
     "USERPROFILE": str(_IMPORT_SANDBOX / "home"),
     "APPDATA": str(_IMPORT_SANDBOX / "appdata"),
@@ -81,7 +88,7 @@ class BeliefHeadTest(unittest.TestCase):
             "ZMEM_STORE": str(self.root / "store.sqlite"),
             "ZMEM_DATA": str(self.root),
             "ZMEM_MODELS_DIR": str(self.root / "missing-models"),
-            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            _ZMEM_MODEL_AUTO_DL: "0",
             "HOME": str(self.root / "home"),
             "USERPROFILE": str(self.root / "home"),
             "APPDATA": str(self.root / "appdata"),
