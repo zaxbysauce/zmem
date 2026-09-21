@@ -1608,29 +1608,57 @@ def consolidate(
     # refresh afterwards — two entry points must not double-refresh.
     if belief_heads and not dry_run:
         from storelib import beliefs as _beliefs
-        br = _beliefs.refresh_belief_heads(
-            conn, namespace=namespace, now=now_iso())
-        report["belief_heads"] = {
-            "refreshed": br["refreshed"],
-            "created": br["created"],
-            "updated": br["updated"],
-            "actions_applied": 0,
-        }
-        if llm_local:
-            if adapter is None:
-                raise ValueError("--llm-local requires an adapter callable")
-            actions_applied = 0
-            for summary in br["heads"]:
-                payload = _beliefs.build_adapter_payload(conn, summary)
+        # Atomic maintenance (issue #137 critic round): refresh, adapter
+        # invocation, and action application share one savepoint so an
+        # adapter or action failure rolls the watermark/content back to the
+        # prior state before the CLI maps the error to its exit-1 line.
+        _bsp = "zmem_belief_maintenance"
+        _own = not conn.in_transaction
+        if _own:
+            conn.execute("BEGIN IMMEDIATE")
+        else:
+            conn.execute(f"SAVEPOINT {_bsp}")
+        try:
+            br = _beliefs.refresh_belief_heads(
+                conn, namespace=namespace, now=now_iso())
+            report["belief_heads"] = {
+                "refreshed": br["refreshed"],
+                "created": br["created"],
+                "updated": br["updated"],
+                "actions_applied": 0,
+            }
+            if llm_local:
+                # The built-in conservative adapter applies zero actions; a
+                # caller-supplied adapter (local model) is invoked exactly
+                # the same way. No recall path can reach this code.
+                _adapter = adapter if adapter is not None else _beliefs.null_adapter
+                actions_applied = 0
+                for summary in br["heads"]:
+                    payload = _beliefs.build_adapter_payload(conn, summary)
+                    try:
+                        result = _adapter(payload)
+                    except _beliefs.BeliefActionError:
+                        raise
+                    except Exception as exc:
+                        raise _beliefs.BeliefAdapterError(
+                            "local belief adapter failed: %s" % exc) from exc
+                    actions = (result or {}).get("actions", [])
+                    if actions:
+                        applied = _beliefs.apply_belief_actions(
+                            conn, head_id=summary["head_id"], actions=actions)
+                        actions_applied += applied["applied"]
+                report["belief_heads"]["actions_applied"] = actions_applied
+            if _own:
+                conn.commit()
+            else:
+                conn.execute(f"RELEASE SAVEPOINT {_bsp}")
+        except Exception:
+            if _own:
+                conn.rollback()
+            else:
                 try:
-                    result = adapter(payload)
-                except Exception as exc:
-                    raise _beliefs.BeliefAdapterError(
-                        "local belief adapter failed: %s" % exc) from exc
-                actions = (result or {}).get("actions", [])
-                if actions:
-                    applied = _beliefs.apply_belief_actions(
-                        conn, head_id=summary["head_id"], actions=actions)
-                    actions_applied += applied["applied"]
-            report["belief_heads"]["actions_applied"] = actions_applied
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {_bsp}")
+                finally:
+                    conn.execute(f"RELEASE SAVEPOINT {_bsp}")
+            raise
     return report

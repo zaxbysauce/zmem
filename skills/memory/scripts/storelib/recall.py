@@ -1720,6 +1720,24 @@ def _stable_score_desc(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=key)
 
 
+
+def _suppress_represented_by_head_ns(rows: list[dict],
+                                     fence_id: str) -> list[dict]:
+    """Issue #137: admission-gated represented-row suppression, grouped by
+    each admitted ACTIVE head's OWN namespace — unscoped recall (namespace
+    None) suppresses against the head's namespace, never against a None
+    match. Contested/retracted heads are delivered but never trusted."""
+    by_ns: dict = {}
+    for r in rows:
+        if r.get("type") == "belief_head" and r.get("head_state") == "active":
+            by_ns.setdefault(r.get("namespace"), set()).add(
+                _beliefs.strip_belief_prefix(r["id"]))
+    for ns in sorted(by_ns, key=str):
+        rows = _beliefs.suppress_represented_rows(
+            rows, trusted_head_ids=by_ns[ns], namespace=ns, fence_id=fence_id)
+    return rows
+
+
 def _recall_injection_details(
     rows: list[dict],
     *,
@@ -1792,13 +1810,8 @@ def _recall_injection_details(
     # only within the same namespace + delivered fence. Contested heads are
     # delivered but NEVER trusted for suppression (AC4).
     if selected_rows:
-        selected_rows = _beliefs.suppress_represented_rows(
-            selected_rows,
-            trusted_head_ids={
-                _beliefs.strip_belief_prefix(r["id"]) for r in selected_rows
-                if r.get("type") == "belief_head"
-                and r.get("head_state") == "active"},
-            namespace=namespace, fence_id=fence_id or "")
+        selected_rows = _suppress_represented_by_head_ns(
+            selected_rows, fence_id or "")
 
     if selected_rows:
         reason = "injected"
@@ -2183,8 +2196,20 @@ def _recall_memory_impl(
         belief_rows = []
     if belief_rows:
         seen_ids = {r["id"] for r in results}
-        results = results + [b for b in belief_rows
-                             if b["id"] not in seen_ids]
+        _excl_set = set(exclude_ids or [])
+        _merged = []
+        for _b in belief_rows:
+            if _b["id"] in seen_ids:
+                continue
+            if _b["id"] in _excl_set:
+                # Issue #137 critic round: an excluded virtual head must not
+                # re-enter after the plain path's exclusion pass, and an
+                # excluded head can never be admitted (so it can never
+                # suppress).
+                excluded += 1
+                continue
+            _merged.append(_b)
+        results = results + _merged
 
     injection_details = None
     if for_injection:
@@ -2217,13 +2242,7 @@ def _recall_memory_impl(
         # Issue #137 (plain lane): suppression runs on the final admitted set,
         # so a head that never reached the fence suppresses zero rows.
         # Contested heads are delivered but never trusted for suppression.
-        results = _beliefs.suppress_represented_rows(
-            results,
-            trusted_head_ids={
-                _beliefs.strip_belief_prefix(r["id"]) for r in results
-                if r.get("type") == "belief_head"
-                and r.get("head_state") == "active"},
-            namespace=namespace, fence_id=fence_id)
+        results = _suppress_represented_by_head_ns(results, fence_id)
 
     if as_json:
         # v13 (issue #65, 10.8/10.9): reads emit an ENVELOPE, not a bare list,

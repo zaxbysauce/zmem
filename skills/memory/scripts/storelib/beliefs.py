@@ -771,3 +771,17 @@ def build_adapter_payload(conn: sqlite3.Connection, summary: dict) -> dict:
         "section_evidence_ids": list(summary["evidence_ids"]),
         "source_rows": payload_rows,
     }
+
+
+def null_adapter(payload: dict) -> dict:
+    """Built-in maintenance adapter (issue #137): the wired default for
+    ``--llm-local``. It receives the bounded payload, validates nothing is
+    asked of it, and applies zero actions — the conservative behavior when
+    no local model-backed adapter is configured. A real local adapter can
+    replace it wherever the maintenance caller constructs one; the
+    action-validation/rollback contract is identical either way."""
+    for key in ("head_id", "section_source_ids",
+                "section_evidence_ids", "source_rows"):
+        if key not in payload:
+            raise BeliefActionError("adapter payload missing %s" % key)
+    return {"actions": []}
