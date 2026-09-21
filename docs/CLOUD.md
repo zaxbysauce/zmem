@@ -531,7 +531,8 @@ At recall time heads surface as VIRTUAL rows with ids `belief:<head_id>` (type
 They never enter the canonical `memory` table. A trusted, admitted, ACTIVE
 head suppresses its represented source rows — but only within the same
 namespace and the same delivered fence (the fence identity is the session id
-plus the runtime moment). Contested, filtered, budget-dropped, and
+plus the runtime moment on the passive surfaces; explicit CLI recall uses a
+fresh per-call fence id). Contested, filtered, budget-dropped, and
 not-admitted heads suppress zero rows.
 
 The optional local-LLM action path (`--llm-local`, only together with

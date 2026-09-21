@@ -634,7 +634,7 @@ def organize(
     exists. Treat ``would_*`` as "what a full run would attempt", never as a
     promise of exactly-N inserts.
 
-    Pipeline order (1-8):
+    Pipeline order (1-9):
       1. Cadence gate — the SHARED consolidate meta-key gate (7-day / 20%
          growth), modeled under dry-run, bypassed only by ``force``. Implemented
          ONCE in ``consolidate._cadence_gate_skipped`` and called by both entry
@@ -784,62 +784,15 @@ def organize(
     # --- 5b) Belief heads (issue #137): opt-in deterministic side tables ---
     # Runs BEFORE consolidation: heads ground on the episode's pre-merge
     # live set (consolidation absorbs members and supersedes their ids, so a
-    # post-merge refresh would find nothing to aggregate). The adapter path
-    # is maintenance-only and mutates ONLY via apply_belief_actions.
+    # post-merge refresh would find nothing to aggregate). The atomicity/
+    # adapter contract lives in beliefs.run_belief_maintenance — shared with
+    # consolidate so the two entry points cannot drift; that helper applies
+    # validated adapter actions via beliefs.apply_belief_actions inside one
+    # savepoint, so a failure rolls the refresh watermark back.
     if belief_heads and not dry_run:
         from storelib import beliefs as _beliefs
-        # Atomic maintenance (issue #137 critic round): refresh, adapter
-        # invocation, and action application share one savepoint so an
-        # adapter or action failure rolls the watermark/content back to the
-        # prior state before the CLI maps the error to its exit-1 line.
-        _bsp = "zmem_belief_maintenance"
-        _own = not conn.in_transaction
-        if _own:
-            conn.execute("BEGIN IMMEDIATE")
-        else:
-            conn.execute(f"SAVEPOINT {_bsp}")
-        try:
-            br = _beliefs.refresh_belief_heads(conn, now=now_iso())
-            report["belief_heads"] = {
-                "refreshed": br["refreshed"],
-                "created": br["created"],
-                "updated": br["updated"],
-                "actions_applied": 0,
-            }
-            if llm_local:
-                # The built-in conservative adapter applies zero actions; a
-                # caller-supplied adapter (local model) is invoked exactly
-                # the same way. No recall path can reach this code.
-                _adapter = adapter if adapter is not None else _beliefs.null_adapter
-                actions_applied = 0
-                for summary in br["heads"]:
-                    payload = _beliefs.build_adapter_payload(conn, summary)
-                    try:
-                        result = _adapter(payload)
-                    except _beliefs.BeliefActionError:
-                        raise
-                    except Exception as exc:
-                        raise _beliefs.BeliefAdapterError(
-                            "local belief adapter failed: %s" % exc) from exc
-                    actions = (result or {}).get("actions", [])
-                    if actions:
-                        applied = _beliefs.apply_belief_actions(
-                            conn, head_id=summary["head_id"], actions=actions)
-                        actions_applied += applied["applied"]
-                report["belief_heads"]["actions_applied"] = actions_applied
-            if _own:
-                conn.commit()
-            else:
-                conn.execute(f"RELEASE SAVEPOINT {_bsp}")
-        except Exception:
-            if _own:
-                conn.rollback()
-            else:
-                try:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {_bsp}")
-                finally:
-                    conn.execute(f"RELEASE SAVEPOINT {_bsp}")
-            raise
+        report["belief_heads"] = _beliefs.run_belief_maintenance(
+            conn, llm_local=llm_local, adapter=adapter, now=now_iso())
 
     # --- 6) Consolidation on the bounded episode (7.1) ---
     # force=True: the cadence gate above already passed (organize reached here

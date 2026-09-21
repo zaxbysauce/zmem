@@ -2195,6 +2195,14 @@ def _recall_memory_impl(
     except sqlite3.Error:
         belief_rows = []
     if belief_rows:
+        # F-002 (PR review): virtual heads are classified with the SAME
+        # injection-risk classifier as canonical rows, and the passive
+        # (no_bump) lane applies the SAME omission filter to them that
+        # canonical rows get at 2041-2048 — an untrusted_web or
+        # injection-flagged head must never ride into a delivered fence
+        # just because it merged after the canonical filter pass.
+        for _b in belief_rows:
+            _b["prompt_injection_risk"] = _classify_injection(_b)
         seen_ids = {r["id"] for r in results}
         _excl_set = set(exclude_ids or [])
         _merged = []
@@ -2208,8 +2216,15 @@ def _recall_memory_impl(
                 # suppress).
                 excluded += 1
                 continue
+            if no_bump and (_b.get("prompt_injection_risk")
+                            or _b.get("taint") == "untrusted_web"):
+                omitted += 1
+                continue
             _merged.append(_b)
         results = results + _merged
+        # Keep the flagged-row telemetry honest after the merge (F-002).
+        injection_risk_count += sum(
+            1 for r in _merged if r.get("prompt_injection_risk"))
 
     injection_details = None
     if for_injection:

@@ -335,9 +335,13 @@ OBSERVATION_GATE_PATH = ("evidence", "gates", "172-observation.json")
 
 
 def _observation_gate_default_path():
+    # parents[3] reaches the repository/plugin root from
+    # <root>/skills/memory/scripts/schema_meta.py — the same convention the
+    # sibling operator scripts use (doctor.py, drift.py). parents[2] stops
+    # at skills/ and misses evidence/gates/ entirely (Copilot review round).
     from pathlib import Path
 
-    return Path(__file__).resolve().parents[2].joinpath(*OBSERVATION_GATE_PATH)
+    return Path(__file__).resolve().parents[3].joinpath(*OBSERVATION_GATE_PATH)
 
 
 def observation_gate_decision(path=None) -> str:

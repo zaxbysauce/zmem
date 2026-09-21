@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 
 from storelib.schema import now_iso
@@ -115,6 +116,22 @@ def _retracted_record(conn: sqlite3.Connection, head_id: str) -> list[str]:
 
 def _split_tags(tags: str) -> set[str]:
     return {t.strip().lower() for t in (tags or "").split(",") if t.strip()}
+
+
+def _load_links(conn: sqlite3.Connection, candidates: list[dict]) -> list:
+    """Load memory_link edges touching the candidate set, bounded by the
+    candidate ids in chunks (PR review RP-002: never scan the whole link
+    table on a scoped refresh)."""
+    ids = sorted({r["id"] for r in candidates})
+    links = []
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        ph = ",".join("?" * len(chunk))
+        links.extend(conn.execute(
+            "SELECT src_id, dst_id FROM memory_link "
+            f"WHERE src_id IN ({ph}) OR dst_id IN ({ph})",
+            chunk + chunk).fetchall())
+    return [(r[0], r[1]) for r in links]
 
 
 def _candidate_rows(conn: sqlite3.Connection, namespace: str | None,
@@ -303,8 +320,10 @@ def refresh_belief_heads(conn: sqlite3.Connection, *,
     Head identity is STABLE across membership change: an existing head is
     refreshed in place over the surviving live subset of its recorded
     sources (drops are recorded as retracted), and a live topic group that
-    is covered by an existing head's recorded members never forks a second
-    head.  New heads take their identity from their founding member set.
+    intersects an existing head's membership GROWS that head in place
+    (smallest head id survives; intersecting sibling heads merge away)
+    instead of forking a second active head over the same topic (PR review
+    F-001).  New heads take their identity from their founding member set.
     """
     watermark = now if now is not None else now_iso()
     own_transaction = not conn.in_transaction
@@ -317,14 +336,14 @@ def refresh_belief_heads(conn: sqlite3.Connection, *,
         by_ns: dict[str, list[dict]] = {}
         for r in candidates:
             by_ns.setdefault(r["namespace"], []).append(r)
-        link_rows = conn.execute(
-            "SELECT src_id, dst_id FROM memory_link").fetchall()
-        links = [(r[0], r[1]) for r in link_rows]
+        links = _load_links(conn, candidates)
 
         heads: list[dict] = []
         created = 0
         updated = 0
-        covered_member_sets: list[set[str]] = []
+        # head_id -> live recorded membership, used by Phase B to decide
+        # grow-in-place vs create (PR review F-001: growth must not fork).
+        covered: dict[str, set[str]] = {}
 
         # Phase A — existing heads refresh in place (stable identity) over
         # the live subset of their recorded sources.
@@ -353,7 +372,7 @@ def refresh_belief_heads(conn: sqlite3.Connection, *,
                 summary["replaced"] = True
                 heads.append(summary)
                 updated += 1
-                covered_member_sets.append(set(recorded))
+                covered[existing_id] = {m["id"] for m in live_rows}
             else:
                 # The belief no longer has a live source base: retract.
                 _delete_head_children(conn, existing_id)
@@ -363,25 +382,60 @@ def refresh_belief_heads(conn: sqlite3.Connection, *,
                     (watermark, existing_id))
                 _record_retracted(conn, existing_id, dead or recorded)
 
-        # Phase B — brand-new topics over live rows.  A group whose members
-        # are all covered by an existing head's recorded set never forks a
-        # second head (the parent was just refreshed over its survivors).
+        # Phase B — grow-or-create (PR review F-001): a candidate group that
+        # INTERSECTS any existing head's membership grows that head in place
+        # (smallest head id survives; fully-contained groups are no-ops;
+        # intersecting sibling heads are merged away) instead of forking a
+        # second active head over the same topic.  A group intersecting no
+        # existing head creates a new head.
         for ns in sorted(by_ns):
             ns_rows = sorted(by_ns[ns], key=lambda r: r["id"])
             ns_ids = {r["id"] for r in ns_rows}
             ns_links = [(s, d) for s, d in links if s in ns_ids and d in ns_ids]
             for group in _topic_groups(ns_rows, ns_links):
                 member_ids = {m["id"] for m in group}
-                if any(member_ids <= covered for covered in covered_member_sets):
+                intersecting = sorted(
+                    hid for hid, cov in covered.items() if cov & member_ids)
+                if not intersecting:
+                    summary = _refresh_one_topic(
+                        conn, group, _newest_updates_dst(conn, group),
+                        _topic_contested(conn, group), watermark)
+                    heads.append(summary)
+                    if summary["replaced"]:
+                        updated += 1
+                    else:
+                        created += 1
+                    covered[summary["head_id"]] = set(summary["source_ids"])
                     continue
+                survivor = intersecting[0]
+                grown = set(member_ids)
+                for hid in intersecting:
+                    grown |= covered[hid]
+                placeholders = ",".join("?" * len(grown)) or "''"
+                live_rows = [dict(r) for r in conn.execute(
+                    "SELECT id, namespace, type, content, tags, source_ref, "
+                    "confidence, signal, taint, trust_score, ingestion_ts "
+                    "FROM memory WHERE id IN (%s) AND superseded_at IS NULL "
+                    "ORDER BY id" % placeholders, sorted(grown))]
+                dead_ids = sorted(
+                    set().union(*(
+                        covered[hid] - {m["id"] for m in live_rows}
+                        for hid in intersecting)))
+                # Merged-away siblings disappear; the survivor absorbs their
+                # live membership (their dead sources are recorded retracted
+                # under the survivor).
+                for hid in intersecting[1:]:
+                    _delete_head_children(conn, hid)
+                    conn.execute("DELETE FROM belief_head WHERE id=?", (hid,))
+                    covered.pop(hid, None)
                 summary = _refresh_one_topic(
-                    conn, group, _newest_updates_dst(conn, group),
-                    _topic_contested(conn, group), watermark)
+                    conn, live_rows, _newest_updates_dst(conn, live_rows),
+                    _topic_contested(conn, live_rows), watermark,
+                    head_id=survivor, retracted_new=dead_ids)
+                summary["replaced"] = True
                 heads.append(summary)
-                if summary["replaced"]:
-                    updated += 1
-                else:
-                    created += 1
+                updated += 1
+                covered[survivor] = set(summary["source_ids"])
         report = {
             "refreshed": len(heads),
             "created": created,
@@ -477,7 +531,12 @@ def belief_head_rows(conn: sqlite3.Connection, *, query: str,
     ``represented_ids``, ``support_count``, ``head_state``, weakest-source
     floors, and a ``belief-head:`` source_ref.  Contested heads ARE returned
     (flagged) — they never suppress.  ``as_of`` admits a head only when every
-    source predates the instant.
+    source predates the instant.  All per-head data is loaded in a fixed
+    number of batched queries (PR review F-003: the cost must not grow with
+    the head count on the recall hot path), and only heads with at least one
+    LIVE source are delivered (PR review F-005/IA-004: a head whose sources
+    were all tombstoned since the last refresh must not keep injecting its
+    frozen content).
     """
     sql = "SELECT * FROM belief_head"
     params: list[str] = []
@@ -486,22 +545,48 @@ def belief_head_rows(conn: sqlite3.Connection, *, query: str,
         params.append(namespace)
     sql += " ORDER BY support_count DESC, id"
     heads = conn.execute(sql, params).fetchall()
+    if not heads:
+        return []
+    head_ids = [h["id"] for h in heads]
+    ph = ",".join("?" * len(head_ids))
+    src_rows = conn.execute(
+        "SELECT s.head_id AS head_id, s.source_id AS source_id, "
+        "m.content AS content, m.signal AS signal, m.taint AS taint, "
+        "m.confidence AS confidence, m.trust_score AS trust_score, "
+        "m.ingestion_ts AS ingestion_ts "
+        "FROM belief_head_source s JOIN memory m ON m.id = s.source_id "
+        f"WHERE s.head_id IN ({ph}) AND m.superseded_at IS NULL "
+        "ORDER BY s.head_id, s.source_id", head_ids).fetchall()
+    ev_rows = conn.execute(
+        "SELECT head_id, evidence_id FROM belief_head_evidence "
+        f"WHERE head_id IN ({ph}) ORDER BY head_id, evidence_id",
+        head_ids).fetchall()
+
+    members: dict[str, list] = {}
+    for r in src_rows:
+        members.setdefault(r["head_id"], []).append(dict(r))
+    evidence: dict[str, list[str]] = {}
+    for r in ev_rows:
+        evidence.setdefault(r["head_id"], []).append(r["evidence_id"])
+
     if as_of:
-        heads = [h for h in heads if _head_valid_at(conn, h["id"], as_of)]
+        heads = [h for h in heads
+                 if members.get(h["id"])
+                 and all(m["ingestion_ts"] and m["ingestion_ts"] <= as_of
+                         for m in members[h["id"]])]
     terms = _query_terms(query)
     matched: list[dict] = []
     for h in heads:
         if not terms:
             break
-        member_texts = [r[0] for r in conn.execute(
-            "SELECT m.content FROM belief_head_source s "
-            "JOIN memory m ON m.id = s.source_id WHERE s.head_id=? "
-            "ORDER BY s.source_id", (h["id"],))]
+        rows = members.get(h["id"]) or []
+        if not rows:
+            continue  # F-005: no live sources -> not deliverable
         haystack = " ".join([h["content"] or ""] + [
-            t or "" for t in member_texts]).lower()
+            m["content"] or "" for m in rows]).lower()
         if not any(t in haystack for t in terms):
             continue
-        matched.append(_virtual_row(conn, h, member_texts))
+        matched.append(_virtual_row(h, rows, sorted(evidence.get(h["id"], []))))
         if len(matched) >= limit:
             break
     for row in matched:
@@ -516,32 +601,20 @@ def _head_valid_at(conn: sqlite3.Connection, head_id: str, as_of: str) -> bool:
     return bool(row and row[0] and row[0] <= as_of)
 
 
-def _virtual_row(conn: sqlite3.Connection, head: sqlite3.Row,
-                 member_texts: list[str]) -> dict:
-    sources = sorted(r[0] for r in conn.execute(
-        "SELECT source_id FROM belief_head_source WHERE head_id=?",
-        (head["id"],)))
-    evidence = sorted({r[0] for r in conn.execute(
-        "SELECT evidence_id FROM belief_head_evidence WHERE head_id=?",
-        (head["id"],))})
-    # Head floors live on the row; derive them from the live sources so a
-    # refreshed membership immediately re-floors the virtual row.
-    floors = conn.execute(
-        """SELECT MIN(confidence) AS confidence, MIN(trust_score) AS trust_score
-           FROM memory WHERE id IN (%s)""" % ",".join("?" * len(sources)),
-        sources).fetchone() if sources else None
-    signals = [r[0] for r in conn.execute(
-        "SELECT signal FROM memory WHERE id IN (%s)" % ",".join("?" * len(sources)),
-        sources)] if sources else []
-    taints = [r[0] for r in conn.execute(
-        "SELECT taint FROM memory WHERE id IN (%s)" % ",".join("?" * len(sources)),
-        sources)] if sources else []
+def _virtual_row(head: sqlite3.Row, member_rows: list[dict],
+                 evidence: list[str]) -> dict:
+    """Build one virtual recall row from pre-fetched, LIVE member rows
+    (superseded sources are excluded upstream), so floors reflect the
+    current store state and the query count stays O(1) per recall."""
+    sources = sorted(m["source_id"] for m in member_rows)
     weakest_signal = (
-        min(signals, key=lambda s: _SIGNAL_RANK.get(s or "none", 0))
-        if signals else "none")
+        min((m["signal"] for m in member_rows),
+            key=lambda s: _SIGNAL_RANK.get(s or "none", 0))
+        if member_rows else "none")
     worst_taint = (
-        max(taints, key=lambda t: schema_meta.TAINT_RANK.get(t or "trusted_internal", 0))
-        if taints else "trusted_internal")
+        max((m["taint"] for m in member_rows),
+            key=lambda t: schema_meta.TAINT_RANK.get(t or "trusted_internal", 0))
+        if member_rows else "trusted_internal")
     return {
         "id": BELIEF_ROW_PREFIX + head["id"],
         "namespace": head["namespace"],
@@ -549,10 +622,10 @@ def _virtual_row(conn: sqlite3.Connection, head: sqlite3.Row,
         "content": head["content"],
         "tags": "belief-head",
         "source_ref": "belief-head:" + head["generator_revision"],
-        "confidence": floors["confidence"] if floors else head["support_count"] * 0.0,
+        "confidence": min(m["confidence"] for m in member_rows),
         "signal": weakest_signal or "none",
         "taint": worst_taint,
-        "trust_score": floors["trust_score"] if floors else 0.0,
+        "trust_score": min(m["trust_score"] for m in member_rows),
         "head_id": head["id"],
         "head_state": head["head_state"],
         "support_count": head["support_count"],
@@ -779,9 +852,88 @@ def null_adapter(payload: dict) -> dict:
     asked of it, and applies zero actions — the conservative behavior when
     no local model-backed adapter is configured. A real local adapter can
     replace it wherever the maintenance caller constructs one; the
-    action-validation/rollback contract is identical either way."""
+    action-validation/rollback contract is identical either way.
+
+    ``ZMEM_BELIEF_ADAPTER_ACTIONS=<path>`` (maintenance-only fixture seam,
+    PR review F-004) makes the adapter return the JSON actions read from
+    the file, so the CLI's exit-code/stderr contract is exercisable
+    end-to-end without a local model; invalid action files deliberately
+    flow through the same validation/rollback path as adapter output.
+    """
     for key in ("head_id", "section_source_ids",
                 "section_evidence_ids", "source_rows"):
         if key not in payload:
             raise BeliefActionError("adapter payload missing %s" % key)
+    actions_path = os.environ.get("ZMEM_BELIEF_ADAPTER_ACTIONS")
+    if actions_path:
+        with open(actions_path, encoding="utf-8") as fh:
+            return json.load(fh)
     return {"actions": []}
+
+
+def run_belief_maintenance(conn: sqlite3.Connection, *,
+                           namespace: str | None = None,
+                           llm_local: bool = False,
+                           adapter=None,
+                           now: str | None = None) -> dict:
+    """Run one atomic belief-maintenance block (PR review COP-3): refresh,
+    optional adapter invocation, and action application inside a single
+    savepoint/transaction, so an adapter or action failure rolls the
+    refresh watermark and content back to the prior state.  Organize and
+    consolidate both delegate here — the atomicity/adapter contract has one
+    home.  Never called from recall.
+
+    Returns the ``belief_heads`` report fragment for the caller's report.
+    """
+    _bsp = "zmem_belief_maintenance"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {_bsp}")
+    try:
+        br = refresh_belief_heads(conn, namespace=namespace, now=now or now_iso())
+        out = {
+            "refreshed": br["refreshed"],
+            "created": br["created"],
+            "updated": br["updated"],
+            "actions_applied": 0,
+        }
+        if llm_local:
+            _adapter = adapter if adapter is not None else null_adapter
+            actions_applied = 0
+            for summary in br["heads"]:
+                payload = build_adapter_payload(conn, summary)
+                try:
+                    result = _adapter(payload)
+                except BeliefActionError:
+                    raise
+                except Exception as exc:
+                    raise BeliefAdapterError(
+                        "local belief adapter failed: %s" % exc) from exc
+                # UI-001: validate the adapter result shape before acting.
+                if (not isinstance(result, dict)
+                        or not isinstance(result.get("actions"), list)):
+                    raise BeliefAdapterError(
+                        "local belief adapter returned a malformed result "
+                        "(expected a dict with an 'actions' list)")
+                actions = result["actions"]
+                if actions:
+                    applied = apply_belief_actions(
+                        conn, head_id=summary["head_id"], actions=actions)
+                    actions_applied += applied["applied"]
+            out["actions_applied"] = actions_applied
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {_bsp}")
+        return out
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {_bsp}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {_bsp}")
+        raise
