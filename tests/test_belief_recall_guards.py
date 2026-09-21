@@ -445,3 +445,64 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
+
+
+class BeliefCriticRoundGuards(unittest.TestCase):
+    """Final-critic round: F-003 chunking — belief-head loading must survive
+    head counts beyond SQLite's bind-parameter limit."""
+
+    def test_f003_chunked_loading_survives_bind_limit(self):
+        tmp = tempfile.TemporaryDirectory(prefix="zmem-belief-chunk-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        old_env = os.environ.copy()
+        self.addCleanup(os.environ.clear)
+        self.addCleanup(os.environ.update, old_env)
+        for key in _ROUTE_ENV_KEYS:
+            os.environ.pop(key, None)
+        os.environ.update({
+            "ZMEM_STORE": str(root / "store.sqlite"),
+            "ZMEM_DATA": str(root),
+            "ZMEM_MODELS_DIR": str(root / "missing-models"),
+            _ENV_MODEL_AUTODL: "0",
+        })
+        conn = sqlite3.connect(root / "store.sqlite")
+        conn.row_factory = sqlite3.Row
+        self.addCleanup(conn.close)
+        schema.init_db(conn)
+        schema.migrate(conn)
+        # >32,766 SQL variables requires >32,766 heads in one unbounded IN;
+        # seed 33,000 single-source heads via the cheapest legal route.
+        conn.execute("PRAGMA synchronous=OFF")
+        ts = "2026-09-10T00:00:01Z"
+        for i in range(33_000):
+            mid = "00000000-0000-4000-8000-%012d" % (1_000_000 + i)
+            conn.execute(
+                """INSERT INTO memory
+                   (id, namespace, type, content, tags, source_ref, source_hash,
+                    confidence, signal, valid_from, superseded_at, ingestion_ts,
+                    retrieval_count, taint, trust_score)
+                   VALUES (?,'chunk:ns','fact',?,?,'','',0.8,'user','',NULL,?,
+                           0,'trusted_internal',0.9)""",
+                (mid, "chunk topic row %d" % i, "chunk-topic", ts))
+            hid = beliefs.topic_identity("chunk:ns", [mid])
+            conn.execute(
+                "INSERT INTO belief_head (id, namespace, topic_identity, "
+                "content, head_state, head_source_id, support_count, "
+                "refresh_watermark, generator_revision, confidence, signal, "
+                "taint, trust_score) VALUES (?,'chunk:ns',?,?,'active',?,1,?,"
+                "'belief-heads-v1',0.8,'user','trusted_internal',0.9)",
+                (hid, hid, "chunk topic row %d" % i, mid,
+                 "2026-09-10T00:00:02Z"))
+            conn.execute(
+                "INSERT INTO belief_head_source (head_id, source_id, role, "
+                "source_ingestion_ts, source_checksum) VALUES (?,?,'support',"
+                "?, '')", (hid, mid, ts))
+        conn.commit()
+        rows = beliefs.belief_head_rows(
+            conn, query="chunk topic", namespace="chunk:ns", limit=5)
+        self.assertEqual(len(rows), 5,
+                         "belief-head loading must survive head counts beyond "
+                         "the SQLite bind-parameter limit")
+        for r in rows:
+            self.assertEqual(len(r["source_ids"]), 1)

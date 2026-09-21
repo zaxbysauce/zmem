@@ -548,26 +548,27 @@ def belief_head_rows(conn: sqlite3.Connection, *, query: str,
     if not heads:
         return []
     head_ids = [h["id"] for h in heads]
-    ph = ",".join("?" * len(head_ids))
-    src_rows = conn.execute(
-        "SELECT s.head_id AS head_id, s.source_id AS source_id, "
-        "m.content AS content, m.signal AS signal, m.taint AS taint, "
-        "m.confidence AS confidence, m.trust_score AS trust_score, "
-        "m.ingestion_ts AS ingestion_ts "
-        "FROM belief_head_source s JOIN memory m ON m.id = s.source_id "
-        f"WHERE s.head_id IN ({ph}) AND m.superseded_at IS NULL "
-        "ORDER BY s.head_id, s.source_id", head_ids).fetchall()
-    ev_rows = conn.execute(
-        "SELECT head_id, evidence_id FROM belief_head_evidence "
-        f"WHERE head_id IN ({ph}) ORDER BY head_id, evidence_id",
-        head_ids).fetchall()
-
     members: dict[str, list] = {}
-    for r in src_rows:
-        members.setdefault(r["head_id"], []).append(dict(r))
     evidence: dict[str, list[str]] = {}
-    for r in ev_rows:
-        evidence.setdefault(r["head_id"], []).append(r["evidence_id"])
+    # Chunked IN clauses (final-critic round): the bind-parameter count must
+    # not grow with the head count — beyond SQLite's variable limit the
+    # queries would raise and recall would silently lose every virtual head.
+    for i in range(0, len(head_ids), 400):
+        chunk = head_ids[i:i + 400]
+        ph = ",".join("?" * len(chunk))
+        for r in conn.execute(
+            "SELECT s.head_id AS head_id, s.source_id AS source_id, "
+            "m.content AS content, m.signal AS signal, m.taint AS taint, "
+            "m.confidence AS confidence, m.trust_score AS trust_score, "
+            "m.ingestion_ts AS ingestion_ts "
+            "FROM belief_head_source s JOIN memory m ON m.id = s.source_id "
+            f"WHERE s.head_id IN ({ph}) AND m.superseded_at IS NULL "
+            "ORDER BY s.head_id, s.source_id", chunk):
+            members.setdefault(r["head_id"], []).append(dict(r))
+        for r in conn.execute(
+            "SELECT head_id, evidence_id FROM belief_head_evidence "
+            f"WHERE head_id IN ({ph}) ORDER BY head_id, evidence_id", chunk):
+            evidence.setdefault(r["head_id"], []).append(r["evidence_id"])
 
     if as_of:
         heads = [h for h in heads
