@@ -25,7 +25,7 @@ README.
   byte-identical when the flag is absent. Adds the deterministic oracle pair
   `tests/fixtures/replay/actions.json` / `actions-expected.json` with the
   refuse-on-drift generator `tests/fixtures/replay/generate_actions.py`,
-  eight pinned tests (`ActionMatcherTest`, `ReplayReportTest`), and
+  nine pinned tests (`ActionMatcherTest`, `ReplayReportTest`), and
   documentation of the report-only boundary in README and the memory skill.
 
 ## [0.54.0] - 2026-09-20

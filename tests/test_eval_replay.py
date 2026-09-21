@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import ast
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -1224,6 +1225,7 @@ class ActionMatcherTest(unittest.TestCase):
         self.assertEqual(row["action"], "violated")
         self.assertEqual(row["event_kind"], "failure")
         self.assertEqual(row["elapsed_s"], 60.0)
+        self.assertEqual(row["overlap_count"], 3)
 
     def test_unrelated_operation_is_ignored(self):
         module = self._module()
@@ -1360,6 +1362,116 @@ class ActionMatcherTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(store.read_bytes()).hexdigest(), before)
 
 
+    def test_window_boundary_is_inclusive_at_1800_seconds(self):
+        # PRR-005: the window is inclusive (elapsed <= window_s); pin both edges.
+        module = self._module()
+        base = {"id": "d0000000-0000-4000-8000-000000000b01", "session_id": "s-edge",
+                "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"}
+        at_edge = module.match_observational_actions(
+            [base],
+            [{"session_id": "s-edge", "timestamp": "2026-06-01T00:30:00Z",
+              "event_kind": "success", "operation": "git stash pop"}],
+        )
+        self.assertEqual(at_edge[0]["action"], "applied")
+        self.assertEqual(at_edge[0]["elapsed_s"], 1800.0)
+        past_edge = module.match_observational_actions(
+            [base],
+            [{"session_id": "s-edge", "timestamp": "2026-06-01T00:30:01Z",
+              "event_kind": "success", "operation": "git stash pop"}],
+        )
+        self.assertEqual(past_edge[0]["action"], "ignored")
+
+    def test_same_session_multiple_delivered_rows_match_independently(self):
+        # PRR-006: two delivered rows in one session match evidence independently.
+        module = self._module()
+        delivered = [
+            {"id": "d0000000-0000-4000-8000-000000000c01", "session_id": "s-multi",
+             "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"},
+            {"id": "d0000000-0000-4000-8000-000000000c02", "session_id": "s-multi",
+             "timestamp": "2026-06-01T00:10:00Z", "operation": "bun test suite"},
+        ]
+        evidence = [
+            {"session_id": "s-multi", "timestamp": "2026-06-01T00:01:00Z",
+             "event_kind": "success", "operation": "git stash pop"},
+            {"session_id": "s-multi", "timestamp": "2026-06-01T00:11:00Z",
+             "event_kind": "failure", "operation": "bun test suite"},
+        ]
+        results = module.match_observational_actions(delivered, evidence)
+        first = self._result_for(results, "0c01")
+        second = self._result_for(results, "0c02")
+        self.assertEqual(first["action"], "applied")
+        self.assertEqual(second["action"], "violated")
+
+    def test_results_order_across_sessions_by_session_id(self):
+        # PRR-007: cross-session ordering is by session_id, delivered input
+        # order breaks ties only inside a session.
+        module = self._module()
+        delivered = [
+            {"id": "d0000000-0000-4000-8000-000000000d11", "session_id": "session-zzz",
+             "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"},
+            {"id": "d0000000-0000-4000-8000-000000000d12", "session_id": "session-aaa",
+             "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"},
+        ]
+        evidence = [
+            {"session_id": "session-zzz", "timestamp": "2026-06-01T00:01:00Z",
+             "event_kind": "success", "operation": "git stash pop"},
+            {"session_id": "session-aaa", "timestamp": "2026-06-01T00:01:00Z",
+             "event_kind": "success", "operation": "git stash pop"},
+        ]
+        results = module.match_observational_actions(delivered, evidence)
+        self.assertEqual([row["session_id"] for row in results], ["session-aaa", "session-zzz"])
+        self.assertEqual([row["delivered_id"][-4:] for row in results], ["0d12", "0d11"])
+
+    def test_unrecognized_event_kind_is_ignored_with_observation_fields(self):
+        # PRR-018: an overlapping event with an unrecognized kind is ignored but
+        # keeps its observed event_kind/elapsed_s (only the no-match branch is null).
+        module = self._module()
+        base = {"id": "d0000000-0000-4000-8000-000000000e01", "session_id": "s-kind",
+                "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"}
+        results = module.match_observational_actions(
+            [base],
+            [{"session_id": "s-kind", "timestamp": "2026-06-01T00:01:00Z",
+              "event_kind": "warning", "operation": "git stash pop"}],
+        )
+        self.assertEqual(results[0]["action"], "ignored")
+        self.assertEqual(results[0]["event_kind"], "warning")
+        self.assertEqual(results[0]["elapsed_s"], 60.0)
+
+    def test_duplicate_delivered_ids_produce_one_result_per_row(self):
+        # PRR-018: the matcher does not deduplicate delivered ids.
+        module = self._module()
+        delivered = [
+            {"id": "d0000000-0000-4000-8000-000000000f01", "session_id": "s-dup",
+             "timestamp": "2026-06-01T00:00:00Z", "operation": "git stash pop"},
+            {"id": "d0000000-0000-4000-8000-000000000f01", "session_id": "s-dup",
+             "timestamp": "2026-06-01T00:05:00Z", "operation": "git stash pop"},
+        ]
+        results = module.match_observational_actions(
+            delivered,
+            [{"session_id": "s-dup", "timestamp": "2026-06-01T00:06:00Z",
+              "event_kind": "success", "operation": "git stash pop"}],
+        )
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(row["delivered_id"].endswith("0f01") for row in results))
+
+    def test_empty_row_lists_yield_no_results(self):
+        # PRR-018: empty inputs are valid and produce no results.
+        module = self._module()
+        self.assertEqual(module.match_observational_actions([], []), [])
+
+    def test_non_string_field_types_fail_closed(self):
+        # PRR-018: non-string field values are rejected, not coerced.
+        module = self._module()
+        bad_timestamp = [{"id": "d1", "session_id": "s",
+                          "timestamp": 1800, "operation": "git stash pop"}]
+        with self.assertRaises(module.ReplayError):
+            module.match_observational_actions(bad_timestamp, [])
+        bad_operation = [{"id": "d1", "session_id": "s",
+                          "timestamp": "2026-06-01T00:00:00Z", "operation": None}]
+        with self.assertRaises(module.ReplayError):
+            module.match_observational_actions(bad_operation, [])
+
+
 class ReplayReportTest(unittest.TestCase):
     """Issue #156 report contract: byte-identical action output, read-only run.
 
@@ -1433,6 +1545,69 @@ class ReplayReportTest(unittest.TestCase):
                 self.assertEqual(run.returncode, 0, run.stderr)
                 digests.append(json.loads(out_path.read_text(encoding="utf-8"))["input_digest"])
         self.assertNotEqual(digests[0], digests[1])
+
+
+    def test_actions_input_operator_alias_is_rejected(self):
+        # PRR-008: --actions-input is refused like every other input when it
+        # aliases the operator store. The env-pinned ZMEM_STORE scratch path
+        # is an operator candidate; materialize it so the regular-file probe
+        # passes and the alias refusal (not the file-shape error) fires.
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-alias-") as raw:
+            scratch = Path(raw)
+            alias = scratch / "ambient.sqlite"
+            alias.write_bytes(b"not-a-real-store")
+            run = subprocess.run(
+                [PYTHON, str(EVALUATOR),
+                 "--store", str(FIXTURES / "store.sqlite"),
+                 "--log", str(FIXTURES / "decisions.log"),
+                 "--days", "30", "--actions",
+                 "--actions-input", str(alias),
+                 "--json-out", str(scratch / "out.json")],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(run.returncode, 2)
+            self.assertIn("operator store", run.stderr or "")
+
+    def test_changed_actions_input_aborts_before_output(self):
+        # PRR-009: the actions input is re-verified after evaluation; a
+        # mid-run mutation must exit 2 WITHOUT writing --json-out, so the
+        # snapshot-verify-write ordering cannot be silently reordered.
+        module = ActionMatcherTest._module()
+        with tempfile.TemporaryDirectory(prefix="zmem-actions-toctou-") as raw:
+            scratch = Path(raw)
+            src = scratch / "actions.json"
+            src.write_bytes((FIXTURES / "actions.json").read_bytes())
+            out_path = scratch / "report.json"
+            real_read_bounded = module._read_bounded
+            calls = {"count": 0}
+
+            def flaky_read_bounded(path, label, maximum):
+                data = real_read_bounded(path, label, maximum)
+                if label == "actions input":
+                    calls["count"] += 1
+                    if calls["count"] >= 2:
+                        return data + b" "
+                return data
+
+            module._read_bounded = flaky_read_bounded
+            stderr = io.StringIO()
+            try:
+                argv = [
+                    "eval_replay.py",
+                    "--store", str(FIXTURES / "store.sqlite"),
+                    "--log", str(FIXTURES / "decisions.log"),
+                    "--days", "30", "--actions", "--actions-input", str(src),
+                    "--json-out", str(out_path),
+                ]
+                with patch.object(sys, "argv", argv):
+                    with patch.object(sys, "stderr", stderr):
+                        exit_code = module.main()
+            finally:
+                module._read_bounded = real_read_bounded
+            self.assertEqual(exit_code, 2)
+            self.assertIn("actions input", stderr.getvalue())
+            self.assertFalse(out_path.exists())
 
 
 if __name__ == "__main__":

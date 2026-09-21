@@ -98,7 +98,11 @@ def _json_bytes(payload: object) -> bytes:
 
 
 def _write_checked(path: Path, data: bytes) -> None:
-    """Replace ``path`` only when its committed bytes equal ``data`` or it is absent."""
+    """Replace ``path`` only when its committed bytes equal ``data`` or it is absent.
+
+    The replacement itself is atomic (temp file + os.replace) so a crash
+    mid-write can never leave a half-written committed fixture behind.
+    """
     if path.exists():
         existing = path.read_bytes()
         if existing == data:
@@ -109,7 +113,19 @@ def _write_checked(path: Path, data: bytes) -> None:
             "deliberately after reviewing the drift"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise RuntimeError(f"cannot write fixture {path}: {exc}") from exc
 
 
 def _env(scratch: Path) -> dict[str, str]:
@@ -139,16 +155,19 @@ def generate(actions_out: Path, expected_out: Path) -> dict[str, str]:
         staged_actions.write_bytes(actions_bytes)
         report_candidate = scratch / "actions-expected.json"
         evaluator = ROOT / "scripts" / "eval_replay.py"
-        result = subprocess.run(
-            [sys.executable, str(evaluator),
-             "--store", str(FIXTURE_DIR / "store.sqlite"),
-             "--log", str(FIXTURE_DIR / "decisions.log"),
-             "--days", "30", "--actions",
-             "--actions-input", str(staged_actions),
-             "--json-out", str(report_candidate)],
-            cwd=str(ROOT), env=_env(scratch),
-            capture_output=True, text=True, timeout=180,
-        )
+        try:
+            result = subprocess.run(
+                [sys.executable, str(evaluator),
+                 "--store", str(FIXTURE_DIR / "store.sqlite"),
+                 "--log", str(FIXTURE_DIR / "decisions.log"),
+                 "--days", "30", "--actions",
+                 "--actions-input", str(staged_actions),
+                 "--json-out", str(report_candidate)],
+                cwd=str(ROOT), env=_env(scratch),
+                capture_output=True, text=True, timeout=180,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"--actions evaluator timed out after {exc.timeout}s") from exc
         if result.returncode:
             raise RuntimeError(f"--actions evaluator failed ({result.returncode}): {result.stderr}")
         expected_bytes = report_candidate.read_bytes()

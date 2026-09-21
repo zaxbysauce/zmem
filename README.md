@@ -217,8 +217,8 @@ for the fixture and two-build reproducibility contract.
 Observational action matching (issue #156) is a report-only `--actions` mode
 on the same evaluator. Pass `--actions --actions-input PATH`, where the input
 is an explicit JSON file of recorded `delivered_rows` and `evidence_rows`
-(each row carries `session_id`, `timestamp`, and `operation`; evidence rows
-add `event_kind`). For each delivered row the matcher selects the first later
+(delivered rows carry `id`, `session_id`, `timestamp`, and `operation`;
+evidence rows carry `session_id`, `timestamp`, `event_kind`, and `operation`). For each delivered row the matcher selects the first later
 same-session evidence event inside the fixed `ZMEM_MATCH_WINDOW_S = 1800`
 second window whose `derive_ops_tokens` normalization shares at least
 `ZMEM_MATCH_MIN_OVERLAP = 2` tokens with the delivered trigger, and classifies
