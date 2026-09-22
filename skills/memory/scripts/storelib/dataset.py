@@ -179,9 +179,12 @@ _MEMBER_PARQUET_TYPES: dict[str, str] = {}
 _LINK_PARQUET_TYPES = {"score": "double"}
 _FAMILY_COLUMNS = {
     "memories": MEMORY_DATASET_COLUMNS,
-    "episodes": EPISODE_COLUMNS,
-    "episode_members": MEMBER_COLUMNS,
-    "links": LINK_COLUMNS,
+    # Every record family carries its stored row_checksum (issue D1: import
+    # verifies EVERY manifest checksum, which requires a checksum per
+    # record in every container).
+    "episodes": EPISODE_COLUMNS + ("row_checksum",),
+    "episode_members": MEMBER_COLUMNS + ("row_checksum",),
+    "links": LINK_COLUMNS + ("row_checksum",),
 }
 _FAMILY_TYPES = {
     "memories": _MEMORY_PARQUET_TYPES,
@@ -327,6 +330,13 @@ def export_dataset(conn: sqlite3.Connection, *, out_dir: str,
     episode_ids = {e["id"] for e in episode_rows}
     member_rows = []
     link_rows = []
+    # Endpoint integrity (issue #134: "Endpoint rows are retained in the
+    # audit file and omitted from the live file when their parent is
+    # filtered"): a membership is exported only when its memory endpoint is
+    # part of THIS view's memory set — the audit view (include_tombstones)
+    # retains memberships onto tombstoned rows; the live view omits them
+    # rather than shipping a dangling membership.
+    memory_ids = {m["id"] for m in memory_rows}
     if episode_ids:
         marks = ",".join("?" * len(episode_ids))
         member_rows = [
@@ -335,8 +345,8 @@ def export_dataset(conn: sqlite3.Connection, *, out_dir: str,
                 "SELECT " + ", ".join(MEMBER_COLUMNS)
                 + f" FROM episode_memory WHERE episode_id IN ({marks})"
                 + " ORDER BY episode_id, memory_id", tuple(episode_ids))
+            if r["memory_id"] in memory_ids
         ]
-    memory_ids = {m["id"] for m in memory_rows}
     if memory_ids:
         marks = ",".join("?" * len(memory_ids))
         link_rows = [
@@ -700,6 +710,43 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
         key=lambda entry: entry["id"])
     uploaded = [row for row in memories if row["id"] not in held_ids]
 
+    # Self-consistent published identity (issue #134: "Held-back rows are
+    # removed before manifest hashing"): when the scan held rows back, the
+    # uploaded artifact is RE-HASHED over the surviving rows only — the
+    # pass-1 checksums are recomputed without the held rows, a new
+    # snapshot id is derived, and every uploaded memory row is re-stamped
+    # (export_snapshot_id, generator_revision, final row_checksum) — so
+    # import_dataset's verification accepts exactly what was published.
+    # A clean publish (nothing held) keeps the export's identity verbatim.
+    if held:
+        kept_ids = {row["id"] for row in uploaded}
+        rebuilt = []
+        for row in uploaded:
+            row = {k: v for k, v in row.items()
+                   if k not in ("export_snapshot_id", "generator_revision",
+                                "row_checksum")}
+            rebuilt.append(row)
+        uploaded_families = dict(families)
+        uploaded_families["memories"] = rebuilt
+        # Endpoint integrity applies to the upload too: a membership or
+        # link whose memory endpoint was held back must not dangle.
+        uploaded_families["episode_members"] = [
+            m for m in families["episode_members"]
+            if m["memory_id"] in kept_ids]
+        uploaded_families["links"] = [
+            l for l in families["links"]
+            if l["src"] in kept_ids and l["dst"] in kept_ids]
+        published_snapshot = _compute_snapshot_hash(
+            uploaded_families, memories_have_snapshot_id=False)
+        for row in rebuilt:
+            row["export_snapshot_id"] = published_snapshot
+            row["generator_revision"] = GENERATOR_REVISION
+            row["row_checksum"] = row_checksum(row)
+        uploaded = rebuilt
+    else:
+        uploaded_families = families
+        published_snapshot = manifest["source_snapshot_hash"]
+
     staging = Path(tempfile.mkdtemp(prefix="zmem-publish-"))
     try:
         data_dir = staging / "data"
@@ -707,13 +754,19 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
         upload_manifest = dict(manifest)
         upload_manifest["row_counts"] = dict(manifest["row_counts"])
         upload_manifest["row_counts"]["memories"] = len(uploaded)
+        if held:
+            for family in DATASET_FAMILIES:
+                upload_manifest["row_counts"][family] = \
+                    len(uploaded_families[family])
+        upload_manifest["source_snapshot_hash"] = published_snapshot
+        upload_manifest["export_snapshot_id"] = published_snapshot
         if used_unscanned_override:
             upload_manifest["governance"] = dict(
                 manifest.get("governance", {}))
             upload_manifest["governance"]["egress_scan"] = {
                 "status": "unscanned", "override": "--allow-unscanned"}
         for family in DATASET_FAMILIES:
-            rows = uploaded if family == "memories" else families[family]
+            rows = uploaded_families[family]
             fmt = manifest.get("format", DATASET_FORMAT_PARQUET)
             if fmt == DATASET_FORMAT_JSONL:
                 stem = _FAMILY_FILES[family]

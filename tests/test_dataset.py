@@ -191,21 +191,48 @@ class DatasetExportTest(_StoreCase):
     def test_tombstones_are_audit_only_by_default(self):
         rid = _rid(1)
         self.seed_row(rid, "project:tomb", "to be tombstoned")
+        self.seed_row(_rid(2), "project:tomb", "keeper for episode")
         conn = sqlite3.connect(self.store)
         try:
             conn.execute(
                 "UPDATE memory SET superseded_at = ?, supersede_reason = ? "
                 "WHERE id = ?", ("2026-09-11T00:00:00Z", "test tombstone",
                                  rid))
+            conn.execute(
+                "INSERT INTO episode (id, namespace, started_at, ended_at,"
+                " summary_memory_id, token_count) VALUES"
+                " ('00000000-0000-4000-8000-000000000401', 'project:tomb',"
+                " '2026-09-10T00:00:00Z', '', '', 0)")
+            # Memberships onto BOTH the tombstoned row and the keeper.
+            for mid in (rid, _rid(2)):
+                conn.execute(
+                    "INSERT INTO episode_memory (episode_id, memory_id,"
+                    " added_at) VALUES"
+                    " ('00000000-0000-4000-8000-000000000401', ?,"
+                    " '2026-09-10T00:00:00Z')", (mid,))
             conn.commit()
         finally:
             conn.close()
         live_out = self.export("live", "--namespace", "project:tomb")
-        self.assertEqual([row["id"] for row in self.memory_rows(live_out)],
-                         [], "tombstones must be audit-only by default")
+        self.assertEqual(sorted(row["id"] for row in self.memory_rows(live_out)),
+                         [_rid(2)],
+                         "tombstones must be audit-only by default; the "
+                         "live keeper row stays")
+        live_members = ds._read_family(live_out, "episode_members",
+                                       self.manifest(live_out)["format"])
+        self.assertEqual(
+            sorted(m["memory_id"] for m in live_members), [_rid(2)],
+            "live view keeps the keeper's membership and omits the one "
+            "whose memory endpoint was filtered (no dangling endpoints)")
         audit_out = self.export("audit", "--namespace", "project:tomb",
                                 "--include-tombstones")
         self.assertIn(rid, [row["id"] for row in self.memory_rows(audit_out)])
+        audit_members = ds._read_family(audit_out, "episode_members",
+                                        self.manifest(audit_out)["format"])
+        self.assertEqual(
+            sorted(m["memory_id"] for m in audit_members),
+            sorted([rid, _rid(2)]),
+            "audit view retains endpoint rows behind tombstones")
         self.assertTrue(self.manifest(audit_out)["include_tombstones"])
 
     def test_egress_scan_holds_back_secret_rows(self):
@@ -360,6 +387,72 @@ class DatasetExportTest(_StoreCase):
         self.assertIn("namespace absent", r.stderr)
         self.assertFalse(os.path.exists(
             os.path.join(dest, "snapshot.sqlite")))
+
+    def test_held_back_upload_is_importable(self):
+        """Final-critic regression (trace round 2): when the egress scan
+        holds rows back, the published artifact is RE-HASHED over the
+        surviving rows, so the exact uploaded tree imports cleanly under
+        its own published revision — with the secret row absent and no
+        dangling links/memberships behind it."""
+        self.seed_row(SECRET_ID, "project:test", SECRET_CONTENT)
+        self.seed_row(_rid(210), "project:test", "publishable row one")
+        # A link and a membership anchored on BOTH rows: the held-back
+        # side must not dangle in the upload.
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.execute(
+                "INSERT INTO memory_link (src_id, dst_id, relation, score, "
+                "created_at) VALUES (?, ?, 'related', 0.5, ?)",
+                (SECRET_ID, _rid(210), TS))
+            conn.commit()
+        finally:
+            conn.close()
+        out = self.export("importable-exp", "--namespace", "project:test")
+        client = fake_dataset_client.FakeDatasetClient(["old"])
+        scanner = FakeSecretScanner(flag_if_contains=(SECRET_CONTENT,))
+        original = ds.SecretScanner
+        ds.SecretScanner = lambda: scanner
+        try:
+            result = storelib.publish_dataset(out, TARGET, yes=True,
+                                              client=client)
+        finally:
+            ds.SecretScanner = original
+        self.assertEqual(result["held_back"], 1)
+        self.assertEqual(result["uploaded_rows"], 1)
+
+        # Reconstruct the EXACT uploaded tree from the fake client's
+        # commit and import it as a consumer would.
+        self.assertEqual(len(client.committed_trees), 1)
+        _, _, tree = client.committed_trees[0]
+        upload_dir = os.path.join(self.tmp, "upload")
+        os.mkdir(upload_dir)
+        for rel, blob in tree.items():
+            path = os.path.join(upload_dir, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(blob)
+        with open(os.path.join(upload_dir, "manifest.json"), "rb") as fh:
+            published = json.loads(fh.read().decode("utf-8"))
+        self.assertNotEqual(published["source_snapshot_hash"],
+                            self.manifest(out)["source_snapshot_hash"],
+                            "held-back upload must carry a RE-HASHED "
+                            "identity over the surviving rows")
+        dest = os.path.join(self.tmp, "upload-snap")
+        r = run_cli(self.env, "import-dataset", upload_dir,
+                    "--revision", published["source_snapshot_hash"],
+                    "--dest", dest)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        snap = os.path.join(dest, "snapshot.sqlite")
+        conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+        try:
+            ids = [row[0] for row in
+                   conn.execute("SELECT id FROM memory ORDER BY id")]
+            links = conn.execute("SELECT COUNT(*) FROM memory_link"
+                                 ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(ids, [_rid(210)], "secret row must be absent")
+        self.assertEqual(links, 0, "links behind held rows must not dangle")
 
     def test_publish_never_opens_ambient_store(self):
         self.seed_row(_rid(205), "project:ambient", "ambient probe row")
