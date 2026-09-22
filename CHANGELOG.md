@@ -10,6 +10,27 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.59.0] - 2026-09-22
+
+### Added
+- **Governed dataset artifact layer (issue #134)**: `store.py
+  export-dataset <dir>` writes a deterministic knowledge dataset
+  (manifest + Parquet records + README; tombstones audit-only by default;
+  namespace-scoped with explicit `--all-namespaces --yes`); `store.py
+  publish-dataset <dir> hf://datasets/owner/repo` publishes to a
+  private-by-default Hub repo behind a whole-row TruffleHog egress scan
+  (flagged rows are held back in `held_back.json` and never uploaded;
+  scanner absence refuses unless `--allow-unscanned`, which the manifest
+  records; one CAS parent-conflict retry then fail closed); and
+  `store.py import-dataset SOURCE --revision <sha> --dest <dir>` verifies
+  the exact revision and every row checksum, then builds an isolated
+  `snapshot.sqlite` (never the caller's store) with namespace, confidence,
+  trust, taint, temporal, and tombstone filters applied before recall.
+  SQLite stays authoritative, embeddings never export, and publication is
+  explicit-only - no hook/provider/queue/ledger path can publish.
+  `docs/CLOUD.md` documents the four governed paths; CI installs pyarrow
+  so the dataset suite runs on both legs.
+
 ## [0.58.0] - 2026-09-21
 
 ### Added

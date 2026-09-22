@@ -64,6 +64,14 @@ EXPECTED_EXPORTS = [
     "counts_agree", "create_snapshot", "entities_for_memory", "entities_for_memories", "entity_match_ids", "evaluate_items", "extract_entities", "feedback_memory", "get_memory", "init_db", "link_memory_entities", "list_memory", "list_snapshots",
     "load_gold", "main", "migrate", "nonnegative_int", "now_iso", "organize", "promote_memory", "recall_memory",
     "recent_memory", "rekey_namespace", "relink_memory", "stats", "supersede_memory", "tune_weights", "update_memory", "validate_taint", "verify_snapshot", "worse_taint",
+    # Issue #134 (Workstream E): governed dataset artifact surface.
+    "DATASET_FORMAT_JSONL", "DATASET_FORMAT_PARQUET", "DATASET_SCHEMA_VERSION",
+    "DatasetError", "DatasetNamespaceUnavailable", "GENERATOR_REVISION",
+    "HubDatasetClient", "ParentConflict", "PublishError",
+    "REDACTION_POLICY_VERSION", "ScannerFailed", "ScannerUnavailable",
+    "SecretScanner", "canonical_row_bytes", "cmd_export_dataset",
+    "cmd_import_dataset", "cmd_publish_dataset", "export_dataset",
+    "import_dataset", "publish_dataset", "row_checksum",
 ]
 
 
@@ -163,6 +171,20 @@ class ExportSurfaceTests(unittest.TestCase):
         self.assertAlmostEqual(VIOLATED_FEEDBACK_FACTOR, 0.25, places=12)
         self.assertTrue(issubclass(FeedbackSidecarError, RuntimeError))
         self.assertTrue(issubclass(FeedbackTargetError, ValueError))
+
+
+    def test_dataset_callables_are_exported(self):
+        """Issue #134: the dataset surface must resolve through the store
+        shim exactly like every other split module's exports."""
+        for name in ("export_dataset", "publish_dataset", "import_dataset",
+                     "SecretScanner", "canonical_row_bytes", "row_checksum",
+                     "cmd_export_dataset", "cmd_publish_dataset",
+                     "cmd_import_dataset"):
+            self.assertTrue(hasattr(store, name), name)
+            self.assertTrue(callable(getattr(store, name)), name)
+        for name in ("DATASET_SCHEMA_VERSION", "GENERATOR_REVISION",
+                     "REDACTION_POLICY_VERSION"):
+            self.assertTrue(hasattr(store, name), name)
 
 
 class CaptureCliBoundaryTest(unittest.TestCase):

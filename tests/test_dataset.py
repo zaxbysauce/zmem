@@ -1,0 +1,381 @@
+"""Issue #134 (Workstream E): governed dataset export / publish / import.
+
+CLI behavior runs through the real store.py subprocess with the canonical
+isolation env (the tests/test_jsonl_sync.py discipline); publish-seam
+behavior calls the library in-process with the store env pinned at MODULE
+IMPORT (storelib freezes STORE_PATH at first import — see the repo-test
+hazard notes). No test in this file ever touches the operator's ~/.zmem.
+"""
+
+import os
+import sys
+import tempfile
+
+_TMP = tempfile.mkdtemp(prefix="zmem-test-dataset-")
+os.environ["ZMEM_STORE"] = os.path.join(_TMP, "store.sqlite")
+os.environ.pop("ZMEM_DATA", None)
+os.environ.pop("ZMEM_BACKUP_DIR", None)
+os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "no-such-models")
+os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
+for _key in list(sys.modules):
+    if _key == "storelib" or _key.startswith("storelib."):
+        del sys.modules[_key]
+
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import shutil  # noqa: E402
+import sqlite3  # noqa: E402
+import subprocess  # noqa: E402
+import unittest  # noqa: E402
+from unittest import mock  # noqa: E402
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STORE_PY = os.path.join(REPO_ROOT, "skills", "memory", "scripts", "store.py")
+sys.path.insert(0, os.path.join(REPO_ROOT, "skills", "memory", "scripts"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "tests", "support"))
+
+import fake_dataset_client  # noqa: E402
+import storelib  # noqa: E402
+from storelib import dataset as ds  # noqa: E402
+from fake_secret_scanner import FakeSecretScanner  # noqa: E402
+
+TARGET = "hf://datasets/owner/repo"
+TS = "2026-09-10T00:00:00Z"
+SECRET_ID = "00000000-0000-4000-8000-000000000101"
+SECRET_CONTENT = "token ghp_fixture_000000000000000000000000000000000000"
+EXPECTED_HELD_BACK = (
+    '{"held_back":[{"id":"00000000-0000-4000-8000-000000000101",'
+    '"reason":"secret_scan","row_checksum":"9471fb35c39b082bbb9ac6ee30406'
+    'd731b4acefabd8b4a6ce9a8fb3ed8e8bfa2"}],"uploaded_rows":0}\n'
+).encode("utf-8")
+EXPECTED_HELD_BACK_SHA = (
+    "e3c0d78bb6ed457a601a2ca4131eb728c2120e38b3d8f34cbf5932155fb81eec")
+
+
+def base_env(store_path: str) -> dict:
+    env = {**os.environ}
+    env["ZMEM_STORE"] = store_path
+    env.pop("ZMEM_DATA", None)
+    env.pop("ZMEM_BACKUP_DIR", None)
+    env.pop("ZMEM_BACKUP_INTERVAL_DAYS", None)
+    env["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "no-such-models")
+    env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def run_cli(env: dict, *args: str):
+    return subprocess.run([sys.executable, STORE_PY, *args], env=env,
+                          capture_output=True, text=True, timeout=300)
+
+
+def sha256_file(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+class _StoreCase(unittest.TestCase):
+    """One throwaway store + scratch dir per test."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="zmem-dataset-case-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store = os.path.join(self.tmp, "store.sqlite")
+        self.env = base_env(self.store)
+        r = run_cli(self.env, "init")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def seed_row(self, rid: str, ns: str, content: str,
+                 confidence: float = 0.5) -> None:
+        """Direct, explicit SQL insert so fixture ids and timestamps never
+        depend on the CLI's UUID or wall-clock write path (the
+        injection-parity generator discipline)."""
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, "
+                "ingestion_ts, confidence) VALUES (?, ?, 'fact', ?, ?, ?)",
+                (rid, ns, content, TS, confidence))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def export(self, name: str, *extra: str) -> str:
+        out = os.path.join(self.tmp, name)
+        r = run_cli(self.env, "export-dataset", out, *extra)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return out
+
+    def manifest(self, export_dir: str) -> dict:
+        with open(os.path.join(export_dir, "manifest.json"), "rb") as fh:
+            return json.loads(fh.read().decode("utf-8"))
+
+    def memory_rows(self, export_dir: str) -> list:
+        return ds._read_family(export_dir, "memories",
+                               self.manifest(export_dir)["format"])
+
+
+def _rid(n: int) -> str:
+    return f"00000000-0000-4000-8000-{n:012d}"
+
+
+class _CleanScanner:
+    """Patch the scanner seam on the dataset MODULE (publish resolves the
+    name from storelib.dataset globals at call time) with a scanner that
+    reports a clean scan."""
+
+    def __init__(self):
+        self._original = ds.SecretScanner
+
+    def __enter__(self):
+        ds.SecretScanner = lambda: FakeSecretScanner()
+        return self
+
+    def __exit__(self, *exc):
+        ds.SecretScanner = self._original
+        return False
+
+
+class DatasetExportTest(_StoreCase):
+    """The issue's 13 named dataset behaviors."""
+
+    def test_namespace_scoped_export_is_deterministic(self):
+        self.seed_row(_rid(1), "project:det", "alpha determinism row")
+        self.seed_row(_rid(2), "project:det", "beta determinism row")
+        out1 = self.export("exp1", "--namespace", "project:det")
+        out2 = self.export("exp2", "--namespace", "project:det")
+        self.assertEqual(sha256_file(os.path.join(out1, "manifest.json")),
+                         sha256_file(os.path.join(out2, "manifest.json")))
+        for name in ("memories-000.parquet", "episodes-000.parquet",
+                     "episode_members-000.parquet", "links-000.parquet"):
+            self.assertEqual(
+                sha256_file(os.path.join(out1, "data", name)),
+                sha256_file(os.path.join(out2, "data", name)),
+                name)
+        self.assertEqual(self.manifest(out1)["namespaces"], ["project:det"])
+
+    def test_unscoped_export_requires_yes(self):
+        self.seed_row(_rid(1), "project:guard", "guarded row one")
+        out = os.path.join(self.tmp, "guarded")
+        r = run_cli(self.env, "export-dataset", out, "--all-namespaces")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--yes is required with --all-namespaces", r.stderr)
+        self.assertFalse(os.path.exists(out),
+                         "exit 2 must fire before any row query / output")
+        r = run_cli(self.env, "export-dataset", out, "--all-namespaces",
+                    "--yes")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("project:guard", self.manifest(out)["namespaces"])
+
+    def test_manifest_and_row_checksums_verify(self):
+        self.seed_row(_rid(1), "project:chk", "checksum row alpha")
+        out = self.export("chkexp", "--namespace", "project:chk")
+        manifest = self.manifest(out)
+        rows = self.memory_rows(out)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(ds.row_checksum(row), row["row_checksum"],
+                             row["id"])
+            self.assertEqual(row["export_snapshot_id"],
+                             manifest["export_snapshot_id"])
+            self.assertEqual(row["generator_revision"],
+                             manifest["generator_revision"])
+        self.assertEqual(
+            ds._compute_snapshot_hash(
+                {"memories": rows, "episodes": [], "episode_members": [],
+                 "links": []}, True),
+            manifest["source_snapshot_hash"])
+
+    def test_tombstones_are_audit_only_by_default(self):
+        rid = _rid(1)
+        self.seed_row(rid, "project:tomb", "to be tombstoned")
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.execute(
+                "UPDATE memory SET superseded_at = ?, supersede_reason = ? "
+                "WHERE id = ?", ("2026-09-11T00:00:00Z", "test tombstone",
+                                 rid))
+            conn.commit()
+        finally:
+            conn.close()
+        live_out = self.export("live", "--namespace", "project:tomb")
+        self.assertEqual([row["id"] for row in self.memory_rows(live_out)],
+                         [], "tombstones must be audit-only by default")
+        audit_out = self.export("audit", "--namespace", "project:tomb",
+                                "--include-tombstones")
+        self.assertIn(rid, [row["id"] for row in self.memory_rows(audit_out)])
+        self.assertTrue(self.manifest(audit_out)["include_tombstones"])
+
+    def test_egress_scan_holds_back_secret_rows(self):
+        fixture = os.path.join(REPO_ROOT, "tests", "fixtures", "dataset",
+                               "expected-held-back.json")
+        with open(fixture, "rb") as fh:
+            self.assertEqual(fh.read(), EXPECTED_HELD_BACK,
+                             "committed held-back fixture drifted")
+        self.assertEqual(sha256_file(fixture), EXPECTED_HELD_BACK_SHA)
+
+        self.seed_row(SECRET_ID, "project:test", SECRET_CONTENT)
+        out = self.export("secret-exp", "--namespace", "project:test")
+        clean = os.path.join(self.tmp, "secret-clean")
+        shutil.copytree(out, clean)
+        with _CleanScanner():
+            result = storelib.publish_dataset(
+                clean, TARGET, yes=True,
+                client=fake_dataset_client.FakeDatasetClient(["old"]))
+        self.assertEqual(set(result),
+                         {"target", "revision", "uploaded_rows",
+                          "held_back", "private"})
+        self.assertEqual(result["held_back"], 0)
+
+        found = os.path.join(self.tmp, "secret-found")
+        shutil.copytree(out, found)
+        scanner = FakeSecretScanner(flag_if_contains=(SECRET_CONTENT,))
+        original = ds.SecretScanner
+        ds.SecretScanner = lambda: scanner
+        try:
+            result = storelib.publish_dataset(
+                found, TARGET, yes=True,
+                client=fake_dataset_client.FakeDatasetClient(["old"]))
+        finally:
+            ds.SecretScanner = original
+        self.assertEqual(result["held_back"], 1)
+        self.assertEqual(result["uploaded_rows"], 0)
+        with open(os.path.join(found, "held_back.json"), "rb") as fh:
+            self.assertEqual(fh.read(), EXPECTED_HELD_BACK)
+
+    def test_missing_scanner_refuses_without_allow_unscanned(self):
+        self.seed_row(_rid(201), "project:scan", "plain row")
+        out = self.export("scan-exp", "--namespace", "project:scan")
+        with mock.patch.dict(os.environ, {"PATH": ""}):
+            with self.assertRaises(storelib.ScannerUnavailable):
+                storelib.publish_dataset(
+                    out, TARGET, yes=True,
+                    client=fake_dataset_client.FakeDatasetClient(["old"]))
+        result = storelib.publish_dataset(
+            out, TARGET, yes=True, allow_unscanned=True,
+            client=fake_dataset_client.FakeDatasetClient(["old"]))
+        self.assertEqual(result["uploaded_rows"], 1)
+        self.assertIn("unscanned",
+                      self.manifest(out)["governance"]["egress_scan"]
+                      ["status"])
+
+    def test_publish_retries_one_parent_conflict(self):
+        self.seed_row(_rid(202), "project:cas", "cas row")
+        out = self.export("cas-exp", "--namespace", "project:cas")
+        stub_path = os.path.join(REPO_ROOT, "tests", "fixtures", "dataset",
+                                 "hub-client-stub.json")
+        with open(stub_path, "rb") as fh:
+            stub = json.loads(fh.read().decode("utf-8"))
+        self.assertEqual(stub["parents"], ["old", "conflict", "new"])
+        self.assertTrue(stub["publish_private"])
+        client = fake_dataset_client.FakeDatasetClient(stub["parents"])
+        with _CleanScanner():
+            result = storelib.publish_dataset(out, TARGET, yes=True,
+                                              client=client)
+        self.assertEqual(client.commit_attempts, 2)
+        self.assertEqual(client.commits, 1)
+        self.assertEqual(client.head_reads, 2)
+        self.assertGreaterEqual(client.private_creates, 1)
+        self.assertTrue(result["private"])
+        self.assertIn("revision", result)
+
+    def test_publish_fails_after_second_parent_conflict(self):
+        self.seed_row(_rid(203), "project:cas2", "cas2 row")
+        out = self.export("cas2-exp", "--namespace", "project:cas2")
+        client = fake_dataset_client.FakeDatasetClient(
+            ["old", "conflict", "conflict"])
+        with _CleanScanner():
+            with self.assertRaises(storelib.PublishError):
+                storelib.publish_dataset(out, TARGET, yes=True, client=client)
+        self.assertEqual(client.commit_attempts, 2)
+        self.assertEqual(client.commits, 0)
+
+    def test_wrong_target_namespace_requires_confirmation(self):
+        self.seed_row(_rid(204), "project:overlap", "overlap row")
+        out = self.export("overlap-exp", "--namespace", "project:overlap")
+        refusing = fake_dataset_client.FakeDatasetClient(
+            ["old"], existing_manifest={"namespaces": ["project:overlap"]})
+        with self.assertRaises(storelib.PublishError):
+            storelib.publish_dataset(out, TARGET, yes=False, client=refusing)
+        self.assertEqual(refusing.commits, 0)
+        confirming = fake_dataset_client.FakeDatasetClient(
+            ["old"], existing_manifest={"namespaces": ["project:overlap"]})
+        with _CleanScanner():
+            result = storelib.publish_dataset(out, TARGET, yes=True,
+                                              client=confirming)
+        self.assertIn("revision", result)
+
+    def test_import_requires_exact_revision(self):
+        self.seed_row(_rid(1), "project:rev", "revision pinned row")
+        out = self.export("rev-exp", "--namespace", "project:rev")
+        revision = self.manifest(out)["source_snapshot_hash"]
+        dest = os.path.join(self.tmp, "snap-bad")
+        r = run_cli(self.env, "import-dataset", out, "--revision", "0" * 40,
+                    "--dest", dest)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(
+            os.path.join(dest, "snapshot.sqlite")))
+        dest2 = os.path.join(self.tmp, "snap-ok")
+        r = run_cli(self.env, "import-dataset", out, "--revision", revision,
+                    "--dest", dest2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.isfile(
+            os.path.join(dest2, "snapshot.sqlite")))
+
+    def test_import_filters_before_recall(self):
+        self.seed_row(_rid(301), "project:filter",
+                      "unique llama husbandry guidance", confidence=0.95)
+        self.seed_row(_rid(302), "project:filter",
+                      "unique llama feeding schedules", confidence=0.20)
+        out = self.export("filter-exp", "--namespace", "project:filter")
+        revision = self.manifest(out)["source_snapshot_hash"]
+        dest = os.path.join(self.tmp, "snap-filtered")
+        r = run_cli(self.env, "import-dataset", out, "--revision", revision,
+                    "--dest", dest, "--min-confidence", "0.9")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snap = os.path.join(dest, "snapshot.sqlite")
+        conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+        try:
+            kept = [row[0] for row in
+                    conn.execute("SELECT id FROM memory ORDER BY id")]
+        finally:
+            conn.close()
+        self.assertEqual(kept, [_rid(301)],
+                         "filters must apply before the snapshot exists")
+        r = run_cli(base_env(snap), "recall", "--query",
+                    "llama husbandry", "--no-bump")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("llama husbandry", r.stdout)
+
+    def test_missing_namespace_refuses_without_fallback(self):
+        self.seed_row(_rid(1), "project:absent-ns", "absent namespace row")
+        out = self.export("absent-exp", "--namespace", "project:absent-ns")
+        revision = self.manifest(out)["source_snapshot_hash"]
+        dest = os.path.join(self.tmp, "snap-absent")
+        r = run_cli(self.env, "import-dataset", out, "--revision", revision,
+                    "--dest", dest, "--namespace", "project:nowhere")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("namespace absent", r.stderr)
+        self.assertFalse(os.path.exists(
+            os.path.join(dest, "snapshot.sqlite")))
+
+    def test_publish_never_opens_ambient_store(self):
+        self.seed_row(_rid(205), "project:ambient", "ambient probe row")
+        out = self.export("ambient-exp", "--namespace", "project:ambient")
+        # ZMEM_STORE points at a path that does not exist: sqlite's connect()
+        # would CREATE it, so if publish-dataset were dispatched through the
+        # connected section (connect + _prepare_store), the ghost file would
+        # exist after the run. The command still fails on its own contract
+        # (non-Hub target) — fully offline, no Hub client is ever built.
+        ghost = os.path.join(self.tmp, "ghost", "store.sqlite")
+        r = run_cli(base_env(ghost), "publish-dataset", out, "./local/path")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("target must use hf://datasets/", r.stderr)
+        self.assertFalse(os.path.exists(ghost),
+                         "publish-dataset must never open ZMEM_STORE")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
