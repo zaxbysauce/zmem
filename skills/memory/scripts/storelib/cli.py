@@ -2960,9 +2960,14 @@ def main():
             # Issue #124: operational failures exit 1 with the stable
             # envelope and NO stdout; argparse owns usage errors (exit 2).
             # Success writes one compact sorted-key JSON list plus LF.
+            data_dir = os.environ.get("ZMEM_DATA")
+            if not data_dir:
+                print("[zmem] operation-feedback: ZMEM_DATA is not set",
+                      file=sys.stderr)
+                sys.exit(1)
             try:
                 rows = apply_operation_feedback(
-                    conn, data_dir=os.environ["ZMEM_DATA"],
+                    conn, data_dir=data_dir,
                     session_id=args.session_id, event_id=args.event_id,
                     operation_tokens=list(args.operation_tokens),
                     outcome=args.outcome, evidence_id=args.evidence_id,

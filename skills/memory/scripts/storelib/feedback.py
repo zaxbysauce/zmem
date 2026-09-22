@@ -12,8 +12,9 @@ commands are never operation outcomes.
 
 One event cannot increment the same memory twice: the per-session feedback
 sidecar (issue #124, ``delivery_ledger.feedback_event_path``) records every
-``(session_id, event_id, memory_id)`` triple and any repeat is skipped
-regardless of verdict. A sidecar failure raises
+``(session_id, event_id, memory_id, verdict)`` tuple and the orchestration
+skips any already-recorded ``(session_id, event_id, memory_id)`` triple
+regardless of which verdict was recorded. A sidecar failure raises
 :class:`~storelib.delivery_ledger.FeedbackSidecarError` and rolls back every
 counter update in the invocation; an invalid (missing or superseded) live
 target raises the existing ``FeedbackTargetError`` and rolls back too.
@@ -120,6 +121,8 @@ def apply_operation_feedback(conn: sqlite3.Connection, *, data_dir: str,
         raise ValueError("event_id must be non-empty")
     if not isinstance(operation_tokens, list):
         raise ValueError("operation_tokens must be a list of non-empty strings")
+    if not operation_tokens:
+        raise ValueError("operation_tokens must be non-empty")
     for token in operation_tokens:
         if not isinstance(token, str) or not token:
             raise ValueError("operation tokens must be non-empty strings")
@@ -185,8 +188,13 @@ def apply_operation_feedback(conn: sqlite3.Connection, *, data_dir: str,
         started_tx = True
     try:
         out_rows = []
-        written = False
+        pending = []
         if survivors:
+            # Count every survivor first; sidecar records are written only
+            # after the whole loop succeeds so a mid-loop FeedbackTargetError
+            # cannot leave durable sidecar lines ahead of rolled-back
+            # counters (swarm-pr-review PRR-003). Still strictly before the
+            # commit, per the issue contract.
             for memory_id, verdict, overlap in sorted(
                     survivors, key=lambda item: (item[0], event_id)):
                 if delivery_ledger.feedback_seen(
@@ -195,16 +203,7 @@ def apply_operation_feedback(conn: sqlite3.Connection, *, data_dir: str,
                         data_dir, session_id, event_id, memory_id, "violated"):
                     continue
                 feedback_memory(conn, memory_id=memory_id, verdict=verdict)
-                try:
-                    delivery_ledger.record_feedback_event(
-                        data_dir, session_id, event_id, memory_id, verdict,
-                        overlap, evidence_id, now=now)
-                except delivery_ledger.FeedbackSidecarError:
-                    raise
-                except OSError as exc:
-                    raise delivery_ledger.FeedbackSidecarError(
-                        f"feedback sidecar write failed: {exc}") from exc
-                written = True
+                pending.append((memory_id, verdict, overlap))
                 out_rows.append({
                     "memory_id": memory_id,
                     "verdict": verdict,
@@ -216,16 +215,17 @@ def apply_operation_feedback(conn: sqlite3.Connection, *, data_dir: str,
         else:
             if not delivery_ledger.feedback_seen(
                     data_dir, session_id, event_id, "", "unmatched"):
-                try:
-                    delivery_ledger.record_feedback_event(
-                        data_dir, session_id, event_id, "", "unmatched",
-                        0, evidence_id, now=now)
-                except delivery_ledger.FeedbackSidecarError:
-                    raise
-                except OSError as exc:
-                    raise delivery_ledger.FeedbackSidecarError(
-                        f"feedback sidecar write failed: {exc}") from exc
-                written = True
+                pending.append(("", "unmatched", 0))
+        for memory_id, verdict, overlap in pending:
+            try:
+                delivery_ledger.record_feedback_event(
+                    data_dir, session_id, event_id, memory_id, verdict,
+                    overlap, evidence_id, now=now)
+            except delivery_ledger.FeedbackSidecarError:
+                raise
+            except OSError as exc:
+                raise delivery_ledger.FeedbackSidecarError(
+                    f"feedback sidecar write failed: {exc}") from exc
         if started_tx:
             conn.commit()
         return sorted(out_rows, key=lambda r: (r["memory_id"], r["event_id"]))

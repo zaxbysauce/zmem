@@ -120,9 +120,10 @@ OUT="$(printf '%s' "$INPUT" | "$PYTHON_BIN" "$RECALL_BODY" "$STORE_PY_PY" "$NS" 
 # required --namespace. Event/evidence ids are derived deterministically
 # from the payload bytes (evidence_id/tool_use_id wins when present); the
 # call is fail-open and inherits ZMEM_STORE/ZMEM_DATA.
-"$PYTHON_BIN" -c '
-import hashlib, json, subprocess, sys
-store, raw = sys.argv[1], sys.argv[2]
+printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
+import hashlib, json, os, subprocess, sys
+store = sys.argv[1]
+raw = sys.stdin.read()
 try:
     payload = json.loads(raw)
 except Exception:
@@ -139,12 +140,26 @@ for use in payload.get("tool_uses") or []:
     inp = use.get("input")
     if not isinstance(inp, dict):
         continue
-    text = " ".join(str(v) for v in inp.values() if v).lower()
+    # Same restricted field set as the delivery side
+    # (zmem-recall-body.py extract_posttoolbatch_events) so the matcher
+    # compares like vocabularies (swarm-pr-review PRR-016).
+    text = " ".join(str(inp.get(k) or "")
+                    for k in ("command", "file_path", "notebook_path",
+                              "path")).lower()
     tokens.extend(w for w in text.split() if w)
-import re as _re
-_SECRET = _re.compile(r"(ghp_|gho_|github_pat_|sk-[A-Za-z0-9]|AKIA|glpat_|xox[bap]-|AIza)", _re.I)
+try:
+    sys.path.insert(0, os.path.dirname(store))
+    from redaction import redact_secret_like_text
+except Exception:
+    # Degraded filter when redaction.py is unavailable (kept for wrapper
+    # store layouts); the real plugin layout always ships it.
+    import re as _re
+    _SECRET = _re.compile(r"(ghp_|gho_|github_pat_|sk-[A-Za-z0-9]|AKIA|glpat_|xox[bap]-|AIza)", _re.I)
+    def redact_secret_like_text(text):
+        return text, 0 if _SECRET.search(text) is None else 1
 tokens = [w for w in tokens
-          if not w.startswith("-") and not _SECRET.search(w)]
+          if not w.startswith("-")
+          and redact_secret_like_text(w)[1] == 0]
 if not tokens:
     raise SystemExit(0)
 seen = []
@@ -165,7 +180,7 @@ for tok in seen[:8]:
     args.extend(["--operation-token", tok])
 subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 raise SystemExit(0)
-' "$STORE_PY_PY" "$INPUT" 2>/dev/null || true
+' "$STORE_PY_PY" 2>/dev/null || true
 
 # Neutralize sentinel/fence tokens a memory's own content might contain
 # (same defense as zmem-pretool-recall.sh — the launcher locates the payload

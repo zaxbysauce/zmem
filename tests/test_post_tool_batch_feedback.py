@@ -52,7 +52,6 @@ SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
 REAL_STORE_PY = SCRIPTS / "store.py"
 BATCH_HOOK = REPO_ROOT / "hooks" / "zmem-posttoolbatch-recall.sh"
 FAILURE_HOOK = REPO_ROOT / "hooks" / "zmem-capture-failure.sh"
-SIDECAR_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "feedback_sidecar_expected.jsonl"
 
 sys.path.insert(0, str(SCRIPTS))
 
@@ -225,23 +224,10 @@ class PostToolBatchFeedbackTest(unittest.TestCase):
     # -- tests ----------------------------------------------------------------
 
     def test_successful_batch_applies_only_matching_memory(self):
-        # PRODUCTION BUG PINNED RED (issue #124 hook lane — do not "fix" this
-        # test; fix hooks/zmem-posttoolbatch-recall.sh):
-        #
-        # The hook's operation-feedback helper builds its token list as
-        # [tool_name] + input values, so apply_operation_feedback joins them
-        # into the evidence operation string "bash git stash pop". The #156
-        # matcher re-derives tokens from that STRING via
-        # storelib.ops_tokens.derive_ops_tokens, and "bash" is NOT in
-        # _RUNNER_HEADS: the non-runner branch keeps at most ONE shaped
-        # last-word token, so derive_ops_tokens("bash git stash pop") == []
-        # while the delivered row's "git stash pop" derives to
-        # [git, stash, pop]. The overlap (0) never reaches the matcher's
-        # min_overlap=2, so NO realistic PostToolBatch success can ever land
-        # an applied_count — every batch event lands "unmatched" (when in
-        # window) and the counters stay 0. Secondary, same class: any dashed
-        # argv token ("python -m ...", "git status --short") makes argparse
-        # exit 2 and the whole event is silently dropped (fail-open DEVNULL).
+        # The hook derives operation tokens from the restricted input-field
+        # set (command/file_path/notebook_path/path — no tool-name prefix),
+        # matching the delivery side, so a matching batch increments
+        # applied_count on exactly the matching memory.
         r = self._run_hook(BATCH_HOOK, {
             "session_id": FB_SESS,
             "evidence_id": FB_EV131,

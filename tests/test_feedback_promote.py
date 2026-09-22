@@ -677,6 +677,59 @@ class OperationFeedbackTest(FeedbackTestBase):
                           record["verdict"], record["evidence_id"]),
                          ("", 0, "unmatched", FB_EV132))
 
+    def test_mid_loop_target_error_rolls_back_sidecar(self):
+        # Phase-4.5 reviewer recommendation (PRR-003 discriminator): a
+        # multi-match event whose second feedback_memory call raises
+        # FeedbackTargetError must roll back the counters AND leave no
+        # orphan sidecar lines for the earlier survivor -- the sidecar
+        # writes are deferred past the whole survivor loop.
+        import sqlite3 as _sq
+        import sys as _sys
+        import unittest.mock
+        _sys.path.insert(0, os.path.join(REPO_ROOT, "skills", "memory",
+                                          "scripts"))
+        import storelib.feedback as fb_mod
+        import storelib.write as write_mod
+        # Both delivered entries must derive to >= 2 shared tokens with the
+        # one event so a single event yields two survivors.
+        ops = os.path.join(self.tmp, "ops")
+        ledger = os.path.join(
+            ops, hashlib.sha256(FB_SESS.encode("utf-8")).hexdigest()[:32]
+            + ".ledger")
+        with open(ledger, "w", encoding="utf-8") as f:
+            json.dump({"entries": [
+                {"id": FB_M125, "moment": "pretool",
+                 "ts": _fb_epoch("2026-09-10T10:00:00Z"),
+                 "text": "python test_feedback_promote.py guard"},
+                {"id": FB_M126, "moment": "pretool",
+                 "ts": _fb_epoch("2026-09-10T10:01:00Z"),
+                 "text": "python test_feedback_promote.py helper"}]}, f)
+        conn = _sq.connect(self.store)
+        try:
+            with unittest.mock.patch.object(
+                    fb_mod, "feedback_memory",
+                    side_effect=[None,
+                                 write_mod.FeedbackTargetError(
+                                     "no live memory with id second")]):
+                with self.assertRaises(write_mod.FeedbackTargetError):
+                    fb_mod.apply_operation_feedback(
+                        conn, data_dir=self.tmp, session_id=FB_SESS,
+                        event_id=FB_E127,
+                        operation_tokens=["python",
+                                          "test_feedback_promote.py"],
+                        outcome="failure", evidence_id=None,
+                        now="2026-09-10T10:02:00Z")
+        finally:
+            conn.close()
+        self.assertEqual(self._counters(FB_M125), (0, 0))
+        self.assertEqual(self._counters(FB_M126), (0, 0))
+        sidecar = os.path.join(
+            self.tmp, "ops",
+            hashlib.sha256(FB_SESS.encode("utf-8")).hexdigest()[:32]
+            + ".feedback.jsonl")
+        self.assertFalse(os.path.exists(sidecar),
+                         "orphan sidecar line survived the rollback")
+
     def test_same_session_event_cannot_double_count(self):
         args = (
             "--session-id", FB_SESS, "--event-id", FB_E127,
