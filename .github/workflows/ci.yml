@@ -77,6 +77,14 @@ jobs:
       - name: Install pyarrow
         shell: bash
         run: python -m pip install --disable-pip-version-check "pyarrow>=15,<26"
+
+      # Issue #134 follow-up: tests/test_dataset.py::test_hub_client_maps_
+      # conflict_and_notfound constructs the real HubDatasetClient (its
+      # __init__ imports huggingface_hub; the API itself is stubbed), so
+      # the dependency must be present for the path to stay exercised.
+      - name: Install huggingface_hub
+        shell: bash
+        run: python -m pip install --disable-pip-version-check "huggingface_hub>=0.30"
       - name: MCP tool suites (skipped=0 gate)
         shell: bash
         run: |
