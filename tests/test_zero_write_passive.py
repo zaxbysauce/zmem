@@ -525,21 +525,34 @@ class ZeroWriteTest(ForInjectionBase):
 
 
 class PopularityInputTest(unittest.TestCase):
-    """compute_score popularity reads retrieval_count only (issue #114)."""
+    """compute_score popularity reads usefulness counters only (#114, #124).
+
+    #114 dropped surfaced_count and made retrieval_count the interim
+    popularity input; #124 is the landing that replaced retrieval_count with
+    the applied/violated usefulness counters, so NO telemetry count moves
+    the score anymore."""
 
     ROW_BASE = {"confidence": 0.9, "ingestion_ts": "2026-09-01T00:00:00Z"}
 
-    def _score(self, retrieval, surfaced):
+    def _score(self, retrieval, surfaced, applied=0, violated=0):
         row = {**self.ROW_BASE, "retrieval_count": retrieval,
-               "surfaced_count": surfaced}
+               "surfaced_count": surfaced, "applied_count": applied,
+               "violated_count": violated}
         return storelib.compute_score(row, None, 1780000000.0, vec_sim=0.5)
 
     def test_surfaced_count_no_longer_feeds_the_score(self):
         # Pre-#114 this pair differed; the loop lived here.
         self.assertEqual(self._score(0, 0), self._score(0, 999))
 
-    def test_retrieval_count_still_feeds_the_score(self):
-        self.assertLess(self._score(0, 999), self._score(5, 0))
+    def test_retrieval_count_no_longer_feeds_the_score(self):
+        # Issue #124 flip of the interim #114 pin: retrieval exposure is
+        # not endorsement; usefulness feedback is the only popularity input.
+        self.assertEqual(self._score(0, 999), self._score(5, 0))
+
+    def test_applied_feedback_feeds_the_score(self):
+        self.assertGreater(self._score(0, 0, applied=4), self._score(0, 0))
+        self.assertLess(self._score(0, 0, violated=4),
+                        self._score(0, 0, applied=4))
 
     def test_weights_unchanged_and_normalized(self):
         self.assertAlmostEqual(
