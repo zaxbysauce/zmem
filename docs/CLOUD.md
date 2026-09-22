@@ -130,7 +130,11 @@ atomically and never the caller's store — applying filters before recall:
 temporal validity (rows not yet in force — `valid_from` in the future — and
 expired rows are dropped). Episodes whose summary row is excluded by a
 filter import with an empty `summary_memory_id` rather than a dangling
-reference. Point recall at the snapshot by running later commands with
+reference. Scope note: the snapshot hash certifies RECORD content; the
+manifest-level `governance`/`namespaces` metadata sits outside that chain,
+and records are materialized fully in memory (bounded per row by the
+store's content cap) — datasets are sized for personal-memory corpora,
+not unlimited streams. Point recall at the snapshot by running later commands with
 `ZMEM_STORE=<dest>/snapshot.sqlite`.
 
 ## Tier 1 — Memory pack (read-only snapshot, committed to the repo)

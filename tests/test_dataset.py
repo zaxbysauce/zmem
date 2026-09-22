@@ -278,9 +278,10 @@ class DatasetExportTest(_StoreCase):
         --fail — plain trufflehog exits 0 even with findings, which would
         make the egress scan a silent no-op. Assert the invocation contract
         against the source: --fail sits between --json and the staging dir."""
-        source = open(os.path.join(REPO_ROOT, "skills", "memory", "scripts",
-                                   "storelib", "dataset.py"),
-                      encoding="utf-8").read()
+        source_path = os.path.join(REPO_ROOT, "skills", "memory", "scripts",
+                                   "storelib", "dataset.py")
+        with open(source_path, encoding="utf-8") as fh:
+            source = fh.read()
         self.assertIn('"--json", "--fail"', source,
                       "trufflehog invocation must pass --fail (F-001)")
 
@@ -294,13 +295,22 @@ class DatasetExportTest(_StoreCase):
         if os.name == "nt":
             stub += ".bat"
         lines = [
-            "@echo off",
-            'echo {"Source":{"Data":"payload-000000.bin"},'
-            '"DetectorName":"GitHub"}',
+            "#!/bin/sh",
+            'echo \'{"Source":{"Data":"payload-000000.bin"},'
+            '"DetectorName":"GitHub"}\'',
             "exit 183",
         ]
         with open(stub, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(lines) + "\n")
+        if os.name != "nt":
+            os.chmod(stub, 0o755)
+        else:
+            # Windows: rewrite as a batch stub (sh shebang is unusable).
+            with open(stub, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write('@echo off\n'
+                         'echo {"Source":{"Data":"payload-000000.bin"},'
+                         '"DetectorName":"GitHub"}\n'
+                         'exit 183\n')
         env = {**os.environ, "PATH": bindir + os.pathsep + os.environ["PATH"]}
         original = os.environ["PATH"]
         os.environ["PATH"] = env["PATH"]
@@ -661,6 +671,51 @@ class DatasetExportTest(_StoreCase):
         self.assertIn("target must use hf://datasets/", r.stderr)
         self.assertFalse(os.path.exists(ghost),
                          "publish-dataset must never open ZMEM_STORE")
+
+    def test_hub_client_maps_conflict_and_notfound(self):
+        """C-010 regression: the REAL HubDatasetClient maps a commit
+        conflict-shaped exception to ParentConflict (named so the publish
+        seam retries) and a not-found repo to an empty head — while other
+        failures fail closed as PublishError."""
+        client = storelib.HubDatasetClient()
+
+        class StubApi:
+            def __init__(self, behavior):
+                self.behavior = behavior
+
+            def repo_info(self, repo_id, repo_type=None, revision=None):
+                if self.behavior == "missing":
+                    raise Exception("Repository not found for id")
+                if self.behavior == "network":
+                    raise Exception("connection reset by peer")
+                raise AssertionError(self.behavior)
+
+            def create_commit(self, repo_id, operations=None,
+                              repo_type=None, commit_message=None,
+                              parent_commit=None):
+                if self.behavior == "conflict":
+                    raise Exception(
+                        f"parent_commit {parent_commit!r} did not match")
+                return type("R", (), {"commit_id": "abc"})()
+
+        original = client._api
+        client._api = StubApi("conflict")
+        try:
+            with self.assertRaises(ds.ParentConflict):
+                client.commit(TARGET, "old", {"f": b"x"})
+        finally:
+            client._api = original
+        client._api = StubApi("missing")
+        try:
+            self.assertEqual(client.head(TARGET), "")
+        finally:
+            client._api = original
+        client._api = StubApi("network")
+        try:
+            with self.assertRaises(storelib.PublishError):
+                client.head(TARGET)
+        finally:
+            client._api = original
 
 
 if __name__ == "__main__":

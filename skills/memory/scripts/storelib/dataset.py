@@ -668,8 +668,17 @@ def _read_export_records(export_dir: Path, manifest: dict) -> dict[str, list]:
         raise PublishError(f"unsupported dataset format: {fmt}")
     families = {family: _read_family(export_dir, family, fmt)
                 for family in DATASET_FAMILIES}
+    required = {"memories": ("id", "namespace"),
+                "episodes": ("id", "namespace"),
+                "episode_members": ("episode_id", "memory_id"),
+                "links": ("src", "dst")}
     for family, rows in families.items():
         for row in rows:
+            for key in required[family]:
+                if key not in row:
+                    raise PublishError(
+                        f"malformed {family} record: missing {key!r} "
+                        f"(row checksum {row.get('row_checksum')!r})")
             if row_checksum(row) != row.get("row_checksum"):
                 raise PublishError("checksum mismatch")
     recomputed = _compute_snapshot_hash(
@@ -985,8 +994,16 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
         raise DatasetError(f"unsupported dataset format: {fmt}")
     families = {family: _read_family(source_path, family, fmt)
                 for family in DATASET_FAMILIES}
+    required = {"memories": ("id", "namespace"),
+                "episodes": ("id", "namespace"),
+                "episode_members": ("episode_id", "memory_id"),
+                "links": ("src", "dst")}
     for family, rows in families.items():
         for row in rows:
+            for key in required[family]:
+                if key not in row:
+                    raise DatasetError(
+                        f"malformed {family} record: missing {key!r}")
             if row_checksum(row) != row.get("row_checksum"):
                 raise DatasetError("checksum mismatch")
     if _compute_snapshot_hash(families, True) != \

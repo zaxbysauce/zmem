@@ -10,7 +10,8 @@ Sequence semantics (the issue's declared CAS exercises):
 - a retry ``head()`` after the first conflict returns ``"conflict"`` — the
   moved head;
 - the first commit attempt that is not scripted to conflict succeeds and
-  returns the revision (``"new"``).
+  returns ``"<revision>-<n>"`` (n = accepted-commit count), e.g. ``"new-1"``
+  for the first accepted commit.
 
 So ``["old", "conflict", "new"]`` = one conflict then success (exactly two
 commit attempts), and ``["old", "conflict", "conflict"]`` = two conflicts
