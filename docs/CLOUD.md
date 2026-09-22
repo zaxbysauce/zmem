@@ -42,6 +42,101 @@ memory tiers (Tier 0 core.md, Tier 2 semantic store) described in
 1 and 2, but they classify different things (cloud hand-off mechanism here vs.
 where memory physically lives there) and the overlap is coincidental.
 
+## Governed dataset paths (issue #134) — export, publish, import
+
+Beyond the sync tiers below, zmem ships an explicit, governed dataset
+artifact layer with **four distinct paths** — local export, private sync,
+explicit Hub publish, and revision-pinned import. SQLite stays the source of
+truth in every one of them; the dataset artifact (Parquet records +
+`manifest.json` + `README.md`) is disposable and rebuildable, and no
+embeddings or derived index bytes ever leave the store through it.
+
+### Path 1 — Local export (`export-dataset`)
+
+```bash
+python skills/memory/scripts/store.py export-dataset ./my-dataset \
+  --namespace "project:github.com/you/your-repo"
+```
+
+Writes `manifest.json`, `README.md`, and `data/*.parquet` (one record file
+per family: memories, episodes, episode_members, links). Deterministic: two
+exports from one store snapshot produce byte-identical artifacts. Tombstones
+are audit-only by default; `--include-tombstones` produces the audit view.
+An unscoped export (every namespace) demands `--all-namespaces --yes`, and
+an omitted `--namespace` is resolved from the project — if no project
+namespace can be determined, the command refuses rather than silently
+exporting a global scope.
+
+### Path 2 — Private sync
+
+The Tier 3 sync-repo contract below (plaintext content, write access =
+store content, keep it **private**) applies with full force to anything a
+dataset export contains — a dataset export is a complete authority
+projection of the exported namespaces, not a redacted view. Keep generated
+datasets under the same access discipline as the store itself until they are
+deliberately published.
+
+### Path 3 — Explicit Hub publish (`publish-dataset`)
+
+```bash
+python skills/memory/scripts/store.py publish-dataset ./my-dataset \
+  hf://datasets/you/your-memories
+```
+
+Publication is **explicit-only**: no capture path, hook, provider, queue,
+ledger, cron, or MCP surface ever publishes; `store.py publish-dataset` is
+the only process boundary, and Hub datasets are private by default. The
+target must be `hf://datasets/owner/repo`, and every serialized row (plus
+tags, source references, governance fields, README, and manifest) is scanned
+with TruffleHog before upload:
+
+- clean scan → publish proceeds;
+- a flagged row is **held back** — removed from the upload and reported in
+  `held_back.json` (id, reason, checksum). A positive finding is never
+  bypassable;
+- TruffleHog missing → the publish refuses; `--allow-unscanned` is the only
+  bypass and is recorded in the dataset manifest;
+- scanner failure (any other exit) → refuse, no override. The invocation
+  passes `--fail` so a finding-bearing scan can never masquerade as clean;
+- `held_back.json` is written **next to the local export only** — it is an
+  audit record of secret content (row ids + content-derived checksums) and
+  is deliberately never uploaded.
+
+Republishing over namespaces the target already carries demands `--yes`,
+as does publishing to a target repo that already exists **public**
+(`create_repo` cannot change the visibility of an existing repo, so zmem
+refuses a public target instead of silently writing into it — the publish
+result reports the actual visibility either way). Commits are CAS-guarded:
+one parent-conflict retry, then fail closed. When rows are held back, the
+uploaded artifact is **re-hashed over the surviving rows** and the published
+manifest carries that new `source_snapshot_hash`/`export_snapshot_id` —
+importers must use the revision reported by the publish (printed as
+`dataset revision`), not the pre-publish export hash.
+
+### Path 4 — Revision-pinned import (`import-dataset`)
+
+```bash
+python skills/memory/scripts/store.py import-dataset ./my-dataset --revision <source_snapshot_hash> --dest ./imported-snap
+python skills/memory/scripts/store.py import-dataset hf://datasets/you/your-memories --revision <40-char-commit-sha> --dest ./imported-snap
+```
+
+The revision must match the dataset's `source_snapshot_hash` exactly (Hub
+sources additionally require the 40-character commit SHA and read only the
+local Hub cache for that SHA). Every record checksum is verified, then the
+import builds an **isolated snapshot** — `<dest>/snapshot.sqlite`, written
+atomically and never the caller's store — applying filters before recall:
+`--namespace` (an absent namespace refuses; no empty substitute),
+`--min-confidence`, `--min-trust`, `--taint`, `--include-tombstones`, and
+temporal validity (rows not yet in force — `valid_from` in the future — and
+expired rows are dropped). Episodes whose summary row is excluded by a
+filter import with an empty `summary_memory_id` rather than a dangling
+reference. Scope note: the snapshot hash certifies RECORD content; the
+manifest-level `governance`/`namespaces` metadata sits outside that chain,
+and records are materialized fully in memory (bounded per row by the
+store's content cap) — datasets are sized for personal-memory corpora,
+not unlimited streams. Point recall at the snapshot by running later commands with
+`ZMEM_STORE=<dest>/snapshot.sqlite`.
+
 ## Tier 1 — Memory pack (read-only snapshot, committed to the repo)
 
 The simplest option: periodically export the store's most relevant memories
@@ -509,6 +604,12 @@ Set `ZMEM_PROXY_FORGE_HOST=` (empty) in that environment.
   before they count, gate the local-side `ingest-jsonl` step behind that
   review (a PR against the sync repo, not a direct push) rather than
   auto-ingesting every outbox on arrival.
+- Never wire dataset publication into anything automatic (issue #134):
+  `publish-dataset` is an explicit operator command, never a hook, provider,
+  queue, ledger, cron, or MCP side effect — and never publish with
+  `--allow-unscanned` as a habit; the override is an auditable exception,
+  recorded in the dataset manifest, for boxes that genuinely lack
+  TruffleHog.
 
 ## Belief heads (issue #137)
 

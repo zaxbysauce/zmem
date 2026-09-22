@@ -180,6 +180,8 @@ KNOWN_SUBCMDS = [
     "organize",
     # v12 (issue #64): explicit usage-feedback + dry-run weight tuning.
     "feedback", "tune-weights",
+    # Issue #134 (Workstream E): the governed dataset artifact surface.
+    "export-dataset", "publish-dataset", "import-dataset",
 ]
 
 # Subcommands whose argparse parser exposes ONLY the universal -h/--help
@@ -426,21 +428,22 @@ class CharacterizationTests(unittest.TestCase):
         # surface without duplicating the live list verbatim (a verbatim copy
         # would be self-referential -- cubic review round 1).
         # 36 -> 37: promote-store joined the surface (issue #71 E).
-        self.assertEqual(len(KNOWN_SUBCMDS), 37)
+        # 37 -> 40: the governed dataset commands joined (issue #134).
+        self.assertEqual(len(KNOWN_SUBCMDS), 40)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
     def test_organize_and_consolidate_expose_belief_flags(self):
         # Issue #137: --belief-heads and --llm-local are FLAGS on the two
         # maintenance subcommands (never new subcommands — KNOWN_SUBCMDS
-        # stays frozen at 37).
+        # stays frozen at 40).
         for cmd in ("organize", "consolidate"):
             r = _run_cli({}, cmd, "--help")
             self.assertEqual(r.returncode, 0, f"{cmd} --help rc={r.returncode}")
             for flag in ("--belief-heads", "--llm-local"):
                 self.assertIn(flag, r.stdout,
                               f"{cmd} --help must expose {flag} (issue #137)")
-        self.assertEqual(len(KNOWN_SUBCMDS), 37)
+        self.assertEqual(len(KNOWN_SUBCMDS), 40)
 
     def test_recall_clock_seam_is_honored_and_deterministic(self):
         """ZMEM_TEST_NOW pins the scoring clock (see _run_env). Two pins of

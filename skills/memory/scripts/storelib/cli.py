@@ -47,6 +47,10 @@ from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import reembed_embeddings
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
+from storelib.dataset import (
+    cmd_export_dataset, cmd_import_dataset, cmd_publish_dataset,
+    export_dataset, import_dataset, publish_dataset,
+)
 from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory, warn_reserved_source_ref
 from storelib.delivery_ledger import FeedbackSidecarError
 from storelib.feedback import apply_operation_feedback
@@ -1632,6 +1636,77 @@ def main():
              "evidence discriminator",
     )
 
+    # Workstream E (issue #134): governed dataset artifact commands. The
+    # exact flag contracts are pinned by the issue and the frozen
+    # acceptance checks (trace 134-dataset-export-publish-import).
+    p_export_dataset = _add_parser(
+        "export-dataset",
+        help="export a governed knowledge dataset directory "
+             "(manifest + parquet records; SQLite stays authoritative)")
+    p_export_dataset.add_argument("dir", type=str,
+                                  help="output dataset directory")
+    p_export_dataset.add_argument("--namespace", dest="namespace", type=str,
+                                  default=None,
+                                  help="export one namespace")
+    p_export_dataset.add_argument("--all-namespaces", dest="all_namespaces",
+                                  action="store_true", default=False,
+                                  help="select every namespace")
+    p_export_dataset.add_argument("--include-tombstones",
+                                  dest="include_tombstones",
+                                  action="store_true", default=False,
+                                  help="include tombstones in the audit view")
+    p_export_dataset.add_argument("--yes", dest="yes", action="store_true",
+                                  default=False,
+                                  help="confirm an unscoped export")
+
+    p_publish_dataset = _add_parser(
+        "publish-dataset",
+        help="publish a generated dataset directory to a private-by-default "
+             "Hugging Face Hub dataset repo (egress-scanned)")
+    p_publish_dataset.add_argument("dir", type=str,
+                                   help="generated dataset directory")
+    p_publish_dataset.add_argument("target", type=str,
+                                   help="hf://datasets/owner/repo target")
+    p_publish_dataset.add_argument("--yes", dest="yes", action="store_true",
+                                   default=False,
+                                   help="confirm target namespace overlap")
+    p_publish_dataset.add_argument("--allow-unscanned",
+                                   dest="allow_unscanned",
+                                   action="store_true", default=False,
+                                   help="allow publication when TruffleHog "
+                                        "is unavailable")
+
+    p_import_dataset = _add_parser(
+        "import-dataset",
+        help="import a dataset into an isolated revision-pinned snapshot "
+             "(never touches the caller's store)")
+    p_import_dataset.add_argument("source", type=str,
+                                  help="hf://datasets/owner/repo (Hub cache) "
+                                       "or a local dataset directory")
+    p_import_dataset.add_argument("--revision", dest="revision", type=str,
+                                  required=True,
+                                  help="exact source revision SHA")
+    p_import_dataset.add_argument("--dest", dest="dest_dir", type=str,
+                                  required=True,
+                                  help="isolated snapshot directory")
+    p_import_dataset.add_argument("--namespace", dest="namespace", type=str,
+                                  default=None,
+                                  help="restrict the imported namespace")
+    p_import_dataset.add_argument("--min-confidence",
+                                  dest="min_confidence", type=float,
+                                  default=None, help="minimum confidence")
+    p_import_dataset.add_argument("--min-trust", dest="min_trust", type=float,
+                                  default=None, help="minimum trust score")
+    p_import_dataset.add_argument("--taint", dest="taint", type=str,
+                                  choices=("trusted_internal",
+                                           "untrusted_tool",
+                                           "untrusted_web"),
+                                  default=None, help="allowed taint value")
+    p_import_dataset.add_argument("--include-tombstones",
+                                  dest="include_tombstones",
+                                  action="store_true", default=False,
+                                  help="include audit tombstones")
+
     p_fail = _add_parser(
         "failures",
         help="detect failed tool calls for a session (transcript JSONL or db.sqlite)")
@@ -2225,6 +2300,46 @@ def main():
                         pass
             sys.exit(0)
 
+    # Workstream E (issue #134): the dataset publication commands are
+    # store-free by contract -- publish-dataset reads only the explicit
+    # export directory (never ZMEM_STORE) and import-dataset reads only the
+    # explicit source, so both branch BEFORE connect()/_prepare_store()
+    # exactly like the other store-independent surfaces above. The
+    # export-dataset argument guards also fire here (parse-time exit 2,
+    # before any row query): an unscoped export demands --yes, and an
+    # omitted --namespace is resolved through the project namespace
+    # resolver with the user:global fallback treated as "unavailable" so a
+    # global scope can never be exported implicitly.
+    if args.cmd == "publish-dataset":
+        sys.exit(cmd_publish_dataset(args.dir, args.target, yes=args.yes,
+                                     allow_unscanned=args.allow_unscanned))
+    if args.cmd == "import-dataset":
+        if (args.min_confidence is not None
+                and not 0.0 <= args.min_confidence <= 1.0) or (
+                args.min_trust is not None
+                and not 0.0 <= args.min_trust <= 1.0):
+            ap.error("--min-confidence and --min-trust must be between "
+                     "0.0 and 1.0")
+        if args.taint is not None and args.taint not in (
+                "trusted_internal", "untrusted_tool", "untrusted_web"):
+            # Defensive: argparse choices already reject these; this branch
+            # covers programmatic dispatch bypassing the parser.
+            ap.error("invalid taint value")
+        sys.exit(cmd_import_dataset(
+            args.source, revision=args.revision, dest_dir=args.dest_dir,
+            namespace=args.namespace, min_confidence=args.min_confidence,
+            min_trust=args.min_trust, taint=args.taint,
+            include_tombstones=args.include_tombstones))
+    if args.cmd == "export-dataset":
+        if args.all_namespaces and not args.yes:
+            ap.error("--yes is required with --all-namespaces")
+        if not args.all_namespaces and args.namespace is None:
+            resolved = _schema_host.resolve_namespace(os.getcwd())
+            if resolved == GLOBAL_NAMESPACE:
+                ap.error("--namespace is required when the project "
+                         "namespace is unavailable")
+            args.namespace = resolved
+
     # PR-review PRR-P (issue #59 review round): `--content -` reads the content
     # from stdin. Windows argv caps near 32k chars while the content cap is
     # MAX_CONTENT_CHARS (65536), so large-but-valid content cannot always be
@@ -2250,7 +2365,11 @@ def main():
     # remediation work, and the auto pass running first would consume the rows
     # their command targets — turning --dry-run into an empty preview and
     # --confirm into "no matching live rows found".
-    if args.cmd != "rekey-namespace" and not existing_only_evidence_write:
+    if args.cmd not in ("rekey-namespace", "export-dataset") \
+            and not existing_only_evidence_write:
+        # export-dataset joins the exemption (issue #134): it is a pure-read
+        # surface and must not trigger the near-miss rekey's writes against
+        # the store it is reading.
         _auto_near_miss_rekey(conn, force_off=getattr(args, "no_auto_rekey", False))
 
     # Issue #63, 8.2: fail-closed embedding-profile gate. Applied ONLY to
@@ -3002,6 +3121,17 @@ def main():
             rc = cmd_export_jsonl(
                 conn, out=args.out, namespace=args.namespace,
                 include_superseded=args.include_superseded,
+            )
+            sys.exit(rc)
+        elif args.cmd == "export-dataset":
+            # Pure-read dispatch (issue #134): the handler opens its own
+            # read queries only; the parse-time guards above have already
+            # resolved/validated the namespace selection.
+            rc = cmd_export_dataset(
+                conn, out_dir=args.dir, namespace=args.namespace,
+                all_namespaces=args.all_namespaces,
+                include_tombstones=args.include_tombstones,
+                allow_unscoped=args.yes,
             )
             sys.exit(rc)
         elif args.cmd == "ingest-jsonl":

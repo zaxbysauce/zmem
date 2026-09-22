@@ -36,3 +36,4 @@ tests/fixtures/evidence/*.jsonl text eol=lf
 # Issue #124 feedback sidecar fixture is a byte-contract input compared with
 # read_bytes(); keep checkout bytes LF-stable under Windows autocrlf.
 tests/fixtures/feedback_*.jsonl text eol=lf
+tests/fixtures/dataset/** text eol=lf

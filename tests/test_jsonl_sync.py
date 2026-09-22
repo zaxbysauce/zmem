@@ -2366,5 +2366,101 @@ class VoyagerCounterSyncTest(_TwoStoreCase):
         self.assertEqual(restored[2], 2)
 
 
+class DatasetAuthorityParityTest(unittest.TestCase):
+    """Issue #134: the dataset memory record's field set is EXACTLY the live
+    SQLite authority projection (every portable column; derived columns
+    excluded) plus the governance-null fields and the dataset identity
+    fields — and it is a superset of the JSONL sync projection, which omits
+    source_hash and retrieval telemetry by design and carries kind/links.
+    Both sides are DERIVED at runtime from the live schema and real exports;
+    nothing is hardcoded. This file stays subprocess-only (see the module
+    docstring), so the in-process dataset read happens in an env-pinned
+    child."""
+
+    def test_dataset_authority_field_set_matches_sqlite(self):
+        store = Store(tempfile.mkdtemp(prefix="zmem-dataset-parity-"))
+        self.addCleanup(shutil.rmtree, store.tmp, True)
+        r = store.run("init")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for content in ("parity row one", "parity row two"):
+            r = store.run("add", "--namespace", NS, "--type", "fact",
+                          "--content", content)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+        jsonl_out = os.path.join(store.tmp, "sync.jsonl")
+        r = store.run("export-jsonl", "--out", jsonl_out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        dataset_dir = os.path.join(store.tmp, "dataset")
+        r = store.run("export-dataset", dataset_dir, "--namespace", NS)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        probe = os.path.join(store.tmp, "probe_fields.py")
+        with open(probe, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_DATASET_FIELD_PROBE)
+        env = dict(store.env)
+        scripts_dir = str(REPO_ROOT / "skills" / "memory" / "scripts")
+        r = subprocess.run([sys.executable, probe, scripts_dir,
+                            jsonl_out, dataset_dir],
+                           env=env, capture_output=True, text=True,
+                           timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        observed = json.loads(r.stdout)
+
+        dataset_fields = set(observed["dataset_fields"])
+        self.assertEqual(
+            dataset_fields,
+            set(observed["authority"]) | set(observed["governance"])
+            | set(observed["identity"]),
+            "dataset field set must equal the SQLite authority projection "
+            "+ governance nulls + dataset identity fields")
+        jsonl_fields = set(observed["jsonl_fields"]) - {"kind", "links"}
+        self.assertTrue(
+            jsonl_fields <= dataset_fields,
+            "JSONL authority fields missing from dataset: "
+            f"{sorted(jsonl_fields - dataset_fields)}")
+        # The dataset carries exactly the fields the JSONL omits for
+        # portability: source_hash + retrieval telemetry (both stay in the
+        # live store and are exported by the dataset layer only).
+        self.assertEqual(
+            sorted(dataset_fields - jsonl_fields),
+            sorted(set(observed["governance"]) | set(observed["identity"])
+                   | {"source_hash", "retrieval_count", "surfaced_count",
+                      "last_retrieved", "last_surfaced"}))
+
+
+_DATASET_FIELD_PROBE = """
+import json, os, sqlite3, sys
+sys.path.insert(0, sys.argv[1])
+from storelib.dataset import _read_family, MEMORY_GOVERNANCE_FIELDS
+
+jsonl_path, dataset_dir = sys.argv[2], sys.argv[3]
+
+with open(jsonl_path, encoding='utf-8') as fh:
+    jsonl_rows = [json.loads(line) for line in fh if line.strip()]
+jsonl_fields = set(jsonl_rows[0])
+
+with open(os.path.join(dataset_dir, 'manifest.json'), encoding='utf-8') as fh:
+    manifest = json.load(fh)
+ds_rows = _read_family(dataset_dir, 'memories', manifest['format'])
+dataset_fields = set(ds_rows[0])
+
+conn = sqlite3.connect(os.environ['ZMEM_STORE'])
+sqlite_cols = {row[1] for row in conn.execute('PRAGMA table_info(memory)')}
+conn.close()
+derived = {c for c in sqlite_cols
+           if c.startswith('embedding') or c.startswith('embedded')
+           or c in ('content_norm', 'consolidated_at')}
+authority = sqlite_cols - derived
+identity = {'export_snapshot_id', 'generator_revision', 'row_checksum'}
+print(json.dumps({
+    'jsonl_fields': sorted(jsonl_fields),
+    'dataset_fields': sorted(dataset_fields),
+    'authority': sorted(authority),
+    'governance': sorted(MEMORY_GOVERNANCE_FIELDS),
+    'identity': sorted(identity),
+}))
+"""
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = "0.58.0"
+EXPECTED_VERSION = "0.59.0"
 SCORE_MARGIN_VERSION = "0.34.0"
 _SCORE_MARGIN_VERSION_RE = re.escape(SCORE_MARGIN_VERSION)
 
