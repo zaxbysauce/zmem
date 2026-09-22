@@ -4,3 +4,4 @@ Source raw bytes: 3025 (109 CRLF sequences)
 Fixture normalization: CRLF -> LF only; no JSON parse, sort, or reserialization
 Fixture SHA256: 6ceb70a0914533d75c64ad46fef8b4c54a799abf40efa1346ec22004bce3522e
 Fixture bytes: 2916
+Refreshed 2026-09-21 (issue #124, release 0.58.0): recall JSON row dicts now expose integer applied_count/violated_count (AC7), so the pinned AC6 wire + expected envelope were regenerated from the same immutable-base fixed-clock replay (ZMEM_TEST_NOW=2026-06-01T00:00:00Z, ZMEM_QUERY_CONTEXT=0, session phase25-parity-session, moment user_prompt, lane claude).

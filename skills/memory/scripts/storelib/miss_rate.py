@@ -1288,6 +1288,25 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     # read-only report.  The exact matrix is always 20 rows, sorted and
     # zero-filled; the aggregate side records lane-less/compatibility values
     # that intentionally do not fit the named report projection.
+    # Issue #124: feedback totals + associations. A malformed sidecar
+    # returns the existing report error shape plus a bounded diagnostic and
+    # never creates a store (the rollup opens the store read-only).
+    try:
+        conn_ro = sqlite3.connect(
+            f"file:{store.resolve().as_posix()}?mode=ro", uri=True)
+        try:
+            feedback_values, feedback_associations, malformed_sidecar = (
+                feedback_surface(conn_ro, data_dir))
+        finally:
+            conn_ro.close()
+    except Exception:
+        feedback_values = {key: 0 for key in FEEDBACK_KEYS}
+        feedback_associations = []
+        malformed_sidecar = None
+    if malformed_sidecar is not None:
+        return {"error": "malformed feedback sidecar",
+                "diagnostic": malformed_sidecar}
+
     attribution_matrix = _decision_matrix(lines)
     attribution_aggregate = _attribution_aggregate(lines)
 
@@ -1312,6 +1331,14 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
                  "lines_without_arms": arms_lines_without,
                  "carried": arm_carry},
         "false_injection": false_injection,
+        "total_applied": feedback_values["total_applied"],
+        "total_violated": feedback_values["total_violated"],
+        "nonzero_applied": feedback_values["nonzero_applied"],
+        "nonzero_violated": feedback_values["nonzero_violated"],
+        "matched_applied": feedback_values["matched_applied"],
+        "matched_violated": feedback_values["matched_violated"],
+        "unmatched_operations": feedback_values["unmatched_operations"],
+        "feedback_associations": feedback_associations,
         "lane_moment_matrix": attribution_matrix,
         "attribution": {
             "matrix": attribution_matrix,
@@ -1329,3 +1356,96 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
                                 key=lambda kv: -kv[1])[:10],
         "caveats": caveats,
     }
+
+
+# ---------------------------------------------------------------------------
+# Issue #124 (Workstream E): observational feedback totals for the report
+# surfaces (miss report, doctor voyager-counters check, stats). Read-only:
+# four SQL aggregates over live rows plus counts of the per-session feedback
+# sidecar records under the data dir.
+# ---------------------------------------------------------------------------
+
+FEEDBACK_KEYS = ("total_applied", "total_violated", "nonzero_applied",
+                 "nonzero_violated", "matched_applied", "matched_violated",
+                 "unmatched_operations")
+
+
+def feedback_sql_totals(conn):
+    """First four feedback keys, in contract order, over LIVE rows."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(applied_count), 0), "
+        "COALESCE(SUM(violated_count), 0), "
+        "COALESCE(SUM(CASE WHEN applied_count > 0 THEN 1 ELSE 0 END), 0), "
+        "COALESCE(SUM(CASE WHEN violated_count > 0 THEN 1 ELSE 0 END), 0) "
+        "FROM memory WHERE superseded_at IS NULL"
+    ).fetchone()
+    return {
+        "total_applied": int(row[0] or 0),
+        "total_violated": int(row[1] or 0),
+        "nonzero_applied": int(row[2] or 0),
+        "nonzero_violated": int(row[3] or 0),
+    }
+
+
+def feedback_sidecar_counts(data_dir):
+    """Counts of applied/violated/unmatched sidecar records for the data
+    dir, the matched association rows (five fields each, sorted), and the
+    path of a malformed sidecar if one was found (None otherwise)."""
+    import json as _json
+    from pathlib import Path as _Path
+    counts = {"matched_applied": 0, "matched_violated": 0,
+              "unmatched_operations": 0}
+    associations = []
+    malformed = None
+    ops_dir = _Path(data_dir) / "ops" if data_dir else None
+    if ops_dir is not None and ops_dir.is_dir():
+        for path in sorted(ops_dir.glob("*.feedback.jsonl")):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            records = []
+            ok = True
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rec = _json.loads(line)
+                except ValueError:
+                    ok = False
+                    break
+                if not isinstance(rec, dict):
+                    ok = False
+                    break
+                records.append(rec)
+            if not ok:
+                malformed = str(path)
+                break
+            for rec in records:
+                verdict = rec.get("verdict")
+                if verdict == "applied":
+                    counts["matched_applied"] += 1
+                elif verdict == "violated":
+                    counts["matched_violated"] += 1
+                elif verdict == "unmatched":
+                    counts["unmatched_operations"] += 1
+                if verdict in ("applied", "violated") and rec.get("memory_id"):
+                    associations.append({
+                        "session_id": rec.get("session_id"),
+                        "event_id": rec.get("event_id"),
+                        "memory_id": rec.get("memory_id"),
+                        "overlap": int(rec.get("overlap") or 0),
+                        "evidence_id": rec.get("evidence_id"),
+                    })
+    associations.sort(key=lambda a: (a.get("session_id") or "",
+                                     a.get("event_id") or "",
+                                     a.get("memory_id") or ""))
+    return counts, associations, malformed
+
+
+def feedback_surface(conn, data_dir):
+    """(ordered seven-key dict, associations, malformed sidecar path)."""
+    values = feedback_sql_totals(conn)
+    counts, associations, malformed = feedback_sidecar_counts(data_dir)
+    values.update(counts)
+    return values, associations, malformed

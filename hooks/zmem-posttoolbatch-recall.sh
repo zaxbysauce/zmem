@@ -114,6 +114,74 @@ fi
 
 OUT="$(printf '%s' "$INPUT" | "$PYTHON_BIN" "$RECALL_BODY" "$STORE_PY_PY" "$NS" "$BUDGET" "posttoolbatch" 2>/dev/null || echo '{}')"
 
+# Issue #124: report the successful batch to the observational feedback loop
+# after the selector decision and before the next delivery moment. The
+# selector invocation above remains the sole delivery decision and keeps its
+# required --namespace. Event/evidence ids are derived deterministically
+# from the payload bytes (evidence_id/tool_use_id wins when present); the
+# call is fail-open and inherits ZMEM_STORE/ZMEM_DATA.
+printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
+import hashlib, json, os, subprocess, sys
+store = sys.argv[1]
+raw = sys.stdin.read()
+try:
+    payload = json.loads(raw)
+except Exception:
+    raise SystemExit(0)
+if not isinstance(payload, dict):
+    raise SystemExit(0)
+session = payload.get("session_id")
+if not isinstance(session, str) or not session:
+    raise SystemExit(0)
+tokens = []
+for use in payload.get("tool_uses") or []:
+    if not isinstance(use, dict):
+        continue
+    inp = use.get("input")
+    if not isinstance(inp, dict):
+        continue
+    # Same restricted field set as the delivery side
+    # (zmem-recall-body.py extract_posttoolbatch_events) so the matcher
+    # compares like vocabularies (swarm-pr-review PRR-016).
+    text = " ".join(str(inp.get(k) or "")
+                    for k in ("command", "file_path", "notebook_path",
+                              "path")).lower()
+    tokens.extend(w for w in text.split() if w)
+try:
+    sys.path.insert(0, os.path.dirname(store))
+    from redaction import redact_secret_like_text
+except Exception:
+    # Degraded filter when redaction.py is unavailable (kept for wrapper
+    # store layouts); the real plugin layout always ships it.
+    import re as _re
+    _SECRET = _re.compile(r"(ghp_|gho_|github_pat_|sk-[A-Za-z0-9]|AKIA|glpat_|xox[bap]-|AIza)", _re.I)
+    def redact_secret_like_text(text):
+        return text, 0 if _SECRET.search(text) is None else 1
+tokens = [w for w in tokens
+          if not w.startswith("-")
+          and redact_secret_like_text(w)[1] == 0]
+if not tokens:
+    raise SystemExit(0)
+seen = []
+for tok in tokens:
+    if tok not in seen:
+        seen.append(tok)
+event = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
+args = [sys.executable, store, "operation-feedback",
+        "--session-id", session, "--event-id", event,
+        "--outcome", "success"]
+# Same evidence-id rule as the capture-failure hook: forward the evidence_id
+# supplied by the payload when present, omit the flag otherwise (final-critic
+# round 1).
+ev = payload.get("evidence_id")
+if isinstance(ev, str) and ev:
+    args.extend(["--evidence-id", ev])
+for tok in seen[:8]:
+    args.extend(["--operation-token", tok])
+subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+raise SystemExit(0)
+' "$STORE_PY_PY" 2>/dev/null || true
+
 # Neutralize sentinel/fence tokens a memory's own content might contain
 # (same defense as zmem-pretool-recall.sh — the launcher locates the payload
 # by scanning for the literal markers).

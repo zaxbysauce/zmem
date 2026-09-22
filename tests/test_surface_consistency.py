@@ -704,19 +704,22 @@ class AgentWriteSurfaceParityTest(unittest.TestCase):
 
 
 class ComputeScorePopularityBlendTest(unittest.TestCase):
-    """compute_score popularity input (issue #114: explicit reads only).
+    """compute_score popularity input (issues #114 + #124: usefulness only).
 
     Pre-#114 the popularity term read retrieval_count + surfaced_count, so
-    every passive hook pull inflated the score of rows the model never saw
-    (surfaced_count=371/retrieval_count=0 in the live store). The term now
-    reads retrieval_count ONLY; surfaced_count is still recorded (#21,
-    promote/prune/consolidate consume it) but stays out of ranking until
-    #124 lands applied/violated counters."""
+    every passive hook pull inflated the score of rows the model never saw.
+    #114 made it retrieval_count-only as an interim pin "until #124 lands
+    applied/violated counters"; #124 is that landing: the term now reads the
+    usefulness counters ONLY (applied_count/violated_count) and neither
+    retrieval_count nor surfaced_count moves ranking."""
 
-    def _row(self, retrieval: int, surfaced: int) -> dict:
+    def _row(self, retrieval: int, surfaced: int, applied: int = 0,
+             violated: int = 0) -> dict:
         return {
             "retrieval_count": retrieval,
             "surfaced_count": surfaced,
+            "applied_count": applied,
+            "violated_count": violated,
             "confidence": 0.5,
             "ingestion_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -734,14 +737,31 @@ class ComputeScorePopularityBlendTest(unittest.TestCase):
         self.assertEqual(more_surfaced, inert,
                          "surfaced_count magnitude must not move the score")
 
-    def test_retrieval_only_outranks_inert(self):
+    def test_retrieval_only_does_not_outrank_inert(self):
+        # Issue #124 flip of the interim #114 pin: retrieval exposure is not
+        # endorsement. A retrieval-only row no longer outranks an inert one;
+        # usefulness feedback is the only popularity input.
         now = time.time()
         retrieved = store.compute_score(self._row(5, 0), None, now, vec_sim=0.5)
         inert = store.compute_score(self._row(0, 999), None, now, vec_sim=0.5)
-        self.assertGreater(retrieved, inert,
-                           "explicit retrieval is the honest popularity "
-                           "signal and still outranks even heavy passive "
-                           "surfacing (issue #114)")
+        self.assertEqual(retrieved, inert,
+                         "retrieval_count must not move the score now that "
+                         "usefulness feedback drives popularity (issue #124)")
+
+    def test_applied_only_outranks_inert_and_violated_lags(self):
+        # The #124 replacement signal: matched usefulness feedback.
+        now = time.time()
+        applied = store.compute_score(self._row(0, 0, applied=4), None, now,
+                                      vec_sim=0.5)
+        inert = store.compute_score(self._row(0, 0), None, now, vec_sim=0.5)
+        violated = store.compute_score(self._row(0, 0, violated=4), None, now,
+                                       vec_sim=0.5)
+        self.assertGreater(applied, inert,
+                           "matched applied feedback must outrank an inert "
+                           "row (issue #124)")
+        self.assertEqual(violated, inert,
+                         "violated feedback is clamped at the floor and must "
+                         "not outrank an inert row either")
 
 
 class UnrecalledPruneExtensionTest(unittest.TestCase):

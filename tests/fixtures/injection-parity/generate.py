@@ -47,6 +47,7 @@ def _expected_row(memory_id: str, content: str) -> dict:
         "_rel_lex": 1.0,
         "_score": 0.88,
         "_stale_note": "",
+        "applied_count": 0,
         "confidence": 0.9,
         "content": content,
         "entities": [],
@@ -61,6 +62,7 @@ def _expected_row(memory_id: str, content: str) -> dict:
         "tags": "",
         "type": "fact",
         "update_of": "",
+        "violated_count": 0,
         "valid_from": FIXTURE_TS,
         "valid_until": "",
     }

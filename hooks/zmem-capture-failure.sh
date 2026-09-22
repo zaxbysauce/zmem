@@ -285,6 +285,64 @@ case "$SOURCE_EXISTS" in
   *) emit_empty ;;
 esac
 
+# Issue #124: report the failed operation to the observational feedback loop
+# before rendering the nudge. The event id is derived deterministically from
+# the payload bytes, so a replayed event can never double-count. The payload's
+# evidence_id is forwarded when present; the association gate is the store's
+# business. The helper is stdlib-only and the call is fail-open: a store
+# problem never blocks the nudge (ZMEM_STORE/ZMEM_DATA are inherited from the
+# launcher).
+printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
+import hashlib, json, os, subprocess, sys
+store, session = sys.argv[1], sys.argv[2]
+raw = sys.stdin.read()
+try:
+    payload = json.loads(raw)
+except Exception:
+    raise SystemExit(0)
+if not isinstance(payload, dict):
+    raise SystemExit(0)
+tool_input = payload.get("tool_input")
+if not isinstance(tool_input, dict):
+    tool_input = {}
+text = " ".join(str(tool_input.get(k) or "")
+                for k in ("command", "file_path", "notebook_path", "path"))
+tokens = [w for w in text.lower().split() if w]
+try:
+    sys.path.insert(0, os.path.dirname(store))
+    from redaction import redact_secret_like_text
+except Exception:
+    # Degraded filter when redaction.py is unavailable (kept for wrapper
+    # store layouts); the real plugin layout always ships it.
+    import re as _re
+    _SECRET = _re.compile(r"(ghp_|gho_|github_pat_|sk-[A-Za-z0-9]|AKIA|glpat_|xox[bap]-|AIza)", _re.I)
+    def redact_secret_like_text(text):
+        return text, 0 if _SECRET.search(text) is None else 1
+tokens = [w for w in tokens
+          if not w.startswith("-")
+          and redact_secret_like_text(w)[1] == 0][:6]
+if not tokens:
+    tool = str(payload.get("tool_name") or "").lower()
+    tokens = [tool] if tool and not tool.startswith("-") else []
+if not tokens:
+    raise SystemExit(0)
+event = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
+args = [sys.executable, store, "operation-feedback",
+        "--session-id", session, "--event-id", event,
+        "--outcome", "failure"]
+# Issue #124 + final-critic round 1: pass --evidence-id ONLY when the host
+# payload supplies one (until #171 ships, payloads carry none and the store
+# association gate is vacuous -- a synthetic id here could never be
+# associated and would dead-end every counter).
+ev = payload.get("evidence_id")
+if isinstance(ev, str) and ev:
+    args.extend(["--evidence-id", ev])
+for tok in tokens:
+    args.extend(["--operation-token", tok])
+subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+raise SystemExit(0)
+' "$STORE_PY_PY" "$SESSION_ID" 2>/dev/null || true
+
 CTX_JSON="$("$PYTHON_BIN" -c '
 import json, shlex, sys
 obj = json.loads(sys.argv[1])

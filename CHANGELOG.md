@@ -10,6 +10,22 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.58.0] - 2026-09-21
+
+### Added
+- **Observational operation feedback (issue #124)**: the feedback loop is
+  closed — `store.py operation-feedback` applies one host operation event's
+  outcome to the delivered memories it observationally matches (issue #156
+  matcher, 1,800 s window, >= 2 token overlap, evidence association), so a
+  matched failure increments `violated_count`, a matched success increments
+  `applied_count`, and one session event can never count the same memory
+  twice (per-session `.feedback.jsonl` sidecar). The capture-failure and
+  posttoolbatch hooks report outcomes fail-open with deterministic event ids.
+  Ranking popularity is now usefulness feedback
+  (`0.15*sqrt(applied) - 0.25*sqrt(violated)`, clamped to [0, 1]; read
+  telemetry no longer feeds ranking), and `stats`, doctor, and the miss-rate
+  report expose the seven feedback totals plus `feedback_associations`.
+
 ## [0.57.0] - 2026-09-21
 
 ### Added

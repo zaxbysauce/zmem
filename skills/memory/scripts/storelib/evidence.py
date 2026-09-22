@@ -271,3 +271,16 @@ def sweep_evidence(
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         print("evidence retention failed", file=sys.stderr)
         return zero
+
+
+def evidence_ids_for_memory(conn, memory_id: str) -> list:
+    """Issue #124: association read for the operation-feedback loop — the
+    evidence ids linked to one memory via the schema-14 memory_evidence
+    table. Read-only; the association WRITE API and the MCP surfaces remain
+    issue #171's scope. Sorted for deterministic membership checks."""
+    rows = conn.execute(
+        "SELECT evidence_id FROM memory_evidence WHERE memory_id = ? "
+        "ORDER BY evidence_id",
+        (memory_id,),
+    ).fetchall()
+    return [r[0] for r in rows]

@@ -32,3 +32,7 @@ tests/fixtures/prefetch/** text eol=lf
 # binary-safe by the default binary detection.
 tests/fixtures/replay/*.log text eol=lf
 tests/fixtures/evidence/*.jsonl text eol=lf
+
+# Issue #124 feedback sidecar fixture is a byte-contract input compared with
+# read_bytes(); keep checkout bytes LF-stable under Windows autocrlf.
+tests/fixtures/feedback_*.jsonl text eol=lf
