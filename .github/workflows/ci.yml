@@ -75,6 +75,7 @@ jobs:
       # (export is parquet-only). Install it in BOTH matrix legs so the
       # dataset suite RUNS instead of erroring.
       - name: Install pyarrow
+        shell: bash
         run: python -m pip install --disable-pip-version-check "pyarrow>=15,<26"
       - name: MCP tool suites (skipped=0 gate)
         shell: bash

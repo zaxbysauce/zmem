@@ -198,9 +198,6 @@ _FAMILY_FILES = {
     "episode_members": "episode_members-000",
     "links": "links-000",
 }
-_MEMORY_LINK_DB_MAP = {"src": "src_id", "dst": "dst_id"}
-
-
 def _import_pyarrow():
     try:
         import pyarrow  # noqa: F401
@@ -375,8 +372,7 @@ def export_dataset(conn: sqlite3.Connection, *, out_dir: str,
     }
     source_snapshot_hash = _compute_snapshot_hash(
         families, memories_have_snapshot_id=False)
-    namespaces = sorted({row["namespace"] for row in memory_rows}
-                        | {row["namespace"] for row in episode_rows})
+    namespaces = sorted({row["namespace"] for row in memory_rows})
     for row in memory_rows:
         row["export_snapshot_id"] = source_snapshot_hash
         row["generator_revision"] = GENERATOR_REVISION
@@ -404,6 +400,12 @@ def export_dataset(conn: sqlite3.Connection, *, out_dir: str,
     }
 
     out = Path(out_dir)
+    if out.exists():
+        marker = out / "manifest.json"
+        if not marker.is_file():
+            raise DatasetError(
+                f"refusing to overwrite {out_dir}: it exists and is not a "
+                "dataset directory (no manifest.json)")
     staging = Path(str(out) + f".staging-{os.getpid()}")
     if staging.exists():
         shutil.rmtree(staging)
@@ -477,9 +479,11 @@ def cmd_export_dataset(conn: sqlite3.Connection, *, out_dir: str,
 
 class SecretScanner:
     """Real egress scanner: TruffleHog filesystem scan over a private
-    staging dir. Exit 0 = clean, exit 183 = findings, anything else =
-    ``ScannerFailed``; a missing binary is ``ScannerUnavailable`` (the only
-    ``--allow-unscanned`` bypass)."""
+    staging dir. ``--fail`` is MANDATORY in the invocation (F-001): plain
+    ``trufflehog`` exits 0 even when it finds secrets, which would make the
+    scan a silent no-op. With ``--fail``: exit 0 = clean, exit 183 =
+    findings, anything else = ``ScannerFailed``; a missing binary is
+    ``ScannerUnavailable`` (the only ``--allow-unscanned`` bypass)."""
 
     def scan(self, serialized_rows: list[bytes]) -> list[dict]:
         binary = shutil.which("trufflehog")
@@ -494,9 +498,13 @@ class SecretScanner:
                 p = Path(staging) / f"payload-{i:06d}.bin"
                 p.write_bytes(blob)
                 paths.append(p)
-            proc = subprocess.run(
-                [binary, "filesystem", "--json", staging],
-                capture_output=True, text=True, timeout=600, check=False)
+            try:
+                proc = subprocess.run(
+                    [binary, "filesystem", "--json", "--fail", staging],
+                    capture_output=True, text=True, timeout=600, check=False)
+            except subprocess.TimeoutExpired as exc:
+                raise ScannerFailed(
+                    f"trufflehog timed out after {exc.timeout}s") from exc
             if proc.returncode == 0:
                 return []
             if proc.returncode != 183:
@@ -566,13 +574,39 @@ class HubDatasetClient:
         # do NOT prepend the "datasets/" family here.
         return target[len("hf://datasets/"):]
 
+    @staticmethod
+    def _is_missing_repo_error(exc: Exception) -> bool:
+        """True only for 'repository does not exist' shapes; anything else
+        (network, auth, quota) must fail closed rather than degrade (F-004:
+        a skipped CAS/consent gate is worse than a refused publish)."""
+        name = type(exc).__name__
+        if "NotFound" in name or "Missing" in name:
+            return True
+        text = str(exc).lower()
+        return "not found" in text or "does not exist" in text \
+            or "404" in text
+
     def head(self, target: str) -> str:
         try:
             info = self._api.repo_info(self._repo_id(target),
                                        repo_type="dataset", revision="main")
             return info.sha or ""
-        except Exception:
-            return ""  # missing repository → empty parent (first commit)
+        except Exception as exc:
+            if self._is_missing_repo_error(exc):
+                return ""  # missing repository → empty parent (first commit)
+            raise PublishError(
+                f"could not read Hub head for {target}: {exc}") from exc
+
+    def is_private(self, target: str) -> bool:
+        """Visibility of an EXISTING repo. Raises for missing repos is fine
+        (callers treat any exception as unknown → refuse)."""
+        try:
+            info = self._api.repo_info(self._repo_id(target),
+                                       repo_type="dataset")
+        except Exception as exc:
+            raise PublishError(
+                f"could not read Hub visibility for {target}: {exc}") from exc
+        return bool(getattr(info, "private", False))
 
     def manifest(self, target: str) -> dict:
         try:
@@ -581,8 +615,11 @@ class HubDatasetClient:
                 self._repo_id(target), "manifest.json", repo_type="dataset")
             with open(path, "rb") as fh:
                 return json.loads(fh.read().decode("utf-8"))
-        except Exception:
-            return {}
+        except Exception as exc:
+            if self._is_missing_repo_error(exc) or "manifest" in str(exc).lower():
+                return {}  # repo (or manifest in it) genuinely absent
+            raise PublishError(
+                f"could not read Hub manifest for {target}: {exc}") from exc
 
     def create_private(self, target: str) -> None:
         try:
@@ -618,7 +655,14 @@ def _parse_target(target: str) -> str:
     return target
 
 
+def _validate_manifest_shape(manifest: dict, err: type) -> None:
+    if not isinstance(manifest.get("row_counts"), dict) or             not isinstance(manifest.get("namespaces"), list) or             not manifest.get("source_snapshot_hash"):
+        raise err("malformed dataset manifest (missing row_counts / "
+                  "namespaces / source_snapshot_hash)")
+
+
 def _read_export_records(export_dir: Path, manifest: dict) -> dict[str, list]:
+    _validate_manifest_shape(manifest, PublishError)
     fmt = manifest.get("format", DATASET_FORMAT_PARQUET)
     if fmt not in (DATASET_FORMAT_PARQUET, DATASET_FORMAT_JSONL):
         raise PublishError(f"unsupported dataset format: {fmt}")
@@ -686,7 +730,7 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
     unholdable: list[int] = []
     for finding in findings:
         idx = finding.get("row_index")
-        if idx is None or idx >= len(payload_rows):
+        if idx is None or idx < 0 or idx >= len(payload_rows):
             unholdable.append(-1 if idx is None else idx)
             continue
         kind, row_id = payload_rows[idx]
@@ -773,6 +817,11 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
             for family in DATASET_FAMILIES:
                 upload_manifest["row_counts"][family] = \
                     len(uploaded_families[family])
+            # F-005: the published manifest must advertise exactly the
+            # namespaces that survive in the uploaded memory rows — a
+            # fully-held-back namespace disappears from the listing.
+            upload_manifest["namespaces"] = sorted(
+                {row["namespace"] for row in uploaded})
         upload_manifest["source_snapshot_hash"] = published_snapshot
         upload_manifest["export_snapshot_id"] = published_snapshot
         if used_unscanned_override:
@@ -801,12 +850,15 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
         for path in sorted(data_dir.iterdir()):
             tree[f"data/{path.name}"] = path.read_bytes()
         if held:
+            # F-006: held_back.json stays LOCAL-ONLY. Its row_checksums are
+            # unsalted fingerprints of held row content — uploading it next
+            # to the manifest (which discloses the namespace) would hand a
+            # content-confirmation oracle to anyone who can read the repo.
             held_payload = {"held_back": held,
                             "uploaded_rows": len(uploaded)}
             held_bytes = canonical_row_bytes(held_payload)
             with open(export_path / "held_back.json", "wb") as fh:
                 fh.write(held_bytes)
-            tree["held_back.json"] = held_bytes
         if used_unscanned_override:
             # Also record the override on the LOCAL export manifest so the
             # operator's copy carries the audit trail.
@@ -818,7 +870,18 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
             with open(export_path / "manifest.json", "wb") as fh:
                 fh.write(canonical_row_bytes(local_manifest))
 
+        # F-003: private-by-default must hold for PRE-EXISTING repos too —
+        # huggingface_hub's create_repo(private=True, exist_ok=True) ignores
+        # `private` when the repo already exists, so an accidentally-public
+        # target would silently receive memory content. Refuse unless the
+        # operator explicitly re-confirms with --yes.
         client.create_private(target)
+        target_private = client.is_private(target)
+        if not target_private and not yes:
+            raise PublishError(
+                f"target {target} exists and is PUBLIC; refusing to publish "
+                "memory content to it (create a private repo or pass --yes "
+                "to confirm a public publish)")
         parent = client.head(target)
         # The injected client signals a moved head with an exception NAMED
         # ParentConflict (the issue's seam contract declares that name on
@@ -838,8 +901,9 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
                     "publish failed: head moved twice during commit "
                     "(CAS exhausted)") from exc2
         return {"target": target, "revision": revision,
+                "dataset_revision": published_snapshot,
                 "uploaded_rows": len(uploaded), "held_back": len(held),
-                "private": True}
+                "private": bool(target_private)}
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -856,7 +920,8 @@ def cmd_publish_dataset(out_dir: str, target: str, *, yes: bool = False,
         print(f"[zmem] publish-dataset: {exc}", file=sys.stderr)
         return 1
     line = (f"[zmem] published {result['uploaded_rows']} row(s) to "
-            f"{result['target']} revision {result['revision'] or '(new)'}")
+            f"{result['target']} commit {result['revision'] or '(new)'} "
+            f"dataset revision {result['dataset_revision'][:12]}...")
     if result["held_back"]:
         line += f" ({result['held_back']} row(s) held back; held_back.json)"
     print(line)
@@ -901,8 +966,20 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
         source_path = Path(source)
 
     manifest = load_manifest(source_path)
-    if (revision or "") != manifest.get("source_snapshot_hash"):
+    if manifest.get("schema_version") != DATASET_SCHEMA_VERSION:
+        raise DatasetError(
+            "unsupported dataset schema_version "
+            f"{manifest.get('schema_version')!r} "
+            f"(expected {DATASET_SCHEMA_VERSION})")
+    # F-002: for LOCAL sources the revision IS the manifest's
+    # source_snapshot_hash and equality is the pin. For HUB sources the
+    # revision is the repo's 40-char commit SHA — already exact-pinned by
+    # reading only that revision from the local cache above — so comparing
+    # it against the 64-char hash can never pass; content integrity is
+    # enforced by the per-record checksums + snapshot re-derivation below.
+    if not source.startswith("hf://datasets/") and             (revision or "") != manifest.get("source_snapshot_hash"):
         raise DatasetError("revision mismatch")
+    _validate_manifest_shape(manifest, DatasetError)
     fmt = manifest.get("format", DATASET_FORMAT_PARQUET)
     if fmt not in (DATASET_FORMAT_PARQUET, DATASET_FORMAT_JSONL):
         raise DatasetError(f"unsupported dataset format: {fmt}")
@@ -937,6 +1014,10 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
             continue
         if taint is not None and row.get("taint") != taint:
             continue
+        valid_from = row.get("valid_from") or ""
+        if valid_from and valid_from > now:
+            continue  # not yet in force (NEW-01: mirror the canonical
+        # _as_of_temporal_predicate semantics, valid_from <= now)
         valid_until = row.get("valid_until") or ""
         if valid_until and not include_tombstones and valid_until <= now:
             continue
@@ -945,7 +1026,7 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
     kept_ids = {row["id"] for row in kept}
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    tmp_path = dest / "snapshot.sqlite.tmp"
+    tmp_path = dest / f"snapshot.sqlite.tmp-{os.getpid()}"
     final_path = dest / "snapshot.sqlite"
     if tmp_path.exists():
         tmp_path.unlink()
@@ -958,43 +1039,48 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
         # store.
         init_db(conn)
         migrate(conn)
-        for row in kept:
-            conn.execute(
-                "INSERT INTO memory (" + ", ".join(_MEMORY_STORE_COLUMNS)
-                + ") VALUES (" + ", ".join("?" * len(_MEMORY_STORE_COLUMNS))
-                + ")",
-                tuple(row.get(col) for col in _MEMORY_STORE_COLUMNS))
-        episodes = [e for e in families["episodes"]
-                    if namespace is None or e["namespace"] == namespace]
-        kept_ids = {row["id"] for row in kept}
-        # Endpoint validation after filtering: a summary reference to a
-        # memory the filters excluded becomes the no-summary value rather
-        # than a dangling pointer in the snapshot.
-        for e in episodes:
-            if e["summary_memory_id"] and \
-                    e["summary_memory_id"] not in kept_ids:
-                e["summary_memory_id"] = ""
-        for e in episodes:
-            conn.execute(
-                "INSERT INTO episode (id, namespace, started_at, ended_at, "
-                "summary_memory_id, token_count) VALUES (?, ?, ?, ?, ?, ?)",
-                (e["id"], e["namespace"], e["started_at"], e["ended_at"],
-                 e["summary_memory_id"], e["token_count"]))
-        for m in families["episode_members"]:
-            if m["episode_id"] in {e["id"] for e in episodes} and \
-                    m["memory_id"] in kept_ids:
+        try:
+            for row in kept:
                 conn.execute(
-                    "INSERT OR IGNORE INTO episode_memory (episode_id, "
-                    "memory_id, added_at) VALUES (?, ?, ?)",
-                    (m["episode_id"], m["memory_id"], m["added_at"]))
-        for l in families["links"]:
-            if l["src"] in kept_ids and l["dst"] in kept_ids:
+                    "INSERT INTO memory (" + ", ".join(_MEMORY_STORE_COLUMNS)
+                    + ") VALUES ("
+                    + ", ".join("?" * len(_MEMORY_STORE_COLUMNS)) + ")",
+                    tuple(row.get(col) for col in _MEMORY_STORE_COLUMNS))
+            kept_ids = {row["id"] for row in kept}
+            episodes = [e for e in families["episodes"]
+                        if namespace is None or e["namespace"] == namespace]
+            # Endpoint validation after filtering: a summary reference to a
+            # memory the filters excluded becomes the no-summary value rather
+            # than a dangling pointer in the snapshot.
+            for e in episodes:
+                if e["summary_memory_id"] and \
+                        e["summary_memory_id"] not in kept_ids:
+                    e["summary_memory_id"] = ""
+            for e in episodes:
                 conn.execute(
-                    "INSERT OR IGNORE INTO memory_link (src_id, dst_id, "
-                    "relation, score, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (l["src"], l["dst"], l["relation"], l["score"],
-                     l["created_at"]))
-        conn.commit()
+                    "INSERT INTO episode (id, namespace, started_at, ended_at, "
+                    "summary_memory_id, token_count) VALUES (?, ?, ?, ?, ?, ?)",
+                    (e["id"], e["namespace"], e["started_at"], e["ended_at"],
+                     e["summary_memory_id"], e["token_count"]))
+            for m in families["episode_members"]:
+                if m["episode_id"] in {e["id"] for e in episodes} and \
+                        m["memory_id"] in kept_ids:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO episode_memory (episode_id, "
+                        "memory_id, added_at) VALUES (?, ?, ?)",
+                        (m["episode_id"], m["memory_id"], m["added_at"]))
+            for l in families["links"]:
+                if l["src"] in kept_ids and l["dst"] in kept_ids:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO memory_link (src_id, dst_id, "
+                        "relation, score, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (l["src"], l["dst"], l["relation"], l["score"],
+                         l["created_at"]))
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise DatasetError(
+                f"crafted dataset rejected (duplicate/inconsistent ids): "
+                f"{exc}") from exc
     finally:
         conn.close()
     os.replace(tmp_path, final_path)

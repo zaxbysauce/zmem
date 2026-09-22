@@ -27,12 +27,13 @@ class ParentConflict(RuntimeError):
 
 class FakeDatasetClient:
     def __init__(self, parents=(), existing_manifest=None,
-                 revision="new") -> None:
+                 revision="new", existing_private=True) -> None:
         parents = list(parents)
         self._conflicts_remaining = parents.count("conflict")
         self._head_values = ["old"] + ["conflict"] * (1 if parents else 0)
         self.revision = revision
         self.existing_manifest = existing_manifest
+        self.existing_private = existing_private
         self.head_reads = 0
         self.commit_attempts = 0
         self.commits = 0
@@ -50,6 +51,9 @@ class FakeDatasetClient:
         if self.existing_manifest:
             return dict(self.existing_manifest)
         return {}
+
+    def is_private(self, target: str) -> bool:
+        return bool(self.existing_private)
 
     def create_private(self, target: str) -> None:
         self.private_creates += 1

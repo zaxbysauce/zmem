@@ -96,10 +96,22 @@ with TruffleHog before upload:
   bypassable;
 - TruffleHog missing → the publish refuses; `--allow-unscanned` is the only
   bypass and is recorded in the dataset manifest;
-- scanner failure (any other exit) → refuse, no override.
+- scanner failure (any other exit) → refuse, no override. The invocation
+  passes `--fail` so a finding-bearing scan can never masquerade as clean;
+- `held_back.json` is written **next to the local export only** — it is an
+  audit record of secret content (row ids + content-derived checksums) and
+  is deliberately never uploaded.
 
-Republishing over namespaces the target already carries demands `--yes`.
-Commits are CAS-guarded: one parent-conflict retry, then fail closed.
+Republishing over namespaces the target already carries demands `--yes`,
+as does publishing to a target repo that already exists **public**
+(`create_repo` cannot change the visibility of an existing repo, so zmem
+refuses a public target instead of silently writing into it — the publish
+result reports the actual visibility either way). Commits are CAS-guarded:
+one parent-conflict retry, then fail closed. When rows are held back, the
+uploaded artifact is **re-hashed over the surviving rows** and the published
+manifest carries that new `source_snapshot_hash`/`export_snapshot_id` —
+importers must use the revision reported by the publish (printed as
+`dataset revision`), not the pre-publish export hash.
 
 ### Path 4 — Revision-pinned import (`import-dataset`)
 
@@ -115,8 +127,11 @@ import builds an **isolated snapshot** — `<dest>/snapshot.sqlite`, written
 atomically and never the caller's store — applying filters before recall:
 `--namespace` (an absent namespace refuses; no empty substitute),
 `--min-confidence`, `--min-trust`, `--taint`, `--include-tombstones`, and
-temporal validity. Point recall at the snapshot by running later commands
-with `ZMEM_STORE=<dest>/snapshot.sqlite`.
+temporal validity (rows not yet in force — `valid_from` in the future — and
+expired rows are dropped). Episodes whose summary row is excluded by a
+filter import with an empty `summary_memory_id` rather than a dangling
+reference. Point recall at the snapshot by running later commands with
+`ZMEM_STORE=<dest>/snapshot.sqlite`.
 
 ## Tier 1 — Memory pack (read-only snapshot, committed to the repo)
 

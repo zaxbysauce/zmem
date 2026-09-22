@@ -29,6 +29,7 @@ import shutil  # noqa: E402
 import sqlite3  # noqa: E402
 import subprocess  # noqa: E402
 import unittest  # noqa: E402
+from pathlib import Path  # noqa: E402
 from unittest import mock  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -252,8 +253,8 @@ class DatasetExportTest(_StoreCase):
                 clean, TARGET, yes=True,
                 client=fake_dataset_client.FakeDatasetClient(["old"]))
         self.assertEqual(set(result),
-                         {"target", "revision", "uploaded_rows",
-                          "held_back", "private"})
+                         {"target", "revision", "dataset_revision",
+                          "uploaded_rows", "held_back", "private"})
         self.assertEqual(result["held_back"], 0)
 
         found = os.path.join(self.tmp, "secret-found")
@@ -271,6 +272,69 @@ class DatasetExportTest(_StoreCase):
         self.assertEqual(result["uploaded_rows"], 0)
         with open(os.path.join(found, "held_back.json"), "rb") as fh:
             self.assertEqual(fh.read(), EXPECTED_HELD_BACK)
+
+    def test_real_scanner_passes_fail_flag(self):
+        """F-001 regression: the real trufflehog invocation MUST carry
+        --fail — plain trufflehog exits 0 even with findings, which would
+        make the egress scan a silent no-op. Assert the invocation contract
+        against the source: --fail sits between --json and the staging dir."""
+        source = open(os.path.join(REPO_ROOT, "skills", "memory", "scripts",
+                                   "storelib", "dataset.py"),
+                      encoding="utf-8").read()
+        self.assertIn('"--json", "--fail"', source,
+                      "trufflehog invocation must pass --fail (F-001)")
+
+    def test_real_scanner_exit183_yields_findings(self):
+        """F-001 companion: with --fail, trufflehog exits 183 on findings;
+        a stub exercising the real scan() (not the fake seam) must surface
+        those findings rather than reporting a clean scan."""
+        bindir = os.path.join(self.tmp, "bin")
+        os.mkdir(bindir)
+        stub = os.path.join(bindir, "trufflehog")
+        if os.name == "nt":
+            stub += ".bat"
+        lines = [
+            "@echo off",
+            'echo {"Source":{"Data":"payload-000000.bin"},'
+            '"DetectorName":"GitHub"}',
+            "exit 183",
+        ]
+        with open(stub, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines) + "\n")
+        env = {**os.environ, "PATH": bindir + os.pathsep + os.environ["PATH"]}
+        original = os.environ["PATH"]
+        os.environ["PATH"] = env["PATH"]
+        try:
+            findings = ds.SecretScanner().scan([b"token ghp_probe"])
+        finally:
+            os.environ["PATH"] = original
+        self.assertEqual([f["row_index"] for f in findings], [0])
+
+    def test_public_target_refused_without_yes(self):
+        """F-003 regression: create_repo(private=True, exist_ok=True)
+        ignores `private` on an EXISTING repo — publish must refuse a
+        public target unless --yes, and report visibility honestly."""
+        self.seed_row(_rid(206), "project:vis", "visibility row")
+        out = self.export("vis-exp", "--namespace", "project:vis")
+        refusing = fake_dataset_client.FakeDatasetClient(
+            ["old"], existing_private=False)
+        with _CleanScanner():
+            with self.assertRaises(storelib.PublishError):
+                storelib.publish_dataset(out, TARGET, yes=False,
+                                         client=refusing)
+        self.assertEqual(refusing.commits, 0)
+        public_ok = fake_dataset_client.FakeDatasetClient(
+            ["old"], existing_private=False)
+        with _CleanScanner():
+            result = storelib.publish_dataset(out, TARGET, yes=True,
+                                              client=public_ok)
+        self.assertFalse(result["private"],
+                         "a confirmed public publish must report private=False")
+        private_ok = fake_dataset_client.FakeDatasetClient(["old"])
+        with _CleanScanner():
+            result = storelib.publish_dataset(out, TARGET, yes=True,
+                                              client=private_ok)
+        self.assertTrue(result["private"])
 
     def test_missing_scanner_refuses_without_allow_unscanned(self):
         self.seed_row(_rid(201), "project:scan", "plain row")
@@ -466,6 +530,122 @@ class DatasetExportTest(_StoreCase):
         self.assertEqual(summaries, [""],
                          "episode summaries anchored on held rows must "
                          "arrive as the no-summary value, not dangle")
+        # F-006: held_back.json stays LOCAL-ONLY (unsalted content
+        # fingerprints must not ship beside the manifest that discloses
+        # the namespace).
+        _, _, uploaded_tree = client.committed_trees[0]
+        self.assertNotIn("held_back.json", uploaded_tree)
+
+    def test_hub_import_accepts_commit_sha_revision(self):
+        """F-002 regression: an hf:// source's revision is the repo's
+        40-char commit SHA, pinned by reading only that revision from the
+        local cache — it must NOT be compared against the manifest's
+        64-char source_snapshot_hash. The cache lookup is stubbed to the
+        local export dir, which is exactly what a warm Hub cache gives."""
+        self.seed_row(_rid(220), "project:hub", "hub import row")
+        out = self.export("hub-exp", "--namespace", "project:hub")
+        sha40 = "a" * 40
+        original = ds._hub_cache_dir
+        ds._hub_cache_dir = lambda source, revision: Path(out)
+        try:
+            dest = os.path.join(self.tmp, "hub-snap")
+            result = ds.import_dataset(
+                TARGET, revision=sha40, dest_dir=dest,
+                namespace="project:hub")
+        finally:
+            ds._hub_cache_dir = original
+        self.assertEqual(result["memories"], 1)
+
+    def test_import_excludes_future_valid_from(self):
+        """NEW-01 regression: temporal filtering mirrors the canonical
+        predicate — a row not yet in force (valid_from in the future,
+        valid_until empty) must not import."""
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, "
+                "ingestion_ts, valid_from) VALUES (?, ?, 'fact', ?, ?, ?)",
+                (_rid(221), "project:temporal", "future row", TS,
+                 "2099-01-01T00:00:00Z"))
+            conn.commit()
+        finally:
+            conn.close()
+        out = self.export("temporal-exp", "--namespace", "project:temporal")
+        revision = self.manifest(out)["source_snapshot_hash"]
+        dest = os.path.join(self.tmp, "temporal-snap")
+        r = run_cli(self.env, "import-dataset", out, "--revision", revision,
+                    "--dest", dest)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snap = os.path.join(dest, "snapshot.sqlite")
+        conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM memory").fetchone()[0], 0,
+                "a future-valid_from row must not import")
+        finally:
+            conn.close()
+
+    def test_import_committed_jsonl_fixtures(self):
+        """NEW-03 + C-014 regression: the committed manifest-v1.json
+        fixture set carries checksums from an INDEPENDENT inline oracle
+        (build_fixtures.py, no storelib import) — the real importer must
+        verify and import it, proving the integrity chain against
+        non-self-derived values."""
+        fixture_dir = os.path.join(REPO_ROOT, "tests", "fixtures", "dataset")
+        work = os.path.join(self.tmp, "fixture-dataset")
+        shutil.copytree(fixture_dir, work)
+        shutil.copy2(os.path.join(work, "manifest-v1.json"),
+                     os.path.join(work, "manifest.json"))
+        with open(os.path.join(work, "manifest.json"), "rb") as fh:
+            revision = json.loads(fh.read().decode("utf-8"))[
+                "source_snapshot_hash"]
+        dest = os.path.join(self.tmp, "fixture-snap")
+        r = run_cli(self.env, "import-dataset", work, "--revision", revision,
+                    "--dest", dest)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        snap = os.path.join(dest, "snapshot.sqlite")
+        conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
+        try:
+            names = sorted(row[0] for row in conn.execute(
+                "SELECT DISTINCT namespace FROM memory"))
+        finally:
+            conn.close()
+        self.assertEqual(names, ["project:a", "project:b"],
+                         "the independent-oracle fixture must import intact")
+
+    def test_export_refuses_non_dataset_dir(self):
+        """C-011 regression: export-dataset must never clobber an existing
+        directory that is not a dataset (no manifest.json)."""
+        victim = os.path.join(self.tmp, "victim")
+        os.mkdir(victim)
+        with open(os.path.join(victim, "precious.txt"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("do not delete")
+        r = run_cli(self.env, "export-dataset", victim,
+                    "--namespace", "project:whatever")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("refusing to overwrite", r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(victim, "precious.txt")))
+
+    def test_import_rejects_wrong_schema_version(self):
+        """C-013 regression: a manifest whose schema_version the importer
+        does not support is refused, not silently imported."""
+        self.seed_row(_rid(222), "project:schema", "schema row")
+        out = self.export("schema-exp", "--namespace", "project:schema")
+        revision = self.manifest(out)["source_snapshot_hash"]
+        tampered = os.path.join(self.tmp, "tampered")
+        shutil.copytree(out, tampered)
+        path = os.path.join(tampered, "manifest.json")
+        with open(path, "rb") as fh:
+            manifest = json.loads(fh.read().decode("utf-8"))
+        manifest["schema_version"] = 999
+        with open(path, "wb") as fh:
+            fh.write(ds.canonical_row_bytes(manifest))
+        dest = os.path.join(self.tmp, "schema-snap")
+        r = run_cli(self.env, "import-dataset", tampered,
+                    "--revision", revision, "--dest", dest)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("schema_version", r.stderr)
 
     def test_publish_never_opens_ambient_store(self):
         self.seed_row(_rid(205), "project:ambient", "ambient probe row")

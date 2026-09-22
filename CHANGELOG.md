@@ -19,13 +19,19 @@ README.
   namespace-scoped with explicit `--all-namespaces --yes`); `store.py
   publish-dataset <dir> hf://datasets/owner/repo` publishes to a
   private-by-default Hub repo behind a whole-row TruffleHog egress scan
-  (flagged rows are held back in `held_back.json` and never uploaded;
-  scanner absence refuses unless `--allow-unscanned`, which the manifest
-  records; one CAS parent-conflict retry then fail closed); and
+  flagged rows are held back in a LOCAL-ONLY `held_back.json` and never
+  uploaded, and a held-back publish re-hashes the upload over the
+  surviving rows (importers use the published dataset revision, printed
+  by the command); scanner absence refuses unless `--allow-unscanned`,
+  which the manifest records; the scan passes `--fail` so findings can
+  never masquerade as clean; publishing to an existing PUBLIC repo
+  refuses without `--yes`; one CAS parent-conflict retry then fail
+  closed); and
   `store.py import-dataset SOURCE --revision <sha> --dest <dir>` verifies
   the exact revision and every row checksum, then builds an isolated
   `snapshot.sqlite` (never the caller's store) with namespace, confidence,
-  trust, taint, temporal, and tombstone filters applied before recall.
+  trust, taint, temporal (not-yet-in-force and expired rows), and tombstone
+  filters applied before recall.
   SQLite stays authoritative, embeddings never export, and publication is
   explicit-only - no hook/provider/queue/ledger path can publish.
   `docs/CLOUD.md` documents the four governed paths; CI installs pyarrow
