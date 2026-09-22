@@ -328,6 +328,13 @@ def export_dataset(conn: sqlite3.Connection, *, out_dir: str,
             + ep_where + " ORDER BY namespace, started_at, id", ep_params)
     ]
     episode_ids = {e["id"] for e in episode_rows}
+    # Endpoint integrity for episode summaries: a summary reference that
+    # points outside this view's memory set is blanked to the schema's
+    # no-summary value so no view ships a dangling summary.
+    for e in episode_rows:
+        if e["summary_memory_id"] and e["summary_memory_id"] not in {
+                m["id"] for m in memory_rows}:
+            e["summary_memory_id"] = ""
     member_rows = []
     link_rows = []
     # Endpoint integrity (issue #134: "Endpoint rows are retained in the
@@ -736,6 +743,14 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
         uploaded_families["links"] = [
             l for l in families["links"]
             if l["src"] in kept_ids and l["dst"] in kept_ids]
+        # Episode summaries anchored on a held-back row are blanked to the
+        # no-summary value (the episode and its surviving memberships stay;
+        # the secret-linking reference does not). Re-stamp each touched
+        # episode's row_checksum so the upload remains verifiable.
+        for e in uploaded_families["episodes"]:
+            if e["summary_memory_id"] and e["summary_memory_id"] not in kept_ids:
+                e["summary_memory_id"] = ""
+                e["row_checksum"] = row_checksum(e)
         published_snapshot = _compute_snapshot_hash(
             uploaded_families, memories_have_snapshot_id=False)
         for row in rebuilt:
@@ -951,6 +966,14 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                 tuple(row.get(col) for col in _MEMORY_STORE_COLUMNS))
         episodes = [e for e in families["episodes"]
                     if namespace is None or e["namespace"] == namespace]
+        kept_ids = {row["id"] for row in kept}
+        # Endpoint validation after filtering: a summary reference to a
+        # memory the filters excluded becomes the no-summary value rather
+        # than a dangling pointer in the snapshot.
+        for e in episodes:
+            if e["summary_memory_id"] and \
+                    e["summary_memory_id"] not in kept_ids:
+                e["summary_memory_id"] = ""
         for e in episodes:
             conn.execute(
                 "INSERT INTO episode (id, namespace, started_at, ended_at, "

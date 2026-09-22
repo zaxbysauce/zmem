@@ -404,6 +404,14 @@ class DatasetExportTest(_StoreCase):
                 "INSERT INTO memory_link (src_id, dst_id, relation, score, "
                 "created_at) VALUES (?, ?, 'related', 0.5, ?)",
                 (SECRET_ID, _rid(210), TS))
+            # An episode whose extractive summary IS the held secret row
+            # (final-critic round-3 regression): the upload must not ship
+            # a summary reference to the held-back memory.
+            conn.execute(
+                "INSERT INTO episode (id, namespace, started_at, ended_at,"
+                " summary_memory_id, token_count) VALUES"
+                " ('00000000-0000-4000-8000-000000000501', 'project:test',"
+                " ?, '', ?, 7)", (TS, SECRET_ID))
             conn.commit()
         finally:
             conn.close()
@@ -449,10 +457,15 @@ class DatasetExportTest(_StoreCase):
                    conn.execute("SELECT id FROM memory ORDER BY id")]
             links = conn.execute("SELECT COUNT(*) FROM memory_link"
                                  ).fetchone()[0]
+            summaries = [row[0] for row in conn.execute(
+                "SELECT summary_memory_id FROM episode")]
         finally:
             conn.close()
         self.assertEqual(ids, [_rid(210)], "secret row must be absent")
         self.assertEqual(links, 0, "links behind held rows must not dangle")
+        self.assertEqual(summaries, [""],
+                         "episode summaries anchored on held rows must "
+                         "arrive as the no-summary value, not dangle")
 
     def test_publish_never_opens_ambient_store(self):
         self.seed_row(_rid(205), "project:ambient", "ambient probe row")
