@@ -137,6 +137,24 @@ class TokenConfigParsingTest(unittest.TestCase):
         self.assertEqual(
             cfg.namespaces, frozenset({"project:zmem", "user:global"}))
 
+    def test_scoped_prefixes_from_fixture(self):
+        fixture = REPO_ROOT / "tests" / "fixtures" / "hermes" / "scoped_tokens.json"
+        expected = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "hermes" /
+             "scoped_tokens.expected.json").read_text(encoding="utf-8")
+        )
+        values = json.loads(fixture.read_text(encoding="utf-8"))
+        accepted = []
+        for entry in values["tokens"]:
+            os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(
+                json.dumps(entry)
+            )
+            cfg = self.auth.load_token_config()
+            self.assertTrue(cfg.scoped)
+            self.assertEqual(set(cfg.namespaces), set(entry["namespaces"]))
+            accepted.extend(entry["namespaces"])
+        self.assertEqual(accepted, expected["accepted"])
+
     def test_json_file_without_namespaces_key_is_unscoped(self):
         os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(
             json.dumps({"token": "json-unscoped"}))
@@ -275,6 +293,27 @@ class ScopedTokenToolSurfaceTest(unittest.TestCase):
                                    content="in-scope write",
                                    namespace="project:mine", signal="test"))
         self.assertEqual(result.get("result"), "stored", result)
+
+    def test_fleet_scope_denies_project(self):
+        expected = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "hermes" /
+             "scoped_tokens.expected.json").read_text(encoding="utf-8")
+        )
+        _call = self._build(
+            scoped=True, scoped_namespaces=("fleet:dgx-spark",)
+        )
+        allowed = asyncio_run(_call(
+            "add", type="fact", content="fleet scoped write",
+            namespace="fleet:dgx-spark", signal="test"
+        ))
+        self.assertEqual(allowed.get("result"), "stored", allowed)
+
+        denied = asyncio_run(_call(
+            "add", type="fact", content="project must be denied",
+            namespace="project:x", signal="test"
+        ))
+        self.assertEqual(denied.get("error"), "namespace_not_allowed", denied)
+        self.assertEqual(expected["project_x"], "denied")
 
     def test_scoped_token_cannot_read_foreign_namespace(self):
         _call = self._build(scoped=True)

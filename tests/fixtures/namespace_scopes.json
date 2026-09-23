@@ -1,0 +1,1 @@
+{"accepted":["project:localhost:3000/git/myorg/myrepo","project:c:/users/x/repo","fleet:dgx-spark","host:spark1","agent:ops","domain:example"],"rejected":["fleet","Fleet:x","fleet::x","fleet:a:b","global","users:global"]}

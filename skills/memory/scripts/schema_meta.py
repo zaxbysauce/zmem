@@ -24,6 +24,17 @@ from __future__ import annotations
 import re
 
 
+# Namespace admission grammar (issue #166).  Project and user values retain
+# the legacy later-colon form because resolver output can contain host ports
+# and Windows paths.  The new fleet/host/agent/domain scopes are deliberately
+# strict: one non-empty, whitespace-free, colon-free value after their prefix.
+# Keep this dependency-free module as the sole source for writer, MCP, auth,
+# and doctor validation so their admission rules cannot drift.
+NAMESPACE_RE = re.compile(
+    r"^(?:(?:project|user):[^\s:][^\s]*|(?:fleet|host|agent|domain):[^\s:]+)$"
+)
+
+
 def normalize_content(s: str) -> str:
     """Canonical content form for exact-match dedup (#39 E4).
 

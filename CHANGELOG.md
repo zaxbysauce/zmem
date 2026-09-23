@@ -10,6 +10,17 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.61.0] - 2026-09-23
+
+### Added
+- **Shared scope-namespace grammar (issue #166):** new writes, MCP input,
+  scoped-token parsing, and doctor now use one schema-meta grammar. Project
+  and user values retain compatible later-colon forms; fleet, host, agent, and
+  domain accept a strict single-value scope. `host.resolve_scopes` derives
+  explicit project, host, fleet, and agent entries without hostname guessing.
+  Scoped token admission fails closed when the selected checkout lacks the
+  shared grammar. Existing recall and legacy JSONL ingest behavior are unchanged.
+
 ## [0.60.0] - 2026-09-23
 
 ### Added

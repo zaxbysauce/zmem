@@ -17,6 +17,13 @@ Run: python tests/test_namespace_schema.py
 from __future__ import annotations
 
 import sys
+import importlib.util
+import json
+import os
+import sqlite3
+import subprocess
+import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -31,6 +38,207 @@ class NamespaceSchemaTest(unittest.TestCase):
     def setUp(self):
         self.hermes_src = HERMES_INIT.read_text(encoding="utf-8")
         self.assertTrue(self.hermes_src, f"could not read {HERMES_INIT}")
+
+    def _load_scope_validators(self):
+        """Load the three scope validators without requiring the MCP SDK.
+
+        The namespace grammar is a stdlib-only contract.  ``auth.py`` imports
+        two SDK protocol classes at module load, so install the smallest shape
+        compatible stub only when the optional dependency is absent.  The
+        loaded modules are restored before returning to keep this source-scan
+        test safe in a shared unittest process.
+        """
+        saved = {
+            name: sys.modules.get(name)
+            for name in (
+                "auth",
+                "_zmem_auth_scope_matrix",
+                "_zmem_mcp_scope_matrix",
+                "mcp",
+                "mcp.server",
+                "mcp.server.auth",
+                "mcp.server.auth.provider",
+            )
+        }
+        saved_path = sys.path[:]
+        saved_module_names = set(sys.modules)
+        try:
+            server_dir = str(REPO_ROOT / "hermes-plugin" / "server")
+            if server_dir not in sys.path:
+                sys.path.insert(0, server_dir)
+            try:
+                mcp_available = importlib.util.find_spec("mcp") is not None
+            except (ImportError, ValueError):
+                mcp_available = "mcp.server.auth.provider" in sys.modules
+            if not mcp_available:
+                provider = types.ModuleType("mcp.server.auth.provider")
+
+                class AccessToken:
+                    pass
+
+                class TokenVerifier:
+                    pass
+
+                provider.AccessToken = AccessToken
+                provider.TokenVerifier = TokenVerifier
+                mcp_mod = types.ModuleType("mcp")
+                server_mod = types.ModuleType("mcp.server")
+                auth_pkg = types.ModuleType("mcp.server.auth")
+                auth_pkg.provider = provider
+                server_mod.auth = auth_pkg
+                mcp_mod.server = server_mod
+                sys.modules.update({
+                    "mcp": mcp_mod,
+                    "mcp.server": server_mod,
+                    "mcp.server.auth": auth_pkg,
+                    "mcp.server.auth.provider": provider,
+                })
+
+            auth_spec = importlib.util.spec_from_file_location(
+                "_zmem_auth_scope_matrix", REPO_ROOT / "hermes-plugin" / "server" / "auth.py"
+            )
+            auth_mod = importlib.util.module_from_spec(auth_spec)
+            sys.modules["_zmem_auth_scope_matrix"] = auth_mod
+            assert auth_spec.loader is not None
+            auth_spec.loader.exec_module(auth_mod)
+
+            # mcp_server imports its sibling as the top-level name ``auth``
+            # when run directly, matching production's launch mode.
+            sys.modules["auth"] = auth_mod
+            mcp_spec = importlib.util.spec_from_file_location(
+                "_zmem_mcp_scope_matrix",
+                REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py",
+            )
+            mcp_mod = importlib.util.module_from_spec(mcp_spec)
+            sys.modules["_zmem_mcp_scope_matrix"] = mcp_mod
+            assert mcp_spec.loader is not None
+            mcp_spec.loader.exec_module(mcp_mod)
+
+            from storelib import write as write_mod
+
+            return write_mod, mcp_mod, auth_mod
+        finally:
+            for name, previous in saved.items():
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
+            for name in list(sys.modules):
+                if name not in saved_module_names and name in {
+                    "bind_guard", "zmem_schema_meta_mcp"
+                }:
+                    sys.modules.pop(name, None)
+            sys.path[:] = saved_path
+
+    def test_shared_grammar_matrix(self):
+        """Every active validator must implement the exact issue #166 matrix."""
+        fixture_dir = REPO_ROOT / "tests" / "fixtures"
+        matrix = json.loads(
+            (fixture_dir / "namespace_scopes.json").read_text(encoding="utf-8")
+        )
+        expected = json.loads(
+            (fixture_dir / "namespace_scopes.expected.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            {
+                "accepted_count": len(matrix["accepted"]),
+                "rejected_count": len(matrix["rejected"]),
+                "all_accepted": True,
+                "all_rejected": True,
+            },
+            expected,
+        )
+
+        import schema_meta
+
+        grammar = getattr(schema_meta, "NAMESPACE_RE", None)
+        self.assertIsNotNone(grammar, "schema_meta.NAMESPACE_RE is the shared contract")
+        self.assertTrue(grammar.fullmatch("project:localhost:3000/git/myorg/myrepo"))
+
+        write_mod, mcp_mod, auth_mod = self._load_scope_validators()
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            for namespace in matrix["accepted"]:
+                with self.subTest(surface="writer", namespace=namespace):
+                    self.assertEqual(
+                        write_mod._validate_namespace(conn, namespace), namespace
+                    )
+                with self.subTest(surface="mcp", namespace=namespace):
+                    self.assertTrue(mcp_mod._valid_mcp_namespace(namespace))
+                with self.subTest(surface="auth", namespace=namespace):
+                    self.assertTrue(auth_mod._valid_scope_namespace(namespace))
+
+            for namespace in matrix["rejected"]:
+                with self.subTest(surface="writer", namespace=namespace):
+                    with self.assertRaises(write_mod.CapturePolicyRefusal):
+                        write_mod._validate_namespace(conn, namespace)
+                with self.subTest(surface="mcp", namespace=namespace):
+                    self.assertFalse(mcp_mod._valid_mcp_namespace(namespace))
+                with self.subTest(surface="auth", namespace=namespace):
+                    self.assertFalse(auth_mod._valid_scope_namespace(namespace))
+
+            # Existing user/project namespaces retain later-colon compatibility
+            # even though the new fleet/host/agent/domain branches are strict.
+            later_colon = "user:ops:box"
+            self.assertEqual(
+                write_mod._validate_namespace(conn, later_colon), later_colon
+            )
+            self.assertTrue(mcp_mod._valid_mcp_namespace(later_colon))
+            self.assertTrue(auth_mod._valid_scope_namespace(later_colon))
+
+        finally:
+            conn.close()
+
+    def test_doctor_accepts_fleet_scoped_token(self):
+        """The read-only doctor agrees with auth/MCP on fleet scope admission."""
+        import doctor
+
+        saved_token = os.environ.get("ZMEM_MCP_TOKEN")
+        saved_token_file = os.environ.get("ZMEM_MCP_TOKEN_FILE")
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".json", delete=False
+        ) as token_file:
+            json.dump(
+                {"token": "fixture-fleet", "namespaces": ["fleet:dgx-spark"]},
+                token_file,
+            )
+            token_path = token_file.name
+        try:
+            os.environ.pop("ZMEM_MCP_TOKEN", None)
+            os.environ["ZMEM_MCP_TOKEN_FILE"] = token_path
+            doctor_report = doctor._check_mcp_token()
+        finally:
+            os.unlink(token_path)
+            if saved_token is None:
+                os.environ.pop("ZMEM_MCP_TOKEN", None)
+            else:
+                os.environ["ZMEM_MCP_TOKEN"] = saved_token
+            if saved_token_file is None:
+                os.environ.pop("ZMEM_MCP_TOKEN_FILE", None)
+            else:
+                os.environ["ZMEM_MCP_TOKEN_FILE"] = saved_token_file
+        self.assertEqual(doctor_report.get("status"), "pass", doctor_report)
+        self.assertEqual(
+            doctor_report.get("details", {}).get("namespaces"), 1,
+            doctor_report,
+        )
+
+    def test_release_gate_commands(self):
+        """The issue's two release checks remain executable and side-effect free."""
+        manifest = REPO_ROOT / "release-manifest.json"
+        original = manifest.read_bytes()
+        try:
+            for args in (
+                (sys.executable, "scripts/release_gate.py", "--emit-manifest"),
+                (sys.executable, "scripts/release_gate.py"),
+            ):
+                subprocess.run(
+                    args, cwd=REPO_ROOT, check=True,
+                    env={**os.environ, "PYTHONUTF8": "1"},
+                )
+        finally:
+            manifest.write_bytes(original)
 
     def test_search_schema_namespace_description_does_not_lie_about_global(self):
         """The _SEARCH_SCHEMA namespace description must NOT claim that

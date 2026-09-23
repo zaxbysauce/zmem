@@ -637,6 +637,45 @@ def resolve_namespace(project_dir: str | Path) -> str:
     return "user:global"
 
 
+def resolve_scopes(
+    project_dir: str | Path | None,
+    hostname: str | None,
+    env: dict | None,
+    hermes_kwargs: dict | None,
+) -> dict[str, str]:
+    """Derive explicit namespace scopes for callers that need them.
+
+    This deliberately performs no hostname discovery and creates no domain
+    scope: each non-project identity must be supplied by the caller.  The
+    returned values are validated through the shared admission grammar so a
+    bad injected host, fleet, or agent identity is never silently persisted.
+    """
+    from schema_meta import NAMESPACE_RE
+
+    values: dict[str, str] = {}
+    if project_dir is not None:
+        values["project"] = resolve_namespace(project_dir)
+
+    source_env = os.environ if env is None else env
+    fleet = source_env.get("ZMEM_FLEET") if source_env else None
+    agent = hermes_kwargs.get("agent_identity") if hermes_kwargs else None
+    for label, raw in (("host", hostname), ("fleet", fleet), ("agent", agent)):
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if not value:
+            continue
+        namespace = f"{label}:{value}"
+        if (not NAMESPACE_RE.fullmatch(namespace)
+                or any(ord(c) < 0x20 or ord(c) == 0x7F for c in namespace)):
+            raise ValueError(f"invalid {label} scope value: {raw!r}")
+        values[label] = namespace
+
+    if "project" in values and not NAMESPACE_RE.fullmatch(values["project"]):
+        raise ValueError(f"invalid project scope value: {values['project']!r}")
+    return values
+
+
 # ---------------------------------------------------------------------------
 # Single-flight advisory locks (P11)
 # ---------------------------------------------------------------------------

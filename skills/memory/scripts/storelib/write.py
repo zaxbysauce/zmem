@@ -70,6 +70,7 @@ try:
         ALLOWED_TAINTS,
         TAINT_RANK,
         TAINT_TRUSTED_SIGNALS,
+        NAMESPACE_RE,
         validate_taint,
         worse_taint,
     )
@@ -84,6 +85,7 @@ except ImportError:
         ALLOWED_TAINTS,
         TAINT_RANK,
         TAINT_TRUSTED_SIGNALS,
+        NAMESPACE_RE,
         validate_taint,
         worse_taint,
     )
@@ -631,7 +633,10 @@ def _validate_namespace(conn: sqlite3.Connection, namespace: str) -> str:
       count. Reconciliation of those legacy rows is a separate data-hygiene
       task (doctor/consolidate); this guard only prevents NEW ones.
 
-    Arbitrary namespaces (``project:<x>``, custom keys) pass through untouched.
+    Project/user keys retain their historical later-colon compatibility.  The
+    scoped forms ``fleet:``, ``host:``, ``agent:``, and ``domain:`` require one
+    non-empty, colon-free value.  Imported legacy rows remain handled by the
+    sync path; this guard applies to new writer admission only.
     """
     if namespace is None or not namespace.strip():
         raise CapturePolicyRefusal(
@@ -639,6 +644,14 @@ def _validate_namespace(conn: sqlite3.Connection, namespace: str) -> str:
             "cross-project knowledge or 'project:<name>' for project-scoped"
         )
     trimmed = namespace.strip()
+
+    # Keep writer admission aligned with auth/MCP: Python's ``\s`` does not
+    # cover every C0 byte or DEL, and such values are unsafe to carry through
+    # subprocess argv even when they happen to match NAMESPACE_RE.
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in trimmed):
+        raise CapturePolicyRefusal(
+            f"refusing write: namespace {trimmed!r} contains a control character"
+        )
 
     # The canonical form passes through untouched.
     if trimmed == GLOBAL_NAMESPACE:
@@ -682,6 +695,12 @@ def _validate_namespace(conn: sqlite3.Connection, namespace: str) -> str:
                 "right now with `rekey-namespace --near-miss-global --confirm`.)"
             )
         raise CapturePolicyRefusal(msg)
+    if not NAMESPACE_RE.fullmatch(trimmed):
+        raise CapturePolicyRefusal(
+            f"refusing write: namespace {trimmed!r} is invalid; use "
+            "project:<name>, user:<name>, fleet:<name>, host:<name>, "
+            "agent:<name>, domain:<name>, or the canonical user:global"
+        )
     return trimmed
 
 def rekey_namespace(
