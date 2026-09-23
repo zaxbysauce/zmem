@@ -706,7 +706,12 @@ class CrossEncoderProfileAndBudgetTests(unittest.TestCase):
 
 
 FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "cross_encoder"
+# Normalize the fixture read against CRLF materialization (house pattern):
+# the committed blob is LF (pinned by digest), and .gitattributes now pins
+# eol=lf for this path, but the normalization keeps the comparison exact
+# even under a checkout config that ignores the attribute.
 EXPECTED_SHADOW = (FIXTURE_DIR / "expected-shadow.jsonl").read_bytes()
+EXPECTED_SHADOW = EXPECTED_SHADOW.replace(b"\r\n", b"\n")
 EXPECTED_PROFILE_BYTES = (
     FIXTURE_DIR / "expected-profile.json").read_bytes()
 SHADOW_IDS = ["00000000-0000-4000-8000-000000000001",
