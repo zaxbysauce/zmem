@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "f936eda50eef760870b40f65f6ab2b47e7522b34c2592481c14a706ae8a465dc",
+  "digest": "eb715be93646c718951f993778a5682c6c2d4885026b0b62abdca1408eef5576",
   "files": {
     "hermes-plugin/__init__.py": "c584903ad0a6a68838c637e6b21191fcab149e4e116546f2b4919e897f0f9c16",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -58,7 +58,8 @@
     "skills/memory/scripts/capture_quality.py": "1dc991c100dad7f6045406c810014357ee351425c9095f5624ff6051bfb79ded",
     "skills/memory/scripts/correction_queue.py": "ccaaecb868cb0571b08784da9ef503d1ea28d01f9776dbc966fb3aeed7cf25e8",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
-    "skills/memory/scripts/doctor.py": "c470b4355a907235c450e47aaca7c97596d3ed78e8d1da8c8641fb263f40e64a",
+    "skills/memory/scripts/cross_encoder_profiles.py": "5fbf8dec9f660b76234e4254a8964e4b5756bfec4f88df6483d71b6b8250b42d",
+    "skills/memory/scripts/doctor.py": "bbae620d6ba33be91c774dc9c70ba50bdb090e88b20f670e17a744314b1b45a0",
     "skills/memory/scripts/drift.py": "c281946a92c5c0bdebef6df3ceaee460d76766c75e109566e81645fde823feee",
     "skills/memory/scripts/embed_profiles.py": "0666878e7c4924bf8798fed0641bbdaf36b33edad1c7f7d16ecf5e984e06899c",
     "skills/memory/scripts/embeddings.py": "5828b0a26701315f730ba383bc4545bffe9f64859ec7426161dde65acfa6cd0a",
