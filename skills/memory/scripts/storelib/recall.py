@@ -95,7 +95,6 @@ def rerank_final_injection_set(query: str, rows: list[dict], *,
         _ce_emit_reason("load-error")
         return rows
     try:
-        original_index = {r["id"]: i for i, r in enumerate(rows)}
         shadow_index = {r["id"]: i for i, r in enumerate(scored_rows)}
         lines = []
         for current_rank, row in enumerate(rows, start=1):

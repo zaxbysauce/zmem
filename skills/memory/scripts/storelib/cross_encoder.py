@@ -335,6 +335,10 @@ def _local_scorer():
             model_bytes = fh.read()
         sess = ort.InferenceSession(model_bytes)
         if not tok_path or not os.path.isfile(tok_path):
+            # Copilot review finding: a present model with a missing
+            # sibling tokenizer is a load failure, not an absent model -
+            # label it so the terminal reason stays actionable.
+            _last_load_failure = "load-error"
             return None
         tok = Tokenizer.from_file(tok_path)
         tok.enable_padding(length=128)

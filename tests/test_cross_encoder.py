@@ -501,6 +501,9 @@ class CrossEncoderProfileAndBudgetTests(unittest.TestCase):
         self.assertEqual(tok.stat().st_size, 899)
         self.assertEqual(
             hashlib.sha256(tok.read_bytes()).hexdigest(), TOKENIZER_SHA256)
+        # tf-02: the expected-profile fixture is a real output authority -
+        # its bytes must equal the canonical record for the shipped profile.
+        self.assertEqual(EXPECTED_PROFILE_BYTES, _expected_profile_record())
 
     def test_autodownload_is_off_by_default(self):
         import cross_encoder_profiles as profiles
@@ -714,6 +717,24 @@ EXPECTED_SHADOW = (FIXTURE_DIR / "expected-shadow.jsonl").read_bytes()
 EXPECTED_SHADOW = EXPECTED_SHADOW.replace(b"\r\n", b"\n")
 EXPECTED_PROFILE_BYTES = (
     FIXTURE_DIR / "expected-profile.json").read_bytes()
+
+
+def _expected_profile_record() -> bytes:
+    # The canonical expected-profile.json line for the shipped profile
+    # (LF-terminated; the byte contract the committed fixture must match).
+    import json as _json
+    import cross_encoder_profiles as _profiles
+    entry = _profiles.resolve_profile()
+    record = {
+        "model_file": entry["model_file"],
+        "model_sha256": entry["sha256"],
+        "model_size": 128,
+        "tokenizer_file": entry["tokenizer_file"],
+        "tokenizer_sha256": TOKENIZER_SHA256,
+        "tokenizer_size": 899,
+    }
+    line = _json.dumps(record, sort_keys=True, separators=(",", ":"))
+    return (line + chr(10)).encode("utf-8")
 SHADOW_IDS = ["00000000-0000-4000-8000-000000000001",
               "00000000-0000-4000-8000-000000000002",
               "00000000-0000-4000-8000-000000000003"]
@@ -922,7 +943,8 @@ class CrossEncoderShadowAndFinalSetTests(unittest.TestCase):
             self.assertTrue(all(t in set(admit) | set(lowconf)
                                 for t in scored_texts),
                             f"unexpected scored content: {scored_texts}")
-            self.assertIn("reason=applied", err_text)
+            self.assertEqual(err_text.count("reason=applied"), 1,
+                             "exactly one applied terminal reason expected")
         finally:
             set_scorer(None)
 
@@ -1001,7 +1023,8 @@ class CrossEncoderShadowAndFinalSetTests(unittest.TestCase):
         try:
             with contextlib.redirect_stderr(io.StringIO()) as err:
                 out = recall_module.rerank_final_injection_set("query", rows)
-            self.assertIn("reason=load-error", err.getvalue())
+            self.assertEqual(err.getvalue().count("reason=load-error"), 1,
+                             "exactly one load-error terminal reason expected")
             self.assertEqual([r["id"] for r in out], SHADOW_IDS)
         finally:
             set_scorer(None)

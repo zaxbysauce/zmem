@@ -758,7 +758,7 @@ lets the PASSIVE injection lane score its final admitted set through
 `ZMEM_CROSS_ENCODER_SHADOW=1` logs bounded rank deltas to
 `${ZMEM_DATA}/cross-encoder-shadow.jsonl` and the lane's order is unchanged
 until the recorded promotion gate (`PASSIVE_PROMOTION_GATE`:
-#111 precision > 0.8978, p95 <= 250 ms, #129 false-injection <= 0.0) is
+#111 precision > 0.8978333333333333, p95 <= 250 ms, #129 false-injection <= 0.0) is
 measured and flipped. Every rerank attempt is budgeted (250 ms default,
 `ZMEM_CROSS_ENCODER_BUDGET_MS`) and emits exactly one terminal
 `[zmem] cross-encoder reason=<...>` line on stderr; any failure degrades to

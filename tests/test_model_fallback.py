@@ -1372,6 +1372,10 @@ class CrossEncoderFallbackTests(unittest.TestCase):
 
     def test_part_file_removed_after_failure(self):
         scratch = self._scratch()
+        # KNOWN FLAKE (~1/30 runs on Windows): the prod .part cleanup's
+        # finally-unlink can transiently lose an AV/indexer lock race,
+        # leaving a stale .part that fails the assertion below. Fail-open
+        # by design (recall still exits 0); disclosed in PR #228's body.
         # A real file whose digest CANNOT match the profile pin: the repo's
         # tokenizer fixture served over file://.
         wrong_bytes = (REPO_ROOT / "tests" / "fixtures" / "cross_encoder"
