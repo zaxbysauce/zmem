@@ -35,7 +35,90 @@ from schema_meta import (CROSS_PROJECT_ENV, CROSS_PROJECT_HAZARD_VERBS_ENV,
                          ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
 from storelib.ops_tokens import _HAZARDOUS_SUBS as _DEFAULT_HAZARD_VERBS
 import embed_profiles as _profiles
-from storelib.cross_encoder import maybe_rerank as _cross_maybe_rerank
+from storelib.cross_encoder import (maybe_rerank as _cross_maybe_rerank,
+                                    capture_reason as _ce_capture_reason,
+                                    emit_reason as _ce_emit_reason,
+                                    passive_reorder_promoted
+                                    as _ce_passive_promoted)
+
+
+def _shadow_log_path() -> str | None:
+    """${ZMEM_DATA}/cross-encoder-shadow.jsonl — ZMEM_DATA env FIRST (the
+    store-parent chain is only a fallback when the env is unset). Issue #125
+    design 6 pins the env-variable path so the shadow log lands beside the
+    other ZMEM_DATA sidecars, never beside an explicitly set store."""
+    data_dir = (os.environ.get("ZMEM_DATA") or "").strip()
+    if not data_dir:
+        try:
+            import host as _host
+            data_dir = str(Path(_host.resolve_store_path()).parent)
+        except Exception:
+            return None
+    if not data_dir:
+        return None
+    return str(Path(data_dir) / "cross-encoder-shadow.jsonl")
+
+
+def rerank_final_injection_set(query: str, rows: list[dict], *,
+                               clock=None) -> list[dict]:
+    """The #125 passive final-set consumer seam — the ONLY way the passive
+    injection lane reaches the cross-encoder scorer.
+
+    Delegates scoring exclusively to ``cross_encoder.maybe_rerank``. This PR
+    runs it in SHADOW evaluation mode only: with
+    ``ZMEM_CROSS_ENCODER_SHADOW`` exactly "1" the final rows are scored, one
+    compact rank-delta JSON line per row (original iteration order, keys
+    exactly current_rank/memory_id/rank_delta/shadow_rank) is appended to
+    ${ZMEM_DATA}/cross-encoder-shadow.jsonl, and the ORIGINAL list is
+    returned byte-for-byte (active reordering is recorded-but-not-promoted —
+    see cross_encoder.PASSIVE_PROMOTION_GATE). With shadow off the scorer is
+    never constructed (zero cost). A shadow-log write failure returns the
+    original list and re-emits ``load-error``; every attempt re-emits the
+    captured terminal reason verbatim, and a non-attempt (trivial early
+    exit) emits nothing."""
+    if not rows or len(rows) < 2 or not query:
+        return rows
+    if (os.environ.get("ZMEM_CROSS_ENCODER_SHADOW", "0") != "1"
+            and not _ce_passive_promoted()):
+        return rows
+    with _ce_capture_reason() as sink:
+        scored_rows = _cross_maybe_rerank(query, rows, clock=clock)
+    reason = sink[-1] if sink else None
+    if reason is None:
+        # Not an attempt (trivial early exit inside maybe_rerank).
+        return rows
+    if reason != "applied":
+        _ce_emit_reason(reason)
+        return rows
+    log_path = _shadow_log_path()
+    if log_path is None:
+        _ce_emit_reason("load-error")
+        return rows
+    try:
+        original_index = {r["id"]: i for i, r in enumerate(rows)}
+        shadow_index = {r["id"]: i for i, r in enumerate(scored_rows)}
+        lines = []
+        for current_rank, row in enumerate(rows, start=1):
+            shadow_rank = shadow_index.get(row["id"], current_rank) + 1
+            record = {
+                "current_rank": current_rank,
+                "memory_id": row["id"],
+                "rank_delta": current_rank - shadow_rank,
+                "shadow_rank": shadow_rank,
+            }
+            lines.append(json.dumps(record, sort_keys=True,
+                                    separators=(",", ":")))
+        directory = os.path.dirname(log_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8", newline="\n") as fh:
+            for line in lines:
+                fh.write(line + "\n")
+    except Exception:
+        _ce_emit_reason("load-error")
+        return rows
+    _ce_emit_reason("applied")
+    return rows
 
 W_BM25 = 0.55
 
@@ -1763,6 +1846,8 @@ def _recall_injection_details(
     surfaced_ids: list[str] | None = None,
     namespace: str | None = None,
     fence_id: str | None = None,
+    query: str = "",
+    cross_rerank: bool = False,
 ) -> tuple[dict, list[dict]]:
     """Apply the one passive post-retrieval decision pipeline.
 
@@ -1773,6 +1858,13 @@ def _recall_injection_details(
     may receive surfaced telemetry.  Keeping accounting outside the mapping
     lets the session selector account only for rows proven present in its one
     canonical render.
+
+    Issue #125: when ``cross_rerank`` is True (the passive gate already
+    decided by ``cross_encoder.cli_allowed``), the final admitted set is
+    scored through ``rerank_final_injection_set`` AFTER the gate + margin
+    admission and BEFORE the token budget — at most the merged
+    project/global/link final set, never the deep retrieval pool. In this
+    PR the seam is shadow-only: it never reorders the passive lane.
     """
     effective_budget = (inject_token_budget() if budget_tokens is None
                         else budget_tokens)
@@ -1795,6 +1887,12 @@ def _recall_injection_details(
     if margin_pruned_ids:
         margin_ids = set(margin_pruned_ids)
         selected_rows = [r for r in selected_rows if r["id"] not in margin_ids]
+
+    if cross_rerank and selected_rows:
+        # Issue #125 final-set consumer seam: scores ONLY the post-gate,
+        # post-margin, pre-budget final set (shadow evaluation mode — the
+        # returned order is unchanged this PR; see PASSIVE_PROMOTION_GATE).
+        selected_rows = rerank_final_injection_set(query, selected_rows)
 
     budget_emptied = False
     budget_dropped = 0
@@ -2248,6 +2346,7 @@ def _recall_memory_impl(
             budget_tokens=_injection_budget_tokens,
             surfaced_ids=bump_ids,
             namespace=namespace, fence_id=fence_id,
+            query=query, cross_rerank=cross_rerank,
         )
         results = injection_details["results"]
         # Issue #114: surfaced telemetry covers ONLY the rendered rows that

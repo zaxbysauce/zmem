@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,16 @@ SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 PYTHON = sys.executable
 
 sys.path.insert(0, str(SCRIPTS_DIR))
+# Issue #125: pin the store/isolation env BEFORE importing store -- storelib
+# freezes ZMEM_STORE at first import from the ambient env, so a module-top
+# import could point an accidental connect() at the operator's ~/.zmem
+# (issue #125 Tests contract: "Move the module's store import below the
+# required isolation-variable setup").
+_ISO_SCRATCH = tempfile.mkdtemp(prefix="zmem-fallback-iso-")
+os.environ["ZMEM_STORE"] = os.path.join(_ISO_SCRATCH, "store.sqlite")
+os.environ["ZMEM_DATA"] = _ISO_SCRATCH
+os.environ["ZMEM_MODELS_DIR"] = os.path.join(_ISO_SCRATCH, "missing-models")
+os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 import embeddings  # noqa: E402
 import store  # noqa: E402
 
@@ -1264,6 +1275,153 @@ class ResolveModelsDirTests(unittest.TestCase):
             Path(self.tmp) / "store.sqlite"
         ).resolve_store_path = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
         self.assertEqual(embeddings._resolve_models_dir(), bundled)
+
+
+PROFILE_SHA256_FB = (
+    "be30078bc29868074ddb09c8eefc8170594368fc82908d63988dd9e226c26993")
+
+
+class CrossEncoderFallbackTests(unittest.TestCase):
+    """Issue #125 AC2/AC6: the profile download seam never installs an
+    unverified model, never leaves a .part sibling, degrades the recall CLI
+    to exit 0 with exactly one bounded reason, and parses
+    ZMEM_MODEL_AUTODOWNLOAD with exact-"1" semantics at call time."""
+
+    def _scratch(self):
+        scratch = Path(tempfile.mkdtemp(prefix="zmem-ce-fallback-"))
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        return scratch
+
+    def _seed_and_recall(self, scratch, env_extra, expect_rc=0):
+        """Seed two query-matching rows via the CLI, then run recall with
+        the given env overlay; return (rc, stdout, stderr, rows)."""
+        env = dict(os.environ)
+        env.update({
+            "ZMEM_STORE": str(scratch / "store.sqlite"),
+            "ZMEM_DATA": str(scratch),
+            "ZMEM_MODELS_DIR": str(scratch / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_EMBED_PROFILE": "fake",
+        })
+        env.pop("ZMEM_CROSS_ENCODER_MODEL", None)
+        env.pop("ZMEM_CROSS_ENCODER_MODEL_URL", None)
+        env.pop("ZMEM_CROSS_ENCODER_BUDGET_MS", None)
+        env.update(env_extra)
+        # A None overlay value means "unset" for this run; subprocess env
+        # values must all be strings.
+        env = {k: v for k, v in env.items() if v is not None}
+        add_argv = [
+            PYTHON, str(STORE_PY), "add", "--namespace", "user:issue-125",
+            "--type", "fact", "--content",
+            "fallback probe row alpha receiver", "--confidence", "0.9"]
+        subprocess.run(add_argv, env=env, capture_output=True, check=True)
+        add_argv[-3] = "fallback probe row bravo receiver"
+        subprocess.run(add_argv, env=env, capture_output=True, check=True)
+        recall_argv = [
+            PYTHON, str(STORE_PY), "recall", "--query", "receiver",
+            "--namespace", "user:issue-125", "--json"]
+        proc = subprocess.run(recall_argv, env=env, capture_output=True)
+        rows = []
+        try:
+            payload = json.loads(proc.stdout.decode("utf-8"))
+            rows = (payload.get("results") if isinstance(payload, dict)
+                    else payload) or []
+        except Exception:
+            pass
+        return (proc.returncode,
+                proc.stdout.decode("utf-8", "replace"),
+                proc.stderr.decode("utf-8", "replace"), rows)
+
+    def test_missing_model_returns_input_order(self):
+        scratch = self._scratch()
+        rc, _out, err, rows = self._seed_and_recall(scratch, {
+            "ZMEM_CROSS_ENCODER": "1",
+        })
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(rows), 2)
+        self.assertIn("[zmem] cross-encoder state=autodownload-disabled", err)
+        self.assertIn("[zmem] cross-encoder reason=missing-model", err)
+        self.assertTrue(all("score" not in r for r in rows))
+
+    def test_empty_url_returns_input_order(self):
+        scratch = self._scratch()
+        rc, _out, err, rows = self._seed_and_recall(scratch, {
+            "ZMEM_CROSS_ENCODER": "1",
+            "ZMEM_CROSS_ENCODER_MODEL_URL": "",
+            "ZMEM_MODEL_AUTODOWNLOAD": "1",
+        })
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(rows), 2)
+        self.assertIn("[zmem] cross-encoder reason=missing-model", err)
+
+    def test_url_failure_returns_input_order(self):
+        scratch = self._scratch()
+        bogus = (Path(scratch) / "no-such-model.bin").as_uri()
+        rc, _out, err, rows = self._seed_and_recall(scratch, {
+            "ZMEM_CROSS_ENCODER": "1",
+            "ZMEM_CROSS_ENCODER_MODEL_URL": bogus,
+            "ZMEM_MODEL_AUTODOWNLOAD": "1",
+        })
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(rows), 2)
+        self.assertIn("[zmem] cross-encoder reason=load-error", err)
+        parts = list((scratch / "missing-models").glob("*.part"))
+        self.assertEqual(parts, [], "URL failure left a .part sibling")
+        self.assertFalse((scratch / "missing-models"
+                          / "mini_pair_scorer.onnx").exists())
+
+    def test_part_file_removed_after_failure(self):
+        scratch = self._scratch()
+        # A real file whose digest CANNOT match the profile pin: the repo's
+        # tokenizer fixture served over file://.
+        wrong_bytes = (REPO_ROOT / "tests" / "fixtures" / "cross_encoder"
+                       / "tokenizer.json").as_uri()
+        rc, _out, err, _rows = self._seed_and_recall(scratch, {
+            "ZMEM_CROSS_ENCODER": "1",
+            "ZMEM_CROSS_ENCODER_MODEL_URL": wrong_bytes,
+            "ZMEM_MODEL_AUTODOWNLOAD": "1",
+        })
+        self.assertEqual(rc, 0)
+        self.assertIn("[zmem] cross-encoder reason=load-error", err)
+        models = scratch / "missing-models"
+        parts = list(models.glob("*.part")) if models.is_dir() else []
+        self.assertEqual(parts, [], "checksum mismatch left a .part sibling")
+        self.assertFalse((models / "mini_pair_scorer.onnx").exists(),
+                         "unverified bytes must never be installed")
+
+    def test_call_time_autodownload_parsing(self):
+        scratch = self._scratch()
+        fixture_uri = (REPO_ROOT / "tests" / "fixtures" / "cross_encoder"
+                       / "mini_pair_scorer.onnx").as_uri()
+        # Non-"1" values never download; the disabled state is observable.
+        for value in (None, "0", "yes"):
+            env_extra = {"ZMEM_CROSS_ENCODER": "1",
+                         "ZMEM_CROSS_ENCODER_MODEL_URL": fixture_uri}
+            if value is None:
+                env_extra["ZMEM_MODEL_AUTODOWNLOAD"] = None
+            else:
+                env_extra["ZMEM_MODEL_AUTODOWNLOAD"] = value
+            rc, _out, err, _rows = self._seed_and_recall(scratch, env_extra)
+            self.assertEqual(rc, 0)
+            self.assertIn(
+                "[zmem] cross-encoder state=autodownload-disabled", err)
+            self.assertFalse((scratch / "missing-models"
+                              / "mini_pair_scorer.onnx").exists())
+        # Exactly "1" installs the digest-verified file once.
+        rc, _out, err, _rows = self._seed_and_recall(scratch, {
+            "ZMEM_CROSS_ENCODER": "1",
+            "ZMEM_CROSS_ENCODER_MODEL_URL": fixture_uri,
+            "ZMEM_MODEL_AUTODOWNLOAD": "1",
+        })
+        self.assertEqual(rc, 0)
+        dest = scratch / "missing-models" / "mini_pair_scorer.onnx"
+        self.assertTrue(dest.exists(), "exact-1 must install the fixture")
+        import hashlib as _hashlib
+        self.assertEqual(
+            _hashlib.sha256(dest.read_bytes()).hexdigest(),
+            PROFILE_SHA256_FB)
+        parts = list((scratch / "missing-models").glob("*.part"))
+        self.assertEqual(parts, [])
 
 
 if __name__ == "__main__":

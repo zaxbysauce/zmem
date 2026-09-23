@@ -741,14 +741,30 @@ knob is lambda: default 0.7, env `ZMEM_MMR_LAMBDA` (0.0 = maximize
 registry in `skills/memory/scripts/embed_profiles.py` — unknown values refuse
 with exit 2 before any store work, and a value whose dimension differs from
 the store's committed vectors refuses until `reembed --all` converts it.
-`ZMEM_CROSS_ENCODER=1` enables the optional cross-encoder rerank on explicit
-CLI `recall` invocations only (never hooks / `recent` / PreCompact /
-`search`-aliases / `--no-bump` runs), pointing `ZMEM_CROSS_ENCODER_MODEL` at a
-LOCAL pair-scoring `.onnx` plus sibling `tokenizer.json`. A missing or broken
-model degrades silently to un-reranked results — rerank can never fail a
-recall. No public cross-encoder hash ships because none was verifiable;
-there is likewise NO unverified-load escape hatch for the main model
-(`ZMEM_MODEL_ALLOW_UNVERIFIED` does not exist).
+`ZMEM_CROSS_ENCODER=1` enables the optional cross-encoder rerank. The
+EXPLICIT lane covers CLI `recall` invocations that are not `--no-bump`/
+`--no-hybrid` (never `recent` / `search`-aliases); pointing
+`ZMEM_CROSS_ENCODER_MODEL` at a LOCAL pair-scoring `.onnx` plus sibling
+`tokenizer.json` keeps the operator-vouched load path. Issue #125 adds a
+checked-in `mini-pair-scorer` profile
+(`skills/memory/scripts/cross_encoder_profiles.py`, exact SHA-256 pin) used
+when `ZMEM_CROSS_ENCODER_MODEL` is unset — resolved from `ZMEM_MODELS_DIR`
+or the shared models dir, and loaded ONLY after `verify_profile_file`
+confirms the digest; `ZMEM_CROSS_ENCODER_MODEL_URL` plus exact
+`ZMEM_MODEL_AUTODOWNLOAD=1` permits one digest-verified, atomic-download
+attempt at scorer-load time. A second opt-in, `ZMEM_CROSS_ENCODER_PASSIVE=1`,
+lets the PASSIVE injection lane score its final admitted set through
+`rerank_final_injection_set` (issue #125) in shadow-only mode:
+`ZMEM_CROSS_ENCODER_SHADOW=1` logs bounded rank deltas to
+`${ZMEM_DATA}/cross-encoder-shadow.jsonl` and the lane's order is unchanged
+until the recorded promotion gate (`PASSIVE_PROMOTION_GATE`:
+#111 precision > 0.8978, p95 <= 250 ms, #129 false-injection <= 0.0) is
+measured and flipped. Every rerank attempt is budgeted (250 ms default,
+`ZMEM_CROSS_ENCODER_BUDGET_MS`) and emits exactly one terminal
+`[zmem] cross-encoder reason=<...>` line on stderr; any failure degrades to
+un-reranked results and rerank can never fail a recall. There is still NO
+unverified-load escape hatch (`ZMEM_MODEL_ALLOW_UNVERIFIED` does not
+exist).
 diversity, 1.0 = no diversity — identical ordering to `--no-mmr`).
 `--no-mmr` and `--no-hybrid` are independent flags and can be combined.
 
@@ -1117,11 +1133,16 @@ Notes:
   readers proceed on WAL snapshots. Schedule large conversions for idle
   windows.
 
-**Cross-encoder trust note** (issue #63 review round): `ZMEM_CROSS_ENCODER_MODEL`
-loads an operator-supplied local ONNX file with NO checksum pin — none was
-publishable offline. Treat that path with the same caution as any executable;
-doctor's `embeddings_health.cross_encoder` block surfaces enabled/model-file
-state so a missing-model silent degrade is visible.
+**Cross-encoder trust note** (issue #63 review round; updated by issue #125):
+the operator-supplied `ZMEM_CROSS_ENCODER_MODEL` path stays
+operator-vouched (no checksum pin — treat it with the same caution as any
+executable), while the DEFAULT `mini-pair-scorer` profile path is
+digest-gated by `verify_profile_file` on every load and any download is
+digest-verified before an atomic install. doctor's
+`embeddings_health.cross_encoder` block now surfaces
+`profile`/`model_path`/`checksum_state` (`verified|mismatch|missing|
+unreadable`)/`passive`/`shadow`/`autodownload` so a missing-model silent
+degrade and the passive/shadow opt-in state stay visible.
 
 ### episode-open / episode-add / episode-close / episode-list — session containers (v13, issue #65 10.7)
 

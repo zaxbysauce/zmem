@@ -247,5 +247,41 @@ class NoUnverifiedEscapeHatch(unittest.TestCase):
                          f"unverified-load hatch introduced: {hatch}")
 
 
+class CrossEncoderProfileValidationTests(unittest.TestCase):
+    """Issue #125 guardrail: the cross-encoder profile registry refuses a
+    malformed checksum AT IMPORT TIME, before any download can be attempted."""
+
+    def test_malformed_checksum_raises_before_download(self):
+        # importlib.reload would REBIND PROFILES from source (wiping the
+        # mutation) before validation runs, so instead exec a malformed COPY
+        # of the module source: the import-time validator must refuse it
+        # before any download can be attempted.
+        import types
+        import urllib.request
+        from unittest import mock
+        sys.path.insert(0, str(SCRIPTS))
+        import cross_encoder_profiles as cep
+        source = Path(cep.__file__).read_text(encoding="utf-8")
+        original = cep.PROFILES["mini-pair-scorer"]["sha256"]
+        malformed = source.replace(original, "not-a-sha")
+        self.assertNotEqual(malformed, source, "digest literal not in source")
+        calls = []
+
+        def _spy(*a, **k):
+            calls.append(a)
+            raise AssertionError("download must never be attempted")
+
+        mod = types.ModuleType("cross_encoder_profiles_malformed")
+        mod.__file__ = cep.__file__
+        code = compile(malformed, cep.__file__, "exec")
+        with mock.patch("urllib.request.urlopen", _spy):
+            with self.assertRaises(ValueError) as ctx:
+                exec(code, mod.__dict__)
+        self.assertEqual(
+            str(ctx.exception),
+            "invalid cross-encoder profile checksum: mini-pair-scorer.sha256")
+        self.assertEqual(calls, [], "download spy count must be zero")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

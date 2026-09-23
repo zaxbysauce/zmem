@@ -839,6 +839,7 @@ def select_and_budget_for_injection(
     from storelib import delivery_ledger as ledger  # type: ignore
     from storelib import ops_tokens as ops  # type: ignore
     from storelib import recall as recall_module  # type: ignore
+    from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 
     # Resolve/derive operation context only on the pretool lane.  The current
     # raw event is a private hook-to-store input, not a public selector
@@ -949,6 +950,11 @@ def select_and_budget_for_injection(
 
     capture: dict = {}
     try:
+        # Issue #125: cross_rerank goes ONLY in the query branch — it must
+        # NEVER enter this shared dict, because recent_memory has no
+        # cross_rerank parameter and the blanket except below would convert
+        # that TypeError into a silent empty envelope on every query-less
+        # passive pull (plan-critic round-1 finding).
         kwargs = dict(
             namespace=namespace, limit=limit, as_json=False, no_bump=True,
             include_global=True, global_limit=global_limit,
@@ -965,6 +971,10 @@ def select_and_budget_for_injection(
         )
         if effective_query.strip():
             kwargs["query"] = effective_query
+            # Issue #125 passive gate: the selector is the only consumer of
+            # the passive cross-encoder lane (CE + PASSIVE=1 + no-bump).
+            kwargs["cross_rerank"] = _ce_cli_allowed(
+                no_bump=True, no_hybrid=False, for_injection=True)
             recall_module.recall_memory(conn, **kwargs)
         else:
             recall_module.recent_memory(conn, **kwargs)
