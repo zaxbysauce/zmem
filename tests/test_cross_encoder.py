@@ -111,10 +111,18 @@ class CliAllowedGate(unittest.TestCase):
         from storelib.cross_encoder import cli_allowed
         saved = {k: os.environ.get(k) for k in (ENABLE,
                                                 "ZMEM_CROSS_ENCODER_PASSIVE")}
-        self.addCleanup(lambda: [os.environ.clear(),
-                                 os.environ.update(
-                                     {k: v for k, v in saved.items()
-                                      if v is not None})])
+
+        def _restore_two():
+            # Targeted restore ONLY -- a wholesale os.environ.clear() here
+            # wiped USERPROFILE/PATH for every later test in the process
+            # (doctor import then failed on Path.home()).
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        self.addCleanup(_restore_two)
         os.environ[ENABLE] = "1"
         os.environ.pop("ZMEM_CROSS_ENCODER_PASSIVE", None)
         self.assertFalse(cli_allowed(no_bump=True, no_hybrid=False,
@@ -522,6 +530,101 @@ class CrossEncoderProfileAndBudgetTests(unittest.TestCase):
                     "[zmem] cross-encoder state=autodownload-disabled",
                     err.getvalue())
         self.assertFalse(dest.exists())
+
+    def test_doctor_reports_unreadable_checksum_state(self):
+        # Reviewer round 1, finding 1: a present-but-unreadable model must
+        # surface as checksum_state="unreadable", never "missing".
+        import doctor as doctor_module
+        import builtins
+        from unittest import mock
+        models_dir = Path(os.environ["ZMEM_MODELS_DIR"])
+        models_dir.mkdir(parents=True, exist_ok=True)
+        model_file = models_dir / "mini_pair_scorer.onnx"
+        model_file.write_bytes(b"present but locked")
+        (models_dir / "tokenizer.json").write_text("[]", encoding="utf-8")
+        real_open = builtins.open
+
+        def _locked_open(file, *a, **k):
+            if str(file) == str(model_file):
+                raise PermissionError(13, "locked by probe")
+            return real_open(file, *a, **k)
+
+        with mock.patch("builtins.open", _locked_open):
+            report = doctor_module.build_report(REPO_ROOT, REPO_ROOT,
+                                                store_override=os.environ["ZMEM_STORE"])
+        ce = None
+        for check in report.get("checks", []):
+            details = check.get("details") or {}
+            if "cross_encoder" in details:
+                ce = details["cross_encoder"]
+                break
+        self.assertIsNotNone(ce)
+        self.assertEqual(ce["checksum_state"], "unreadable")
+        self.assertTrue(ce["model_path"].endswith("mini_pair_scorer.onnx"))
+
+    def test_profile_path_refuses_digest_mismatch_before_load(self):
+        # Reviewer round 1, finding 2: the load-time digest gate must be
+        # discriminating. With LOADER FAKES installed, the mismatched
+        # profile-path file WOULD construct a scorer — so a None result is
+        # attributable to verify_profile_file alone, not to load failure.
+        import types
+        from unittest import mock
+        import cross_encoder_profiles as profiles
+        from storelib import cross_encoder as ce
+
+        models_dir = Path(os.environ["ZMEM_MODELS_DIR"])
+        models_dir.mkdir(parents=True, exist_ok=True)
+        (models_dir / "mini_pair_scorer.onnx").write_bytes(b"loadable-by-fakes")
+        (models_dir / "tokenizer.json").write_text("[]", encoding="utf-8")
+
+        fake_ort = types.ModuleType("onnxruntime")
+
+        class _FakeSession:
+            instances = 0
+
+            def __init__(self, model_bytes):
+                _FakeSession.instances += 1
+                assert isinstance(model_bytes, (bytes, bytearray))
+
+            def run(self, _names, _feeds):
+                return [[ [0.0] ]]
+
+        fake_ort.InferenceSession = _FakeSession
+        fake_tok = types.ModuleType("tokenizers")
+
+        class _FakeTok:
+            @staticmethod
+            def from_file(_path):
+                return _FakeTok()
+
+            def enable_padding(self, **_k):
+                pass
+
+            def enable_truncation(self, **_k):
+                pass
+
+            def encode(self, _q, _t):
+                class _Enc:
+                    ids = [1]
+                    attention_mask = [1]
+                return _Enc()
+
+        fake_tok.Tokenizer = _FakeTok
+        ce.set_scorer(None)
+        _FakeSession.instances = 0
+        with mock.patch.dict(sys.modules, {"onnxruntime": fake_ort,
+                                           "tokenizers": fake_tok}):
+            # Gate present: digest mismatch refuses BEFORE construction.
+            self.assertIsNone(ce._local_scorer())
+            self.assertEqual(_FakeSession.instances, 0,
+                             "session constructed despite digest mismatch")
+            # Gate (simulated) absent: the same file WOULD load — proving
+            # the refusal above came from the digest gate.
+            with mock.patch.object(profiles, "verify_profile_file",
+                                   return_value=True):
+                self.assertIsNotNone(ce._local_scorer())
+                self.assertGreaterEqual(_FakeSession.instances, 1)
+        ce.set_scorer(None)
 
     def test_checksum_mismatch_fails_open(self):
         import cross_encoder_profiles as profiles

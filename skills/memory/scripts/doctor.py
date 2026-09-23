@@ -3430,15 +3430,22 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
                 if not model_file.is_file():
                     ce_checksum_state = "missing"
                 else:
-                    digest = hashlib.sha256()
-                    with open(model_file, "rb") as fh:
-                        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                    if digest.hexdigest() == (ce_profile.get("sha256")
-                                              or "").lower():
-                        ce_checksum_state = "verified"
+                    try:
+                        digest = hashlib.sha256()
+                        with open(model_file, "rb") as fh:
+                            for chunk in iter(lambda: fh.read(1024 * 1024),
+                                              b""):
+                                digest.update(chunk)
+                    except OSError:
+                        # Present but unreadable must not be misreported as
+                        # absent (reviewer round 1, finding 1).
+                        ce_checksum_state = "unreadable"
                     else:
-                        ce_checksum_state = "mismatch"
+                        if digest.hexdigest() == (ce_profile.get("sha256")
+                                                  or "").lower():
+                            ce_checksum_state = "verified"
+                        else:
+                            ce_checksum_state = "mismatch"
         except Exception:
             ce_profile = None
         passive_on = (os.environ.get("ZMEM_CROSS_ENCODER_PASSIVE",
