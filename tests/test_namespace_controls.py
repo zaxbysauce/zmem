@@ -55,6 +55,17 @@ class NamespaceControlCharacterTest(unittest.TestCase):
             with self.subTest(namespace=repr(namespace)):
                 self.assertFalse(self.auth._valid_scope_namespace(namespace))
 
+    def test_project_user_leading_colon_matches_issue_grammar(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            for namespace in ("project::x", "user::x"):
+                with self.subTest(namespace=namespace):
+                    self.assertEqual(self.writer._validate_namespace(conn, namespace), namespace)
+                    self.assertTrue(self.mcp._valid_mcp_namespace(namespace))
+                    self.assertTrue(self.auth._valid_scope_namespace(namespace))
+        finally:
+            conn.close()
+
     def test_scope_resolver_rejects_c0_and_del_identities(self):
         scripts = Path(__file__).resolve().parents[1] / "skills" / "memory" / "scripts"
         sys.path.insert(0, str(scripts))

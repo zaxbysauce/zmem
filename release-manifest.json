@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "e9e20fdbce1fc1497efb439e4cb40fda683deff2db8217fad12e8138ecfea009",
+  "digest": "4be37fb2949eff2769453061704529caf90c83384010926f37fee81215d12665",
   "files": {
     "hermes-plugin/__init__.py": "c584903ad0a6a68838c637e6b21191fcab149e4e116546f2b4919e897f0f9c16",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -67,7 +67,7 @@
     "skills/memory/scripts/host.py": "8e3da98c7e81d8b64833224872acefe3f8be18fdfb257f3ee62c56fff8dcb9df",
     "skills/memory/scripts/import-store.py": "75047ada65ad486b1acaa9ff13e38c316ca8dd586d567b3d78f2f9c189398b0d",
     "skills/memory/scripts/redaction.py": "1accf1f502a1018bf1c18a189fd710a7378135e1cfc09d6cce9a2920b4dedc6e",
-    "skills/memory/scripts/schema_meta.py": "dd2eb9f45aa06aba489ed94dd7a4f7ae831f50311b2b00306bf82c676891bbe0",
+    "skills/memory/scripts/schema_meta.py": "c346a9e495b98c0363a3d7200a56fc358aca45687fe7f9d71a72fcbcf58ee3b4",
     "skills/memory/scripts/store.py": "99d721f53e8f8c2ba0df6bd60f839f44235f22d8a0dd751020cbad26b4543ffb",
     "skills/memory/scripts/storelib/__init__.py": "a3995502d6f466963d649627c4d138cae22b9ef6bd24349297dc8d126e06ccfc",
     "skills/memory/scripts/storelib/backup.py": "a504e6943c69f923ceee1f8696a3e1e7779012afd0463920c2ce3fa491de8d80",

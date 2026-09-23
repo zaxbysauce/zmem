@@ -31,7 +31,7 @@ import re
 # Keep this dependency-free module as the sole source for writer, MCP, auth,
 # and doctor validation so their admission rules cannot drift.
 NAMESPACE_RE = re.compile(
-    r"^(?:(?:project|user):[^\s:][^\s]*|(?:fleet|host|agent|domain):[^\s:]+)$"
+    r"^(?:(?:project|user):\S+|(?:fleet|host|agent|domain):[^\s:]+)$"
 )
 
 
