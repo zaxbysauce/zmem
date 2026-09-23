@@ -24,6 +24,12 @@ skills/memory/models/tokenizer.json filter=lfs diff=lfs merge=lfs -text
 tests/fixtures/cross_encoder/*.onnx -filter -diff -merge -text
 tests/fixtures/cross_encoder/tokenizer.json -filter -diff -merge -text
 
+# Issue #125 cross-encoder output-authority fixtures are byte-contract
+# inputs (pinned by SHA-256 in tests and by the trace checkpoint); they must
+# never pick up CRLF on Windows checkout.
+tests/fixtures/cross_encoder/expected-profile.json text eol=lf
+tests/fixtures/cross_encoder/expected-shadow.jsonl text eol=lf
+
 # Issue #159 prefetch fixtures pin exact ledger bytes; keep them LF on checkout.
 tests/fixtures/prefetch/** text eol=lf
 

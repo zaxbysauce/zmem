@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -3401,11 +3402,68 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
         if ce_model_cfg:
             sibling = Path(ce_model_cfg).parent / "tokenizer.json"
             ce_tok_present = sibling.is_file()
+        # Issue #125: profile, resolved path, checksum state, passive,
+        # shadow, and autodownload state. Advisory-only (never fails this
+        # check, never downloads); checksum_state compares the resolved
+        # model against the mini-pair-scorer profile digest regardless of
+        # how the path was resolved — an operator-supplied file whose bytes
+        # differ reports "mismatch" informationally while the load policy
+        # stays operator-vouched.
+        ce_profile = ce_profile_name = None
+        ce_model_resolved = ""
+        ce_checksum_state = "missing"
+        try:
+            # doctor.py lives in the scripts dir itself; make the sibling
+            # profile/cross-encoder modules importable when doctor is loaded
+            # as a module (e.g. from tests) rather than run as a script.
+            _scripts_dir = str(Path(__file__).resolve().parent)
+            if _scripts_dir not in sys.path:
+                sys.path.insert(0, _scripts_dir)
+            import cross_encoder_profiles as _ce_profiles  # noqa: E402
+            import storelib.cross_encoder as _ce  # noqa: E402
+            ce_profile = _ce_profiles.resolve_profile()
+            ce_profile_name = _ce_profiles.DEFAULT_PROFILE
+            model_path, _tok_path = _ce.resolve_model_paths()
+            ce_model_resolved = model_path or ""
+            if model_path:
+                model_file = Path(model_path)
+                if not model_file.is_file():
+                    ce_checksum_state = "missing"
+                else:
+                    try:
+                        digest = hashlib.sha256()
+                        with open(model_file, "rb") as fh:
+                            for chunk in iter(lambda: fh.read(1024 * 1024),
+                                              b""):
+                                digest.update(chunk)
+                    except OSError:
+                        # Present but unreadable must not be misreported as
+                        # absent (reviewer round 1, finding 1).
+                        ce_checksum_state = "unreadable"
+                    else:
+                        if digest.hexdigest() == (ce_profile.get("sha256")
+                                                  or "").lower():
+                            ce_checksum_state = "verified"
+                        else:
+                            ce_checksum_state = "mismatch"
+        except Exception:
+            ce_profile = None
+        passive_on = (os.environ.get("ZMEM_CROSS_ENCODER_PASSIVE",
+                                     "0") == "1")
+        shadow_on = (os.environ.get("ZMEM_CROSS_ENCODER_SHADOW",
+                                    "0") == "1")
+        autodl = (os.environ.get("ZMEM_MODEL_AUTODOWNLOAD", "0") == "1")
         details["cross_encoder"] = {
             "enabled": ce_enabled,
             "model_path_configured": ce_model_cfg,
             "model_file_present": ce_model_present,
             "tokenizer_file_present": ce_tok_present if ce_model_cfg else None,
+            "profile": ce_profile_name,
+            "model_path": ce_model_resolved,
+            "checksum_state": ce_checksum_state,
+            "passive": passive_on,
+            "shadow": shadow_on,
+            "autodownload": "enabled" if autodl else "disabled",
         }
     except Exception:
         pass

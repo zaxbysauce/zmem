@@ -10,6 +10,11 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.60.0] - 2026-09-23
+
+### Added
+- **Opt-in local ONNX cross-encoder rerank, profile + budget + passive shadow seam (issue #125)**: a checked-in `mini-pair-scorer` profile registry (`skills/memory/scripts/cross_encoder_profiles.py`, exact SHA-256 pin, import-time checksum validation); profile-aware model resolution (`ZMEM_CROSS_ENCODER_MODEL` operator path unchanged; default path digest-gated via `verify_profile_file`); safe call-time autodownload (exact `ZMEM_MODEL_AUTODOWNLOAD=1`, `ZMEM_CROSS_ENCODER_MODEL_URL`, unique `.part` sibling, digest-verified atomic install, `[zmem] cross-encoder state=autodownload-disabled` otherwise); a 250 ms fail-open budget (`ZMEM_CROSS_ENCODER_BUDGET_MS`) with exactly one terminal `[zmem] cross-encoder reason=<...>` line per scorer attempt; per-process scorer caching keyed `(path, st_mtime_ns)`; a passive final-set seam `rerank_final_injection_set` (double opt-in `ZMEM_CROSS_ENCODER` + `ZMEM_CROSS_ENCODER_PASSIVE=1`) scoring ONLY the admitted final set with bounded shadow rank-delta logging (`ZMEM_CROSS_ENCODER_SHADOW=1` -> `${ZMEM_DATA}/cross-encoder-shadow.jsonl`); doctor `cross_encoder` status gains `profile`/`model_path`/`checksum_state`/`passive`/`shadow`/`autodownload`; passive reordering stays NOT promoted (`PASSIVE_PROMOTION_GATE` records the #155/#111/#129 conditions).
+
 ## [0.59.0] - 2026-09-22
 
 ### Added

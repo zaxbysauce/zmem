@@ -2636,19 +2636,19 @@ def main():
                 hybrid_arg = True
             else:
                 hybrid_arg = None
-            # Issue #63, 8.6: cross-encoder rerank is an explicit-recall-only,
-            # opt-in feature. The single decision point lives in
-            # cross_encoder.cli_allowed; --no-bump excludes every passive hook
-            # caller structurally, --no-hybrid keeps search's byte-stable
-            # contract out of scope even when aliased through this argv.
-            # Issue #114 review (PRR-002): the injection lane is passive
-            # even without an explicit --no-bump (recall_memory forces
-            # no_bump for it), so it must be structurally incapable of
-            # reaching the cross-encoder scorer like every other passive
-            # surface.
-            rerank_flag = (_ce_cli_allowed(no_bump=args.no_bump,
-                                           no_hybrid=args.no_hybrid)
-                           and not args.for_injection)
+            # Issue #63, 8.6: cross-encoder rerank is an opt-in feature.
+            # The single decision point lives in cross_encoder.cli_allowed;
+            # --no-bump keeps every passive hook caller out of the EXPLICIT
+            # lane, --no-hybrid keeps search's byte-stable contract out of
+            # scope even when aliased through this argv.
+            # Issue #125: the gate itself now expresses the passive policy —
+            # for_injection=True reaches the scorer only under the second
+            # opt-in ZMEM_CROSS_ENCODER_PASSIVE=1 (shadow mode scores the
+            # final set and returns the original order), so the old
+            # unconditional `and not args.for_injection` exclusion is gone.
+            rerank_flag = _ce_cli_allowed(no_bump=args.no_bump,
+                                          no_hybrid=args.no_hybrid,
+                                          for_injection=args.for_injection)
             # Issue #82: --explain dispatches to the read-only retrieval
             # debugger (zero writes, never unfolds, fail-open). It is a flag,
             # not a subcommand, so KNOWN_SUBCMDS stays byte-identical.
