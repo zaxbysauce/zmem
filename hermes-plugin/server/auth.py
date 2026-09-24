@@ -39,7 +39,6 @@ import hmac
 import json as _json
 import importlib.util
 import os
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,7 +56,7 @@ NAMESPACE_NOT_ALLOWED = "namespace_not_allowed"
 _SCHEMA_META_REL = Path("skills") / "memory" / "scripts" / "schema_meta.py"
 
 
-def _load_namespace_re():
+def _load_namespace_validator():
     home = os.environ.get("ZMEM_HOME", "").strip()
     if home:
         path = Path(home).expanduser() / _SCHEMA_META_REL
@@ -69,19 +68,13 @@ def _load_namespace_re():
             return None
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        grammar = getattr(mod, "NAMESPACE_RE", None)
-        return grammar if callable(getattr(grammar, "fullmatch", None)) else None
-    except Exception:  # malformed/unreadable selected grammar fails closed
+        validator = getattr(mod, "is_valid_namespace", None)
+        return validator if callable(validator) else None
+    except Exception:  # malformed/unreadable selected validator fails closed
         return None
 
 
-_NAMESPACE_RE = _load_namespace_re()
-# Near-miss forms the store itself rejects (storelib.write near-miss stems):
-# a token scoped to "global" would silently not match any real namespace.
-_NS_NEAR_MISS_RE = re.compile(
-    r"^(global|userglobal|users:global|user\.global|global:user|user-global)$",
-    re.IGNORECASE,
-)
+_NAMESPACE_VALIDATOR = _load_namespace_validator()
 
 
 class NamespaceDenied(Exception):
@@ -131,13 +124,11 @@ def _valid_scope_namespace(ns: object) -> bool:
     v = ns.strip()
     if not v or v == "*":
         return False  # a scope of '*' is the unscoped case — not expressible
-    if _NS_NEAR_MISS_RE.match(v):
-        return False
-    # F15: reject C0 control chars and DEL — Python's \s does not cover
-    # all of them, and they cannot survive a subprocess argv safely.
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
-        return False
-    return bool(_NAMESPACE_RE and _NAMESPACE_RE.fullmatch(v))
+    if _NAMESPACE_VALIDATOR is None:
+        # user:global is the one canonical scope understood without loading
+        # the selected checkout's grammar; all other scopes fail closed.
+        return v == "user:global"
+    return bool(_NAMESPACE_VALIDATOR(v))
 
 
 def _parse_token_file(raw: str, source: str) -> TokenConfig:
@@ -170,6 +161,13 @@ def _parse_token_file(raw: str, source: str) -> TokenConfig:
         )
     cleaned: list[str] = []
     for ns in scopes:
+        if (_NAMESPACE_VALIDATOR is None
+                and isinstance(ns, str)
+                and ns.strip() != "user:global"):
+            _fail_config(
+                f"{source} cannot load the shared namespace validator from the "
+                "selected checkout; scoped namespace validation is unavailable"
+            )
         if not _valid_scope_namespace(ns):
             _fail_config(
                 f"{source} 'namespaces' entry {ns!r} is not a valid namespace "

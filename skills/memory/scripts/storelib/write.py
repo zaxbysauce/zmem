@@ -70,7 +70,8 @@ try:
         ALLOWED_TAINTS,
         TAINT_RANK,
         TAINT_TRUSTED_SIGNALS,
-        NAMESPACE_RE,
+        has_namespace_control,
+        is_valid_namespace,
         validate_taint,
         worse_taint,
     )
@@ -85,7 +86,8 @@ except ImportError:
         ALLOWED_TAINTS,
         TAINT_RANK,
         TAINT_TRUSTED_SIGNALS,
-        NAMESPACE_RE,
+        has_namespace_control,
+        is_valid_namespace,
         validate_taint,
         worse_taint,
     )
@@ -645,10 +647,10 @@ def _validate_namespace(conn: sqlite3.Connection, namespace: str) -> str:
         )
     trimmed = namespace.strip()
 
-    # Keep writer admission aligned with auth/MCP: Python's ``\s`` does not
-    # cover every C0 byte or DEL, and such values are unsafe to carry through
-    # subprocess argv even when they happen to match NAMESPACE_RE.
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in trimmed):
+    # Keep writer admission aligned with auth, MCP, doctor, and scope
+    # resolution through the common validator. C0 and DEL receive a specific
+    # refusal because they cannot safely pass through subprocess argv.
+    if has_namespace_control(trimmed):
         raise CapturePolicyRefusal(
             f"refusing write: namespace {trimmed!r} contains a control character"
         )
@@ -695,7 +697,7 @@ def _validate_namespace(conn: sqlite3.Connection, namespace: str) -> str:
                 "right now with `rekey-namespace --near-miss-global --confirm`.)"
             )
         raise CapturePolicyRefusal(msg)
-    if not NAMESPACE_RE.fullmatch(trimmed):
+    if not is_valid_namespace(trimmed):
         raise CapturePolicyRefusal(
             f"refusing write: namespace {trimmed!r} is invalid; use "
             "project:<name>, user:<name>, fleet:<name>, host:<name>, "

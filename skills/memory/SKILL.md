@@ -1219,6 +1219,12 @@ every namespace, exactly the pre-v13 behavior. To scope it, point
 {"token": "<secret>", "namespaces": ["project:zmem", "user:global"]}
 ```
 
+Allowed namespace forms are project:name, user:name, fleet:name, host:name,
+agent:name, and domain:name. Project and user values retain later-colon
+compatibility; existing local project path keys may also contain internal
+spaces. The fleet, host, agent, and domain forms require one non-empty value
+without whitespace or colons.
+
 Requests outside the allow-list fail closed with the stable
 `namespace_not_allowed` error. `supersede`/`invalidate` are namespace-guarded
 too (issue #109): for a scoped token the server reads the target row's

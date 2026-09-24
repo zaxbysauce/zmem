@@ -117,6 +117,18 @@ def _synthetic_migration_checkouts(tmp_path: Path) -> dict[str, Path]:
 class TestResolveNamespaceNormalization(unittest.TestCase):
     """git@ vs https vs trailing-slash vs case all collapse to one key."""
 
+    def test_resolve_scopes_defaults_and_environment_selection(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(host.resolve_scopes(), {})
+            self.assertEqual(host.resolve_scopes(hostname="spark1"), {
+                "host": "host:spark1",
+            })
+            self.assertEqual(host.resolve_scopes(env={}), {})
+        with mock.patch.dict(os.environ, {"ZMEM_FLEET": "ambient"}, clear=False):
+            self.assertEqual(host.resolve_scopes(env=None), {
+                "fleet": "fleet:ambient",
+            })
+
     def test_resolve_scopes_without_project(self):
         with mock.patch.dict(os.environ, {"ZMEM_FLEET": "ambient-must-not-win"}, clear=False):
             scopes = host.resolve_scopes(

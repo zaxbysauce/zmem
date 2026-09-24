@@ -13,13 +13,16 @@ README.
 ## [0.61.0] - 2026-09-23
 
 ### Added
-- **Shared scope-namespace grammar (issue #166):** new writes, MCP input,
-  scoped-token parsing, and doctor now use one schema-meta grammar. Project
-  and user values retain compatible later-colon forms; fleet, host, agent, and
-  domain accept a strict single-value scope. `host.resolve_scopes` derives
-  explicit project, host, fleet, and agent entries without hostname guessing.
-  Scoped token admission fails closed when the selected checkout lacks the
-  shared grammar. Existing recall and legacy JSONL ingest behavior are unchanged.
+- **Shared scope-namespace validation (issue #166):** new writes, MCP input,
+  scoped-token parsing, and doctor now use one schema-meta validator. Project
+  and user values retain compatible later-colon and internal-space forms for
+  existing local path keys. Fleet, host, agent, and domain accept a strict
+  single-value scope. The host resolver derives explicit project, host, fleet,
+  and agent entries without hostname guessing.
+  Scoped-token admission and MCP namespace writes fail closed when the
+  selected checkout lacks the shared validator. Namespace admission rejects
+  C0 and DEL control characters. Existing recall and legacy JSONL ingest
+  behavior are unchanged.
 
 ## [0.60.0] - 2026-09-23
 

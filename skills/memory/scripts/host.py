@@ -638,10 +638,10 @@ def resolve_namespace(project_dir: str | Path) -> str:
 
 
 def resolve_scopes(
-    project_dir: str | Path | None,
-    hostname: str | None,
-    env: dict | None,
-    hermes_kwargs: dict | None,
+    project_dir: str | Path | None = None,
+    hostname: str | None = None,
+    env: dict | None = None,
+    hermes_kwargs: dict | None = None,
 ) -> dict[str, str]:
     """Derive explicit namespace scopes for callers that need them.
 
@@ -650,7 +650,7 @@ def resolve_scopes(
     returned values are validated through the shared admission grammar so a
     bad injected host, fleet, or agent identity is never silently persisted.
     """
-    from schema_meta import NAMESPACE_RE
+    from schema_meta import is_valid_namespace
 
     values: dict[str, str] = {}
     if project_dir is not None:
@@ -666,12 +666,12 @@ def resolve_scopes(
         if not value:
             continue
         namespace = f"{label}:{value}"
-        if (not NAMESPACE_RE.fullmatch(namespace)
-                or any(ord(c) < 0x20 or ord(c) == 0x7F for c in namespace)):
+        if not is_valid_namespace(namespace):
             raise ValueError(f"invalid {label} scope value: {raw!r}")
         values[label] = namespace
 
-    if "project" in values and not NAMESPACE_RE.fullmatch(values["project"]):
+    if ("project" in values
+            and not is_valid_namespace(values["project"])):
         raise ValueError(f"invalid project scope value: {values['project']!r}")
     return values
 

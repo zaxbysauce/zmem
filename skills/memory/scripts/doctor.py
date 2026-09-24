@@ -53,12 +53,19 @@ except ImportError:
 # module store.py uses) so doctor and store can never disagree. A stale local
 # copy here once made every healthy v7 store FAIL doctor's schema gate (#36 M11).
 try:
-    from schema_meta import (NAMESPACE_RE, SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION,
-                         FORWARD_COMPAT_SCHEMA_VERSION as COMPAT_CEILING)
+    from schema_meta import (
+        is_valid_namespace,
+        SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION,
+        FORWARD_COMPAT_SCHEMA_VERSION as COMPAT_CEILING,
+    )
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
-    from schema_meta import (NAMESPACE_RE, SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION,  # type: ignore # noqa: E501
-                             FORWARD_COMPAT_SCHEMA_VERSION as COMPAT_CEILING)
+    from schema_meta import (  # type: ignore
+        is_valid_namespace,
+        SUPPORTED_SCHEMA_VERSION as CURRENT_SCHEMA_VERSION,
+        FORWARD_COMPAT_SCHEMA_VERSION as COMPAT_CEILING,
+    )
+
 try:
     import host_registry
 except ImportError:
@@ -947,15 +954,8 @@ def _check_mcp_token() -> dict:
         )
     # Use schema_meta's shared grammar without importing the server module so
     # doctor never reports "pass" for a token file the server will refuse.
-    import re as _re
-    _near_miss = _re.compile(
-        r"^(global|userglobal|users:global|user\.global|global:user|user-global)$",
-        _re.IGNORECASE,
-    )
     for ns in scopes:
-        if (not isinstance(ns, str) or not NAMESPACE_RE.fullmatch(ns.strip())
-                or _near_miss.match(ns.strip())
-                or any(ord(c) < 0x20 or ord(c) == 0x7F for c in ns.strip())):
+        if not is_valid_namespace(ns):
             return _check(
                 "mcp-token", "fail",
                 f"ZMEM_MCP_TOKEN_FILE 'namespaces' entry {ns!r} is not a "

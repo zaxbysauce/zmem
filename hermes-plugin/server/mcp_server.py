@@ -70,9 +70,9 @@ _MAX_CONTENT_CHARS = 65536
 _ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
 _ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint")
 _ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
-# Never invent a grammar fallback.  If the selected checkout cannot provide
-# schema_meta.NAMESPACE_RE, noncanonical namespaces fail closed.
-_NAMESPACE_RE = None
+# Never invent a validator fallback. If the selected checkout cannot provide
+# the shared namespace validator, noncanonical namespaces fail closed.
+_NAMESPACE_VALIDATOR = None
 # Issue #153: closed runtime lanes.  The fallback is intentionally kept
 # byte-identical with schema_meta and the local Hermes provider.
 _INJECT_LANES = (
@@ -310,14 +310,14 @@ def _load_store_constants() -> None:
     checkout — calling it here would emit that noise on every import outside a
     checkout (e.g. a lint pass or a test reading a constant), even though the
     SystemExit is caught (PRR-009). A ZMEM_HOME selection is authoritative for
-    grammar loading, matching the store.py subprocess it will execute.
+    validator loading, matching the store.py subprocess it will execute.
     """
     global _MAX_CONTENT_CHARS, _ALLOWED_SIGNALS, _ALLOWED_TYPES, _ALLOWED_TAINTS
-    global _NAMESPACE_RE
+    global _NAMESPACE_VALIDATOR
     global _INJECT_LANES
     global _INJECT_SILENT_REASONS, _INJECT_REASON_INJECTED
     global _INJECT_REASON_DISABLED
-    _NAMESPACE_RE = None
+    _NAMESPACE_VALIDATOR = None
     try:
         import importlib.util
         # Resolve schema_meta with the SAME precedence _resolve_zmem_home() uses
@@ -366,9 +366,9 @@ def _load_store_constants() -> None:
         _INJECT_REASON_DISABLED = getattr(
             mod, "INJECT_REASON_DISABLED", _INJECT_REASON_DISABLED
         )
-        grammar = getattr(mod, "NAMESPACE_RE", None)
-        if callable(getattr(grammar, "fullmatch", None)):
-            _NAMESPACE_RE = grammar
+        validator = getattr(mod, "is_valid_namespace", None)
+        if callable(validator):
+            _NAMESPACE_VALIDATOR = validator
     except Exception as exc:  # noqa: BLE001
         logger.debug("schema_meta constants load failed (%s); using defaults", exc)
 
@@ -907,27 +907,14 @@ def _namespace_flag(namespace: Optional[str]) -> list[str]:
     return []
 
 
-# v13 (issue #65, 10.1): fail-fast namespace shape validation, mirroring the
-# CLI's rules (storelib.write._validate_namespace) without importing storelib:
-# reject near-miss global variants and use schema_meta's shared grammar.
-_NS_NEAR_MISS = re.compile(
-    r"^(global|userglobal|users:global|user\.global|global:user|user-global)$",
-    re.IGNORECASE,
-)
-
-
+# Namespace admission goes through the selected checkout's shared validator.
 def _valid_mcp_namespace(namespace: str) -> bool:
     ns = (namespace or "").strip()
     if not ns:
         return False
-    # Match auth's F15 guard: ``\s`` alone does not reject every C0 byte/DEL.
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in ns):
-        return False
-    if _NS_NEAR_MISS.match(ns):
-        return False
     if ns == "user:global":
         return True
-    return bool(_NAMESPACE_RE and _NAMESPACE_RE.fullmatch(ns))
+    return bool(_NAMESPACE_VALIDATOR and _NAMESPACE_VALIDATOR(ns))
 
 
 def _parse_results(r: dict[str, Any]) -> dict[str, Any]:

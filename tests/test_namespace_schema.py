@@ -131,7 +131,7 @@ class NamespaceSchemaTest(unittest.TestCase):
             sys.path[:] = saved_path
 
     def test_shared_grammar_matrix(self):
-        """Every active validator must implement the exact issue #166 matrix."""
+        """All validators match issue #166 and the legacy spaced-path case."""
         fixture_dir = REPO_ROOT / "tests" / "fixtures"
         matrix = json.loads(
             (fixture_dir / "namespace_scopes.json").read_text(encoding="utf-8")
@@ -223,6 +223,70 @@ class NamespaceSchemaTest(unittest.TestCase):
             doctor_report.get("details", {}).get("namespaces"), 1,
             doctor_report,
         )
+
+    def test_spaced_no_remote_project_key_is_admitted_everywhere(self):
+        import host
+        from storelib import write as write_mod
+
+        with tempfile.TemporaryDirectory(prefix="zmem local project ") as tmp:
+            namespace = host.resolve_namespace(tmp)
+            self.assertIn(" ", namespace)
+            write_mod, mcp_mod, auth_mod = self._load_scope_validators()
+            conn = sqlite3.connect(":memory:")
+            try:
+                self.assertEqual(
+                    write_mod._validate_namespace(conn, namespace), namespace
+                )
+                self.assertTrue(mcp_mod._valid_mcp_namespace(namespace))
+                self.assertTrue(auth_mod._valid_scope_namespace(namespace))
+                self.assertEqual(
+                    host.resolve_scopes(project_dir=tmp, env={}),
+                    {"project": namespace},
+                )
+            finally:
+                conn.close()
+
+    def test_doctor_matches_shared_namespace_fixture_matrix(self):
+        import doctor
+
+        matrix = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "namespace_scopes.json")
+            .read_text(encoding="utf-8")
+        )
+        saved_token = os.environ.get("ZMEM_MCP_TOKEN")
+        saved_token_file = os.environ.get("ZMEM_MCP_TOKEN_FILE")
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".json", delete=False
+        ) as token_file:
+            token_path = token_file.name
+        try:
+            os.environ.pop("ZMEM_MCP_TOKEN", None)
+            os.environ["ZMEM_MCP_TOKEN_FILE"] = token_path
+            for expected_status, values in (
+                ("pass", matrix["accepted"]),
+                ("fail", matrix["rejected"]),
+            ):
+                for namespace in values:
+                    with self.subTest(namespace=namespace, status=expected_status):
+                        with open(token_path, "w", encoding="utf-8") as token_file:
+                            json.dump(
+                                {"token": "fixture-matrix", "namespaces": [namespace]},
+                                token_file,
+                            )
+                        report = doctor._check_mcp_token()
+                        self.assertEqual(
+                            report.get("status"), expected_status, report
+                        )
+        finally:
+            os.unlink(token_path)
+            if saved_token is None:
+                os.environ.pop("ZMEM_MCP_TOKEN", None)
+            else:
+                os.environ["ZMEM_MCP_TOKEN"] = saved_token
+            if saved_token_file is None:
+                os.environ.pop("ZMEM_MCP_TOKEN_FILE", None)
+            else:
+                os.environ["ZMEM_MCP_TOKEN_FILE"] = saved_token_file
 
     def test_release_gate_commands(self):
         """The issue's two release checks remain executable and side-effect free."""

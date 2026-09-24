@@ -7,11 +7,14 @@ frozen namespace matrix, so it remains runnable without the optional MCP SDK.
 
 from __future__ import annotations
 
+import io
 import os
 import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from unittest import mock
 from pathlib import Path
 
 try:
@@ -83,6 +86,12 @@ class NamespaceControlCharacterTest(unittest.TestCase):
         finally:
             sys.path.remove(str(scripts))
 
+        with mock.patch.object(
+            host, "resolve_namespace", return_value="project:checkout" + chr(0x7F)
+        ):
+            with self.assertRaises(ValueError):
+                host.resolve_scopes(project_dir="unused")
+
     def test_selected_checkout_without_schema_fails_closed(self):
         """An explicit incomplete checkout cannot widen noncanonical scopes."""
         old_home = os.environ.get("ZMEM_HOME")
@@ -100,7 +109,17 @@ class NamespaceControlCharacterTest(unittest.TestCase):
 
         self.assertFalse(auth._valid_scope_namespace("fleet:dgx-spark"))
         self.assertFalse(mcp._valid_mcp_namespace("fleet:dgx-spark"))
+        self.assertTrue(auth._valid_scope_namespace("user:global"))
         self.assertTrue(mcp._valid_mcp_namespace("user:global"))
+
+        error = io.StringIO()
+        with redirect_stderr(error):
+            with self.assertRaises(SystemExit):
+                auth._parse_token_file(
+                    '{"token":"fixture","namespaces":["fleet:dgx-spark"]}',
+                    "fixture token",
+                )
+        self.assertIn("shared namespace validator", error.getvalue())
 
 
 if __name__ == "__main__":
