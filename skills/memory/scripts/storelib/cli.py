@@ -2659,7 +2659,8 @@ def main():
                 hybrid_arg = True
             else:
                 hybrid_arg = None
-            # Issue #63, 8.6: cross-encoder rerank is an opt-in feature.
+            # Issue #63, 8.6 / issue #126: cross-encoder rerank is enabled by
+            # default at unset (opt out with ZMEM_CROSS_ENCODER=0).
             # The single decision point lives in cross_encoder.cli_allowed;
             # --no-bump keeps every passive hook caller out of the EXPLICIT
             # lane, --no-hybrid keeps search's byte-stable contract out of
