@@ -25,6 +25,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import shutil
 import struct
@@ -687,6 +688,123 @@ class FailClosedDimensionGuard(unittest.TestCase):
         cnt = sqlite3.connect(str(Path(self.tmp) / "store.sqlite")).execute(
             "SELECT COUNT(*) FROM memory").fetchone()[0]
         self.assertEqual(cnt, 1, "refusal must leave zero partial writes")
+
+
+class ReembedCheckSurface(unittest.TestCase):
+    """Issue #168's read-only embedding census surface.
+
+    The base commit is intentionally RED because ``reembed --check`` is not
+    registered by the CLI yet.  The fixture has complete 384-dim vectors, so
+    the clean case is independent of a downloaded embedding model.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture_builder = REPO_ROOT / "tests" / "fixtures" / "rekey" / "build_fixture.py"
+
+    def setUp(self):
+        if not _sqlite_vec_available():
+            self.skipTest("sqlite-vec required")
+        self.tmp = tempfile.mkdtemp(prefix="zmem-reembed-check-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store_path = Path(self.tmp) / "store.sqlite"
+        self.data_path = Path(self.tmp) / "data"
+        self.data_path.mkdir()
+        built = subprocess.run(
+            [sys.executable, str(self.fixture_builder), str(self.store_path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(built.returncode, 0, built.stderr)
+        self.env = dict(os.environ)
+        self.env.update({
+            "ZMEM_STORE": str(self.store_path),
+            "ZMEM_DATA": str(self.data_path),
+            "ZMEM_MODELS_DIR": str(Path(self.tmp) / "no-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        self.env.pop("ZMEM_EMBED_PROFILE", None)
+
+    def _run_check(self, *extra: str):
+        return subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "reembed", "--check", *extra],
+            capture_output=True, text=True, env=self.env, cwd=str(SCRIPTS), timeout=60,
+        )
+
+    def _connect(self):
+        conn = sqlite3.connect(str(self.store_path))
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        return conn
+
+    def _store_digest(self):
+        h = hashlib.sha256()
+        for path in (
+            self.store_path,
+            Path(f"{self.store_path}-wal"),
+            Path(f"{self.store_path}-shm"),
+        ):
+            h.update(path.name.encode())
+            h.update(path.read_bytes() if path.exists() else b"<missing>")
+        return h.hexdigest()
+
+    def test_clean_check_exact_and_readonly(self):
+        before = self._store_digest()
+        result = self._run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "reembed check: 0 inconsistencies\n")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self._store_digest(), before)
+
+    def test_inconsistent_check_reports_counts_without_mutation(self):
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM memory_vec WHERE memory_id='fixture-01'")
+            blob = struct.pack("<384f", *([0.25] * 384))
+            conn.execute(
+                "INSERT INTO memory_vec(embedding,memory_id) VALUES (?,?)",
+                (blob, "orphan-vector"),
+            )
+            conn.execute(
+                "UPDATE memory SET embedding=? WHERE id='fixture-02'",
+                (struct.pack("<2f", 0.1, 0.2),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        before = self._store_digest()
+        result = self._run_check()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        match = re.fullmatch(
+            r"reembed check: (\d+) inconsistencies "
+            r"\(missing=(\d+), orphan=(\d+), dimension=(\d+)\)\n",
+            result.stdout,
+        )
+        self.assertIsNotNone(match, result.stdout)
+        self.assertEqual(match.groups(), ("3", "1", "1", "1"))
+        self.assertEqual(self._store_digest(), before)
+
+    def test_tombstoned_missing_vector_is_excluded(self):
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE memory SET superseded_at='2026-02-01T00:00:00Z' "
+                "WHERE id='fixture-01'"
+            )
+            conn.execute("DELETE FROM memory_vec WHERE memory_id='fixture-01'")
+            conn.commit()
+        finally:
+            conn.close()
+        result = self._run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "reembed check: 0 inconsistencies\n")
+
+    def test_check_rejects_mutating_flags(self):
+        before = self._store_digest()
+        result = self._run_check("--all")
+        self.assertEqual(result.returncode, 2)
+        self.assertRegex(result.stderr.lower(), r"check|all|exclusive")
+        self.assertEqual(self._store_digest(), before)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,3 @@
+# YAML subset intentionally accepted by issue #168.
+"db:spark-kb": "fleet:dgx-spark"
+"hermes-spark1": "host:spark1"

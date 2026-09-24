@@ -45,7 +45,10 @@ from storelib.inject import (INJECTION_LANES, INJECTION_MOMENTS,
                              inject_token_budget,
                              select_and_budget_for_injection)
 from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
-from storelib.recall import reembed_embeddings
+from storelib.recall import _declared_vec0_dim, reembed_embeddings
+from storelib.rekey import (MapError, apply_namespace_map, embedding_census,
+                            open_readonly_store, parse_namespace_map,
+                            preview_namespace_map)
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
 from storelib.dataset import (
@@ -1383,7 +1386,7 @@ def main():
                            help="with --all: embedding profile to convert "
                                 "the store to (default: active "
                                 "ZMEM_EMBED_PROFILE or minilm)")
-    p_reembed.add_argument("--batch", type=nonnegative_int, default=64,
+    p_reembed.add_argument("--batch", type=nonnegative_int, default=None,
                            help="progress-report granularity in rows "
                                 "(stderr pacing only; does not affect "
                                 "transaction atomicity; values < 1 reset "
@@ -1392,8 +1395,10 @@ def main():
                            help="report what --all would change; writes nothing")
     p_reembed.add_argument("--confirm", action="store_true",
                            help="required by --all --profile fake when the "
-                                "store holds committed non-fake vectors "
-                                "(conversion overwrites them with placeholders)")
+                              "store holds committed non-fake vectors "
+                              "(conversion overwrites them with placeholders)")
+    p_reembed.add_argument("--check", action="store_true",
+                           help="read-only embedding/vector consistency census")
 
 
     p_consolidate = _add_parser("consolidate", help="merge near-duplicate memories")
@@ -1555,10 +1560,12 @@ def main():
         "rekey-namespace",
         help="admin: rewrite the namespace of live rows (remediate stranded "
              "global-near-miss rows so they surface again)")
+    p_rekey.add_argument("--map", dest="map_path", default=None,
+                         help="ordered quoted source_ref-prefix to target-scope map")
     p_rekey.add_argument("--from", dest="from_namespace", default=None,
                          help="source namespace to rekey from (required unless "
                               "--near-miss-global is set). Case-sensitive exact match.")
-    p_rekey.add_argument("--to", dest="to_namespace", default=GLOBAL_NAMESPACE,
+    p_rekey.add_argument("--to", dest="to_namespace", default=None,
                          help=f"destination namespace (default {GLOBAL_NAMESPACE}). "
                               "Must not itself be a global near-miss.")
     p_rekey.add_argument("--near-miss-global", action="store_true",
@@ -2037,6 +2044,82 @@ def main():
                        default="json", help="Report format")
 
     args = ap.parse_args()
+
+    # `None` is an explicit parser sentinel: --check rejects an operator's
+    # supplied --batch but ordinary reembed retains its historical default.
+    if args.cmd == "reembed":
+        args.batch_supplied = args.batch is not None
+        if args.batch is None:
+            args.batch = 64
+        if args.check and (args.all or args.dry_run or args.confirm
+                           or args.profile is not None or args.batch_supplied):
+            ap.error("reembed: --check is exclusive with --all, --dry-run, "
+                     "--confirm, --profile, and --batch")
+
+    if args.cmd == "rekey-namespace" and args.map_path is not None:
+        if args.dry_run == args.confirm:
+            ap.error("rekey-namespace: --map requires --confirm or --dry-run")
+        if (args.from_namespace is not None or args.to_namespace is not None
+                or args.near_miss_global):
+            ap.error("rekey-namespace: --map cannot be combined with --from, "
+                     "--to, or --near-miss-global")
+        try:
+            map_entries = parse_namespace_map(args.map_path)
+        except MapError as exc:
+            ap.error(f"rekey-namespace: {exc}")
+        # Both map modes are intentionally before ordinary connect(): preview
+        # has a byte-preserving ro handle, while apply owns its narrow rw
+        # connection plus writer lease and verified snapshot.
+        if args.dry_run:
+            try:
+                ro_conn = open_readonly_store(STORE_PATH)
+                try:
+                    sys.exit(preview_namespace_map(ro_conn, map_entries))
+                finally:
+                    ro_conn.close()
+            except RuntimeError as exc:
+                print(f"[zmem] rekey-namespace: {exc}", file=sys.stderr)
+                sys.exit(2)
+        map_lease = None
+        map_conn = None
+        try:
+            map_lease = _acquire_writer_lease("rekey-namespace")
+            map_conn = _connect_existing_store()
+            sys.exit(apply_namespace_map(map_conn, store_path=STORE_PATH,
+                                         entries=map_entries))
+        except (RuntimeError, FileNotFoundError) as exc:
+            print(f"[zmem] rekey-namespace: {exc}", file=sys.stderr)
+            sys.exit(2)
+        finally:
+            if map_conn is not None:
+                map_conn.close()
+            _release_writer_lease(map_lease)
+
+    if args.cmd == "reembed" and args.check:
+        check_conn = None
+        try:
+            check_conn = open_readonly_store(STORE_PATH, load_vec=True)
+            declared_dim = _declared_vec0_dim(check_conn)
+            if declared_dim is None:
+                raise RuntimeError("memory_vec table/runtime is unavailable")
+            missing, orphan, dimension = embedding_census(check_conn, declared_dim)
+            total = missing + orphan + dimension
+            if total:
+                print(f"reembed check: {total} inconsistencies "
+                      f"(missing={missing}, orphan={orphan}, dimension={dimension})")
+                sys.exit(1)
+            print("reembed check: 0 inconsistencies")
+            sys.exit(0)
+        except RuntimeError as exc:
+            print(f"[zmem] reembed check: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except sqlite3.Error as exc:
+            print(f"[zmem] reembed check: vector table/runtime unavailable: {exc}",
+                  file=sys.stderr)
+            sys.exit(2)
+        finally:
+            if check_conn is not None:
+                check_conn.close()
 
     # Issue #137: --llm-local drives the maintenance action adapter and has no
     # meaning without --belief-heads; refused at parse time, before any

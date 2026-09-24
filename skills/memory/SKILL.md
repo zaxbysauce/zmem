@@ -1104,6 +1104,7 @@ the vec lane should be re-run with `--no-hybrid` to include the FTS lane.
 ```
 python <store.py> reembed
 python <store.py> reembed --all [--profile NAME] [--batch N] [--dry-run]
+python <store.py> reembed --check
 ```
 Flagless form (unchanged contract): backfills embeddings for live memories that
 are MISSING them when the optional embedding runtime and model are available.
@@ -1138,6 +1139,15 @@ Idempotency detail: change detection keys on
 `embedding IS NULL OR blob dim mismatch OR embedding_model marker differs`,
 so switching `--profile` back and forth always reports honestly instead of
 silently treating rows as current.
+
+`--check` is an exclusive, read-only consistency census. It reports live rows
+missing a `memory_vec` row, vector rows whose memory no longer exists, and live
+embedding blobs whose exact byte length differs from the declared vec0 dimension.
+It exits 0 with `reembed check: 0 inconsistencies`; otherwise it prints the three
+counts and exits 1. It never downloads a model, takes a writer lease, performs
+auto-rekey, or changes the store. A store with an active `-wal` sidecar is refused
+with exit 2 so the census cannot recover or create shared-memory files; checkpoint
+the store first.
 
 ### Embedding profiles — shipped registry (`embed_profiles.py`)
 
@@ -1609,6 +1619,8 @@ template store with `store.py organize --dry-run` before upgrading.
 ```
 python <store.py> rekey-namespace --near-miss-global [--to user:global] [--dry-run] --confirm
 python <store.py> rekey-namespace --from <old-namespace> --to <new-namespace> [--dry-run] --confirm
+python <store.py> rekey-namespace --map <map.yaml> --dry-run
+python <store.py> rekey-namespace --map <map.yaml> --confirm
 ```
 Rewrites the `namespace` column of live rows. The primary use is remediating
 legacy rows stranded under a global near-miss namespace (`global`,
@@ -1627,6 +1639,21 @@ for kill-switch deployments. Namespace contract: fleet facts live in
 `user:global`; project facts in `project:<canonical-git-remote>`; MCP `add`
 without a namespace uses `ZMEM_MCP_DEFAULT_NS` when the operator set it,
 else `user:global` — a bare `global` is never invented.
+
+`--map` is separate from the legacy selectors. Its file is UTF-8 without a BOM
+and contains only unindented quoted pairs such as
+`"db:source-prefix": "fleet:scope"`; blank lines and full-line comments are
+allowed. Entries are evaluated in file order, so the first matching `source_ref`
+prefix wins. Every target must satisfy the shared namespace grammar. Map mode
+requires exactly one of `--dry-run` or `--confirm` and cannot be combined with
+`--from`, `--to`, or `--near-miss-global`.
+
+The preview opens the existing store read-only and prints one count per map entry
+plus `unmapped`, with no backup, log, lease, migration, or auto-rekey. Apply takes
+a verified snapshot before its single transaction, updates and relinks only IDs
+whose namespace changes, then appends one decision-log line per map entry. A
+post-commit decision-log failure reports exit 1 with the committed result intact;
+restore the verified snapshot if recovery is required.
 
 ### promote-store — merge a leftover second store (admin, issue #71 E)
 ```
