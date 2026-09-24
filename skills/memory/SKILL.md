@@ -682,10 +682,11 @@ numerals fail before the scoped pipeline opens a SQL lane. The scoped
 `cross_project` pool is closed by default and calls `_cross_project_eligible`
 for any policy supplied by the caller. This is separate from the legacy #98
 `--include-cross-project` hazard lane. Scoped rows are stable-deduplicated by id
-and carry their tier in JSON; fenced output prefixes `[tier=<name>]`, and a
-tierless row is explicitly prefixed `[tier=unknown]`. The legacy `tier=cross`
-renderer marker remains a suffix. Explicit `--namespace`, search, hook, and
-injection calls retain their legacy route and limit arguments. Explicit
+and carry their tier in JSON; generic fenced output prefixes `[tier=<name>]`,
+and a tierless generic row is explicitly prefixed `[tier=unknown]`. Legacy
+passive injection retains its established tierless wire bytes. The legacy
+`tier=cross` renderer marker remains a suffix. Explicit `--namespace`, search,
+hook, and injection calls retain their legacy route and limit arguments. Explicit
 `--include-global` and `--include-cross-project` flags likewise keep their
 legacy union lanes and limit or hazard semantics. Direct scoped
 `recall_memory`/`recent_memory` calls reject `for_injection=True`; scoped explain

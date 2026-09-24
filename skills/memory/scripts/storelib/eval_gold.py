@@ -388,7 +388,8 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
     # against the SAME ceiling; otherwise a stub landing in
     # (budget-128, budget] slips past undetected.
     shell = getattr(_inject, "FENCE_SHELL_ALLOWANCE", 0)
-    used = sum(_inject.fence_row_cost(r) for r in rows)
+    used = sum(_inject.fence_row_cost(
+        r, legacy_injection_wire=True) for r in rows)
     protected = getattr(_inject, "_PROTECTED_TYPES",
                         ("decision", "constraint"))
     all_protected = bool(rows) and all(
@@ -628,7 +629,8 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
         rows, envelope = _run_lane(item, executed_query or "", k)
         rendered_ids = [r["id"] for r in rows]
         fence = _format_fenced_recall(
-            rows, header=f"Relevant memories (namespace {item.namespace or 'unscoped'}).")
+            rows, header=f"Relevant memories (namespace {item.namespace or 'unscoped'}).",
+            legacy_injection_wire=True)
         _verify_real_lane(item.id, rows, envelope, fence, conn=conn,
                           candidate_ids=envelope.get("candidate_ids"),
                           candidate_lanes=envelope.get("candidate_lanes"))

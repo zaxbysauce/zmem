@@ -96,9 +96,11 @@ Set `ZMEM_TIER_SLOTS` to exactly five comma-separated ASCII nonnegative integers
 in that order to change the caps per call. The scoped cross-project pool is
 closed unless a caller supplies the `_cross_project_eligible` policy seam; the
 legacy `--include-cross-project` hazard lane remains separate. Fenced scoped rows
-carry `[tier=<name>]` prefixes, while tierless rows use `[tier=unknown]` and the
-legacy `tier=cross` marker keeps its suffix form. Explicit `--namespace`, search,
-hook, and injection calls retain their existing legacy routing and limits.
+carry `[tier=<name>]` prefixes, while the generic tierless renderer uses
+`[tier=unknown]` and the legacy `tier=cross` marker keeps its suffix form.
+Passive injection retains its established tierless wire bytes. Explicit
+`--namespace`, search, hook, and injection calls retain their existing legacy
+routing and limits.
 Explicit `--include-global` and `--include-cross-project` flags also stay on
 their corresponding legacy union lane so `--global-limit` and hazard admission
 keep their existing semantics.

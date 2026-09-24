@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -449,7 +450,8 @@ def _fence_renderer():
         return None
 
 
-def _local_fenced_recall(rows, header: str, budget_note: str = "") -> str:
+def _local_fenced_recall(rows, header: str, budget_note: str = "",
+                         legacy_injection_wire: bool = False) -> str:
     """Degraded-mode fence mirroring storelib's token accounting.
 
     ``budget_note`` (issue #116) keeps the degraded render on the same
@@ -469,6 +471,9 @@ def _local_fenced_recall(rows, header: str, budget_note: str = "") -> str:
         elif tier in _SCOPED_TIER_ORDER:
             tier_token = ""
             tier_prefix = f"[tier={tier}] "
+        elif legacy_injection_wire and (tier is None or tier == ""):
+            tier_token = ""
+            tier_prefix = ""
         else:
             tier_token = ""
             tier_prefix = "[tier=unknown] "
@@ -485,6 +490,45 @@ def _local_fenced_recall(rows, header: str, budget_note: str = "") -> str:
         lines.append("# " + budget_note)
     lines.append("<<<END_ZMEM_UNTRUSTED_FENCE>>>")
     return "\n".join(lines) + "\n"
+
+
+def _renderer_rejected_keyword(renderer, keyword: str, exc: TypeError) -> bool:
+    """Return true only when a renderer signature cannot accept ``keyword``."""
+    try:
+        params = inspect.signature(renderer).parameters.values()
+    except (TypeError, ValueError):
+        # Extension/decorator callables can lack a signature. Their Python
+        # TypeError remains the available compatibility evidence.
+        return keyword in str(exc)
+    return not any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        or (param.name == keyword and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ))
+        for param in params
+    )
+
+
+def _render_legacy_injection_fence(renderer, rows, header: str,
+                                   budget_note: str) -> str:
+    """Use the new passive wire while accepting deployed old renderers."""
+    try:
+        return renderer(rows, header, budget_note=budget_note,
+                        legacy_injection_wire=True)
+    except TypeError as exc:
+        if not _renderer_rejected_keyword(
+                renderer, "legacy_injection_wire", exc):
+            raise
+    try:
+        # A #183-preparation storelib can understand budget_note but not the
+        # compatibility keyword.
+        return renderer(rows, header, budget_note=budget_note)
+    except TypeError as exc:
+        if not _renderer_rejected_keyword(renderer, "budget_note", exc):
+            raise
+    # The oldest renderer has neither keyword.
+    return renderer(rows, header)
 
 
 def _log_embedding_availability(return_status: bool = False):
@@ -1814,13 +1858,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         except Exception:
             reason = "empty-pool"
         if rows:
-            try:
-                context = renderer(rows, header,
-                                   budget_note=budget_note_text)
-            except TypeError:
-                # PR-review hardening: an older storelib renderer without the
-                # budget_note kwarg degrades to the legacy call (fail-open).
-                context = renderer(rows, header)
+            context = _render_legacy_injection_fence(
+                renderer, rows, header, budget_note_text)
         elif reason == "budget-drop":
             # F9/C14: rows existed but the token budget dropped them all
             # — say so instead of implying the store had nothing.

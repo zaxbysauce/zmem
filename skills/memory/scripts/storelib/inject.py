@@ -143,7 +143,8 @@ def _row_markers(row: dict[str, Any]) -> list:
     return markers
 
 
-def fence_row_cost(row: dict[str, Any]) -> int:
+def fence_row_cost(row: dict[str, Any], *,
+                   legacy_injection_wire: bool = False) -> int:
     """Admission-control token cost of one row's FULL fence contribution
     (issue #116).
 
@@ -157,6 +158,8 @@ def fence_row_cost(row: dict[str, Any]) -> int:
     join/newline arithmetic variance. Input contract: dict-like rows
     (missing keys cost as empty, matching the renderer's ``.get``-style
     defaults); the +2 margin is what the renderer's line separators cost.
+    ``legacy_injection_wire`` mirrors the immutable #183 passive-wire mode:
+    tierless rows omit the generic ``[tier=unknown]`` prefix there.
     """
     markers = _row_markers(row)
     inj_prefix = (" " + " ".join(markers)) if markers else ""
@@ -168,6 +171,9 @@ def fence_row_cost(row: dict[str, Any]) -> int:
     elif tier == "cross":
         tier_prefix = ""
         tier_suffix = " [tier=cross]"
+    elif legacy_injection_wire and (tier is None or tier == ""):
+        tier_prefix = ""
+        tier_suffix = ""
     else:
         tier_prefix = "[tier=unknown] "
         tier_suffix = ""
@@ -315,8 +321,22 @@ def _row_priority(row: dict[str, Any], index: int) -> Tuple[float, int, int]:
     return (-score, none_last, index)
 
 
+def _fence_row_cost_for_wire(
+    row: dict[str, Any], *, legacy_injection_wire: bool,
+) -> int:
+    """Call the public seam while retaining old one-argument test doubles."""
+    try:
+        return fence_row_cost(
+            row, legacy_injection_wire=legacy_injection_wire)
+    except TypeError as exc:
+        if "legacy_injection_wire" not in str(exc):
+            raise
+        return fence_row_cost(row)
+
+
 def _truncate_protected_row(
-    row: dict[str, Any], remaining: int
+    row: dict[str, Any], remaining: int, *,
+    legacy_injection_wire: bool = True,
 ) -> Optional[Tuple[dict[str, Any], int]]:
     """Fit a protected row into ``remaining`` tokens by clipping its content
     (issue #116 scope 2). Returns ``(new_row, cost)`` with a SHALLOW COPY of
@@ -330,7 +350,8 @@ def _truncate_protected_row(
     # Token cost of the row WITHOUT its content: header + optional lines.
     probe = dict(row)
     probe["content"] = ""
-    overhead = fence_row_cost(probe)
+    overhead = _fence_row_cost_for_wire(
+        probe, legacy_injection_wire=legacy_injection_wire)
     marker = TRUNCATION_MARKER
     # Characters of content that keep the whole block within `remaining`.
     # estimate_tokens = chars // 4, so allowed total chars for the block is
@@ -341,7 +362,8 @@ def _truncate_protected_row(
         return None
     clipped = row.copy()
     clipped["content"] = content[:allowed].rstrip() + marker
-    cost = fence_row_cost(clipped)
+    cost = _fence_row_cost_for_wire(
+        clipped, legacy_injection_wire=legacy_injection_wire)
     if cost > remaining:
         # Fail-closed: the arithmetic above is conservative, but if the
         # re-measure ever disagrees, drop instead of breaking the ceiling.
@@ -351,7 +373,7 @@ def _truncate_protected_row(
 
 def apply_token_budget(
     rows: list[dict[str, Any]], budget: Optional[int] = None,
-    *, with_stats: bool = False,
+    *, with_stats: bool = False, legacy_injection_wire: bool = True,
 ) -> Any:
     """Admit rows under ``budget`` tokens as a MEASURED HARD CEILING
     (issue #116; original policy issue #65, 10.9).
@@ -370,7 +392,9 @@ def apply_token_budget(
     never exceeds the budget.
 
     Admission charges each row ``fence_row_cost`` (its full rendered fence
-    contribution). Returns ``(kept, tokens_estimate, dropped)`` where
+    contribution). Its default wire mode is the legacy passive lane; callers
+    rendering generic or scoped fences can opt out. Returns
+    ``(kept, tokens_estimate, dropped)`` where
     ``tokens_estimate`` is the admission accounting of the kept rows; kept
     preserves the caller's original row order (membership is decided by
     admission, order by the caller's score-ranked render). With
@@ -396,12 +420,15 @@ def apply_token_budget(
     truncated = 0
     dropped_protected = 0
     for i in protected_idx:
-        cost = fence_row_cost(rows[i])
+        cost = _fence_row_cost_for_wire(
+            rows[i], legacy_injection_wire=legacy_injection_wire)
         if cost <= available - used:
             admitted[i] = (rows[i], cost)
             used += cost
             continue
-        stub = _truncate_protected_row(rows[i], available - used)
+        stub = _truncate_protected_row(
+            rows[i], available - used,
+            legacy_injection_wire=legacy_injection_wire)
         if stub is not None:
             admitted[i] = stub
             used += stub[1]
@@ -409,7 +436,8 @@ def apply_token_budget(
         else:
             dropped_protected += 1
     for _key, i in normal:
-        cost = fence_row_cost(rows[i])
+        cost = _fence_row_cost_for_wire(
+            rows[i], legacy_injection_wire=legacy_injection_wire)
         if used + cost > available:
             # Issue #116 scope 3: skip and keep scanning — a later smaller
             # row must not be lost to an earlier oversized one.
@@ -1022,7 +1050,8 @@ def select_and_budget_for_injection(
         rendered = ""
         if rows:
             rendered = recall_module._format_fenced_recall(
-                rows, header=header, budget_note=parsed.get("budget_note"))
+                rows, header=header, budget_note=parsed.get("budget_note"),
+                legacy_injection_wire=True)
         present = ledger.rows_present_in(rows, rendered)
         # Expansion rows are rendered but deliberately NOT bumped —
         # popularity rewards query-MATCHED rows only (recall.py bump law).

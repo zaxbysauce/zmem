@@ -21,9 +21,9 @@ README.
   explain overflow verdicts, and closed cross-project policy seam are documented
   and covered by additive integration checks. Legacy explicit namespace,
   injection, hook, search, and #98 cross-project lanes retain their routing.
-  Fence bullets now carry `[tier=<name>]` for scoped rows and `[tier=unknown]`
-  for tierless legacy rows; consumers matching fence bullets should accept the
-  new prefix. Scoped recall/recent reject the legacy `include_cross_project`
+  Generic fence bullets carry `[tier=<name>]` for scoped rows and
+  `[tier=unknown]` for tierless rows; the legacy passive-injection wire keeps
+  its established tierless bytes. Scoped recall/recent reject the legacy `include_cross_project`
   flag instead of silently ignoring it.
 
 ## [0.61.0] - 2026-09-23

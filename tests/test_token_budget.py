@@ -205,16 +205,52 @@ class BudgetAdmissionTest(unittest.TestCase):
         varied[1]["entities"] = [{"name": "Entity"}, {"name": "Beta"},
                                  {"name": "Gamma"}, {"name": "Delta"}]
         varied[1]["_stale_note"] = " [stale]"
-        shell = inject.estimate_tokens(
-            _format_fenced_recall([], "header words here"))
-        for row in varied:
-            rendered = inject.estimate_tokens(
-                _format_fenced_recall([row], "header words here"))
-            contribution = rendered - shell
-            self.assertGreaterEqual(
-                inject.fence_row_cost(row), contribution,
-                "fence_row_cost must cover the row's real fence "
-                "contribution for %s" % row["id"])
+        for legacy_injection_wire in (False, True):
+            shell = inject.estimate_tokens(_format_fenced_recall(
+                [], "header words here",
+                legacy_injection_wire=legacy_injection_wire))
+            for row in varied:
+                rendered = inject.estimate_tokens(_format_fenced_recall(
+                    [row], "header words here",
+                    legacy_injection_wire=legacy_injection_wire))
+                contribution = rendered - shell
+                self.assertGreaterEqual(
+                    inject.fence_row_cost(
+                        row, legacy_injection_wire=legacy_injection_wire),
+                    contribution,
+                    "fence_row_cost must cover the row's real fence "
+                    "contribution for %s (legacy=%s)" % (
+                        row["id"], legacy_injection_wire))
+
+    def test_legacy_injection_wire_keeps_tierless_bullet_bytes(self):
+        from storelib.recall import _format_fenced_recall
+        row = _row("compatibility row", score=0.8)
+        generic = _format_fenced_recall([row], "header")
+        legacy = _format_fenced_recall(
+            [row], "header", legacy_injection_wire=True)
+        self.assertIn("- [tier=unknown] [%s]" % row["id"], generic)
+        self.assertIn("- [%s]" % row["id"], legacy)
+        self.assertNotIn("[tier=unknown]", legacy)
+        self.assertLess(
+            inject.fence_row_cost(row, legacy_injection_wire=True),
+            inject.fence_row_cost(row),
+        )
+
+    def test_legacy_injection_wire_keeps_malformed_tier_unknown(self):
+        from storelib.recall import _format_fenced_recall
+        for malformed_tier in ("not-a-tier", 0, " "):
+            row = _row("malformed tier", score=0.8)
+            row["tier"] = malformed_tier
+            generic = _format_fenced_recall([row], "header")
+            legacy = _format_fenced_recall(
+                [row], "header", legacy_injection_wire=True)
+            bullet = "- [tier=unknown] [%s]" % row["id"]
+            self.assertIn(bullet, generic)
+            self.assertIn(bullet, legacy)
+            self.assertEqual(
+                inject.fence_row_cost(row, legacy_injection_wire=True),
+                inject.fence_row_cost(row),
+            )
 
 
 class EnvelopeResultsTest(unittest.TestCase):
@@ -605,11 +641,63 @@ class DegradedFenceFallbackTest(unittest.TestCase):
             {"id": "cross", "confidence": 0.9, "signal": "test",
              "namespace": "project:y", "type": "lesson", "content": "d",
              "tier": "cross"},
+            {"id": "malformed", "confidence": 0.9, "signal": "test",
+             "namespace": "project:z", "type": "fact", "content": "e",
+             "tier": "not-a-tier"},
         ]
         out = mod._local_fenced_recall(rows, "hdr")
         self.assertIn("- [tier=project] [scoped]", out)
         self.assertIn("- [tier=unknown] [unknown]", out)
+        self.assertIn("- [tier=unknown] [malformed]", out)
         self.assertIn("[ns=project:y] [tier=cross] [type=lesson]", out)
+        legacy = mod._local_fenced_recall(
+            rows, "hdr", legacy_injection_wire=True)
+        self.assertIn("- [unknown]", legacy)
+        self.assertNotIn("- [tier=unknown] [unknown]", legacy)
+        self.assertIn("- [tier=unknown] [malformed]", legacy)
+
+    def test_mcp_renderer_signature_ladder_preserves_type_errors(self):
+        import importlib.util
+
+        server_dir = str(REPO_ROOT / "hermes-plugin" / "server")
+        sys.path.insert(0, server_dir)
+        self.addCleanup(sys.path.remove, server_dir)
+        spec = importlib.util.spec_from_file_location(
+            "zmem_mcp_renderer_ladder",
+            REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["zmem_mcp_renderer_ladder"] = mod
+        self.addCleanup(sys.modules.pop, "zmem_mcp_renderer_ladder", None)
+        spec.loader.exec_module(mod)
+        rows = [{"id": "row"}]
+
+        def current(rows, header, *, budget_note="", legacy_injection_wire=False):
+            self.assertTrue(legacy_injection_wire)
+            self.assertEqual(budget_note, "note")
+            return "current"
+
+        def old_with_note(rows, header, *, budget_note=""):
+            self.assertEqual(budget_note, "note")
+            return "old-with-note"
+
+        def oldest(rows, header):
+            return "oldest"
+
+        self.assertEqual(
+            mod._render_legacy_injection_fence(current, rows, "hdr", "note"),
+            "current")
+        self.assertEqual(
+            mod._render_legacy_injection_fence(
+                old_with_note, rows, "hdr", "note"), "old-with-note")
+        self.assertEqual(
+            mod._render_legacy_injection_fence(oldest, rows, "hdr", "note"),
+            "oldest")
+
+        def broken(rows, header, **kwargs):
+            raise TypeError("renderer internal failure")
+
+        with self.assertRaisesRegex(TypeError, "renderer internal failure"):
+            mod._render_legacy_injection_fence(broken, rows, "hdr", "note")
 
 
 if __name__ == "__main__":

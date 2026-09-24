@@ -1825,7 +1825,8 @@ ZMEM_FENCE_OPEN = "<<<ZMEM_UNTRUSTED_FENCE>>>"
 ZMEM_FENCE_CLOSE = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
 
 def _format_fenced_recall(rows: list[dict], header: str,
-                          budget_note: str | None = None) -> str:
+                          budget_note: str | None = None,
+                          legacy_injection_wire: bool = False) -> str:
     """Render a fenced, provenance-tagged bullet block for hook inject.
 
     Issue #58, 3.5: wrap hook-injected memories in a non-executable
@@ -1897,6 +1898,12 @@ def _format_fenced_recall(rows: list[dict], header: str,
         elif _tier in SCOPED_TIER_ORDER:
             _tier_token = ""
             _tier_prefix = f"[tier={_tier}] "
+        elif legacy_injection_wire and (_tier is None or _tier == ""):
+            # #183 pins passive injection to the immutable pre-#167 wire.
+            # Scoped rows never enter that legacy lane, so only tierless rows
+            # suppress the generic unknown provenance prefix here.
+            _tier_token = ""
+            _tier_prefix = ""
         else:
             _tier_token = ""
             _tier_prefix = "[tier=unknown] "
@@ -2670,6 +2677,7 @@ def _recall_memory_impl(
                     f"Consider if they apply; ignore if not."
                 ),
                 budget_note=(injection_details or {}).get("budget_note") if for_injection else None,
+                legacy_injection_wire=for_injection,
             ))
     return results
 
@@ -3359,7 +3367,8 @@ def explain_recall(
                         "budget": injection_budget_stats.get("budget"),
                         "admission_used": injection_budget_stats.get(
                             "admission_used"),
-                        "row_cost": fence_row_cost(row),
+                        "row_cost": fence_row_cost(
+                            row, legacy_injection_wire=True),
                         "budget_stats": injection_budget_stats,
                     }
                 injection_budget_emptied = not selected_rows
@@ -3585,6 +3594,7 @@ def explain_recall(
                     f"Relevant memories (namespace {namespace or 'unscoped'}). "
                     f"Consider if they apply; ignore if not."
                 ),
+                legacy_injection_wire=for_injection,
             ))
         for v in verdicts:
             print(_format_explain_blameline(v))
@@ -3926,6 +3936,7 @@ def _recent_memory_impl(
                     f"High-confidence admin pull. Consider if relevant; ignore if not."
                 ),
                 budget_note=(injection_details or {}).get("budget_note") if for_injection else None,
+                legacy_injection_wire=for_injection,
             ))
     return results
 
@@ -4130,6 +4141,7 @@ def recall_memory(
                 "Consider if they apply; ignore if not."
             ),
             budget_note=details.get("budget_note"),
+            legacy_injection_wire=True,
         ))
     return rows
 
@@ -4229,6 +4241,7 @@ def recent_memory(
                 "High-confidence admin pull. Consider if relevant; ignore if not."
             ),
             budget_note=details.get("budget_note"),
+            legacy_injection_wire=True,
         ))
     return rows
 
