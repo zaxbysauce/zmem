@@ -81,6 +81,32 @@ in deterministic verification) > `reviewer/user` (medium) > `none` (low, below t
 retrieval floor by default). This follows the finding that intrinsic self-correction
 (lessons from the agent's own opinion, ungrounded) degrades accuracy.
 
+### Scoped five-tier recall (issue #167)
+
+The ordinary implicit `recall` and `recent` commands resolve the current project,
+fleet, and host through the shared scope resolver when no `--namespace` is given.
+Their scoped path reserves independent slots in this order:
+`project`, `domain`, `fleet_host`, `cross_project`, `user_global`, with defaults
+`5/2/2/2/3`. The programmatic `recall_memory`, `recent_memory`, and
+`explain_recall` APIs opt in with a `scopes=` map using those same keys (the
+resolver's `agent` key is ignored). `user_global` is included only when
+`include_global=True`.
+
+Set `ZMEM_TIER_SLOTS` to exactly five comma-separated ASCII nonnegative integers
+in that order to change the caps per call. The scoped cross-project pool is
+closed unless a caller supplies the `_cross_project_eligible` policy seam; the
+legacy `--include-cross-project` hazard lane remains separate. Fenced scoped rows
+carry `[tier=<name>]` prefixes, while tierless rows use `[tier=unknown]` and the
+legacy `tier=cross` marker keeps its suffix form. Explicit `--namespace`, search,
+hook, and injection calls retain their existing legacy routing and limits.
+Explicit `--include-global` and `--include-cross-project` flags also stay on
+their corresponding legacy union lane so `--global-limit` and hazard admission
+keep their existing semantics.
+Use the programmatic `scopes=` map with `include_global=True` when tier labels
+and global rows are needed together. Programmatic scoped recall and recent
+reject `include_cross_project=True`; the scoped cross-project tier admits rows
+only through its separate policy predicate.
+
 ### Cross-project hazard lane (issue #98)
 
 A fourth, precision-gated recall tier can deliver up to **2** live, grounded rows

@@ -160,13 +160,26 @@ def fence_row_cost(row: dict[str, Any]) -> int:
     """
     markers = _row_markers(row)
     inj_prefix = (" " + " ".join(markers)) if markers else ""
+    tier = row.get("tier")
+    if tier in ("project", "domain", "fleet_host", "cross_project",
+                "user_global"):
+        tier_prefix = "[tier={}] ".format(tier)
+        tier_suffix = ""
+    elif tier == "cross":
+        tier_prefix = ""
+        tier_suffix = " [tier=cross]"
+    else:
+        tier_prefix = "[tier=unknown] "
+        tier_suffix = ""
     header = (
-        "{}- [{}] [conf={}] [signal={}] [ns={}] [type={}]{}".format(
+        "{}- {}[{}] [conf={}] [signal={}] [ns={}]{} [type={}]{}".format(
             inj_prefix,
+            tier_prefix,
             row.get("id", ""),
             row.get("confidence", ""),
             row.get("signal", ""),
             row.get("namespace", ""),
+            tier_suffix,
             row.get("type", ""),
             row.get("_stale_note", "") or "",
         )

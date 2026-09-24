@@ -282,6 +282,19 @@ class LedgerModuleTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in present], ["r1"],
                          "bullet-form match must not confuse r1 with r10")
 
+    def test_rows_present_in_accepts_renderer_marker_prefix(self):
+        # Scoped and explicitly marked rows put only the renderer's known
+        # provenance markers before the dash; arbitrary prose must not count.
+        rows = [{"id": "r1", "content": "a"}, {"id": "r2", "content": "b"}]
+        text = (
+            " [PREVIOUSLY] [INJECTION RISK]- [tier=unknown] [r1] [conf=0.9]\n"
+            "    a\n"
+            " [arbitrary prose]- [tier=unknown] [r2] [conf=0.9]\n"
+            "    b\n"
+        )
+        present = self.dl.rows_present_in(rows, text)
+        self.assertEqual([r["id"] for r in present], ["r1"])
+
     def test_ops_tokens_escalation_input_contract(self):
         import storelib.ops_tokens as ot
         toks = ot.derive_ops_tokens("git stash pop")

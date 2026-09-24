@@ -322,12 +322,13 @@ class PassiveSelectorContractTest(unittest.TestCase):
             ).fetchall()
             before = {row[0]: tuple(row[1:]) for row in before_rows}
 
-            # 162 is exactly the fixed 128-token fence shell plus one
-            # 34-token fixture row.  The second row would require 196, so
-            # this makes the rendered/ledger set differ from the candidate
-            # set without depending on ranking order.
+            # 180 leaves room for the fixed fence shell plus the first fixture
+            # row's cost, including its new [tier=unknown] prefix. The second
+            # row would require another full row cost, so this makes the
+            # rendered/ledger set differ from the candidate set without
+            # depending on ranking order.
             payload = self._call_selector(
-                selector, conn, session_id=session_id, budget=162,
+                selector, conn, session_id=session_id, budget=180,
                 data_dir=data_dir,
             )
             self.assertEqual(set(payload["candidate_ids"]), set(ROW_IDS))

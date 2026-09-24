@@ -248,7 +248,7 @@ class ExplainReasonCoverageTests(ExplainFixtureBase):
              "not_valid_at_as_of", "vec_lane_miss", "not_in_pool",
              "link_expansion",  # issue #113: link-hop-aware verdict
              "not_in_db", "explain_unavailable", "margin_pruned",
-             "selective_rejected", "budget_rejected"},
+             "selective_rejected", "tier_slot_exhausted", "budget_rejected"},
         )
 
     def _seed_margin_rows(self):

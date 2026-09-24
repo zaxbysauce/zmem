@@ -665,6 +665,36 @@ lessons reach project-scoped sessions. Without it, behaviour is strict-namespace
 want a per-tier budget, use `recall --namespace project:<x> --include-global`
 rather than going unscoped.
 
+#### Scoped five-tier recall (issue #167)
+
+Ordinary implicit `recall` and `recent` calls without `--namespace` resolve the
+current project, fleet, and host through the shared #166 scope resolver and use
+five independent reservations in this order:
+`project`, `domain`, `fleet_host`, `cross_project`, `user_global`. The default
+slot caps are `5/2/2/2/3`. Library callers opt in explicitly with a `scopes=` map
+on `recall_memory`, `recent_memory`, or the read-only `explain_recall` API; the
+resolver's `agent` value is ignored. `user_global` is admitted only when
+`include_global=True`.
+
+`ZMEM_TIER_SLOTS` overrides the caps per call as exactly five comma-separated
+ASCII nonnegative integers in that order. Empty, malformed, signed, or Unicode
+numerals fail before the scoped pipeline opens a SQL lane. The scoped
+`cross_project` pool is closed by default and calls `_cross_project_eligible`
+for any policy supplied by the caller. This is separate from the legacy #98
+`--include-cross-project` hazard lane. Scoped rows are stable-deduplicated by id
+and carry their tier in JSON; fenced output prefixes `[tier=<name>]`, and a
+tierless row is explicitly prefixed `[tier=unknown]`. The legacy `tier=cross`
+renderer marker remains a suffix. Explicit `--namespace`, search, hook, and
+injection calls retain their legacy route and limit arguments. Explicit
+`--include-global` and `--include-cross-project` flags likewise keep their
+legacy union lanes and limit or hazard semantics. Direct scoped
+`recall_memory`/`recent_memory` calls reject `for_injection=True`; scoped explain
+remains read-only and accepts it.
+For tier-labeled global rows, call the programmatic API with `scopes=` and
+`include_global=True`. Scoped recall/recent reject the legacy
+`include_cross_project=True` flag; their cross-project tier uses the separate
+policy predicate.
+
 #### Cross-project hazard tier (issue #98)
 
 A fourth, precision-gated tier (`--include-cross-project`, wired automatically

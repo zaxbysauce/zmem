@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import struct
 import subprocess
@@ -69,6 +70,28 @@ def _warn_reserved_source_ref(source_ref: str | None) -> None:
     canonical message bytes live in storelib.write so the CLI paths and the
     JSONL ingest row loop cannot drift apart."""
     warn_reserved_source_ref(source_ref)
+
+
+def _recall_scopes(args: argparse.Namespace) -> dict[str, str]:
+    """Resolve the implicit #167 scope map used by ordinary read commands.
+
+    Explicit ``--namespace`` values are classified only for the helper's
+    contract and remain on the legacy dispatch lane.  The implicit path uses
+    issue #166's resolver so project, fleet, host, and optional agent context
+    share one admission source; recall itself ignores the out-of-contract
+    ``agent`` key.
+    """
+    namespace = getattr(args, "namespace", None)
+    if namespace:
+        if namespace == GLOBAL_NAMESPACE:
+            return {"user_global": namespace}
+        return {"project": namespace}
+    return _schema_host.resolve_scopes(
+        project_dir=Path.cwd(),
+        hostname=socket.gethostname(),
+        env=os.environ,
+        hermes_kwargs={},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2649,6 +2672,13 @@ def main():
             rerank_flag = _ce_cli_allowed(no_bump=args.no_bump,
                                           no_hybrid=args.no_hybrid,
                                           for_injection=args.for_injection)
+            scoped_cli_scopes = (
+                _recall_scopes(args)
+                if (args.namespace is None and not args.for_injection
+                    and not args.include_global
+                    and not args.include_cross_project)
+                else None
+            )
             # Issue #82: --explain dispatches to the read-only retrieval
             # debugger (zero writes, never unfolds, fail-open). It is a flag,
             # not a subcommand, so KNOWN_SUBCMDS stays byte-identical.
@@ -2664,6 +2694,7 @@ def main():
                     sys.exit(2)
                 explain_recall(conn, query=args.query, target=args.target,
                                namespace=args.namespace, limit=args.limit,
+                               scopes=scoped_cli_scopes,
                                as_json=args.json, hybrid=hybrid_arg,
                                no_bump=args.no_bump,
                                include_global=args.include_global,
@@ -2676,6 +2707,7 @@ def main():
                                for_injection=args.for_injection)
             else:
                 recall_memory(conn, query=args.query, namespace=args.namespace,
+                              scopes=scoped_cli_scopes,
                               limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
                               no_bump=args.no_bump, include_global=args.include_global,
                               global_limit=args.global_limit, as_of=args.as_of,
@@ -2715,7 +2747,15 @@ def main():
                     sys.exit(2)
                 print(json.dumps(payload, indent=2))
                 return
+            scoped_cli_scopes = (
+                _recall_scopes(args)
+                if (args.namespace is None and not args.for_injection
+                    and not args.include_global
+                    and not args.include_cross_project)
+                else None
+            )
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
+                          scopes=scoped_cli_scopes,
                           min_confidence=(args.min_confidence
                                           if args.min_confidence is not None
                                           else inject_recent_floor()),

@@ -10,6 +10,22 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.62.0] - 2026-09-24
+
+### Added
+- **Scoped five-tier recall (issue #167):** implicit ordinary recall/recent
+  calls now use independent project, domain, fleet/host, cross-project, and
+  user-global reservations when scope resolution is available. Programmatic
+  recall, recent, and explain callers can opt in with `scopes=`; the
+  `ZMEM_TIER_SLOTS` five-integer override, deterministic tier labels, read-only
+  explain overflow verdicts, and closed cross-project policy seam are documented
+  and covered by additive integration checks. Legacy explicit namespace,
+  injection, hook, search, and #98 cross-project lanes retain their routing.
+  Fence bullets now carry `[tier=<name>]` for scoped rows and `[tier=unknown]`
+  for tierless legacy rows; consumers matching fence bullets should accept the
+  new prefix. Scoped recall/recent reject the legacy `include_cross_project`
+  flag instead of silently ignoring it.
+
 ## [0.61.0] - 2026-09-23
 
 ### Added

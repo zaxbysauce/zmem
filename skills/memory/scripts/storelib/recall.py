@@ -154,8 +154,49 @@ EXPLAIN_REASONS = (
     "omitted_untrusted_web", "namespace", "superseded", "not_valid_at_as_of",
     "vec_lane_miss", "not_in_pool", "not_in_db", "explain_unavailable",
     "link_expansion", "margin_pruned", "selective_rejected",
+    "tier_slot_exhausted",
     "budget_rejected",
 )
+
+# Issue #167: the explicit scoped path reserves these independent slots in this
+# order.  The legacy project/global path below deliberately keeps its own
+# ``limit`` and ``global_limit`` arguments and row shape.
+SCOPED_TIER_ORDER = (
+    "project", "domain", "fleet_host", "cross_project", "user_global",
+)
+_DEFAULT_TIER_SLOTS = dict(zip(SCOPED_TIER_ORDER, (5, 2, 2, 2, 3)))
+
+
+def _tier_slots() -> dict[str, int]:
+    """Parse the per-call five-tier reservation caps.
+
+    The environment is intentionally parsed on every call: hooks and library
+    callers can change it between invocations without reloading this module.
+    ``[0-9]+`` is used instead of ``str.isdigit`` so Unicode numerals cannot
+    silently enter a slot budget.
+    """
+    raw = os.environ.get("ZMEM_TIER_SLOTS")
+    if raw is None:
+        return dict(_DEFAULT_TIER_SLOTS)
+    parts = raw.split(",")
+    if len(parts) != len(SCOPED_TIER_ORDER) or any(
+            re.fullmatch(r"[0-9]+", part) is None for part in parts):
+        raise ValueError(
+            "ZMEM_TIER_SLOTS must contain exactly five ASCII nonnegative "
+            "integers in project,domain,fleet_host,cross_project,user_global order"
+        )
+    return dict(zip(SCOPED_TIER_ORDER, (int(part) for part in parts)))
+
+
+def _cross_project_eligible(row: dict, scopes: dict[str, str]) -> bool:
+    """Scoped #167 seam for a future foreign-project admission predicate.
+
+    The default is closed.  Tests and a later policy issue can supply a
+    predicate at this seam without changing the five-tier allocator or the
+    legacy #98 hazard lane.
+    """
+    del row, scopes
+    return False
 
 
 def build_injection_envelope(
@@ -976,6 +1017,7 @@ def _recall_one_tier(
     weights: dict | None = None,
     collect_lanes: bool = False,
     arm_stats: dict | None = None,
+    stable_ties: bool = False,
 ) -> list[tuple[float, dict]]:
     """FTS5 + composite scoring for ONE namespace set (a single recall tier).
 
@@ -1369,7 +1411,13 @@ def _recall_one_tier(
             }
 
     # Sort by composite score descending within this tier, take top `limit`.
-    scored.sort(key=lambda x: x[0], reverse=True)
+    if stable_ties:
+        # Scoped reservations need a deterministic tie-break independent of
+        # SQLite's FTS plan. Legacy callers retain their historical stable
+        # input ordering.
+        scored.sort(key=lambda x: (-x[0], x[1]["id"]))
+    else:
+        scored.sort(key=lambda x: x[0], reverse=True)
     # v10 (issue #60, 5.5): MMR diversity on the candidate set BEFORE the
     # limit, per tier. Ordering vs the other emit-time passes: MMR runs here
     # (inside the tier, before merge/filters); classify_injection and the
@@ -1417,6 +1465,164 @@ def _merge_tiers(
         seen.add(rid)
         results.append(item)
     return results
+
+
+def _scope_namespace_values(value: object) -> list[str]:
+    """Normalize one resolver scope value while preserving caller order."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if isinstance(item, str) and item]
+    raise ValueError("recall scopes must map tier names to namespace strings")
+
+
+def _scope_aliases(conn: sqlite3.Connection, values: list[str]) -> list[str]:
+    """Expand resolver values to migration aliases with stable ordering."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        aliases = _expand_namespace_aliases(conn, value) or []
+        for alias in sorted(aliases):
+            if alias not in seen:
+                seen.add(alias)
+                out.append(alias)
+    return out
+
+
+def _scoped_namespaces(
+    conn: sqlite3.Connection,
+    scopes: dict[str, str],
+    *,
+    include_global: bool,
+) -> tuple[dict[str, list[str]], set[str]]:
+    """Build the four namespace pools and optional global pool for #167."""
+    project = _scope_aliases(conn, _scope_namespace_values(scopes.get("project")))
+    domain = _scope_aliases(conn, _scope_namespace_values(scopes.get("domain")))
+    fleet_host = _scope_aliases(
+        conn,
+        _scope_namespace_values(scopes.get("fleet"))
+        + _scope_namespace_values(scopes.get("host")),
+    )
+    # A scoped call with include_global explicitly opts into the global tier.
+    # The resolver normally omits this key, so the canonical global namespace
+    # is the fallback; an explicit user_global value remains alias-expandable.
+    user_global: list[str] = []
+    if include_global:
+        user_global = _scope_aliases(
+            conn,
+            _scope_namespace_values(scopes.get("user_global"))
+            or [GLOBAL_NAMESPACE],
+        )
+    tiers = {
+        "project": project,
+        "domain": domain,
+        "fleet_host": fleet_host,
+        "cross_project": [],
+        "user_global": user_global,
+    }
+    selected = set(project) | set(domain) | set(fleet_host) | set(user_global)
+    return tiers, selected
+
+
+def _merge_reserved_tiers(
+    tiers: dict[str, list[tuple[float, dict]]],
+    slots: dict[str, int],
+) -> list[dict]:
+    """Reserve each scoped tier independently, deduplicating by memory id."""
+    results: list[dict] = []
+    seen: set[str] = set()
+    for tier in SCOPED_TIER_ORDER:
+        admitted = 0
+        for _score, item in tiers.get(tier, []):
+            if admitted >= slots.get(tier, 0):
+                break
+            rid = item["id"]
+            if rid in seen:
+                continue
+            seen.add(rid)
+            results.append(item)
+            admitted += 1
+    return results
+
+
+def _scoped_tier_pools(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    scopes: dict[str, str],
+    include_global: bool,
+    slots: dict[str, int],
+    min_confidence: float | None,
+    hybrid: bool,
+    now_epoch: float,
+    as_of: str | None,
+    mmr: bool,
+    weights: dict | None,
+    arm_stats: dict | None = None,
+    collect_lanes: bool = False,
+    deep: bool = False,
+) -> tuple[dict[str, list[tuple[float, dict]]], list[str]]:
+    """Score the independent scoped pools and apply tier provenance labels."""
+    namespace_tiers, selected_namespaces = _scoped_namespaces(
+        conn, scopes, include_global=include_global)
+    pools: dict[str, list[tuple[float, dict]]] = {
+        tier: [] for tier in SCOPED_TIER_ORDER
+    }
+
+    def pool_limit(tier: str) -> int:
+        slot = slots[tier]
+        # Keep a bounded deep pool even for normal recall so a duplicate ID
+        # admitted by an earlier tier cannot leave this tier's reservation
+        # under-filled. Explain uses the same pool to identify exhaustion.
+        tier_index = SCOPED_TIER_ORDER.index(tier)
+        prior_slots = sum(
+            slots[name] for name in SCOPED_TIER_ORDER[:tier_index]
+        )
+        return max(slot * 3, prior_slots + slot + 5, 5)
+
+    for tier in ("project", "domain", "fleet_host", "user_global"):
+        ns_list = namespace_tiers[tier]
+        if not ns_list:
+            continue
+        scored = _recall_one_tier(
+            conn, query=query, ns_list=ns_list,
+            limit=pool_limit(tier), min_confidence=min_confidence,
+            hybrid=hybrid, now_epoch=now_epoch, as_of=as_of, mmr=mmr,
+            weights=weights, arm_stats=arm_stats, collect_lanes=collect_lanes,
+            stable_ties=True,
+        )
+        for _score, item in scored:
+            item["tier"] = tier
+        pools[tier] = scored
+
+    # The scoped cross-project tier is an intentionally closed seam.  Build a
+    # foreign project candidate pool outside every selected namespace, then
+    # invoke the policy predicate per candidate before ranking/capping.
+    cross_limit = pool_limit("cross_project") * 16
+    if cross_limit:
+        candidates = _recall_one_tier(
+            conn, query=query, ns_list=None, limit=cross_limit,
+            min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+            as_of=as_of, mmr=False, weights=weights, arm_stats=arm_stats,
+            collect_lanes=collect_lanes, stable_ties=True,
+        )
+        admitted: list[tuple[float, dict]] = []
+        for score, item in candidates:
+            namespace = item.get("namespace") or ""
+            if not namespace.startswith("project:"):
+                continue
+            if namespace in selected_namespaces:
+                continue
+            if not _cross_project_eligible(item, scopes):
+                continue
+            item["tier"] = "cross_project"
+            admitted.append((score, item))
+        admitted.sort(key=lambda pair: (-pair[0], pair[1]["id"]))
+        pools["cross_project"] = admitted
+
+    return pools, sorted(set().union(*namespace_tiers.values()))
 
 
 # ---- Issue #98: query-time cross-project hazard tier ----------------------
@@ -1684,9 +1890,18 @@ def _format_fenced_recall(rows: list[dict], header: str,
         # after the source-namespace token, so the reader sees the row came
         # from a foreign project. Rows without a "tier" key — every project
         # and global row today — render byte-identically to before.
-        _tier_token = " [tier=cross]" if r.get("tier") == "cross" else ""
+        _tier = r.get("tier")
+        if _tier == "cross":
+            _tier_token = " [tier=cross]"
+            _tier_prefix = ""
+        elif _tier in SCOPED_TIER_ORDER:
+            _tier_token = ""
+            _tier_prefix = f"[tier={_tier}] "
+        else:
+            _tier_token = ""
+            _tier_prefix = "[tier=unknown] "
         lines.append(
-            f"{inj_prefix}- [{r['id']}] [conf={r['confidence']}] [signal={r['signal']}] "
+            f"{inj_prefix}- {_tier_prefix}[{r['id']}] [conf={r['confidence']}] [signal={r['signal']}] "
             f"[ns={r['namespace']}]{_tier_token} [type={r['type']}]"
             f"{r.get('_stale_note', '')}"
         )
@@ -1977,6 +2192,7 @@ def _recall_memory_impl(
     *,
     query: str,
     namespace: str | None = None,
+    scopes: dict[str, str] | None = None,
     limit: int = 5,
     as_json: bool = False,
     min_confidence: float | None = None,
@@ -2067,7 +2283,23 @@ def _recall_memory_impl(
     structurally by the ``no_bump`` gate and search-shaped surfaces by their
     ``link_hops=0`` contract (see ``_unfold_enabled``).
     """
+    if scopes is not None and include_cross_project:
+        raise ValueError(
+            "scoped recall cannot be combined with include_cross_project=True; "
+            "the scoped cross_project tier uses its own admission predicate"
+        )
     now_epoch = _now_epoch()
+    if scopes is not None:
+        # Tier labels and independent reservations are not consumable by the
+        # passive injection collector yet.  Refuse direct API mixing before
+        # touching SQL, embeddings, telemetry, or the store.
+        if for_injection:
+            raise ValueError(
+                "scoped recall cannot be combined with for_injection=True"
+            )
+        scoped_slots = _tier_slots()
+    else:
+        scoped_slots = None
     # Issue #114: --for-injection is a passive surface by construction (the
     # injection lane never writes retrieval_count), so it inherits every
     # no_bump semantic downstream: the injection-risk/untrusted_web omit
@@ -2098,18 +2330,32 @@ def _recall_memory_impl(
     # it (possibly via a v5 migration alias), so folding would only risk
     # double-counting. This guard is therefore both a correctness and a perf
     # shortcut. (issue #18 plan-critic M2)
-    do_global = bool(include_global and namespace and namespace != GLOBAL_NAMESPACE)
+    do_global = bool(
+        scopes is None and include_global and namespace
+        and namespace != GLOBAL_NAMESPACE
+    )
 
-    if do_global:
+    # Issue #136: ONE arms dict shared across tiers — the scoped and legacy
+    # builders both contribute to this envelope attribution.
+    arms: dict = {}
+    scoped_tiers: dict[str, list[tuple[float, dict]]] | None = None
+    if scopes is not None:
+        scoped_tiers, scoped_ns = _scoped_tier_pools(
+            conn, query=query, scopes=scopes, include_global=include_global,
+            slots=scoped_slots or _DEFAULT_TIER_SLOTS,
+            min_confidence=min_confidence, hybrid=hybrid,
+            now_epoch=now_epoch, as_of=as_of, mmr=not no_mmr,
+            weights=weights, arm_stats=arms,
+        )
+        # Expansion and belief surfaces must stay inside the selected scoped
+        # namespace union; foreign candidates enter only through the explicit
+        # predicate seam above.
+        ns_list = scoped_ns
+        global_ns_list = None
+    elif do_global:
         global_ns_list = _expand_namespace_aliases(conn, GLOBAL_NAMESPACE)
     else:
         global_ns_list = None
-
-    # Issue #136: ONE arms dict shared across tiers — _recall_one_tier merges
-    # per-arm pre/post-cap counts in place so the envelopes below report the
-    # whole pipeline's attribution (the B-1 report's "which arm carried a
-    # hit").
-    arms: dict = {}
 
     # Project tier: scoped to the project namespace aliases only. It is NOT
     # widened to include global aliases on the hybrid path — the global tier's
@@ -2119,11 +2365,13 @@ def _recall_memory_impl(
     # than leaking into the project tier and breaking the per-tier-budget /
     # hard-floor contract. (Final-critic F1: the widening was redundant and
     # contract-violating.)
-    project_scored = _recall_one_tier(
-        conn, query=query, ns_list=ns_list, limit=limit,
-        min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-        as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
-    )
+    project_scored: list[tuple[float, dict]] = []
+    if scopes is None:
+        project_scored = _recall_one_tier(
+            conn, query=query, ns_list=ns_list, limit=limit,
+            min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+            as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
+        )
 
     global_scored: list[tuple[float, dict]] = []
     if do_global:
@@ -2142,6 +2390,10 @@ def _recall_memory_impl(
         item["prompt_injection_risk"] = _classify_injection(item)
     for _score, item in global_scored:
         item["prompt_injection_risk"] = _classify_injection(item)
+    if scoped_tiers is not None:
+        for scored_rows in scoped_tiers.values():
+            for _score, item in scored_rows:
+                item["prompt_injection_risk"] = _classify_injection(item)
 
     # Issue #98: evaluate the cross-project hazard tier once, up front, and
     # hold the admitted rows aside. They join `results` only AFTER the
@@ -2149,7 +2401,7 @@ def _recall_memory_impl(
     # unfolded, or entity-carded — the tier cap is its only size) and BEFORE
     # the injection-risk count / gate+budget pass so the same gates apply.
     cross_scored: list = []
-    if include_cross_project:
+    if include_cross_project and scopes is None:
         cross_scored = cross_project_admissions(
             conn, query=query, moment=_cross_moment,
             current_namespace=namespace, ops_tokens=_cross_ops_tokens,
@@ -2160,7 +2412,10 @@ def _recall_memory_impl(
         for _score, item in cross_scored:
             item["prompt_injection_risk"] = _classify_injection(item)
 
-    if do_global:
+    if scopes is not None:
+        results = _merge_reserved_tiers(
+            scoped_tiers or {}, scoped_slots or _DEFAULT_TIER_SLOTS)
+    elif do_global:
         results = _merge_tiers(project_scored, global_scored, limit, global_limit)
     else:
         results = [item for _score, item in project_scored[:limit]]
@@ -2473,6 +2728,22 @@ _EXPLAIN_TARGET_COLUMNS = """id, namespace, type, content, tags, source_ref,
                    content_norm, embedding"""
 
 
+def _explain_target_columns(conn: sqlite3.Connection) -> str:
+    """Use a NULL embedding on pre-vector fixture stores.
+
+    The read-only explain surface is also used against throwaway stores built
+    with ``init_db`` but without the optional embedding migration.  Keeping
+    the column in the row shape preserves the as-of/hybrid checks while
+    avoiding a schema-dependent ``no_in_db`` false negative.
+    """
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(memory)").fetchall()
+    }
+    if "embedding" in columns:
+        return _EXPLAIN_TARGET_COLUMNS
+    return _EXPLAIN_TARGET_COLUMNS.rsplit("embedding", 1)[0] + "NULL AS embedding"
+
+
 def _resolve_explain_targets(
     conn: sqlite3.Connection,
     target: str,
@@ -2496,8 +2767,9 @@ def _resolve_explain_targets(
     # private caller uses a non-UUID identifier.  UUID-shaped prefixes retain
     # their existing whole-store lookup below; arbitrary ids should not be
     # mistaken for content fragments when they name a stored row exactly.
+    columns = _explain_target_columns(conn)
     exact = conn.execute(
-        f"SELECT {_EXPLAIN_TARGET_COLUMNS} FROM memory WHERE id = ?",
+        f"SELECT {columns} FROM memory WHERE id = ?",
         (target,),
     ).fetchall()
     if exact:
@@ -2505,7 +2777,7 @@ def _resolve_explain_targets(
     looks_uuid = re.fullmatch(r"[0-9a-fA-F-]{4,36}", target) is not None
     if looks_uuid:
         rows = conn.execute(
-            f"""SELECT {_EXPLAIN_TARGET_COLUMNS}
+            f"""SELECT {columns}
                 FROM memory
                 WHERE id LIKE ? || '%'
                 ORDER BY id""",
@@ -2521,7 +2793,7 @@ def _resolve_explain_targets(
     # Fragment pass 1: case-insensitive substring.
     like = "%" + target.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%"
     rows = conn.execute(
-        f"""SELECT {_EXPLAIN_TARGET_COLUMNS}
+        f"""SELECT {columns}
             FROM memory
             WHERE content LIKE ? ESCAPE '\\' {scope_clause}
             ORDER BY id""",
@@ -2534,7 +2806,7 @@ def _resolve_explain_targets(
     if not frag_tokens:
         return [], True
     all_rows = conn.execute(
-        f"""SELECT {_EXPLAIN_TARGET_COLUMNS}
+        f"""SELECT {columns}
             FROM memory WHERE 1=1 {scope_clause}""",
         list(params),
     ).fetchall()
@@ -2589,10 +2861,14 @@ def _explain_nearest_neighbors(
 def _explain_run_pipeline(
     conn: sqlite3.Connection, *, query: str, ns_list: list[str] | None,
     global_ns_list: list[str] | None, limit: int, global_limit: int,
+    include_global: bool = False,
     min_confidence: float | None, hybrid: bool, now_epoch: float,
     as_of: str | None, no_mmr: bool, weights: dict | None,
     arm_stats: dict | None = None,
-) -> tuple[list[dict], list[tuple[float, dict]], list[tuple[float, dict]]]:
+    scopes: dict[str, str] | None = None,
+    scoped_slots: dict[str, int] | None = None,
+) -> tuple[list[dict], list[tuple[float, dict]], list[tuple[float, dict]],
+           dict[str, list[tuple[float, dict]]], dict[str, int] | None]:
     """Run the SAME orchestration recall_memory runs (same helpers, same
     order, same real `limit`) and return (presented_pre_omit, project_deep,
     global_deep). The deep pool runs the same tiers at over-fetch depth so
@@ -2608,6 +2884,18 @@ def _explain_run_pipeline(
     Issue #136: ``arm_stats`` (when given) collects the per-arm pre/post-cap
     counts from the REAL-LIMIT presented runs only — the over-fetch deep
     re-run is a diagnostic and is deliberately not double-counted."""
+    if scopes is not None:
+        slots = scoped_slots or _tier_slots()
+        pools, _scoped_ns = _scoped_tier_pools(
+            conn, query=query, scopes=scopes, include_global=include_global,
+            slots=slots, min_confidence=min_confidence, hybrid=hybrid,
+            now_epoch=now_epoch, as_of=as_of, mmr=not no_mmr,
+            weights=weights, arm_stats=arm_stats, collect_lanes=True,
+            deep=True,
+        )
+        presented = _merge_reserved_tiers(pools, slots)
+        return presented, [], [], pools, slots
+
     project_scored = _recall_one_tier(
         conn, query=query, ns_list=ns_list, limit=limit,
         min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
@@ -2643,7 +2931,7 @@ def _explain_run_pipeline(
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
         )
-    return presented, project_deep, global_deep
+    return presented, project_deep, global_deep, {}, None
 
 
 def _explain_lane_detail(row: dict) -> dict:
@@ -2677,6 +2965,8 @@ def _explain_verdict_for_target(
     presented: list[dict], omitted: list[tuple[dict, str]],
     project_deep: list[tuple[float, dict]],
     global_deep: list[tuple[float, dict]],
+    scoped_tiers: dict[str, list[tuple[float, dict]]] | None = None,
+    scoped_slots: dict[str, int] | None = None,
     margin_pruned: dict[str, dict] | None = None,
     margin_pruned_scores: dict[str, object] | None = None,
     selective_rejected: dict[str, dict] | None = None,
@@ -2699,9 +2989,15 @@ def _explain_verdict_for_target(
     the gate thresholds reported top-level as ``lane_floors``.
     """
     mid = row["id"]
+    scoped_tier_for_id = None
+    if scoped_tiers:
+        for tier, scored_rows in scoped_tiers.items():
+            if any(item["id"] == mid for _score, item in scored_rows):
+                scoped_tier_for_id = tier
+                break
     in_project = ns_list is None or row["namespace"] in ns_list
     in_global = bool(global_ns_list) and row["namespace"] in global_ns_list
-    if not in_project and not in_global:
+    if not in_project and not in_global and scoped_tier_for_id is None:
         return {"id": mid, "reason": "namespace", "rank": None, "score": None,
                 "detail": {"row_namespace": row["namespace"],
                            "include_global": include_global}}
@@ -2744,6 +3040,26 @@ def _explain_verdict_for_target(
                 "score": ((budget_rejected_scores or {}).get(mid)
                           if budget_rejected_scores is not None else None),
                 "detail": budget_rejected[mid]}
+    if scoped_tier_for_id and scoped_slots is not None:
+        scored_rows = scoped_tiers.get(scoped_tier_for_id, [])
+        slot = scoped_slots.get(scoped_tier_for_id, 0)
+        for rank, (_score, candidate) in enumerate(scored_rows, start=1):
+            if candidate["id"] != mid:
+                continue
+            if rank > slot:
+                # The reservation policy's detail score is the source row's
+                # confidence.  The composite retrieval score remains the
+                # top-level verdict score for compatibility with explain.
+                return {
+                    "id": mid, "reason": "tier_slot_exhausted", "rank": rank,
+                    "score": candidate.get("_score"),
+                    "detail": {
+                        "score": candidate.get("confidence"),
+                        "slot": slot,
+                        "tier": scoped_tier_for_id,
+                    },
+                }
+            break
     deep = project_deep + global_deep
     for rank, (score, r) in enumerate(deep, start=1):
         if r["id"] == mid:
@@ -2832,6 +3148,7 @@ def explain_recall(
     query: str,
     target: str | None = None,
     namespace: str | None = None,
+    scopes: dict[str, str] | None = None,
     limit: int = 5,
     as_json: bool = False,
     min_confidence: float | None = None,
@@ -2885,9 +3202,22 @@ def explain_recall(
     if hybrid is None:
         hybrid = bool(_embeddings and _embeddings.is_available())
     as_of = _normalize_as_of(as_of)
-    ns_list, global_ns_list = _explain_scope_ns(conn, namespace, include_global)
+    scoped_slots = _tier_slots() if scopes is not None else None
+    if scopes is not None:
+        _scoped_tier_names, _selected = _scoped_namespaces(
+            conn, scopes, include_global=include_global)
+        ns_list = sorted(set().union(*_scoped_tier_names.values()))
+        global_ns_list = None
+    else:
+        ns_list, global_ns_list = _explain_scope_ns(
+            conn, namespace, include_global)
     scope: list[str] | None = None
-    if ns_list is not None:
+    if scopes is not None:
+        # Scoped explain must resolve a target from a foreign project too;
+        # the scored tier pools and their closed cross-project seam decide
+        # whether that row is admitted or receives a namespace verdict.
+        scope = None
+    elif ns_list is not None:
         scope = list(ns_list) + [n for n in (global_ns_list or [])
                                  if n not in ns_list]
 
@@ -2910,6 +3240,7 @@ def explain_recall(
     omitted: list[tuple[dict, str]] = []
     project_deep: list[tuple[float, dict]] = []
     global_deep: list[tuple[float, dict]] = []
+    scoped_tiers: dict[str, list[tuple[float, dict]]] = {}
     pipeline_error = False
     # Issue #136: per-arm pre/post-cap counts from the presented (real-limit)
     # runs, reported in the explain envelope beside the verdicts.
@@ -2928,13 +3259,22 @@ def explain_recall(
     injection_budget_emptied = False
     injection_reason: str | None = None
     try:
-        presented, project_deep, global_deep = _explain_run_pipeline(
+        pipeline_result = _explain_run_pipeline(
             conn, query=query, ns_list=ns_list, global_ns_list=global_ns_list,
             limit=limit, global_limit=global_limit,
+            include_global=include_global,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, no_mmr=no_mmr, weights=weights,
-            arm_stats=explain_arms,
+            arm_stats=explain_arms, scopes=scopes, scoped_slots=scoped_slots,
         )
+        # Keep test and extension seams that stubbed the pre-#167 three-value
+        # helper compatible while the scoped path carries its tier pools.
+        if len(pipeline_result) == 3:
+            presented, project_deep, global_deep = pipeline_result
+            scoped_tiers, _pipeline_slots = {}, None
+        else:
+            (presented, project_deep, global_deep, scoped_tiers,
+             _pipeline_slots) = pipeline_result
         if no_bump:
             presented, omitted = _explain_omit_filter(presented)
         link_verdict_seeds = list(presented)
@@ -3058,6 +3398,8 @@ def explain_recall(
                     min_confidence=min_confidence, presented=presented,
                     omitted=omitted, project_deep=project_deep,
                     global_deep=global_deep,
+                    scoped_tiers=scoped_tiers,
+                    scoped_slots=scoped_slots,
                     margin_pruned=margin_pruned_details,
                     margin_pruned_scores=margin_pruned_scores,
                     selective_rejected=selective_rejected_details,
@@ -3246,7 +3588,10 @@ def explain_recall(
             ))
         for v in verdicts:
             print(_format_explain_blameline(v))
-    return results
+    # Scoped explain is also a direct API for callers that need the per-row
+    # routing verdicts.  Preserve the historical row-list return for the
+    # legacy explain lane; its JSON/text output still contains ``verdicts``.
+    return verdicts if scopes is not None else results
 
 def _recent_one_tier(
     conn: sqlite3.Connection,
@@ -3255,6 +3600,7 @@ def _recent_one_tier(
     limit: int,
     min_confidence: float,
     as_of: str | None = None,
+    stable_ties: bool = False,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories for ONE namespace set
     (a single recent tier). No FTS, no bump, no print — caller merges, bumps,
@@ -3284,6 +3630,7 @@ def _recent_one_tier(
     params.extend(as_of_params)
     live_clause = "" if as_of else "superseded_at IS NULL AND"
     params.append(limit)
+    order_clause = "ingestion_ts DESC, id" if stable_ties else "ingestion_ts DESC"
     rows = conn.execute(
         f"""SELECT id, namespace, type, content, tags, source_ref, source_hash,
                   confidence, signal, valid_from, ingestion_ts, last_retrieved,
@@ -3293,7 +3640,7 @@ def _recent_one_tier(
             WHERE {live_clause} confidence >= ?
             {ns_clause}
             {as_of_clause}
-            ORDER BY ingestion_ts DESC LIMIT ?""",
+            ORDER BY {order_clause} LIMIT ?""",
         params,
     ).fetchall()
     results = []
@@ -3327,10 +3674,54 @@ def _recent_one_tier(
         })
     return results
 
+
+def _scoped_recent_pools(
+    conn: sqlite3.Connection,
+    *,
+    scopes: dict[str, str],
+    include_global: bool,
+    slots: dict[str, int],
+    min_confidence: float,
+    as_of: str | None,
+) -> dict[str, list[tuple[float, dict]]]:
+    """Build labeled recent rows in the same reservation order as recall."""
+    namespace_tiers, selected_namespaces = _scoped_namespaces(
+        conn, scopes, include_global=include_global)
+    pools: dict[str, list[tuple[float, dict]]] = {
+        tier: [] for tier in SCOPED_TIER_ORDER
+    }
+    for tier in ("project", "domain", "fleet_host", "user_global"):
+        ns_list = namespace_tiers[tier]
+        if not ns_list:
+            continue
+        rows = _recent_one_tier(
+            conn, ns_list=ns_list, limit=max(slots[tier], 1),
+            min_confidence=min_confidence, as_of=as_of, stable_ties=True,
+        )
+        for row in rows:
+            row["tier"] = tier
+        pools[tier] = [(0.0, row) for row in rows]
+
+    candidates = _recent_one_tier(
+        conn, ns_list=None, limit=max(slots["cross_project"], 1) * 16,
+        min_confidence=min_confidence, as_of=as_of, stable_ties=True,
+    )
+    admitted: list[tuple[float, dict]] = []
+    for row in candidates:
+        namespace = row.get("namespace") or ""
+        if (namespace.startswith("project:")
+                and namespace not in selected_namespaces
+                and _cross_project_eligible(row, scopes)):
+            row["tier"] = "cross_project"
+            admitted.append((0.0, row))
+    pools["cross_project"] = admitted
+    return pools
+
 def _recent_memory_impl(
     conn: sqlite3.Connection,
     *,
     namespace: str | None = None,
+    scopes: dict[str, str] | None = None,
     limit: int = 5,
     min_confidence: float = 0.5,
     as_json: bool = False,
@@ -3377,27 +3768,47 @@ def _recent_memory_impl(
     so ``recent --namespace <old pre-v5 key>`` finds rows migrated to the new
     key. (issue #18)
     """
+    if scopes is not None and include_cross_project:
+        raise ValueError(
+            "scoped recent cannot be combined with include_cross_project=True; "
+            "the scoped cross_project tier uses its own admission predicate"
+        )
     # Issue #114: the injection lane is passive by construction (see
     # recall_memory's twin comment).
     if for_injection:
+        if scopes is not None:
+            raise ValueError(
+                "scoped recent cannot be combined with for_injection=True"
+            )
         no_bump = True
-    project_rows: list[dict] = []
-    # PRR-022 fix: same entry-point normalization as recall_memory.
+    scoped_slots = _tier_slots() if scopes is not None else None
     as_of = _normalize_as_of(as_of)
-    if namespace:
-        project_rows = _recent_one_tier(
-            conn, ns_list=_expand_namespace_aliases(conn, namespace),
-            limit=limit, min_confidence=min_confidence, as_of=as_of,
+    if scopes is not None:
+        pools = _scoped_recent_pools(
+            conn, scopes=scopes, include_global=include_global,
+            slots=scoped_slots or _DEFAULT_TIER_SLOTS,
+            min_confidence=min_confidence, as_of=as_of,
         )
+        project_rows = _merge_reserved_tiers(
+            pools, scoped_slots or _DEFAULT_TIER_SLOTS)
     else:
-        # Unscoped: one tier, no namespace filter (searches everything).
-        project_rows = _recent_one_tier(
-            conn, ns_list=None, limit=limit, min_confidence=min_confidence,
-            as_of=as_of,
-        )
+        project_rows = []
+    if scopes is None:
+        if namespace:
+            project_rows = _recent_one_tier(
+                conn, ns_list=_expand_namespace_aliases(conn, namespace),
+                limit=limit, min_confidence=min_confidence, as_of=as_of,
+            )
+        else:
+            # Unscoped: one tier, no namespace filter (searches everything).
+            project_rows = _recent_one_tier(
+                conn, ns_list=None, limit=limit,
+                min_confidence=min_confidence, as_of=as_of,
+            )
 
     # Global tier fold-in — same guard/rationale as recall_memory (see M2).
-    if include_global and namespace and namespace != GLOBAL_NAMESPACE:
+    if (scopes is None and include_global and namespace
+            and namespace != GLOBAL_NAMESPACE):
         global_rows = _recent_one_tier(
             conn, ns_list=_expand_namespace_aliases(conn, GLOBAL_NAMESPACE),
             limit=global_limit, min_confidence=min_confidence, as_of=as_of,
@@ -3423,7 +3834,7 @@ def _recent_memory_impl(
     # query-time: the queryless recent pull yields an empty admission set by
     # construction, so this only fires for direct library callers that pass
     # the cross context anyway.
-    if include_cross_project:
+    if include_cross_project and scopes is None:
         cross_scored = cross_project_admissions(
             conn, query="", moment=_cross_moment,
             current_namespace=namespace, ops_tokens=_cross_ops_tokens,
@@ -3600,6 +4011,7 @@ def recall_memory(
     *,
     query: str,
     namespace: str | None = None,
+    scopes: dict[str, str] | None = None,
     limit: int = 5,
     as_json: bool = False,
     min_confidence: float | None = None,
@@ -3646,6 +4058,7 @@ def recall_memory(
             conn,
             query=query,
             namespace=namespace,
+            scopes=scopes,
             limit=limit,
             as_json=as_json,
             min_confidence=min_confidence,
@@ -3667,6 +4080,11 @@ def recall_memory(
             _cross_ops_tokens=_cross_ops_tokens,
             _cross_explicit=_cross_explicit,
             _fence_id=_fence_id,
+        )
+
+    if scopes is not None:
+        raise ValueError(
+            "scoped recall cannot be combined with for_injection=True"
         )
 
     details = _collect_injection_candidates(
@@ -3720,6 +4138,7 @@ def recent_memory(
     conn: sqlite3.Connection,
     *,
     namespace: str | None = None,
+    scopes: dict[str, str] | None = None,
     limit: int = 5,
     min_confidence: float = 0.5,
     as_json: bool = False,
@@ -3745,6 +4164,7 @@ def recent_memory(
         return _recent_memory_impl(
             conn,
             namespace=namespace,
+            scopes=scopes,
             limit=limit,
             min_confidence=min_confidence,
             as_json=as_json,
@@ -3759,6 +4179,11 @@ def recent_memory(
             _cross_ops_tokens=_cross_ops_tokens,
             _cross_explicit=_cross_explicit,
             _fence_id=_fence_id,
+        )
+
+    if scopes is not None:
+        raise ValueError(
+            "scoped recent cannot be combined with for_injection=True"
         )
 
     details = _collect_injection_candidates(

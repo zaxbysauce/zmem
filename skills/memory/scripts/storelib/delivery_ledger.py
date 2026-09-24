@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -524,16 +525,36 @@ def consume_task_text(data_dir: str, session_id: str,
 
 
 def rows_present_in(rows: List[Dict[str, Any]], text: str) -> List[Dict[str, Any]]:
-    """The subset of rows whose fence bullet ``- [<id>]`` appears in the
-    FINAL emitted context (issue #151 review: a char-budget cut can drop
+    """The subset of rows whose fenced bullet contains its ``[<id>]`` token.
+
+    Scoped recall prefixes bullets with ``[tier=<name>]`` and injection-risk
+    rows can carry additional known markers before the dash, so the id is no
+    longer always the first bracketed token after ``-``.  Restrict the match
+    to the renderer's marker shape and one bullet line so arbitrary prose
+    cannot count as delivery and a short id cannot match a longer prefix.
+
+    The subset of rows whose fence bullet appears in the FINAL emitted context
+    (issue #151 review: a char-budget cut can drop
     tail rows AFTER scoring — recording them anyway would suppress rows
-    the model never saw). The renderer always embeds ``- [<id>]`` per row,
-    so the bullet form is the reliable marker (bare id substring could
+    the model never saw). The renderer always embeds a bracketed ``[<id>]``
+    token on its bullet, so this marker is reliable (a bare id substring could
     false-positive across prefix ids like r1/r10)."""
     if not text or not rows:
         return rows
-    present = [r for r in rows
-               if ("- [" + str(r.get("id", "")) + "]") in text]
+    present = []
+    for row in rows:
+        rid = str(row.get("id", ""))
+        if not rid:
+            continue
+        marker = re.compile(
+            r"(?m)^(?: \[(?:PREVIOUSLY|INJECTION RISK|UNTRUSTED TOOL|"
+            r"UNTRUSTED WEB|CONTESTED LINK)\])*-\s+"
+            r"(?:\[tier=(?:project|domain|fleet_host|cross_project|"
+            r"user_global|unknown)\]\s+)?\["
+            + re.escape(rid) + r"\](?:\s|$)"
+        )
+        if marker.search(text):
+            present.append(row)
     return present
 
 
