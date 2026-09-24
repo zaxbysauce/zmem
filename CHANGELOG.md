@@ -10,6 +10,19 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.64.0] - 2026-09-25
+
+### Added
+- **Imported namespace rekey maps and embedding consistency checks (issue
+  #168):** `rekey-namespace --map` accepts a strict ordered source-reference
+  prefix map with read-only preview and verified-snapshot apply paths. Only
+  matched live rows move, derived links follow moved IDs, and each map entry
+  receives decision-log evidence. `reembed --check` provides a read-only
+  census of missing vectors, orphan vectors, and embedding byte dimensions;
+  it refuses stores with an active WAL so checking cannot recover or mutate
+  the store. Both commands and their recovery behavior are documented in the
+  memory skill.
+
 ## [0.63.0] - 2026-09-25
 
 ### Added
