@@ -239,24 +239,40 @@ def _candidate_store_sources(repo_root: Path) -> tuple[list[dict], str | None]:
     zcode_plugin_data = os.environ.get("ZCODE_PLUGIN_DATA")
     claude_store_dir = os.environ.get("CLAUDE_PLUGIN_OPTION_STOREDIRECTORY")
 
-    add("ZMEM_STORE", env_store, Path(env_store).expanduser() if env_store else None, bool(env_store))
-    add("ZMEM_DATA", env_data, Path(env_data).expanduser() / "store.sqlite" if env_data else None, bool(env_data))
+    add(
+        "ZMEM_STORE",
+        env_store,
+        Path(env_store).expanduser() if env_store else None,
+        bool(env_store),
+    )
+    add(
+        "ZMEM_DATA",
+        env_data,
+        Path(env_data).expanduser() / "store.sqlite" if env_data else None,
+        bool(env_data),
+    )
     add(
         "CLAUDE_PLUGIN_DATA",
         claude_plugin_data,
-        Path(claude_plugin_data).expanduser() / "store.sqlite" if claude_plugin_data else None,
+        Path(claude_plugin_data).expanduser() / "store.sqlite"
+        if claude_plugin_data
+        else None,
         bool(claude_plugin_data),
     )
     add(
         "ZCODE_PLUGIN_DATA",
         zcode_plugin_data,
-        Path(zcode_plugin_data).expanduser() / "store.sqlite" if zcode_plugin_data else None,
+        Path(zcode_plugin_data).expanduser() / "store.sqlite"
+        if zcode_plugin_data
+        else None,
         bool(zcode_plugin_data),
     )
     add(
         "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
         claude_store_dir,
-        Path(claude_store_dir).expanduser() / "store.sqlite" if claude_store_dir else None,
+        Path(claude_store_dir).expanduser() / "store.sqlite"
+        if claude_store_dir
+        else None,
         bool(claude_store_dir),
     )
 
@@ -305,7 +321,9 @@ def _check_store_resolution(repo_root: Path, resolved_store: Path) -> dict:
 
     if split_brain:
         status = "fail"
-        summary = "Multiple active store path sources disagree; this is a split-brain risk."
+        summary = (
+            "Multiple active store path sources disagree; this is a split-brain risk."
+        )
     elif fallback_divergence:
         status = "warn"
         summary = "Resolved store path is stable, but host-specific fallback paths still diverge."
@@ -507,7 +525,12 @@ def _find_windows_bash() -> tuple[Path | None, str]:
         git_dir = Path(git_path).parent
         roots = [git_dir.parent, git_dir.parent.parent]
         for root in roots:
-            for rel in ("usr/bin/bash.exe", "bin/bash.exe", "usr/bin/bash.cmd", "bin/bash.cmd"):
+            for rel in (
+                "usr/bin/bash.exe",
+                "bin/bash.exe",
+                "usr/bin/bash.cmd",
+                "bin/bash.cmd",
+            ):
                 candidate = root / Path(rel)
                 if candidate.exists():
                     return candidate, "derived-from-git"
@@ -545,7 +568,9 @@ def _check_node_and_bash() -> list[dict]:
                 _check(
                     "bash",
                     "pass" if ok else "fail",
-                    "bash is available." if ok else f"bash invocation failed: {version}",
+                    "bash is available."
+                    if ok
+                    else f"bash invocation failed: {version}",
                     path=_display_path(bash_path),
                     version=version,
                 )
@@ -565,7 +590,9 @@ def _check_node_and_bash() -> list[dict]:
 
     ok, version = _run_version([str(bash_path), "--version"])
     normalized = _norm_path(bash_path)
-    looks_usable = any(token in normalized for token in ("\\git\\", "\\cygwin", "\\msys"))
+    looks_usable = any(
+        token in normalized for token in ("\\git\\", "\\cygwin", "\\msys")
+    )
     if not looks_usable and normalized.endswith("\\system32\\bash.exe"):
         reason = "Windows found system bash.exe, which is usually the WSL shim rather than Git Bash/Cygwin."
         status = "fail"
@@ -573,7 +600,9 @@ def _check_node_and_bash() -> list[dict]:
         reason = f"Usable Windows shell found via {source}."
         status = "pass"
     elif ok:
-        reason = f"bash runs, but the path is not recognized as Git Bash/Cygwin: {bash_path}"
+        reason = (
+            f"bash runs, but the path is not recognized as Git Bash/Cygwin: {bash_path}"
+        )
         status = "fail"
     else:
         reason = f"bash invocation failed: {version}"
@@ -798,12 +827,15 @@ def _open_store_ro(store_path: Path) -> sqlite3.Connection | None:
         return None
 
 
-def _meta_ts_days_ago(conn: sqlite3.Connection, key: str) -> tuple[float | None, str | None]:
+def _meta_ts_days_ago(
+    conn: sqlite3.Connection, key: str
+) -> tuple[float | None, str | None]:
     """Return (days since the meta `key` ISO timestamp, value) — (None, None) if
     the row is absent, (None, err) if unreadable. Uses the same calendar/timegm
     parsing store.py's cadence gate uses."""
     import calendar as _cal
     import time as _time
+
     try:
         row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     except Exception as exc:
@@ -864,7 +896,8 @@ def _check_mcp_token() -> dict:
     env_tok = os.environ.get("ZMEM_MCP_TOKEN", "").strip()
     if env_tok:
         return _check(
-            "mcp-token", "warn",
+            "mcp-token",
+            "warn",
             "ZMEM_MCP_TOKEN is an UNSCOPED operator token (full access to "
             "every namespace). Fine for the single-operator box; to scope it, "
             "move the token into a ZMEM_MCP_TOKEN_FILE JSON object with a "
@@ -876,7 +909,8 @@ def _check_mcp_token() -> dict:
     tok_file = os.environ.get("ZMEM_MCP_TOKEN_FILE", "").strip()
     if not tok_file:
         return _check(
-            "mcp-token", "skip",
+            "mcp-token",
+            "skip",
             "No MCP token configured (ZMEM_MCP_TOKEN / ZMEM_MCP_TOKEN_FILE "
             "unset) -- the MCP server is not in use on this box.",
         )
@@ -885,7 +919,8 @@ def _check_mcp_token() -> dict:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
         return _check(
-            "mcp-token", "fail",
+            "mcp-token",
+            "fail",
             f"ZMEM_MCP_TOKEN_FILE ({tok_file}) is configured but unreadable: {exc}",
             unscoped_token=None,
         )
@@ -893,14 +928,16 @@ def _check_mcp_token() -> dict:
         # F16: auth._parse_token_file hard-fails an empty file (exit 2);
         # doctor must not report a usable configuration.
         return _check(
-            "mcp-token", "fail",
+            "mcp-token",
+            "fail",
             f"ZMEM_MCP_TOKEN_FILE ({tok_file}) is empty -- the MCP server "
             "will refuse to start (exit 2).",
             unscoped_token=None,
         )
     if not raw.lstrip().startswith("{"):
         return _check(
-            "mcp-token", "warn",
+            "mcp-token",
+            "warn",
             "ZMEM_MCP_TOKEN_FILE holds a bare token: an UNSCOPED operator "
             "token (full access to every namespace). Fine for the "
             "single-operator box; scope it by switching the file to a JSON "
@@ -913,7 +950,8 @@ def _check_mcp_token() -> dict:
         obj = json.loads(raw)
     except ValueError:
         return _check(
-            "mcp-token", "fail",
+            "mcp-token",
+            "fail",
             "ZMEM_MCP_TOKEN_FILE starts with '{' but is not valid JSON -- "
             "the MCP server will refuse to start (exit 2). Fix the file or "
             "remove the leading '{' if it is meant to be a bare token.",
@@ -925,7 +963,8 @@ def _check_mcp_token() -> dict:
     tok_value = obj.get("token") if isinstance(obj, dict) else None
     if not isinstance(tok_value, str) or not tok_value.strip():
         return _check(
-            "mcp-token", "fail",
+            "mcp-token",
+            "fail",
             "ZMEM_MCP_TOKEN_FILE JSON must carry a non-empty string 'token' "
             "-- the MCP server will refuse to start (exit 2) as configured.",
             unscoped_token=None,
@@ -935,7 +974,8 @@ def _check_mcp_token() -> dict:
         # absent OR null = a VALID unscoped operator token (auth.py's sniff
         # rule) — warn like every other full-access token, never fail.
         return _check(
-            "mcp-token", "warn",
+            "mcp-token",
+            "warn",
             "ZMEM_MCP_TOKEN_FILE JSON omits 'namespaces': an UNSCOPED "
             "operator token (full access to every namespace). Fine for the "
             "single-operator box; scope it by adding a namespaces allow-list "
@@ -946,7 +986,8 @@ def _check_mcp_token() -> dict:
         )
     if not isinstance(scopes, list) or not scopes:
         return _check(
-            "mcp-token", "fail",
+            "mcp-token",
+            "fail",
             "ZMEM_MCP_TOKEN_FILE 'namespaces' is present but not a non-empty "
             "list -- the MCP server will refuse to start (exit 2) as "
             "configured.",
@@ -957,7 +998,8 @@ def _check_mcp_token() -> dict:
     for ns in scopes:
         if not is_valid_namespace(ns):
             return _check(
-                "mcp-token", "fail",
+                "mcp-token",
+                "fail",
                 f"ZMEM_MCP_TOKEN_FILE 'namespaces' entry {ns!r} is not a "
                 "valid namespace shape (expected project:<name>, user:<name>, "
                 "fleet:<name>, host:<name>, agent:<name>, domain:<name>, or "
@@ -966,7 +1008,8 @@ def _check_mcp_token() -> dict:
                 unscoped_token=None,
             )
     return _check(
-        "mcp-token", "pass",
+        "mcp-token",
+        "pass",
         f"Scoped MCP token: allow-list of {len(scopes)} namespace(s). "
         "Scoped tokens must pass an allowed namespace explicitly on every "
         "read (namespace-less reads span the whole store and are denied).",
@@ -980,15 +1023,16 @@ def _check_mcp_token() -> dict:
 def _check_episode_tables(resolved_store: Path) -> dict:
     """Episode storage check (issue #65, 10.7): structure + counts, read-only.
 
-      skip   no store yet (first writable run will create it at v13)
-      pass   both tables present with the expected columns; details carry
-             open/closed episode and membership counts (0 on a fresh store)
-      warn   store exists but the tables are missing (a v13 store should not
-             be able to get here -- migrate creates them idempotently)
+    skip   no store yet (first writable run will create it at v13)
+    pass   both tables present with the expected columns; details carry
+           open/closed episode and membership counts (0 on a fresh store)
+    warn   store exists but the tables are missing (a v13 store should not
+           be able to get here -- migrate creates them idempotently)
     """
     if not resolved_store.exists():
         return _check(
-            "episode-tables", "skip",
+            "episode-tables",
+            "skip",
             "No store yet; the first writable run will create the v13 "
             "episode tables.",
         )
@@ -997,24 +1041,33 @@ def _check_episode_tables(resolved_store: Path) -> dict:
         conn = sqlite3.connect(uri, uri=True)
     except Exception:
         return _check(
-            "episode-tables", "skip",
+            "episode-tables",
+            "skip",
             "Store unreadable read-only; episode counts unavailable.",
         )
     try:
         names = {
-            r[0] for r in conn.execute(
+            r[0]
+            for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
         required = {
-            "episode": {"id", "namespace", "started_at", "ended_at",
-                        "summary_memory_id", "token_count"},
+            "episode": {
+                "id",
+                "namespace",
+                "started_at",
+                "ended_at",
+                "summary_memory_id",
+                "token_count",
+            },
             "episode_memory": {"episode_id", "memory_id", "added_at"},
         }
         for table, cols in required.items():
             if table not in names:
                 return _check(
-                    "episode-tables", "warn",
+                    "episode-tables",
+                    "warn",
                     f"Table '{table}' is missing -- run any writable store.py "
                     "command once to complete the v13 migration.",
                     store=_display_path(resolved_store),
@@ -1024,7 +1077,8 @@ def _check_episode_tables(resolved_store: Path) -> dict:
             actual = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             if not cols.issubset(actual):
                 return _check(
-                    "episode-tables", "warn",
+                    "episode-tables",
+                    "warn",
                     f"Table '{table}' is missing expected columns "
                     f"{sorted(cols - actual)} -- re-run a writable store.py "
                     "command to complete the v13 migration.",
@@ -1038,7 +1092,8 @@ def _check_episode_tables(resolved_store: Path) -> dict:
         ).fetchone()[0]
         members_n = conn.execute("SELECT count(*) FROM episode_memory").fetchone()[0]
         return _check(
-            "episode-tables", "pass",
+            "episode-tables",
+            "pass",
             f"Episode storage ready: {open_n} open, {closed_n} closed, "
             f"{members_n} membership(s).",
             episodes_open=open_n,
@@ -1049,7 +1104,8 @@ def _check_episode_tables(resolved_store: Path) -> dict:
         # B-07: DatabaseError (corrupt/non-database file) is not an
         # OperationalError subclass -- doctor is fail-open, never a crash.
         return _check(
-            "episode-tables", "warn",
+            "episode-tables",
+            "warn",
             f"Episode tables unreadable: {exc}",
         )
     finally:
@@ -1081,7 +1137,8 @@ def _check_ns_migration(resolved_store: Path) -> dict:
     # An absent checkout is skipped and retried later (PRR-008). Filter the map
     # so the preview only counts namespaces that would really be re-keyed.
     actionable = {
-        old_ns: checkout for old_ns, checkout in migration_map.items()
+        old_ns: checkout
+        for old_ns, checkout in migration_map.items()
         if Path(checkout).is_dir()
     }
     skipped_absent = len(migration_map) - len(actionable)
@@ -1115,9 +1172,11 @@ def _check_ns_migration(resolved_store: Path) -> dict:
     if count == 0:
         note = ""
         if skipped_absent:
-            note = (f" ({skipped_absent} mapped namespace(s) have an absent "
-                    f"checkout dir — their rows will be skipped until the "
-                    f"checkout appears, then re-keyed automatically.)")
+            note = (
+                f" ({skipped_absent} mapped namespace(s) have an absent "
+                f"checkout dir — their rows will be skipped until the "
+                f"checkout appears, then re-keyed automatically.)"
+            )
         return _check(
             "ns-migration",
             "pass",
@@ -1146,8 +1205,11 @@ def _check_operational_health(resolved_store: Path) -> list[dict]:
     conn = _open_store_ro(resolved_store)
     if conn is None:
         return [
-            _check("operational-health", "skip",
-                   "Store not available; skipped backup/consolidation cadence checks."),
+            _check(
+                "operational-health",
+                "skip",
+                "Store not available; skipped backup/consolidation cadence checks.",
+            ),
         ]
     checks: list[dict] = []
     try:
@@ -1158,43 +1220,59 @@ def _check_operational_health(resolved_store: Path) -> list[dict]:
             days, ts_or_err = _meta_ts_days_ago(conn, key)
             if ts_or_err and days is None:
                 # unreadable row — warn (do not fail the whole report)
-                checks.append(_check(
-                    f"operational-health-{name}", "warn",
-                    f"last_{name} present but unreadable: {ts_or_err}",
-                    key=key,
-                ))
+                checks.append(
+                    _check(
+                        f"operational-health-{name}",
+                        "warn",
+                        f"last_{name} present but unreadable: {ts_or_err}",
+                        key=key,
+                    )
+                )
                 continue
             if days is None:
-                checks.append(_check(
-                    f"operational-health-{name}", "warn",
-                    f"last_{name}: (never) — maintenance has not run yet. The "
-                    f"session-start hook fires {name} on a cadence; if this store "
-                    f"predates the hook or the hook is disabled, run "
-                    f"`store.py {'backup --if-due' if name == 'backup' else 'consolidate'}` manually.",
-                    key=key,
-                ))
+                checks.append(
+                    _check(
+                        f"operational-health-{name}",
+                        "warn",
+                        f"last_{name}: (never) — maintenance has not run yet. The "
+                        f"session-start hook fires {name} on a cadence; if this store "
+                        f"predates the hook or the hook is disabled, run "
+                        f"`store.py {'backup --if-due' if name == 'backup' else 'consolidate'}` manually.",
+                        key=key,
+                    )
+                )
                 continue
             if days > warn_days:
-                checks.append(_check(
-                    f"operational-health-{name}", "warn",
-                    f"last_{name}: {ts_or_err} ({days:.1f}d ago, more than "
-                    f"{warn_days:.1f}d / 2x cadence overdue). Maintenance may not "
-                    f"be running on the session-start hook.",
-                    key=key, last_value=ts_or_err, days_ago=round(days, 1),
-                    warn_days=round(warn_days, 1),
-                ))
+                checks.append(
+                    _check(
+                        f"operational-health-{name}",
+                        "warn",
+                        f"last_{name}: {ts_or_err} ({days:.1f}d ago, more than "
+                        f"{warn_days:.1f}d / 2x cadence overdue). Maintenance may not "
+                        f"be running on the session-start hook.",
+                        key=key,
+                        last_value=ts_or_err,
+                        days_ago=round(days, 1),
+                        warn_days=round(warn_days, 1),
+                    )
+                )
             else:
                 # "within warning threshold" (not "within cadence"): the pass
                 # threshold is 2x the real cadence, so a value between 1x and
                 # 2x may already be past the writer's --if-due gate. Phrase the
                 # status as healthy (under the 2x warn line) without implying
                 # the cadence tick is fully current (PRR-007).
-                checks.append(_check(
-                    f"operational-health-{name}", "pass",
-                    f"last_{name}: {ts_or_err} ({days:.1f}d ago, under the "
-                    f"{warn_days:.1f}d warning threshold).",
-                    key=key, last_value=ts_or_err, days_ago=round(days, 1),
-                ))
+                checks.append(
+                    _check(
+                        f"operational-health-{name}",
+                        "pass",
+                        f"last_{name}: {ts_or_err} ({days:.1f}d ago, under the "
+                        f"{warn_days:.1f}d warning threshold).",
+                        key=key,
+                        last_value=ts_or_err,
+                        days_ago=round(days, 1),
+                    )
+                )
     finally:
         conn.close()
     return checks
@@ -1212,7 +1290,8 @@ def _check_inject_switch() -> dict:
     disabled = os.environ.get("ZMEM_INJECT", "1").strip() == "0"
     if disabled:
         return _check(
-            "inject-switch", "warn",
+            "inject-switch",
+            "warn",
             "passive injection DISABLED (ZMEM_INJECT=0) — the recall hooks, "
             "SessionStart (incl. Tier 0), Hermes prefetch/reflect "
             "session_start and MCP session_start emit nothing and log "
@@ -1220,7 +1299,8 @@ def _check_inject_switch() -> dict:
             env="ZMEM_INJECT=0",
         )
     return _check(
-        "inject-switch", "pass",
+        "inject-switch",
+        "pass",
         "passive injection enabled (ZMEM_INJECT unset or not 0)",
     )
 
@@ -1290,7 +1370,9 @@ def _hook_state_for_repo(codex_cfg: dict, repo_root: Path) -> list[str]:
     return hits
 
 
-def _check_codex_memory_and_trust(home: Path, project: Path, repo_root: Path) -> list[dict]:
+def _check_codex_memory_and_trust(
+    home: Path, project: Path, repo_root: Path
+) -> list[dict]:
     checks: list[dict] = []
     config_path = home / ".codex" / "config.toml"
     cfg = _load_toml(config_path)
@@ -1315,9 +1397,15 @@ def _check_codex_memory_and_trust(home: Path, project: Path, repo_root: Path) ->
 
     features = cfg.get("features") if isinstance(cfg, dict) else {}
     memories = cfg.get("memories") if isinstance(cfg, dict) else {}
-    feature_memories = bool(features.get("memories")) if isinstance(features, dict) else False
-    use_memories = bool(memories.get("use_memories")) if isinstance(memories, dict) else False
-    generate_memories = bool(memories.get("generate_memories")) if isinstance(memories, dict) else False
+    feature_memories = (
+        bool(features.get("memories")) if isinstance(features, dict) else False
+    )
+    use_memories = (
+        bool(memories.get("use_memories")) if isinstance(memories, dict) else False
+    )
+    generate_memories = (
+        bool(memories.get("generate_memories")) if isinstance(memories, dict) else False
+    )
     memory_enabled = feature_memories or use_memories or generate_memories
 
     if memory_enabled:
@@ -1455,12 +1543,16 @@ def _check_surfaces(repo_root: Path) -> dict:
         )
     elif optional_present:
         status = "pass"
-        summary = ("Claude, Codex, and ZCode plugin surfaces plus the memory skill "
-                    "are present; optional Codex adapter files are also present.")
+        summary = (
+            "Claude, Codex, and ZCode plugin surfaces plus the memory skill "
+            "are present; optional Codex adapter files are also present."
+        )
     else:
         status = "pass"
-        summary = ("Claude, Codex, and ZCode plugin surfaces plus the memory skill "
-                    "are present; optional Codex adapter files are not in this repo yet.")
+        summary = (
+            "Claude, Codex, and ZCode plugin surfaces plus the memory skill "
+            "are present; optional Codex adapter files are not in this repo yet."
+        )
 
     return _check("host-surfaces", status, summary, surfaces=details)
 
@@ -1482,22 +1574,27 @@ def _check_served_drift(repo_root: Path) -> dict:
     """
     if drift is None:
         return _check(
-            "served-drift", "skip",
+            "served-drift",
+            "skip",
             "Served-tree drift check unavailable: drift.py is missing from "
-            "this tree (pre-0.17.0 served tree or partial mirror).")
+            "this tree (pre-0.17.0 served tree or partial mirror).",
+        )
     try:
         result = drift.evaluate(repo_root)
     except Exception:
         return _check(
-            "served-drift", "skip",
-            "Served-tree drift check could not run (unexpected error).")
+            "served-drift",
+            "skip",
+            "Served-tree drift check could not run (unexpected error).",
+        )
     status = result.get("status")
     if status == "drifted":
         n = result.get("differing_count", 0)
         differing = result.get("differing", [])
         preview = ", ".join(differing[:10])
         return _check(
-            "served-drift", "warn",
+            "served-drift",
+            "warn",
             f"Served tree DRIFTED from release {result.get('version') or '?'} "
             f"— {n} runtime file(s) differ (served {result.get('served')} vs "
             f"release {result.get('release')}); first differing: {preview}.",
@@ -1510,7 +1607,8 @@ def _check_served_drift(repo_root: Path) -> dict:
         )
     if status == "matched":
         return _check(
-            "served-drift", "pass",
+            "served-drift",
+            "pass",
             f"Served tree matches release manifest "
             f"({result.get('files_compared')} files, digest "
             f"{result.get('served')}).",
@@ -1526,14 +1624,16 @@ def _check_served_drift(repo_root: Path) -> dict:
     # (skip).
     if result.get("manifest_status") == "corrupt":
         return _check(
-            "served-drift", "warn",
+            "served-drift",
+            "warn",
             "release-manifest.json is PRESENT but unreadable/corrupt "
             "(failed its algorithm or digest integrity gate) — this served "
             "cache mirror is damaged; force a refresh per README Upgrade.",
             served=result.get("served"),
         )
     return _check(
-        "served-drift", "skip",
+        "served-drift",
+        "skip",
         "No release-manifest.json in this tree — cannot compare served code "
         "to a release (pre-0.17.0 served tree, or a checkout without one).",
         served=result.get("served"),
@@ -1546,8 +1646,12 @@ def _check_served_drift(repo_root: Path) -> dict:
 # declared-vs-registered drift, so an invented name here is exactly the
 # "3-line stub" class of bug this check exists to catch.
 _HERMES_PROVIDER_HOOKS = {
-    "prefetch", "queue_prefetch", "sync_turn",
-    "on_session_end", "on_pre_compress", "on_memory_write",
+    "prefetch",
+    "queue_prefetch",
+    "sync_turn",
+    "on_session_end",
+    "on_pre_compress",
+    "on_memory_write",
     "post_tool_call",
 }
 
@@ -1560,6 +1664,7 @@ def _parse_simple_yaml(path: Path) -> dict:
     text = path.read_text(encoding="utf-8", errors="replace")
     try:
         import yaml  # type: ignore
+
         data = yaml.safe_load(text)
         if isinstance(data, dict):
             return data
@@ -1590,8 +1695,9 @@ def _parse_simple_yaml(path: Path) -> dict:
     return out
 
 
-def _check_second_stores(resolved_store: Path,
-                         extra_candidates: list[Path] | None = None) -> dict:
+def _check_second_stores(
+    resolved_store: Path, extra_candidates: list[Path] | None = None
+) -> dict:
     """Issue #71 E: detect leftover second stores on the known host paths and
     FAIL when any live row is missing from the canonical store (the cutover
     blocker from the field report: `.zcode/memory/store.sqlite` kept 349 live
@@ -1612,15 +1718,15 @@ def _check_second_stores(resolved_store: Path,
     try:
         data_dir = Path.home() / ".zcode" / "cli" / "plugins" / "data"
         candidates.extend(
-            p for p in data_dir.glob("*zmem*/store.sqlite") if p.is_file())
+            p for p in data_dir.glob("*zmem*/store.sqlite") if p.is_file()
+        )
     except OSError:
         pass
     for var in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
         raw = os.environ.get(var, "").strip()
         if raw:
             p = Path(raw)
-            candidates.append(
-                p / "store.sqlite" if p.suffix != ".sqlite" else p)
+            candidates.append(p / "store.sqlite" if p.suffix != ".sqlite" else p)
     # Injectable candidates (tests / future host probes); real paths only.
     candidates.extend(extra_candidates or [])
     seen: set[str] = set()
@@ -1637,9 +1743,12 @@ def _check_second_stores(resolved_store: Path,
             continue
     details: dict = {"canonical": _display_path(canonical), "second_stores": []}
     if not extra:
-        return _check("second-stores", "skip",
-                      "No leftover second store on the known host paths.",
-                      **details)
+        return _check(
+            "second-stores",
+            "skip",
+            "No leftover second store on the known host paths.",
+            **details,
+        )
 
     canonical_ids: set[str] | None = None
     if canonical.exists():
@@ -1647,8 +1756,11 @@ def _check_second_stores(resolved_store: Path,
             conn = sqlite3.connect(f"file:{canonical}?mode=ro", uri=True)
             try:
                 canonical_ids = {
-                    r[0] for r in conn.execute(
-                        "SELECT id FROM memory WHERE superseded_at IS NULL")}
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT id FROM memory WHERE superseded_at IS NULL"
+                    )
+                }
             finally:
                 conn.close()
         except sqlite3.Error:
@@ -1690,28 +1802,34 @@ def _check_second_stores(resolved_store: Path,
         results.append(entry)
 
     statuses = {e["status"] for e in results}
-    worst = ("fail" if "fail" in statuses
-             else "warn" if "warn" in statuses else "skip")
+    worst = "fail" if "fail" in statuses else "warn" if "warn" in statuses else "skip"
 
     details["second_stores"] = results
     if worst == "fail":
         return _check(
-            "second-stores", "fail",
+            "second-stores",
+            "fail",
             f"{unique_total} live row(s) exist OUTSIDE the canonical store "
             f"({_display_path(canonical)}) — cutover would strand them. Run "
             "`promote-store --from <path>` to merge them in, then retire the "
             "second store; also disable the old host's native memory (see "
             "the claude-native-memory / codex-native-memory checks).",
-            **details)
+            **details,
+        )
     if worst == "warn":
         return _check(
-            "second-stores", "warn",
+            "second-stores",
+            "warn",
             "A leftover second store exists but every live row is already in "
             "the canonical store; retire it when convenient.",
-            **details)
-    return _check("second-stores", "skip",
-                  "Second-store candidates found but none are readable/live.",
-                  **details)
+            **details,
+        )
+    return _check(
+        "second-stores",
+        "skip",
+        "Second-store candidates found but none are readable/live.",
+        **details,
+    )
 
 
 def _version_tuple(value) -> tuple | None:
@@ -1765,8 +1883,9 @@ def _norm_key(path: str | Path) -> str:
     return os.path.normcase(str(Path(path))).lower()
 
 
-def _host_registry_status(host: str, path: Path, detail_error=None,
-                          reason: str | None = None) -> dict:
+def _host_registry_status(
+    host: str, path: Path, detail_error=None, reason: str | None = None
+) -> dict:
     if detail_error is not None:
         error_text = _display_path(f"{detail_error}")
         return _check(
@@ -1831,8 +1950,11 @@ def _host_install_checks(home: Path, project: Path, repo_root: Path) -> list[dic
     )
     if host_registry is None:
         for host, path in targets:
-            checks.append(_host_registry_status(
-                host, path, detail_error="host_registry module unavailable"))
+            checks.append(
+                _host_registry_status(
+                    host, path, detail_error="host_registry module unavailable"
+                )
+            )
         # Review PRR-004: the manifest-trust check does not depend on
         # host_registry — a degraded deployment must still surface it.
         checks.append(_check_codex_manifest_trust(home, repo_root))
@@ -1872,7 +1994,8 @@ def _host_install_checks(home: Path, project: Path, repo_root: Path) -> list[dic
         # count as a zmem install (false duplicate-install) and its
         # non-semver version must never reach the pin comparison.
         zmem_records = [
-            record for record in records
+            record
+            for record in records
             if record.get("_id", "").startswith(ZMEM_PLUGIN_NAME)
         ]
         for record in zmem_records:
@@ -1881,10 +2004,12 @@ def _host_install_checks(home: Path, project: Path, repo_root: Path) -> list[dic
             if _version_tuple(record.get("version")) is None:
                 malformed.append(
                     f"{record.get('_id')!r} version {record.get('version')!r} "
-                    "is not major.minor.patch")
+                    "is not major.minor.patch"
+                )
         if malformed:
-            checks.append(_host_registry_status(
-                host, path, detail_error="; ".join(malformed)))
+            checks.append(
+                _host_registry_status(host, path, detail_error="; ".join(malformed))
+            )
             continue
         host_records.append((host, path, zmem_records))
 
@@ -1913,69 +2038,84 @@ def _host_install_checks(home: Path, project: Path, repo_root: Path) -> list[dic
                 if raw_market is None:
                     continue
                 market_version, market_error = _load_marketplace_version(
-                    raw_market, home)
+                    raw_market, home
+                )
                 if market_error is not None:
-                    checks.append(_host_registry_status(
-                        host, path, detail_error=market_error))
+                    checks.append(
+                        _host_registry_status(host, path, detail_error=market_error)
+                    )
                     continue
                 if market_version != version:
-                    skew_pairs.append({
-                        "host": host,
-                        "id": record_id,
-                        "installed": record.get("version"),
-                        "marketplace": ".".join(str(p) for p in market_version),
-                        "marketplace_path": _display_path(raw_market),
-                    })
+                    skew_pairs.append(
+                        {
+                            "host": host,
+                            "id": record_id,
+                            "installed": record.get("version"),
+                            "marketplace": ".".join(str(p) for p in market_version),
+                            "marketplace_path": _display_path(raw_market),
+                        }
+                    )
 
             if len(enabled_user) > 1:
                 ids = sorted({rid for rid, _ in enabled_user})
-                checks.append(_check(
-                    "duplicate-install",
-                    "fail",
-                    f"duplicate-install host={host} ids={','.join(ids)}",
-                    host=host,
-                    ids=ids,
-                    records=[_display_path(r.get("installPath") or r.get("_id"))
-                             for r in records
-                             if r.get("enabled", True)
-                             and (r.get("scope") or "user") == "user"],
-                ))
+                checks.append(
+                    _check(
+                        "duplicate-install",
+                        "fail",
+                        f"duplicate-install host={host} ids={','.join(ids)}",
+                        host=host,
+                        ids=ids,
+                        records=[
+                            _display_path(r.get("installPath") or r.get("_id"))
+                            for r in records
+                            if r.get("enabled", True)
+                            and (r.get("scope") or "user") == "user"
+                        ],
+                    )
+                )
             if enabled_project and enabled_user:
                 top_user = max(v for _, v in enabled_user)
                 pins = [(rid, v) for rid, v in enabled_project if v < top_user]
                 if pins:
                     pin_id, pin_version = pins[0]
-                    checks.append(_check(
-                        "project-pin",
-                        "warn",
-                        f"project-pin project="
-                        f"{'.'.join(str(p) for p in pin_version)} "
-                        f"user={'.'.join(str(p) for p in top_user)}",
-                        host=host,
-                        project_version=".".join(str(p) for p in pin_version),
-                        user_version=".".join(str(p) for p in top_user),
-                        project_ids=sorted(rid for rid, _ in pins),
-                        user_ids=sorted(rid for rid, v in enabled_user
-                                        if v == top_user),
-                    ))
+                    checks.append(
+                        _check(
+                            "project-pin",
+                            "warn",
+                            f"project-pin project="
+                            f"{'.'.join(str(p) for p in pin_version)} "
+                            f"user={'.'.join(str(p) for p in top_user)}",
+                            host=host,
+                            project_version=".".join(str(p) for p in pin_version),
+                            user_version=".".join(str(p) for p in top_user),
+                            project_ids=sorted(rid for rid, _ in pins),
+                            user_ids=sorted(
+                                rid for rid, v in enabled_user if v == top_user
+                            ),
+                        )
+                    )
 
         if skew_pairs:
             first = skew_pairs[0]
-            checks.append(_check(
-                "marketplace-skew",
-                "warn",
-                f"marketplace-skew installed={first['installed']} "
-                f"marketplace={first['marketplace']}",
-                pairs=skew_pairs,
-            ))
+            checks.append(
+                _check(
+                    "marketplace-skew",
+                    "warn",
+                    f"marketplace-skew installed={first['installed']} "
+                    f"marketplace={first['marketplace']}",
+                    pairs=skew_pairs,
+                )
+            )
     except Exception as exc:
-        checks.append(_check(
-            "host-install",
-            "warn",
-            f"host-install inspection failed unexpectedly: "
-            f"{type(exc).__name__}: {exc}",
-            error=f"{type(exc).__name__}: {exc}",
-        ))
+        checks.append(
+            _check(
+                "host-install",
+                "warn",
+                f"host-install inspection failed unexpectedly: "
+                f"{type(exc).__name__}: {exc}",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        )
     # Codex manifest-trust coverage rides with the host install checks so
     # every host-state diagnostic shares one wiring point (issue #185).
     checks.append(_check_codex_manifest_trust(home, repo_root))
@@ -2119,7 +2259,8 @@ def _check_codex_manifest_trust(home: Path, repo_root: Path) -> dict:
     manifest_path = repo_root / "hooks" / "hooks.codex.json"
     if not manifest_path.exists():
         manifest_path = (
-            Path(__file__).resolve().parents[3] / "hooks" / "hooks.codex.json")
+            Path(__file__).resolve().parents[3] / "hooks" / "hooks.codex.json"
+        )
     config_path = home / ".codex" / "config.toml"
     if not manifest_path.exists():
         return _check(
@@ -2157,8 +2298,7 @@ def _check_codex_manifest_trust(home: Path, repo_root: Path) -> dict:
     # "nothing registered" — that would PASS the trust check on a manifest
     # that cannot be interpreted. WARN on malformed content instead.
     if not isinstance(manifest_data, dict) or (
-        "hooks" in manifest_data
-        and not isinstance(manifest_data["hooks"], dict)
+        "hooks" in manifest_data and not isinstance(manifest_data["hooks"], dict)
     ):
         return _check(
             "untrusted-hook",
@@ -2207,9 +2347,9 @@ def _check_codex_manifest_trust(home: Path, repo_root: Path) -> dict:
     )
 
 
-def _orphan_store_candidates(resolved_store: Path, home: Path,
-                             extra_candidates: list[Path] | None = None
-                             ) -> list[Path]:
+def _orphan_store_candidates(
+    resolved_store: Path, home: Path, extra_candidates: list[Path] | None = None
+) -> list[Path]:
     """Known non-canonical store paths (issue #185, read-only inventory).
 
     Only these candidates are inspected — never a directory scan:
@@ -2229,7 +2369,8 @@ def _orphan_store_candidates(resolved_store: Path, home: Path,
     for p in candidates:
         try:
             key = os.path.normcase(
-                str(p.resolve() if p.exists() else Path(os.path.abspath(str(p)))))
+                str(p.resolve() if p.exists() else Path(os.path.abspath(str(p))))
+            )
         except OSError:
             key = os.path.normcase(str(p))
         if key in seen:
@@ -2248,23 +2389,24 @@ def _orphan_store_candidates(resolved_store: Path, home: Path,
     return out
 
 
-def _check_orphan_stores(resolved_store: Path,
-                         extra_candidates: list[Path] | None = None
-                         ) -> list[dict]:
+def _check_orphan_stores(
+    resolved_store: Path, extra_candidates: list[Path] | None = None
+) -> list[dict]:
     """Issue #185: inventory non-canonical SQLite stores with schema and
     row counts. WARN-only: an orphan never fails the report on its own;
     inspection recommends promote-store --from <path> instead of deleting.
     """
-    candidates = _orphan_store_candidates(
-        resolved_store, Path.home(), extra_candidates)
+    candidates = _orphan_store_candidates(resolved_store, Path.home(), extra_candidates)
     if not candidates:
-        return [_check(
-            "orphan-store",
-            "skip",
-            "No orphan store on the known host paths.",
-            resolved=_display_path(resolved_store),
-            candidates=[],
-        )]
+        return [
+            _check(
+                "orphan-store",
+                "skip",
+                "No orphan store on the known host paths.",
+                resolved=_display_path(resolved_store),
+                candidates=[],
+            )
+        ]
     checks: list[dict] = []
     for candidate in candidates:
         details: dict = {"path": _display_path(candidate)}
@@ -2285,8 +2427,7 @@ def _check_orphan_stores(resolved_store: Path,
                         schema_version = int(str(raw_version).strip())
                     except (TypeError, ValueError):
                         schema_version = str(raw_version)
-                count_row = conn.execute(
-                    "SELECT count(*) FROM memory").fetchone()
+                count_row = conn.execute("SELECT count(*) FROM memory").fetchone()
                 rows = int(count_row[0]) if count_row else 0
             except sqlite3.Error as exc:
                 error = f"{type(exc).__name__}: {exc}"
@@ -2297,22 +2438,26 @@ def _check_orphan_stores(resolved_store: Path,
                 conn.close()
         if error is not None:
             details["error"] = error
-            checks.append(_check(
-                "orphan-store",
-                "warn",
-                f"orphan store at {details['path']} could not be inspected: "
-                f"{error}",
-                **details,
-            ))
+            checks.append(
+                _check(
+                    "orphan-store",
+                    "warn",
+                    f"orphan store at {details['path']} could not be inspected: "
+                    f"{error}",
+                    **details,
+                )
+            )
             continue
         details["schema_version"] = schema_version
         details["rows"] = rows
-        checks.append(_check(
-            "orphan-store",
-            "warn",
-            f"orphan-store schema={schema_version} rows={rows}",
-            **details,
-        ))
+        checks.append(
+            _check(
+                "orphan-store",
+                "warn",
+                f"orphan-store schema={schema_version} rows={rows}",
+                **details,
+            )
+        )
     return checks
 
 
@@ -2337,12 +2482,15 @@ def _check_hermes_plugin(repo_root: Path) -> dict:
     usage at all (no ~/.hermes, no ZMEM_MCP_URL), the check is `skip`.
     Never fails a doctor run on a box that does not use Hermes."""
     import os
+
     hermes_home = Path.home() / ".hermes"
     remote_url = os.environ.get("ZMEM_MCP_URL", "").strip()
     if not hermes_home.exists() and not remote_url:
-        return _check("hermes-plugin", "skip",
-                      "Hermes not in use on this box (no ~/.hermes, "
-                      "ZMEM_MCP_URL unset).")
+        return _check(
+            "hermes-plugin",
+            "skip",
+            "Hermes not in use on this box (no ~/.hermes, " "ZMEM_MCP_URL unset).",
+        )
 
     hp = repo_root / "hermes-plugin"
     problems: list[str] = []
@@ -2358,28 +2506,33 @@ def _check_hermes_plugin(repo_root: Path) -> dict:
         if not parsed:
             problems.append("plugin.yaml unparseable")
         if parsed:
-            missing_keys = [k for k in ("name", "version", "description")
-                            if not parsed.get(k)]
+            missing_keys = [
+                k for k in ("name", "version", "description") if not parsed.get(k)
+            ]
             if missing_keys:
-                problems.append(
-                    "plugin.yaml missing " + ", ".join(missing_keys))
+                problems.append("plugin.yaml missing " + ", ".join(missing_keys))
             hooks = parsed.get("hooks") or []
             unknown = [h for h in hooks if h not in _HERMES_PROVIDER_HOOKS]
             if unknown:
                 problems.append(
                     "plugin.yaml declares hooks the provider does not "
-                    "implement: " + ", ".join(sorted(unknown)))
+                    "implement: " + ", ".join(sorted(unknown))
+                )
             details["manifest_hooks"] = list(hooks)
 
     # Provider + hook scripts.
     provider_init = hp / "__init__.py"
     if not provider_init.is_file():
         problems.append("__init__.py missing")
-    elif "def register(" not in provider_init.read_text(encoding="utf-8",
-                                                        errors="replace"):
+    elif "def register(" not in provider_init.read_text(
+        encoding="utf-8", errors="replace"
+    ):
         problems.append("__init__.py has no register(ctx) entry point")
-    hook_names = ["zmem-hermes-convention.py", "zmem-hermes-reflect.py",
-                  "zmem-hermes-verify.py"]
+    hook_names = [
+        "zmem-hermes-convention.py",
+        "zmem-hermes-reflect.py",
+        "zmem-hermes-verify.py",
+    ]
     missing_hooks = [h for h in hook_names if not (hp / "hooks" / h).is_file()]
     if missing_hooks:
         problems.append("hook scripts missing: " + ", ".join(missing_hooks))
@@ -2395,9 +2548,9 @@ def _check_hermes_plugin(repo_root: Path) -> dict:
     else:
         try:
             import importlib.util as _ilu
+
             if _ilu.find_spec("mcp") is not None:
-                spec = _ilu.spec_from_file_location(
-                    "zmem_doctor_mcp_probe", server)
+                spec = _ilu.spec_from_file_location("zmem_doctor_mcp_probe", server)
                 mod = _ilu.module_from_spec(spec)
                 # Import guarded + transient: mcp_server.py's argparse only
                 # runs under __main__; module import defines the FastMCP app.
@@ -2410,43 +2563,59 @@ def _check_hermes_plugin(repo_root: Path) -> dict:
                 # mode, handled in the remote branch below (CI fix: this
                 # branch previously failed every stdlib-only run).
                 details["mcp_server_importable"] = "unverified"
-                details["mcp_server_import_note"] = (
-                    "not verified: the 'mcp' package is not installed here")
+                details[
+                    "mcp_server_import_note"
+                ] = "not verified: the 'mcp' package is not installed here"
         except Exception as exc:
             details["mcp_server_importable"] = False
-            problems.append(f"server/mcp_server.py failed to import "
-                            f"({type(exc).__name__}: {exc})")
+            problems.append(
+                f"server/mcp_server.py failed to import "
+                f"({type(exc).__name__}: {exc})"
+            )
     if not client.is_file():
         problems.append("server/mcp_client.py missing")
 
     # Remote-mode box: fail when prefetch cannot work at all.
     if remote_url:
         details["remote_mode"] = {"ZMEM_MCP_URL": remote_url}
-        has_token = bool(os.environ.get("ZMEM_MCP_TOKEN", "").strip()
-                         or os.environ.get("ZMEM_MCP_TOKEN_FILE", "").strip())
+        has_token = bool(
+            os.environ.get("ZMEM_MCP_TOKEN", "").strip()
+            or os.environ.get("ZMEM_MCP_TOKEN_FILE", "").strip()
+        )
         details["remote_mode"]["token_present"] = has_token
         if not has_token:
-            problems.append("ZMEM_MCP_URL is set but no token source "
-                            "(ZMEM_MCP_TOKEN / ZMEM_MCP_TOKEN_FILE) — every "
-                            "prefetch would fail open")
+            problems.append(
+                "ZMEM_MCP_URL is set but no token source "
+                "(ZMEM_MCP_TOKEN / ZMEM_MCP_TOKEN_FILE) — every "
+                "prefetch would fail open"
+            )
         try:
             import importlib.util as _ilu
+
             if _ilu.find_spec("mcp") is None:
-                problems.append("ZMEM_MCP_URL is set but the 'mcp' package is "
-                                "not installed — prefetch fails open on this "
-                                "box (pip install -r hermes-plugin/server/"
-                                "requirements.txt)")
+                problems.append(
+                    "ZMEM_MCP_URL is set but the 'mcp' package is "
+                    "not installed — prefetch fails open on this "
+                    "box (pip install -r hermes-plugin/server/"
+                    "requirements.txt)"
+                )
         except Exception:
             pass
 
     if problems:
-        return _check("hermes-plugin", "fail",
-                      "Hermes plugin surface problems: " + "; ".join(problems),
-                      **details)
-    return _check("hermes-plugin", "pass",
-                  "Hermes plugin surface is complete (manifest, provider, "
-                  "hook scripts, MCP server + client).",
-                  **details)
+        return _check(
+            "hermes-plugin",
+            "fail",
+            "Hermes plugin surface problems: " + "; ".join(problems),
+            **details,
+        )
+    return _check(
+        "hermes-plugin",
+        "pass",
+        "Hermes plugin surface is complete (manifest, provider, "
+        "hook scripts, MCP server + client).",
+        **details,
+    )
 
 
 # The three v9 (issue #59, 4.1) append-only lineage columns. A healthy store
@@ -2468,14 +2637,16 @@ def _check_v9_columns(resolved_store: Path) -> dict:
     conn = _open_store_ro(resolved_store)
     if conn is None:
         return _check(
-            "v9-columns", "skip",
+            "v9-columns",
+            "skip",
             "Store not available; skipped v9 columns check.",
         )
     try:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
     except Exception as exc:
         return _check(
-            "v9-columns", "warn",
+            "v9-columns",
+            "warn",
             f"Could not inspect memory table columns: {type(exc).__name__}: {exc}",
         )
     finally:
@@ -2483,16 +2654,19 @@ def _check_v9_columns(resolved_store: Path) -> dict:
     missing = [c for c in V9_COLUMNS if c not in cols]
     if not missing:
         return _check(
-            "v9-columns", "pass",
+            "v9-columns",
+            "pass",
             "memory table carries all v9 lineage columns "
             "(valid_until, update_of, taint).",
             columns=list(V9_COLUMNS),
         )
     return _check(
-        "v9-columns", "warn",
+        "v9-columns",
+        "warn",
         f"memory table is missing v9 column(s): {', '.join(missing)}; a writable "
         f"store.py run will add them via migration (issue #59, 4.1).",
-        missing=missing, expected=list(V9_COLUMNS),
+        missing=missing,
+        expected=list(V9_COLUMNS),
     )
 
 
@@ -2519,49 +2693,60 @@ def _check_entity_tables(resolved_store: Path) -> dict:
     conn = _open_store_ro(resolved_store)
     if conn is None:
         return _check(
-            "entity-tables", "skip",
+            "entity-tables",
+            "skip",
             "Store not available; skipped entity tables check.",
         )
     try:
         tables = {
-            row[0] for row in conn.execute(
+            row[0]
+            for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
         missing = [t for t in V10_ENTITY_TABLES if t not in tables]
         if missing:
             return _check(
-                "entity-tables", "warn",
+                "entity-tables",
+                "warn",
                 f"entity table(s) missing: {', '.join(missing)}; a writable "
                 f"store.py run will create them and backfill via migration "
                 f"(issue #60, 5.1).",
-                missing=missing, expected=list(V10_ENTITY_TABLES),
+                missing=missing,
+                expected=list(V10_ENTITY_TABLES),
             )
         n_memory = conn.execute("SELECT count(*) FROM memory").fetchone()[0]
         n_entities = conn.execute("SELECT count(*) FROM entity").fetchone()[0]
         n_links = conn.execute("SELECT count(*) FROM memory_entity").fetchone()[0]
     except Exception as exc:
         return _check(
-            "entity-tables", "warn",
+            "entity-tables",
+            "warn",
             f"Could not inspect entity tables: {type(exc).__name__}: {exc}",
         )
     finally:
         conn.close()
     if n_memory > 0 and n_entities == 0 and n_links == 0:
         return _check(
-            "entity-tables", "warn",
+            "entity-tables",
+            "warn",
             f"entity tables exist but are empty on a store with {n_memory} "
             f"memory row(s) — the deterministic extractor should have derived "
             f"at least namespace/tag entities on write (issue #60, 5.2). "
             f"Re-run a writable store.py command to trigger the migration "
             f"backfill, then inspect with `store.py entity-list`.",
-            entities=n_entities, links=n_links, memories=n_memory,
+            entities=n_entities,
+            links=n_links,
+            memories=n_memory,
         )
     return _check(
-        "entity-tables", "pass",
+        "entity-tables",
+        "pass",
         f"entity identity tables present (entities={n_entities}, "
         f"links={n_links}); inspect with `store.py entity-list`.",
-        entities=n_entities, links=n_links, memories=n_memory,
+        entities=n_entities,
+        links=n_links,
+        memories=n_memory,
     )
 
 
@@ -2589,57 +2774,67 @@ def _check_link_tables(resolved_store: Path) -> dict:
     conn = _open_store_ro(resolved_store)
     if conn is None:
         return _check(
-            "link-tables", "skip",
+            "link-tables",
+            "skip",
             "Store not available; skipped link tables check.",
         )
     try:
         tables = {
-            row[0] for row in conn.execute(
+            row[0]
+            for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
         if V11_LINK_TABLE not in tables:
             return _check(
-                "link-tables", "warn",
+                "link-tables",
+                "warn",
                 f"{V11_LINK_TABLE} table missing; a writable store.py run "
                 "will create it via migration (issue #61, 6.1).",
-                missing=[V11_LINK_TABLE], expected=[V11_LINK_TABLE],
+                missing=[V11_LINK_TABLE],
+                expected=[V11_LINK_TABLE],
             )
         cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
         if "trust_score" not in cols:
             return _check(
-                "link-tables", "warn",
+                "link-tables",
+                "warn",
                 "memory.trust_score column missing; a writable store.py run "
                 "will add it via migration (issue #61, 6.1).",
-                missing=["trust_score"], expected=["trust_score"],
+                missing=["trust_score"],
+                expected=["trust_score"],
             )
-        n_links = conn.execute(
-            f"SELECT count(*) FROM {V11_LINK_TABLE}"
-        ).fetchone()[0]
+        n_links = conn.execute(f"SELECT count(*) FROM {V11_LINK_TABLE}").fetchone()[0]
         lo, hi = conn.execute(
             "SELECT MIN(trust_score), MAX(trust_score) FROM memory"
         ).fetchone()
     except Exception as exc:
         return _check(
-            "link-tables", "warn",
+            "link-tables",
+            "warn",
             f"Could not inspect link tables: {type(exc).__name__}: {exc}",
         )
     finally:
         conn.close()
     if lo is not None and (lo < 0.0 or hi > 1.0):
         return _check(
-            "link-tables", "warn",
+            "link-tables",
+            "warn",
             f"trust_score range [{lo}, {hi}] outside [0.0, 1.0] — writes "
             "clamp in SQL, so this store was hand-edited; inspect with "
             "`store.py get --json`.",
-            trust_min=lo, trust_max=hi,
+            trust_min=lo,
+            trust_max=hi,
         )
     return _check(
-        "link-tables", "pass",
+        "link-tables",
+        "pass",
         f"memory_link table present (edges={n_links}); trust_score in range "
         f"[{lo if lo is not None else 'n/a'}, {hi if hi is not None else 'n/a'}]; "
         "inspect with `store.py links --id <uuid>`.",
-        edges=n_links, trust_min=lo, trust_max=hi,
+        edges=n_links,
+        trust_min=lo,
+        trust_max=hi,
     )
 
 
@@ -2662,7 +2857,8 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
     conn = _open_store_ro(resolved_store)
     if conn is None:
         return _check(
-            "voyager-counters", "skip",
+            "voyager-counters",
+            "skip",
             "Store not available; skipped usage-counter check.",
         )
     try:
@@ -2685,11 +2881,14 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
             # real memory table cannot actually lack the columns through any
             # shipped code path; no separate fail branch is needed.
             return _check(
-                "voyager-counters", "warn",
+                "voyager-counters",
+                "warn",
                 "memory is missing the v12 usage counters "
                 f"({', '.join(missing)}); a writable store.py run will add "
                 "them via migration (issue #64).",
-                missing=missing, expected=expected, schema_version=store_version,
+                missing=missing,
+                expected=expected,
+                schema_version=store_version,
             )
         lo_applied, hi_applied, lo_violated, hi_violated = conn.execute(
             "SELECT MIN(applied_count), MAX(applied_count), "
@@ -2697,7 +2896,8 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
         ).fetchone()
     except Exception as exc:
         return _check(
-            "voyager-counters", "warn",
+            "voyager-counters",
+            "warn",
             f"Could not inspect usage counters: {type(exc).__name__}: {exc}",
         )
     finally:
@@ -2708,44 +2908,56 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
     extremes = (lo_applied, hi_applied, lo_violated, hi_violated)
     if any(v is not None and not isinstance(v, int) for v in extremes):
         return _check(
-            "voyager-counters", "warn",
+            "voyager-counters",
+            "warn",
             "non-integer usage counter value(s) — writes only ever store "
             "integers, so this store was hand-edited; inspect with "
             "`store.py get --json`.",
-            applied_min=lo_applied, applied_max=hi_applied,
-            violated_min=lo_violated, violated_max=hi_violated,
+            applied_min=lo_applied,
+            applied_max=hi_applied,
+            violated_min=lo_violated,
+            violated_max=hi_violated,
         )
     mins = (lo_applied, lo_violated)
     if any(m is not None and m < 0 for m in mins):
         return _check(
-            "voyager-counters", "warn",
+            "voyager-counters",
+            "warn",
             f"negative usage counter value(s) (applied_min={lo_applied}, "
             f"violated_min={lo_violated}) — writes only increment, so this "
             "store was hand-edited; inspect with `store.py get --json`.",
-            applied_min=lo_applied, violated_min=lo_violated,
+            applied_min=lo_applied,
+            violated_min=lo_violated,
         )
     # Issue #124: report the observational feedback totals (live-row SQL
     # aggregates + sidecar record counts from the store's parent data dir)
     # with the seven stable labels, in contract order, in both the details
     # and the human summary.
-    feedback_values = {key: 0 for key in (
-        "total_applied", "total_violated", "nonzero_applied",
-        "nonzero_violated", "matched_applied", "matched_violated",
-        "unmatched_operations")}
+    feedback_values = {
+        key: 0
+        for key in (
+            "total_applied",
+            "total_violated",
+            "nonzero_applied",
+            "nonzero_violated",
+            "matched_applied",
+            "matched_violated",
+            "unmatched_operations",
+        )
+    }
     feedback_note = ""
     try:
         from storelib.miss_rate import feedback_surface
+
         data_dir = str(resolved_store.parent)
         probe = _open_store_ro(resolved_store)
         if probe is not None:
             try:
-                feedback_values, _assoc, malformed = feedback_surface(
-                    probe, data_dir)
+                feedback_values, _assoc, malformed = feedback_surface(probe, data_dir)
             finally:
                 probe.close()
             if malformed:
-                feedback_note = (f" malformed feedback sidecar ignored: "
-                                 f"{malformed}")
+                feedback_note = f" malformed feedback sidecar ignored: " f"{malformed}"
     except Exception:
         feedback_note = " feedback totals unavailable"
     summary = (
@@ -2762,8 +2974,11 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
         f"{feedback_note}"
     )
     return _check(
-        "voyager-counters", "pass", summary,
-        applied_max=hi_applied, violated_max=hi_violated,
+        "voyager-counters",
+        "pass",
+        summary,
+        applied_max=hi_applied,
+        violated_max=hi_violated,
         total_applied=feedback_values["total_applied"],
         total_violated=feedback_values["total_violated"],
         nonzero_applied=feedback_values["nonzero_applied"],
@@ -2844,7 +3059,8 @@ def _check_tier0_size(project: Path) -> dict:
         f"{f['path']}: {f['lines']} lines / {f['bytes']} bytes" for f in files
     )
     over = [
-        f for f in files
+        f
+        for f in files
         if f["lines"] > TIER0_WARN_LINES or f["bytes"] > TIER0_WARN_BYTES
     ]
     if over:
@@ -2855,13 +3071,17 @@ def _check_tier0_size(project: Path) -> dict:
             f"{TIER0_WARN_BYTES // 1024}KB context-budget guideline ({described}). "
             "Prune them, or move durable knowledge into the store (retrieved on "
             "relevance, not always-injected).",
-            files=files, warn_lines=TIER0_WARN_LINES, warn_bytes=TIER0_WARN_BYTES,
+            files=files,
+            warn_lines=TIER0_WARN_LINES,
+            warn_bytes=TIER0_WARN_BYTES,
         )
     return _check(
         "tier0-size",
         "pass",
         f"Tier-0 always-injected file(s) within the size guideline ({described}).",
-        files=files, warn_lines=TIER0_WARN_LINES, warn_bytes=TIER0_WARN_BYTES,
+        files=files,
+        warn_lines=TIER0_WARN_LINES,
+        warn_bytes=TIER0_WARN_BYTES,
     )
 
 
@@ -2913,7 +3133,9 @@ def _check_session_retention(home: Path) -> dict:
             "30-day default applies. Only matters if you want historical "
             "transcript mining; to extend it, set "
             '{"cleanupPeriodDays": <larger int>} in ~/.claude/settings.json.',
-            cleanup_period_days=None, configured=False, default=30,
+            cleanup_period_days=None,
+            configured=False,
+            default=30,
             inspected=inspected,
         )
     if days <= 30:
@@ -2924,7 +3146,9 @@ def _check_session_retention(home: Path) -> dict:
             "default-like retention. Only matters if you want historical "
             "transcript mining; to extend it, raise cleanupPeriodDays in "
             "~/.claude/settings.json.",
-            cleanup_period_days=days, configured=True, default=30,
+            cleanup_period_days=days,
+            configured=True,
+            default=30,
             inspected=inspected,
         )
     return _check(
@@ -2932,7 +3156,9 @@ def _check_session_retention(home: Path) -> dict:
         "pass",
         f"Claude Code retains transcripts for {days} day(s) ({source}) — "
         "transcript mining history preserved.",
-        cleanup_period_days=days, configured=True, default=30,
+        cleanup_period_days=days,
+        configured=True,
+        default=30,
         inspected=inspected,
     )
 
@@ -3061,8 +3287,9 @@ def _recommendations(checks: list[dict]) -> list[str]:
             # is deliberately NO unverified-load escape hatch.
             note = details.get("note") or ""
             notes.append(
-                "The installed minilm.onnx FAILED its checksum pin. " + note +
-                " Restore the correct Xenova ONNX export (or point "
+                "The installed minilm.onnx FAILED its checksum pin. "
+                + note
+                + " Restore the correct Xenova ONNX export (or point "
                 "ZMEM_MODEL_URL at a source matching the pinned SHA-256 with "
                 "ZMEM_MODEL_AUTODOWNLOAD=1); the model stays refused until then."
             )
@@ -3108,11 +3335,17 @@ def _check_vec_ns_overfetch(resolved_store: Path, namespace: str | None = None) 
     count when no namespace was resolved. Skipped when the store is
     absent/unreadable (already flagged by store-access).
     """
-    from storelib.schema import ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV, _load_vec
+    from storelib.schema import (
+        ZMEM_VEC_NS_OVERFETCH_DEFAULT,
+        ZMEM_VEC_NS_OVERFETCH_ENV,
+        _load_vec,
+    )
+
     conn = _open_store_ro(resolved_store)
     if conn is None:
         return _check(
-            "vec-ns-overfetch", "skip",
+            "vec-ns-overfetch",
+            "skip",
             "Store not available; skipped vec-ns-overfetch check.",
         )
     # The vec0 virtual table needs the sqlite-vec extension loaded into the
@@ -3125,7 +3358,8 @@ def _check_vec_ns_overfetch(resolved_store: Path, namespace: str | None = None) 
     except Exception:
         conn.close()
         return _check(
-            "vec-ns-overfetch", "skip",
+            "vec-ns-overfetch",
+            "skip",
             "sqlite-vec extension unavailable; vec-ns-overfetch skipped.",
         )
     ns_filter = ""
@@ -3140,14 +3374,14 @@ def _check_vec_ns_overfetch(resolved_store: Path, namespace: str | None = None) 
         row = conn.execute(
             "SELECT count(*) FROM memory_vec mv "
             "JOIN memory m ON m.id = mv.memory_id "
-            "WHERE m.superseded_at IS NULL"
-            + ns_filter,
+            "WHERE m.superseded_at IS NULL" + ns_filter,
             params,
         ).fetchone()
         ns_rows = int(row[0]) if row else 0
     except (sqlite3.OperationalError, TypeError, ValueError):
         return _check(
-            "vec-ns-overfetch", "skip",
+            "vec-ns-overfetch",
+            "skip",
             "memory_vec table not present; vec-ns-overfetch skipped.",
         )
     finally:
@@ -3161,7 +3395,8 @@ def _check_vec_ns_overfetch(resolved_store: Path, namespace: str | None = None) 
         try:
             candidate = float(raw_env)
             if candidate == candidate and candidate not in (
-                float("inf"), float("-inf")
+                float("inf"),
+                float("-inf"),
             ):
                 overfetch = candidate
         except ValueError:
@@ -3173,7 +3408,9 @@ def _check_vec_ns_overfetch(resolved_store: Path, namespace: str | None = None) 
         f"ZMEM_VEC_NS_OVERFETCH={overfetch:g} ratio={ratio:.2f}"
     )
     return _check(
-        "vec-ns-overfetch", status, summary,
+        "vec-ns-overfetch",
+        status,
+        summary,
         namespace=namespace,
         live_vec_rows=ns_rows,
         zmem_vec_ns_overfetch=overfetch,
@@ -3204,7 +3441,8 @@ def _check_hybrid_default() -> dict:
         import embeddings  # type: ignore
     except Exception as exc:
         return _check(
-            "hybrid-default", "warn",
+            "hybrid-default",
+            "warn",
             f"hybrid-default: embeddings module not importable "
             f"({type(exc).__name__}); recall defaults to lexical.",
         )
@@ -3214,17 +3452,18 @@ def _check_hybrid_default() -> dict:
         st = embeddings.availability_status()
     except Exception as exc:
         return _check(
-            "hybrid-default", "warn",
+            "hybrid-default",
+            "warn",
             f"hybrid-default: availability probe failed: {type(exc).__name__}: {exc}",
         )
     available = bool(st.get("available"))
     reason = st.get("reason") or "unknown"
     status = "pass" if available else "info"
-    summary = (
-        f"hybrid-default: embeddings.available={available} reason={reason}"
-    )
+    summary = f"hybrid-default: embeddings.available={available} reason={reason}"
     return _check(
-        "hybrid-default", status, summary,
+        "hybrid-default",
+        status,
+        summary,
         available=available,
         reason=reason,
         missing_imports=st.get("missing_imports", []),
@@ -3239,7 +3478,8 @@ def _store_path_is_temp(resolved_store: Path) -> bool:
 
     try:
         return resolved_store.resolve().is_relative_to(
-            Path(_tempfile.gettempdir()).resolve())
+            Path(_tempfile.gettempdir()).resolve()
+        )
     except Exception:
         return False
 
@@ -3249,8 +3489,8 @@ def _embedding_health_warnings(
     active_profile,
     embeddings_available: bool,
     matches_store,  # bool | None
-    total_live,     # int | None
-    with_emb,       # int | None
+    total_live,  # int | None
+    with_emb,  # int | None
     store_is_temp: bool,
 ) -> list:
     """Pure decision core of _check_embeddings_health warnings (unit-tested
@@ -3295,8 +3535,10 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
         import embeddings  # type: ignore
     except Exception as exc:
         return _check(
-            "embeddings_health", "skip",
-            f"embeddings module unavailable ({type(exc).__name__})")
+            "embeddings_health",
+            "skip",
+            f"embeddings module unavailable ({type(exc).__name__})",
+        )
 
     st = embeddings.availability_status()
     details: dict = {
@@ -3335,8 +3577,7 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
                         "AND name='memory_vec'"
                     ).fetchone()
                     if row3 and row3[0]:
-                        m = re.search(r"float\[(\d+)\]", row3[0],
-                                      re.IGNORECASE)
+                        m = re.search(r"float\[(\d+)\]", row3[0], re.IGNORECASE)
                         declared_dim = int(m.group(1)) if m else None
                 except sqlite3.Error:
                     pass
@@ -3362,9 +3603,7 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
         declared_vec_dim=declared_dim,
         last_rebuilt_profile=meta_profile,
         matches_store=(
-            None
-            if live_dim is None or st.get("dim") is None
-            else st["dim"] == live_dim
+            None if live_dim is None or st.get("dim") is None else st["dim"] == live_dim
         ),
     )
 
@@ -3379,26 +3618,30 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
             else:
                 mf = entry.get("model_file", "")
                 installed = bool(mf) and (models_dir / mf).is_file()
-            shipped.append({
-                "name": name,
-                "hf_id": entry.get("hf_id", ""),
-                "dim": entry.get("dim"),
-                "installed": installed,
-            })
+            shipped.append(
+                {
+                    "name": name,
+                    "hf_id": entry.get("hf_id", ""),
+                    "dim": entry.get("dim"),
+                    "installed": installed,
+                }
+            )
     except Exception:
         shipped = []
     details["shipped_profiles"] = shipped
 
     # Issue #63 zax-review L3 / PRR-005 (restored after an isolation-revert
-    # dropped it once): surface the opt-in cross-encoder state. An
-    # enabled-but-missing model silently degrades to no rerank; that must be
-    # visible in the operator's primary diagnostic, not just doc prose.
+    # dropped it once): surface the cross-encoder state. An enabled-but-
+    # missing model silently degrades to no rerank; that must be visible in
+    # the operator's primary diagnostic, not just doc prose. Issue #126
+    # default flip: the enabled bit is routed through cross_encoder.enabled()
+    # (unset = ON) instead of a local re-parse, so doctor can never disagree
+    # with the dispatch gate.
     try:
-        _truthy_ce = {"1", "true", "yes", "on"}
-        ce_enabled = os.environ.get(
-            "ZMEM_CROSS_ENCODER", "").strip().lower() in _truthy_ce
-        ce_model_cfg = (os.environ.get("ZMEM_CROSS_ENCODER_MODEL")
-                        or "").strip()
+        import storelib.cross_encoder as _ce_gate  # noqa: E402
+
+        ce_enabled = _ce_gate.enabled()
+        ce_model_cfg = (os.environ.get("ZMEM_CROSS_ENCODER_MODEL") or "").strip()
         ce_model_present = bool(ce_model_cfg) and Path(ce_model_cfg).is_file()
         ce_tok_present = False
         if ce_model_cfg:
@@ -3423,6 +3666,7 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
                 sys.path.insert(0, _scripts_dir)
             import cross_encoder_profiles as _ce_profiles  # noqa: E402
             import storelib.cross_encoder as _ce  # noqa: E402
+
             ce_profile = _ce_profiles.resolve_profile()
             ce_profile_name = _ce_profiles.DEFAULT_PROFILE
             model_path, _tok_path = _ce.resolve_model_paths()
@@ -3435,26 +3679,25 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
                     try:
                         digest = hashlib.sha256()
                         with open(model_file, "rb") as fh:
-                            for chunk in iter(lambda: fh.read(1024 * 1024),
-                                              b""):
+                            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
                                 digest.update(chunk)
                     except OSError:
                         # Present but unreadable must not be misreported as
                         # absent (reviewer round 1, finding 1).
                         ce_checksum_state = "unreadable"
                     else:
-                        if digest.hexdigest() == (ce_profile.get("sha256")
-                                                  or "").lower():
+                        if (
+                            digest.hexdigest()
+                            == (ce_profile.get("sha256") or "").lower()
+                        ):
                             ce_checksum_state = "verified"
                         else:
                             ce_checksum_state = "mismatch"
         except Exception:
             ce_profile = None
-        passive_on = (os.environ.get("ZMEM_CROSS_ENCODER_PASSIVE",
-                                     "0") == "1")
-        shadow_on = (os.environ.get("ZMEM_CROSS_ENCODER_SHADOW",
-                                    "0") == "1")
-        autodl = (os.environ.get("ZMEM_MODEL_AUTODOWNLOAD", "0") == "1")
+        passive_on = os.environ.get("ZMEM_CROSS_ENCODER_PASSIVE", "0") == "1"
+        shadow_on = os.environ.get("ZMEM_CROSS_ENCODER_SHADOW", "0") == "1"
+        autodl = os.environ.get("ZMEM_MODEL_AUTODOWNLOAD", "0") == "1"
         details["cross_encoder"] = {
             "enabled": ce_enabled,
             "model_path_configured": ce_model_cfg,
@@ -3469,7 +3712,6 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
         }
     except Exception:
         pass
-
 
     active = st.get("profile")
     warnings = _embedding_health_warnings(
@@ -3497,10 +3739,12 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
         status = "pass"
         parts = [
             f"profile '{active}'",
-            f"stored {live_dim}-dim" if live_dim
-            else "no committed vectors yet",
-            (f"{with_emb}/{total_live} rows embedded"
-             if total_live is not None else ""),
+            f"stored {live_dim}-dim" if live_dim else "no committed vectors yet",
+            (
+                f"{with_emb}/{total_live} rows embedded"
+                if total_live is not None
+                else ""
+            ),
         ]
         summary = ", ".join(x for x in parts if x)
         if active == "fake":
@@ -3521,8 +3765,9 @@ def _same_file(left, right) -> bool:
     except (TypeError, ValueError, OSError):
         pass
     try:
-        return (os.path.normcase(os.path.realpath(str(left)))
-                == os.path.normcase(os.path.realpath(str(right))))
+        return os.path.normcase(os.path.realpath(str(left))) == os.path.normcase(
+            os.path.realpath(str(right))
+        )
     except (TypeError, ValueError, OSError):
         return False
 
@@ -3535,8 +3780,7 @@ def _nonnegative_int(value: str) -> int:
     except ValueError:
         raise argparse.ArgumentTypeError(f"invalid integer: {value!r}")
     if iv < 0:
-        raise argparse.ArgumentTypeError(
-            f"must be >= 0 (got {value})")
+        raise argparse.ArgumentTypeError(f"must be >= 0 (got {value})")
     return iv
 
 
@@ -3548,13 +3792,13 @@ def _positive_int(value: str) -> int:
     except ValueError:
         raise argparse.ArgumentTypeError(f"invalid integer: {value!r}")
     if iv < 1:
-        raise argparse.ArgumentTypeError(
-            f"must be >= 1 (got {value})")
+        raise argparse.ArgumentTypeError(f"must be >= 1 (got {value})")
     return iv
 
 
-def _check_miss_rate(resolved_store: "str | Path", opts: dict,
-                     store_explicit: bool = False) -> dict:
+def _check_miss_rate(
+    resolved_store: "str | Path", opts: dict, store_explicit: bool = False
+) -> dict:
     """Issue #94: the miss-rate join (failures × store recall × bg-log
     injections), opt-in via --miss-rate.
 
@@ -3575,8 +3819,7 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             from storelib import miss_rate  # type: ignore
         except Exception as exc:
-            return _check("miss-rate", "fail",
-                          f"join library import failed: {exc}")
+            return _check("miss-rate", "fail", f"join library import failed: {exc}")
     remediation = (
         "snapshot the store into a temp dir — copy store.sqlite AND any "
         "store.sqlite-wal/-shm beside it (plus zmem-decisions.log, its "
@@ -3584,10 +3827,12 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
         "zmem-bg.log, plus the ops/ ring dir "
         "when present) — then re-run with --store <snapshot path>. exit 1 "
         "from --miss-rate most often means exactly this: snapshot the "
-        "store and re-run with --store.")
+        "store and re-run with --store."
+    )
     if not store_explicit:
         return _check(
-            "miss-rate", "fail",
+            "miss-rate",
+            "fail",
             "REFUSED: --miss-rate requires an explicit --store — the join "
             "reads session data, so it must be pointed at a snapshot copy, "
             "never an env-resolved (possibly live) store",
@@ -3597,11 +3842,13 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
     try:
         host_default = miss_rate.host_default_store()
     except Exception as exc:
-        return _check("miss-rate", "fail",
-                      f"host-default store resolution failed: {exc}")
+        return _check(
+            "miss-rate", "fail", f"host-default store resolution failed: {exc}"
+        )
     if _same_file(resolved_store, host_default):
         return _check(
-            "miss-rate", "fail",
+            "miss-rate",
+            "fail",
             "REFUSED: the --store path resolves to the host-default store "
             "— the miss-rate join reads session data and must be pointed "
             "at a snapshot copy, never the live store",
@@ -3622,11 +3869,9 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
             min_token_overlap=opts.get("min_overlap", 2),
         )
     except Exception as exc:
-        return _check("miss-rate", "fail",
-                      f"join failed: {type(exc).__name__}: {exc}")
+        return _check("miss-rate", "fail", f"join failed: {type(exc).__name__}: {exc}")
     if report.get("error"):
-        return _check("miss-rate", "fail",
-                      f"join failed: {report['error']}")
+        return _check("miss-rate", "fail", f"join failed: {report['error']}")
     counts = report["counts"]
     status = "pass"
     if report.get("db_error"):
@@ -3636,8 +3881,11 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
         status = "warn"
     elif not report.get("bg_log_decision_lines"):
         status = "warn"
-    elif (counts["missed"] == 0 and counts["surfaced_sid"] == 0
-            and counts["surfaced_legacy"] == 0):
+    elif (
+        counts["missed"] == 0
+        and counts["surfaced_sid"] == 0
+        and counts["surfaced_legacy"] == 0
+    ):
         # PRR-007 / cubic #6: the operator asked for a rate and the run has
         # no denominator (every failure capture-gap/no-query) — that is not
         # a clean pass. The human render prints only the summary line, so
@@ -3668,11 +3916,11 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
         for _a in ("fts", "vec", "ent", "graph"):
             _b = (arm_rep.get("carried") or {}).get(_a) or {}
             if _b.get("injected", 0) or _b.get("silent", 0):
-                arm_bits.append("{0} {1}/{2}".format(
-                    _a, _b.get("injected", 0), _b.get("silent", 0)))
+                arm_bits.append(
+                    "{0} {1}/{2}".format(_a, _b.get("injected", 0), _b.get("silent", 0))
+                )
         if arm_bits:
-            summary += ("; arm attribution carried (inj/silent): "
-                        + ", ".join(arm_bits))
+            summary += "; arm attribution carried (inj/silent): " + ", ".join(arm_bits)
     # Issue #129: both directions always print together. The counter
     # subtree is best-effort in the join (a failure degrades to a caveat
     # inside it), so guard the read.
@@ -3686,8 +3934,9 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
         # failure; the cause stays in false_injection.caveats.
         status = "warn"
         fi_caveats = fi.get("caveats") or []
-        summary += ("; false-injection counter DEGRADED (%s)"
-                    % (fi_caveats[0] if fi_caveats else "unknown cause"))
+        summary += "; false-injection counter DEGRADED (%s)" % (
+            fi_caveats[0] if fi_caveats else "unknown cause"
+        )
     if fi_overall.get("injected"):
         summary += (
             f"; false-injection {fi_overall.get('false', 0)}/"
@@ -3696,8 +3945,10 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
             f"min_overlap {fi.get('min_token_overlap', 2)})"
         )
         for m, b in sorted((fi.get("per_moment") or {}).items()):
-            summary += (f"; [{m}] {b.get('false', 0)}/{b.get('injected', 0)}"
-                        f" (rate {b.get('false_rate')})")
+            summary += (
+                f"; [{m}] {b.get('false', 0)}/{b.get('injected', 0)}"
+                f" (rate {b.get('false_rate')})"
+            )
     elif not fi_degraded:
         summary += "; false-injection: no injected decision lines in the log"
     # Issue #153: the JSON report carries the complete deterministic named
@@ -3706,16 +3957,21 @@ def _check_miss_rate(resolved_store: "str | Path", opts: dict,
     # moments remain available in report.attribution.aggregate.
     matrix = report.get("lane_moment_matrix")
     if isinstance(matrix, list) and len(matrix) == 20:
-        nonzero = sum(1 for row in matrix
-                      if isinstance(row, dict) and row.get("count", 0))
+        nonzero = sum(
+            1 for row in matrix if isinstance(row, dict) and row.get("count", 0)
+        )
         summary += f"; attribution matrix 20 cells ({nonzero} non-empty)"
     return _check("miss-rate", status, summary, report=report)
 
 
-def build_report(project: Path, repo_root: Path,
-                 store_override=None, miss_rate_opts=None) -> dict:
-    resolved_store = (Path(store_override).expanduser()
-                      if store_override else host.resolve_store_path())
+def build_report(
+    project: Path, repo_root: Path, store_override=None, miss_rate_opts=None
+) -> dict:
+    resolved_store = (
+        Path(store_override).expanduser()
+        if store_override
+        else host.resolve_store_path()
+    )
     checks: list[dict] = []
     checks.append(_check_store_resolution(repo_root, resolved_store))
     checks.append(_check_local_path(resolved_store))
@@ -3762,7 +4018,8 @@ def build_report(project: Path, repo_root: Path,
     checks.append(_check_hybrid_default())
     ns_for_vec = (
         namespace_check["details"].get("namespace")
-        if namespace_check["status"] == "pass" else None
+        if namespace_check["status"] == "pass"
+        else None
     )
     checks.append(_check_vec_ns_overfetch(resolved_store, namespace=ns_for_vec))
     # Operational health (backup/consolidation cadence) — read-only, best-effort
@@ -3779,8 +4036,11 @@ def build_report(project: Path, repo_root: Path,
     # any invocation without an explicit --store, and the host-default store
     # even when given explicitly (see _check_miss_rate).
     if miss_rate_opts is not None:
-        checks.append(_check_miss_rate(resolved_store, miss_rate_opts,
-                                       store_explicit=bool(store_override)))
+        checks.append(
+            _check_miss_rate(
+                resolved_store, miss_rate_opts, store_explicit=bool(store_override)
+            )
+        )
 
     # "info" is a supported non-ok-flipping status (hybrid-default's
     # embeddings-unavailable branch: lexical fallback works — PRR-001R fix;
@@ -3790,7 +4050,11 @@ def build_report(project: Path, repo_root: Path,
         counts[check["status"]] += 1
 
     recommendations = _recommendations(checks)
-    namespace = namespace_check["details"].get("namespace") if namespace_check["status"] == "pass" else None
+    namespace = (
+        namespace_check["details"].get("namespace")
+        if namespace_check["status"] == "pass"
+        else None
+    )
     return {
         "doctor_version": 1,
         "ok": counts["fail"] == 0,
@@ -3806,7 +4070,11 @@ def build_report(project: Path, repo_root: Path,
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Read-only install diagnostics for zmem")
-    ap.add_argument("--project", default=os.getcwd(), help="project path used for canonical namespace resolution")
+    ap.add_argument(
+        "--project",
+        default=os.getcwd(),
+        help="project path used for canonical namespace resolution",
+    )
     ap.add_argument(
         "--repo-root",
         default=str(Path(__file__).resolve().parents[3]),
@@ -3822,21 +4090,21 @@ def main(argv: list[str] | None = None) -> int:
         "--store",
         default=None,
         help="explicit store path — repoints the WHOLE report at this store "
-             "(e.g. a snapshot copy; every check reads it instead of the "
-             "env-resolved store)",
+        "(e.g. a snapshot copy; every check reads it instead of the "
+        "env-resolved store)",
     )
     ap.add_argument(
         "--miss-rate",
         action="store_true",
         help="issue #94: add the miss-rate check (failures × store recall × "
-             "bg-log injections). Read-only; REFUSES the host-default store "
-             "— take a snapshot and pass --store <snapshot path>",
+        "bg-log injections). Read-only; REFUSES the host-default store "
+        "— take a snapshot and pass --store <snapshot path>",
     )
     ap.add_argument(
         "--miss-db",
         default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
         help="ZCode episodic db for the failure side of the miss-rate join "
-             "(read-only; same default as store.py failures)",
+        "(read-only; same default as store.py failures)",
     )
     ap.add_argument(
         "--miss-transcripts",
@@ -3844,41 +4112,48 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         metavar="GLOB",
         help="transcript JSONL glob(s) for the failure side (repeatable; "
-             "expanded in-process, read-only)",
+        "expanded in-process, read-only)",
     )
     ap.add_argument(
         "--miss-bg-log",
         default=None,
         help="explicit decision-log path (default: <dir of --store>/"
-             "zmem-decisions.log, falling back to the legacy co-located "
-             "zmem-bg.log when no decisions log exists)",
+        "zmem-decisions.log, falling back to the legacy co-located "
+        "zmem-bg.log when no decisions log exists)",
     )
     ap.add_argument(
-        "--miss-window-before", type=_nonnegative_int, default=1800,
+        "--miss-window-before",
+        type=_nonnegative_int,
+        default=1800,
         help="seconds before a failure in which an injection counts as "
-             "surfaced (default 1800; must be >= 0)",
+        "surfaced (default 1800; must be >= 0)",
     )
     ap.add_argument(
-        "--miss-window-after", type=_nonnegative_int, default=300,
+        "--miss-window-after",
+        type=_nonnegative_int,
+        default=300,
         help="seconds after a failure in which an injection counts as "
-             "surfaced (default 300; must be >= 0)",
+        "surfaced (default 300; must be >= 0)",
     )
     ap.add_argument(
-        "--miss-limit", type=_positive_int, default=200,
-        help="max failures to examine, newest first (default 200; must be "
-             ">= 1)",
+        "--miss-limit",
+        type=_positive_int,
+        default=200,
+        help="max failures to examine, newest first (default 200; must be " ">= 1)",
     )
     ap.add_argument(
-        "--miss-min-overlap", type=_positive_int, default=2,
+        "--miss-min-overlap",
+        type=_positive_int,
+        default=2,
         help="issue #129: minimum distinct ops-token overlaps between an "
-             "injected row and a later same-session reference for the row "
-             "to count as used (default 2; must be >= 1)",
+        "injected row and a later same-session reference for the row "
+        "to count as used (default 2; must be >= 1)",
     )
     ap.add_argument(
         "--miss-verbose",
         action="store_true",
         help="include a short content preview per top missed memory id "
-             "(default: ids and namespaces only)",
+        "(default: ids and namespaces only)",
     )
     args = ap.parse_args(argv)
 
@@ -3895,10 +4170,12 @@ def main(argv: list[str] | None = None) -> int:
             "min_overlap": args.miss_min_overlap,
         }
 
-    report = build_report(Path(args.project).expanduser(),
-                          Path(args.repo_root).expanduser(),
-                          store_override=args.store,
-                          miss_rate_opts=miss_rate_opts)
+    report = build_report(
+        Path(args.project).expanduser(),
+        Path(args.repo_root).expanduser(),
+        store_override=args.store,
+        miss_rate_opts=miss_rate_opts,
+    )
     human = _render_human(report)
     payload = json.dumps(report, indent=2, sort_keys=True)
 

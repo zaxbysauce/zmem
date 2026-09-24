@@ -1,15 +1,19 @@
-"""Optional post-MMR cross-encoder rerank (issue #63, 8.6) extended with the
+"""Post-MMR cross-encoder rerank (issue #63, 8.6) extended with the
 checked-in mini-pair-scorer profile, a 250 ms fail-open budget, and the
-opt-in passive final-set seam (issue #125).
+opt-in passive final-set seam (issue #125). Default flipped ON at unset by
+the owner's instruction riding issue #126's release (user-directed, 2026-09-23).
 
 POLICY (load-bearing — do not weaken):
-- Default OFF everywhere. Enablement requires ZMEM_CROSS_ENCODER to opt in.
+- Default ON when ZMEM_CROSS_ENCODER is UNSET. Opt out by setting it to any
+  non-truthy value (`0` is the canonical opt-out). A SET value keeps the
+  original parse: truthy ("1"/"true"/"yes"/"on") enables; every other set
+  value (including empty, "0", "false", "off", and garbage) disables.
 - Explicit rerank fires ONLY on explicit CLI `recall` runs that also mutate
   telemetry: `cli_allowed` demands recall-without---no-bump. Passive rerank
-  requires a SECOND opt-in, ZMEM_CROSS_ENCODER_PASSIVE exactly "1", plus the
-  passive lane itself (for_injection + --no-bump); without it every hook
-  surface (UserPromptSubmit / SubagentStart / PreCompact / SessionStart) and
-  the Hermes prefetch remain structurally excluded.
+  still requires a SECOND opt-in, ZMEM_CROSS_ENCODER_PASSIVE exactly "1",
+  plus the passive lane itself (for_injection + --no-bump); without it
+  every hook surface (UserPromptSubmit / SubagentStart / PreCompact /
+  SessionStart) and the Hermes prefetch remain structurally excluded.
 - The `search` subcommand never evaluates this module at all (its dispatch
   omits the enablement parameter outright). Its Hermes/MCP aliases additionally
   pin --no-hybrid by byte-stable contract, so they stay excluded even if a
@@ -83,7 +87,7 @@ CROSS_ENCODER_BUDGET_ENV = "ZMEM_CROSS_ENCODER_BUDGET_MS"
 PASSIVE_PROMOTION_GATE = {
     "reorder_enabled": False,
     "requires": "#155 decision; #111 precision_at_k > 0.8978333333333333; "
-                "p95 latency <= 250; #129 false_injection_rate <= 0.0",
+    "p95 latency <= 250; #129 false_injection_rate <= 0.0",
 }
 
 
@@ -114,12 +118,18 @@ def set_scorer(fn) -> None:
 
 def enabled() -> bool:
     """Env parse ONLY — deliberately performs zero I/O so dispatch-time gating
-    is free even for the hot hook paths that must never pay for this feature."""
-    return (os.environ.get(ENABLE_ENV, "").strip().lower() in _TRUTHY)
+    is free even for the hot hook paths that must never pay for this feature.
+
+    Issue #126 default flip: UNSET means ON (opt out with any non-truthy
+    set value, canonically ``ZMEM_CROSS_ENCODER=0``); a SET value keeps the
+    original truthy-membership parse unchanged."""
+    raw = os.environ.get(ENABLE_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() in _TRUTHY
 
 
-def cli_allowed(*, no_bump: bool, no_hybrid: bool,
-                for_injection: bool = False) -> bool:
+def cli_allowed(*, no_bump: bool, no_hybrid: bool, for_injection: bool = False) -> bool:
     """The single decision point the recall dispatch consults.
 
     EXPLICIT lane (for_injection=False, the unchanged #63 truth table):
@@ -133,8 +143,7 @@ def cli_allowed(*, no_bump: bool, no_hybrid: bool,
       explicit-lane concern.
     """
     if for_injection:
-        return (enabled() and no_bump
-                and os.environ.get(PASSIVE_ENV, "0") == "1")
+        return enabled() and no_bump and os.environ.get(PASSIVE_ENV, "0") == "1"
     return enabled() and not no_bump and not no_hybrid
 
 
@@ -175,12 +184,12 @@ def resolve_model_paths() -> tuple[str | None, str | None]:
     model file. (None, None) when no directory can be resolved."""
     explicit = (os.environ.get(MODEL_PATH_ENV) or "").strip()
     if explicit:
-        return explicit, os.path.join(os.path.dirname(explicit),
-                                      "tokenizer.json")
+        return explicit, os.path.join(os.path.dirname(explicit), "tokenizer.json")
     models_dir = (os.environ.get("ZMEM_MODELS_DIR") or "").strip()
     if not models_dir:
         try:
             import embeddings as _embeddings
+
             models_dir = str(_embeddings._resolve_models_dir())
         except Exception:
             return None, None
@@ -205,8 +214,7 @@ def _download_profile_model(model_path: str, profile: dict) -> str:
     if os.environ.get(AUTODOWNLOAD_ENV, "0") != "1":
         _emit_stderr("[zmem] cross-encoder state=autodownload-disabled")
         return "missing-model"
-    url = ((os.environ.get(MODEL_URL_ENV) or "").strip()
-           or (profile.get("url") or ""))
+    url = (os.environ.get(MODEL_URL_ENV) or "").strip() or (profile.get("url") or "")
     if not url:
         return "missing-model"
     from urllib.request import urlopen
@@ -217,8 +225,9 @@ def _download_profile_model(model_path: str, profile: dict) -> str:
         # The models dir may not exist yet on a fresh install; create it
         # only once the download is actually permitted.
         dest.parent.mkdir(parents=True, exist_ok=True)
-        part = str(dest.with_name(
-            f"{dest.name}.{os.getpid()}.{os.urandom(4).hex()}.part"))
+        part = str(
+            dest.with_name(f"{dest.name}.{os.getpid()}.{os.urandom(4).hex()}.part")
+        )
         with urlopen(url, timeout=30) as resp:
             data = resp.read()
         with open(part, "wb") as fh:
@@ -242,6 +251,7 @@ def _download_profile_model(model_path: str, profile: dict) -> str:
 
 def _stream_sha256(path: str) -> str:
     import hashlib
+
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
@@ -328,6 +338,7 @@ def _local_scorer():
     try:
         import onnxruntime as ort
         from tokenizers import Tokenizer
+
         # TOCTOU parity with embeddings.py (zax-review follow-up): stat for
         # cache freshness, then load ONE buffer for the session so a swap
         # between freshness check and construction cannot take effect here.
@@ -351,10 +362,13 @@ def _local_scorer():
                 enc = tok.encode(query, t)
                 pair_ids.append(list(enc.ids))
                 pair_mask.append(list(enc.attention_mask))
-            out = sess.run(None, {
-                "input_ids": pair_ids,
-                "attention_mask": pair_mask,
-            })
+            out = sess.run(
+                None,
+                {
+                    "input_ids": pair_ids,
+                    "attention_mask": pair_mask,
+                },
+            )
             logits = out[0]
             rows = logits.tolist() if hasattr(logits, "tolist") else logits
             if rows and isinstance(rows[0], (list, tuple)):
@@ -370,6 +384,7 @@ def _local_scorer():
         # Opt-in operator diagnostics without weakening the degrade contract.
         if os.environ.get("ZMEM_CE_DEBUG_TRACEBACK") == "1":
             import traceback as _tb
+
             _tb.print_exc()
         _last_load_failure = "load-error"
         return None
@@ -387,8 +402,9 @@ def _parse_budget_ms() -> int:
     except (TypeError, ValueError):
         value = -1
     if value < 0:
-        _emit_stderr("[zmem] WARNING: invalid ZMEM_CROSS_ENCODER_BUDGET_MS; "
-                     "using 250 ms")
+        _emit_stderr(
+            "[zmem] WARNING: invalid ZMEM_CROSS_ENCODER_BUDGET_MS; " "using 250 ms"
+        )
         return CROSS_ENCODER_BUDGET_MS
     return value
 
@@ -471,8 +487,7 @@ def maybe_rerank(query: str, rows: list, *, clock=None) -> list:
         # scores wrong-shaped models must not stay pinned forever (reviewer
         # round: cache-pinning gap).
         if fn is not _scorer_fn:
-            for key in [k for k, val in _SCORER_CACHE.items()
-                        if val[1] is fn]:
+            for key in [k for k, val in _SCORER_CACHE.items() if val[1] is fn]:
                 _SCORER_CACHE.pop(key, None)
         emit_reason("load-error")
         return rows
