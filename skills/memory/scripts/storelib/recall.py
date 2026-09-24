@@ -3821,10 +3821,15 @@ def _recent_one_tier(
     byte-identical (plain ``ORDER BY ingestion_ts DESC LIMIT limit``). An
     explicit canonical runtime moment selects the profile-aware path:
     ``limit * RECENT_PROFILE_SCAN_MULTIPLIER`` rows are fetched under
-    ``ORDER BY ingestion_ts DESC, id ASC``, each row's ``type_preference``
+    ``ORDER BY ingestion_ts DESC, rowid DESC``, each row's ``type_preference``
     multiplier is computed, and the tier returns the first ``limit`` rows of
-    ``(-multiplier, -ingestion_epoch, id)`` order. The multiplier reorders
-    only — it never filters a row, and the output dicts gain no score field.
+    ``(-multiplier, -ingestion_epoch, -rowid)`` order. Same-second rows
+    therefore tiebreak by ARRIVAL order (newest inserted first — rowid, not
+    the random uuid4 ``id``: a uuid tiebreak made the freshest row
+    nondeterministically droppable at the limit cut, PR #230 review PRR-230-1;
+    a disclosed deviation from the issue-text literal "id ASC"). The
+    multiplier reorders only — it never filters a row, and the output dicts
+    gain no score field.
     """
     params: list = [min_confidence]
     ns_clause = ""
@@ -3841,12 +3846,12 @@ def _recent_one_tier(
     order_clause = "ORDER BY ingestion_ts DESC LIMIT ?"
     if moment is not None:
         params[-1] = limit * RECENT_PROFILE_SCAN_MULTIPLIER
-        order_clause = "ORDER BY ingestion_ts DESC, id ASC LIMIT ?"
+        order_clause = "ORDER BY ingestion_ts DESC, rowid DESC LIMIT ?"
     rows = conn.execute(
-        f"""SELECT id, namespace, type, content, tags, source_ref, source_hash,
-                  confidence, signal, valid_from, ingestion_ts, last_retrieved,
-                  valid_until, update_of, taint, trust_score,
-                  applied_count, violated_count
+        f"""SELECT rowid, id, namespace, type, content, tags, source_ref,
+                   source_hash, confidence, signal, valid_from, ingestion_ts,
+                   last_retrieved, valid_until, update_of, taint, trust_score,
+                   applied_count, violated_count
             FROM memory
             WHERE {live_clause} confidence >= ?
             {ns_clause}
@@ -3859,7 +3864,7 @@ def _recent_one_tier(
         def _profile_key(r) -> tuple:
             mult = type_preference(r["type"], moment=moment, lane=lane)
             epoch = _parse_iso_to_epoch(r["ingestion_ts"] or "")
-            return (-mult, -epoch, r["id"])
+            return (-mult, -epoch, -r["rowid"])
 
         rows = sorted(rows, key=_profile_key)[:limit]
     results = []

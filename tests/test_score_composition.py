@@ -887,10 +887,11 @@ class RecentMomentPreferenceTest(unittest.TestCase):
         )
 
     def test_scan_multiplier_cuts_beyond_limit(self):
-        """Guardrail (plan-critic round 1): the explicit-moment path returns
-        exactly ``limit`` rows chosen by multiplier (not ingestion), and the
-        ``ingestion_ts DESC, id ASC`` fetch tiebreak is deterministic for
-        equal timestamps."""
+        """Guardrail (plan-critic round 1; tiebreak amended PR #230 review
+        PRR-230-1): the explicit-moment path returns exactly ``limit`` rows
+        chosen by multiplier (not ingestion), and equal timestamps tiebreak
+        by ARRIVAL order (rowid DESC — newest inserted first), not by the
+        random uuid4 id."""
         rows = [
             {
                 "id": f"126-cut-fact-{i}",
@@ -921,9 +922,10 @@ class RecentMomentPreferenceTest(unittest.TestCase):
         )
         self.assertEqual(
             [r["id"] for r in got],
-            ["126-cut-fact-a", "126-cut-fact-b"],
+            ["126-cut-fact-b", "126-cut-fact-a"],
             "multiplier must outrank recency and cut at limit; "
-            "equal-ts rows tiebreak by id ASC",
+            "equal-ts rows tiebreak by arrival order (rowid DESC: "
+            "newest inserted first)",
         )
         plain = recall_mod.recent_memory(
             self._conn, namespace=NS126, limit=2, min_confidence=0.5, no_bump=True
