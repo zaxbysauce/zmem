@@ -1,0 +1,167 @@
+{
+  "gold_sha256": "d0a9d31af604102969db365a82e794c1992459b44416bdca004aa53796a58c05",
+  "profile": "fake (model-absent)",
+  "clock": "2026-06-01T00:00:00Z",
+  "lane": "for-injection",
+  "runtime_moments": {
+    "user-prompt": "user_prompt",
+    "pretool": "pretool",
+    "subagent": "subagent",
+    "precompact": "precompact"
+  },
+  "profiles": {
+    "per_moment": {
+      "pretool": {
+        "constraint": 1.25,
+        "decision": 1.2,
+        "convention": 1.15,
+        "lesson": 1.0,
+        "preference": 0.95,
+        "fact": 0.9
+      },
+      "user_prompt": {
+        "fact": 1.15,
+        "lesson": 1.1,
+        "preference": 1.05,
+        "convention": 1.0,
+        "decision": 1.0,
+        "constraint": 1.0
+      },
+      "session_start": {
+        "fact": 1.15,
+        "lesson": 1.1,
+        "preference": 1.05,
+        "convention": 1.0,
+        "decision": 1.0,
+        "constraint": 1.0
+      },
+      "subagent": {
+        "convention": 1.1,
+        "lesson": 1.05,
+        "constraint": 1.05,
+        "decision": 1.0,
+        "preference": 1.0,
+        "fact": 1.0
+      },
+      "precompact": {
+        "fact": 1.05,
+        "lesson": 1.05,
+        "convention": 1.0,
+        "preference": 1.0,
+        "decision": 1.0,
+        "constraint": 1.0
+      }
+    },
+    "per_lane": {
+      "claude": {
+        "fact": 1.0,
+        "lesson": 1.0,
+        "convention": 1.0,
+        "preference": 1.0,
+        "decision": 1.0,
+        "constraint": 1.0
+      },
+      "codex": {
+        "fact": 1.0,
+        "lesson": 1.0,
+        "convention": 1.0,
+        "preference": 1.0,
+        "decision": 1.0,
+        "constraint": 1.0
+      },
+      "zcode": {
+        "fact": 1.0,
+        "lesson": 1.0,
+        "convention": 1.0,
+        "preference": 1.0,
+        "decision": 1.0,
+        "constraint": 1.0
+      },
+      "hermes-provider": {
+        "fact": 1.0,
+        "lesson": 1.0,
+        "convention": 1.0,
+        "preference": 1.0,
+        "decision": 1.0,
+        "constraint": 1.0
+      },
+      "hermes-compat": {
+        "fact": 1.0,
+        "lesson": 1.0,
+        "convention": 1.0,
+        "preference": 1.0,
+        "decision": 1.0,
+        "constraint": 1.0
+      }
+    }
+  },
+  "metrics": {
+    "hit_at_k": 1.0,
+    "precision_at_k": 0.8978333333333333,
+    "false_injection_rate": 0.0,
+    "empty_pool_rate": 0.08181818181818182,
+    "mrr": 0.98,
+    "items": 110,
+    "positive_items": 100,
+    "negative_items": 10,
+    "silent_reasons": {
+      "empty-pool": 9,
+      "omitted": 0,
+      "below-bar": 0,
+      "budget-drop": 0,
+      "below-relevance": 1,
+      "already-delivered": 0,
+      "expired": 0
+    }
+  },
+  "per_moment": {
+    "user-prompt": {
+      "items": 71,
+      "positive_items": 65,
+      "negative_items": 6,
+      "hit_at_k": 1.0,
+      "precision_at_k": 0.8735897435897435,
+      "false_injection_rate": 0.0,
+      "empty_pool_rate": 0.08450704225352113,
+      "mrr": 0.9846153846153847,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
+    },
+    "pretool": {
+      "items": 20,
+      "positive_items": 18,
+      "negative_items": 2,
+      "hit_at_k": 1.0,
+      "precision_at_k": 0.9722222222222222,
+      "false_injection_rate": 0.0,
+      "empty_pool_rate": 0.05,
+      "mrr": 1.0,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
+    },
+    "subagent": {
+      "items": 17,
+      "positive_items": 16,
+      "negative_items": 1,
+      "hit_at_k": 1.0,
+      "precision_at_k": 0.90625,
+      "false_injection_rate": 0.0,
+      "empty_pool_rate": 0.058823529411764705,
+      "mrr": 0.9375,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
+    },
+    "precompact": {
+      "items": 2,
+      "positive_items": 1,
+      "negative_items": 1,
+      "hit_at_k": 1.0,
+      "precision_at_k": 1.0,
+      "false_injection_rate": 0.0,
+      "empty_pool_rate": 0.5,
+      "mrr": 1.0,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
+    }
+  }
+}

@@ -47,9 +47,13 @@ os.environ["ZMEM_EMBED_PROFILE"] = "fake"
 # No auto link generation in the fixture (edges would only add noise); the
 # write path itself stays real. Same knob as tests/fixtures/eval_store.py.
 os.environ["ZMEM_LINK_THRESHOLD"] = "1.01"
-for _k in ("ZMEM_DATA", "ZMEM_BACKUP_DIR",
-           "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
-           "ZMEM_INJECT_FLOOR_ENT"):
+for _k in (
+    "ZMEM_DATA",
+    "ZMEM_BACKUP_DIR",
+    "ZMEM_INJECT_FLOOR_LEX",
+    "ZMEM_INJECT_FLOOR_COS",
+    "ZMEM_INJECT_FLOOR_ENT",
+):
     os.environ.pop(_k, None)
 
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -64,7 +68,10 @@ from unittest import mock  # noqa: E402
 
 import storelib.recall as recall_mod  # noqa: E402  (env pinned above)
 import storelib.write as write_mod  # noqa: E402
-from storelib.inject import classify_silent_reason, selective_inject_filter  # noqa: E402
+from storelib.inject import (
+    classify_silent_reason,
+    selective_inject_filter,
+)  # noqa: E402
 from storelib.schema import _prepare_store, connect  # noqa: E402
 from storelib.write import add_memory  # noqa: E402
 
@@ -78,11 +85,16 @@ FIXED_NOW = float(calendar.timegm((2026, 6, 1, 0, 0, 0)))
 # A. compute_score unit level
 # ---------------------------------------------------------------------------
 
+
 class ComputeScoreRelevanceLaneTest(unittest.TestCase):
     """``relevance`` kwarg: exactly the 0.55-weighted share; None = legacy."""
 
-    ROW = {"confidence": 0.9, "retrieval_count": 0, "surfaced_count": 0,
-           "ingestion_ts": PIN_TS}
+    ROW = {
+        "confidence": 0.9,
+        "retrieval_count": 0,
+        "surfaced_count": 0,
+        "ingestion_ts": PIN_TS,
+    }
 
     def test_relevance_kwarg_drives_exactly_the_bm25_share(self):
         # Same synthetic row, same clock: the ONLY difference is the lane
@@ -90,16 +102,138 @@ class ComputeScoreRelevanceLaneTest(unittest.TestCase):
         # W_BM25 * (0.9 - 0.1) — the lane value drives the relevance term.
         hi = recall_mod.compute_score(self.ROW, None, FIXED_NOW, relevance=0.9)
         lo = recall_mod.compute_score(self.ROW, None, FIXED_NOW, relevance=0.1)
-        self.assertAlmostEqual(hi - lo, 0.55 * 0.8, places=12,
-                               msg="relevance lane must drive W_BM25 exactly")
+        self.assertAlmostEqual(
+            hi - lo,
+            0.55 * 0.8,
+            places=12,
+            msg="relevance lane must drive W_BM25 exactly",
+        )
 
     def test_relevance_none_reproduces_legacy_arithmetic(self):
         # fts_rank -1.5 => ar = 1.5, ar/(1+ar) = 0.6;
         # 0.55*0.6 + 0.20*0.9 + 0.15*1.0 + 0.10*0 = 0.66 exactly (12 dp).
         score = recall_mod.compute_score(self.ROW, -1.5, FIXED_NOW)
-        self.assertAlmostEqual(score, 0.66, places=12,
-                               msg="relevance=None must keep the legacy "
-                                   "ar/(1+ar) formula byte-identically")
+        self.assertAlmostEqual(
+            score,
+            0.66,
+            places=12,
+            msg="relevance=None must keep the legacy "
+            "ar/(1+ar) formula byte-identically",
+        )
+
+    # ------------------------------------------------------------------
+    # Issue #126 (Workstream F, PR 2 of 7): per-moment type preferences.
+    # ------------------------------------------------------------------
+
+    def test_type_preference_mean_normalized(self):
+        """Fixture-driven AC1: multipliers and scores match
+        tests/fixtures/issue126/score-expected.json exactly; the base
+        composite is 0.660000000000 (relevance=0.6, pinned clock, popularity
+        and applied/violated counters all zero, trust 1.0)."""
+        import json
+
+        fixture = REPO_ROOT / "tests" / "fixtures" / "issue126"
+        expected = json.loads(
+            (fixture / "score-expected.json").read_text(encoding="utf-8")
+        )
+        rows = [
+            json.loads(line)
+            for line in (fixture / "score-input.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        by_id = {r["id"]: r for r in rows}
+        self.assertEqual(
+            expected["now_epoch"], FIXED_NOW, "fixture clock must equal the module pin"
+        )
+        for case in expected["cases"]:
+            row = dict(by_id[case["id"]])
+            tp = recall_mod.type_preference(
+                row["type"], moment=case["moment"], lane=case["lane"]
+            )
+            self.assertAlmostEqual(
+                tp, case["multiplier"], places=15, msg=f"multiplier for {case['id']}"
+            )
+            base = recall_mod.compute_score(
+                row, None, FIXED_NOW, relevance=0.6, moment=None, lane=None
+            )
+            self.assertAlmostEqual(
+                base, case["base_score"], places=12, msg=f"base score for {case['id']}"
+            )
+            scored = recall_mod.compute_score(
+                row,
+                None,
+                FIXED_NOW,
+                relevance=0.6,
+                moment=case["moment"],
+                lane=case["lane"],
+            )
+            self.assertAlmostEqual(
+                scored,
+                case["score"],
+                places=15,
+                msg=f"moment-weighted score for {case['id']}",
+            )
+        fact_score = recall_mod.compute_score(
+            by_id["00000000-0000-4000-8000-000000000126"],
+            None,
+            FIXED_NOW,
+            relevance=0.6,
+            moment="user_prompt",
+            lane=None,
+        )
+        self.assertAlmostEqual(
+            fact_score, 0.722857142857, places=12, msg="AC1 exact fact score"
+        )
+
+    def test_runtime_moment_and_lane_validation(self):
+        """AC2: five runtime moments x five lanes accepted; exact ValueError
+        messages for the four invalid inputs (hyphenated moments leak the
+        schema separator; bogus lane; underscore-spelled moments)."""
+        moments = ("session_start", "user_prompt", "pretool", "subagent", "precompact")
+        lanes = ("claude", "codex", "zcode", "hermes-provider", "hermes-compat")
+        for m in moments:
+            for lane in lanes:
+                self.assertIsInstance(
+                    recall_mod.type_preference("fact", moment=m, lane=lane), float
+                )
+            self.assertIsInstance(recall_mod.type_preference("fact", moment=m), float)
+        for bad, want in (
+            ("user-prompt", "invalid injection moment: user-prompt"),
+            ("pre_tool", "invalid injection moment: pre_tool"),
+            ("pre_compact", "invalid injection moment: pre_compact"),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                recall_mod.type_preference("fact", moment=bad)
+            self.assertEqual(str(ctx.exception), want)
+        with self.assertRaises(ValueError) as ctx:
+            recall_mod.type_preference("fact", moment="pretool", lane="bogus")
+        self.assertEqual(str(ctx.exception), "invalid injection lane: bogus")
+        with self.assertRaises(ValueError) as ctx:
+            recall_mod.type_preference("bogus", moment="pretool")
+        self.assertEqual(str(ctx.exception), "unknown memory type: bogus")
+        with self.assertRaises(ValueError) as ctx:
+            recall_mod.compute_score(
+                dict(self.ROW, type="fact"),
+                None,
+                FIXED_NOW,
+                relevance=0.6,
+                lane="codex",
+            )
+        self.assertEqual(str(ctx.exception), "lane requires moment")
+
+    def test_legacy_compute_score_default_is_stable(self):
+        """AC3: moment=None, lane=None is byte-equal (12 dp) to the explicit
+        legacy call — no direct caller receives a non-unit profile."""
+        row = dict(self.ROW, type="fact")
+        legacy = recall_mod.compute_score(row, None, FIXED_NOW, relevance=0.6)
+        explicit = recall_mod.compute_score(
+            row, None, FIXED_NOW, relevance=0.6, moment=None, lane=None
+        )
+        self.assertAlmostEqual(
+            legacy, explicit, places=12, msg="moment=None must be the identity path"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -107,10 +241,10 @@ class ComputeScoreRelevanceLaneTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 NS = "project:lanecompose"
-QUERY = "kubernetes tolerations"                       # 2 normalized terms
-ROW_BOTH = "kubernetes tolerations schedule tainted nodes"        # both terms
+QUERY = "kubernetes tolerations"  # 2 normalized terms
+ROW_BOTH = "kubernetes tolerations schedule tainted nodes"  # both terms
 ROW_ONE_STRONG = "kubernetes quota defaults for the staging cluster"  # 1 term
-ROW_ONE_WEAK = "kubernetes upgrade channel pinning cadence"       # 1 term
+ROW_ONE_WEAK = "kubernetes upgrade channel pinning cadence"  # 1 term
 
 # Hand-placed 16-dim geometry (embed_profiles.FAKE_DIM == 16; the stub packs
 # exactly like the fake profile: struct.pack("<16f", ...)). Q = unit(0.6*e1 +
@@ -177,12 +311,19 @@ class RecallLaneCompositionTest(unittest.TestCase):
         write_mod._embeddings = STUB
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                for key, content in (("both", ROW_BOTH),
-                                     ("one_strong", ROW_ONE_STRONG),
-                                     ("one_weak", ROW_ONE_WEAK)):
+                for key, content in (
+                    ("both", ROW_BOTH),
+                    ("one_strong", ROW_ONE_STRONG),
+                    ("one_weak", ROW_ONE_WEAK),
+                ):
                     cls.ids[key] = add_memory(
-                        cls.conn, namespace=NS, type_="fact", content=content,
-                        tags="lanetest", signal="test", confidence=0.9,
+                        cls.conn,
+                        namespace=NS,
+                        type_="fact",
+                        content=content,
+                        tags="lanetest",
+                        signal="test",
+                        confidence=0.9,
                         source_ref="session:lane-seed",
                     )
         finally:
@@ -199,11 +340,15 @@ class RecallLaneCompositionTest(unittest.TestCase):
 
     def _recall(self):
         recall_mod._embeddings = STUB
-        self.addCleanup(setattr, recall_mod, "_embeddings",
-                        recall_mod._embeddings)
+        self.addCleanup(setattr, recall_mod, "_embeddings", recall_mod._embeddings)
         return recall_mod._recall_one_tier(
-            self.conn, query=QUERY, ns_list=[NS], limit=5,
-            min_confidence=None, hybrid=True, now_epoch=FIXED_NOW,
+            self.conn,
+            query=QUERY,
+            ns_list=[NS],
+            limit=5,
+            min_confidence=None,
+            hybrid=True,
+            now_epoch=FIXED_NOW,
             collect_lanes=True,
         )
 
@@ -212,14 +357,26 @@ class RecallLaneCompositionTest(unittest.TestCase):
         rows = {item["id"]: item for _score, item in scored}
         both = rows[self.ids["both"]]
         lanes = both["_lanes"]
-        self.assertGreater(lanes["lex"], 0.0, "both-terms row: lexical lane "
-                           "must be measured positive")
-        self.assertGreater(lanes["cos"], 0.0, "both-terms row: cosine lane "
-                           "must be measured positive (AC3: both lanes live)")
-        expected_rel = max(v for v in (lanes["lex"], lanes["cos"],
-                                       lanes["entity"]) if v is not None)
-        self.assertAlmostEqual(lanes["rel"], expected_rel, places=12,
-                               msg="rel must be the max of measured lanes")
+        self.assertGreater(
+            lanes["lex"],
+            0.0,
+            "both-terms row: lexical lane " "must be measured positive",
+        )
+        self.assertGreater(
+            lanes["cos"],
+            0.0,
+            "both-terms row: cosine lane "
+            "must be measured positive (AC3: both lanes live)",
+        )
+        expected_rel = max(
+            v for v in (lanes["lex"], lanes["cos"], lanes["entity"]) if v is not None
+        )
+        self.assertAlmostEqual(
+            lanes["rel"],
+            expected_rel,
+            places=12,
+            msg="rel must be the max of measured lanes",
+        )
 
     def test_per_pk_fallback_measures_cos_when_knn_misses(self):
         # Issue #113 review round (tc-3): a candidate the KNN generator did
@@ -229,18 +386,24 @@ class RecallLaneCompositionTest(unittest.TestCase):
         # reading the stored memory.embedding blob.
         both_id = self.ids["both"]
         self.assertGreater(
-            float(self.conn.execute(
-                "SELECT length(embedding) FROM memory WHERE id = ?",
-                (both_id,)).fetchone()[0]), 0,
-            "fixture precondition: memory.embedding must be populated")
-        with mock.patch.object(recall_mod, "_vec_knn_in_namespace",
-                               lambda *a, **k: []):
+            float(
+                self.conn.execute(
+                    "SELECT length(embedding) FROM memory WHERE id = ?", (both_id,)
+                ).fetchone()[0]
+            ),
+            0,
+            "fixture precondition: memory.embedding must be populated",
+        )
+        with mock.patch.object(recall_mod, "_vec_knn_in_namespace", lambda *a, **k: []):
             scored = self._recall()
         rows = {item["id"]: item for _score, item in scored}
         both = rows[both_id]
-        self.assertGreater(both["_lanes"]["cos"], 0.0,
-                           "per-PK fallback must measure the cosine lane "
-                           "when the KNN lane surfaces nothing")
+        self.assertGreater(
+            both["_lanes"]["cos"],
+            0.0,
+            "per-PK fallback must measure the cosine lane "
+            "when the KNN lane surfaces nothing",
+        )
         self.assertGreater(both["_rel_cos"], 0.0)
         # The fallback value is the same primitive the KNN path produces:
         # cos(Q, both) ~ 0.514 for the hand-placed geometry.
@@ -266,14 +429,18 @@ class RecallLaneCompositionTest(unittest.TestCase):
         strong, weak = rows[self.ids["one_strong"]], rows[self.ids["one_weak"]]
         self.assertGreater(strong["_lanes"]["cos"], 0.7)
         self.assertLess(weak["_lanes"]["cos"], strong["_lanes"]["cos"])
-        self.assertGreater(strong["_score"], weak["_score"],
-                           "a lexically-matched row must also be scored on "
-                           "its cosine (composition = max of lanes)")
+        self.assertGreater(
+            strong["_score"],
+            weak["_score"],
+            "a lexically-matched row must also be scored on "
+            "its cosine (composition = max of lanes)",
+        )
 
 
 # ---------------------------------------------------------------------------
 # C. inject gate precedence
 # ---------------------------------------------------------------------------
+
 
 class _RrBindsStub:
     """Per-row hand-placed blobs for the rr-binds fixture (issue #113 tc-2).
@@ -301,11 +468,11 @@ class _RrBindsStub:
 # body — long enough that its bm25 sinks well under the short tf=4 decoys'
 # (rr needs real headroom under 0.30, and bm25's tf saturation caps how far
 # tf alone can go).
-_RR_TARGET_CONTENT = (QUERY + " "
-                      + " ".join(f"filler{i}" for i in range(250)))
+_RR_TARGET_CONTENT = QUERY + " " + " ".join(f"filler{i}" for i in range(250))
 _RR_DECOY_CONTENTS = [
     f"kubernetes kubernetes kubernetes kubernetes tolerations "
-    f"decoy{i} zzz{i} qqq{i}" for i in range(8)
+    f"decoy{i} zzz{i} qqq{i}"
+    for i in range(8)
 ]
 _RR_BLOBS = {
     QUERY: _BLOB_QUERY,
@@ -313,8 +480,8 @@ _RR_BLOBS = {
 }
 for _i, _c in enumerate(_RR_DECOY_CONTENTS):
     _RR_BLOBS[_c] = _unit_blob(
-        [0.9 if _j == 0 else (1.0 if _j == 2 + _i else 0.0)
-         for _j in range(DIM)])
+        [0.9 if _j == 0 else (1.0 if _j == 2 + _i else 0.0) for _j in range(DIM)]
+    )
 RR_STUB = _RrBindsStub(_RR_BLOBS)
 
 
@@ -335,9 +502,13 @@ class RrBindsIntegrationTest(unittest.TestCase):
                 # Target: matches BOTH query terms (cov = 1.0, eligible) but
                 # long content dilutes its term frequency -> deep pool rank.
                 cls.target_id = add_memory(
-                    cls.conn, namespace=NS, type_="fact",
+                    cls.conn,
+                    namespace=NS,
+                    type_="fact",
                     content=_RR_TARGET_CONTENT,
-                    tags="rrbind", signal="test", confidence=0.9,
+                    tags="rrbind",
+                    signal="test",
+                    confidence=0.9,
                     source_ref="session:rr-seed",
                 )
                 # Decoys: short docs with tf=4 on term 1 AND term 2 present
@@ -347,9 +518,13 @@ class RrBindsIntegrationTest(unittest.TestCase):
                 # the pool-best bm25 regardless of dilution).
                 for content in _RR_DECOY_CONTENTS:
                     add_memory(
-                        cls.conn, namespace=NS, type_="fact",
+                        cls.conn,
+                        namespace=NS,
+                        type_="fact",
                         content=content,
-                        tags="rrbind", signal="test", confidence=0.9,
+                        tags="rrbind",
+                        signal="test",
+                        confidence=0.9,
                         source_ref="session:rr-seed",
                     )
         finally:
@@ -366,26 +541,30 @@ class RrBindsIntegrationTest(unittest.TestCase):
         recall_mod._embeddings = RR_STUB
         self.addCleanup(setattr, recall_mod, "_embeddings", orig_emb)
         scored = recall_mod._recall_one_tier(
-            self.conn, query=QUERY, ns_list=[NS], limit=25,
-            min_confidence=None, hybrid=True, now_epoch=FIXED_NOW,
+            self.conn,
+            query=QUERY,
+            ns_list=[NS],
+            limit=25,
+            min_confidence=None,
+            hybrid=True,
+            now_epoch=FIXED_NOW,
             collect_lanes=True,
         )
         # The fixture must survive write-path dedup: 9 rows written, so the
         # pool must still hold most of them (a dedup collapse silently
         # empties the decoy pool and pins rr at 1.0).
         self.assertGreaterEqual(
-            len(scored), 7,
-            "fixture collapsed: write-path dedup ate the decoy pool")
+            len(scored), 7, "fixture collapsed: write-path dedup ate the decoy pool"
+        )
         rows = {item["id"]: item for _score, item in scored}
         target = rows[self.target_id]
         lanes = target["_lanes"]
         self.assertEqual(lanes["cov"], 1.0, "target matches both terms")
         self.assertLess(lanes["rr"], 1.0, "target is NOT pool-best")
         self.assertLess(
-            lanes["lex"], 0.30,
-            f"cov*rr must trip the 0.30 lexical floor; got {lanes}")
-        selected, status, stats = selective_inject_filter(
-            [target], with_stats=True)
+            lanes["lex"], 0.30, f"cov*rr must trip the 0.30 lexical floor; got {lanes}"
+        )
+        selected, status, stats = selective_inject_filter([target], with_stats=True)
         self.assertEqual(selected, [], "lex below floor -> relevance-dropped")
         self.assertEqual(stats["relevance_failed"], 1)
 
@@ -395,9 +574,16 @@ class GatePrecedenceTest(unittest.TestCase):
 
     @staticmethod
     def _row(**over) -> dict:
-        row = {"id": "row", "content": "synthetic", "type": "fact",
-               "signal": "test", "confidence": 0.9,
-               "_rel_lex": 0.0, "_rel_cos": None, "_rel_ent": None}
+        row = {
+            "id": "row",
+            "content": "synthetic",
+            "type": "fact",
+            "signal": "test",
+            "confidence": 0.9,
+            "_rel_lex": 0.0,
+            "_rel_cos": None,
+            "_rel_ent": None,
+        }
         row.update(over)
         return row
 
@@ -406,10 +592,12 @@ class GatePrecedenceTest(unittest.TestCase):
         selected, status, stats = selective_inject_filter(rows, with_stats=True)
         self.assertEqual(selected, [])
         self.assertEqual(status, "silent")
-        self.assertEqual(stats, {"trust_passed": 3, "relevance_failed": 3,
-                                 "trust_failed": 0})
-        self.assertEqual(classify_silent_reason(rows, lane_stats=stats),
-                         "below-relevance")
+        self.assertEqual(
+            stats, {"trust_passed": 3, "relevance_failed": 3, "trust_failed": 0}
+        )
+        self.assertEqual(
+            classify_silent_reason(rows, lane_stats=stats), "below-relevance"
+        )
 
     def test_untrusted_rows_still_name_below_bar(self):
         # Trust failure wins even though the relevance lanes would also fail:
@@ -417,10 +605,10 @@ class GatePrecedenceTest(unittest.TestCase):
         rows = [self._row(id=f"row-{i}", confidence=0.1) for i in range(3)]
         selected, status, stats = selective_inject_filter(rows, with_stats=True)
         self.assertEqual((selected, status), ([], "silent"))
-        self.assertEqual(stats, {"trust_passed": 0, "relevance_failed": 0,
-                                 "trust_failed": 3})
-        self.assertEqual(classify_silent_reason(rows, lane_stats=stats),
-                         "below-bar")
+        self.assertEqual(
+            stats, {"trust_passed": 0, "relevance_failed": 0, "trust_failed": 3}
+        )
+        self.assertEqual(classify_silent_reason(rows, lane_stats=stats), "below-bar")
 
     def test_default_call_contract_is_a_two_tuple(self):
         result = selective_inject_filter([self._row()])
@@ -435,26 +623,32 @@ class GatePrecedenceTest(unittest.TestCase):
         # conjunctive reading would drop entity/cosine-only positives that
         # carry a measured-zero lex lane. Pinned both directions.
         lex_fail_cos_pass = self._row(
-            id="lfcp", _rel_lex=0.0, _rel_cos=0.9, _rel_ent=None)
+            id="lfcp", _rel_lex=0.0, _rel_cos=0.9, _rel_ent=None
+        )
         lex_pass_cos_fail = self._row(
-            id="lpcf", _rel_lex=0.9, _rel_cos=0.0, _rel_ent=None)
-        both_fail = self._row(
-            id="both-fail", _rel_lex=0.0, _rel_cos=0.0, _rel_ent=0.0)
+            id="lpcf", _rel_lex=0.9, _rel_cos=0.0, _rel_ent=None
+        )
+        both_fail = self._row(id="both-fail", _rel_lex=0.0, _rel_cos=0.0, _rel_ent=0.0)
         selected, status, stats = selective_inject_filter(
-            [lex_fail_cos_pass, lex_pass_cos_fail, both_fail],
-            with_stats=True)
+            [lex_fail_cos_pass, lex_pass_cos_fail, both_fail], with_stats=True
+        )
         self.assertEqual(status, "injected")
         self.assertEqual([r["id"] for r in selected], ["lfcp", "lpcf"])
-        self.assertEqual(stats, {"trust_passed": 3, "relevance_failed": 1,
-                                 "trust_failed": 0})
+        self.assertEqual(
+            stats, {"trust_passed": 3, "relevance_failed": 1, "trust_failed": 0}
+        )
 
     def test_all_lanes_absent_row_is_exempt_and_admitted(self):
         # Link-expansion row shape: NO _rel_* keys at all. Absent lanes are
         # exempt from the relevance gate, so a trusted row passes.
-        row = {"id": "expansion-row", "content": "linked neighbor",
-               "type": "fact", "signal": "test", "confidence": 0.9}
-        selected, status, stats = selective_inject_filter([row],
-                                                          with_stats=True)
+        row = {
+            "id": "expansion-row",
+            "content": "linked neighbor",
+            "type": "fact",
+            "signal": "test",
+            "confidence": 0.9,
+        }
+        selected, status, stats = selective_inject_filter([row], with_stats=True)
         self.assertEqual(selected, [row])
         self.assertEqual(status, "injected")
         self.assertEqual(stats["relevance_failed"], 0)
@@ -465,13 +659,20 @@ class GatePrecedenceTest(unittest.TestCase):
 # compute_score's popularity input.
 # ---------------------------------------------------------------------------
 
+
 class FeedbackPopularityTest(unittest.TestCase):
     """Popularity reads ONLY the matched-operation counters: 0.15*sqrt(applied)
     - 0.25*sqrt(violated), clamped to [0,1], riding the unchanged 0.10 weight.
     Retrieval/surfaced telemetry moves the score by exactly nothing."""
 
-    ROW = {"confidence": 0.9, "retrieval_count": 7, "surfaced_count": 3,
-           "ingestion_ts": PIN_TS, "applied_count": 0, "violated_count": 0}
+    ROW = {
+        "confidence": 0.9,
+        "retrieval_count": 7,
+        "surfaced_count": 3,
+        "ingestion_ts": PIN_TS,
+        "applied_count": 0,
+        "violated_count": 0,
+    }
 
     def _score(self, **over) -> float:
         row = dict(self.ROW)
@@ -483,8 +684,7 @@ class FeedbackPopularityTest(unittest.TestCase):
         applied = self._score(applied_count=4)
         violated = self._score(violated_count=4)
         # Endorsement outranks violation at equal magnitude.
-        self.assertGreater(applied, violated,
-                           "applied=4 must score above violated=4")
+        self.assertGreater(applied, violated, "applied=4 must score above violated=4")
         # applied=4 => popularity 0.15*sqrt(4) = 0.30 => exactly
         # W_POPULARITY * 0.30 over the zero-counter baseline.
         self.assertAlmostEqual(applied - base, 0.10 * 0.30, places=12)
@@ -492,21 +692,249 @@ class FeedbackPopularityTest(unittest.TestCase):
         # wildly different retrieval/surfaced exposure score identically.
         hi_tel = self._score(retrieval_count=50, surfaced_count=20)
         lo_tel = self._score(retrieval_count=0, surfaced_count=0)
-        self.assertEqual(hi_tel, lo_tel,
-                         "exposure is not endorsement (#114/#124)")
+        self.assertEqual(hi_tel, lo_tel, "exposure is not endorsement (#114/#124)")
 
     def test_feedback_popularity_is_clamped(self):
         base = self._score()
         # (0, 4): 0.15*0 - 0.25*2 = -0.5 clamps to 0.0 — the popularity term
         # can never SUBTRACT from the score.
         neg = self._score(applied_count=0, violated_count=4)
-        self.assertEqual(neg, base,
-                         "a violations-only row must not score below the "
-                         "zero-counter baseline (floor at 0.0)")
+        self.assertEqual(
+            neg,
+            base,
+            "a violations-only row must not score below the "
+            "zero-counter baseline (floor at 0.0)",
+        )
         # (100, 0): 0.15*10 = 1.5 clamps to 1.0 — exactly W_POPULARITY * 1.0.
         big = self._score(applied_count=100)
-        self.assertAlmostEqual(big - base, 0.10 * 1.0, places=12,
-                               msg="popularity must clamp at 1.0")
+        self.assertAlmostEqual(
+            big - base, 0.10 * 1.0, places=12, msg="popularity must clamp at 1.0"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #126: queryless profile ordering (recent lane) + the selector seam.
+# ---------------------------------------------------------------------------
+
+NS126 = "project:issue126"
+
+
+class RecentMomentPreferenceTest(unittest.TestCase):
+    """AC4 + the D1 selector-seam discriminator (plan-critic round 1).
+
+    Seeding is direct SQL on the module-pinned scratch store (same shape as
+    tests/test_as_of_recall.py's setUp); the namespace is swept in setUp so
+    the fixed fixture ids stay insertable across tests in one process.
+    """
+
+    def _seed(self, conn, rows):
+        conn.execute("DELETE FROM memory WHERE namespace = ?", (NS126,))
+        for r in rows:
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, source_hash, confidence, signal, valid_from, "
+                "ingestion_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    r["id"],
+                    NS126,
+                    r["type"],
+                    r["content"],
+                    "",
+                    "",
+                    "",
+                    0.9,
+                    "test",
+                    r["valid_from"],
+                    r["ingestion_ts"],
+                ),
+            )
+        conn.commit()
+
+    def _fixture_rows(self):
+        import json
+
+        fixture = REPO_ROOT / "tests" / "fixtures" / "issue126"
+        return [
+            json.loads(line)
+            for line in (fixture / "recent-input.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+
+    def setUp(self):
+        self._conn = connect()
+        # Self-sufficient schema (impl-review round 1): bare connect() does
+        # not create the memory table on a fresh store — _prepare_store is
+        # idempotent, so the named test runs standalone, not only after
+        # sibling classes happened to prepare the module store.
+        _prepare_store(self._conn)
+        self._seed(self._conn, self._fixture_rows())
+        self.addCleanup(self._conn.close)
+
+    def test_precompact_reorders_recent_candidates(self):
+        """AC4: under moment=precompact the OLDER fact outranks the NEWER
+        constraint (reverse of ingestion order); moment=None keeps the
+        ingestion-order contract byte-for-byte."""
+        import json
+
+        fixture = REPO_ROOT / "tests" / "fixtures" / "issue126"
+        expected = json.loads(
+            (fixture / "recent-expected.json").read_text(encoding="utf-8")
+        )
+        profiled = recall_mod.recent_memory(
+            self._conn,
+            namespace=NS126,
+            limit=2,
+            min_confidence=0.5,
+            no_bump=True,
+            moment="precompact",
+            lane="codex",
+        )
+        self.assertEqual(
+            [r["id"] for r in profiled],
+            expected["ids"],
+            "precompact profile must surface the fact first",
+        )
+        plain = recall_mod.recent_memory(
+            self._conn, namespace=NS126, limit=2, min_confidence=0.5, no_bump=True
+        )
+        self.assertEqual(
+            [r["id"] for r in plain],
+            [
+                "00000000-0000-4000-8000-000000000127",
+                "00000000-0000-4000-8000-000000000126",
+            ],
+            "moment=None must keep plain ingestion-desc order",
+        )
+
+    def test_selector_seam_resolves_moment_from_cross_moment(self):
+        """D1 discriminator (plan-critic round 1): the #158 selector forwards
+        only ``_cross_moment`` — the impl-level fallback must still deliver
+        profiled order through the REAL selector, and the public ``lane``
+        must survive the ``for_injection`` seam without a TypeError."""
+        from storelib.inject import select_and_budget_for_injection
+
+        envelope = select_and_budget_for_injection(
+            self._conn,
+            query="",
+            namespace=NS126,
+            moment="precompact",
+            session_id="00000000-0000-4000-8000-0000000009a",
+            limit=2,
+            global_limit=0,
+        )
+        rendered_ids = [
+            r.get("id") for r in envelope.get("results", []) if isinstance(r, dict)
+        ]
+        self.assertEqual(
+            rendered_ids,
+            [
+                "00000000-0000-4000-8000-000000000126",
+                "00000000-0000-4000-8000-000000000127",
+            ],
+            "the selector's _cross_moment seam must reach the profiled order",
+        )
+        # Lane threading through _collect_injection_candidates: an explicit
+        # public moment+lane on the injection path must not raise (kwargs
+        # parity across the shared seam) and must render an envelope.
+        import json
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            recall_mod.recall_memory(
+                self._conn,
+                query="fact",
+                namespace=NS126,
+                limit=2,
+                no_telemetry=True,
+                for_injection=True,
+                as_json=True,
+                moment="user_prompt",
+                lane="codex",
+            )
+        parsed = json.loads(captured.getvalue())
+        self.assertIsInstance(parsed, dict)
+        # Seam DISCRIMINATOR (impl-review round 1): the PUBLIC moment must
+        # actually reach the queryless injection lane — with moment/lane
+        # dropped from _collect_injection_candidates' common dict, the
+        # effective moment reverts to None and this order flips back to
+        # ingestion-desc (constraint first). The amended C7 ratchet cannot
+        # see that omission (deltas stay 0.0), so this assertion is the
+        # only guard for the evaluator's moment path.
+        with contextlib.redirect_stdout(io.StringIO()) as captured_recent:
+            recent_envelope = recall_mod.recent_memory(
+                self._conn,
+                namespace=NS126,
+                limit=2,
+                min_confidence=0.5,
+                no_bump=True,
+                no_telemetry=True,
+                for_injection=True,
+                as_json=True,
+                moment="precompact",
+                lane="codex",
+            )
+        recent_ids = [r.get("id") for r in recent_envelope]
+        self.assertEqual(
+            recent_ids,
+            [
+                "00000000-0000-4000-8000-000000000126",
+                "00000000-0000-4000-8000-000000000127",
+            ],
+            "the PUBLIC moment must survive the for_injection seam "
+            "(fact first under precompact; ingestion order means the "
+            "common-dict threading was dropped)",
+        )
+
+    def test_scan_multiplier_cuts_beyond_limit(self):
+        """Guardrail (plan-critic round 1; tiebreak amended PR #230 review
+        PRR-230-1): the explicit-moment path returns exactly ``limit`` rows
+        chosen by multiplier (not ingestion), and equal timestamps tiebreak
+        by ARRIVAL order (rowid DESC — newest inserted first), not by the
+        random uuid4 id."""
+        rows = [
+            {
+                "id": f"126-cut-fact-{i}",
+                "type": "fact",
+                "content": f"f{i}",
+                "valid_from": "2026-05-01T00:00:00Z",
+                "ingestion_ts": "2026-05-01T00:00:00Z",
+            }
+            for i in "ab"
+        ] + [
+            {
+                "id": f"126-cut-con-{i}",
+                "type": "constraint",
+                "content": f"c{i}",
+                "valid_from": f"2026-06-0{i}T00:00:00Z",
+                "ingestion_ts": f"2026-06-0{i}T00:00:00Z",
+            }
+            for i in range(1, 6)
+        ]
+        self._seed(self._conn, rows)
+        got = recall_mod.recent_memory(
+            self._conn,
+            namespace=NS126,
+            limit=2,
+            min_confidence=0.5,
+            no_bump=True,
+            moment="precompact",
+        )
+        self.assertEqual(
+            [r["id"] for r in got],
+            ["126-cut-fact-b", "126-cut-fact-a"],
+            "multiplier must outrank recency and cut at limit; "
+            "equal-ts rows tiebreak by arrival order (rowid DESC: "
+            "newest inserted first)",
+        )
+        plain = recall_mod.recent_memory(
+            self._conn, namespace=NS126, limit=2, min_confidence=0.5, no_bump=True
+        )
+        self.assertEqual(
+            [r["id"] for r in plain],
+            ["126-cut-con-5", "126-cut-con-4"],
+            "moment=None keeps the plain ingestion order",
+        )
 
 
 if __name__ == "__main__":

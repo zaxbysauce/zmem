@@ -38,9 +38,20 @@ from typing import Any
 # buckets. Documented exception to the ">= 5 items per bucket" rule: the
 # three #82 buckets carry >= 3 items each (tests/test_eval_runner.py pins
 # the split: original six >= 5, new three >= 3).
-BUCKETS = ("as-of", "injection", "entity-alias", "namespace", "contested",
-           "fts", "adapter", "retraction", "polarity", "change-intent",
-           "decision-point", "negative-control")
+BUCKETS = (
+    "as-of",
+    "injection",
+    "entity-alias",
+    "namespace",
+    "contested",
+    "fts",
+    "adapter",
+    "retraction",
+    "polarity",
+    "change-intent",
+    "decision-point",
+    "negative-control",
+)
 
 # Issue #111: the four hook query shapes the injection gold scores. Each is a
 # different query against the same store (the hook builds a different query
@@ -160,7 +171,8 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
     if expect != "inject" and not moment:
         raise GoldError(
             "field 'expect' requires 'moment' (legacy items are positive "
-            "recall items)")
+            "recall items)"
+        )
     query = obj.get("query", "")
     if moment == "precompact":
         if not isinstance(query, str):
@@ -168,7 +180,8 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
         if query.strip():
             raise GoldError(
                 "a precompact item is a query-less recent pull; 'query' must "
-                "be empty or omitted")
+                "be empty or omitted"
+            )
     else:
         if not isinstance(query, str) or not query.strip():
             raise GoldError("missing required non-empty string field 'query'")
@@ -176,8 +189,10 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
     include_ids = obj.get("must_include_ids", [])
     exclude_ids = obj.get("must_exclude_ids", [])
     include_text = obj.get("must_include_text")
-    for name, value in (("must_include_ids", include_ids),
-                        ("must_exclude_ids", exclude_ids)):
+    for name, value in (
+        ("must_include_ids", include_ids),
+        ("must_exclude_ids", exclude_ids),
+    ):
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise GoldError(f"field '{name}' must be a list of strings")
     overlap = sorted(set(include_ids) & set(exclude_ids))
@@ -193,14 +208,18 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
         if include_ids:
             raise GoldError(
                 "a negative-control item (moment set, expect 'silent') must "
-                "not carry must_include_ids")
+                "not carry must_include_ids"
+            )
     elif moment and not include_ids:
         raise GoldError(
             "an injection-gold positive (moment set, expect 'inject') must "
-            "label must_include_ids")
+            "label must_include_ids"
+        )
     if not moment and not include_ids and not exclude_ids and not include_text:
-        raise GoldError("item asserts nothing: give must_include_ids, "
-                        "must_exclude_ids, or must_include_text")
+        raise GoldError(
+            "item asserts nothing: give must_include_ids, "
+            "must_exclude_ids, or must_include_text"
+        )
 
     namespace = obj.get("namespace")
     if namespace is not None and not isinstance(namespace, str):
@@ -261,9 +280,24 @@ def _validate_item(obj: dict[str, Any]) -> GoldItem:
 # RENDERED set — the rows that would land in the fence the agent sees.
 
 INJECTION_PER_ITEM_REPORT_KEYS = (
-    "id", "bucket", "moment", "expect", "namespace", "query", "ops_query",
-    "as_of", "reason", "rendered_ids", "candidate_ids", "tokens_used",
-    "tokens_budget", "hit", "precision", "first_hit_rank", "fence_ok", "ok",
+    "id",
+    "bucket",
+    "moment",
+    "expect",
+    "namespace",
+    "query",
+    "ops_query",
+    "as_of",
+    "reason",
+    "rendered_ids",
+    "candidate_ids",
+    "tokens_used",
+    "tokens_budget",
+    "hit",
+    "precision",
+    "first_hit_rank",
+    "fence_ok",
+    "ok",
 )
 
 
@@ -283,12 +317,10 @@ class BypassError(RuntimeError):
 
 
 def _rendered_ids_in_fence(rows: list[dict], fence: str) -> set[str]:
-    """Return row ids whose renderer-shaped bullets survived into ``fence``.
+    """Parse delivery bullets using the same strict ledger parser.
 
-    Keep the evaluator on the same strict marker parser as the delivery
-    ledger: scoped rows put ``[tier=...]`` before the id, while arbitrary
-    prose and prefix ids must not count as rendered delivery.  An empty fence
-    is never evidence that non-empty rows were rendered.
+    Scoped rows add a tier prefix, while #183 passive rows keep their frozen
+    tierless wire.  Both forms must count as a rendered delivery.
     """
     if not fence:
         return set()
@@ -304,21 +336,36 @@ def _injection_silent_reasons() -> tuple:
     # schema_meta lives at the TOP of skills/memory/scripts/ next to store.py
     # (same import discipline as inject.py's guarded import above).
     import schema_meta as _sm  # lazy: keep module import cheap
+
     # Keep the partial-deployment fallback byte-identical to schema_meta and
     # storelib.inject.  ``expired`` is reserved vocabulary; no producer is
     # introduced here (issue #153 / #174 boundary).
-    return tuple(getattr(
-        _sm,
-        "INJECT_SILENT_REASONS",
-        ("empty-pool", "omitted", "below-bar", "budget-drop",
-         "below-relevance", "already-delivered", "expired"),
-    ))
+    return tuple(
+        getattr(
+            _sm,
+            "INJECT_SILENT_REASONS",
+            (
+                "empty-pool",
+                "omitted",
+                "below-bar",
+                "budget-drop",
+                "below-relevance",
+                "already-delivered",
+                "expired",
+            ),
+        )
+    )
 
 
-def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
-                      fence: str, conn: sqlite3.Connection = None,
-                      candidate_ids: list[str] = None,
-                      candidate_lanes: dict | None = None) -> None:
+def _verify_real_lane(
+    item_id: str,
+    rows: list[dict],
+    envelope: dict,
+    fence: str,
+    conn: sqlite3.Connection = None,
+    candidate_ids: list[str] = None,
+    candidate_lanes: dict | None = None,
+) -> None:
     """Re-derive the lane's invariants from pure primitives (see
     BypassError). Raises BypassError naming the item on any violation.
 
@@ -368,17 +415,20 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
                     f"{item_id}: rendered row {rid} has signal=none "
                     f"confidence {conf} below the gate-none floor "
                     f"{gate_none_floor} — the selective-inject gate did not "
-                    "run on the rendered set")
+                    "run on the rendered set"
+                )
         elif sig in grounded:
             if conf < floor:
                 raise BypassError(
                     f"{item_id}: rendered row {rid} has grounded "
                     f"signal {sig} confidence {conf} below the prompt floor "
-                    f"{floor} — the selective-inject gate did not run")
+                    f"{floor} — the selective-inject gate did not run"
+                )
         else:
             raise BypassError(
                 f"{item_id}: rendered row {rid} carries ungrounded "
-                f"signal {sig!r}, which the real gate never admits")
+                f"signal {sig!r}, which the real gate never admits"
+            )
     budget = _inject.inject_token_budget()
     # Issue #116: the guard must mirror the estimator admission actually
     # charges — fence_row_cost (full render contribution), not the legacy
@@ -388,35 +438,35 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
     # against the SAME ceiling; otherwise a stub landing in
     # (budget-128, budget] slips past undetected.
     shell = getattr(_inject, "FENCE_SHELL_ALLOWANCE", 0)
-    used = sum(_inject.fence_row_cost(
-        r, legacy_injection_wire=True) for r in rows)
-    protected = getattr(_inject, "_PROTECTED_TYPES",
-                        ("decision", "constraint"))
-    all_protected = bool(rows) and all(
-        (r.get("type") or "") in protected for r in rows)
+    used = sum(_inject.fence_row_cost(r, legacy_injection_wire=True) for r in rows)
+    protected = getattr(_inject, "_PROTECTED_TYPES", ("decision", "constraint"))
+    all_protected = bool(rows) and all((r.get("type") or "") in protected for r in rows)
     if used + shell > budget and not all_protected:
         raise BypassError(
             f"{item_id}: rendered set costs ~{used} tokens, over the "
             f"{budget}-token budget, with non-protected rows present — the "
-            "token budget did not run")
+            "token budget did not run"
+        )
     rendered_fence_ids = _rendered_ids_in_fence(rows, fence)
     for r in rows:
         if str(r.get("id")) not in rendered_fence_ids:
             raise BypassError(
                 f"{item_id}: rendered row {r.get('id')} is absent from the "
-                "fence text — metrics must come off the rendered fence")
-    if rows and not (fence.startswith(ZMEM_FENCE_OPEN)
-                     and ZMEM_FENCE_CLOSE in fence):
+                "fence text — metrics must come off the rendered fence"
+            )
+    if rows and not (fence.startswith(ZMEM_FENCE_OPEN) and ZMEM_FENCE_CLOSE in fence):
         raise BypassError(f"{item_id}: fence markers missing from the render")
     if envelope.get("tokens_budget") != budget:
         raise BypassError(
             f"{item_id}: envelope tokens_budget "
             f"{envelope.get('tokens_budget')!r} != resolved budget "
-            f"{budget} — the envelope did not come from the injection lane")
+            f"{budget} — the envelope did not come from the injection lane"
+        )
     if (envelope.get("reason") == "injected") != bool(rows):
         raise BypassError(
             f"{item_id}: envelope reason {envelope.get('reason')!r} "
-            f"inconsistent with {len(rows)} rendered rows")
+            f"inconsistent with {len(rows)} rendered rows"
+        )
 
     # Independent reconstruction: rebuild the expected selection from the
     # envelope's pre-gate candidate ids and compare membership with the
@@ -426,16 +476,20 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
     if conn is not None and candidate_ids:
         placeholders = ",".join("?" * len(candidate_ids))
         cand_rows = [
-            dict(r) for r in conn.execute(
+            dict(r)
+            for r in conn.execute(
                 f"SELECT id, confidence, signal, type, content, "
                 f"trust_score FROM memory "
-                f"WHERE id IN ({placeholders})", candidate_ids)
+                f"WHERE id IN ({placeholders})",
+                candidate_ids,
+            )
         ]
         if len(cand_rows) != len(set(candidate_ids)):
             raise BypassError(
                 f"{item_id}: only {len(cand_rows)} of "
                 f"{len(set(candidate_ids))} candidate ids found in the "
-                "store — envelope candidates inconsistent with the store")
+                "store — envelope candidates inconsistent with the store"
+            )
         # Issue #113: attach the envelope's pre-gate lane values so the
         # reconstruction models the relevance floors too (rows re-read from
         # SQL do not carry recall-time lane keys).
@@ -450,10 +504,18 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
             # real gate judged; a lane map without the entry degrades to the
             # exempt 1.0 path inside _row_trust (legacy envelopes).
             r["trust_score"] = lanes.get("trust")
-        expected_gate = [r for r in cand_rows
-                         if _gate_passes(r, floor, gate_none_floor, grounded,
-                                         lane_floors=_inject._lane_floors(),
-                                         trust_floor=_inject._trust_floor())]
+        expected_gate = [
+            r
+            for r in cand_rows
+            if _gate_passes(
+                r,
+                floor,
+                gate_none_floor,
+                grounded,
+                lane_floors=_inject._lane_floors(),
+                trust_floor=_inject._trust_floor(),
+            )
+        ]
         expected_kept = _inject.apply_token_budget(expected_gate)[0]
         rendered_set = {r.get("id") for r in rows}
         expected_ids = {r["id"] for r in expected_kept}
@@ -463,7 +525,8 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
                 f"reconstructed gate+budget selection "
                 f"(rendered={_rendered_ids_sort(rendered_set)} "
                 f"expected={sorted(expected_ids)}) — the gate or token "
-                "budget did not run on the candidate pool")
+                "budget did not run on the candidate pool"
+            )
 
 
 def _rendered_ids_sort(ids):
@@ -484,17 +547,21 @@ def _mrr(pop: list[dict], denom: int) -> float:
     # positives-only denominator).
     if not pop or denom <= 0:
         return 0.0
-    return sum((1.0 / it["first_hit_rank"] if it["first_hit_rank"]
-                else 0.0) for it in pop) / denom
+    return (
+        sum((1.0 / it["first_hit_rank"] if it["first_hit_rank"] else 0.0) for it in pop)
+        / denom
+    )
 
 
-def _gate_passes(r, floor, gate_none_floor, grounded,
-                 lane_floors=None, trust_floor=None) -> bool:
+def _gate_passes(
+    r, floor, gate_none_floor, grounded, lane_floors=None, trust_floor=None
+) -> bool:
     # Issue #115: mirror the gate's trust_score hard floor FIRST (same
     # normalization via the owning module's _row_trust: missing -> 1.0
     # exempt, unparseable/non-finite -> 0.0, clamped to [0,1]).
     if trust_floor is not None:
         import storelib.inject as _inject_mod
+
         if _inject_mod._row_trust(r) < trust_floor:
             return False
     conf = _conf_row(r)
@@ -517,8 +584,9 @@ def _gate_passes(r, floor, gate_none_floor, grounded,
         # indexes, review round) so a legacy 3-value lane_floors override
         # still works — the graph floor applies only when a fourth value is
         # supplied (the gate's 4-tuple).
-        for key, fl in zip(("_rel_lex", "_rel_cos", "_rel_ent", "_rel_graph"),
-                           lane_floors):
+        for key, fl in zip(
+            ("_rel_lex", "_rel_cos", "_rel_ent", "_rel_graph"), lane_floors
+        ):
             val = r.get(key)
             if val is None:
                 continue
@@ -546,9 +614,13 @@ def _conf_row(r) -> float:
     return value
 
 
-def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
-                             *, k_default: int = 5,
-                             ) -> tuple[list[dict], dict]:
+def evaluate_injection_items(
+    conn: sqlite3.Connection,
+    items: list[GoldItem],
+    *,
+    k_default: int = 5,
+    lane: str | None = None,
+) -> tuple[list[dict], dict]:
     """Run every injection-gold item through the hook's REAL lane and score
     the rendered set (issue #111).
 
@@ -591,8 +663,12 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
     import io
     import json as _json
     from storelib.ops_tokens import compose_inject_query
-    from storelib.recall import (_format_fenced_recall, _normalize_as_of,
-                                 recent_memory, recall_memory)
+    from storelib.recall import (
+        _format_fenced_recall,
+        _normalize_as_of,
+        recent_memory,
+        recall_memory,
+    )
 
     def _run_lane(item: GoldItem, query: str, k: int) -> tuple[list, dict]:
         if item.moment == "precompact":
@@ -604,14 +680,29 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
             extra["query"] = query
         if item.as_of:
             extra["as_of"] = item.as_of
+        # Issue #126: translate the gold's historical moment label to the
+        # canonical runtime vocabulary and thread it (plus the optional
+        # host lane) into BOTH recall lanes so the evaluation measures the
+        # per-moment type profiles. Legacy items without a moment keep
+        # byte-identical behavior (no kwarg).
+        if item.moment:
+            extra["moment"] = GOLD_MOMENT_TO_RUNTIME[item.moment]
+            extra["lane"] = lane
         with contextlib.redirect_stdout(io.StringIO()) as captured:
-            fn(conn, namespace=item.namespace,
-               include_global=True,
-               global_limit=3 if item.moment != "precompact" else 2,
-               no_telemetry=True, for_injection=True, as_json=True,
-               **kwargs, **extra)
+            fn(
+                conn,
+                namespace=item.namespace,
+                include_global=True,
+                global_limit=3 if item.moment != "precompact" else 2,
+                no_telemetry=True,
+                for_injection=True,
+                as_json=True,
+                **kwargs,
+                **extra,
+            )
         envelope = _json.loads(captured.getvalue())
         from storelib.inject import envelope_results
+
         return envelope_results(envelope), envelope
 
     per_item: list[dict] = []
@@ -623,19 +714,30 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
             # Hook parity: every query lane caps the query at 500 chars
             # (UserPromptSubmit prose, derived ops tokens, subagent task
             # text all go through the cap), so the eval must too.
-            base_query = (compose_inject_query(item.query, item.ops)
-                          if item.ops else item.query)
+            base_query = (
+                compose_inject_query(item.query, item.ops) if item.ops else item.query
+            )
             executed_query = base_query[:500]
         rows, envelope = _run_lane(item, executed_query or "", k)
         rendered_ids = [r["id"] for r in rows]
         fence = _format_fenced_recall(
-            rows, header=f"Relevant memories (namespace {item.namespace or 'unscoped'}).",
-            legacy_injection_wire=True)
-        _verify_real_lane(item.id, rows, envelope, fence, conn=conn,
-                          candidate_ids=envelope.get("candidate_ids"),
-                          candidate_lanes=envelope.get("candidate_lanes"))
-        fence_ok = (_rendered_ids_in_fence(rows, fence)
-                    == {str(rid) for rid in rendered_ids})
+            rows,
+            header=f"Relevant memories (namespace {item.namespace or 'unscoped'}).",
+            legacy_injection_wire=True,
+        )
+        _verify_real_lane(
+            item.id,
+            rows,
+            envelope,
+            fence,
+            conn=conn,
+            candidate_ids=envelope.get("candidate_ids"),
+            candidate_lanes=envelope.get("candidate_lanes"),
+        )
+        fence_ok = (
+            _rendered_ids_in_fence(rows, fence)
+            == {str(rid) for rid in rendered_ids}
+        )
 
         labeled = set(item.must_include_ids)
         if item.expect == "silent":
@@ -644,8 +746,11 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
             false_injection = bool(rendered_ids)
         else:
             hit = all(rid in rendered_ids for rid in labeled)
-            precision = (len(labeled & set(rendered_ids)) / len(rendered_ids)
-                         if rendered_ids else 0.0)
+            precision = (
+                len(labeled & set(rendered_ids)) / len(rendered_ids)
+                if rendered_ids
+                else 0.0
+            )
             false_injection = False
         reason = envelope.get("reason")
         first_hit_rank = 0
@@ -653,27 +758,30 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
             if rid in labeled:
                 first_hit_rank = i
                 break
-        per_item.append({
-            "id": item.id,
-            "bucket": item.bucket,
-            "moment": item.moment,
-            "expect": item.expect,
-            "namespace": item.namespace,
-            "query": item.query,
-            "ops_query": executed_query if (item.moment != "precompact"
-                                            and item.ops) else None,
-            "as_of": _normalize_as_of(item.as_of) if item.as_of else None,
-            "reason": reason,
-            "rendered_ids": rendered_ids,
-            "candidate_ids": envelope.get("candidate_ids", []),
-            "tokens_used": envelope.get("tokens_used"),
-            "tokens_budget": envelope.get("tokens_budget"),
-            "hit": hit,
-            "precision": precision,
-            "fence_ok": fence_ok,
-            "first_hit_rank": first_hit_rank,
-            "ok": hit and fence_ok,
-        })
+        per_item.append(
+            {
+                "id": item.id,
+                "bucket": item.bucket,
+                "moment": item.moment,
+                "expect": item.expect,
+                "namespace": item.namespace,
+                "query": item.query,
+                "ops_query": executed_query
+                if (item.moment != "precompact" and item.ops)
+                else None,
+                "as_of": _normalize_as_of(item.as_of) if item.as_of else None,
+                "reason": reason,
+                "rendered_ids": rendered_ids,
+                "candidate_ids": envelope.get("candidate_ids", []),
+                "tokens_used": envelope.get("tokens_used"),
+                "tokens_budget": envelope.get("tokens_budget"),
+                "hit": hit,
+                "precision": precision,
+                "fence_ok": fence_ok,
+                "first_hit_rank": first_hit_rank,
+                "ok": hit and fence_ok,
+            }
+        )
 
     positives = [it for it in per_item if it["expect"] == "inject"]
     negatives = [it for it in per_item if it["expect"] == "silent"]
@@ -686,10 +794,8 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
     metrics = {
         "hit_at_k": _share(positives, lambda it: it["hit"]),
         "precision_at_k": _mean_precision(positives),
-        "false_injection_rate": _share(negatives,
-                                       lambda it: bool(it["rendered_ids"])),
-        "empty_pool_rate": _share(per_item,
-                                  lambda it: it["reason"] == "empty-pool"),
+        "false_injection_rate": _share(negatives, lambda it: bool(it["rendered_ids"])),
+        "empty_pool_rate": _share(per_item, lambda it: it["reason"] == "empty-pool"),
         "mrr": _mrr(positives, len(positives)),
         "items": len(per_item),
         "positive_items": len(positives),
@@ -717,17 +823,21 @@ def injection_per_moment(per_item: list[dict]) -> dict:
             "hit_at_k": _share(positives, lambda it: it["hit"]),
             "precision_at_k": _mean_precision(positives),
             "false_injection_rate": _share(
-                negatives, lambda it: bool(it["rendered_ids"])),
-            "empty_pool_rate": _share(
-                subset, lambda it: it["reason"] == "empty-pool"),
+                negatives, lambda it: bool(it["rendered_ids"])
+            ),
+            "empty_pool_rate": _share(subset, lambda it: it["reason"] == "empty-pool"),
             "mrr": _mrr(positives, len(positives)),
         }
     return out
 
 
-def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
-                   k_default: int = 5,
-                   weights: dict | None = None) -> tuple[list[dict], dict]:
+def evaluate_items(
+    conn: sqlite3.Connection,
+    items: list[GoldItem],
+    *,
+    k_default: int = 5,
+    weights: dict | None = None,
+) -> tuple[list[dict], dict]:
     """Run every gold item through the REAL recall pipeline and score it.
 
     ``weights`` (issue #64, 9.6): optional compute_score override threaded
@@ -773,7 +883,8 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
                 f"{item.id!r}: item has moment={item.moment!r} — "
                 "injection-gold items must be evaluated with "
                 "evaluate_injection_items (scripts/eval_inject_runner.py), "
-                "not the recall-direction evaluate_items")
+                "not the recall-direction evaluate_items"
+            )
 
     per_item: list[dict] = []
     for item in items:
@@ -783,8 +894,7 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
         # UserPromptSubmit hook uses so the eval measures the real query.
         # Without ops the composition is the byte-exact identity (pinned by
         # tests), so every legacy item's query — and score — is unchanged.
-        query = compose_inject_query(item.query, item.ops) if item.ops \
-            else item.query
+        query = compose_inject_query(item.query, item.ops) if item.ops else item.query
         # recall_memory prints its CLI surface (fences or JSON) regardless of
         # as_json — the runner's stdout is reserved for the JSON report, so
         # the per-query prints are captured and discarded. no_bump supplies
@@ -828,31 +938,37 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
         # the per-bucket `excluded_surfaced` counter in the runner report.
         # hit_at_k therefore counts exclude-only items as hits by design;
         # do not read a retraction regression off hit@k alone.
-        text_hit = bool(item.must_include_text) and item.must_include_text in top_content
+        text_hit = (
+            bool(item.must_include_text) and item.must_include_text in top_content
+        )
         excluded_hit = [rid for rid in item.must_exclude_ids if rid in ranked_ids]
         # The injection-omit behavior under measurement is the HOOK path's:
         # with no_bump=True, recall omits injection-risk rows entirely, so an
         # omitted injection row is simply absent from ranked_ids.
-        injection_omitted = (item.bucket == "injection" and not excluded_hit)
+        injection_omitted = item.bucket == "injection" and not excluded_hit
 
-        per_item.append({
-            "id": item.id,
-            "bucket": item.bucket,
-            "query": item.query,
-            # Review PRR-91-006: for ops items the recall ran on the COMPOSED
-            # query — record it so report rows reflect what was executed.
-            "ops_query": query if item.ops else None,
-            "as_of": _normalize_as_of(item.as_of) if item.as_of else None,
-            "k": k,
-            "explicit": item.explicit,
-            "hit": hit,
-            "text_hit": text_hit,
-            "first_hit_rank": first_hit_rank,
-            "excluded_ids_surfaced": excluded_hit,
-            "injection_omitted": injection_omitted,
-            "ranked_ids": ranked_ids,
-            "ok": hit and (text_hit or not item.must_include_text) and not excluded_hit,
-        })
+        per_item.append(
+            {
+                "id": item.id,
+                "bucket": item.bucket,
+                "query": item.query,
+                # Review PRR-91-006: for ops items the recall ran on the COMPOSED
+                # query — record it so report rows reflect what was executed.
+                "ops_query": query if item.ops else None,
+                "as_of": _normalize_as_of(item.as_of) if item.as_of else None,
+                "k": k,
+                "explicit": item.explicit,
+                "hit": hit,
+                "text_hit": text_hit,
+                "first_hit_rank": first_hit_rank,
+                "excluded_ids_surfaced": excluded_hit,
+                "injection_omitted": injection_omitted,
+                "ranked_ids": ranked_ids,
+                "ok": hit
+                and (text_hit or not item.must_include_text)
+                and not excluded_hit,
+            }
+        )
 
     n = len(per_item)
     as_of_items = [it for it in per_item if it["as_of"]]
@@ -862,10 +978,12 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
         "mrr": sum(
             (1.0 / it["first_hit_rank"] if it["first_hit_rank"] else 0.0)
             for it in per_item
-        ) / n,
+        )
+        / n,
         "as_of_accuracy": _share(as_of_items, lambda it: it["hit"]),
-        "injection_omit_rate": _share(injection_items,
-                                      lambda it: it["injection_omitted"]),
+        "injection_omit_rate": _share(
+            injection_items, lambda it: it["injection_omitted"]
+        ),
     }
     metrics["items"] = n
     metrics["as_of_items"] = len(as_of_items)
@@ -878,9 +996,20 @@ def evaluate_items(conn: sqlite3.Connection, items: list[GoldItem], *,
 # subset). A single constant makes key drift an import-time-visible edit in
 # ONE place instead of a runtime KeyError in the runner.
 PER_ITEM_REPORT_KEYS = (
-    "id", "bucket", "query", "ops_query", "as_of", "k", "explicit", "hit",
-    "text_hit", "first_hit_rank", "excluded_ids_surfaced",
-    "injection_omitted", "ranked_ids", "ok",
+    "id",
+    "bucket",
+    "query",
+    "ops_query",
+    "as_of",
+    "k",
+    "explicit",
+    "hit",
+    "text_hit",
+    "first_hit_rank",
+    "excluded_ids_surfaced",
+    "injection_omitted",
+    "ranked_ids",
+    "ok",
 )
 
 

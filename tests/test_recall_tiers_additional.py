@@ -88,6 +88,41 @@ class ScopedTierIntegrationTests(unittest.TestCase):
             )
         self.assertNotIn("tier-global", [row["id"] for row in without_global])
 
+    def test_scoped_tiers_preserve_moment_profile_ranking(self):
+        """The #126 profile must reach #167's reserved project pool."""
+        self.conn.executemany(
+            """INSERT INTO memory
+               (id, namespace, type, content, tags, source_ref,
+                confidence, signal, valid_from, ingestion_ts)
+               VALUES (?, 'project:demo', ?, 'profile context query',
+                       'test', ?, 0.9, 'test', ?, ?)""",
+            (
+                ("tier-profile-fact", "fact", "test:profile-fact",
+                 "2026-09-24T00:06:00Z", "2026-09-24T00:06:00Z"),
+                ("tier-profile-constraint", "constraint", "test:profile-constraint",
+                 "2026-09-24T00:06:00Z", "2026-09-24T00:06:00Z"),
+            ),
+        )
+        self.conn.commit()
+        with contextlib.redirect_stdout(io.StringIO()):
+            rows = recall_mod.recall_memory(
+                self.conn,
+                query="profile context query",
+                scopes=SCOPES,
+                min_confidence=0.0,
+                no_bump=True,
+                no_telemetry=True,
+                no_mmr=True,
+                moment="pretool",
+                lane="codex",
+            )
+        profile_ids = [
+            row["id"] for row in rows
+            if row["id"] in {"tier-profile-fact", "tier-profile-constraint"}
+        ]
+        self.assertEqual(profile_ids, ["tier-profile-constraint", "tier-profile-fact"])
+        self.assertTrue(all(row["tier"] == "project" for row in rows if row["id"] in profile_ids))
+
     def test_invalid_slots_fail_before_sql_or_telemetry(self):
         statements: list[str] = []
         self.conn.set_trace_callback(statements.append)

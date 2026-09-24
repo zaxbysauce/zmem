@@ -29,8 +29,9 @@ from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
                              fence_row_cost, inject_score_margin,
                              inject_token_budget,
                              selective_inject_filter)
-from schema_meta import (CROSS_PROJECT_ENV, CROSS_PROJECT_HAZARD_VERBS_ENV,
-                         CROSS_PROJECT_MAX, CROSS_PROJECT_SIGNALS,
+from schema_meta import (ALLOWED_TYPES, CROSS_PROJECT_ENV,
+                         CROSS_PROJECT_HAZARD_VERBS_ENV, CROSS_PROJECT_MAX,
+                         CROSS_PROJECT_SIGNALS, INJECT_LANES, INJECT_MOMENTS,
                          PROTECTED_INJECT_TYPES,
                          ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
 from storelib.ops_tokens import _HAZARDOUS_SUBS as _DEFAULT_HAZARD_VERBS
@@ -136,6 +137,42 @@ VIOLATED_FEEDBACK_FACTOR = 0.25
 # Recency half-life: a memory from RECENCY_HALF_LIFE_DAYS ago contributes half.
 
 RECENCY_HALF_LIFE_DAYS = 90
+
+# Issue #126: deterministic type preferences are applied only when a caller
+# supplies a canonical runtime moment.  The default path remains unchanged.
+PER_MOMENT_TYPE_WEIGHTS = {
+    "pretool": {"constraint": 1.25, "decision": 1.20, "convention": 1.15,
+                "lesson": 1.00, "preference": 0.95, "fact": 0.90},
+    "user_prompt": {"fact": 1.15, "lesson": 1.10, "preference": 1.05,
+                    "convention": 1.00, "decision": 1.00, "constraint": 1.00},
+    "session_start": {"fact": 1.15, "lesson": 1.10, "preference": 1.05,
+                      "convention": 1.00, "decision": 1.00, "constraint": 1.00},
+    "subagent": {"convention": 1.10, "lesson": 1.05, "constraint": 1.05,
+                 "decision": 1.00, "preference": 1.00, "fact": 1.00},
+    "precompact": {"fact": 1.05, "lesson": 1.05, "convention": 1.00,
+                   "preference": 1.00, "decision": 1.00, "constraint": 1.00},
+}
+PER_LANE_TYPE_WEIGHTS: dict[str, dict[str, float]] = {
+    lane: {type_name: 1.0 for type_name in ALLOWED_TYPES} for lane in INJECT_LANES
+}
+RECENT_PROFILE_SCAN_MULTIPLIER = 5
+
+
+def type_preference(type_name: str, *, moment: str, lane: str | None = None) -> float:
+    """Return the mean-normalized #126 moment/lane type multiplier."""
+    if moment not in INJECT_MOMENTS:
+        raise ValueError(f"invalid injection moment: {moment}")
+    if lane is not None and lane not in INJECT_LANES:
+        raise ValueError(f"invalid injection lane: {lane}")
+    if type_name not in ALLOWED_TYPES:
+        raise ValueError(f"unknown memory type: {type_name}")
+    moment_profile = PER_MOMENT_TYPE_WEIGHTS[moment]
+    lane_profile = PER_LANE_TYPE_WEIGHTS.get(lane, {}) if lane is not None else {}
+    products = [
+        moment_profile.get(t, 1.0) * lane_profile.get(t, 1.0) for t in ALLOWED_TYPES
+    ]
+    mean = sum(products) / len(products)
+    return (moment_profile.get(type_name, 1.0) * lane_profile.get(type_name, 1.0)) / mean
 
 # v10 (issue #60, 5.5): MMR diversity knob. Lambda trades relevance against
 # diversity: 1.0 = pure composite-score order (diversity off), 0.7 = default.
@@ -334,7 +371,9 @@ def _uses_count(row: sqlite3.Row | dict) -> int:
 def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: float,
                   vec_sim: float | None = None,
                   relevance: float | None = None,
-                  weights: dict | None = None) -> float:
+                  weights: dict | None = None,
+                  moment: str | None = None,
+                  lane: str | None = None) -> float:
     """Composite score: BM25 relevance + confidence boost + recency + popularity.
 
     fts_rank is the raw FTS5 rank value (lower = better match). For memories
@@ -355,6 +394,8 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
     the tuner passes explicit candidate dicts so it never has to mutate the
     module globals another in-process consumer might be reading.
     """
+    if lane is not None and moment is None:
+        raise ValueError("lane requires moment")
     if weights is None:
         w_bm25, w_conf = W_BM25, W_CONFIDENCE
         w_rec, w_pop = W_RECENCY, W_POPULARITY
@@ -418,12 +459,15 @@ def compute_score(row: sqlite3.Row | dict, fts_rank: float | None, now_epoch: fl
     # untouched — explicit recall/search still return it, only lower).
     trust = _row_trust(row)
 
-    return (
+    composite = (
         w_bm25 * relevance_comp
         + w_conf * confidence
         + w_rec * recency
         + w_pop * popularity
     ) * trust
+    if moment is None:
+        return composite
+    return composite * type_preference(row["type"], moment=moment, lane=lane)
 
 def _vector_knn(conn: sqlite3.Connection, embedding: bytes, k: int) -> list[str]:
     """Query the vec0 table for k nearest neighbors. Returns memory_id list.
@@ -1018,6 +1062,8 @@ def _recall_one_tier(
     collect_lanes: bool = False,
     arm_stats: dict | None = None,
     stable_ties: bool = False,
+    moment: str | None = None,
+    lane: str | None = None,
 ) -> list[tuple[float, dict]]:
     """FTS5 + composite scoring for ONE namespace set (a single recall tier).
 
@@ -1352,7 +1398,8 @@ def _recall_one_tier(
         # (same normalization the gate uses), reported under --explain.
         trust = _row_trust(row_fields)
         score = compute_score(row_fields, fts_r, now_epoch, vec_sim=vsim,
-                              relevance=rel, weights=weights)
+                              relevance=rel, weights=weights, moment=moment,
+                              lane=lane)
         norm_map[r["id"]] = r["content_norm"] or ""
         scored.append((score, {
             "id": r["id"],
@@ -1563,6 +1610,8 @@ def _scoped_tier_pools(
     arm_stats: dict | None = None,
     collect_lanes: bool = False,
     deep: bool = False,
+    moment: str | None = None,
+    lane: str | None = None,
 ) -> tuple[dict[str, list[tuple[float, dict]]], list[str]]:
     """Score the independent scoped pools and apply tier provenance labels."""
     namespace_tiers, selected_namespaces = _scoped_namespaces(
@@ -1591,7 +1640,7 @@ def _scoped_tier_pools(
             limit=pool_limit(tier), min_confidence=min_confidence,
             hybrid=hybrid, now_epoch=now_epoch, as_of=as_of, mmr=mmr,
             weights=weights, arm_stats=arm_stats, collect_lanes=collect_lanes,
-            stable_ties=True,
+            stable_ties=True, moment=moment, lane=lane,
         )
         for _score, item in scored:
             item["tier"] = tier
@@ -1606,7 +1655,8 @@ def _scoped_tier_pools(
             conn, query=query, ns_list=None, limit=cross_limit,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=False, weights=weights, arm_stats=arm_stats,
-            collect_lanes=collect_lanes, stable_ties=True,
+            collect_lanes=collect_lanes, stable_ties=True, moment=moment,
+            lane=lane,
         )
         admitted: list[tuple[float, dict]] = []
         for score, item in candidates:
@@ -2224,6 +2274,8 @@ def _recall_memory_impl(
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
     _fence_id: str | None = None,
+    moment: str | None = None,
+    lane: str | None = None,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -2323,6 +2375,10 @@ def _recall_memory_impl(
     if hybrid is None:
         hybrid = bool(_embeddings and _embeddings.is_available())
 
+    # The public parameter wins; the established selector seam is the
+    # compatible fallback for callers that already carry a runtime moment.
+    effective_moment = moment if moment is not None else _cross_moment
+
     # PRR-022 fix: normalize the temporal predicate ONCE at the entry point
     # so programmatic callers (MCP/Hermes/tests) get the same Z-suffixed
     # UTC form the CLI's argparse type produces.
@@ -2352,7 +2408,8 @@ def _recall_memory_impl(
             slots=scoped_slots or _DEFAULT_TIER_SLOTS,
             min_confidence=min_confidence, hybrid=hybrid,
             now_epoch=now_epoch, as_of=as_of, mmr=not no_mmr,
-            weights=weights, arm_stats=arms,
+            weights=weights, arm_stats=arms, moment=effective_moment,
+            lane=lane,
         )
         # Expansion and belief surfaces must stay inside the selected scoped
         # namespace union; foreign candidates enter only through the explicit
@@ -2378,6 +2435,7 @@ def _recall_memory_impl(
             conn, query=query, ns_list=ns_list, limit=limit,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
+            moment=effective_moment, lane=lane,
         )
 
     global_scored: list[tuple[float, dict]] = []
@@ -2386,6 +2444,7 @@ def _recall_memory_impl(
             conn, query=query, ns_list=global_ns_list, limit=global_limit,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
+            moment=effective_moment, lane=lane,
         )
 
     # Issue #58, 3.4: at emit time, re-classify each row for
@@ -3611,6 +3670,8 @@ def _recent_one_tier(
     min_confidence: float,
     as_of: str | None = None,
     stable_ties: bool = False,
+    moment: str | None = None,
+    lane: str | None = None,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories for ONE namespace set
     (a single recent tier). No FTS, no bump, no print — caller merges, bumps,
@@ -3640,9 +3701,17 @@ def _recent_one_tier(
     params.extend(as_of_params)
     live_clause = "" if as_of else "superseded_at IS NULL AND"
     params.append(limit)
-    order_clause = "ingestion_ts DESC, id" if stable_ties else "ingestion_ts DESC"
+    if moment is not None:
+        # Over-fetch before re-sorting so a profile can promote a row which
+        # chronological SQL ordering would otherwise cut at the limit.
+        params[-1] = limit * RECENT_PROFILE_SCAN_MULTIPLIER
+        order_clause = "ingestion_ts DESC, rowid DESC"
+    elif stable_ties:
+        order_clause = "ingestion_ts DESC, id"
+    else:
+        order_clause = "ingestion_ts DESC"
     rows = conn.execute(
-        f"""SELECT id, namespace, type, content, tags, source_ref, source_hash,
+        f"""SELECT rowid, id, namespace, type, content, tags, source_ref, source_hash,
                   confidence, signal, valid_from, ingestion_ts, last_retrieved,
                   valid_until, update_of, taint, trust_score,
                   applied_count, violated_count
@@ -3653,6 +3722,15 @@ def _recent_one_tier(
             ORDER BY {order_clause} LIMIT ?""",
         params,
     ).fetchall()
+    if moment is not None:
+        rows = sorted(
+            rows,
+            key=lambda r: (
+                -type_preference(r["type"], moment=moment, lane=lane),
+                -_parse_iso_to_epoch(r["ingestion_ts"] or ""),
+                -r["rowid"],
+            ),
+        )[:limit]
     results = []
     for r in rows:
         conf = r["confidence"]
@@ -3693,6 +3771,8 @@ def _scoped_recent_pools(
     slots: dict[str, int],
     min_confidence: float,
     as_of: str | None,
+    moment: str | None = None,
+    lane: str | None = None,
 ) -> dict[str, list[tuple[float, dict]]]:
     """Build labeled recent rows in the same reservation order as recall."""
     namespace_tiers, selected_namespaces = _scoped_namespaces(
@@ -3707,6 +3787,7 @@ def _scoped_recent_pools(
         rows = _recent_one_tier(
             conn, ns_list=ns_list, limit=max(slots[tier], 1),
             min_confidence=min_confidence, as_of=as_of, stable_ties=True,
+            moment=moment, lane=lane,
         )
         for row in rows:
             row["tier"] = tier
@@ -3715,6 +3796,7 @@ def _scoped_recent_pools(
     candidates = _recent_one_tier(
         conn, ns_list=None, limit=max(slots["cross_project"], 1) * 16,
         min_confidence=min_confidence, as_of=as_of, stable_ties=True,
+        moment=moment, lane=lane,
     )
     admitted: list[tuple[float, dict]] = []
     for row in candidates:
@@ -3749,6 +3831,8 @@ def _recent_memory_impl(
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
     _fence_id: str | None = None,
+    moment: str | None = None,
+    lane: str | None = None,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -3791,6 +3875,7 @@ def _recent_memory_impl(
                 "scoped recent cannot be combined with for_injection=True"
             )
         no_bump = True
+    effective_moment = moment if moment is not None else _cross_moment
     scoped_slots = _tier_slots() if scopes is not None else None
     as_of = _normalize_as_of(as_of)
     if scopes is not None:
@@ -3798,6 +3883,7 @@ def _recent_memory_impl(
             conn, scopes=scopes, include_global=include_global,
             slots=scoped_slots or _DEFAULT_TIER_SLOTS,
             min_confidence=min_confidence, as_of=as_of,
+            moment=effective_moment, lane=lane,
         )
         project_rows = _merge_reserved_tiers(
             pools, scoped_slots or _DEFAULT_TIER_SLOTS)
@@ -3808,12 +3894,14 @@ def _recent_memory_impl(
             project_rows = _recent_one_tier(
                 conn, ns_list=_expand_namespace_aliases(conn, namespace),
                 limit=limit, min_confidence=min_confidence, as_of=as_of,
+                moment=effective_moment, lane=lane,
             )
         else:
             # Unscoped: one tier, no namespace filter (searches everything).
             project_rows = _recent_one_tier(
                 conn, ns_list=None, limit=limit,
                 min_confidence=min_confidence, as_of=as_of,
+                moment=effective_moment, lane=lane,
             )
 
     # Global tier fold-in — same guard/rationale as recall_memory (see M2).
@@ -3822,6 +3910,7 @@ def _recent_memory_impl(
         global_rows = _recent_one_tier(
             conn, ns_list=_expand_namespace_aliases(conn, GLOBAL_NAMESPACE),
             limit=global_limit, min_confidence=min_confidence, as_of=as_of,
+            moment=effective_moment, lane=lane,
         )
         # Merge project-first (hard floor) then global, dedup by id.
         seen: set[str] = {r["id"] for r in project_rows}
@@ -3965,6 +4054,8 @@ def _collect_injection_candidates(
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
     _fence_id: str | None = None,
+    moment: str | None = None,
+    lane: str | None = None,
 ) -> dict:
     """Run one passive retrieval and return its unrendered details object.
 
@@ -3992,6 +4083,8 @@ def _collect_injection_candidates(
         _cross_ops_tokens=_cross_ops_tokens,
         _cross_explicit=_cross_explicit,
         _fence_id=_fence_id,
+        moment=moment,
+        lane=lane,
     )
     if query is None:
         _recent_memory_impl(
@@ -4047,6 +4140,8 @@ def recall_memory(
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
     _fence_id: str | None = None,
+    moment: str | None = None,
+    lane: str | None = None,
 ) -> list[dict]:
     """Explicit recall entry point (UserPromptSubmit, SubagentStart,
     and SessionStart hook surfaces share this path).
@@ -4091,6 +4186,8 @@ def recall_memory(
             _cross_ops_tokens=_cross_ops_tokens,
             _cross_explicit=_cross_explicit,
             _fence_id=_fence_id,
+            moment=moment,
+            lane=lane,
         )
 
     if scopes is not None:
@@ -4122,6 +4219,8 @@ def recall_memory(
         _cross_ops_tokens=_cross_ops_tokens,
         _cross_explicit=_cross_explicit,
         _fence_id=_fence_id,
+        moment=moment,
+        lane=lane,
     )
     if _capture is not None:
         _capture.clear()
@@ -4168,6 +4267,8 @@ def recent_memory(
     _cross_ops_tokens: list[str] | None = None,
     _cross_explicit: bool = False,
     _fence_id: str | None = None,
+    moment: str | None = None,
+    lane: str | None = None,
 ) -> list[dict]:
     # _recent_memory_impl performs the same emit-time _classify_injection
     # filtering before this public wrapper hands candidates to the shared
@@ -4191,6 +4292,8 @@ def recent_memory(
             _cross_ops_tokens=_cross_ops_tokens,
             _cross_explicit=_cross_explicit,
             _fence_id=_fence_id,
+            moment=moment,
+            lane=lane,
         )
 
     if scopes is not None:
@@ -4222,6 +4325,8 @@ def recent_memory(
         _cross_ops_tokens=_cross_ops_tokens,
         _cross_explicit=_cross_explicit,
         _fence_id=_fence_id,
+        moment=moment,
+        lane=lane,
     )
     if _capture is not None:
         _capture.clear()

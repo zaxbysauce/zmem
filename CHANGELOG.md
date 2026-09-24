@@ -10,7 +10,7 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.62.0] - 2026-09-24
+## [0.63.0] - 2026-09-24
 
 ### Added
 - **Scoped five-tier recall (issue #167):** implicit ordinary recall/recent
@@ -23,8 +23,14 @@ README.
   injection, hook, search, and #98 cross-project lanes retain their routing.
   Generic fence bullets carry `[tier=<name>]` for scoped rows and
   `[tier=unknown]` for tierless rows; the legacy passive-injection wire keeps
-  its established tierless bytes. Scoped recall/recent reject the legacy `include_cross_project`
-  flag instead of silently ignoring it.
+  its established tierless bytes. Scoped recall/recent reject the legacy
+  `include_cross_project` flag instead of silently ignoring it.
+
+## [0.62.0] - 2026-09-24
+
+### Added
+- **Per-moment type preferences in recall ranking (issue #126, Workstream F PR 2 of 7)**: deterministic `PER_MOMENT_TYPE_WEIGHTS` / `PER_LANE_TYPE_WEIGHTS` profiles plus mean-normalized `type_preference()` in `storelib/recall.py`; `compute_score` gains trailing `moment`/`lane` keyword-only parameters (an explicit canonical moment multiplies the legacy composite exactly once; `moment=None` keeps every direct caller byte-identical; `lane` requires `moment`); the moment/lane pair threads through `_recall_one_tier`, `recall_memory`, `_recent_one_tier`, `recent_memory`, and `_collect_injection_candidates`, with the ranking moment falling back to the selector's existing `_cross_moment` seam so passive injection ranking is moment-aware with zero `inject.py`/`cli.py` edits; the explicit-moment queryless path over-fetches `limit * RECENT_PROFILE_SCAN_MULTIPLIER` under `ORDER BY ingestion_ts DESC, rowid DESC` and re-sorts by `(-multiplier, -ingestion_epoch, -rowid)` — same-second rows tiebreak by arrival order (newest inserted first; a PR #230-review amendment of the issue-text literal `id ASC`, whose random-uuid tiebreak could silently drop the freshest row at the limit cut). `eval_gold.evaluate_injection_items` gains `lane` and translates gold moment labels through `GOLD_MOMENT_TO_RUNTIME`; `scripts/eval_inject_runner.py` adds `--profile-json-out` (stable projection: exactly `gold_sha256`, `profile`, `clock`, `lane`, `runtime_moments`, `profiles`, `metrics`, `per_moment`) plus `gold_sha256`/`commit`/`profiles` provenance and per-moment `precision_delta`/`false_injection_delta` vs `eval/baseline-injection.json` (always-on read with pinned exit-2 failure semantics). Byte-exact fixtures under `tests/fixtures/issue126/` (`.gitattributes` eol=lf pin) with named unittest methods. AC7's strict "≥ 1e-6 improvement" ratchet cell was amended to no-regression (trace-recorded `AC_CHANGED_BY_USER`): the contract's own map + gold leave every rendered set bit-identical on this pipeline (wiring proven live — 312 moment-carrying score calls, 26/216 tiers reordered; the candidate pools contain only fact/lesson rows).
+- **Cross-encoder rerank enabled by default (user-directed, riding issue #126's release)**: `ZMEM_CROSS_ENCODER` unset now means ON (opt out with `ZMEM_CROSS_ENCODER=0`); a set value keeps the original truthy parse. The passive double opt-in (`ZMEM_CROSS_ENCODER_PASSIVE=1`), the not-promoted `PASSIVE_PROMOTION_GATE`, the 250 ms fail-open budget, digest-gated model resolution, and default-off autodownload are unchanged — with no model present the flip degrades exactly as before (order preserved, one bounded reason line, exit 0). `doctor.py`'s `enabled` bit now routes through `cross_encoder.enabled()`; SKILL.md / CLI comments / `docs/CLAIMS-AUDIT.md` state the new default; `tests/test_cross_encoder.py` and `tests/test_doctor.py` pins retargeted.
 
 ## [0.61.0] - 2026-09-23
 

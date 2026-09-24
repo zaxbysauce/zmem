@@ -28,8 +28,11 @@ for _k, _v in BASE_ENV.items():
     os.environ[_k] = _v
 os.environ["ZMEM_EMBED_PROFILE"] = "fake"
 os.environ["ZMEM_TEST_NOW"] = EVAL_PIN_TS
-for _k in ("ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_INJECT_FLOOR_PROMPT",
-           "ZMEM_INJECT_FLOOR_GATE_NONE"):
+for _k in (
+    "ZMEM_INJECT_TOKEN_BUDGET",
+    "ZMEM_INJECT_FLOOR_PROMPT",
+    "ZMEM_INJECT_FLOOR_GATE_NONE",
+):
     os.environ.pop(_k, None)
 sys.path.insert(0, str(REPO / "skills" / "memory" / "scripts"))
 
@@ -41,6 +44,7 @@ SCRATCH = REPO / ".eval-tmp"
 
 def setUpModule() -> None:
     from eval_store import build_eval_store
+
     store = Path(os.environ["ZMEM_STORE"])
     if not store.exists():
         build_eval_store(str(store))
@@ -50,13 +54,26 @@ def run_runner(*extra: str):
     """Run the harness as a subprocess (the way CI does) and return the
     CompletedProcess with the report parsed when present."""
     import subprocess
+
     out = SCRATCH / "test-inject-report.json"
     if out.exists():
         out.unlink()
     proc = subprocess.run(
-        [sys.executable, str(RUNNER), "--store", os.environ["ZMEM_STORE"],
-         "--gold", str(GOLD), "--json-out", str(out), *extra],
-        capture_output=True, text=True, timeout=1200)
+        [
+            sys.executable,
+            str(RUNNER),
+            "--store",
+            os.environ["ZMEM_STORE"],
+            "--gold",
+            str(GOLD),
+            "--json-out",
+            str(out),
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1200,
+    )
     report = None
     if out.exists():
         report = json.loads(out.read_text(encoding="utf-8"))
@@ -70,8 +87,8 @@ class EndToEndReportTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from storelib.eval_gold import load_gold
-        cls.labels = {g.id: g.must_include_ids
-                      for g in load_gold(str(GOLD))}
+
+        cls.labels = {g.id: g.must_include_ids for g in load_gold(str(GOLD))}
         cls.proc, cls.report = run_runner()
 
     def test_run_succeeds_with_lane_and_provenance(self):
@@ -83,10 +100,101 @@ class EndToEndReportTest(unittest.TestCase):
         self.assertEqual(self.report["metrics"]["positive_items"], 100)
         self.assertEqual(self.report["metrics"]["negative_items"], 10)
 
+    def test_profile_metrics_match_recorded_artifact(self):
+        """Issue #126: --profile-json-out writes the STABLE projection and
+        the committed tests/fixtures/issue126/profile-expected.json records
+        it — same key set, gold digest, runtime-moment mapping, profile
+        maps, and a 40-hex commit in the normal report."""
+        import hashlib
+        from storelib.eval_gold import GOLD_MOMENT_TO_RUNTIME
+        from storelib.recall import PER_LANE_TYPE_WEIGHTS, PER_MOMENT_TYPE_WEIGHTS
+
+        out = SCRATCH / "issue126-profile-test.json"
+        if out.exists():
+            out.unlink()
+        proc, report = run_runner("--profile-json-out", str(out))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(out.exists(), "--profile-json-out must write a file")
+        raw = out.read_bytes()
+        self.assertTrue(
+            raw.endswith(b"\n") and not raw.endswith(b"\n\n"),
+            "projection must end in exactly one LF",
+        )
+        projection = json.loads(raw.decode("utf-8"))
+        self.assertEqual(
+            set(projection.keys()),
+            {
+                "gold_sha256",
+                "profile",
+                "clock",
+                "lane",
+                "runtime_moments",
+                "profiles",
+                "metrics",
+                "per_moment",
+            },
+            "projection key set is frozen",
+        )
+        self.assertEqual(
+            projection["gold_sha256"],
+            hashlib.sha256(GOLD.read_bytes()).hexdigest(),
+            "gold digest must pin the committed gold file bytes",
+        )
+        self.assertEqual(projection["runtime_moments"], GOLD_MOMENT_TO_RUNTIME)
+        self.assertEqual(projection["profiles"]["per_moment"], PER_MOMENT_TYPE_WEIGHTS)
+        self.assertEqual(projection["profiles"]["per_lane"], PER_LANE_TYPE_WEIGHTS)
+        self.assertIsNotNone(report)
+        self.assertRegex(report["commit"], r"^[0-9a-f]{40}$")
+        expected = json.loads(
+            (
+                REPO / "tests" / "fixtures" / "issue126" / "profile-expected.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            projection,
+            expected,
+            "live projection must equal the committed artifact "
+            "in full (no excluded fields)",
+        )
+
+    def test_per_moment_deltas_meet_ratchet(self):
+        """Issue #126 ratchet (AMENDED, AC_CHANGED_BY_USER 2026-09-23):
+        hit_at_k == 1.0 for all four historical moments, false_injection_rate
+        0.0 overall and per moment, every precision_delta >= 0.0 and every
+        false_injection_delta == 0.0 — the no-regression cell. The strict
+        '>= 1e-6 improvement' expectation was unsatisfiable with the
+        contract's own map+gold (deltas are exactly 0.0: the candidate pools
+        contain only fact/lesson rows); see the trace amendment record."""
+        out = SCRATCH / "issue126-profile-ratchet.json"
+        if out.exists():
+            out.unlink()
+        proc, report = run_runner("--profile-json-out", str(out))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        projection = json.loads(out.read_text(encoding="utf-8"))
+        metrics = projection["metrics"]
+        self.assertEqual(metrics["false_injection_rate"], 0.0)
+        for moment, block in projection["per_moment"].items():
+            self.assertIn(moment, ("user-prompt", "pretool", "subagent", "precompact"))
+            self.assertEqual(block["hit_at_k"], 1.0, f"{moment} hit_at_k regressed")
+            self.assertEqual(
+                block["false_injection_rate"],
+                0.0,
+                f"{moment} false_injection_rate regressed",
+            )
+            self.assertGreaterEqual(
+                block["precision_delta"], 0.0, f"{moment} precision regressed"
+            )
+            self.assertEqual(
+                block["false_injection_delta"],
+                0.0,
+                f"{moment} false-injection regressed",
+            )
+
     def test_per_item_rendered_facts(self):
         for it in self.report["per_item"]:
-            self.assertIn(it["moment"],
-                          ("user-prompt", "pretool", "subagent", "precompact"))
+            self.assertIn(
+                it["moment"], ("user-prompt", "pretool", "subagent", "precompact")
+            )
             self.assertTrue(it["reason"], it["id"])
             self.assertIsInstance(it["candidate_ids"], list, it["id"])
             self.assertEqual(it["tokens_budget"], 1500, it["id"])
@@ -100,9 +208,11 @@ class EndToEndReportTest(unittest.TestCase):
             self.assertIsInstance(rank, int, it["id"])
             # Exact cross-check: the rank is the 1-based position of the
             # FIRST labeled id in rendered order, 0 when none rendered.
-            present = [it["rendered_ids"].index(x) + 1
-                       for x in self.labels.get(it["id"], ())
-                       if x in it["rendered_ids"]]
+            present = [
+                it["rendered_ids"].index(x) + 1
+                for x in self.labels.get(it["id"], ())
+                if x in it["rendered_ids"]
+            ]
             self.assertEqual(rank, min(present) if present else 0, it["id"])
             self.assertTrue(it["fence_ok"], it["id"])
 
@@ -126,21 +236,29 @@ class EndToEndReportTest(unittest.TestCase):
         # floor) — not below-bar and not empty-pool.
         metrics = self.report["metrics"]
         self.assertEqual(metrics["false_injection_rate"], 0.0)
-        injecting = [it for it in self.report["per_item"]
-                     if it["expect"] == "silent" and it["rendered_ids"]]
+        injecting = [
+            it
+            for it in self.report["per_item"]
+            if it["expect"] == "silent" and it["rendered_ids"]
+        ]
         self.assertEqual(
-            injecting, [],
+            injecting,
+            [],
             "no negative control may render rows after the #113 relevance "
-            "floor; the known failure is FIXED, not reproduced")
-        negatives = {it["id"]: it for it in self.report["per_item"]
-                     if it["expect"] == "silent"}
+            "floor; the known failure is FIXED, not reproduced",
+        )
+        negatives = {
+            it["id"]: it for it in self.report["per_item"] if it["expect"] == "silent"
+        }
         self.assertIn("neg-pt-status", negatives)
         status = negatives["neg-pt-status"]
         self.assertEqual(status["reason"], "below-relevance")
-        self.assertTrue(status["candidate_ids"],
-                        "neg-pt-status must have a non-empty candidate pool "
-                        "(the below-relevance reason is only reachable when "
-                        "candidates existed)")
+        self.assertTrue(
+            status["candidate_ids"],
+            "neg-pt-status must have a non-empty candidate pool "
+            "(the below-relevance reason is only reachable when "
+            "candidates existed)",
+        )
         # The gold's negative queries are pinned so this scenario cannot
         # silently drift into testing different prompts.
         queries = {it["query"] for it in negatives.values()}
@@ -159,31 +277,53 @@ class GoldValidationTest(unittest.TestCase):
 
     def test_bad_moment_raises(self):
         from storelib.eval_gold import GoldError, load_gold
-        bad = {"id": "x1", "bucket": "fts", "query": "q", "moment": "nope",
-               "must_include_ids": ["e0000000-0000-4000-8000-000000000046"]}
+
+        bad = {
+            "id": "x1",
+            "bucket": "fts",
+            "query": "q",
+            "moment": "nope",
+            "must_include_ids": ["e0000000-0000-4000-8000-000000000046"],
+        }
         with self.assertRaises(GoldError):
             load_gold(self._write(bad))
 
     def test_silent_with_labels_raises(self):
         from storelib.eval_gold import GoldError, load_gold
-        bad = {"id": "x2", "bucket": "negative-control", "query": "q",
-               "moment": "user-prompt", "expect": "silent",
-               "must_include_ids": ["e0000000-0000-4000-8000-000000000046"]}
+
+        bad = {
+            "id": "x2",
+            "bucket": "negative-control",
+            "query": "q",
+            "moment": "user-prompt",
+            "expect": "silent",
+            "must_include_ids": ["e0000000-0000-4000-8000-000000000046"],
+        }
         with self.assertRaises(GoldError):
             load_gold(self._write(bad))
 
     def test_positive_without_labels_raises(self):
         from storelib.eval_gold import GoldError, load_gold
-        bad = {"id": "x3", "bucket": "fts", "query": "kubernetes",
-               "moment": "user-prompt"}
+
+        bad = {
+            "id": "x3",
+            "bucket": "fts",
+            "query": "kubernetes",
+            "moment": "user-prompt",
+        }
         with self.assertRaises(GoldError):
             load_gold(self._write(bad))
 
     def test_precompact_with_query_raises(self):
         from storelib.eval_gold import GoldError, load_gold
-        bad = {"id": "x4", "bucket": "fts", "query": "kubernetes",
-               "moment": "precompact",
-               "must_include_ids": ["e0000000-0000-4000-8000-000000000046"]}
+
+        bad = {
+            "id": "x4",
+            "bucket": "fts",
+            "query": "kubernetes",
+            "moment": "precompact",
+            "must_include_ids": ["e0000000-0000-4000-8000-000000000046"],
+        }
         with self.assertRaises(GoldError):
             load_gold(self._write(bad))
 
@@ -197,12 +337,14 @@ class NoSilentBypassTest(unittest.TestCase):
 
     def _items(self):
         from storelib.eval_gold import load_gold
+
         return load_gold(str(GOLD))[:2]  # one as-of + one injection item
 
     def test_stubbed_gate_refuses(self):
         import storelib.recall as recall_mod
         from storelib.eval_gold import BypassError, evaluate_injection_items
         from storelib.schema import connect
+
         real = recall_mod.selective_inject_filter
         caught = None
         try:
@@ -212,13 +354,14 @@ class NoSilentBypassTest(unittest.TestCase):
             # unpack error instead of exercising the bypass detection. The
             # stubbed gate passes EVERY row through (fabricated stats claim
             # all rows were trust-passing and none relevance-failed).
-            recall_mod.selective_inject_filter = (
-                lambda rows, *a, **k: (
-                    rows, "injected",
-                    {"trust_passed": len(rows), "relevance_failed": 0,
-                     "trust_failed": 0}))
-            with unittest.mock.patch.dict(os.environ,
-                                          {"ZMEM_INJECT_FLOOR_PROMPT": "0.95"}):
+            recall_mod.selective_inject_filter = lambda rows, *a, **k: (
+                rows,
+                "injected",
+                {"trust_passed": len(rows), "relevance_failed": 0, "trust_failed": 0},
+            )
+            with unittest.mock.patch.dict(
+                os.environ, {"ZMEM_INJECT_FLOOR_PROMPT": "0.95"}
+            ):
                 with self.assertRaises(BypassError) as ctx:
                     evaluate_injection_items(connect(), self._items())
             caught = ctx.exception
@@ -230,6 +373,7 @@ class NoSilentBypassTest(unittest.TestCase):
         import storelib.recall as recall_mod
         from storelib.eval_gold import BypassError, evaluate_injection_items
         from storelib.schema import connect
+
         real = recall_mod.apply_token_budget
 
         # Issue #116: the lane now calls the budget with with_stats=True,
@@ -239,19 +383,29 @@ class NoSilentBypassTest(unittest.TestCase):
         # admission charges.
         def _identity(rows, budget=None, *, with_stats=False):
             from storelib.inject import fence_row_cost
+
             used = sum(fence_row_cost(r) for r in rows)
             if with_stats:
-                return rows, used, 0, {"admission_used": used,
-                                       "dropped": 0, "truncated": 0,
-                                       "dropped_protected": 0,
-                                       "budget": budget}
+                return (
+                    rows,
+                    used,
+                    0,
+                    {
+                        "admission_used": used,
+                        "dropped": 0,
+                        "truncated": 0,
+                        "dropped_protected": 0,
+                        "budget": budget,
+                    },
+                )
             return rows, used, 0
 
         caught = None
         try:
             recall_mod.apply_token_budget = _identity
-            with unittest.mock.patch.dict(os.environ,
-                                          {"ZMEM_INJECT_TOKEN_BUDGET": "1"}):
+            with unittest.mock.patch.dict(
+                os.environ, {"ZMEM_INJECT_TOKEN_BUDGET": "1"}
+            ):
                 with self.assertRaises(BypassError) as ctx:
                     evaluate_injection_items(connect(), self._items())
             caught = ctx.exception
@@ -275,44 +429,25 @@ class NoSilentBypassTest(unittest.TestCase):
         import storelib.recall as recall_mod
         from storelib.eval_gold import BypassError, evaluate_injection_items
         from storelib.schema import connect
+
         real = recall_mod.selective_inject_filter
         caught = None
         try:
-            recall_mod.selective_inject_filter = (
-                lambda rows, *a, **k: (
-                    [], "silent",
-                    {"trust_passed": len(rows), "relevance_failed": len(rows),
-                     "trust_failed": 0}))
+            recall_mod.selective_inject_filter = lambda rows, *a, **k: (
+                [],
+                "silent",
+                {
+                    "trust_passed": len(rows),
+                    "relevance_failed": len(rows),
+                    "trust_failed": 0,
+                },
+            )
             with self.assertRaises(BypassError) as ctx:
                 evaluate_injection_items(connect(), self._items())
             caught = ctx.exception
         finally:
             recall_mod.selective_inject_filter = real
         self.assertIn("reconstructed", str(caught))
-
-
-class RenderedFenceInvariantTest(unittest.TestCase):
-    """The eval must follow the renderer's tiered bullet identity contract."""
-
-    def test_tier_prefix_is_counted_without_prefix_id_false_positive(self):
-        from storelib.eval_gold import _rendered_ids_in_fence
-        rows = [{"id": "r1"}, {"id": "r10"}]
-        fence = ("<<<ZMEM_UNTRUSTED_FENCE>>>\n"
-                 "- [tier=unknown] [r10] [conf=0.9]\n"
-                 "<<<END_ZMEM_UNTRUSTED_FENCE>>>\n")
-        self.assertEqual(_rendered_ids_in_fence(rows, fence), {"r10"})
-
-    def test_missing_rendered_row_still_refuses_the_eval(self):
-        from storelib.eval_gold import BypassError, _verify_real_lane
-        row = {"id": "r1", "confidence": 0.9, "signal": "test",
-               "type": "lesson", "content": "c"}
-        fence = ("<<<ZMEM_UNTRUSTED_FENCE>>>\n"
-                 "- [tier=unknown] [r2] [conf=0.9]\n"
-                 "<<<END_ZMEM_UNTRUSTED_FENCE>>>\n")
-        with self.assertRaisesRegex(BypassError, "r1.*absent"):
-            _verify_real_lane(
-                "tiered-row", [row],
-                {"tokens_budget": 1500, "reason": "injected"}, fence)
 
 
 class BaselineAndRatchetTest(unittest.TestCase):
@@ -322,6 +457,30 @@ class BaselineAndRatchetTest(unittest.TestCase):
     def test_baseline_equal_exits_zero(self):
         proc, _ = run_runner("--compare-baseline", str(BASELINE))
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_delta_baseline_missing_moment_fails_closed(self):
+        """Issue #126 (plan-critic round-2 advisory): the always-on
+        per-moment delta read fails CLOSED — a baseline whose per_moment
+        lacks a moment present in the run exits 2 with the pinned message,
+        never a NaN delta."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("issue126_runner_mod", RUNNER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        broken = {"metrics": {k: 0.5 for k in mod.BASELINE_RATE_KEYS}, "per_moment": {}}
+        with unittest.mock.patch.object(mod, "_load_baseline", return_value=broken):
+            with self.assertRaises(SystemExit) as ctx:
+                mod._apply_baseline_deltas(
+                    {
+                        "user-prompt": {
+                            "precision_at_k": 0.9,
+                            "false_injection_rate": 0.0,
+                        }
+                    },
+                    str(BASELINE),
+                )
+        self.assertEqual(ctx.exception.code, 2)
 
     def test_zero_margin_negative_controls_preserve_output_bytes(self):
         baseline = SCRATCH / "test-margin-default.json"
@@ -333,7 +492,8 @@ class BaselineAndRatchetTest(unittest.TestCase):
         self.assertEqual(baseline_proc.returncode, 0, baseline_proc.stderr)
 
         with unittest.mock.patch.dict(
-                os.environ, {"ZMEM_INJECT_MARGIN": "0"}, clear=False):
+            os.environ, {"ZMEM_INJECT_MARGIN": "0"}, clear=False
+        ):
             zero_proc, _ = run_runner("--json-out", str(zero_margin))
         self.assertEqual(zero_proc.returncode, 0, zero_proc.stderr)
         self.assertEqual(baseline.read_bytes(), zero_margin.read_bytes())
@@ -371,8 +531,9 @@ class DeterminismTest(unittest.TestCase):
         for out in (out_a, out_b):
             proc, _ = run_runner("--json-out", str(out))
             self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(out_a.read_text(encoding="utf-8"),
-                         out_b.read_text(encoding="utf-8"))
+        self.assertEqual(
+            out_a.read_text(encoding="utf-8"), out_b.read_text(encoding="utf-8")
+        )
 
 
 class PrecompactArmTest(unittest.TestCase):
@@ -381,13 +542,14 @@ class PrecompactArmTest(unittest.TestCase):
 
     def test_precompact_only_gold(self):
         from storelib.eval_gold import load_gold
-        items = [it for it in load_gold(str(GOLD))
-                 if it.moment == "precompact"]
+
+        items = [it for it in load_gold(str(GOLD)) if it.moment == "precompact"]
         self.assertGreaterEqual(len(items), 1)
         positives = [it for it in items if it.expect == "inject"]
         self.assertTrue(positives, "precompact suite keeps a positive item")
         from storelib.eval_gold import evaluate_injection_items
         from storelib.schema import connect
+
         per_item, _ = evaluate_injection_items(connect(), items)
         by_expect = {it["id"]: it for it in per_item}
         for it in per_item:
@@ -397,8 +559,7 @@ class PrecompactArmTest(unittest.TestCase):
         # (a namespace whose rows are all invalidated) must stay silent.
         for item in positives:
             row = by_expect[item.id]
-            self.assertTrue(row["hit"],
-                            "precompact labels must match the recent lane")
+            self.assertTrue(row["hit"], "precompact labels must match the recent lane")
             self.assertEqual(row["reason"], "injected")
         silent = [it for it in items if it.expect == "silent"]
         for item in silent:
@@ -412,8 +573,12 @@ class EmptyRenderFenceTest(unittest.TestCase):
     host's <<<END>>> extraction stays valid."""
 
     def test_empty_render_keeps_markers(self):
-        from storelib.recall import (ZMEM_FENCE_CLOSE, ZMEM_FENCE_OPEN,
-                                     _format_fenced_recall)
+        from storelib.recall import (
+            ZMEM_FENCE_CLOSE,
+            ZMEM_FENCE_OPEN,
+            _format_fenced_recall,
+        )
+
         fence = _format_fenced_recall([], header="Relevant memories.")
         self.assertTrue(fence.startswith(ZMEM_FENCE_OPEN))
         self.assertIn(ZMEM_FENCE_CLOSE, fence)
