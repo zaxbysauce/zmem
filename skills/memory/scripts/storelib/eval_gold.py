@@ -282,6 +282,24 @@ class BypassError(RuntimeError):
     """
 
 
+def _rendered_ids_in_fence(rows: list[dict], fence: str) -> set[str]:
+    """Return row ids whose renderer-shaped bullets survived into ``fence``.
+
+    Keep the evaluator on the same strict marker parser as the delivery
+    ledger: scoped rows put ``[tier=...]`` before the id, while arbitrary
+    prose and prefix ids must not count as rendered delivery.  An empty fence
+    is never evidence that non-empty rows were rendered.
+    """
+    if not fence:
+        return set()
+    from storelib.delivery_ledger import rows_present_in
+    return {
+        str(row.get("id"))
+        for row in rows_present_in(rows, fence)
+        if row.get("id") is not None
+    }
+
+
 def _injection_silent_reasons() -> tuple:
     # schema_meta lives at the TOP of skills/memory/scripts/ next to store.py
     # (same import discipline as inject.py's guarded import above).
@@ -380,8 +398,9 @@ def _verify_real_lane(item_id: str, rows: list[dict], envelope: dict,
             f"{item_id}: rendered set costs ~{used} tokens, over the "
             f"{budget}-token budget, with non-protected rows present — the "
             "token budget did not run")
+    rendered_fence_ids = _rendered_ids_in_fence(rows, fence)
     for r in rows:
-        if f"- [{r.get('id')}]" not in fence:
+        if str(r.get("id")) not in rendered_fence_ids:
             raise BypassError(
                 f"{item_id}: rendered row {r.get('id')} is absent from the "
                 "fence text — metrics must come off the rendered fence")
@@ -613,7 +632,8 @@ def evaluate_injection_items(conn: sqlite3.Connection, items: list[GoldItem],
         _verify_real_lane(item.id, rows, envelope, fence, conn=conn,
                           candidate_ids=envelope.get("candidate_ids"),
                           candidate_lanes=envelope.get("candidate_lanes"))
-        fence_ok = all(f"- [{rid}]" in fence for rid in rendered_ids)
+        fence_ok = (_rendered_ids_in_fence(rows, fence)
+                    == {str(rid) for rid in rendered_ids})
 
         labeled = set(item.must_include_ids)
         if item.expect == "silent":

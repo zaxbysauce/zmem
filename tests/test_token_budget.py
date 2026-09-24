@@ -583,6 +583,34 @@ class DegradedFenceFallbackTest(unittest.TestCase):
         plain = mod._local_fenced_recall(rows, "hdr")
         self.assertNotIn("[budget:", plain)
 
+    @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed")
+    def test_mcp_fallback_preserves_scoped_tier_markers(self):
+        import importlib.util
+        server_dir = str(REPO_ROOT / "hermes-plugin" / "server")
+        sys.path.insert(0, server_dir)
+        self.addCleanup(sys.path.remove, server_dir)
+        spec = importlib.util.spec_from_file_location(
+            "zmem_mcp_fallback_tiers",
+            REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["zmem_mcp_fallback_tiers"] = mod
+        self.addCleanup(sys.modules.pop, "zmem_mcp_fallback_tiers", None)
+        spec.loader.exec_module(mod)
+        rows = [
+            {"id": "scoped", "confidence": 0.9, "signal": "test",
+             "namespace": "project:x", "type": "fact", "content": "c",
+             "tier": "project"},
+            {"id": "unknown", "confidence": 0.9, "signal": "test",
+             "namespace": "project:z", "type": "fact", "content": "e"},
+            {"id": "cross", "confidence": 0.9, "signal": "test",
+             "namespace": "project:y", "type": "lesson", "content": "d",
+             "tier": "cross"},
+        ]
+        out = mod._local_fenced_recall(rows, "hdr")
+        self.assertIn("- [tier=project] [scoped]", out)
+        self.assertIn("- [tier=unknown] [unknown]", out)
+        self.assertIn("[ns=project:y] [tier=cross] [type=lesson]", out)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

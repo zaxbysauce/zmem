@@ -291,6 +291,30 @@ class NoSilentBypassTest(unittest.TestCase):
         self.assertIn("reconstructed", str(caught))
 
 
+class RenderedFenceInvariantTest(unittest.TestCase):
+    """The eval must follow the renderer's tiered bullet identity contract."""
+
+    def test_tier_prefix_is_counted_without_prefix_id_false_positive(self):
+        from storelib.eval_gold import _rendered_ids_in_fence
+        rows = [{"id": "r1"}, {"id": "r10"}]
+        fence = ("<<<ZMEM_UNTRUSTED_FENCE>>>\n"
+                 "- [tier=unknown] [r10] [conf=0.9]\n"
+                 "<<<END_ZMEM_UNTRUSTED_FENCE>>>\n")
+        self.assertEqual(_rendered_ids_in_fence(rows, fence), {"r10"})
+
+    def test_missing_rendered_row_still_refuses_the_eval(self):
+        from storelib.eval_gold import BypassError, _verify_real_lane
+        row = {"id": "r1", "confidence": 0.9, "signal": "test",
+               "type": "lesson", "content": "c"}
+        fence = ("<<<ZMEM_UNTRUSTED_FENCE>>>\n"
+                 "- [tier=unknown] [r2] [conf=0.9]\n"
+                 "<<<END_ZMEM_UNTRUSTED_FENCE>>>\n")
+        with self.assertRaisesRegex(BypassError, "r1.*absent"):
+            _verify_real_lane(
+                "tiered-row", [row],
+                {"tokens_budget": 1500, "reason": "injected"}, fence)
+
+
 class BaselineAndRatchetTest(unittest.TestCase):
     """Tests (5)+(6): --compare-baseline zero/drift/invalid exits and the
     ratchet flags."""

@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "115c0e5c47403feaa2bcd35b27f17b0c650f37362dfc5e8a8dd7cb502dac02f5",
+  "digest": "ad413e6fdd26cf43ce59d8b1e3b6fd19198a71f503eebb6aefb12a957d1b1e5b",
   "files": {
     "hermes-plugin/__init__.py": "c584903ad0a6a68838c637e6b21191fcab149e4e116546f2b4919e897f0f9c16",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -11,7 +11,7 @@
     "hermes-plugin/server/auth.py": "50f23542b04ac05004d8d86182064d68501afae3d37efe4ea63ccc2d6996bcb8",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
-    "hermes-plugin/server/mcp_server.py": "b167ded5d196fe681e2f930aaa1e708197b89a3c5de0e2d98a874b1cb136dccb",
+    "hermes-plugin/server/mcp_server.py": "d04e818e8fcf7ec722553c89db8587b023c2f991c87d714353adcbd1efc60eac",
     "hermes-plugin/server/requirements-embeddings.txt": "437505a8ebb55933f5b50e9334849e88a9ce0b57ee534c5f6864a5cda1f8aca6",
     "hermes-plugin/server/requirements.txt": "799aad6ca2a111d8c21b746fae1a2770278b29554900f95b9241c686d7149189",
     "hooks/hooks.claude.json": "f926d43f08d3a18abb3754d25628ef467a79fb856ca8963b2f9b11573f0a2d62",
@@ -79,7 +79,7 @@
     "skills/memory/scripts/storelib/delivery_ledger.py": "853777c3bce697e9db1b7d8856e23faf0937c654bbbdd12d3913b3ac976c9d66",
     "skills/memory/scripts/storelib/entity.py": "915fdbafdbe79f1643af751a19ed366e3e2bec3beddcef42e881122310527949",
     "skills/memory/scripts/storelib/episodes.py": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb",
-    "skills/memory/scripts/storelib/eval_gold.py": "65d5e0ddb9245d9c7cf606455c208c5c3ce3c833cfbcdb78b97cd24f5833dcad",
+    "skills/memory/scripts/storelib/eval_gold.py": "4c5697d22f283a436c6f7b6b02e5606bc31eb8ee48733388f97ed33ba2214b37",
     "skills/memory/scripts/storelib/evidence.py": "a0c710b89d827d6c2bd377576ed8ded7e66afbede2841fdfe72a7a7f10c6ae83",
     "skills/memory/scripts/storelib/false_inject.py": "21bfc993a36454b8b89a3c32c5f6d404e2663177182094209d5b96c6e34e4211",
     "skills/memory/scripts/storelib/feedback.py": "d5b432b4250ee6eec5e612e4841a1dd5e4f83215e139914b067adf573b947463",
