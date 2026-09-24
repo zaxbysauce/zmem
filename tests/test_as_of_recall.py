@@ -23,7 +23,6 @@ sys.path.insert(0, str(SCRIPTS_DIR / "storelib"))
 
 
 class AsOfBehaviorTests(unittest.TestCase):
-
     def setUp(self):
         # Per-test tmp dir so state cannot leak across cases (UNIQUE
         # constraint violations on the deterministic ids).
@@ -36,26 +35,41 @@ class AsOfBehaviorTests(unittest.TestCase):
             if mod == "store" or mod.startswith("storelib"):
                 del sys.modules[mod]
         from storelib.schema import init_db, connect, ALLOWED_TYPES
+
         conn = connect()
         init_db(conn)
         # Three rows with staggered valid_from. T1 < T2 < T3.
-        for idx, (ts, content) in enumerate([
-            ("2026-01-01T00:00:00Z", "row T1"),
-            ("2026-02-01T00:00:00Z", "row T2"),
-            ("2026-03-01T00:00:00Z", "row T3"),
-        ]):
+        for idx, (ts, content) in enumerate(
+            [
+                ("2026-01-01T00:00:00Z", "row T1"),
+                ("2026-02-01T00:00:00Z", "row T2"),
+                ("2026-03-01T00:00:00Z", "row T3"),
+            ]
+        ):
             conn.execute(
                 "INSERT INTO memory (id, namespace, type, content, tags, "
                 "source_ref, source_hash, confidence, signal, valid_from, "
                 "ingestion_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (f"asof-row-{idx}", "project:asof-test", ALLOWED_TYPES[0],
-                 content, "", "", "", 0.9, "test", ts, ts),
+                (
+                    f"asof-row-{idx}",
+                    "project:asof-test",
+                    ALLOWED_TYPES[0],
+                    content,
+                    "",
+                    "",
+                    "",
+                    0.9,
+                    "test",
+                    ts,
+                    ts,
+                ),
             )
         conn.commit()
         conn.close()
 
     def tearDown(self):
         import shutil
+
         shutil.rmtree(self.tmp, ignore_errors=True)
         # PRR-024 fix: restore the ambient env (sibling convention in
         # tests/test_host.py) — a leaked ZMEM_STORE silently redirects any
@@ -68,6 +82,7 @@ class AsOfBehaviorTests(unittest.TestCase):
     def test_as_of_returns_rows_at_or_before(self):
         """Query at T2 returns the first two rows only."""
         from storelib import recall_memory, connect
+
         results = recall_memory(
             connect(),
             query="row",
@@ -80,7 +95,8 @@ class AsOfBehaviorTests(unittest.TestCase):
         )
         contents = sorted(r["content"] for r in results)
         self.assertEqual(
-            contents, ["row T1", "row T2"],
+            contents,
+            ["row T1", "row T2"],
             f"as_of=T2 must return T1 and T2 only, got {contents}",
         )
 
@@ -94,6 +110,7 @@ class AsOfBehaviorTests(unittest.TestCase):
         callers, not just the CLI argparse type.
         """
         from storelib import connect, recent_memory
+
         results_z = recent_memory(
             connect(),
             namespace="project:asof-test",
@@ -113,13 +130,15 @@ class AsOfBehaviorTests(unittest.TestCase):
         ids_z = sorted(r["id"] for r in results_z)
         ids_p = sorted(r["id"] for r in results_p)
         self.assertEqual(
-            ids_z, ids_p,
+            ids_z,
+            ids_p,
             "Z-suffix and +00:00 inputs at the SAME instant must produce "
             "identical results (entry-point normalization). Z=%s, +00:00=%s"
             % (ids_z, ids_p),
         )
         self.assertEqual(
-            ids_z, ["asof-row-0", "asof-row-1"],
+            ids_z,
+            ["asof-row-0", "asof-row-1"],
             f"boundary as_of == T2.valid_from must include T1 and T2; got {ids_z}",
         )
 
@@ -128,6 +147,7 @@ class AsOfBehaviorTests(unittest.TestCase):
         UTC instant, not compared as wall-clock text. 2026-02-01T05:30+05:30
         == 2026-02-01T00:00Z == T2's valid_from, so T1+T2 return."""
         from storelib import connect, recent_memory
+
         results = recent_memory(
             connect(),
             namespace="project:asof-test",
@@ -138,7 +158,8 @@ class AsOfBehaviorTests(unittest.TestCase):
         )
         ids = sorted(r["id"] for r in results)
         self.assertEqual(
-            ids, ["asof-row-0", "asof-row-1"],
+            ids,
+            ["asof-row-0", "asof-row-1"],
             f"non-UTC offset must resolve to the UTC instant; got {ids}",
         )
 
@@ -146,13 +167,29 @@ class AsOfBehaviorTests(unittest.TestCase):
         """PRR-010 fix: --as-of must work through the real `search`
         subcommand (previously only recall/recent were tested)."""
         import subprocess
-        env = {**os.environ, "ZMEM_STORE": str(self.store_path),
-               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+
+        env = {
+            **os.environ,
+            "ZMEM_STORE": str(self.store_path),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
         r = subprocess.run(
-            [sys.executable, str(SCRIPTS_DIR / "store.py"), "search",
-             "--text", "row", "--namespace", "project:asof-test",
-             "--no-bump", "--as-of", "2026-02-15T00:00:00Z"],
-            env=env, capture_output=True, text=True, timeout=60,
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "store.py"),
+                "search",
+                "--text",
+                "row",
+                "--namespace",
+                "project:asof-test",
+                "--no-bump",
+                "--as-of",
+                "2026-02-15T00:00:00Z",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("row T1", r.stdout)
@@ -167,24 +204,41 @@ class AsOfBehaviorTests(unittest.TestCase):
         the real `search` subprocess using the FTS/keyword lane."""
         import sqlite3
         import subprocess
+
         conn = sqlite3.connect(self.store_path)
         try:
             conn.execute(
                 "UPDATE memory SET superseded_at=?, valid_until=? WHERE id=?",
-                ("2026-02-10T00:00:00Z", "2026-02-10T00:00:00Z", "asof-row-1"))
+                ("2026-02-10T00:00:00Z", "2026-02-10T00:00:00Z", "asof-row-1"),
+            )
             conn.commit()
         finally:
             conn.close()
 
-        env = {**os.environ, "ZMEM_STORE": str(self.store_path),
-               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        env = {
+            **os.environ,
+            "ZMEM_STORE": str(self.store_path),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
 
         def search_at(as_of):
             r = subprocess.run(
-                [sys.executable, str(SCRIPTS_DIR / "store.py"), "search",
-                 "--text", "row", "--namespace", "project:asof-test",
-                 "--no-bump", "--as-of", as_of],
-                env=env, capture_output=True, text=True, timeout=60,
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "store.py"),
+                    "search",
+                    "--text",
+                    "row",
+                    "--namespace",
+                    "project:asof-test",
+                    "--no-bump",
+                    "--as-of",
+                    as_of,
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
             self.assertEqual(r.returncode, 0, r.stderr)
             return r.stdout
@@ -192,23 +246,29 @@ class AsOfBehaviorTests(unittest.TestCase):
         # Inside the validity window: row T2 returns DESPITE superseded_at being
         # set (live filter dropped under as-of); T3 is not yet born.
         out_inside = search_at("2026-02-05T00:00:00Z")
-        self.assertIn("row T2", out_inside,
-                      "search --as-of inside the window must surface the "
-                      "superseded row")
+        self.assertIn(
+            "row T2",
+            out_inside,
+            "search --as-of inside the window must surface the " "superseded row",
+        )
         self.assertNotIn("row T3", out_inside)
         # AT the exclusive end: row T2 no longer valid.
         out_at = search_at("2026-02-10T00:00:00Z")
-        self.assertNotIn("row T2", out_at,
-                         "search --as-of == valid_until must EXCLUDE the row "
-                         "(exclusive end)")
+        self.assertNotIn(
+            "row T2",
+            out_at,
+            "search --as-of == valid_until must EXCLUDE the row " "(exclusive end)",
+        )
         # AFTER the end.
         out_after = search_at("2026-02-11T00:00:00Z")
-        self.assertNotIn("row T2", out_after,
-                         "search --as-of after valid_until must exclude the row")
+        self.assertNotIn(
+            "row T2", out_after, "search --as-of after valid_until must exclude the row"
+        )
 
     def test_absent_as_of_returns_all_live(self):
         """Absent flag → no temporal predicate → all live rows."""
         from storelib import recall_memory, connect
+
         results = recall_memory(
             connect(),
             query="row",
@@ -219,7 +279,8 @@ class AsOfBehaviorTests(unittest.TestCase):
             hybrid=False,
         )
         self.assertEqual(
-            len(results), 3,
+            len(results),
+            3,
             f"absent --as-of must return all 3 live rows, got {len(results)}",
         )
 
@@ -230,6 +291,7 @@ class AsOfBehaviorTests(unittest.TestCase):
         because every row's valid_from is <= 2099.
         """
         from storelib import recall_memory, connect
+
         results = recall_memory(
             connect(),
             query="row",
@@ -241,10 +303,63 @@ class AsOfBehaviorTests(unittest.TestCase):
             as_of="2025-12-31T00:00:00Z",
         )
         self.assertEqual(
-            len(results), 0,
+            len(results),
+            0,
             f"as_of=2025-12-31 (before all valid_from) must return 0 "
             f"rows, got {len(results)}",
         )
+
+    def test_moment_weighting_does_not_change_valid_until_boundaries(self):
+        """Issue #126 AC5: the same three as_of instants under an explicit
+        ``moment="pretool"`` return the EXACT half-open sets the plain path
+        pins (test_superseded_row_valid_inside_window_gone_at_or_after_end)
+        — type preferences reweight ORDER, never temporal validity, and no
+        live row receives a ``valid_until`` value from the profile path."""
+        from storelib import connect, recent_memory
+
+        conn = connect()
+        try:
+            conn.execute(
+                "UPDATE memory SET superseded_at=?, valid_until=? WHERE id=?",
+                ("2026-02-10T00:00:00Z", "2026-02-10T00:00:00Z", "asof-row-1"),
+            )
+            conn.commit()
+
+            def ids_at(as_of):
+                rows = recent_memory(
+                    conn,
+                    namespace="project:asof-test",
+                    limit=10,
+                    as_json=True,
+                    no_bump=True,
+                    as_of=as_of,
+                    moment="pretool",
+                )
+                return sorted(r["id"] for r in rows)
+
+            self.assertEqual(
+                ids_at("2026-02-05T00:00:00Z"),
+                ["asof-row-0", "asof-row-1"],
+                "moment weighting must not change the " "in-window membership",
+            )
+            self.assertEqual(
+                ids_at("2026-02-10T00:00:00Z"),
+                ["asof-row-0"],
+                "moment weighting must not change the " "exclusive end bound",
+            )
+            self.assertEqual(
+                ids_at("2026-02-11T00:00:00Z"),
+                ["asof-row-0"],
+                "moment weighting must not change the " "after-end bound",
+            )
+            live = conn.execute(
+                "SELECT COUNT(*) FROM memory "
+                "WHERE namespace='project:asof-test' "
+                "AND id != 'asof-row-1' AND valid_until != ''"
+            ).fetchone()[0]
+            self.assertEqual(live, 0, "no live row may receive a valid_until value")
+        finally:
+            conn.close()
 
     def test_superseded_row_valid_inside_window_gone_at_or_after_end(self):
         """Issue #59, 4.4: complete --as-of against valid_until. as_of must
@@ -263,17 +378,23 @@ class AsOfBehaviorTests(unittest.TestCase):
           - after (02-11): T2 gone.
         """
         from storelib import connect, recent_memory
+
         conn = connect()
         try:
             conn.execute(
                 "UPDATE memory SET superseded_at=?, valid_until=? WHERE id=?",
-                ("2026-02-10T00:00:00Z", "2026-02-10T00:00:00Z", "asof-row-1"))
+                ("2026-02-10T00:00:00Z", "2026-02-10T00:00:00Z", "asof-row-1"),
+            )
             conn.commit()
 
             def ids_at(as_of):
                 rows = recent_memory(
-                    conn, namespace="project:asof-test", limit=10,
-                    as_json=True, no_bump=True, as_of=as_of,
+                    conn,
+                    namespace="project:asof-test",
+                    limit=10,
+                    as_json=True,
+                    no_bump=True,
+                    as_of=as_of,
                 )
                 return sorted(r["id"] for r in rows)
 
@@ -311,32 +432,39 @@ class VecLaneAsOfFilterScanTest(unittest.TestCase):
 
     def test_recall_filters_vec_candidates_under_as_of(self):
         src = (SCRIPTS_DIR / "storelib" / "recall.py").read_text(encoding="utf-8")
-        self.assertIn("if as_of and vec_ids:", src,
-                      "the hybrid path must temporal-filter vec candidates "
-                      "when as_of is set (PRR-K)")
-        self.assertIn("AND valid_from <= ? AND (valid_until = '' OR valid_until > ?)",
-                      src,
-                      "the vec-candidate filter must use the same half-open "
-                      "validity predicate as the FTS lane")
-        self.assertIn("if as_of else max(15, limit + 10)", src,
-                      "the vec KNN window must over-fetch under as_of to "
-                      "compensate for post-filtering (PRR-K)")
+        self.assertIn(
+            "if as_of and vec_ids:",
+            src,
+            "the hybrid path must temporal-filter vec candidates "
+            "when as_of is set (PRR-K)",
+        )
+        self.assertIn(
+            "AND valid_from <= ? AND (valid_until = '' OR valid_until > ?)",
+            src,
+            "the vec-candidate filter must use the same half-open "
+            "validity predicate as the FTS lane",
+        )
+        self.assertIn(
+            "if as_of else max(15, limit + 10)",
+            src,
+            "the vec KNN window must over-fetch under as_of to "
+            "compensate for post-filtering (PRR-K)",
+        )
 
 
 class Iso8601ArgparseTests(unittest.TestCase):
-
     def test_iso8601_normalizes_plus_to_z(self):
         """``_iso8601`` (the argparse type=) must convert ``+00:00`` to
         ``Z`` so lex-comparison against ``now_iso()`` output works."""
         from storelib.cli import _iso8601
-        self.assertEqual(_iso8601("2026-02-15T00:00:00+00:00"),
-                         "2026-02-15T00:00:00Z")
-        self.assertEqual(_iso8601("2026-02-15T00:00:00Z"),
-                         "2026-02-15T00:00:00Z")
+
+        self.assertEqual(_iso8601("2026-02-15T00:00:00+00:00"), "2026-02-15T00:00:00Z")
+        self.assertEqual(_iso8601("2026-02-15T00:00:00Z"), "2026-02-15T00:00:00Z")
 
     def test_iso8601_rejects_garbage(self):
         from storelib.cli import _iso8601
         import argparse
+
         for bad in ["", "not-a-date", "2026-13-01T00:00:00Z"]:
             with self.assertRaises(argparse.ArgumentTypeError):
                 _iso8601(bad)

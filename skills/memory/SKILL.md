@@ -741,7 +741,7 @@ knob is lambda: default 0.7, env `ZMEM_MMR_LAMBDA` (0.0 = maximize
 registry in `skills/memory/scripts/embed_profiles.py` — unknown values refuse
 with exit 2 before any store work, and a value whose dimension differs from
 the store's committed vectors refuses until `reembed --all` converts it.
-`ZMEM_CROSS_ENCODER=1` enables the optional cross-encoder rerank. The
+The cross-encoder rerank is enabled by default (issue #126 flip); set `ZMEM_CROSS_ENCODER=0` to disable it. The
 EXPLICIT lane covers CLI `recall` invocations that are not `--no-bump`/
 `--no-hybrid` (never `recent` / `search`-aliases); pointing
 `ZMEM_CROSS_ENCODER_MODEL` at a LOCAL pair-scoring `.onnx` plus sibling

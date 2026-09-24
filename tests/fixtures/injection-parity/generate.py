@@ -45,7 +45,7 @@ def _expected_row(memory_id: str, content: str) -> dict:
         "_rel_ent": None,
         "_rel_graph": None,
         "_rel_lex": 1.0,
-        "_score": 0.88,
+        "_score": 0.9638,
         "_stale_note": "",
         "applied_count": 0,
         "confidence": 0.9,
@@ -71,6 +71,9 @@ def _expected_row(memory_id: str, content: str) -> dict:
 # Independent oracle.  Keep this literal rather than deriving it from the
 # store implementation: otherwise a renderer/selector regression could update
 # both the producer and the expected bytes together.
+# Refreshed 2026-09-23 (issue #126, release 0.61.0): the selector subprocess
+# now applies the user_prompt fact profile (moment weighting), so the
+# pinned score is the base 0.88 x (1.15/1.05) = 0.9638 (4 dp).
 EXPECTED_ENVELOPE = {
     "arms": {
         "entity": {"cap": 50, "post": 0, "pre": 0},

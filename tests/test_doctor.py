@@ -72,7 +72,13 @@ class DoctorCliTest(unittest.TestCase):
         self._write_repo_surfaces()
         subprocess.run([REAL_GIT, "init", "-q"], cwd=str(self.project), check=True)
         subprocess.run(
-            [REAL_GIT, "remote", "add", "origin", "https://github.com/Example/Widget.git"],
+            [
+                REAL_GIT,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Example/Widget.git",
+            ],
             cwd=str(self.project),
             check=True,
         )
@@ -84,9 +90,9 @@ class DoctorCliTest(unittest.TestCase):
         node = self.bin / "node.cmd"
         git = self.bin / "git.cmd"
         bash = self.bin / "Git" / "bin" / "bash.cmd"
-        _write_text(node, _cmd_script('echo v20.11.0'))
-        _write_text(git, _cmd_script('echo https://github.com/Example/Widget.git'))
-        _write_text(bash, _cmd_script('echo GNU bash, version 5.2.0'))
+        _write_text(node, _cmd_script("echo v20.11.0"))
+        _write_text(git, _cmd_script("echo https://github.com/Example/Widget.git"))
+        _write_text(bash, _cmd_script("echo GNU bash, version 5.2.0"))
 
     def _write_repo_surfaces(self):
         _write_text(
@@ -209,19 +215,21 @@ class DoctorCliTest(unittest.TestCase):
                     (self.repo / rel).unlink()
                 try:
                     result = self._run(
-                        "--format", "json",
-                        "--repo-root", str(self.repo),
-                        "--project", str(self.project),
+                        "--format",
+                        "json",
+                        "--repo-root",
+                        str(self.repo),
+                        "--project",
+                        str(self.project),
                     )
                 finally:
                     self._write_repo_surfaces()
                 self.assertNotEqual(
-                    result.returncode, 0,
-                    "missing %s must fail doctor" % group)
+                    result.returncode, 0, "missing %s must fail doctor" % group
+                )
                 report = json.loads(result.stdout)
                 self.assertFalse(report["ok"], group)
-                check = next(
-                    c for c in report["checks"] if c["id"] == "host-surfaces")
+                check = next(c for c in report["checks"] if c["id"] == "host-surfaces")
                 self.assertEqual(check["status"], "fail", group)
                 self.assertIn(group, check["summary"])
 
@@ -411,13 +419,23 @@ class DoctorCliTest(unittest.TestCase):
         _write_text(
             self.home / ".codex" / "config.toml",
             "\n".join(
-                ["[features]", "memories = false", "", "[memories]",
-                 "use_memories = false", "generate_memories = false"]
+                [
+                    "[features]",
+                    "memories = false",
+                    "",
+                    "[memories]",
+                    "use_memories = false",
+                    "generate_memories = false",
+                ]
             ),
         )
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project),
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
@@ -430,8 +448,9 @@ class DoctorCliTest(unittest.TestCase):
         needed), not FAIL — and a store at a NEWER version must FAIL."""
         store_dir = self.home / ".zmem"
         # An older store (current-1) should warn, not pass-as-current.
-        _make_store(store_dir / "store.sqlite",
-                    schema_version=CURRENT_SCHEMA_VERSION - 1)
+        _make_store(
+            store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION - 1
+        )
         _write_text(
             self.home / ".claude" / "settings.json",
             json.dumps({"autoMemoryEnabled": False}),
@@ -439,13 +458,23 @@ class DoctorCliTest(unittest.TestCase):
         _write_text(
             self.home / ".codex" / "config.toml",
             "\n".join(
-                ["[features]", "memories = false", "", "[memories]",
-                 "use_memories = false", "generate_memories = false"]
+                [
+                    "[features]",
+                    "memories = false",
+                    "",
+                    "[memories]",
+                    "use_memories = false",
+                    "generate_memories = false",
+                ]
             ),
         )
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project),
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
         )
         report = json.loads(result.stdout)
         schema = next(c for c in report["checks"] if c["id"] == "schema-version")
@@ -459,8 +488,9 @@ class DoctorCliTest(unittest.TestCase):
         supported version and the ceiling is covered by the in-process
         doctor grading tests in tests/test_schema_forward_compat.py."""
         store_dir = self.home / ".zmem"
-        _make_store(store_dir / "store.sqlite",
-                    schema_version=CURRENT_SCHEMA_VERSION + 1)
+        _make_store(
+            store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION + 1
+        )
         _write_text(
             self.home / ".claude" / "settings.json",
             json.dumps({"autoMemoryEnabled": False}),
@@ -468,13 +498,23 @@ class DoctorCliTest(unittest.TestCase):
         _write_text(
             self.home / ".codex" / "config.toml",
             "\n".join(
-                ["[features]", "memories = false", "", "[memories]",
-                 "use_memories = false", "generate_memories = false"]
+                [
+                    "[features]",
+                    "memories = false",
+                    "",
+                    "[memories]",
+                    "use_memories = false",
+                    "generate_memories = false",
+                ]
             ),
         )
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project),
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
         )
         report = json.loads(result.stdout)
         schema = next(c for c in report["checks"] if c["id"] == "schema-version")
@@ -483,38 +523,44 @@ class DoctorCliTest(unittest.TestCase):
     # ------------------------------------------------------------------
     # v11 (issue #61, 6.1): the link-tables check
     # ------------------------------------------------------------------
-    def _make_v11_link_store(self, store_path: Path, *, with_link_table: bool,
-                             trust_values=(1.0,)) -> None:
+    def _make_v11_link_store(
+        self, store_path: Path, *, with_link_table: bool, trust_values=(1.0,)
+    ) -> None:
         store_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(store_path))
         try:
-            conn.execute(
-                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
-                (str(CURRENT_SCHEMA_VERSION),))
+                (str(CURRENT_SCHEMA_VERSION),),
+            )
             conn.execute(
                 "CREATE TABLE memory(id TEXT PRIMARY KEY, trust_score REAL "
-                "NOT NULL DEFAULT 1.0)")
+                "NOT NULL DEFAULT 1.0)"
+            )
             for i, t in enumerate(trust_values):
                 conn.execute(
-                    "INSERT INTO memory(id, trust_score) VALUES (?, ?)",
-                    (f"row-{i}", t))
+                    "INSERT INTO memory(id, trust_score) VALUES (?, ?)", (f"row-{i}", t)
+                )
             if with_link_table:
                 conn.execute(
                     "CREATE TABLE memory_link(src_id TEXT, dst_id TEXT, "
-                    "relation TEXT, score REAL, created_at TEXT)")
+                    "relation TEXT, score REAL, created_at TEXT)"
+                )
             conn.commit()
         finally:
             conn.close()
 
     def test_link_tables_check_passes_on_healthy_v11_store(self):
         store_dir = self.home / ".zmem"
-        self._make_v11_link_store(store_dir / "store.sqlite",
-                                  with_link_table=True)
+        self._make_v11_link_store(store_dir / "store.sqlite", with_link_table=True)
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project),
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
         )
         report = json.loads(result.stdout)
         check = next(c for c in report["checks"] if c["id"] == "link-tables")
@@ -523,11 +569,14 @@ class DoctorCliTest(unittest.TestCase):
 
     def test_link_tables_check_warns_when_table_missing(self):
         store_dir = self.home / ".zmem"
-        self._make_v11_link_store(store_dir / "store.sqlite",
-                                  with_link_table=False)
+        self._make_v11_link_store(store_dir / "store.sqlite", with_link_table=False)
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project),
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
         )
         report = json.loads(result.stdout)
         check = next(c for c in report["checks"] if c["id"] == "link-tables")
@@ -538,11 +587,16 @@ class DoctorCliTest(unittest.TestCase):
         """adjust_trust clamps in SQL, so an out-of-range value means a
         hand-edited store — doctor warns (read-only, never repairs)."""
         store_dir = self.home / ".zmem"
-        self._make_v11_link_store(store_dir / "store.sqlite",
-                                  with_link_table=True, trust_values=(1.0, 1.7))
+        self._make_v11_link_store(
+            store_dir / "store.sqlite", with_link_table=True, trust_values=(1.0, 1.7)
+        )
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project),
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
         )
         report = json.loads(result.stdout)
         check = next(c for c in report["checks"] if c["id"] == "link-tables")
@@ -552,45 +606,53 @@ class DoctorCliTest(unittest.TestCase):
     # ------------------------------------------------------------------
     # v12 (issue #64): the voyager-counters check
     # ------------------------------------------------------------------
-    def _make_v12_counter_store(self, store_path: Path,
-                                counters: list[tuple[int, int]]) -> None:
+    def _make_v12_counter_store(
+        self, store_path: Path, counters: list[tuple[int, int]]
+    ) -> None:
         """Minimal v12-tagged store whose memory table carries ONLY the
         columns the voyager-counters check reads."""
         store_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(store_path))
         try:
-            conn.execute(
-                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
-                (str(CURRENT_SCHEMA_VERSION),))
+                (str(CURRENT_SCHEMA_VERSION),),
+            )
             conn.execute(
                 "CREATE TABLE memory(id TEXT PRIMARY KEY, "
                 "applied_count INTEGER NOT NULL DEFAULT 0, "
-                "violated_count INTEGER NOT NULL DEFAULT 0)")
+                "violated_count INTEGER NOT NULL DEFAULT 0)"
+            )
             for i, (applied, violated) in enumerate(counters):
                 conn.execute(
                     "INSERT INTO memory(id, applied_count, violated_count) "
-                    "VALUES (?, ?, ?)", (f"row-{i}", applied, violated))
+                    "VALUES (?, ?, ?)",
+                    (f"row-{i}", applied, violated),
+                )
             conn.commit()
         finally:
             conn.close()
 
     def _voyager_check(self):
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project),
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
         )
         report = json.loads(result.stdout)
-        check = next(c for c in report["checks"]
-                     if c["id"] == "voyager-counters")
+        check = next(c for c in report["checks"] if c["id"] == "voyager-counters")
         return result, check
 
     def test_voyager_counters_pass_on_healthy_v12_store(self):
         self._disable_native_memory()
         store_dir = self.home / ".zmem"
-        self._make_v12_counter_store(store_dir / "store.sqlite",
-                                     counters=[(0, 0), (3, 1), (2, 0)])
+        self._make_v12_counter_store(
+            store_dir / "store.sqlite", counters=[(0, 0), (3, 1), (2, 0)]
+        )
         result, check = self._voyager_check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(check["status"], "pass", check)
@@ -603,8 +665,7 @@ class DoctorCliTest(unittest.TestCase):
         report — doctor recovers, it does not gate."""
         self._disable_native_memory()
         store_dir = self.home / ".zmem"
-        _make_store(store_dir / "store.sqlite",
-                    schema_version=CURRENT_SCHEMA_VERSION)
+        _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)
         result, check = self._voyager_check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(check["status"], "warn", check)
@@ -613,8 +674,9 @@ class DoctorCliTest(unittest.TestCase):
     def test_voyager_counters_warn_on_negative_counter(self):
         self._disable_native_memory()
         store_dir = self.home / ".zmem"
-        self._make_v12_counter_store(store_dir / "store.sqlite",
-                                     counters=[(0, 0), (1, -2)])
+        self._make_v12_counter_store(
+            store_dir / "store.sqlite", counters=[(0, 0), (1, -2)]
+        )
         result, check = self._voyager_check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(check["status"], "warn", check)
@@ -630,8 +692,10 @@ class DoctorCliTest(unittest.TestCase):
         self._make_v12_counter_store(store, counters=[(0, 0)])
         conn = sqlite3.connect(str(store))
         try:
-            conn.execute("INSERT INTO memory(id, applied_count, "
-                         "violated_count) VALUES ('row-x', 'many', 0)")
+            conn.execute(
+                "INSERT INTO memory(id, applied_count, "
+                "violated_count) VALUES ('row-x', 'many', 0)"
+            )
             conn.commit()
         finally:
             conn.close()
@@ -643,8 +707,12 @@ class DoctorCliTest(unittest.TestCase):
     # ------------------------------------------------------------------
     # E8 (#39): pending namespace-migration preview in doctor
     # ------------------------------------------------------------------
-    def _make_store_with_rows(self, store_path: Path, rows: list[tuple[str, str]],
-                              schema_version: int = CURRENT_SCHEMA_VERSION) -> None:
+    def _make_store_with_rows(
+        self,
+        store_path: Path,
+        rows: list[tuple[str, str]],
+        schema_version: int = CURRENT_SCHEMA_VERSION,
+    ) -> None:
         """Create a minimal store with a meta + memory table populated with
         (namespace, content) rows. Used by the ns-migration preview tests."""
         store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -677,8 +745,14 @@ class DoctorCliTest(unittest.TestCase):
         _write_text(
             self.home / ".codex" / "config.toml",
             "\n".join(
-                ["[features]", "memories = false", "", "[memories]",
-                 "use_memories = false", "generate_memories = false"]
+                [
+                    "[features]",
+                    "memories = false",
+                    "",
+                    "[memories]",
+                    "use_memories = false",
+                    "generate_memories = false",
+                ]
             ),
         )
 
@@ -693,8 +767,13 @@ class DoctorCliTest(unittest.TestCase):
         env = self._base_env()
         env.pop("ZMEM_NS_MIGRATION_MAP", None)
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project), env=env,
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+            env=env,
         )
         report = json.loads(result.stdout)
         nsm = next(c for c in report["checks"] if c["id"] == "ns-migration")
@@ -713,8 +792,13 @@ class DoctorCliTest(unittest.TestCase):
             {"project:oldwidget": str(self.project)}
         )
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project), env=env,
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+            env=env,
         )
         report = json.loads(result.stdout)
         nsm = next(c for c in report["checks"] if c["id"] == "ns-migration")
@@ -729,7 +813,7 @@ class DoctorCliTest(unittest.TestCase):
             [
                 ("project:oldwidget", "content one"),
                 ("project:oldwidget", "content two"),  # same old ns, 2 rows
-                ("user:global", "unrelated"),          # not in the map
+                ("user:global", "unrelated"),  # not in the map
             ],
         )
         env = self._base_env()
@@ -737,15 +821,23 @@ class DoctorCliTest(unittest.TestCase):
             {"project:oldwidget": str(self.project)}
         )
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project), env=env,
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+            env=env,
         )
         report = json.loads(result.stdout)
         nsm = next(c for c in report["checks"] if c["id"] == "ns-migration")
         self.assertEqual(nsm["status"], "warn", nsm)
-        self.assertEqual(nsm["details"].get("stranded_count"), 1,
-                         "count is DISTINCT namespaces, so 2 rows under one "
-                         "old-style key count as 1")
+        self.assertEqual(
+            nsm["details"].get("stranded_count"),
+            1,
+            "count is DISTINCT namespaces, so 2 rows under one "
+            "old-style key count as 1",
+        )
         self.assertIn("oldwidget", nsm["summary"])
 
     def test_ns_migration_invalid_json_does_not_crash(self):
@@ -760,8 +852,13 @@ class DoctorCliTest(unittest.TestCase):
         env = self._base_env()
         env["ZMEM_NS_MIGRATION_MAP"] = "{not valid json"
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project), env=env,
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+            env=env,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
@@ -791,23 +888,38 @@ class DoctorCliTest(unittest.TestCase):
             "ids=['row-0'] all=['row-0'] sid=sess-fi moment=user_prompt\n",
         )
         result = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project),
-            "--store", str(store),
-            "--miss-rate", "--miss-min-overlap", "3",
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+            "--store",
+            str(store),
+            "--miss-rate",
+            "--miss-min-overlap",
+            "3",
         )
         report = json.loads(result.stdout)
         check = next(c for c in report["checks"] if c["id"] == "miss-rate")
         fi = check["details"]["report"]["false_injection"]
-        self.assertEqual(fi["min_token_overlap"], 3,
-                         "the flag value must pass through to the counter")
-        self.assertEqual(fi["overall"]["injected"], 1,
-                         "the counter consumed the decisions-log line")
-        self.assertIn("missed", check["summary"],
-                      "the summary keeps the miss direction")
-        self.assertIn("false-injection", check["summary"],
-                      "the summary prints the false-injection direction "
-                      "alongside the miss rate")
+        self.assertEqual(
+            fi["min_token_overlap"],
+            3,
+            "the flag value must pass through to the counter",
+        )
+        self.assertEqual(
+            fi["overall"]["injected"], 1, "the counter consumed the decisions-log line"
+        )
+        self.assertIn(
+            "missed", check["summary"], "the summary keeps the miss direction"
+        )
+        self.assertIn(
+            "false-injection",
+            check["summary"],
+            "the summary prints the false-injection direction "
+            "alongside the miss rate",
+        )
         self.assertIn("min_overlap 3", check["summary"])
 
 
@@ -839,9 +951,15 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         _write_text(node, _cmd_script("echo v20.11.0"))
         subprocess.run([REAL_GIT, "init", "-q"], cwd=str(self.project), check=True)
         subprocess.run(
-            [REAL_GIT, "remote", "add", "origin",
-             "https://github.com/Example/Widget.git"],
-            cwd=str(self.project), check=True,
+            [
+                REAL_GIT,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Example/Widget.git",
+            ],
+            cwd=str(self.project),
+            check=True,
         )
 
     def tearDown(self):
@@ -854,31 +972,51 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
         env["ZMEM_BASH_PATH"] = str(self.bin / "Git" / "bin" / "bash.cmd")
         for key in (
-            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_CORE_MD",
-            "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+            "ZMEM_STORE",
+            "ZMEM_DATA",
+            "ZMEM_CORE_MD",
+            "CLAUDE_PLUGIN_DATA",
+            "ZCODE_PLUGIN_DATA",
             "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
             # issue #63 review round: the new embedding/CE knobs must not
             # leak from a developer shell into doctor's sandbox (PRR-013)
-            "ZMEM_EMBED_PROFILE", "ZMEM_CROSS_ENCODER",
-            "ZMEM_CROSS_ENCODER_MODEL", "ZMEM_MODELS_DIR",
-            "OneDrive", "OneDriveConsumer", "OneDriveCommercial",
+            "ZMEM_EMBED_PROFILE",
+            "ZMEM_CROSS_ENCODER",
+            "ZMEM_CROSS_ENCODER_MODEL",
+            "ZMEM_MODELS_DIR",
+            "OneDrive",
+            "OneDriveConsumer",
+            "OneDriveCommercial",
         ):
             env.pop(key, None)
         return env
 
     def _run_doctor(self):
         result = subprocess.run(
-            [PYTHON, str(DOCTOR_PY), "--format", "json",
-             "--repo-root", str(self.repo), "--project", str(self.project)],
-            env=self._env(), capture_output=True, text=True, timeout=60,
+            [
+                PYTHON,
+                str(DOCTOR_PY),
+                "--format",
+                "json",
+                "--repo-root",
+                str(self.repo),
+                "--project",
+                str(self.project),
+            ],
+            env=self._env(),
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         self.assertNotIn("Traceback", result.stderr, result.stderr)
         if not result.stdout.strip():
-            self.fail("doctor wrote no JSON on stdout "
-                      f"(rc={result.returncode}) stderr={result.stderr[-400:]!r} "
-                      "— a crash here previously masked itself as a confusing "
-                      "JSONDecodeError (PRR-014 courtesy note)")
+            self.fail(
+                "doctor wrote no JSON on stdout "
+                f"(rc={result.returncode}) stderr={result.stderr[-400:]!r} "
+                "— a crash here previously masked itself as a confusing "
+                "JSONDecodeError (PRR-014 courtesy note)"
+            )
         return result, json.loads(result.stdout)
 
     def _check(self, report, check_id):
@@ -893,8 +1031,10 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         self.assertIn("No Tier-0", check["summary"])
 
     def test_tier0_small_core_md_passes_with_stats(self):
-        _write_text(self.home / ".zmem" / "core.md",
-                    "\n".join(f"line {i}" for i in range(10)) + "\n")
+        _write_text(
+            self.home / ".zmem" / "core.md",
+            "\n".join(f"line {i}" for i in range(10)) + "\n",
+        )
         _, report = self._run_doctor()
         check = self._check(report, "tier0-size")
         self.assertEqual(check["status"], "pass", check)
@@ -904,8 +1044,10 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         self.assertGreater(stats["bytes"], 0)
 
     def test_tier0_300_line_core_md_warns(self):
-        _write_text(self.home / ".zmem" / "core.md",
-                    "\n".join(f"rule {i}" for i in range(300)) + "\n")
+        _write_text(
+            self.home / ".zmem" / "core.md",
+            "\n".join(f"rule {i}" for i in range(300)) + "\n",
+        )
         _, report = self._run_doctor()
         check = self._check(report, "tier0-size")
         self.assertEqual(check["status"], "warn", check)
@@ -914,8 +1056,10 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
 
     def test_tier0_oversized_agents_md_alone_warns(self):
         _write_text(self.home / ".zmem" / "core.md", "small\n")
-        _write_text(self.project / "AGENTS.md",
-                    "\n".join(f"agent rule {i}" for i in range(250)) + "\n")
+        _write_text(
+            self.project / "AGENTS.md",
+            "\n".join(f"agent rule {i}" for i in range(250)) + "\n",
+        )
         _, report = self._run_doctor()
         check = self._check(report, "tier0-size")
         self.assertEqual(check["status"], "warn", check)
@@ -924,8 +1068,10 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
 
     def test_tier0_bytes_threshold_independent_of_lines(self):
         # 60 lines but > 16KB (each line ~300 bytes): byte cap must trip alone.
-        _write_text(self.home / ".zmem" / "core.md",
-                    "\n".join("x" * 300 for _ in range(60)) + "\n")
+        _write_text(
+            self.home / ".zmem" / "core.md",
+            "\n".join("x" * 300 for _ in range(60)) + "\n",
+        )
         _, report = self._run_doctor()
         check = self._check(report, "tier0-size")
         self.assertEqual(check["status"], "warn", check)
@@ -956,8 +1102,10 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         self.assertFalse(check["details"]["configured"])
 
     def test_retention_unset_key_passes(self):
-        _write_text(self.home / ".claude" / "settings.json",
-                    json.dumps({"autoMemoryEnabled": False}))
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
         _, report = self._run_doctor()
         check = self._check(report, "session-retention")
         self.assertEqual(check["status"], "pass", check)
@@ -965,8 +1113,10 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
 
     def test_retention_thirty_days_is_pass_default_like(self):
         # 30 is the CC default: info-shaped pass, never a warn.
-        _write_text(self.home / ".claude" / "settings.json",
-                    json.dumps({"cleanupPeriodDays": 30}))
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"cleanupPeriodDays": 30}),
+        )
         _, report = self._run_doctor()
         check = self._check(report, "session-retention")
         self.assertEqual(check["status"], "pass", check)
@@ -974,8 +1124,10 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         self.assertEqual(check["details"]["cleanup_period_days"], 30)
 
     def test_retention_large_value_passes_with_retains_summary(self):
-        _write_text(self.home / ".claude" / "settings.json",
-                    json.dumps({"cleanupPeriodDays": 99999}))
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"cleanupPeriodDays": 99999}),
+        )
         _, report = self._run_doctor()
         check = self._check(report, "session-retention")
         self.assertEqual(check["status"], "pass", check)
@@ -984,15 +1136,19 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
     def test_retention_bool_and_nonpositive_count_as_unset(self):
         """PR feedback PRR-019/PRR-027: booleans and non-positive ints read as
         unset (default-30 note), never echoed as valid configuration."""
-        _write_text(self.home / ".claude" / "settings.json",
-                    json.dumps({"cleanupPeriodDays": True}))
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"cleanupPeriodDays": True}),
+        )
         _, report = self._run_doctor()
         check = self._check(report, "session-retention")
         self.assertEqual(check["status"], "pass", check)
         self.assertFalse(check["details"]["configured"])
 
-        _write_text(self.home / ".claude" / "settings.json",
-                    json.dumps({"cleanupPeriodDays": -5}))
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"cleanupPeriodDays": -5}),
+        )
         _, report = self._run_doctor()
         check = self._check(report, "session-retention")
         self.assertEqual(check["status"], "pass", check)
@@ -1000,10 +1156,14 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
         self.assertNotIn("-5", check["summary"])
 
     def test_retention_local_settings_override_shared(self):
-        _write_text(self.home / ".claude" / "settings.json",
-                    json.dumps({"cleanupPeriodDays": 30}))
-        _write_text(self.home / ".claude" / "settings.local.json",
-                    json.dumps({"cleanupPeriodDays": 365}))
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"cleanupPeriodDays": 30}),
+        )
+        _write_text(
+            self.home / ".claude" / "settings.local.json",
+            json.dumps({"cleanupPeriodDays": 365}),
+        )
         _, report = self._run_doctor()
         check = self._check(report, "session-retention")
         self.assertEqual(check["status"], "pass", check)
@@ -1013,10 +1173,14 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
     def test_retention_invalid_local_does_not_clobber_shared(self):
         """Feedback-reviewer finding: an INVALID local override (e.g. -5) must
         fail to override — it must not silently discard a valid shared value."""
-        _write_text(self.home / ".claude" / "settings.json",
-                    json.dumps({"cleanupPeriodDays": 60}))
-        _write_text(self.home / ".claude" / "settings.local.json",
-                    json.dumps({"cleanupPeriodDays": -5}))
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"cleanupPeriodDays": 60}),
+        )
+        _write_text(
+            self.home / ".claude" / "settings.local.json",
+            json.dumps({"cleanupPeriodDays": -5}),
+        )
         _, report = self._run_doctor()
         check = self._check(report, "session-retention")
         self.assertEqual(check["status"], "pass", check)
@@ -1026,14 +1190,19 @@ class DoctorIssue49ChecksTest(unittest.TestCase):
     def test_new_checks_never_contribute_a_fail(self):
         # Retention is informational and tier0 warns at most: neither may add
         # a fail (warn/skip/pass only), whatever the fixture.
-        _write_text(self.home / ".zmem" / "core.md",
-                    "\n".join(f"rule {i}" for i in range(300)) + "\n")
+        _write_text(
+            self.home / ".zmem" / "core.md",
+            "\n".join(f"rule {i}" for i in range(300)) + "\n",
+        )
         (self.home / ".claude").mkdir()
         _, report = self._run_doctor()
         self.assertEqual(self._check(report, "tier0-size")["status"], "warn")
         self.assertEqual(self._check(report, "session-retention")["status"], "pass")
-        statuses = {c["status"] for c in report["checks"]
-                    if c["id"] in ("tier0-size", "session-retention")}
+        statuses = {
+            c["status"]
+            for c in report["checks"]
+            if c["id"] in ("tier0-size", "session-retention")
+        }
         self.assertNotIn("fail", statuses)
 
 
@@ -1046,17 +1215,30 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
 
     def _run_json(self, env):
         result = subprocess.run(
-            [PYTHON, str(DOCTOR_PY), "--format", "json",
-             "--repo-root", str(self.repo), "--project", str(self.project)],
-            env=env, capture_output=True, text=True, timeout=60,
+            [
+                PYTHON,
+                str(DOCTOR_PY),
+                "--format",
+                "json",
+                "--repo-root",
+                str(self.repo),
+                "--project",
+                str(self.project),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         # C39: same PRR-014 guard as _run_doctor — a doctor crash must
         # surface as its traceback here, not as a confusing
         # JSONDecodeError on empty stdout in the caller.
         self.assertNotIn("Traceback", result.stderr, result.stderr)
-        self.assertTrue(result.stdout.strip(),
-                        f"doctor wrote no JSON (rc={result.returncode}) "
-                        f"stderr={result.stderr[-400:]!r}")
+        self.assertTrue(
+            result.stdout.strip(),
+            f"doctor wrote no JSON (rc={result.returncode}) "
+            f"stderr={result.stderr[-400:]!r}",
+        )
         return result
 
     @staticmethod
@@ -1083,9 +1265,12 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
 
     def test_mcp_token_scoped_json_is_pass(self):
         tok = self.tmp / "scoped-token.json"
-        _write_text(tok, json.dumps(
-            {"token": "doctor-scoped-secret",
-             "namespaces": ["project:zmem"]}))
+        _write_text(
+            tok,
+            json.dumps(
+                {"token": "doctor-scoped-secret", "namespaces": ["project:zmem"]}
+            ),
+        )
         env = self._env()
         env.pop("ZMEM_MCP_TOKEN", None)
         env["ZMEM_MCP_TOKEN_FILE"] = str(tok)
@@ -1123,8 +1308,7 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
 
     def test_mcp_token_json_null_namespaces_is_unscoped_warn(self):
         tok = self.tmp / "null-ns-token.json"
-        _write_text(tok, json.dumps(
-            {"token": "null-ns-secret", "namespaces": None}))
+        _write_text(tok, json.dumps({"token": "null-ns-secret", "namespaces": None}))
         env = self._env()
         env.pop("ZMEM_MCP_TOKEN", None)
         env["ZMEM_MCP_TOKEN_FILE"] = str(tok)
@@ -1153,7 +1337,8 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
                 " token_count INTEGER NOT NULL DEFAULT 0);"
                 "CREATE TABLE episode_memory (episode_id TEXT NOT NULL,"
                 " memory_id TEXT NOT NULL, added_at TEXT NOT NULL DEFAULT '',"
-                " PRIMARY KEY (episode_id, memory_id));")
+                " PRIMARY KEY (episode_id, memory_id));"
+            )
             conn.commit()
         finally:
             conn.close()
@@ -1173,8 +1358,11 @@ class DoctorUnitFailOpenTest(unittest.TestCase):
         import doctor  # noqa: E402
         from unittest import mock  # noqa: E402
 
-        with mock.patch.object(doctor.host, "resolve_core_md_path",
-                               side_effect=RuntimeError("hostile store env")):
+        with mock.patch.object(
+            doctor.host,
+            "resolve_core_md_path",
+            side_effect=RuntimeError("hostile store env"),
+        ):
             check = doctor._check_tier0_size(Path("/nonexistent-project"))
         # The unresolvable core.md simply is not measured — doctor never
         # tracebacks on a hostile store env.
@@ -1200,8 +1388,9 @@ class PythonFloorTest(unittest.TestCase):
         # self-contradictory line, and assertIn("3.11") then passed via the
         # leaked version instead of the floor being named (PRR-004).
         fake_version = "3.10.9 (tags/v3.10.9:b694321) [MSC v.1929 64 bit (AMD64)]"
-        with mock.patch("sys.version_info", (3, 10, 9, "final", 0)), \
-             mock.patch("sys.version", fake_version):
+        with mock.patch("sys.version_info", (3, 10, 9, "final", 0)), mock.patch(
+            "sys.version", fake_version
+        ):
             check = doctor._check_python()
         self.assertEqual(check["status"], "warn", check)
         self.assertIn("3.10.9", check["summary"], check)
@@ -1228,6 +1417,7 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
     def _report(self, env_extra):
         import json as _json
         import subprocess as _sub
+
         tmp = tempfile.mkdtemp(prefix="zmem-doctor63-")
         self.addCleanup(shutil.rmtree, tmp, True)
         data = Path(tmp) / "data"
@@ -1246,10 +1436,12 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
             if var not in env_extra:
                 env.pop(var, None)
         r = _sub.run(
-            [sys.executable, str(self.scripts / "doctor.py"),
-             "--format", "json"],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(self.scripts), env=env,
+            [sys.executable, str(self.scripts / "doctor.py"), "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(self.scripts),
+            env=env,
         )
         rep = _json.loads(r.stdout) if r.stdout.strip() else {"checks": []}
         return rep
@@ -1264,6 +1456,7 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
         sys.path.insert(0, str(self.scripts))
         import tempfile as _tf
         import sqlite3 as _sq
+
         store_dir = Path(_tf.mkdtemp(prefix="zmem-doctor63b-"))
         self.addCleanup(shutil.rmtree, store_dir, True)
         db = store_dir / "store.sqlite"
@@ -1287,56 +1480,84 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
             " VALUES('r1','hello world','2026-01-01T00:00:00Z',"
             "'2026-01-01T00:00:00Z');"
         )
-        c.commit(); c.close()
+        c.commit()
+        c.close()
         env = {
             "ZMEM_DATA": str(store_dir),
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
             "ZMEM_MODELS_DIR": str(store_dir / "no-models"),
         }
         rep = self._report(env)
-        eh = next(c for c in rep["checks"]
-                  if c["id"] == "embeddings_health")
+        eh = next(c for c in rep["checks"] if c["id"] == "embeddings_health")
         d = eh["details"]
-        for key in ("rows_with_embedding", "rows_without_embedding",
-                    "shipped_profiles", "active_profile", "matches_store"):
+        for key in (
+            "rows_with_embedding",
+            "rows_without_embedding",
+            "shipped_profiles",
+            "active_profile",
+            "matches_store",
+        ):
             self.assertIn(key, d, key)
         self.assertEqual(d["live_memories"], 1)
         names = {p["name"] for p in d["shipped_profiles"]}
         self.assertEqual(names, {"minilm", "fake"})
-        # zax-L3/PRR-005: opt-in cross-encoder visibility must exist in the
-        # health payload even when unset (disabled + unconfigured defaults)
+        # zax-L3/PRR-005: cross-encoder visibility must exist in the
+        # health payload even when unset (issue #126: unset = enabled
+        # by default; unconfigured model still degrades fail-open)
         ce = d.get("cross_encoder") or {}
         self.assertIn("enabled", ce)
-        self.assertEqual(ce.get("enabled"), False)
+        self.assertEqual(ce.get("enabled"), True)
 
     def test_warning_decision_core_unit(self):
         sys.path.insert(0, str(self.scripts))
         import doctor
 
         w = doctor._embedding_health_warnings(
-            active_profile="fake", embeddings_available=True,
-            matches_store=None, total_live=5, with_emb=5,
-            store_is_temp=False)
+            active_profile="fake",
+            embeddings_available=True,
+            matches_store=None,
+            total_live=5,
+            with_emb=5,
+            store_is_temp=False,
+        )
         self.assertEqual(len(w), 1)
         self.assertIn("NON-temporary", w[0])
 
         w2 = doctor._embedding_health_warnings(
-            active_profile="minilm", embeddings_available=True,
-            matches_store=True, total_live=9, with_emb=0,
-            store_is_temp=True)
+            active_profile="minilm",
+            embeddings_available=True,
+            matches_store=True,
+            total_live=9,
+            with_emb=0,
+            store_is_temp=True,
+        )
         self.assertEqual(len(w2), 1)
         self.assertIn("ZERO embedded", w2[0])
 
         # fake inside a temp sandbox stays quiet; unavailable runtime mutes
         # the zero-embedded advisory
-        self.assertEqual(doctor._embedding_health_warnings(
-            active_profile="fake", embeddings_available=True,
-            matches_store=None, total_live=5, with_emb=5,
-            store_is_temp=True), [])
-        self.assertEqual(doctor._embedding_health_warnings(
-            active_profile="minilm", embeddings_available=False,
-            matches_store=None, total_live=9, with_emb=0,
-            store_is_temp=True), [])
+        self.assertEqual(
+            doctor._embedding_health_warnings(
+                active_profile="fake",
+                embeddings_available=True,
+                matches_store=None,
+                total_live=5,
+                with_emb=5,
+                store_is_temp=True,
+            ),
+            [],
+        )
+        self.assertEqual(
+            doctor._embedding_health_warnings(
+                active_profile="minilm",
+                embeddings_available=False,
+                matches_store=None,
+                total_live=9,
+                with_emb=0,
+                store_is_temp=True,
+            ),
+            [],
+        )
 
 
 INSTALL_SKEW_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "doctor" / "install-skew"
@@ -1391,9 +1612,15 @@ class DoctorInstallSkewTest(unittest.TestCase):
         if REAL_GIT:
             subprocess.run([REAL_GIT, "init", "-q"], cwd=str(self.project), check=True)
             subprocess.run(
-                [REAL_GIT, "remote", "add", "origin",
-                 "https://github.com/Example/Widget.git"],
-                cwd=str(self.project), check=True,
+                [
+                    REAL_GIT,
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/Example/Widget.git",
+                ],
+                cwd=str(self.project),
+                check=True,
             )
 
     def tearDown(self):
@@ -1434,14 +1661,21 @@ class DoctorInstallSkewTest(unittest.TestCase):
         env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
         env["ZMEM_BASH_PATH"] = str(self.bin / "Git" / "bin" / "bash.cmd")
         for key in (
-            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_CORE_MD",
-            "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+            "ZMEM_STORE",
+            "ZMEM_DATA",
+            "ZMEM_CORE_MD",
+            "CLAUDE_PLUGIN_DATA",
+            "ZCODE_PLUGIN_DATA",
             "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
-            "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
-            "ZMEM_EMBED_PROFILE", "ZMEM_CROSS_ENCODER",
+            "ZMEM_MODELS_DIR",
+            "ZMEM_MODEL_AUTODOWNLOAD",
+            "ZMEM_EMBED_PROFILE",
+            "ZMEM_CROSS_ENCODER",
             "ZMEM_CROSS_ENCODER_MODEL",
-            "OneDrive", "OneDriveConsumer", "OneDriveCommercial",
+            "OneDrive",
+            "OneDriveConsumer",
+            "OneDriveCommercial",
         ):
             env.pop(key, None)
         return env
@@ -1469,13 +1703,14 @@ class DoctorInstallSkewTest(unittest.TestCase):
     def _doctor(self):
         sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
         import doctor  # noqa: E402
+
         return doctor
 
     def _relative_to_home(self, raw) -> str:
         text = str(raw).replace("\\", "/")
         prefix = str(self.home).replace("\\", "/").rstrip("/") + "/"
         if text.lower().startswith(prefix.lower()):
-            return text[len(prefix):]
+            return text[len(prefix) :]
         return text.lstrip("/")
 
     # --- _host_install_checks ----------------------------------------------
@@ -1500,28 +1735,42 @@ class DoctorInstallSkewTest(unittest.TestCase):
         # non-semver foreign version must not crash the pin comparison).
         foreign_home = self.tmp / "foreign-home"
         foreign_registry = (
-            foreign_home / ".claude" / "plugins" / "installed_plugins.json")
-        _write_text(foreign_registry, json.dumps({
-            "version": 2,
-            "plugins": {
-                "zmem@solo": [{
-                    "scope": "user",
-                    "version": "0.27.0",
-                    "enabled": True,
-                }],
-                "other-author@other-plugin": [{
-                    "scope": "user",
-                    "version": "1.2.3",
-                    "enabled": True,
-                }],
-            },
-        }) + "\n")
+            foreign_home / ".claude" / "plugins" / "installed_plugins.json"
+        )
+        _write_text(
+            foreign_registry,
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {
+                        "zmem@solo": [
+                            {
+                                "scope": "user",
+                                "version": "0.27.0",
+                                "enabled": True,
+                            }
+                        ],
+                        "other-author@other-plugin": [
+                            {
+                                "scope": "user",
+                                "version": "1.2.3",
+                                "enabled": True,
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n",
+        )
         foreign_checks = doctor._host_install_checks(
-            foreign_home, self.project, self.repo)
+            foreign_home, self.project, self.repo
+        )
         foreign_dupes = [
-            c for c in foreign_checks if c.get("id") == "duplicate-install"]
+            c for c in foreign_checks if c.get("id") == "duplicate-install"
+        ]
         self.assertEqual(
-            len(foreign_dupes), 0,
+            len(foreign_dupes),
+            0,
             "non-zmem plugins must not produce duplicate-install: %r"
             % (foreign_checks,),
         )
@@ -1554,7 +1803,8 @@ class DoctorInstallSkewTest(unittest.TestCase):
         check = pins[0]
         self.assertEqual(check["status"], "warn", check)
         self.assertEqual(
-            check["summary"], "project-pin project=0.14.0 user=0.27.0", check)
+            check["summary"], "project-pin project=0.14.0 user=0.27.0", check
+        )
         rendered = json.dumps(check.get("details", {}))
         self.assertIn("zmem@project-pin", rendered)
         self.assertIn("project", rendered)
@@ -1566,14 +1816,14 @@ class DoctorInstallSkewTest(unittest.TestCase):
         doctor = self._doctor()
         self._install_fixture_home()
         hook_ids = doctor._codex_manifest_hook_ids(
-            INSTALL_SKEW_FIXTURES / "hooks" / "hooks.codex.json")
+            INSTALL_SKEW_FIXTURES / "hooks" / "hooks.codex.json"
+        )
         self.assertIn("session_start", hook_ids, hook_ids)
         self.assertIn("pre_tool_use", hook_ids, hook_ids)
         # The fixture config trusts only session_start for C:/fixture/repo;
         # matching is a string comparison and never requires that key to
         # exist as a real directory.
-        check = doctor._check_codex_manifest_trust(
-            self.home, Path("C:/fixture/repo"))
+        check = doctor._check_codex_manifest_trust(self.home, Path("C:/fixture/repo"))
         self.assertEqual(check["id"], "untrusted-hook", check)
         self.assertEqual(check["status"], "warn", check)
         self.assertEqual(check["summary"], "untrusted-hook pre_tool_use", check)
@@ -1584,14 +1834,15 @@ class DoctorInstallSkewTest(unittest.TestCase):
         # WARN, never read as "nothing registered" (silent PASS). The
         # manifest resolves from repo_root when present, so point repo_root
         # at a scratch repo holding each bad payload.
-        for payload in ("[]", "{\"hooks\": \"x\"}", "{}"):
+        for payload in ("[]", '{"hooks": "x"}', "{}"):
             shape_repo = self.tmp / "shape-repo"
             shape_repo_hooks = shape_repo / "hooks"
             if shape_repo_hooks.exists():
                 shutil.rmtree(shape_repo_hooks)
             shape_repo_hooks.mkdir(parents=True)
             (shape_repo_hooks / "hooks.codex.json").write_text(
-                payload, encoding="utf-8", newline="\n")
+                payload, encoding="utf-8", newline="\n"
+            )
             check = doctor._check_codex_manifest_trust(self.home, shape_repo)
             if payload == "{}":
                 # An empty manifest registers nothing: PASS is correct.
@@ -1602,9 +1853,9 @@ class DoctorInstallSkewTest(unittest.TestCase):
         # Issue #185 review PRR-004: even with host_registry unavailable,
         # the manifest-trust check must still run.
         from unittest import mock
+
         with mock.patch.object(doctor, "host_registry", None):
-            checks = doctor._host_install_checks(
-                self.home, self.project, self.repo)
+            checks = doctor._host_install_checks(self.home, self.project, self.repo)
         self.assertTrue(
             [c for c in checks if c.get("id") == "untrusted-hook"],
             checks,
@@ -1617,7 +1868,8 @@ class DoctorInstallSkewTest(unittest.TestCase):
         setting = self.home / ".zcode" / "v2" / "setting.json"
         setting.parent.mkdir(parents=True, exist_ok=True)
         setting.write_bytes(
-            (INSTALL_SKEW_FIXTURES / "zcode" / "v2" / "setting.json").read_bytes())
+            (INSTALL_SKEW_FIXTURES / "zcode" / "v2" / "setting.json").read_bytes()
+        )
         check = doctor._check_zcode_native_memory(self.home)
         self.assertEqual(check["id"], "zcode-native-memory", check)
         self.assertEqual(check["status"], "pass", check)
@@ -1627,8 +1879,7 @@ class DoctorInstallSkewTest(unittest.TestCase):
         self.assertIn("setting.json", rendered)
         # Issue #185 review PRR-007: pin the remaining branches — explicit
         # true FAILs, a missing key warns, and unreadable JSON warns.
-        setting.write_text("{\"memoryEnabled\": true}\n",
-                           encoding="utf-8", newline="\n")
+        setting.write_text('{"memoryEnabled": true}\n', encoding="utf-8", newline="\n")
         check = doctor._check_zcode_native_memory(self.home)
         self.assertEqual(check["status"], "fail", check)
         setting.write_text("{}\n", encoding="utf-8", newline="\n")
@@ -1650,14 +1901,15 @@ class DoctorInstallSkewTest(unittest.TestCase):
         decoy.parent.mkdir(parents=True, exist_ok=True)
         decoy.write_bytes(b"not a sqlite database")
         env = {"HOME": str(self.home), "USERPROFILE": str(self.home)}
-        with mock.patch.dict(os.environ, env), \
-                mock.patch.object(Path, "home", return_value=self.home):
+        with mock.patch.dict(os.environ, env), mock.patch.object(
+            Path, "home", return_value=self.home
+        ):
             for key in ("ZCODE_PLUGIN_DATA", "CLAUDE_PLUGIN_DATA"):
                 os.environ.pop(key, None)
             candidates = doctor._orphan_store_candidates(
-                resolved, self.home, extra_candidates=[orphan])
-            checks = doctor._check_orphan_stores(
-                resolved, extra_candidates=[orphan])
+                resolved, self.home, extra_candidates=[orphan]
+            )
+            checks = doctor._check_orphan_stores(resolved, extra_candidates=[orphan])
         # Only the injected fixture is a candidate: no env vars point
         # anywhere, home has no .zcode/memory store, and unrelated decoy
         # directories are never scanned.
@@ -1692,15 +1944,19 @@ class DoctorInstallSkewTest(unittest.TestCase):
         self.assertIsInstance(checks, list, checks)
         self.assertFalse([c for c in checks if c["status"] == "fail"], checks)
         warned = [
-            c for c in checks
+            c
+            for c in checks
             if c["status"] == "warn"
             and "installed_plugins.json" in json.dumps(c).replace("\\", "/")
         ]
         self.assertTrue(warned, checks)
         result = self._run(
-            "--format", "json",
-            "--repo-root", str(self.repo),
-            "--project", str(self.project),
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
         )
         self.assertNotIn("Traceback", result.stderr, result.stderr)
         self.assertTrue(result.stdout.strip(), result.stderr)
@@ -1717,17 +1973,20 @@ class DoctorInstallSkewTest(unittest.TestCase):
         self._install_fixture_home_at(big_home)
         big_registry = big_home / ".claude" / "plugins" / "installed_plugins.json"
         registry = json.loads(big_registry.read_text(encoding="utf-8"))
-        registry["plugins"]["zmem@big"] = [{
-            "scope": "user",
-            "version": "1." + "9" * 5000 + ".3",
-            "enabled": True,
-        }]
+        registry["plugins"]["zmem@big"] = [
+            {
+                "scope": "user",
+                "version": "1." + "9" * 5000 + ".3",
+                "enabled": True,
+            }
+        ]
         big_registry.write_text(
-            json.dumps(registry) + "\n", encoding="utf-8", newline="\n")
-        big_checks = doctor._host_install_checks(
-            big_home, self.project, self.repo)
+            json.dumps(registry) + "\n", encoding="utf-8", newline="\n"
+        )
+        big_checks = doctor._host_install_checks(big_home, self.project, self.repo)
         big_warned = [
-            c for c in big_checks
+            c
+            for c in big_checks
             if c.get("id") == "host-registry" and c.get("status") == "warn"
         ]
         self.assertTrue(big_warned, big_checks)
@@ -1749,13 +2008,15 @@ class DoctorInstallSkewTest(unittest.TestCase):
         )
         self._install_fixture_home()
         (self.repo / "hooks" / "hooks.codex.json").write_bytes(
-            (INSTALL_SKEW_FIXTURES / "hooks" / "hooks.codex.json").read_bytes())
+            (INSTALL_SKEW_FIXTURES / "hooks" / "hooks.codex.json").read_bytes()
+        )
         env = self._scratch_env()
         env["CLAUDE_PLUGIN_DATA"] = str(self.home / "orphan")
         scratch_store = Path(env["ZMEM_STORE"])
 
         fixture_files = sorted(
-            p for p in INSTALL_SKEW_FIXTURES.rglob("*") if p.is_file())
+            p for p in INSTALL_SKEW_FIXTURES.rglob("*") if p.is_file()
+        )
         before = {p: _sha256(p) for p in fixture_files}
         digest_before = _fixture_tree_digest(INSTALL_SKEW_FIXTURES)
         self.assertRegex(digest_before, r"^[0-9a-f]{64}$")
@@ -1767,11 +2028,23 @@ class DoctorInstallSkewTest(unittest.TestCase):
         }
 
         json_run = self._run(
-            "--format", "json", "--repo-root", str(self.repo),
-            "--project", str(self.project), env=env)
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+            env=env,
+        )
         human_run = self._run(
-            "--format", "human", "--repo-root", str(self.repo),
-            "--project", str(self.project), env=env)
+            "--format",
+            "human",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+            env=env,
+        )
         self.assertEqual(json_run.returncode, 1, json_run.stdout + json_run.stderr)
         self.assertEqual(human_run.returncode, 1, human_run.stdout + human_run.stderr)
 
@@ -1800,7 +2073,9 @@ class DoctorInstallSkewTest(unittest.TestCase):
                 self.assertEqual(entry["details"]["schema_version"], 9, check)
                 self.assertEqual(entry["details"]["rows"], 362, check)
             extracted.append(entry)
-        expected_line = (INSTALL_SKEW_FIXTURES / "expected.json").read_bytes().rstrip(b"\n")
+        expected_line = (
+            (INSTALL_SKEW_FIXTURES / "expected.json").read_bytes().rstrip(b"\n")
+        )
         self.assertEqual(
             json.dumps({"checks": extracted}, separators=(",", ":")).encode("utf-8"),
             expected_line,
@@ -1810,20 +2085,28 @@ class DoctorInstallSkewTest(unittest.TestCase):
         # JSON/human parity: the same six ids render with the same tokens.
         self.assertIn(
             "[FAIL] duplicate-install: duplicate-install host=claude "
-            "ids=zmem@primary,zmem@secondary", human_run.stdout)
+            "ids=zmem@primary,zmem@secondary",
+            human_run.stdout,
+        )
         self.assertIn(
             "[WARN] marketplace-skew: marketplace-skew "
-            "installed=0.27.0 marketplace=0.14.0", human_run.stdout)
+            "installed=0.27.0 marketplace=0.14.0",
+            human_run.stdout,
+        )
         self.assertIn(
             "[WARN] project-pin: project-pin project=0.14.0 user=0.27.0",
-            human_run.stdout)
-        self.assertIn("[WARN] untrusted-hook: untrusted-hook pre_tool_use",
-                      human_run.stdout)
+            human_run.stdout,
+        )
+        self.assertIn(
+            "[WARN] untrusted-hook: untrusted-hook pre_tool_use", human_run.stdout
+        )
         self.assertIn(
             "[PASS] zcode-native-memory: ZCode native memory is disabled.",
-            human_run.stdout)
-        self.assertIn("[WARN] orphan-store: orphan-store schema=9 rows=362",
-                      human_run.stdout)
+            human_run.stdout,
+        )
+        self.assertIn(
+            "[WARN] orphan-store: orphan-store schema=9 rows=362", human_run.stdout
+        )
 
         # Read-only proof: doctor never creates or rewrites a single byte.
         self.assertFalse(scratch_store.exists(), "doctor must not create the store")
@@ -1853,9 +2136,15 @@ class FeedbackDoctorTest(unittest.TestCase):
     FB_SESS = "00000000-0000-4000-8000-000000000124"
     FB_M125 = "00000000-0000-4000-8000-000000000125"
     FB_M126 = "00000000-0000-4000-8000-000000000126"
-    _LABELS = ("total_applied", "total_violated", "nonzero_applied",
-               "nonzero_violated", "matched_applied", "matched_violated",
-               "unmatched_operations")
+    _LABELS = (
+        "total_applied",
+        "total_violated",
+        "nonzero_applied",
+        "nonzero_violated",
+        "matched_applied",
+        "matched_violated",
+        "unmatched_operations",
+    )
 
     def test_counter_totals_and_ranges(self):
         import doctor
@@ -1866,21 +2155,23 @@ class FeedbackDoctorTest(unittest.TestCase):
         store = Path(tmp) / "store.sqlite"
         conn = sqlite3.connect(str(store))
         try:
-            conn.execute(
-                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
-                (str(CURRENT_SCHEMA_VERSION),))
+                (str(CURRENT_SCHEMA_VERSION),),
+            )
             conn.execute(
                 "CREATE TABLE memory(id TEXT PRIMARY KEY, superseded_at TEXT,"
                 " applied_count INTEGER NOT NULL DEFAULT 0,"
-                " violated_count INTEGER NOT NULL DEFAULT 0)")
+                " violated_count INTEGER NOT NULL DEFAULT 0)"
+            )
             # Fixture semantics: one row violated once, one row applied once
             # (both live — the totals aggregate over live rows only).
             conn.executemany(
                 "INSERT INTO memory(id, superseded_at, applied_count,"
                 " violated_count) VALUES (?, NULL, ?, ?)",
-                [(self.FB_M125, 0, 1), (self.FB_M126, 1, 0)])
+                [(self.FB_M125, 0, 1), (self.FB_M126, 1, 0)],
+            )
             conn.commit()
         finally:
             conn.close()
@@ -1889,19 +2180,36 @@ class FeedbackDoctorTest(unittest.TestCase):
         # violated + one applied + one unmatched record.
         ops = Path(tmp) / "ops"
         ops.mkdir()
-        sidecar = ops / (hashlib.sha256(
-            self.FB_SESS.encode("utf-8")).hexdigest()[:32]
-            + ".feedback.jsonl")
+        sidecar = ops / (
+            hashlib.sha256(self.FB_SESS.encode("utf-8")).hexdigest()[:32]
+            + ".feedback.jsonl"
+        )
         sidecar.write_bytes(
-            (REPO_ROOT / "tests" / "fixtures"
-             / "feedback_sidecar_expected.jsonl").read_bytes())
+            (
+                REPO_ROOT / "tests" / "fixtures" / "feedback_sidecar_expected.jsonl"
+            ).read_bytes()
+        )
 
-        env = {k: v for k, v in os.environ.items() if k not in (
-            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_BACKUP_DIR",
-            "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")}
-        env.update({"ZMEM_STORE": str(store), "ZMEM_DATA": tmp,
-                    "ZMEM_MODELS_DIR": os.path.join(tmp, "missing-models"),
-                    "ZMEM_MODEL_AUTODOWNLOAD": "0"})
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in (
+                "ZMEM_STORE",
+                "ZMEM_DATA",
+                "ZMEM_BACKUP_DIR",
+                "CLAUDE_PLUGIN_DATA",
+                "ZCODE_PLUGIN_DATA",
+            )
+        }
+        env.update(
+            {
+                "ZMEM_STORE": str(store),
+                "ZMEM_DATA": tmp,
+                "ZMEM_MODELS_DIR": os.path.join(tmp, "missing-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            }
+        )
         with mock.patch.dict(os.environ, env):
             check = doctor._check_voyager_counters(store)
         self.assertEqual(check["status"], "pass", check)
@@ -1919,11 +2227,13 @@ class FeedbackDoctorTest(unittest.TestCase):
         summary = check["summary"]
         positions = []
         for label in self._LABELS:
-            self.assertIn(label + "=", summary,
-                          f"summary must name {label} (got: {summary!r})")
+            self.assertIn(
+                label + "=", summary, f"summary must name {label} (got: {summary!r})"
+            )
             positions.append(summary.index(label + "="))
-        self.assertEqual(positions, sorted(positions),
-                         f"labels out of order in summary: {summary!r}")
+        self.assertEqual(
+            positions, sorted(positions), f"labels out of order in summary: {summary!r}"
+        )
         self.assertEqual(len(set(positions)), 7)
 
 

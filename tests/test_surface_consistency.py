@@ -70,9 +70,9 @@ class AdapterScanTest(unittest.TestCase):
         """Return the body of `def method(...)` up to the next `def ` at col 0."""
         m = re.search(rf"^\s*def {method}\(.*$", text, re.MULTILINE)
         self.assertIsNotNone(m, f"def {method} not found")
-        rest = text[m.end():]
+        rest = text[m.end() :]
         nxt = re.search(r"^\s*def ", rest, re.MULTILINE)
-        return rest if nxt is None else rest[:nxt.start()]
+        return rest if nxt is None else rest[: nxt.start()]
 
     def test_passive_hooks_carry_no_bump(self):
         # Issue #58, 3.9: recall (UserPromptSubmit) and precompact share a
@@ -92,14 +92,14 @@ class AdapterScanTest(unittest.TestCase):
             # CreateProcess command-line limit and silently degraded.
             if rel in ("hooks/zmem-recall.sh", "hooks/zmem-precompact.sh"):
                 self.assertIn(
-                    "lib/zmem-recall-body.py", text,
+                    "lib/zmem-recall-body.py",
+                    text,
                     f"{rel} must source the shared recall body to honor "
                     f"--no-bump (issue #58, 3.5/3.8/3.9)",
                 )
                 combined = text + "\n" + body_text
             elif rel == "hooks/zmem-session-start.sh":
-                payload = (REPO_ROOT / "hooks" / "lib"
-                           / "zmem-session-start-payload.py")
+                payload = REPO_ROOT / "hooks" / "lib" / "zmem-session-start-payload.py"
                 self.assertTrue(
                     payload.is_file(),
                     "session-start must keep its payload block in "
@@ -111,18 +111,26 @@ class AdapterScanTest(unittest.TestCase):
             else:
                 combined = text
             self.assertIn(
-                "--no-bump", combined,
+                "--no-bump",
+                combined,
                 f"{rel} is a passive recall path and MUST pass --no-bump so it records "
-                "a surface event, not a retrieval")
+                "a surface event, not a retrieval",
+            )
 
     def test_passive_hermes_prefetch_carries_no_bump(self):
         text = (REPO_ROOT / "hermes-plugin" / "__init__.py").read_text(encoding="utf-8")
         prefetch = self._method_body(text, "prefetch")
         helper = self._method_body(text, "_passive_store_args")
-        self.assertIn("_passive_store_args", prefetch,
-                      "Hermes prefetch must use the shared passive argv builder")
-        self.assertIn("--no-bump", helper,
-                      "the shared Hermes passive argv builder MUST pass --no-bump")
+        self.assertIn(
+            "_passive_store_args",
+            prefetch,
+            "Hermes prefetch must use the shared passive argv builder",
+        )
+        self.assertIn(
+            "--no-bump",
+            helper,
+            "the shared Hermes passive argv builder MUST pass --no-bump",
+        )
 
     # --- issue #122: Hermes compatibility adapter surface ---
 
@@ -130,14 +138,22 @@ class AdapterScanTest(unittest.TestCase):
         # The compat hook's LOCAL prefetch command must be the shared
         # selector shape: namespace + session attribution + the closed
         # moment/lane vocabulary + the passive injection markers.
-        text = (REPO_ROOT / "hermes-plugin" / "hooks"
-                / "zmem-hermes-reflect.py").read_text(encoding="utf-8")
+        text = (
+            REPO_ROOT / "hermes-plugin" / "hooks" / "zmem-hermes-reflect.py"
+        ).read_text(encoding="utf-8")
         body = self._method_body(text, "_prefetch")
-        for literal in ('"--namespace"', '"--session-id"',
-                        '"--moment", "user_prompt"', '"--lane", "hermes-compat"',
-                        '"--for-injection"', '"--no-bump"', '"--json"'):
-            self.assertIn(literal, body,
-                          f"compat local prefetch command must carry {literal}")
+        for literal in (
+            '"--namespace"',
+            '"--session-id"',
+            '"--moment", "user_prompt"',
+            '"--lane", "hermes-compat"',
+            '"--for-injection"',
+            '"--no-bump"',
+            '"--json"',
+        ):
+            self.assertIn(
+                literal, body, f"compat local prefetch command must carry {literal}"
+            )
 
     def test_signal_none_at_030_stays_out_of_compatibility_context(self):
         # The below-relevance selector response passes through UNTOUCHED:
@@ -147,27 +163,29 @@ class AdapterScanTest(unittest.TestCase):
         import io
         from unittest import mock as _mock
         import types as _types
+
         compat = REPO_ROOT / "tests" / "fixtures" / "hermes_compat"
-        envelope = (compat / "rejected-response.json").read_text(
-            encoding="utf-8")
+        envelope = (compat / "rejected-response.json").read_text(encoding="utf-8")
         memory_id = json.loads(envelope)["candidate_ids"][0]
         self.assertEqual(len(memory_id), 36, memory_id)
 
         spec = _ilu.spec_from_file_location(
             "zmem_reflect_surface_scan",
-            REPO_ROOT / "hermes-plugin" / "hooks" / "zmem-hermes-reflect.py")
+            REPO_ROOT / "hermes-plugin" / "hooks" / "zmem-hermes-reflect.py",
+        )
         mod = _ilu.module_from_spec(spec)
         spec.loader.exec_module(mod)
         real_run = mod.subprocess.run
 
         def fake_run(cmd, **kwargs):
             if any("mcp_client.py" in str(part) for part in cmd):
-                return _types.SimpleNamespace(returncode=0, stdout=envelope,
-                                              stderr="")
+                return _types.SimpleNamespace(returncode=0, stdout=envelope, stderr="")
             return real_run(cmd, **kwargs)
 
         out, err = io.StringIO(), io.StringIO()
-        with _mock.patch.dict(os.environ, {
+        with _mock.patch.dict(
+            os.environ,
+            {
                 "ZMEM_STORE": os.path.join(_IMPORT_TMP, "store.sqlite"),
                 "ZMEM_DATA": _IMPORT_TMP,
                 "ZMEM_MODELS_DIR": os.path.join(_IMPORT_TMP, "no-models"),
@@ -175,14 +193,23 @@ class AdapterScanTest(unittest.TestCase):
                 "ZMEM_MCP_URL": "http://127.0.0.1:9/mcp",
                 "ZMEM_MCP_TOKEN": "scan-token",
                 "ZMEM_MCP_NAMESPACE": "project:github.com/acme/demo",
-        }), _mock.patch.object(mod.subprocess, "run", fake_run), \
-                _mock.patch.object(sys, "stdin", io.StringIO(json.dumps({
-                    "session_id": "00000000-0000-4000-8000-000000000122",
-                    "user_message":
-                        "Please check the stash safety for this turn.",
-                }))), \
-                _mock.patch.object(sys, "stdout", out), \
-                _mock.patch.object(sys, "stderr", err):
+            },
+        ), _mock.patch.object(mod.subprocess, "run", fake_run), _mock.patch.object(
+            sys,
+            "stdin",
+            io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": "00000000-0000-4000-8000-000000000122",
+                        "user_message": "Please check the stash safety for this turn.",
+                    }
+                )
+            ),
+        ), _mock.patch.object(
+            sys, "stdout", out
+        ), _mock.patch.object(
+            sys, "stderr", err
+        ):
             rc = mod.main()
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out.getvalue()), {})
@@ -193,34 +220,47 @@ class AdapterScanTest(unittest.TestCase):
 
     def test_explicit_hermes_tool_search_omits_no_bump(self):
         text = (REPO_ROOT / "hermes-plugin" / "__init__.py").read_text(encoding="utf-8")
-        self.assertNotIn("--no-bump", self._method_body(text, "_tool_search"),
-                         "Hermes _tool_search is EXPLICIT and must NOT pass --no-bump")
+        self.assertNotIn(
+            "--no-bump",
+            self._method_body(text, "_tool_search"),
+            "Hermes _tool_search is EXPLICIT and must NOT pass --no-bump",
+        )
 
     def test_explicit_mcp_recall_omits_no_bump(self):
         text = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py").read_text(
-            encoding="utf-8")
+            encoding="utf-8"
+        )
         # v13 (issue #65, 10.5): session_start is the D4 PASSIVE path. Issue
         # #159 reworked it onto the queryless selector path — passivity is
         # now STRUCTURAL (the selector records surfaced events and never
         # bumps retrieval_count), carried by the literal --for-injection
         # marker instead of a client-side --no-bump flag.
         import ast as _ast
+
         tree = _ast.parse(text)
         bodies = {}
         for node in _ast.walk(tree):
             if isinstance(node, _ast.AsyncFunctionDef) and node.name in (
-                "recall", "search", "recent", "session_start", "session_end",
+                "recall",
+                "search",
+                "recent",
+                "session_start",
+                "session_end",
             ):
                 bodies[node.name] = _ast.get_source_segment(text, node) or ""
         for explicit in ("recall", "search", "recent"):
             self.assertIn(explicit, bodies, f"tool {explicit} missing?")
             self.assertNotIn(
-                "--no-bump", bodies[explicit],
-                f"MCP {explicit} is EXPLICIT and must NOT pass --no-bump")
+                "--no-bump",
+                bodies[explicit],
+                f"MCP {explicit} is EXPLICIT and must NOT pass --no-bump",
+            )
         self.assertIn(
-            "--for-injection", bodies.get("session_start", ""),
+            "--for-injection",
+            bodies.get("session_start", ""),
             "MCP session_start is the D4 passive path and MUST pass --no-bump "
-            "(issue #65, 10.5)")
+            "(issue #65, 10.5)",
+        )
 
     def test_explicit_mcp_recall_docstring_documents_bump(self):
         # I2 (#38 / #56): the explicit-vs-passive bump rule is tested design,
@@ -232,21 +272,30 @@ class AdapterScanTest(unittest.TestCase):
         # prohibition on the passive flag literal in this file is pinned
         # separately by test_explicit_mcp_recall_omits_no_bump.
         source = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py").read_text(
-            encoding="utf-8")
+            encoding="utf-8"
+        )
         tree = ast.parse(source)
         doc = None
         for node in ast.walk(tree):
             # The MCP tools are `async def` closures, so the recall tool is an
             # ast.AsyncFunctionDef, not an ast.FunctionDef.
-            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name == "recall"):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "recall"
+            ):
                 doc = ast.get_docstring(node)
                 break
         self.assertIsNotNone(doc, "MCP recall tool must have a docstring")
-        self.assertIn("retrieval_count", doc,
-                      "the docstring must name the counter that explicit recall bumps")
-        self.assertIn("passive", doc,
-                      "the docstring must contrast explicit recall with the passive surfaces")
+        self.assertIn(
+            "retrieval_count",
+            doc,
+            "the docstring must name the counter that explicit recall bumps",
+        )
+        self.assertIn(
+            "passive",
+            doc,
+            "the docstring must contrast explicit recall with the passive surfaces",
+        )
 
     def test_passive_surfaces_omit_issue82_flags(self):
         """Issue #82: passive surfaces must never pass --explain/--no-unfold.
@@ -254,26 +303,30 @@ class AdapterScanTest(unittest.TestCase):
         structurally excluded from both (no_telemetry / the no_bump gate), and
         their argv must stay byte-identical."""
         body_text = (REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py").read_text(
-            encoding="utf-8")
+            encoding="utf-8"
+        )
         for rel in sorted(self.PASSIVE):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             # Mirror test_passive_hooks_carry_no_bump: only the hooks that
             # SOURCE the shared body get it appended — session-start inlines
             # its own store.py invocation and must not inherit shared-body
             # text it never executes (PR-review PRR-022/cubic).
-            if rel in ("hooks/zmem-recall.sh", "hooks/zmem-precompact.sh",
-                       "hooks/zmem-subagent-recall.sh"):
+            if rel in (
+                "hooks/zmem-recall.sh",
+                "hooks/zmem-precompact.sh",
+                "hooks/zmem-subagent-recall.sh",
+            ):
                 combined = text + "\n" + body_text
             else:
                 combined = text
-            self.assertNotIn("--no-unfold", combined,
-                             f"{rel} must not pass --no-unfold")
-            self.assertNotIn("--explain", combined,
-                             f"{rel} must not pass --explain")
+            self.assertNotIn(
+                "--no-unfold", combined, f"{rel} must not pass --no-unfold"
+            )
+            self.assertNotIn("--explain", combined, f"{rel} must not pass --explain")
         prefetch = self._method_body(
-            (REPO_ROOT / "hermes-plugin" / "__init__.py").read_text(
-                encoding="utf-8"),
-            "prefetch")
+            (REPO_ROOT / "hermes-plugin" / "__init__.py").read_text(encoding="utf-8"),
+            "prefetch",
+        )
         self.assertNotIn("--no-unfold", prefetch)
         self.assertNotIn("--explain", prefetch)
 
@@ -282,38 +335,48 @@ class AdapterScanTest(unittest.TestCase):
         hook, Hermes, or MCP surface may pass it (the no_bump gate already
         excludes passive paths; search-shaped surfaces stay unfold-free via
         their link_hops=0 contract)."""
-        cli_text = (SCRIPTS_DIR / "storelib" / "cli.py").read_text(
-            encoding="utf-8")
+        cli_text = (SCRIPTS_DIR / "storelib" / "cli.py").read_text(encoding="utf-8")
         self.assertIn('"--no-unfold"', cli_text)
         surfaces = list((REPO_ROOT / "hooks").rglob("*.py"))
         surfaces += list((REPO_ROOT / "hooks").rglob("*.sh"))
         surfaces += [REPO_ROOT / "hermes-plugin" / "__init__.py"]
         surfaces += list((REPO_ROOT / "hermes-plugin" / "server").rglob("*.py"))
-        offenders = [str(p) for p in surfaces
-                     if "--no-unfold" in p.read_text(encoding="utf-8",
-                                                     errors="replace")]
-        self.assertEqual(offenders, [],
-                         f"--no-unfold leaked onto non-CLI surfaces: {offenders}")
+        offenders = [
+            str(p)
+            for p in surfaces
+            if "--no-unfold" in p.read_text(encoding="utf-8", errors="replace")
+        ]
+        self.assertEqual(
+            offenders, [], f"--no-unfold leaked onto non-CLI surfaces: {offenders}"
+        )
 
     def test_mcp_recall_docstring_documents_unfold(self):
         """Issue #82: explicit MCP recall inherits the change-intent unfold
         for free; the docstring must say so (and scope the exclusion)."""
         source = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py").read_text(
-            encoding="utf-8")
+            encoding="utf-8"
+        )
         tree = ast.parse(source)
         doc = None
         for node in ast.walk(tree):
-            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name == "recall"):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "recall"
+            ):
                 doc = ast.get_docstring(node)
                 break
         self.assertIsNotNone(doc)
-        self.assertIn("[PREVIOUSLY]", doc,
-                      "the docstring must document the predecessor rows")
-        self.assertIn("unfold_of", doc,
-                      "the docstring must name the JSON keys (MCP sees JSON)")
-        self.assertIn("session_start", doc,
-                      "the docstring must scope the exclusion to session_start/prefetch")
+        self.assertIn(
+            "[PREVIOUSLY]", doc, "the docstring must document the predecessor rows"
+        )
+        self.assertIn(
+            "unfold_of", doc, "the docstring must name the JSON keys (MCP sees JSON)"
+        )
+        self.assertIn(
+            "session_start",
+            doc,
+            "the docstring must scope the exclusion to session_start/prefetch",
+        )
 
     def test_readonly_invariant_docstring_covers_shared_helper(self):
         # The passive read-only invariant is owned by the shared post-retrieval
@@ -323,8 +386,10 @@ class AdapterScanTest(unittest.TestCase):
         tree = ast.parse(source)
         doc = None
         for node in ast.walk(tree):
-            if (isinstance(node, ast.FunctionDef)
-                    and node.name == "_recall_injection_details"):
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "_recall_injection_details"
+            ):
                 doc = ast.get_docstring(node)
                 break
         self.assertIsNotNone(doc, "shared injection helper must have a docstring")
@@ -339,15 +404,23 @@ class SurfaceTempStoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.store = os.path.join(self.tmp, "store.sqlite")
-        self.env = {**os.environ, "ZMEM_STORE": self.store,
-                    "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        self.env = {
+            **os.environ,
+            "ZMEM_STORE": self.store,
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _run(self, *args):
-        return subprocess.run([PYTHON, str(STORE_PY), *args],
-                              env=self.env, capture_output=True, text=True, timeout=60)
+        return subprocess.run(
+            [PYTHON, str(STORE_PY), *args],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
 
     def _conn(self):
         return sqlite3.connect(self.store)
@@ -357,10 +430,31 @@ class SurfaceTempStoreTest(unittest.TestCase):
         try:
             return c.execute(
                 "SELECT retrieval_count, surfaced_count, superseded_at FROM memory "
-                "WHERE content LIKE ?", (f"%{content}%",)
+                "WHERE content LIKE ?",
+                (f"%{content}%",),
             ).fetchone()
         finally:
             c.close()
+
+    def test_empty_valid_until_fence_bytes_are_unchanged(self):
+        """Issue #126 AC6: a row with an EMPTY ``valid_until`` renders through
+        ``_format_fenced_recall`` byte-identically to the committed fixture —
+        no expiry marker exists on this surface (``[EXPIRES]``/``[EXPIRED]``
+        are #173/#174 surfaces), no score field leaks, and the fence keeps
+        its single terminal LF."""
+        import json
+        from storelib.recall import _format_fenced_recall
+
+        fixture = REPO_ROOT / "tests" / "fixtures" / "issue126"
+        row = json.loads((fixture / "fence-input.json").read_text(encoding="utf-8"))
+        rendered = _format_fenced_recall([row], "Relevant memories.").encode("utf-8")
+        expected = (fixture / "fence-expected.txt").read_bytes()
+        self.assertEqual(
+            rendered, expected, "empty-valid_until fence bytes must be unchanged"
+        )
+        self.assertNotIn(b"[EXPIRES]", rendered)
+        self.assertNotIn(b"[EXPIRED]", rendered)
+        self.assertNotIn(b"score", rendered)
 
     def test_prune_does_not_prune_surfaced_but_unretrieved(self):
         # Two old, low-confidence, signal=none rows: one really never surfaced, one
@@ -368,8 +462,19 @@ class SurfaceTempStoreTest(unittest.TestCase):
         inert = "definitely never surfaced nor retrieved row alpha"
         surfaced = "surfaced many times by hooks but never fetched row beta"
         for content, sc in ((inert, 0), (surfaced, 3)):
-            r = self._run("add", "--namespace", NS, "--type", "fact",
-                          "--content", content, "--signal", "none", "--confidence", "0.2")
+            r = self._run(
+                "add",
+                "--namespace",
+                NS,
+                "--type",
+                "fact",
+                "--content",
+                content,
+                "--signal",
+                "none",
+                "--confidence",
+                "0.2",
+            )
             self.assertEqual(r.returncode, 0, r.stderr)
         c = self._conn()
         try:
@@ -377,7 +482,8 @@ class SurfaceTempStoreTest(unittest.TestCase):
                 c.execute(
                     "UPDATE memory SET surfaced_count=?, confidence=0.2, "
                     "ingestion_ts=datetime('now','-60 days') WHERE content LIKE ?",
-                    (sc, f"%{content}%"))
+                    (sc, f"%{content}%"),
+                )
             c.commit()
         finally:
             c.close()
@@ -401,10 +507,12 @@ class SurfaceTempStoreTest(unittest.TestCase):
         self.assertIsNotNone(surfaced_counts, "surfaced row should exist")
         self.assertIsNotNone(
             inert_counts[2],
-            f"never-surfaced, never-retrieved row MUST be pruned (superseded); got {inert_counts}")
+            f"never-surfaced, never-retrieved row MUST be pruned (superseded); got {inert_counts}",
+        )
         self.assertIsNone(
             surfaced_counts[2],
-            f"surfaced-but-unretrieved row must NOT be pruned; got {surfaced_counts}")
+            f"surfaced-but-unretrieved row must NOT be pruned; got {surfaced_counts}",
+        )
 
 
 class GetExitContractTest(unittest.TestCase):
@@ -415,15 +523,23 @@ class GetExitContractTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="zmem-get-contract-")
         self.store = os.path.join(self.tmp, "store.sqlite")
-        self.env = {**os.environ, "ZMEM_STORE": self.store,
-                    "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        self.env = {
+            **os.environ,
+            "ZMEM_STORE": self.store,
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _run(self, *args):
-        return subprocess.run([PYTHON, str(STORE_PY), *args],
-                              env=self.env, capture_output=True, text=True, timeout=60)
+        return subprocess.run(
+            [PYTHON, str(STORE_PY), *args],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
 
     def test_missing_id_exits_1_with_stable_stderr_token(self):
         missing = "no-such-id-00000000"
@@ -433,8 +549,17 @@ class GetExitContractTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stdout + r.stderr)
 
     def test_existing_id_exits_0_with_json_on_stdout(self):
-        r = self._run("add", "--namespace", NS, "--type", "fact",
-                      "--content", "get exit contract probe row", "--signal", "test")
+        r = self._run(
+            "add",
+            "--namespace",
+            NS,
+            "--type",
+            "fact",
+            "--content",
+            "get exit contract probe row",
+            "--signal",
+            "test",
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         m = re.search(r"added memory ([0-9a-f-]{36})", r.stdout)
         self.assertIsNotNone(m, r.stdout)
@@ -458,14 +583,25 @@ class GetExitContractTest(unittest.TestCase):
         # embedding runtime — CI is model-absent and never creates BLOBs
         # organically, so seed one directly and pin the rendered marker, the
         # exit code, and the absence of a traceback.
-        r = self._run("add", "--namespace", NS, "--type", "fact",
-                      "--content", "blob marker probe row", "--signal", "test")
+        r = self._run(
+            "add",
+            "--namespace",
+            NS,
+            "--type",
+            "fact",
+            "--content",
+            "blob marker probe row",
+            "--signal",
+            "test",
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         mid = re.search(r"added memory ([0-9a-f-]{36})", r.stdout).group(1)
         conn = sqlite3.connect(self.store)
         try:
-            conn.execute("UPDATE memory SET embedding=? WHERE id=?",
-                         (sqlite3.Binary(b"\x00" * 16), mid))
+            conn.execute(
+                "UPDATE memory SET embedding=? WHERE id=?",
+                (sqlite3.Binary(b"\x00" * 16), mid),
+            )
             conn.commit()
         finally:
             conn.close()
@@ -480,8 +616,17 @@ class GetExitContractTest(unittest.TestCase):
         # tombstoned rows too (its SELECT has no superseded_at filter, unlike
         # recall/search/list) — history stays inspectable by id. Documented
         # behavior, previously unpinned (PRR-009a).
-        r = self._run("add", "--namespace", NS, "--type", "fact",
-                      "--content", "superseded get probe row", "--signal", "test")
+        r = self._run(
+            "add",
+            "--namespace",
+            NS,
+            "--type",
+            "fact",
+            "--content",
+            "superseded get probe row",
+            "--signal",
+            "test",
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         mid = re.search(r"added memory ([0-9a-f-]{36})", r.stdout).group(1)
         s = self._run("supersede", "--id", mid, "--reason", "probe")
@@ -489,9 +634,11 @@ class GetExitContractTest(unittest.TestCase):
         g = self._run("get", "--id", mid)
         self.assertEqual(g.returncode, 0, g.stderr)
         parsed = json.loads(g.stdout)
-        self.assertIsNotNone(parsed.get("superseded_at"),
-                             "get by id is a forensic read: tombstoned rows "
-                             "must still be inspectable")
+        self.assertIsNotNone(
+            parsed.get("superseded_at"),
+            "get by id is a forensic read: tombstoned rows "
+            "must still be inspectable",
+        )
 
 
 class TaintAutoInjectSurfaceTest(unittest.TestCase):
@@ -507,12 +654,20 @@ class TaintAutoInjectSurfaceTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="zmem-taint-surface-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.store = os.path.join(self.tmp, "store.sqlite")
-        self.env = {**os.environ, "ZMEM_STORE": self.store,
-                    "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        self.env = {
+            **os.environ,
+            "ZMEM_STORE": self.store,
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
 
     def _run(self, *args):
-        r = subprocess.run([PYTHON, str(STORE_PY), *args],
-                           env=self.env, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), *args],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         return r
 
@@ -522,12 +677,24 @@ class TaintAutoInjectSurfaceTest(unittest.TestCase):
         ``{taint: id, "ns": ns}`` so a test holds direct references."""
         ns = f"project:taint-surface-{marker}"
         by_taint = {}
-        for taint, word in (("untrusted_web", "webey"),
-                            ("untrusted_tool", "tooly"),
-                            ("trusted_internal", "trusty")):
-            r = self._run("add", "--namespace", ns, "--type", "fact",
-                          "--content", f"{taint} {word} {marker} quokka",
-                          "--signal", "test", "--taint", taint)
+        for taint, word in (
+            ("untrusted_web", "webey"),
+            ("untrusted_tool", "tooly"),
+            ("trusted_internal", "trusty"),
+        ):
+            r = self._run(
+                "add",
+                "--namespace",
+                ns,
+                "--type",
+                "fact",
+                "--content",
+                f"{taint} {word} {marker} quokka",
+                "--signal",
+                "test",
+                "--taint",
+                taint,
+            )
             mid = re.search(r"added memory ([0-9a-f-]{36})", r.stdout)
             self.assertIsNotNone(mid, r.stdout)
             by_taint[taint] = mid.group(1)
@@ -536,23 +703,34 @@ class TaintAutoInjectSurfaceTest(unittest.TestCase):
 
     def test_no_bump_recall_omits_untrusted_web_keeps_tool(self):
         seeded = self._seed("alpha")
-        r = self._run("recall", "--query", "quokka", "--namespace", seeded["ns"],
-                      "--no-bump", "--json")
+        r = self._run(
+            "recall",
+            "--query",
+            "quokka",
+            "--namespace",
+            seeded["ns"],
+            "--no-bump",
+            "--json",
+        )
         _parsed = json.loads(r.stdout)
         # v13 (issue #65, 10.8): read --json emits the envelope.
         _rows = _parsed["results"] if isinstance(_parsed, dict) else _parsed
         ids = {x["id"] for x in _rows}
-        self.assertNotIn(seeded["untrusted_web"], ids,
-                         "passive recall must OMIT untrusted_web (same path as "
-                         "injection-risk)")
-        self.assertIn(seeded["untrusted_tool"], ids,
-                      "passive recall must KEEP untrusted_tool: it is trusted "
-                      "enough to surface passively and gets flagged on the "
-                      "explicit path")
+        self.assertNotIn(
+            seeded["untrusted_web"],
+            ids,
+            "passive recall must OMIT untrusted_web (same path as " "injection-risk)",
+        )
+        self.assertIn(
+            seeded["untrusted_tool"],
+            ids,
+            "passive recall must KEEP untrusted_tool: it is trusted "
+            "enough to surface passively and gets flagged on the "
+            "explicit path",
+        )
         self.assertIn(seeded["trusted_internal"], ids)
         # The payload still carries taint so a --json consumer can filter.
-        tool_item = next(x for x in _rows
-                         if x["id"] == seeded["untrusted_tool"])
+        tool_item = next(x for x in _rows if x["id"] == seeded["untrusted_tool"])
         self.assertEqual(tool_item["taint"], "untrusted_tool")
 
     def test_no_bump_recent_omits_untrusted_web(self):
@@ -560,19 +738,29 @@ class TaintAutoInjectSurfaceTest(unittest.TestCase):
         r = self._run("recent", "--namespace", seeded["ns"], "--no-bump", "--json")
         _parsed = json.loads(r.stdout)
         # v13 (issue #65, 10.8): read --json emits the envelope.
-        ids = {x["id"] for x in (_parsed["results"] if isinstance(_parsed, dict) else _parsed)}
-        self.assertNotIn(seeded["untrusted_web"], ids,
-                         "passive recent must OMIT untrusted_web")
+        ids = {
+            x["id"]
+            for x in (_parsed["results"] if isinstance(_parsed, dict) else _parsed)
+        }
+        self.assertNotIn(
+            seeded["untrusted_web"], ids, "passive recent must OMIT untrusted_web"
+        )
         self.assertIn(seeded["untrusted_tool"], ids)
         self.assertIn(seeded["trusted_internal"], ids)
 
     def test_explicit_recall_keeps_all_and_prefixes_untrusted_taints(self):
         seeded = self._seed("charlie")
         r = self._run("recall", "--query", "quokka", "--namespace", seeded["ns"])
-        self.assertIn("[UNTRUSTED WEB]", r.stdout,
-                      "explicit recall text must prefix untrusted_web")
-        self.assertIn("[UNTRUSTED TOOL]", r.stdout,
-                      "explicit recall text must prefix untrusted_tool")
+        self.assertIn(
+            "[UNTRUSTED WEB]",
+            r.stdout,
+            "explicit recall text must prefix untrusted_web",
+        )
+        self.assertIn(
+            "[UNTRUSTED TOOL]",
+            r.stdout,
+            "explicit recall text must prefix untrusted_tool",
+        )
         # Every rank still surfaces on the explicit path (a deliberate fetch —
         # the operator sees the marker, not an omission).
         self.assertIn("trusty", r.stdout)
@@ -581,8 +769,9 @@ class TaintAutoInjectSurfaceTest(unittest.TestCase):
 
     def test_explicit_json_includes_all_ranks_with_taint_field(self):
         seeded = self._seed("delta")
-        r = self._run("recall", "--query", "quokka", "--namespace", seeded["ns"],
-                      "--json")
+        r = self._run(
+            "recall", "--query", "quokka", "--namespace", seeded["ns"], "--json"
+        )
         _parsed = json.loads(r.stdout)
         # v13 (issue #65, 10.8): read --json emits the envelope.
         items = _parsed["results"] if isinstance(_parsed, dict) else _parsed
@@ -592,8 +781,12 @@ class TaintAutoInjectSurfaceTest(unittest.TestCase):
         self.assertIn(seeded["trusted_internal"], ids)
         taint_by_id = {x["id"]: x["taint"] for x in items}
         for taint in ("untrusted_web", "untrusted_tool", "trusted_internal"):
-            self.assertEqual(taint_by_id[seeded[taint]], taint,
-                             f"explicit JSON must carry the real taint for {taint}")
+            self.assertEqual(
+                taint_by_id[seeded[taint]],
+                taint,
+                f"explicit JSON must carry the real taint for {taint}",
+            )
+
 
 class AgentWriteSurfaceParityTest(unittest.TestCase):
     """PR-review PRR-L/M/P/Y (issue #59 review round): the agent write
@@ -614,14 +807,28 @@ class AgentWriteSurfaceParityTest(unittest.TestCase):
         contract, two surfaces (source-scan so CI guards it too)."""
         mcp = self._src("hermes-plugin/server/mcp_server.py")
         hermes = self._src("hermes-plugin/__init__.py")
-        for tool in ("session_start", "session_end", "update", "invalidate",
-                     "search", "recall", "recent", "add"):
+        for tool in (
+            "session_start",
+            "session_end",
+            "update",
+            "invalidate",
+            "search",
+            "recall",
+            "recent",
+            "add",
+        ):
             self.assertIn(f"async def {tool}(", mcp, f"MCP missing tool {tool}")
-        for tool in ("zmem_session_start", "zmem_session_end", "zmem_update",
-                     "zmem_invalidate", "zmem_search"):
+        for tool in (
+            "zmem_session_start",
+            "zmem_session_end",
+            "zmem_update",
+            "zmem_invalidate",
+            "zmem_search",
+        ):
             self.assertIn(f'"{tool}"', hermes, f"Hermes missing tool {tool}")
-        schemas = [f'"{t}"' in hermes for t in
-                   ("zmem_session_start", "zmem_session_end")]
+        schemas = [
+            f'"{t}"' in hermes for t in ("zmem_session_start", "zmem_session_end")
+        ]
         self.assertTrue(all(schemas), "Hermes session tool schemas missing")
 
     def test_hermes_search_never_expands_links(self):
@@ -630,10 +837,13 @@ class AgentWriteSurfaceParityTest(unittest.TestCase):
         dropping the flag would silently append linked neighbors past --limit."""
         src = self._src("hermes-plugin/__init__.py")
         start = src.find("def _tool_search")
-        window = src[start:start + 2500]
-        self.assertIn('"--link-hops", "0"', window,
-                      "hermes _tool_search must pin --link-hops 0 (parity "
-                      "with the CLI search subcommand and MCP search)")
+        window = src[start : start + 2500]
+        self.assertIn(
+            '"--link-hops", "0"',
+            window,
+            "hermes _tool_search must pin --link-hops 0 (parity "
+            "with the CLI search subcommand and MCP search)",
+        )
 
     def test_both_write_surfaces_use_structured_json_result(self):
         """10.8: MCP and Hermes add/update consume the structured --json write
@@ -652,55 +862,76 @@ class AgentWriteSurfaceParityTest(unittest.TestCase):
         hermes = self._src("hermes-plugin/__init__.py")
         mcp_start = mcp.find("async def update(")
         # Window widened: the scoped-token F6 pin block grew the tool body.
-        self.assertIn('"--namespace", ns_override', mcp[mcp_start:mcp_start + 8000])
+        self.assertIn('"--namespace", ns_override', mcp[mcp_start : mcp_start + 8000])
         h_start = hermes.find("def _tool_update")
-        self.assertIn('"--namespace", ns_override', hermes[h_start:h_start + 4000])
+        self.assertIn('"--namespace", ns_override', hermes[h_start : h_start + 4000])
 
     def test_agent_write_paths_pass_capture_mode_auto(self):
         src = self._src("hermes-plugin/__init__.py")
         for m in ("_tool_add", "_tool_update"):
             start = src.find(f"def {m}")
             self.assertGreater(start, 0, f"def {m} not found in hermes source")
-            window = src[start:start + 5000]
-            self.assertIn('"--capture-mode", "auto"', window,
-                          f"hermes {m} must pass --capture-mode auto so secrets "
-                          "are redacted like the MCP path (PRR-L)")
+            window = src[start : start + 5000]
+            self.assertIn(
+                '"--capture-mode", "auto"',
+                window,
+                f"hermes {m} must pass --capture-mode auto so secrets "
+                "are redacted like the MCP path (PRR-L)",
+            )
         mcp = self._src("hermes-plugin/server/mcp_server.py")
-        self.assertGreaterEqual(mcp.count('"--capture-mode", "auto"'), 2,
-                                "MCP add AND update must keep --capture-mode auto")
+        self.assertGreaterEqual(
+            mcp.count('"--capture-mode", "auto"'),
+            2,
+            "MCP add AND update must keep --capture-mode auto",
+        )
 
     def test_remote_error_paths_never_echo_raw_stderr(self):
-        for rel in ("hermes-plugin/server/mcp_server.py",
-                    "hermes-plugin/__init__.py"):
+        for rel in ("hermes-plugin/server/mcp_server.py", "hermes-plugin/__init__.py"):
             src = self._src(rel)
-            self.assertIn("_sanitize_store_error", src,
-                          f"{rel} must route remote error payloads through the "
-                          "sanitizer (PRR-M)")
-            self.assertNotIn('_error(r["stderr"]', src,
-                             f"{rel} must not return raw stderr to remote clients")
-            self.assertNotIn("r['stderr'] or r['stdout'][:200]", src,
-                             f"{rel} must not splice raw stderr into tool errors")
+            self.assertIn(
+                "_sanitize_store_error",
+                src,
+                f"{rel} must route remote error payloads through the "
+                "sanitizer (PRR-M)",
+            )
+            self.assertNotIn(
+                '_error(r["stderr"]',
+                src,
+                f"{rel} must not return raw stderr to remote clients",
+            )
+            self.assertNotIn(
+                "r['stderr'] or r['stdout'][:200]",
+                src,
+                f"{rel} must not splice raw stderr into tool errors",
+            )
         # The invalidate/supersede remote paths are covered by the file-wide
         # checks above (critic nit): their failure payloads are built by the
         # same sanitized call sites, so no separate unwired path exists.
         mcp = self._src("hermes-plugin/server/mcp_server.py")
-        self.assertGreaterEqual(mcp.count("_sanitize_store_error(r)"), 4,
-                                "sanitize every remote failure site incl. "
-                                "supersede/invalidate/update")
+        self.assertGreaterEqual(
+            mcp.count("_sanitize_store_error(r)"),
+            4,
+            "sanitize every remote failure site incl. " "supersede/invalidate/update",
+        )
 
     def test_oversize_content_uses_stdin_not_argv(self):
-        for rel in ("hermes-plugin/__init__.py",
-                    "hermes-plugin/server/mcp_server.py"):
+        for rel in ("hermes-plugin/__init__.py", "hermes-plugin/server/mcp_server.py"):
             src = self._src(rel)
-            self.assertIn("_ARGV_SAFE_CONTENT_CHARS", src,
-                          f"{rel} must gate content-by-argv on the safe "
-                          "threshold and pipe larger content via stdin (PRR-P)")
-            self.assertIn('.index("--content")', src,
-                          f"{rel} must switch to the stdin content path for "
-                          "oversize payloads")
+            self.assertIn(
+                "_ARGV_SAFE_CONTENT_CHARS",
+                src,
+                f"{rel} must gate content-by-argv on the safe "
+                "threshold and pipe larger content via stdin (PRR-P)",
+            )
+            self.assertIn(
+                '.index("--content")',
+                src,
+                f"{rel} must switch to the stdin content path for " "oversize payloads",
+            )
         cli = self._src("skills/memory/scripts/storelib/cli.py")
-        self.assertIn('== "-"', cli,
-                      "the CLI must honor `--content -` as read-from-stdin")
+        self.assertIn(
+            '== "-"', cli, "the CLI must honor `--content -` as read-from-stdin"
+        )
 
 
 class ComputeScorePopularityBlendTest(unittest.TestCase):
@@ -713,8 +944,9 @@ class ComputeScorePopularityBlendTest(unittest.TestCase):
     usefulness counters ONLY (applied_count/violated_count) and neither
     retrieval_count nor surfaced_count moves ranking."""
 
-    def _row(self, retrieval: int, surfaced: int, applied: int = 0,
-             violated: int = 0) -> dict:
+    def _row(
+        self, retrieval: int, surfaced: int, applied: int = 0, violated: int = 0
+    ) -> dict:
         return {
             "retrieval_count": retrieval,
             "surfaced_count": surfaced,
@@ -731,11 +963,15 @@ class ComputeScorePopularityBlendTest(unittest.TestCase):
         surfaced = store.compute_score(self._row(0, 5), None, now, vec_sim=0.5)
         more_surfaced = store.compute_score(self._row(0, 999), None, now, vec_sim=0.5)
         inert = store.compute_score(self._row(0, 0), None, now, vec_sim=0.5)
-        self.assertEqual(surfaced, inert,
-                         "a surfaced-only memory must NOT outrank a "
-                         "never-surfaced one (issue #114)")
-        self.assertEqual(more_surfaced, inert,
-                         "surfaced_count magnitude must not move the score")
+        self.assertEqual(
+            surfaced,
+            inert,
+            "a surfaced-only memory must NOT outrank a "
+            "never-surfaced one (issue #114)",
+        )
+        self.assertEqual(
+            more_surfaced, inert, "surfaced_count magnitude must not move the score"
+        )
 
     def test_retrieval_only_does_not_outrank_inert(self):
         # Issue #124 flip of the interim #114 pin: retrieval exposure is not
@@ -744,24 +980,34 @@ class ComputeScorePopularityBlendTest(unittest.TestCase):
         now = time.time()
         retrieved = store.compute_score(self._row(5, 0), None, now, vec_sim=0.5)
         inert = store.compute_score(self._row(0, 999), None, now, vec_sim=0.5)
-        self.assertEqual(retrieved, inert,
-                         "retrieval_count must not move the score now that "
-                         "usefulness feedback drives popularity (issue #124)")
+        self.assertEqual(
+            retrieved,
+            inert,
+            "retrieval_count must not move the score now that "
+            "usefulness feedback drives popularity (issue #124)",
+        )
 
     def test_applied_only_outranks_inert_and_violated_lags(self):
         # The #124 replacement signal: matched usefulness feedback.
         now = time.time()
-        applied = store.compute_score(self._row(0, 0, applied=4), None, now,
-                                      vec_sim=0.5)
+        applied = store.compute_score(
+            self._row(0, 0, applied=4), None, now, vec_sim=0.5
+        )
         inert = store.compute_score(self._row(0, 0), None, now, vec_sim=0.5)
-        violated = store.compute_score(self._row(0, 0, violated=4), None, now,
-                                       vec_sim=0.5)
-        self.assertGreater(applied, inert,
-                           "matched applied feedback must outrank an inert "
-                           "row (issue #124)")
-        self.assertEqual(violated, inert,
-                         "violated feedback is clamped at the floor and must "
-                         "not outrank an inert row either")
+        violated = store.compute_score(
+            self._row(0, 0, violated=4), None, now, vec_sim=0.5
+        )
+        self.assertGreater(
+            applied,
+            inert,
+            "matched applied feedback must outrank an inert " "row (issue #124)",
+        )
+        self.assertEqual(
+            violated,
+            inert,
+            "violated feedback is clamped at the floor and must "
+            "not outrank an inert row either",
+        )
 
 
 class UnrecalledPruneExtensionTest(unittest.TestCase):
@@ -779,8 +1025,11 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="zmem-unrecalled-")
         self.store = os.path.join(self.tmp, "store.sqlite")
-        self.env = {**os.environ, "ZMEM_STORE": self.store,
-                    "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        self.env = {
+            **os.environ,
+            "ZMEM_STORE": self.store,
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
         # cubic#76 / Claude Code round 4 (env isolation): a host-leaked
         # ZMEM_UNRECALLED_DAYS would silently change every expectation here —
         # including test_default_unrecalled_days_is_30's premise. Pop it so
@@ -791,14 +1040,38 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _run(self, *args):
-        return subprocess.run([PYTHON, str(STORE_PY), *args],
-                              env=self.env, capture_output=True, text=True, timeout=60)
+        return subprocess.run(
+            [PYTHON, str(STORE_PY), *args],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
 
-    def _add_old_row(self, content, *, surfaced_count, last_surfaced, days_old=60,
-                     signal="none", confidence="0.2", retrieval=0):
-        r = self._run("add", "--namespace", NS, "--type", "fact",
-                      "--content", content, "--signal", signal,
-                      "--confidence", confidence)
+    def _add_old_row(
+        self,
+        content,
+        *,
+        surfaced_count,
+        last_surfaced,
+        days_old=60,
+        signal="none",
+        confidence="0.2",
+        retrieval=0,
+    ):
+        r = self._run(
+            "add",
+            "--namespace",
+            NS,
+            "--type",
+            "fact",
+            "--content",
+            content,
+            "--signal",
+            signal,
+            "--confidence",
+            confidence,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         c = sqlite3.connect(self.store)
         try:
@@ -806,14 +1079,21 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
                 c.execute(
                     "UPDATE memory SET retrieval_count=?, surfaced_count=?, "
                     "ingestion_ts=datetime('now', ?) WHERE content LIKE ?",
-                    (retrieval, surfaced_count, f"-{days_old} days", f"%{content}%"))
+                    (retrieval, surfaced_count, f"-{days_old} days", f"%{content}%"),
+                )
             else:
                 c.execute(
                     "UPDATE memory SET retrieval_count=?, surfaced_count=?, "
                     "last_surfaced=datetime('now', ?), "
                     "ingestion_ts=datetime('now', ?) WHERE content LIKE ?",
-                    (retrieval, surfaced_count, f"-{last_surfaced} days",
-                     f"-{days_old} days", f"%{content}%"))
+                    (
+                        retrieval,
+                        surfaced_count,
+                        f"-{last_surfaced} days",
+                        f"-{days_old} days",
+                        f"%{content}%",
+                    ),
+                )
             c.commit()
         finally:
             c.close()
@@ -823,13 +1103,15 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
         try:
             row = c.execute(
                 "SELECT superseded_at FROM memory WHERE content LIKE ?",
-                (f"%{content}%",)).fetchone()
+                (f"%{content}%",),
+            ).fetchone()
             return row[0] if row else None
         finally:
             c.close()
 
-    def _add_old_row_iso(self, content, *, surfaced_count, last_surfaced_days,
-                         days_old=60):
+    def _add_old_row_iso(
+        self, content, *, surfaced_count, last_surfaced_days, days_old=60
+    ):
         """Seed a row whose timestamps are the REAL store format — ISO-8601
         ``YYYY-MM-DDTHH:MM:SSZ`` from ``now_iso()`` — unlike ``_add_old_row``,
         which writes SQLite's space-form ``datetime('now', ...)``. PRR-005:
@@ -837,22 +1119,38 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
         cutoff, and 'T' (0x54) > ' ' (0x20) in byte order, so genuinely-stale
         ISO rows silently NEVER qualified — the space-form seeds below were
         structurally blind to the inversion."""
-        r = self._run("add", "--namespace", NS, "--type", "fact",
-                      "--content", content, "--signal", "none",
-                      "--confidence", "0.2")
+        r = self._run(
+            "add",
+            "--namespace",
+            NS,
+            "--type",
+            "fact",
+            "--content",
+            content,
+            "--signal",
+            "none",
+            "--confidence",
+            "0.2",
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
 
         def iso(days: float) -> str:
             return time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400)
+            )
 
         c = sqlite3.connect(self.store)
         try:
             c.execute(
                 "UPDATE memory SET retrieval_count=0, surfaced_count=?, "
                 "last_surfaced=?, ingestion_ts=? WHERE content LIKE ?",
-                (surfaced_count, iso(last_surfaced_days), iso(days_old),
-                 f"%{content}%"))
+                (
+                    surfaced_count,
+                    iso(last_surfaced_days),
+                    iso(days_old),
+                    f"%{content}%",
+                ),
+            )
             c.commit()
         finally:
             c.close()
@@ -875,11 +1173,13 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
         self.assertIsNotNone(
             self._superseded(stale),
             f"60-day-old ISO-form last_surfaced must be pruned; "
-            f"out={r.stdout!r} {r.stderr!r}")
+            f"out={r.stdout!r} {r.stderr!r}",
+        )
         self.assertIsNone(
             self._superseded(fresh),
             f"10-day-old ISO-form last_surfaced must stay protected; "
-            f"out={r.stdout!r} {r.stderr!r}")
+            f"out={r.stdout!r} {r.stderr!r}",
+        )
 
     def test_surfaced_beyond_unrecalled_days_is_pruned(self):
         """surfaced_count=3 with last_surfaced OLDER than ZMEM_UNRECALLED_DAYS:
@@ -892,7 +1192,8 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
         self.assertIsNotNone(
             self._superseded(stale),
             f"stale-surfaced row must be pruned when last_surfaced > 30d; "
-            f"out={r.stdout!r} {r.stderr!r}")
+            f"out={r.stdout!r} {r.stderr!r}",
+        )
 
     def test_recently_surfaced_stays_protected(self):
         """last_surfaced 10 days ago < ZMEM_UNRECALLED_DAYS=30: protected."""
@@ -904,7 +1205,8 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
         self.assertIsNone(
             self._superseded(fresh),
             f"recently-surfaced row must NOT be pruned (last_surfaced < 30d); "
-            f"out={r.stdout!r} {r.stderr!r}")
+            f"out={r.stdout!r} {r.stderr!r}",
+        )
 
     def test_default_unrecalled_days_is_30(self):
         """With no ZMEM_UNRECALLED_DAYS, the default 30 applies: a row surfaced
@@ -915,10 +1217,14 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
         self._add_old_row(drop, surfaced_count=2, last_surfaced=31)
         r = self._run("consolidate", "--prune")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIsNone(self._superseded(keep),
-                          f"29-day-surfaced row must survive the default-30 gate")
-        self.assertIsNotNone(self._superseded(drop),
-                             f"31-day-surfaced row must be pruned under default-30")
+        self.assertIsNone(
+            self._superseded(keep),
+            f"29-day-surfaced row must survive the default-30 gate",
+        )
+        self.assertIsNotNone(
+            self._superseded(drop),
+            f"31-day-surfaced row must be pruned under default-30",
+        )
 
     def test_never_surfaced_null_last_surfaced_still_prunable(self):
         """NULL last_surfaced + surfaced_count=0 keeps qualifying (the existing
@@ -928,8 +1234,9 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
         self.env = {**self.env, "ZMEM_UNRECALLED_DAYS": "30"}
         r = self._run("consolidate", "--prune")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIsNotNone(self._superseded(inert),
-                             f"never-surfaced row must still be pruned")
+        self.assertIsNotNone(
+            self._superseded(inert), f"never-surfaced row must still be pruned"
+        )
 
     def test_signal_not_none_never_pruned(self):
         """signal!=none rows are never pruned even when every numeric gate
@@ -942,7 +1249,8 @@ class UnrecalledPruneExtensionTest(unittest.TestCase):
         self.assertIsNone(
             self._superseded(kept),
             f"signal!=none row must NEVER be pruned, regardless of staleness; "
-            f"out={r.stdout!r}")
+            f"out={r.stdout!r}",
+        )
 
 
 if __name__ == "__main__":
