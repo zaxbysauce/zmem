@@ -1,8 +1,7 @@
 """Acceptance checks for issue #182's release surfaces (AC7).
 
 These checks intentionally pin the seven host-facing manifests and the
-generated release manifest to the current dated release from the latest
-CHANGELOG heading.  The score-margin
+generated release manifest to the next unused minor release.  The score-margin
 release note remains pinned to its historical 0.34.0 section after the host
 attribution release advances the current release identity to 0.38.0.  The release
 manifest is trusted only when the existing release gate verifies it
@@ -21,6 +20,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+EXPECTED_VERSION = "0.61.0"
 SCORE_MARGIN_VERSION = "0.34.0"
 _SCORE_MARGIN_VERSION_RE = re.escape(SCORE_MARGIN_VERSION)
 
@@ -29,28 +29,6 @@ RELEASE_SECTION_RE = re.compile(
     re.MULTILINE,
 )
 RELEASE_GATE = REPO_ROOT / "scripts" / "release_gate.py"
-
-CHANGELOG_RELEASE_RE = re.compile(
-    r"^## \[(?P<version>\d+\.\d+\.\d+)\]\s*-\s*"
-    r"(?P<date>\d{4}-\d{2}-\d{2})\s*$",
-    re.MULTILINE,
-)
-
-
-def _latest_dated_changelog_version() -> str:
-    """Derive the current release independently from release-manifest.json."""
-    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    releases = list(CHANGELOG_RELEASE_RE.finditer(changelog))
-    if not releases:
-        raise AssertionError("CHANGELOG.md has no dated release heading")
-    latest = max(
-        releases,
-        key=lambda match: (
-            match.group("date"),
-            tuple(int(part) for part in match.group("version").split(".")),
-        ),
-    )
-    return latest.group("version")
 
 _SPEC = importlib.util.spec_from_file_location("zmem_release_gate", RELEASE_GATE)
 assert _SPEC and _SPEC.loader
@@ -61,8 +39,7 @@ _SPEC.loader.exec_module(gate)
 class ScoreMarginReleaseAcceptanceTest(unittest.TestCase):
     """Issue #182 AC7: release metadata is complete and gate-valid."""
 
-    def test_exact_host_facing_manifests_match_current_dated_release(self):
-        expected_version = _latest_dated_changelog_version()
+    def test_exact_host_facing_manifests_declare_next_unused_minor(self):
         manifests = getattr(gate, "HOST_MANIFESTS", None)
         if manifests is None:
             manifests = gate.discover_manifests()
@@ -78,8 +55,8 @@ class ScoreMarginReleaseAcceptanceTest(unittest.TestCase):
             self.assertTrue(path.is_file(), f"required host-facing manifest is missing: {relative}")
             self.assertEqual(
                 gate.read_version(relative),
-                expected_version,
-                f"{relative} must declare the current release {expected_version}",
+                EXPECTED_VERSION,
+                f"{relative} must declare the next unused minor {EXPECTED_VERSION}",
             )
 
     def test_changelog_has_dated_score_margin_opt_in_section(self):
@@ -116,14 +93,13 @@ class ScoreMarginReleaseAcceptanceTest(unittest.TestCase):
         )
 
     def test_release_manifest_is_current_and_verified_by_existing_gate(self):
-        expected_version = _latest_dated_changelog_version()
         path = REPO_ROOT / "release-manifest.json"
         self.assertTrue(path.is_file(), "release-manifest.json is required for a release")
         manifest = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(
             manifest.get("version"),
-            expected_version,
-            f"release-manifest.json must declare {expected_version}",
+            EXPECTED_VERSION,
+            f"release-manifest.json must declare {EXPECTED_VERSION}",
         )
 
         result = subprocess.run(

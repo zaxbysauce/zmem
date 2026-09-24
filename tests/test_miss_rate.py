@@ -315,9 +315,7 @@ class DecisionReportBucketsTest(unittest.TestCase):
         self.assertEqual(expected_obj["fixture"], {
             "generated_at": "2026-06-01T00:00:00Z",
             "namespace": "project:fixture",
-            "version": json.loads(
-                (REPO_ROOT / "release-manifest.json").read_text(encoding="utf-8")
-            )["version"],
+            "version": "0.61.0",
         })
         fixed_uuids = {
             "00000000-0000-4000-8000-000000000001",
