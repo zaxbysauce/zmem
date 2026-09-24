@@ -19,6 +19,20 @@ STORE = SCRIPTS / "store.py"
 BUILDER = ROOT / "tests" / "fixtures" / "rekey" / "build_fixture.py"
 
 
+def _sqlite_vec_available() -> bool:
+    """Whether this process can open the fixture's vec0 virtual table.
+
+    The regular CI job deliberately omits sqlite-vec to exercise degraded
+    operation.  The two ``reembed --check`` cases below inspect a persisted
+    vec0 table, so their non-skipping coverage belongs in test-embeddings.
+    """
+    try:
+        import sqlite_vec  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 class NamespaceMapAdversarial(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="zmem-168-adv-")
@@ -71,6 +85,7 @@ class NamespaceMapAdversarial(unittest.TestCase):
         ).fetchall(), links_before)
         conn.close()
 
+    @unittest.skipUnless(_sqlite_vec_available(), "sqlite-vec required")
     def test_check_bypasses_auto_rekey_and_rejects_explicit_batch(self):
         conn = sqlite3.connect(self.store)
         conn.execute("UPDATE memory SET namespace='global' WHERE id='fixture-01'")
@@ -86,6 +101,7 @@ class NamespaceMapAdversarial(unittest.TestCase):
         ).fetchone()[0], "global")
         conn.close()
 
+    @unittest.skipUnless(_sqlite_vec_available(), "sqlite-vec required")
     def test_tombstoned_retained_vector_is_not_orphan(self):
         conn = sqlite3.connect(self.store)
         conn.execute("UPDATE memory SET superseded_at='2026-03-01T00:00:00Z' "
