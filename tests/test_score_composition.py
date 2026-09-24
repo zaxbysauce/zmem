@@ -764,6 +764,11 @@ class RecentMomentPreferenceTest(unittest.TestCase):
 
     def setUp(self):
         self._conn = connect()
+        # Self-sufficient schema (impl-review round 1): bare connect() does
+        # not create the memory table on a fresh store — _prepare_store is
+        # idempotent, so the named test runs standalone, not only after
+        # sibling classes happened to prepare the module store.
+        _prepare_store(self._conn)
         self._seed(self._conn, self._fixture_rows())
         self.addCleanup(self._conn.close)
 
@@ -849,6 +854,37 @@ class RecentMomentPreferenceTest(unittest.TestCase):
             )
         parsed = json.loads(captured.getvalue())
         self.assertIsInstance(parsed, dict)
+        # Seam DISCRIMINATOR (impl-review round 1): the PUBLIC moment must
+        # actually reach the queryless injection lane — with moment/lane
+        # dropped from _collect_injection_candidates' common dict, the
+        # effective moment reverts to None and this order flips back to
+        # ingestion-desc (constraint first). The amended C7 ratchet cannot
+        # see that omission (deltas stay 0.0), so this assertion is the
+        # only guard for the evaluator's moment path.
+        with contextlib.redirect_stdout(io.StringIO()) as captured_recent:
+            recent_envelope = recall_mod.recent_memory(
+                self._conn,
+                namespace=NS126,
+                limit=2,
+                min_confidence=0.5,
+                no_bump=True,
+                no_telemetry=True,
+                for_injection=True,
+                as_json=True,
+                moment="precompact",
+                lane="codex",
+            )
+        recent_ids = [r.get("id") for r in recent_envelope]
+        self.assertEqual(
+            recent_ids,
+            [
+                "00000000-0000-4000-8000-000000000126",
+                "00000000-0000-4000-8000-000000000127",
+            ],
+            "the PUBLIC moment must survive the for_injection seam "
+            "(fact first under precompact; ingestion order means the "
+            "common-dict threading was dropped)",
+        )
 
     def test_scan_multiplier_cuts_beyond_limit(self):
         """Guardrail (plan-critic round 1): the explicit-moment path returns
