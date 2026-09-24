@@ -1473,8 +1473,13 @@ class ZmemMemoryProvider(MemoryProvider):
             # Default to the session namespace (mirror prefetch/add isolation).
             cli_args += ["--namespace", self._namespace]
             cli_args += ["--include-global", "--global-limit", "3"]
-        # Empty/ns_arg == '*' → no --namespace flag → store.py searches all
-        # (unscoped already covers every namespace, so no --include-global).
+        elif ns_arg == "*":
+            # An explicit '*' requests the legacy unscoped union.  Without the
+            # global flag, the #167 CLI dispatch treats a namespace-less recall
+            # as an implicit scoped call and can hide foreign/global rows.
+            cli_args += ["--include-global", "--global-limit", "3"]
+        # Empty namespace defaults to the session namespace above; '*' remains
+        # unscoped while the explicit global flag keeps it on the legacy lane.
         r = _run_store(cli_args)
         if not r["ok"]:
             return _tool_error(f"Search failed: {_sanitize_store_error(r)}")
