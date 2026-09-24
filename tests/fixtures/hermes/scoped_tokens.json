@@ -1,0 +1,1 @@
+{"tokens":[{"token":"fixture-fleet","namespaces":["fleet:dgx-spark"]},{"token":"fixture-host","namespaces":["host:spark1"]},{"token":"fixture-agent","namespaces":["agent:ops"]},{"token":"fixture-domain","namespaces":["domain:example"]}]}

@@ -22,8 +22,9 @@ v13 (issue #65, 10.2): a token may carry an OPTIONAL namespace allow-list.
   * a JSON object file starting with ``{``: ``{"token": "...", "namespaces":
     ["project:a", "user:global"]}`` — a SCOPED token. ``namespaces`` absent
     or null means unscoped; when present it MUST be a non-empty list of
-    valid namespace shapes (``project:*``, ``user:*``, or the canonical
-    ``user:global`` — near-miss globals like ``global`` are refused). A file
+    valid namespace shapes (``project:*``, ``user:*``, ``fleet:*``, ``host:*``,
+    ``agent:*``, ``domain:*``, or canonical ``user:global``; near-miss globals
+    like ``global`` are refused). A file
     that STARTS with ``{`` but does not parse as such a JSON object is a
     hard startup error (exit 2) — never a silent fallback to bare-token
     mode, which would silently un-scope a scoped deployment.
@@ -36,8 +37,8 @@ from __future__ import annotations
 
 import hmac
 import json as _json
+import importlib.util
 import os
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,17 +50,31 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 # readable constant, not a human message, so clients can branch on it.
 NAMESPACE_NOT_ALLOWED = "namespace_not_allowed"
 
-# Namespace shape accepted in a token allow-list: the canonical global, or a
-# project:/user: prefixed namespace. Deliberately mirrors the CLI's
-# validation (storelib.write._validate_namespace) WITHOUT importing storelib —
-# auth.py runs in the server process and must stay dependency-free.
-_NS_SHAPE_RE = re.compile(r"^(user:global|project:[^\s:][^:]*|user:[^\s:][^:]*)$")
-# Near-miss forms the store itself rejects (storelib.write near-miss stems):
-# a token scoped to "global" would silently not match any real namespace.
-_NS_NEAR_MISS_RE = re.compile(
-    r"^(global|userglobal|users:global|user\.global|global:user|user-global)$",
-    re.IGNORECASE,
-)
+# Namespace grammar is loaded directly from the same selected checkout as the
+# MCP store subprocess.  auth.py remains dependency-free and fails closed for
+# noncanonical scopes if that checkout is incomplete or unreadable.
+_SCHEMA_META_REL = Path("skills") / "memory" / "scripts" / "schema_meta.py"
+
+
+def _load_namespace_validator():
+    home = os.environ.get("ZMEM_HOME", "").strip()
+    if home:
+        path = Path(home).expanduser() / _SCHEMA_META_REL
+    else:
+        path = Path(__file__).resolve().parents[2] / _SCHEMA_META_REL
+    try:
+        spec = importlib.util.spec_from_file_location("zmem_schema_meta_auth", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        validator = getattr(mod, "is_valid_namespace", None)
+        return validator if callable(validator) else None
+    except Exception:  # malformed/unreadable selected validator fails closed
+        return None
+
+
+_NAMESPACE_VALIDATOR = _load_namespace_validator()
 
 
 class NamespaceDenied(Exception):
@@ -109,13 +124,11 @@ def _valid_scope_namespace(ns: object) -> bool:
     v = ns.strip()
     if not v or v == "*":
         return False  # a scope of '*' is the unscoped case — not expressible
-    if _NS_NEAR_MISS_RE.match(v):
-        return False
-    # F15: reject C0 control chars and DEL — Python's \s does not cover
-    # all of them, and they cannot survive a subprocess argv safely.
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
-        return False
-    return bool(_NS_SHAPE_RE.match(v))
+    if _NAMESPACE_VALIDATOR is None:
+        # user:global is the one canonical scope understood without loading
+        # the selected checkout's grammar; all other scopes fail closed.
+        return v == "user:global"
+    return bool(_NAMESPACE_VALIDATOR(v))
 
 
 def _parse_token_file(raw: str, source: str) -> TokenConfig:
@@ -148,10 +161,18 @@ def _parse_token_file(raw: str, source: str) -> TokenConfig:
         )
     cleaned: list[str] = []
     for ns in scopes:
+        if (_NAMESPACE_VALIDATOR is None
+                and isinstance(ns, str)
+                and ns.strip() != "user:global"):
+            _fail_config(
+                f"{source} cannot load the shared namespace validator from the "
+                "selected checkout; scoped namespace validation is unavailable"
+            )
         if not _valid_scope_namespace(ns):
             _fail_config(
                 f"{source} 'namespaces' entry {ns!r} is not a valid namespace "
-                "shape (expected project:<name>, user:<name>, or user:global)"
+                "shape (expected project:<name>, user:<name>, fleet:<name>, "
+                "host:<name>, agent:<name>, domain:<name>, or user:global)"
             )
         cleaned.append(str(ns).strip())
     return TokenConfig(

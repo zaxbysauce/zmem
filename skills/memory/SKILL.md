@@ -932,8 +932,12 @@ MCP and Hermes add surfaces use it. Default output is unchanged.
 Namespace validation: obvious misspellings of the global namespace (`global`,
 `userglobal`, `users:global`, …) are rejected at `add` time AND on `ingest-jsonl`
 sync import with a message naming the canonical `user:global` — such rows would
-be unreachable from the automatic hooks. `project:<x>` and arbitrary namespaces
-pass through untouched. Legacy rows already stranded under a near-miss namespace
+be unreachable from the automatic hooks. New writes accept `project:<x>` and
+`user:<x>` (including later colons in their values), plus strict
+`fleet:<x>`, `host:<x>`, `agent:<x>`, and `domain:<x>` forms. The latter four
+require one non-empty, whitespace-free, colon-free value. `ingest-jsonl`
+retains its legacy near-miss-only validation until the explicit rekey work.
+Legacy rows already stranded under a near-miss namespace
 (before this guard existed) can be remediated with `rekey-namespace
 --near-miss-global --confirm` (see below).
 
@@ -1214,6 +1218,12 @@ every namespace, exactly the pre-v13 behavior. To scope it, point
 ```json
 {"token": "<secret>", "namespaces": ["project:zmem", "user:global"]}
 ```
+
+Allowed namespace forms are project:name, user:name, fleet:name, host:name,
+agent:name, and domain:name. Project and user values retain later-colon
+compatibility; existing local project path keys may also contain internal
+spaces. The fleet, host, agent, and domain forms require one non-empty value
+without whitespace or colons.
 
 Requests outside the allow-list fail closed with the stable
 `namespace_not_allowed` error. `supersede`/`invalidate` are namespace-guarded

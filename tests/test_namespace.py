@@ -117,6 +117,81 @@ def _synthetic_migration_checkouts(tmp_path: Path) -> dict[str, Path]:
 class TestResolveNamespaceNormalization(unittest.TestCase):
     """git@ vs https vs trailing-slash vs case all collapse to one key."""
 
+    def test_resolve_scopes_defaults_and_environment_selection(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(host.resolve_scopes(), {})
+            self.assertEqual(host.resolve_scopes(hostname="spark1"), {
+                "host": "host:spark1",
+            })
+            self.assertEqual(host.resolve_scopes(env={}), {})
+        with mock.patch.dict(os.environ, {"ZMEM_FLEET": "ambient"}, clear=False):
+            self.assertEqual(host.resolve_scopes(env=None), {
+                "fleet": "fleet:ambient",
+            })
+
+    def test_resolve_scopes_without_project(self):
+        with mock.patch.dict(os.environ, {"ZMEM_FLEET": "ambient-must-not-win"}, clear=False):
+            scopes = host.resolve_scopes(
+                None,
+                "spark1",
+                {"ZMEM_FLEET": "dgx"},
+                {"agent_identity": "ops"},
+            )
+        self.assertEqual(
+            scopes,
+            {
+                "host": "host:spark1",
+                "fleet": "fleet:dgx",
+                "agent": "agent:ops",
+            },
+        )
+        with mock.patch.dict(os.environ, {"ZMEM_FLEET": "dgx"}, clear=False):
+            env_none_scopes = host.resolve_scopes(
+                None, "spark1", None, {"agent_identity": "ops"}
+            )
+        self.assertEqual(
+            env_none_scopes,
+            {
+                "host": "host:spark1",
+                "fleet": "fleet:dgx",
+                "agent": "agent:ops",
+            },
+        )
+
+    def test_resolve_scopes_with_project_origin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_git_repo(
+                Path(tmp), "https://github.com/O/R.git"
+            )
+            scopes = host.resolve_scopes(
+                repo,
+                "spark1",
+                {"ZMEM_FLEET": "dgx"},
+                {"agent_identity": "ops"},
+            )
+        self.assertEqual(
+            scopes,
+            {
+                "project": "project:github.com/o/r",
+                "host": "host:spark1",
+                "fleet": "fleet:dgx",
+                "agent": "agent:ops",
+            },
+        )
+
+    def test_resolve_scopes_rejects_invalid_injected_value(self):
+        cases = (
+            (None, "spark:1", {}, None),
+            (None, None, {"ZMEM_FLEET": "dgx:spark"}, None),
+            (None, None, {}, {"agent_identity": "ops:1"}),
+        )
+        for project_dir, hostname, env, hermes_kwargs in cases:
+            with self.subTest(hostname=hostname, env=env, hermes_kwargs=hermes_kwargs):
+                with self.assertRaises(ValueError):
+                    host.resolve_scopes(
+                        project_dir, hostname, env, hermes_kwargs
+                    )
+
     def test_ssh_and_https_same_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

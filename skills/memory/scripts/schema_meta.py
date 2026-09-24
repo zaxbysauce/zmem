@@ -24,6 +24,38 @@ from __future__ import annotations
 import re
 
 
+# Namespace admission grammar (issue #166). Project and user values preserve
+# legacy resolver keys, including later colons and internal spaces in local
+# paths. The new fleet/host/agent/domain scopes are deliberately strict: one
+# non-empty, whitespace-free, colon-free value after their prefix. Keep this
+# dependency-free module as the sole source for writer, MCP, auth, and doctor
+# validation so their admission rules cannot drift.
+NAMESPACE_RE = re.compile(
+    r"^(?:(?:project|user):.+|(?:fleet|host|agent|domain):[^\s:]+)$"
+)
+
+NAMESPACE_NEAR_MISS_RE = re.compile(
+    r"^(global|userglobal|users:global|user\.global|global:user|user-global)$",
+    re.IGNORECASE,
+)
+
+
+def has_namespace_control(namespace: str) -> bool:
+    """Return whether a namespace contains C0 or DEL characters."""
+    return any(ord(char) < 0x20 or ord(char) == 0x7F for char in namespace)
+
+
+def is_valid_namespace(namespace: object) -> bool:
+    """Apply the common trimming, near-miss, control, and grammar rules."""
+    if not isinstance(namespace, str):
+        return False
+    value = namespace.strip()
+    if (not value or value == "*" or NAMESPACE_NEAR_MISS_RE.fullmatch(value)
+            or has_namespace_control(value)):
+        return False
+    return bool(NAMESPACE_RE.fullmatch(value))
+
+
 def normalize_content(s: str) -> str:
     """Canonical content form for exact-match dedup (#39 E4).
 

@@ -279,6 +279,13 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         self.assertIn("id", result)
         self.assertRegex(result["id"], r"^[0-9a-f-]{36}$")
 
+    def test_mcp_add_accepts_fleet_scope(self):
+        result = self._call(
+            "add", type="fact", content="fleet namespace write",
+            namespace="fleet:dgx-spark", signal="test"
+        )
+        self.assertEqual(result.get("result"), "stored", result)
+
     def test_add_bad_type_returns_error(self):
         result = self._call("add", type="bogus", content="x", namespace=self._ns())
         self.assertIn("error", result)

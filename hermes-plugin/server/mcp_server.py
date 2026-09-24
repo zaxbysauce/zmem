@@ -70,6 +70,9 @@ _MAX_CONTENT_CHARS = 65536
 _ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
 _ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint")
 _ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
+# Never invent a validator fallback. If the selected checkout cannot provide
+# the shared namespace validator, noncanonical namespaces fail closed.
+_NAMESPACE_VALIDATOR = None
 # Issue #153: closed runtime lanes.  The fallback is intentionally kept
 # byte-identical with schema_meta and the local Hermes provider.
 _INJECT_LANES = (
@@ -296,8 +299,9 @@ def _load_store_constants() -> None:
     is tiny and dependency-free so it imports with no side effects — unlike
     store.py itself, which is a ~250 KB CLI module with env reads and
     embedding/sqlite side effects at import time. Best-effort: on any failure
-    the module-level fallbacks (the historical literals) stay in effect, so a
-    missing file never wedges the server (#37 L7/L8).
+    the module-level fallbacks (the historical literals) stay in effect for
+    content/type constants. Namespace grammar has no fallback: noncanonical
+    scopes fail closed when the selected schema_meta cannot be loaded.
 
     This locates schema_meta DIRECTLY via the in-tree relative path (this file
     is at <repo>/hermes-plugin/server/mcp_server.py, so the checkout root is
@@ -305,14 +309,15 @@ def _load_store_constants() -> None:
     writes a fatal-looking stderr message and sys.exit(2)s on a missing
     checkout — calling it here would emit that noise on every import outside a
     checkout (e.g. a lint pass or a test reading a constant), even though the
-    SystemExit is caught (PRR-009). ZMEM_HOME-override checkouts are still
-    covered because the tool paths that actually NEED store.py resolve it
-    lazily via _resolve_zmem_home() at first use.
+    SystemExit is caught (PRR-009). A ZMEM_HOME selection is authoritative for
+    validator loading, matching the store.py subprocess it will execute.
     """
     global _MAX_CONTENT_CHARS, _ALLOWED_SIGNALS, _ALLOWED_TYPES, _ALLOWED_TAINTS
+    global _NAMESPACE_VALIDATOR
     global _INJECT_LANES
     global _INJECT_SILENT_REASONS, _INJECT_REASON_INJECTED
     global _INJECT_REASON_DISABLED
+    _NAMESPACE_VALIDATOR = None
     try:
         import importlib.util
         # Resolve schema_meta with the SAME precedence _resolve_zmem_home() uses
@@ -325,15 +330,14 @@ def _load_store_constants() -> None:
         meta_path = None
         home_env = os.environ.get("ZMEM_HOME", "").strip()
         if home_env:
-            candidate = Path(home_env).expanduser() / _SCHEMA_META_REL
-            if candidate.is_file():
-                meta_path = candidate
-        if meta_path is None:
+            # An explicit checkout selection is authoritative.  Falling back
+            # to this server's tree would validate a different store.py tree.
+            meta_path = Path(home_env).expanduser() / _SCHEMA_META_REL
+        else:
             # In-tree: <repo>/hermes-plugin/server/mcp_server.py -> <repo>/skills/...
             candidate = Path(__file__).resolve().parents[2] / _SCHEMA_META_REL
-            if candidate.is_file():
-                meta_path = candidate
-        if meta_path is None:
+            meta_path = candidate
+        if meta_path is None or not meta_path.is_file():
             return
         spec = importlib.util.spec_from_file_location("zmem_schema_meta_mcp", meta_path)
         if spec is None or spec.loader is None:
@@ -362,6 +366,9 @@ def _load_store_constants() -> None:
         _INJECT_REASON_DISABLED = getattr(
             mod, "INJECT_REASON_DISABLED", _INJECT_REASON_DISABLED
         )
+        validator = getattr(mod, "is_valid_namespace", None)
+        if callable(validator):
+            _NAMESPACE_VALIDATOR = validator
     except Exception as exc:  # noqa: BLE001
         logger.debug("schema_meta constants load failed (%s); using defaults", exc)
 
@@ -900,24 +907,14 @@ def _namespace_flag(namespace: Optional[str]) -> list[str]:
     return []
 
 
-# v13 (issue #65, 10.1): fail-fast namespace shape validation, mirroring the
-# CLI's rules (storelib.write._validate_namespace) without importing storelib:
-# reject near-miss global variants; accept project:*, user:*, user:global.
-_NS_NEAR_MISS = re.compile(
-    r"^(global|userglobal|users:global|user\.global|global:user|user-global)$",
-    re.IGNORECASE,
-)
-
-
+# Namespace admission goes through the selected checkout's shared validator.
 def _valid_mcp_namespace(namespace: str) -> bool:
     ns = (namespace or "").strip()
     if not ns:
         return False
-    if _NS_NEAR_MISS.match(ns):
-        return False
     if ns == "user:global":
         return True
-    return bool(re.match(r"^(project|user):[^\s:][^:]*$", ns))
+    return bool(_NAMESPACE_VALIDATOR and _NAMESPACE_VALIDATOR(ns))
 
 
 def _parse_results(r: dict[str, Any]) -> dict[str, Any]:
@@ -1144,13 +1141,16 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             if not _valid_mcp_namespace(ns):
                 return _error(
                     f"ZMEM_MCP_DEFAULT_NS={ns!r} is not a valid namespace; "
-                    "set it to 'user:global' or 'project:<name>' (near-miss "
+                    "set it to user:global, project:<name>, user:<name>, "
+                    "fleet:<name>, host:<name>, agent:<name>, or domain:<name> "
+                    "(near-miss "
                     "forms like 'global' are refused)"
                 )
         if not _valid_mcp_namespace(ns):
             return _error(
-                "namespace must be project:<name>, user:<name>, or the "
-                "canonical user:global (near-miss forms like 'global' are "
+                "namespace must be project:<name>, user:<name>, fleet:<name>, "
+                "host:<name>, agent:<name>, domain:<name>, or the canonical "
+                "user:global (near-miss forms like 'global' are "
                 "refused — they are unreachable from every automatic hook)"
             )
         denied = _guard_namespace(ns)
@@ -1340,8 +1340,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if ns_override:
             if not _valid_mcp_namespace(ns_override):
                 return _error(
-                    "namespace must be project:<name>, user:<name>, or the "
-                    "canonical user:global (near-miss forms are refused)"
+                    "namespace must be project:<name>, user:<name>, fleet:<name>, "
+                    "host:<name>, agent:<name>, domain:<name>, or the canonical "
+                    "user:global (near-miss forms are refused)"
                 )
             denied = _guard_namespace(ns_override)
             if denied:
@@ -1868,8 +1869,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             resolved_ns = "user:global"
         if not _valid_mcp_namespace(resolved_ns):
             return _error(
-                "namespace must be project:<name>, user:<name>, or the "
-                "canonical user:global"
+                "namespace must be project:<name>, user:<name>, fleet:<name>, "
+                "host:<name>, agent:<name>, domain:<name>, or the canonical "
+                "user:global"
             )
         denied = _guard_namespace(resolved_ns)
         if denied:
