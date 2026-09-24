@@ -1,0 +1,25 @@
+{
+  "clock": "2026-06-01T00:00:00Z",
+  "now_epoch": 1780272000.0,
+  "namespace": "project:issue126",
+  "cases": [
+    {
+      "id": "00000000-0000-4000-8000-000000000126",
+      "type": "fact",
+      "moment": "user_prompt",
+      "lane": null,
+      "multiplier": 1.0952380952380951,
+      "base_score": 0.66,
+      "score": 0.7228571428571429
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000127",
+      "type": "constraint",
+      "moment": "user_prompt",
+      "lane": null,
+      "multiplier": 0.9523809523809523,
+      "base_score": 0.66,
+      "score": 0.6285714285714286
+    }
+  ]
+}

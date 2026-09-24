@@ -43,3 +43,4 @@ tests/fixtures/evidence/*.jsonl text eol=lf
 # read_bytes(); keep checkout bytes LF-stable under Windows autocrlf.
 tests/fixtures/feedback_*.jsonl text eol=lf
 tests/fixtures/dataset/** text eol=lf
+tests/fixtures/issue126/** text eol=lf

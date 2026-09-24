@@ -70,8 +70,13 @@ DEFAULT_BASELINE = REPO_ROOT / "eval" / "baseline-injection.json"
 
 # The rate keys compared against a baseline (and gated by the ratchet
 # flags). Deterministic floats in [0, 1].
-BASELINE_RATE_KEYS = ("hit_at_k", "precision_at_k", "false_injection_rate",
-                      "empty_pool_rate", "mrr")
+BASELINE_RATE_KEYS = (
+    "hit_at_k",
+    "precision_at_k",
+    "false_injection_rate",
+    "empty_pool_rate",
+    "mrr",
+)
 
 
 def _bootstrap_env(store: str) -> None:
@@ -85,6 +90,7 @@ def _bootstrap_env(store: str) -> None:
     os.environ["ZMEM_STORE"] = store
     sys.path.insert(0, str(FIXTURES_DIR))
     from eval_store import BASE_ENV, EVAL_PIN_TS  # noqa: E402
+
     for key, value in BASE_ENV.items():
         os.environ[key] = value
     os.environ["ZMEM_EMBED_PROFILE"] = "fake"
@@ -97,13 +103,19 @@ def _ensure_store(store: str) -> None:
     if Path(store).exists():
         return
     from eval_store import build_eval_store  # noqa: E402  (path set above)
-    print(f"[eval] store not found; building deterministic eval corpus at {store}",
-          file=sys.stderr)
+
+    print(
+        f"[eval] store not found; building deterministic eval corpus at {store}",
+        file=sys.stderr,
+    )
     try:
         build_eval_store(store)
     except Exception as exc:
-        print(f"[eval] cannot build eval store at {store}: "
-              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        print(
+            f"[eval] cannot build eval store at {store}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
 
@@ -119,23 +131,31 @@ def _load_baseline(path: str) -> dict:
         sys.exit(2)
     missing = [k for k in BASELINE_RATE_KEYS if k not in metrics]
     if missing:
-        print(f"[eval] baseline {path} metrics missing keys: "
-              + ", ".join(missing), file=sys.stderr)
+        print(
+            f"[eval] baseline {path} metrics missing keys: " + ", ".join(missing),
+            file=sys.stderr,
+        )
         sys.exit(2)
     for key in BASELINE_RATE_KEYS:
         value = metrics[key]
-        if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(value)):
-            print(f"[eval] baseline {path} metric {key} is not numeric: "
-                  f"{value!r}", file=sys.stderr)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            print(
+                f"[eval] baseline {path} metric {key} is not numeric: " f"{value!r}",
+                file=sys.stderr,
+            )
             sys.exit(2)
-    return metrics
+    return doc
 
 
 def _compare_baseline(metrics: dict, baseline_path: str) -> int:
     """Print per-metric deltas against the baseline. Exit 1 when any shared
     rate differs — this flag IS the future one-flag CI ratchet."""
-    baseline = _load_baseline(baseline_path)
+    doc = _load_baseline(baseline_path)
+    baseline = doc["metrics"]
     drift = []
     for key in BASELINE_RATE_KEYS:
         base_v = float(baseline[key])
@@ -143,51 +163,148 @@ def _compare_baseline(metrics: dict, baseline_path: str) -> int:
         if base_v != cur_v:
             drift.append((key, base_v, cur_v))
     if not drift:
-        print(f"[eval] baseline match: all {len(BASELINE_RATE_KEYS)} metrics "
-              f"equal {baseline_path}", file=sys.stderr)
+        print(
+            f"[eval] baseline match: all {len(BASELINE_RATE_KEYS)} metrics "
+            f"equal {baseline_path}",
+            file=sys.stderr,
+        )
         return 0
     for key, base_v, cur_v in drift:
-        print(f"[eval] DELTA {key}: baseline={base_v:.6f} current={cur_v:.6f} "
-              f"delta={cur_v - base_v:+.6f}", file=sys.stderr)
-    print(f"[eval] baseline drift: {len(drift)}/{len(BASELINE_RATE_KEYS)} "
-          f"metrics differ from {baseline_path}", file=sys.stderr)
+        print(
+            f"[eval] DELTA {key}: baseline={base_v:.6f} current={cur_v:.6f} "
+            f"delta={cur_v - base_v:+.6f}",
+            file=sys.stderr,
+        )
+    print(
+        f"[eval] baseline drift: {len(drift)}/{len(BASELINE_RATE_KEYS)} "
+        f"metrics differ from {baseline_path}",
+        file=sys.stderr,
+    )
     return 1
+
+
+def _git_commit_sha() -> str:
+    """40-lowercase-hex HEAD of this repository (issue #126 provenance)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostic provenance path
+        print(f"[eval] cannot read commit: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    sha = out.stdout.strip()
+    if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+        print(
+            f"[eval] cannot read commit: unexpected git output {sha!r}", file=sys.stderr
+        )
+        raise SystemExit(2)
+    return sha
+
+
+def _apply_baseline_deltas(per_moment: dict, baseline_path: str) -> dict:
+    """Issue #126: attach precision/false-injection deltas vs the SAME moment
+    in the committed baseline to every per_moment block. The baseline is read
+    on EVERY report run (a new operational dependency); an unreadable
+    baseline or a missing per-moment key is a deterministic exit 2, never a
+    NaN delta. Baseline moments absent from the run are simply ignored.
+    """
+    doc = _load_baseline(baseline_path)
+    base_pm = doc.get("per_moment") if isinstance(doc, dict) else None
+    if not isinstance(base_pm, dict):
+        print(
+            f"[eval] baseline {baseline_path} has no per_moment object", file=sys.stderr
+        )
+        sys.exit(2)
+    for moment, block in per_moment.items():
+        base_block = base_pm.get(moment)
+        if not isinstance(base_block, dict):
+            print(
+                f"[eval] baseline {baseline_path} per_moment missing "
+                f"moment {moment}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        block["precision_delta"] = float(block["precision_at_k"]) - float(
+            base_block["precision_at_k"]
+        )
+        block["false_injection_delta"] = float(block["false_injection_rate"]) - float(
+            base_block["false_injection_rate"]
+        )
+    return per_moment
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="eval_inject_runner.py",
         description="Run the injection-direction precision gold through the "
-                    "REAL inject gate + token budget (rendered-set scoring; "
-                    "JSON report on stdout)")
-    ap.add_argument("--store", required=True,
-                    help="path to the eval store. REQUIRED — the runner never "
-                         "touches the default home store. A missing store is "
-                         "built as the deterministic eval corpus at this path.")
-    ap.add_argument("--gold", default=str(DEFAULT_GOLD),
-                    help="injection gold JSONL path "
-                         f"(default: {DEFAULT_GOLD}); point it at a local "
-                         "decision-log-derived labeled file to evaluate the "
-                         "real prompt log window without code changes")
-    ap.add_argument("--k", type=int, default=5,
-                    help="default top-k cut for the query lanes (default 5; "
-                         "the hook's UserPromptSubmit/PreToolUse/Subagent "
-                         "limit; a gold item may override with its own 'k')")
-    ap.add_argument("--fail-under-precision", type=float, default=None,
-                    help="OPTIONAL ratchet: exit 1 when precision@k falls "
-                         "below this value. Off by default and OFF in CI.")
-    ap.add_argument("--fail-under-false-injection", type=float, default=None,
-                    help="OPTIONAL ratchet: exit 1 when the negative-control "
-                         "false-injection rate rises above this value. Off by "
-                         "default and OFF in CI.")
-    ap.add_argument("--compare-baseline", default=None,
-                    help="OPTIONAL: compare the run's metrics against the "
-                         "committed baseline (exit 1 on any delta, exit 2 on "
-                         "an unreadable baseline). Off by default and OFF in "
-                         "CI; this flag is the one-flag ratchet.")
-    ap.add_argument("--json-out", default=None,
-                    help="also write the JSON report to this path (CI uploads "
-                         "it as a workflow artifact)")
+        "REAL inject gate + token budget (rendered-set scoring; "
+        "JSON report on stdout)",
+    )
+    ap.add_argument(
+        "--store",
+        required=True,
+        help="path to the eval store. REQUIRED — the runner never "
+        "touches the default home store. A missing store is "
+        "built as the deterministic eval corpus at this path.",
+    )
+    ap.add_argument(
+        "--gold",
+        default=str(DEFAULT_GOLD),
+        help="injection gold JSONL path "
+        f"(default: {DEFAULT_GOLD}); point it at a local "
+        "decision-log-derived labeled file to evaluate the "
+        "real prompt log window without code changes",
+    )
+    ap.add_argument(
+        "--k",
+        type=int,
+        default=5,
+        help="default top-k cut for the query lanes (default 5; "
+        "the hook's UserPromptSubmit/PreToolUse/Subagent "
+        "limit; a gold item may override with its own 'k')",
+    )
+    ap.add_argument(
+        "--fail-under-precision",
+        type=float,
+        default=None,
+        help="OPTIONAL ratchet: exit 1 when precision@k falls "
+        "below this value. Off by default and OFF in CI.",
+    )
+    ap.add_argument(
+        "--fail-under-false-injection",
+        type=float,
+        default=None,
+        help="OPTIONAL ratchet: exit 1 when the negative-control "
+        "false-injection rate rises above this value. Off by "
+        "default and OFF in CI.",
+    )
+    ap.add_argument(
+        "--compare-baseline",
+        default=None,
+        help="OPTIONAL: compare the run's metrics against the "
+        "committed baseline (exit 1 on any delta, exit 2 on "
+        "an unreadable baseline). Off by default and OFF in "
+        "CI; this flag is the one-flag ratchet.",
+    )
+    ap.add_argument(
+        "--json-out",
+        default=None,
+        help="also write the JSON report to this path (CI uploads "
+        "it as a workflow artifact)",
+    )
+    ap.add_argument(
+        "--profile-json-out",
+        dest="profile_json_out",
+        type=str,
+        default=None,
+        help="write the stable issue-126 report projection to " "this path",
+    )
     args = ap.parse_args()
     if args.k < 1:
         ap.error(f"--k must be a positive integer, got {args.k}")
@@ -202,8 +319,13 @@ def main() -> int:
 
     sys.path.insert(0, str(SCRIPTS_DIR))
     from storelib.eval_gold import (  # noqa: E402
-        INJECTION_PER_ITEM_REPORT_KEYS, BypassError, GoldError,
-        evaluate_injection_items, injection_per_moment, load_gold)
+        INJECTION_PER_ITEM_REPORT_KEYS,
+        BypassError,
+        GoldError,
+        evaluate_injection_items,
+        injection_per_moment,
+        load_gold,
+    )
     from storelib.schema import connect  # noqa: E402
 
     try:
@@ -219,9 +341,19 @@ def main() -> int:
         print(f"[eval] BYPASS INVARIANT FAILED: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:
-        print(f"[eval] evaluation failed: {type(exc).__name__}: {exc}",
-              file=sys.stderr)
+        print(f"[eval] evaluation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
+
+    per_moment = _apply_baseline_deltas(
+        injection_per_moment(per_item), str(DEFAULT_BASELINE)
+    )
+    try:
+        commit_sha = _git_commit_sha()
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    import hashlib
+    from storelib.eval_gold import GOLD_MOMENT_TO_RUNTIME
+    from storelib.recall import PER_LANE_TYPE_WEIGHTS, PER_MOMENT_TYPE_WEIGHTS
 
     report = {
         "runner": "scripts/eval_inject_runner.py",
@@ -231,20 +363,27 @@ def main() -> int:
         "profile": "fake (model-absent)",
         "clock": os.environ.get("ZMEM_TEST_NOW"),
         "lane": "for-injection",
+        "gold_sha256": hashlib.sha256(Path(args.gold).read_bytes()).hexdigest(),
+        "commit": commit_sha,
+        "profiles": {
+            "per_moment": PER_MOMENT_TYPE_WEIGHTS,
+            "per_lane": PER_LANE_TYPE_WEIGHTS,
+        },
         "metrics": metrics,
-        "per_moment": injection_per_moment(per_item),
+        "per_moment": per_moment,
         "per_item": [
-            {key: it[key] for key in INJECTION_PER_ITEM_REPORT_KEYS}
-            for it in per_item
+            {key: it[key] for key in INJECTION_PER_ITEM_REPORT_KEYS} for it in per_item
         ],
     }
     text = json.dumps(report, ensure_ascii=False, indent=2)
     # Same line-terminator escaping sync.py's export applies (U+2028/2029/0085
     # are not escaped by json.dumps but terminate lines for splitlines-based
     # artifact consumers).
-    text = (text.replace("\u2028", "\\u2028")
-                .replace("\u2029", "\\u2029")
-                .replace("\u0085", "\\u0085"))
+    text = (
+        text.replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+        .replace("\u0085", "\\u0085")
+    )
     print(text)
     if args.json_out:
         try:
@@ -252,8 +391,40 @@ def main() -> int:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(text + "\n", encoding="utf-8", newline="\n")
         except OSError as exc:
-            print(f"[eval] cannot write --json-out {args.json_out}: {exc}",
-                  file=sys.stderr)
+            print(
+                f"[eval] cannot write --json-out {args.json_out}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+    if args.profile_json_out:
+        # Issue #126: the stable projection — exactly this key set, UTF-8,
+        # two-space indent, one final LF. Deterministic content only (no
+        # memory text rides in it), so the line-terminator escaping the
+        # report path applies is unnecessary here.
+        projection = {
+            "gold_sha256": report["gold_sha256"],
+            "profile": report["profile"],
+            "clock": report["clock"],
+            "lane": report["lane"],
+            "runtime_moments": GOLD_MOMENT_TO_RUNTIME,
+            "profiles": report["profiles"],
+            "metrics": report["metrics"],
+            "per_moment": report["per_moment"],
+        }
+        try:
+            pout = Path(args.profile_json_out)
+            pout.parent.mkdir(parents=True, exist_ok=True)
+            pout.write_text(
+                json.dumps(projection, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+        except OSError as exc:
+            print(
+                f"[eval] cannot write --profile-json-out "
+                f"{args.profile_json_out}: {exc}",
+                file=sys.stderr,
+            )
             return 2
 
     exit_code = 0
@@ -263,19 +434,27 @@ def main() -> int:
         except SystemExit as exc:
             return int(exc.code or 0)
         exit_code = max(exit_code, drift)
-    if (args.fail_under_precision is not None
-            and metrics["precision_at_k"] < args.fail_under_precision):
-        print(f"[eval] FAIL: precision@k={metrics['precision_at_k']:.4f} "
-              f"below --fail-under-precision {args.fail_under_precision}",
-              file=sys.stderr)
+    if (
+        args.fail_under_precision is not None
+        and metrics["precision_at_k"] < args.fail_under_precision
+    ):
+        print(
+            f"[eval] FAIL: precision@k={metrics['precision_at_k']:.4f} "
+            f"below --fail-under-precision {args.fail_under_precision}",
+            file=sys.stderr,
+        )
         exit_code = 1
-    if (args.fail_under_false_injection is not None
-            and metrics["false_injection_rate"]
-            > args.fail_under_false_injection):
-        print(f"[eval] FAIL: false_injection_rate="
-              f"{metrics['false_injection_rate']:.4f} above "
-              f"--fail-under-false-injection "
-              f"{args.fail_under_false_injection}", file=sys.stderr)
+    if (
+        args.fail_under_false_injection is not None
+        and metrics["false_injection_rate"] > args.fail_under_false_injection
+    ):
+        print(
+            f"[eval] FAIL: false_injection_rate="
+            f"{metrics['false_injection_rate']:.4f} above "
+            f"--fail-under-false-injection "
+            f"{args.fail_under_false_injection}",
+            file=sys.stderr,
+        )
         exit_code = 1
     return exit_code
 
