@@ -200,6 +200,56 @@ class ScopedTierIntegrationTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in rows], ["implicit-project"])
         self.assertEqual(rows[0]["tier"], "project")
 
+    def test_cli_cross_policy_keeps_scope_and_dispatch_consistent(self):
+        """Env-enabled implicit scopes must not reach the legacy cross guard."""
+        store = Path(self.tmp.name) / "store.sqlite"
+        env = dict(os.environ)
+        env.update({
+            "ZMEM_STORE": str(store),
+            "ZMEM_DATA": self.tmp.name,
+            "ZMEM_MODELS_DIR": str(Path(self.tmp.name) / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_CROSS_PROJECT": "1",
+        })
+        store_py = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
+        commands = (
+            ("recall", "--query", "cross policy", "--json", "--no-bump",
+             "--no-hybrid", "--no-mmr"),
+            ("recent", "--json", "--no-bump"),
+        )
+        for command in commands:
+            result = subprocess.run(
+                [sys.executable, str(store_py), *command], cwd=str(REPO_ROOT),
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIsInstance(json.loads(result.stdout), dict)
+
+        # The default policy enables cross-project only on pretool. This had
+        # the same raw/effective mismatch as ZMEM_CROSS_PROJECT=1.
+        env.pop("ZMEM_CROSS_PROJECT")
+        for command in commands:
+            result = subprocess.run(
+                [sys.executable, str(store_py), *command, "--moment",
+                 "pretool", "--session-id", "cross-policy-pretool"],
+                cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIsInstance(json.loads(result.stdout), dict)
+
+        # The explicit flag continues to select the legacy unscoped lane even
+        # when the policy kill switch makes its effective dispatch value false.
+        env["ZMEM_CROSS_PROJECT"] = "0"
+        for command in commands:
+            result = subprocess.run(
+                [sys.executable, str(store_py), *command,
+                 "--include-cross-project"], cwd=str(REPO_ROOT), env=env,
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIsInstance(json.loads(result.stdout), dict)
+
 
 if __name__ == "__main__":
     unittest.main()

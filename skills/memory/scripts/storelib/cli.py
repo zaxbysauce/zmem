@@ -2672,11 +2672,14 @@ def main():
             rerank_flag = _ce_cli_allowed(no_bump=args.no_bump,
                                           no_hybrid=args.no_hybrid,
                                           for_injection=args.for_injection)
+            effective_cross_project = cross_project_surface_enabled(
+                args.moment, explicit=args.include_cross_project)
             scoped_cli_scopes = (
                 _recall_scopes(args)
                 if (args.namespace is None and not args.for_injection
                     and not args.include_global
-                    and not args.include_cross_project)
+                    and not args.include_cross_project
+                    and not effective_cross_project)
                 else None
             )
             # Issue #82: --explain dispatches to the read-only retrieval
@@ -2718,9 +2721,7 @@ def main():
                               no_unfold=args.no_unfold,
                               for_injection=args.for_injection,
                               exclude_ids=args.exclude,
-                              include_cross_project=cross_project_surface_enabled(
-                                  args.moment,
-                                  explicit=args.include_cross_project),
+                              include_cross_project=effective_cross_project,
                               _cross_moment=args.moment,
                               _cross_ops_tokens=list(args.ops_token) or None,
                               _cross_explicit=args.include_cross_project)
@@ -2747,11 +2748,14 @@ def main():
                     sys.exit(2)
                 print(json.dumps(payload, indent=2))
                 return
+            effective_cross_project = cross_project_surface_enabled(
+                args.moment, explicit=args.include_cross_project)
             scoped_cli_scopes = (
                 _recall_scopes(args)
                 if (args.namespace is None and not args.for_injection
                     and not args.include_global
-                    and not args.include_cross_project)
+                    and not args.include_cross_project
+                    and not effective_cross_project)
                 else None
             )
             recent_memory(conn, namespace=args.namespace, limit=args.limit,
@@ -2764,9 +2768,7 @@ def main():
                           global_limit=args.global_limit, as_of=args.as_of,
                           for_injection=args.for_injection,
                           exclude_ids=args.exclude,
-                          include_cross_project=cross_project_surface_enabled(
-                              args.moment,
-                              explicit=args.include_cross_project),
+                          include_cross_project=effective_cross_project,
                           _cross_moment=args.moment,
                           _cross_ops_tokens=list(args.ops_token) or None,
                           _cross_explicit=args.include_cross_project)
