@@ -10,6 +10,27 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.64.0] - 2026-09-25
+
+### Added
+- **Imported namespace rekey maps and embedding consistency checks (issue
+  #168):** `rekey-namespace --map` accepts a strict ordered source-reference
+  prefix map with read-only preview and verified-snapshot apply paths. Only
+  matched live rows move, derived links follow moved IDs, and each map entry
+  receives decision-log evidence with distinct matched/moved counts.
+  `reembed --check` provides a read-only census of missing vectors, orphan
+  vectors, and embedding byte dimensions; it refuses stores with an active
+  WAL so checking cannot recover or mutate the store. Both commands and their
+  recovery behavior are documented in the memory skill.
+- **Namespace-map hardening (issue #168 review follow-up):** map preview and
+  apply now enforce forward-schema and local-filesystem admission, reject
+  control characters, whitespace, and `=` in source prefixes; percent-encode
+  target values in decision-log fields; and report structured sorted before/
+  after censuses. Apply streams live rows in bounded batches, verifies vector
+  bytes when sqlite-vec is available and always verifies link endpoints inside
+  its transaction, and makes post-commit log failures explicitly distinguish
+  the committed outcome.
+
 ## [0.63.0] - 2026-09-25
 
 ### Added

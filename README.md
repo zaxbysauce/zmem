@@ -1376,11 +1376,50 @@ lose semantic recall.
    model-absent tests/CI only). The pin covers the Xenova ONNX export —
    sentence-transformers PyTorch weights differ by design; verification has no
    override or bypass.
+
+   Run `python <store.py> reembed --check` for a read-only consistency census.
+   It reports live rows missing vectors, orphan vector rows, and live embedding
+   blobs whose byte length does not match the declared vector dimension. A
+   clean store prints `reembed check: 0 inconsistencies`; an inconsistent store
+   exits 1, and a store with an active `-wal` sidecar exits 2 so the check cannot
+   recover or create shared-memory files. The command never downloads a model
+   or changes the store.
 Backfilling before fixing the root cause only treats the backlog — new captures
 keep landing unembedded until embeddings are available in the capturing
 environment. When embeddings are unavailable, ZMem prints a one-time-per-process
 warning naming the reason and the resolved models dir on the first unembedded
 capture, so silent drift does not recur.
+
+### Imported namespace remediation
+
+For imported rows whose namespace needs an operator-supplied correction, use an
+ordered map of quoted `source_ref` prefixes to validated namespace targets:
+
+```bash
+python <store.py> rekey-namespace --map map.yaml --dry-run
+python <store.py> rekey-namespace --map map.yaml --confirm
+```
+
+The map is a narrow UTF-8 YAML subset: unindented quoted pairs only, with blank
+lines and full-line comments allowed. Entries are evaluated in file order, so
+the first matching prefix wins. Preview is read-only and prints one count per
+entry plus `unmapped`; apply takes one verified snapshot and transaction, moves
+only matched live rows whose namespace changes, and records one decision-log
+line per entry with separate `matched` and `moved` counts. A post-commit log
+failure returns exit 3 and says explicitly that the map changes are committed;
+pre-commit failures return nonzero without that committed-state diagnostic. Use
+the verified snapshot with the restore command when recovery is required. Both
+map modes and `reembed --check` refuse a store whose schema version is newer
+than this plugin supports;
+upgrade the plugin (or use the documented compatibility override) before
+inspecting or changing that store. See the memory skill for the complete grammar
+and failure semantics.
+
+Source prefixes cannot contain control characters, whitespace, or `=` because
+they are written as key/value fields in the decision log. Valid target namespace
+values are percent-encoded in that log. Apply loads the optional sqlite-vec
+extension when available to verify vector bytes; link endpoints are checked on
+every apply.
 
 ## Cross-platform hook execution
 

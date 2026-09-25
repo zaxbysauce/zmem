@@ -1104,6 +1104,7 @@ the vec lane should be re-run with `--no-hybrid` to include the FTS lane.
 ```
 python <store.py> reembed
 python <store.py> reembed --all [--profile NAME] [--batch N] [--dry-run]
+python <store.py> reembed --check
 ```
 Flagless form (unchanged contract): backfills embeddings for live memories that
 are MISSING them when the optional embedding runtime and model are available.
@@ -1130,7 +1131,8 @@ the operator-grade converter when you switch profiles:
 - `--batch N` paces stderr progress lines ONLY (display chunks inside the
   single transaction — batches are never separate commits). For very large
   stores run during an idle window: the single transaction briefly grows the
-  WAL by roughly the size of all rebuilt vectors (~1.5 KB/row at 384-dim).
+  WAL by roughly the size of all rebuilt vectors (~1.5 KB/row at 384-dim);
+  the default batch size is 64.
 - `--dry-run` reports how many of the live rows would change and writes
   nothing (no writer lease, no meta write).
 
@@ -1138,6 +1140,15 @@ Idempotency detail: change detection keys on
 `embedding IS NULL OR blob dim mismatch OR embedding_model marker differs`,
 so switching `--profile` back and forth always reports honestly instead of
 silently treating rows as current.
+
+`--check` is an exclusive, read-only consistency census. It reports live rows
+missing a `memory_vec` row, vector rows whose memory no longer exists, and live
+embedding blobs whose exact byte length differs from the declared vec0 dimension.
+It exits 0 with `reembed check: 0 inconsistencies`; otherwise it prints the three
+counts and exits 1. It never downloads a model, takes a writer lease, performs
+auto-rekey, or changes the store. A store with an active `-wal` sidecar is refused
+with exit 2 so the census cannot recover or create shared-memory files; checkpoint
+the store first.
 
 ### Embedding profiles — shipped registry (`embed_profiles.py`)
 
@@ -1609,6 +1620,8 @@ template store with `store.py organize --dry-run` before upgrading.
 ```
 python <store.py> rekey-namespace --near-miss-global [--to user:global] [--dry-run] --confirm
 python <store.py> rekey-namespace --from <old-namespace> --to <new-namespace> [--dry-run] --confirm
+python <store.py> rekey-namespace --map <map.yaml> --dry-run
+python <store.py> rekey-namespace --map <map.yaml> --confirm
 ```
 Rewrites the `namespace` column of live rows. The primary use is remediating
 legacy rows stranded under a global near-miss namespace (`global`,
@@ -1627,6 +1640,33 @@ for kill-switch deployments. Namespace contract: fleet facts live in
 `user:global`; project facts in `project:<canonical-git-remote>`; MCP `add`
 without a namespace uses `ZMEM_MCP_DEFAULT_NS` when the operator set it,
 else `user:global` — a bare `global` is never invented.
+
+`--map` is separate from the legacy selectors. Its file is UTF-8 without a BOM
+and contains only unindented quoted pairs such as
+`"db:source-prefix": "fleet:scope"`; blank lines and full-line comments are
+allowed. Entries are evaluated in file order, so the first matching `source_ref`
+prefix wins. A source prefix must also exclude C0/C1 controls, whitespace, and
+`=` so it cannot forge key/value fields in the decision log. Every target must
+satisfy the shared namespace grammar; its value is percent-encoded in the log,
+so valid project/user names containing spaces or `=` remain safe. Map mode
+requires exactly one of `--dry-run` or `--confirm` and cannot be combined with
+`--from`, `--to`, or `--near-miss-global`.
+
+Both map modes enforce the store's forward-schema compatibility gate through
+the connection they use for the operation. If the store has a newer unsupported
+schema, upgrade this plugin or use the documented compatibility override before
+previewing or applying the map.
+
+The preview opens the existing store read-only and prints one count per map entry
+plus `unmapped`, with no backup, log, lease, migration, or auto-rekey. Apply takes
+a verified snapshot before its single transaction, updates and relinks only IDs
+whose namespace changes, then appends one decision-log line per map entry with
+separate `matched` and `moved` counts. A post-commit decision-log failure reports
+exit 3 and explicitly says that the map changes are committed; pre-commit
+failures return nonzero without that committed-state diagnostic. Restore the
+verified snapshot if recovery is required. Apply loads the optional sqlite-vec
+extension when available and checks vector bytes in the transaction; link
+endpoints are checked on every apply.
 
 ### promote-store — merge a leftover second store (admin, issue #71 E)
 ```

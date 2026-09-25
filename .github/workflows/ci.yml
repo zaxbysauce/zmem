@@ -347,4 +347,4 @@ jobs:
         shell: bash
         run: |
           set -e
-          python -m unittest -v tests/test_consolidate_namespace.py tests/test_consolidate_contested.py tests/test_reembed.py
+          python -m unittest -v tests/test_consolidate_namespace.py tests/test_consolidate_contested.py tests/test_reembed.py tests/test_rekey_namespace_adversarial.py tests/test_rekey_namespace_map.py
