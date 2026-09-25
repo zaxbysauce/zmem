@@ -1475,11 +1475,12 @@ class ZmemMemoryProvider(MemoryProvider):
             cli_args += ["--include-global", "--global-limit", "3"]
         elif ns_arg == "*":
             # An explicit '*' requests the legacy unscoped union.  Without the
-            # global flag, the #167 CLI dispatch treats a namespace-less recall
-            # as an implicit scoped call and can hide foreign/global rows.
+            # legacy-lane marker, the #167 CLI dispatch treats a namespace-less
+            # recall as an implicit scoped call and can hide foreign rows.
             cli_args += ["--include-global", "--global-limit", "3"]
+            cli_args += ["--legacy-unscoped"]
         # Empty namespace defaults to the session namespace above; '*' remains
-        # unscoped while the explicit global flag keeps it on the legacy lane.
+        # unscoped via the compatibility marker above.
         r = _run_store(cli_args)
         if not r["ok"]:
             return _tool_error(f"Search failed: {_sanitize_store_error(r)}")

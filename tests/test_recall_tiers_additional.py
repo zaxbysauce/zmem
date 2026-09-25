@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sqlite3
+import socket
 import subprocess
 import sys
 import tempfile
@@ -16,10 +17,16 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
+_SAVED_SYS_PATH = list(sys.path)
 sys.path.insert(0, str(SCRIPTS))
-
-from storelib import recall as recall_mod  # noqa: E402
-from storelib import schema as schema_mod  # noqa: E402
+try:
+    # Load the actual script-level module first; tests below call the resolver
+    # directly after the temporary scripts path has been restored.
+    import host as host_mod  # noqa: E402
+    from storelib import recall as recall_mod  # noqa: E402
+    from storelib import schema as schema_mod  # noqa: E402
+finally:
+    sys.path[:] = _SAVED_SYS_PATH
 
 
 SCOPES = {
@@ -32,6 +39,9 @@ SCOPES = {
 
 class ScopedTierIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._tier_env = mock.patch.dict(os.environ)
+        self._tier_env.start()
+        os.environ.pop("ZMEM_TIER_SLOTS", None)
         self.tmp = tempfile.TemporaryDirectory(prefix="zmem-recall-tier-additional-")
         self.conn = sqlite3.connect(os.path.join(self.tmp.name, "store.sqlite"))
         self.conn.row_factory = sqlite3.Row
@@ -57,6 +67,7 @@ class ScopedTierIntegrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.close()
         self.tmp.cleanup()
+        self._tier_env.stop()
 
     def test_recent_uses_the_same_reservation_order_and_global_gate(self):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -197,8 +208,6 @@ class ScopedTierIntegrationTests(unittest.TestCase):
                          ["shared", "domain-one", "domain-two"])
 
     def test_implicit_cli_recall_uses_resolved_project_tier(self):
-        import host as host_mod
-
         project_env = dict(os.environ)
         project_env.pop("ZMEM_FLEET", None)
         resolved = host_mod.resolve_scopes(
@@ -235,55 +244,188 @@ class ScopedTierIntegrationTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in rows], ["implicit-project"])
         self.assertEqual(rows[0]["tier"], "project")
 
-    def test_cli_cross_policy_keeps_scope_and_dispatch_consistent(self):
-        """Env-enabled implicit scopes must not reach the legacy cross guard."""
-        store = Path(self.tmp.name) / "store.sqlite"
-        env = dict(os.environ)
+    def test_implicit_include_global_preserves_scoped_ids_and_tiers(self):
+        project_env = dict(os.environ)
+        project_env.pop("ZMEM_FLEET", None)
+        project_namespace = host_mod.resolve_scopes(
+            project_dir=REPO_ROOT, hostname="tier-test-host",
+            env=project_env, hermes_kwargs={},
+        )["project"]
+        self.conn.execute(
+            "UPDATE memory SET id='implicit-project', namespace=?, "
+            "content='implicit scoped routing project note' WHERE id='tier-project'",
+            (project_namespace,),
+        )
+        self.conn.execute(
+            "UPDATE memory SET id='implicit-global', "
+            "content='implicit scoped routing global note' WHERE id='tier-global'"
+        )
+        self.conn.execute(
+            "DELETE FROM memory WHERE id NOT IN "
+            "('implicit-project', 'implicit-global')"
+        )
+        self.conn.commit()
+
+        env = dict(project_env)
         env.update({
+            "ZMEM_STORE": str(Path(self.tmp.name) / "store.sqlite"),
+            "ZMEM_DATA": self.tmp.name,
+            "ZMEM_MODELS_DIR": str(Path(self.tmp.name) / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        store_py = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
+        recall_result = subprocess.run(
+            [sys.executable, str(store_py), "recall", "--query",
+             "implicit scoped routing", "--include-global", "--json",
+             "--no-bump", "--no-hybrid", "--no-mmr"],
+            cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+            timeout=60,
+        )
+        self.assertEqual(recall_result.returncode, 0, recall_result.stderr)
+        recall_rows = json.loads(recall_result.stdout)["results"]
+        self.assertEqual(
+            [(row["id"], row["tier"]) for row in recall_rows],
+            [("implicit-project", "project"),
+             ("implicit-global", "user_global")],
+        )
+
+        recent_result = subprocess.run(
+            [sys.executable, str(store_py), "recent", "--include-global",
+             "--json", "--no-bump"],
+            cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+            timeout=60,
+        )
+        self.assertEqual(recent_result.returncode, 0, recent_result.stderr)
+        recent_rows = json.loads(recent_result.stdout)["results"]
+        self.assertEqual(
+            [(row["id"], row["tier"]) for row in recent_rows],
+            [("implicit-project", "project"),
+             ("implicit-global", "user_global")],
+        )
+
+    def test_invalid_scoped_config_uses_cli_error_contract(self):
+        store_py = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
+        base_env = dict(os.environ)
+        base_env.update({
+            "ZMEM_STORE": str(Path(self.tmp.name) / "store.sqlite"),
+            "ZMEM_DATA": self.tmp.name,
+            "ZMEM_MODELS_DIR": str(Path(self.tmp.name) / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        base_env.pop("ZMEM_FLEET", None)
+        for key, value, message in (
+            ("ZMEM_TIER_SLOTS", "1,2,bad,4,5", "ZMEM_TIER_SLOTS"),
+            ("ZMEM_FLEET", "bad value", "invalid fleet scope value"),
+        ):
+            env = dict(base_env)
+            env[key] = value
+            result = subprocess.run(
+                [sys.executable, str(store_py), "recall", "--query", "x",
+                 "--json", "--no-bump", "--no-hybrid", "--no-mmr"],
+                cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn(message, result.stderr)
+            self.assertTrue(result.stderr.startswith("[zmem]"), result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_cli_cross_policy_keeps_scope_and_dispatch_consistent(self):
+        """CLI policy lanes return their actual rows with intended provenance."""
+        store = Path(self.tmp.name) / "store.sqlite"
+        scope_env = dict(os.environ)
+        scope_env.pop("ZMEM_FLEET", None)
+        scopes = host_mod.resolve_scopes(
+            project_dir=REPO_ROOT, hostname=socket.gethostname().lower(),
+            env=scope_env, hermes_kwargs={},
+        )
+        self.conn.execute("DELETE FROM memory")
+        timestamp = "2026-09-24T00:06:00Z"
+        rows_to_seed = (
+            ("policy-project", scopes["project"],
+             "cross policy project sentinel"),
+            ("policy-host", scopes["host"], "host-only recent sentinel"),
+            ("policy-global", "user:global", "global-only recent sentinel"),
+        )
+        self.conn.executemany(
+            """INSERT INTO memory
+               (id, namespace, type, content, tags, source_ref,
+                confidence, signal, valid_from, ingestion_ts)
+               VALUES (?, ?, 'lesson', ?, 'test', ?, 0.9, 'test', ?, ?)""",
+            [(memory_id, namespace, content, f"test:{memory_id}",
+              timestamp, timestamp)
+             for memory_id, namespace, content in rows_to_seed],
+        )
+        self.conn.commit()
+
+        base_env = dict(scope_env)
+        base_env.update({
             "ZMEM_STORE": str(store),
             "ZMEM_DATA": self.tmp.name,
             "ZMEM_MODELS_DIR": str(Path(self.tmp.name) / "missing-models"),
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
-            "ZMEM_CROSS_PROJECT": "1",
         })
         store_py = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
-        commands = (
-            ("recall", "--query", "cross policy", "--json", "--no-bump",
-             "--no-hybrid", "--no-mmr"),
-            ("recent", "--json", "--no-bump"),
-        )
-        for command in commands:
-            result = subprocess.run(
-                [sys.executable, str(store_py), *command], cwd=str(REPO_ROOT),
-                env=env, capture_output=True, text=True, timeout=60,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIsInstance(json.loads(result.stdout), dict)
 
-        # The default policy enables cross-project only on pretool. This had
-        # the same raw/effective mismatch as ZMEM_CROSS_PROJECT=1.
-        env.pop("ZMEM_CROSS_PROJECT")
-        for command in commands:
+        def run(command, env, extra=()):
             result = subprocess.run(
-                [sys.executable, str(store_py), *command, "--moment",
-                 "pretool", "--session-id", "cross-policy-pretool"],
-                cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
-                timeout=60,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIsInstance(json.loads(result.stdout), dict)
-
-        # The explicit flag continues to select the legacy unscoped lane even
-        # when the policy kill switch makes its effective dispatch value false.
-        env["ZMEM_CROSS_PROJECT"] = "0"
-        for command in commands:
-            result = subprocess.run(
-                [sys.executable, str(store_py), *command,
-                 "--include-cross-project"], cwd=str(REPO_ROOT), env=env,
+                [sys.executable, str(store_py), *command, *extra],
+                cwd=str(REPO_ROOT), env=env,
                 capture_output=True, text=True, timeout=60,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIsInstance(json.loads(result.stdout), dict)
+            return json.loads(result.stdout)["results"]
+
+        recall = ("recall", "--query", "cross policy project sentinel",
+                  "--json", "--no-bump", "--no-hybrid", "--no-mmr")
+        recent = ("recent", "--json", "--no-bump")
+
+        # An explicit disabled policy uses the scoped allocator: project rows
+        # carry tier provenance; host rows reserve the fleet_host tier; global
+        # rows remain excluded unless --include-global is passed.
+        disabled_env = dict(base_env, ZMEM_CROSS_PROJECT="0")
+        self.assertEqual(
+            sorted((row["id"], row["tier"])
+                   for row in run(recall, disabled_env)),
+            [("policy-host", "fleet_host"), ("policy-project", "project")],
+        )
+        self.assertEqual(
+            sorted((row["id"], row["tier"]) for row in run(recent, disabled_env)),
+            [("policy-host", "fleet_host"), ("policy-project", "project")],
+        )
+
+        # The unset default and explicit env opt-in route to the legacy hazard
+        # lane when enabled. The legacy lane returns its store-wide result set
+        # without scoped tier labels. Recall's FTS query uses OR matching, so
+        # the shared "sentinel" token intentionally admits all three rows.
+        for env, extra in (
+            (base_env, ("--moment", "pretool", "--session-id",
+                        "cross-policy-pretool")),
+            (dict(base_env, ZMEM_CROSS_PROJECT="1"), ()),
+        ):
+            recall_rows = run(recall, env, extra)
+            self.assertEqual(
+                sorted(row["id"] for row in recall_rows),
+                ["policy-global", "policy-host", "policy-project"],
+            )
+            self.assertTrue(all("tier" not in row for row in recall_rows))
+            recent_rows = run(recent, env, extra)
+            self.assertEqual(
+                sorted(row["id"] for row in recent_rows),
+                ["policy-global", "policy-host", "policy-project"],
+            )
+            self.assertTrue(all("tier" not in row for row in recent_rows))
+
+        # An explicit flag still routes through the legacy lane, while the
+        # operator kill switch prevents cross-project admissions.
+        explicit_rows = run(
+            recall, disabled_env, ("--include-cross-project",)
+        )
+        self.assertEqual(
+            sorted(row["id"] for row in explicit_rows),
+            ["policy-global", "policy-host", "policy-project"],
+        )
+        self.assertTrue(all("tier" not in row for row in explicit_rows))
 
 
 if __name__ == "__main__":

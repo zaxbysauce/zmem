@@ -26,6 +26,7 @@ can still cut the tail.
 
 from __future__ import annotations
 
+import inspect
 import math
 import os
 from typing import Any, Optional, Tuple
@@ -326,12 +327,25 @@ def _fence_row_cost_for_wire(
 ) -> int:
     """Call the public seam while retaining old one-argument test doubles."""
     try:
+        params = inspect.signature(fence_row_cost).parameters.values()
+    except (TypeError, ValueError):
+        # An opaque callable gets the current API shape. Never infer argument
+        # compatibility from a TypeError message raised inside its body.
         return fence_row_cost(
             row, legacy_injection_wire=legacy_injection_wire)
-    except TypeError as exc:
-        if "legacy_injection_wire" not in str(exc):
-            raise
-        return fence_row_cost(row)
+    accepts_keyword = any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        or (param.name == "legacy_injection_wire"
+            and param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ))
+        for param in params
+    )
+    if accepts_keyword:
+        return fence_row_cost(
+            row, legacy_injection_wire=legacy_injection_wire)
+    return fence_row_cost(row)
 
 
 def _truncate_protected_row(

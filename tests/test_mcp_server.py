@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import inspect
+import json
 import os
 import sqlite3
 import sys
@@ -195,6 +196,56 @@ class McpServerToolSurfaceTest(unittest.TestCase):
                 os.environ[k] = v
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
+    def test_local_fallback_renderer_matches_tier_marker_matrix(self):
+        saved_path = list(sys.path)
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        try:
+            from storelib.recall import _format_fenced_recall
+        finally:
+            sys.path[:] = saved_path
+
+        cases = (
+            ("project", False, "[tier=project]"),
+            ("domain", False, "[tier=domain]"),
+            ("fleet_host", False, "[tier=fleet_host]"),
+            ("cross_project", False, "[tier=cross_project]"),
+            ("user_global", False, "[tier=user_global]"),
+            ("cross", False, "[tier=cross]"),
+            ("unknown", False, "[tier=unknown]"),
+            (None, False, "[tier=unknown]"),
+            (None, True, None),
+        )
+        for index, (tier, legacy, expected_marker) in enumerate(cases):
+            row = {
+                "id": f"marker-{index}",
+                "confidence": 0.9,
+                "signal": "test",
+                "namespace": "project:marker",
+                "type": "lesson",
+                "content": "tier marker parity",
+            }
+            if tier is not None:
+                row["tier"] = tier
+            canonical = _format_fenced_recall(
+                [row], "header", legacy_injection_wire=legacy
+            )
+            fallback = self.mcp_server._local_fenced_recall(
+                [row], "header", legacy_injection_wire=legacy
+            )
+            canonical_bullet = next(
+                line for line in canonical.splitlines() if line.startswith("- ")
+            )
+            fallback_bullet = next(
+                line for line in fallback.splitlines() if line.startswith("- ")
+            )
+            if expected_marker is None:
+                self.assertNotIn("[tier=", canonical_bullet)
+                self.assertNotIn("[tier=", fallback_bullet)
+            else:
+                self.assertIn(expected_marker, canonical_bullet)
+                self.assertIn(expected_marker, fallback_bullet)
+
+
     # -- helpers ------------------------------------------------------------
 
     def _call(self, name: str, **args):
@@ -207,7 +258,7 @@ class McpServerToolSurfaceTest(unittest.TestCase):
 
     def _ns(self):
         """A unique namespace per test method so tests never couple through the
-        shared store (dedup/content/order-dependence). All 14 tests share one
+        shared store (dedup/content/order-dependence). All tool tests share one
         store.sqlite (setUpClass), so scoping each test to its own namespace
         makes them order-independent and merge-safe."""
         return f"user:test-{uuid.uuid4().hex[:8]}"
@@ -225,6 +276,90 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         recent filters out by design."""
         return self._add(content=content, namespace=namespace or self._ns(),
                          signal="test")
+
+    def test_namespace_less_mcp_reads_keep_legacy_store_wide_dispatch(self):
+        calls = []
+        original = self.mcp_server._run_store
+
+        def capture(args, input_text=None):
+            calls.append(list(args))
+            return {"ok": True, "stdout": '{"results": [], "count": 0}',
+                    "stderr": "", "returncode": 0}
+
+        self.mcp_server._run_store = capture
+        try:
+            for namespace in (None, "*"):
+                self._call("recall", query="legacy wildcard", namespace=namespace)
+                self._call("recent", namespace=namespace)
+                self._call("search", query="legacy wildcard", namespace=namespace)
+        finally:
+            self.mcp_server._run_store = original
+
+        self.assertEqual(len(calls), 6, calls)
+        for argv in calls:
+            self.assertIn("--legacy-unscoped", argv, argv)
+            self.assertNotIn("--namespace", argv, argv)
+
+    def test_namespace_less_mcp_search_keeps_legacy_store_wide_results(self):
+        query = f"mcpsearchprobe {uuid.uuid4().hex}"
+        expected = set()
+        for suffix in ("one", "two"):
+            namespace = f"project:search-outside-{uuid.uuid4().hex}"
+            stored = self._add_test_signal(
+                content=f"{query} {suffix}", namespace=namespace)
+            expected.add(stored["id"])
+
+        for namespace in (None, "*"):
+            result = self._call("search", query=query,
+                                namespace=namespace, limit=10)
+            with self.subTest(namespace=namespace):
+                self.assertEqual(
+                    {row["id"] for row in result["results"]}, expected, result)
+
+    def test_scoped_token_rejects_omitted_and_wildcard_read_namespaces(self):
+        token_file = os.path.join(self.tmp, "scoped-read-token.json")
+        with open(token_file, "w", encoding="utf-8") as f:
+            json.dump({"token": "scoped-read-secret",
+                       "namespaces": ["project:allowed"]}, f)
+        saved = {key: os.environ.get(key)
+                 for key in ("ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE")}
+        os.environ.pop("ZMEM_MCP_TOKEN", None)
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = token_file
+        calls = []
+        original = self.mcp_server._run_store
+
+        def capture(args, input_text=None):
+            calls.append(list(args))
+            return {"ok": True, "stdout": '{"results": [], "count": 0}',
+                    "stderr": "", "returncode": 0}
+
+        self.mcp_server._run_store = capture
+        try:
+            scoped = self.mcp_server.build_server(
+                host="127.0.0.1", port=0, use_tls=False)
+            for name, namespace in (
+                ("recall", None), ("recall", "*"),
+                ("recent", None), ("recent", "*"),
+                ("search", None), ("search", "*"),
+            ):
+                args = {"namespace": namespace}
+                if name in {"recall", "search"}:
+                    args["query"] = "scoped wildcard refusal"
+                result = asyncio.run(scoped._tool_manager.call_tool(
+                    name, args, context=None))
+                with self.subTest(tool=name, namespace=namespace):
+                    self.assertEqual(result.get("error"),
+                                     "namespace_not_allowed", result)
+        finally:
+            self.mcp_server._run_store = original
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual(calls, [],
+                         "scoped reads without an allowed namespace must not "
+                         "reach the legacy-unscoped store path")
 
     # -- recall -------------------------------------------------------------
 

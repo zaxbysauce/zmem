@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
 import shutil
@@ -34,19 +36,38 @@ SCOPES = {
 }
 TS = "2026-01-01T00:00:00Z"
 
-# Pin store resolution before importing storelib.  This mirrors the hermetic
-# fixture convention used by test_cross_project_lane.py.
+# Import storelib with an isolated path and environment, then restore the
+# caller's process state immediately so unittest discovery cannot poison later
+# modules in the same interpreter.
 _BOOT_TMP = tempfile.mkdtemp(prefix="zmem-recall-tiers-boot-")
-os.environ["ZMEM_STORE"] = os.path.join(_BOOT_TMP, "store.sqlite")
-os.environ["ZMEM_DATA"] = _BOOT_TMP
-os.environ["ZMEM_MODELS_DIR"] = os.path.join(_BOOT_TMP, "missing-models")
-os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
-os.environ.pop("ZMEM_TIER_SLOTS", None)
+_BOOT_SAVED_PATH = list(sys.path)
+_BOOT_SAVED_MODULES = {
+    name: module for name, module in sys.modules.items()
+    if name == "storelib" or name.startswith("storelib.")
+}
+_BOOT_ENV = mock.patch.dict(os.environ, {
+    "ZMEM_STORE": os.path.join(_BOOT_TMP, "store.sqlite"),
+    "ZMEM_DATA": _BOOT_TMP,
+    "ZMEM_MODELS_DIR": os.path.join(_BOOT_TMP, "missing-models"),
+    "ZMEM_MODEL_AUTODOWNLOAD": "0",
+}, clear=False)
+_BOOT_ENV.start()
 sys.path.insert(0, str(SCRIPTS_DIR))
-
-from storelib import cli as cli_mod  # noqa: E402
-from storelib import recall as recall_mod  # noqa: E402
-from storelib import schema as schema_mod  # noqa: E402
+for _name in list(sys.modules):
+    if _name == "storelib" or _name.startswith("storelib."):
+        sys.modules.pop(_name, None)
+try:
+    cli_mod = importlib.import_module("storelib.cli")
+    recall_mod = importlib.import_module("storelib.recall")
+    schema_mod = importlib.import_module("storelib.schema")
+finally:
+    sys.path[:] = _BOOT_SAVED_PATH
+    _BOOT_ENV.stop()
+    for _name in list(sys.modules):
+        if _name == "storelib" or _name.startswith("storelib."):
+            sys.modules.pop(_name, None)
+    sys.modules.update(_BOOT_SAVED_MODULES)
+    shutil.rmtree(_BOOT_TMP, ignore_errors=True)
 
 
 def _compact(value: object) -> str:
@@ -100,8 +121,34 @@ def _projection(rows: list[dict]) -> dict:
     return {"counts": counts, "rows": projected}
 
 
+
+
+class RecallTierFixtureGeneratorTests(unittest.TestCase):
+    def test_committed_fixtures_match_generator(self):
+        path = FIXTURE_DIR / "build_fixture.py"
+        spec = importlib.util.spec_from_file_location(
+            "zmem_recall_tier_fixture_generator", path
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        generator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generator)
+        self.assertEqual(
+            _compact(generator.rows()),
+            (FIXTURE_DIR / "reserved_slots.json").read_text(encoding="utf-8"),
+        )
+        for name, value in generator.expected_projections().items():
+            self.assertEqual(
+                _compact(value),
+                (FIXTURE_DIR / name).read_text(encoding="utf-8"),
+            )
+
+
 class RecallTierTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._tier_env = mock.patch.dict(os.environ)
+        self._tier_env.start()
+        os.environ.pop("ZMEM_TIER_SLOTS", None)
         self.tmp = tempfile.mkdtemp(prefix="zmem-recall-tiers-")
         self.store = os.path.join(self.tmp, "store.sqlite")
         self.conn = _open_store(self.store)
@@ -110,6 +157,7 @@ class RecallTierTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
+        self._tier_env.stop()
 
     def _scoped_recall(self) -> list[dict]:
         return recall_mod.recall_memory(
@@ -136,16 +184,68 @@ class RecallTierTests(unittest.TestCase):
         rows = self._scoped_recall()
         self._assert_projection(rows, "expected_without_cross.json")
 
-    def test_cross_project_predicate_fills_reserved_slots(self):
-        def eligible(row: dict, scopes: dict[str, str]) -> bool:
-            del scopes
-            return _fixture_key(row) in {"cross-01", "cross-02"}
-
+    def test_closed_cross_project_policy_keeps_reserved_slots_empty(self):
+        foreign_rows = [
+            row for row in json.loads(
+                (FIXTURE_DIR / "reserved_slots.json").read_text(encoding="utf-8")
+            )
+            if row["namespace"] == "project:other"
+        ]
+        self.assertTrue(foreign_rows)
+        self.assertFalse(
+            any(recall_mod._cross_project_eligible(row, SCOPES)
+                for row in foreign_rows)
+        )
+        self.assertFalse(recall_mod._SCOPED_CROSS_PROJECT_POLICY_ENABLED)
         with mock.patch.object(
-            recall_mod, "_cross_project_eligible", side_effect=eligible
+            recall_mod, "_SCOPED_CROSS_PROJECT_POLICY_ENABLED", False
+        ):
+            rows = self._scoped_recall()
+        self._assert_projection(rows, "expected_without_cross.json")
+
+    def test_cross_project_policy_admission_fills_reserved_slots(self):
+        # Forward-compatibility guard for #98: while production policy stays
+        # closed in this release, the tier allocator must still fill the two
+        # reserved slots if an approved admission predicate is later enabled.
+        with (
+            mock.patch.object(
+                recall_mod, "_SCOPED_CROSS_PROJECT_POLICY_ENABLED", True
+            ),
+            mock.patch.object(
+                recall_mod, "_cross_project_eligible", return_value=True
+            ),
         ):
             rows = self._scoped_recall()
         self._assert_projection(rows, "expected_with_cross.json")
+
+    def test_closed_cross_project_tier_skips_unfiltered_recall(self):
+        calls = []
+        original = recall_mod._recall_one_tier
+
+        def capture(*args, **kwargs):
+            calls.append(kwargs.get("ns_list"))
+            return original(*args, **kwargs)
+
+        with mock.patch.object(recall_mod, "_recall_one_tier", side_effect=capture):
+            self._scoped_recall()
+        self.assertTrue(calls)
+        self.assertNotIn(None, calls)
+
+    def test_closed_cross_project_tier_skips_unfiltered_recent(self):
+        calls = []
+        original = recall_mod._recent_one_tier
+
+        def capture(*args, **kwargs):
+            calls.append(kwargs.get("ns_list"))
+            return original(*args, **kwargs)
+
+        with mock.patch.object(recall_mod, "_recent_one_tier", side_effect=capture):
+            recall_mod.recent_memory(
+                self.conn, scopes=SCOPES, min_confidence=0.0,
+                no_bump=True, no_telemetry=True,
+            )
+        self.assertTrue(calls)
+        self.assertNotIn(None, calls)
 
     def test_fleet_score_cannot_displace_project(self):
         rows = self._scoped_recall()
@@ -269,6 +369,9 @@ class RecallTierTests(unittest.TestCase):
 
 class ExplainTierOverflowTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._tier_env = mock.patch.dict(os.environ)
+        self._tier_env.start()
+        os.environ.pop("ZMEM_TIER_SLOTS", None)
         self.tmp = tempfile.mkdtemp(prefix="zmem-recall-explain-")
         self.store = os.path.join(self.tmp, "store.sqlite")
         self.conn = _open_store(self.store)
@@ -277,6 +380,7 @@ class ExplainTierOverflowTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
+        self._tier_env.stop()
 
     def test_tier_slot_exhausted(self):
         before = hashlib.sha256(Path(self.store).read_bytes()).digest()
@@ -305,6 +409,16 @@ class ExplainTierOverflowTests(unittest.TestCase):
 
 
 class CliScopePropagationTests(unittest.TestCase):
+    def test_failed_project_resolution_keeps_user_global_provenance(self):
+        with mock.patch.object(
+            cli_mod._schema_host, "resolve_scopes",
+            return_value={"project": "user:global", "host": "host:box"},
+        ):
+            scopes = cli_mod._recall_scopes(argparse.Namespace(namespace=None))
+        self.assertEqual(
+            scopes, {"host": "host:box", "user_global": "user:global"}
+        )
+
     def test_explicit_namespace_classification(self):
         self.assertEqual(
             cli_mod._recall_scopes(argparse.Namespace(namespace="project:demo")),
@@ -335,10 +449,20 @@ class CliScopePropagationTests(unittest.TestCase):
         self.assertEqual(actual, resolved)
         resolver.assert_called_once_with(
             project_dir=Path.cwd(),
-            hostname=socket.gethostname(),
+            hostname=socket.gethostname().lower(),
             env=os.environ,
             hermes_kwargs={},
         )
+
+    def test_implicit_scopes_normalize_host_case(self):
+        with mock.patch.object(
+            cli_mod._schema_host, "resolve_scopes",
+            return_value={"project": "project:demo", "host": "host:workstation"},
+        ) as resolver, mock.patch.object(
+            cli_mod.socket, "gethostname", return_value="WorkStation"
+        ):
+            cli_mod._recall_scopes(argparse.Namespace(namespace=None))
+        self.assertEqual(resolver.call_args.kwargs["hostname"], "workstation")
 
 
 class CrossProjectCompatibilityTests(unittest.TestCase):

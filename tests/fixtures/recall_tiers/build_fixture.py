@@ -64,8 +64,7 @@ def write_json(path: Path, value: object) -> None:
     )
 
 
-def main() -> None:
-    fixture_rows = rows()
+def expected_projections() -> dict[str, dict]:
     without_cross = [
         *((f"project-{i:02d}", "project") for i in range(1, 6)),
         *((f"domain-{i:02d}", "domain") for i in range(1, 3)),
@@ -86,10 +85,16 @@ def main() -> None:
         "global-01", "global-02", "global-03",
     ]
     assert len(with_cross) == 14
-    write_json(ROOT / "reserved_slots.json", fixture_rows)
-    write_json(ROOT / "expected_without_cross.json", projection(without_cross))
-    write_json(ROOT / "expected_with_cross.json", projection(with_cross))
-    for name in ("expected_without_cross.json", "expected_with_cross.json"):
+    return {
+        "expected_without_cross.json": projection(without_cross),
+        "expected_with_cross.json": projection(with_cross),
+    }
+
+
+def main() -> None:
+    write_json(ROOT / "reserved_slots.json", rows())
+    for name, value in expected_projections().items():
+        write_json(ROOT / name, value)
         digest = hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
         print(f"{name}: {digest}")
 

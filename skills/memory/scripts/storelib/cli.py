@@ -86,12 +86,28 @@ def _recall_scopes(args: argparse.Namespace) -> dict[str, str]:
         if namespace == GLOBAL_NAMESPACE:
             return {"user_global": namespace}
         return {"project": namespace}
-    return _schema_host.resolve_scopes(
+    scopes = _schema_host.resolve_scopes(
         project_dir=Path.cwd(),
-        hostname=socket.gethostname(),
+        hostname=socket.gethostname().lower(),
         env=os.environ,
         hermes_kwargs={},
     )
+    # resolve_namespace() falls back to user:global when Git identity
+    # resolution fails without a cached project key. Preserve that provenance
+    # so ordinary scoped reads do not admit it without --include-global.
+    if scopes.get("project") == "user:global":
+        scopes.pop("project")
+        scopes["user_global"] = "user:global"
+    return scopes
+
+
+def _read_cli_or_report_value_error(call, *args, **kwargs):
+    """Keep invalid scoped-read configuration on the CLI error contract."""
+    try:
+        return call(*args, **kwargs)
+    except ValueError as exc:
+        print(f"[zmem] {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +960,10 @@ def main():
     p_recall = _add_parser("recall", help="recall relevant memories")
     p_recall.add_argument("--query", required=True)
     p_recall.add_argument("--namespace", default=None)
+    p_recall.add_argument(
+        "--legacy-unscoped", action="store_true", default=False,
+        help=argparse.SUPPRESS,
+    )
     p_recall.add_argument("--limit", type=nonnegative_int, default=5)
     p_recall.add_argument("--json", action="store_true")
     p_recall.add_argument("--hybrid", action="store_true",
@@ -1053,6 +1073,10 @@ def main():
 
     p_recent = _add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
+    p_recent.add_argument(
+        "--legacy-unscoped", action="store_true", default=False,
+        help=argparse.SUPPRESS,
+    )
     p_recent.add_argument("--limit", type=nonnegative_int, default=5)
     p_recent.add_argument("--min-confidence", type=float, default=None,
                           help="SQL confidence floor; omitted uses the dynamic "
@@ -2676,10 +2700,10 @@ def main():
             effective_cross_project = cross_project_surface_enabled(
                 args.moment, explicit=args.include_cross_project)
             scoped_cli_scopes = (
-                _recall_scopes(args)
+                _read_cli_or_report_value_error(_recall_scopes, args)
                 if (args.namespace is None and not args.for_injection
-                    and not args.include_global
                     and not args.include_cross_project
+                    and not args.legacy_unscoped
                     and not effective_cross_project)
                 else None
             )
@@ -2696,36 +2720,38 @@ def main():
                           "never filters. Re-run without --exclude.",
                           file=sys.stderr)
                     sys.exit(2)
-                explain_recall(conn, query=args.query, target=args.target,
-                               namespace=args.namespace, limit=args.limit,
-                               scopes=scoped_cli_scopes,
-                               as_json=args.json, hybrid=hybrid_arg,
-                               no_bump=args.no_bump,
-                               include_global=args.include_global,
-                               global_limit=args.global_limit, as_of=args.as_of,
-                               no_mmr=args.no_mmr,
-                               link_hops=args.link_hops,
-                               link_budget=args.link_budget,
-                               cross_rerank=rerank_flag,
-                               min_confidence=args.min_confidence,
-                               for_injection=args.for_injection)
+                _read_cli_or_report_value_error(
+                    explain_recall, conn, query=args.query, target=args.target,
+                    namespace=args.namespace, limit=args.limit,
+                    scopes=scoped_cli_scopes,
+                    as_json=args.json, hybrid=hybrid_arg,
+                    no_bump=args.no_bump,
+                    include_global=args.include_global,
+                    global_limit=args.global_limit, as_of=args.as_of,
+                    no_mmr=args.no_mmr,
+                    link_hops=args.link_hops,
+                    link_budget=args.link_budget,
+                    cross_rerank=rerank_flag,
+                    min_confidence=args.min_confidence,
+                    for_injection=args.for_injection)
             else:
-                recall_memory(conn, query=args.query, namespace=args.namespace,
-                              scopes=scoped_cli_scopes,
-                              limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
-                              no_bump=args.no_bump, include_global=args.include_global,
-                              global_limit=args.global_limit, as_of=args.as_of,
-                              min_confidence=args.min_confidence,
-                              no_mmr=args.no_mmr,
-                              link_hops=args.link_hops, link_budget=args.link_budget,
-                              cross_rerank=rerank_flag,
-                              no_unfold=args.no_unfold,
-                              for_injection=args.for_injection,
-                              exclude_ids=args.exclude,
-                              include_cross_project=effective_cross_project,
-                              _cross_moment=args.moment,
-                              _cross_ops_tokens=list(args.ops_token) or None,
-                              _cross_explicit=args.include_cross_project)
+                _read_cli_or_report_value_error(
+                    recall_memory, conn, query=args.query, namespace=args.namespace,
+                    scopes=scoped_cli_scopes,
+                    limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
+                    no_bump=args.no_bump, include_global=args.include_global,
+                    global_limit=args.global_limit, as_of=args.as_of,
+                    min_confidence=args.min_confidence,
+                    no_mmr=args.no_mmr,
+                    link_hops=args.link_hops, link_budget=args.link_budget,
+                    cross_rerank=rerank_flag,
+                    no_unfold=args.no_unfold,
+                    for_injection=args.for_injection,
+                    exclude_ids=args.exclude,
+                    include_cross_project=effective_cross_project,
+                    _cross_moment=args.moment,
+                    _cross_ops_tokens=list(args.ops_token) or None,
+                    _cross_explicit=args.include_cross_project)
         elif args.cmd == "recent":
             if args.for_injection and args.json and args.session_id:
                 try:
@@ -2752,27 +2778,28 @@ def main():
             effective_cross_project = cross_project_surface_enabled(
                 args.moment, explicit=args.include_cross_project)
             scoped_cli_scopes = (
-                _recall_scopes(args)
+                _read_cli_or_report_value_error(_recall_scopes, args)
                 if (args.namespace is None and not args.for_injection
-                    and not args.include_global
                     and not args.include_cross_project
+                    and not args.legacy_unscoped
                     and not effective_cross_project)
                 else None
             )
-            recent_memory(conn, namespace=args.namespace, limit=args.limit,
-                          scopes=scoped_cli_scopes,
-                          min_confidence=(args.min_confidence
-                                          if args.min_confidence is not None
-                                          else inject_recent_floor()),
-                          as_json=args.json,
-                          no_bump=args.no_bump, include_global=args.include_global,
-                          global_limit=args.global_limit, as_of=args.as_of,
-                          for_injection=args.for_injection,
-                          exclude_ids=args.exclude,
-                          include_cross_project=effective_cross_project,
-                          _cross_moment=args.moment,
-                          _cross_ops_tokens=list(args.ops_token) or None,
-                          _cross_explicit=args.include_cross_project)
+            _read_cli_or_report_value_error(
+                recent_memory, conn, namespace=args.namespace, limit=args.limit,
+                scopes=scoped_cli_scopes,
+                min_confidence=(args.min_confidence
+                                if args.min_confidence is not None
+                                else inject_recent_floor()),
+                as_json=args.json,
+                no_bump=args.no_bump, include_global=args.include_global,
+                global_limit=args.global_limit, as_of=args.as_of,
+                for_injection=args.for_injection,
+                exclude_ids=args.exclude,
+                include_cross_project=effective_cross_project,
+                _cross_moment=args.moment,
+                _cross_ops_tokens=list(args.ops_token) or None,
+                _cross_explicit=args.include_cross_project)
         elif args.cmd == "prefetch":
             # Issue #159: one selector call, one envelope. Fixed limit/
             # global_limit/budget (the contract's exact dispatch values);

@@ -969,6 +969,19 @@ def _namespace_flag(namespace: Optional[str]) -> list[str]:
     return []
 
 
+def _legacy_unscoped_flag(namespace: Optional[str]) -> list[str]:
+    """Keep namespace-less MCP reads on the legacy full-store path.
+
+    Ordinary CLI calls with no namespace now use resolver-scoped tiers. MCP's
+    unscoped operator token intentionally retains its documented multi-user
+    store-wide default, so compatibility reads mark that lane explicitly.
+    Scoped tokens are rejected by ``_guard_namespace`` before this helper is
+    reached with an omitted or wildcard namespace.
+    """
+    ns = (namespace or "").strip()
+    return ["--legacy-unscoped"] if not ns or ns == "*" else []
+
+
 # Namespace admission goes through the selected checkout's shared validator.
 def _valid_mcp_namespace(namespace: str) -> bool:
     ns = (namespace or "").strip()
@@ -1144,6 +1157,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if _include_global_allowed():
             args.insert(3, "--include-global")
         args += _namespace_flag(namespace)
+        args += _legacy_unscoped_flag(namespace)
         return _parse_results(await _run_store_async(args))
 
     @mcp.tool()
@@ -1300,6 +1314,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if _include_global_allowed():
             args.insert(3, "--include-global")
         args += _namespace_flag(namespace)
+        args += _legacy_unscoped_flag(namespace)
         return _parse_results(await _run_store_async(args))
 
     @mcp.tool()
@@ -1577,6 +1592,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args.append("--global-limit")
             args.append("3")
         args += _namespace_flag(namespace)
+        args += _legacy_unscoped_flag(namespace)
         return _parse_results(await _run_store_async(args))
 
     @mcp.tool()
@@ -1596,7 +1612,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         (namespace, session_id, moment required; lane against the five-value
         tuple — never defaulted to a host lane), enforces namespace scope,
         and returns the complete selector envelope plus the additive
-        ``context`` alias equal to ``rendered``. ``lane=None`` stays None.
+        ``context`` alias equal to ``rendered``. Scoped tokens cannot use the
+        legacy cross-project admission tokens because that admission path
+        predates MCP namespace allow-lists. ``lane=None`` stays None.
         """
         if not (namespace or "").strip() or not (session_id or "").strip() \
                 or not (moment or "").strip():
@@ -1646,7 +1664,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ]
         if lane is not None:
             args += ["--lane", lane]
-        for _tok in (ops_tokens or []):
+        # The legacy cross-project hazard lane does not consult MCP token
+        # allow-lists. Passing caller-supplied operation tokens through would
+        # therefore let a project-scoped token admit rows from foreign
+        # projects (issue #236). Keep that operator-only capability for
+        # unscoped tokens, and fail closed for every scoped token.
+        effective_ops_tokens = [] if token_config.scoped else (ops_tokens or [])
+        for _tok in effective_ops_tokens:
             args += ["--ops-token", _tok]
         r = await _run_store_async(args)
         if not r["ok"]:

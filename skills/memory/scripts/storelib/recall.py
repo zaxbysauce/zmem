@@ -202,6 +202,9 @@ SCOPED_TIER_ORDER = (
     "project", "domain", "fleet_host", "cross_project", "user_global",
 )
 _DEFAULT_TIER_SLOTS = dict(zip(SCOPED_TIER_ORDER, (5, 2, 2, 2, 3)))
+# There is no public scoped cross-project policy yet. Keep its reserved slots,
+# but avoid an unfiltered global search until a policy is wired.
+_SCOPED_CROSS_PROJECT_POLICY_ENABLED = False
 
 
 def _tier_slots() -> dict[str, int]:
@@ -1609,7 +1612,6 @@ def _scoped_tier_pools(
     weights: dict | None,
     arm_stats: dict | None = None,
     collect_lanes: bool = False,
-    deep: bool = False,
     moment: str | None = None,
     lane: str | None = None,
 ) -> tuple[dict[str, list[tuple[float, dict]]], list[str]]:
@@ -1646,11 +1648,11 @@ def _scoped_tier_pools(
             item["tier"] = tier
         pools[tier] = scored
 
-    # The scoped cross-project tier is an intentionally closed seam.  Build a
-    # foreign project candidate pool outside every selected namespace, then
-    # invoke the policy predicate per candidate before ranking/capping.
+    # The cross-project tier reserves result capacity but remains closed until
+    # an explicit policy is wired. Avoid the expensive unfiltered FTS/vector
+    # candidate pass while that policy is disabled.
     cross_limit = pool_limit("cross_project") * 16
-    if cross_limit:
+    if slots["cross_project"] > 0 and _SCOPED_CROSS_PROJECT_POLICY_ENABLED:
         candidates = _recall_one_tier(
             conn, query=query, ns_list=None, limit=cross_limit,
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
@@ -2958,7 +2960,6 @@ def _explain_run_pipeline(
             slots=slots, min_confidence=min_confidence, hybrid=hybrid,
             now_epoch=now_epoch, as_of=as_of, mmr=not no_mmr,
             weights=weights, arm_stats=arm_stats, collect_lanes=True,
-            deep=True,
         )
         presented = _merge_reserved_tiers(pools, slots)
         return presented, [], [], pools, slots
@@ -3793,20 +3794,21 @@ def _scoped_recent_pools(
             row["tier"] = tier
         pools[tier] = [(0.0, row) for row in rows]
 
-    candidates = _recent_one_tier(
-        conn, ns_list=None, limit=max(slots["cross_project"], 1) * 16,
-        min_confidence=min_confidence, as_of=as_of, stable_ties=True,
-        moment=moment, lane=lane,
-    )
-    admitted: list[tuple[float, dict]] = []
-    for row in candidates:
-        namespace = row.get("namespace") or ""
-        if (namespace.startswith("project:")
-                and namespace not in selected_namespaces
-                and _cross_project_eligible(row, scopes)):
-            row["tier"] = "cross_project"
-            admitted.append((0.0, row))
-    pools["cross_project"] = admitted
+    if slots["cross_project"] > 0 and _SCOPED_CROSS_PROJECT_POLICY_ENABLED:
+        candidates = _recent_one_tier(
+            conn, ns_list=None, limit=slots["cross_project"] * 16,
+            min_confidence=min_confidence, as_of=as_of, stable_ties=True,
+            moment=moment, lane=lane,
+        )
+        admitted: list[tuple[float, dict]] = []
+        for row in candidates:
+            namespace = row.get("namespace") or ""
+            if (namespace.startswith("project:")
+                    and namespace not in selected_namespaces
+                    and _cross_project_eligible(row, scopes)):
+                row["tier"] = "cross_project"
+                admitted.append((0.0, row))
+        pools["cross_project"] = admitted
     return pools
 
 def _recent_memory_impl(

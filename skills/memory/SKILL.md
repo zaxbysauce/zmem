@@ -606,14 +606,16 @@ hit as blocking review (read the lesson before proceeding; do not skip it
 because the task feels urgent):
 
 - before `git stash pop` / any stash-consume — `recall --query "git stash
-  pop foreign stash conflict"` (a blind pop can apply a foreign stash)
+  pop foreign stash conflict" --include-global` (a blind pop can apply a
+  foreign stash)
 - before `git reset --soft` (squash assembly) — `recall --query "git reset
-  soft origin main stale tree"` (a fetch may have moved the base)
+  soft origin main stale tree" --include-global` (a fetch may have moved the
+  base)
 - before `git push` — `recall --query "git push stale tree fetch rebase
-  verify"` (verify the tree against the fetched base first)
+  verify" --include-global` (verify the tree against the fetched base first)
 - before editing any file named by a stored citation/ratchet lesson —
-  `recall --query "<path basename> ratchet citation re-pin"` (cited-file
-  edits have local gate batteries)
+  `recall --query "<path basename> ratchet citation re-pin" --include-global`
+  (cited-file edits have local gate batteries)
 
 These checkpoints complement the pre-tool hook; they are not a substitute
 for it (an agent improvising a raw command is exactly who the hook covers).
@@ -669,7 +671,8 @@ rather than going unscoped.
 
 Ordinary implicit `recall` and `recent` calls without `--namespace` resolve the
 current project, fleet, and host through the shared #166 scope resolver and use
-five independent reservations in this order:
+five independent reservations in this order; hostnames are normalized to
+lowercase for `host:` scope lookup:
 `project`, `domain`, `fleet_host`, `cross_project`, `user_global`. The default
 slot caps are `5/2/2/2/3`. Library callers opt in explicitly with a `scopes=` map
 on `recall_memory`, `recent_memory`, or the read-only `explain_recall` API; the
@@ -679,22 +682,26 @@ resolver's `agent` value is ignored. `user_global` is admitted only when
 `ZMEM_TIER_SLOTS` overrides the caps per call as exactly five comma-separated
 ASCII nonnegative integers in that order. Empty, malformed, signed, or Unicode
 numerals fail before the scoped pipeline opens a SQL lane. The scoped
-`cross_project` pool is closed by default and calls `_cross_project_eligible`
-for any policy supplied by the caller. This is separate from the legacy #98
+`cross_project` slots remain reserved until a public admission policy is
+available. While no policy is wired, recall and recent skip the unfiltered
+candidate scan. This is separate from the legacy #98
 `--include-cross-project` hazard lane. Scoped rows are stable-deduplicated by id
 and carry their tier in JSON; generic fenced output prefixes `[tier=<name>]`,
-and a tierless generic row is explicitly prefixed `[tier=unknown]`. Legacy
-passive injection retains its established tierless wire bytes. The legacy
+and a tierless generic row is explicitly prefixed `[tier=unknown]`. Ordinary
+plain-text recall/recent output includes that marker too. Legacy passive
+injection retains its established tierless wire bytes. The legacy
 `tier=cross` renderer marker remains a suffix. Explicit `--namespace`, search,
-hook, and injection calls retain their legacy route and limit arguments. Explicit
-`--include-global` and `--include-cross-project` flags likewise keep their
-legacy union lanes and limit or hazard semantics. Direct scoped
+hook, and injection calls retain their legacy route and limit arguments.
+On implicit ordinary recall and recent, `--include-global` opts into the
+scoped `user_global` reservation and preserves tier labels. Explicit
+`--namespace` calls retain their legacy union behavior; `--include-cross-project`
+retains its legacy hazard semantics. Direct scoped
 `recall_memory`/`recent_memory` calls reject `for_injection=True`; scoped explain
-remains read-only and accepts it.
-For tier-labeled global rows, call the programmatic API with `scopes=` and
-`include_global=True`. Scoped recall/recent reject the legacy
-`include_cross_project=True` flag; their cross-project tier uses the separate
-policy predicate.
+remains read-only and accepts it. Programmatic callers use `scopes=` and
+`include_global=True` for the same labeled global tier.
+The `domain` reservation is available to programmatic callers that supply a
+domain scope; shipped CLI, hook, and MCP resolvers do not currently create one.
+Scoped recall/recent reject the legacy `include_cross_project=True` flag.
 
 #### Cross-project hazard tier (issue #98)
 
@@ -725,6 +732,9 @@ from the prompt event itself — the #158 hook boundary keeps the hook a thin
 flag forwarder); any other non-empty value → `pretool` only plus a one-shot
 stderr warning. The tier is query-time — the queryless `recent` pull never
 admits cross rows.
+Scoped MCP tokens do not forward `ops_tokens` to this legacy path, so foreign
+rows are excluded before rendering, context construction, or delivery-ledger
+updates.
 
 No-copy rule: a cross row is never copied, rewritten, or mirrored — the
 store's own row renders in place, inside the untrusted fence, tagged
@@ -919,6 +929,9 @@ validated against the five-value tuple, never defaulted to a host lane — and
 `ops_tokens`), enforcing namespace scope and the `ZMEM_INJECT=0` kill switch
 before any store subprocess, and returning the complete selector envelope
 plus the additive `context` alias equal to `rendered`. The MCP
+server does not forward `ops_tokens` for scoped tokens: the legacy cross-project
+admission path has no namespace-allow-list awareness, so scoped prefetch cannot
+admit foreign project rows before rendering or ledger updates. The MCP
 `session_start` tool rides the same store-owned queryless selector path via
 `recent --for-injection --json --session-id <id> --moment session_start`,
 returning that envelope (additive `context` alias; `result`/`namespace`/

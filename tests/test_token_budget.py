@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -221,6 +222,17 @@ class BudgetAdmissionTest(unittest.TestCase):
                     "fence_row_cost must cover the row's real fence "
                     "contribution for %s (legacy=%s)" % (
                         row["id"], legacy_injection_wire))
+
+    def test_fence_cost_does_not_swallow_internal_type_error(self):
+        def broken_cost(row, *, legacy_injection_wire):
+            del row, legacy_injection_wire
+            raise TypeError("legacy_injection_wire failed inside cost")
+
+        with mock.patch.object(inject, "fence_row_cost", new=broken_cost):
+            with self.assertRaisesRegex(TypeError, "failed inside cost"):
+                inject._fence_row_cost_for_wire(
+                    _row("broken"), legacy_injection_wire=True
+                )
 
     def test_legacy_injection_wire_keeps_tierless_bullet_bytes(self):
         from storelib.recall import _format_fenced_recall
