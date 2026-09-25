@@ -1409,7 +1409,8 @@ line per entry with separate `matched` and `moved` counts. A post-commit log
 failure returns exit 3 and says explicitly that the map changes are committed;
 pre-commit failures return nonzero without that committed-state diagnostic. Use
 the verified snapshot with the restore command when recovery is required. Both
-map modes refuse a store whose schema version is newer than this plugin supports;
+map modes and `reembed --check` refuse a store whose schema version is newer
+than this plugin supports;
 upgrade the plugin (or use the documented compatibility override) before
 inspecting or changing that store. See the memory skill for the complete grammar
 and failure semantics.

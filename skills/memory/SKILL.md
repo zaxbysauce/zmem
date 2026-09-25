@@ -1131,7 +1131,8 @@ the operator-grade converter when you switch profiles:
 - `--batch N` paces stderr progress lines ONLY (display chunks inside the
   single transaction — batches are never separate commits). For very large
   stores run during an idle window: the single transaction briefly grows the
-  WAL by roughly the size of all rebuilt vectors (~1.5 KB/row at 384-dim).
+  WAL by roughly the size of all rebuilt vectors (~1.5 KB/row at 384-dim);
+  the default batch size is 64.
 - `--dry-run` reports how many of the live rows would change and writes
   nothing (no writer lease, no meta write).
 
