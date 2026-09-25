@@ -17,11 +17,24 @@ README.
   #168):** `rekey-namespace --map` accepts a strict ordered source-reference
   prefix map with read-only preview and verified-snapshot apply paths. Only
   matched live rows move, derived links follow moved IDs, and each map entry
-  receives decision-log evidence. `reembed --check` provides a read-only
+  receives decision-log evidence with distinct matched/moved counts. Unsafe
+  source prefixes cannot inject control, whitespace, or key/value separator
+  characters; target values are percent-encoded in the decision log so valid
+  project/user names cannot inject fields. Apply loads sqlite-vec when the
+  optional package is available before checking vector-byte invariants.
+  A post-commit log failure has a distinct exit status and explicit committed
+  diagnostic. `reembed --check` provides a read-only
   census of missing vectors, orphan vectors, and embedding byte dimensions;
   it refuses stores with an active WAL so checking cannot recover or mutate
   the store. Both commands and their recovery behavior are documented in the
   memory skill.
+- **Namespace-map hardening (issue #168 review follow-up):** map preview and
+  apply now enforce forward-schema and local-filesystem admission, reject
+  control characters in source prefixes, and report structured sorted before/
+  after censuses. Apply streams live rows in bounded batches, verifies vector
+  bytes when sqlite-vec is available and always verifies link endpoints inside
+  its transaction, and makes post-commit log failures explicitly distinguish
+  the committed outcome.
 
 ## [0.63.0] - 2026-09-25
 

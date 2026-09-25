@@ -1644,16 +1644,28 @@ else `user:global` — a bare `global` is never invented.
 and contains only unindented quoted pairs such as
 `"db:source-prefix": "fleet:scope"`; blank lines and full-line comments are
 allowed. Entries are evaluated in file order, so the first matching `source_ref`
-prefix wins. Every target must satisfy the shared namespace grammar. Map mode
+prefix wins. A source prefix must also exclude C0/C1 controls, whitespace, and
+`=` so it cannot forge key/value fields in the decision log. Every target must
+satisfy the shared namespace grammar; its value is percent-encoded in the log,
+so valid project/user names containing spaces or `=` remain safe. Map mode
 requires exactly one of `--dry-run` or `--confirm` and cannot be combined with
 `--from`, `--to`, or `--near-miss-global`.
+
+Both map modes enforce the store's forward-schema compatibility gate through
+the connection they use for the operation. If the store has a newer unsupported
+schema, upgrade this plugin or use the documented compatibility override before
+previewing or applying the map.
 
 The preview opens the existing store read-only and prints one count per map entry
 plus `unmapped`, with no backup, log, lease, migration, or auto-rekey. Apply takes
 a verified snapshot before its single transaction, updates and relinks only IDs
-whose namespace changes, then appends one decision-log line per map entry. A
-post-commit decision-log failure reports exit 1 with the committed result intact;
-restore the verified snapshot if recovery is required.
+whose namespace changes, then appends one decision-log line per map entry with
+separate `matched` and `moved` counts. A post-commit decision-log failure reports
+exit 3 and explicitly says that the map changes are committed; pre-commit
+failures return nonzero without that committed-state diagnostic. Restore the
+verified snapshot if recovery is required. Apply loads the optional sqlite-vec
+extension when available and checks vector bytes in the transaction; link
+endpoints are checked on every apply.
 
 ### promote-store — merge a leftover second store (admin, issue #71 E)
 ```

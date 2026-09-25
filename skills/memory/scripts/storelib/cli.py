@@ -46,8 +46,9 @@ from storelib.inject import (INJECTION_LANES, INJECTION_MOMENTS,
                              select_and_budget_for_injection)
 from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import _declared_vec0_dim, reembed_embeddings
-from storelib.rekey import (MapError, apply_namespace_map, embedding_census,
-                            open_readonly_store, parse_namespace_map,
+from storelib.rekey import (MapError, apply_namespace_map, assert_store_schema_compatible,
+                            embedding_census, load_vec_extension,
+                            load_vec_extension_if_available, open_readonly_store, parse_namespace_map,
                             preview_namespace_map)
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
@@ -2070,24 +2071,40 @@ def main():
         # Both map modes are intentionally before ordinary connect(): preview
         # has a byte-preserving ro handle, while apply owns its narrow rw
         # connection plus writer lease and verified snapshot.
+        try:
+            if _schema_host is not None:
+                _schema_host.assert_local_fs(STORE_PATH.resolve().parent)
+        except (RuntimeError, ValueError) as exc:
+            print(f"[zmem] rekey-namespace: {exc}", file=sys.stderr)
+            sys.exit(2)
         if args.dry_run:
             try:
                 ro_conn = open_readonly_store(STORE_PATH)
                 try:
+                    assert_store_schema_compatible(ro_conn, STORE_PATH)
                     sys.exit(preview_namespace_map(ro_conn, map_entries))
                 finally:
                     ro_conn.close()
             except RuntimeError as exc:
                 print(f"[zmem] rekey-namespace: {exc}", file=sys.stderr)
                 sys.exit(2)
+            except sqlite3.Error as exc:
+                print(f"[zmem] rekey-namespace: read-only census failed: {exc}",
+                      file=sys.stderr)
+                sys.exit(2)
         map_lease = None
         map_conn = None
         try:
             map_lease = _acquire_writer_lease("rekey-namespace")
             map_conn = _connect_existing_store()
+            assert_store_schema_compatible(map_conn, STORE_PATH)
+            # Load the optional vector virtual table when installed so the
+            # transactional identity digest checks actual vector bytes. The
+            # standard-library CLI still supports maps without sqlite-vec.
+            load_vec_extension_if_available(map_conn)
             sys.exit(apply_namespace_map(map_conn, store_path=STORE_PATH,
                                          entries=map_entries))
-        except (RuntimeError, FileNotFoundError) as exc:
+        except (RuntimeError, FileNotFoundError, ValueError, sqlite3.Error) as exc:
             print(f"[zmem] rekey-namespace: {exc}", file=sys.stderr)
             sys.exit(2)
         finally:
@@ -2098,7 +2115,9 @@ def main():
     if args.cmd == "reembed" and args.check:
         check_conn = None
         try:
-            check_conn = open_readonly_store(STORE_PATH, load_vec=True)
+            check_conn = open_readonly_store(STORE_PATH)
+            assert_store_schema_compatible(check_conn, STORE_PATH)
+            load_vec_extension(check_conn)
             declared_dim = _declared_vec0_dim(check_conn)
             if declared_dim is None:
                 raise RuntimeError("memory_vec table/runtime is unavailable")

@@ -1405,9 +1405,20 @@ lines and full-line comments allowed. Entries are evaluated in file order, so
 the first matching prefix wins. Preview is read-only and prints one count per
 entry plus `unmapped`; apply takes one verified snapshot and transaction, moves
 only matched live rows whose namespace changes, and records one decision-log
-line per entry. If post-commit logging fails, the rows remain committed; use
-the verified snapshot with the restore command when recovery is required. See
-the memory skill for the complete grammar and failure semantics.
+line per entry with separate `matched` and `moved` counts. A post-commit log
+failure returns exit 3 and says explicitly that the map changes are committed;
+pre-commit failures return nonzero without that committed-state diagnostic. Use
+the verified snapshot with the restore command when recovery is required. Both
+map modes refuse a store whose schema version is newer than this plugin supports;
+upgrade the plugin (or use the documented compatibility override) before
+inspecting or changing that store. See the memory skill for the complete grammar
+and failure semantics.
+
+Source prefixes cannot contain control characters, whitespace, or `=` because
+they are written as key/value fields in the decision log. Valid target namespace
+values are percent-encoded in that log. Apply loads the optional sqlite-vec
+extension when available to verify vector bytes; link endpoints are checked on
+every apply.
 
 ## Cross-platform hook execution
 

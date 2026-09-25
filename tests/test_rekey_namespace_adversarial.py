@@ -19,6 +19,26 @@ STORE = SCRIPTS / "store.py"
 BUILDER = ROOT / "tests" / "fixtures" / "rekey" / "build_fixture.py"
 
 
+def _surface_digest(*roots: Path) -> bytes:
+    """Stable byte digest for map refusals and contention checks."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for root in roots:
+        for path in [root, Path(f"{root}-wal"), Path(f"{root}-shm")]:
+            digest.update(str(path).encode())
+            if path.is_file():
+                digest.update(path.read_bytes())
+            elif path.is_dir():
+                for child in sorted(path.rglob("*")):
+                    digest.update(str(child.relative_to(path)).encode())
+                    if child.is_file():
+                        digest.update(child.read_bytes())
+            else:
+                digest.update(b"missing")
+    return digest.digest()
+
+
 def _sqlite_vec_available() -> bool:
     """Whether this process can open the fixture's vec0 virtual table.
 
@@ -64,6 +84,92 @@ class NamespaceMapAdversarial(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("[zmem] rekey-namespace:", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_newer_schema_refuses_map_preview_and_apply_without_side_effects(self):
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.execute("UPDATE meta SET value='999999' WHERE key='schema_version'")
+            conn.commit()
+        finally:
+            conn.close()
+        mapping = ROOT / "tests" / "fixtures" / "rekey" / "map.yaml"
+        for mode in ("--dry-run", "--confirm"):
+            with self.subTest(mode=mode):
+                before = _surface_digest(self.store, self.data, Path(self.env["ZMEM_BACKUP_DIR"]))
+                result = self.run_store("rekey-namespace", "--map", str(mapping), mode)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("newer than", result.stderr)
+                self.assertEqual(
+                    _surface_digest(self.store, self.data, Path(self.env["ZMEM_BACKUP_DIR"])), before
+                )
+
+    def test_newer_schema_refuses_reembed_check_before_vector_runtime_load(self):
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.execute("UPDATE meta SET value='999999' WHERE key='schema_version'")
+            conn.commit()
+        finally:
+            conn.close()
+        before = _surface_digest(self.store, self.data, Path(self.env["ZMEM_BACKUP_DIR"]))
+        result = self.run_store("reembed", "--check")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("newer than", result.stderr)
+        self.assertNotIn("sqlite_vec", result.stderr)
+        self.assertEqual(
+            _surface_digest(self.store, self.data, Path(self.env["ZMEM_BACKUP_DIR"])), before
+        )
+
+    def test_apply_reports_writer_contention_without_partial_update(self):
+        check = sqlite3.connect(self.store)
+        try:
+            before_rows = check.execute(
+                "SELECT id, namespace FROM memory ORDER BY id"
+            ).fetchall()
+        finally:
+            check.close()
+        conn = sqlite3.connect(self.store, timeout=0.1)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            mapping = ROOT / "tests" / "fixtures" / "rekey" / "map.yaml"
+            result = self.run_store("rekey-namespace", "--map", str(mapping), "--confirm")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertRegex(result.stderr.lower(), r"locked|lease|writer|busy")
+        finally:
+            conn.rollback()
+            conn.close()
+        check = sqlite3.connect(self.store)
+        try:
+            self.assertEqual(check.execute(
+                "SELECT id, namespace FROM memory ORDER BY id"
+            ).fetchall(), before_rows)
+        finally:
+            check.close()
+        self.assertFalse((self.data / "zmem-decisions.log").exists())
+
+    def test_reembed_check_rejects_each_mutation_flag(self):
+        cases = (
+            ("--all",),
+            ("--dry-run",),
+            ("--confirm",),
+            ("--profile", "fake"),
+            ("--batch", "64"),
+        )
+        for flags in cases:
+            with self.subTest(flags=flags):
+                before = _surface_digest(
+                    self.store, self.data, Path(self.env["ZMEM_BACKUP_DIR"])
+                )
+                result = self.run_store("reembed", "--check", *flags)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(
+                    "reembed: --check is exclusive with", result.stderr
+                )
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(
+                    _surface_digest(
+                        self.store, self.data, Path(self.env["ZMEM_BACKUP_DIR"])
+                    ), before,
+                )
 
     def test_crlf_map_reapply_is_noop_for_entity_links(self):
         mapping = Path(self.temp.name) / "map.yaml"
@@ -113,6 +219,28 @@ class NamespaceMapAdversarial(unittest.TestCase):
 
 
 class ReadonlyAndCensusGuardrail(unittest.TestCase):
+    def test_optional_vector_extension_only_suppresses_missing_dependency(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib.rekey import load_vec_extension_if_available
+        conn = sqlite3.connect(":memory:")
+
+        def missing_package(_conn):
+            try:
+                raise ModuleNotFoundError("sqlite_vec is optional")
+            except ImportError as cause:
+                raise RuntimeError("cannot load sqlite-vec") from cause
+
+        with mock.patch("storelib.rekey.load_vec_extension",
+                        side_effect=missing_package):
+            self.assertFalse(load_vec_extension_if_available(conn))
+        with mock.patch("storelib.rekey.load_vec_extension", return_value=None):
+            self.assertTrue(load_vec_extension_if_available(conn))
+        with mock.patch("storelib.rekey.load_vec_extension",
+                        side_effect=RuntimeError("extension load failed")):
+            with self.assertRaisesRegex(RuntimeError, "extension load failed"):
+                load_vec_extension_if_available(conn)
+        conn.close()
+
     def test_readonly_handle_uses_immutable_ro_uri(self):
         sys.path.insert(0, str(SCRIPTS))
         from storelib.rekey import open_readonly_store
@@ -135,6 +263,42 @@ class ReadonlyAndCensusGuardrail(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "WAL sidecar"):
                 open_readonly_store(path)
             self.assertEqual(wal.read_bytes(), b"do not recover this")
+
+    def test_readonly_handle_refuses_resolved_target_wal(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib.rekey import open_readonly_store
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.sqlite"
+            sqlite3.connect(target).close()
+            alias = root / "alias.sqlite"
+            try:
+                alias.symlink_to(target)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks unavailable on this host")
+            target_wal = Path(f"{target}-wal")
+            target_wal.write_bytes(b"target WAL")
+            with self.assertRaisesRegex(RuntimeError, "WAL sidecar"):
+                open_readonly_store(alias)
+            self.assertEqual(target_wal.read_bytes(), b"target WAL")
+
+    def test_immutable_handle_rejects_actual_write(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib.rekey import open_readonly_store
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "store.sqlite"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE evidence(value TEXT)")
+            conn.commit()
+            conn.close()
+            ro = open_readonly_store(path)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    ro.execute("INSERT INTO evidence VALUES ('must fail')")
+            finally:
+                ro.close()
+            self.assertFalse(Path(f"{path}-wal").exists())
+            self.assertFalse(Path(f"{path}-shm").exists())
 
     def test_dimension_census_uses_memory_blob_not_vector_blob(self):
         sys.path.insert(0, str(SCRIPTS))

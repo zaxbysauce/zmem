@@ -12,6 +12,7 @@ operator or repository data.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -134,10 +135,12 @@ class RekeyNamespaceMapTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def _map_command(self, *args: str, map_path: Path = MAP_FILE):
-        return self.run_store(
-            "rekey-namespace", "--map", str(map_path), *args
-        )
+    def _map_command(self, *args: str, map_path: Path = MAP_FILE,
+                     env: dict[str, str] | None = None):
+        command = ("rekey-namespace", "--map", str(map_path), *args)
+        if env is None:
+            return self.run_store(*command)
+        return self.run_store(*command, env=env)
 
     def test_map_command_argv_places_flag_after_map_path(self):
         with mock.patch.object(self, "run_store", return_value="sentinel") as run:
@@ -165,6 +168,13 @@ class RekeyNamespaceMapTest(unittest.TestCase):
             _surface_digest(self.store, self.data, self.backups), before,
             "dry-run must not change database, WAL, log, or backup bytes/mtimes",
         )
+
+    def test_map_refuses_onedrive_path_with_cli_error_contract(self):
+        env = {**self.env, "OneDrive": str(self.tmp)}
+        result = self._map_command("--dry-run", env=env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("OneDrive root", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_apply_moves_only_source_prefix_matches(self):
         before = self._all_memory_rows()
@@ -225,7 +235,7 @@ class RekeyNamespaceMapTest(unittest.TestCase):
         before = _surface_digest(self.store, self.data, self.backups)
         result = self._map_command("--dry-run", map_path=bad_map)
         self.assertEqual(result.returncode, 2)
-        self.assertRegex(result.stderr.lower(), r"invalid|scope|namespace")
+        self.assertIn("has invalid target scope 'global'", result.stderr)
         self.assertEqual(_surface_digest(self.store, self.data, self.backups), before)
 
     def test_strict_map_syntax_refused_without_mutation(self):
@@ -235,6 +245,8 @@ class RekeyNamespaceMapTest(unittest.TestCase):
             "\"db:spark-kb\\\"x\": \"fleet:dgx-spark\"\n",
             "\"db:spark-kb\": \"fleet:dgx-spark\"\n"
             "\"db:spark-kb\": \"host:spark1\"\n",
+            "\"db:\\tspark-kb\": \"fleet:dgx-spark\"\n",
+            "\"db:spark-kb target=x mapped=999\": \"fleet:dgx-spark\"\n",
         )
         for number, contents in enumerate(invalid_maps):
             with self.subTest(number=number):
@@ -253,6 +265,21 @@ class RekeyNamespaceMapTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertRegex(result.stderr.lower(), r"map|from|exclusive|combine")
         self.assertEqual(_surface_digest(self.store, self.data, self.backups), before)
+
+    def test_map_requires_exactly_one_mode_and_rejects_every_legacy_selector(self):
+        cases = (
+            (),
+            ("--dry-run", "--confirm"),
+            ("--dry-run", "--to", "user:global"),
+            ("--dry-run", "--near-miss-global"),
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                before = _surface_digest(self.store, self.data, self.backups)
+                result = self._map_command(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertRegex(result.stderr.lower(), r"map|confirm|dry.run|combine")
+                self.assertEqual(_surface_digest(self.store, self.data, self.backups), before)
 
     def test_bank_name_is_not_inferred(self):
         result = self._map_command("--confirm")
@@ -326,6 +353,18 @@ class RekeyNamespaceMapTest(unittest.TestCase):
             )[0][0],
             5,
         )
+        self.assertEqual(
+            [tuple(row) for row in self.query(
+                "SELECT f.rowid, f.content, f.tags, f.namespace "
+                "FROM memory_fts f JOIN memory m ON m.rowid=f.rowid "
+                "WHERE m.superseded_at IS NULL ORDER BY f.rowid"
+            )],
+            [tuple(row) for row in self.query(
+                "SELECT rowid, content, tags, namespace FROM memory "
+                "WHERE superseded_at IS NULL ORDER BY rowid"
+            )],
+            "FTS rows must preserve each memory row identity and exact content",
+        )
 
     def test_verified_single_backup_and_decision_log(self):
         result = self._map_command("--confirm")
@@ -350,6 +389,42 @@ class RekeyNamespaceMapTest(unittest.TestCase):
         lines = (self.data / "zmem-decisions.log").read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 2)
         snapshot_sha = hashlib.sha256(snapshots[0].read_bytes()).hexdigest()
+        before_line = next(
+            line for line in result.stdout.splitlines()
+            if line.startswith("rekey-namespace map before: ")
+        )
+        after_line = next(
+            line for line in result.stdout.splitlines()
+            if line.startswith("rekey-namespace map after: ")
+        )
+        expected_prefixes = [
+            {"source_ref_prefix": "db:spark-kb", "target": "fleet:dgx-spark",
+             "total": 12, "live": 12, "moved": 0},
+            {"source_ref_prefix": "hermes-spark1", "target": "host:spark1",
+             "total": 5, "live": 5, "moved": 0},
+        ]
+        self.assertEqual(json.loads(before_line.split(": ", 1)[1]), {
+            "total": 20, "live": 20,
+            "by_namespace": [
+                {"namespace": "user:global", "total": 20, "live": 20},
+            ],
+            "by_prefix": expected_prefixes,
+            "unmapped": {"total": 3, "live": 3},
+        })
+        expected_after_prefixes = [
+            {**expected_prefixes[0], "moved": 12},
+            {**expected_prefixes[1], "moved": 5},
+        ]
+        self.assertEqual(json.loads(after_line.split(": ", 1)[1]), {
+            "total": 20, "live": 20,
+            "by_namespace": [
+                {"namespace": "fleet:dgx-spark", "total": 12, "live": 12},
+                {"namespace": "host:spark1", "total": 5, "live": 5},
+                {"namespace": "user:global", "total": 3, "live": 3},
+            ],
+            "by_prefix": expected_after_prefixes,
+            "unmapped": {"total": 3, "live": 3},
+        })
         for line, source, target, mapped in (
             (lines[0], "db:spark-kb", "fleet:dgx-spark", 12),
             (lines[1], "hermes-spark1", "host:spark1", 5),
@@ -358,10 +433,38 @@ class RekeyNamespaceMapTest(unittest.TestCase):
                 line,
                 rf"^\[\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}Z\] "
                 rf"zmem-rekey kind=namespace source_ref_prefix={re.escape(source)} "
-                rf"target={re.escape(target)} mapped={mapped} unmapped=3 "
+                rf"target={re.escape(target)} matched={mapped} moved={mapped} unmapped=3 "
                 r"snapshot_sha256=[0-9a-f]{64}$",
             )
             self.assertEqual(line.rsplit("snapshot_sha256=", 1)[1], snapshot_sha)
+
+    def test_decision_log_percent_encodes_target_field_delimiters(self):
+        mapping = self.tmp / "target-with-delimiters.yaml"
+        mapping.write_text(
+            '"db:spark-kb": "project:tenant injected=999"\n',
+            encoding="utf-8",
+        )
+        result = self._map_command("--confirm", map_path=mapping)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = (self.data / "zmem-decisions.log").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("target=project:tenant%20injected%3D999 ", lines[0])
+        self.assertNotIn("target=project:tenant injected=999", lines[0])
+        self.assertIn(" matched=12 moved=12 unmapped=8 ", lines[0])
+
+    def test_reapply_records_matches_but_zero_rows_moved(self):
+        first = self._map_command("--confirm")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self._map_command("--confirm")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        lines = (self.data / "zmem-decisions.log").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertIn("matched=12 moved=0 unmapped=3", lines[2])
+        self.assertIn("matched=5 moved=0 unmapped=3", lines[3])
 
     def test_backup_failure_blocks_apply(self):
         self.backups.write_text("not a directory", encoding="utf-8")
@@ -388,9 +491,41 @@ class RekeyNamespaceMapTest(unittest.TestCase):
         finally:
             conn.close()
         before_rows = self._all_memory_rows()
+        before_store = _store_digest(self.store)
+        before_data = _surface_digest(self.data)
         result = self._map_command("--confirm")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self._all_memory_rows(), before_rows)
+        self.assertEqual(_store_digest(self.store), before_store)
+        self.assertEqual(_surface_digest(self.data), before_data)
+        # The snapshot is deliberately before BEGIN IMMEDIATE; a failed
+        # transaction may leave that verified recovery artifact, but no log.
+        self.assertEqual(len(list(self.backups.glob("store-*.sqlite"))), 1)
+
+    def test_derived_identity_invariant_failure_rolls_back(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib.rekey import apply_namespace_map
+
+        before = self._all_memory_rows()
+        conn = _connect(self.store)
+        conn.row_factory = sqlite3.Row
+        try:
+            with mock.patch.dict(os.environ, {
+                "ZMEM_DATA": str(self.data),
+                "ZMEM_BACKUP_DIR": str(self.backups),
+            }, clear=False), mock.patch(
+                "storelib.rekey._derived_identity_digest",
+                side_effect=("before", "after"),
+            ):
+                result = apply_namespace_map(
+                    conn, store_path=self.store,
+                    entries=[("db:spark-kb", "fleet:dgx-spark")],
+                )
+        finally:
+            conn.close()
+        self.assertEqual(result, 1)
+        self.assertEqual(self._all_memory_rows(), before)
+        self.assertFalse((self.data / "zmem-decisions.log").exists())
         self.assertEqual(self.query("PRAGMA integrity_check")[0][0], "ok")
         self.assertEqual(
             self.query(
@@ -402,7 +537,9 @@ class RekeyNamespaceMapTest(unittest.TestCase):
     def test_decision_log_failure_reports_committed_result(self):
         (self.data / "zmem-decisions.log").mkdir()
         result = self._map_command("--confirm")
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("committed, but decision log append failed", result.stderr)
+        self.assertIn("map changes are committed", result.stderr)
         self.assertEqual(
             self.query(
                 "SELECT COUNT(*) FROM memory WHERE namespace='fleet:dgx-spark'"
@@ -415,6 +552,26 @@ class RekeyNamespaceMapTest(unittest.TestCase):
             )[0][0],
             5,
         )
+
+    def test_mapped_tombstone_is_excluded_from_apply_and_census(self):
+        conn = _connect(self.store)
+        try:
+            conn.execute("UPDATE memory SET superseded_at='2026-01-01T00:00:00Z' "
+                         "WHERE id='fixture-01'")
+            conn.commit()
+        finally:
+            conn.close()
+        result = self._map_command("--confirm")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.query(
+            "SELECT namespace FROM memory WHERE id='fixture-01'"
+        )[0][0], "user:global")
+        after = result.stdout.split("rekey-namespace map after: ", 1)[1].splitlines()[0]
+        census = json.loads(after)
+        self.assertEqual(census["total"], 20)
+        self.assertEqual(census["live"], 19)
+        self.assertEqual(census["by_prefix"][0]["total"], 12)
+        self.assertEqual(census["by_prefix"][0]["live"], 11)
 
 
 if __name__ == "__main__":
