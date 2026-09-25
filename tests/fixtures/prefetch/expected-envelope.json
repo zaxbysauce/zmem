@@ -61,6 +61,7 @@
       "_rel_lex": 1.0,
       "_score": 0.88,
       "_stale_note": "",
+      "applied_count": 0,
       "confidence": 0.9,
       "content": "stash pop recovery note one",
       "entities": [],
@@ -76,7 +77,8 @@
       "type": "fact",
       "update_of": "",
       "valid_from": "2026-06-01T00:00:00Z",
-      "valid_until": ""
+      "valid_until": "",
+      "violated_count": 0
     },
     {
       "_graph_arrival_only": false,
@@ -86,6 +88,7 @@
       "_rel_lex": 1.0,
       "_score": 0.88,
       "_stale_note": "",
+      "applied_count": 0,
       "confidence": 0.9,
       "content": "stash pop recovery note two",
       "entities": [],
@@ -101,7 +104,8 @@
       "type": "fact",
       "update_of": "",
       "valid_from": "2026-06-01T00:00:00Z",
-      "valid_until": ""
+      "valid_until": "",
+      "violated_count": 0
     }
   ],
   "tokens_budget": 1500,

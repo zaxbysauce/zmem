@@ -316,6 +316,22 @@ class BypassError(RuntimeError):
     """
 
 
+def _rendered_ids_in_fence(rows: list[dict], fence: str) -> set[str]:
+    """Parse delivery bullets using the same strict ledger parser.
+
+    Scoped rows add a tier prefix, while #183 passive rows keep their frozen
+    tierless wire.  Both forms must count as a rendered delivery.
+    """
+    if not fence:
+        return set()
+    from storelib.delivery_ledger import rows_present_in
+    return {
+        str(row.get("id"))
+        for row in rows_present_in(rows, fence)
+        if row.get("id") is not None
+    }
+
+
 def _injection_silent_reasons() -> tuple:
     # schema_meta lives at the TOP of skills/memory/scripts/ next to store.py
     # (same import discipline as inject.py's guarded import above).
@@ -422,7 +438,7 @@ def _verify_real_lane(
     # against the SAME ceiling; otherwise a stub landing in
     # (budget-128, budget] slips past undetected.
     shell = getattr(_inject, "FENCE_SHELL_ALLOWANCE", 0)
-    used = sum(_inject.fence_row_cost(r) for r in rows)
+    used = sum(_inject.fence_row_cost(r, legacy_injection_wire=True) for r in rows)
     protected = getattr(_inject, "_PROTECTED_TYPES", ("decision", "constraint"))
     all_protected = bool(rows) and all((r.get("type") or "") in protected for r in rows)
     if used + shell > budget and not all_protected:
@@ -431,8 +447,9 @@ def _verify_real_lane(
             f"{budget}-token budget, with non-protected rows present — the "
             "token budget did not run"
         )
+    rendered_fence_ids = _rendered_ids_in_fence(rows, fence)
     for r in rows:
-        if f"- [{r.get('id')}]" not in fence:
+        if str(r.get("id")) not in rendered_fence_ids:
             raise BypassError(
                 f"{item_id}: rendered row {r.get('id')} is absent from the "
                 "fence text — metrics must come off the rendered fence"
@@ -706,6 +723,7 @@ def evaluate_injection_items(
         fence = _format_fenced_recall(
             rows,
             header=f"Relevant memories (namespace {item.namespace or 'unscoped'}).",
+            legacy_injection_wire=True,
         )
         _verify_real_lane(
             item.id,
@@ -716,7 +734,10 @@ def evaluate_injection_items(
             candidate_ids=envelope.get("candidate_ids"),
             candidate_lanes=envelope.get("candidate_lanes"),
         )
-        fence_ok = all(f"- [{rid}]" in fence for rid in rendered_ids)
+        fence_ok = (
+            _rendered_ids_in_fence(rows, fence)
+            == {str(rid) for rid in rendered_ids}
+        )
 
         labeled = set(item.must_include_ids)
         if item.expect == "silent":

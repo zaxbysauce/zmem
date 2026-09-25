@@ -822,5 +822,59 @@ class QueryRewriteSurfaceIntegrationTest(unittest.TestCase):
             provider._NATIVE_EVIDENCE_QUEUE = original_queue
 
 
+class HermesExplicitSearchIntegrationTest(unittest.TestCase):
+    def test_star_search_returns_foreign_project_and_user_global_rows(self):
+        """The Hermes '*' search must retain the store-wide search contract.
+
+        This crosses the real provider -> ``store.py`` subprocess boundary.  A
+        source or argv-only assertion would miss the #167 regression, where
+        the namespace-less CLI call entered implicit scoped recall and silently
+        dropped both a foreign project row and the ``user:global`` row.
+        """
+        with tempfile.TemporaryDirectory(prefix="zmem-hermes-star-search-") as raw:
+            tmp = Path(raw)
+            env = _env(tmp, ZMEM_NAMESPACE="project:current")
+            with mock.patch.dict(os.environ, env, clear=True):
+                _init_store(tmp)
+                for namespace, content in (
+                    (
+                        "project:foreign",
+                        "hermes star regression foreign project sentinel",
+                    ),
+                    (
+                        "user:global",
+                        "hermes star regression user global sentinel",
+                    ),
+                ):
+                    added = _run_store(
+                        tmp,
+                        "add", "--namespace", namespace,
+                        "--type", "fact", "--content", content,
+                        "--signal", "test", "--confidence", "1.0", "--json",
+                    )
+                    self.assertEqual(added.returncode, 0, added.stderr)
+
+                provider = _load_provider()
+                instance = provider.ZmemMemoryProvider()
+                instance._namespace = "project:current"
+                raw_result = instance.handle_tool_call(
+                    "zmem_search",
+                    {
+                        "query": "hermes star regression sentinel",
+                        "namespace": "*",
+                        "limit": 5,
+                    },
+                )
+                payload = json.loads(raw_result)
+                self.assertEqual(payload.get("count"), 2, payload)
+                contents = {item.get("content") for item in payload["results"]}
+                self.assertIn(
+                    "hermes star regression foreign project sentinel", contents
+                )
+                self.assertIn(
+                    "hermes star regression user global sentinel", contents
+                )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

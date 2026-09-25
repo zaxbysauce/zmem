@@ -81,6 +81,38 @@ in deterministic verification) > `reviewer/user` (medium) > `none` (low, below t
 retrieval floor by default). This follows the finding that intrinsic self-correction
 (lessons from the agent's own opinion, ungrounded) degrades accuracy.
 
+### Scoped five-tier recall (issue #167)
+
+The ordinary implicit `recall` and `recent` commands resolve the current project,
+fleet, and host through the shared scope resolver when no `--namespace` is given;
+hostnames are normalized to lowercase for `host:` scope lookup.
+Their scoped path reserves independent slots in this order:
+`project`, `domain`, `fleet_host`, `cross_project`, `user_global`, with defaults
+`5/2/2/2/3`. The programmatic `recall_memory`, `recent_memory`, and
+`explain_recall` APIs opt in with a `scopes=` map using those same keys (the
+resolver's `agent` key is ignored). `user_global` is included only when
+`include_global=True`.
+
+Set `ZMEM_TIER_SLOTS` to exactly five comma-separated ASCII nonnegative integers
+in that order to change the caps per call. The scoped cross-project reservation
+remains closed until a public admission policy is available. While disabled,
+recall and recent skip the unfiltered candidate scan. The legacy
+`--include-cross-project` hazard lane remains separate. Fenced scoped rows carry
+`[tier=<name>]` prefixes, while the generic tierless renderer uses
+`[tier=unknown]` and the legacy `tier=cross` marker keeps its suffix form.
+Ordinary plain-text recall/recent output includes the unknown marker too. Passive
+injection retains its established tierless wire bytes. Explicit `--namespace`,
+search, hook, and injection calls retain their legacy routing and limits.
+Hermes `namespace="*"` searches and namespace-less unscoped MCP reads retain the
+full-store legacy path through an internal dispatch marker.
+On implicit ordinary recall and recent, `--include-global` opts into the
+scoped `user_global` reservation and preserves tier labels. Explicit
+`--namespace` calls retain their legacy union behavior; `--include-cross-project`
+retains the legacy hazard semantics.
+The `domain` reservation is available to programmatic callers that supply a
+domain scope; shipped CLI, hook, and MCP resolvers do not currently create one.
+Programmatic scoped recall and recent reject `include_cross_project=True`.
+
 ### Cross-project hazard lane (issue #98)
 
 A fourth, precision-gated recall tier can deliver up to **2** live, grounded rows
@@ -107,6 +139,10 @@ governs. The tier is query-time: the queryless `recent` pull never admits
 cross rows. The #155 real-corpus replay baseline has landed: the predeclared
 measurement record `eval/real-corpus-2026-09-19.json` is the calibration
 reference for this tier.
+Scoped MCP tokens do not forward `ops_tokens` to this legacy path, so foreign
+rows are excluded before rendering, context construction, or delivery-ledger
+updates. The selector and delivery boundary are described in Query-aware
+passive prefetch (#159) below.
 
 ### Query-aware passive prefetch (issue #159)
 

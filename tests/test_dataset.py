@@ -446,7 +446,8 @@ class DatasetExportTest(_StoreCase):
         self.assertEqual(kept, [_rid(301)],
                          "filters must apply before the snapshot exists")
         r = run_cli(base_env(snap), "recall", "--query",
-                    "llama husbandry", "--no-bump")
+                    "llama husbandry", "--namespace", "project:filter",
+                    "--no-bump")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("llama husbandry", r.stdout)
 

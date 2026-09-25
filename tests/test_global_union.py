@@ -169,11 +169,11 @@ class TestRecentIncludeGlobal(_StoreCase):
         self.assertTrue(all(r["namespace"] == PROJECT_NS for r in results))
 
     def test_recent_include_global_with_no_namespace_unscoped(self):
-        """Reviewer blind spot: when no namespace is given, --include-global is
-        a no-op (the unscoped recent already returns everything)."""
+        """The explicit compatibility marker retains the old unscoped union."""
         self.add("user:global", "global lesson gamma")
         self.add(PROJECT_NS, "project note delta")
-        results = self.recent_json("--include-global", "--limit", "5")
+        results = self.recent_json("--legacy-unscoped", "--include-global",
+                                   "--limit", "5")
         nss = {r["namespace"] for r in results}
         self.assertIn("user:global", nss, "unscoped recent must still return the global row")
         self.assertIn(PROJECT_NS, nss)
@@ -351,11 +351,11 @@ class TestMergeContract(_StoreCase):
                          "--global-limit 0 must exclude the global tier")
 
     def test_include_global_with_no_namespace_unscoped(self):
-        """When no namespace is given, --include-global is a no-op: the unscoped
-        query already searches everything. The contract must hold (critic test)."""
+        """The explicit compatibility marker retains the old unscoped union."""
         self.add("user:global", "global cross-project fact about caching")
         self.add(PROJECT_NS, "project note")
-        results = self.recall_json("caching", "--include-global")
+        results = self.recall_json("caching", "--legacy-unscoped",
+                                   "--include-global")
         self.assertTrue(any(r["namespace"] == "user:global" for r in results),
                         "unscoped recall must still return the global row")
 

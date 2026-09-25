@@ -450,7 +450,7 @@ class SurfaceTempStoreTest(unittest.TestCase):
         rendered = _format_fenced_recall([row], "Relevant memories.").encode("utf-8")
         expected = (fixture / "fence-expected.txt").read_bytes()
         self.assertEqual(
-            rendered, expected, "empty-valid_until fence bytes must be unchanged"
+            rendered, expected, "expiry-marker bytes must be unchanged"
         )
         self.assertNotIn(b"[EXPIRES]", rendered)
         self.assertNotIn(b"[EXPIRED]", rendered)

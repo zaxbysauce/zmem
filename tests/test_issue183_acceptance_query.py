@@ -290,6 +290,7 @@ class Issue183QueryAcceptance(unittest.TestCase):
                 fixed_env = _env(tmp, ZMEM_TEST_NOW="2026-06-01T00:00:00Z")
                 proc = subprocess.run([sys.executable, str(gen), "--store", str(fixture_store), "--expected", str(expected)], env=fixed_env, capture_output=True, text=True, timeout=30)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(expected.read_bytes(), EXPECTED_NEGATIVE.read_bytes())
                 result = subprocess.run([sys.executable, str(STORE_PY), "recall", "--query", "stash pop", "--namespace", "project:parity", "--limit", "5", "--include-global", "--global-limit", "3", "--no-bump", "--for-injection", "--json", "--session-id", "phase25-parity-session", "--moment", "user_prompt", "--lane", "claude"], env=dict(fixed_env, ZMEM_STORE=str(fixture_store), ZMEM_QUERY_CONTEXT="0"), capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.encode(), AC6_BASE_WIRE.read_bytes())

@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import struct
 import subprocess
@@ -18,17 +19,7 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
-from storelib.backup import (
-    BACKUP_DEFAULT_RETENTION,
-    CONSOLIDATE_LOCK_STALE_SECONDS,
-    SENTINEL_SWEEP_DAYS_DEFAULT,
-    SNAPSHOT_GLOB,
-    _acquire_lock,
-    _release_lock,
-    cmd_backup,
-    cmd_restore,
-    cmd_sweep,
-)
+from storelib.backup import BACKUP_DEFAULT_RETENTION, CONSOLIDATE_LOCK_STALE_SECONDS, SENTINEL_SWEEP_DAYS_DEFAULT, SNAPSHOT_GLOB, _acquire_lock, _release_lock, cmd_backup, cmd_restore, cmd_sweep
 from storelib.consolidate import CONSOLIDATE_DEFAULT_THRESHOLD, consolidate
 from storelib import beliefs as _beliefs
 from storelib.organize import organize
@@ -41,88 +32,27 @@ from storelib.evidence import (
     write_evidence,
 )
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
-from storelib.mine import (
-    cmd_corrections,
-    cmd_failures,
-    cmd_mine_history,
-    cmd_mine_history_adapters,
-    cmd_ops_append,
-    cmd_queue_clear,
-    cmd_queue_list,
-    cmd_promote_store,
-    source_exists,
-)
+from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_ops_append, cmd_queue_clear, cmd_queue_list, cmd_promote_store, source_exists
 from storelib.promote import promote_memory
-
 # _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
 # this module's re-export surface for `storelib/__init__.py` and legacy
 # importers — removing it broke that chain.
-from storelib.recall import (
-    _reembed,
-    cross_project_surface_enabled,
-    explain_recall,
-    get_memory,
-    list_memory,
-    recall_memory,
-    recent_memory,
-    stats,
-)
-from storelib.inject import (
-    INJECTION_LANES,
-    INJECTION_MOMENTS,
-    _injection_data_dir,
-    inject_recent_floor,
-    inject_token_budget,
-    select_and_budget_for_injection,
-)
+from storelib.recall import (_reembed, cross_project_surface_enabled,
+                             explain_recall, get_memory, list_memory,
+                             recall_memory, recent_memory, stats)
+from storelib.inject import (INJECTION_LANES, INJECTION_MOMENTS,
+                             _injection_data_dir, inject_recent_floor,
+                             inject_token_budget,
+                             select_and_budget_for_injection)
 from storelib.cross_encoder import cli_allowed as _ce_cli_allowed
 from storelib.recall import reembed_embeddings
-from storelib.schema import (
-    ALLOWED_SIGNALS,
-    ALLOWED_TYPES,
-    ALLOWED_TAINTS,
-    CAPTURE_MODES,
-    GLOBAL_NAMESPACE,
-    STORE_PATH,
-    _acquire_writer_lease,
-    assert_embedding_compatible,
-    _prepare_store,
-    _release_writer_lease,
-    _wait_for_maintenance_clear,
-    connect,
-    _host as _schema_host,
-)
-from storelib.sync import (
-    EXPORT_PACK_DEFAULT_GLOBAL_LIMIT,
-    EXPORT_PACK_DEFAULT_MAX_BYTES,
-    EXPORT_PACK_DEFAULT_MIN_CONFIDENCE,
-    EXPORT_PACK_DEFAULT_PROJECT_LIMIT,
-    cmd_export_jsonl,
-    cmd_export_pack,
-    cmd_ingest_jsonl,
-    cmd_ingest_jsonl_strict,
-)
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host
+from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
 from storelib.dataset import (
-    cmd_export_dataset,
-    cmd_import_dataset,
-    cmd_publish_dataset,
-    export_dataset,
-    import_dataset,
-    publish_dataset,
+    cmd_export_dataset, cmd_import_dataset, cmd_publish_dataset,
+    export_dataset, import_dataset, publish_dataset,
 )
-from storelib.write import (
-    CapturePolicyRefusal,
-    ContentTooLarge,
-    FeedbackTargetError,
-    _GLOBAL_NEAR_MISS_STEMS,
-    _global_near_miss_key,
-    add_memory,
-    feedback_memory,
-    rekey_namespace,
-    supersede_memory,
-    update_memory,
-    warn_reserved_source_ref,
-)
+from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory, warn_reserved_source_ref
 from storelib.delivery_ledger import FeedbackSidecarError
 from storelib.feedback import apply_operation_feedback
 from storelib.tune import tune_weights
@@ -142,6 +72,44 @@ def _warn_reserved_source_ref(source_ref: str | None) -> None:
     warn_reserved_source_ref(source_ref)
 
 
+def _recall_scopes(args: argparse.Namespace) -> dict[str, str]:
+    """Resolve the implicit #167 scope map used by ordinary read commands.
+
+    Explicit ``--namespace`` values are classified only for the helper's
+    contract and remain on the legacy dispatch lane.  The implicit path uses
+    issue #166's resolver so project, fleet, host, and optional agent context
+    share one admission source; recall itself ignores the out-of-contract
+    ``agent`` key.
+    """
+    namespace = getattr(args, "namespace", None)
+    if namespace:
+        if namespace == GLOBAL_NAMESPACE:
+            return {"user_global": namespace}
+        return {"project": namespace}
+    scopes = _schema_host.resolve_scopes(
+        project_dir=Path.cwd(),
+        hostname=socket.gethostname().lower(),
+        env=os.environ,
+        hermes_kwargs={},
+    )
+    # resolve_namespace() falls back to user:global when Git identity
+    # resolution fails without a cached project key. Preserve that provenance
+    # so ordinary scoped reads do not admit it without --include-global.
+    if scopes.get("project") == "user:global":
+        scopes.pop("project")
+        scopes["user_global"] = "user:global"
+    return scopes
+
+
+def _read_cli_or_report_value_error(call, *args, **kwargs):
+    """Keep invalid scoped-read configuration on the CLI error contract."""
+    try:
+        return call(*args, **kwargs)
+    except ValueError as exc:
+        print(f"[zmem] {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
 # ---------------------------------------------------------------------------
 # Issue #122: Hermes compatibility bridge. The reflect hook must stay
 # stdlib-only and store-free (no storelib import, no SQLite in the hook
@@ -149,7 +117,6 @@ def _warn_reserved_source_ref(source_ref: str | None) -> None:
 # the operation-ring read + delivered-cursor commit run HERE, inside the
 # store process, behind one JSON-printing subprocess command.
 # ---------------------------------------------------------------------------
-
 
 def _hermes_failure_nudge(session_id: str) -> str:
     """Exact pending-failure nudge text pinned by the hermes_compat fixtures
@@ -165,9 +132,8 @@ def _hermes_failure_nudge(session_id: str) -> str:
     )
 
 
-def _hermes_failure_carrier(
-    value: object, *, max_depth: int = 6, max_nodes: int = 128
-) -> bool:
+def _hermes_failure_carrier(value: object, *, max_depth: int = 6,
+                            max_nodes: int = 128) -> bool:
     """Find a bounded failure marker in a Hermes result envelope.
 
     Hermes integrations have used several nested result/tool-result shapes over
@@ -177,11 +143,7 @@ def _hermes_failure_carrier(
     """
     failure_statuses = {"error", "failed", "failure"}
     failure_keys = {
-        "error",
-        "error_message",
-        "error_type",
-        "tool_error",
-        "toolError",
+        "error", "error_message", "error_type", "tool_error", "toolError",
         "failure",
     }
     seen = 0
@@ -209,9 +171,8 @@ def _hermes_failure_carrier(
     return visit(value, 0)
 
 
-def _hermes_capture_correction(
-    namespace: str, session_id: str, user_message: str, data_dir: str
-) -> bool:
+def _hermes_capture_correction(namespace: str, session_id: str,
+                               user_message: str, data_dir: str) -> bool:
     """Classify and queue the current user turn with the SAME
     corrections/correction_queue modules every other host's capture hook
     uses (host="hermes"); dedup via the hashed ``.corr`` sidecar. Returns
@@ -233,28 +194,16 @@ def _hermes_capture_correction(
     try:
         import corrections  # type: ignore
         import correction_queue as cq  # type: ignore
-
         if not corrections.should_include_message(text):
             return False
-        (
-            item_type,
-            patterns,
-            confidence,
-            sentiment,
-            decay_days,
-        ) = corrections.detect_patterns(text)
+        item_type, patterns, confidence, sentiment, decay_days = \
+            corrections.detect_patterns(text)
         if not item_type:
             return False
         item = cq.make_item(
-            message=text,
-            type_=item_type,
-            patterns=patterns,
-            confidence=confidence,
-            sentiment=sentiment,
-            decay_days=decay_days,
-            session=session_id,
-            namespace=namespace,
-            host="hermes",
+            message=text, type_=item_type, patterns=patterns,
+            confidence=confidence, sentiment=sentiment, decay_days=decay_days,
+            session=session_id, namespace=namespace, host="hermes",
         )
         ok = cq.append_queue(namespace, item)
     except Exception:
@@ -308,11 +257,9 @@ def cmd_hermes_reflect(*, payload: object) -> int:
     :func:`_hermes_capture_correction`; the hook remains stdlib-only and the
     older ``hermes-context`` command is now limited to post-stdout actions.
     """
-
     def _emit(obj: dict) -> None:
-        sys.stdout.write(
-            json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
-        )
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False,
+                                    separators=(",", ":")) + "\n")
 
     if not isinstance(payload, dict):
         _emit({"error": "hermes-reflect unavailable"})
@@ -320,19 +267,14 @@ def cmd_hermes_reflect(*, payload: object) -> int:
     namespace = payload.get("namespace")
     session_id = payload.get("session_id")
     user_message = payload.get("user_message", "")
-    if (
-        not isinstance(namespace, str)
-        or not namespace.strip()
-        or not isinstance(session_id, str)
-        or not session_id.strip()
-        or not isinstance(user_message, str)
-    ):
+    if not isinstance(namespace, str) or not namespace.strip() or \
+            not isinstance(session_id, str) or not session_id.strip() or \
+            not isinstance(user_message, str):
         _emit({"error": "hermes-reflect unavailable"})
         return 1
     try:
         correction_captured = _hermes_capture_correction(
-            namespace, session_id, user_message, os.path.dirname(STORE_PATH)
-        )
+            namespace, session_id, user_message, os.path.dirname(STORE_PATH))
         result = _hermes_prepare(namespace=namespace, session_id=session_id)
         result["correction_captured"] = bool(correction_captured)
         _emit(result)
@@ -342,40 +284,29 @@ def cmd_hermes_reflect(*, payload: object) -> int:
         return 1
 
 
-def cmd_hermes_context(
-    *,
-    action: str,
-    namespace: str,
-    session_id: str,
-    cursor_ts: float | None,
-    cursor_count: int | None,
-) -> int:
+def cmd_hermes_context(*, action: str, namespace: str, session_id: str,
+                       cursor_ts: float | None,
+                       cursor_count: int | None) -> int:
     """`store.py hermes-context` post-stdout acknowledge/cursor actions.
 
     It deliberately does not prepare or capture corrections.  Keeping the
     small command preserves #122's render-before-ack/cursor ordering without
     permitting a second capture path.
     """
-
     def _emit(obj: dict) -> None:
-        sys.stdout.write(
-            json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
-        )
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False,
+                                    separators=(",", ":")) + "\n")
 
     data_dir = os.path.dirname(STORE_PATH)
 
     if action == "commit-cursor":
         if cursor_ts is None or cursor_count is None:
-            print(
-                "store.py: error: --cursor-ts and --cursor-count are "
-                "required with --action commit-cursor",
-                file=sys.stderr,
-            )
+            print("store.py: error: --cursor-ts and --cursor-count are "
+                  "required with --action commit-cursor", file=sys.stderr)
             return 2
         try:
             _ops_tokens.write_delivered_cursor(
-                data_dir, session_id, (float(cursor_ts), int(cursor_count))
-            )
+                data_dir, session_id, (float(cursor_ts), int(cursor_count)))
             _ops_tokens.clear_retry_state(data_dir, session_id)
         except Exception:
             _emit({"error": "hermes-context unavailable"})
@@ -388,14 +319,10 @@ def cmd_hermes_context(
             if os.path.isfile(STORE_PATH):
                 conn = connect()
                 try:
-                    conn.execute(
-                        "DELETE FROM meta WHERE key = ?",
-                        (f"hermes_pending_failure_{session_id}",),
-                    )
-                    conn.execute(
-                        "DELETE FROM meta WHERE key = ?",
-                        (f"hermes_failure_captured_{session_id}",),
-                    )
+                    conn.execute("DELETE FROM meta WHERE key = ?",
+                                 (f"hermes_pending_failure_{session_id}",))
+                    conn.execute("DELETE FROM meta WHERE key = ?",
+                                 (f"hermes_failure_captured_{session_id}",))
                     conn.commit()
                 finally:
                     conn.close()
@@ -446,8 +373,7 @@ def _auto_near_miss_rekey(conn: sqlite3.Connection, force_off: bool = False) -> 
             "SELECT DISTINCT namespace FROM memory WHERE superseded_at IS NULL"
         ).fetchall()
         stranded = [
-            r["namespace"]
-            for r in rows
+            r["namespace"] for r in rows
             if r["namespace"] != GLOBAL_NAMESPACE
             and _global_near_miss_key(r["namespace"]) in _GLOBAL_NEAR_MISS_STEMS
         ]
@@ -462,11 +388,8 @@ def _auto_near_miss_rekey(conn: sqlite3.Connection, force_off: bool = False) -> 
             file=sys.stderr,
         )
     except Exception as exc:
-        print(
-            f"[zmem] near-miss auto-remediation skipped: "
-            f"{type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
+        print(f"[zmem] near-miss auto-remediation skipped: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def nonnegative_int(value: str) -> int:
@@ -475,9 +398,7 @@ def nonnegative_int(value: str) -> int:
     would silently defeat the cap instead of erroring. Reject it up front."""
     n = int(value)
     if n < 0:
-        raise argparse.ArgumentTypeError(
-            f"must be a non-negative integer, got {value!r}"
-        )
+        raise argparse.ArgumentTypeError(f"must be a non-negative integer, got {value!r}")
     return n
 
 
@@ -489,7 +410,6 @@ def positive_int(value: str) -> int:
     if n < 1:
         raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
     return n
-
 
 def _iso8601(value: str) -> str:
     """argparse type= for --as-of (issue #58, 3.6): accept an ISO-8601
@@ -503,11 +423,8 @@ def _iso8601(value: str) -> str:
     validation.
     """
     from datetime import datetime
-
     if not value:
-        raise argparse.ArgumentTypeError(
-            "--as-of requires a non-empty ISO-8601 timestamp"
-        )
+        raise argparse.ArgumentTypeError("--as-of requires a non-empty ISO-8601 timestamp")
     normalized = value.strip()
     try:
         dt = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
@@ -515,7 +432,6 @@ def _iso8601(value: str) -> str:
         raise argparse.ArgumentTypeError(f"invalid ISO-8601 for --as-of: {exc}")
     if dt.tzinfo is not None:
         from datetime import timezone
-
         dt = dt.astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
@@ -552,7 +468,9 @@ def _read_one_json_object() -> dict[str, object]:
     except UnicodeDecodeError as exc:
         raise json.JSONDecodeError("invalid JSON", "", 0) from exc
     try:
-        value = json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
+        value = json.loads(
+            text, object_pairs_hook=_reject_duplicate_json_keys
+        )
     except DuplicateJSONKeyError:
         raise
     except (json.JSONDecodeError, RecursionError) as exc:
@@ -574,39 +492,20 @@ def _read_private_pretool_object() -> dict[str, object] | None:
         raw = sys.stdin.buffer.read(PRIVATE_PRETOOL_STDIN_MAX_BYTES + 1)
         if len(raw) > PRIVATE_PRETOOL_STDIN_MAX_BYTES:
             return None
-        value = json.loads(
-            raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys
-        )
+        value = json.loads(raw.decode("utf-8"),
+                           object_pairs_hook=_reject_duplicate_json_keys)
         return value if isinstance(value, dict) else None
-    except (
-        AttributeError,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        DuplicateJSONKeyError,
-        RecursionError,
-        ValueError,
-        OSError,
-    ):
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError,
+            DuplicateJSONKeyError, RecursionError, ValueError, OSError):
         return None
 
 
 def _evidence_row(row: sqlite3.Row | tuple) -> dict[str, object]:
-    values = dict(
-        zip(
-            (
-                "id",
-                "session_id",
-                "lane",
-                "moment",
-                "kind",
-                "ts",
-                "excerpt",
-                "ref_path",
-                "ref_offset",
-            ),
-            row,
-        )
-    )
+    values = dict(zip(
+        ("id", "session_id", "lane", "moment", "kind", "ts", "excerpt",
+         "ref_path", "ref_offset"),
+        row,
+    ))
     return values
 
 
@@ -643,13 +542,8 @@ def _connect_existing_store() -> sqlite3.Connection:
 
 def _query_rewrite_output(query: str, rewritten: bool) -> None:
     """Emit the closed query-rewrite wire object in canonical key order."""
-    print(
-        json.dumps(
-            {"query": query, "rewrite": int(bool(rewritten))},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-    )
+    print(json.dumps({"query": query, "rewrite": int(bool(rewritten))},
+                     ensure_ascii=False, separators=(",", ":")))
 
 
 def _query_rewrite_context(
@@ -673,9 +567,7 @@ def _query_rewrite_context(
         return original, False
     if explicit_ops is None:
         events = _ops_tokens.read_ops_ring(
-            str(STORE_PATH.parent),
-            session_id.strip(),
-            max_events=8,
+            str(STORE_PATH.parent), session_id.strip(), max_events=8,
             strict_errors=True,
         )
         ops_tokens = _ops_tokens.derive_ops_tokens(*events)
@@ -689,8 +581,7 @@ def _query_rewrite_context(
     # rewrite.  ``original`` above remains the bounded fail-open fallback.
     return rewrite_ambiguous_query(
         prompt if isinstance(prompt, str) else "",
-        ops_tokens=ops_tokens,
-        edited_basenames=edited,
+        ops_tokens=ops_tokens, edited_basenames=edited
     )
 
 
@@ -702,7 +593,8 @@ def _query_rewrite_has_evidence(conn: sqlite3.Connection) -> bool:
     if not row:
         return False
     columns = {
-        item[1] for item in conn.execute("PRAGMA table_info(evidence)") if len(item) > 1
+        item[1] for item in conn.execute("PRAGMA table_info(evidence)")
+        if len(item) > 1
     }
     required = {"id", "session_id", "kind", "ts", "ref_path"}
     if not required.issubset(columns):
@@ -722,7 +614,8 @@ def cmd_query_rewrite(*, prompt: str, session_id: str, namespace: str) -> int:
     except OSError:
         store_exists = False
     if not session_id.strip() or not store_exists:
-        print("[zmem] query-rewrite unavailable; using original query", file=sys.stderr)
+        print("[zmem] query-rewrite unavailable; using original query",
+              file=sys.stderr)
         _query_rewrite_output(original, False)
         return 0
     conn: sqlite3.Connection | None = None
@@ -739,7 +632,9 @@ def cmd_query_rewrite(*, prompt: str, session_id: str, namespace: str) -> int:
         conn.execute("BEGIN")
         if not _query_rewrite_has_evidence(conn):
             raise RuntimeError("evidence table unavailable")
-        rewritten, applied = _query_rewrite_context(conn, prompt, session_id.strip())
+        rewritten, applied = _query_rewrite_context(
+            conn, prompt, session_id.strip()
+        )
         conn.execute("ROLLBACK")
         _query_rewrite_output(rewritten, applied)
         return 0
@@ -749,7 +644,8 @@ def cmd_query_rewrite(*, prompt: str, session_id: str, namespace: str) -> int:
                 conn.rollback()
         except Exception:
             pass
-        print("[zmem] query-rewrite unavailable; using original query", file=sys.stderr)
+        print("[zmem] query-rewrite unavailable; using original query",
+              file=sys.stderr)
         _query_rewrite_output(original, False)
         return 0
     finally:
@@ -760,17 +656,13 @@ def cmd_query_rewrite(*, prompt: str, session_id: str, namespace: str) -> int:
                 pass
 
 
-def cmd_evidence_write(conn: sqlite3.Connection, *, payload: dict[str, object]) -> int:
+def cmd_evidence_write(
+    conn: sqlite3.Connection, *, payload: dict[str, object]
+) -> int:
     """Insert one evidence row; the CLI command owns the single commit."""
     required = {
-        "session_id",
-        "lane",
-        "moment",
-        "kind",
-        "ts",
-        "excerpt",
-        "ref_path",
-        "ref_offset",
+        "session_id", "lane", "moment", "kind", "ts", "excerpt",
+        "ref_path", "ref_offset",
     }
     allowed = required | {"id"}
     if set(payload) - allowed or not required.issubset(payload):
@@ -783,9 +675,7 @@ def cmd_evidence_write(conn: sqlite3.Connection, *, payload: dict[str, object]) 
         raise ValueError("lane must be a string or null")
     ref_offset = payload["ref_offset"]
     if ref_offset is not None and (
-        isinstance(ref_offset, bool)
-        or not isinstance(ref_offset, int)
-        or ref_offset < 0
+        isinstance(ref_offset, bool) or not isinstance(ref_offset, int) or ref_offset < 0
     ):
         raise ValueError("ref_offset must be a non-negative integer or null")
     evidence_id = payload.get("id")
@@ -854,22 +744,10 @@ def cmd_evidence_list(
         print(json.dumps(values, ensure_ascii=False, separators=(",", ":")))
     else:
         for value in values:
-            print(
-                "\t".join(
-                    _display_field(value[key])
-                    for key in (
-                        "id",
-                        "session_id",
-                        "lane",
-                        "moment",
-                        "kind",
-                        "ts",
-                        "excerpt",
-                        "ref_path",
-                        "ref_offset",
-                    )
-                )
-            )
+            print("\t".join(_display_field(value[key]) for key in (
+                "id", "session_id", "lane", "moment", "kind", "ts",
+                "excerpt", "ref_path", "ref_offset",
+            )))
     return 0
 
 
@@ -894,22 +772,10 @@ def cmd_evidence_show(
     if as_json:
         print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
     else:
-        print(
-            "\t".join(
-                _display_field(value[key])
-                for key in (
-                    "id",
-                    "session_id",
-                    "lane",
-                    "moment",
-                    "kind",
-                    "ts",
-                    "excerpt",
-                    "ref_path",
-                    "ref_offset",
-                )
-            )
-        )
+        print("\t".join(_display_field(value[key]) for key in (
+            "id", "session_id", "lane", "moment", "kind", "ts",
+            "excerpt", "ref_path", "ref_offset",
+        )))
     return 0
 
 
@@ -939,11 +805,9 @@ def cmd_hermes_convention(
             value = source.get("status")
             if isinstance(value, str):
                 statuses.append(value.strip().lower())
-        status = (
-            "error"
-            if any(value in {"error", "failed", "failure"} for value in statuses)
-            else ""
-        )
+        status = "error" if any(
+            value in {"error", "failed", "failure"} for value in statuses
+        ) else ""
         if _hermes_failure_carrier(payload):
             status = "error"
         if status in {"error", "failed", "failure"}:
@@ -963,9 +827,7 @@ def cmd_hermes_convention(
                 "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
                 (key,),
             )
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key = ?", (key,)
-            ).fetchone()
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
             try:
                 count = int(row[0]) if row else 0
             except (TypeError, ValueError):
@@ -1027,14 +889,12 @@ def _append_hermes_query_ring(payload: dict[str, object]) -> None:
                 break
         if descriptor:
             _ops_tokens.append_ops_ring(
-                str(STORE_PATH.parent),
-                session,
+                str(STORE_PATH.parent), session,
                 str(extra.get("tool") or event.get("tool_name") or ""),
                 descriptor,
             )
     except Exception:
         pass
-
 
 def main():
     # Production-stream encoding hardening (issue #62 editorial round, Claude
@@ -1058,11 +918,9 @@ def main():
     # subcommand — shared via a parent parser rather than 40 copies.
     _auto_rekey_parent = argparse.ArgumentParser(add_help=False)
     _auto_rekey_parent.add_argument(
-        "--no-auto-rekey",
-        action="store_true",
+        "--no-auto-rekey", action="store_true",
         help="disable the automatic near-miss namespace rekey for this "
-        "invocation (same as ZMEM_AUTO_REKEY=0)",
-    )
+             "invocation (same as ZMEM_AUTO_REKEY=0)")
 
     def _add_parser(name: str, **kwargs):
         kwargs.setdefault("parents", [_auto_rekey_parent])
@@ -1075,599 +933,376 @@ def main():
     p_add = _add_parser("add", help="add a memory")
     p_add.add_argument("--namespace", required=True)
     p_add.add_argument("--type", required=True, choices=list(ALLOWED_TYPES))
-    p_add.add_argument(
-        "--content",
-        required=True,
-        help="the memory text; the literal '-' reads content from "
-        "stdin (use for payloads near the content cap — "
-        "Windows argv caps far below MAX_CONTENT_CHARS)",
-    )
+    p_add.add_argument("--content", required=True,
+                       help="the memory text; the literal '-' reads content from "
+                            "stdin (use for payloads near the content cap — "
+                            "Windows argv caps far below MAX_CONTENT_CHARS)")
     p_add.add_argument("--tags", default="")
     p_add.add_argument("--source-ref", default="")
     p_add.add_argument("--confidence", type=float, default=None)
     p_add.add_argument("--signal", default="none", choices=list(ALLOWED_SIGNALS))
-    p_add.add_argument(
-        "--taint",
-        default=None,
-        choices=list(ALLOWED_TAINTS),
-        help="provenance/trust origin (issue #59, 4.7): "
-        "trusted_internal (human/closeout/grounded), "
-        "untrusted_tool (agent/MCP/Hermes/mine-history), or "
-        "untrusted_web (web fetch). Default derives from "
-        "--signal: grounded signals are trusted_internal, "
-        "`none` is untrusted_tool. Unknown values are refused.",
-    )
-    p_add.add_argument(
-        "--capture-mode",
-        default=None,
-        choices=list(CAPTURE_MODES),
-        help="manual/reviewed keep the original text with warnings; "
-        "auto redacts likely secrets by default before writing",
-    )
-    p_add.add_argument(
-        "--json",
-        action="store_true",
-        help="print a structured write result (id, result, warnings) "
-        "as JSON on stdout instead of the human lines "
-        "(issue #65, 10.8 — consumed by the MCP/Hermes add "
-        "surfaces; stderr advisory lines are unchanged)",
-    )
+    p_add.add_argument("--taint", default=None, choices=list(ALLOWED_TAINTS),
+                       help="provenance/trust origin (issue #59, 4.7): "
+                            "trusted_internal (human/closeout/grounded), "
+                            "untrusted_tool (agent/MCP/Hermes/mine-history), or "
+                            "untrusted_web (web fetch). Default derives from "
+                            "--signal: grounded signals are trusted_internal, "
+                            "`none` is untrusted_tool. Unknown values are refused.")
+    p_add.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
+                       help="manual/reviewed keep the original text with warnings; "
+                            "auto redacts likely secrets by default before writing")
+    p_add.add_argument("--json", action="store_true",
+                       help="print a structured write result (id, result, warnings) "
+                            "as JSON on stdout instead of the human lines "
+                            "(issue #65, 10.8 — consumed by the MCP/Hermes add "
+                            "surfaces; stderr advisory lines are unchanged)")
 
     p_recall = _add_parser("recall", help="recall relevant memories")
     p_recall.add_argument("--query", required=True)
     p_recall.add_argument("--namespace", default=None)
+    p_recall.add_argument(
+        "--legacy-unscoped", action="store_true", default=False,
+        help=argparse.SUPPRESS,
+    )
     p_recall.add_argument("--limit", type=nonnegative_int, default=5)
     p_recall.add_argument("--json", action="store_true")
-    p_recall.add_argument(
-        "--hybrid",
-        action="store_true",
-        help="explicit hybrid BM25+vector recall (alias; hybrid is the "
-        "default when embeddings are available — use --no-hybrid to "
-        "force lexical, issue #58 3.3)",
-    )
-    p_recall.add_argument(
-        "--no-hybrid",
-        action="store_true",
-        help="force lexical-only recall even when embeddings are available "
-        "(issue #58 3.3)",
-    )
-    p_recall.add_argument(
-        "--no-mmr",
-        action="store_true",
-        help="disable MMR diversity re-ranking for this recall "
-        "(issue #60 5.5). By default recall re-orders the "
-        "fused candidate set with Maximal Marginal Relevance "
-        "so near-paraphrase duplicates do not crowd out "
-        "distinct facts; --no-mmr returns pure composite-"
-        "score order. Independent of --no-hybrid (the two "
-        "lanes can be mixed freely). Lambda default 0.7, "
-        "env ZMEM_MMR_LAMBDA.",
-    )
-    p_recall.add_argument(
-        "--no-bump",
-        action="store_true",
-        help="suppress the retrieval_count/last_retrieved write; record "
-        "surfaced_count/last_surfaced instead (passive recall, used "
-        "by hook-driven recall so subagent fan-out does not create N "
-        "concurrent retrieval_count writers — issue #21)",
-    )
-    p_recall.add_argument(
-        "--for-injection",
-        action="store_true",
-        help="passive INJECTION lane (issue #114, P2-3): apply the "
-        "selective inject gate and token budget INSIDE this call, "
-        "return only the rendered rows, and record exactly one "
-        "surfaced_count event per rendered QUERY-MATCHED row "
-        "(link neighbors render but are never counted; "
-        "unfold is explicit-recall-only and never runs here). "
-        "Implies --no-bump; the --json envelope gains reason and "
-        "candidate_ids (pre-gate ids) for the hook decision log.",
-    )
-    p_recall.add_argument(
-        "--as-of",
-        type=_iso8601,
-        default=None,
-        help="temporal predicate (issue #59, 4.4): only return "
-        "rows VALID at as_of — valid_from <= as_of AND "
-        "(valid_until empty OR valid_until > as_of). "
-        "May return historically-superseded rows that were "
-        "valid at that instant. Absent = as of now (live "
-        "rows only).",
-    )
-    p_recall.add_argument(
-        "--include-global",
-        action="store_true",
-        help="also surface user:global rows (project-first merge; "
-        "a global row never crowds out a project row). The "
-        "automatic hooks pass this so cross-project lessons "
-        "reach project-scoped sessions (issue #18).",
-    )
-    p_recall.add_argument(
-        "--global-limit",
-        type=nonnegative_int,
-        default=3,
-        help="max user:global rows when --include-global is set "
-        f"(default 3). No effect without --include-global.",
-    )
-    p_recall.add_argument(
-        "--min-confidence",
-        type=float,
-        default=None,
-        help="SQL confidence floor (PR #190 review PRR-006): "
-        "drop rows below this confidence before scoring. "
-        "Default None = recall's internal CONFIDENCE_FLOOR "
-        "(0.25); the session-start compact lane passes 0.5 "
-        "for parity with the cold-start recent pull.",
-    )
-    p_recall.add_argument(
-        "--link-hops",
-        type=int,
-        choices=[0, 1],
-        default=1,
-        help="v11 (issue #61, 6.3): walk related/supports links "
-        "ONE hop from each recalled memory and append up to "
-        "--link-budget neighbor rows (contradicts neighbors "
-        "only if they survive the confidence floor, tagged "
-        "[CONTESTED LINK]). Default 1; 0 disables expansion.",
-    )
-    p_recall.add_argument(
-        "--link-budget",
-        type=nonnegative_int,
-        default=2,
-        help="max extra rows appended by 1-hop link expansion "
-        "(default 2; 0 disables expansion — equivalent to "
-        "--link-hops 0).",
-    )
-    p_recall.add_argument(
-        "--explain",
-        action="store_true",
-        help="issue #82: read-only retrieval debugger. Runs the real "
-        "pipeline (zero writes) and prints one blameline per "
-        "verdict explaining why a row did or did not surface. "
-        "Combine with --target to debug a specific row, and "
-        "--json for the machine-readable envelope. Never bumps, "
-        "never unfolds.",
-    )
-    p_recall.add_argument(
-        "--target",
-        default=None,
-        help="with --explain: the row to explain — a memory id "
-        "(full or unambiguous prefix) or a content fragment "
-        "(case-insensitive substring, then token overlap). "
-        "Multiple matches get one verdict per id.",
-    )
-    p_recall.add_argument(
-        "--no-unfold",
-        action="store_true",
-        help="issue #82: disable the change-intent lineage unfold "
-        "(explicit recall only: change-intent queries like "
-        "'what changed about X' otherwise append budgeted "
-        "[PREVIOUSLY] update_of predecessors). Passive "
-        "surfaces never unfold regardless (--no-bump).",
-    )
+    p_recall.add_argument("--hybrid", action="store_true",
+                          help="explicit hybrid BM25+vector recall (alias; hybrid is the "
+                               "default when embeddings are available — use --no-hybrid to "
+                               "force lexical, issue #58 3.3)")
+    p_recall.add_argument("--no-hybrid", action="store_true",
+                          help="force lexical-only recall even when embeddings are available "
+                               "(issue #58 3.3)")
+    p_recall.add_argument("--no-mmr", action="store_true",
+                          help="disable MMR diversity re-ranking for this recall "
+                               "(issue #60 5.5). By default recall re-orders the "
+                               "fused candidate set with Maximal Marginal Relevance "
+                               "so near-paraphrase duplicates do not crowd out "
+                               "distinct facts; --no-mmr returns pure composite-"
+                               "score order. Independent of --no-hybrid (the two "
+                               "lanes can be mixed freely). Lambda default 0.7, "
+                               "env ZMEM_MMR_LAMBDA.")
+    p_recall.add_argument("--no-bump", action="store_true",
+                          help="suppress the retrieval_count/last_retrieved write; record "
+                               "surfaced_count/last_surfaced instead (passive recall, used "
+                               "by hook-driven recall so subagent fan-out does not create N "
+                               "concurrent retrieval_count writers — issue #21)")
+    p_recall.add_argument("--for-injection", action="store_true",
+                          help="passive INJECTION lane (issue #114, P2-3): apply the "
+                               "selective inject gate and token budget INSIDE this call, "
+                               "return only the rendered rows, and record exactly one "
+                               "surfaced_count event per rendered QUERY-MATCHED row "
+                               "(link neighbors render but are never counted; "
+                               "unfold is explicit-recall-only and never runs here). "
+                               "Implies --no-bump; the --json envelope gains reason and "
+                               "candidate_ids (pre-gate ids) for the hook decision log.")
+    p_recall.add_argument("--as-of", type=_iso8601, default=None,
+                          help="temporal predicate (issue #59, 4.4): only return "
+                               "rows VALID at as_of — valid_from <= as_of AND "
+                               "(valid_until empty OR valid_until > as_of). "
+                               "May return historically-superseded rows that were "
+                               "valid at that instant. Absent = as of now (live "
+                               "rows only).")
+    p_recall.add_argument("--include-global", action="store_true",
+                          help="also surface user:global rows (project-first merge; "
+                               "a global row never crowds out a project row). The "
+                               "automatic hooks pass this so cross-project lessons "
+                               "reach project-scoped sessions (issue #18).")
+    p_recall.add_argument("--global-limit", type=nonnegative_int, default=3,
+                          help="max user:global rows when --include-global is set "
+                               f"(default 3). No effect without --include-global.")
+    p_recall.add_argument("--min-confidence", type=float, default=None,
+                          help="SQL confidence floor (PR #190 review PRR-006): "
+                               "drop rows below this confidence before scoring. "
+                               "Default None = recall's internal CONFIDENCE_FLOOR "
+                               "(0.25); the session-start compact lane passes 0.5 "
+                               "for parity with the cold-start recent pull.")
+    p_recall.add_argument("--link-hops", type=int, choices=[0, 1], default=1,
+                          help="v11 (issue #61, 6.3): walk related/supports links "
+                               "ONE hop from each recalled memory and append up to "
+                               "--link-budget neighbor rows (contradicts neighbors "
+                               "only if they survive the confidence floor, tagged "
+                               "[CONTESTED LINK]). Default 1; 0 disables expansion.")
+    p_recall.add_argument("--link-budget", type=nonnegative_int, default=2,
+                          help="max extra rows appended by 1-hop link expansion "
+                               "(default 2; 0 disables expansion — equivalent to "
+                               "--link-hops 0).")
+    p_recall.add_argument("--explain", action="store_true",
+                          help="issue #82: read-only retrieval debugger. Runs the real "
+                               "pipeline (zero writes) and prints one blameline per "
+                               "verdict explaining why a row did or did not surface. "
+                               "Combine with --target to debug a specific row, and "
+                               "--json for the machine-readable envelope. Never bumps, "
+                               "never unfolds.")
+    p_recall.add_argument("--target", default=None,
+                          help="with --explain: the row to explain — a memory id "
+                               "(full or unambiguous prefix) or a content fragment "
+                               "(case-insensitive substring, then token overlap). "
+                               "Multiple matches get one verdict per id.")
+    p_recall.add_argument("--no-unfold", action="store_true",
+                          help="issue #82: disable the change-intent lineage unfold "
+                               "(explicit recall only: change-intent queries like "
+                               "'what changed about X' otherwise append budgeted "
+                               "[PREVIOUSLY] update_of predecessors). Passive "
+                               "surfaces never unfold regardless (--no-bump).")
 
-    p_recall.add_argument(
-        "--exclude",
-        action="append",
-        default=None,
-        help="repeatable: exclude these memory ids from the results "
-        "(issue #117 D-1: the hooks pass the "
-        "session delivery ledger so a row is not "
-        "re-delivered within the window); the --json "
-        "envelope reports the drop count as 'excluded'",
-    )
-    p_recall.add_argument(
-        "--session-id",
-        dest="session_id",
-        type=str,
-        default=None,
-        help="Session id for the delivery ledger; enables "
-        "store-side selection and the rendered field",
-    )
-    p_recall.add_argument(
-        "--moment",
-        dest="moment",
-        type=str,
-        choices=INJECTION_MOMENTS,
-        default=None,
-        help="Injection moment",
-    )
-    p_recall.add_argument(
-        "--lane",
-        dest="lane",
-        type=str,
-        choices=INJECTION_LANES,
-        default=None,
-        help="Injection lane",
-    )
-    p_recall.add_argument(
-        "--ops-token",
-        dest="ops_token",
-        action="append",
-        type=str,
-        default=[],
-        help="Operation token from the pretool ring " "(repeatable)",
-    )
-    p_recall.add_argument(
-        "--include-cross-project",
-        dest="include_cross_project",
-        action="store_true",
-        default=False,
-        help="Include the precision-gated cross-project tier.",
-    )
+    p_recall.add_argument("--exclude", action="append", default=None,
+                          help="repeatable: exclude these memory ids from the results "
+                               "(issue #117 D-1: the hooks pass the "
+                               "session delivery ledger so a row is not "
+                               "re-delivered within the window); the --json "
+                               "envelope reports the drop count as 'excluded'")
+    p_recall.add_argument("--session-id", dest="session_id", type=str,
+                          default=None,
+                          help="Session id for the delivery ledger; enables "
+                               "store-side selection and the rendered field")
+    p_recall.add_argument("--moment", dest="moment", type=str,
+                          choices=INJECTION_MOMENTS, default=None,
+                          help="Injection moment")
+    p_recall.add_argument("--lane", dest="lane", type=str,
+                          choices=INJECTION_LANES, default=None,
+                          help="Injection lane")
+    p_recall.add_argument("--ops-token", dest="ops_token", action="append",
+                          type=str, default=[],
+                          help="Operation token from the pretool ring "
+                               "(repeatable)")
+    p_recall.add_argument("--include-cross-project",
+                          dest="include_cross_project", action="store_true",
+                          default=False,
+                          help="Include the precision-gated cross-project tier.")
 
-    p_recent = _add_parser(
-        "recent", help="most recent live memories (no FTS, admin pull)"
-    )
+    p_recent = _add_parser("recent", help="most recent live memories (no FTS, admin pull)")
     p_recent.add_argument("--namespace", default=None)
+    p_recent.add_argument(
+        "--legacy-unscoped", action="store_true", default=False,
+        help=argparse.SUPPRESS,
+    )
     p_recent.add_argument("--limit", type=nonnegative_int, default=5)
-    p_recent.add_argument(
-        "--min-confidence",
-        type=float,
-        default=None,
-        help="SQL confidence floor; omitted uses the dynamic "
-        "ZMEM_INJECT_FLOOR_RECENT floor (default 0.5)",
-    )
+    p_recent.add_argument("--min-confidence", type=float, default=None,
+                          help="SQL confidence floor; omitted uses the dynamic "
+                               "ZMEM_INJECT_FLOOR_RECENT floor (default 0.5)")
     p_recent.add_argument("--json", action="store_true")
-    p_recent.add_argument(
-        "--no-bump",
-        action="store_true",
-        help="suppress the retrieval_count/last_retrieved write; record "
-        "surfaced_count/last_surfaced instead (passive recent, used "
-        "by hook-driven subagent recall — issue #21)",
-    )
-    p_recent.add_argument(
-        "--for-injection",
-        action="store_true",
-        help="passive INJECTION lane (issue #114, P2-3): apply the "
-        "selective inject gate and token budget INSIDE this call, "
-        "return only the rendered rows, and record exactly one "
-        "surfaced_count event per rendered row. Implies --no-bump; "
-        "the --json envelope gains reason and candidate_ids "
-        "(pre-gate ids) for the hook decision log.",
-    )
-    p_recent.add_argument(
-        "--include-global",
-        action="store_true",
-        help="also surface user:global rows (project-first merge). "
-        "The automatic hooks pass this so cross-project "
-        "lessons reach project-scoped sessions (issue #18).",
-    )
-    p_recent.add_argument(
-        "--global-limit",
-        type=nonnegative_int,
-        default=3,
-        help="max user:global rows when --include-global is set "
-        f"(default 3). No effect without --include-global.",
-    )
-    p_recent.add_argument(
-        "--as-of",
-        type=_iso8601,
-        default=None,
-        help="temporal predicate (issue #59, 4.4): only return "
-        "rows VALID at as_of (valid_from <= as_of AND "
-        "(valid_until empty OR valid_until > as_of)).",
-    )
+    p_recent.add_argument("--no-bump", action="store_true",
+                          help="suppress the retrieval_count/last_retrieved write; record "
+                               "surfaced_count/last_surfaced instead (passive recent, used "
+                               "by hook-driven subagent recall — issue #21)")
+    p_recent.add_argument("--for-injection", action="store_true",
+                          help="passive INJECTION lane (issue #114, P2-3): apply the "
+                               "selective inject gate and token budget INSIDE this call, "
+                               "return only the rendered rows, and record exactly one "
+                               "surfaced_count event per rendered row. Implies --no-bump; "
+                               "the --json envelope gains reason and candidate_ids "
+                               "(pre-gate ids) for the hook decision log.")
+    p_recent.add_argument("--include-global", action="store_true",
+                          help="also surface user:global rows (project-first merge). "
+                               "The automatic hooks pass this so cross-project "
+                               "lessons reach project-scoped sessions (issue #18).")
+    p_recent.add_argument("--global-limit", type=nonnegative_int, default=3,
+                          help="max user:global rows when --include-global is set "
+                               f"(default 3). No effect without --include-global.")
+    p_recent.add_argument("--as-of", type=_iso8601, default=None,
+                          help="temporal predicate (issue #59, 4.4): only return "
+                               "rows VALID at as_of (valid_from <= as_of AND "
+                               "(valid_until empty OR valid_until > as_of)).")
 
-    p_recent.add_argument(
-        "--exclude",
-        action="append",
-        default=None,
-        help="repeatable: exclude these memory ids from the results "
-        "(issue #117 D-1: the hooks pass the "
-        "session delivery ledger so a row is not "
-        "re-delivered within the window); the --json "
-        "envelope reports the drop count as 'excluded'",
-    )
-    p_recent.add_argument(
-        "--session-id",
-        dest="session_id",
-        type=str,
-        default=None,
-        help="Session id for the delivery ledger; enables "
-        "store-side selection and the rendered field",
-    )
-    p_recent.add_argument(
-        "--moment",
-        dest="moment",
-        type=str,
-        choices=INJECTION_MOMENTS,
-        default=None,
-        help="Injection moment",
-    )
-    p_recent.add_argument(
-        "--lane",
-        dest="lane",
-        type=str,
-        choices=INJECTION_LANES,
-        default=None,
-        help="Injection lane",
-    )
-    p_recent.add_argument(
-        "--ops-token",
-        dest="ops_token",
-        action="append",
-        type=str,
-        default=[],
-        help="Operation token from the pretool ring " "(repeatable)",
-    )
-    p_recent.add_argument(
-        "--include-cross-project",
-        dest="include_cross_project",
-        action="store_true",
-        default=False,
-        help="Include the precision-gated cross-project tier.",
-    )
+    p_recent.add_argument("--exclude", action="append", default=None,
+                          help="repeatable: exclude these memory ids from the results "
+                               "(issue #117 D-1: the hooks pass the "
+                               "session delivery ledger so a row is not "
+                               "re-delivered within the window); the --json "
+                               "envelope reports the drop count as 'excluded'")
+    p_recent.add_argument("--session-id", dest="session_id", type=str,
+                          default=None,
+                          help="Session id for the delivery ledger; enables "
+                               "store-side selection and the rendered field")
+    p_recent.add_argument("--moment", dest="moment", type=str,
+                          choices=INJECTION_MOMENTS, default=None,
+                          help="Injection moment")
+    p_recent.add_argument("--lane", dest="lane", type=str,
+                          choices=INJECTION_LANES, default=None,
+                          help="Injection lane")
+    p_recent.add_argument("--ops-token", dest="ops_token", action="append",
+                          type=str, default=[],
+                          help="Operation token from the pretool ring "
+                               "(repeatable)")
+    p_recent.add_argument("--include-cross-project",
+                          dest="include_cross_project", action="store_true",
+                          default=False,
+                          help="Include the precision-gated cross-project tier.")
 
     # Issue #159 (Workstream H-2): query-aware passive prefetch. One selector
     # call, one envelope; --for-injection/--no-bump/--json are accepted as
     # explicit markers of the (only) passive mode the compat hook pins.
-    p_prefetch = _add_parser(
-        "prefetch",
-        help="query-aware passive prefetch (selector " "envelope; issue #159)",
-    )
-    p_prefetch.add_argument(
-        "--query",
-        dest="query",
-        type=str,
-        required=True,
-        help="query for passive memory selection",
-    )
-    p_prefetch.add_argument(
-        "--namespace",
-        dest="namespace",
-        type=str,
-        required=True,
-        help="scope the passive recall namespace",
-    )
-    p_prefetch.add_argument(
-        "--session-id",
-        dest="session_id",
-        type=str,
-        required=True,
-        help="Session id for the delivery ledger; enables "
-        "store-side selection and the rendered field",
-    )
-    p_prefetch.add_argument(
-        "--moment",
-        dest="moment",
-        type=str,
-        choices=INJECTION_MOMENTS,
-        required=True,
-        help="Injection moment",
-    )
-    p_prefetch.add_argument(
-        "--lane",
-        dest="lane",
-        type=str,
-        choices=INJECTION_LANES,
-        default=None,
-        help="Injection lane",
-    )
-    p_prefetch.add_argument(
-        "--ops-token",
-        dest="ops_tokens",
-        type=str,
-        action="append",
-        default=[],
-        help="Operation token from the pretool ring " "(repeatable)",
-    )
-    p_prefetch.add_argument(
-        "--exclude",
-        dest="exclude_ids",
-        type=str,
-        action="append",
-        default=[],
-        help="Memory id excluded from passive results " "(repeatable)",
-    )
-    p_prefetch.add_argument(
-        "--for-injection",
-        action="store_true",
-        help="explicit marker: prefetch is always the "
-        "passive injection lane (issue #159)",
-    )
-    p_prefetch.add_argument(
-        "--no-bump",
-        action="store_true",
-        help="explicit marker: the selector never bumps "
-        "retrieval_count (issue #159)",
-    )
-    p_prefetch.add_argument(
-        "--json",
-        action="store_true",
-        help="print the selector envelope as JSON (the "
-        "only output mode; issue #159)",
-    )
+    p_prefetch = _add_parser("prefetch",
+                             help="query-aware passive prefetch (selector "
+                                  "envelope; issue #159)")
+    p_prefetch.add_argument("--query", dest="query", type=str, required=True,
+                            help="query for passive memory selection")
+    p_prefetch.add_argument("--namespace", dest="namespace", type=str,
+                            required=True,
+                            help="scope the passive recall namespace")
+    p_prefetch.add_argument("--session-id", dest="session_id", type=str,
+                            required=True,
+                            help="Session id for the delivery ledger; enables "
+                                 "store-side selection and the rendered field")
+    p_prefetch.add_argument("--moment", dest="moment", type=str,
+                            choices=INJECTION_MOMENTS, required=True,
+                            help="Injection moment")
+    p_prefetch.add_argument("--lane", dest="lane", type=str,
+                            choices=INJECTION_LANES, default=None,
+                            help="Injection lane")
+    p_prefetch.add_argument("--ops-token", dest="ops_tokens", type=str,
+                            action="append", default=[],
+                            help="Operation token from the pretool ring "
+                                 "(repeatable)")
+    p_prefetch.add_argument("--exclude", dest="exclude_ids", type=str,
+                            action="append", default=[],
+                            help="Memory id excluded from passive results "
+                                 "(repeatable)")
+    p_prefetch.add_argument("--for-injection", action="store_true",
+                            help="explicit marker: prefetch is always the "
+                                 "passive injection lane (issue #159)")
+    p_prefetch.add_argument("--no-bump", action="store_true",
+                            help="explicit marker: the selector never bumps "
+                                 "retrieval_count (issue #159)")
+    p_prefetch.add_argument("--json", action="store_true",
+                            help="print the selector envelope as JSON (the "
+                                 "only output mode; issue #159)")
 
     p_query_rewrite = _add_parser(
-        "query-rewrite", help="deterministically add recent passive context"
-    )
+        "query-rewrite", help="deterministically add recent passive context")
     p_query_rewrite.add_argument(
-        "--prompt",
-        required=True,
-        help="prompt text; option-looking values must use --prompt=<value>",
-    )
-    p_query_rewrite.add_argument(
-        "--session-id", required=True, help="session whose evidence/ring is read"
-    )
-    p_query_rewrite.add_argument(
-        "--namespace", required=True, help="selection namespace marker (not auth)"
-    )
-    p_query_rewrite.add_argument(
-        "--json", action="store_true", help="emit the exact {query,rewrite} object"
-    )
+        "--prompt", required=True,
+        help="prompt text; option-looking values must use --prompt=<value>")
+    p_query_rewrite.add_argument("--session-id", required=True,
+                                 help="session whose evidence/ring is read")
+    p_query_rewrite.add_argument("--namespace", required=True,
+                                 help="selection namespace marker (not auth)")
+    p_query_rewrite.add_argument("--json", action="store_true",
+                                 help="emit the exact {query,rewrite} object")
 
     p_ledger_clear = _add_parser(
-        "ledger-clear", help="clear one session's passive delivery ledger"
-    )
-    p_ledger_clear.add_argument(
-        "--session-id",
-        required=True,
-        help="Session id whose delivery ledger will be cleared",
-    )
+        "ledger-clear", help="clear one session's passive delivery ledger")
+    p_ledger_clear.add_argument("--session-id", required=True,
+                                help="Session id whose delivery ledger will be cleared")
 
     p_search = _add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
     p_search.add_argument("--namespace", default=None)
     p_search.add_argument("--limit", type=nonnegative_int, default=10)
-    p_search.add_argument(
-        "--include-global",
-        action="store_true",
-        help="also surface user:global rows (project-first merge). "
-        "Use this instead of going unscoped when you want the "
-        "global tier unioned in but still want a per-tier "
-        "budget (issue #18).",
-    )
-    p_search.add_argument(
-        "--global-limit",
-        type=nonnegative_int,
-        default=3,
-        help="max user:global rows when --include-global is set "
-        f"(default 3). No effect without --include-global.",
-    )
-    p_search.add_argument(
-        "--no-bump",
-        action="store_true",
-        help="suppress the retrieval_count/last_retrieved write; record "
-        "surfaced_count/last_surfaced instead (passive search). Search "
-        "defaults to bumping retrieval like recall; pass this for an "
-        "audit query that still counts the surface — issue #21",
-    )
-    p_search.add_argument(
-        "--as-of",
-        type=_iso8601,
-        default=None,
-        help="temporal predicate (issue #59, 4.4): only return "
-        "rows VALID at as_of (valid_from <= as_of AND "
-        "(valid_until empty OR valid_until > as_of)).",
-    )
-    p_search.add_argument(
-        "--json",
-        action="store_true",
-        help="print the result envelope {results, count, omitted, "
-        "injection_risk, tokens_used, tokens_budget} (issue "
-        "#65, 10.8) — plain output is unchanged",
-    )
+    p_search.add_argument("--include-global", action="store_true",
+                          help="also surface user:global rows (project-first merge). "
+                               "Use this instead of going unscoped when you want the "
+                               "global tier unioned in but still want a per-tier "
+                               "budget (issue #18).")
+    p_search.add_argument("--global-limit", type=nonnegative_int, default=3,
+                          help="max user:global rows when --include-global is set "
+                               f"(default 3). No effect without --include-global.")
+    p_search.add_argument("--no-bump", action="store_true",
+                          help="suppress the retrieval_count/last_retrieved write; record "
+                               "surfaced_count/last_surfaced instead (passive search). Search "
+                               "defaults to bumping retrieval like recall; pass this for an "
+                               "audit query that still counts the surface — issue #21")
+    p_search.add_argument("--as-of", type=_iso8601, default=None,
+                          help="temporal predicate (issue #59, 4.4): only return "
+                               "rows VALID at as_of (valid_from <= as_of AND "
+                               "(valid_until empty OR valid_until > as_of)).")
+    p_search.add_argument("--json", action="store_true",
+                          help="print the result envelope {results, count, omitted, "
+                               "injection_risk, tokens_used, tokens_budget} (issue "
+                               "#65, 10.8) — plain output is unchanged")
 
-    p_search.add_argument(
-        "--exclude",
-        action="append",
-        default=None,
-        help="repeatable: exclude these memory ids from the results "
-        "(issue #117 D-1: the hooks pass the "
-        "session delivery ledger so a row is not "
-        "re-delivered within the window); the --json "
-        "envelope reports the drop count as 'excluded'",
-    )
+    p_search.add_argument("--exclude", action="append", default=None,
+                          help="repeatable: exclude these memory ids from the results "
+                               "(issue #117 D-1: the hooks pass the "
+                               "session delivery ledger so a row is not "
+                               "re-delivered within the window); the --json "
+                               "envelope reports the drop count as 'excluded'")
 
     p_sup = _add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
     p_sup.add_argument("--reason", default="")
     p_sup.add_argument(
-        "--expected-namespace",
-        default=None,
+        "--expected-namespace", default=None,
         help="refuse (exit 2, nothing written) unless the target row lives in "
-        "exactly this namespace — the atomic store-side guard the MCP "
-        "server pins a scoped token's verified namespace through "
-        "(issue #109). Omit for the historical unguarded behavior.",
-    )
+             "exactly this namespace — the atomic store-side guard the MCP "
+             "server pins a scoped token's verified namespace through "
+             "(issue #109). Omit for the historical unguarded behavior.")
 
     p_inv = _add_parser(
         "invalidate",
         help="tombstone a memory because the fact is no longer true "
-        "(supersede with a REQUIRED reason — issue #59, 4.3)",
-        description='`invalidate` is the preferred way to record "this fact is '
-        'no longer true": it tombstones the row (superseded_at=now, '
-        "valid_until=now) and REQUIRES --reason so the correction is "
-        "auditable. `supersede` remains for general tombstone use "
-        "(e.g. consolidated/pruned rows) where a reason is optional.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+             "(supersede with a REQUIRED reason — issue #59, 4.3)",
+        description="`invalidate` is the preferred way to record \"this fact is "
+                    "no longer true\": it tombstones the row (superseded_at=now, "
+                    "valid_until=now) and REQUIRES --reason so the correction is "
+                    "auditable. `supersede` remains for general tombstone use "
+                    "(e.g. consolidated/pruned rows) where a reason is optional.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p_inv.add_argument("--id", required=True, help="id of the memory to invalidate")
+    p_inv.add_argument("--reason", required=True,
+                       help="why the fact is no longer true (REQUIRED)")
     p_inv.add_argument(
-        "--reason", required=True, help="why the fact is no longer true (REQUIRED)"
-    )
-    p_inv.add_argument(
-        "--expected-namespace",
-        default=None,
+        "--expected-namespace", default=None,
         help="same guard as `supersede --expected-namespace`: refuse (exit 2, "
-        "nothing written) unless the target row lives in exactly this "
-        "namespace (issue #109).",
-    )
+             "nothing written) unless the target row lives in exactly this "
+             "namespace (issue #109).")
 
     p_upd = _add_parser(
         "update",
         help="append-only knowledge update: replace a memory, keeping history "
-        "(issue #59, 4.2)",
+             "(issue #59, 4.2)",
         description="Creates a NEW live row carrying the new content, tombstones "
-        "the target row (superseded_at=now, valid_until=now, "
-        "supersede_reason='updated'), and links the new row back to it "
-        "via update_of. Namespace/type/tags/source_ref/confidence/"
-        "signal are copied from the target unless overridden; the old "
-        "row's content is NEVER mutated. Unknown or already-superseded "
-        "ids are refused (exit 2, nothing written). Dedup runs against "
-        "OTHER live rows (the replaced row is excluded). --as-of before "
-        "the update returns the OLD content; after returns the NEW.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+                    "the target row (superseded_at=now, valid_until=now, "
+                    "supersede_reason='updated'), and links the new row back to it "
+                    "via update_of. Namespace/type/tags/source_ref/confidence/"
+                    "signal are copied from the target unless overridden; the old "
+                    "row's content is NEVER mutated. Unknown or already-superseded "
+                    "ids are refused (exit 2, nothing written). Dedup runs against "
+                    "OTHER live rows (the replaced row is excluded). --as-of before "
+                    "the update returns the OLD content; after returns the NEW.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p_upd.add_argument("--id", required=True, help="id of the live memory to update")
-    p_upd.add_argument(
-        "--content",
-        required=True,
-        help="the new content; the literal '-' reads content from "
-        "stdin (use for payloads near the content cap — "
-        "Windows argv caps far below MAX_CONTENT_CHARS)",
-    )
+    p_upd.add_argument("--content", required=True,
+                       help="the new content; the literal '-' reads content from "
+                            "stdin (use for payloads near the content cap — "
+                            "Windows argv caps far below MAX_CONTENT_CHARS)")
     p_upd.add_argument("--namespace", default=None)
-    p_upd.add_argument(
-        "--expected-old-namespace",
-        default=None,
-        help="same guard family as `supersede --expected-namespace`: "
-        "refuse (exit 2, nothing written) unless the TARGET row "
-        "being replaced lives in exactly this namespace — the "
-        "pin the MCP server sets for scoped tokens so the "
-        "old-row tombstone cannot land on a row that drifted "
-        "out of scope (issue #109 follow-up).",
-    )
+    p_upd.add_argument("--expected-old-namespace", default=None,
+                       help="same guard family as `supersede --expected-namespace`: "
+                            "refuse (exit 2, nothing written) unless the TARGET row "
+                            "being replaced lives in exactly this namespace — the "
+                            "pin the MCP server sets for scoped tokens so the "
+                            "old-row tombstone cannot land on a row that drifted "
+                            "out of scope (issue #109 follow-up).")
     p_upd.add_argument("--type", default=None, choices=list(ALLOWED_TYPES))
     p_upd.add_argument("--tags", default=None)
     p_upd.add_argument("--source-ref", default=None)
     p_upd.add_argument("--confidence", type=float, default=None)
     p_upd.add_argument("--signal", default=None, choices=list(ALLOWED_SIGNALS))
-    p_upd.add_argument(
-        "--taint",
-        default=None,
-        choices=list(ALLOWED_TAINTS),
-        help="provenance/trust origin override (default: inherit the "
-        "target's lineage, worst-of with the caller's origin)",
-    )
-    p_upd.add_argument(
-        "--capture-mode",
-        default=None,
-        choices=list(CAPTURE_MODES),
-        help="same capture policy as `add` (manual/reviewed keep text "
-        "with warnings; auto redacts secrets)",
-    )
-    p_upd.add_argument(
-        "--json",
-        action="store_true",
-        help="print a structured write result (id, result, created_new, "
-        "warnings) as JSON on stdout instead of the human lines "
-        "(issue #65, 10.8 — consumed by the MCP/Hermes update "
-        "surfaces; stderr advisory lines are unchanged)",
-    )
+    p_upd.add_argument("--taint", default=None, choices=list(ALLOWED_TAINTS),
+                       help="provenance/trust origin override (default: inherit the "
+                            "target's lineage, worst-of with the caller's origin)")
+    p_upd.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
+                       help="same capture policy as `add` (manual/reviewed keep text "
+                            "with warnings; auto redacts secrets)")
+    p_upd.add_argument("--json", action="store_true",
+                       help="print a structured write result (id, result, created_new, "
+                            "warnings) as JSON on stdout instead of the human lines "
+                            "(issue #65, 10.8 — consumed by the MCP/Hermes update "
+                            "surfaces; stderr advisory lines are unchanged)")
 
     p_get = _add_parser(
         "get",
         help="show a memory by id",
         description="Show one memory row as JSON (binary columns render as a "
-        "'<N-byte blob>' marker). Exit contract: 0 + JSON on "
-        "stdout when found; 1 with the stable stderr line "
-        "`[zmem] no memory with id <id>` when no row has that id "
-        "— the same not-found code as `supersede`, never a "
-        "traceback.",
-    )
-    p_get.add_argument("--id", required=True, help="id of the memory to show")
+                    "'<N-byte blob>' marker). Exit contract: 0 + JSON on "
+                    "stdout when found; 1 with the stable stderr line "
+                    "`[zmem] no memory with id <id>` when no row has that id "
+                    "— the same not-found code as `supersede`, never a "
+                    "traceback.")
+    p_get.add_argument("--id", required=True,
+                       help="id of the memory to show")
 
     p_list = _add_parser("list", help="list memories")
     p_list.add_argument("--namespace", default=None)
@@ -1680,56 +1315,27 @@ def main():
     evidence_sub = p_evidence.add_subparsers(dest="evidence_cmd", required=True)
     evidence_sub.add_parser("write", help="write one JSON evidence object from stdin")
     p_evidence_list = evidence_sub.add_parser("list", help="list evidence rows")
-    p_evidence_list.add_argument(
-        "--namespace",
-        dest="namespace",
-        type=str,
-        required=True,
-        help="namespace to inspect",
-    )
-    p_evidence_list.add_argument(
-        "--session-id",
-        dest="session_id",
-        type=str,
-        default=None,
-        help="filter by session",
-    )
-    p_evidence_list.add_argument(
-        "--lane",
-        dest="lane",
-        type=str,
-        choices=EVIDENCE_LANES,
-        default=None,
-        help="filter by lane",
-    )
-    p_evidence_list.add_argument(
-        "--moment",
-        dest="moment",
-        type=str,
-        choices=EVIDENCE_MOMENTS,
-        default=None,
-        help="filter by moment",
-    )
-    p_evidence_list.add_argument(
-        "--limit", dest="limit", type=positive_int, default=100, help="maximum rows"
-    )
-    p_evidence_list.add_argument(
-        "--json", dest="as_json", action="store_true", default=False, help="emit JSON"
-    )
+    p_evidence_list.add_argument("--namespace", dest="namespace", type=str,
+                                 required=True, help="namespace to inspect")
+    p_evidence_list.add_argument("--session-id", dest="session_id", type=str,
+                                 default=None, help="filter by session")
+    p_evidence_list.add_argument("--lane", dest="lane", type=str,
+                                 choices=EVIDENCE_LANES, default=None,
+                                 help="filter by lane")
+    p_evidence_list.add_argument("--moment", dest="moment", type=str,
+                                 choices=EVIDENCE_MOMENTS, default=None,
+                                 help="filter by moment")
+    p_evidence_list.add_argument("--limit", dest="limit", type=positive_int,
+                                 default=100, help="maximum rows")
+    p_evidence_list.add_argument("--json", dest="as_json", action="store_true",
+                                 default=False, help="emit JSON")
     p_evidence_show = evidence_sub.add_parser("show", help="show one evidence row")
-    p_evidence_show.add_argument(
-        "--namespace",
-        dest="namespace",
-        type=str,
-        required=True,
-        help="namespace to inspect",
-    )
-    p_evidence_show.add_argument(
-        "--id", dest="evidence_id", type=str, required=True, help="evidence identifier"
-    )
-    p_evidence_show.add_argument(
-        "--json", dest="as_json", action="store_true", default=False, help="emit JSON"
-    )
+    p_evidence_show.add_argument("--namespace", dest="namespace", type=str,
+                                 required=True, help="namespace to inspect")
+    p_evidence_show.add_argument("--id", dest="evidence_id", type=str,
+                                 required=True, help="evidence identifier")
+    p_evidence_show.add_argument("--json", dest="as_json", action="store_true",
+                                 default=False, help="emit JSON")
 
     _add_parser("stats", help="store statistics")
 
@@ -1745,21 +1351,13 @@ def main():
     p_session_cadence = _add_parser(
         "session-cadence",
         help="run consolidate + backup --if-due + sweep in one process "
-        "(session-start cadence batch)",
-    )
-    p_session_cadence.add_argument(
-        "--backup-retention",
-        type=int,
-        default=BACKUP_DEFAULT_RETENTION,
-        help=f"backup retention in days (default {BACKUP_DEFAULT_RETENTION})",
-    )
-    p_session_cadence.add_argument(
-        "--json",
-        dest="as_json",
-        action="store_true",
-        default=False,
-        help="emit a machine-readable summary",
-    )
+             "(session-start cadence batch)")
+    p_session_cadence.add_argument("--backup-retention", type=int,
+                                   default=BACKUP_DEFAULT_RETENTION,
+                                   help=f"backup retention in days (default {BACKUP_DEFAULT_RETENTION})")
+    p_session_cadence.add_argument("--json", dest="as_json", action="store_true",
+                                   default=False,
+                                   help="emit a machine-readable summary")
 
     _add_parser("rebuild-fts", help="rebuild the FTS5 index from scratch")
 
@@ -1768,106 +1366,64 @@ def main():
     p_reembed = _add_parser(
         "reembed",
         help="backfill missing embeddings (flagless), or rebuild every live "
-        "embedding under a profile (--all)",
+             "embedding under a profile (--all)",
     )
-    p_reembed.add_argument(
-        "--all",
-        action="store_true",
-        help="rebuild EVERY live memory's embedding (not "
-        "just missing ones); recreates memory_vec at "
-        "the profile's dimension when it changes",
-    )
+    p_reembed.add_argument("--all", action="store_true",
+                           help="rebuild EVERY live memory's embedding (not "
+                                "just missing ones); recreates memory_vec at "
+                                "the profile's dimension when it changes")
     try:
         import embed_profiles as _ep_mod
-
         _PROFILE_CHOICES = sorted(_ep_mod.PROFILES)
     except ImportError:  # pragma: no cover — repo always ships it
         from embed_profiles import PROFILES as _P  # type: ignore
 
         _PROFILE_CHOICES = sorted(_P)
-    p_reembed.add_argument(
-        "--profile",
-        choices=_PROFILE_CHOICES,
-        default=None,
-        help="with --all: embedding profile to convert "
-        "the store to (default: active "
-        "ZMEM_EMBED_PROFILE or minilm)",
-    )
-    p_reembed.add_argument(
-        "--batch",
-        type=nonnegative_int,
-        default=64,
-        help="progress-report granularity in rows "
-        "(stderr pacing only; does not affect "
-        "transaction atomicity; values < 1 reset "
-        "to the default 64)",
-    )
-    p_reembed.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="report what --all would change; writes nothing",
-    )
-    p_reembed.add_argument(
-        "--confirm",
-        action="store_true",
-        help="required by --all --profile fake when the "
-        "store holds committed non-fake vectors "
-        "(conversion overwrites them with placeholders)",
-    )
+    p_reembed.add_argument("--profile", choices=_PROFILE_CHOICES, default=None,
+                           help="with --all: embedding profile to convert "
+                                "the store to (default: active "
+                                "ZMEM_EMBED_PROFILE or minilm)")
+    p_reembed.add_argument("--batch", type=nonnegative_int, default=64,
+                           help="progress-report granularity in rows "
+                                "(stderr pacing only; does not affect "
+                                "transaction atomicity; values < 1 reset "
+                                "to the default 64)")
+    p_reembed.add_argument("--dry-run", action="store_true",
+                           help="report what --all would change; writes nothing")
+    p_reembed.add_argument("--confirm", action="store_true",
+                           help="required by --all --profile fake when the "
+                                "store holds committed non-fake vectors "
+                                "(conversion overwrites them with placeholders)")
+
 
     p_consolidate = _add_parser("consolidate", help="merge near-duplicate memories")
-    p_consolidate.add_argument(
-        "--threshold", type=float, default=CONSOLIDATE_DEFAULT_THRESHOLD
-    )
-    p_consolidate.add_argument(
-        "--prune",
-        action="store_true",
-        help="also supersede low-value never-retrieved memories",
-    )
-    p_consolidate.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="show what would be consolidated without changing anything",
-    )
-    p_consolidate.add_argument(
-        "--namespace", default=None, help="limit consolidation to a specific namespace"
-    )
-    p_consolidate.add_argument(
-        "--force",
-        action="store_true",
-        help="bypass the cadence gate and run consolidation now",
-    )
-    p_consolidate.add_argument(
-        "--merge-contested",
-        action="store_true",
-        help="also merge contested (mixed negation-polarity) clusters; "
-        "use only for confirmed heuristic false positives — by "
-        "default they are reported, never merged",
-    )
-    p_consolidate.add_argument(
-        "--json",
-        action="store_true",
-        help="print a machine-readable run report (contested clusters "
-        "included) as the ONLY stdout content; human output goes "
-        "to stderr",
-    )
+    p_consolidate.add_argument("--threshold", type=float,
+                               default=CONSOLIDATE_DEFAULT_THRESHOLD)
+    p_consolidate.add_argument("--prune", action="store_true",
+                               help="also supersede low-value never-retrieved memories")
+    p_consolidate.add_argument("--dry-run", action="store_true",
+                               help="show what would be consolidated without changing anything")
+    p_consolidate.add_argument("--namespace", default=None,
+                               help="limit consolidation to a specific namespace")
+    p_consolidate.add_argument("--force", action="store_true",
+                               help="bypass the cadence gate and run consolidation now")
+    p_consolidate.add_argument("--merge-contested", action="store_true",
+                               help="also merge contested (mixed negation-polarity) clusters; "
+                                    "use only for confirmed heuristic false positives — by "
+                                    "default they are reported, never merged")
+    p_consolidate.add_argument("--json", action="store_true",
+                               help="print a machine-readable run report (contested clusters "
+                                    "included) as the ONLY stdout content; human output goes "
+                                    "to stderr")
     # Issue #137: opt-in deterministic belief heads (+ maintenance-only local
     # action adapter). --llm-local without --belief-heads is refused at parse
     # time, before any lock is taken.
-    p_consolidate.add_argument(
-        "--belief-heads",
-        dest="belief_heads",
-        action="store_true",
-        default=False,
-        help="refresh deterministic belief heads",
-    )
-    p_consolidate.add_argument(
-        "--llm-local",
-        dest="llm_local",
-        action="store_true",
-        default=False,
-        help="run the local maintenance action adapter",
-    )
+    p_consolidate.add_argument("--belief-heads", dest="belief_heads",
+                               action="store_true", default=False,
+                               help="refresh deterministic belief heads")
+    p_consolidate.add_argument("--llm-local", dest="llm_local",
+                               action="store_true", default=False,
+                               help="run the local maintenance action adapter")
 
     # Sleep-time organize (issue #62). NOT flagless: it deliberately exposes
     # --prune/--dry-run/--force/--json (each wired to a real behavior below —
@@ -1875,104 +1431,60 @@ def main():
     p_organize = _add_parser(
         "organize",
         help="sleep-time organization: bounded-episode consolidation, entity/link "
-        "backfill, topic clustering, hierarchical extractive summaries, "
-        "compression (issue #62)",
-    )
-    p_organize.add_argument(
-        "--prune",
-        action="store_true",
-        help="also supersede low-value never-retrieved memories "
-        "(unrecalled prune extension, issue #62 7.6)",
-    )
-    p_organize.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="show what would be organized without changing anything",
-    )
-    p_organize.add_argument(
-        "--force",
-        action="store_true",
-        help="bypass the shared cadence gate and run organize now",
-    )
-    p_organize.add_argument(
-        "--json",
-        action="store_true",
-        help="print a machine-readable run report as the ONLY stdout "
-        "content; human output goes to stderr",
-    )
+             "backfill, topic clustering, hierarchical extractive summaries, "
+             "compression (issue #62)")
+    p_organize.add_argument("--prune", action="store_true",
+                            help="also supersede low-value never-retrieved memories "
+                                 "(unrecalled prune extension, issue #62 7.6)")
+    p_organize.add_argument("--dry-run", action="store_true",
+                            help="show what would be organized without changing anything")
+    p_organize.add_argument("--force", action="store_true",
+                            help="bypass the shared cadence gate and run organize now")
+    p_organize.add_argument("--json", action="store_true",
+                            help="print a machine-readable run report as the ONLY stdout "
+                                 "content; human output goes to stderr")
     # Issue #137: opt-in deterministic belief heads (+ maintenance-only local
     # action adapter). --llm-local without --belief-heads is refused at parse
     # time, before any lock is taken.
-    p_organize.add_argument(
-        "--belief-heads",
-        dest="belief_heads",
-        action="store_true",
-        default=False,
-        help="refresh deterministic belief heads",
-    )
-    p_organize.add_argument(
-        "--llm-local",
-        dest="llm_local",
-        action="store_true",
-        default=False,
-        help="run the local maintenance action adapter",
-    )
+    p_organize.add_argument("--belief-heads", dest="belief_heads",
+                            action="store_true", default=False,
+                            help="refresh deterministic belief heads")
+    p_organize.add_argument("--llm-local", dest="llm_local",
+                            action="store_true", default=False,
+                            help="run the local maintenance action adapter")
 
-    p_promote = _add_parser(
-        "promote", help="promote high-confidence lessons to SKILL.md files"
-    )
+    p_promote = _add_parser("promote", help="promote high-confidence lessons to SKILL.md files")
     # Issue #71 E: merge a leftover second store into this (canonical) one.
     p_promote_store = _add_parser(
         "promote-store",
         help="merge every row of another zmem store into this one "
-        "(idempotent; doctor's second-stores check recommends this)",
-    )
-    p_promote_store.add_argument(
-        "--from",
-        dest="from_path",
-        required=True,
-        help="path to the source store.sqlite "
-        "(opened read-only; newer source "
-        "schemas are refused)",
-    )
-    p_promote_store.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="report would-promote tallies and " "defaulted fields without writing",
-    )
-    p_promote.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="show promotion candidates without creating skills",
-    )
-    p_promote.add_argument(
-        "--id", default=None, help="promote a specific memory by UUID"
-    )
-    p_promote.add_argument(
-        "--namespace", default=None, help="limit candidates to a specific namespace"
-    )
-    p_promote.add_argument(
-        "--description",
-        default=None,
-        help="override the synthesized trigger description verbatim "
-        "(used with --id --confirm)",
-    )
-    p_promote.add_argument(
-        "--confirm",
-        action="store_true",
-        help="REQUIRED to write. Promotion creates a SKILL.md in every dir "
-        "in the review-candidate area; add --install-approved for the "
-        "explicit live install into ZMEM_SKILLS_DIRS (default: both "
-        "~/.claude/skills and ~/.zcode/skills). --id alone refuses "
-        "with exit 2. --dry-run needs no confirmation (and lists ALL "
-        "candidates — it ignores --id).",
-    )
-    p_promote.add_argument(
-        "--install-approved",
-        action="store_true",
-        help="explicitly install the generated SKILL.md into the live "
-        "skills dirs after writing the review candidate",
-    )
+             "(idempotent; doctor's second-stores check recommends this)")
+    p_promote_store.add_argument("--from", dest="from_path", required=True,
+                                 help="path to the source store.sqlite "
+                                      "(opened read-only; newer source "
+                                      "schemas are refused)")
+    p_promote_store.add_argument("--dry-run", action="store_true",
+                                 help="report would-promote tallies and "
+                                      "defaulted fields without writing")
+    p_promote.add_argument("--dry-run", action="store_true",
+                           help="show promotion candidates without creating skills")
+    p_promote.add_argument("--id", default=None,
+                           help="promote a specific memory by UUID")
+    p_promote.add_argument("--namespace", default=None,
+                           help="limit candidates to a specific namespace")
+    p_promote.add_argument("--description", default=None,
+                           help="override the synthesized trigger description verbatim "
+                                "(used with --id --confirm)")
+    p_promote.add_argument("--confirm", action="store_true",
+                           help="REQUIRED to write. Promotion creates a SKILL.md in every dir "
+                                "in the review-candidate area; add --install-approved for the "
+                                "explicit live install into ZMEM_SKILLS_DIRS (default: both "
+                                "~/.claude/skills and ~/.zcode/skills). --id alone refuses "
+                                "with exit 2. --dry-run needs no confirmation (and lists ALL "
+                                "candidates — it ignores --id).")
+    p_promote.add_argument("--install-approved", action="store_true",
+                           help="explicitly install the generated SKILL.md into the live "
+                                "skills dirs after writing the review candidate")
 
     # v12 (issue #64, 9.4): explicit usage-feedback CLI. The ONLY writer of
     # applied_count / violated_count anywhere in the codebase — hooks,
@@ -1980,27 +1492,19 @@ def main():
     p_feedback = _add_parser(
         "feedback",
         help="record explicit usage feedback on one memory (Voyager counters; "
-        "feeds the promote ladder)",
-    )
-    p_feedback.add_argument(
-        "--id", required=True, help="UUID of the memory the feedback is about"
-    )
+             "feeds the promote ladder)")
+    p_feedback.add_argument("--id", required=True,
+                            help="UUID of the memory the feedback is about")
     p_feedback_group = p_feedback.add_mutually_exclusive_group(required=True)
-    p_feedback_group.add_argument(
-        "--applied",
-        action="store_true",
-        help="the memory helped: increments applied_count. "
-        "applied_count >= 3 with violated_count == 0 makes a "
-        "lesson promote-eligible (see `promote --dry-run`).",
-    )
-    p_feedback_group.add_argument(
-        "--violated",
-        action="store_true",
-        help="the memory misled: increments violated_count. The "
-        "2nd violation applies a ONE-TIME -0.15 trust_score "
-        "drop (signal is never changed); any violation makes "
-        "the row promote-ineligible.",
-    )
+    p_feedback_group.add_argument("--applied", action="store_true",
+                                  help="the memory helped: increments applied_count. "
+                                       "applied_count >= 3 with violated_count == 0 makes a "
+                                       "lesson promote-eligible (see `promote --dry-run`).")
+    p_feedback_group.add_argument("--violated", action="store_true",
+                                  help="the memory misled: increments violated_count. The "
+                                       "2nd violation applies a ONE-TIME -0.15 trust_score "
+                                       "drop (signal is never changed); any violation makes "
+                                       "the row promote-ineligible.")
 
     # Issue #124 (Workstream E): observational operation-feedback. The
     # matcher, association check, sidecar, and counter writer all live in
@@ -2009,50 +1513,23 @@ def main():
     p_opfb = _add_parser(
         "operation-feedback",
         help="apply one host operation event's outcome to the delivered "
-        "memories it observationally matches (Voyager counters)",
-    )
-    p_opfb.add_argument(
-        "--session-id",
-        dest="session_id",
-        type=str,
-        required=True,
-        help="session id owning the delivered rows",
-    )
-    p_opfb.add_argument(
-        "--event-id",
-        dest="event_id",
-        type=str,
-        required=True,
-        help="stable host operation event id",
-    )
-    p_opfb.add_argument(
-        "--operation-token",
-        dest="operation_tokens",
-        action="append",
-        default=[],
-        help="normalized operation token (repeatable)",
-    )
-    p_opfb.add_argument(
-        "--outcome",
-        dest="outcome",
-        choices=("success", "failure"),
-        required=True,
-        help="completed operation outcome",
-    )
-    p_opfb.add_argument(
-        "--evidence-id",
-        dest="evidence_id",
-        type=str,
-        default=None,
-        help="associated evidence id",
-    )
-    p_opfb.add_argument(
-        "--now",
-        dest="now",
-        type=str,
-        default=None,
-        help="fixed ISO-8601 UTC time for tests",
-    )
+             "memories it observationally matches (Voyager counters)")
+    p_opfb.add_argument("--session-id", dest="session_id", type=str,
+                        required=True,
+                        help="session id owning the delivered rows")
+    p_opfb.add_argument("--event-id", dest="event_id", type=str,
+                        required=True,
+                        help="stable host operation event id")
+    p_opfb.add_argument("--operation-token", dest="operation_tokens",
+                        action="append", default=[],
+                        help="normalized operation token (repeatable)")
+    p_opfb.add_argument("--outcome", dest="outcome",
+                        choices=("success", "failure"), required=True,
+                        help="completed operation outcome")
+    p_opfb.add_argument("--evidence-id", dest="evidence_id", type=str,
+                        default=None, help="associated evidence id")
+    p_opfb.add_argument("--now", dest="now", type=str, default=None,
+                        help="fixed ISO-8601 UTC time for tests")
 
     # v12 (issue #64, 9.6): offline weight tuning. Dry-run ONLY — suggested
     # W_* weights are computed in memory from the gold set; nothing is ever
@@ -2061,117 +1538,66 @@ def main():
     p_tune = _add_parser(
         "tune-weights",
         help="suggest recall scoring weights from a gold set (dry-run only; "
-        "writes nothing)",
-    )
-    p_tune.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="REQUIRED (the command is analysis-only): evaluate the "
-        "current weights and a deterministic hill-climb over "
-        "candidate weights against the gold set",
-    )
-    p_tune.add_argument(
-        "--gold",
-        required=True,
-        help="path to the gold JSONL (build one with "
-        "scripts/eval_adapters.py, or use eval/gold.jsonl against "
-        "a fixture-built store — never the operator home store)",
-    )
-    p_tune.add_argument(
-        "--k",
-        type=positive_int,
-        default=5,
-        help="top-k cut for hit@k (default 5; applied to gold "
-        "items that do not set their own 'k')",
-    )
+             "writes nothing)")
+    p_tune.add_argument("--dry-run", action="store_true",
+                        help="REQUIRED (the command is analysis-only): evaluate the "
+                             "current weights and a deterministic hill-climb over "
+                             "candidate weights against the gold set")
+    p_tune.add_argument("--gold", required=True,
+                        help="path to the gold JSONL (build one with "
+                             "scripts/eval_adapters.py, or use eval/gold.jsonl against "
+                             "a fixture-built store — never the operator home store)")
+    p_tune.add_argument("--k", type=positive_int, default=5,
+                        help="top-k cut for hit@k (default 5; applied to gold "
+                             "items that do not set their own 'k')")
 
     p_rekey = _add_parser(
         "rekey-namespace",
         help="admin: rewrite the namespace of live rows (remediate stranded "
-        "global-near-miss rows so they surface again)",
-    )
-    p_rekey.add_argument(
-        "--from",
-        dest="from_namespace",
-        default=None,
-        help="source namespace to rekey from (required unless "
-        "--near-miss-global is set). Case-sensitive exact match.",
-    )
-    p_rekey.add_argument(
-        "--to",
-        dest="to_namespace",
-        default=GLOBAL_NAMESPACE,
-        help=f"destination namespace (default {GLOBAL_NAMESPACE}). "
-        "Must not itself be a global near-miss.",
-    )
-    p_rekey.add_argument(
-        "--near-miss-global",
-        action="store_true",
-        help="rekey EVERY live row whose namespace is a global "
-        "near-miss (global, userglobal, users:global, ...) to "
-        "--to. Ignores --from. This is the remediation for "
-        "legacy rows stranded before the write-time guard.",
-    )
-    p_rekey.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="report the candidate count and namespaces without writing",
-    )
-    p_rekey.add_argument(
-        "--confirm",
-        action="store_true",
-        help="REQUIRED to actually write. rekey-namespace without "
-        "--confirm (and without --dry-run) refuses with exit 2.",
-    )
+             "global-near-miss rows so they surface again)")
+    p_rekey.add_argument("--from", dest="from_namespace", default=None,
+                         help="source namespace to rekey from (required unless "
+                              "--near-miss-global is set). Case-sensitive exact match.")
+    p_rekey.add_argument("--to", dest="to_namespace", default=GLOBAL_NAMESPACE,
+                         help=f"destination namespace (default {GLOBAL_NAMESPACE}). "
+                              "Must not itself be a global near-miss.")
+    p_rekey.add_argument("--near-miss-global", action="store_true",
+                         help="rekey EVERY live row whose namespace is a global "
+                              "near-miss (global, userglobal, users:global, ...) to "
+                              "--to. Ignores --from. This is the remediation for "
+                              "legacy rows stranded before the write-time guard.")
+    p_rekey.add_argument("--dry-run", action="store_true",
+                         help="report the candidate count and namespaces without writing")
+    p_rekey.add_argument("--confirm", action="store_true",
+                         help="REQUIRED to actually write. rekey-namespace without "
+                              "--confirm (and without --dry-run) refuses with exit 2.")
 
     p_backup = _add_parser(
-        "backup", help="take a verified, retention-rotated snapshot of the store"
-    )
-    p_backup.add_argument(
-        "--retention",
-        type=int,
-        default=BACKUP_DEFAULT_RETENTION,
-        help=f"keep the newest N '{SNAPSHOT_GLOB}' snapshots and delete "
-        f"only the oldest beyond that (default "
-        f"{BACKUP_DEFAULT_RETENTION}; 0 disables pruning). "
-        f"Nothing else in the backup dir is ever touched.",
-    )
-    p_backup.add_argument(
-        "--out-dir",
-        default=None,
-        help="backup directory override (default: $ZMEM_BACKUP_DIR, "
-        "else <store dir>/backups)",
-    )
-    p_backup.add_argument(
-        "--if-due",
-        action="store_true",
-        help="no-op unless $ZMEM_BACKUP_INTERVAL_DAYS (default 1) has "
-        "elapsed since the last successful backup; used by the "
-        "SessionStart hook so the automatic trigger is cheap. "
-        "Without this flag the backup always runs.",
-    )
+        "backup", help="take a verified, retention-rotated snapshot of the store")
+    p_backup.add_argument("--retention", type=int, default=BACKUP_DEFAULT_RETENTION,
+                          help=f"keep the newest N '{SNAPSHOT_GLOB}' snapshots and delete "
+                               f"only the oldest beyond that (default "
+                               f"{BACKUP_DEFAULT_RETENTION}; 0 disables pruning). "
+                               f"Nothing else in the backup dir is ever touched.")
+    p_backup.add_argument("--out-dir", default=None,
+                          help="backup directory override (default: $ZMEM_BACKUP_DIR, "
+                               "else <store dir>/backups)")
+    p_backup.add_argument("--if-due", action="store_true",
+                          help="no-op unless $ZMEM_BACKUP_INTERVAL_DAYS (default 1) has "
+                               "elapsed since the last successful backup; used by the "
+                               "SessionStart hook so the automatic trigger is cheap. "
+                               "Without this flag the backup always runs.")
 
     p_restore = _add_parser(
-        "restore",
-        help="restore the store from a snapshot (verifies first, "
-        "backs up the current store first)",
-    )
-    p_restore.add_argument(
-        "--from",
-        dest="from_path",
-        required=True,
-        help="path to the snapshot .sqlite to restore from",
-    )
-    p_restore.add_argument(
-        "--force",
-        action="store_true",
-        help="required to overwrite an existing destination store",
-    )
-    p_restore.add_argument(
-        "--out-dir",
-        default=None,
-        help="where to put the pre-restore backup (default: same as " "`backup`)",
-    )
+        "restore", help="restore the store from a snapshot (verifies first, "
+                        "backs up the current store first)")
+    p_restore.add_argument("--from", dest="from_path", required=True,
+                           help="path to the snapshot .sqlite to restore from")
+    p_restore.add_argument("--force", action="store_true",
+                           help="required to overwrite an existing destination store")
+    p_restore.add_argument("--out-dir", default=None,
+                           help="where to put the pre-restore backup (default: same as "
+                                "`backup`)")
 
     p_export_pack = _add_parser(
         "export-pack",
@@ -2186,113 +1612,75 @@ def main():
             "     rather than assuming a nonempty write.\n"
             "\n"
             "See docs/CLOUD.md for the full Tier 1 contract."
-        ),
-    )
-    p_export_pack.add_argument(
-        "--namespace",
-        required=True,
-        help="project namespace to pack (e.g. project:foo)",
-    )
-    p_export_pack.add_argument(
-        "--out",
-        default=None,
-        help="write the pack to this file (UTF-8, LF); default: stdout",
-    )
-    p_export_pack.add_argument(
-        "--project-limit",
-        type=nonnegative_int,
-        default=EXPORT_PACK_DEFAULT_PROJECT_LIMIT,
-        help=f"max rows from --namespace (default {EXPORT_PACK_DEFAULT_PROJECT_LIMIT})",
-    )
-    p_export_pack.add_argument(
-        "--global-limit",
-        type=nonnegative_int,
-        default=EXPORT_PACK_DEFAULT_GLOBAL_LIMIT,
-        help=f"max rows from {GLOBAL_NAMESPACE} (default {EXPORT_PACK_DEFAULT_GLOBAL_LIMIT})",
-    )
-    p_export_pack.add_argument(
-        "--min-confidence",
-        type=float,
-        default=EXPORT_PACK_DEFAULT_MIN_CONFIDENCE,
-        help=f"confidence floor for both sections (default {EXPORT_PACK_DEFAULT_MIN_CONFIDENCE})",
-    )
-    p_export_pack.add_argument(
-        "--max-bytes",
-        type=int,
-        default=EXPORT_PACK_DEFAULT_MAX_BYTES,
-        help="budget (UTF-8 bytes) for the bullet lines; a bullet that "
-        "would exceed it is omitted whole, never truncated, and "
-        "later smaller bullets are still emitted. The budget "
-        "applies to the whole rendered pack — structural framing "
-        "(header, titles, section headings, '(none)') counts "
-        "toward the cap — so only framing appended after the "
-        "walk (an empty later section's heading/'(none)' and the "
-        "trailing omitted-count note, rendered whenever rows "
-        f"were omitted) can push the output past it (default {EXPORT_PACK_DEFAULT_MAX_BYTES})",
-    )
+        ))
+    p_export_pack.add_argument("--namespace", required=True,
+                               help="project namespace to pack (e.g. project:foo)")
+    p_export_pack.add_argument("--out", default=None,
+                               help="write the pack to this file (UTF-8, LF); default: stdout")
+    p_export_pack.add_argument("--project-limit", type=nonnegative_int,
+                               default=EXPORT_PACK_DEFAULT_PROJECT_LIMIT,
+                               help=f"max rows from --namespace (default {EXPORT_PACK_DEFAULT_PROJECT_LIMIT})")
+    p_export_pack.add_argument("--global-limit", type=nonnegative_int,
+                               default=EXPORT_PACK_DEFAULT_GLOBAL_LIMIT,
+                               help=f"max rows from {GLOBAL_NAMESPACE} (default {EXPORT_PACK_DEFAULT_GLOBAL_LIMIT})")
+    p_export_pack.add_argument("--min-confidence", type=float,
+                               default=EXPORT_PACK_DEFAULT_MIN_CONFIDENCE,
+                               help=f"confidence floor for both sections (default {EXPORT_PACK_DEFAULT_MIN_CONFIDENCE})")
+    p_export_pack.add_argument("--max-bytes", type=int,
+                               default=EXPORT_PACK_DEFAULT_MAX_BYTES,
+                               help="budget (UTF-8 bytes) for the bullet lines; a bullet that "
+                                    "would exceed it is omitted whole, never truncated, and "
+                                    "later smaller bullets are still emitted. The budget "
+                                    "applies to the whole rendered pack — structural framing "
+                                    "(header, titles, section headings, '(none)') counts "
+                                    "toward the cap — so only framing appended after the "
+                                    "walk (an empty later section's heading/'(none)' and the "
+                                    "trailing omitted-count note, rendered whenever rows "
+                                    f"were omitted) can push the output past it (default {EXPORT_PACK_DEFAULT_MAX_BYTES})")
 
     p_export_jsonl = _add_parser(
         "export-jsonl",
-        help="export Tier 3 sync JSONL (one memory row per line, no embeddings)",
-    )
-    p_export_jsonl.add_argument(
-        "--out", default=None, help="write to this file (UTF-8, LF); default: stdout"
-    )
-    p_export_jsonl.add_argument(
-        "--namespace",
-        default=None,
-        help="limit to a specific namespace (default: all namespaces)",
-    )
-    p_export_jsonl.add_argument(
-        "--include-superseded",
-        action="store_true",
-        help="also export tombstoned rows (default: live rows only)",
-    )
+        help="export Tier 3 sync JSONL (one memory row per line, no embeddings)")
+    p_export_jsonl.add_argument("--out", default=None,
+                                help="write to this file (UTF-8, LF); default: stdout")
+    p_export_jsonl.add_argument("--namespace", default=None,
+                                help="limit to a specific namespace (default: all namespaces)")
+    p_export_jsonl.add_argument("--include-superseded", action="store_true",
+                                help="also export tombstoned rows (default: live rows only)")
 
     p_ingest_jsonl = _add_parser(
-        "ingest-jsonl", help="import Tier 3 sync JSONL written by export-jsonl"
-    )
+        "ingest-jsonl",
+        help="import Tier 3 sync JSONL written by export-jsonl")
+    p_ingest_jsonl.add_argument("--in", dest="in_path", required=True,
+                                help="JSONL file to ingest")
+    p_ingest_jsonl.add_argument("--source-ref", default=None,
+                                help="override source_ref on every row inserted this run "
+                                     "(default: keep each row's own incoming source_ref)")
+    p_ingest_jsonl.add_argument("--allow-tombstones", action="store_true",
+                                help="let an incoming superseded row TOMBSTONE a live local "
+                                     "row with the same id. Off by default: use it only when "
+                                     "the file is an export of a store you trust as "
+                                     "authoritative for those ids (e.g. rebuilding a local "
+                                     "store from your own export). Ingesting a cloud/remote "
+                                     "outbox must NOT use it -- without the flag such rows "
+                                     "are counted as tombstones_refused and the local rows "
+                                     "are left alone. A brand-new id that arrives already "
+                                     "tombstoned is still inserted as history either way.")
+    p_ingest_jsonl.add_argument("--capture-mode", default=None,
+                                choices=list(CAPTURE_MODES),
+                                help="apply the same capture policy as `add` to every "
+                                     "ingested row. ALWAYS tags prompt-injection-risk "
+                                     "(defends against poisoned sync files surfacing into "
+                                     "model context); 'auto' additionally redacts "
+                                     "secret-like text in content/tags and refuses rows "
+                                     "whose source_ref looks like a secret. Default resolves "
+                                     "like `add` (ZMEM_CAPTURE_MODE env or 'manual'): verbatim "
+                                     "content with injection-risk tagging. Use 'auto' when "
+                                     "ingesting an untrusted/remote sync file.")
     p_ingest_jsonl.add_argument(
-        "--in", dest="in_path", required=True, help="JSONL file to ingest"
-    )
-    p_ingest_jsonl.add_argument(
-        "--source-ref",
-        default=None,
-        help="override source_ref on every row inserted this run "
-        "(default: keep each row's own incoming source_ref)",
-    )
-    p_ingest_jsonl.add_argument(
-        "--allow-tombstones",
-        action="store_true",
-        help="let an incoming superseded row TOMBSTONE a live local "
-        "row with the same id. Off by default: use it only when "
-        "the file is an export of a store you trust as "
-        "authoritative for those ids (e.g. rebuilding a local "
-        "store from your own export). Ingesting a cloud/remote "
-        "outbox must NOT use it -- without the flag such rows "
-        "are counted as tombstones_refused and the local rows "
-        "are left alone. A brand-new id that arrives already "
-        "tombstoned is still inserted as history either way.",
-    )
-    p_ingest_jsonl.add_argument(
-        "--capture-mode",
-        default=None,
-        choices=list(CAPTURE_MODES),
-        help="apply the same capture policy as `add` to every "
-        "ingested row. ALWAYS tags prompt-injection-risk "
-        "(defends against poisoned sync files surfacing into "
-        "model context); 'auto' additionally redacts "
-        "secret-like text in content/tags and refuses rows "
-        "whose source_ref looks like a secret. Default resolves "
-        "like `add` (ZMEM_CAPTURE_MODE env or 'manual'): verbatim "
-        "content with injection-risk tagging. Use 'auto' when "
-        "ingesting an untrusted/remote sync file.",
-    )
-    p_ingest_jsonl.add_argument(
-        "--strict",
-        action="store_true",
+        "--strict", action="store_true",
         help="require all-or-nothing validation even without a parseable "
-        "evidence discriminator",
+             "evidence discriminator",
     )
 
     # Workstream E (issue #134): governed dataset artifact commands. The
@@ -2301,292 +1689,164 @@ def main():
     p_export_dataset = _add_parser(
         "export-dataset",
         help="export a governed knowledge dataset directory "
-        "(manifest + parquet records; SQLite stays authoritative)",
-    )
-    p_export_dataset.add_argument("dir", type=str, help="output dataset directory")
-    p_export_dataset.add_argument(
-        "--namespace",
-        dest="namespace",
-        type=str,
-        default=None,
-        help="export one namespace",
-    )
-    p_export_dataset.add_argument(
-        "--all-namespaces",
-        dest="all_namespaces",
-        action="store_true",
-        default=False,
-        help="select every namespace",
-    )
-    p_export_dataset.add_argument(
-        "--include-tombstones",
-        dest="include_tombstones",
-        action="store_true",
-        default=False,
-        help="include tombstones in the audit view",
-    )
-    p_export_dataset.add_argument(
-        "--yes",
-        dest="yes",
-        action="store_true",
-        default=False,
-        help="confirm an unscoped export",
-    )
+             "(manifest + parquet records; SQLite stays authoritative)")
+    p_export_dataset.add_argument("dir", type=str,
+                                  help="output dataset directory")
+    p_export_dataset.add_argument("--namespace", dest="namespace", type=str,
+                                  default=None,
+                                  help="export one namespace")
+    p_export_dataset.add_argument("--all-namespaces", dest="all_namespaces",
+                                  action="store_true", default=False,
+                                  help="select every namespace")
+    p_export_dataset.add_argument("--include-tombstones",
+                                  dest="include_tombstones",
+                                  action="store_true", default=False,
+                                  help="include tombstones in the audit view")
+    p_export_dataset.add_argument("--yes", dest="yes", action="store_true",
+                                  default=False,
+                                  help="confirm an unscoped export")
 
     p_publish_dataset = _add_parser(
         "publish-dataset",
         help="publish a generated dataset directory to a private-by-default "
-        "Hugging Face Hub dataset repo (egress-scanned)",
-    )
-    p_publish_dataset.add_argument("dir", type=str, help="generated dataset directory")
-    p_publish_dataset.add_argument(
-        "target", type=str, help="hf://datasets/owner/repo target"
-    )
-    p_publish_dataset.add_argument(
-        "--yes",
-        dest="yes",
-        action="store_true",
-        default=False,
-        help="confirm target namespace overlap",
-    )
-    p_publish_dataset.add_argument(
-        "--allow-unscanned",
-        dest="allow_unscanned",
-        action="store_true",
-        default=False,
-        help="allow publication when TruffleHog " "is unavailable",
-    )
+             "Hugging Face Hub dataset repo (egress-scanned)")
+    p_publish_dataset.add_argument("dir", type=str,
+                                   help="generated dataset directory")
+    p_publish_dataset.add_argument("target", type=str,
+                                   help="hf://datasets/owner/repo target")
+    p_publish_dataset.add_argument("--yes", dest="yes", action="store_true",
+                                   default=False,
+                                   help="confirm target namespace overlap")
+    p_publish_dataset.add_argument("--allow-unscanned",
+                                   dest="allow_unscanned",
+                                   action="store_true", default=False,
+                                   help="allow publication when TruffleHog "
+                                        "is unavailable")
 
     p_import_dataset = _add_parser(
         "import-dataset",
         help="import a dataset into an isolated revision-pinned snapshot "
-        "(never touches the caller's store)",
-    )
-    p_import_dataset.add_argument(
-        "source",
-        type=str,
-        help="hf://datasets/owner/repo (Hub cache) " "or a local dataset directory",
-    )
-    p_import_dataset.add_argument(
-        "--revision",
-        dest="revision",
-        type=str,
-        required=True,
-        help="exact source revision SHA",
-    )
-    p_import_dataset.add_argument(
-        "--dest",
-        dest="dest_dir",
-        type=str,
-        required=True,
-        help="isolated snapshot directory",
-    )
-    p_import_dataset.add_argument(
-        "--namespace",
-        dest="namespace",
-        type=str,
-        default=None,
-        help="restrict the imported namespace",
-    )
-    p_import_dataset.add_argument(
-        "--min-confidence",
-        dest="min_confidence",
-        type=float,
-        default=None,
-        help="minimum confidence",
-    )
-    p_import_dataset.add_argument(
-        "--min-trust",
-        dest="min_trust",
-        type=float,
-        default=None,
-        help="minimum trust score",
-    )
-    p_import_dataset.add_argument(
-        "--taint",
-        dest="taint",
-        type=str,
-        choices=("trusted_internal", "untrusted_tool", "untrusted_web"),
-        default=None,
-        help="allowed taint value",
-    )
-    p_import_dataset.add_argument(
-        "--include-tombstones",
-        dest="include_tombstones",
-        action="store_true",
-        default=False,
-        help="include audit tombstones",
-    )
+             "(never touches the caller's store)")
+    p_import_dataset.add_argument("source", type=str,
+                                  help="hf://datasets/owner/repo (Hub cache) "
+                                       "or a local dataset directory")
+    p_import_dataset.add_argument("--revision", dest="revision", type=str,
+                                  required=True,
+                                  help="exact source revision SHA")
+    p_import_dataset.add_argument("--dest", dest="dest_dir", type=str,
+                                  required=True,
+                                  help="isolated snapshot directory")
+    p_import_dataset.add_argument("--namespace", dest="namespace", type=str,
+                                  default=None,
+                                  help="restrict the imported namespace")
+    p_import_dataset.add_argument("--min-confidence",
+                                  dest="min_confidence", type=float,
+                                  default=None, help="minimum confidence")
+    p_import_dataset.add_argument("--min-trust", dest="min_trust", type=float,
+                                  default=None, help="minimum trust score")
+    p_import_dataset.add_argument("--taint", dest="taint", type=str,
+                                  choices=("trusted_internal",
+                                           "untrusted_tool",
+                                           "untrusted_web"),
+                                  default=None, help="allowed taint value")
+    p_import_dataset.add_argument("--include-tombstones",
+                                  dest="include_tombstones",
+                                  action="store_true", default=False,
+                                  help="include audit tombstones")
 
     p_fail = _add_parser(
         "failures",
-        help="detect failed tool calls for a session (transcript JSONL or db.sqlite)",
-    )
-    p_fail.add_argument(
-        "--session", default="", help="session id (used with the db.sqlite substrate)"
-    )
-    p_fail.add_argument(
-        "--transcript",
-        default="",
-        help="Claude Code transcript JSONL path (wins when present)",
-    )
-    p_fail.add_argument(
-        "--db",
-        default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
-        help="ZCode episodic db.sqlite path (default ~/.zcode/cli/db/db.sqlite)",
-    )
-    p_fail.add_argument(
-        "--db-timeout",
-        dest="db_timeout",
-        type=float,
-        default=None,
-        help="seconds to wait for a busy ZCode db before reporting a "
-        "substrate error (default: ZMEM_FAILURES_DB_TIMEOUT_S or 1.0; "
-        "clamped to 0.1-5.0)",
-    )
+        help="detect failed tool calls for a session (transcript JSONL or db.sqlite)")
+    p_fail.add_argument("--session", default="",
+                        help="session id (used with the db.sqlite substrate)")
+    p_fail.add_argument("--transcript", default="",
+                        help="Claude Code transcript JSONL path (wins when present)")
+    p_fail.add_argument("--db", default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
+                        help="ZCode episodic db.sqlite path (default ~/.zcode/cli/db/db.sqlite)")
+    p_fail.add_argument("--db-timeout", dest="db_timeout", type=float, default=None,
+                        help="seconds to wait for a busy ZCode db before reporting a "
+                             "substrate error (default: ZMEM_FAILURES_DB_TIMEOUT_S or 1.0; "
+                             "clamped to 0.1-5.0)")
 
     p_corr = _add_parser(
         "corrections",
-        help="mine user corrections from a Claude Code transcript JSONL (read-only)",
-    )
-    p_corr.add_argument(
-        "--transcript", default="", help="Claude Code transcript JSONL path"
-    )
-    p_corr.add_argument(
-        "--json",
-        action="store_true",
-        help="emit JSON (default output is already JSON; kept for parity)",
-    )
+        help="mine user corrections from a Claude Code transcript JSONL (read-only)")
+    p_corr.add_argument("--transcript", default="",
+                       help="Claude Code transcript JSONL path")
+    p_corr.add_argument("--json", action="store_true",
+                       help="emit JSON (default output is already JSON; kept for parity)")
 
     p_queue_list = _add_parser(
         "queue-list",
         help="list live-capture correction candidates for a namespace "
-        "(read-only sidecar, store-independent)",
-    )
-    p_queue_list.add_argument(
-        "--namespace",
-        required=True,
-        help="namespace to list (e.g. the derived project key)",
-    )
-    p_queue_list.add_argument(
-        "--json",
-        action="store_true",
-        help='emit {"count": N, "items": [...]} ' "(default: human list)",
-    )
+             "(read-only sidecar, store-independent)")
+    p_queue_list.add_argument("--namespace", required=True,
+                              help="namespace to list (e.g. the derived project key)")
+    p_queue_list.add_argument("--json", action="store_true",
+                              help="emit {\"count\": N, \"items\": [...]} "
+                                   "(default: human list)")
 
     p_queue_clear = _add_parser(
         "queue-clear",
         help="clear processed/deferred live-capture correction candidates "
-        "(sidecar, store-independent)",
-    )
+             "(sidecar, store-independent)")
     p_queue_clear.add_argument("--namespace", required=True)
     # --id / --all / --drop-stale are mutually exclusive: passing --all with
     # --id or --drop-stale was silently dropping --all (a surprising no-op).
     # required=True also makes a FLAG-LESS `queue-clear --namespace X` a hard
     # argparse error (rc 2) instead of silently wiping the whole namespace queue.
     _qc_grp = p_queue_clear.add_mutually_exclusive_group(required=True)
-    _qc_grp.add_argument(
-        "--id",
-        action="append",
-        default=[],
-        help="remove specific item id(s) (repeatable)",
-    )
-    _qc_grp.add_argument(
-        "--all", action="store_true", help="clear the entire namespace queue"
-    )
-    _qc_grp.add_argument(
-        "--drop-stale",
-        action="store_true",
-        help="remove stale items with confidence < 0.6",
-    )
+    _qc_grp.add_argument("--id", action="append", default=[],
+                         help="remove specific item id(s) (repeatable)")
+    _qc_grp.add_argument("--all", action="store_true",
+                         help="clear the entire namespace queue")
+    _qc_grp.add_argument("--drop-stale", action="store_true",
+                         help="remove stale items with confidence < 0.6")
 
     p_source_exists = _add_parser(
-        "source-exists", help="check whether a live source reference exists"
-    )
-    p_source_exists.add_argument(
-        "--namespace", dest="namespace", required=True, help="namespace to inspect"
-    )
-    p_source_exists.add_argument(
-        "--source-ref",
-        dest="source_ref",
-        required=True,
-        help="source reference to inspect",
-    )
-    p_source_exists.add_argument(
-        "--json",
-        dest="json",
-        action="store_true",
-        default=False,
-        help="emit a machine-readable result",
-    )
+        "source-exists", help="check whether a live source reference exists")
+    p_source_exists.add_argument("--namespace", dest="namespace", required=True,
+                                 help="namespace to inspect")
+    p_source_exists.add_argument("--source-ref", dest="source_ref", required=True,
+                                 help="source reference to inspect")
+    p_source_exists.add_argument("--json", dest="json", action="store_true",
+                                 default=False, help="emit a machine-readable result")
 
     p_ops_append = _add_parser(
-        "ops-append", help="append one normalized operation-ring event"
-    )
-    p_ops_append.add_argument(
-        "--session", dest="session", required=True, help="session id"
-    )
-    p_ops_append.add_argument("--tool", dest="tool", required=True, help="tool name")
-    p_ops_append.add_argument(
-        "--op", dest="op", required=True, help="operation descriptor"
-    )
-    p_ops_append.add_argument(
-        "--json",
-        dest="json",
-        action="store_true",
-        default=False,
-        help="emit a machine-readable result",
-    )
+        "ops-append", help="append one normalized operation-ring event")
+    p_ops_append.add_argument("--session", dest="session", required=True,
+                              help="session id")
+    p_ops_append.add_argument("--tool", dest="tool", required=True,
+                              help="tool name")
+    p_ops_append.add_argument("--op", dest="op", required=True,
+                              help="operation descriptor")
+    p_ops_append.add_argument("--json", dest="json", action="store_true",
+                              default=False, help="emit a machine-readable result")
 
-    p_hermes_reflect = _add_parser("hermes-reflect", help=argparse.SUPPRESS)
-    p_hermes_reflect.add_argument(
-        "--json",
-        dest="json",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
+    p_hermes_reflect = _add_parser(
+        "hermes-reflect", help=argparse.SUPPRESS)
+    p_hermes_reflect.add_argument("--json", dest="json", action="store_true",
+                                  default=False, help=argparse.SUPPRESS)
 
     p_hermes_ctx = _add_parser(
         "hermes-context",
-        help="Hermes compatibility bridge post-output acknowledge/cursor actions",
-    )
-    p_hermes_ctx.add_argument(
-        "--action",
-        dest="action",
-        type=str,
-        choices=("ack-failure", "commit-cursor"),
-        required=True,
-        help="action to perform",
-    )
-    p_hermes_ctx.add_argument(
-        "--namespace",
-        dest="namespace",
-        type=str,
-        required=True,
-        help="resolved memory namespace",
-    )
-    p_hermes_ctx.add_argument(
-        "--session-id",
-        dest="session_id",
-        type=str,
-        required=True,
-        help="full session identifier",
-    )
-    p_hermes_ctx.add_argument(
-        "--cursor-ts",
-        dest="cursor_ts",
-        type=float,
-        default=None,
-        help="delivered cursor timestamp",
-    )
-    p_hermes_ctx.add_argument(
-        "--cursor-count",
-        dest="cursor_count",
-        type=int,
-        default=None,
-        help="delivered operation count",
-    )
+        help="Hermes compatibility bridge post-output acknowledge/cursor actions")
+    p_hermes_ctx.add_argument("--action", dest="action", type=str,
+                              choices=("ack-failure", "commit-cursor"),
+                              required=True,
+                              help="action to perform")
+    p_hermes_ctx.add_argument("--namespace", dest="namespace", type=str,
+                              required=True,
+                              help="resolved memory namespace")
+    p_hermes_ctx.add_argument("--session-id", dest="session_id", type=str,
+                              required=True,
+                              help="full session identifier")
+    p_hermes_ctx.add_argument("--cursor-ts", dest="cursor_ts", type=float,
+                              default=None,
+                              help="delivered cursor timestamp")
+    p_hermes_ctx.add_argument("--cursor-count", dest="cursor_count", type=int,
+                              default=None,
+                              help="delivered operation count")
 
     # Internal compatibility hook bridge.  It intentionally has no selector
     # flags: the hook supplies one bounded JSON object on stdin.
@@ -2595,130 +1855,79 @@ def main():
     p_mine = _add_parser(
         "mine-history",
         help="mine corrections/rejections/error-patterns from HISTORICAL Claude Code "
-        "transcripts (read-only; CC-transcript host surface only)",
-    )
-    p_mine.add_argument(
-        "--transcript-dir",
-        default="",
-        help="Claude Code transcript root (default ~/.claude/projects)",
-    )
-    p_mine.add_argument(
-        "--all-projects",
-        action="store_true",
-        help="walk every project folder (default: current project only)",
-    )
-    p_mine.add_argument(
-        "--days",
-        type=nonnegative_int,
-        default=None,
-        help="only transcripts modified within this many days "
-        "(default: no time filter)",
-    )
-    p_mine.add_argument(
-        "--min-count",
-        type=nonnegative_int,
-        default=2,
-        help="error-aggregation threshold (default 2)",
-    )
-    p_mine.add_argument(
-        "--limit",
-        type=nonnegative_int,
-        default=None,
-        help="cap the number of correction candidates in output "
-        "(default: no cap; 0 emits none, negatives rejected)",
-    )
-    p_mine.add_argument(
-        "--queue",
-        action="store_true",
-        help="append candidates to the PR-2 review queue "
-        "(source=history-mine; resolves the store namespace "
-        "from the current project's git origin, so it may "
-        "spawn one short `git` subprocess)",
-    )
-    p_mine.add_argument(
-        "--source",
-        choices=["claude", "codex", "hermes"],
-        default="claude",
-        help="input surface (issue #71 I): claude = Claude Code "
-        "transcripts (default, full report); codex = a "
-        "curated Codex MEMORY.md (ZMEM_CODEX_MEMORY or "
-        "~/.codex/MEMORY.md; raw_memories.md is refused); "
-        "hermes = Hermes session JSONL under "
-        "ZMEM_HERMES_SESSIONS or ~/.hermes/sessions. "
-        "codex/hermes emit review-queue candidates only.",
-    )
-    p_mine.add_argument(
-        "--json",
-        action="store_true",
-        help="emit the full merged candidate report as JSON",
-    )
+             "transcripts (read-only; CC-transcript host surface only)")
+    p_mine.add_argument("--transcript-dir", default="",
+                        help="Claude Code transcript root (default ~/.claude/projects)")
+    p_mine.add_argument("--all-projects", action="store_true",
+                        help="walk every project folder (default: current project only)")
+    p_mine.add_argument("--days", type=nonnegative_int, default=None,
+                        help="only transcripts modified within this many days "
+                             "(default: no time filter)")
+    p_mine.add_argument("--min-count", type=nonnegative_int, default=2,
+                        help="error-aggregation threshold (default 2)")
+    p_mine.add_argument("--limit", type=nonnegative_int, default=None,
+                        help="cap the number of correction candidates in output "
+                             "(default: no cap; 0 emits none, negatives rejected)")
+    p_mine.add_argument("--queue", action="store_true",
+                        help="append candidates to the PR-2 review queue "
+                             "(source=history-mine; resolves the store namespace "
+                             "from the current project's git origin, so it may "
+                             "spawn one short `git` subprocess)")
+    p_mine.add_argument("--source", choices=["claude", "codex", "hermes"],
+                        default="claude",
+                        help="input surface (issue #71 I): claude = Claude Code "
+                             "transcripts (default, full report); codex = a "
+                             "curated Codex MEMORY.md (ZMEM_CODEX_MEMORY or "
+                             "~/.codex/MEMORY.md; raw_memories.md is refused); "
+                             "hermes = Hermes session JSONL under "
+                             "ZMEM_HERMES_SESSIONS or ~/.hermes/sessions. "
+                             "codex/hermes emit review-queue candidates only.")
+    p_mine.add_argument("--json", action="store_true",
+                        help="emit the full merged candidate report as JSON")
 
     p_sweep = _add_parser(
-        "sweep", help="remove stale per-session cooldown sentinel files (issue #23)"
-    )
-    p_sweep.add_argument(
-        "--marker-dir",
-        default=None,
-        help="override the directory to sweep (default: the union of "
-        "every dir the capture/convention hooks can write markers "
-        "into)",
-    )
-    p_sweep.add_argument(
-        "--max-age-days",
-        type=float,
-        default=None,
-        help=f"drop markers older than this many days (default "
-        f"{SENTINEL_SWEEP_DAYS_DEFAULT:.0f}; env "
-        f"ZMEM_SENTINEL_SWEEP_DAYS)",
-    )
-    p_sweep.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="count what would be pruned without deleting anything",
-    )
+        "sweep",
+        help="remove stale per-session cooldown sentinel files (issue #23)")
+    p_sweep.add_argument("--marker-dir", default=None,
+                         help="override the directory to sweep (default: the union of "
+                              "every dir the capture/convention hooks can write markers "
+                              "into)")
+    p_sweep.add_argument("--max-age-days", type=float, default=None,
+                         help=f"drop markers older than this many days (default "
+                              f"{SENTINEL_SWEEP_DAYS_DEFAULT:.0f}; env "
+                              f"ZMEM_SENTINEL_SWEEP_DAYS)")
+    p_sweep.add_argument("--dry-run", action="store_true",
+                         help="count what would be pruned without deleting anything")
 
     # v10 (issue #60, 5.4): entity inspection surface — so humans and doctor
     # can see what the deterministic extractor minted without raw SQL.
     p_entity_list = _add_parser(
-        "entity-list", help="list entities (kind, canonical name, aliases, link count)"
-    )
-    p_entity_list.add_argument(
-        "--kind",
-        default=None,
-        choices=list(ENTITY_KINDS),
-        help="filter to one entity kind " "(person/project/tool/preference/other)",
-    )
-    p_entity_list.add_argument(
-        "--json",
-        action="store_true",
-        help="emit [{id, kind, name, aliases, links}] " "(default: human list)",
-    )
+        "entity-list",
+        help="list entities (kind, canonical name, aliases, link count)")
+    p_entity_list.add_argument("--kind", default=None, choices=list(ENTITY_KINDS),
+                               help="filter to one entity kind "
+                                    "(person/project/tool/preference/other)")
+    p_entity_list.add_argument("--json", action="store_true",
+                               help="emit [{id, kind, name, aliases, links}] "
+                                    "(default: human list)")
 
     # v10 (issue #60, 5.6): manual entity reconciliation. DRY RUN by default —
     # without --confirm nothing is written (the plan is printed instead).
     p_entity_merge = _add_parser(
         "entity-merge",
         help="merge two entities: move aliases + memory links to the target, "
-        "delete the source (dry-run unless --confirm)",
-    )
-    p_entity_merge.add_argument(
-        "--from",
-        dest="from_id",
-        required=True,
-        help="id of the entity to dissolve (its aliases " "and links move to --to)",
-    )
-    p_entity_merge.add_argument(
-        "--to", dest="to_id", required=True, help="id of the entity that survives"
-    )
-    p_entity_merge.add_argument(
-        "--confirm",
-        action="store_true",
-        help="REQUIRED to write. Without it the merge is "
-        "a dry run that prints the plan. Refuses "
-        "kind mismatches (an entity's kind never "
-        "changes silently); person-to-person "
-        "merges are allowed but only ever manual.",
-    )
+             "delete the source (dry-run unless --confirm)")
+    p_entity_merge.add_argument("--from", dest="from_id", required=True,
+                                help="id of the entity to dissolve (its aliases "
+                                     "and links move to --to)")
+    p_entity_merge.add_argument("--to", dest="to_id", required=True,
+                                help="id of the entity that survives")
+    p_entity_merge.add_argument("--confirm", action="store_true",
+                                help="REQUIRED to write. Without it the merge is "
+                                     "a dry run that prints the plan. Refuses "
+                                     "kind mismatches (an entity's kind never "
+                                     "changes silently); person-to-person "
+                                     "merges are allowed but only ever manual.")
 
     # v11 (issue #61, 6.5): associative-link inspection + curation. List mode
     # mirrors the `get` not-found contract; --add is the CLI insertion path
@@ -2727,165 +1936,105 @@ def main():
         "links",
         help="inspect a memory's associative links (or insert one with --add)",
         description="List mode (default): `links --id UUID [--json]` prints "
-        "every memory_link edge touching the memory, both "
-        "directions. Missing id exits 1 with the same stderr line "
-        "as `get`. Add mode: `links --add --id A --id B --relation "
-        "R [--score S]` inserts a curated edge — symmetric "
-        "relations (related/supports/contradicts) are stored both "
-        "directions (supports carries the +0.05 trust event); "
-        "typed relations (updates/extends/derives) keep their one "
-        "authored direction. Refuses self-links and cross-"
-        "namespace pairs.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p_links.add_argument(
-        "--id",
-        required=True,
-        action="append",
-        dest="ids",
-        metavar="UUID",
-        help="memory id; once for list mode, twice (--id A "
-        "--id B) with --add for src and dst",
-    )
-    p_links.add_argument(
-        "--json",
-        action="store_true",
-        help="emit [{src, dst, direction, other, relation, "
-        "score, created_at}] (default: human list)",
-    )
-    p_links.add_argument(
-        "--add",
-        action="store_true",
-        help="insert a link instead of listing (requires "
-        "exactly two --id values and --relation)",
-    )
-    p_links.add_argument(
-        "--relation",
-        default=None,
-        choices=list(LINK_RELATIONS),
-        help="relation to insert (--add mode only)",
-    )
-    p_links.add_argument(
-        "--score",
-        type=float,
-        default=None,
-        help="link score 0..1 (--add mode only; default " "ZMEM_LINK_THRESHOLD)",
-    )
-    p_links.add_argument(
-        "--reason",
-        default="",
-        help="why the link is being recorded; REQUIRED for "
-        "--relation contradicts|supports (they adjust "
-        "trust_score — the `contradict` deliberate-use "
-        "convention; validated and echoed, not "
-        "persisted)",
-    )
+                    "every memory_link edge touching the memory, both "
+                    "directions. Missing id exits 1 with the same stderr line "
+                    "as `get`. Add mode: `links --add --id A --id B --relation "
+                    "R [--score S]` inserts a curated edge — symmetric "
+                    "relations (related/supports/contradicts) are stored both "
+                    "directions (supports carries the +0.05 trust event); "
+                    "typed relations (updates/extends/derives) keep their one "
+                    "authored direction. Refuses self-links and cross-"
+                    "namespace pairs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_links.add_argument("--id", required=True, action="append", dest="ids",
+                         metavar="UUID",
+                         help="memory id; once for list mode, twice (--id A "
+                              "--id B) with --add for src and dst")
+    p_links.add_argument("--json", action="store_true",
+                         help="emit [{src, dst, direction, other, relation, "
+                              "score, created_at}] (default: human list)")
+    p_links.add_argument("--add", action="store_true",
+                         help="insert a link instead of listing (requires "
+                              "exactly two --id values and --relation)")
+    p_links.add_argument("--relation", default=None, choices=list(LINK_RELATIONS),
+                         help="relation to insert (--add mode only)")
+    p_links.add_argument("--score", type=float, default=None,
+                         help="link score 0..1 (--add mode only; default "
+                              "ZMEM_LINK_THRESHOLD)")
+    p_links.add_argument("--reason", default="",
+                         help="why the link is being recorded; REQUIRED for "
+                              "--relation contradicts|supports (they adjust "
+                              "trust_score — the `contradict` deliberate-use "
+                              "convention; validated and echoed, not "
+                              "persisted)")
 
     p_contradict = _add_parser(
         "contradict",
         help="record that two memories contradict (contradicts pair + trust "
-        "-0.10 each)",
+             "-0.10 each)",
         description="`contradict --id A --id B --reason ...` inserts a "
-        "contradicts pair (both directions) and applies the "
-        "-0.10 trust event to BOTH rows — without merging, "
-        "deleting, or changing either row's content, confidence, "
-        "or signal. --reason is REQUIRED (deliberate-use guard, "
-        "the `invalidate` convention); the issue's v11 schema has "
-        "no reason column, so it is validated and echoed but not "
-        "persisted. Re-running the same contradict is an exact "
-        "no-op (idempotent; no second trust delta). Missing ids "
-        "exit 1 (the `get` contract).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p_contradict.add_argument(
-        "--id",
-        required=True,
-        action="append",
-        dest="ids",
-        metavar="UUID",
-        help="the two contradicting memory ids (--id A " "--id B)",
-    )
-    p_contradict.add_argument(
-        "--reason", required=True, help="why they contradict (REQUIRED)"
-    )
+                    "contradicts pair (both directions) and applies the "
+                    "-0.10 trust event to BOTH rows — without merging, "
+                    "deleting, or changing either row's content, confidence, "
+                    "or signal. --reason is REQUIRED (deliberate-use guard, "
+                    "the `invalidate` convention); the issue's v11 schema has "
+                    "no reason column, so it is validated and echoed but not "
+                    "persisted. Re-running the same contradict is an exact "
+                    "no-op (idempotent; no second trust delta). Missing ids "
+                    "exit 1 (the `get` contract).",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_contradict.add_argument("--id", required=True, action="append", dest="ids",
+                              metavar="UUID",
+                              help="the two contradicting memory ids (--id A "
+                                   "--id B)")
+    p_contradict.add_argument("--reason", required=True,
+                              help="why they contradict (REQUIRED)")
 
     # v13 (issue #65, 10.7): episode container commands. episode-list is
     # read-only; the other three take the writer lease (see the lease block).
     p_ep_open = _add_parser(
-        "episode-open", help="open a new episode (session container)"
-    )
+        "episode-open", help="open a new episode (session container)")
     p_ep_open.add_argument("--namespace", required=True)
-    p_ep_open.add_argument(
-        "--json", action="store_true", help="print the created episode row as JSON"
-    )
+    p_ep_open.add_argument("--json", action="store_true",
+                           help="print the created episode row as JSON")
 
     p_ep_add = _add_parser(
-        "episode-add", help="attach a LIVE memory to an open episode"
-    )
+        "episode-add", help="attach a LIVE memory to an open episode")
     p_ep_add.add_argument("--episode", required=True, help="episode id")
     p_ep_add.add_argument("--memory", required=True, help="memory id (must be live)")
-    p_ep_add.add_argument(
-        "--json", action="store_true", help="print the membership result as JSON"
-    )
+    p_ep_add.add_argument("--json", action="store_true",
+                          help="print the membership result as JSON")
 
     p_ep_close = _add_parser(
         "episode-close",
-        help="close an open episode (append-only; computes token_count)",
-    )
+        help="close an open episode (append-only; computes token_count)")
     p_ep_close.add_argument("--episode", required=True, help="episode id")
-    p_ep_close.add_argument(
-        "--summary",
-        action="store_true",
-        help="attach an extractive summary row built from "
-        "the episode's LIVE members (written via add "
-        "with capture-mode auto)",
-    )
-    p_ep_close.add_argument(
-        "--json", action="store_true", help="print the closed episode row as JSON"
-    )
+    p_ep_close.add_argument("--summary", action="store_true",
+                            help="attach an extractive summary row built from "
+                                 "the episode's LIVE members (written via add "
+                                 "with capture-mode auto)")
+    p_ep_close.add_argument("--json", action="store_true",
+                            help="print the closed episode row as JSON")
 
-    p_ep_list = _add_parser("episode-list", help="list episodes (newest first)")
+    p_ep_list = _add_parser(
+        "episode-list", help="list episodes (newest first)")
     p_ep_list.add_argument("--namespace", default=None)
-    p_ep_list.add_argument("--json", action="store_true", help="print episodes as JSON")
+    p_ep_list.add_argument("--json", action="store_true",
+                           help="print episodes as JSON")
 
     p_hyg = _add_parser(
-        "hygiene", help="read-only store hygiene snapshot report (issue #97)"
-    )
-    p_hyg.add_argument(
-        "--store",
-        dest="store",
-        type=str,
-        required=True,
-        help="SQLite snapshot to inspect",
-    )
-    p_hyg.add_argument(
-        "--origin-map",
-        dest="origin_map",
-        type=str,
-        required=True,
-        help="Reviewed Hermes origin map JSON path",
-    )
-    p_hyg.add_argument(
-        "--evidence-map",
-        dest="evidence_map",
-        type=str,
-        required=True,
-        help="None-upgrade evidence map JSON path",
-    )
-    p_hyg.add_argument(
-        "--out",
-        dest="out",
-        type=str,
-        required=True,
-        help="Canonical report output path",
-    )
-    p_hyg.add_argument(
-        "--format",
-        dest="format",
-        choices=("json", "text"),
-        default="json",
-        help="Report format",
-    )
+        "hygiene",
+        help="read-only store hygiene snapshot report (issue #97)")
+    p_hyg.add_argument("--store", dest="store", type=str, required=True,
+                       help="SQLite snapshot to inspect")
+    p_hyg.add_argument("--origin-map", dest="origin_map", type=str, required=True,
+                       help="Reviewed Hermes origin map JSON path")
+    p_hyg.add_argument("--evidence-map", dest="evidence_map", type=str, required=True,
+                       help="None-upgrade evidence map JSON path")
+    p_hyg.add_argument("--out", dest="out", type=str, required=True,
+                       help="Canonical report output path")
+    p_hyg.add_argument("--format", dest="format", choices=("json", "text"),
+                       default="json", help="Report format")
 
     args = ap.parse_args()
 
@@ -2910,7 +2059,8 @@ def main():
         and getattr(args, "session_id", None)
         and getattr(args, "moment", None) == "pretool"
     )
-    if os.environ.get(_PRIVATE_PRETOOL_STDIN_MARKER) == "1" and private_pretool_shape:
+    if (os.environ.get(_PRIVATE_PRETOOL_STDIN_MARKER) == "1"
+            and private_pretool_shape):
         try:
             stdin_is_tty = sys.stdin.isatty()
         except (AttributeError, OSError):
@@ -2931,14 +2081,8 @@ def main():
     # connect()/assert_local_fs()/migrate() so a bad ZMEM_DATA location, a
     # locked store, or a mid-migration state can never break failure detection.
     if args.cmd == "failures":
-        sys.exit(
-            cmd_failures(
-                session=args.session,
-                transcript=args.transcript,
-                db=args.db,
-                db_timeout=args.db_timeout,
-            )
-        )
+        sys.exit(cmd_failures(session=args.session, transcript=args.transcript, db=args.db,
+                              db_timeout=args.db_timeout))
 
     # `corrections` is store-independent (it mines a transcript JSONL, never the
     # ZMem store) and read-only by design (candidates are reviewed by an
@@ -2955,34 +2099,22 @@ def main():
     if args.cmd == "queue-list":
         sys.exit(cmd_queue_list(namespace=args.namespace, as_json=args.json))
     if args.cmd == "queue-clear":
-        sys.exit(
-            cmd_queue_clear(
-                namespace=args.namespace,
-                ids=args.id,
-                clear_all=args.all,
-                drop_stale=args.drop_stale,
-            )
-        )
+        sys.exit(cmd_queue_clear(namespace=args.namespace, ids=args.id,
+                                 clear_all=args.all, drop_stale=args.drop_stale))
 
     # Delivery state is a sidecar concern.  Clear it before connect()/migrate()
     # so session lifecycle cleanup remains idempotent and SQLite-independent.
     if args.cmd == "ledger-clear":
         from storelib import delivery_ledger
-
         try:
             data_dir = _injection_data_dir(None)
             delivery_ledger.clear(data_dir, args.session_id)
         except Exception:
             print("[zmem] ledger-clear failed", file=sys.stderr)
             sys.exit(1)
-        print(
-            json.dumps(
-                {"ok": True, "session_id": args.session_id, "cleared": True},
-                separators=(",", ":"),
-            )
-            + "\n",
-            end="",
-        )
+        print(json.dumps({"ok": True, "session_id": args.session_id,
+                          "cleared": True}, separators=(",", ":")) + "\n",
+              end="")
         sys.exit(0)
 
     # `mine-history` is READ-ONLY against transcripts AND the store (the only
@@ -2993,26 +2125,22 @@ def main():
     # issue #71 I Codex/Hermes adapters (queue candidates only).
     if args.cmd == "mine-history":
         if getattr(args, "source", "claude") != "claude":
-            sys.exit(
-                cmd_mine_history_adapters(
-                    source=args.source,
-                    transcript_dir=args.transcript_dir or "",
-                    queue=args.queue,
-                    as_json=args.json,
-                    limit=args.limit,
-                )
-            )
-        sys.exit(
-            cmd_mine_history(
-                transcript_dir=args.transcript_dir or None,
-                all_projects=args.all_projects,
-                days=args.days,
-                min_count=args.min_count,
-                limit=args.limit,
+            sys.exit(cmd_mine_history_adapters(
+                source=args.source,
+                transcript_dir=args.transcript_dir or "",
                 queue=args.queue,
                 as_json=args.json,
-            )
-        )
+                limit=args.limit,
+            ))
+        sys.exit(cmd_mine_history(
+            transcript_dir=args.transcript_dir or None,
+            all_projects=args.all_projects,
+            days=args.days,
+            min_count=args.min_count,
+            limit=args.limit,
+            queue=args.queue,
+            as_json=args.json,
+        ))
 
     # `restore` overwrites the destination store FILE. It must not hold an open
     # sqlite3 connection on that file while doing so (a Windows file handle can
@@ -3020,24 +2148,17 @@ def main():
     # is dispatched BEFORE connect()/init_db()/migrate() and does its own
     # minimal, self-contained, open-close-per-step file work.
     if args.cmd == "restore":
-        sys.exit(
-            cmd_restore(
-                from_path=args.from_path, force=args.force, out_dir=args.out_dir
-            )
-        )
+        sys.exit(cmd_restore(from_path=args.from_path, force=args.force,
+                             out_dir=args.out_dir))
 
     # `sweep` is pure file maintenance (removes stale cooldown markers), never
     # touches the store itself, so — like `failures`/`restore` above — it is
     # dispatched BEFORE connect()/init_db()/migrate(): a locked or mid-migration
     # store can never block the reaper, and no store.sqlite is required.
     if args.cmd == "sweep":
-        sys.exit(
-            cmd_sweep(
-                marker_dir=args.marker_dir,
-                max_age_days=args.max_age_days,
-                dry_run=args.dry_run,
-            )
-        )
+        sys.exit(cmd_sweep(marker_dir=args.marker_dir,
+                           max_age_days=args.max_age_days,
+                           dry_run=args.dry_run))
 
     # `session-cadence` runs sweep BEFORE connect()/_prepare_store() (PRR-004):
     # sweep is store-independent file maintenance, so a locked/mid-restore store
@@ -3048,16 +2169,11 @@ def main():
     _cadence_sweep: tuple[str, bool] | None = None
     if args.cmd == "session-cadence":
         try:
-            with (
-                contextlib.redirect_stdout(sys.stderr)
-                if getattr(args, "as_json", False)
-                else contextlib.nullcontext()
-            ):
+            with (contextlib.redirect_stdout(sys.stderr)
+                  if getattr(args, "as_json", False)
+                  else contextlib.nullcontext()):
                 rc_s = cmd_sweep()
-            _cadence_sweep = (
-                f"sweep: {'ok' if rc_s == 0 else f'exit {rc_s}'}",
-                rc_s != 0,
-            )
+            _cadence_sweep = (f"sweep: {'ok' if rc_s == 0 else f'exit {rc_s}'}", rc_s != 0)
         except Exception as exc:
             _cadence_sweep = (f"sweep: error - {type(exc).__name__}: {exc}", True)
 
@@ -3078,33 +2194,22 @@ def main():
     if args.cmd == "hygiene":
         from storelib.hygiene import main as _hygiene_main
 
-        sys.exit(
-            _hygiene_main(
-                [
-                    "--store",
-                    args.store,
-                    "--origin-map",
-                    args.origin_map,
-                    "--evidence-map",
-                    args.evidence_map,
-                    "--out",
-                    args.out,
-                    "--format",
-                    args.format,
-                ]
-            )
-        )
+        sys.exit(_hygiene_main([
+            "--store", args.store,
+            "--origin-map", args.origin_map,
+            "--evidence-map", args.evidence_map,
+            "--out", args.out,
+            "--format", args.format,
+        ]))
 
     # Query rewriting is intentionally an early, read-only command.  Keeping
     # this branch before every connect/_prepare/migration path is what makes a
     # missing/legacy store a safe fail-open observation rather than a schema
     # upgrade side effect.
     if args.cmd == "query-rewrite":
-        sys.exit(
-            cmd_query_rewrite(
-                prompt=args.prompt, session_id=args.session_id, namespace=args.namespace
-            )
-        )
+        sys.exit(cmd_query_rewrite(
+            prompt=args.prompt, session_id=args.session_id,
+            namespace=args.namespace))
 
     # Capture adapters use this read through the public store boundary instead
     # of opening SQLite in hook processes.  It is deliberately read-only and
@@ -3123,8 +2228,7 @@ def main():
             try:
                 probe.execute("PRAGMA query_only=1")
                 exists = source_exists(
-                    probe, namespace=args.namespace, source_ref=args.source_ref
-                )
+                    probe, namespace=args.namespace, source_ref=args.source_ref)
             finally:
                 probe.close()
         except Exception:
@@ -3137,14 +2241,9 @@ def main():
     # normalizer remains storelib.ops_tokens; this CLI is the only bridge used
     # by capture hooks that cannot import store internals.
     if args.cmd == "ops-append":
-        sys.exit(
-            cmd_ops_append(
-                data_dir=str(STORE_PATH.parent),
-                session=args.session,
-                tool=args.tool,
-                op=args.op,
-            )
-        )
+        sys.exit(cmd_ops_append(
+            data_dir=str(STORE_PATH.parent), session=args.session,
+            tool=args.tool, op=args.op))
 
     # One JSON payload crosses from the stdlib-only Hermes hook into the store
     # process.  It is parsed before any stateful work; malformed input is a
@@ -3160,15 +2259,10 @@ def main():
     # It must never create a missing store when acknowledging or committing a
     # delivery cursor.
     if args.cmd == "hermes-context":
-        sys.exit(
-            cmd_hermes_context(
-                action=args.action,
-                namespace=args.namespace,
-                session_id=args.session_id,
-                cursor_ts=args.cursor_ts,
-                cursor_count=args.cursor_count,
-            )
-        )
+        sys.exit(cmd_hermes_context(
+            action=args.action, namespace=args.namespace,
+            session_id=args.session_id,
+            cursor_ts=args.cursor_ts, cursor_count=args.cursor_count))
 
     hermes_payload: dict[str, object] | None = None
     existing_only_evidence_write = (
@@ -3264,49 +2358,33 @@ def main():
     # resolver with the user:global fallback treated as "unavailable" so a
     # global scope can never be exported implicitly.
     if args.cmd == "publish-dataset":
-        sys.exit(
-            cmd_publish_dataset(
-                args.dir,
-                args.target,
-                yes=args.yes,
-                allow_unscanned=args.allow_unscanned,
-            )
-        )
+        sys.exit(cmd_publish_dataset(args.dir, args.target, yes=args.yes,
+                                     allow_unscanned=args.allow_unscanned))
     if args.cmd == "import-dataset":
-        if (
-            args.min_confidence is not None and not 0.0 <= args.min_confidence <= 1.0
-        ) or (args.min_trust is not None and not 0.0 <= args.min_trust <= 1.0):
-            ap.error("--min-confidence and --min-trust must be between " "0.0 and 1.0")
+        if (args.min_confidence is not None
+                and not 0.0 <= args.min_confidence <= 1.0) or (
+                args.min_trust is not None
+                and not 0.0 <= args.min_trust <= 1.0):
+            ap.error("--min-confidence and --min-trust must be between "
+                     "0.0 and 1.0")
         if args.taint is not None and args.taint not in (
-            "trusted_internal",
-            "untrusted_tool",
-            "untrusted_web",
-        ):
+                "trusted_internal", "untrusted_tool", "untrusted_web"):
             # Defensive: argparse choices already reject these; this branch
             # covers programmatic dispatch bypassing the parser.
             ap.error("invalid taint value")
-        sys.exit(
-            cmd_import_dataset(
-                args.source,
-                revision=args.revision,
-                dest_dir=args.dest_dir,
-                namespace=args.namespace,
-                min_confidence=args.min_confidence,
-                min_trust=args.min_trust,
-                taint=args.taint,
-                include_tombstones=args.include_tombstones,
-            )
-        )
+        sys.exit(cmd_import_dataset(
+            args.source, revision=args.revision, dest_dir=args.dest_dir,
+            namespace=args.namespace, min_confidence=args.min_confidence,
+            min_trust=args.min_trust, taint=args.taint,
+            include_tombstones=args.include_tombstones))
     if args.cmd == "export-dataset":
         if args.all_namespaces and not args.yes:
             ap.error("--yes is required with --all-namespaces")
         if not args.all_namespaces and args.namespace is None:
             resolved = _schema_host.resolve_namespace(os.getcwd())
             if resolved == GLOBAL_NAMESPACE:
-                ap.error(
-                    "--namespace is required when the project "
-                    "namespace is unavailable"
-                )
+                ap.error("--namespace is required when the project "
+                         "namespace is unavailable")
             args.namespace = resolved
 
     # PR-review PRR-P (issue #59 review round): `--content -` reads the content
@@ -3334,10 +2412,8 @@ def main():
     # remediation work, and the auto pass running first would consume the rows
     # their command targets — turning --dry-run into an empty preview and
     # --confirm into "no matching live rows found".
-    if (
-        args.cmd not in ("rekey-namespace", "export-dataset")
-        and not existing_only_evidence_write
-    ):
+    if args.cmd not in ("rekey-namespace", "export-dataset") \
+            and not existing_only_evidence_write:
         # export-dataset joins the exemption (issue #134): it is a pure-read
         # surface and must not trigger the near-miss rekey's writes against
         # the store it is reading.
@@ -3355,20 +2431,9 @@ def main():
     # loop embeds fresh vectors via _detect_duplicate and inserts into
     # memory_vec, so an unmatched active profile could previously write
     # wrong-dim blobs with the vec-row insert silently swallowed.
-    if (
-        args.cmd
-        in {
-            "add",
-            "update",
-            "recall",
-            "search",
-            "consolidate",
-            "organize",
-            "ingest-jsonl",
-        }
-        or args.cmd == "reembed"
-        or (args.cmd == "episode-close" and args.summary)
-    ):
+    if args.cmd in {"add", "update", "recall", "search", "consolidate",
+                    "organize", "ingest-jsonl"} or args.cmd == "reembed" \
+            or (args.cmd == "episode-close" and args.summary):
         # PR-review F1 (PR #81 round 2): episode-close --summary embeds via
         # add_memory — include it so a profile/dimension mismatch refuses
         # upfront instead of silently writing wrong-dim vectors (the KNN
@@ -3384,8 +2449,7 @@ def main():
 
     writer_lease = None
     if (
-        args.cmd
-        in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl"}
+        args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl"}
         or (args.cmd == "evidence" and args.evidence_cmd == "write")
         or args.cmd == "hermes-convention"
         # v12 (issue #64, 9.4): feedback is a write surface — it takes the
@@ -3409,17 +2473,11 @@ def main():
         # Issue #82 (PR-review PRR-002): --explain is a zero-write read-only
         # debugger — it must never hold the writer lease (which would make a
         # concurrent restore/backup refuse against a diagnostic read).
-        or (
-            args.cmd == "recall"
-            and not args.no_bump
+        or (args.cmd == "recall" and not args.no_bump
             and not getattr(args, "for_injection", False)
-            and not getattr(args, "explain", False)
-        )
-        or (
-            args.cmd == "recent"
-            and not args.no_bump
-            and not getattr(args, "for_injection", False)
-        )
+            and not getattr(args, "explain", False))
+        or (args.cmd == "recent" and not args.no_bump
+            and not getattr(args, "for_injection", False))
         or (args.cmd == "search" and not args.no_bump)
         or (args.cmd == "rekey-namespace" and not args.dry_run and args.confirm)
         # v10 (issue #60): entity-merge writes ONLY under --confirm; the
@@ -3449,9 +2507,7 @@ def main():
                     sys.exit(cmd_evidence_write(conn, payload=payload))
                 except DuplicateJSONKeyError:
                     conn.rollback()
-                    print(
-                        "evidence write failed: DuplicateJSONKeyError", file=sys.stderr
-                    )
+                    print("evidence write failed: DuplicateJSONKeyError", file=sys.stderr)
                     sys.exit(2)
                 except json.JSONDecodeError:
                     conn.rollback()
@@ -3470,25 +2526,15 @@ def main():
                     print("evidence write failed: SQLiteError", file=sys.stderr)
                     sys.exit(2)
             if args.evidence_cmd == "list":
-                sys.exit(
-                    cmd_evidence_list(
-                        conn,
-                        namespace=args.namespace,
-                        session_id=args.session_id,
-                        lane=args.lane,
-                        moment=args.moment,
-                        limit=args.limit,
-                        as_json=args.as_json,
-                    )
-                )
-            sys.exit(
-                cmd_evidence_show(
-                    conn,
-                    namespace=args.namespace,
-                    evidence_id=args.evidence_id,
+                sys.exit(cmd_evidence_list(
+                    conn, namespace=args.namespace, session_id=args.session_id,
+                    lane=args.lane, moment=args.moment, limit=args.limit,
                     as_json=args.as_json,
-                )
-            )
+                ))
+            sys.exit(cmd_evidence_show(
+                conn, namespace=args.namespace, evidence_id=args.evidence_id,
+                as_json=args.as_json,
+            ))
         elif args.cmd == "hermes-convention":
             payload = hermes_payload if hermes_payload is not None else {}
             sys.exit(cmd_hermes_convention(conn, payload=payload))
@@ -3522,15 +2568,11 @@ def main():
                     # Structured write result (issue #65, 10.8): consumed by the
                     # MCP/Hermes add surfaces so remote write warnings (e.g. a
                     # redaction) are structured data, not stderr text.
-                    print(
-                        json.dumps(
-                            {
-                                "id": str(res),
-                                "result": "deduped" if res.deduped else "stored",
-                                "warnings": res.warnings,
-                            }
-                        )
-                    )
+                    print(json.dumps({
+                        "id": str(res),
+                        "result": "deduped" if res.deduped else "stored",
+                        "warnings": res.warnings,
+                    }))
             except CapturePolicyRefusal as exc:
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(2)
@@ -3549,19 +2591,12 @@ def main():
             # empty/whitespace reason is refused here so the audit trail can
             # never be blank (MCP/Hermes already strip-refuse at the boundary).
             if not args.reason.strip():
-                print(
-                    "[zmem] invalidate --reason must be non-empty — the reason "
-                    "is the audit trail",
-                    file=sys.stderr,
-                )
+                print("[zmem] invalidate --reason must be non-empty — the reason "
+                      "is the audit trail", file=sys.stderr)
                 sys.exit(2)
             try:
-                ok = supersede_memory(
-                    conn,
-                    args.id,
-                    args.reason,
-                    expected_namespace=args.expected_namespace,
-                )
+                ok = supersede_memory(conn, args.id, args.reason,
+                                      expected_namespace=args.expected_namespace)
             except ValueError as exc:
                 # PR-review PRR-B: already-tombstoned rows are refused (never
                 # re-tombstoned); issue #109: cross-namespace expectations are
@@ -3596,16 +2631,12 @@ def main():
                     if _human_out is not None:
                         sys.stdout = _human_out
                 if args.json:
-                    print(
-                        json.dumps(
-                            {
-                                "id": str(res),
-                                "result": "updated",
-                                "created_new": created_new,
-                                "warnings": res.warnings,
-                            }
-                        )
-                    )
+                    print(json.dumps({
+                        "id": str(res),
+                        "result": "updated",
+                        "created_new": created_new,
+                        "warnings": res.warnings,
+                    }))
             except CapturePolicyRefusal as exc:
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(2)
@@ -3663,10 +2694,18 @@ def main():
             # opt-in ZMEM_CROSS_ENCODER_PASSIVE=1 (shadow mode scores the
             # final set and returns the original order), so the old
             # unconditional `and not args.for_injection` exclusion is gone.
-            rerank_flag = _ce_cli_allowed(
-                no_bump=args.no_bump,
-                no_hybrid=args.no_hybrid,
-                for_injection=args.for_injection,
+            rerank_flag = _ce_cli_allowed(no_bump=args.no_bump,
+                                          no_hybrid=args.no_hybrid,
+                                          for_injection=args.for_injection)
+            effective_cross_project = cross_project_surface_enabled(
+                args.moment, explicit=args.include_cross_project)
+            scoped_cli_scopes = (
+                _read_cli_or_report_value_error(_recall_scopes, args)
+                if (args.namespace is None and not args.for_injection
+                    and not args.include_cross_project
+                    and not args.legacy_unscoped
+                    and not effective_cross_project)
+                else None
             )
             # Issue #82: --explain dispatches to the read-only retrieval
             # debugger (zero writes, never unfolds, fail-open). It is a flag,
@@ -3676,59 +2715,43 @@ def main():
                     # Issue #151 review (CUBIC-cli-278): --exclude is parsed
                     # on recall but explain_recall has no exclusion surface —
                     # reject loudly instead of silently ignoring the flag.
-                    print(
-                        "[zmem] --exclude is not supported with --explain: "
-                        "explain is the read-only retrieval debugger and "
-                        "never filters. Re-run without --exclude.",
-                        file=sys.stderr,
-                    )
+                    print("[zmem] --exclude is not supported with --explain: "
+                          "explain is the read-only retrieval debugger and "
+                          "never filters. Re-run without --exclude.",
+                          file=sys.stderr)
                     sys.exit(2)
-                explain_recall(
-                    conn,
-                    query=args.query,
-                    target=args.target,
-                    namespace=args.namespace,
-                    limit=args.limit,
-                    as_json=args.json,
-                    hybrid=hybrid_arg,
+                _read_cli_or_report_value_error(
+                    explain_recall, conn, query=args.query, target=args.target,
+                    namespace=args.namespace, limit=args.limit,
+                    scopes=scoped_cli_scopes,
+                    as_json=args.json, hybrid=hybrid_arg,
                     no_bump=args.no_bump,
                     include_global=args.include_global,
-                    global_limit=args.global_limit,
-                    as_of=args.as_of,
+                    global_limit=args.global_limit, as_of=args.as_of,
                     no_mmr=args.no_mmr,
                     link_hops=args.link_hops,
                     link_budget=args.link_budget,
                     cross_rerank=rerank_flag,
                     min_confidence=args.min_confidence,
-                    for_injection=args.for_injection,
-                )
+                    for_injection=args.for_injection)
             else:
-                recall_memory(
-                    conn,
-                    query=args.query,
-                    namespace=args.namespace,
-                    limit=args.limit,
-                    as_json=args.json,
-                    hybrid=hybrid_arg,
-                    no_bump=args.no_bump,
-                    include_global=args.include_global,
-                    global_limit=args.global_limit,
-                    as_of=args.as_of,
+                _read_cli_or_report_value_error(
+                    recall_memory, conn, query=args.query, namespace=args.namespace,
+                    scopes=scoped_cli_scopes,
+                    limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
+                    no_bump=args.no_bump, include_global=args.include_global,
+                    global_limit=args.global_limit, as_of=args.as_of,
                     min_confidence=args.min_confidence,
                     no_mmr=args.no_mmr,
-                    link_hops=args.link_hops,
-                    link_budget=args.link_budget,
+                    link_hops=args.link_hops, link_budget=args.link_budget,
                     cross_rerank=rerank_flag,
                     no_unfold=args.no_unfold,
                     for_injection=args.for_injection,
                     exclude_ids=args.exclude,
-                    include_cross_project=cross_project_surface_enabled(
-                        args.moment, explicit=args.include_cross_project
-                    ),
+                    include_cross_project=effective_cross_project,
                     _cross_moment=args.moment,
                     _cross_ops_tokens=list(args.ops_token) or None,
-                    _cross_explicit=args.include_cross_project,
-                )
+                    _cross_explicit=args.include_cross_project)
         elif args.cmd == "recent":
             if args.for_injection and args.json and args.session_id:
                 try:
@@ -3752,39 +2775,39 @@ def main():
                     sys.exit(2)
                 print(json.dumps(payload, indent=2))
                 return
-            recent_memory(
-                conn,
-                namespace=args.namespace,
-                limit=args.limit,
-                min_confidence=(
-                    args.min_confidence
-                    if args.min_confidence is not None
-                    else inject_recent_floor()
-                ),
+            effective_cross_project = cross_project_surface_enabled(
+                args.moment, explicit=args.include_cross_project)
+            scoped_cli_scopes = (
+                _read_cli_or_report_value_error(_recall_scopes, args)
+                if (args.namespace is None and not args.for_injection
+                    and not args.include_cross_project
+                    and not args.legacy_unscoped
+                    and not effective_cross_project)
+                else None
+            )
+            _read_cli_or_report_value_error(
+                recent_memory, conn, namespace=args.namespace, limit=args.limit,
+                scopes=scoped_cli_scopes,
+                min_confidence=(args.min_confidence
+                                if args.min_confidence is not None
+                                else inject_recent_floor()),
                 as_json=args.json,
-                no_bump=args.no_bump,
-                include_global=args.include_global,
-                global_limit=args.global_limit,
-                as_of=args.as_of,
+                no_bump=args.no_bump, include_global=args.include_global,
+                global_limit=args.global_limit, as_of=args.as_of,
                 for_injection=args.for_injection,
                 exclude_ids=args.exclude,
-                include_cross_project=cross_project_surface_enabled(
-                    args.moment, explicit=args.include_cross_project
-                ),
+                include_cross_project=effective_cross_project,
                 _cross_moment=args.moment,
                 _cross_ops_tokens=list(args.ops_token) or None,
-                _cross_explicit=args.include_cross_project,
-            )
+                _cross_explicit=args.include_cross_project)
         elif args.cmd == "prefetch":
             # Issue #159: one selector call, one envelope. Fixed limit/
             # global_limit/budget (the contract's exact dispatch values);
             # data_dir=None so the selector resolves the sidecar dir through
             # the canonical store precedence.
             prefetch_query = args.query
-            if (
-                args.moment == "user_prompt"
-                and os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() != "0"
-            ):
+            if (args.moment == "user_prompt"
+                    and os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() != "0"):
                 # The store boundary owns this one rewrite for compat/MCP
                 # prefetch.  Native provider and hook paths call the dedicated
                 # command before recall and therefore do not pass here.
@@ -3795,9 +2818,7 @@ def main():
                 if evidence_ready:
                     try:
                         prefetch_query, _ = _query_rewrite_context(
-                            conn,
-                            prefetch_query,
-                            args.session_id,
+                            conn, prefetch_query, args.session_id,
                             explicit_ops=(args.ops_tokens or None),
                         )
                     except Exception:
@@ -3832,29 +2853,16 @@ def main():
             # v11 (issue #61, 6.3): same reasoning for link expansion — it is
             # a RECALL behavior; search keeps its byte-identical contract.
             # v13 (issue #65, 10.8): --json emits the read envelope.
-            recall_memory(
-                conn,
-                query=args.text,
-                namespace=args.namespace,
-                limit=args.limit,
-                as_json=args.json,
-                min_confidence=0.0,
-                include_global=args.include_global,
-                global_limit=args.global_limit,
-                no_bump=args.no_bump,
-                hybrid=False,
-                as_of=args.as_of,
-                link_hops=0,
-                exclude_ids=args.exclude,
-            )
+            recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
+                          as_json=args.json, min_confidence=0.0,
+                          include_global=args.include_global,
+                          global_limit=args.global_limit, no_bump=args.no_bump,
+                          hybrid=False, as_of=args.as_of, link_hops=0,
+                          exclude_ids=args.exclude)
         elif args.cmd == "supersede":
             try:
-                ok = supersede_memory(
-                    conn,
-                    args.id,
-                    args.reason,
-                    expected_namespace=args.expected_namespace,
-                )
+                ok = supersede_memory(conn, args.id, args.reason,
+                                      expected_namespace=args.expected_namespace)
             except ValueError as exc:
                 # PR-review PRR-B: already-tombstoned rows are refused (never
                 # re-tombstoned); issue #109: cross-namespace expectations are
@@ -3865,12 +2873,7 @@ def main():
         elif args.cmd == "get":
             sys.exit(0 if get_memory(conn, args.id) else 1)
         elif args.cmd == "list":
-            list_memory(
-                conn,
-                namespace=args.namespace,
-                limit=args.limit,
-                include_superseded=args.include_superseded,
-            )
+            list_memory(conn, namespace=args.namespace, limit=args.limit, include_superseded=args.include_superseded)
         elif args.cmd == "stats":
             stats(conn)
         elif args.cmd == "rebuild-fts":
@@ -3882,23 +2885,15 @@ def main():
                 # Silent no-op would be crueler than refusal: --profile alone
                 # looks like a conversion but only ever took effect with
                 # --all. Say exactly what to type (review round, R2).
-                print(
-                    "[zmem] --profile only takes effect with --all "
-                    "(use: reembed --all --profile <name> to convert)",
-                    file=sys.stderr,
-                )
+                print("[zmem] --profile only takes effect with --all "
+                      "(use: reembed --all --profile <name> to convert)",
+                      file=sys.stderr)
                 sys.exit(2)
             if args.all or args.dry_run:
-                sys.exit(
-                    reembed_embeddings(
-                        conn,
-                        rebuild_all=args.all,
-                        profile=args.profile,
-                        batch=args.batch,
-                        dry_run=args.dry_run,
-                        confirm=args.confirm,
-                    )
-                )
+                sys.exit(reembed_embeddings(
+                    conn, rebuild_all=args.all, profile=args.profile,
+                    batch=args.batch, dry_run=args.dry_run,
+                    confirm=args.confirm))
             # legacy flagless/backfill form: byte-identical stdout contract;
             # --batch passes through purely as stderr progress pacing.
             sys.exit(reembed_embeddings(conn, batch=args.batch))
@@ -3921,48 +2916,31 @@ def main():
             c_report = None
             redirect = (
                 contextlib.redirect_stdout(sys.stderr)
-                if args.json
-                else contextlib.nullcontext()
+                if args.json else contextlib.nullcontext()
             )
             with redirect:
                 if not args.dry_run:
-                    c_token = _acquire_lock(
-                        "consolidate", CONSOLIDATE_LOCK_STALE_SECONDS
-                    )
+                    c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
                     if c_token is None:
-                        print(
-                            "[zmem] consolidate: another consolidation is already "
-                            "running - skipped"
-                        )
+                        print("[zmem] consolidate: another consolidation is already "
+                              "running - skipped")
                         lock_busy = True
                 if not lock_busy:
                     try:
                         c_report = consolidate(
-                            conn,
-                            threshold=args.threshold,
-                            prune=args.prune,
-                            dry_run=args.dry_run,
-                            namespace=args.namespace,
-                            force=args.force,
-                            merge_contested=args.merge_contested,
+                            conn, threshold=args.threshold, prune=args.prune,
+                            dry_run=args.dry_run, namespace=args.namespace,
+                            force=args.force, merge_contested=args.merge_contested,
                             belief_heads=args.belief_heads,
-                            llm_local=args.llm_local,
-                        )
-                    except (
-                        _beliefs.BeliefActionError,
-                        _beliefs.BeliefAdapterError,
-                    ) as _bexc:
+                            llm_local=args.llm_local)
+                    except (_beliefs.BeliefActionError,
+                            _beliefs.BeliefAdapterError) as _bexc:
                         _release_lock("consolidate", c_token)
                         c_token = None
-                        print(
-                            "[zmem] belief-heads: %s"
-                            % (
-                                "invalid action"
-                                if isinstance(_bexc, _beliefs.BeliefActionError)
-                                else "adapter failed"
-                            ),
-                            file=sys.stderr,
-                        )
+                        print("[zmem] belief-heads: %s" % (
+                            "invalid action" if isinstance(
+                                _bexc, _beliefs.BeliefActionError)
+                            else "adapter failed"), file=sys.stderr)
                         sys.exit(1)
                     finally:
                         _release_lock("consolidate", c_token)
@@ -3994,45 +2972,29 @@ def main():
             o_report = None
             o_redirect = (
                 contextlib.redirect_stdout(sys.stderr)
-                if args.json
-                else contextlib.nullcontext()
+                if args.json else contextlib.nullcontext()
             )
             with o_redirect:
                 if not args.dry_run:
-                    o_token = _acquire_lock(
-                        "consolidate", CONSOLIDATE_LOCK_STALE_SECONDS
-                    )
+                    o_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
                     if o_token is None:
-                        print(
-                            "[zmem] organize: another organize/consolidation is "
-                            "already running - skipped"
-                        )
+                        print("[zmem] organize: another organize/consolidation is "
+                              "already running - skipped")
                         lock_busy = True
                 if not lock_busy:
                     try:
                         o_report = organize(
-                            conn,
-                            dry_run=args.dry_run,
-                            force=args.force,
-                            prune=args.prune,
-                            belief_heads=args.belief_heads,
-                            llm_local=args.llm_local,
-                        )
-                    except (
-                        _beliefs.BeliefActionError,
-                        _beliefs.BeliefAdapterError,
-                    ) as _bexc:
+                            conn, dry_run=args.dry_run, force=args.force,
+                            prune=args.prune, belief_heads=args.belief_heads,
+                            llm_local=args.llm_local)
+                    except (_beliefs.BeliefActionError,
+                            _beliefs.BeliefAdapterError) as _bexc:
                         _release_lock("consolidate", o_token)
                         o_token = None
-                        print(
-                            "[zmem] belief-heads: %s"
-                            % (
-                                "invalid action"
-                                if isinstance(_bexc, _beliefs.BeliefActionError)
-                                else "adapter failed"
-                            ),
-                            file=sys.stderr,
-                        )
+                        print("[zmem] belief-heads: %s" % (
+                            "invalid action" if isinstance(
+                                _bexc, _beliefs.BeliefActionError)
+                            else "adapter failed"), file=sys.stderr)
                         sys.exit(1)
                     finally:
                         _release_lock("consolidate", o_token)
@@ -4045,9 +3007,8 @@ def main():
             if args.json:
                 print(json.dumps(o_report))
         elif args.cmd == "backup":
-            rc = cmd_backup(
-                conn, retention=args.retention, out_dir=args.out_dir, if_due=args.if_due
-            )
+            rc = cmd_backup(conn, retention=args.retention, out_dir=args.out_dir,
+                            if_due=args.if_due)
             sys.exit(rc)
         elif args.cmd == "session-cadence":
             # Batch the three session-start cadence ops into one process (#39 E9).
@@ -4086,9 +3047,7 @@ def main():
                         _release_lock("consolidate", o_token)
                 # 2) backup --if-due (cheap no-op almost every session)
                 try:
-                    rc_b = cmd_backup(
-                        conn, retention=args.backup_retention, if_due=True
-                    )
+                    rc_b = cmd_backup(conn, retention=args.backup_retention, if_due=True)
                     backed_up = rc_b == 0
                     steps.append(f"backup: {'ok' if rc_b == 0 else f'exit {rc_b}'}")
                     if rc_b != 0:
@@ -4108,29 +3067,21 @@ def main():
             cadence_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             retention = sweep_evidence(conn, now_ts=cadence_now)
             if getattr(args, "as_json", False):
-                print(
-                    json.dumps(
-                        {
-                            "organized": organized,
-                            "backed_up": backed_up,
-                            "evidence_expired": retention["expired"],
-                            "evidence_capped": retention["capped"],
-                            "episode_links": retention["episode_links"],
-                            "memory_links": retention["memory_links"],
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                )
+                print(json.dumps({
+                    "organized": organized,
+                    "backed_up": backed_up,
+                    "evidence_expired": retention["expired"],
+                    "evidence_capped": retention["capped"],
+                    "episode_links": retention["episode_links"],
+                    "memory_links": retention["memory_links"],
+                }, ensure_ascii=False, separators=(",", ":")))
             else:
-                steps.extend(
-                    [
-                        f"evidence_expired={retention['expired']}",
-                        f"evidence_capped={retention['capped']}",
-                        f"episode_links={retention['episode_links']}",
-                        f"memory_links={retention['memory_links']}",
-                    ]
-                )
+                steps.extend([
+                    f"evidence_expired={retention['expired']}",
+                    f"evidence_capped={retention['capped']}",
+                    f"episode_links={retention['episode_links']}",
+                    f"memory_links={retention['memory_links']}",
+                ])
                 print("[zmem] session-cadence: " + "; ".join(steps))
             # Exit nonzero if any op failed (PRR-003): former separate processes
             # surfaced per-op exit codes; preserve that signal. The hook runs
@@ -4141,26 +3092,20 @@ def main():
         elif args.cmd == "promote-store":
             # Issue #71 E: one-shot merge of a leftover second store. Idempotent
             # (source ids preserved), read-only on the source.
-            sys.exit(
-                cmd_promote_store(conn, from_path=args.from_path, dry_run=args.dry_run)
-            )
+            sys.exit(cmd_promote_store(conn, from_path=args.from_path,
+                                       dry_run=args.dry_run))
         elif args.cmd == "rekey-namespace":
             # --confirm (or --dry-run) is a REAL gate: this rewrites the
             # namespace column of live rows. Without either flag it refuses.
             if not args.confirm and not args.dry_run:
-                print(
-                    "[zmem] rekey-namespace: refusing to write without "
-                    "--confirm (or --dry-run to preview).",
-                    file=sys.stderr,
-                )
+                print("[zmem] rekey-namespace: refusing to write without "
+                      "--confirm (or --dry-run to preview).", file=sys.stderr)
                 sys.exit(2)
             try:
                 rekey_namespace(
-                    conn,
-                    from_namespace=args.from_namespace,
+                    conn, from_namespace=args.from_namespace,
                     to_namespace=args.to_namespace,
-                    near_miss_global=args.near_miss_global,
-                    dry_run=args.dry_run,
+                    near_miss_global=args.near_miss_global, dry_run=args.dry_run,
                 )
             except ValueError as exc:
                 print(f"[zmem] rekey-namespace: {exc}", file=sys.stderr)
@@ -4172,28 +3117,20 @@ def main():
             if args.id and not args.dry_run and not args.confirm:
                 print("[zmem] refusing to promote without --confirm.", file=sys.stderr)
                 print(f"[zmem]   promote --id {args.id} --confirm", file=sys.stderr)
-                print(
-                    '[zmem] (add --description "..." to write the trigger line yourself — '
-                    "the description is the entire trigger surface)",
-                    file=sys.stderr,
-                )
-                # sys.exit, not return: main()'s return value is discarded by the
-                # `if __name__ == "__main__": main()` entrypoint, so a bare `return 2`
-                # prints the refusal but still exits 0 — a refusal indistinguishable
-                # from success to any caller checking $?. 2 matches cmd_restore's
-                # "refused, destination untouched" codes (see its refusal branches);
-                # note restore uses 1 for its own missing-flag case, and `failures`
-                # surfaces no code at all, so this is deliberately the refused-and-
-                # nothing-written convention rather than a blanket house style.
+                print("[zmem] (add --description \"...\" to write the trigger line yourself — "
+                      "the description is the entire trigger surface)", file=sys.stderr)
+            # sys.exit, not return: main()'s return value is discarded by the
+            # `if __name__ == "__main__": main()` entrypoint, so a bare `return 2`
+            # prints the refusal but still exits 0 — a refusal indistinguishable
+            # from success to any caller checking $?. 2 matches cmd_restore's
+            # "refused, destination untouched" codes (see its refusal branches);
+            # note restore uses 1 for its own missing-flag case, and `failures`
+            # surfaces no code at all, so this is deliberately the refused-and-
+            # nothing-written convention rather than a blanket house style.
                 sys.exit(2)
-            rc = promote_memory(
-                conn,
-                memory_id=args.id,
-                dry_run=args.dry_run,
-                namespace=args.namespace,
-                description=args.description,
-                install_approved=args.install_approved,
-            )
+            rc = promote_memory(conn, memory_id=args.id, dry_run=args.dry_run,
+                                namespace=args.namespace, description=args.description,
+                                install_approved=args.install_approved)
             if rc:
                 sys.exit(rc)
         elif args.cmd == "feedback":
@@ -4202,11 +3139,8 @@ def main():
             # `get` convention). argparse's mutually-exclusive required group
             # already refuses both/neither flags and a missing --id with exit 2.
             try:
-                result = feedback_memory(
-                    conn,
-                    memory_id=args.id,
-                    verdict="applied" if args.applied else "violated",
-                )
+                result = feedback_memory(conn, memory_id=args.id,
+                                         verdict="applied" if args.applied else "violated")
             except FeedbackTargetError as exc:
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(1)
@@ -4217,68 +3151,45 @@ def main():
             # Success writes one compact sorted-key JSON list plus LF.
             data_dir = os.environ.get("ZMEM_DATA")
             if not data_dir:
-                print(
-                    "[zmem] operation-feedback: ZMEM_DATA is not set", file=sys.stderr
-                )
+                print("[zmem] operation-feedback: ZMEM_DATA is not set",
+                      file=sys.stderr)
                 sys.exit(1)
             try:
                 rows = apply_operation_feedback(
-                    conn,
-                    data_dir=data_dir,
-                    session_id=args.session_id,
-                    event_id=args.event_id,
+                    conn, data_dir=data_dir,
+                    session_id=args.session_id, event_id=args.event_id,
                     operation_tokens=list(args.operation_tokens),
-                    outcome=args.outcome,
-                    evidence_id=args.evidence_id,
-                    now=args.now,
-                )
-            except (
-                FeedbackTargetError,
-                FeedbackSidecarError,
-                ValueError,
-                KeyError,
-                RuntimeError,
-                sqlite3.Error,
-            ) as exc:
+                    outcome=args.outcome, evidence_id=args.evidence_id,
+                    now=args.now)
+            except (FeedbackTargetError, FeedbackSidecarError, ValueError,
+                    KeyError, RuntimeError, sqlite3.Error) as exc:
                 print(f"[zmem] operation-feedback: {exc}", file=sys.stderr)
                 sys.exit(1)
-            print(
-                json.dumps(
-                    rows, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-                )
-            )
+            print(json.dumps(rows, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False))
         elif args.cmd == "tune-weights":
             # v12 (issue #64, 9.6): dry-run only. A missing --dry-run is a
             # usage refusal (exit 2) — it keeps the door visibly closed on an
             # untested apply path; applying weights is a documented manual
             # edit of storelib/recall.py's W_* constants (SKILL.md).
             if not args.dry_run:
-                print(
-                    "[zmem] tune-weights: only --dry-run is implemented; the "
-                    "evaluation is read-only. Applying suggested weights is "
-                    "a manual edit of the W_* constants in "
-                    "skills/memory/scripts/storelib/recall.py (see SKILL.md "
-                    "§tune-weights).",
-                    file=sys.stderr,
-                )
+                print("[zmem] tune-weights: only --dry-run is implemented; the "
+                      "evaluation is read-only. Applying suggested weights is "
+                      "a manual edit of the W_* constants in "
+                      "skills/memory/scripts/storelib/recall.py (see SKILL.md "
+                      "§tune-weights).", file=sys.stderr)
                 sys.exit(2)
             sys.exit(tune_weights(conn, gold_path=args.gold, k=args.k))
         elif args.cmd == "export-pack":
             rc = cmd_export_pack(
-                conn,
-                namespace=args.namespace,
-                out=args.out,
-                project_limit=args.project_limit,
-                global_limit=args.global_limit,
-                min_confidence=args.min_confidence,
-                max_bytes=args.max_bytes,
+                conn, namespace=args.namespace, out=args.out,
+                project_limit=args.project_limit, global_limit=args.global_limit,
+                min_confidence=args.min_confidence, max_bytes=args.max_bytes,
             )
             sys.exit(rc)
         elif args.cmd == "export-jsonl":
             rc = cmd_export_jsonl(
-                conn,
-                out=args.out,
-                namespace=args.namespace,
+                conn, out=args.out, namespace=args.namespace,
                 include_superseded=args.include_superseded,
             )
             sys.exit(rc)
@@ -4287,9 +3198,7 @@ def main():
             # read queries only; the parse-time guards above have already
             # resolved/validated the namespace selection.
             rc = cmd_export_dataset(
-                conn,
-                out_dir=args.dir,
-                namespace=args.namespace,
+                conn, out_dir=args.dir, namespace=args.namespace,
                 all_namespaces=args.all_namespaces,
                 include_tombstones=args.include_tombstones,
                 allow_unscoped=args.yes,
@@ -4298,52 +3207,28 @@ def main():
         elif args.cmd == "ingest-jsonl":
             _warn_reserved_source_ref(args.source_ref)
             ingest = cmd_ingest_jsonl_strict if args.strict else cmd_ingest_jsonl
-            rc = ingest(
-                conn,
-                in_path=args.in_path,
-                source_ref=args.source_ref,
-                allow_tombstones=args.allow_tombstones,
-                capture_mode=args.capture_mode,
-            )
+            rc = ingest(conn, in_path=args.in_path, source_ref=args.source_ref,
+                        allow_tombstones=args.allow_tombstones,
+                        capture_mode=args.capture_mode)
             sys.exit(rc)
         elif args.cmd == "entity-list":
             sys.exit(cmd_entity_list(conn, kind=args.kind, as_json=args.json))
         elif args.cmd == "entity-merge":
-            sys.exit(
-                cmd_entity_merge(
-                    conn, from_id=args.from_id, to_id=args.to_id, confirm=args.confirm
-                )
-            )
+            sys.exit(cmd_entity_merge(conn, from_id=args.from_id, to_id=args.to_id,
+                                      confirm=args.confirm))
         elif args.cmd == "links":
-            sys.exit(
-                cmd_links(
-                    conn,
-                    ids=args.ids,
-                    as_json=args.json,
-                    add=args.add,
-                    relation=args.relation,
-                    score=args.score,
-                    reason=args.reason,
-                )
-            )
+            sys.exit(cmd_links(conn, ids=args.ids, as_json=args.json,
+                               add=args.add, relation=args.relation,
+                               score=args.score, reason=args.reason))
         elif args.cmd == "contradict":
             sys.exit(cmd_contradict(conn, ids=args.ids, reason=args.reason))
-        elif args.cmd in {
-            "episode-open",
-            "episode-add",
-            "episode-close",
-            "episode-list",
-        }:
+        elif args.cmd in {"episode-open", "episode-add", "episode-close",
+                          "episode-list"}:
             # v13 (issue #65, 10.7). Refusals are stable exit-2 [zmem] lines
             # (the supersede/invalidate convention), never tracebacks.
             from storelib.episodes import (
-                EpisodeError,
-                episode_add,
-                episode_close,
-                episode_list,
-                episode_open,
+                EpisodeError, episode_add, episode_close, episode_list, episode_open,
             )
-
             try:
                 if args.cmd == "episode-list":
                     # episode_list prints its own output (JSON or human rows).
@@ -4360,46 +3245,33 @@ def main():
                         if args.cmd == "episode-open":
                             row = episode_open(conn, namespace=args.namespace)
                         elif args.cmd == "episode-add":
-                            res = episode_add(
-                                conn, episode_id=args.episode, memory_id=args.memory
-                            )
+                            res = episode_add(conn, episode_id=args.episode,
+                                              memory_id=args.memory)
                         else:
-                            row = episode_close(
-                                conn, episode_id=args.episode, with_summary=args.summary
-                            )
+                            row = episode_close(conn, episode_id=args.episode,
+                                                with_summary=args.summary)
                     finally:
                         if _human_out is not None:
                             sys.stdout = _human_out
                     if args.cmd == "episode-open":
-                        print(
-                            json.dumps(row, indent=2)
-                            if args.json
-                            else f"[zmem] episode opened: {row['id']} "
-                            f"(ns={row['namespace']} started={row['started_at']})"
-                        )
+                        print(json.dumps(row, indent=2) if args.json else
+                              f"[zmem] episode opened: {row['id']} "
+                              f"(ns={row['namespace']} started={row['started_at']})")
                     elif args.cmd == "episode-add":
                         if args.json:
                             print(json.dumps(res))
                         else:
-                            state = "attached" if res["added"] else "already attached"
-                            print(
-                                f"[zmem] episode-add: memory {args.memory} "
-                                f"{state} to episode {args.episode}"
-                            )
+                            state = ("attached" if res["added"]
+                                     else "already attached")
+                            print(f"[zmem] episode-add: memory {args.memory} "
+                                  f"{state} to episode {args.episode}")
                     else:
-                        print(
-                            json.dumps(row, indent=2)
-                            if args.json
-                            else f"[zmem] episode closed: {row['id']} "
-                            f"(members={row['member_count']} "
-                            f"tokens={row['token_count']}"
-                            + (
-                                f" summary={row['summary_memory_id']}"
-                                if row["summary_memory_id"]
-                                else ""
-                            )
-                            + ")"
-                        )
+                        print(json.dumps(row, indent=2) if args.json else
+                              f"[zmem] episode closed: {row['id']} "
+                              f"(members={row['member_count']} "
+                              f"tokens={row['token_count']}"
+                              + (f" summary={row['summary_memory_id']}"
+                                 if row["summary_memory_id"] else "") + ")")
             except EpisodeError as exc:
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)

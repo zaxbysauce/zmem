@@ -10,6 +10,36 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.63.0] - 2026-09-25
+
+### Added
+- **Scoped five-tier recall (issue #167):** implicit ordinary recall/recent
+  calls reserve project, domain, and fleet/host slots when scope resolution is
+  available; user-global slots are populated only with explicit
+  `--include-global` opt-in. Programmatic
+  recall, recent, and explain callers can opt in with `scopes=`; the
+  `ZMEM_TIER_SLOTS` five-integer override, deterministic tier labels, read-only
+  explain overflow verdicts, and closed cross-project policy seam are documented
+  and covered by additive integration checks; while the scoped cross-project
+  policy remains disabled, recall/recent skip its unfiltered candidate scan.
+  Implicit hostname scopes normalize hostnames to lowercase. Legacy explicit namespace,
+  injection, hook, search, and unscoped #98 cross-project lanes retain their
+  routing.
+  Generic fenced and ordinary plain-text recall/recent bullets carry
+  `[tier=<name>]` for scoped rows and `[tier=unknown]` for tierless rows; the
+  legacy passive-injection wire keeps its established tierless bytes. Scoped recall/recent reject the legacy
+  `include_cross_project` flag instead of silently ignoring it.
+- **Scoped MCP prefetch isolation (issue #236):** do not forward operation
+  tokens from namespace-scoped bearer tokens into the legacy #98 cross-project
+  admission path. This blocks foreign rows before store-side rendering,
+  context construction, and delivery-ledger updates; unscoped operator tokens
+  retain the existing hazard admission behavior. Namespace-less Hermes
+  wildcard and unscoped MCP recall/recent/search reads use an internal legacy-lane
+  marker to preserve their full-store semantics alongside scoped CLI defaults.
+  Scoped implicit `--include-global` retains the resolver-scoped project IDs
+  and adds only the `user_global` reservation, as pinned by the integration
+  projection test.
+
 ## [0.62.0] - 2026-09-24
 
 ### Added

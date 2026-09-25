@@ -508,6 +508,84 @@ class PrefetchValidationTest(unittest.TestCase):
                          "a scoped-token refusal must not spawn a store "
                          "subprocess")
 
+    def test_scoped_token_cannot_admit_cross_project_prefetch_rows(self):
+        # Issue #236: the legacy prefetch hazard lane treats operation tokens
+        # as admission evidence without consulting MCP namespace scopes. Seed
+        # matching rows in both the caller's project and a foreign project,
+        # then exercise the actual scoped FastMCP tool and store subprocess.
+        query = f"scope-boundary-{uuid.uuid4().hex}"
+        own = _run_store(
+            "add", "--namespace", "project:allowed", "--type", "fact",
+            "--content", f"{query} stash pop allowed", "--signal", "test",
+            "--confidence", "0.9", "--json")
+        self.assertEqual(own.returncode, 0, own.stderr)
+        own_id = json.loads(own.stdout)["id"]
+        foreign = _run_store(
+            "add", "--namespace", "project:foreign", "--type", "fact",
+            "--content", f"{query} stash pop foreign-secret", "--signal",
+            "test", "--confidence", "0.9", "--json")
+        self.assertEqual(foreign.returncode, 0, foreign.stderr)
+        foreign_id = json.loads(foreign.stdout)["id"]
+
+        token_file = os.path.join(self._tmp, "scoped-prefetch-token.json")
+        with open(token_file, "w", encoding="utf-8") as f:
+            json.dump({"token": "scoped-prefetch-secret",
+                       "namespaces": ["project:allowed", "user:global"]}, f)
+        saved = {k: os.environ.get(k) for k in (
+            "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE", "ZMEM_CROSS_PROJECT")}
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = token_file
+        os.environ.pop("ZMEM_MCP_TOKEN", None)
+        try:
+            scoped = self.mcp_server.build_server(
+                host="127.0.0.1", port=0, use_tls=False)
+            outcomes = []
+            for moment, cross_project in (("pretool", None),
+                                          ("user_prompt", "1")):
+                if cross_project is None:
+                    os.environ.pop("ZMEM_CROSS_PROJECT", None)
+                else:
+                    os.environ["ZMEM_CROSS_PROJECT"] = cross_project
+                calls, restore = self._patched_run_store(delegate=True)
+                session_id = f"scoped-prefetch-{uuid.uuid4()}"
+                _reset_ledger(self._tmp, session_id)
+                try:
+                    result = asyncio.run(scoped._tool_manager.call_tool(
+                        "prefetch",
+                        {"query": query, "namespace": "project:allowed",
+                         "session_id": session_id, "moment": moment,
+                         "lane": "claude",
+                         "ops_tokens": ["stash", "pop"]},
+                        context=None))
+                finally:
+                    restore()
+                outcomes.append((moment, calls, result, session_id))
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        for moment, calls, result, session_id in outcomes:
+            with self.subTest(moment=moment):
+                self.assertNotIn("error", result, result)
+                self.assertEqual(len(calls), 1, calls)
+                self.assertNotIn("--ops-token", calls[0],
+                                 "scoped-token operations must not reach the "
+                                 "legacy cross-project admission path")
+                self.assertNotIn(foreign_id,
+                                 {row["id"] for row in result["results"]},
+                                 result)
+                self.assertNotIn("foreign-secret", result["rendered"], result)
+                self.assertEqual(result["context"], result["rendered"])
+                ledger = json.loads(
+                    _ledger_path(self._tmp, session_id).read_text(
+                        encoding="utf-8"))
+                ledger_ids = {entry["id"] for entry in ledger["entries"]}
+                self.assertEqual(ledger_ids, {own_id},
+                                 "only the allowed delivered row belongs in "
+                                 "the delivery ledger")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

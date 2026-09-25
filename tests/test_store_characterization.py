@@ -301,7 +301,8 @@ def _capture_snapshot() -> dict:
         out = _norm_stats(h.stdout) if label == "stats" else _norm(h.stdout)
         snap.setdefault("data_sha", {})[label] = _sha(out)
     builder._pin_timestamps(store)  # clear any prior telemetry before recall
-    h = _run_cli(env, "recall", "--query", "python insertion", "--json", "--limit", "5")
+    h = _run_cli(env, "recall", "--query", "python insertion",
+                 "--namespace", "project:char", "--json", "--limit", "5")
     snap.setdefault("data_sha", {})["recall"] = _sha(_norm(h.stdout))
     return snap
 
@@ -399,7 +400,8 @@ class CharacterizationTests(unittest.TestCase):
         self._assert_sha("list", _sha(_norm(r.stdout)), DATA_SHA["list"])
 
     def test_data_recall_json(self):
-        r = _run_cli(self.env, "recall", "--query", "python insertion", "--json", "--limit", "5")
+        r = _run_cli(self.env, "recall", "--query", "python insertion",
+                     "--namespace", "project:char", "--json", "--limit", "5")
         self.assertEqual(r.returncode, 0, r.stderr)
         self._assert_sha("recall --json", _sha(_norm(r.stdout)), DATA_SHA["recall"])
 
@@ -457,7 +459,8 @@ class CharacterizationTests(unittest.TestCase):
         nondeterminism (the 2026-08-25 failure mode was day-boundary _score
         drift, not telemetry)."""
         import shutil
-        args = ("recall", "--query", "python insertion", "--json", "--limit", "5")
+        args = ("recall", "--query", "python insertion", "--namespace",
+                "project:char", "--json", "--limit", "5")
 
         def run_fresh(test_now: str) -> str:
             tmp = tempfile.mkdtemp(prefix="zmem-char-seam-")
