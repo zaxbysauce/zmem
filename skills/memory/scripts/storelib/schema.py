@@ -1263,6 +1263,94 @@ _BELIEF_SCHEMA_DDL = (
 )
 
 
+# Issue #135: governed training capture is local-only side storage.  These
+# additive tables deliberately run independently of the numbered migration
+# sequence: clients that understand v14 continue to share the same schema
+# version while each capable client installs this idempotent set atomically.
+_TRAINING_CAPTURE_SCHEMA_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS training_capture (
+      capture_id TEXT PRIMARY KEY,
+      host TEXT NOT NULL,
+      host_task_id TEXT,
+      session_id TEXT,
+      namespace TEXT,
+      cwd TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      finalized_at TEXT,
+      acknowledged_at TEXT,
+      acknowledgement_attestation TEXT,
+      state TEXT NOT NULL CHECK (state IN
+        ('partial', 'emitted_to_host', 'acknowledged', 'completed')),
+      prompt TEXT,
+      assistant_response TEXT,
+      consent_scope TEXT,
+      content_license TEXT,
+      redaction_status TEXT NOT NULL CHECK (redaction_status IN
+        ('redacted', 'metadata_only')),
+      redaction_policy_version TEXT,
+      governance_source TEXT NOT NULL,
+      quarantine_reason TEXT,
+      revoked_at TEXT,
+      revoked_by TEXT,
+      revocation_reason TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_capture_state_idx "
+    "ON training_capture(state, updated_at)",
+    "CREATE INDEX IF NOT EXISTS training_capture_session_idx "
+    "ON training_capture(namespace, session_id)",
+    """
+    CREATE TABLE IF NOT EXISTS training_delivery_snapshot (
+      delivery_snapshot_id TEXT PRIMARY KEY,
+      capture_id TEXT NOT NULL UNIQUE REFERENCES training_capture(capture_id),
+      rendered TEXT,
+      effective_ops_json TEXT,
+      rendered_hash TEXT,
+      transform_version TEXT,
+      emitted_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_delivery_capture_idx "
+    "ON training_delivery_snapshot(capture_id)",
+    """
+    CREATE TABLE IF NOT EXISTS training_capture_completion (
+      capture_id TEXT PRIMARY KEY REFERENCES training_capture(capture_id),
+      evidence_id TEXT NOT NULL REFERENCES evidence(id),
+      associated_memory_ids_json TEXT NOT NULL,
+      verifier_id TEXT NOT NULL,
+      verified_at TEXT NOT NULL,
+      outcome_kind TEXT NOT NULL CHECK (outcome_kind IN
+        ('test', 'compile', 'lint', 'user_acceptance', 'reviewer_acceptance')),
+      outcome_value TEXT NOT NULL,
+      acknowledgement_attestation TEXT NOT NULL,
+      export_consent_scope TEXT NOT NULL,
+      export_content_license TEXT NOT NULL,
+      reviewer_id TEXT,
+      reviewer_confirmed INTEGER NOT NULL DEFAULT 0 CHECK
+        (reviewer_confirmed IN (0, 1)),
+      correction_closeout INTEGER NOT NULL DEFAULT 0 CHECK
+        (correction_closeout IN (0, 1)),
+      correction_chain_id TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_completion_evidence_idx "
+    "ON training_capture_completion(evidence_id)",
+    """
+    CREATE TABLE IF NOT EXISTS training_capture_observation (
+      observation_id TEXT PRIMARY KEY,
+      capture_id TEXT NOT NULL REFERENCES training_capture(capture_id),
+      observation_kind TEXT NOT NULL,
+      payload TEXT,
+      observed_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_observation_capture_idx "
+    "ON training_capture_observation(capture_id, observed_at)",
+)
+
+
 def _ensure_belief_tables(conn: sqlite3.Connection) -> None:
     """Create the additive belief-head side tables atomically (issue #137).
 
@@ -1277,6 +1365,36 @@ def _ensure_belief_tables(conn: sqlite3.Connection) -> None:
         conn.execute(f"SAVEPOINT {savepoint}")
     try:
         for ddl in _BELIEF_SCHEMA_DDL:
+            conn.execute(ddl)
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
+def _ensure_training_capture_tables(conn: sqlite3.Connection) -> None:
+    """Install Issue #135's four local capture tables atomically.
+
+    This must stay version-independent: a numbered migration would violate the
+    v14 compatibility contract for automatic partial capture.
+    """
+    savepoint = "zmem_training_capture_ddl"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for ddl in _TRAINING_CAPTURE_SCHEMA_DDL:
             conn.execute(ddl)
         if own_transaction:
             conn.commit()
@@ -1719,6 +1837,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     # so older clients keep their additive-window contract; the IF NOT EXISTS
     # block is idempotent and atomic (see _ensure_belief_tables).
     _ensure_belief_tables(conn)
+    _ensure_training_capture_tables(conn)
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
     # skip. See _retry_pending_ns_migration for why this cannot live behind the

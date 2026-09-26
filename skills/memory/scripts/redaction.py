@@ -6,6 +6,10 @@ import re
 
 
 SECRET_CREDENTIAL_PATTERNS = [
+    # Authorization headers occur in prompts, rendered fences, and operation
+    # transcripts.  Keep this ahead of the generic token patterns so the whole
+    # credential (rather than an arbitrary suffix) is replaced consistently.
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._+/~-]{16,}\b"),
     re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd|private[_-]?key)\s*[:=]\s*\S{8,}"),
     re.compile(r"-----BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY-----"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),

@@ -313,7 +313,9 @@ class EnvelopeContractTest(unittest.TestCase):
             "budget_dropped", "budget_admission", "budget_truncated",
             "budget_dropped_protected", "arms", "rendered",
         }
-        expected_optional = {"injection_risk", "candidate_lanes", "budget_note"}
+        expected_optional = {
+            "injection_risk", "candidate_lanes", "budget_note", "effective_ops",
+        }
         self.assertEqual(set(INJECTION_ENVELOPE_REQUIRED), expected_required)
         self.assertEqual(set(INJECTION_ENVELOPE_OPTIONAL), expected_optional)
 
@@ -342,6 +344,49 @@ class EnvelopeContractTest(unittest.TestCase):
             set(INJECTION_ENVELOPE_REQUIRED) | set(INJECTION_ENVELOPE_OPTIONAL),
         )
         self.assertEqual(envelope["rendered"], expected["rendered"])
+
+    def test_capture_envelope_carries_effective_ops(self):
+        from storelib import build_injection_envelope  # noqa: PLC0415
+
+        expected = self.expected
+        envelope = build_injection_envelope(
+            expected["results"],
+            omitted=expected["omitted"],
+            reason=expected["reason"],
+            excluded=expected["excluded"],
+            candidate_ids=expected["candidate_ids"],
+            tokens_used=expected["tokens_used"],
+            tokens_budget=expected["tokens_budget"],
+            budget_dropped=expected["budget_dropped"],
+            budget_admission=expected["budget_admission"],
+            budget_truncated=expected["budget_truncated"],
+            budget_dropped_protected=expected["budget_dropped_protected"],
+            arms=expected["arms"],
+            rendered=expected["rendered"],
+            effective_ops=["git", "pytest"],
+        )
+        self.assertEqual(envelope["effective_ops"], ["git", "pytest"])
+
+        # Direct callers retain the historical wire shape unless capture data
+        # is explicitly supplied.
+        self.assertNotIn(
+            "effective_ops",
+            build_injection_envelope(
+                expected["results"],
+                omitted=expected["omitted"],
+                reason=expected["reason"],
+                excluded=expected["excluded"],
+                candidate_ids=expected["candidate_ids"],
+                tokens_used=expected["tokens_used"],
+                tokens_budget=expected["tokens_budget"],
+                budget_dropped=expected["budget_dropped"],
+                budget_admission=expected["budget_admission"],
+                budget_truncated=expected["budget_truncated"],
+                budget_dropped_protected=expected["budget_dropped_protected"],
+                arms=expected["arms"],
+                rendered=expected["rendered"],
+            ),
+        )
 
     def test_core_callables_callable(self):
         self.assertTrue(callable(self.storelib.select_and_budget_for_injection))
