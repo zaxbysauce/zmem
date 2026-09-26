@@ -883,10 +883,10 @@ flags `--session-id`, `--moment`, `--lane`, and repeatable `--ops-token` when
 called with `--for-injection --json`. An empty query dispatches to recent
 selection. An omitted `--ops-token` list lets the store read the pre-tool ring;
 the ring is composed only for `pretool`, not for UserPromptSubmit or other
-moments. `ledger-clear --session-id <id>` clears one session's delivery ledger
-and legacy pending sidecar without opening SQLite and is idempotent when either
-sidecar is absent. A session id requires a
-moment, and a moment requires a session id.
+moments. For passive `recall` and `recent`, a session id requires a moment, and
+a moment requires a session id. `ledger-clear --session-id <id>` clears one
+session's delivery ledger and legacy pending sidecar without opening SQLite and
+is idempotent when either sidecar is absent.
 
 The old hook-owned pending, compact-summary, and task-text sidecars are no
 longer produced or consumed by these adapters. The D-2 #118 compaction-snapshot
