@@ -105,6 +105,7 @@ class CodexManifestContractTest(unittest.TestCase):
         "subagent-recall",
         "subagent-reflect",
         "precompact",
+        "session-end",
     ]
 
     @staticmethod
@@ -122,8 +123,8 @@ class CodexManifestContractTest(unittest.TestCase):
     def test_codex_entries_have_windows_commands_and_context_limits(self):
         entries = self._codex_entries()
         self.assertEqual(
-            len(entries), 10,
-            "hooks.codex.json must declare exactly ten hook entries, got %d"
+            len(entries), 11,
+            "hooks.codex.json must declare exactly eleven hook entries, got %d"
             % len(entries),
         )
         verbs = []
@@ -157,8 +158,19 @@ class CodexManifestContractTest(unittest.TestCase):
                     )
         self.assertEqual(
             verbs, self.EXPECTED_VERBS,
-            "the ten entries must keep their existing verbs in manifest order",
+            "the eleven entries must keep their existing verbs in manifest order",
         )
+
+        session_end = [entry for event, entry in entries if event == "SessionEnd"]
+        self.assertEqual(len(session_end), 1,
+                         "Codex must declare exactly one SessionEnd command")
+        self.assertEqual(session_end[0].get("timeout"), 2)
+        self.assertEqual(session_end[0].get("commandWindows"),
+                         "node ${PLUGIN_ROOT}/hooks/zmem-launch.js session-end")
+        self.assertNotIn("additionalContextLimit", session_end[0])
+        self.assertNotIn("Interrupt", json.loads(
+            (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8")
+        )["hooks"])
 
     def test_codex_limit_matches_launcher_constant(self):
         probe = (

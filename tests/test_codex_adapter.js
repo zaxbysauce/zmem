@@ -821,7 +821,7 @@ testDegenerateBudgetFailsOpen();
 testInvalidRawFailsOpen();
 
 // --- issue #188: execute the manifest's real Windows command strings --------
-// Each of the ten hooks.codex.json entries carries a quote-free
+// Each of the eleven hooks.codex.json entries carries a quote-free
 // `commandWindows` string. This section expands ${PLUGIN_ROOT} against a
 // throwaway plugin tree (launcher + generated stub scripts), runs the
 // command through cmd.exe exactly as the Codex Windows host would, and
@@ -879,7 +879,7 @@ function buildAndRunCases(tree) {
         }
     }
 
-    eq("windows-manifest: ten fixture cases match ten manifest entries",
+    eq("windows-manifest: eleven fixture cases match eleven manifest entries",
         casesDoc.cases.length, manifestEntries.length);
 
     const pluginRoot = path.join(tree, "plugin");
