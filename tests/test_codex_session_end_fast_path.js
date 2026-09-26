@@ -74,7 +74,7 @@ async function testHelpers() {
                 order.push("spawn");
                 assert.strictEqual(python, "python-override");
                 assert.deepStrictEqual(argv, [
-                    "plugin-root\\skills\\memory\\scripts\\store.py",
+                    path.join("plugin-root", "skills", "memory", "scripts", "store.py"),
                     "ledger-clear", "--session-id", "sid",
                 ]);
                 assert.strictEqual(options.stdio, "ignore");
