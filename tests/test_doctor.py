@@ -1471,7 +1471,7 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture(
                 capture_id TEXT PRIMARY KEY, state TEXT,
                 redaction_status TEXT, redaction_policy_version TEXT,
-                acknowledged_at TEXT, revoked_at TEXT
+                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT
             );
             CREATE TABLE training_delivery_snapshot(
                 delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
@@ -1507,7 +1507,7 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture(
                 capture_id TEXT PRIMARY KEY, state TEXT,
                 redaction_status TEXT, redaction_policy_version TEXT,
-                acknowledged_at TEXT, revoked_at TEXT
+                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT
             );
             CREATE TABLE training_delivery_snapshot(
                 delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
@@ -1546,7 +1546,7 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture(
                 capture_id TEXT PRIMARY KEY, state TEXT,
                 redaction_status TEXT, redaction_policy_version TEXT,
-                acknowledged_at TEXT, revoked_at TEXT
+                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT
             );
             CREATE TABLE training_delivery_snapshot(
                 delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
@@ -1575,6 +1575,50 @@ class TrainingDependencyCheckTest(unittest.TestCase):
         self.assertEqual(check["details"]["issues"], {})
         self.assertEqual(check["details"]["revoked_records"], 1)
         self.assertIn("revoked", check["summary"])
+
+    def test_expired_capture_is_reported_without_doctor_writes(self):
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-retention-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / "store.sqlite"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            """
+            CREATE TABLE training_capture(
+                capture_id TEXT PRIMARY KEY, state TEXT,
+                redaction_status TEXT, redaction_policy_version TEXT,
+                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT
+            );
+            CREATE TABLE training_delivery_snapshot(
+                delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
+            );
+            CREATE TABLE training_capture_completion(
+                capture_id TEXT PRIMARY KEY, evidence_id TEXT,
+                associated_memory_ids_json TEXT
+            );
+            CREATE TABLE training_capture_observation(
+                observation_id TEXT PRIMARY KEY, capture_id TEXT
+            );
+            CREATE TABLE memory_evidence(memory_id TEXT, evidence_id TEXT);
+            INSERT INTO training_capture(
+                capture_id, state, redaction_status, redaction_policy_version,
+                revoked_at, finalized_at
+            ) VALUES ('capture-expired', 'partial', 'redacted', 'v1',
+                      '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z');
+            """
+        )
+        conn.commit()
+        conn.close()
+        before = path.read_bytes()
+
+        check = doctor._check_training_capture_health(path)
+
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["details"]["issues"], {"expired_retention": 1})
+        self.assertEqual(path.read_bytes(), before)
+        self.assertTrue(any("purge-training-captures --confirm" in note
+                            for note in doctor._recommendations([check])))
 
     def test_abandoned_staging_directory_is_reported(self):
         import doctor  # noqa: E402
