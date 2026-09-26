@@ -854,6 +854,20 @@ function stubScriptBody(childStdout) {
     return "#!/usr/bin/env bash\nprintf '%s' '" + childStdout + "'\n";
 }
 
+function directStoreStubBody() {
+    // The ordered session-end fixture must exercise the launcher fast path's
+    // direct store.py child, not a copied zmem-session-end.sh body. Keep the
+    // stub Python so the normal Windows interpreter selection is covered and
+    // record argv/env for an explicit assertion below.
+    return [
+        "import json, os, sys",
+        "with open(os.environ['ZMEM_FAST_PATH_MARKER'], 'a', encoding='utf-8', newline='\\n') as handle:",
+        "    handle.write(json.dumps({'argv': sys.argv[1:], 'store': os.environ.get('ZMEM_STORE'), 'session': os.environ.get('ZMEM_SESSION')}) + '\\n')",
+        "print('direct-store-child-noise')",
+        "",
+    ].join("\n");
+}
+
 function testWindowsManifestCommandExecution() {
     const tree = fs.mkdtempSync(path.join(TMP_ROOT, "winmanifest-"));
     try {
@@ -885,14 +899,20 @@ function buildAndRunCases(tree) {
     const pluginRoot = path.join(tree, "plugin");
     fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
     fs.copyFileSync(LAUNCHER, path.join(pluginRoot, "hooks", "zmem-launch.js"));
+    fs.mkdirSync(path.join(pluginRoot, "skills", "memory", "scripts"), { recursive: true });
     for (const caseRecord of casesDoc.cases) {
+        if (caseRecord.verb === "session-end") continue;
         fs.writeFileSync(
             path.join(pluginRoot, "hooks", `zmem-${caseRecord.verb}.sh`),
             stubScriptBody(caseRecord.child_stdout));
     }
 
     const dataDir = path.join(tree, "data");
+    const directStoreMarker = path.join(tree, "direct-store-marker.json");
     fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(
+        path.join(pluginRoot, "skills", "memory", "scripts", "store.py"),
+        directStoreStubBody());
     const childEnv = { ...process.env };
     delete childEnv.ZMEM_STORE;
     Object.assign(childEnv, {
@@ -900,6 +920,7 @@ function buildAndRunCases(tree) {
         ZMEM_HOST: "codex",
         ZMEM_DATA: dataDir,
         ZMEM_STORE: path.join(dataDir, "store.sqlite"),
+        ZMEM_FAST_PATH_MARKER: directStoreMarker,
         ZMEM_MODELS_DIR: path.join(tree, "nonexistent-models"),
         ZMEM_MODEL_AUTODOWNLOAD: "0",
         ZMEM_BASH_PATH: launch.resolveShell(),
@@ -928,6 +949,21 @@ function buildAndRunCases(tree) {
             const want = expected[caseRecord.verb];
             eq(`${label}: envelope equals committed expected (canonical bytes)`,
                 JSON.stringify(result.parsed), JSON.stringify(want));
+            if (caseRecord.verb === "session-end") {
+                let directChild = null;
+                try {
+                    const records = fs.readFileSync(directStoreMarker, "utf8").trim()
+                        .split(/\r?\n/).map((line) => JSON.parse(line));
+                    const ledgerChildren = records.filter((record) =>
+                        record.argv && record.argv[0] === "ledger-clear");
+                    directChild = ledgerChildren.length === 1 ? ledgerChildren[0] : null;
+                } catch { /* assertion below */ }
+                ok(`${label}: direct store.py child was exercised`,
+                    directChild && JSON.stringify(directChild.argv)
+                    === JSON.stringify(["ledger-clear", "--session-id", caseRecord.stdin.session_id])
+                    && directChild.store === childEnv.ZMEM_STORE
+                    && directChild.session === null);
+            }
             if (caseRecord.expected_event) {
                 eq(`${label}: hookEventName matches fixture expected_event`,
                     result.parsed && result.parsed.hookSpecificOutput &&

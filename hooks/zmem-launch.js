@@ -35,6 +35,7 @@ const { createHash, randomUUID } = require("crypto");
 const { existsSync, mkdirSync, appendFileSync, readFileSync } = require("fs");
 const { join, dirname, basename, resolve, delimiter } = require("path");
 const { homedir } = require("os");
+const { performance } = require("perf_hooks");
 
 // Hooks that emit the <<<ZMEM_JSON>>> sentinel and get envelope translation.
 // Every OTHER hook is passed through verbatim with its own exit code preserved
@@ -161,6 +162,14 @@ const DEFAULT_NAMESPACE_RESOLVE_MS = 2000;
 const DEFAULT_NAMESPACE_CACHE_TTL_MS = 60000;
 const NAMESPACE_CACHE_MAX_ENTRIES = 128;
 const MAX_HOOK_INPUT_BYTES = 256 * 1024;
+
+// Codex kills SessionEnd hooks after two seconds. Keep a 100ms output margin
+// and derive the child deadline from process elapsed time so launcher startup
+// and module loading consume the same budget as the direct store child.
+const CODEX_SESSION_END_HOST_TIMEOUT_MS = 2000;
+const CODEX_SESSION_END_OUTPUT_MARGIN_MS = 100;
+const CODEX_SESSION_END_TARGET_MS =
+    CODEX_SESSION_END_HOST_TIMEOUT_MS - CODEX_SESSION_END_OUTPUT_MARGIN_MS;
 
 // Read one positive-integer millisecond env override. Invalid (non-integer,
 // zero, negative) values fall back to the default and write exactly ONE
@@ -752,6 +761,134 @@ function resolvePython(env = process.env) {
         }
     }
     return candidates[0];
+}
+
+// --- Codex SessionEnd fast path (issue #189) -------------------------------
+// SessionEnd is the one Codex hook whose host budget is only two seconds. The
+// normal launcher path resolves shells, builds the full canonical environment,
+// and starts a bash/body chain; that work can outlive the host budget on a cold
+// Windows process. This path is deliberately narrow: it is selected only for
+// Codex's session-end verb, takes an id from the payload, and starts exactly one
+// store.py ledger-clear child without where(), bash, or resolvePython().
+function codexSessionEndId(meta) {
+    for (const value of [meta && meta.session_id, meta && meta.sessionId]) {
+        if (typeof value !== "string") continue;
+        const id = value.trim();
+        if (id) return id;
+    }
+    return "";
+}
+
+function codexSessionEndEnv(env = process.env) {
+    const childEnv = { ...(env || {}) };
+    // Codex cleanup is payload-authoritative. A stale inherited session id
+    // must never become a fallback when the current event has no id.
+    delete childEnv.ZMEM_SESSION;
+    childEnv.ZMEM_DATA = (env && env.ZMEM_DATA) || join(homedir(), ".zmem");
+    return childEnv;
+}
+
+function codexSessionEndPython(env, platform) {
+    const explicit = env && typeof env.ZMEM_PYTHON === "string"
+        ? env.ZMEM_PYTHON.trim() : "";
+    if (explicit) return explicit;
+    return platform === "win32" ? "python" : "python3";
+}
+
+function elapsedProcessMs() {
+    try {
+        if (performance && typeof performance.now === "function") {
+            return performance.now();
+        }
+    } catch { /* fall through to uptime */ }
+    return process.uptime() * 1000;
+}
+
+// Resolve the one direct store.py child and settle close/error/timeout exactly
+// once. The timer is armed before spawn so spawn latency consumes the remaining
+// process budget. A timeout uses child.kill() only: store.py is the direct
+// process and this fast path must not introduce taskkill/where/bash children.
+function runCodexSessionEndFastPath(meta, options = {}) {
+    const env = options.env || process.env;
+    const sessionId = codexSessionEndId(meta);
+    if (!sessionId) return Promise.resolve({ spawned: false, reason: "no-session-id" });
+
+    const now = typeof options.now === "function" ? options.now : elapsedProcessMs;
+    let elapsed;
+    try { elapsed = Number(now()); } catch { elapsed = NaN; }
+    const remaining = Number.isFinite(elapsed)
+        ? Math.max(0, CODEX_SESSION_END_TARGET_MS - elapsed) : 0;
+    if (remaining <= 0) {
+        return Promise.resolve({ spawned: false, reason: "no-budget" });
+    }
+
+    const platform = options.platform || process.platform;
+    const childEnv = codexSessionEndEnv(env);
+    const root = options.pluginRoot || env.PLUGIN_ROOT || env.CLAUDE_PLUGIN_ROOT
+        || env.ZCODE_PLUGIN_ROOT || env.ZMEM_ROOT || getPluginRoot();
+    const storePy = options.storePath || join(root, "skills", "memory", "scripts", "store.py");
+    const spawnFn = typeof options.spawnFn === "function" ? options.spawnFn : spawn;
+    const setTimer = typeof options.setTimeoutFn === "function"
+        ? options.setTimeoutFn : setTimeout;
+    const clearTimer = typeof options.clearTimeoutFn === "function"
+        ? options.clearTimeoutFn : clearTimeout;
+    const listen = (child, event, handler) => {
+        if (typeof child.once === "function") child.once(event, handler);
+        else if (typeof child.on === "function") child.on(event, handler);
+        else throw new TypeError("store child is not an event emitter");
+    };
+
+    return new Promise((resolvePromise) => {
+        let child = null;
+        let timer = null;
+        let settled = false;
+        const finish = (result, kill) => {
+            if (settled) return;
+            settled = true;
+            if (timer !== null) {
+                try { clearTimer(timer); } catch { /* fail open */ }
+                timer = null;
+            }
+            if (kill && child && typeof child.kill === "function") {
+                try { child.kill(); } catch { /* already gone */ }
+                // A misbehaving platform child must not keep the launcher
+                // alive after the bounded result has been emitted.
+                try { if (typeof child.unref === "function") child.unref(); } catch { /* already gone */ }
+            }
+            resolvePromise(result);
+        };
+
+        // Arm before spawn; a cold spawn must not get a fresh full budget.
+        timer = setTimer(() => finish({ spawned: true, reason: "timeout" }, true), remaining);
+        try {
+            child = spawnFn(codexSessionEndPython(childEnv, platform),
+                [storePy, "ledger-clear", "--session-id", sessionId], {
+                    env: childEnv,
+                    stdio: "ignore",
+                    cwd: root,
+                });
+            if (!child) {
+                finish({ spawned: true, reason: "spawn-empty" });
+                return;
+            }
+            listen(child, "error", () => finish({ spawned: true, reason: "spawn-error" }));
+            listen(child, "close", (code) => finish({
+                spawned: true,
+                completed: true,
+                ok: code === 0,
+                code,
+            }));
+        } catch {
+            finish({ spawned: true, reason: "spawn-throw" });
+        }
+    });
+}
+
+function emitCodexSessionEndResult() {
+    // Setting exitCode lets Node flush the exact host bytes before exiting;
+    // process.exit() here could truncate a pipe on a busy Windows host.
+    try { process.stdout.write("{}\n"); } catch { /* fail open */ }
+    process.exitCode = 0;
 }
 
 function _patchPath(value) {
@@ -1384,8 +1521,9 @@ async function main() {
         return;
     }
     const scriptPath = join(getPluginRoot(), "hooks", `zmem-${hookName}.sh`);
+    const codexSessionEnd = detectHost() === "codex" && hookName === "session-end";
 
-    if (!existsSync(scriptPath)) {
+    if (!codexSessionEnd && !existsSync(scriptPath)) {
         // Target script missing — fail open.
         process.stdout.write("{}\n");
         process.exit(0);
@@ -1457,6 +1595,11 @@ async function main() {
     }
 
     const host = detectHost();
+    if (host === "codex" && hookName === "session-end") {
+        await runCodexSessionEndFastPath(meta);
+        emitCodexSessionEndResult();
+        return;
+    }
     const prepared = prepareHookPayload(host, hookName, stdinBuf, meta);
     if (!prepared) {
         process.stdout.write("{}\n");
@@ -1620,6 +1763,12 @@ module.exports = {
     failureSignals,
     safeJsonStringify,
     resolvePython,
+    codexSessionEndId,
+    codexSessionEndEnv,
+    runCodexSessionEndFastPath,
+    CODEX_SESSION_END_HOST_TIMEOUT_MS,
+    CODEX_SESSION_END_OUTPUT_MARGIN_MS,
+    CODEX_SESSION_END_TARGET_MS,
     canonicalUtcNow,
     recordEvidence,
     extractPayload,
