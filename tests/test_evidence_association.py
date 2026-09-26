@@ -302,6 +302,69 @@ class RecallJsonTest(unittest.TestCase):
             self.assertEqual(by_id[associated]["evidence_ids"], [EVIDENCE_1])
             self.assertEqual(by_id[unassociated]["evidence_ids"], [])
 
+    def test_recent_json_contains_sorted_evidence_ids(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-171-recent-") as td:
+            scratch = Path(td)
+            _init(scratch)
+            _write_evidence(scratch, _evidence_payload(
+                EVIDENCE_1, lane="claude", moment="pretool", kind="tool_call",
+                excerpt="command=git status", ref_path="hooks/zmem-session-start.sh",
+                ref_offset=1,
+            ))
+            _write_evidence(scratch, _evidence_payload(
+                EVIDENCE_2, lane="codex", moment="pretool", kind="tool_failure",
+                excerpt="exit=1", ref_path="hooks/zmem-launch.js", ref_offset=2,
+            ))
+            associated = _add(
+                scratch, "fixture-recent-171 associated",
+                evidence=f"{EVIDENCE_2},{EVIDENCE_1}",
+            )
+            unassociated = _add(scratch, "fixture-recent-171 unassociated")
+            result = _run(
+                scratch, "recent", "--namespace", WRITE_NS, "--limit", "10",
+                "--json", "--no-bump",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = json.loads(result.stdout)["results"]
+            by_id = {row["id"]: row for row in rows}
+            self.assertEqual(
+                by_id[associated]["evidence_ids"], [EVIDENCE_1, EVIDENCE_2]
+            )
+            self.assertEqual(by_id[unassociated]["evidence_ids"], [])
+
+    def test_recall_explain_json_contains_sorted_evidence_ids(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-171-recall-explain-") as td:
+            scratch = Path(td)
+            _init(scratch)
+            _write_evidence(scratch, _evidence_payload(
+                EVIDENCE_1, lane="claude", moment="pretool", kind="tool_call",
+                excerpt="command=git status", ref_path="hooks/zmem-session-start.sh",
+                ref_offset=1,
+            ))
+            _write_evidence(scratch, _evidence_payload(
+                EVIDENCE_2, lane="codex", moment="pretool", kind="tool_failure",
+                excerpt="exit=1", ref_path="hooks/zmem-launch.js", ref_offset=2,
+            ))
+            associated = _add(
+                scratch, "fixture-recall-explain-171 associated",
+                evidence=f"{EVIDENCE_2},{EVIDENCE_1}",
+            )
+            unassociated = _add(scratch, "fixture-recall-explain-171 unassociated")
+            result = _run(
+                scratch, "recall", "--explain", "--json", "--no-hybrid",
+                "--no-bump", "--query", "fixture-recall-explain-171",
+                "--namespace", WRITE_NS, "--limit", "10",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            rows = payload["results"]
+            by_id = {row["id"]: row for row in rows}
+            self.assertIn("explain", payload)
+            self.assertEqual(
+                by_id[associated]["evidence_ids"], [EVIDENCE_1, EVIDENCE_2]
+            )
+            self.assertEqual(by_id[unassociated]["evidence_ids"], [])
+
 
 class McpEvidenceTest(unittest.TestCase):
     @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed")
