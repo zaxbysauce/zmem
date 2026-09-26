@@ -1161,6 +1161,79 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         return _parse_results(await _run_store_async(args))
 
     @mcp.tool()
+    async def evidence_for(memory_id: str) -> dict[str, Any]:
+        """Return evidence for one memory after deriving and checking its namespace."""
+        mid = (memory_id or "").strip()
+        if not mid:
+            return _error("memory_id is required")
+        result = await _run_store_async(["evidence", "for", "--memory-id", mid, "--json"])
+        if not result["ok"]:
+            return _error(_sanitize_store_error(result) or "memory id not found")
+        try:
+            payload = json.loads(result["stdout"])
+            namespace = str(payload.get("namespace") or "")
+        except (json.JSONDecodeError, AttributeError):
+            return _error("invalid evidence response")
+        denied = _guard_namespace(namespace)
+        if denied:
+            return denied
+        return payload
+
+    @mcp.tool()
+    async def evidence_show(
+        id: str, namespace: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Show one evidence row without leaking foreign-ID existence.
+
+        Scoped tokens receive one identical namespace denial for both a missing
+        id and an id unassociated with their allowed namespace.  Operators are
+        unscoped and retain the existing not-found response.
+        """
+        evidence_id = (id or "").strip()
+        if not evidence_id:
+            return _error("id is required")
+        denied = _guard_namespace(namespace)
+        if denied:
+            return denied
+        if token_config.scoped:
+            scoped_namespace = (namespace or "").strip()
+            result = await _run_store_async([
+                "evidence", "scoped-show", "--namespace", scoped_namespace,
+                "--id", evidence_id, "--json",
+            ])
+            if not result["ok"]:
+                return {
+                    "error": NAMESPACE_NOT_ALLOWED,
+                    "namespace": scoped_namespace,
+                    "detail": "evidence id is not associated with the requested namespace",
+                }
+        else:
+            result = await _run_store_async([
+                "evidence", "show", "--namespace", namespace or "",
+                "--id", evidence_id, "--json",
+            ])
+            if not result["ok"]:
+                detail = _sanitize_store_error(result)
+                if detail in {"evidence id not found", "[zmem] evidence id not found"}:
+                    return {"error": "evidence id not found"}
+                return _error(detail or "evidence lookup failed")
+        try:
+            payload = json.loads(result["stdout"])
+        except (json.JSONDecodeError, TypeError):
+            return _error("invalid evidence response")
+        if not token_config.scoped:
+            associations = await _run_store_async([
+                "evidence", "associations", "--id", evidence_id, "--json",
+            ])
+            if not associations["ok"]:
+                return _error(_sanitize_store_error(associations) or "evidence lookup failed")
+            try:
+                payload["associations"] = json.loads(associations["stdout"])
+            except (json.JSONDecodeError, TypeError):
+                return _error("invalid evidence response")
+        return payload
+
+    @mcp.tool()
     async def add(
         type: str,
         content: str,

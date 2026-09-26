@@ -198,6 +198,16 @@ Association rows are removed in the same transaction, and stale associations
 are repaired. An invalid retention setting disables that sweep rather than
 guessing a limit.
 
+`add` and `update` accept `--evidence ID[,ID...]`. The writer validates every
+supplied ID immediately after its transaction begins, before advisory output
+or memory mutation, and links it to the resulting memory before commit;
+repeated links are idempotent. `evidence for --memory-id UUID --json` returns
+that memory's namespace and its hash-free evidence rows. Explicit JSON
+`recall`, `recent`, and `recall --explain` rows include sorted `evidence_ids`;
+human and passive-injection output stay unchanged. Strict JSONL import
+prevalidates `memory_evidence` endpoints and rejects a missing endpoint with
+its physical input line before inserting any staged association.
+
 `export-jsonl` is one consistent read snapshot. An unscoped export includes all
 evidence rows and only associations whose parent rows are in that export. A
 namespace-scoped export includes only evidence reached through the exported

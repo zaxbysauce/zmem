@@ -273,7 +273,56 @@ def sweep_evidence(
         return zero
 
 
-def evidence_ids_for_memory(conn, memory_id: str) -> list:
+def attach_memory_evidence(
+    conn: sqlite3.Connection, *, memory_id: str, evidence_ids: list[str] | tuple[str, ...]
+) -> None:
+    """Attach evidence rows to one memory atomically and idempotently.
+
+    Writer callers normally already own a transaction.  The standalone form is
+    useful to administrative callers, while the savepoint keeps a failed
+    association from partially changing a caller-owned transaction.
+    """
+    ids = [str(value).strip() for value in evidence_ids]
+    if any(not value for value in ids):
+        raise ValueError("evidence ids must not contain empty values")
+    if len(set(ids)) != len(ids):
+        raise ValueError("evidence ids must not contain duplicates")
+    ids.sort()
+    if not ids:
+        return
+
+    own_transaction = not conn.in_transaction
+    savepoint = "zmem_attach_memory_evidence"
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        if conn.execute("SELECT 1 FROM memory WHERE id=?", (memory_id,)).fetchone() is None:
+            raise ValueError(f"memory id not found: {memory_id}")
+        for evidence_id in ids:
+            if conn.execute("SELECT 1 FROM evidence WHERE id=?", (evidence_id,)).fetchone() is None:
+                raise ValueError(f"evidence id not found: {evidence_id}")
+        conn.executemany(
+            "INSERT OR IGNORE INTO memory_evidence(memory_id, evidence_id) VALUES (?, ?)",
+            [(memory_id, evidence_id) for evidence_id in ids],
+        )
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
+def evidence_ids_for_memory(conn, memory_id: str) -> list[str]:
     """Issue #124: association read for the operation-feedback loop — the
     evidence ids linked to one memory via the schema-14 memory_evidence
     table. Read-only; the association WRITE API and the MCP surfaces remain

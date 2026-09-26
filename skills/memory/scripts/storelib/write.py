@@ -844,6 +844,22 @@ def _default_taint_for_signal(signal: str) -> str:
     """
     return "trusted_internal" if signal in TAINT_TRUSTED_SIGNALS else "untrusted_tool"
 
+
+def _validated_evidence_ids(
+    conn: sqlite3.Connection, evidence_ids: list[str] | tuple[str, ...] | None
+) -> list[str]:
+    """Canonicalize and prevalidate association endpoints before write effects."""
+    ids = [str(value).strip() for value in (evidence_ids or [])]
+    if any(not value for value in ids):
+        raise ValueError("evidence ids must not contain empty values")
+    if len(set(ids)) != len(ids):
+        raise ValueError("evidence ids must not contain duplicates")
+    ids.sort()
+    for evidence_id in ids:
+        if conn.execute("SELECT 1 FROM evidence WHERE id=?", (evidence_id,)).fetchone() is None:
+            raise ValueError(f"evidence id not found: {evidence_id}")
+    return ids
+
 def add_memory(
     conn: sqlite3.Connection,
     *,
@@ -858,6 +874,7 @@ def add_memory(
     capture_mode: str = "manual",
     taint: str | None = None,
     link_attr_propagate: bool = True,
+    evidence_ids: list[str] | tuple[str, ...] | None = None,
 ) -> WriteResult:
     content, source_ref, tags, warns = _apply_capture_policy(
         content=content,
@@ -871,12 +888,6 @@ def add_memory(
     # automatic hook (issue #18 "Related observation"). Whitespace is trimmed
     # (intentional — `add --namespace "  user:global  "` canonicalizes).
     namespace = _validate_namespace(conn, namespace)
-    for w in warns:
-        prefix = "WARNING (advisory, write proceeded)"
-        if _normalize_capture_mode(capture_mode) == "auto":
-            prefix = "NOTICE (automatic capture sanitized)"
-        print(f"[zmem] {prefix}: {w['message']}", file=sys.stderr)
-
     if confidence is None:
         confidence = SIGNAL_CONFIDENCE.get(signal, SIGNAL_CONFIDENCE["none"])
 
@@ -902,6 +913,15 @@ def add_memory(
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
+
+        # Validate before any dedup/model work can emit advisory stderr.  A
+        # missing endpoint is an atomic input refusal, never a partial write.
+        normalized_evidence_ids = _validated_evidence_ids(conn, evidence_ids)
+        for w in warns:
+            prefix = "WARNING (advisory, write proceeded)"
+            if _normalize_capture_mode(capture_mode) == "auto":
+                prefix = "NOTICE (automatic capture sanitized)"
+            print(f"[zmem] {prefix}: {w['message']}", file=sys.stderr)
 
         # Dedup-on-write: semantic similarity (if embeddings available) or exact
         # match fallback. Semantic dedup catches paraphrases the exact-match miss.
@@ -958,6 +978,11 @@ def add_memory(
             # _merge_on_dedup — tags are an extraction input, so re-derive the
             # keeper's entity links from its (unchanged content, merged tags).
             relink_memory(conn, existing["id"])
+            if normalized_evidence_ids:
+                from storelib.evidence import attach_memory_evidence
+                attach_memory_evidence(
+                    conn, memory_id=existing["id"], evidence_ids=normalized_evidence_ids
+                )
             if started_tx:
                 _commit(conn)
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
@@ -1023,6 +1048,9 @@ def add_memory(
             print(f"[zmem] links: +{link_report['related']} related, "
                   f"+{link_report['contradicts']} contradicts "
                   f"(threshold={_link_threshold_now()})")
+        if normalized_evidence_ids:
+            from storelib.evidence import attach_memory_evidence
+            attach_memory_evidence(conn, memory_id=mid, evidence_ids=normalized_evidence_ids)
         if started_tx:
             _commit(conn)
         print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"
@@ -1261,6 +1289,7 @@ def update_memory(
     capture_mode: str = "manual",
     link_attr_propagate: bool = True,
     expected_old_namespace: str | None = None,
+    evidence_ids: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[WriteResult, bool]:
     """Append-only knowledge update (issue #59, 4.2): create a NEW live row
     that replaces ``mid``, tombstone ``mid``, and link the new row back to it
@@ -1335,12 +1364,6 @@ def update_memory(
         capture_mode=capture_mode,
     )
     ns = _validate_namespace(conn, ns)
-    for w in warns:
-        prefix = "WARNING (advisory, write proceeded)"
-        if _normalize_capture_mode(capture_mode) == "auto":
-            prefix = "NOTICE (automatic capture sanitized)"
-        print(f"[zmem] {prefix}: {w['message']}", file=sys.stderr)
-
     # Single content-size cap, identical to add_memory (M8b / #36 M17) and
     # applied to the POST-capture content: an oversize update must be refused
     # at the CLI boundary like an oversize add, not silently stored (an
@@ -1367,6 +1390,13 @@ def update_memory(
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
+
+        normalized_evidence_ids = _validated_evidence_ids(conn, evidence_ids)
+        for w in warns:
+            prefix = "WARNING (advisory, write proceeded)"
+            if _normalize_capture_mode(capture_mode) == "auto":
+                prefix = "NOTICE (automatic capture sanitized)"
+            print(f"[zmem] {prefix}: {w['message']}", file=sys.stderr)
 
         # 1) Tombstone the old row (append-only history). valid_until=now so
         # point-in-time as-of never resurrects it (see supersede_memory).
@@ -1439,6 +1469,11 @@ def update_memory(
             # v10 (issue #60, 5.2): dedup fold unioned tags onto the target —
             # re-derive its entity links (same as add's dedup branch).
             relink_memory(conn, dup_id)
+            if normalized_evidence_ids:
+                from storelib.evidence import attach_memory_evidence
+                attach_memory_evidence(
+                    conn, memory_id=dup_id, evidence_ids=normalized_evidence_ids
+                )
             if started_tx:
                 _commit(conn)
             print(f"[zmem] update: {mid} superseded; new content merged into existing "
@@ -1493,6 +1528,9 @@ def update_memory(
             print(f"[zmem] links: +{link_report['related']} related, "
                   f"+{link_report['contradicts']} contradicts "
                   f"(threshold={_link_threshold_now()})")
+        if normalized_evidence_ids:
+            from storelib.evidence import attach_memory_evidence
+            attach_memory_evidence(conn, memory_id=new_id, evidence_ids=normalized_evidence_ids)
         if started_tx:
             _commit(conn)
         print(f"[zmem] updated memory {mid} -> {new_id} (ns={ns}, type={type_eff}, "

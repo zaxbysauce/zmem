@@ -1894,6 +1894,7 @@ capability, not completion of the larger #163 pre-LLM/pre-verify transport.
 python <store.py> evidence write < payload.json
 python <store.py> evidence list --namespace NS [--session-id SID] [--lane LANE] [--moment MOMENT] [--json]
 python <store.py> evidence show --namespace NS --id UUID [--json]
+python <store.py> evidence for --memory-id UUID --json
 ```
 
 The required `--namespace` argument on list/show is a compatibility/context
@@ -1908,6 +1909,16 @@ defaults to 50,000 and keeps the newest rows by stable `ts,id` order.
 Associations are deleted with their evidence and stale associations are swept.
 Invalid retention settings disable the evidence sweep rather than selecting a
 surprising limit.
+
+`add` and `update` accept `--evidence ID[,ID...]`. Immediately after opening
+their transaction, they validate each supplied ID before warnings or memory
+mutation and attach the ids to the resulting memory before commit; existing
+pairs are ignored. Explicit JSON `recall`, `recent`, and `recall --explain`
+rows include sorted `evidence_ids`. Passive injection and human fenced output
+do not gain that field. `evidence for --memory-id UUID --json` returns the
+memory namespace with its hash-free evidence rows. Strict import prevalidates
+all `memory_evidence` endpoints and reports a missing endpoint using its
+physical source line before association insertion.
 
 `export-jsonl` reads one consistent snapshot. An unscoped export includes all
 evidence rows and only associations whose parent rows are in that export. A

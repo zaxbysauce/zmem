@@ -170,6 +170,12 @@ class _PreV14Evidence(Exception):
     """Internal sentinel for a genuinely absent pre-v14 table set."""
 
 
+class _MemoryEvidenceEndpointMissing(ValueError):
+    def __init__(self, lineno: int) -> None:
+        self.lineno = lineno
+        super().__init__("memory_evidence endpoint not found")
+
+
 def _cmd_export_jsonl_body(
     conn: sqlite3.Connection,
     *,
@@ -1391,11 +1397,13 @@ def _strict_staged_rows(spool: tempfile.SpooledTemporaryFile) -> list[tuple[str,
     spool.seek(0)
     text = io.TextIOWrapper(spool, encoding="utf-8", newline="\n")
     rows: list[tuple[str, dict]] = []
+    physical_lineno = 0
     try:
         while True:
             raw_line = text.readline(MAX_LINE_CHARS + 1)
             if raw_line == "":
                 break
+            physical_lineno += 1
             if len(raw_line) > MAX_LINE_CHARS:
                 if not raw_line.endswith("\n"):
                     while True:
@@ -1413,20 +1421,25 @@ def _strict_staged_rows(spool: tempfile.SpooledTemporaryFile) -> list[tuple[str,
             obj = json.loads(line, object_pairs_hook=_strict_object_pairs)
             if not isinstance(obj, dict):
                 raise ValueError("line is not a JSON object")
-            lineno = len(rows) + 1
+            lineno = physical_lineno
             if "table" in obj:
                 table_obj = _strict_table_for_object(obj, lineno)
+                table_obj["_source_lineno"] = lineno
                 rows.append((str(table_obj["table"]), table_obj))
                 continue
             kind = obj.get("kind", "memory")
             if kind == "episode":
                 _validate_episode_row(obj, lineno)
+                obj["_source_lineno"] = lineno
                 rows.append(("episode", obj))
             elif kind == "episode_memory":
                 _validate_membership_row(obj, lineno)
+                obj["_source_lineno"] = lineno
                 rows.append(("episode_memory", obj))
             elif kind == "memory":
-                rows.append(("memory", _validate_sync_row(obj, lineno)))
+                memory = _validate_sync_row(obj, lineno)
+                memory["_source_lineno"] = lineno
+                rows.append(("memory", memory))
             else:
                 raise ValueError(f"unknown kind {kind!r}")
     finally:
@@ -1495,9 +1508,9 @@ def _strict_ingest_staged(
                 raise ValueError("episode_evidence references unknown evidence")
         elif table == "memory_evidence":
             if obj["memory_id"] not in memory_ids | existing_memory:
-                raise ValueError("memory_evidence references an unknown memory")
+                raise _MemoryEvidenceEndpointMissing(obj["_source_lineno"])
             if obj["evidence_id"] not in evidence_ids | existing_evidence:
-                raise ValueError("memory_evidence references unknown evidence")
+                raise _MemoryEvidenceEndpointMissing(obj["_source_lineno"])
 
     savepoint = "zmem_strict_ingest"
     own_transaction = not conn.in_transaction
@@ -1660,6 +1673,12 @@ def cmd_ingest_jsonl_strict(
             conn, spool, source_ref=source_ref,
             allow_tombstones=allow_tombstones, capture_mode=capture_mode,
         )
+    except _MemoryEvidenceEndpointMissing as exc:
+        print(
+            f"[zmem] ingest-jsonl: line {exc.lineno}: memory_evidence endpoint not found",
+            file=sys.stderr,
+        )
+        return 2
     except Exception as exc:
         print(
             f"[zmem] ingest-jsonl: strict import rejected: "
