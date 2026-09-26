@@ -1168,6 +1168,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return _error("memory_id is required")
         result = await _run_store_async(["evidence", "for", "--memory-id", mid, "--json"])
         if not result["ok"]:
+            if token_config.scoped:
+                return {
+                    "error": NAMESPACE_NOT_ALLOWED,
+                    "namespace": None,
+                    "detail": "memory is not associated with an allowed namespace",
+                }
             return _error(_sanitize_store_error(result) or "memory id not found")
         try:
             payload = json.loads(result["stdout"])
@@ -1176,6 +1182,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return _error("invalid evidence response")
         denied = _guard_namespace(namespace)
         if denied:
+            if token_config.scoped:
+                return {
+                    "error": NAMESPACE_NOT_ALLOWED,
+                    "namespace": None,
+                    "detail": "memory is not associated with an allowed namespace",
+                }
             return denied
         return payload
 
