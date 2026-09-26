@@ -914,8 +914,10 @@ main, the [Release workflow](.github/workflows/release.yml) verifies that every
 host-facing manifest agrees on the version and that
 [`CHANGELOG.md`](CHANGELOG.md) carries the matching section, then tags the
 merge commit and publishes the GitHub Release with those notes. A merge
-without a version bump publishes nothing; a partial bump or a bump without
-its changelog section fails the workflow.
+without a version bump publishes nothing; a partial bump, a bump without
+its changelog section, or a CHANGELOG whose dated release headings violate
+the heading contract (a duplicated release version, or headings that are not
+strictly descending newest-first) fails the workflow.
 
 To pick up a new release:
 

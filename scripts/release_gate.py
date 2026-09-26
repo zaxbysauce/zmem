@@ -16,7 +16,10 @@ workflow runs on every push to main:
   2. Fail loudly if their versions disagree (a partial version bump is a
      release violation, not a warning).
   3. Fail loudly if the CHANGELOG has no `## [X.Y.Z]` section matching the
-     manifest version (no naked version bumps).
+     manifest version (no naked version bumps), or — since issue #233 — if
+     the dated release headings violate the heading contract: a duplicated
+     released version, or placement that is not strictly descending
+     newest-first.
   4. Emit the resolved version, the release title, and the extracted
      CHANGELOG notes so the workflow can publish the tag + GitHub Release
      at the MAIN commit that carries the version (never a PR-branch head —
@@ -202,6 +205,69 @@ def latest_changelog_section(text: str) -> tuple[str, str] | None:
     nxt = text.find("\n## ", start)
     body = text[start:] if nxt < 0 else text[start:nxt]
     return m.group(1), body.lstrip("\n").rstrip() + "\n"
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """A released version as a comparable tuple (SECTION_RE guarantees X.Y.Z)."""
+    return tuple(int(part) for part in version.split("."))
+
+
+def _changelog_heading_violations(text: str) -> list[str]:
+    """Heading-contract diagnostics for dated release headings (issue #233).
+
+    `latest_changelog_section`'s first-match semantics are only sound while
+    every released version carries exactly one `## [X.Y.Z]` heading and the
+    headings are strictly descending by semantic version in file order. Both
+    invariants were violated in shipped history (#214's duplicate 0.43.0
+    sections; PR #230's retitle-in-place ordering failure), so the default
+    gate validates them before trusting the newest-section resolution.
+
+    Returns one diagnostic per duplicated version (naming every line number
+    it appears at) and one per adjacent pair that is not strictly descending
+    (naming the pair). An equal adjacent pair is both a duplicate and a
+    non-descending pair, so both diagnostics fire — they name distinct
+    defects (ambiguity vs misorder) even when they share lines. Adjacent
+    pairs suffice for global order: strict descent is transitive.
+    `[Unreleased]` sits outside SECTION_RE and is unaffected.
+
+    Known limitations (reviewed on PR #237, all fail-safe or latent):
+    SECTION_RE is not markdown-structure-aware, so a heading-shaped line
+    inside a fenced code block or a multi-line HTML comment counts as a
+    release heading (fail-closed: a hypothetical-version example would block
+    the release; no such line exists in this repo's history); a UTF-8 BOM
+    before a release heading on line 1 hides that heading from the scan
+    (the manifest-mismatch path still fails the gate, but one masking
+    arrangement can pass — title-first files, this repo's shape, are
+    unaffected); and a plain `## H2` interleaved between two released
+    sections is invisible to the adjacency scan (also invisible to
+    `latest_changelog_section`'s search, so the two agree on what a release
+    is; no live occurrence).
+    """
+    matches = [
+        (m.group(1), text.count("\n", 0, m.start()) + 1)
+        for m in SECTION_RE.finditer(text)
+    ]
+    violations: list[str] = []
+    lines_by_version: dict[str, list[int]] = {}
+    for version, line in matches:
+        lines_by_version.setdefault(version, []).append(line)
+    for version, lines in lines_by_version.items():
+        if len(lines) > 1:
+            violations.append(
+                f"CHANGELOG.md has {len(lines)} duplicate '## [{version}]' "
+                f"release headings (lines "
+                f"{' and '.join(str(n) for n in lines)}) — a released "
+                f"version must have exactly one heading (issue #233)"
+            )
+    for (prev_v, prev_line), (cur_v, cur_line) in zip(matches, matches[1:]):
+        if _version_tuple(prev_v) <= _version_tuple(cur_v):
+            violations.append(
+                f"CHANGELOG.md release headings are not strictly descending "
+                f"newest-first: [{prev_v}] (line {prev_line}) is followed by "
+                f"[{cur_v}] (line {cur_line}) — move the newer section above "
+                f"the older one (issue #233)"
+            )
+    return violations
 
 
 def tag_exists(version: str) -> bool:
@@ -631,7 +697,20 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     version = next(iter(distinct))  # type: ignore[arg-type]
 
-    changelog = CHANGELOG_PATH.read_text(encoding="utf-8")
+    try:
+        changelog = CHANGELOG_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"::error::{CHANGELOG_PATH} is unreadable — the release gate "
+              f"cannot run: {exc}")
+        return 1
+    # Issue #233: a heading-contract violation makes "the newest section"
+    # ill-defined, so validate the structure BEFORE trusting the first-match
+    # resolution below (which guards the assumption, not replaces it).
+    heading_violations = _changelog_heading_violations(changelog)
+    if heading_violations:
+        for diagnostic in heading_violations:
+            print(f"::error::{diagnostic}")
+        return 1
     section = latest_changelog_section(changelog)
     if section is None:
         print(f"::error::CHANGELOG.md has no released `## [X.Y.Z]` section "
