@@ -498,6 +498,55 @@ class CliEvidenceAssociationTest(unittest.TestCase):
 
 
 class FixtureTransportTest(unittest.TestCase):
+    def test_strict_association_missing_endpoint_preserves_physical_line_and_rolls_back(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-171-diagnostic-") as td:
+            scratch = Path(td)
+            memory = {
+                "kind": "memory", "id": MEMORY_1, "namespace": NS, "type": "fact",
+                "content": "strict association diagnostic", "tags": "", "source_ref": "",
+                "confidence": 0.9, "signal": "test", "valid_from": TS,
+                "valid_until": "", "update_of": "", "taint": "trusted_internal",
+                "ingestion_ts": TS, "superseded_at": None, "supersede_reason": "",
+                "merged_from": None, "trust_score": 1.0, "applied_count": 0,
+                "violated_count": 0, "links": [],
+            }
+            malformed = scratch / "missing-association.jsonl"
+            payload = (
+                json.dumps(memory, separators=(",", ":"))
+                + "\n\n"
+                + json.dumps(
+                    {
+                        "table": "memory_evidence",
+                        "memory_id": MEMORY_1,
+                        "evidence_id": MISSING_EVIDENCE,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            malformed.write_bytes(payload.encode("utf-8"))
+
+            _init(scratch)
+            result = _run(scratch, "ingest-jsonl", "--strict", "--in", str(malformed))
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(
+                result.stderr,
+                "[zmem] ingest-jsonl: line 3: memory_evidence endpoint not found\n",
+            )
+
+            conn = sqlite3.connect(scratch / "store.sqlite")
+            try:
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM memory_evidence").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0],
+                    0,
+                )
+            finally:
+                conn.close()
+
     def test_fixture_reexport_is_byte_stable_and_association_import_is_idempotent(self):
         with tempfile.TemporaryDirectory(prefix="zmem-171-fixture-") as td:
             scratch = Path(td)
