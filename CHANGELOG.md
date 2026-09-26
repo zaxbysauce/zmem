@@ -10,6 +10,16 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.67.0] - 2026-09-27
+
+### Fixed
+- **Fail-closed evidence retention (issue #170):** malformed or out-of-range
+  `ZMEM_EVIDENCE_DAYS` and `ZMEM_EVIDENCE_CAP` values now disable the complete
+  retention sweep before any transaction or deletion, emit one setting-only
+  diagnostic, and leave evidence and association rows unchanged. Valid expiry,
+  cap ordering, rollback, and the shipped #183 evidence writer behavior remain
+  covered.
+
 ## [0.66.0] - 2026-09-26
 
 ### Added
@@ -95,7 +105,6 @@ README.
   manifest-covered surface), and the five-lanes decision fixtures are
   regenerated at the new version. (Base-drift retarget from 0.63.0: sibling
   releases 0.63.0 and 0.64.0 landed on main while this PR was in review.)
-
 ## [0.64.0] - 2026-09-25
 
 ### Added

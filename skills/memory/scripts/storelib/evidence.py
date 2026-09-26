@@ -169,17 +169,19 @@ def sweep_evidence(
         os.environ.get("ZMEM_EVIDENCE_CAP"), "cap",
         EVIDENCE_DEFAULT_CAP, minimum=1,
     )
+    zero = {"expired": 0, "capped": 0, "episode_links": 0, "memory_links": 0}
     if days_invalid:
         print(
-            f"evidence retention: invalid ZMEM_EVIDENCE_DAYS; using default {EVIDENCE_DEFAULT_RETENTION_DAYS}",
+            "evidence retention disabled: invalid ZMEM_EVIDENCE_DAYS",
             file=sys.stderr,
         )
+        return zero
     if cap_invalid:
         print(
-            f"evidence retention: invalid ZMEM_EVIDENCE_CAP; using default {EVIDENCE_DEFAULT_CAP}",
+            "evidence retention disabled: invalid ZMEM_EVIDENCE_CAP",
             file=sys.stderr,
         )
-    zero = {"expired": 0, "capped": 0, "episode_links": 0, "memory_links": 0}
+        return zero
     now = datetime.strptime(now_ts, "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=timezone.utc
     )
