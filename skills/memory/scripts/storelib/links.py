@@ -462,7 +462,8 @@ def expand_recall_links(
     contradicts only — the confidence floor. Expansion rows carry
     ``link_relation`` / ``link_of`` / ``link_score`` / ``contested_link`` keys
     and NOTHING writes those keys on non-expansion rows, so a link-free store
-    keeps byte-identical recall output.
+    keeps byte-identical recall output. When ``as_of`` is set, an edge is
+    eligible only when its ``created_at`` is at or before that instant.
     """
     from storelib.recall import _classify_injection, _fetch_by_ids
 
@@ -475,11 +476,15 @@ def expand_recall_links(
     best: dict[str, tuple[float, str, str]] = {}
     for r in results:
         rid = r["id"]
-        edges = conn.execute(
+        sql = (
             "SELECT src_id, dst_id, relation, score FROM memory_link "
-            "WHERE (src_id=? OR dst_id=?)",
-            (rid, rid),
-        ).fetchall()
+            "WHERE (src_id=? OR dst_id=?)"
+        )
+        params = [rid, rid]
+        if as_of is not None:
+            sql += " AND created_at <= ?"
+            params.append(as_of)
+        edges = conn.execute(sql, params).fetchall()
         for e in edges:
             relation = e["relation"]
             if relation not in _EXPANSION_RELATIONS:
