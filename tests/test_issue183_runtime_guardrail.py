@@ -198,17 +198,16 @@ class RuntimeGuardrailTest(unittest.TestCase):
                     provider = context.provider
                     provider.initialize(SESSION)
 
-                    # Exact zero kill-switch: the provider's rewrite boundary
-                    # must return the untouched prompt and false marker.
-                    os.environ["ZMEM_QUERY_CONTEXT"] = "0"
-                    disabled_query, disabled = plugin._rewrite_provider_query(
-                        "continue", namespace=NAMESPACE, session_id=SESSION
-                    )
-                    self.assertEqual((disabled_query, disabled), ("continue", False))
+                    # Context-gate leg removed with issue #160: the provider
+                    # no longer consults ZMEM_QUERY_CONTEXT itself.  That
+                    # exact-zero gate now lives in the store boundary's
+                    # prefetch branch (storelib/cli.py), pinned by
+                    # tests/test_issue183_query_integration.py
+                    # (test_query_context_zero_keeps_raw_query_and_enabled_
+                    # context_delivers).
 
-                    # Re-enable context and prove a raw prompt does not deliver
-                    # the unique marker before any eligible evidence exists.
-                    os.environ["ZMEM_QUERY_CONTEXT"] = "1"
+                    # Prove a raw prompt does not deliver the unique marker
+                    # before any eligible evidence exists.
                     no_evidence = provider.prefetch("continue", session_id=SESSION)
                     self.assertNotIn(SENTINEL, no_evidence)
 
@@ -281,35 +280,46 @@ class RuntimeGuardrailTest(unittest.TestCase):
                     self.assertIn("retrieval_guardrail_canary.py", payload["query"])
                     self.assertIn("retrieval_guardrail_anchor.py", payload["query"])
 
-                    passive_calls: list[tuple[list[str], dict[str, object]]] = []
-                    real_passive_store = plugin._run_passive_store
+                    # Issue #160 repin: the passive seam is the provider's
+                    # transport delegation.  The passthrough wrap records the
+                    # delegated call and delegates to the REAL transport so
+                    # the real-store sentinel below stays live — the store
+                    # boundary performs the rewrite proved above
+                    # (payload["query"]) and its selector delivers on it; the
+                    # no-marker prefetch earlier in this test proves a raw
+                    # "continue" alone cannot reach the sentinel.
+                    transport_calls: list[tuple[str, dict[str, object]]] = []
+                    real_transport_prefetch = provider._transport.prefetch
 
-                    def observe_passive(args, *call_args, **call_kwargs):
-                        result = real_passive_store(args, *call_args, **call_kwargs)
-                        passive_calls.append((list(args), result))
-                        return result
+                    def observe_transport(query, **kwargs):
+                        transport_calls.append((query, dict(kwargs)))
+                        return real_transport_prefetch(query, **kwargs)
 
-                    plugin._run_passive_store = observe_passive
+                    provider._transport.prefetch = observe_transport
                     try:
                         delivered = provider.prefetch("continue", session_id=SESSION)
                     finally:
-                        plugin._run_passive_store = real_passive_store
-                    self.assertTrue(passive_calls, "provider did not invoke its real passive store seam")
-                    self.assertTrue(
-                        passive_calls[-1][1].get("ok"),
-                        f"provider passive recall failed: {passive_calls[-1]!r}",
+                        provider._transport.prefetch = real_transport_prefetch
+                    self.assertEqual(
+                        len(transport_calls), 1,
+                        "provider did not delegate exactly one prefetch",
                     )
-                    self.assertEqual(passive_calls[-1][0][0], "recall")
-                    self.assertIn(payload["query"], passive_calls[-1][0])
-                    self.assertIn("--for-injection", passive_calls[-1][0])
-                    self.assertIn("--lane", passive_calls[-1][0])
-                    self.assertIn(SENTINEL, delivered, f"provider delivery={passive_calls[-1]!r}")
+                    delegated_query, delegated_kwargs = transport_calls[0]
+                    self.assertEqual(delegated_query, "continue")
+                    self.assertEqual(delegated_kwargs["namespace"], NAMESPACE)
+                    self.assertEqual(delegated_kwargs["session_id"], SESSION)
+                    self.assertEqual(delegated_kwargs["moment"], "user_prompt")
+                    self.assertEqual(delegated_kwargs["lane"], "hermes-provider")
+                    self.assertIn(
+                        SENTINEL, delivered, f"provider delivery={delivered!r}")
                     self.assertIn("retrieval_guardrail_canary.py", delivered)
 
-                    other_query, other_rewrite = plugin._rewrite_provider_query(
-                        "continue", namespace=NAMESPACE, session_id=OTHER_SESSION
-                    )
-                    self.assertEqual((other_query, other_rewrite), ("continue", False))
+                    # Cross-session isolation leg removed with issue #160: the
+                    # provider-side rewrite helper that had to be reminded
+                    # about session scoping is gone.  The in-store rewrite's
+                    # session_id handling (storelib/query_ambiguity.py reads
+                    # evidence scoped to the delegated session_id) owns that
+                    # isolation now.
 
                     # The passive provider must not retain the evidence/query
                     # rewrite state after the test's environment is restored.

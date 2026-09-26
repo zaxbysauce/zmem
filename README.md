@@ -592,6 +592,19 @@ store directory the plugin hosts use.
 
 ### Hermes Agent — local (memory provider + reflection hooks)
 
+The provider picks its transport from configuration alone (issue #160):
+an explicit `ZMEM_HERMES_MODE` (`local` or `mcp`) wins; otherwise a
+nonempty `ZMEM_MCP_URL` selects the MCP-over-HTTP transport and a
+resolvable local `skills/memory/scripts/store.py` checkout selects the
+local subprocess transport. Availability is path/environment checks only —
+a remote-only box with `ZMEM_MCP_URL` set is available with zero socket
+probes — and `unavailable_reason()` reports the exact resolution reason.
+Every prefetch runs under `ZMEM_HERMES_DEADLINE_S` (default 6.0 s, always
+below the manager's 8 s join; a deadline hit kills the local child or
+cancels the MCP coroutine and fails open). The MCP transport resolves its
+bearer token as explicit argument > `ZMEM_MCP_TOKEN_FILE` (bare or JSON
+`{"token": ...}`) > `ZMEM_MCP_TOKEN`.
+
 Hermes reads/writes the same canonical store via a `MemoryProvider` adapter.
 Unlike ZCode/CC/Codex (which use the host adapter + bash hooks), Hermes has
 its own first-class memory-provider ABC and a shell-hook system, so the
@@ -832,6 +845,8 @@ MCP server:
 | Var | Purpose | Default |
 |-----|---------|---------|
 | `ZMEM_MCP_TOKEN` | Bearer token for the MCP server. **Required** to start the server. | — |
+| `ZMEM_HERMES_MODE` | Explicit Hermes provider transport override (issue #160): `local` or `mcp`. Explicit `local` requires a resolvable local store (never falls back to MCP); any other nonempty value is invalid. Unset = auto (`ZMEM_MCP_URL` → mcp, else local store). | — |
+| `ZMEM_HERMES_DEADLINE_S` | Hermes provider prefetch deadline in seconds (issue #160). Nonnumeric, nonfinite, zero, negative, and `>= 8.0` values resolve to `6.0` with one stderr warning. | `6` |
 | `ZMEM_MCP_URL` | Remote mode (issue #71 A): point the Hermes `pre_llm_call` hook at the LAN MCP server; the passive prefetch rides `session_start` (`--no-bump`). Unset = local-store mode. | — |
 | `ZMEM_MCP_TIMEOUT` | Prefetch subprocess timeout in seconds (the hook itself allows 15). | `8` |
 | `ZMEM_MCP_NAMESPACE` | Namespace for the remote prefetch, correction capture, and query-context recall when `ZMEM_NAMESPACE` is unset (empty → server default `user:global`). **Required for scoped-token deployments** — name a namespace the token allows. | — |

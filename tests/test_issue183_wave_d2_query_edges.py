@@ -87,6 +87,24 @@ def _load_compat_hook():
     return module
 
 
+# A complete #158/#159 selector envelope (the transport coerces to exactly
+# this key set), used by the recording transport stubs below.
+_OK_ENVELOPE = {
+    "results": [], "count": 0, "omitted": 0, "reason": "ok",
+    "excluded": [], "candidate_ids": [], "tokens_used": 0,
+    "tokens_budget": 0, "budget_dropped": 0, "budget_admission": 0,
+    "budget_truncated": 0, "budget_dropped_protected": 0, "arms": {},
+    "rendered": "",
+}
+
+# Issue #160: deterministic local-mode construction for the provider under
+# test (auto-local mode against this checkout, never a stray ZMEM_MCP_URL).
+_PROVIDER_ENV = {
+    "ZMEM_QUERY_CONTEXT": "1", "ZMEM_INJECT": "1",
+    "ZMEM_HOME": str(ROOT), "ZMEM_MCP_URL": "",
+}
+
+
 class WaveD2QueryEdges(unittest.TestCase):
     def test_query_rewrite_real_writer_edit_and_exact_wire(self):
         with tempfile.TemporaryDirectory(prefix="zmem-183-d2-query-") as raw:
@@ -146,140 +164,155 @@ class WaveD2QueryEdges(unittest.TestCase):
             self.assertNotIn("evidence", names)
 
     def test_provider_rewrite_uses_leading_dash_safe_prompt_and_one_recall(self):
+        # Issue #160 repin: the provider delegates ONE prefetch through the
+        # real transport; dash-safety now lives in the transport's argv
+        # builder (a leading-dash query rides the --query=<value> form — also
+        # pinned by tests/test_hermes_transport.py RecordedCallTest).
         provider_mod = _load_provider()
-        calls: list[list[str]] = []
+        argv_seen: list[list[str]] = []
 
-        def fake_store(args, timing=None, input_text=None):
-            calls.append(list(args))
-            if args[0] == "query-rewrite":
-                return {"ok": True, "stdout": '{"query":"--dry-run git","rewrite":1}\n'}
-            return {"ok": True, "stdout": '{"rendered":"ok"}\n'}
+        class RecordingExecutor:
+            def run(self, fn, deadline_s):
+                del deadline_s
+                argv_seen.append(list(fn._cmd))
+                return json.dumps(dict(_OK_ENVELOPE, rendered="ok"))
 
-        with mock.patch.dict(os.environ, {"ZMEM_QUERY_CONTEXT": "1", "ZMEM_INJECT": "1"}, clear=False):
-            with mock.patch.object(provider_mod, "_run_store", fake_store):
-                provider = provider_mod.ZmemMemoryProvider()
-                provider._namespace = "project:d2"
-                self.assertEqual(provider.prefetch("--dry-run", session_id="s"), "ok")
-        self.assertEqual([args[0] for args in calls], ["query-rewrite", "recall"])
-        self.assertEqual(calls[0][calls[0].index("--prompt=--dry-run")], "--prompt=--dry-run")
-        recall = calls[1]
-        self.assertIn("--query=--dry-run git", recall)
+        with mock.patch.dict(os.environ, dict(_PROVIDER_ENV), clear=False):
+            provider = provider_mod.ZmemMemoryProvider()
+            provider._namespace = "project:d2"
+            self.assertIsNotNone(provider._transport)
+            provider._transport = provider_mod._transport.LocalSubprocess(
+                store_py=str(STORE), executor=RecordingExecutor(),
+                deadline_s=6.0)
+            self.assertEqual(provider.prefetch("--dry-run", session_id="s"), "ok")
+        self.assertEqual(len(argv_seen), 1, argv_seen)
+        argv = argv_seen[0]
+        self.assertIn("prefetch", argv)
+        self.assertIn("--query=--dry-run", argv)
+        self.assertFalse(
+            any("query-rewrite" in part for part in argv),
+            "no provider-side query-rewrite subprocess may run",
+        )
 
     def test_provider_rewrite_bridge_failure_is_fail_open(self):
+        # Issue #160 repin: fail-open at the transport seam — a real
+        # LocalSubprocess + DeadlineExecutor pointed at a nonexistent store.py
+        # returns the empty envelope and the provider surfaces "".
         provider_mod = _load_provider()
-        provider = provider_mod.ZmemMemoryProvider()
-        provider._namespace = "project:d2"
-        with mock.patch.dict(os.environ, {"ZMEM_QUERY_CONTEXT": "1", "ZMEM_INJECT": "1"}, clear=False):
-            with mock.patch.object(provider_mod, "_run_store", side_effect=OSError("offline")):
+        with mock.patch.dict(os.environ, dict(_PROVIDER_ENV), clear=False):
+            provider = provider_mod.ZmemMemoryProvider()
+            provider._namespace = "project:d2"
+            self.assertIsNotNone(provider._transport)
+            with tempfile.TemporaryDirectory(prefix="zmem-183-d2-failopen-") as raw:
+                provider._transport = provider_mod._transport.LocalSubprocess(
+                    store_py=str(Path(raw) / "no-such-store.py"),
+                    executor=provider_mod._transport.DeadlineExecutor(),
+                    deadline_s=6.0)
                 self.assertEqual(provider.prefetch("continue", session_id="s"), "")
 
     def test_provider_empty_user_prompt_uses_shared_rewrite_before_recent(self):
+        # Issue #160 repin: an empty prompt is delegated ONCE with query "";
+        # the queryless selector path inside store.py's prefetch replaces the
+        # old provider-side rewrite-before-recent sequence.
         provider_mod = _load_provider()
-        calls: list[list[str]] = []
+        delegations: list[tuple[str, dict]] = []
 
-        def fake_store(args, timing=None, input_text=None):
-            calls.append(list(args))
-            if args[0] == "query-rewrite":
-                return {"ok": True, "stdout": '{"query":"actual.py","rewrite":1}\n'}
-            return {"ok": True, "stdout": '{"rendered":"ok"}\n'}
+        def recording_prefetch(query, **kwargs):
+            delegations.append((query, dict(kwargs)))
+            return dict(_OK_ENVELOPE, rendered="ok")
 
-        with mock.patch.dict(os.environ, {"ZMEM_QUERY_CONTEXT": "1", "ZMEM_INJECT": "1"}, clear=False):
-            with mock.patch.object(provider_mod, "_run_store", fake_store):
-                provider = provider_mod.ZmemMemoryProvider()
-                provider._namespace = "project:d2"
-                self.assertEqual(provider.prefetch("", session_id="s"), "ok")
-        self.assertEqual([args[0] for args in calls], ["query-rewrite", "recall"])
+        with mock.patch.dict(os.environ, dict(_PROVIDER_ENV), clear=False):
+            provider = provider_mod.ZmemMemoryProvider()
+            provider._namespace = "project:d2"
+            self.assertIsNotNone(provider._transport)
+            provider._transport.prefetch = recording_prefetch
+            self.assertEqual(provider.prefetch("", session_id="s"), "ok")
+        self.assertEqual(len(delegations), 1, delegations)
+        self.assertEqual(delegations[0][0], "")
+        self.assertEqual(delegations[0][1]["moment"], "user_prompt")
 
     def test_provider_classifies_full_prompt_before_500_char_output_cap(self):
+        # Issue #160 repin: the provider delegates the RAW prompt — no
+        # provider-side pre-truncation.  Classification-on-complete-prompt
+        # and the 500-char rewrite output cap are store-owned
+        # (storelib/query_ambiguity.py), reached through the delegated
+        # prefetch subprocess.
         provider_mod = _load_provider()
-        calls: list[list[str]] = []
         prefix = "please continue finalizing work " * 20
         prompt = prefix + " actual.py"
         self.assertGreater(len(prompt), 500)
         self.assertLessEqual(len(prompt), 4096)
+        delegations: list[tuple[str, dict]] = []
 
-        def prompt_arg(args):
-            if "--prompt" in args:
-                return args[args.index("--prompt") + 1]
-            return next(item.split("=", 1)[1] for item in args
-                        if item.startswith("--prompt="))
+        def recording_prefetch(query, **kwargs):
+            delegations.append((query, dict(kwargs)))
+            return dict(_OK_ENVELOPE, rendered="ok")
 
-        def fake_store(args, timing=None, input_text=None):
-            del timing, input_text
-            calls.append(list(args))
-            if args[0] == "query-rewrite":
-                full_prompt = prompt_arg(args)
-                # A real store rewrite would preserve this exact anchor and
-                # therefore decline rewriting.  A pre-capped provider would
-                # not see it and would take the rewrite branch instead.
-                if "actual.py" in full_prompt:
-                    return {
-                        "ok": True,
-                        "stdout": json.dumps({
-                            "query": full_prompt[:500], "rewrite": 0,
-                        }),
-                    }
-                return {
-                    "ok": True,
-                    "stdout": '{"query":"rewritten","rewrite":1}',
-                }
-            return {"ok": True, "stdout": '{"rendered":"ok"}'}
-
-        with mock.patch.dict(
-            os.environ, {"ZMEM_QUERY_CONTEXT": "1", "ZMEM_INJECT": "1"},
-            clear=False,
-        ), mock.patch.object(provider_mod, "_run_store", fake_store):
+        with mock.patch.dict(os.environ, dict(_PROVIDER_ENV), clear=False):
             provider = provider_mod.ZmemMemoryProvider()
             provider._namespace = "project:d2"
+            self.assertIsNotNone(provider._transport)
+            provider._transport.prefetch = recording_prefetch
             self.assertEqual(provider.prefetch(prompt, session_id="s"), "ok")
 
-        rewrite_args, recall_args = calls
-        self.assertEqual(rewrite_args[0], "query-rewrite")
-        self.assertEqual(prompt_arg(rewrite_args), prompt)
-        self.assertEqual(
-            recall_args[recall_args.index("--query") + 1], prompt.strip()[:500]
-        )
+        self.assertEqual(len(delegations), 1, delegations)
+        delegated_query, delegated_kwargs = delegations[0]
+        self.assertEqual(delegated_query, prompt)
+        self.assertEqual(len(delegated_query), len(prompt))
+        self.assertEqual(delegated_kwargs["moment"], "user_prompt")
+        self.assertEqual(delegated_kwargs["lane"], "hermes-provider")
 
-    def test_provider_oversized_prompt_skips_rewrite_and_falls_back_bounded(self):
-        provider_mod = _load_provider()
-        calls: list[list[str]] = []
-
-        def unexpected_store(args, timing=None, input_text=None):
-            del timing, input_text
-            calls.append(list(args))
-            raise AssertionError("oversized prompt must not launch rewrite")
-
-        prompt = "continue " + ("ambiguous work " * 300)
-        self.assertGreater(len(prompt), 4096)
-        with mock.patch.dict(os.environ, {"ZMEM_QUERY_CONTEXT": "1"}, clear=False), \
-                mock.patch.object(provider_mod, "_run_store", unexpected_store):
-            result = provider_mod._rewrite_provider_query(
-                prompt, namespace="project:d2", session_id="s"
-            )
-        self.assertEqual(result, (prompt.strip()[:500], False))
-        self.assertEqual(calls, [])
+    # test_provider_oversized_prompt_skips_rewrite_and_falls_back_bounded was
+    # removed with issue #160 — the provider no longer gates at 4096 (it
+    # 4096-truncates the prompt and delegates; the store's rewrite output cap
+    # owns the bound).
 
     def test_provider_valid_long_ambiguous_rewrite_stays_bounded(self):
-        provider_mod = _load_provider()
-        calls: list[list[str]] = []
-        prompt = "please continue finalizing work " * 60
+        # Issue #160 repin: the cap's home moved in-store with #160 — the
+        # store's rewrite output cap (storelib/query_ambiguity.py) owns the
+        # 500-char bound.  Observed at the store boundary the provider's
+        # transport now delegates to: one query-rewrite subprocess proves the
+        # rewritten query stays bounded, and the prefetch subprocess (the
+        # transport's exact argv shape) completes against the seeded scratch
+        # store.
+        # AC2 (tests/test_issue183_acceptance_query.py) proves this long
+        # prompt is classified ambiguous; here it must rewrite but stay
+        # bounded by the store's cap.
+        prompt = "x" * 900
         self.assertLess(len(prompt), 4096)
-
-        def fake_store(args, timing=None, input_text=None):
-            del timing, input_text
-            calls.append(list(args))
-            return {
-                "ok": True,
-                "stdout": json.dumps({"query": "x" * 500, "rewrite": 1}),
+        with tempfile.TemporaryDirectory(prefix="zmem-183-d2-bound-") as raw:
+            tmp = Path(raw)
+            self.assertEqual(_run_store(tmp, "init").returncode, 0)
+            evidence = {
+                "session_id": "d2-session", "lane": "claude",
+                "moment": "user_prompt", "kind": "edit",
+                "ts": "2026-09-17T12:00:00Z", "excerpt": "write",
+                "ref_path": "C:/work/actual.py", "ref_offset": None,
             }
-
-        with mock.patch.dict(os.environ, {"ZMEM_QUERY_CONTEXT": "1"}, clear=False), \
-                mock.patch.object(provider_mod, "_run_store", fake_store):
-            result = provider_mod._rewrite_provider_query(
-                prompt, namespace="project:d2", session_id="s"
+            write = _run_store(
+                tmp, "evidence", "write",
+                env_extra={"ZMEM_STORE": str(tmp / "store.sqlite")},
+                input=json.dumps(evidence),
             )
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(result, ("x" * 500, True))
+            self.assertEqual(write.returncode, 0, write.stderr)
+            rewrite = _run_store(
+                tmp, "query-rewrite", "--prompt", prompt,
+                "--session-id", "d2-session", "--namespace", "project:d2",
+                "--json",
+            )
+            self.assertEqual(rewrite.returncode, 0, rewrite.stderr)
+            payload = json.loads(rewrite.stdout)
+            self.assertEqual(payload["rewrite"], 1, payload)
+            self.assertLessEqual(len(payload["query"]), 500, payload)
+            prefetch = _run_store(
+                tmp, "prefetch", "--query", prompt,
+                "--namespace", "project:d2", "--session-id", "d2-session",
+                "--moment", "user_prompt", "--lane", "hermes-provider",
+                "--json",
+            )
+            self.assertEqual(prefetch.returncode, 0, prefetch.stderr)
+            envelope = json.loads(prefetch.stdout)
+            self.assertIn("rendered", envelope)
 
     def test_query_rewrite_command_timeout_is_one_second(self):
         provider_mod = _load_provider()

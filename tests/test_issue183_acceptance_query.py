@@ -232,22 +232,43 @@ class Issue183QueryAcceptance(unittest.TestCase):
                 hook_rendered = hook_envelope.get("additionalContext", "")
                 self.assertEqual(hook_rendered, "shared-bytes")
 
+                # Issue #160 repin: the provider delegates ONE prefetch to its
+                # transport with the RAW prompt (no rewrite argv — the store
+                # boundary owns the rewrite) and extracts ``rendered``.  The
+                # stub returns the same canned wire the hook leg's fake store
+                # emitted, so the rendered-level parity assertion still
+                # discriminates shared bytes across surfaces.
                 provider_mod = _load_provider()
-                provider_calls: list[list[str]] = []
+                delegations: list[tuple[str, dict]] = []
+                store_calls: list[list[str]] = []
 
-                def provider_store(args, timing=None, input_text=None):
-                    provider_calls.append(list(args))
-                    if args[0] == "query-rewrite":
-                        return {"ok": True, "stdout": '{"query":"continue from yesterday git status","rewrite":1}\n'}
-                    return {"ok": True, "stdout": '{"rendered":"shared-bytes"}\n'}
+                def stub_transport_prefetch(query, **kwargs):
+                    delegations.append((query, dict(kwargs)))
+                    return json.loads(
+                        '{"rendered":"shared-bytes","results":[],'
+                        '"reason":"injected"}\n')
 
-                provider_mod._run_store = provider_store
+                def unexpected_store(args, timing=None, input_text=None):
+                    del timing, input_text
+                    store_calls.append(list(args))
+                    return {"ok": True, "stdout": "", "stderr": "",
+                            "returncode": 0}
+
+                provider_mod._run_store = unexpected_store
                 provider = provider_mod.ZmemMemoryProvider()
                 provider._namespace = "project:ambiguity"
+                provider._transport.prefetch = stub_transport_prefetch
                 provider_rendered = provider.prefetch("continue from yesterday", session_id="s")
                 self.assertEqual(provider_rendered, hook_rendered)
-                provider_query = next(a[a.index("--query") + 1] for a in provider_calls if a[0] == "recall")
-                self.assertEqual(provider_query, hook_query)
+                self.assertEqual(len(delegations), 1, delegations)
+                # The delegated query is the raw prompt — the hook surface's
+                # rewrite stays the hook/store's job, never the provider's.
+                self.assertEqual(delegations[0][0], "continue from yesterday")
+                self.assertNotEqual(delegations[0][0], hook_query)
+                self.assertEqual(delegations[0][1]["moment"], "user_prompt")
+                self.assertEqual(delegations[0][1]["lane"], "hermes-provider")
+                # No provider-side subprocess at all on the prefetch path.
+                self.assertEqual(store_calls, [])
 
                 os.environ["ZMEM_QUERY_CONTEXT"] = "0"
                 hook_calls.clear()
@@ -263,13 +284,18 @@ class Issue183QueryAcceptance(unittest.TestCase):
                 self.assertEqual(disabled_query, "continue from yesterday")
                 self.assertFalse(any(a[0] == "query-rewrite" for a in hook_calls))
 
-                provider_calls.clear()
-                self.assertEqual(provider.prefetch("continue from yesterday", session_id="s"), hook_rendered)
-                provider_disabled_recalls = [a for a in provider_calls if a[0] == "recall"]
-                self.assertTrue(provider_disabled_recalls)
-                provider_disabled_query = provider_disabled_recalls[-1][provider_disabled_recalls[-1].index("--query") + 1]
-                self.assertEqual(provider_disabled_query, "continue from yesterday")
-                self.assertFalse(any(a[0] == "query-rewrite" for a in provider_calls))
+                # Kill-switch leg repinned for #160: ZMEM_INJECT=0 short-
+                # circuits the provider BEFORE delegation — zero transport
+                # delegations and an empty delivery.
+                os.environ["ZMEM_INJECT"] = "0"
+                delegations.clear()
+                try:
+                    self.assertEqual(
+                        provider.prefetch("continue from yesterday", session_id="s"),
+                        "")
+                finally:
+                    os.environ.pop("ZMEM_INJECT", None)
+                self.assertEqual(delegations, [])
 
     def test_ac6_logging_process_bound_and_negative_control(self):
         with tempfile.TemporaryDirectory(prefix="zmem-183-ac6-") as raw:
