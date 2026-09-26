@@ -10,6 +10,14 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.66.0] - 2026-09-26
+
+### Fixed
+- **Historical edge-layer temporality (issue #130):** recall and explain link
+  expansion now admit a `memory_link` only when its existing `created_at` is at
+  or before the requested `--as-of` instant. Present-time expansion preserves
+  its existing output and ordering.
+
 ## [0.65.0] - 2026-09-25
 
 ### Added

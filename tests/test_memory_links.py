@@ -18,6 +18,7 @@ Run: python tests/test_memory_links.py
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -369,6 +370,143 @@ class GenerationTest(_Store):
 
 
 class RecallExpansionTest(_Store):
+    _ISSUE130_FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "issue130"
+    _ISSUE130_TEST_NOW = "2026-09-26T00:00:00Z"
+
+    def _seed_issue130_fixture(self):
+        fixture = json.loads(
+            (self._ISSUE130_FIXTURE_DIR / "edge-input.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        expected = json.loads(
+            (self._ISSUE130_FIXTURE_DIR / "edge-expected.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        r = self.run_store("init")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn = self.db()
+        conn.executemany(
+            "INSERT INTO memory (id, namespace, type, content, tags, source_ref, "
+            "source_hash, confidence, signal, valid_from, ingestion_ts) "
+            "VALUES (?, ?, 'fact', ?, '', '', '', 0.9, 'test', ?, ?)",
+            [
+                (row["id"], fixture["namespace"], row["content"],
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+                for row in fixture["memories"]
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO memory_link (src_id, dst_id, relation, score, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (edge["src_id"], edge["dst_id"], edge["relation"],
+                 edge["score"], edge["created_at"])
+                for edge in fixture["edges"]
+            ],
+        )
+        conn.commit()
+        return fixture, expected
+
+    def _issue130_capture(self, *, as_of, explain):
+        args = [
+            "recall", "--query", "seed main", "--namespace", "project:issue130",
+            "--limit", "1", "--json", "--no-bump", "--no-hybrid", "--no-mmr",
+            "--link-hops", "1", "--link-budget", "10",
+        ]
+        if as_of is not None:
+            args.extend(["--as-of", as_of])
+        if explain:
+            args.append("--explain")
+        env = dict(self.env)
+        # Raw JSON includes a recency-derived score. Freeze the same scoring
+        # instant that produces C4's checked-in present-time baseline.
+        env["ZMEM_TEST_NOW"] = self._ISSUE130_TEST_NOW
+        result = self.run_store(*args, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        raw = result.stdout.encode("utf-8")
+        return json.loads(raw), raw
+
+    @staticmethod
+    def _expansion_ids(envelope):
+        return [
+            row["id"] for row in envelope["results"]
+            if "link_relation" in row
+        ]
+
+    @staticmethod
+    def _explain_expansion_ids(envelope):
+        return [
+            verdict["id"]
+            for verdict in envelope["explain"]["verdicts"]
+            if verdict.get("reason") == "link_expansion"
+        ]
+
+    def test_as_of_excludes_edge_created_after_instant(self):
+        fixture, expected = self._seed_issue130_fixture()
+        envelope, _raw = self._issue130_capture(
+            as_of=fixture["as_of"], explain=False
+        )
+        self.assertEqual(self._expansion_ids(envelope), expected["historical"])
+        self.assertNotIn(
+            "00000000-0000-4000-8000-000000000133",
+            self._expansion_ids(envelope),
+        )
+
+    def test_as_of_includes_edge_at_equality_boundary(self):
+        fixture, expected = self._seed_issue130_fixture()
+        envelope, _raw = self._issue130_capture(
+            as_of=fixture["as_of"], explain=False
+        )
+        self.assertIn(
+            "00000000-0000-4000-8000-000000000132",
+            self._expansion_ids(envelope),
+        )
+        self.assertEqual(self._expansion_ids(envelope), expected["historical"])
+
+    def test_explain_as_of_lists_only_edges_existing_at_instant(self):
+        fixture, expected = self._seed_issue130_fixture()
+        envelope, _raw = self._issue130_capture(
+            as_of=fixture["as_of"], explain=True
+        )
+        self.assertEqual(
+            self._explain_expansion_ids(envelope), expected["explain"]
+        )
+
+    def test_present_time_expansion_is_byte_identical(self):
+        _fixture, expected = self._seed_issue130_fixture()
+        recall_first, recall_first_raw = self._issue130_capture(
+            as_of=None, explain=False
+        )
+        recall_second, recall_second_raw = self._issue130_capture(
+            as_of=None, explain=False
+        )
+        explain_first, explain_first_raw = self._issue130_capture(
+            as_of=None, explain=True
+        )
+        explain_second, explain_second_raw = self._issue130_capture(
+            as_of=None, explain=True
+        )
+        self.assertEqual(recall_first_raw, recall_second_raw)
+        self.assertEqual(explain_first_raw, explain_second_raw)
+        self.assertEqual(
+            hashlib.sha256(recall_first_raw).hexdigest(),
+            "ed7b46ef462e974796a9f5d7c966481d174bf6056225ea52f55363634b273b82",
+        )
+        self.assertEqual(
+            hashlib.sha256(explain_first_raw).hexdigest(),
+            "dff6a68104aa332b1b3d5ce1115e8377ce342233110af3506df062ff0ee3110a",
+        )
+        self.assertEqual(self._expansion_ids(recall_first), expected["present"])
+        self.assertEqual(self._expansion_ids(recall_second), expected["present"])
+        self.assertEqual(
+            self._explain_expansion_ids(explain_first), expected["present"]
+        )
+        self.assertEqual(
+            self._explain_expansion_ids(explain_second), expected["present"]
+        )
+
     def _seed_linked_pair(self):
         """One query-matching row linked to one neighbor that does NOT match
         the query's distinctive terms (so it can only surface via expansion)."""
