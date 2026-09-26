@@ -275,14 +275,87 @@ def sweep_evidence(
         return zero
 
 
-def evidence_ids_for_memory(conn, memory_id: str) -> list:
+def attach_memory_evidence(
+    conn: sqlite3.Connection, *, memory_id: str, evidence_ids: list[str] | tuple[str, ...]
+) -> int:
+    """Attach evidence rows to one memory atomically and idempotently.
+
+    Writer callers normally already own a transaction.  The standalone form is
+    useful to administrative callers, while the savepoint keeps a failed
+    association from partially changing a caller-owned transaction. Returns
+    the number of newly inserted pairs; existing pairs contribute zero.
+    """
+    ids = [str(value).strip() for value in evidence_ids]
+    for evidence_id in ids:
+        if not evidence_id:
+            raise ValueError("evidence id is empty")
+    seen: set[str] = set()
+    for evidence_id in ids:
+        if evidence_id in seen:
+            raise ValueError(f"duplicate evidence id: {evidence_id}")
+        seen.add(evidence_id)
+    ids.sort()
+    if not ids:
+        return 0
+
+    own_transaction = not conn.in_transaction
+    savepoint = "zmem_attach_memory_evidence"
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        if conn.execute("SELECT 1 FROM memory WHERE id=?", (memory_id,)).fetchone() is None:
+            raise ValueError(f"memory id not found: {memory_id}")
+        for evidence_id in ids:
+            if conn.execute("SELECT 1 FROM evidence WHERE id=?", (evidence_id,)).fetchone() is None:
+                raise ValueError(f"evidence id not found: {evidence_id}")
+        inserted = 0
+        for evidence_id in ids:
+            inserted += conn.execute(
+                "INSERT OR IGNORE INTO memory_evidence(memory_id, evidence_id) VALUES (?, ?)",
+                (memory_id, evidence_id),
+            ).rowcount
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return inserted
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
+def evidence_ids_for_memory(conn, memory_id: str) -> list[str]:
     """Issue #124: association read for the operation-feedback loop — the
     evidence ids linked to one memory via the schema-14 memory_evidence
     table. Read-only; the association WRITE API and the MCP surfaces remain
     issue #171's scope. Sorted for deterministic membership checks."""
-    rows = conn.execute(
-        "SELECT evidence_id FROM memory_evidence WHERE memory_id = ? "
-        "ORDER BY evidence_id",
-        (memory_id,),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT evidence_id FROM memory_evidence WHERE memory_id = ? "
+            "ORDER BY evidence_id",
+            (memory_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        # Older, schema-initialized stores can legitimately lack this v14
+        # side table.  Do not hide a damaged v14 schema or unrelated SQL error.
+        if "no such table: memory_evidence" not in str(exc):
+            raise
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        try:
+            pre_v14 = version is not None and int(version[0]) < 14
+        except (TypeError, ValueError):
+            pre_v14 = False
+        if not pre_v14:
+            raise
+        return []
     return [r[0] for r in rows]

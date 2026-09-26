@@ -5,11 +5,13 @@ from __future__ import annotations
 import contextlib
 import atexit
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -38,7 +40,7 @@ _IMPORT_VALUES = {
     "LOCALAPPDATA": str(_IMPORT_SANDBOX / "localappdata"),
 }
 with patch.dict(os.environ, _IMPORT_VALUES, clear=False):
-    from storelib import evidence, schema, sync  # noqa: E402
+    from storelib import evidence, recall, schema, sync, write  # noqa: E402
 
 
 class _StoreCase(unittest.TestCase):
@@ -70,7 +72,158 @@ class _StoreCase(unittest.TestCase):
         self.tmp.cleanup()
 
 
+class EvidenceAssociationWriteTest(_StoreCase):
+    def _evidence(self, evidence_id: str) -> None:
+        evidence.write_evidence(
+            self.conn, id=evidence_id, session_id="association-test",
+            lane="codex", moment="pretool", kind="tool_call",
+            ts="2026-09-10T00:00:00Z", excerpt="association evidence",
+            ref_path="tests/test_evidence.py", ref_offset=1,
+        )
+
+    def test_add_attaches_sorted_ids_and_missing_id_rolls_back(self):
+        first = "00000000-0000-4000-8000-000000000701"
+        second = "00000000-0000-4000-8000-000000000702"
+        missing = "00000000-0000-4000-8000-000000000799"
+        self._evidence(first)
+        self._evidence(second)
+        memory_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="association write", signal="test", evidence_ids=[second, first],
+        ))
+        self.assertEqual(evidence.evidence_ids_for_memory(self.conn, memory_id), [first, second])
+        before = self.conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+        with self.assertRaisesRegex(ValueError, f"evidence id not found: {missing}"):
+            write.add_memory(
+                self.conn, namespace="project:evidence-association", type_="fact",
+                content="must not persist", signal="test", evidence_ids=[missing],
+            )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0], before)
+
+    def test_attach_returns_new_pair_count_and_exact_input_errors(self):
+        first = "00000000-0000-4000-8000-000000000703"
+        second = "00000000-0000-4000-8000-000000000704"
+        self._evidence(first)
+        self._evidence(second)
+        memory_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="direct association helper", signal="test",
+        ))
+        self.assertEqual(
+            evidence.attach_memory_evidence(
+                self.conn, memory_id=memory_id, evidence_ids=[first, second]
+            ),
+            2,
+        )
+        self.assertEqual(
+            evidence.attach_memory_evidence(
+                self.conn, memory_id=memory_id, evidence_ids=[second, first]
+            ),
+            0,
+        )
+        with self.assertRaisesRegex(ValueError, "^evidence id is empty$"):
+            evidence.attach_memory_evidence(
+                self.conn, memory_id=memory_id, evidence_ids=["  "]
+            )
+        with self.assertRaisesRegex(
+            ValueError, f"^duplicate evidence id: {first}$"
+        ):
+            evidence.attach_memory_evidence(
+                self.conn, memory_id=memory_id, evidence_ids=[first, f" {first} "]
+            )
+
+    def test_evidence_for_accepts_positional_and_legacy_option_ids(self):
+        evidence_id = "00000000-0000-4000-8000-000000000705"
+        self._evidence(evidence_id)
+        memory_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="evidence reader alias", signal="test", evidence_ids=[evidence_id],
+        ))
+        store = ROOT / "skills" / "memory" / "scripts" / "store.py"
+
+        def run(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, str(store), "evidence", "for", *args],
+                cwd=ROOT, env=os.environ.copy(), text=True,
+                capture_output=True, check=False,
+            )
+
+        self.conn.commit()
+        self.conn.close()
+        try:
+            positional = run(memory_id, "--json")
+            legacy = run("--memory-id", memory_id, "--json")
+            self.assertEqual(positional.returncode, 0, positional.stderr)
+            self.assertEqual(legacy.returncode, 0, legacy.stderr)
+            self.assertEqual(json.loads(positional.stdout), json.loads(legacy.stdout))
+            self.assertEqual(json.loads(positional.stdout)["memory_id"], memory_id)
+
+            missing = run("--json")
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("evidence for requires a memory id", missing.stderr)
+            conflicting = run(memory_id, "--memory-id", "other-memory", "--json")
+            self.assertEqual(conflicting.returncode, 2)
+            self.assertIn(
+                "evidence for positional id conflicts with --memory-id",
+                conflicting.stderr,
+            )
+        finally:
+            self.conn = sqlite3.connect(self.root / "store.sqlite")
+            self.conn.row_factory = sqlite3.Row
+
+    def test_update_keeps_historical_links_and_attaches_to_replacement(self):
+        old_evidence = "00000000-0000-4000-8000-000000000711"
+        new_evidence = "00000000-0000-4000-8000-000000000712"
+        self._evidence(old_evidence)
+        self._evidence(new_evidence)
+        old_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="original association", signal="test", evidence_ids=[old_evidence],
+        ))
+        replacement_id, created_new = write.update_memory(
+            self.conn, mid=old_id, content="replacement association",
+            evidence_ids=[new_evidence],
+        )
+        self.assertTrue(created_new)
+        self.assertEqual(evidence.evidence_ids_for_memory(self.conn, old_id), [old_evidence])
+        self.assertEqual(
+            evidence.evidence_ids_for_memory(self.conn, str(replacement_id)), [new_evidence]
+        )
+
+    def test_passive_injection_capture_does_not_gain_evidence_ids(self):
+        evidence_id = "00000000-0000-4000-8000-000000000713"
+        self._evidence(evidence_id)
+        memory_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-passive", type_="fact",
+            content="passive injection evidence preservation", signal="test",
+            evidence_ids=[evidence_id],
+        ))
+        captured: dict = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            recall.recent_memory(
+                self.conn, namespace="project:evidence-passive", limit=5,
+                as_json=True, for_injection=True, no_telemetry=True,
+                _capture=captured,
+            )
+        rows = captured.get("results", [])
+        self.assertEqual([row["id"] for row in rows], [memory_id], captured)
+        self.assertNotIn("evidence_ids", rows[0], captured)
+
+
 class EvidenceSchemaTest(_StoreCase):
+    def test_pre_v14_association_lookup_returns_empty_without_hiding_v14_damage(self):
+        legacy = sqlite3.connect(self.root / "pre-v14.sqlite")
+        schema.init_db(legacy)
+        version = legacy.execute(
+            "SELECT value FROM meta WHERE key=?", ("schema_version",)
+        ).fetchone()[0]
+        self.assertLess(int(version), 14)
+        self.assertEqual(evidence.evidence_ids_for_memory(legacy, "missing"), [])
+        legacy.execute("UPDATE meta SET value='14' WHERE key='schema_version'")
+        with self.assertRaisesRegex(sqlite3.OperationalError, "no such table"):
+            evidence.evidence_ids_for_memory(legacy, "missing")
+        legacy.close()
+
     def test_fresh_init_and_v13_upgrade(self):
         version = self.conn.execute(
             "SELECT value FROM meta WHERE key=?", ("schema_version",)

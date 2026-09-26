@@ -121,6 +121,14 @@ DATA_SHA = {
     # saturating ar/(1+ar) back-solve, so the fixture rows' `_score` values
     # (and their order at the top-5 boundary) legitimately moved.
     # stats/list/export_jsonl are byte-identical to their prior freezes.
+    # issue #171 (release 0.67.0): non-injection recall --json rows gained
+    # `evidence_ids` for the new association read surface. A dual-tree capture
+    # at #170 head 6223a42 and #171 head 38ec242 proved that removing exactly
+    # `evidence_ids` from the parsed #171 envelope reproduces the #170 parsed
+    # envelope; both compact sorted-key JSON documents hash to
+    # 450880a08e8636732bfaa0e2a75d69bbbb46fb475e647d7049ca9dc856995f65.
+    # The raw normalized recall surface therefore intentionally moved from
+    # 2b2b7cfb... to b0625e5b..., while stats/list/export_jsonl stay unchanged.
     # issue #115: recall rows gained the `trust_score` key — the row data
     # the inject gate and compute_score now read. RE-CAPTURED 2026-09-07 via
     # ZMEM_CHAR_RECORD=1: ONLY the recall surface moved; stats/list/
@@ -140,7 +148,7 @@ DATA_SHA = {
     # no `_score`, ordering, or content change on this link-free fixture
     # (the graph lane joins the lane-max at None, which max() ignores).
     # stats/list/export_jsonl are byte-identical to their prior freezes.
-    "recall": "2b2b7cfbccc161bff74f8eb8aec87bb2950f5088d5340383c755fd0abc33a19c",
+    "recall": "b0625e5bb3ba6f8ba3fe34217f11cf41be2a4b8c85e055b80a4a276a2dad2b79",
     # v11 (issue #61): export-jsonl re-captured ONLY for the two new row keys
     # (`trust_score`, `links`) — stripping exactly those keys from the new
     # output reproduces the v10 freeze 8552767c… byte-for-byte (verified at

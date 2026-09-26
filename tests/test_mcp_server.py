@@ -361,6 +361,114 @@ class McpServerToolSurfaceTest(unittest.TestCase):
                          "scoped reads without an allowed namespace must not "
                          "reach the legacy-unscoped store path")
 
+    def test_evidence_show_hides_missing_and_unassociated_ids_for_scoped_token(self):
+        """Issue #171: scoped callers get one non-oracular denial shape."""
+        token_file = os.path.join(self.tmp, "scoped-evidence-token.json")
+        with open(token_file, "w", encoding="utf-8") as f:
+            json.dump({"token": "scoped-evidence-secret",
+                       "namespaces": ["project:allowed"]}, f)
+        saved = {key: os.environ.get(key)
+                 for key in ("ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE")}
+        os.environ.pop("ZMEM_MCP_TOKEN", None)
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = token_file
+        calls = []
+        original = self.mcp_server._run_store
+
+        def missing_or_unassociated(args, input_text=None):
+            calls.append(list(args))
+            return {"ok": False, "stdout": "",
+                    "stderr": "[zmem] evidence id not found\n", "returncode": 1}
+
+        self.mcp_server._run_store = missing_or_unassociated
+        try:
+            scoped = self.mcp_server.build_server(
+                host="127.0.0.1", port=0, use_tls=False)
+            expected = {
+                "error": "namespace_not_allowed", "namespace": "project:allowed",
+                "detail": "evidence id is not associated with the requested namespace",
+            }
+            missing = asyncio.run(scoped._tool_manager.call_tool(
+                "evidence_show", {"id": "missing-evidence",
+                                  "namespace": "project:allowed"}, context=None))
+            unassociated = asyncio.run(scoped._tool_manager.call_tool(
+                "evidence_show", {"id": "unassociated-evidence",
+                                  "namespace": "project:allowed"}, context=None))
+            self.assertEqual(missing, expected)
+            self.assertEqual(unassociated, expected)
+            self.assertEqual(calls, [
+                ["evidence", "scoped-show", "--namespace", "project:allowed",
+                 "--id", "missing-evidence", "--json"],
+                ["evidence", "scoped-show", "--namespace", "project:allowed",
+                 "--id", "unassociated-evidence", "--json"],
+            ])
+        finally:
+            self.mcp_server._run_store = original
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_evidence_show_keeps_unscoped_missing_id_error(self):
+        original = self.mcp_server._run_store
+
+        def missing(args, input_text=None):
+            return {"ok": False, "stdout": "",
+                    "stderr": "[zmem] evidence id not found\n", "returncode": 1}
+
+        self.mcp_server._run_store = missing
+        try:
+            result = self._call("evidence_show", id="missing-evidence")
+        finally:
+            self.mcp_server._run_store = original
+        self.assertEqual(result, {"error": "evidence id not found"})
+
+    def test_evidence_for_hides_missing_and_foreign_memory_for_scoped_token(self):
+        """Issue #171: evidence_for cannot expose global memory existence."""
+        token_file = os.path.join(self.tmp, "scoped-evidence-for-token.json")
+        with open(token_file, "w", encoding="utf-8") as f:
+            json.dump({"token": "scoped-evidence-for-secret",
+                       "namespaces": ["project:allowed"]}, f)
+        saved = {key: os.environ.get(key)
+                 for key in ("ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE")}
+        os.environ.pop("ZMEM_MCP_TOKEN", None)
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = token_file
+        original = self.mcp_server._run_store
+
+        def distinct_store_outcomes(args, input_text=None):
+            memory_id = args[args.index("--memory-id") + 1]
+            if memory_id == "missing-memory":
+                return {"ok": False, "stdout": "",
+                        "stderr": "[zmem] memory id not found\n", "returncode": 1}
+            return {"ok": True, "stdout": json.dumps({
+                "memory_id": "foreign-memory", "namespace": "project:foreign",
+                "evidence": [{"id": "foreign-evidence", "excerpt": "must not leak"}],
+            }), "stderr": "", "returncode": 0}
+
+        self.mcp_server._run_store = distinct_store_outcomes
+        try:
+            scoped = self.mcp_server.build_server(
+                host="127.0.0.1", port=0, use_tls=False)
+            expected = {
+                "error": "namespace_not_allowed", "namespace": None,
+                "detail": "memory is not associated with an allowed namespace",
+            }
+            missing = asyncio.run(scoped._tool_manager.call_tool(
+                "evidence_for", {"memory_id": "missing-memory"}, context=None))
+            foreign = asyncio.run(scoped._tool_manager.call_tool(
+                "evidence_for", {"memory_id": "foreign-memory"}, context=None))
+            self.assertEqual(missing, expected)
+            self.assertEqual(foreign, expected)
+            self.assertNotIn("foreign-evidence", str(foreign))
+            self.assertNotIn("project:foreign", str(foreign))
+        finally:
+            self.mcp_server._run_store = original
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     # -- recall -------------------------------------------------------------
 
     def test_recall_success_returns_results_and_count(self):

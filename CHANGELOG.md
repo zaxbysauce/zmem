@@ -10,6 +10,17 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.67.0] - 2026-09-26
+
+### Added
+- **Evidence associations (issue #171):** `add` and `update` accept
+  `--evidence` IDs and validate and attach them atomically, with repeated links
+  remaining idempotent. `evidence for` returns a memory's associated evidence;
+  explicit JSON `recall`, `recent`, and `recall --explain` rows include sorted
+  `evidence_ids`; strict JSONL import validates `memory_evidence` endpoints
+  before inserting staged associations; and the MCP server exposes
+  namespace-guarded evidence lookup tools.
+
 ## [0.66.0] - 2026-09-26
 
 ### Fixed

@@ -185,18 +185,46 @@ redacts before capping the excerpt at 400 characters, and stores
 fails open on malformed or unavailable host data, and does not add the remote
 `pre_llm_call`/`pre_verify` transport promised by the larger #163 idea.
 
-Evidence can be inspected with `evidence list --namespace NS` and
-`evidence show --namespace NS --id UUID`; `--namespace` is a required
-compatibility/context marker that is ignored — evidence has no namespace
-filter or authorization boundary. `evidence list` filters by `--session-id`,
-`--lane`, and `--moment`; `evidence show` selects by `--id` only. Use
-`evidence write` for the validated JSON stdin writer. Retention is applied by
+Legacy unscoped CLI/operator reads use `evidence list --namespace NS` and
+`evidence show --namespace NS --id UUID`; on these commands, `--namespace` is a
+required compatibility/context marker that is ignored. Evidence rows have no
+namespace filter or authorization boundary on this legacy list/show path.
+`evidence list` filters by `--session-id`, `--lane`, and `--moment`; `evidence show`
+selects by `--id` only. The hidden unscoped helper used by the operator MCP
+bridge, `evidence associations --id UUID --json`, returns association rows.
+Use `evidence write` for the validated JSON stdin writer. The scoped store
+lookup is `evidence scoped-show --namespace NS --id UUID [--json]`: it returns a
+row only when the evidence is associated with a memory in `NS`, and emits
+`namespace_not_allowed` for a missing, unassociated, or foreign ID.
+
+The Hermes MCP `evidence_for(memory_id)` and `evidence_show(id, namespace)`
+tools apply namespace authority for scoped tokens. `evidence_for` derives the
+memory namespace; a scoped token receives the hash-free evidence rows only for
+an allowed memory, while a missing or foreign memory returns the same
+`namespace_not_allowed` response with `namespace: null`. For scoped
+`evidence_show`, missing, unassociated, and foreign evidence IDs all return the
+same `namespace_not_allowed` response for the requested namespace. Unscoped
+operators retain the exact missing-ID responses (`memory id not found` for
+`evidence_for` and `evidence id not found` for `evidence_show`) and the legacy
+association behavior.
+
+Retention is applied by
 the existing session-cadence maintenance path: rows older than
 the supplied cadence time minus `ZMEM_EVIDENCE_DAYS` (default 30) expire, then the newest
 `ZMEM_EVIDENCE_CAP` rows (default 50,000) survive by stable `ts,id` order.
 Association rows are removed in the same transaction, and stale associations
 are repaired. An invalid retention setting disables that sweep rather than
 guessing a limit.
+
+`add` and `update` accept `--evidence ID[,ID...]`. The writer validates every
+supplied ID immediately after its transaction begins, before advisory output
+or memory mutation, and links it to the resulting memory before commit;
+repeated links are idempotent. `evidence for --memory-id UUID --json` returns
+that memory's namespace and its hash-free evidence rows. Explicit JSON
+`recall`, `recent`, and `recall --explain` rows include sorted `evidence_ids`;
+human and passive-injection output stay unchanged. Strict JSONL import
+prevalidates `memory_evidence` endpoints and rejects a missing endpoint with
+its physical input line before inserting any staged association.
 
 `export-jsonl` is one consistent read snapshot. An unscoped export includes all
 evidence rows and only associations whose parent rows are in that export. A
