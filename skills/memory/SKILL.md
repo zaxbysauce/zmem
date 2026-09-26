@@ -1895,12 +1895,33 @@ python <store.py> evidence write < payload.json
 python <store.py> evidence list --namespace NS [--session-id SID] [--lane LANE] [--moment MOMENT] [--json]
 python <store.py> evidence show --namespace NS --id UUID [--json]
 python <store.py> evidence for --memory-id UUID --json
+python <store.py> evidence scoped-show --namespace NS --id UUID [--json]
+python <store.py> evidence associations --id UUID --json  # hidden operator helper
 ```
 
-The required `--namespace` argument on list/show is a compatibility/context
-marker and is ignored: evidence rows have no namespace column, so there is no
-namespace filter or authorization boundary. `evidence list` filters only by
-`--session-id`, `--lane`, and `--moment`; `evidence show` selects by `--id`.
+The required `--namespace` argument on legacy CLI `list`/`show` is a
+compatibility/context marker and is ignored: evidence rows have no namespace
+column, so this unscoped list/show path has no namespace filter or
+authorization boundary. `evidence list` filters only by `--session-id`,
+`--lane`, and `--moment`; `evidence show` selects by `--id`. The hidden
+unscoped `evidence associations` helper is used by the operator MCP bridge to
+expose association rows for an evidence ID. `evidence scoped-show` is the
+store-owned scoped lookup:
+it requires both `--namespace` and `--id`, returns the row only when an
+association reaches that namespace, and emits `namespace_not_allowed` for a
+missing, unassociated, or foreign ID.
+
+The Hermes MCP `evidence_for(memory_id)` tool derives the memory namespace.
+For a scoped token, a missing or foreign memory returns the same structured
+`namespace_not_allowed` response (`namespace: null`, with detail that the
+memory is not associated with an allowed namespace); an allowed memory returns
+its hash-free evidence rows. The MCP `evidence_show(id, namespace)` tool uses
+the scoped lookup for scoped tokens, so missing, unassociated, and foreign
+evidence IDs all return the same structured `namespace_not_allowed` response
+for the requested namespace. Unscoped operators retain the exact missing-ID
+responses (`memory id not found` and `evidence id not found`) and legacy
+association behavior.
+
 The session-cadence maintenance transaction runs evidence retention after its
 normal organize/backup work. `ZMEM_EVIDENCE_DAYS` defaults to 30 and removes
 rows strictly older than the supplied cadence clock minus that many days;
