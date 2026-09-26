@@ -2910,9 +2910,9 @@ def main():
             prefetch_query = args.query
             if (args.moment == "user_prompt"
                     and os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() != "0"):
-                # The store boundary owns this one rewrite for compat/MCP
-                # prefetch.  Native provider and hook paths call the dedicated
-                # command before recall and therefore do not pass here.
+                # The store boundary owns this one rewrite for ALL prefetch
+                # callers (native provider transport, hook, compat, MCP) --
+                # one rewrite, one boundary (issue #160).
                 try:
                     evidence_ready = _query_rewrite_has_evidence(conn)
                 except Exception:

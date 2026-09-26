@@ -10,6 +10,52 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.66.0] - 2026-09-26
+
+### Added
+- **Hermes provider transport abstraction with configuration-only
+  availability (issue #160, Workstream H PR 3 of 8)**: new
+  `hermes-plugin/transport.py` with `TransportMode` (`local`/`mcp`),
+  `resolve_transport_mode` (explicit `ZMEM_HERMES_MODE` wins; otherwise a
+  nonempty `ZMEM_MCP_URL` selects MCP, else a resolvable local
+  `skills/memory/scripts/store.py` selects local; exact failure reasons
+  `mode=<value> invalid`, `mode=none unavailable`,
+  `mode=local unavailable: local store missing` with no MCP fallback),
+  `LocalSubprocess`/`McpHttp` transports returning the complete parsed
+  #158/#159 envelope, and a `DeadlineExecutor` (daemon worker, child-kill /
+  coroutine-cancel on deadline, joined after cancellation).
+- **Six-second provider deadline**: `ZMEM_HERMES_DEADLINE_S` (default 6.0;
+  nonnumeric, nonfinite, zero, negative, and `>= 8.0` values all resolve to
+  6.0 with exactly one `transport: invalid ZMEM_HERMES_DEADLINE_S; using
+  6.0` stderr line) bounds every provider prefetch below the host
+  manager's 8.0 s external-provider join.
+- **Configuration-only provider availability**: `ZmemMemoryProvider` selects
+  its transport at construction; `is_available()` is path/environment
+  checks only (a remote-only box with `ZMEM_MCP_URL` set and no local
+  checkout is now available; never a socket), `unavailable_reason()` reports
+  the exact resolution reason, and `initialize()` creates a local store only
+  in local mode. Provider `prefetch` delegates to the transport with
+  `lane="hermes-provider"` and returns the envelope's `rendered`; every
+  failure class (nonzero exit, empty stdout, invalid JSON, missing
+  `rendered`, deadline, malformed token file) fails open into the empty
+  envelope. The provider-side query-rewrite preprocessing was removed — the
+  #159 `prefetch` command owns the user_prompt rewrite in-store under the
+  same `ZMEM_QUERY_CONTEXT` gate (one rewrite, one boundary), and the
+  delegated query is the raw prompt bounded at 4096 characters.
+- **`FakeExecutor` test seam finalized** (`tests/support/fake_executor.py`):
+  `submit(fn)` stores the callable without executing (a handle with no
+  declared delay never fires), `advance` drives the fake clock, `cancel`
+  marks a pending handle cancelled, and a test-declared completion time
+  proves deadline hits with zero wall-clock (issue #96 consumers unchanged).
+- **New tests and fixtures**: `tests/test_hermes_transport.py`
+  (TransportSelectionTest, TokenResolutionTest, DeadlineTest,
+  RecordedCallTest incl. failure-class rows and the no-storelib/no-ledger
+  guardrail), a revived `McpSessionToolsTest` provider-to-MCP fixture-parity
+  class in `tests/test_session_tools.py`, and
+  `tests/fixtures/hermes/{generate.py,mcp-prefetch.json,expected-envelope.json}`
+  (deterministic #159-envelope projection, fixed store clock, sentinel ids).
+  Issue-183/#158 argv pins repinned to the transport boundary.
+
 ## [0.65.0] - 2026-09-25
 
 ### Added

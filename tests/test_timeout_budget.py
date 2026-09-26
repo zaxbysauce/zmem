@@ -1,9 +1,10 @@
 """Issue #121 — timeout budget + Tier 0 fast path (launcher-side tests).
 
-NOTE(#160): the deterministic executor/clock seam used here is local to this
-module because tests/support/fake_executor.py does not exist on main yet
-(issue #160 owns that file and its FakeExecutor). When #160 lands, migrate
-this seam to the shared one (submit(fn) / advance(seconds) / now()).
+NOTE(#160, landed): tests/support/fake_executor.py now hosts the shared
+FakeExecutor seam (submit(fn) / advance(seconds) / now() / cancel(handle)).
+This module keeps its local seam deliberately — the launcher budget lanes
+assert the hook's own timeout plumbing, not the transport contract; a
+migration is optional follow-up hygiene, not a #160 gate.
 
 No test asserts elapsed wall time: every deadline assertion drives the
 injected clock (the two integration tests bound total runtime with generous

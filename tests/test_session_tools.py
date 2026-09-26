@@ -889,5 +889,104 @@ class ProviderEnvelopeTest(unittest.TestCase):
             self.assertEqual(entry["text"], text)
 
 
+class McpSessionToolsTest(unittest.TestCase):
+    """Issue #160: provider-to-MCP fixture parity.
+
+    The provider, constructed in MCP mode with its ``McpHttp`` transport's
+    ``call_fn`` stubbed to return the ``tests/fixtures/hermes/
+    mcp-prefetch.json`` envelope (the exact #159 ``store.py prefetch``
+    output), delivers exactly that envelope's ``rendered`` bytes — the same
+    projection the #159 CLI produces for the same wire shape.  No network
+    and no MCP server are involved.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        saved = {k: os.environ.get(k) for k in (
+            "ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODEL_AUTODOWNLOAD",
+            "ZMEM_MODELS_DIR", "ZMEM_HERMES_MODE", "ZMEM_MCP_URL",
+            "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE", "ZMEM_HERMES_DEADLINE_S",
+        )}
+
+        def _restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            sys.modules.pop("zmem_hermes_160_parity", None)
+
+        # addClassCleanup (not tearDownClass): it still runs when a later
+        # line of THIS setUpClass fails, so the MCP-mode env never leaks
+        # into sibling classes in a full-module run.
+        cls.addClassCleanup(_restore)
+
+        import importlib.util
+
+        cls._tmp = tempfile.mkdtemp(prefix="zmem-160-parity-")
+        os.environ["ZMEM_STORE"] = os.path.join(cls._tmp, "store.sqlite")
+        os.environ["ZMEM_DATA"] = cls._tmp
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(cls._tmp, "no-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        # Remote-only box: no local store, a URL, so the provider selects
+        # the MCP transport at construction (issue #160 availability).
+        empty_home = os.path.join(cls._tmp, "empty-home")
+        os.makedirs(empty_home, exist_ok=True)
+        os.environ["ZMEM_HOME"] = empty_home
+        os.environ["ZMEM_MCP_URL"] = "http://127.0.0.1:9/mcp"
+
+        agent = types.ModuleType("agent")
+        mp = types.ModuleType("agent.memory_provider")
+
+        class MemoryProvider:  # minimal stand-in
+            pass
+
+        mp.MemoryProvider = MemoryProvider
+        agent.memory_provider = mp
+        sys.modules.setdefault("agent", agent)
+        sys.modules.setdefault("agent.memory_provider", mp)
+        spec = importlib.util.spec_from_file_location(
+            "zmem_hermes_160_parity",
+            REPO_ROOT / "hermes-plugin" / "__init__.py")
+        cls.mod = importlib.util.module_from_spec(spec)
+        sys.modules["zmem_hermes_160_parity"] = cls.mod
+        spec.loader.exec_module(cls.mod)
+        cls.provider = cls.mod.ZmemMemoryProvider()
+        cls.raw_envelope = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "hermes" /
+             "mcp-prefetch.json").read_text(encoding="utf-8"))
+        cls.expected_rendered = json.loads(
+            (REPO_ROOT / "tests" / "fixtures" / "hermes" /
+             "expected-envelope.json").read_text(encoding="utf-8"))["rendered"]
+        # Inject the fixture envelope through the McpHttp call_fn seam.
+        envelope = cls.raw_envelope
+
+        async def fixture_call(url, token, tool, arguments):
+            assert tool == "prefetch", tool
+            assert arguments["lane"] == "hermes-provider", arguments
+            return envelope
+
+        transport = cls.mod._transport
+        cls.provider._transport = transport.McpHttp(
+            url="http://127.0.0.1:9/mcp",
+            executor=transport.DeadlineExecutor(),
+            call_fn=fixture_call)
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    def test_remote_only_provider_is_available(self):
+        self.assertTrue(self.provider.is_available())
+        self.assertEqual(self.provider.unavailable_reason(), "mode=mcp (url)")
+
+    def test_provider_prefetch_equals_fixture_rendered(self):
+        rendered = self.provider.prefetch("stash pop", session_id="s")
+        self.assertEqual(rendered, self.expected_rendered)
+        self.assertEqual(rendered, self.raw_envelope["rendered"])
+        self.assertNotEqual(rendered, "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
