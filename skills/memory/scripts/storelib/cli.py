@@ -612,9 +612,16 @@ def _parse_evidence_ids(value: str | None) -> list[str]:
         return []
     ids = [part.strip() for part in value.split(",")]
     if any(not evidence_id for evidence_id in ids):
-        raise ValueError("--evidence must not contain empty ids")
-    if len(set(ids)) != len(ids):
-        raise ValueError("--evidence must not contain duplicate ids")
+        raise argparse.ArgumentTypeError(
+            "evidence ids must not contain empty tokens"
+        )
+    seen: set[str] = set()
+    for evidence_id in ids:
+        if evidence_id in seen:
+            raise argparse.ArgumentTypeError(
+                f"duplicate evidence id: {evidence_id}"
+            )
+        seen.add(evidence_id)
     return sorted(ids)
 
 
@@ -1443,7 +1450,10 @@ def main():
     p_evidence_show.add_argument("--json", dest="as_json", action="store_true",
                                   default=False, help="emit JSON")
     p_evidence_for = evidence_sub.add_parser("for", help="list evidence for one memory")
-    p_evidence_for.add_argument("--memory-id", required=True)
+    p_evidence_for.add_argument("memory_id_positional", nargs="?",
+                                help="memory identifier")
+    p_evidence_for.add_argument("--memory-id", dest="memory_id_option",
+                                help="backward-compatible memory identifier")
     p_evidence_for.add_argument("--json", dest="as_json", action="store_true", default=False)
     p_evidence_scoped_show = evidence_sub.add_parser(
         "scoped-show", help="show evidence associated with one namespace"
@@ -2616,8 +2626,17 @@ def main():
     if args.cmd in {"add", "update"}:
         try:
             args.evidence_ids = _parse_evidence_ids(args.evidence)
-        except ValueError as exc:
+        except argparse.ArgumentTypeError as exc:
             ap.error(str(exc))
+
+    if args.cmd == "evidence" and args.evidence_cmd == "for":
+        positional = args.memory_id_positional
+        option = args.memory_id_option
+        if positional is None and option is None:
+            ap.error("evidence for requires a memory id")
+        if positional is not None and option is not None and positional != option:
+            ap.error("evidence for positional id conflicts with --memory-id")
+        args.memory_id = option or positional
 
     try:
         _wait_for_maintenance_clear(args.cmd)

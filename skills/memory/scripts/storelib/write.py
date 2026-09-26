@@ -850,10 +850,14 @@ def _validated_evidence_ids(
 ) -> list[str]:
     """Canonicalize and prevalidate association endpoints before write effects."""
     ids = [str(value).strip() for value in (evidence_ids or [])]
-    if any(not value for value in ids):
-        raise ValueError("evidence ids must not contain empty values")
-    if len(set(ids)) != len(ids):
-        raise ValueError("evidence ids must not contain duplicates")
+    for evidence_id in ids:
+        if not evidence_id:
+            raise ValueError("evidence id is empty")
+    seen: set[str] = set()
+    for evidence_id in ids:
+        if evidence_id in seen:
+            raise ValueError(f"duplicate evidence id: {evidence_id}")
+        seen.add(evidence_id)
     ids.sort()
     for evidence_id in ids:
         if conn.execute("SELECT 1 FROM evidence WHERE id=?", (evidence_id,)).fetchone() is None:

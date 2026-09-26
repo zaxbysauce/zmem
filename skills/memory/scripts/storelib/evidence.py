@@ -277,21 +277,26 @@ def sweep_evidence(
 
 def attach_memory_evidence(
     conn: sqlite3.Connection, *, memory_id: str, evidence_ids: list[str] | tuple[str, ...]
-) -> None:
+) -> int:
     """Attach evidence rows to one memory atomically and idempotently.
 
     Writer callers normally already own a transaction.  The standalone form is
     useful to administrative callers, while the savepoint keeps a failed
-    association from partially changing a caller-owned transaction.
+    association from partially changing a caller-owned transaction. Returns
+    the number of newly inserted pairs; existing pairs contribute zero.
     """
     ids = [str(value).strip() for value in evidence_ids]
-    if any(not value for value in ids):
-        raise ValueError("evidence ids must not contain empty values")
-    if len(set(ids)) != len(ids):
-        raise ValueError("evidence ids must not contain duplicates")
+    for evidence_id in ids:
+        if not evidence_id:
+            raise ValueError("evidence id is empty")
+    seen: set[str] = set()
+    for evidence_id in ids:
+        if evidence_id in seen:
+            raise ValueError(f"duplicate evidence id: {evidence_id}")
+        seen.add(evidence_id)
     ids.sort()
     if not ids:
-        return
+        return 0
 
     own_transaction = not conn.in_transaction
     savepoint = "zmem_attach_memory_evidence"
@@ -305,14 +310,17 @@ def attach_memory_evidence(
         for evidence_id in ids:
             if conn.execute("SELECT 1 FROM evidence WHERE id=?", (evidence_id,)).fetchone() is None:
                 raise ValueError(f"evidence id not found: {evidence_id}")
-        conn.executemany(
-            "INSERT OR IGNORE INTO memory_evidence(memory_id, evidence_id) VALUES (?, ?)",
-            [(memory_id, evidence_id) for evidence_id in ids],
-        )
+        inserted = 0
+        for evidence_id in ids:
+            inserted += conn.execute(
+                "INSERT OR IGNORE INTO memory_evidence(memory_id, evidence_id) VALUES (?, ?)",
+                (memory_id, evidence_id),
+            ).rowcount
         if own_transaction:
             conn.commit()
         else:
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return inserted
     except Exception:
         if own_transaction:
             conn.rollback()
