@@ -48,8 +48,19 @@ INJECTION_ENVELOPE_REQUIRED = frozenset({
     "budget_truncated", "budget_dropped_protected", "arms", "rendered",
 })
 INJECTION_ENVELOPE_OPTIONAL = frozenset({
-    "injection_risk", "candidate_lanes", "budget_note",
+    "injection_risk", "candidate_lanes", "budget_note", "effective_ops",
 })
+
+
+def _capture_envelope_enabled() -> bool:
+    """Expose capture-only delivery metadata for host adapter subprocesses.
+
+    The launcher sets ``ZMEM_CAPTURE`` in its child environment.  Keeping the
+    field opt-in at this boundary preserves the established CLI wire shape for
+    direct store callers while letting automatic host capture receive the exact
+    operation tokens selected for this injection.
+    """
+    return "ZMEM_CAPTURE" in os.environ and os.environ.get("ZMEM_CAPTURE", "").strip() != "0"
 
 # Best-effort single-source-of-truth for the protected type literals; the
 # fallbacks keep this module importable with no schema_meta on sys.path.
@@ -1094,6 +1105,7 @@ def select_and_budget_for_injection(
             budget_truncated=parsed.get("budget_truncated", 0),
             budget_dropped_protected=parsed.get("budget_dropped_protected", 0),
             arms=parsed.get("arms", {}), rendered=rendered,
+            effective_ops=list(effective_ops) if _capture_envelope_enabled() else None,
             injection_risk=parsed.get("injection_risk"),
             candidate_lanes=parsed.get("candidate_lanes"),
             budget_note=parsed.get("budget_note") if rows else None,

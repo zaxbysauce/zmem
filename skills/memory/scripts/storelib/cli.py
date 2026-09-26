@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import contextlib
+from collections.abc import Mapping
 import hashlib
 import json
 import math
@@ -59,6 +60,14 @@ from storelib.dataset import (
 from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory, warn_reserved_source_ref
 from storelib.delivery_ledger import FeedbackSidecarError
 from storelib.feedback import apply_operation_feedback
+from storelib.training_capture import (
+    CaptureBusyError, TrainingCaptureConflict, acknowledge_training_delivery,
+    append_training_capture_observation, assert_training_capture_replay_binding,
+    capture_id_for_delivery_snapshot,
+    complete_training_capture,
+    purge_expired_training_captures, record_training_delivery_snapshot,
+    start_training_capture,
+)
 from storelib.tune import tune_weights
 from storelib import ops_tokens as _ops_tokens
 from storelib.query_ambiguity import (
@@ -252,6 +261,208 @@ def _hermes_prepare(*, namespace: str, session_id: str) -> dict[str, object]:
         "ops_tokens": list(tokens),
         "failure_nudge": failure_nudge,
     }
+
+
+def _read_training_capture_input(path_value: object) -> dict[str, object]:
+    """Read one strict object from an explicit trusted-local input file."""
+    if not isinstance(path_value, str) or not path_value:
+        raise ValueError("--input is required")
+    with open(path_value, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError("training capture input must be a JSON object")
+    return payload
+
+
+def _require_payload_fields(payload: Mapping[str, object], fields: tuple[str, ...]) -> None:
+    for field in fields:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"missing governance field: {field}")
+
+
+def _require_capture_governance(payload: Mapping[str, object]) -> None:
+    _require_payload_fields(payload, (
+        "consent_scope", "content_license", "redaction_policy_version",
+    ))
+
+
+def _require_completion_governance(payload: Mapping[str, object]) -> None:
+    # The user-facing completion schema uses the same names as capture-time
+    # governance.  Accept the internal-prefixed aliases for installed callers
+    # during the transition, while preserving the frozen refusal text.
+    consent_scope = payload.get("consent_scope", payload.get("export_consent_scope"))
+    if not isinstance(consent_scope, str) or not consent_scope.strip():
+        raise ValueError("missing governance field: consent_scope")
+    content_license = payload.get("content_license", payload.get("export_content_license"))
+    if not isinstance(content_license, str) or not content_license.strip():
+        raise ValueError("missing governance field: content_license")
+
+
+def _completion_export_governance(payload: Mapping[str, object]) -> tuple[object, object]:
+    """Return completion governance after its public-name validation."""
+    _require_completion_governance(payload)
+    return (
+        payload.get("consent_scope", payload.get("export_consent_scope")),
+        payload.get("content_license", payload.get("export_content_license")),
+    )
+
+
+def _capture_replay_identity(payload: Mapping[str, object]) -> dict[str, object]:
+    """Map public capture fields to the immutable fields stored by the core."""
+    identity = {
+        field: payload[field]
+        for field in (
+            "host", "session_id", "namespace", "cwd", "prompt", "assistant_response",
+            "consent_scope", "content_license", "redaction_policy_version", "redaction_status",
+        )
+        if field in payload
+    }
+    if "host_task_id" in payload:
+        identity["host_task_id"] = payload["host_task_id"]
+    elif "task_id" in payload:
+        identity["host_task_id"] = payload["task_id"]
+    return identity
+
+
+def _trusted_training_caller() -> str:
+    """Return the stable identity of this local CLI authority.
+
+    JSON inputs are intentionally not an identity authority.  An operator may
+    configure a stable identity for an installed service; ordinary local CLI
+    use has the explicit stable identity ``local-cli``.
+    """
+    caller = os.environ.get("ZMEM_TRAINING_CALLER_ID", "local-cli")
+    if not isinstance(caller, str) or not caller.strip() or len(caller.encode("utf-8")) > 512:
+        raise ValueError("ZMEM_TRAINING_CALLER_ID must be a non-empty value up to 512 UTF-8 bytes")
+    return caller.strip()
+
+
+def _capture_namespace_from_evidence(
+    conn: sqlite3.Connection, payload: Mapping[str, object]
+) -> str | None:
+    """Resolve a governed capture namespace from store-owned evidence rows.
+
+    ``project_key`` is a dataset-facing label and is deliberately not used as
+    the canonical store namespace.  When the host omits an explicit namespace,
+    use the evidence association already in the store and require one unique
+    memory namespace plus a matching evidence session.
+    """
+    evidence_id = payload.get("evidence_ref")
+    if evidence_id is None:
+        evidence_id = payload.get("evidence_id")
+    explicit = payload.get("namespace")
+    if explicit is not None:
+        if not isinstance(explicit, str) or not explicit.strip():
+            raise ValueError("namespace must be a non-empty project: namespace")
+        if not explicit.startswith("project:") or not explicit[8:].strip():
+            raise ValueError("namespace must be a non-empty project: namespace")
+        explicit = explicit.strip()
+    if evidence_id is None:
+        return explicit
+    if not isinstance(evidence_id, str) or not evidence_id.strip():
+        raise ValueError("evidence_ref must be a non-empty string")
+    evidence = conn.execute(
+        "SELECT session_id FROM evidence WHERE id=?", (evidence_id.strip(),)
+    ).fetchone()
+    if evidence is None:
+        raise ValueError("evidence_ref does not identify store-owned evidence")
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("session_id must be a non-empty string")
+    if str(evidence[0]) != session_id:
+        raise ValueError("evidence session_id does not match capture session_id")
+    rows = conn.execute(
+        "SELECT DISTINCT m.namespace "
+        "FROM memory_evidence me JOIN memory m ON m.id=me.memory_id "
+        "WHERE me.evidence_id=? ORDER BY m.namespace",
+        (evidence_id.strip(),),
+    ).fetchall()
+    namespaces = {str(row[0]) for row in rows if row[0]}
+    if len(namespaces) > 1:
+        raise ValueError("evidence must resolve to one project namespace")
+    if explicit is not None:
+        if namespaces and explicit not in namespaces:
+            raise ValueError("namespace does not match evidence memory namespace")
+        return explicit
+    if namespaces:
+        return next(iter(namespaces))
+
+    # Completion owns the memory_evidence association, so a first delivery can
+    # precede that row.  Bootstrap only the capture namespace from bounded
+    # UUIDs already present in the redacted rendered fence; completion still
+    # validates the requested memory/evidence association transactionally.
+    rendered = payload.get("rendered")
+    if rendered is None:
+        rendered = payload.get("context_fence")
+    if not isinstance(rendered, str) or len(rendered.encode("utf-8")) > 16_000:
+        raise ValueError("evidence must resolve to one project namespace")
+    memory_ids = sorted(set(re.findall(
+        r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        rendered,
+    )))
+    if not memory_ids or len(memory_ids) > 64:
+        raise ValueError("evidence must resolve to one project namespace")
+    placeholders = ",".join("?" for _ in memory_ids)
+    memory_rows = conn.execute(
+        f"SELECT id, namespace FROM memory WHERE id IN ({placeholders}) ORDER BY id",
+        memory_ids,
+    ).fetchall()
+    if len(memory_rows) != len(memory_ids):
+        raise ValueError("evidence must resolve to one project namespace")
+    namespaces = {str(row[1]) for row in memory_rows if row[1]}
+    if len(namespaces) != 1:
+        raise ValueError("evidence must resolve to one project namespace")
+    return next(iter(namespaces))
+
+
+def _trusted_acknowledgement(payload: Mapping[str, object], caller: str) -> dict[str, object]:
+    raw = payload.get("attestation")
+    if isinstance(raw, Mapping):
+        claimed = raw.get("attested_by")
+        if claimed is not None and claimed != caller:
+            raise ValueError("attestation identity must match the trusted local caller")
+    elif isinstance(raw, str) and raw.strip() and len(raw.encode("utf-8")) <= 4096:
+        # Legacy trusted-local adapters supplied an opaque display token as a
+        # string.  It is accepted for compatibility, but never becomes the
+        # persisted identity or verifier; only the configured local caller is
+        # retained by the capture state machine.
+        pass
+    else:
+        raise ValueError("attestation must be an object or non-empty token")
+    # The host/service JSON can prove neither arbitrary facts nor retain
+    # transcript-like notes.  The core persists only this stable identity.
+    return {"attested_by": caller}
+
+
+def _trusted_completion_fields(payload: Mapping[str, object]) -> tuple[str, str | None, bool]:
+    caller = _trusted_training_caller()
+    claimed_verifier = payload.get("verifier_id")
+    if claimed_verifier is not None and claimed_verifier != caller:
+        raise ValueError("verifier_id must match the trusted local caller")
+    outcome_kind = payload.get("outcome_kind")
+    if outcome_kind != "reviewer_acceptance":
+        if payload.get("reviewer_id") is not None or payload.get("reviewer_confirmed", False):
+            raise ValueError("reviewer fields are only valid for reviewer_acceptance")
+        return caller, None, False
+    claimed_reviewer = payload.get("reviewer_id")
+    if claimed_reviewer is not None and (
+            not isinstance(claimed_reviewer, str) or
+            not claimed_reviewer.strip() or
+            len(claimed_reviewer.encode("utf-8")) > 512):
+        raise ValueError("reviewer_id must be a non-empty string")
+    configured = {
+        item.strip() for item in os.environ.get("ZMEM_TRAINING_REVIEWER_IDS", "").split(",")
+        if item.strip()
+    }
+    if configured and caller not in configured:
+        raise ValueError("trusted local caller is not an authorized reviewer")
+    if payload.get("reviewer_confirmed") is not True:
+        raise ValueError("reviewer_acceptance requires reviewer_confirmed=true")
+    # The local caller remains both verifier and reviewer authority.  A host
+    # payload may carry a display-only reviewer label, but cannot make itself
+    # trusted by claiming another identity.
+    return caller, caller, True
 
 
 def cmd_hermes_reflect(*, payload: object) -> int:
@@ -1290,6 +1501,8 @@ def main():
     p_upd.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
                        help="same capture policy as `add` (manual/reviewed keep text "
                             "with warnings; auto redacts secrets)")
+    p_upd.add_argument("--reason", default="updated",
+                       help="lineage reason: 'updated' (default) or 'explicit correction'")
     p_upd.add_argument("--json", action="store_true",
                        help="print a structured write result (id, result, created_new, "
                             "warnings) as JSON on stdout instead of the human lines "
@@ -1340,6 +1553,33 @@ def main():
                                  required=True, help="evidence identifier")
     p_evidence_show.add_argument("--json", dest="as_json", action="store_true",
                                  default=False, help="emit JSON")
+
+    # Explicit trusted local adapters. Existing hooks call the state-machine
+    # APIs directly and never manufacture an acknowledgement or completion.
+    p_capture_delivery = _add_parser("capture-training-delivery",
+                                     help="create a governed capture and delivery snapshot")
+    p_capture_delivery.add_argument("--input", required=True, help="JSON input file")
+    p_capture_ack = _add_parser("capture-training-acknowledge",
+                                help="record a trusted delivery acknowledgement")
+    p_capture_ack.add_argument("--input", required=True, help="JSON input file")
+    p_capture_completion = _add_parser("capture-training-completion",
+                                       help="complete an acknowledged training capture")
+    p_capture_completion.add_argument("--input", required=True, help="JSON input file")
+    p_purge_training = _add_parser(
+        "purge-training-captures",
+        help="purge finalized or revoked local captures past the 30-day retention window",
+    )
+    p_purge_training.add_argument(
+        "--confirm", action="store_true", default=False,
+        help="confirm permanent deletion of expired local capture records",
+    )
+    p_training_export = _add_parser("export-training",
+                                    help="write reviewed governed training views")
+    p_training_export.add_argument("dir", help="output directory")
+    p_training_export.add_argument("--snapshot-id", dest="snapshot_id", default=None)
+    p_training_export.add_argument("--reviewer-confirmed", action="store_true", default=False)
+    p_training_export.add_argument("--namespace", default=None)
+    p_training_export.add_argument("--quarantine-raw", action="store_true", default=False)
 
     _add_parser("stats", help="store statistics")
 
@@ -2489,6 +2729,39 @@ def main():
                          "namespace is unavailable")
             args.namespace = resolved
 
+    # These refusal paths must run before the normal connect/migrate flow.  A
+    # missing immutable export selector or reviewer confirmation creates no
+    # SQLite store and no output directory.
+    if args.cmd == "export-training":
+        if not args.snapshot_id:
+            print("--snapshot-id is required", file=sys.stderr)
+            sys.exit(2)
+        if not args.reviewer_confirmed:
+            print("--reviewer-confirmed is required", file=sys.stderr)
+            sys.exit(2)
+    if args.cmd == "purge-training-captures":
+        if not args.confirm:
+            print("--confirm is required", file=sys.stderr)
+            sys.exit(2)
+        if not STORE_PATH.is_file():
+            print(f"[zmem] store does not exist: {STORE_PATH}", file=sys.stderr)
+            sys.exit(2)
+
+    # Refuse malformed governed write inputs before connect/migrate.  Besides
+    # avoiding an unwanted first-run store, this keeps the frozen completion
+    # missing-governance path side-effect free.
+    training_capture_payload: dict[str, object] | None = None
+    if args.cmd in {"capture-training-delivery", "capture-training-completion"}:
+        try:
+            training_capture_payload = _read_training_capture_input(args.input)
+            if args.cmd == "capture-training-delivery":
+                _require_capture_governance(training_capture_payload)
+            else:
+                _require_completion_governance(training_capture_payload)
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+
     # PR-review PRR-P (issue #59 review round): `--content -` reads the content
     # from stdin. Windows argv caps near 32k chars while the content cap is
     # MAX_CONTENT_CHARS (65536), so large-but-valid content cannot always be
@@ -2551,7 +2824,9 @@ def main():
 
     writer_lease = None
     if (
-        args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl"}
+        args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl",
+                     "capture-training-delivery", "capture-training-acknowledge",
+                     "capture-training-completion", "purge-training-captures"}
         or (args.cmd == "evidence" and args.evidence_cmd == "write")
         or args.cmd == "hermes-convention"
         # v12 (issue #64, 9.4): feedback is a write surface — it takes the
@@ -2592,9 +2867,10 @@ def main():
         # _ingest_row, so a real run serializes against restore/backup like
         # every other writer; --dry-run is read-only and never takes it.
         or (args.cmd == "promote-store" and not args.dry_run)
-        # Session cadence performs evidence retention after organize/backup;
-        # keep its writer lease until that final transaction is complete so a
-        # concurrent restore cannot interleave between cadence steps.
+        # Session cadence purges expired local training records before backup
+        # and performs evidence retention afterwards. Keep its writer lease
+        # until both retention transactions complete so a concurrent restore
+        # cannot interleave between cadence steps.
         or args.cmd == "session-cadence"
     ):
         writer_lease = _acquire_writer_lease(args.cmd)
@@ -2637,6 +2913,159 @@ def main():
                 conn, namespace=args.namespace, evidence_id=args.evidence_id,
                 as_json=args.as_json,
             ))
+        elif args.cmd == "capture-training-delivery":
+            try:
+                payload = training_capture_payload
+                assert payload is not None
+                delivery_id = payload.get("delivery_snapshot_id")
+                capture_id = None
+                if delivery_id is not None:
+                    try:
+                        capture_id = capture_id_for_delivery_snapshot(conn, delivery_id)
+                    except ValueError:
+                        pass
+                if capture_id is None:
+                    # ``project_key`` is a dataset-facing label.  Resolve the
+                    # canonical store namespace only from the store-owned
+                    # evidence association, with session binding enforced.
+                    namespace = _capture_namespace_from_evidence(conn, payload)
+                    capture = start_training_capture(
+                        conn, host=payload.get("host", "service"),
+                        session_id=payload.get("session_id"), namespace=namespace,
+                        host_task_id=(payload.get("host_task_id")
+                                      if payload.get("host_task_id") is not None
+                                      else payload.get("task_id")),
+                        cwd=payload.get("cwd"),
+                        prompt=payload.get("prompt"), assistant_response=payload.get("assistant_response"),
+                        consent_scope=payload.get("consent_scope"),
+                        content_license=payload.get("content_license"),
+                        redaction_policy_version=payload.get("redaction_policy_version"),
+                        governance_source="trusted_local_cli",
+                    )
+                    capture_id = capture["capture_id"]
+                else:
+                    assert_training_capture_replay_binding(
+                        conn, capture_id, _capture_replay_identity(payload)
+                    )
+                source_event_id = payload.get("source_event_id")
+                if source_event_id is not None:
+                    if not isinstance(source_event_id, str) or not source_event_id.strip():
+                        raise ValueError("source_event_id must be a non-empty string")
+                    source_event_id = source_event_id.strip()
+                    if len(source_event_id.encode("utf-8")) > 1024:
+                        raise ValueError("source_event_id is too large")
+                    observation_payload = json.dumps(
+                        {"source_event_id": source_event_id},
+                        ensure_ascii=False, separators=(",", ":"),
+                    )
+                    existing = conn.execute(
+                        "SELECT 1 FROM training_capture_observation "
+                        "WHERE capture_id=? AND observation_kind=? AND payload=? LIMIT 1",
+                        (capture_id, "source_event_id", observation_payload),
+                    ).fetchone()
+                    if existing is None:
+                        append_training_capture_observation(
+                            conn, capture_id, observation_kind="source_event_id",
+                            payload=observation_payload,
+                        )
+                snapshot = record_training_delivery_snapshot(
+                    conn, capture_id,
+                    rendered=(payload.get("rendered")
+                              if payload.get("rendered") is not None
+                              else payload.get("context_fence")),
+                    effective_ops=(payload.get("effective_ops")
+                                   if payload.get("effective_ops") is not None
+                                   else payload.get("ops_tokens")),
+                    transform_version=payload.get("transform_version", "v1"),
+                    delivery_snapshot_id=delivery_id,
+                )
+                print(json.dumps({"capture_id": capture_id,
+                                  "delivery_snapshot_id": snapshot["delivery_snapshot_id"],
+                                  "state": "emitted_to_host"}, sort_keys=True))
+            except (ValueError, TrainingCaptureConflict, CaptureBusyError, OSError,
+                    json.JSONDecodeError) as exc:
+                conn.rollback()
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
+        elif args.cmd == "capture-training-acknowledge":
+            try:
+                payload = _read_training_capture_input(args.input)
+                capture_id = capture_id_for_delivery_snapshot(conn, payload.get("delivery_snapshot_id"))
+                caller = _trusted_training_caller()
+                capture = acknowledge_training_delivery(
+                    conn, capture_id, attestation=_trusted_acknowledgement(payload, caller),
+                    acknowledged_at=payload.get("acknowledged_at"),
+                )
+                print(json.dumps({
+                    "capture_id": capture_id,
+                    "delivery_snapshot_id": payload.get("delivery_snapshot_id"),
+                    "state": capture["state"],
+                }, sort_keys=True))
+            except (ValueError, TrainingCaptureConflict, CaptureBusyError, OSError,
+                    json.JSONDecodeError) as exc:
+                conn.rollback()
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
+        elif args.cmd == "capture-training-completion":
+            try:
+                payload = training_capture_payload
+                assert payload is not None
+                export_consent_scope, export_content_license = _completion_export_governance(payload)
+                capture_id = capture_id_for_delivery_snapshot(conn, payload.get("delivery_snapshot_id"))
+                assert_training_capture_replay_binding(
+                    conn, capture_id, _capture_replay_identity(payload)
+                )
+                verifier_id, reviewer_id, reviewer_confirmed = _trusted_completion_fields(payload)
+                evidence_id = payload.get("evidence_id")
+                if evidence_id is None:
+                    # The frozen host fixture calls this dataset-facing
+                    # reference ``evidence_ref``; accept it as the completion
+                    # evidence identifier while keeping association authority
+                    # in complete_training_capture.
+                    evidence_id = payload.get("evidence_ref")
+                completion = complete_training_capture(
+                    conn, capture_id, evidence_id=evidence_id,
+                    memory_ids=payload.get("memory_ids"), verifier_id=verifier_id,
+                    outcome_kind=payload.get("outcome_kind"), outcome_value=payload.get("outcome_value"),
+                    export_consent_scope=export_consent_scope,
+                    export_content_license=export_content_license,
+                    reviewer_id=reviewer_id, reviewer_confirmed=reviewer_confirmed,
+                    correction_closeout=payload.get("correction_closeout", False),
+                    correction_chain_id=payload.get("correction_chain_id"),
+                    verified_at=payload.get("verified_at"),
+                )
+                print(json.dumps({"capture_id": capture_id, "evidence_id": completion["evidence_id"],
+                                  "state": "completed"}, sort_keys=True))
+            except (ValueError, TrainingCaptureConflict, CaptureBusyError, OSError,
+                    json.JSONDecodeError) as exc:
+                conn.rollback()
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
+        elif args.cmd == "purge-training-captures":
+            try:
+                result = purge_expired_training_captures(
+                    conn,
+                    now_ts=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                print(json.dumps(result, sort_keys=True))
+            except (ValueError, sqlite3.Error) as exc:
+                conn.rollback()
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
+        elif args.cmd == "export-training":
+            # Derived Parquet construction remains separately owned; import it
+            # lazily so ordinary capture starts have no exporter dependency.
+            try:
+                from storelib.training_export import TrainingExportError, write_training_views
+                result = write_training_views(
+                    conn, out_dir=args.dir, namespace=args.namespace,
+                    snapshot_id=args.snapshot_id, reviewer_confirmed=True,
+                    quarantine_raw=args.quarantine_raw,
+                )
+                print(json.dumps(result, sort_keys=True))
+            except (ImportError, TrainingExportError, ValueError, OSError) as exc:
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
         elif args.cmd == "hermes-convention":
             payload = hermes_payload if hermes_payload is not None else {}
             sys.exit(cmd_hermes_convention(conn, payload=payload))
@@ -2728,6 +3157,7 @@ def main():
                         taint=args.taint,
                         capture_mode=args.capture_mode,
                         expected_old_namespace=args.expected_old_namespace,
+                        supersede_reason=args.reason,
                     )
                 finally:
                     if _human_out is not None:
@@ -3118,7 +3548,10 @@ def main():
             # single-flight lock + shared cadence gate (force=False respects it —
             # issue #62 7.7 wired SessionStart to organize, NOT consolidate; the
             # consolidate CLI remains for manual/ad-hoc runs), backup runs with
-            # --if-due (cheap no-op when not due), and sweep is the same
+            # --if-due (cheap no-op when not due), training retention runs
+            # before backup so a successful purge keeps expired records out of
+            # a new snapshot,
+            # and sweep is the same
             # store-independent file reaper. A failure in any one op is reported
             # but does not abort the others (cadence ops are independent).
             # sweep already ran BEFORE connect() (store-independence, PRR-004)
@@ -3127,6 +3560,11 @@ def main():
             failures = 0
             organized = False
             backed_up = False
+            training_retention = {"purged_captures": 0}
+            # One clock defines both fixed retention boundaries. Compute it
+            # before backup so a successful purge keeps a record the cadence
+            # regards as expired out of that backup.
+            cadence_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             cadence_redirect = (
                 contextlib.redirect_stdout(sys.stderr)
                 if getattr(args, "as_json", False)
@@ -3147,7 +3585,23 @@ def main():
                         failures += 1
                     finally:
                         _release_lock("consolidate", o_token)
-                # 2) backup --if-due (cheap no-op almost every session)
+                # 2) bounded local capture retention. This is independent of
+                # backup: failure is surfaced but must not prevent a backup.
+                try:
+                    training_retention = purge_expired_training_captures(
+                        conn, now_ts=cadence_now,
+                    )
+                    steps.append(
+                        "training-captures: purged="
+                        f"{training_retention['purged_captures']}"
+                    )
+                except Exception as exc:
+                    steps.append(
+                        "training-captures: error - "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    failures += 1
+                # 3) backup --if-due (cheap no-op almost every session)
                 try:
                     rc_b = cmd_backup(conn, retention=args.backup_retention, if_due=True)
                     backed_up = rc_b == 0
@@ -3157,16 +3611,14 @@ def main():
                 except Exception as exc:
                     steps.append(f"backup: error - {type(exc).__name__}: {exc}")
                     failures += 1
-                # 3) file sweep result (already computed pre-connect)
+                # 4) file sweep result (already computed pre-connect)
                 if _cadence_sweep is not None:
                     steps.append(_cadence_sweep[0])
                     if _cadence_sweep[1]:
                         failures += 1
 
             # Evidence retention runs after organize/backup on the connected
-            # store and owns one transaction.  Derive the clock once at command
-            # dispatch so every deletion in this cadence shares one boundary.
-            cadence_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # store and owns one transaction using the cadence boundary.
             retention = sweep_evidence(conn, now_ts=cadence_now)
             if getattr(args, "as_json", False):
                 print(json.dumps({
@@ -3356,7 +3808,10 @@ def main():
                         if _human_out is not None:
                             sys.stdout = _human_out
                     if args.cmd == "episode-open":
-                        print(json.dumps(row, indent=2) if args.json else
+                        # Keep --json to one physical line so simple host
+                        # adapters can consume the final object from stdout
+                        # without parsing a pretty-printed multiline value.
+                        print(json.dumps(row) if args.json else
                               f"[zmem] episode opened: {row['id']} "
                               f"(ns={row['namespace']} started={row['started_at']})")
                     elif args.cmd == "episode-add":
@@ -3368,7 +3823,7 @@ def main():
                             print(f"[zmem] episode-add: memory {args.memory} "
                                   f"{state} to episode {args.episode}")
                     else:
-                        print(json.dumps(row, indent=2) if args.json else
+                        print(json.dumps(row) if args.json else
                               f"[zmem] episode closed: {row['id']} "
                               f"(members={row['member_count']} "
                               f"tokens={row['token_count']}"

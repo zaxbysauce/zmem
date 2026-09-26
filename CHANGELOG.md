@@ -10,6 +10,35 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.67.0] - 2026-09-26
+
+### Added
+
+- **Governed training views (issue #135):** automatic host hooks now create
+  default-deny partial capture records. A trusted delivery acknowledgement and
+  verifier-backed completion are required before a capture can become eligible
+  for export. Capture, delivery, acknowledgement and completion state is kept
+  in additive local tables without changing the schema version or syncing
+  transcript content.
+- **Deterministic training export:** `export-training DIR` writes the fixed SFT
+  and preference Parquet schemas plus `manifest.json` and `deletion-map.json`
+  directly in `DIR` through a staged publish. The export derives
+  evidence and source-memory provenance from the store, applies the configured
+  governance and redaction policy, and keeps semantic dedup vectors in memory.
+  The optional `--quarantine-raw` artifact is bounded and redacted; it does not
+  make a refused or incomplete capture exportable.
+- **Training dependency packaging and diagnostics:** the PyArrow range is
+  declared in `skills/memory/scripts/requirements-training.txt` and the Hermes
+  server requirements. Doctor reports the dependency state and the exact
+  requirements-file install command so each host can enable training export in
+  its store-host interpreter.
+
+### Changed
+
+- **Release surfaces:** all seven host-facing manifests target 0.67.0. The
+  release manifest and five-lane decision fixtures are regenerated from the
+  final tracked runtime tree before release publication.
+
 ## [0.65.0] - 2026-09-25
 
 ### Added

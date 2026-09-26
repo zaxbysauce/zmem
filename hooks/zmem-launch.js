@@ -638,6 +638,13 @@ const EVIDENCE_RAW_MAX_BYTES = 64 * 1024;
 const EVIDENCE_WRITER_MAX_INFLIGHT = 8;
 const EVIDENCE_WRITER_TIMEOUT_MS = 15000;
 let evidenceWritersInFlight = 0;
+// Issue #135: automatic training capture is a bounded, fail-open adapter.  A
+// start must be synchronous so the store-generated capture id is available to
+// later observation/snapshot callbacks; snapshots are likewise issued only
+// after the child produced the exact sentinel payload.  The adapter itself
+// owns redaction and default-deny governance.
+const TRAINING_CAPTURE_HOSTS = new Set(["claude", "codex", "zcode"]);
+const TRAINING_CAPTURE_TIMEOUT_MS = 1200;
 const EDIT_TOOL_NAMES = new Set([
     "edit", "edit_file", "write", "write_file", "writefile", "notebookedit",
     "notebook_edit", "multiedit", "multi_edit", "applypatch", "apply_patch",
@@ -940,6 +947,111 @@ function recordEvidence(host, hookName, payload, meta, env = process.env,
     } catch {
         return false;
     }
+}
+
+function _trainingCaptureScript(env = process.env) {
+    const root = (env && (env.ZMEM_ROOT || env.PLUGIN_ROOT ||
+        env.CLAUDE_PLUGIN_ROOT || env.ZCODE_PLUGIN_ROOT)) || getPluginRoot();
+    const script = join(root, "hooks", "lib", "zmem-training-capture.py");
+    return existsSync(script) ? script : "";
+}
+
+function _trainingCaptureSession(meta, env) {
+    return _firstNonEmptyString(
+        meta && meta.session_id, meta && meta.sessionId,
+        env && env.ZMEM_SESSION, env && env.CLAUDE_SESSION_ID,
+    );
+}
+
+function _trainingCaptureObservation(meta, hookName) {
+    const raw = _compactJson({ hook_name: hookName, callback: meta || {} });
+    if (!raw) return { hook_name: hookName };
+    try { return JSON.parse(raw); } catch { return { hook_name: hookName }; }
+}
+
+function _trainingCaptureInput(host, hookName, meta, env, action, extra = {}) {
+    const callback = meta && typeof meta === "object" && !Array.isArray(meta) ? meta : {};
+    const sessionId = _trainingCaptureSession(callback, env);
+    const input = {
+        action,
+        host,
+        hook_name: hookName,
+        session_id: sessionId,
+        namespace: _firstNonEmptyString(callback.namespace, env && env.ZMEM_NAMESPACE),
+        cwd: _firstNonEmptyString(
+            callback.cwd, env && env.CLAUDE_PROJECT_DIR,
+            env && env.CODEX_PROJECT_DIR, env && env.ZCODE_PROJECT_DIR,
+        ),
+        host_task_id: _firstNonEmptyString(
+            callback.host_task_id, callback.hostTaskId,
+            callback.task_id, callback.taskId,
+        ),
+        prompt: _firstNonEmptyString(
+            callback.prompt, callback.user_prompt, callback.userPrompt,
+            callback.user_message, callback.userMessage,
+        ),
+        assistant_response: _firstNonEmptyString(
+            callback.assistant_response, callback.assistantResponse,
+        ),
+        ...extra,
+    };
+    if (action === "observe") {
+        input.observation_kind = extra.observation_kind || "post_tool";
+        input.observation = _trainingCaptureObservation(callback, hookName);
+    }
+    return input;
+}
+
+function runTrainingCapture(host, hookName, meta, env = process.env,
+                            action = "observe", extra = {}, execFn = execFileSync) {
+    try {
+        if (!TRAINING_CAPTURE_HOSTS.has(host)) return {};
+        const script = _trainingCaptureScript(env);
+        if (!script || typeof execFn !== "function") return {};
+        const input = _trainingCaptureInput(host, hookName, meta, env, action, extra);
+        const encoded = safeJsonStringify(input, EVIDENCE_RAW_MAX_BYTES);
+        if (!encoded) return {};
+        const output = execFn(resolvePython(env), [script, "--action", action], {
+            input: encoded + "\n",
+            encoding: "utf8",
+            timeout: TRAINING_CAPTURE_TIMEOUT_MS,
+            env: { ...(env || {}), ZMEM_HOST: host },
+            stdio: ["pipe", "pipe", "ignore"],
+        });
+        const parsed = JSON.parse(String(output || "{}"));
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+        return {};
+    }
+}
+
+function _trainingCaptureAction(hookName) {
+    // SessionStart runs before a user prompt can establish a capture.  Avoid a
+    // needless Python subprocess on that hot path; the first UserPromptSubmit
+    // callback creates the partial and later hooks attach observations.
+    if (hookName === "session-start") return null;
+    if (hookName === "recall") return "start";
+    if (hookName === "session-end") return "clear";
+    return "observe";
+}
+
+function snapshotTrainingDelivery(host, hookName, meta, env, payload,
+                                  execFn = execFileSync) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return {};
+    const hasContext = Object.prototype.hasOwnProperty.call(payload, "rendered")
+        || Object.prototype.hasOwnProperty.call(payload, "additionalContext");
+    if (!hasContext) return {};
+    const rendered = typeof payload.rendered === "string" ? payload.rendered
+        : typeof payload.additionalContext === "string" ? payload.additionalContext : "";
+    const effectiveOps = Array.isArray(payload.effective_ops)
+        ? payload.effective_ops : Array.isArray(payload.effectiveOps)
+            ? payload.effectiveOps : [];
+    return runTrainingCapture(host, hookName, meta, env, "snapshot", {
+        rendered,
+        effective_ops: effectiveOps,
+        transform_version: typeof payload.transform_version === "string"
+            ? payload.transform_version : "v1",
+    }, execFn);
 }
 
 // --- Build the canonical ZMEM_* env for the child ---------------------------
@@ -1402,7 +1514,8 @@ async function main() {
     // exit 0. Pass-through hooks stay unwatched (documented residual).
     const translated = TRANSLATED_HOOKS.has(hookName);
     const outChunks = [];
-    const fireState = { child: null, host: "", budget: 0, env: null };
+    const fireState = { child: null, host: "", budget: 0, env: null,
+        meta: null };
     let watchdog = null;
     if (translated) {
         const watchdogMs = readPositiveIntMs(process.env, "ZMEM_LAUNCHER_WATCHDOG_MS",
@@ -1417,6 +1530,12 @@ async function main() {
             } catch {
                 envelope = {};
             }
+            try {
+                snapshotTrainingDelivery(
+                    fireState.host || detectHost(), hookName,
+                    fireState.meta || {}, fireState.env || process.env,
+                    extractPayload(raw));
+            } catch { /* capture is fail-open */ }
             process.stdout.write((safeJsonStringify(envelope) || "{}") + "\n");
             appendOuterTimeoutDecision(fireState.env || process.env, hookName, "launcher", {
                 tier0_emitted: hookName === "session-start" && extractPayload(raw) !== null,
@@ -1465,6 +1584,9 @@ async function main() {
     }
 
     const env = buildCanonicalEnv(host, prepared.meta, hookName);
+    fireState.host = host;
+    fireState.env = env;
+    fireState.meta = prepared.meta;
     let budget = resolveBudget(env);
     if (host === "codex" && budget > CODEX_ENVELOPE_CAP_BYTES) {
         // PRR-002 (#95): an explicitly-set operator budget above the codex
@@ -1483,6 +1605,15 @@ async function main() {
     // fitEnvelope but propagated unclamped to child shell scripts that read
     // $ZMEM_CTX_BUDGET directly.
     env.ZMEM_CTX_BUDGET = String(budget);
+
+    // Issue #135: create a store-owned partial before the child runs, then
+    // append observations on later callbacks. This is bounded and fail-open.
+    try {
+        const captureAction = _trainingCaptureAction(hookName);
+        if (captureAction) {
+            runTrainingCapture(host, hookName, prepared.meta, env, captureAction);
+        }
+    } catch { /* automatic capture never blocks the host */ }
 
     // Evidence is captured exactly once, after payload normalization and
     // before the delivery child is spawned.  The detached writer never awaits
@@ -1580,6 +1711,10 @@ async function main() {
             } catch {
                 envelope = {};
             }
+            try {
+                snapshotTrainingDelivery(host, hookName, prepared.meta, env,
+                    extractPayload(raw));
+            } catch { /* capture is fail-open */ }
             process.stdout.write((safeJsonStringify(envelope) || "{}") + "\n");
             // Translated hooks are always fail-open: exit 0 regardless of child.
             process.exit(0);
@@ -1622,6 +1757,8 @@ module.exports = {
     resolvePython,
     canonicalUtcNow,
     recordEvidence,
+    runTrainingCapture,
+    snapshotTrainingDelivery,
     extractPayload,
     makeEnvelope,
     encodedSize,

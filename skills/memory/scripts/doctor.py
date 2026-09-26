@@ -8,19 +8,24 @@ This command is deliberately side-effect free:
 
 Usage:
   python doctor.py [--project PATH] [--repo-root PATH] [--format human|json|both]
+  python doctor.py --cleanup-training-staging --training-output DIR \
+    --confirm-no-training-export
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
+import math
 import os
 import shutil
 import re
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -380,6 +385,429 @@ def _check_python() -> dict:
         version=version,
         interpreter=sys.executable,
     )
+
+
+def _check_training_dependency() -> dict:
+    """Report whether the optional issue #135 export dependency is installed.
+
+    Training capture remains usable without PyArrow, so this is a warning-only
+    check. Keep the remediation executable and tied to the requirements file
+    shipped beside doctor.py; installed plugin caches therefore get the same
+    guidance as a source checkout.
+    """
+    requirements = Path(__file__).with_name("requirements-training.txt")
+    install_command = (
+        f'"{sys.executable}" -m pip install --disable-pip-version-check '
+        f'-r "{requirements}"'
+    )
+    if not requirements.is_file():
+        return _check(
+            "training-dependency",
+            "warn",
+            "Training requirements file is missing; export-training cannot be "
+            "installed from this plugin tree.",
+            package="pyarrow",
+            requirements_file=str(requirements),
+            install_command=install_command,
+        )
+    try:
+        available = importlib.util.find_spec("pyarrow") is not None
+    except Exception as exc:
+        return _check(
+            "training-dependency",
+            "warn",
+            "PyArrow availability could not be determined for export-training.",
+            package="pyarrow",
+            requirements_file=str(requirements),
+            install_command=install_command,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    if not available:
+        return _check(
+            "training-dependency",
+            "warn",
+            "PyArrow is unavailable for export-training; install it with "
+            f"{install_command}.",
+            package="pyarrow",
+            requirements_file=str(requirements),
+            install_command=install_command,
+        )
+    return _check(
+        "training-dependency",
+        "pass",
+        "PyArrow is available for export-training.",
+        package="pyarrow",
+        requirements_file=str(requirements),
+        install_command=install_command,
+    )
+
+
+def _check_training_capture_health(store_path: Path) -> dict:
+    """Audit the local issue #135 side tables without opening a writer.
+
+    Capture rows are intentionally local-only, but a damaged or partially
+    refreshed store must be visible before an operator exports training data.
+    The check reports counts only, including final records past the fixed
+    retention window. It never installs tables, purges rows, or repairs
+    associations.
+    """
+    conn = _open_store_ro(store_path)
+    if conn is None:
+        return _check(
+            "training-capture",
+            "skip",
+            "Store is unavailable; training capture health was skipped.",
+        )
+    conn.row_factory = sqlite3.Row
+    required = {
+        "training_capture",
+        "training_delivery_snapshot",
+        "training_capture_completion",
+        "training_capture_observation",
+    }
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN (?, ?, ?, ?)",
+            tuple(sorted(required)),
+        ).fetchall()
+        present = {str(row[0]) for row in rows}
+        missing = sorted(required - present)
+        if missing:
+            return _check(
+                "training-capture",
+                "warn",
+                "Training capture tables are incomplete; run a writable zmem "
+                "command to install the additive local tables.",
+                missing_tables=missing,
+            )
+
+        counts: dict[str, int] = {}
+
+        def count(name: str, sql: str) -> None:
+            row = conn.execute(sql).fetchone()
+            counts[name] = int(row[0]) if row else 0
+
+        count(
+            "illegal_state",
+            "SELECT count(*) FROM training_capture WHERE state NOT IN "
+            "('partial', 'emitted_to_host', 'acknowledged', 'completed')",
+        )
+        count(
+            "missing_redaction_metadata",
+            "SELECT count(*) FROM training_capture WHERE "
+            "redaction_status IS NULL "
+            "OR redaction_status NOT IN ('redacted', 'metadata_only') "
+            "OR (redaction_status='redacted' AND "
+            "(redaction_policy_version IS NULL "
+            "OR trim(redaction_policy_version) = ''))",
+        )
+        count(
+            "orphan_snapshots",
+            "SELECT count(*) FROM training_delivery_snapshot s "
+            "LEFT JOIN training_capture c ON c.capture_id=s.capture_id "
+            "WHERE c.capture_id IS NULL",
+        )
+        count(
+            "orphan_completions",
+            "SELECT count(*) FROM training_capture_completion x "
+            "LEFT JOIN training_capture c ON c.capture_id=x.capture_id "
+            "WHERE c.capture_id IS NULL",
+        )
+        count(
+            "orphan_observations",
+            "SELECT count(*) FROM training_capture_observation o "
+            "LEFT JOIN training_capture c ON c.capture_id=o.capture_id "
+            "WHERE c.capture_id IS NULL",
+        )
+        count(
+            "illegal_state_transition",
+            "SELECT count(*) FROM training_capture c WHERE "
+            "(c.state IN ('emitted_to_host', 'acknowledged', 'completed') "
+            "AND NOT EXISTS (SELECT 1 FROM training_delivery_snapshot s "
+            "WHERE s.capture_id=c.capture_id)) "
+            "OR (c.state IN ('acknowledged', 'completed') "
+            "AND c.acknowledged_at IS NULL) "
+            "OR (c.state='completed' AND NOT EXISTS (SELECT 1 "
+            "FROM training_capture_completion x WHERE x.capture_id=c.capture_id)) "
+            "OR (c.state<>'completed' AND EXISTS (SELECT 1 "
+            "FROM training_capture_completion x WHERE x.capture_id=c.capture_id))",
+        )
+        count(
+            "revoked_records",
+            "SELECT count(*) FROM training_capture WHERE revoked_at IS NOT NULL",
+        )
+        count(
+            "expired_retention",
+            "SELECT count(*) FROM training_capture WHERE finalized_at IS NOT NULL "
+            "AND datetime(finalized_at, '+30 days') <= datetime('now')",
+        )
+
+        # The completion payload is a cache of the authoritative
+        # memory_evidence rows. Compare it with the store-owned association so
+        # a hand-edited or interrupted completion cannot go unnoticed.
+        association_mismatch = 0
+        try:
+            completions = conn.execute(
+                "SELECT capture_id, evidence_id, associated_memory_ids_json "
+                "FROM training_capture_completion"
+            ).fetchall()
+            for completion in completions:
+                try:
+                    supplied = json.loads(completion["associated_memory_ids_json"])
+                    supplied_ids = sorted({str(value) for value in supplied})
+                except (TypeError, ValueError):
+                    association_mismatch += 1
+                    continue
+                actual_rows = conn.execute(
+                    "SELECT memory_id FROM memory_evidence WHERE evidence_id=?",
+                    (completion["evidence_id"],),
+                ).fetchall()
+                actual_ids = sorted({str(row[0]) for row in actual_rows})
+                if supplied_ids != actual_ids:
+                    association_mismatch += 1
+        except sqlite3.Error:
+            # Older or damaged stores may not have evidence tables yet; the
+            # schema check reports that condition separately.
+            association_mismatch = 0
+        counts["source_memory_mismatch"] = association_mismatch
+    except sqlite3.Error as exc:
+        return _check(
+            "training-capture",
+            "warn",
+            "Training capture tables could not be audited read-only.",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    finally:
+        conn.close()
+
+    revoked_records = counts.get("revoked_records", 0)
+    # Revocation is a normal governed terminal outcome. Keep its count in the
+    # report for operator visibility, but do not classify it as corruption.
+    problems = {
+        name: value
+        for name, value in counts.items()
+        if value and name != "revoked_records"
+    }
+    if problems:
+        labels = ", ".join(f"{name}={value}" for name, value in sorted(problems.items()))
+        return _check(
+            "training-capture",
+            "warn",
+            f"Training capture health needs review ({labels}).",
+            issues=problems,
+            revoked_records=revoked_records,
+        )
+    revoked_note = (
+        f" {revoked_records} revoked record(s) remain excluded from export."
+        if revoked_records
+        else ""
+    )
+    return _check(
+        "training-capture",
+        "pass",
+        "Training capture tables and local associations are consistent."
+        + revoked_note,
+        issues={},
+        revoked_records=revoked_records,
+    )
+
+
+def _training_output_path(training_output: str | Path) -> Path:
+    output = Path(training_output).expanduser()
+    if not output.is_absolute():
+        output = Path.cwd() / output
+    return Path(os.path.abspath(str(output)))
+
+
+def _training_staging_parent(
+    project: Path, training_output: str | Path | None = None
+) -> Path:
+    """Resolve the direct parent in which export-training stages output."""
+    if training_output is None:
+        return project
+    return _training_output_path(training_output).parent
+
+
+def _is_link_like(path: Path) -> bool:
+    """Reject symlinks and Windows reparse points for cleanup targets."""
+    try:
+        if path.is_symlink():
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        return bool(attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _training_staging_candidates(parent: Path) -> list[Path]:
+    """List only direct, non-symlink staging-directory children."""
+    if not parent.is_dir() or _is_link_like(parent):
+        return []
+    return sorted(
+        path
+        for path in parent.iterdir()
+        if path.name.startswith(".training-staging-")
+        and path.is_dir()
+        and not _is_link_like(path)
+    )
+
+
+def _check_training_staging(
+    project: Path, training_output: str | Path | None = None
+) -> dict:
+    """Find abandoned staging siblings without changing the filesystem."""
+    parent = _training_staging_parent(project, training_output)
+    if not parent.is_dir() or _is_link_like(parent):
+        return _check(
+            "training-staging",
+            "skip",
+            "Training output parent is unavailable; training staging was skipped.",
+            parent=_display_path(parent),
+            output_dir=_display_path(training_output) if training_output else None,
+        )
+    try:
+        candidates = _training_staging_candidates(parent)
+    except OSError as exc:
+        return _check(
+            "training-staging",
+            "warn",
+            "Training staging directories could not be inspected.",
+            error=f"{type(exc).__name__}: {exc}",
+            parent=_display_path(parent),
+            output_dir=_display_path(training_output) if training_output else None,
+        )
+    if candidates:
+        return _check(
+            "training-staging",
+            "warn",
+            f"Found {len(candidates)} incomplete training export staging "
+            "directory(s); inspect and remove them after confirming no export "
+            "is running.",
+            paths=[_display_path(path) for path in candidates[:10]],
+            count=len(candidates),
+            parent=_display_path(parent),
+            output_dir=_display_path(training_output) if training_output else None,
+        )
+    return _check(
+        "training-staging",
+        "pass",
+        "No incomplete training export staging directories found.",
+        count=0,
+        parent=_display_path(parent),
+        output_dir=_display_path(training_output) if training_output else None,
+    )
+
+
+def _training_staging_latest_mtime(path: Path) -> float | None:
+    """Return the newest mtime without following symlinked children."""
+    latest = 0.0
+    pending = [path]
+    try:
+        while pending:
+            current = pending.pop()
+            latest = max(latest, current.stat().st_mtime)
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    if entry.is_symlink() or _is_link_like(child := Path(entry.path)):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(child)
+                    else:
+                        latest = max(latest, entry.stat(follow_symlinks=False).st_mtime)
+    except OSError:
+        return None
+    return latest
+
+
+def _cleanup_training_staging(
+    project: Path,
+    training_output: str | Path,
+    *,
+    max_age_hours: float = 24.0,
+    confirm_no_training_export: bool = False,
+) -> dict:
+    """Opt-in cleanup of stale direct staging siblings.
+
+    Normal doctor runs never call this function. The caller must explicitly
+    confirm that no export is active. A candidate is removed only
+    when it is a direct, non-symlink child of the explicit output parent and
+    every observed mtime is older than ``max_age_hours``. A second mtime probe
+    immediately before removal skips candidates that changed, which protects a
+    concurrently active exporter while it is writing. No claim is made that
+    age can prove a dead process; callers should still confirm no export is
+    running before using this explicit cleanup action.
+    """
+    if max_age_hours <= 0 or not math.isfinite(max_age_hours):
+        raise ValueError("max_age_hours must be a finite positive number")
+    output_path = _training_output_path(training_output)
+    parent = output_path.parent
+    details = {
+        "parent": _display_path(parent),
+        "output_dir": _display_path(training_output),
+        "max_age_hours": max_age_hours,
+        "removed": [],
+        "skipped_recent": [],
+        "errors": [],
+    }
+    if (
+        not str(training_output).strip()
+        or output_path.name.startswith(".training-staging-")
+        or _is_link_like(output_path)
+    ):
+        details["errors"].append(
+            "training output must be a non-link path outside the staging-name namespace"
+        )
+        details["status"] = "warn"
+        return details
+    if not confirm_no_training_export:
+        details["errors"].append(
+            "explicit confirmation that no training export is active is required"
+        )
+        details["status"] = "warn"
+        return details
+    if not parent.is_dir() or _is_link_like(parent):
+        details["errors"].append("output parent is unavailable or symlinked")
+        details["status"] = "warn"
+        return details
+
+    cutoff = time.time() - (max_age_hours * 60 * 60)
+    try:
+        candidates = _training_staging_candidates(parent)
+    except OSError as exc:
+        details["errors"].append(f"{type(exc).__name__}: {exc}")
+        details["status"] = "warn"
+        return details
+
+    for candidate in candidates:
+        before = _training_staging_latest_mtime(candidate)
+        if before is None or before >= cutoff:
+            details["skipped_recent"].append(_display_path(candidate))
+            continue
+        after = _training_staging_latest_mtime(candidate)
+        if (
+            after is None
+            or after != before
+            or after >= cutoff
+            or candidate.parent != parent
+            or _is_link_like(candidate)
+            or not candidate.is_dir()
+        ):
+            details["skipped_recent"].append(_display_path(candidate))
+            continue
+        try:
+            shutil.rmtree(candidate)
+        except OSError as exc:
+            details["errors"].append(
+                f"{_display_path(candidate)}: {type(exc).__name__}: {exc}"
+            )
+        else:
+            details["removed"].append(_display_path(candidate))
+
+    details["status"] = "warn" if details["errors"] else "pass"
+    return details
 
 
 def _check_sqlite_fts5() -> dict:
@@ -3246,6 +3674,49 @@ def _recommendations(checks: list[dict]) -> list[str]:
         notes.append(
             f"Run the first writable zmem command only after the shared store path is correct; that first run may need to initialize or migrate schema v{CURRENT_SCHEMA_VERSION}."
         )
+    training = by_id.get("training-dependency", {})
+    if training.get("status") == "warn":
+        command = training.get("details", {}).get("install_command")
+        if command:
+            notes.append(
+                "PyArrow is unavailable for export-training. Install the "
+                f"declared training dependency with {command}, then reload the "
+                "host and rerun doctor."
+            )
+    capture = by_id.get("training-capture", {})
+    if capture.get("status") == "warn":
+        missing = capture.get("details", {}).get("missing_tables") or []
+        expired = capture.get("details", {}).get("issues", {}).get(
+            "expired_retention", 0
+        )
+        if missing:
+            notes.append(
+                "The local training capture tables are incomplete "
+                f"({', '.join(missing)}); run a writable zmem command to let "
+                "the additive initializer install them, then rerun doctor."
+            )
+        elif expired:
+            notes.append(
+                f"{expired} finalized training capture record(s) exceeded the "
+                "30-day local retention window. Run `python <store.py> "
+                "purge-training-captures --confirm`; doctor remains read-only, "
+                "and session-cadence also sweeps expired capture rows before "
+                "backup."
+            )
+        else:
+            notes.append(
+                "Training capture state needs review before export; inspect the "
+                "training-capture check and repair the source workflow, then "
+                "rerun doctor. Doctor never repairs capture rows."
+            )
+    staging = by_id.get("training-staging", {})
+    if staging.get("status") == "warn":
+        paths = staging.get("details", {}).get("paths") or []
+        shown = ", ".join(str(path) for path in paths[:3])
+        notes.append(
+            "Training export staging output is present; confirm no export is "
+            f"running, then remove the abandoned staging directory(s){': ' + shown if shown else ''}."
+        )
     emb = by_id.get("embeddings", {})
     if emb.get("status") == "warn":
         reason = emb.get("details", {}).get("reason")
@@ -3312,6 +3783,14 @@ def _render_human(report: dict) -> str:
     )
     lines.append(f"Resolved store: {report['resolved_store']}")
     lines.append(f"Project namespace: {report.get('namespace') or '(not resolved)'}")
+    cleanup = report.get("training_staging_cleanup")
+    if cleanup is not None:
+        lines.append(
+            "Training staging cleanup: "
+            f"{cleanup.get('status', 'unknown')} "
+            f"removed={len(cleanup.get('removed', []))} "
+            f"skipped_recent={len(cleanup.get('skipped_recent', []))}"
+        )
     lines.append("")
     for check in report["checks"]:
         lines.append(f"[{check['status'].upper()}] {check['id']}: {check['summary']}")
@@ -3796,6 +4275,17 @@ def _positive_int(value: str) -> int:
     return iv
 
 
+def _positive_float(value: str) -> float:
+    """argparse type for finite positive durations."""
+    try:
+        fv = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid number: {value!r}")
+    if not math.isfinite(fv) or fv <= 0:
+        raise argparse.ArgumentTypeError(f"must be finite and > 0 (got {value})")
+    return fv
+
+
 def _check_miss_rate(
     resolved_store: "str | Path", opts: dict, store_explicit: bool = False
 ) -> dict:
@@ -3965,8 +4455,28 @@ def _check_miss_rate(
 
 
 def build_report(
-    project: Path, repo_root: Path, store_override=None, miss_rate_opts=None
+    project: Path,
+    repo_root: Path,
+    store_override=None,
+    miss_rate_opts=None,
+    *,
+    training_output: str | Path | None = None,
+    cleanup_training_staging: bool = False,
+    training_staging_max_age_hours: float = 24.0,
+    confirm_no_training_export: bool = False,
 ) -> dict:
+    staging_cleanup = None
+    if cleanup_training_staging:
+        if training_output is None:
+            raise ValueError(
+                "training_output is required for cleanup_training_staging"
+            )
+        staging_cleanup = _cleanup_training_staging(
+            project,
+            training_output,
+            max_age_hours=training_staging_max_age_hours,
+            confirm_no_training_export=confirm_no_training_export,
+        )
     resolved_store = (
         Path(store_override).expanduser()
         if store_override
@@ -3984,11 +4494,18 @@ def build_report(
     # Issue #71 E: leftover second stores with live rows not in canonical.
     checks.append(_check_second_stores(resolved_store))
     checks.append(_check_python())
+    # Issue #135: PyArrow is optional for capture but required for the
+    # export-training Parquet views. Warn with the exact shipped install path.
+    checks.append(_check_training_dependency())
     checks.append(_check_sqlite_fts5())
     checks.extend(_check_node_and_bash())
     access_check = _check_store_access(resolved_store)
     checks.append(access_check)
     checks.append(_check_schema(resolved_store, access_check))
+    # Issue #135: local capture tables and completion associations are audited
+    # read-only; the check never initializes or repairs the side tables.
+    checks.append(_check_training_capture_health(resolved_store))
+    checks.append(_check_training_staging(project, training_output))
     checks.append(_check_v9_columns(resolved_store))
     checks.append(_check_entity_tables(resolved_store))
     # v11 (issue #61, 6.1): link surface + trust range probe.
@@ -4065,6 +4582,7 @@ def build_report(
         "namespace": namespace,
         "checks": checks,
         "recommendations": recommendations,
+        "training_staging_cleanup": staging_cleanup,
     }
 
 
@@ -4092,6 +4610,29 @@ def main(argv: list[str] | None = None) -> int:
         help="explicit store path — repoints the WHOLE report at this store "
         "(e.g. a snapshot copy; every check reads it instead of the "
         "env-resolved store)",
+    )
+    ap.add_argument(
+        "--training-output",
+        default=None,
+        help="export-training output DIR; doctor checks its direct sibling "
+        ".training-staging-* directories instead of the project root",
+    )
+    ap.add_argument(
+        "--cleanup-training-staging",
+        action="store_true",
+        help="explicitly remove only stale direct staging siblings; requires "
+        "--training-output and --confirm-no-training-export",
+    )
+    ap.add_argument(
+        "--confirm-no-training-export",
+        action="store_true",
+        help="confirm no export is active before explicit staging cleanup",
+    )
+    ap.add_argument(
+        "--training-staging-max-age-hours",
+        type=_positive_float,
+        default=24.0,
+        help="minimum age for explicit staging cleanup (default: 24 hours)",
     )
     ap.add_argument(
         "--miss-rate",
@@ -4157,6 +4698,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
+    if args.cleanup_training_staging:
+        if not args.training_output:
+            ap.error("--cleanup-training-staging requires --training-output DIR")
+        if not args.confirm_no_training_export:
+            ap.error(
+                "--cleanup-training-staging requires "
+                "--confirm-no-training-export"
+            )
+
     miss_rate_opts = None
     if args.miss_rate:
         miss_rate_opts = {
@@ -4175,6 +4725,10 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.repo_root).expanduser(),
         store_override=args.store,
         miss_rate_opts=miss_rate_opts,
+        training_output=args.training_output,
+        cleanup_training_staging=args.cleanup_training_staging,
+        training_staging_max_age_hours=args.training_staging_max_age_hours,
+        confirm_no_training_export=args.confirm_no_training_export,
     )
     human = _render_human(report)
     payload = json.dumps(report, indent=2, sort_keys=True)

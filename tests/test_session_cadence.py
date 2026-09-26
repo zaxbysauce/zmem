@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -77,6 +79,39 @@ class SessionCadenceTests(unittest.TestCase):
         self.assertIn("organize:", r.stdout)
         self.assertIn("backup:", r.stdout)
         self.assertIn("sweep:", r.stdout)
+
+    def test_cadence_purges_expired_capture_before_backup(self):
+        self.assertEqual(self._run("init").returncode, 0)
+        expired_id = str(uuid.uuid4())
+        partial_id = str(uuid.uuid4())
+        conn = sqlite3.connect(self.store)
+        for capture_id, state, finalized_at in (
+            (expired_id, "completed", "2000-01-01T00:00:00Z"),
+            (partial_id, "partial", None),
+        ):
+            conn.execute(
+                "INSERT INTO training_capture("
+                "capture_id, host, created_at, updated_at, finalized_at, state, "
+                "redaction_status, governance_source) VALUES (?, 'test', "
+                "'2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z', ?, ?, "
+                "'metadata_only', 'test')",
+                (capture_id, finalized_at, state),
+            )
+        conn.commit()
+        conn.close()
+
+        result = self._run("session-cadence", "--backup-retention", "7")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("training-captures: purged=1", result.stdout)
+        conn = sqlite3.connect(self.store)
+        self.assertIsNone(conn.execute(
+            "SELECT 1 FROM training_capture WHERE capture_id=?", (expired_id,)
+        ).fetchone())
+        self.assertIsNotNone(conn.execute(
+            "SELECT 1 FROM training_capture WHERE capture_id=?", (partial_id,)
+        ).fetchone())
+        conn.close()
 
     def test_second_run_is_cadence_noop(self):
         """Hard assertion (critic-required; cubic#76 + Claude Code round 4):

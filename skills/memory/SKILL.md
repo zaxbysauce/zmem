@@ -1811,6 +1811,99 @@ Entity links are deliberately NOT carried in the JSONL (they are store-local
 derived data, like embeddings and content_norm): the receiving store rebuilds
 them by re-running the deterministic extractor on ingest — see below.
 
+### Governed training capture and export (issue #135)
+
+Automatic Claude, Codex, ZCode, and Hermes hooks may create a partial training
+capture. Capture governance defaults to deny and a denied or missing policy
+stores metadata only; local capture consent permits redacted partial storage
+but does not authorize export. A capture is exportable only after the actual
+injection result has been snapshotted, a trusted workflow has acknowledged the
+delivery, and a verifier has completed the capture with a supported outcome,
+evidence id, scoped memory ids, current export governance, and any required
+reviewer correction fields. Hook observations, Stop, tool success/failure,
+and displayed text never complete a capture.
+
+The explicit trusted local adapters accept reviewed JSON input and keep the
+state transitions separate:
+
+```bash
+python <store.py> capture-training-delivery --input delivery.json
+python <store.py> capture-training-acknowledge --input acknowledgement.json
+python <store.py> capture-training-completion --input completion.json
+```
+
+The delivery response contains the local `capture_id` and immutable
+`delivery_snapshot_id`; later adapters resolve the capture through the snapshot
+id. `host_task_id` is correlation metadata only when the host supplies it.
+Replayed compatible inputs are idempotent, while conflicting snapshots or
+completion data are refused.
+
+Finalized and revoked capture records, their local delivery/completion/
+observation rows, remain for 30 days. The detached `session-cadence` task
+attempts the purge before its backup step; a successful purge keeps expired
+records out of new backups. Doctor reports overdue rows but stays
+read-only; an operator can run the explicit cleanup instead:
+
+```bash
+python <store.py> purge-training-captures --confirm
+```
+
+Before enabling export, install PyArrow in the store-host interpreter:
+
+```bash
+python -m pip install --disable-pip-version-check \
+  -r skills/memory/scripts/requirements-training.txt
+```
+
+The Hermes server environment can use its packaged requirements file instead:
+
+```bash
+python -m pip install --disable-pip-version-check \
+  -r hermes-plugin/server/requirements.txt
+```
+
+The read-only doctor reports the exact requirements-file command when PyArrow
+is unavailable. Reload the host after updating a plugin cache and run doctor
+before exporting.
+
+### export-training — write reviewed SFT and preference views
+
+```bash
+python <store.py> export-training DIR --snapshot-id ID \
+  --reviewer-confirmed [--namespace NS] [--quarantine-raw]
+```
+
+`--snapshot-id` selects the immutable source export snapshot and
+`--reviewer-confirmed` is a required export authorization. Both are checked
+before SQLite opens or output is created. `DIR` is the training output
+directory itself and contains the fixed `sft-000.parquet`,
+`preferences-000.parquet`, `manifest.json`, and `deletion-map.json` artifacts
+directly. Empty eligible selections still produce schema-only Parquet files. A
+missing PyArrow dependency or unavailable local model for a nonempty semantic
+export fails closed before publish.
+
+`--quarantine-raw` writes a separate bounded, redacted derived dump under
+`DIR/quarantine/` with `DIR/quarantine-manifest.json`. It does not change
+capture state or make denied, revoked, incomplete, or otherwise excluded
+captures eligible. Training vectors are in-memory only and never sync or back
+up. Output is published from a validated same-volume staging
+directory, with the final manifest written last; consumers must reject output
+without a valid manifest. Doctor reports abandoned staging directories but is
+read-only by default. After confirming no export is running, an operator can
+explicitly remove only stale direct, non-symlink `.training-staging-*` siblings
+of `DIR`:
+
+```bash
+python <doctor.py> --project . --training-output ./training \
+  --cleanup-training-staging --confirm-no-training-export
+```
+
+The cleanup skips candidates newer than 24 hours and rechecks mtimes before
+removal. For `./training`, a candidate is `./.training-staging-*`. The
+exporter has no cross-process lock that doctor could use to prove an export is
+inactive, so the confirmation flag is an operator assertion. Revoked captures
+are reported as an informational count and remain ineligible for export.
+
 v13 (issue #65, 10.7): every row carries a `kind` discriminator (`"memory"`);
 episodes round-trip as additional `"episode"` and `"episode_memory"`
 records when any exist (memberships are emitted only when both endpoints are
