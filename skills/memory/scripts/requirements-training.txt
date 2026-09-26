@@ -1,0 +1,4 @@
+# Disposable SFT/preference export support for issue #135.
+# Keep a Python 3.11 compatible range while allowing host environments to
+# resolve an already installed Arrow build without an exact-pin conflict.
+pyarrow>=14.0.0,<26.0.0

@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1404,6 +1405,280 @@ class PythonFloorTest(unittest.TestCase):
             self.skipTest("interpreter is below the 3.11 floor")
         check = doctor._check_python()
         self.assertEqual(check["status"], "pass", check)
+
+
+class TrainingDependencyCheckTest(unittest.TestCase):
+    """Issue #135: doctor gives a precise, warning-only PyArrow remediation."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scripts = REPO_ROOT / "skills" / "memory" / "scripts"
+        sys.path.insert(0, str(cls.scripts))
+
+    def test_missing_pyarrow_names_declared_install_command(self):
+        import doctor  # noqa: E402
+        from unittest import mock  # noqa: E402
+
+        with mock.patch.object(doctor.importlib.util, "find_spec", return_value=None):
+            check = doctor._check_training_dependency()
+        self.assertEqual(check["status"], "warn", check)
+        self.assertIn("PyArrow is unavailable", check["summary"], check)
+        command = check["details"]["install_command"]
+        self.assertIn("-r", command)
+        self.assertIn("requirements-training.txt", command)
+        self.assertIn(command, " ".join(doctor._recommendations([check])))
+
+    def test_available_pyarrow_passes(self):
+        import doctor  # noqa: E402
+        from unittest import mock  # noqa: E402
+
+        with mock.patch.object(doctor.importlib.util, "find_spec", return_value=object()):
+            check = doctor._check_training_dependency()
+        self.assertEqual(check["status"], "pass", check)
+
+    def test_missing_capture_tables_warn_without_creating_them(self):
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-training-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / "store.sqlite"
+        conn = sqlite3.connect(str(path))
+        conn.execute("CREATE TABLE marker(value TEXT)")
+        conn.commit()
+        conn.close()
+        before = path.read_bytes()
+
+        check = doctor._check_training_capture_health(path)
+
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(set(check["details"]["missing_tables"]), {
+            "training_capture",
+            "training_delivery_snapshot",
+            "training_capture_completion",
+            "training_capture_observation",
+        })
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_healthy_capture_tables_pass(self):
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-training-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / "store.sqlite"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            """
+            CREATE TABLE training_capture(
+                capture_id TEXT PRIMARY KEY, state TEXT,
+                redaction_status TEXT, redaction_policy_version TEXT,
+                acknowledged_at TEXT, revoked_at TEXT
+            );
+            CREATE TABLE training_delivery_snapshot(
+                delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
+            );
+            CREATE TABLE training_capture_completion(
+                capture_id TEXT PRIMARY KEY, evidence_id TEXT,
+                associated_memory_ids_json TEXT
+            );
+            CREATE TABLE training_capture_observation(
+                observation_id TEXT PRIMARY KEY, capture_id TEXT
+            );
+            CREATE TABLE memory_evidence(memory_id TEXT, evidence_id TEXT);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        check = doctor._check_training_capture_health(path)
+
+        self.assertEqual(check["status"], "pass", check)
+        self.assertEqual(check["details"]["issues"], {})
+
+    def test_metadata_only_partial_without_policy_version_passes(self):
+        """Default-deny metadata-only partials do not need a policy version."""
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-metadata-only-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / "store.sqlite"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            """
+            CREATE TABLE training_capture(
+                capture_id TEXT PRIMARY KEY, state TEXT,
+                redaction_status TEXT, redaction_policy_version TEXT,
+                acknowledged_at TEXT, revoked_at TEXT
+            );
+            CREATE TABLE training_delivery_snapshot(
+                delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
+            );
+            CREATE TABLE training_capture_completion(
+                capture_id TEXT PRIMARY KEY, evidence_id TEXT,
+                associated_memory_ids_json TEXT
+            );
+            CREATE TABLE training_capture_observation(
+                observation_id TEXT PRIMARY KEY, capture_id TEXT
+            );
+            CREATE TABLE memory_evidence(memory_id TEXT, evidence_id TEXT);
+            INSERT INTO training_capture(
+                capture_id, state, redaction_status, redaction_policy_version
+            ) VALUES ('capture-denied', 'partial', 'metadata_only', NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        check = doctor._check_training_capture_health(path)
+
+        self.assertEqual(check["status"], "pass", check)
+        self.assertEqual(check["details"]["issues"], {})
+        self.assertEqual(check["details"]["revoked_records"], 0)
+
+    def test_revoked_capture_is_informational(self):
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-revoked-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / "store.sqlite"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            """
+            CREATE TABLE training_capture(
+                capture_id TEXT PRIMARY KEY, state TEXT,
+                redaction_status TEXT, redaction_policy_version TEXT,
+                acknowledged_at TEXT, revoked_at TEXT
+            );
+            CREATE TABLE training_delivery_snapshot(
+                delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
+            );
+            CREATE TABLE training_capture_completion(
+                capture_id TEXT PRIMARY KEY, evidence_id TEXT,
+                associated_memory_ids_json TEXT
+            );
+            CREATE TABLE training_capture_observation(
+                observation_id TEXT PRIMARY KEY, capture_id TEXT
+            );
+            CREATE TABLE memory_evidence(memory_id TEXT, evidence_id TEXT);
+            INSERT INTO training_capture(
+                capture_id, state, redaction_status, redaction_policy_version,
+                revoked_at
+            ) VALUES ('capture-revoked', 'partial', 'metadata_only', NULL,
+                      '2026-09-26T12:00:00Z');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        check = doctor._check_training_capture_health(path)
+
+        self.assertEqual(check["status"], "pass", check)
+        self.assertEqual(check["details"]["issues"], {})
+        self.assertEqual(check["details"]["revoked_records"], 1)
+        self.assertIn("revoked", check["summary"])
+
+    def test_abandoned_staging_directory_is_reported(self):
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-project-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        staging = tmp / ".training-staging-test"
+        staging.mkdir()
+
+        check = doctor._check_training_staging(tmp)
+
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["details"]["count"], 1, check)
+        self.assertIn(".training-staging-test", check["details"]["paths"][0])
+
+    def test_staging_check_uses_explicit_output_parent(self):
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-output-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        output_parent = tmp / "nested" / "exports"
+        output_parent.mkdir(parents=True)
+        output = output_parent / "training"
+        staging = output_parent / ".training-staging-nested"
+        staging.mkdir()
+        root_staging = tmp / ".training-staging-root"
+        root_staging.mkdir()
+
+        check = doctor._check_training_staging(tmp, output)
+
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["details"]["count"], 1, check)
+        self.assertIn(".training-staging-nested", check["details"]["paths"][0])
+        self.assertNotIn(".training-staging-root", check["details"]["paths"])
+        self.assertIn("exports", check["details"]["parent"])
+
+    def test_explicit_cleanup_removes_only_stale_direct_candidates(self):
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-cleanup-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        output_parent = tmp / "exports"
+        output_parent.mkdir()
+        output = output_parent / "training"
+        stale = output_parent / ".training-staging-stale"
+        stale.mkdir()
+        (stale / "partial.parquet").write_bytes(b"partial")
+        old = time.time() - (48 * 60 * 60)
+        os.utime(stale / "partial.parquet", (old, old))
+        os.utime(stale, (old, old))
+        recent = output_parent / ".training-staging-recent"
+        recent.mkdir()
+        (recent / "partial.parquet").write_bytes(b"active")
+        keep = output_parent / "keep.txt"
+        keep.write_text("retain", encoding="utf-8")
+        outside = tmp / ".training-staging-outside"
+        outside.mkdir()
+
+        result = doctor._cleanup_training_staging(
+            tmp,
+            output,
+            max_age_hours=24.0,
+            confirm_no_training_export=True,
+        )
+
+        self.assertEqual(result["status"], "pass", result)
+        self.assertEqual(len(result["removed"]), 1, result)
+        self.assertEqual(len(result["skipped_recent"]), 1, result)
+        self.assertFalse(stale.exists())
+        self.assertTrue(recent.is_dir())
+        self.assertTrue(keep.is_file())
+        self.assertTrue(outside.is_dir())
+
+    def test_explicit_cleanup_requires_no_export_confirmation(self):
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-confirm-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        output_parent = tmp / "exports"
+        output_parent.mkdir()
+        output = output_parent / "training"
+        staging = output_parent / ".training-staging-confirm"
+        staging.mkdir()
+        old = time.time() - (48 * 60 * 60)
+        os.utime(staging, (old, old))
+
+        result = doctor._cleanup_training_staging(tmp, output, max_age_hours=24.0)
+
+        self.assertEqual(result["status"], "warn", result)
+        self.assertTrue(staging.is_dir())
+        self.assertIn("confirmation", result["errors"][0])
+
+    def test_default_staging_check_does_not_delete(self):
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-readonly-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        staging = tmp / ".training-staging-readonly"
+        staging.mkdir()
+
+        check = doctor._check_training_staging(tmp)
+
+        self.assertEqual(check["status"], "warn", check)
+        self.assertTrue(staging.is_dir())
 
 
 class EmbeddingsHealthCheckTest(unittest.TestCase):

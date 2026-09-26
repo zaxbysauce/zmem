@@ -3,7 +3,8 @@
 
 The host hooks own event decoding and transport wrapping. ``store.py`` owns
 selection, budgeting, rendering, surfaced telemetry, and delivery state. This
-adapter consumes only the envelope's string ``rendered`` member.
+adapter consumes the envelope's string ``rendered`` member and, when capture is
+enabled, forwards the store-owned ``effective_ops`` list as delivery metadata.
 Decision lines carry ``sid=<sanitized session id>`` (or ``sid=unknown`` when
 the host supplies no session id) and a closed-set ``moment=`` attribution.
 
@@ -552,12 +553,15 @@ def _query_for(mode: str, event: dict) -> str:
     return value[:_POSTTOOLBATCH_QUERY_CAP]
 
 
-def _emit(rendered: str) -> None:
+def _emit(rendered: str, effective_ops: object = None) -> None:
     if not isinstance(rendered, str) or not rendered:
         print("{}")
         return
-    encoded = json.dumps({"additionalContext": rendered}, ensure_ascii=False,
-                         separators=(",", ":"))
+    payload = {"additionalContext": rendered}
+    if isinstance(effective_ops, list) and all(isinstance(item, str)
+                                               for item in effective_ops):
+        payload["effective_ops"] = effective_ops
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     # U+2028/U+2029 are valid JSON but remain line separators in some host
     # transports; keep the output one physical line for hook runners.
     print(encoded.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
@@ -744,7 +748,7 @@ def main() -> int:
         t_ms=attribution_t_ms,
         rewrite=rewrite_applied,
     )
-    _emit(rendered)
+    _emit(rendered, envelope.get("effective_ops"))
     if mode == "precompact":
         _clear_delivery_state(store_py, session_id)
     return 0

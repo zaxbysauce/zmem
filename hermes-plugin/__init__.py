@@ -18,6 +18,7 @@ so ``ZMEM_HOME`` is optional for a standalone install.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -77,6 +78,12 @@ _NATIVE_EVIDENCE_WORKERS = 2
 _NATIVE_EVIDENCE_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=_NATIVE_EVIDENCE_QUEUE_MAX)
 _NATIVE_EVIDENCE_START_LOCK = threading.Lock()
 _NATIVE_EVIDENCE_STARTED = False
+_TRAINING_CAPTURE_TIMEOUT_S = 1.2
+_TRAINING_CAPTURE_INFLIGHT_MAX = 4
+_TRAINING_CAPTURE_INFLIGHT = threading.BoundedSemaphore(_TRAINING_CAPTURE_INFLIGHT_MAX)
+_CAPTURE_STORE_ENV: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "zmem_capture_store_env", default=False,
+)
 
 
 def _resolve_zmem_home() -> Optional[Path]:
@@ -518,6 +525,7 @@ def _rewrite_provider_query(
 
 def _run_passive_store(
     args: List[str], timing: Optional[Dict[str, int]] = None,
+    *, capture: bool = False,
 ) -> Dict[str, Any]:
     """Run a passive command without allowing adapter failures to escape.
 
@@ -525,7 +533,15 @@ def _run_passive_store(
     store attempt behind a decision line can carry its measured ``t_ms``.
     """
     try:
-        result = _run_store(args, timing=timing)
+        marker = _CAPTURE_STORE_ENV.set(capture)
+        try:
+            # Preserve the historical call shape for provider/test adapters
+            # that replace _run_store with a narrow fail-open seam.  The real
+            # subprocess helper reads the context marker below and adds the
+            # capture envelope flag only to that child process.
+            result = _run_store(args, timing=timing)
+        finally:
+            _CAPTURE_STORE_ENV.reset(marker)
     except Exception as exc:  # pragma: no cover - defensive seam for hosts
         logger.debug("zmem passive store call failed (%s)", exc)
         return {"ok": False, "stdout": "", "stderr": "", "returncode": 1}
@@ -564,6 +580,7 @@ def _sanitize_store_error(r: Dict[str, Any], limit: int = 200) -> str:
 def _run_store(
     args: List[str], input_text: str | None = None,
     timing: Optional[Dict[str, int]] = None,
+    env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Run ``store.py <args>`` and return ``{ok, stdout, stderr, returncode}``.
 
@@ -581,6 +598,9 @@ def _run_store(
             "returncode": 127,
         }
     cmd = [_python_bin(), str(store_py), *args]
+    if env is None and _CAPTURE_STORE_ENV.get():
+        env = os.environ.copy()
+        env["ZMEM_CAPTURE"] = "1"
     # Start at the exact subprocess boundary.  Path resolution is outside this
     # interval, matching the MCP server's attributed timing contract.
     started = time.perf_counter()
@@ -602,6 +622,7 @@ def _run_store(
             encoding="utf-8",
             errors="replace",
             timeout=command_timeout,
+            env=env,
         )
         _record_timing()
         return {
@@ -626,6 +647,58 @@ def _run_store(
             "stderr": f"store.py failed: {exc}",
             "returncode": 1,
         }
+
+
+def _training_capture_script() -> Optional[Path]:
+    home = _resolve_zmem_home()
+    if home is None:
+        return None
+    script = home / "hooks" / "lib" / "zmem-training-capture.py"
+    return script if script.is_file() else None
+
+
+def _run_training_capture(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Invoke the shared partial-capture adapter without exposing failures."""
+    script = _training_capture_script()
+    if script is None or action not in {"start", "observe", "snapshot", "clear"}:
+        return {}
+    request = dict(payload)
+    request["action"] = action
+    encoded = _safe_json_dumps(request, max_bytes=64 * 1024)
+    if encoded is None:
+        return {}
+    try:
+        proc = subprocess.run(
+            [_python_bin(), str(script), "--action", action],
+            input=encoded + "\n", capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_TRAINING_CAPTURE_TIMEOUT_S,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {}
+        decoded = json.loads((proc.stdout or "{}").strip())
+        return decoded if isinstance(decoded, dict) else {}
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError,
+            json.JSONDecodeError):
+        return {}
+
+
+def _background_training_capture(action: str, payload: Dict[str, Any]) -> None:
+    """Bound post-tool capture work so the Hermes callback stays fail-open."""
+    if not _TRAINING_CAPTURE_INFLIGHT.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            _run_training_capture(action, payload)
+        finally:
+            _TRAINING_CAPTURE_INFLIGHT.release()
+
+    try:
+        threading.Thread(target=_worker, name="zmem-training-capture",
+                         daemon=True).start()
+    except Exception:
+        _TRAINING_CAPTURE_INFLIGHT.release()
 
 
 def _native_edit_path(args: Any) -> str:
@@ -1393,11 +1466,23 @@ class ZmemMemoryProvider(MemoryProvider):
             session_id=sid,
             moment="user_prompt",
             lane="hermes-provider",
-        ))
+        ), capture=True)
         payload = _decode_rendered_envelope(result)
         if payload is None:
             logger.debug("zmem prefetch: missing or malformed rendered envelope")
             return ""
+        # The store envelope is authoritative for the emitted fence and any
+        # effective operation tokens. Hooks never infer acknowledgement or an
+        # outcome from this snapshot.
+        _run_training_capture("snapshot", {
+            "host": "hermes",
+            "hook_name": "prefetch",
+            "session_id": sid,
+            "namespace": self._namespace,
+            "rendered": payload["rendered"],
+            "effective_ops": payload.get("effective_ops", []),
+            "transform_version": payload.get("transform_version", "v1"),
+        })
         return payload["rendered"]
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -1414,6 +1499,16 @@ class ZmemMemoryProvider(MemoryProvider):
         uses the existing ``_run_store`` CLI seam and drops on overflow.
         """
         try:
+            session_id = str(kwargs.get("session_id") or self._session_id or "").strip()
+            _background_training_capture("observe", {
+                "host": "hermes",
+                "hook_name": "post_tool_call",
+                "session_id": session_id,
+                "namespace": self._namespace,
+                "host_task_id": kwargs.get("task_id") or kwargs.get("taskId"),
+                "observation_kind": "post_tool_call",
+                "observation": dict(kwargs),
+            })
             _enqueue_native_evidence(dict(kwargs))
         except Exception:
             pass
@@ -1944,6 +2039,12 @@ class ZmemMemoryProvider(MemoryProvider):
         ``_STORE_TIMEOUT_S`` (20s) subprocess cap.
         """
         try:
+            _run_training_capture("clear", {
+                "host": "hermes",
+                "hook_name": "session-end",
+                "session_id": self._session_id,
+                "namespace": self._namespace,
+            })
             _run_store(["organize"])
             _run_store(["backup", "--if-due"])
         except Exception as exc:  # pragma: no cover — defensive
@@ -1981,11 +2082,30 @@ class ZmemMemoryProvider(MemoryProvider):
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        **kwargs: Any,
     ) -> None:
-        """No-op. zmem captures lessons via explicit agent action (zmem_add),
-        not passive turn ingestion — unlike mem0/honcho which do server-side
-        extraction. Turning here would duplicate the reflection loop's job.
+        """Start a governed partial for an actually supplied Hermes turn.
+
+        The turn callback supplies content but does not prove display receipt,
+        acknowledgement, or a verified outcome. Those facts stay in the later
+        trusted workflow.
         """
+        sid = str(session_id or self._session_id or "").strip()
+        try:
+            _run_training_capture("start", {
+                "host": "hermes",
+                "hook_name": "sync_turn",
+                "session_id": sid,
+                "namespace": self._namespace,
+                "cwd": os.getcwd(),
+                "prompt": user_content if isinstance(user_content, str) else "",
+                "assistant_response": (
+                    assistant_content if isinstance(assistant_content, str) else ""
+                ),
+                "host_task_id": kwargs.get("task_id") or kwargs.get("taskId"),
+            })
+        except Exception:
+            pass
         return None
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
