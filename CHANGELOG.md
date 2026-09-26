@@ -10,7 +10,7 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.66.0] - 2026-09-26
+## [0.67.0] - 2026-09-26
 
 ### Added
 - **Evidence associations (issue #171):** `add` and `update` accept
@@ -21,7 +21,7 @@ README.
   before inserting staged associations; and the MCP server exposes
   namespace-guarded evidence lookup tools.
 
-## [0.65.0] - 2026-09-26
+## [0.66.0] - 2026-09-26
 
 ### Fixed
 - **Fail-closed evidence retention (issue #170):** malformed or out-of-range
@@ -30,6 +30,45 @@ README.
   diagnostic, and leave evidence and association rows unchanged. Valid expiry,
   cap ordering, rollback, and the shipped #183 evidence writer behavior remain
   covered.
+
+## [0.65.0] - 2026-09-25
+
+### Added
+- **CHANGELOG release-heading contract in the release gate (issue #233)**: the
+  default gate mode now validates, before the manifest comparison, that every
+  dated `## [X.Y.Z]` release heading appears exactly once and that released
+  headings are strictly descending newest-first by semantic version — with
+  distinct diagnostics naming the offending versions and line numbers. Base-
+  drift retarget mistakes (the PR #230 failure class: retitle-in-place below a
+  just-landed section) and duplicate release sections now fail the gate
+  directly instead of surfacing as a confusing newest-section mismatch.
+  `latest_changelog_section`'s topmost-match semantics are unchanged on the
+  success path — the check guards the assumption, it does not replace it.
+- **Heading-contract regression tests (issue #233)**: new
+  `tests/test_release_heading_contract.py` covers the duplicate-heading
+  diagnostic (line numbers named), the ordering diagnostic (pair named), the
+  equal-adjacent-pair double defect, the well-formed negative, both gate-path
+  exits through the default mode, and the repaired repo CHANGELOG (exactly
+  one `## [0.43.0]` heading, zero contract violations).
+
+### Fixed
+- **Repaired the duplicate `## [0.43.0]` sections (fixes #214)**: the stale
+  `## [0.43.0] - 2026-09-17` section — a pre-retarget draft that survived PR
+  #209's CHANGELOG union — is removed; its entries that the shipped
+  `## [0.45.0]` section did not already record (the #169/#170 evidence
+  storage and transport feature set, the #155 read-only replay audit, the
+  "explicit search unchanged" clause, and the CI replay-audit clause) are
+  folded under `## [0.45.0]`, the version that actually shipped them (tag
+  `v0.45.0` = `d51cbd3`, whose manifests read 0.45.0). Exactly one
+  `## [0.43.0]` heading remains: the 2026-09-16 section that tag `v0.43.0`
+  shipped (PR #207).
+
+### Changed
+- **Release and CI surfaces**: all host manifests target 0.65.0;
+  `release-manifest.json` is regenerated (the gate script is a
+  manifest-covered surface), and the five-lanes decision fixtures are
+  regenerated at the new version. (Base-drift retarget from 0.63.0: sibling
+  releases 0.63.0 and 0.64.0 landed on main while this PR was in review.)
 
 ## [0.64.0] - 2026-09-25
 
@@ -407,14 +446,27 @@ README.
 - **Deterministic passive query context (issue #183)**: ambiguous
   `user_prompt` queries use bounded operation/edit context with exact-token
   namespace bypass, fail-open behavior, and a whitespace-tolerant
-  `ZMEM_QUERY_CONTEXT=0` kill switch.
+  `ZMEM_QUERY_CONTEXT=0` kill switch. Explicit search and other passive
+  moments remain unchanged.
 - **Bounded evidence and replay hardening**: retention holds the writer lease,
   evidence input and replay files are bounded, nested host failures are
   classified, and detached writers use stable identities and admission caps.
+- **Bounded evidence storage and transport (issues #169/#170)**: schema v14
+  adds the evidence side tables, redaction/hash validation, native Hermes
+  `post_tool_call` observation, strict evidence-aware JSONL transport, and
+  bounded retention. The implemented callback is evidence-only; this release
+  does not claim the broader #163 pre-LLM/pre-verify transport.
+- **Read-only replay audit (issue #155)**: the committed evaluator covers the
+  exact two lanes crossed with four report moments, bounded explicit
+  transcript inputs, fixed-log scoring time, digest checks, and baseline
+  ratchets. Empty observation denominators are reported as unavailable zero
+  compatibility values, not as live efficacy measurements.
 
 ### Changed
 - **Release and CI surfaces**: all host manifests target 0.45.0; cross-project
-  query forwarding from 0.44.0 remains preserved.
+  query forwarding from 0.44.0 remains preserved; both matrix platform jobs
+  run the canonical replay command against the committed fixture and
+  baseline.
 
 ## [0.44.0] - 2026-09-16
 
@@ -493,29 +545,6 @@ README.
 - The #155 real-corpus replay baseline remains future work: this lane ships
   conservatively (pretool-only by default, cap 2, four grounded signals) and
   #155's measurement supersedes the initial calibration when it lands.
-
-## [0.43.0] - 2026-09-17
-
-### Added
-- **Bounded evidence storage and transport (issues #169/#170)**: schema v14
-  adds the evidence side tables, redaction/hash validation, native Hermes
-  `post_tool_call` observation, strict evidence-aware JSONL transport, and
-  bounded retention. The implemented callback is evidence-only; this release
-  does not claim the broader #163 pre-LLM/pre-verify transport.
-- **Deterministic passive query context (issue #183)**: ambiguous
-  `user_prompt` queries can use bounded operation/edit context with exact-token
-  bypass, fail-open behavior, and the exact `ZMEM_QUERY_CONTEXT=0` kill switch.
-  Explicit search and other passive moments remain unchanged.
-- **Read-only replay audit (issue #155)**: the committed evaluator covers the
-  exact two lanes crossed with four report moments, bounded explicit transcript
-  inputs, fixed-log scoring time, digest checks, and baseline ratchets. Empty
-  observation denominators are reported as unavailable zero compatibility
-  values, not as live efficacy measurements.
-
-### Changed
-- **Release and CI surfaces**: all host manifests target 0.43.0, and both
-  matrix platform jobs run the canonical replay command against the committed
-  fixture and baseline.
 
 ## [0.42.0] - 2026-09-15
 
