@@ -65,7 +65,8 @@ from storelib.training_capture import (
     append_training_capture_observation, assert_training_capture_replay_binding,
     capture_id_for_delivery_snapshot,
     complete_training_capture,
-    record_training_delivery_snapshot, start_training_capture,
+    purge_expired_training_captures, record_training_delivery_snapshot,
+    start_training_capture,
 )
 from storelib.tune import tune_weights
 from storelib import ops_tokens as _ops_tokens
@@ -1564,6 +1565,14 @@ def main():
     p_capture_completion = _add_parser("capture-training-completion",
                                        help="complete an acknowledged training capture")
     p_capture_completion.add_argument("--input", required=True, help="JSON input file")
+    p_purge_training = _add_parser(
+        "purge-training-captures",
+        help="purge finalized or revoked local captures past the 30-day retention window",
+    )
+    p_purge_training.add_argument(
+        "--confirm", action="store_true", default=False,
+        help="confirm permanent deletion of expired local capture records",
+    )
     p_training_export = _add_parser("export-training",
                                     help="write reviewed governed training views")
     p_training_export.add_argument("dir", help="output directory")
@@ -2730,6 +2739,13 @@ def main():
         if not args.reviewer_confirmed:
             print("--reviewer-confirmed is required", file=sys.stderr)
             sys.exit(2)
+    if args.cmd == "purge-training-captures":
+        if not args.confirm:
+            print("--confirm is required", file=sys.stderr)
+            sys.exit(2)
+        if not STORE_PATH.is_file():
+            print(f"[zmem] store does not exist: {STORE_PATH}", file=sys.stderr)
+            sys.exit(2)
 
     # Refuse malformed governed write inputs before connect/migrate.  Besides
     # avoiding an unwanted first-run store, this keeps the frozen completion
@@ -2810,7 +2826,7 @@ def main():
     if (
         args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl",
                      "capture-training-delivery", "capture-training-acknowledge",
-                     "capture-training-completion"}
+                     "capture-training-completion", "purge-training-captures"}
         or (args.cmd == "evidence" and args.evidence_cmd == "write")
         or args.cmd == "hermes-convention"
         # v12 (issue #64, 9.4): feedback is a write surface — it takes the
@@ -2851,9 +2867,10 @@ def main():
         # _ingest_row, so a real run serializes against restore/backup like
         # every other writer; --dry-run is read-only and never takes it.
         or (args.cmd == "promote-store" and not args.dry_run)
-        # Session cadence performs evidence retention after organize/backup;
-        # keep its writer lease until that final transaction is complete so a
-        # concurrent restore cannot interleave between cadence steps.
+        # Session cadence purges expired local training records before backup
+        # and performs evidence retention afterwards. Keep its writer lease
+        # until both retention transactions complete so a concurrent restore
+        # cannot interleave between cadence steps.
         or args.cmd == "session-cadence"
     ):
         writer_lease = _acquire_writer_lease(args.cmd)
@@ -3021,6 +3038,17 @@ def main():
                                   "state": "completed"}, sort_keys=True))
             except (ValueError, TrainingCaptureConflict, CaptureBusyError, OSError,
                     json.JSONDecodeError) as exc:
+                conn.rollback()
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
+        elif args.cmd == "purge-training-captures":
+            try:
+                result = purge_expired_training_captures(
+                    conn,
+                    now_ts=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                print(json.dumps(result, sort_keys=True))
+            except (ValueError, sqlite3.Error) as exc:
                 conn.rollback()
                 print(str(exc), file=sys.stderr)
                 sys.exit(1)
@@ -3520,7 +3548,10 @@ def main():
             # single-flight lock + shared cadence gate (force=False respects it —
             # issue #62 7.7 wired SessionStart to organize, NOT consolidate; the
             # consolidate CLI remains for manual/ad-hoc runs), backup runs with
-            # --if-due (cheap no-op when not due), and sweep is the same
+            # --if-due (cheap no-op when not due), training retention runs
+            # before backup so a successful purge keeps expired records out of
+            # a new snapshot,
+            # and sweep is the same
             # store-independent file reaper. A failure in any one op is reported
             # but does not abort the others (cadence ops are independent).
             # sweep already ran BEFORE connect() (store-independence, PRR-004)
@@ -3529,6 +3560,11 @@ def main():
             failures = 0
             organized = False
             backed_up = False
+            training_retention = {"purged_captures": 0}
+            # One clock defines both fixed retention boundaries. Compute it
+            # before backup so a successful purge keeps a record the cadence
+            # regards as expired out of that backup.
+            cadence_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             cadence_redirect = (
                 contextlib.redirect_stdout(sys.stderr)
                 if getattr(args, "as_json", False)
@@ -3549,7 +3585,23 @@ def main():
                         failures += 1
                     finally:
                         _release_lock("consolidate", o_token)
-                # 2) backup --if-due (cheap no-op almost every session)
+                # 2) bounded local capture retention. This is independent of
+                # backup: failure is surfaced but must not prevent a backup.
+                try:
+                    training_retention = purge_expired_training_captures(
+                        conn, now_ts=cadence_now,
+                    )
+                    steps.append(
+                        "training-captures: purged="
+                        f"{training_retention['purged_captures']}"
+                    )
+                except Exception as exc:
+                    steps.append(
+                        "training-captures: error - "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    failures += 1
+                # 3) backup --if-due (cheap no-op almost every session)
                 try:
                     rc_b = cmd_backup(conn, retention=args.backup_retention, if_due=True)
                     backed_up = rc_b == 0
@@ -3559,21 +3611,20 @@ def main():
                 except Exception as exc:
                     steps.append(f"backup: error - {type(exc).__name__}: {exc}")
                     failures += 1
-                # 3) file sweep result (already computed pre-connect)
+                # 4) file sweep result (already computed pre-connect)
                 if _cadence_sweep is not None:
                     steps.append(_cadence_sweep[0])
                     if _cadence_sweep[1]:
                         failures += 1
 
             # Evidence retention runs after organize/backup on the connected
-            # store and owns one transaction.  Derive the clock once at command
-            # dispatch so every deletion in this cadence shares one boundary.
-            cadence_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # store and owns one transaction using the cadence boundary.
             retention = sweep_evidence(conn, now_ts=cadence_now)
             if getattr(args, "as_json", False):
                 print(json.dumps({
                     "organized": organized,
                     "backed_up": backed_up,
+                    "training_captures_purged": training_retention["purged_captures"],
                     "evidence_expired": retention["expired"],
                     "evidence_capped": retention["capped"],
                     "episode_links": retention["episode_links"],

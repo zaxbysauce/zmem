@@ -24,6 +24,7 @@ from storelib.schema import SUPPORTED_SCHEMA_VERSION, init_db, migrate  # noqa: 
 from storelib.training_capture import (  # noqa: E402
     TrainingCaptureConflict,
     acknowledge_training_delivery,
+    append_training_capture_observation,
     assert_training_capture_replay_binding,
     complete_training_capture,
     purge_expired_training_captures,
@@ -229,6 +230,83 @@ class TrainingCaptureCoreTest(unittest.TestCase):
         self.assertIsNone(self.conn.execute(
             "SELECT 1 FROM training_capture WHERE capture_id=?", (capture_id,)
         ).fetchone())
+
+    def test_retention_purges_expired_terminal_rows_only_and_keeps_associations(self) -> None:
+        completed_id, _ = self._acknowledged_capture()
+        evidence_id = self._evidence()
+        complete_training_capture(
+            self.conn, completed_id, evidence_id=evidence_id,
+            memory_ids=[self.memory_one], verifier_id="trusted-test",
+            outcome_kind="test", outcome_value="passed",
+            export_consent_scope="export-local", export_content_license="licensed",
+            verified_at="2026-01-01T00:00:00Z",
+        )
+        revoked_id, _ = self._acknowledged_capture()
+        revoke_training_capture(
+            self.conn, revoked_id, reason="expired revocation",
+            revoked_by="trusted-test", revoked_at="2026-01-01T00:00:00Z",
+        )
+        recent_id, _ = self._acknowledged_capture()
+        revoke_training_capture(
+            self.conn, recent_id, reason="recent revocation",
+            revoked_by="trusted-test", revoked_at="2026-01-02T00:00:00Z",
+        )
+        partial_id = start_training_capture(
+            self.conn, host="test", session_id=self.session_id,
+            namespace=self.namespace, prompt="partial", assistant_response="partial",
+            consent_scope="local", content_license="licensed",
+            redaction_policy_version="v1",
+        )["capture_id"]
+
+        result = purge_expired_training_captures(
+            self.conn, now_ts="2026-01-31T00:00:00Z",
+        )
+
+        self.assertEqual(result, {"purged_captures": 2})
+        for capture_id in (completed_id, revoked_id):
+            self.assertIsNone(self.conn.execute(
+                "SELECT 1 FROM training_capture WHERE capture_id=?", (capture_id,)
+            ).fetchone())
+        for capture_id in (recent_id, partial_id):
+            self.assertIsNotNone(self.conn.execute(
+                "SELECT 1 FROM training_capture WHERE capture_id=?", (capture_id,)
+            ).fetchone())
+        # The store-owned evidence association is independent of local capture
+        # retention and therefore survives deleting its completed capture.
+        self.assertEqual(self.conn.execute(
+            "SELECT memory_id FROM memory_evidence WHERE evidence_id=?", (evidence_id,)
+        ).fetchone()[0], self.memory_one)
+
+    def test_retention_failure_rolls_back_capture_children(self) -> None:
+        capture_id, _ = self._acknowledged_capture()
+        append_training_capture_observation(
+            self.conn, capture_id, observation_kind="test", payload="retained",
+            observed_at="2026-01-01T00:00:00Z",
+        )
+        self.conn.execute(
+            "UPDATE training_capture SET finalized_at='2026-01-01T00:00:00Z' "
+            "WHERE capture_id=?", (capture_id,)
+        )
+        self.conn.execute(
+            "CREATE TRIGGER fail_training_retention BEFORE DELETE ON training_capture "
+            "BEGIN SELECT RAISE(ABORT, 'injected retention failure'); END"
+        )
+        self.conn.commit()
+
+        with self.assertRaisesRegex(sqlite3.DatabaseError, "injected retention failure"):
+            purge_expired_training_captures(
+                self.conn, now_ts="2026-01-31T00:00:00Z",
+            )
+
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM training_capture WHERE capture_id=?", (capture_id,)
+        ).fetchone())
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM training_delivery_snapshot WHERE capture_id=?", (capture_id,)
+        ).fetchone()[0], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM training_capture_observation WHERE capture_id=?", (capture_id,)
+        ).fetchone()[0], 1)
 
     def test_update_reason_is_normalized_allowlisted_and_written_to_predecessor(self) -> None:
         with self.assertRaisesRegex(ValueError, "update reason"):

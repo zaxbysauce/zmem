@@ -447,8 +447,9 @@ def _check_training_capture_health(store_path: Path) -> dict:
 
     Capture rows are intentionally local-only, but a damaged or partially
     refreshed store must be visible before an operator exports training data.
-    The check reports counts only; it never installs tables, purges rows, or
-    repairs associations.
+    The check reports counts only, including final records past the fixed
+    retention window. It never installs tables, purges rows, or repairs
+    associations.
     """
     conn = _open_store_ro(store_path)
     if conn is None:
@@ -535,6 +536,11 @@ def _check_training_capture_health(store_path: Path) -> dict:
         count(
             "revoked_records",
             "SELECT count(*) FROM training_capture WHERE revoked_at IS NOT NULL",
+        )
+        count(
+            "expired_retention",
+            "SELECT count(*) FROM training_capture WHERE finalized_at IS NOT NULL "
+            "AND datetime(finalized_at, '+30 days') <= datetime('now')",
         )
 
         # The completion payload is a cache of the authoritative
@@ -3680,11 +3686,22 @@ def _recommendations(checks: list[dict]) -> list[str]:
     capture = by_id.get("training-capture", {})
     if capture.get("status") == "warn":
         missing = capture.get("details", {}).get("missing_tables") or []
+        expired = capture.get("details", {}).get("issues", {}).get(
+            "expired_retention", 0
+        )
         if missing:
             notes.append(
                 "The local training capture tables are incomplete "
                 f"({', '.join(missing)}); run a writable zmem command to let "
                 "the additive initializer install them, then rerun doctor."
+            )
+        elif expired:
+            notes.append(
+                f"{expired} finalized training capture record(s) exceeded the "
+                "30-day local retention window. Run `python <store.py> "
+                "purge-training-captures --confirm`; doctor remains read-only, "
+                "and session-cadence also sweeps expired capture rows before "
+                "backup."
             )
         else:
             notes.append(

@@ -1838,6 +1838,16 @@ id. `host_task_id` is correlation metadata only when the host supplies it.
 Replayed compatible inputs are idempotent, while conflicting snapshots or
 completion data are refused.
 
+Finalized and revoked capture records, their local delivery/completion/
+observation rows, remain for 30 days. The detached `session-cadence` task
+attempts the purge before its backup step; a successful purge keeps expired
+records out of new backups. Doctor reports overdue rows but stays
+read-only; an operator can run the explicit cleanup instead:
+
+```bash
+python <store.py> purge-training-captures --confirm
+```
+
 Before enabling export, install PyArrow in the store-host interpreter:
 
 ```bash
