@@ -3624,7 +3624,6 @@ def main():
                 print(json.dumps({
                     "organized": organized,
                     "backed_up": backed_up,
-                    "training_captures_purged": training_retention["purged_captures"],
                     "evidence_expired": retention["expired"],
                     "evidence_capped": retention["capped"],
                     "episode_links": retention["episode_links"],
