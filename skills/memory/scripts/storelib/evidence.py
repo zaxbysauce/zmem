@@ -329,9 +329,25 @@ def evidence_ids_for_memory(conn, memory_id: str) -> list[str]:
     evidence ids linked to one memory via the schema-14 memory_evidence
     table. Read-only; the association WRITE API and the MCP surfaces remain
     issue #171's scope. Sorted for deterministic membership checks."""
-    rows = conn.execute(
-        "SELECT evidence_id FROM memory_evidence WHERE memory_id = ? "
-        "ORDER BY evidence_id",
-        (memory_id,),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT evidence_id FROM memory_evidence WHERE memory_id = ? "
+            "ORDER BY evidence_id",
+            (memory_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        # Older, schema-initialized stores can legitimately lack this v14
+        # side table.  Do not hide a damaged v14 schema or unrelated SQL error.
+        if "no such table: memory_evidence" not in str(exc):
+            raise
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        try:
+            pre_v14 = version is not None and int(version[0]) < 14
+        except (TypeError, ValueError):
+            pre_v14 = False
+        if not pre_v14:
+            raise
+        return []
     return [r[0] for r in rows]

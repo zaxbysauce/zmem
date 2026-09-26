@@ -139,6 +139,19 @@ class EvidenceAssociationWriteTest(_StoreCase):
 
 
 class EvidenceSchemaTest(_StoreCase):
+    def test_pre_v14_association_lookup_returns_empty_without_hiding_v14_damage(self):
+        legacy = sqlite3.connect(self.root / "pre-v14.sqlite")
+        schema.init_db(legacy)
+        version = legacy.execute(
+            "SELECT value FROM meta WHERE key=?", ("schema_version",)
+        ).fetchone()[0]
+        self.assertLess(int(version), 14)
+        self.assertEqual(evidence.evidence_ids_for_memory(legacy, "missing"), [])
+        legacy.execute("UPDATE meta SET value='14' WHERE key='schema_version'")
+        with self.assertRaisesRegex(sqlite3.OperationalError, "no such table"):
+            evidence.evidence_ids_for_memory(legacy, "missing")
+        legacy.close()
+
     def test_fresh_init_and_v13_upgrade(self):
         version = self.conn.execute(
             "SELECT value FROM meta WHERE key=?", ("schema_version",)
