@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deterministic generator for tests/fixtures/launcher/codex-cases.json.
 
-Issue #188 (Workstream N PR 5 of 6): the committed fixture pins the ten
+Issue #188 (Workstream N PR 5 of 6): the committed fixture pins the eleven
 Codex hook verbs in manifest order with a fixed stdin object and a fixed
 sentinel child_stdout per verb, so the adapter's Windows-manifest loop
 (runWindowsManifestCase) can compare exact envelopes against
@@ -44,6 +44,7 @@ EXPECTED_EVENT = {
     "subagent-reflect": "SubagentStop",
     "session-start": None,
     "precompact": None,
+    "session-end": None,
 }
 # Verbs whose stub emits no sentinel: the launcher fails open to {}.
 NO_SENTINEL = {"session-start", "precompact"}
@@ -89,7 +90,11 @@ def manifest_verbs():
 def build_cases():
     cases = []
     for verb in manifest_verbs():
-        if verb in NO_SENTINEL:
+        if verb == "session-end":
+            # SessionEnd is a pass-through command. Its child output must be
+            # valid JSON because the launcher preserves it byte-for-byte.
+            child_stdout = "{}\n"
+        elif verb in NO_SENTINEL:
             child_stdout = ""
         else:
             child_stdout = (

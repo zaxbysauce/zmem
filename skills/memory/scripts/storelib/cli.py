@@ -1186,9 +1186,9 @@ def main():
                                  help="emit the exact {query,rewrite} object")
 
     p_ledger_clear = _add_parser(
-        "ledger-clear", help="clear one session's passive delivery ledger")
+        "ledger-clear", help="clear one session's passive delivery state")
     p_ledger_clear.add_argument("--session-id", required=True,
-                                help="Session id whose delivery ledger will be cleared")
+                                help="Session id whose delivery state will be cleared")
 
     p_search = _add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
@@ -2210,7 +2210,7 @@ def main():
         from storelib import delivery_ledger
         try:
             data_dir = _injection_data_dir(None)
-            delivery_ledger.clear(data_dir, args.session_id)
+            delivery_ledger.clear_delivery_state(data_dir, args.session_id)
         except Exception:
             print("[zmem] ledger-clear failed", file=sys.stderr)
             sys.exit(1)
