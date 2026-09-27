@@ -443,6 +443,27 @@ class RecallExpansionTest(_Store):
             if verdict.get("reason") == "link_expansion"
         ]
 
+    def _set_fixture_edge_timestamp(self, dst_id, created_at):
+        conn = self.db()
+        conn.execute(
+            "UPDATE memory_link SET created_at=? WHERE dst_id=?",
+            (created_at, dst_id),
+        )
+        conn.commit()
+
+    def _direct_expansion(self, *, as_of):
+        from storelib.links import expand_recall_links
+
+        conn = self.db()
+        main = conn.execute(
+            "SELECT * FROM memory WHERE id=?",
+            ("00000000-0000-4000-8000-000000000130",),
+        ).fetchone()
+        return expand_recall_links(
+            conn, [dict(main)], ns_list=["project:issue130"], budget=10,
+            as_of=as_of,
+        )
+
     def test_as_of_excludes_edge_created_after_instant(self):
         fixture, expected = self._seed_issue130_fixture()
         envelope, _raw = self._issue130_capture(
@@ -473,6 +494,169 @@ class RecallExpansionTest(_Store):
         self.assertEqual(
             self._explain_expansion_ids(envelope), expected["explain"]
         )
+
+    def test_as_of_compares_offset_edges_as_utc_instants(self):
+        fixture, _expected = self._seed_issue130_fixture()
+        self._set_fixture_edge_timestamp(
+            "00000000-0000-4000-8000-000000000131",
+            "2026-02-01T13:59:59+02:00",
+        )
+        self._set_fixture_edge_timestamp(
+            "00000000-0000-4000-8000-000000000132",
+            "2026-02-01T07:00:00-05:00",
+        )
+        self._set_fixture_edge_timestamp(
+            "00000000-0000-4000-8000-000000000133",
+            "2026-02-01T08:00:01-04:00",
+        )
+        envelope, _raw = self._issue130_capture(
+            as_of=fixture["as_of"], explain=False
+        )
+        self.assertEqual(
+            self._expansion_ids(envelope),
+            [
+                "00000000-0000-4000-8000-000000000131",
+                "00000000-0000-4000-8000-000000000132",
+            ],
+        )
+
+    def test_as_of_excludes_subsecond_edge_after_whole_second_cutoff(self):
+        fixture, _expected = self._seed_issue130_fixture()
+        self._set_fixture_edge_timestamp(
+            "00000000-0000-4000-8000-000000000132",
+            "2026-02-01T12:00:00.001Z",
+        )
+        envelope, _raw = self._issue130_capture(
+            as_of=fixture["as_of"], explain=False
+        )
+        self.assertEqual(
+            self._expansion_ids(envelope),
+            ["00000000-0000-4000-8000-000000000131"],
+        )
+
+    def test_malformed_edge_fails_closed_only_for_historical_recall(self):
+        fixture, expected = self._seed_issue130_fixture()
+        self._set_fixture_edge_timestamp(
+            "00000000-0000-4000-8000-000000000132", "not-a-timestamp"
+        )
+        historical, _raw = self._issue130_capture(
+            as_of=fixture["as_of"], explain=False
+        )
+        self.assertEqual(
+            self._expansion_ids(historical),
+            ["00000000-0000-4000-8000-000000000131"],
+        )
+        present, _raw = self._issue130_capture(as_of=None, explain=False)
+        self.assertEqual(self._expansion_ids(present), expected["present"])
+
+    def test_invalid_programmatic_as_of_uses_legacy_lexical_fallback(self):
+        self._seed_issue130_fixture()
+        rows = self._direct_expansion(as_of="not-a-timestamp")
+        self.assertEqual(
+            [row["id"] for row in rows],
+            [
+                "00000000-0000-4000-8000-000000000131",
+                "00000000-0000-4000-8000-000000000132",
+                "00000000-0000-4000-8000-000000000133",
+            ],
+        )
+
+    def test_non_string_programmatic_as_of_fails_closed_without_raising(self):
+        self._seed_issue130_fixture()
+        self.assertEqual(self._direct_expansion(as_of=123), [])
+
+    def test_non_string_public_as_of_normalizes_without_raising(self):
+        from storelib.recall import _normalize_as_of
+
+        self.assertIsNone(_normalize_as_of(123))
+
+    def test_non_string_public_recall_cutoff_fails_closed(self):
+        self._seed_issue130_fixture()
+        from storelib.recall import _recall_memory_impl
+
+        self.assertEqual(
+            _recall_memory_impl(
+                self.db(), query="seed main", namespace="project:issue130",
+                limit=1, as_of=123, hybrid=False, no_bump=True,
+                link_hops=1, link_budget=10,
+            ),
+            [],
+        )
+
+    def test_non_string_cutoff_fails_closed_on_all_recall_surfaces(self):
+        """Invalid programmatic cutoffs never become an absent cutoff.
+
+        Keep this at the public entry points and their direct implementations:
+        a regression in explain/recent normalization would otherwise widen the
+        request to present-time rows, and would make the invalid call touch the
+        store before returning.
+        """
+        self._seed_issue130_fixture()
+        from storelib.recall import (
+            _recent_memory_impl,
+            explain_recall,
+            recall_memory,
+            recent_memory,
+        )
+
+        conn = self.db()
+        statements = []
+        conn.set_trace_callback(statements.append)
+        calls = [
+            lambda: recall_memory(
+                conn, query="seed main", namespace="project:issue130",
+                limit=1, as_of=123, hybrid=False, no_bump=True,
+            ),
+            lambda: recent_memory(
+                conn, namespace="project:issue130", limit=1, as_of=123,
+                no_bump=True,
+            ),
+            lambda: recall_memory(
+                conn, query="seed main", namespace="project:issue130",
+                limit=1, as_of=123, for_injection=True,
+            ),
+            lambda: recent_memory(
+                conn, namespace="project:issue130", limit=1, as_of=123,
+                for_injection=True,
+            ),
+            lambda: explain_recall(
+                conn, query="seed main", namespace="project:issue130",
+                limit=1, as_of=123, hybrid=False,
+            ),
+            lambda: _recent_memory_impl(
+                conn, namespace="project:issue130", limit=1, as_of=123,
+                no_bump=True,
+            ),
+        ]
+        for call in calls:
+            self.assertEqual(call(), [])
+        self.assertEqual(
+            statements, [],
+            "invalid as_of must fail closed before any SQL is issued",
+        )
+
+    def test_empty_programmatic_as_of_equals_absent(self):
+        self._seed_issue130_fixture()
+        absent = self._direct_expansion(as_of=None)
+        empty = self._direct_expansion(as_of="")
+        self.assertEqual(
+            [row["id"] for row in empty], [row["id"] for row in absent]
+        )
+
+    def test_issue130_expected_fixture_generator_is_byte_deterministic(self):
+        expected_path = self._ISSUE130_FIXTURE_DIR / "edge-expected.json"
+        output_path = Path(self.tmp) / "generated-edge-expected.json"
+        result = subprocess.run(
+            [
+                PYTHON,
+                str(self._ISSUE130_FIXTURE_DIR / "make_edge_expected.py"),
+                "--input", str(self._ISSUE130_FIXTURE_DIR / "edge-input.json"),
+                "--output", str(output_path),
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output_path.read_bytes(), expected_path.read_bytes())
 
     def test_present_time_expansion_is_byte_identical(self):
         _fixture, expected = self._seed_issue130_fixture()

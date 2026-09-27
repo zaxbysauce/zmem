@@ -2054,6 +2054,82 @@ class LinkTrustSyncTest(_TwoStoreCase):
         self.assertIsNone(self.b.query_one(
             "SELECT id FROM memory WHERE id=?", (row["id"],)))
 
+    def test_malformed_link_timestamp_is_counted_and_not_stored(self):
+        a = self.a.add("project:bad-link-ts", "base row for a bad link timestamp")
+        row = {
+            "id": "20000000-0000-4000-8000-000000000002",
+            "namespace": "project:bad-link-ts",
+            "type": "fact",
+            "content": "remote row with a malformed link timestamp",
+            "links": [{
+                "dst": a, "relation": "related", "score": 0.5,
+                "created_at": "not-a-timestamp",
+            }],
+        }
+        path = os.path.join(self.a.tmp, "bad-link-ts.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("malformed=1", r.stdout, r.stdout)
+        self.assertIsNone(self.b.query_one(
+            "SELECT id FROM memory WHERE id=?", (row["id"],)))
+
+    def test_missing_link_timestamp_defaults_to_now(self):
+        anchor = self.a.add(
+            "project:link-empty-ts", "anchor row for an empty link timestamp"
+        )
+        exported = os.path.join(self.a.tmp, "anchor.jsonl")
+        self.assertEqual(
+            self.a.run("export-jsonl", "--out", exported).returncode, 0
+        )
+        row = {
+            "id": "20000000-0000-4000-8000-000000000003",
+            "namespace": "project:link-empty-ts",
+            "type": "fact",
+            "content": "remote row with an empty link timestamp",
+            "links": [{
+                "dst": anchor, "relation": "related", "score": 0.5,
+                "created_at": "",
+            }],
+        }
+        path = os.path.join(self.a.tmp, "empty-link-ts.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(Path(exported).read_text(encoding="utf-8"))
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("malformed=0", r.stdout, r.stdout)
+        self.assertIn("links_added=1", r.stdout, r.stdout)
+        created_at = self.b.query_one(
+            "SELECT created_at FROM memory_link WHERE src_id=?",
+            (row["id"],),
+        )[0]
+        self.assertTrue(created_at)
+
+    def test_offset_link_timestamp_round_trips_byte_identically(self):
+        a, _b, _c = self._seed(self.a)
+        conn = sqlite3.connect(self.a.path)
+        try:
+            conn.execute(
+                "UPDATE memory_link SET created_at=? WHERE src_id=?",
+                ("2026-02-01T07:00:00-05:00", a),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        out_a = os.path.join(self.a.tmp, "offset-a.jsonl")
+        self.assertEqual(self.a.run("export-jsonl", "--out", out_a).returncode, 0)
+        r = self.b.run("ingest-jsonl", "--in", out_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("malformed=0", r.stdout, r.stdout)
+        out_b = os.path.join(self.b.tmp, "offset-b.jsonl")
+        self.assertEqual(self.b.run("export-jsonl", "--out", out_b).returncode, 0)
+        self.assertEqual(
+            Path(out_a).read_bytes(), Path(out_b).read_bytes(),
+            "valid offset link timestamps must preserve their imported bytes",
+        )
+
     def test_malformed_trust_score_rejected_not_silently_maxed(self):
         """PRR-013: a PRESENT but garbage trust_score must make the row
         malformed (refused, counted) — the old silent-1.0 fallback let an

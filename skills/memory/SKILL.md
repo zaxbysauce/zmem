@@ -2179,8 +2179,8 @@ one warning).
 | Namespace cache TTL | 60000 ms | `ZMEM_NAMESPACE_CACHE_TTL_MS` | Entry expires at exactly TTL; path-key resolutions are never cached. |
 | Store recall | 8000 ms (8.0 s) | `ZMEM_STORE_RECALL_TIMEOUT_S` | SessionStart + the shared recall body. Finite positive float; values above 8.0 clamp to 8.0 (one warning); values below 8.0 are honored. ONE store attempt at SessionStart (no retry loop). |
 | SQLite busy timeout | 5000 ms | - | `storelib/schema.py` (`PRAGMA busy_timeout=5000`); unchanged. |
-| Hermes manager join | 8000 ms | - | Documentation input owned by issue #160 — no runtime change here. |
-| Hermes provider deadline | 6000 ms | - | Documentation input owned by issue #160 — no runtime change here. |
+| Hermes manager join | 8000 ms | - | The Hermes MemoryManager joins external-provider prefetch at 8.0 s (external runtime, not vendored in this repo). |
+| Hermes provider deadline | 6000 ms | `ZMEM_HERMES_DEADLINE_S` | Issue #160: every provider prefetch runs under this deadline (default 6.0; invalid or `>= 8.0` values resolve to 6.0 with exactly one warning). |
 
 SessionStart emits a complete Tier 0 sentinel BEFORE the first store
 subprocess (the fast path), so a store stall inside the watchdog window

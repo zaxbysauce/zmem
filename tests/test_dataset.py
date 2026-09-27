@@ -624,6 +624,62 @@ class DatasetExportTest(_StoreCase):
         self.assertEqual(names, ["project:a", "project:b"],
                          "the independent-oracle fixture must import intact")
 
+    def test_dataset_replayed_malformed_link_fails_closed_historically(self):
+        """Dataset replay preserves authored edge bytes; historical recall
+        must still exclude a malformed legacy edge at the read boundary."""
+        fixture_dir = os.path.join(REPO_ROOT, "tests", "fixtures", "dataset")
+        work = os.path.join(self.tmp, "malformed-link-dataset")
+        shutil.copytree(fixture_dir, work)
+        manifest_path = os.path.join(work, "manifest.json")
+        shutil.copy2(os.path.join(work, "manifest-v1.json"), manifest_path)
+        links_path = os.path.join(work, "data", "links-000.jsonl")
+        rows = [
+            json.loads(line) for line in
+            Path(links_path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        rows[0]["created_at"] = "not-a-timestamp"
+        rows[0]["row_checksum"] = ds.row_checksum(rows[0])
+        Path(links_path).write_text(
+            "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                    for row in rows),
+            encoding="utf-8",
+            newline="\n",
+        )
+        manifest = self.manifest(work)
+        families = {
+            family: ds._read_family(work, family, manifest["format"])
+            for family in ds.DATASET_FAMILIES
+        }
+        manifest["source_snapshot_hash"] = ds._compute_snapshot_hash(
+            families, True
+        )
+        Path(manifest_path).write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        dest = os.path.join(self.tmp, "malformed-link-snapshot")
+        result = ds.import_dataset(
+            work, revision=manifest["source_snapshot_hash"], dest_dir=dest,
+        )
+        conn = sqlite3.connect(os.path.join(dest, "snapshot.sqlite"))
+        conn.row_factory = sqlite3.Row
+        try:
+            from storelib.links import expand_recall_links
+
+            main = conn.execute(
+                "SELECT * FROM memory WHERE namespace=? ORDER BY id LIMIT 1",
+                ("project:a",),
+            ).fetchone()
+            expanded = expand_recall_links(
+                conn, [dict(main)], ns_list=["project:a"], budget=10,
+                as_of="2026-09-11T00:00:00Z",
+            )
+        finally:
+            conn.close()
+        self.assertEqual(expanded, [])
+
     def test_export_refuses_non_dataset_dir(self):
         """C-011 regression: export-dataset must never clobber an existing
         directory that is not a dataset (no manifest.json)."""

@@ -974,7 +974,7 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
         raise ValueError(f"field 'links' must be a list or null, "
                          f"got {type(raw_links).__name__}")
     else:
-        from storelib.links import LINK_RELATIONS
+        from storelib.links import LINK_RELATIONS, _parse_iso_utc
         validated_links = []
         for i, entry in enumerate(raw_links):
             if not isinstance(entry, dict):
@@ -1003,6 +1003,11 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
             if not isinstance(created_at, str):
                 raise ValueError(f"field 'links[{i}].created_at' must be a "
                                  f"string, got {created_at!r}")
+            if created_at and _parse_iso_utc(created_at) is None:
+                raise ValueError(
+                    f"field 'links[{i}].created_at' is not a valid ISO-8601 "
+                    f"timestamp, got {created_at!r}"
+                )
             validated_links.append({
                 "dst": dst, "relation": relation,
                 "score": max(0.0, min(1.0, score)),

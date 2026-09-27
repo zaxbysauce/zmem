@@ -304,24 +304,35 @@ class QueryRewriteSurfaceIntegrationTest(unittest.TestCase):
                 provider = _load_provider()
                 instance = provider.ZmemMemoryProvider()
                 instance._namespace = "project:integration"
-                provider_calls: list[list[str]] = []
-                provider_results: list[dict] = []
-                provider_run = provider._run_store
+                # Issue #160 repin: the provider delegates ONE prefetch to its
+                # transport and never rewrites locally.  The passthrough wrap
+                # keeps the real transport (and the real seeded store) live so
+                # the delivered content still discriminates the in-store
+                # rewrite.
+                delegations: list[tuple[str, dict]] = []
+                original_prefetch = instance._transport.prefetch
 
-                def tracked_provider(args, timing=None, input_text=None):
-                    provider_calls.append(list(args))
-                    result = provider_run(args, timing=timing, input_text=input_text)
-                    provider_results.append(result)
-                    return result
+                def wrapped_prefetch(query, **kwargs):
+                    delegations.append((query, dict(kwargs)))
+                    return original_prefetch(query, **kwargs)
 
-                with mock.patch.object(provider, "_run_store", tracked_provider):
+                instance._transport.prefetch = wrapped_prefetch
+                try:
                     rendered = instance.prefetch("the", session_id="provider-s")
-                self.assertIn("sentinel-provider", rendered, (provider_calls, provider_results))
-                self.assertEqual(
-                    [args[0] for args in provider_calls],
-                    ["query-rewrite", "recall"],
-                )
-                self.assertIn("the provider_py", provider_calls[1])
+                finally:
+                    instance._transport.prefetch = original_prefetch
+                self.assertIn("sentinel-provider", rendered, delegations)
+                self.assertEqual(len(delegations), 1, delegations)
+                provider_query, provider_kwargs = delegations[0]
+                # The delegated query is the RAW input — no provider-side
+                # rewrite before the boundary.
+                self.assertEqual(provider_query, "the")
+                self.assertEqual(provider_kwargs["moment"], "user_prompt")
+                self.assertEqual(provider_kwargs["lane"], "hermes-provider")
+                self.assertEqual(provider_kwargs["ops_tokens"], [])
+
+                def flag_value(argv, flag):
+                    return argv[argv.index(flag) + 1]
 
                 mcp, module_name = _load_mcp_server()
                 try:
@@ -355,6 +366,25 @@ class QueryRewriteSurfaceIntegrationTest(unittest.TestCase):
                     self.assertEqual(len(mcp_calls), 1)
                     self.assertEqual(mcp_calls[0][0], "prefetch")
                     self.assertIn("the", mcp_calls[0])
+                    # One boundary, two attributions: the provider's
+                    # delegated kwargs and the MCP prefetch tool's subprocess
+                    # argv carry the same selector keys (query, namespace,
+                    # session_id, moment, lane) with the raw query; session id
+                    # and lane differ per surface by design.
+                    self.assertEqual(
+                        provider_kwargs["namespace"],
+                        flag_value(mcp_calls[0], "--namespace"))
+                    self.assertEqual(
+                        provider_kwargs["moment"],
+                        flag_value(mcp_calls[0], "--moment"))
+                    self.assertEqual(
+                        provider_query, flag_value(mcp_calls[0], "--query"))
+                    self.assertEqual(provider_kwargs["session_id"], "provider-s")
+                    self.assertEqual(
+                        flag_value(mcp_calls[0], "--session-id"), "mcp-s")
+                    self.assertEqual(provider_kwargs["lane"], "hermes-provider")
+                    self.assertEqual(
+                        flag_value(mcp_calls[0], "--lane"), "hermes-compat")
                 finally:
                     sys.modules.pop(module_name, None)
 
@@ -448,35 +478,47 @@ class QueryRewriteSurfaceIntegrationTest(unittest.TestCase):
                     provider = _load_provider()
                     instance = provider.ZmemMemoryProvider()
                     instance._namespace = "project:integration"
-                    calls: list[list[str]] = []
-                    provider_run = provider._run_store
+                    # Issue #160 repin: the no-rewrite decision moved in-store
+                    # (storelib/cli.py's prefetch ZMEM_QUERY_CONTEXT gate), so
+                    # the provider always delegates ONE prefetch with the raw
+                    # query; the legs discriminate on delivered content.
+                    delegations: list[tuple[str, dict]] = []
+                    original_prefetch = instance._transport.prefetch
 
-                    def tracked(args, timing=None, input_text=None):
-                        calls.append(list(args))
-                        return provider_run(args, timing=timing, input_text=input_text)
+                    def wrapped_prefetch(query, **kwargs):
+                        delegations.append((query, dict(kwargs)))
+                        return original_prefetch(query, **kwargs)
 
-                    with mock.patch.object(provider, "_run_store", tracked):
+                    instance._transport.prefetch = wrapped_prefetch
+                    try:
                         rendered = instance.prefetch("the", session_id=session_id)
-                    return rendered, calls
+                    finally:
+                        instance._transport.prefetch = original_prefetch
+                    return rendered, delegations
 
-        disabled_rendered, disabled_calls = run_provider_case(
+        disabled_rendered, disabled_delegations = run_provider_case(
             "0", "00000000-0000-4000-8000-000000000020", "disabled-s",
             "disabled_py", "sentinel-disabled",
         )
+        # ZMEM_QUERY_CONTEXT=0: the store keeps the raw query (its gate, not
+        # the provider's), so the discriminating memory stays hidden while the
+        # provider still delegates exactly once with the untouched input.
         self.assertNotIn("sentinel-disabled", disabled_rendered)
-        self.assertEqual([args[0] for args in disabled_calls], ["recall"])
-        self.assertIn("the", disabled_calls[0])
+        self.assertEqual(len(disabled_delegations), 1, disabled_delegations)
+        self.assertEqual(disabled_delegations[0][0], "the")
 
-        enabled_rendered, enabled_calls = run_provider_case(
+        enabled_rendered, enabled_delegations = run_provider_case(
             "1", "00000000-0000-4000-8000-000000000021", "enabled-s",
             "enabled_py", "sentinel-enabled",
         )
+        # ZMEM_QUERY_CONTEXT=1: the SAME single delegation delivers the
+        # rewritten recall through the real store — the store boundary did
+        # the rewrite, not the provider.
         self.assertIn("sentinel-enabled", enabled_rendered)
-        self.assertEqual(
-            [args[0] for args in enabled_calls],
-            ["query-rewrite", "recall"],
-        )
-        self.assertIn("the enabled_py", enabled_calls[1])
+        self.assertEqual(len(enabled_delegations), 1, enabled_delegations)
+        self.assertEqual(enabled_delegations[0][0], "the")
+        self.assertEqual(enabled_delegations[0][1]["moment"], "user_prompt")
+        self.assertEqual(enabled_delegations[0][1]["lane"], "hermes-provider")
 
     def test_hermes_reflect_entrypoint_prefetches_once_and_kill_switches(self):
         with tempfile.TemporaryDirectory(prefix="zmem-183-reflect-") as raw:
@@ -626,38 +668,49 @@ class QueryRewriteSurfaceIntegrationTest(unittest.TestCase):
                     )
 
     def test_user_prompt_provider_rewrites_once_and_cli_negative_surfaces_stay_closed(self):
+        # Issue #160 repin: the provider delegates ONE prefetch to its
+        # transport with the raw stripped input and never launches a
+        # query-rewrite subprocess of its own — the rewrite-once contract now
+        # lives at the store boundary (storelib/cli.py's prefetch branch and
+        # its ZMEM_QUERY_CONTEXT gate).
         provider = _load_provider()
-        calls: list[list[str]] = []
+        delegations: list[tuple[str, dict]] = []
+        store_calls: list[list[str]] = []
 
-        def fake_provider_store(args, timing=None, input_text=None):
+        def recording_transport_prefetch(query, **kwargs):
+            delegations.append((query, dict(kwargs)))
+            return {"rendered": "selected"}
+
+        def unexpected_store(args, timing=None, input_text=None):
             del timing, input_text
-            calls.append(list(args))
-            if args[0] == "query-rewrite":
-                return {
-                    "ok": True,
-                    "stdout": '{"query":"continue edit.py","rewrite":1}',
-                    "stderr": "",
-                    "returncode": 0,
-                }
-            return {
-                "ok": True,
-                "stdout": '{"rendered":"selected"}',
-                "stderr": "",
-                "returncode": 0,
-            }
+            store_calls.append(list(args))
+            return {"ok": True, "stdout": "", "stderr": "", "returncode": 0}
+
+        self.assertFalse(
+            hasattr(provider, "_rewrite_provider_query"),
+            "provider-side query-rewrite helpers were removed with #160")
 
         with mock.patch.dict(os.environ, {
             "ZMEM_INJECT": "1", "ZMEM_QUERY_CONTEXT": "1",
+            "ZMEM_HOME": str(ROOT), "ZMEM_MCP_URL": "",
         }, clear=False), mock.patch.object(
-            provider, "_run_store", fake_provider_store
+            provider, "_run_store", unexpected_store
         ):
             instance = provider.ZmemMemoryProvider()
             instance._namespace = "project:integration"
+            self.assertIsNotNone(instance._transport)
+            instance._transport.prefetch = recording_transport_prefetch
             self.assertEqual(instance.prefetch("continue", session_id="s"), "selected")
-        self.assertEqual([args[0] for args in calls], ["query-rewrite", "recall"])
-        self.assertEqual(
-            calls[1][calls[1].index("--query") + 1], "continue edit.py"
-        )
+        self.assertEqual(len(delegations), 1, delegations)
+        delegated_query, delegated_kwargs = delegations[0]
+        self.assertEqual(delegated_query, "continue")
+        self.assertEqual(delegated_kwargs["moment"], "user_prompt")
+        self.assertEqual(delegated_kwargs["lane"], "hermes-provider")
+        self.assertEqual(delegated_kwargs["session_id"], "s")
+        self.assertEqual(delegated_kwargs["ops_tokens"], [])
+        # No query-rewrite subprocess anywhere: prefetch never touches the
+        # provider's legacy store seam.
+        self.assertEqual(store_calls, [])
 
         with tempfile.TemporaryDirectory(prefix="zmem-183-query-closed-") as raw:
             tmp = Path(raw)
@@ -717,28 +770,33 @@ class QueryRewriteSurfaceIntegrationTest(unittest.TestCase):
         self.assertEqual([args[0] for args in calls], ["query-rewrite", "recall"])
         self.assertEqual(calls[1][calls[1].index("--query") + 1], "empty.py")
 
+        # Issue #160 repin: an empty prompt is delegated ONCE with query ""
+        # (the queryless selector path inside store.py's prefetch replaces the
+        # old provider-side rewrite-before-recent sequence; the store-leg
+        # checks below still pin the shared empty-query rewrite itself).
         provider = _load_provider()
-        provider_calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory(prefix="zmem-183-empty-delegate-") as raw:
+            empty_tmp = Path(raw)
+            with mock.patch.dict(os.environ, _env(empty_tmp), clear=True):
+                _init_store(empty_tmp)
+                instance = provider.ZmemMemoryProvider()
+                instance._namespace = "project:integration"
+                delegations: list[tuple[str, dict]] = []
+                original_prefetch = instance._transport.prefetch
 
-        def fake_provider_store(args, timing=None, input_text=None):
-            del timing, input_text
-            provider_calls.append(list(args))
-            if args[0] == "query-rewrite":
-                return {"ok": True, "stdout": '{"query":"empty.py","rewrite":1}',
-                        "stderr": "", "returncode": 0}
-            return {"ok": True, "stdout": '{"rendered":""}', "stderr":"", "returncode":0}
+                def wrapped_prefetch(query, **kwargs):
+                    delegations.append((query, dict(kwargs)))
+                    return original_prefetch(query, **kwargs)
 
-        with mock.patch.dict(os.environ, {"ZMEM_INJECT": "1", "ZMEM_QUERY_CONTEXT": "1"}, clear=False), \
-                mock.patch.object(provider, "_run_store", fake_provider_store):
-            instance = provider.ZmemMemoryProvider()
-            instance._namespace = "project:integration"
-            self.assertEqual(instance.prefetch("", session_id="s"), "")
-        self.assertEqual(
-            [args[0] for args in provider_calls], ["query-rewrite", "recall"]
-        )
-        self.assertEqual(
-            provider_calls[1][provider_calls[1].index("--query") + 1], "empty.py"
-        )
+                instance._transport.prefetch = wrapped_prefetch
+                try:
+                    self.assertEqual(instance.prefetch("", session_id="s"), "")
+                finally:
+                    instance._transport.prefetch = original_prefetch
+                self.assertEqual(len(delegations), 1, delegations)
+                self.assertEqual(delegations[0][0], "")
+                self.assertEqual(delegations[0][1]["moment"], "user_prompt")
+                self.assertEqual(delegations[0][1]["lane"], "hermes-provider")
 
         with tempfile.TemporaryDirectory(prefix="zmem-183-query-prefetch-") as raw:
             tmp = Path(raw)
