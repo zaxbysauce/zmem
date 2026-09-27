@@ -13,12 +13,13 @@ README.
 ## [0.67.0] - 2026-09-27
 
 ### Fixed
-- **Fail-closed evidence retention (issue #170):** malformed or out-of-range
-  `ZMEM_EVIDENCE_DAYS` and `ZMEM_EVIDENCE_CAP` values now disable the complete
-  retention sweep before any transaction or deletion, emit one setting-only
-  diagnostic, and leave evidence and association rows unchanged. Valid expiry,
-  cap ordering, rollback, and the shipped #183 evidence writer behavior remain
-  covered.
+- **Fail-closed evidence retention (issue #170):** malformed non-base-10
+  integer or out-of-range `ZMEM_EVIDENCE_DAYS` and `ZMEM_EVIDENCE_CAP` values
+  (`30.0` is invalid) now disable the complete retention sweep before any
+  transaction or deletion, emit one setting-only diagnostic, and leave evidence
+  and association rows unchanged. When both settings are invalid, the DAYS
+  diagnostic is reported first. Valid expiry, cap ordering, rollback, and the
+  shipped #183 evidence writer behavior remain covered.
 
 ## [0.66.0] - 2026-09-26
 
