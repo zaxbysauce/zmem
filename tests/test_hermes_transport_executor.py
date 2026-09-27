@@ -37,7 +37,8 @@ os.environ["ZMEM_MODELS_DIR"] = str(_SCRATCH / "missing-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 
 _MODE_ENV_KEYS = ("ZMEM_HERMES_MODE", "ZMEM_MCP_URL", "ZMEM_MCP_TOKEN",
-                  "ZMEM_MCP_TOKEN_FILE", "ZMEM_HERMES_DEADLINE_S")
+                  "ZMEM_MCP_TOKEN_FILE", "ZMEM_HERMES_DEADLINE_S",
+                  "ZMEM_HOME")
 
 _ENVELOPE_JSON = (
     '{"results": [], "count": 0, "omitted": 0, "reason": "ok", '
@@ -77,16 +78,23 @@ def _load_provider():
 
 
 class _CancellableOp:
-    """An operation that blocks until its cancel hook releases it."""
+    """An operation that blocks until its cancel hook releases it.
+
+    ``completed`` is set only when ``__call__`` actually returns — after the
+    grace join, run() returning None therefore guarantees the worker was
+    reaped (removing the grace join makes the completed assert race and
+    fail)."""
 
     def __init__(self):
         self.cancel_requested = threading.Event()
         self.released = threading.Event()
+        self.completed = threading.Event()
         self.ran = False
 
     def __call__(self):
         self.ran = True
         self.released.wait(timeout=30)
+        self.completed.set()
         return "should-never-be-returned"
 
     def cancel(self):
@@ -119,6 +127,12 @@ class RealExecutorDeadlineTest(unittest.TestCase):
         self.assertTrue(op.ran, "operation must have started")
         self.assertTrue(op.cancel_requested.is_set(),
                         "deadline must invoke the cancel hook")
+        # The grace join must have reaped the worker before run() returned:
+        # the op completes as soon as the cancel hook releases it, so a
+        # returned-None without the join leaves this Event unset (race).
+        self.assertTrue(op.completed.is_set(),
+                        "grace join must reap the cancelled worker before "
+                        "run() returns")
         self.assertLess(elapsed, 10.0,
                         "cancel-released op must not wait out its 30s cap")
 
@@ -128,14 +142,16 @@ class RealExecutorDeadlineTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(tmp), ignore_errors=True)
         finished = tmp / "finished.txt"
         slow_store = tmp / "store.py"
+        started_marker = tmp / "started.txt"
         slow_store.write_text(textwrap.dedent('''
             import sys, time
             from pathlib import Path
-            for _ in range(300):
-                time.sleep(0.1)
+            Path(r"@START@").write_text("up", encoding="utf-8")
+            time.sleep(1.5)
             Path(r"@FIN@").write_text("done", encoding="utf-8")
             print(@ENVELOPE@)
-        ''').replace("@FIN@", str(finished).replace("\\", "/"))
+        ''').replace("@START@", str(started_marker).replace("\\", "/"))
+            .replace("@FIN@", str(finished).replace("\\", "/"))
             .replace("@ENVELOPE@", repr(_ENVELOPE_JSON)),
             encoding="utf-8")
         local = transport.LocalSubprocess(
@@ -150,10 +166,19 @@ class RealExecutorDeadlineTest(unittest.TestCase):
         self.assertEqual(envelope["reason"], "empty-pool")
         self.assertEqual(envelope["rendered"], "")
         self.assertLess(elapsed, 10.0)
-        # The child must have been killed at the deadline, not allowed to
-        # run to completion (its full loop needs ~30 s).
+        # Wait for the child to have STARTED (so the kill had a real target),
+        # then wait past the child's unfinished 1.5 s finish marker: if the
+        # deadline did NOT kill it, "finished" appears at ~1.7 s and this
+        # assert at ~3 s fails.  With the kill, the child dies at the
+        # deadline and the marker never appears.
+        started_deadline = time.monotonic() + 10.0
+        while not started_marker.exists() and time.monotonic() < started_deadline:
+            time.sleep(0.05)
+        self.assertTrue(started_marker.exists(), "child must have started")
+        time.sleep(max(0.0, 3.0 - (time.monotonic() - started)))
         self.assertFalse(finished.exists(),
-                         "deadline must kill the slow child before it finishes")
+                         "deadline must kill the slow child before it "
+                         "writes its 1.5 s finish marker")
 
     def test_mcp_deadline_cancels_coroutine_returns_empty(self):
         transport = _load_transport()
@@ -186,6 +211,7 @@ class RealExecutorDeadlineTest(unittest.TestCase):
     def test_provider_truncates_over_4096_char_query(self):
         """F3: the raw prompt is truncated to _MAX_PROMPT_CHARS (4096)."""
         os.environ["ZMEM_HOME"] = str(REPO_ROOT)
+        self.addCleanup(os.environ.pop, "ZMEM_HOME", None)
         provider_mod = _load_provider()
         provider = provider_mod.ZmemMemoryProvider()
         seen = []
@@ -198,6 +224,7 @@ class RealExecutorDeadlineTest(unittest.TestCase):
         provider._transport = _RecordingTransport()
         provider.prefetch("x" * 5000, session_id="s")
         self.assertEqual(len(seen), 1)
+        self.assertEqual(len(seen[0]), 4096)
         self.assertEqual(len(seen[0]), provider_mod._MAX_PROMPT_CHARS)
         self.assertTrue(all(ch == "x" for ch in seen[0]))
 
