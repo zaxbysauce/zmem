@@ -1,0 +1,18 @@
+[
+  {
+    "namespace": "project:github.com/zaxbysauce/zmem",
+    "type": "fact",
+    "content": "swarm-pr-review and its siblings (swarm-pr-feedback, swarm-ci-monitor, swarm-pr-subscribe) are not bundled in zmem's own skills/ or commands/ dirs and are not registered in ListSkills/SuggestSkills by default. They live in the zaxbyhub/opencode-swarm repo under .claude/skills/, .opencode/skills/, and .agents/skills/. When a /swarm-* command is invoked in a zmem session and not found locally, add_repo zaxbyhub/opencode-swarm and read .claude/skills/<name>/SKILL.md (usually a thin shim pointing at the canonical .opencode/skills/<name>/SKILL.md there).",
+    "tags": "swarm-pr-review,skills,opencode-swarm,zmem",
+    "signal": "user",
+    "why": "user explicitly told me the skill's location in zaxbyhub/opencode-swarm after an exhaustive local/filesystem search in this session found nothing."
+  },
+  {
+    "namespace": "user:global",
+    "type": "fact",
+    "content": "swarm-pr-review's protocol defines 'Profile A' (a structured controller: dispatch_lanes_async/collect_lane_results/parse_lane_candidates/etc., provided by the OpenCode swarm plugin) versus 'Profile B' (no controller — native Agent/Task subagent dispatch, ledger files instead of .swarm/ artifacts, a procedural rather than mechanical completion gate). A Claude Code session without the swarm plugin's MCP tools runs Profile B: dispatch parallel Agent-tool lanes yourself for the base dimensions and risk families, then a separate independent-reviewer agent, then a critic agent, before synthesizing.",
+    "tags": "swarm-pr-review,profile-b,claude-code,multi-agent-review",
+    "signal": "none",
+    "why": "my own inference from checking this session's actual tool list against the skill's documented Profile A/B capability-detection rule; no tool run verified it, but it follows directly from the skill's own criteria."
+  }
+]
