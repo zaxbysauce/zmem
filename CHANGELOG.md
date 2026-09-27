@@ -110,6 +110,7 @@ README.
   manifest-covered surface), and the five-lanes decision fixtures are
   regenerated at the new version. (Base-drift retarget from 0.63.0: sibling
   releases 0.63.0 and 0.64.0 landed on main while this PR was in review.)
+
 ## [0.64.0] - 2026-09-25
 
 ### Added
