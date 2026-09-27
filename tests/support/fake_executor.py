@@ -1,16 +1,23 @@
-"""FakeExecutor — the deterministic Scheduler + DeadlineExecutor seam for
-the issue #96 lane unit tests.
+"""FakeExecutor — the deterministic Scheduler + DeadlineExecutor seam.
 
-Locally defined pending #160's transport abstraction (the issue #96 contract
-cites this module path; the upstream protocol is specified in the issue text
-and implemented identically here).
+Issue #160 final shape: ``submit(fn)`` stores the callable WITHOUT executing
+it (a handle submitted with no ``delay_s`` has no due time and never fires);
+``advance(seconds)`` drives the fake clock and completes due handles;
+``now()`` reads that clock; ``cancel(handle)`` marks a pending handle
+cancelled so it can never fire afterwards.  ``run(fn, deadline_s)`` is the
+DeadlineExecutor surface: run ordinals listed in ``deadline_hits`` (or all,
+with ``deadline_all``) hit their deadline — the call is cancelled (the cancel
+hook fires exactly once) and ``run`` returns None, and the cancelled call can
+never run afterwards (a late write attempt raises ``FakeCall.Cancelled``),
+which is the no-late-write property the lane contract demands of a timed-out
+child.  When the test declares ``pending_completion`` (fake seconds until the
+NEXT operation completes), ``run`` schedules the operation on the fake clock,
+advances by ``deadline_s``, and returns None when the operation was not due
+yet — a deadline hit proven with zero wall-clock.
 
-Test model: the virtual clock drives ``submit``/``advance``/``now``; the run
-ordinal(s) listed in ``deadline_hits`` hit their deadline — ``run`` cancels
-the call (the cancel hook fires exactly once) and returns None, and the
-cancelled call can never run afterwards (a late write attempt raises
-``FakeCall.Cancelled``), which is the no-late-write property the lane
-contract demands of a timed-out child.
+Issue #96 heritage: the lane unit tests construct ``FakeExecutor(deadline_hits={n})``
+and call ``submit(fn, delay_s=...)``/``advance``/``run`` directly; those
+semantics are unchanged.
 """
 
 
@@ -30,6 +37,7 @@ class FakeCall:
         self.cancelled = False
         self.finished = False
         self.run_count = 0
+        self.result = None
 
     def cancel(self):
         self.cancelled = True
@@ -41,7 +49,8 @@ class FakeCall:
         if self.cancelled:
             raise FakeCall.Cancelled("cancelled at the deadline")
         try:
-            return self._fn(*args, **kwargs)
+            self.result = self._fn(*args, **kwargs)
+            return self.result
         finally:
             self.finished = True
             self.run_count += 1
@@ -52,19 +61,24 @@ class FakeExecutor:
 
     def __init__(self, deadline_hits=()):
         self._now = 0.0
-        self._scheduled = []  # (fire_at, seq, call)
+        self._scheduled = []  # (fire_at, seq, call); no entry = no due time
         self._seq = 0
         self.cancellations = []
         self.deadline_hits = set(deadline_hits)
         self.deadline_all = False
         self._runs = 0
+        # Test-only knob (#160 DeadlineTest): fake seconds until the next
+        # operation handed to ``run`` completes.  None keeps the direct-call
+        # (issue #96) semantics.
+        self.pending_completion = None
 
     # -- Scheduler surface -------------------------------------------------
-    def submit(self, fn, delay_s=0.0):
+    def submit(self, fn, delay_s=None):
         call = fn if isinstance(fn, FakeCall) else FakeCall(fn)
         self._seq += 1
-        self._scheduled.append((self._now + float(delay_s), self._seq, call))
-        self._scheduled.sort(key=lambda item: (item[0], item[1]))
+        if delay_s is not None:
+            self._scheduled.append((self._now + float(delay_s), self._seq, call))
+            self._scheduled.sort(key=lambda item: (item[0], item[1]))
         return call
 
     def advance(self, seconds):
@@ -79,6 +93,11 @@ class FakeExecutor:
     def now(self):
         return self._now
 
+    def cancel(self, handle):
+        handle.cancel()
+        self._scheduled = [
+            item for item in self._scheduled if item[2] is not handle]
+
     # -- DeadlineExecutor surface ------------------------------------------
     def run(self, fn, deadline_s):
         self._runs += 1
@@ -87,7 +106,21 @@ class FakeExecutor:
             call.cancel()
             self.cancellations.append(call)
             return None
-        try:
-            return call()
-        except FakeCall.Cancelled:
+        pending = self.pending_completion
+        if pending is None:
+            try:
+                return call()
+            except FakeCall.Cancelled:
+                return None
+        self.pending_completion = None
+        handle = self.submit(call, delay_s=float(pending))
+        self.advance(float(deadline_s))
+        if handle.cancelled:
+            self.cancellations.append(handle)
             return None
+        if handle.run_count == 0:
+            # Not due by the deadline: cancel so it can never fire late.
+            self.cancel(handle)
+            self.cancellations.append(handle)
+            return None
+        return handle.result
