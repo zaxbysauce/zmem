@@ -272,7 +272,7 @@ class SessionEndCleanupTest(unittest.TestCase):
         self.assertEqual(hook["type"], "command")
         self.assertEqual(hook["timeout"], 2)
         self.assertEqual(hook["commandWindows"],
-                         "node ${PLUGIN_ROOT}/hooks/zmem-launch.js session-end")
+                         'node "${PLUGIN_ROOT}/hooks/zmem-launch.js" session-end')
         self.assertNotIn("additionalContextLimit", hook)
         self.assertNotIn("Interrupt", spec["hooks"])
 

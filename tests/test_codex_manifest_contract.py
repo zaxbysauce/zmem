@@ -95,7 +95,8 @@ class CodexManifestContractTest(unittest.TestCase):
                 )
 
     # Issue #188 (Workstream N PR 5 of 6): every Codex entry carries a literal
-    # quote-free Windows command (no shell wrapper, no nested quotes) and the
+    # quoted Windows command (no shell wrapper) so plugin roots containing
+    # spaces remain one node script-path argument, and the
     # seven context-bearing event families declare the 2,000-token
     # additionalContextLimit — PreCompact is omitted because upstream Codex
     # drops additionalContext on PreCompact.
@@ -147,15 +148,11 @@ class CodexManifestContractTest(unittest.TestCase):
             verb = command.rsplit(" ", 1)[-1] if command else ""
             verbs.append(verb)
             with self.subTest(verb=verb):
-                expected = "node ${PLUGIN_ROOT}/hooks/zmem-launch.js %s" % verb
+                expected = 'node "${PLUGIN_ROOT}/hooks/zmem-launch.js" %s' % verb
                 self.assertEqual(
                     entry.get("commandWindows"), expected,
-                    "entry %r commandWindows must be the exact quote-free "
+                    "entry %r commandWindows must be the exact quoted "
                     "launcher invocation %r" % (verb, expected),
-                )
-                self.assertNotIn(
-                    '"', entry.get("commandWindows", ""),
-                    "commandWindows must contain no nested double quotes",
                 )
                 if event in self.CONTEXT_FAMILIES:
                     self.assertEqual(
@@ -180,7 +177,7 @@ class CodexManifestContractTest(unittest.TestCase):
                          "Codex must declare exactly one SessionEnd command")
         self.assertEqual(session_end[0].get("timeout"), 2)
         self.assertEqual(session_end[0].get("commandWindows"),
-                         "node ${PLUGIN_ROOT}/hooks/zmem-launch.js session-end")
+                         'node "${PLUGIN_ROOT}/hooks/zmem-launch.js" session-end')
         self.assertNotIn("additionalContextLimit", session_end[0])
         self.assertNotIn("Interrupt", json.loads(
             (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8")

@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "d17fabee94ed636b68e57a9acb5caaf3a2994a305b059624d11f2d220ffcaf79",
+  "digest": "0a6ffff83ea718ee385edebf8af858f05a26ec680682a3353670939db9b06e5b",
   "files": {
     "hermes-plugin/__init__.py": "1da167c053b8a58a43b5a536d49e93efae1c18a4059d296d3c2cd7aedeee30e1",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -16,7 +16,7 @@
     "hermes-plugin/server/requirements.txt": "799aad6ca2a111d8c21b746fae1a2770278b29554900f95b9241c686d7149189",
     "hermes-plugin/transport.py": "e9da007cd5f6b521186e6ffe35131dd1fb604eb6075e17a09fcb129a5d547ab6",
     "hooks/hooks.claude.json": "f926d43f08d3a18abb3754d25628ef467a79fb856ca8963b2f9b11573f0a2d62",
-    "hooks/hooks.codex.json": "57d8735465f761cb7c77a33a95f68f2b75b5ebd6cfc38752073855d5eac5ccb7",
+    "hooks/hooks.codex.json": "2e8cde08f1007185619278099f8e02571ae4538d203258a13f02e056fa55286e",
     "hooks/hooks.zcode.json": "8c1f63f4f8be8cd1bf28fe1cb36f5aaf316cb9c293d2db941e6b25b9cf63134c",
     "hooks/lib/zmem-log-rotate.py": "d39b64d4b38856771fc91b6a2060ae585028baea6dc2415a9060cc96364f72d0",
     "hooks/lib/zmem-recall-body.py": "bd5048afbcdf0a6d935069d3d3e6a52236c6afa490287eac76fc5cccb504a3cb",

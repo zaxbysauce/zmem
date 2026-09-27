@@ -832,7 +832,7 @@ testDegenerateBudgetFailsOpen();
 testInvalidRawFailsOpen();
 
 // --- issue #188: execute the manifest's real Windows command strings --------
-// Each of the eleven hooks.codex.json entries carries a quote-free
+// Each of the eleven hooks.codex.json entries carries a quoted
 // `commandWindows` string. This section expands ${PLUGIN_ROOT} against a
 // throwaway plugin tree (launcher + generated stub scripts), runs the
 // command through cmd.exe exactly as the Codex Windows host would, and
@@ -850,6 +850,10 @@ function runWindowsManifestCase(manifestEntry, caseRecord, pluginRoot, env) {
             env,
             encoding: "utf8",
             timeout: 60000,
+            // Preserve the manifest command string verbatim when passing it
+            // through cmd.exe; otherwise Node re-escapes its embedded quotes
+            // and turns a space-bearing launcher path into one malformed argv.
+            windowsVerbatimArguments: true,
             cwd: pluginRoot,
         });
     let parsed = null;
@@ -880,7 +884,7 @@ function directStoreStubBody() {
 }
 
 function testWindowsManifestCommandExecution() {
-    const tree = fs.mkdtempSync(path.join(TMP_ROOT, "winmanifest-"));
+    const tree = fs.mkdtempSync(path.join(TMP_ROOT, "winmanifest space-"));
     try {
         buildAndRunCases(tree);
     } finally {
@@ -908,6 +912,8 @@ function buildAndRunCases(tree) {
         casesDoc.cases.length, manifestEntries.length);
 
     const pluginRoot = path.join(tree, "plugin");
+    ok("windows-manifest: plugin root contains a space", pluginRoot.includes(" "),
+        pluginRoot);
     fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
     fs.copyFileSync(LAUNCHER, path.join(pluginRoot, "hooks", "zmem-launch.js"));
     fs.mkdirSync(path.join(pluginRoot, "skills", "memory", "scripts"), { recursive: true });
