@@ -7,8 +7,9 @@ One module, three responsibilities:
   ``store.py`` subprocess or an MCP-over-HTTP transport.  It never opens a
   socket and never spawns a process.
 - Deadline: :class:`DeadlineExecutor` runs every transport operation in a
-  daemon worker under ``ZMEM_HERMES_DEADLINE_S`` (default 6.0, always below
-  the host manager's 8.0 s external-provider join).  A deadline hit cancels
+  daemon worker under ``ZMEM_HERMES_DEADLINE_S`` (default 6.0; the deadline
+  VALUE is always below the host manager's 8.0 s external-provider join —
+  worst-case wall time adds the bounded post-cancel grace join).  A deadline hit cancels
   the operation (child kill / coroutine cancel) and joins the worker before
   returning, so no side effect can land after the provider returns.
 - Transports: :class:`LocalSubprocess` and :class:`McpHttp` both return the
@@ -34,10 +35,13 @@ import sys
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from enum import Enum
+import logging
 from pathlib import Path
 from typing import Any, Optional, TypeVar
 
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 _STORE_PY_REL = Path("skills") / "memory" / "scripts" / "store.py"
 _DEADLINE_ENV = "ZMEM_HERMES_DEADLINE_S"
@@ -360,11 +364,15 @@ class McpHttp:
             moment=moment, ops_tokens=ops_tokens, lane=lane)
         try:
             payload = self._executor.run(operation, self._deadline_s)
-        except Exception:  # noqa: BLE001 - ImportError/network/JSON all fail open
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - every failure class fails open
+            logger.debug("zmem transport: mcp prefetch failed open: %s", exc)
             return _empty_envelope()
         if payload is None or not isinstance(payload, dict):
+            logger.debug("zmem transport: mcp prefetch returned no envelope")
             return _empty_envelope()
         return _coerce_envelope(payload)
+
+
 class LocalSubprocess:
     """One ``store.py prefetch`` subprocess per call, under the deadline."""
 
@@ -387,13 +395,15 @@ class LocalSubprocess:
         try:
             stdout = self._executor.run(
                 _LocalOperation(argv), self._deadline_s)
-        except Exception:  # noqa: BLE001 - every failure class is fail-open
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - every failure class fails open
+            logger.debug("zmem transport: local prefetch failed open: %s", exc)
             return _empty_envelope()
         if stdout is None or not stdout.strip():
+            logger.debug("zmem transport: local prefetch returned no output")
             return _empty_envelope()
         try:
             payload = json.loads(stdout)
         except ValueError:
+            logger.debug("zmem transport: local prefetch stdout was not JSON")
             return _empty_envelope()
         return _coerce_envelope(payload)
-

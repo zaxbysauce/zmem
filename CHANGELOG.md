@@ -27,8 +27,9 @@ README.
 - **Six-second provider deadline**: `ZMEM_HERMES_DEADLINE_S` (default 6.0;
   nonnumeric, nonfinite, zero, negative, and `>= 8.0` values all resolve to
   6.0 with exactly one `transport: invalid ZMEM_HERMES_DEADLINE_S; using
-  6.0` stderr line) bounds every provider prefetch below the host
-  manager's 8.0 s external-provider join.
+  6.0` stderr line). The deadline VALUE stays below the host manager's
+  8.0 s external-provider join; worst-case wall time adds the bounded
+  1.0 s post-cancel grace join.
 - **Configuration-only provider availability**: `ZmemMemoryProvider` selects
   its transport at construction; `is_available()` is path/environment
   checks only (a remote-only box with `ZMEM_MCP_URL` set and no local

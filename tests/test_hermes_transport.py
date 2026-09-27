@@ -19,11 +19,14 @@ import types
 import unittest
 import socket
 import contextlib
+import atexit
+import shutil
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 _SCRATCH = Path(tempfile.mkdtemp(prefix="zmem-160-transport-"))
+atexit.register(shutil.rmtree, str(_SCRATCH), ignore_errors=True)
 os.environ["ZMEM_STORE"] = str(_SCRATCH / "store.sqlite")
 os.environ["ZMEM_DATA"] = str(_SCRATCH)
 os.environ["ZMEM_MODELS_DIR"] = str(_SCRATCH / "missing-models")
@@ -165,21 +168,31 @@ class TransportSelectionTest(unittest.TestCase):
     def test_resolver_matches_provider_home_semantics(self):
         """D3 parity pin: transport._resolve_store_py mirrors the provider's."""
         transport = _load_transport()
+        provider_mod = _load_provider("zmem_hermes_160_resolver_parity")
         empty_home = Path(tempfile.mkdtemp(prefix="zmem-160-parity-"))
-        os.environ["ZMEM_HOME"] = str(empty_home)
+
+        def _both_agree(expect_store):
+            transport_result = transport._resolve_store_py() is not None
+            provider_result = provider_mod._resolve_store_py() is not None
+            self.assertEqual(
+                transport_result, provider_result,
+                "resolver copies diverged for the same environment")
+            self.assertEqual(transport_result, expect_store)
+
         # A set-and-valid ZMEM_HOME short-circuits: no in-tree fallback.
-        self.assertIsNone(transport._resolve_store_py())
-        os.environ.pop("ZMEM_HOME", None)
-        # ZMEM_HOME unset: the in-tree checkout resolves.
-        self.assertIsNotNone(transport._resolve_store_py())
+        os.environ["ZMEM_HOME"] = str(empty_home)
+        _both_agree(False)
         # A ZMEM_HOME that does not name a directory falls through to the
         # in-tree checkout, exactly like the provider's own resolver
         # (implementation-review round 1, HIGH finding).
         os.environ["ZMEM_HOME"] = str(empty_home / "does-not-exist")
-        self.assertIsNotNone(transport._resolve_store_py())
+        _both_agree(True)
         # ~ in ZMEM_HOME expands like the provider's expanduser() call.
         os.environ["ZMEM_HOME"] = "~/zmem-160-no-such-home"
-        self.assertIsNotNone(transport._resolve_store_py())
+        _both_agree(True)
+        os.environ.pop("ZMEM_HOME", None)
+        # ZMEM_HOME unset: the in-tree checkout resolves.
+        _both_agree(True)
 
 
 class TokenResolutionTest(unittest.TestCase):

@@ -599,8 +599,9 @@ resolvable local `skills/memory/scripts/store.py` checkout selects the
 local subprocess transport. Availability is path/environment checks only —
 a remote-only box with `ZMEM_MCP_URL` set is available with zero socket
 probes — and `unavailable_reason()` reports the exact resolution reason.
-Every prefetch runs under `ZMEM_HERMES_DEADLINE_S` (default 6.0 s, always
-below the manager's 8 s join; a deadline hit kills the local child or
+Every prefetch runs under `ZMEM_HERMES_DEADLINE_S` (default 6.0 s; the
+deadline value stays below the manager's 8 s join, and wall time adds a
+bounded 1.0 s post-cancel grace — a deadline hit kills the local child or
 cancels the MCP coroutine and fails open). The MCP transport resolves its
 bearer token as explicit argument > `ZMEM_MCP_TOKEN_FILE` (bare or JSON
 `{"token": ...}`) > `ZMEM_MCP_TOKEN`.
