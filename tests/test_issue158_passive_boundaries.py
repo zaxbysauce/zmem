@@ -81,32 +81,49 @@ class PassiveEnvelopeBoundaryTest(unittest.TestCase):
             self.assertNotIn("<memory-context>", rendered)
 
     def test_provider_malformed_or_missing_rendered_envelope_is_empty(self):
+        """Issue #160 repin: the provider's transport (hermes-plugin/
+        transport.py LocalSubprocess) fails open to the empty envelope for
+        every malformed-stdout class — malformed/non-JSON output, a JSON
+        object missing ``rendered``, and a nonzero store exit."""
         row = self._row()
-        outputs = {
-            "malformed": "not-json",
-            "missing-rendered": json.dumps({"results": [row]}),
+        fakes = {
+            "malformed": self._fake_store("malformed", "not-json"),
+            "missing-rendered": self._fake_store(
+                "missing-rendered", json.dumps({"results": [row]})),
         }
-        for name, stdout in outputs.items():
-            env = _clean_env(self.tmp, data_dir=self.tmp / name)
-            old_env = os.environ.copy()
-            module_name = f"zmem_phase25_boundary_{name}_{uuid.uuid4().hex}"
-            try:
-                os.environ.clear()
-                os.environ.update(env)
-                module = _load_provider(module_name)
-                module._run_store = lambda *args, **kwargs: {
-                    "ok": True, "stdout": stdout, "stderr": "", "returncode": 0,
-                }
-                provider = module.ZmemMemoryProvider()
-                provider.initialize(f"phase25-provider-{name}")
-                rendered = provider.prefetch("stash pop")
-            finally:
-                sys.modules.pop(module_name, None)
-                os.environ.clear()
-                os.environ.update(old_env)
-            self.assertEqual(rendered, "", name)
-            self.assertNotIn("unfenced candidate text", rendered)
-            self.assertNotIn("<memory-context>", rendered)
+        nonzero = self.tmp / "nonzero.py"
+        nonzero.write_text(
+            "import sys\nsys.stderr.write('boom')\nsys.exit(3)\n",
+            encoding="utf-8",
+        )
+        fakes["nonzero-exit"] = nonzero
+
+        module_name = f"zmem_phase25_transport_{uuid.uuid4().hex}"
+        spec = importlib.util.spec_from_file_location(
+            module_name, REPO_ROOT / "hermes-plugin" / "transport.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+            for name, fake in fakes.items():
+                with self.subTest(name):
+                    transport = module.LocalSubprocess(
+                        store_py=str(fake),
+                        executor=module.DeadlineExecutor(),
+                        deadline_s=6.0,
+                    )
+                    envelope = transport.prefetch(
+                        "stash pop", namespace=NAMESPACE, session_id="s",
+                        moment="user_prompt", ops_tokens=[])
+                    self.assertEqual(envelope["results"], [], name)
+                    self.assertEqual(envelope["count"], 0, name)
+                    self.assertEqual(envelope["rendered"], "", name)
+                    self.assertEqual(envelope["reason"], "empty-pool", name)
+                    self.assertNotIn(
+                        "unfenced candidate text", envelope["rendered"], name)
+        finally:
+            sys.modules.pop(module_name, None)
 
     def test_ledger_write_failure_preserves_rendered_envelope(self):
         """A post-render delivery-write failure must not discard safe text."""

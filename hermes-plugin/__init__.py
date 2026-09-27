@@ -18,6 +18,7 @@ so ``ZMEM_HOME`` is optional for a standalone install.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
@@ -62,15 +63,12 @@ _STORE_PY_REL = Path("skills") / "memory" / "scripts" / "store.py"
 _CORE_MD_REL = Path("core.md")
 # Subprocess cap for store.py calls — recall is fast; this is a safety net.
 _STORE_TIMEOUT_S = 20
-# Max recall results surfaced by prefetch (keeps context lean).
-_PREFETCH_LIMIT = 5
-# Max chars of a query passed to store.py recall.
+# Max chars of a query passed to store.py by the memory tools' argv.
 _MAX_QUERY_CHARS = 500
-_QUERY_REWRITE_INPUT_MAX_CHARS = 4096
-_QUERY_REWRITE_CACHE_TTL_S = 2.0
-_QUERY_REWRITE_CACHE_MAX = 32
-_QUERY_REWRITE_CACHE: Dict[tuple[str, str, str], tuple[float, str, bool]] = {}
-_QUERY_REWRITE_CACHE_LOCK = threading.Lock()
+# Max chars of a query delegated to the transport (issue #160).  argv-safety
+# bound only — the store boundary owns classification-on-complete-prompt and
+# the rewrite output cap; see prefetch().
+_MAX_PROMPT_CHARS = 4096
 _NATIVE_EVIDENCE_MAX_BYTES = 64 * 1024
 _NATIVE_EVIDENCE_QUEUE_MAX = 8
 _NATIVE_EVIDENCE_WORKERS = 2
@@ -114,6 +112,26 @@ def _resolve_store_py() -> Optional[Path]:
         return None
     candidate = home / _STORE_PY_REL
     return candidate if candidate.is_file() else None
+
+
+# -- transport (issue #160) ---------------------------------------------------
+# hermes-plugin/ is not an importable package name (hyphen), so transport.py
+# is loaded beside this file exactly like the tests load this module itself.
+def _load_transport_module():
+    transport_path = Path(__file__).resolve().parent / "transport.py"
+    spec = importlib.util.spec_from_file_location(
+        "zmem_hermes_transport", transport_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["zmem_hermes_transport"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    _transport = _load_transport_module()
+except Exception:  # pragma: no cover - a broken transport must not break import
+    logger.debug("zmem: transport module failed to load", exc_info=True)
+    _transport = None
 
 
 def _fallback_store_path() -> Path:
@@ -438,82 +456,6 @@ def _passive_store_args(
         "--namespace", namespace,
     ])
     return args
-
-
-def _free_text_arg(option: str, value: str) -> list[str]:
-    """Encode an option-looking free-text value without changing normal argv."""
-    return [option + "=" + value] if value.startswith("-") else [option, value]
-
-
-def _decode_query_rewrite(result: Dict[str, Any], original: str) -> tuple[str, bool]:
-    """Validate the exact store-owned query-rewrite wire object."""
-    try:
-        if not isinstance(result, dict) or not result.get("ok"):
-            return original, False
-
-        def _pairs(pairs):
-            out = {}
-            for key, value in pairs:
-                if key in out:
-                    raise ValueError("duplicate key")
-                out[key] = value
-            return out
-
-        payload = json.loads((result.get("stdout") or "").strip(),
-                             object_pairs_hook=_pairs)
-        if not isinstance(payload, dict) or set(payload) != {"query", "rewrite"}:
-            return original, False
-        rewritten = payload["query"]
-        flag = payload["rewrite"]
-        if (not isinstance(rewritten, str) or len(rewritten) > _MAX_QUERY_CHARS
-                or type(flag) is not int or flag not in (0, 1)):
-            return original, False
-        return rewritten, flag == 1
-    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
-        return original, False
-
-
-def _rewrite_provider_query(
-    query: str, *, namespace: str, session_id: str,
-) -> tuple[str, bool]:
-    """Best-effort one-second rewrite before the provider's recall command."""
-    raw_query = query if isinstance(query, str) else ""
-    # Keep the provider's historical 500-character fallback/output boundary,
-    # but let the deterministic classifier see the complete bounded prompt.
-    # Truncating before classification could hide an exact anchor after the
-    # output cap and incorrectly trigger a rewrite.  Oversized input fails
-    # open rather than being truncated into a different classification.
-    original = raw_query.strip()[:_MAX_QUERY_CHARS]
-    if not session_id or os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() == "0":
-        return original, False
-    if len(raw_query) > _QUERY_REWRITE_INPUT_MAX_CHARS:
-        return original, False
-    cache_key = (namespace, session_id, raw_query)
-    now = time.monotonic()
-    with _QUERY_REWRITE_CACHE_LOCK:
-        cached = _QUERY_REWRITE_CACHE.get(cache_key)
-        if cached and now - cached[0] < _QUERY_REWRITE_CACHE_TTL_S:
-            return cached[1], cached[2]
-        if cached:
-            _QUERY_REWRITE_CACHE.pop(cache_key, None)
-    args = ["query-rewrite"]
-    args.extend(_free_text_arg("--prompt", raw_query))
-    args.extend(("--session-id", session_id, "--namespace", namespace, "--json"))
-    try:
-        result = _run_store(args)
-        decoded = _decode_query_rewrite(result, original)
-        # Cache only an applied rewrite.  A negative result can become stale as
-        # soon as a new evidence event lands, so retaining it would suppress a
-        # later valid context expansion within the same session.
-        if decoded[1]:
-            with _QUERY_REWRITE_CACHE_LOCK:
-                _QUERY_REWRITE_CACHE[cache_key] = (now, decoded[0], decoded[1])
-                while len(_QUERY_REWRITE_CACHE) > _QUERY_REWRITE_CACHE_MAX:
-                    _QUERY_REWRITE_CACHE.pop(next(iter(_QUERY_REWRITE_CACHE)))
-        return decoded
-    except Exception as exc:  # provider adapters must remain fail-open
-        logger.debug("zmem query rewrite failed: %s", exc)
-        return original, False
 
 
 def _run_passive_store(
@@ -1289,6 +1231,37 @@ class ZmemMemoryProvider(MemoryProvider):
         self._session_id: str = ""
         self._namespace: str = "user:global"
         self._initialized: bool = False
+        # Issue #160: select the transport at construction, from
+        # configuration only.  A provider with no usable mode stays
+        # unavailable (is_available False) and fails open everywhere.
+        self._mode = None
+        self._mode_reason = "mode=none unavailable"
+        self._transport = None
+        self._select_transport()
+
+    def _select_transport(self) -> None:
+        """Resolve TransportMode once and build the matching transport."""
+        if _transport is None:
+            return
+        mode, reason = _transport.resolve_transport_mode()
+        self._mode, self._mode_reason = mode, reason
+        if mode is None:
+            return
+        deadline_s = _transport.resolve_deadline_s()
+        executor = _transport.DeadlineExecutor()
+        if mode is _transport.TransportMode.local:
+            store_py = _resolve_store_py()
+            if store_py is None:  # pragma: no cover - mode resolution checked
+                self._mode = None
+                self._mode_reason = "mode=local unavailable: local store missing"
+                return
+            self._transport = _transport.LocalSubprocess(
+                store_py=str(store_py), executor=executor,
+                deadline_s=deadline_s)
+        else:
+            url = os.environ.get("ZMEM_MCP_URL", "").strip()
+            self._transport = _transport.McpHttp(
+                url=url, executor=executor, deadline_s=deadline_s)
 
     @property
     def name(self) -> str:
@@ -1297,25 +1270,33 @@ class ZmemMemoryProvider(MemoryProvider):
     # -- core lifecycle -----------------------------------------------------
 
     def is_available(self) -> bool:
-        """True iff ``ZMEM_HOME`` is set and points at a checkout with store.py.
+        """True iff a transport is configured (issue #160).
 
-        No subprocess, no network — pure file checks (per ABC contract).
+        Configuration-only: path and environment checks, never a socket and
+        never a subprocess.  A remote-only box with ``ZMEM_MCP_URL`` set is
+        available; a box with neither a local checkout nor a URL is not.
         """
-        store_py = _resolve_store_py()
-        return store_py is not None
+        return self._mode is not None
+
+    def unavailable_reason(self) -> str:
+        """The exact transport-resolution reason for an unavailable provider."""
+        return self._mode_reason
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id or ""
         self._namespace = self._resolve_namespace(**kwargs)
 
-        # First-run safety: ensure the store exists. store.py init is idempotent
-        # (CREATE TABLE IF NOT EXISTS). Only run if store.sqlite is absent so we
-        # don't spawn a subprocess on every agent startup.
-        store_sqlite = _resolve_store_data_dir() / "store.sqlite"
-        if not store_sqlite.exists():
-            r = _run_store(["init"])
-            if not r["ok"]:
-                logger.warning("zmem: store.py init failed: %s", r["stderr"])
+        # First-run safety: ensure the store exists — LOCAL mode only (issue
+        # #160).  MCP mode opens no socket and creates no store.  store.py
+        # init is idempotent (CREATE TABLE IF NOT EXISTS) and only runs when
+        # store.sqlite is absent so we don't spawn on every agent startup.
+        if self._mode is not None and _transport is not None \
+                and self._mode is _transport.TransportMode.local:
+            store_sqlite = _resolve_store_data_dir() / "store.sqlite"
+            if not store_sqlite.exists():
+                r = _run_store(["init"])
+                if not r["ok"]:
+                    logger.warning("zmem: store.py init failed: %s", r["stderr"])
         self._initialized = True
 
     def _resolve_namespace(self, **kwargs) -> str:
@@ -1356,12 +1337,15 @@ class ZmemMemoryProvider(MemoryProvider):
         return ""
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Passive recall before each turn from the store-rendered envelope.
+        """Passive recall before each turn via the selected transport.
 
-        The MemoryManager runs external-provider prefetch in a background thread
-        with a bounded join (``memory_manager.py``), so the subprocess cost is
-        amortized — no need for queue_prefetch complexity here.  The provider
-        intentionally has no local selection, ledger, budget, or render path.
+        The transport boundary (issue #160) returns the complete parsed
+        #158/#159 envelope — one ``store.py prefetch`` subprocess in local
+        mode, the MCP ``prefetch`` tool over HTTP in remote mode, both under
+        ``ZMEM_HERMES_DEADLINE_S`` — and this adapter extracts ``rendered``.
+        The store subprocess owns selection, budget, the delivery ledger, and
+        the user_prompt query rewrite (its ``ZMEM_QUERY_CONTEXT`` gate); the
+        provider performs no local selection and no rewrite of its own.
         """
         # Issue #110 (P0-5): passive-injection kill switch — no store
         # subprocess, empty delivery, one log line carrying the marker.
@@ -1369,36 +1353,23 @@ class ZmemMemoryProvider(MemoryProvider):
             logger.info(
                 "zmem prefetch: status=silent reason=disabled (ZMEM_INJECT=0)")
             return ""
+        transport = self._transport
+        if transport is None:
+            logger.debug(
+                "zmem prefetch: no transport (reason=%s)", self._mode_reason)
+            return ""
         raw_query = query if isinstance(query, str) else ""
+        q = raw_query.strip()[:_MAX_PROMPT_CHARS]
         sid = (session_id or self._session_id or "").strip()
-        rewrite_applied = False
-        if sid:
-            q, rewrite_applied = _rewrite_provider_query(
-                raw_query, namespace=self._namespace, session_id=sid
-            )
-        else:
-            q = raw_query.strip()[:_MAX_QUERY_CHARS]
-        if rewrite_applied:
-            # The canonical decision-file writer belongs to the hook.  Native
-            # provider prefetch has no second decision producer; this diagnostic
-            # is intentionally emitted only for a real rewrite.
-            logger.info("zmem prefetch: rewrite=1")
-        command = "recall" if q else "recent"
-        result = _run_passive_store(_passive_store_args(
-            command,
-            query=q,
+        envelope = transport.prefetch(
+            q,
             namespace=self._namespace,
-            limit=_PREFETCH_LIMIT,
-            global_limit=3,
             session_id=sid,
             moment="user_prompt",
+            ops_tokens=[],
             lane="hermes-provider",
-        ))
-        payload = _decode_rendered_envelope(result)
-        if payload is None:
-            logger.debug("zmem prefetch: missing or malformed rendered envelope")
-            return ""
-        return payload["rendered"]
+        )
+        return envelope.get("rendered", "")
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """No-op — the manager already background-caches external prefetch."""

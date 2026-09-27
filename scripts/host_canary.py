@@ -351,8 +351,9 @@ class DeadlineExecutor(Protocol):
     hook carried by fn; a timed-out child can never cause a canary result to
     be written (run_command returns None and the lane records a structured
     failure instead). Tests inject FakeExecutor (tests/support/
-    fake_executor.py) — locally defined pending #160's transport
-    abstraction; see the migration note in the issue #96 trace.
+    fake_executor.py) — the shared seam finalized by issue #160's
+    transport abstraction (submit/advance/now/cancel plus the
+    DeadlineExecutor run surface).
     """
 
     def run(self, fn, deadline_s):

@@ -121,10 +121,25 @@ class AdapterScanTest(unittest.TestCase):
         text = (REPO_ROOT / "hermes-plugin" / "__init__.py").read_text(encoding="utf-8")
         prefetch = self._method_body(text, "prefetch")
         helper = self._method_body(text, "_passive_store_args")
+        # Issue #160: the provider delegates its passive prefetch to the
+        # transport.  No-bump is the #159 ``prefetch`` command itself — one
+        # selector call, passive by construction (there is no retrieval to
+        # bump) — so the pin is the delegation plus the transport's local
+        # argv running that command.
         self.assertIn(
-            "_passive_store_args",
+            "transport.prefetch",
             prefetch,
-            "Hermes prefetch must use the shared passive argv builder",
+            "Hermes prefetch must delegate to the issue #160 transport "
+            "(the passive no-bump #159 prefetch command)",
+        )
+        transport = (REPO_ROOT / "hermes-plugin" / "transport.py").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            '"prefetch"',
+            transport,
+            "the transport's local path must run the passive store.py "
+            "prefetch command (issue #159 — no retrieval bump by "
+            "construction)",
         )
         self.assertIn(
             "--no-bump",
