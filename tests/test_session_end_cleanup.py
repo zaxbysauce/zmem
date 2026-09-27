@@ -26,13 +26,22 @@ SESSION_ID = json.loads(
 )["session_id"]
 
 
-def _sidecar_paths(data_dir: Path) -> dict[str, Path]:
-    stem = hashlib.sha256(SESSION_ID.encode("utf-8")).hexdigest()[:32]
+def _sidecar_paths_for(data_dir: Path, session_id: str) -> dict[str, Path]:
+    stem = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
     ops = data_dir / "ops"
     return {
         suffix: ops / f"{stem}.{suffix}"
         for suffix in ("ledger", "pending", "compact", "tasktext")
     }
+
+
+def _sidecar_paths(data_dir: Path) -> dict[str, Path]:
+    return _sidecar_paths_for(data_dir, SESSION_ID)
+
+
+def _ended_marker(data_dir: Path, session_id: str) -> Path:
+    stem = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    return data_dir / "ops" / f"{stem}.delivery-ended"
 
 
 def _isolated_env(data_dir: Path) -> dict[str, str]:
@@ -166,6 +175,41 @@ class SessionEndCleanupTest(unittest.TestCase):
             )
             self.assertFalse(paths["ledger"].exists())
             self.assertFalse(paths["pending"].exists())
+            self.assertTrue(_ended_marker(data_dir, SESSION_ID).exists())
+            self.assertFalse((data_dir / "store.sqlite").exists())
+            again = subprocess.run(
+                [sys.executable, str(STORE_PY), "delivery-clear",
+                 f"--session-id={SESSION_ID}"],
+                capture_output=True, text=True, env=_isolated_env(data_dir),
+                timeout=30,
+            )
+            self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertEqual(again.stdout, result.stdout)
+            self.assertTrue(_ended_marker(data_dir, SESSION_ID).exists())
+
+    def test_delivery_clear_accepts_leading_dash_session_id(self):
+        session_id = "-leading"
+        with tempfile.TemporaryDirectory(prefix="zmem-189-leading-dash-") as raw:
+            data_dir = Path(raw) / "data"
+            paths = _sidecar_paths_for(data_dir, session_id)
+            paths["ledger"].parent.mkdir(parents=True)
+            paths["ledger"].write_text('{"entries":[]}', encoding="utf-8")
+            paths["pending"].write_text('{"entries":[]}', encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(STORE_PY), "delivery-clear",
+                 "--session-id=-leading"],
+                capture_output=True, text=True, env=_isolated_env(data_dir),
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout,
+                json.dumps({"ok": True, "session_id": session_id,
+                            "cleared": True}, separators=(",", ":")) + "\n",
+            )
+            self.assertFalse(paths["ledger"].exists())
+            self.assertFalse(paths["pending"].exists())
+            self.assertTrue(_ended_marker(data_dir, session_id).exists())
             self.assertFalse((data_dir / "store.sqlite").exists())
 
     def test_session_end_clears_ledger_and_pending_via_store_subprocess(self):

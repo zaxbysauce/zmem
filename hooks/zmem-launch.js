@@ -844,6 +844,7 @@ function runCodexSessionEndFastPath(meta, options = {}) {
         ? options.setTimeoutFn : setTimeout;
     const clearTimer = typeof options.clearTimeoutFn === "function"
         ? options.clearTimeoutFn : clearTimeout;
+    const onTimeout = typeof options.onTimeout === "function" ? options.onTimeout : null;
     const listen = (child, event, handler) => {
         if (typeof child.once === "function") child.once(event, handler);
         else if (typeof child.on === "function") child.on(event, handler);
@@ -874,6 +875,9 @@ function runCodexSessionEndFastPath(meta, options = {}) {
             }
             if (kill && child && typeof child.kill === "function") {
                 settling = true;
+                if (onTimeout) {
+                    try { onTimeout(result); } catch { /* fail open */ }
+                }
                 let closed = false;
                 const onClose = () => {
                     if (closed) return;
@@ -890,6 +894,9 @@ function runCodexSessionEndFastPath(meta, options = {}) {
                     settle(result);
                 }, CODEX_SESSION_END_OUTPUT_MARGIN_MS);
                 return;
+            }
+            if (kill && onTimeout) {
+                try { onTimeout(result); } catch { /* fail open */ }
             }
             settle(result);
         };
@@ -1539,7 +1546,11 @@ function resolveBudget(env, stderrWriter) {
 }
 
 // --- Read all of stdin (buffered, for parse + verbatim replay) --------------
-function readStdin() {
+// SessionEnd has a two-second Codex host limit and its payload is only needed
+// to obtain the session id. A host pipe that never reaches EOF must therefore
+// have a bounded read; other hooks retain the original unbounded finite-input
+// behavior because they replay the complete payload to their child.
+function readStdin(timeoutMs = 0) {
     return new Promise((resolve) => {
         if (process.stdin.isTTY) {
             resolve(Buffer.alloc(0));
@@ -1548,17 +1559,56 @@ function readStdin() {
         const chunks = [];
         let total = 0;
         let overflow = false;
-        process.stdin.on("data", (c) => {
-            if (overflow) return;
+        let settled = false;
+        let timer = null;
+        const finish = (value, closeInput = false) => {
+            if (settled) return;
+            settled = true;
+            if (timer !== null) {
+                if (timeoutMs <= 0) clearImmediate(timer);
+                else clearTimeout(timer);
+            }
+            process.stdin.removeListener("data", onData);
+            process.stdin.removeListener("end", onEnd);
+            process.stdin.removeListener("error", onError);
+            if (closeInput) {
+                process.stdin.on("error", () => {});
+                try { process.stdin.pause(); } catch { /* fail open */ }
+                try { process.stdin.destroy(); } catch { /* fail open */ }
+            }
+            resolve(value);
+        };
+        const onData = (c) => {
+            if (overflow || settled) return;
             total += c.length;
             if (total > MAX_HOOK_INPUT_BYTES) {
                 overflow = true;
                 return;
             }
             chunks.push(c);
-        });
-        process.stdin.on("end", () => resolve(overflow ? null : Buffer.concat(chunks)));
-        process.stdin.on("error", () => resolve(overflow ? null : Buffer.concat(chunks)));
+        };
+        const onEnd = () => finish(overflow ? null : Buffer.concat(chunks));
+        const onError = () => finish(overflow ? null : Buffer.concat(chunks));
+        const timedOutInput = () => {
+            if (overflow) return null;
+            const value = Buffer.concat(chunks);
+            value.zmemTimedOut = true;
+            return value;
+        };
+        process.stdin.on("data", onData);
+        process.stdin.on("end", onEnd);
+        process.stdin.on("error", onError);
+        if (Number.isFinite(timeoutMs)) {
+            if (timeoutMs <= 0) {
+                // Let already-buffered finite input deliver its end event
+                // before the no-budget fallback wins. A never-ending pipe
+                // still resolves on this same turn without blocking the
+                // SessionEnd host past its deadline.
+                timer = setImmediate(() => finish(timedOutInput(), true));
+                return;
+            }
+            timer = setTimeout(() => finish(timedOutInput(), true), timeoutMs);
+        }
     });
 }
 
@@ -1630,7 +1680,15 @@ async function main() {
         });
     }
 
-    const stdinBuf = await readStdin();
+    let stdinTimeoutMs = 0;
+    if (codexSessionEnd) {
+        const elapsed = elapsedProcessMs();
+        stdinTimeoutMs = Number.isFinite(elapsed)
+            ? Math.max(0, CODEX_SESSION_END_TARGET_MS - elapsed)
+            : CODEX_SESSION_END_TARGET_MS;
+    }
+    const stdinBuf = await readStdin(codexSessionEnd ? stdinTimeoutMs : null);
+    const stdinTimedOut = Buffer.isBuffer(stdinBuf) && stdinBuf.zmemTimedOut === true;
     if (!Buffer.isBuffer(stdinBuf)) {
         process.stdout.write("{}\n");
         process.exit(0);
@@ -1647,11 +1705,24 @@ async function main() {
 
     const host = detectHost();
     if (host === "codex" && hookName === "session-end") {
-        const fastPath = await runCodexSessionEndFastPath(meta);
+        if (stdinTimedOut) {
+            if (stdinTimeoutMs <= 0) {
+                process.stderr.write("zmem: Codex SessionEnd fast path skipped: no remaining budget\n");
+            }
+            emitCodexSessionEndResult();
+            return;
+        }
+        let outputEmitted = false;
+        const emit = () => {
+            if (outputEmitted) return;
+            outputEmitted = true;
+            emitCodexSessionEndResult();
+        };
+        const fastPath = await runCodexSessionEndFastPath(meta, { onTimeout: emit });
         if (fastPath.reason === "no-budget") {
             process.stderr.write("zmem: Codex SessionEnd fast path skipped: no remaining budget\n");
         }
-        emitCodexSessionEndResult();
+        emit();
         return;
     }
     const prepared = prepareHookPayload(host, hookName, stdinBuf, meta);

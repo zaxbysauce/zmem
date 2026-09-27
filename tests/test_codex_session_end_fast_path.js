@@ -9,7 +9,7 @@ const { EventEmitter } = require("events");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawnSync } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 
 const REPO = path.resolve(__dirname, "..");
 const LAUNCHER = path.join(REPO, "hooks", "zmem-launch.js");
@@ -43,6 +43,31 @@ function runLauncherInput(pluginRoot, input, env, nodeArgs = []) {
         cwd: pluginRoot,
         encoding: "utf8",
         timeout: 15000,
+    });
+}
+
+function runLauncherWithOpenStdin(pluginRoot, input, env, nodeArgs = []) {
+    const launcherArgs = [
+        ...nodeArgs,
+        path.join(pluginRoot, "hooks", "zmem-launch.js"),
+        "session-end",
+    ];
+    const child = spawn(process.execPath, launcherArgs, {
+        env,
+        cwd: pluginRoot,
+        stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdin.on("error", () => {});
+    child.stdin.write(input);
+    return new Promise((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
     });
 }
 
@@ -266,6 +291,49 @@ async function testRealLauncher() {
         const timeoutResult = runLauncher(pluginRoot, { session_id: "timeout-session" }, timeoutEnv);
         check("real Codex SessionEnd timeout fails open within the host budget", () =>
             timeoutResult.status === 0 && timeoutResult.stdout === "{}\n");
+
+        const timeoutPreload = path.join(pluginRoot, "timeout-preload.js");
+        fs.writeFileSync(timeoutPreload, [
+            "const cp = require('child_process');",
+            "const { EventEmitter } = require('events');",
+            "const originalSpawn = cp.spawn;",
+            "cp.spawn = (file, args, options) => {",
+            "  if (file === 'fake-python') {",
+            "    const child = new EventEmitter();",
+            "    child.kill = () => {};",
+            "    child.unref = () => {};",
+            "    return child;",
+            "  }",
+            "  return originalSpawn(file, args, options);",
+            "};",
+            "Object.defineProperty(globalThis.performance, 'now', { value: () => 1800 });",
+        ].join("\n"));
+        const fakeChildEnv = baseEnv(pluginRoot, dataDir, marker);
+        fakeChildEnv.ZMEM_PYTHON = "fake-python";
+        const fakeChild = spawn(process.execPath, ["--require", timeoutPreload, LAUNCHER, "session-end"], {
+            env: fakeChildEnv,
+            cwd: pluginRoot,
+            stdio: ["pipe", "pipe", "pipe"],
+        });
+        let fakeStdout = "";
+        let fakeStderr = "";
+        let publishedWhileRunning = false;
+        fakeChild.stdout.setEncoding("utf8");
+        fakeChild.stderr.setEncoding("utf8");
+        fakeChild.stdout.on("data", (chunk) => {
+            fakeStdout += chunk;
+            publishedWhileRunning = fakeChild.exitCode === null;
+        });
+        fakeChild.stderr.on("data", (chunk) => { fakeStderr += chunk; });
+        fakeChild.stdin.end(JSON.stringify({ session_id: "fake-hung-child" }));
+        const fakeChildResult = await new Promise((resolve, reject) => {
+            fakeChild.once("error", reject);
+            fakeChild.once("close", (code, signal) => resolve({ code, signal }));
+        });
+        check("real launcher publishes timeout output before fake child close grace", () =>
+            fakeChildResult.code === 0 && fakeChildResult.signal === null
+            && fakeStdout === "{}\n" && fakeStderr === "" && publishedWhileRunning);
+
         const nonzeroEnv = baseEnv(pluginRoot, dataDir, marker);
         nonzeroEnv.ZMEM_STUB_MODE = "nonzero";
         const nonzeroResult = runLauncher(pluginRoot, { session_id: "nonzero-session" }, nonzeroEnv);
@@ -288,6 +356,23 @@ async function testRealLauncher() {
             noBudgetResult.status === 0 && noBudgetResult.stdout === "{}\n"
             && noBudgetResult.stderr === "zmem: Codex SessionEnd fast path skipped: no remaining budget\n"
             && fs.readFileSync(marker, "utf8").trim().split(/\r?\n/).length === recordsBeforeNoBudget);
+
+        const openInputPreload = path.join(pluginRoot, "open-input-preload.js");
+        fs.writeFileSync(openInputPreload,
+            "Object.defineProperty(globalThis.performance, 'now', { value: () => 1800 });\n");
+        fs.rmSync(marker, { force: true });
+        const openInputEnv = baseEnv(pluginRoot, dataDir, marker);
+        openInputEnv.ZMEM_PYTHON = process.execPath;
+        const openInputResult = await runLauncherWithOpenStdin(
+            pluginRoot,
+            JSON.stringify({ session_id: "open-input-session" }),
+            openInputEnv,
+            ["--require", openInputPreload],
+        );
+        check("open SessionEnd stdin times out with exact output without cleanup", () =>
+            openInputResult.code === 0 && openInputResult.signal === null
+            && openInputResult.stdout === "{}\n" && openInputResult.stderr === ""
+            && !fs.existsSync(marker));
 
         fs.rmSync(marker, { force: true });
         const noId = runLauncher(pluginRoot, {}, baseEnv(pluginRoot, dataDir, marker));

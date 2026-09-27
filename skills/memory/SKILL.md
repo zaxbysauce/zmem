@@ -868,26 +868,27 @@ The exact session-aware CLI forms are:
 
 ```
 python <store.py> recall --query "<text>" --for-injection --json \
-  --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
+  --session-id=<id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
   [--ops-token <token>]...
 python <store.py> recent --for-injection --json \
-  --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
+  --session-id=<id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
   [--ops-token <token>]...
-python <store.py> ledger-clear --session-id <id>
-python <store.py> delivery-clear --session-id <id>
+python <store.py> ledger-clear --session-id=<id>
+python <store.py> delivery-clear --session-id=<id>
 ```
 
 The passive `recall` and `recent` commands accept the additive attribution
-flags `--session-id`, `--moment`, `--lane`, and repeatable `--ops-token` when
+flags `--session-id=<id>`, `--moment`, `--lane`, and repeatable `--ops-token` when
 called with `--for-injection --json`. An empty query dispatches to recent
 selection. An omitted `--ops-token` list lets the store read the pre-tool ring;
 the ring is composed only for `pretool`, not for UserPromptSubmit or other
 moments. For passive `recall` and `recent`, a session id requires a moment, and
-a moment requires a session id. `ledger-clear --session-id <id>` clears one
+a moment requires a session id. The equals form keeps session ids beginning
+with `-` unambiguous. `ledger-clear --session-id=<id>` clears one
 session's delivery ledger without opening SQLite. `delivery-clear
---session-id <id>` clears the ledger and legacy pending sidecar for SessionEnd
+--session-id=<id>` clears the ledger and legacy pending sidecar for SessionEnd
 cleanup, also without opening SQLite; both commands are idempotent when their
 target sidecars are absent.
 

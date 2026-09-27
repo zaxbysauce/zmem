@@ -2215,7 +2215,7 @@ def main():
         from storelib import delivery_ledger
         try:
             data_dir = _injection_data_dir(None)
-            clear_fn = (delivery_ledger.clear_delivery_state
+            clear_fn = (delivery_ledger.end_delivery_state
                         if args.cmd == "delivery-clear"
                         else delivery_ledger.clear)
             clear_fn(data_dir, args.session_id)
