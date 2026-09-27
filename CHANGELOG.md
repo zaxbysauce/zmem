@@ -10,6 +10,21 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.67.0] - 2026-09-27
+
+### Fixed
+- **Historical edge-layer temporality (issue #130):** recall and explain link
+  expansion now admit a `memory_link` only when its existing `created_at` is at
+  or before the requested `--as-of` instant. Present-time expansion preserves
+  its existing output and ordering. Offset timestamps are compared as UTC
+  instants, including their full edge precision; a subsecond edge after the
+  established whole-second cutoff is excluded. Imported link timestamps are
+  validated without rewriting valid stored bytes: sync rejects malformed
+  non-empty values, missing and empty values retain their existing now
+  behavior, and dataset replay remains byte-preserving. Malformed legacy
+  timestamps are excluded from historical expansion when the cutoff is valid
+  while remaining available to present-time recall.
+
 ## [0.66.0] - 2026-09-26
 
 ### Added

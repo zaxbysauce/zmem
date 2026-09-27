@@ -36,6 +36,7 @@ import json
 import math
 import sqlite3
 import sys
+from datetime import datetime, timezone
 
 from storelib.schema import _env_float, _vec_knn_in_namespace, now_iso
 
@@ -73,6 +74,28 @@ LINK_THRESHOLD = _env_float("ZMEM_LINK_THRESHOLD", 0.75)
 # Relations walked by recall's 1-hop expansion. `contradicts` participates
 # too — gated by the confidence floor and tagged [CONTESTED LINK] at emit.
 _EXPANSION_RELATIONS = ("related", "supports", "contradicts")
+
+
+def _parse_iso_utc(value: object) -> datetime | None:
+    """Parse a link timestamp using the recall timestamp contract.
+
+    ``datetime.fromisoformat`` accepts the offset and subsecond forms emitted
+    by supported importers.  Naive values are interpreted as UTC, matching
+    recall's existing ``--as-of`` behavior; aware values are converted to UTC.
+    Invalid and non-string values return ``None`` so historical expansion can
+    fail closed without raising on legacy or crafted rows.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        return parsed
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 # Issue #136: relations the graph-SEED arm may follow from an entity-anchored
 # seed node. `contradicts` is deliberately absent — a contradiction is an
@@ -462,7 +485,8 @@ def expand_recall_links(
     contradicts only — the confidence floor. Expansion rows carry
     ``link_relation`` / ``link_of`` / ``link_score`` / ``contested_link`` keys
     and NOTHING writes those keys on non-expansion rows, so a link-free store
-    keeps byte-identical recall output.
+    keeps byte-identical recall output. When ``as_of`` is set, an edge is
+    eligible only when its ``created_at`` is at or before that instant.
     """
     from storelib.recall import _classify_injection, _fetch_by_ids
 
@@ -470,17 +494,31 @@ def expand_recall_links(
         return []
 
     have = {r["id"] for r in results}
+    as_of_dt = _parse_iso_utc(as_of) if as_of else None
     # Best edge per candidate neighbor id: highest score wins; ties break by
     # (relation, parent id) so the choice is deterministic run-to-run.
     best: dict[str, tuple[float, str, str]] = {}
     for r in results:
         rid = r["id"]
-        edges = conn.execute(
-            "SELECT src_id, dst_id, relation, score FROM memory_link "
-            "WHERE (src_id=? OR dst_id=?)",
-            (rid, rid),
-        ).fetchall()
+        sql = (
+            "SELECT src_id, dst_id, relation, score, created_at FROM memory_link "
+            "WHERE (src_id=? OR dst_id=?)"
+        )
+        params = [rid, rid]
+        edges = conn.execute(sql, params).fetchall()
         for e in edges:
+            if as_of:
+                created_at = e["created_at"]
+                if as_of_dt is not None:
+                    created_at_dt = _parse_iso_utc(created_at)
+                    if created_at_dt is None or created_at_dt > as_of_dt:
+                        continue
+                elif (not isinstance(as_of, str) or
+                      not isinstance(created_at, str) or
+                      created_at > as_of):
+                    # Preserve the established never-raise lexical fallback
+                    # for an invalid programmatic as_of value.
+                    continue
             relation = e["relation"]
             if relation not in _EXPANSION_RELATIONS:
                 continue
