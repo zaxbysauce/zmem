@@ -1039,6 +1039,11 @@ def _normalize_as_of(as_of: str | None) -> str | None:
     the SQL compare degrades exactly as before (never raises on the hot
     path).
     """
+    if not isinstance(as_of, str):
+        # Programmatic callers can bypass argparse's string contract. Treat a
+        # non-string cutoff as unset here so the public recall path never
+        # raises before expand_recall_links can apply its fail-closed guard.
+        return None
     if not as_of:
         return as_of
     candidate = as_of.strip()
@@ -2344,6 +2349,11 @@ def _recall_memory_impl(
     structurally by the ``no_bump`` gate and search-shaped surfaces by their
     ``link_hops=0`` contract (see ``_unfold_enabled``).
     """
+    if as_of is not None and not isinstance(as_of, str):
+        # A supplied non-string cutoff is invalid input. Fail closed before
+        # normalization, search, telemetry, or any other store interaction;
+        # treating it as absent would widen recall to present-time rows.
+        return []
     if scopes is not None and include_cross_project:
         raise ValueError(
             "scoped recall cannot be combined with include_cross_project=True; "
@@ -3262,6 +3272,11 @@ def explain_recall(
     stay pre-rerank (the pool measures retrieval, not the rerank
     presentation).
     """
+    if as_of is not None and not isinstance(as_of, str):
+        # A supplied non-string cutoff is invalid input. Fail closed before
+        # normalization, query planning, or any other store interaction;
+        # treating it as absent would explain present-time rows instead.
+        return []
     now_epoch = _now_epoch()
     if for_injection:
         # Injection explain mirrors the passive lane and remains strictly
@@ -3864,6 +3879,10 @@ def _recent_memory_impl(
     so ``recent --namespace <old pre-v5 key>`` finds rows migrated to the new
     key. (issue #18)
     """
+    if as_of is not None and not isinstance(as_of, str):
+        # Match recall_memory and explain_recall: invalid programmatic
+        # cutoffs must not degrade into an absent cutoff and present-time rows.
+        return []
     if scopes is not None and include_cross_project:
         raise ValueError(
             "scoped recent cannot be combined with include_cross_project=True; "
