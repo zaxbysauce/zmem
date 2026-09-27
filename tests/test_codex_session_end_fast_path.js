@@ -31,8 +31,13 @@ function runLauncher(pluginRoot, payload, env) {
     return runLauncherInput(pluginRoot, JSON.stringify(payload), env);
 }
 
-function runLauncherInput(pluginRoot, input, env) {
-    return spawnSync(process.execPath, [path.join(pluginRoot, "hooks", "zmem-launch.js"), "session-end"], {
+function runLauncherInput(pluginRoot, input, env, nodeArgs = []) {
+    const launcherArgs = [
+        ...nodeArgs,
+        path.join(pluginRoot, "hooks", "zmem-launch.js"),
+        "session-end",
+    ];
+    return spawnSync(process.execPath, launcherArgs, {
         input,
         env,
         cwd: pluginRoot,
@@ -75,7 +80,7 @@ async function testHelpers() {
                 assert.strictEqual(python, "python-override");
                 assert.deepStrictEqual(argv, [
                     path.join("plugin-root", "skills", "memory", "scripts", "store.py"),
-                    "ledger-clear", "--session-id", "sid",
+                    "delivery-clear", "--session-id=sid",
                 ]);
                 assert.strictEqual(options.stdio, "ignore");
                 assert.strictEqual(options.env.ZMEM_DATA, "data");
@@ -92,6 +97,8 @@ async function testHelpers() {
         closeResult.ok === true && timerCleared && order.indexOf("kill") === -1);
 
     let hungTimer;
+    let hungGraceTimer;
+    let hungGraceMs;
     let killed = false;
     const hungChild = new EventEmitter();
     hungChild.kill = () => { killed = true; };
@@ -99,15 +106,21 @@ async function testHelpers() {
         { session_id: "hung" },
         {
             env: {}, now: () => 1800,
-            setTimeoutFn: (fn) => { hungTimer = fn; return 1; },
+            setTimeoutFn: (fn, ms) => {
+                if (!hungTimer) hungTimer = fn;
+                else { hungGraceTimer = fn; hungGraceMs = ms; }
+                return 1;
+            },
             clearTimeoutFn: () => {},
             spawnFn: () => hungChild,
         },
     );
     hungTimer();
+    hungGraceTimer();
     const hungResult = await hungPromise;
     check("hung child fails open and is killed at remaining deadline", () =>
-        hungResult.reason === "timeout" && killed);
+        hungResult.reason === "timeout" && killed
+        && hungGraceMs === launch.CODEX_SESSION_END_OUTPUT_MARGIN_MS);
 
     let spawned = false;
     const noBudget = await launch.runCodexSessionEndFastPath(
@@ -148,7 +161,29 @@ async function testHelpers() {
     );
     posixChild.emit("close", 0);
     await posixPromise;
-    check("POSIX selects python3 without where probing", () => selectedPython === "python3");
+    check("POSIX candidate ordering starts with python3", () => selectedPython === "python3");
+
+    const fallbackChildren = [new EventEmitter(), new EventEmitter()];
+    const fallbackPythons = [];
+    const fallbackPromise = launch.runCodexSessionEndFastPath(
+        { session_id: "fallback" },
+        {
+            env: {}, platform: "linux", now: () => 0,
+            spawnFn: (python) => {
+                fallbackPythons.push(python);
+                return fallbackChildren[fallbackPythons.length - 1];
+            },
+            setTimeoutFn: () => 1, clearTimeoutFn: () => {},
+        },
+    );
+    const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+    fallbackChildren[0].emit("error", missing);
+    fallbackChildren[0].emit("close", -1);
+    fallbackChildren[1].emit("close", 0);
+    const fallbackResult = await fallbackPromise;
+    check("ENOENT retries the platform alternate without stale close settling", () =>
+        JSON.stringify(fallbackPythons) === JSON.stringify(["python3", "python"])
+        && fallbackResult.ok === true);
 
     const rootChild = new EventEmitter();
     let selectedRoot = "";
@@ -210,6 +245,8 @@ async function testRealLauncher() {
         // exact production store.py argv while Node executes the test stub.
         fs.writeFileSync(path.join(pluginRoot, "skills", "memory", "scripts", "store.py"), [
             "const fs = require('fs');",
+            "if (process.env.ZMEM_STUB_MODE === 'timeout') { setTimeout(() => {}, 5000); }",
+            "if (process.env.ZMEM_STUB_MODE === 'nonzero') { process.exit(9); }",
             "fs.appendFileSync(process.env.ZMEM_MARKER, JSON.stringify({ argv: process.argv.slice(2), data: process.env.ZMEM_DATA, store: process.env.ZMEM_STORE, session: process.env.ZMEM_SESSION }) + '\\n');",
             "process.stdout.write('child stdout noise\\n');",
             "process.stderr.write('child stderr noise\\n');",
@@ -218,11 +255,39 @@ async function testRealLauncher() {
         check("real Codex launcher emits exact empty JSON LF", () => result.status === 0 && result.stdout === "{}\n" && result.stderr === "");
         const records = fs.readFileSync(marker, "utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line));
         const recorded = records[0];
-        check("real Codex launcher exercises one direct ledger-clear child", () =>
-            records.length === 1 && recorded.argv.length === 3 && recorded.argv[0] === "ledger-clear"
-            && recorded.argv[1] === "--session-id" && recorded.argv[2] === "live-session"
+        check("real Codex launcher exercises one direct delivery-clear child", () =>
+            records.length === 1 && recorded.argv.length === 2 && recorded.argv[0] === "delivery-clear"
+            && recorded.argv[1] === "--session-id=live-session"
             && recorded.data === dataDir && recorded.store === path.join(dataDir, "store.sqlite")
             && recorded.session === undefined);
+
+        const timeoutEnv = baseEnv(pluginRoot, dataDir, marker);
+        timeoutEnv.ZMEM_STUB_MODE = "timeout";
+        const timeoutResult = runLauncher(pluginRoot, { session_id: "timeout-session" }, timeoutEnv);
+        check("real Codex SessionEnd timeout fails open within the host budget", () =>
+            timeoutResult.status === 0 && timeoutResult.stdout === "{}\n");
+        const nonzeroEnv = baseEnv(pluginRoot, dataDir, marker);
+        nonzeroEnv.ZMEM_STUB_MODE = "nonzero";
+        const nonzeroResult = runLauncher(pluginRoot, { session_id: "nonzero-session" }, nonzeroEnv);
+        check("real Codex SessionEnd nonzero child remains fail open", () =>
+            nonzeroResult.status === 0 && nonzeroResult.stdout === "{}\n");
+
+        const noBudgetEnv = baseEnv(pluginRoot, dataDir, marker);
+        const elapsedPreload = path.join(pluginRoot, "elapsed-preload.js");
+        fs.writeFileSync(elapsedPreload,
+            "Object.defineProperty(globalThis.performance, 'now', { value: () => 2000 });\n",
+        );
+        const recordsBeforeNoBudget = fs.readFileSync(marker, "utf8").trim().split(/\r?\n/).length;
+        const noBudgetResult = runLauncherInput(
+            pluginRoot,
+            JSON.stringify({ session_id: "no-budget-session" }),
+            noBudgetEnv,
+            ["--require", elapsedPreload],
+        );
+        check("real Codex SessionEnd no-budget keeps exact output and explains skipped cleanup", () =>
+            noBudgetResult.status === 0 && noBudgetResult.stdout === "{}\n"
+            && noBudgetResult.stderr === "zmem: Codex SessionEnd fast path skipped: no remaining budget\n"
+            && fs.readFileSync(marker, "utf8").trim().split(/\r?\n/).length === recordsBeforeNoBudget);
 
         fs.rmSync(marker, { force: true });
         const noId = runLauncher(pluginRoot, {}, baseEnv(pluginRoot, dataDir, marker));

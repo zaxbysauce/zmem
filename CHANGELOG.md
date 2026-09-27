@@ -10,6 +10,15 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.67.0] - 2026-09-27
+
+### Added
+- **Codex SessionEnd delivery cleanup (issue #189):** register the existing
+  session-end launcher on Codex's main thread with a two-second timeout and
+  clear both the session delivery ledger and legacy pending sidecar without
+  opening SQLite. The exact empty JSON response and fail-open behavior remain
+  intact across the launcher boundary.
+
 ## [0.66.0] - 2026-09-26
 
 ### Added
@@ -48,23 +57,14 @@ README.
   declared delay never fires), `advance` drives the fake clock, `cancel`
   marks a pending handle cancelled, and a test-declared completion time
   proves deadline hits with zero wall-clock (issue #96 consumers unchanged).
- - **New tests and fixtures**: `tests/test_hermes_transport.py`
+- **New tests and fixtures**: `tests/test_hermes_transport.py`
   (TransportSelectionTest, TokenResolutionTest, DeadlineTest,
   RecordedCallTest incl. failure-class rows and the no-storelib/no-ledger
   guardrail), a revived `McpSessionToolsTest` provider-to-MCP fixture-parity
   class in `tests/test_session_tools.py`, and
   `tests/fixtures/hermes/{generate.py,mcp-prefetch.json,expected-envelope.json}`
-   (deterministic #159-envelope projection, fixed store clock, sentinel ids).
-   Issue-183/#158 argv pins repinned to the transport boundary.
-
-## [0.67.0] - 2026-09-27
-
-### Added
-- **Codex SessionEnd delivery cleanup (issue #189):** register the existing
-  session-end launcher on Codex's main thread with a two-second timeout and
-  clear both the session delivery ledger and legacy pending sidecar without
-  opening SQLite. The exact empty JSON response and fail-open behavior remain
-  intact across the launcher boundary.
+  (deterministic #159-envelope projection, fixed store clock, sentinel ids).
+  Issue-183/#158 argv pins repinned to the transport boundary.
 
 ## [0.65.0] - 2026-09-25
 

@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
+import io
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STORE_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
 BODY_PY = REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py"
 FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "session-end"
+sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
 SESSION_ID = json.loads(
     (FIXTURE_DIR / "payload.json").read_text(encoding="utf-8")
 )["session_id"]
@@ -42,6 +47,60 @@ def _isolated_env(data_dir: Path) -> dict[str, str]:
     return env
 
 
+class FakeScheduler:
+    """Test-only clock used by the issue #189 body boundary helper."""
+
+    def __init__(self) -> None:
+        self._elapsed_ms = 0.0
+
+    def advance(self, ms: float) -> None:
+        self._elapsed_ms += ms
+
+    def elapsed_ms(self) -> float:
+        return self._elapsed_ms
+
+
+def invoke_session_end(data_dir: Path, session_id: str,
+                       scheduler: FakeScheduler) -> tuple[int, str, list[list[str]]]:
+    """Run the real body with one fake #158 delivery-clear subprocess."""
+    calls: list[list[str]] = []
+    payload = json.dumps({"session_id": session_id})
+
+    def fake_run(argv, *args, **kwargs):
+        calls.append(list(argv))
+        from storelib import delivery_ledger
+        delivery_ledger.clear_delivery_state(str(data_dir), session_id)
+        scheduler.advance(25.0)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    env = _isolated_env(data_dir)
+    original_env = os.environ.copy()
+    original_argv = sys.argv[:]
+    original_stdin = sys.stdin
+    output = io.StringIO()
+    error = io.StringIO()
+    try:
+        os.environ.clear()
+        os.environ.update(env)
+        sys.argv = [str(BODY_PY), str(STORE_PY), "user:global", "25000", "session_end"]
+        sys.stdin = io.StringIO(payload)
+        with patch("subprocess.run", side_effect=fake_run):
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+                try:
+                    runpy.run_path(str(BODY_PY), run_name="__main__")
+                except SystemExit as exc:
+                    rc = int(exc.code or 0)
+        # The body writes directly to stdout; the named helper's contract
+        # records the invocation and elapsed control while the caller captures
+        # the exact output in the integration test below.
+        return rc, output.getvalue(), calls
+    finally:
+        os.environ.clear()
+        os.environ.update(original_env)
+        sys.argv = original_argv
+        sys.stdin = original_stdin
+
+
 class SessionEndCleanupTest(unittest.TestCase):
     def _seed(self, data_dir: Path) -> dict[str, Path]:
         paths = _sidecar_paths(data_dir)
@@ -53,7 +112,7 @@ class SessionEndCleanupTest(unittest.TestCase):
             path.write_text(sentinels[suffix], encoding="utf-8")
         return paths
 
-    def test_ledger_clear_removes_both_delivery_sidecars_without_sqlite(self):
+    def test_ledger_clear_removes_only_ledger_without_sqlite(self):
         with tempfile.TemporaryDirectory(prefix="zmem-189-cli-") as raw:
             data_dir = Path(raw) / "data"
             paths = self._seed(data_dir)
@@ -73,7 +132,7 @@ class SessionEndCleanupTest(unittest.TestCase):
                             "cleared": True}, separators=(",", ":")) + "\n",
             )
             self.assertFalse(paths["ledger"].exists())
-            self.assertFalse(paths["pending"].exists())
+            self.assertTrue(paths["pending"].exists())
             self.assertTrue(paths["compact"].exists())
             self.assertTrue(paths["tasktext"].exists())
             self.assertFalse((data_dir / "store.sqlite").exists())
@@ -88,6 +147,50 @@ class SessionEndCleanupTest(unittest.TestCase):
             )
             self.assertEqual(again.returncode, 0, again.stderr)
             self.assertEqual(again.stdout, result.stdout)
+
+    def test_delivery_clear_cli_boundary_removes_both_sidecars_without_sqlite(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-189-delivery-cli-") as raw:
+            data_dir = Path(raw) / "data"
+            paths = self._seed(data_dir)
+            result = subprocess.run(
+                [sys.executable, str(STORE_PY), "delivery-clear",
+                 f"--session-id={SESSION_ID}"],
+                capture_output=True, text=True, env=_isolated_env(data_dir),
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout,
+                json.dumps({"ok": True, "session_id": SESSION_ID,
+                            "cleared": True}, separators=(",", ":")) + "\n",
+            )
+            self.assertFalse(paths["ledger"].exists())
+            self.assertFalse(paths["pending"].exists())
+            self.assertFalse((data_dir / "store.sqlite").exists())
+
+    def test_session_end_clears_ledger_and_pending_via_store_subprocess(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-189-fake-body-") as raw:
+            data_dir = Path(raw) / "data"
+            paths = _sidecar_paths(data_dir)
+            paths["ledger"].parent.mkdir(parents=True)
+            paths["ledger"].write_bytes((FIXTURE_DIR / "ledger.bin").read_bytes())
+            paths["pending"].write_bytes((FIXTURE_DIR / "pending.bin").read_bytes())
+            self.assertEqual((FIXTURE_DIR / "expected.json").read_bytes(), b"{}\n")
+            self.assertEqual(
+                (FIXTURE_DIR / "manifest.json").read_bytes(),
+                b'{"schema":1,"session_id":"00000000-0000-4000-8000-000000000189",'
+                b'"namespace":"user:global","timestamp":"2026-09-10T00:00:00Z",'
+                b'"files":["ledger.bin","pending.bin","expected.json"]}\n',
+            )
+            scheduler = FakeScheduler()
+            rc, stdout, calls = invoke_session_end(data_dir, SESSION_ID, scheduler)
+            self.assertEqual(rc, 0)
+            self.assertEqual(stdout, "{}\n")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][2:], ["delivery-clear", f"--session-id={SESSION_ID}"])
+            self.assertEqual(scheduler.elapsed_ms(), 25.0)
+            self.assertFalse(paths["ledger"].exists())
+            self.assertFalse(paths["pending"].exists())
 
     def test_session_end_body_is_exact_empty_json_and_cleans_both_sidecars(self):
         with tempfile.TemporaryDirectory(prefix="zmem-189-body-") as raw:

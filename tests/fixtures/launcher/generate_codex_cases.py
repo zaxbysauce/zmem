@@ -91,8 +91,9 @@ def build_cases():
     cases = []
     for verb in manifest_verbs():
         if verb == "session-end":
-            # SessionEnd is a pass-through command. Its child output must be
-            # valid JSON because the launcher preserves it byte-for-byte.
+            # SessionEnd is a pass-through command. Its child output is
+            # intentionally ignored; the launcher emits the exact empty JSON
+            # response required by Codex.
             child_stdout = "{}\n"
         elif verb in NO_SENTINEL:
             child_stdout = ""

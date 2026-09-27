@@ -92,11 +92,22 @@ function runLauncher(hook, payload, env) {
     });
 }
 
+function testCodexSessionEndIsRegistered() {
+    const spec = JSON.parse(fs.readFileSync(
+        path.join(REPO, "hooks", "hooks.codex.json"), "utf8"));
+    const groups = spec.hooks && spec.hooks.SessionEnd;
+    return Array.isArray(groups) && groups.length === 1
+        && groups[0].thread === "main"
+        && groups[0].hooks && groups[0].hooks.length === 1
+        && groups[0].hooks[0].timeout === 2;
+}
+
 const TMP_ROOT = path.join(REPO, ".tmp-tests");
 fs.mkdirSync(TMP_ROOT, { recursive: true });
 const TMP = fs.mkdtempSync(path.join(TMP_ROOT, "zmem-codex-"));
 
 console.log("\n[1] Codex plugin metadata");
+ok("testCodexSessionEndIsRegistered", testCodexSessionEndIsRegistered());
 
 {
     const plugin = JSON.parse(fs.readFileSync(path.join(REPO, ".codex-plugin", "plugin.json"), "utf8"));
@@ -955,12 +966,12 @@ function buildAndRunCases(tree) {
                     const records = fs.readFileSync(directStoreMarker, "utf8").trim()
                         .split(/\r?\n/).map((line) => JSON.parse(line));
                     const ledgerChildren = records.filter((record) =>
-                        record.argv && record.argv[0] === "ledger-clear");
+                        record.argv && record.argv[0] === "delivery-clear");
                     directChild = ledgerChildren.length === 1 ? ledgerChildren[0] : null;
                 } catch { /* assertion below */ }
                 ok(`${label}: direct store.py child was exercised`,
                     directChild && JSON.stringify(directChild.argv)
-                    === JSON.stringify(["ledger-clear", "--session-id", caseRecord.stdin.session_id])
+                    === JSON.stringify(["delivery-clear", `--session-id=${caseRecord.stdin.session_id}`])
                     && directChild.store === childEnv.ZMEM_STORE
                     && directChild.session === null);
             }

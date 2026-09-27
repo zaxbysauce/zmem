@@ -1186,9 +1186,14 @@ def main():
                                  help="emit the exact {query,rewrite} object")
 
     p_ledger_clear = _add_parser(
-        "ledger-clear", help="clear one session's passive delivery state")
+        "ledger-clear", help="clear one session's delivery ledger")
     p_ledger_clear.add_argument("--session-id", required=True,
-                                help="Session id whose delivery state will be cleared")
+                                help="Session id whose delivery ledger will be cleared")
+
+    p_delivery_clear = _add_parser(
+        "delivery-clear", help="clear one session's delivery state")
+    p_delivery_clear.add_argument("--session-id", required=True,
+                                  help="Session id whose delivery state will be cleared")
 
     p_search = _add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
@@ -2206,13 +2211,16 @@ def main():
 
     # Delivery state is a sidecar concern.  Clear it before connect()/migrate()
     # so session lifecycle cleanup remains idempotent and SQLite-independent.
-    if args.cmd == "ledger-clear":
+    if args.cmd in ("ledger-clear", "delivery-clear"):
         from storelib import delivery_ledger
         try:
             data_dir = _injection_data_dir(None)
-            delivery_ledger.clear_delivery_state(data_dir, args.session_id)
+            clear_fn = (delivery_ledger.clear_delivery_state
+                        if args.cmd == "delivery-clear"
+                        else delivery_ledger.clear)
+            clear_fn(data_dir, args.session_id)
         except Exception:
-            print("[zmem] ledger-clear failed", file=sys.stderr)
+            print(f"[zmem] {args.cmd} failed", file=sys.stderr)
             sys.exit(1)
         print(json.dumps({"ok": True, "session_id": args.session_id,
                           "cleared": True}, separators=(",", ":")) + "\n",

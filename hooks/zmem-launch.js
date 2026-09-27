@@ -362,7 +362,8 @@ function _lastTerminateInfoForTests() {
 // hook-runner configuration); (2) nothing may synchronously kill the
 // direct child first — a dead root PID makes the tree walk fail and
 // re-orphans the grandchildren. The watchdog callback bounds teardown
-// with a grace window plus a child.kill() fallback. Fake children
+// on POSIX the launcher owns a detached process group and kills that group;
+// Windows keeps the taskkill tree walk. Fake children
 // without a real pid skip the taskkill branch so injected-clock unit
 // tests stay pure.
 function _terminateChildTree(child) {
@@ -376,6 +377,15 @@ function _terminateChildTree(child) {
             try { tk.unref(); } catch { /* already gone */ }
             _lastTerminateInfo = { mode: "taskkill", pid: child.pid };
             return; // the tree kill is in flight; do NOT kill the root first
+        } catch {
+            _lastTerminateInfo = { mode: "kill-fallback", pid: child.pid };
+        }
+    } else if (process.platform !== "win32" && child && typeof child.pid === "number"
+        && child.pid > 0 && typeof process.kill === "function") {
+        try {
+            process.kill(-child.pid, "SIGKILL");
+            _lastTerminateInfo = { mode: "process-group", pid: child.pid };
+            return;
         } catch {
             _lastTerminateInfo = { mode: "kill-fallback", pid: child.pid };
         }
@@ -769,7 +779,7 @@ function resolvePython(env = process.env) {
 // and starts a bash/body chain; that work can outlive the host budget on a cold
 // Windows process. This path is deliberately narrow: it is selected only for
 // Codex's session-end verb, takes an id from the payload, and starts exactly one
-// store.py ledger-clear child without where(), bash, or resolvePython().
+// store.py delivery-clear child without where(), bash, or resolvePython().
 function codexSessionEndId(meta) {
     for (const value of [meta && meta.session_id, meta && meta.sessionId]) {
         if (typeof value !== "string") continue;
@@ -788,11 +798,11 @@ function codexSessionEndEnv(env = process.env) {
     return childEnv;
 }
 
-function codexSessionEndPython(env, platform) {
+function codexSessionEndPythonCandidates(env, platform) {
     const explicit = env && typeof env.ZMEM_PYTHON === "string"
         ? env.ZMEM_PYTHON.trim() : "";
-    if (explicit) return explicit;
-    return platform === "win32" ? "python" : "python3";
+    if (explicit) return [explicit];
+    return platform === "win32" ? ["python", "python3"] : ["python3", "python"];
 }
 
 function elapsedProcessMs() {
@@ -806,8 +816,9 @@ function elapsedProcessMs() {
 
 // Resolve the one direct store.py child and settle close/error/timeout exactly
 // once. The timer is armed before spawn so spawn latency consumes the remaining
-// process budget. A timeout uses child.kill() only: store.py is the direct
-// process and this fast path must not introduce taskkill/where/bash children.
+// process budget. A timeout kills the direct child and waits only through the
+// existing final output margin; it must not introduce taskkill/where/bash
+// children.
 function runCodexSessionEndFastPath(meta, options = {}) {
     const env = options.env || process.env;
     const sessionId = codexSessionEndId(meta);
@@ -824,6 +835,7 @@ function runCodexSessionEndFastPath(meta, options = {}) {
 
     const platform = options.platform || process.platform;
     const childEnv = codexSessionEndEnv(env);
+    const pythonCandidates = codexSessionEndPythonCandidates(childEnv, platform);
     const root = options.pluginRoot || env.PLUGIN_ROOT || env.CLAUDE_PLUGIN_ROOT
         || env.ZCODE_PLUGIN_ROOT || env.ZMEM_ROOT || getPluginRoot();
     const storePy = options.storePath || join(root, "skills", "memory", "scripts", "store.py");
@@ -842,45 +854,84 @@ function runCodexSessionEndFastPath(meta, options = {}) {
         let child = null;
         let timer = null;
         let settled = false;
-        const finish = (result, kill) => {
+        let settling = false;
+        let closeGrace = null;
+        let activeCandidate = -1;
+        const settle = (result) => {
             if (settled) return;
             settled = true;
+            if (closeGrace !== null) {
+                try { clearTimer(closeGrace); } catch { /* fail open */ }
+                closeGrace = null;
+            }
+            resolvePromise(result);
+        };
+        const finish = (result, kill) => {
+            if (settled || settling) return;
             if (timer !== null) {
                 try { clearTimer(timer); } catch { /* fail open */ }
                 timer = null;
             }
             if (kill && child && typeof child.kill === "function") {
-                try { child.kill(); } catch { /* already gone */ }
+                settling = true;
+                let closed = false;
+                const onClose = () => {
+                    if (closed) return;
+                    closed = true;
+                    settle(result);
+                };
+                try { listen(child, "close", onClose); } catch { /* fail open */ }
+                try { child.kill(platform === "win32" ? undefined : "SIGKILL"); }
+                catch { /* already gone */ }
                 // A misbehaving platform child must not keep the launcher
-                // alive after the bounded result has been emitted.
-                try { if (typeof child.unref === "function") child.unref(); } catch { /* already gone */ }
+                // alive past the existing 100ms output margin.
+                closeGrace = setTimer(() => {
+                    try { if (typeof child.unref === "function") child.unref(); } catch { /* already gone */ }
+                    settle(result);
+                }, CODEX_SESSION_END_OUTPUT_MARGIN_MS);
+                return;
             }
-            resolvePromise(result);
+            settle(result);
         };
 
         // Arm before spawn; a cold spawn must not get a fresh full budget.
         timer = setTimer(() => finish({ spawned: true, reason: "timeout" }, true), remaining);
-        try {
-            child = spawnFn(codexSessionEndPython(childEnv, platform),
-                [storePy, "ledger-clear", "--session-id", sessionId], {
+        const spawnChild = (candidateIndex) => {
+            activeCandidate = candidateIndex;
+            try {
+                child = spawnFn(pythonCandidates[candidateIndex],
+                    [storePy, "delivery-clear", `--session-id=${sessionId}`], {
                     env: childEnv,
                     stdio: "ignore",
                     cwd: root,
+                    });
+                if (!child) {
+                    finish({ spawned: true, reason: "spawn-empty" });
+                    return;
+                }
+                listen(child, "error", (error) => {
+                    if (candidateIndex !== activeCandidate) return;
+                    if (error && error.code === "ENOENT" && candidateIndex + 1 < pythonCandidates.length
+                        && !settled && !settling) {
+                        spawnChild(candidateIndex + 1);
+                        return;
+                    }
+                    finish({ spawned: true, reason: "spawn-error" });
                 });
-            if (!child) {
-                finish({ spawned: true, reason: "spawn-empty" });
-                return;
+                listen(child, "close", (code) => {
+                    if (candidateIndex !== activeCandidate) return;
+                    finish({
+                    spawned: true,
+                    completed: true,
+                    ok: code === 0,
+                    code,
+                    });
+                });
+            } catch {
+                finish({ spawned: true, reason: "spawn-throw" });
             }
-            listen(child, "error", () => finish({ spawned: true, reason: "spawn-error" }));
-            listen(child, "close", (code) => finish({
-                spawned: true,
-                completed: true,
-                ok: code === 0,
-                code,
-            }));
-        } catch {
-            finish({ spawned: true, reason: "spawn-throw" });
-        }
+        };
+        spawnChild(0);
     });
 }
 
@@ -1596,7 +1647,10 @@ async function main() {
 
     const host = detectHost();
     if (host === "codex" && hookName === "session-end") {
-        await runCodexSessionEndFastPath(meta);
+        const fastPath = await runCodexSessionEndFastPath(meta);
+        if (fastPath.reason === "no-budget") {
+            process.stderr.write("zmem: Codex SessionEnd fast path skipped: no remaining budget\n");
+        }
         emitCodexSessionEndResult();
         return;
     }
@@ -1657,6 +1711,9 @@ async function main() {
         child = spawn(bashPath, [bashScriptPath], {
             stdio: ["pipe", translated ? "pipe" : "inherit", translated ? "pipe" : "inherit"],
             env: buildChildEnv(env, bashPath),
+            // POSIX watchdogs kill the complete detached process group;
+            // Windows uses taskkill /T /F for the process tree.
+            detached: process.platform !== "win32",
             // Issue #186: bashScriptPath is plugin-root-relative on Windows, so
             // the child must resolve it against the plugin root. The wrappers
             // self-locate via $(dirname "$0")/BASH_SOURCE, so every downstream

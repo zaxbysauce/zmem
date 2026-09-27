@@ -203,6 +203,47 @@ setTimeout(() => {
         self.assertEqual(result["info"]["mode"], "taskkill",
                          "win32 must select the tree-kill branch")
 
+    def test_posix_timeout_kills_descendant_process_group(self):
+        """A timed out POSIX launcher must not leave a delayed descendant
+        able to write after the launcher reports its timeout."""
+        if sys.platform == "win32":
+            self.skipTest("POSIX process-group branch")
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("no bash on PATH")
+        scratch = _scratch("zmem-posix-group-")
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        marker = scratch / "late-marker"
+        marker_text = str(marker).replace("\\", "/")
+        script = r"""
+const { spawn } = require('child_process');
+const l = require('./hooks/zmem-launch.js');
+const bash = process.argv[1];
+const marker = process.argv[2];
+const child = spawn(bash, ['-c', 'python3 -c ' + JSON.stringify(
+  'import time; time.sleep(0.8); open(' + JSON.stringify(marker) + ', "w").write("late")') + ' & wait'],
+  {detached: true, stdio: 'ignore'});
+setTimeout(() => {
+  l._terminateChildTree(child);
+  child.once('close', () => setTimeout(() => {
+    console.log(JSON.stringify({exists: require('fs').existsSync(marker),
+                                info: l._lastTerminateInfoForTests()}));
+    process.exit(0);
+  }, 1100));
+}, 100);
+setTimeout(() => process.exit(1), 5000);
+"""
+        proc = subprocess.run(
+            ["node", "-e", script, bash, marker_text],
+            capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=15,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads([line for line in proc.stdout.splitlines()
+                             if line.strip().startswith("{")][-1])
+        self.assertFalse(result["exists"],
+                         "a descendant must not write after process-group teardown")
+        self.assertEqual(result["info"]["mode"], "process-group")
+
     def test_watchdog_kills_real_payload_on_timeout(self):
         """The watchdog against the REAL session-start path (not a stub bash
         child): a slow store stub stalls the payload; the launcher must kill

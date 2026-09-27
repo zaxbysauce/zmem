@@ -33,9 +33,11 @@ swept ops suffixes). The file's mtime refreshes on every record() write, so a
 live session is never the oldest thing in the ops dir.
 
 The suppression window and cap are env-tunable (``ZMEM_DELIVER_WINDOW_S``,
-default 6 h; ``ZMEM_LEDGER_CAP``, default 256). Clearing: the precompact and
-session_end moments call :func:`clear_delivery_state` — context summarized
-away or session over means "already delivered" is false.
+default 6 h; ``ZMEM_LEDGER_CAP``, default 256). Clearing: PreCompact uses
+:func:`clear` to remove only the session ledger; SessionEnd uses
+:func:`clear_delivery_state` to remove the ledger and legacy pending sidecar.
+Context summarized away or a session ending means "already delivered" is
+false.
 """
 
 from __future__ import annotations

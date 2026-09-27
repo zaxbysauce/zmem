@@ -35,6 +35,20 @@ MANIFEST_PATHS = {
 
 
 class CodexManifestContractTest(unittest.TestCase):
+    def test_session_end_is_main_thread_only(self):
+        spec = json.loads(
+            (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8")
+        )
+        groups = spec.get("hooks", {}).get("SessionEnd", [])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].get("thread"), "main")
+
+    def test_interrupt_is_not_registered(self):
+        spec = json.loads(
+            (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("Interrupt", spec.get("hooks", {}))
+
     def test_hooks_paths_match_host_contracts(self):
         for host, (want, _) in EXPECTED.items():
             with self.subTest(host=host):
