@@ -221,7 +221,15 @@ class HermesWriterTest(unittest.TestCase):
             self.assertIn("evidence", args)
             self.assertIn("write", args)
             self.assertTrue(any(str(value).endswith("store.py") for value in args))
-            self.assertTrue(options.get("start_new_session") or options.get("creationflags"))
+            if os.name == "nt":
+                self.assertEqual(
+                    options.get("creationflags"),
+                    0x00000008 | 0x00000200,
+                )
+                self.assertNotIn("start_new_session", options)
+            else:
+                self.assertIs(options.get("start_new_session"), True)
+                self.assertNotIn("creationflags", options)
             row = json.loads(raw)
             self.assertEqual(row["lane"], "hermes-compat")
             self.assertEqual(row["kind"], "tool_call")

@@ -27,8 +27,23 @@ class FaultConnection(sqlite3.Connection):
     """Inject one deterministic SQLite failure at a selected SQL boundary."""
 
     fail_fragment: str | None = None
+    fail_association_delete_at: int | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fail_fragment = None
+        self.fail_association_delete_at = None
+        self.association_delete_count = 0
 
     def execute(self, sql, parameters=()):
+        normalized_sql = sql.lstrip().upper()
+        if normalized_sql.startswith((
+            "DELETE FROM EPISODE_EVIDENCE",
+            "DELETE FROM MEMORY_EVIDENCE",
+        )):
+            self.association_delete_count += 1
+            if self.fail_association_delete_at == self.association_delete_count:
+                raise sqlite3.OperationalError("injected retention failure")
         if self.fail_fragment and self.fail_fragment in sql:
             raise sqlite3.OperationalError("injected retention failure")
         return super().execute(sql, parameters)
@@ -249,13 +264,14 @@ class EvidenceRetentionTest(unittest.TestCase):
                 (episode_id, evidence_id),
             )
             conn.commit()
-            # The episode association is removed successfully; fail on the
-            # second association DELETE so rollback must restore both links.
-            conn.fail_fragment = "DELETE FROM memory_evidence"
+            # Fail on the second association DELETE so rollback must restore
+            # the link removed by the first DELETE, regardless of table order.
+            conn.fail_association_delete_at = 2
             os.environ["ZMEM_EVIDENCE_DAYS"] = "0"
             self.assertEqual(evidence.sweep_evidence(
                 conn, now_ts="2026-09-10T00:00:00Z"
             ), ZERO)
+            self.assertEqual(conn.association_delete_count, 2)
             self.assertFalse(conn.in_transaction)
             self.assertIsNotNone(conn.execute(
                 "SELECT 1 FROM evidence WHERE id=?", (evidence_id,)
@@ -274,7 +290,7 @@ class EvidenceRetentionTest(unittest.TestCase):
     def test_cap_delete_failure_rolls_back(self):
         conn = self._fault_connection()
         try:
-            memory_id = "00000000-0000-4000-8000-000000001741"
+            memory_id = "00000000-0000-4000-8000-000000001744"
             episode_id = "00000000-0000-4000-8000-000000001742"
             capped_id = "00000000-0000-4000-8000-000000001741"
             conn.execute(
@@ -355,13 +371,16 @@ class EvidenceRetentionTest(unittest.TestCase):
             conn.execute(
                 "UPDATE memory SET content='caller-owned' WHERE id=?", (memory_id,)
             )
-            conn.fail_fragment = "DELETE FROM memory_evidence"
+            # Fail on the second association DELETE so the rollback proves
+            # the first association mutation was actually attempted.
+            conn.fail_association_delete_at = 2
             os.environ["ZMEM_EVIDENCE_DAYS"] = "0"
             statements: list[str] = []
             conn.set_trace_callback(statements.append)
             self.assertEqual(evidence.sweep_evidence(
                 conn, now_ts="2026-09-10T00:00:00Z"
             ), ZERO)
+            self.assertEqual(conn.association_delete_count, 2)
             conn.set_trace_callback(None)
             self.assertTrue(conn.in_transaction)
             self.assertIn("SAVEPOINT zmem_evidence_sweep", statements)
