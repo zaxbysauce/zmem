@@ -29,6 +29,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
@@ -82,6 +83,55 @@ def _run_body(tmp: str, event: dict, ns: str, mode: str,
 def _ops_files(tmp: str) -> list:
     d = Path(tmp, "ops")
     return sorted(d.iterdir()) if d.is_dir() else []
+
+
+_DELIVERY_RACE_SCRIPT = r'''
+import sys
+
+scripts, data_dir, session_id, mode = sys.argv[1:5]
+sys.path.insert(0, scripts)
+from storelib import delivery_ledger as dl
+import host
+
+dl._DELIVERY_LOCK_TIMEOUT_S = 5.0
+_host_acquire_lock = host.acquire_lock
+
+def _acquire_lock_with_barrier(path, stale_seconds):
+    token = _host_acquire_lock(path, stale_seconds)
+    if token is None:
+        print("BLOCKED", flush=True)
+    return token
+
+host.acquire_lock = _acquire_lock_with_barrier
+
+row = [{"id": "race-row", "content": "race"}]
+if mode == "writer-hold":
+    print("START", flush=True)
+    dl.record(data_dir, session_id, row, "pretool")
+    with dl._delivery_state_lock(data_dir):
+        print("READY", flush=True)
+        if sys.stdin.readline().strip() != "GO":
+            raise SystemExit("writer release barrier failed")
+    print("DONE", flush=True)
+elif mode == "end":
+    print("START", flush=True)
+    dl.end_delivery_state(data_dir, session_id)
+    print("DONE", flush=True)
+elif mode == "terminal-hold":
+    with dl._delivery_state_lock(data_dir):
+        dl._write_delivery_ended_locked(data_dir, session_id)
+        print("MARKED", flush=True)
+        if sys.stdin.readline().strip() != "GO":
+            raise SystemExit("terminal release barrier failed")
+        dl._clear_delivery_sidecars_locked(data_dir, session_id)
+    print("DONE", flush=True)
+elif mode == "writer":
+    print("START", flush=True)
+    dl.record(data_dir, session_id, row, "pretool")
+    print("DONE", flush=True)
+else:
+    raise SystemExit("unknown race mode")
+'''
 
 
 class LedgerModuleTest(unittest.TestCase):
@@ -249,6 +299,98 @@ class LedgerModuleTest(unittest.TestCase):
         self.dl.clear_delivery_state(self.tmp, "sess-a")
         self.assertEqual(self.dl.delivered_ids(self.tmp, "sess-a"), [])
         self.assertEqual(self.dl.consume_pending(self.tmp, "sess-a"), "")
+
+    def test_terminal_marker_expires_for_resumed_session(self):
+        sid = "resume-session"
+        self.dl.record(self.tmp, sid, [{"id": "before"}], "pretool")
+        self.dl.end_delivery_state(self.tmp, sid)
+        marker = self.dl.delivery_ended_path(self.tmp, sid)
+        self.assertTrue(marker)
+        self.assertNotIn(sid, Path(marker).read_text(encoding="utf-8"))
+        with open(marker, "w", encoding="utf-8") as f:
+            json.dump({"session_id": sid,
+                       "ended_at": time.time() - self.dl._DELIVERY_END_MARKER_TTL_S - 1}, f)
+        self.dl.record(self.tmp, sid, [{"id": "after"}], "session_start")
+        self.assertEqual(self.dl.delivered_ids(self.tmp, sid), ["after"])
+
+    def test_delivery_lock_rejects_unusable_host_token(self):
+        import host
+        with patch.object(host, "acquire_lock", return_value="unlocked"):
+            with self.assertRaises(self.dl.DeliveryStateLockError):
+                with self.dl._delivery_state_lock(self.tmp):
+                    pass
+
+    def test_terminal_marker_is_reaped_by_ops_age_sweep(self):
+        marker = Path(self.dl.delivery_ended_path(self.tmp, "sweep-session"))
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{"ended_at": 1}', encoding="utf-8")
+        stale = time.time() - (8 * 24 * 60 * 60)
+        os.utime(marker, (stale, stale))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "sweep",
+             "--max-age-days", "7"],
+            capture_output=True, text=True, env=_clean_env(self.tmp), timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_terminal_clear_serializes_inflight_and_queued_real_process_writers(self):
+        sid = "race-session"
+        ops = Path(self.tmp) / "ops"
+        ops.mkdir(parents=True, exist_ok=True)
+        compact = Path(self.dl.compact_path(self.tmp, sid))
+        tasktext = Path(self.dl.tasktext_path(self.tmp, sid))
+        compact.write_bytes(b"compact-survives")
+        tasktext.write_bytes(b"tasktext-survives")
+        self.dl.park_pending(self.tmp, sid, [{"id": "pending"}], "F", "pretool")
+
+        def start(mode):
+            return subprocess.Popen(
+                [sys.executable, "-c", _DELIVERY_RACE_SCRIPT,
+                 str(SCRIPTS), self.tmp, sid, mode],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=_clean_env(self.tmp),
+            )
+
+        # A public record writer is in-flight while the public terminal clear
+        # queues behind it; the terminal operation then removes both sidecars.
+        inflight = start("writer-hold")
+        self.assertEqual(inflight.stdout.readline().strip(), "START")
+        self.assertEqual(inflight.stdout.readline().strip(), "READY")
+        terminal = start("end")
+        self.assertEqual(terminal.stdout.readline().strip(), "START")
+        self.assertEqual(terminal.stdout.readline().strip(), "BLOCKED")
+        inflight.stdin.write("GO\n")
+        inflight.stdin.flush()
+        inflight_stdout, inflight_stderr = inflight.communicate(timeout=15)
+        terminal_stdout, terminal_stderr = terminal.communicate(timeout=15)
+        self.assertEqual(inflight.returncode, 0, inflight_stderr)
+        self.assertEqual(terminal.returncode, 0, terminal_stderr)
+        self.assertIn("DONE", inflight_stdout)
+        self.assertIn("DONE", terminal_stdout)
+
+        # Hold the terminal lock after writing its marker, then start a real
+        # writer process. It is queued behind the terminal and must observe
+        # the marker after release, leaving no recreated ledger/pending file.
+        terminal_hold = start("terminal-hold")
+        self.assertEqual(terminal_hold.stdout.readline().strip(), "MARKED")
+        queued = start("writer")
+        self.assertEqual(queued.stdout.readline().strip(), "START")
+        self.assertEqual(queued.stdout.readline().strip(), "BLOCKED")
+        terminal_hold.stdin.write("GO\n")
+        terminal_hold.stdin.flush()
+        hold_stdout, hold_stderr = terminal_hold.communicate(timeout=15)
+        queued_stdout, queued_stderr = queued.communicate(timeout=15)
+        self.assertEqual(terminal_hold.returncode, 0, hold_stderr)
+        self.assertEqual(queued.returncode, 0, queued_stderr)
+        self.assertIn("DONE", hold_stdout)
+        self.assertIn("DONE", queued_stdout)
+
+        self.assertFalse(Path(self.dl.ledger_path(self.tmp, sid)).exists())
+        self.assertFalse(Path(self.dl.pending_path(self.tmp, sid)).exists())
+        self.assertEqual(compact.read_bytes(), b"compact-survives")
+        self.assertEqual(tasktext.read_bytes(), b"tasktext-survives")
+        self.assertFalse((Path(self.tmp) / "store.sqlite").exists())
 
     def test_park_multi_row_single_fence_stored_once(self):
         # Issue #151 review (COPILOT-2): a single pretool event selecting

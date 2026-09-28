@@ -22,24 +22,32 @@ parked fences. This module is the delivery-state substrate BOTH lanes share:
 
 Atomicity: every write is tmp-file + ``os.replace`` (the correction_queue
 pattern, inlined here — storelib never imports the scripts-layer module).
-Every function is fail-open: ledger state is an optimization over the pre-#117
-behavior (re-delivery), never a correctness gate, so an OSError degrades to
-"no dedup this event" instead of blocking a hook.
+Ledger/pending mutations and clears are serialized by the shared
+``ops/.delivery-state.lock``. Legacy helpers remain fail-open when that lock
+cannot be acquired; the terminal ``end_delivery_state`` path propagates the
+failure so the CLI cannot claim a cleanup that did not happen.
 
 Bounding: entries older than the suppression window are pruned on every load
 and the store is capped (oldest dropped) on every write, so a file can never
-grow without bound; the backup sweep reaps orphans (``.ledger`` joined the
-swept ops suffixes). The file's mtime refreshes on every record() write, so a
-live session is never the oldest thing in the ops dir.
+grow without bound; the backup sweep reaps orphans (``.ledger`` and
+``.delivery-ended`` joined the swept ops suffixes). The file's mtime refreshes
+on every record() write, so a live session is never the oldest thing in the
+ops dir. Terminal markers suppress same-id writers for a bounded 120 seconds
+so a resumed session can reopen its ledger after the short race window.
 
 The suppression window and cap are env-tunable (``ZMEM_DELIVER_WINDOW_S``,
-default 6 h; ``ZMEM_LEDGER_CAP``, default 256). Clearing: the precompact and
-session_end moments call :func:`clear_delivery_state` — context summarized
-away or session over means "already delivered" is false.
+default 6 h; ``ZMEM_LEDGER_CAP``, default 256). Clearing: PreCompact uses
+:func:`clear` to remove only the session ledger; generic
+:func:`clear_delivery_state` removes the ledger and legacy pending sidecar
+without closing the session. The terminal CLI ``delivery-clear`` uses
+:func:`end_delivery_state` to add the bounded marker before removing both.
+Context summarized away or a session ending means "already delivered" is
+false.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -65,6 +73,15 @@ COMPACT_SUMMARY_MAX = 2000
 # child's SubagentStart.
 TASK_TEXT_MAX = 800
 TASK_TEXT_CAP = 16
+
+_DELIVERY_LOCK_TIMEOUT_S = 0.25
+_DELIVERY_LOCK_POLL_S = 0.005
+_DELIVERY_LOCK_STALE_S = 30.0
+_DELIVERY_END_MARKER_TTL_S = 120.0
+
+
+class DeliveryStateLockError(RuntimeError):
+    """The process could not acquire the shared delivery-state lock."""
 
 
 def _window_s() -> int:
@@ -136,6 +153,94 @@ def tasktext_path(data_dir: str, session_id: str) -> Optional[str]:
     if not name or not data_dir:
         return None
     return os.path.join(data_dir, "ops", name)
+
+
+def delivery_ended_path(data_dir: str, session_id: str) -> Optional[str]:
+    """Path of the terminal per-session delivery marker."""
+    name = _hashed_name(session_id, ".delivery-ended")
+    if not name or not data_dir:
+        return None
+    return os.path.join(data_dir, "ops", name)
+
+
+def _delivery_lock_path(data_dir: str) -> str:
+    return os.path.join(data_dir, "ops", ".delivery-state.lock")
+
+
+@contextlib.contextmanager
+def _delivery_state_lock(data_dir: str):
+    """Serialize delivery mutations per ZMEM_DATA without unlocked fallback.
+
+    ``host.acquire_lock`` supplies the repository's cross-platform exclusive
+    lock implementation.  It is deliberately wrapped with a short retry
+    window and its unusable-lock sentinel is rejected instead of degrading to
+    an unlocked mutation.
+    """
+    try:
+        import host
+    except ImportError as exc:
+        raise DeliveryStateLockError("host lock support unavailable") from exc
+
+    ops_dir = os.path.join(data_dir, "ops")
+    os.makedirs(ops_dir, exist_ok=True)
+    lock_path = _delivery_lock_path(data_dir)
+    deadline = time.monotonic() + _DELIVERY_LOCK_TIMEOUT_S
+    token = None
+    try:
+        while token is None:
+            token = host.acquire_lock(lock_path, _DELIVERY_LOCK_STALE_S)
+            if token == getattr(host, "_NO_LOCK_TOKEN", "unlocked"):
+                raise DeliveryStateLockError(
+                    f"could not safely acquire delivery lock: {lock_path}"
+                )
+            if token is not None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeliveryStateLockError(
+                    f"timed out acquiring delivery lock: {lock_path}"
+                )
+            time.sleep(min(_DELIVERY_LOCK_POLL_S, remaining))
+        yield
+    finally:
+        if token is not None:
+            host.release_lock(lock_path, token)
+
+
+def _delivery_state_ended(data_dir: str, session_id: str) -> bool:
+    path = delivery_ended_path(data_dir, session_id)
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as marker:
+            ended_at = float(json.load(marker).get("ended_at", 0))
+    except (OSError, TypeError, ValueError, AttributeError):
+        try:
+            ended_at = os.stat(path).st_mtime
+        except OSError:
+            return False
+    return (time.time() - ended_at) <= _DELIVERY_END_MARKER_TTL_S
+
+
+def _unlink_delivery_path(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _clear_delivery_sidecars_locked(data_dir: str, session_id: str) -> None:
+    _unlink_delivery_path(ledger_path(data_dir, session_id))
+    _unlink_delivery_path(pending_path(data_dir, session_id))
+
+
+def _write_delivery_ended_locked(data_dir: str, session_id: str) -> None:
+    _atomic_write_json(
+        delivery_ended_path(data_dir, session_id),
+        {"ended_at": time.time()},
+    )
 
 
 def entry_text(row: Dict[str, Any]) -> str:
@@ -236,37 +341,40 @@ def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
         return
     if now is None:
         now = time.time()
-    entries = _load_entries(path, now)
-    by_id = {e["id"]: e for e in entries}
-    for r in rows:
-        rid = r.get("id") if isinstance(r, dict) else None
-        if not isinstance(rid, str) or not rid:
-            continue
-        by_id[rid] = {
-            "id": rid,
-            "moment": str(moment or ""),
-            "ts": now,
-            "text": entry_text(r),
-        }
-    merged = list(by_id.values())
-    merged.sort(key=lambda e: float(e.get("ts", 0) or 0))
-    cap = _cap()
-    if len(merged) > cap:
-        merged = merged[-cap:]
     try:
-        _atomic_write_json(path, {"entries": merged})
-    except OSError:
+        with _delivery_state_lock(data_dir):
+            if _delivery_state_ended(data_dir, session_id):
+                return
+            entries = _load_entries(path, now)
+            by_id = {e["id"]: e for e in entries}
+            for r in rows:
+                rid = r.get("id") if isinstance(r, dict) else None
+                if not isinstance(rid, str) or not rid:
+                    continue
+                by_id[rid] = {
+                    "id": rid,
+                    "moment": str(moment or ""),
+                    "ts": now,
+                    "text": entry_text(r),
+                }
+            merged = list(by_id.values())
+            merged.sort(key=lambda e: float(e.get("ts", 0) or 0))
+            cap = _cap()
+            if len(merged) > cap:
+                merged = merged[-cap:]
+            _atomic_write_json(path, {"entries": merged})
+    except (OSError, DeliveryStateLockError):
         pass
 
 
 def clear(data_dir: str, session_id: str) -> None:
     """Remove the session's ledger (compaction / session end)."""
-    path = ledger_path(data_dir, session_id)
-    if not path:
+    if not ledger_path(data_dir, session_id):
         return
     try:
-        os.unlink(path)
-    except OSError:
+        with _delivery_state_lock(data_dir):
+            _unlink_delivery_path(ledger_path(data_dir, session_id))
+    except (OSError, DeliveryStateLockError):
         pass
 
 
@@ -284,27 +392,30 @@ def park_pending(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
         return
     if now is None:
         now = time.time()
-    entries = _load_entries(path, now)
-    parked_ids = {e["id"] for e in entries}
-    new_rows = [r for r in rows
-                if isinstance(r, dict) and isinstance(r.get("id"), str)
-                and r["id"] not in parked_ids]
-    if not new_rows:
-        return  # every id in this fence is already parked — dedup
-    for i, r in enumerate(new_rows):
-        entries.append({
-            "id": r["id"],
-            "moment": str(moment or ""),
-            "ts": now,
-            # Issue #151 review (COPILOT-2): the fence covers ALL new rows
-            # of this park call — store it ONCE (on the first entry) so
-            # consume cannot join the identical fence N times for an
-            # N-row event; consume_pending drops empty fences.
-            "fence": fence if i == 0 else "",
-        })
     try:
-        _atomic_write_json(path, {"entries": entries})
-    except OSError:
+        with _delivery_state_lock(data_dir):
+            if _delivery_state_ended(data_dir, session_id):
+                return
+            entries = _load_entries(path, now)
+            parked_ids = {e["id"] for e in entries}
+            new_rows = [r for r in rows
+                        if isinstance(r, dict) and isinstance(r.get("id"), str)
+                        and r["id"] not in parked_ids]
+            if not new_rows:
+                return  # every id in this fence is already parked — dedup
+            for i, r in enumerate(new_rows):
+                entries.append({
+                    "id": r["id"],
+                    "moment": str(moment or ""),
+                    "ts": now,
+                    # Issue #151 review (COPILOT-2): the fence covers ALL new rows
+                    # of this park call — store it ONCE (on the first entry) so
+                    # consume cannot join the identical fence N times for an
+                    # N-row event; consume_pending drops empty fences.
+                    "fence": fence if i == 0 else "",
+                })
+            _atomic_write_json(path, {"entries": entries})
+    except (OSError, DeliveryStateLockError):
         pass
 
 
@@ -313,11 +424,12 @@ def consume_pending(data_dir: str, session_id: str) -> str:
     path = pending_path(data_dir, session_id)
     if not path:
         return ""
-    entries = _load_entries(path, time.time())
     try:
-        os.unlink(path)
-    except OSError:
-        pass
+        with _delivery_state_lock(data_dir):
+            entries = _load_entries(path, time.time())
+            _unlink_delivery_path(path)
+    except (OSError, DeliveryStateLockError):
+        return ""
     fences = [e.get("fence", "") for e in entries if e.get("fence")]
     ctx = "\n\n".join(f for f in fences if isinstance(f, str) and f.strip())
     return ctx
@@ -325,14 +437,22 @@ def consume_pending(data_dir: str, session_id: str) -> str:
 
 def clear_delivery_state(data_dir: str, session_id: str) -> None:
     """Compaction / session end: "already delivered" is false again."""
-    clear(data_dir, session_id)
-    path = pending_path(data_dir, session_id)
-    if not path:
+    if not ledger_path(data_dir, session_id):
         return
     try:
-        os.unlink(path)
-    except OSError:
+        with _delivery_state_lock(data_dir):
+            _clear_delivery_sidecars_locked(data_dir, session_id)
+    except (OSError, DeliveryStateLockError):
         pass
+
+
+def end_delivery_state(data_dir: str, session_id: str) -> None:
+    """Terminal SessionEnd clear with an idempotent per-session marker."""
+    if not delivery_ended_path(data_dir, session_id):
+        return
+    with _delivery_state_lock(data_dir):
+        _write_delivery_ended_locked(data_dir, session_id)
+        _clear_delivery_sidecars_locked(data_dir, session_id)
 
 
 def _load_compact(path: Optional[str]) -> Dict[str, Any]:

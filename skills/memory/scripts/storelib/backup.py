@@ -526,7 +526,7 @@ def cmd_sweep(marker_dir: str | None = None,
             except OSError:
                 ring_names = []
             for rname in ring_names:
-                if not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".capture-failure.json")):
+                if not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".delivery-ended", ".capture-failure.json")):
                     continue
                 rp = ops_dir / rname
                 try:

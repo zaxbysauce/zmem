@@ -35,6 +35,7 @@ const { createHash, randomUUID } = require("crypto");
 const { existsSync, mkdirSync, appendFileSync, readFileSync } = require("fs");
 const { join, dirname, basename, resolve, delimiter } = require("path");
 const { homedir } = require("os");
+const { performance } = require("perf_hooks");
 
 // Hooks that emit the <<<ZMEM_JSON>>> sentinel and get envelope translation.
 // Every OTHER hook is passed through verbatim with its own exit code preserved
@@ -161,6 +162,14 @@ const DEFAULT_NAMESPACE_RESOLVE_MS = 2000;
 const DEFAULT_NAMESPACE_CACHE_TTL_MS = 60000;
 const NAMESPACE_CACHE_MAX_ENTRIES = 128;
 const MAX_HOOK_INPUT_BYTES = 256 * 1024;
+
+// Codex kills SessionEnd hooks after two seconds. Keep a 100ms output margin
+// and derive the child deadline from process elapsed time so launcher startup
+// and module loading consume the same budget as the direct store child.
+const CODEX_SESSION_END_HOST_TIMEOUT_MS = 2000;
+const CODEX_SESSION_END_OUTPUT_MARGIN_MS = 100;
+const CODEX_SESSION_END_TARGET_MS =
+    CODEX_SESSION_END_HOST_TIMEOUT_MS - CODEX_SESSION_END_OUTPUT_MARGIN_MS;
 
 // Read one positive-integer millisecond env override. Invalid (non-integer,
 // zero, negative) values fall back to the default and write exactly ONE
@@ -353,7 +362,8 @@ function _lastTerminateInfoForTests() {
 // hook-runner configuration); (2) nothing may synchronously kill the
 // direct child first — a dead root PID makes the tree walk fail and
 // re-orphans the grandchildren. The watchdog callback bounds teardown
-// with a grace window plus a child.kill() fallback. Fake children
+// on POSIX the launcher owns a detached process group and kills that group;
+// Windows keeps the taskkill tree walk. Fake children
 // without a real pid skip the taskkill branch so injected-clock unit
 // tests stay pure.
 function _terminateChildTree(child) {
@@ -367,6 +377,15 @@ function _terminateChildTree(child) {
             try { tk.unref(); } catch { /* already gone */ }
             _lastTerminateInfo = { mode: "taskkill", pid: child.pid };
             return; // the tree kill is in flight; do NOT kill the root first
+        } catch {
+            _lastTerminateInfo = { mode: "kill-fallback", pid: child.pid };
+        }
+    } else if (process.platform !== "win32" && child && typeof child.pid === "number"
+        && child.pid > 0 && typeof process.kill === "function") {
+        try {
+            process.kill(-child.pid, "SIGKILL");
+            _lastTerminateInfo = { mode: "process-group", pid: child.pid };
+            return;
         } catch {
             _lastTerminateInfo = { mode: "kill-fallback", pid: child.pid };
         }
@@ -752,6 +771,182 @@ function resolvePython(env = process.env) {
         }
     }
     return candidates[0];
+}
+
+// --- Codex SessionEnd fast path (issue #189) -------------------------------
+// SessionEnd is the one Codex hook whose host budget is only two seconds. The
+// normal launcher path resolves shells, builds the full canonical environment,
+// and starts a bash/body chain; that work can outlive the host budget on a cold
+// Windows process. This path is deliberately narrow: it is selected only for
+// Codex's session-end verb, takes an id from the payload, and starts exactly one
+// store.py delivery-clear child without where(), bash, or resolvePython().
+function codexSessionEndId(meta) {
+    for (const value of [meta && meta.session_id, meta && meta.sessionId]) {
+        if (typeof value !== "string") continue;
+        const id = value.trim();
+        if (id) return id;
+    }
+    return "";
+}
+
+function codexSessionEndEnv(env = process.env) {
+    const childEnv = { ...(env || {}) };
+    // Codex cleanup is payload-authoritative. A stale inherited session id
+    // must never become a fallback when the current event has no id.
+    delete childEnv.ZMEM_SESSION;
+    childEnv.ZMEM_DATA = (env && env.ZMEM_DATA) || join(homedir(), ".zmem");
+    return childEnv;
+}
+
+function codexSessionEndPythonCandidates(env, platform) {
+    const explicit = env && typeof env.ZMEM_PYTHON === "string"
+        ? env.ZMEM_PYTHON.trim() : "";
+    if (explicit) return [explicit];
+    return platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+}
+
+function elapsedProcessMs() {
+    try {
+        if (performance && typeof performance.now === "function") {
+            return performance.now();
+        }
+    } catch { /* fall through to uptime */ }
+    return process.uptime() * 1000;
+}
+
+// Resolve the one direct store.py child and settle close/error/timeout exactly
+// once. The timer is armed before spawn so spawn latency consumes the remaining
+// process budget. A timeout kills the direct child and waits only through the
+// existing final output margin; it must not introduce taskkill/where/bash
+// children.
+function runCodexSessionEndFastPath(meta, options = {}) {
+    const env = options.env || process.env;
+    const sessionId = codexSessionEndId(meta);
+    if (!sessionId) return Promise.resolve({ spawned: false, reason: "no-session-id" });
+
+    const now = typeof options.now === "function" ? options.now : elapsedProcessMs;
+    let elapsed;
+    try { elapsed = Number(now()); } catch { elapsed = NaN; }
+    const remaining = Number.isFinite(elapsed)
+        ? Math.max(0, CODEX_SESSION_END_TARGET_MS - elapsed) : 0;
+    if (remaining <= 0) {
+        return Promise.resolve({ spawned: false, reason: "no-budget" });
+    }
+
+    const platform = options.platform || process.platform;
+    const childEnv = codexSessionEndEnv(env);
+    const pythonCandidates = codexSessionEndPythonCandidates(childEnv, platform);
+    const root = options.pluginRoot || env.PLUGIN_ROOT || env.CLAUDE_PLUGIN_ROOT
+        || env.ZCODE_PLUGIN_ROOT || env.ZMEM_ROOT || getPluginRoot();
+    const storePy = options.storePath || join(root, "skills", "memory", "scripts", "store.py");
+    const spawnFn = typeof options.spawnFn === "function" ? options.spawnFn : spawn;
+    const setTimer = typeof options.setTimeoutFn === "function"
+        ? options.setTimeoutFn : setTimeout;
+    const clearTimer = typeof options.clearTimeoutFn === "function"
+        ? options.clearTimeoutFn : clearTimeout;
+    const onTimeout = typeof options.onTimeout === "function" ? options.onTimeout : null;
+    const listen = (child, event, handler) => {
+        if (typeof child.once === "function") child.once(event, handler);
+        else if (typeof child.on === "function") child.on(event, handler);
+        else throw new TypeError("store child is not an event emitter");
+    };
+
+    return new Promise((resolvePromise) => {
+        let child = null;
+        let timer = null;
+        let settled = false;
+        let settling = false;
+        let closeGrace = null;
+        let activeCandidate = -1;
+        const settle = (result) => {
+            if (settled) return;
+            settled = true;
+            if (closeGrace !== null) {
+                try { clearTimer(closeGrace); } catch { /* fail open */ }
+                closeGrace = null;
+            }
+            resolvePromise(result);
+        };
+        const finish = (result, kill) => {
+            if (settled || settling) return;
+            if (timer !== null) {
+                try { clearTimer(timer); } catch { /* fail open */ }
+                timer = null;
+            }
+            if (kill && child && typeof child.kill === "function") {
+                settling = true;
+                if (onTimeout) {
+                    try { onTimeout(result); } catch { /* fail open */ }
+                }
+                let closed = false;
+                const onClose = () => {
+                    if (closed) return;
+                    closed = true;
+                    settle(result);
+                };
+                try { listen(child, "close", onClose); } catch { /* fail open */ }
+                try { child.kill(platform === "win32" ? undefined : "SIGKILL"); }
+                catch { /* already gone */ }
+                // A misbehaving platform child must not keep the launcher
+                // alive past the existing 100ms output margin.
+                closeGrace = setTimer(() => {
+                    try { if (typeof child.unref === "function") child.unref(); } catch { /* already gone */ }
+                    settle(result);
+                }, CODEX_SESSION_END_OUTPUT_MARGIN_MS);
+                return;
+            }
+            if (kill && onTimeout) {
+                try { onTimeout(result); } catch { /* fail open */ }
+            }
+            settle(result);
+        };
+
+        // Arm before spawn; a cold spawn must not get a fresh full budget.
+        timer = setTimer(() => finish({ spawned: true, reason: "timeout" }, true), remaining);
+        const spawnChild = (candidateIndex) => {
+            activeCandidate = candidateIndex;
+            try {
+                child = spawnFn(pythonCandidates[candidateIndex],
+                    [storePy, "delivery-clear", `--session-id=${sessionId}`], {
+                    env: childEnv,
+                    stdio: "ignore",
+                    cwd: root,
+                    });
+                if (!child) {
+                    finish({ spawned: true, reason: "spawn-empty" });
+                    return;
+                }
+                listen(child, "error", (error) => {
+                    if (candidateIndex !== activeCandidate) return;
+                    if (error && error.code === "ENOENT" && candidateIndex + 1 < pythonCandidates.length
+                        && !settled && !settling) {
+                        spawnChild(candidateIndex + 1);
+                        return;
+                    }
+                    finish({ spawned: true, reason: "spawn-error" });
+                });
+                listen(child, "close", (code) => {
+                    if (candidateIndex !== activeCandidate) return;
+                    finish({
+                    spawned: true,
+                    completed: true,
+                    ok: code === 0,
+                    code,
+                    });
+                });
+            } catch {
+                finish({ spawned: true, reason: "spawn-throw" });
+            }
+        };
+        spawnChild(0);
+    });
+}
+
+function emitCodexSessionEndResult() {
+    // Setting exitCode lets Node flush the exact host bytes before exiting;
+    // process.exit() here could truncate a pipe on a busy Windows host.
+    try { process.stdout.write("{}\n"); } catch { /* fail open */ }
+    process.exitCode = 0;
 }
 
 function _patchPath(value) {
@@ -1351,7 +1546,11 @@ function resolveBudget(env, stderrWriter) {
 }
 
 // --- Read all of stdin (buffered, for parse + verbatim replay) --------------
-function readStdin() {
+// SessionEnd has a two-second Codex host limit and its payload is only needed
+// to obtain the session id. A host pipe that never reaches EOF must therefore
+// have a bounded read; other hooks retain the original unbounded finite-input
+// behavior because they replay the complete payload to their child.
+function readStdin(timeoutMs = 0) {
     return new Promise((resolve) => {
         if (process.stdin.isTTY) {
             resolve(Buffer.alloc(0));
@@ -1360,17 +1559,56 @@ function readStdin() {
         const chunks = [];
         let total = 0;
         let overflow = false;
-        process.stdin.on("data", (c) => {
-            if (overflow) return;
+        let settled = false;
+        let timer = null;
+        const finish = (value, closeInput = false) => {
+            if (settled) return;
+            settled = true;
+            if (timer !== null) {
+                if (timeoutMs <= 0) clearImmediate(timer);
+                else clearTimeout(timer);
+            }
+            process.stdin.removeListener("data", onData);
+            process.stdin.removeListener("end", onEnd);
+            process.stdin.removeListener("error", onError);
+            if (closeInput) {
+                process.stdin.on("error", () => {});
+                try { process.stdin.pause(); } catch { /* fail open */ }
+                try { process.stdin.destroy(); } catch { /* fail open */ }
+            }
+            resolve(value);
+        };
+        const onData = (c) => {
+            if (overflow || settled) return;
             total += c.length;
             if (total > MAX_HOOK_INPUT_BYTES) {
                 overflow = true;
                 return;
             }
             chunks.push(c);
-        });
-        process.stdin.on("end", () => resolve(overflow ? null : Buffer.concat(chunks)));
-        process.stdin.on("error", () => resolve(overflow ? null : Buffer.concat(chunks)));
+        };
+        const onEnd = () => finish(overflow ? null : Buffer.concat(chunks));
+        const onError = () => finish(overflow ? null : Buffer.concat(chunks));
+        const timedOutInput = () => {
+            if (overflow) return null;
+            const value = Buffer.concat(chunks);
+            value.zmemTimedOut = true;
+            return value;
+        };
+        process.stdin.on("data", onData);
+        process.stdin.on("end", onEnd);
+        process.stdin.on("error", onError);
+        if (Number.isFinite(timeoutMs)) {
+            if (timeoutMs <= 0) {
+                // Let already-buffered finite input deliver its end event
+                // before the no-budget fallback wins. A never-ending pipe
+                // still resolves on this same turn without blocking the
+                // SessionEnd host past its deadline.
+                timer = setImmediate(() => finish(timedOutInput(), true));
+                return;
+            }
+            timer = setTimeout(() => finish(timedOutInput(), true), timeoutMs);
+        }
     });
 }
 
@@ -1384,8 +1622,9 @@ async function main() {
         return;
     }
     const scriptPath = join(getPluginRoot(), "hooks", `zmem-${hookName}.sh`);
+    const codexSessionEnd = detectHost() === "codex" && hookName === "session-end";
 
-    if (!existsSync(scriptPath)) {
+    if (!codexSessionEnd && !existsSync(scriptPath)) {
         // Target script missing — fail open.
         process.stdout.write("{}\n");
         process.exit(0);
@@ -1441,7 +1680,15 @@ async function main() {
         });
     }
 
-    const stdinBuf = await readStdin();
+    let stdinTimeoutMs = 0;
+    if (codexSessionEnd) {
+        const elapsed = elapsedProcessMs();
+        stdinTimeoutMs = Number.isFinite(elapsed)
+            ? Math.max(0, CODEX_SESSION_END_TARGET_MS - elapsed)
+            : CODEX_SESSION_END_TARGET_MS;
+    }
+    const stdinBuf = await readStdin(codexSessionEnd ? stdinTimeoutMs : null);
+    const stdinTimedOut = Buffer.isBuffer(stdinBuf) && stdinBuf.zmemTimedOut === true;
     if (!Buffer.isBuffer(stdinBuf)) {
         process.stdout.write("{}\n");
         process.exit(0);
@@ -1457,6 +1704,27 @@ async function main() {
     }
 
     const host = detectHost();
+    if (host === "codex" && hookName === "session-end") {
+        if (stdinTimedOut) {
+            if (stdinTimeoutMs <= 0) {
+                process.stderr.write("zmem: Codex SessionEnd fast path skipped: no remaining budget\n");
+            }
+            emitCodexSessionEndResult();
+            return;
+        }
+        let outputEmitted = false;
+        const emit = () => {
+            if (outputEmitted) return;
+            outputEmitted = true;
+            emitCodexSessionEndResult();
+        };
+        const fastPath = await runCodexSessionEndFastPath(meta, { onTimeout: emit });
+        if (fastPath.reason === "no-budget") {
+            process.stderr.write("zmem: Codex SessionEnd fast path skipped: no remaining budget\n");
+        }
+        emit();
+        return;
+    }
     const prepared = prepareHookPayload(host, hookName, stdinBuf, meta);
     if (!prepared) {
         process.stdout.write("{}\n");
@@ -1514,6 +1782,9 @@ async function main() {
         child = spawn(bashPath, [bashScriptPath], {
             stdio: ["pipe", translated ? "pipe" : "inherit", translated ? "pipe" : "inherit"],
             env: buildChildEnv(env, bashPath),
+            // POSIX watchdogs kill the complete detached process group;
+            // Windows uses taskkill /T /F for the process tree.
+            detached: process.platform !== "win32",
             // Issue #186: bashScriptPath is plugin-root-relative on Windows, so
             // the child must resolve it against the plugin root. The wrappers
             // self-locate via $(dirname "$0")/BASH_SOURCE, so every downstream
@@ -1620,6 +1891,12 @@ module.exports = {
     failureSignals,
     safeJsonStringify,
     resolvePython,
+    codexSessionEndId,
+    codexSessionEndEnv,
+    runCodexSessionEndFastPath,
+    CODEX_SESSION_END_HOST_TIMEOUT_MS,
+    CODEX_SESSION_END_OUTPUT_MARGIN_MS,
+    CODEX_SESSION_END_TARGET_MS,
     canonicalUtcNow,
     recordEvidence,
     extractPayload,

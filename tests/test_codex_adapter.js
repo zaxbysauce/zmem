@@ -92,11 +92,22 @@ function runLauncher(hook, payload, env) {
     });
 }
 
+function testCodexSessionEndIsRegistered() {
+    const spec = JSON.parse(fs.readFileSync(
+        path.join(REPO, "hooks", "hooks.codex.json"), "utf8"));
+    const groups = spec.hooks && spec.hooks.SessionEnd;
+    return Array.isArray(groups) && groups.length === 1
+        && groups[0].thread === "main"
+        && groups[0].hooks && groups[0].hooks.length === 1
+        && groups[0].hooks[0].timeout === 2;
+}
+
 const TMP_ROOT = path.join(REPO, ".tmp-tests");
 fs.mkdirSync(TMP_ROOT, { recursive: true });
 const TMP = fs.mkdtempSync(path.join(TMP_ROOT, "zmem-codex-"));
 
 console.log("\n[1] Codex plugin metadata");
+ok("testCodexSessionEndIsRegistered", testCodexSessionEndIsRegistered());
 
 {
     const plugin = JSON.parse(fs.readFileSync(path.join(REPO, ".codex-plugin", "plugin.json"), "utf8"));
@@ -821,7 +832,7 @@ testDegenerateBudgetFailsOpen();
 testInvalidRawFailsOpen();
 
 // --- issue #188: execute the manifest's real Windows command strings --------
-// Each of the ten hooks.codex.json entries carries a quote-free
+// Each of the eleven hooks.codex.json entries carries a quoted
 // `commandWindows` string. This section expands ${PLUGIN_ROOT} against a
 // throwaway plugin tree (launcher + generated stub scripts), runs the
 // command through cmd.exe exactly as the Codex Windows host would, and
@@ -839,6 +850,10 @@ function runWindowsManifestCase(manifestEntry, caseRecord, pluginRoot, env) {
             env,
             encoding: "utf8",
             timeout: 60000,
+            // Preserve the manifest command string verbatim when passing it
+            // through cmd.exe; otherwise Node re-escapes its embedded quotes
+            // and turns a space-bearing launcher path into one malformed argv.
+            windowsVerbatimArguments: true,
             cwd: pluginRoot,
         });
     let parsed = null;
@@ -854,8 +869,22 @@ function stubScriptBody(childStdout) {
     return "#!/usr/bin/env bash\nprintf '%s' '" + childStdout + "'\n";
 }
 
+function directStoreStubBody() {
+    // The ordered session-end fixture must exercise the launcher fast path's
+    // direct store.py child, not a copied zmem-session-end.sh body. Keep the
+    // stub Python so the normal Windows interpreter selection is covered and
+    // record argv/env for an explicit assertion below.
+    return [
+        "import json, os, sys",
+        "with open(os.environ['ZMEM_FAST_PATH_MARKER'], 'a', encoding='utf-8', newline='\\n') as handle:",
+        "    handle.write(json.dumps({'argv': sys.argv[1:], 'store': os.environ.get('ZMEM_STORE'), 'session': os.environ.get('ZMEM_SESSION')}) + '\\n')",
+        "print('direct-store-child-noise')",
+        "",
+    ].join("\n");
+}
+
 function testWindowsManifestCommandExecution() {
-    const tree = fs.mkdtempSync(path.join(TMP_ROOT, "winmanifest-"));
+    const tree = fs.mkdtempSync(path.join(TMP_ROOT, "winmanifest space-"));
     try {
         buildAndRunCases(tree);
     } finally {
@@ -879,20 +908,28 @@ function buildAndRunCases(tree) {
         }
     }
 
-    eq("windows-manifest: ten fixture cases match ten manifest entries",
+    eq("windows-manifest: eleven fixture cases match eleven manifest entries",
         casesDoc.cases.length, manifestEntries.length);
 
     const pluginRoot = path.join(tree, "plugin");
+    ok("windows-manifest: plugin root contains a space", pluginRoot.includes(" "),
+        pluginRoot);
     fs.mkdirSync(path.join(pluginRoot, "hooks"), { recursive: true });
     fs.copyFileSync(LAUNCHER, path.join(pluginRoot, "hooks", "zmem-launch.js"));
+    fs.mkdirSync(path.join(pluginRoot, "skills", "memory", "scripts"), { recursive: true });
     for (const caseRecord of casesDoc.cases) {
+        if (caseRecord.verb === "session-end") continue;
         fs.writeFileSync(
             path.join(pluginRoot, "hooks", `zmem-${caseRecord.verb}.sh`),
             stubScriptBody(caseRecord.child_stdout));
     }
 
     const dataDir = path.join(tree, "data");
+    const directStoreMarker = path.join(tree, "direct-store-marker.json");
     fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(
+        path.join(pluginRoot, "skills", "memory", "scripts", "store.py"),
+        directStoreStubBody());
     const childEnv = { ...process.env };
     delete childEnv.ZMEM_STORE;
     Object.assign(childEnv, {
@@ -900,6 +937,7 @@ function buildAndRunCases(tree) {
         ZMEM_HOST: "codex",
         ZMEM_DATA: dataDir,
         ZMEM_STORE: path.join(dataDir, "store.sqlite"),
+        ZMEM_FAST_PATH_MARKER: directStoreMarker,
         ZMEM_MODELS_DIR: path.join(tree, "nonexistent-models"),
         ZMEM_MODEL_AUTODOWNLOAD: "0",
         ZMEM_BASH_PATH: launch.resolveShell(),
@@ -928,6 +966,21 @@ function buildAndRunCases(tree) {
             const want = expected[caseRecord.verb];
             eq(`${label}: envelope equals committed expected (canonical bytes)`,
                 JSON.stringify(result.parsed), JSON.stringify(want));
+            if (caseRecord.verb === "session-end") {
+                let directChild = null;
+                try {
+                    const records = fs.readFileSync(directStoreMarker, "utf8").trim()
+                        .split(/\r?\n/).map((line) => JSON.parse(line));
+                    const ledgerChildren = records.filter((record) =>
+                        record.argv && record.argv[0] === "delivery-clear");
+                    directChild = ledgerChildren.length === 1 ? ledgerChildren[0] : null;
+                } catch { /* assertion below */ }
+                ok(`${label}: direct store.py child was exercised`,
+                    directChild && JSON.stringify(directChild.argv)
+                    === JSON.stringify(["delivery-clear", `--session-id=${caseRecord.stdin.session_id}`])
+                    && directChild.store === childEnv.ZMEM_STORE
+                    && directChild.session === null);
+            }
             if (caseRecord.expected_event) {
                 eq(`${label}: hookEventName matches fixture expected_event`,
                     result.parsed && result.parsed.hookSpecificOutput &&

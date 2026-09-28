@@ -35,6 +35,20 @@ MANIFEST_PATHS = {
 
 
 class CodexManifestContractTest(unittest.TestCase):
+    def test_session_end_is_main_thread_only(self):
+        spec = json.loads(
+            (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8")
+        )
+        groups = spec.get("hooks", {}).get("SessionEnd", [])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].get("thread"), "main")
+
+    def test_interrupt_is_not_registered(self):
+        spec = json.loads(
+            (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("Interrupt", spec.get("hooks", {}))
+
     def test_hooks_paths_match_host_contracts(self):
         for host, (want, _) in EXPECTED.items():
             with self.subTest(host=host):
@@ -81,7 +95,8 @@ class CodexManifestContractTest(unittest.TestCase):
                 )
 
     # Issue #188 (Workstream N PR 5 of 6): every Codex entry carries a literal
-    # quote-free Windows command (no shell wrapper, no nested quotes) and the
+    # quoted Windows command (no shell wrapper) so plugin roots containing
+    # spaces remain one node script-path argument, and the
     # seven context-bearing event families declare the 2,000-token
     # additionalContextLimit — PreCompact is omitted because upstream Codex
     # drops additionalContext on PreCompact.
@@ -105,6 +120,7 @@ class CodexManifestContractTest(unittest.TestCase):
         "subagent-recall",
         "subagent-reflect",
         "precompact",
+        "session-end",
     ]
 
     @staticmethod
@@ -122,8 +138,8 @@ class CodexManifestContractTest(unittest.TestCase):
     def test_codex_entries_have_windows_commands_and_context_limits(self):
         entries = self._codex_entries()
         self.assertEqual(
-            len(entries), 10,
-            "hooks.codex.json must declare exactly ten hook entries, got %d"
+            len(entries), 11,
+            "hooks.codex.json must declare exactly eleven hook entries, got %d"
             % len(entries),
         )
         verbs = []
@@ -132,15 +148,11 @@ class CodexManifestContractTest(unittest.TestCase):
             verb = command.rsplit(" ", 1)[-1] if command else ""
             verbs.append(verb)
             with self.subTest(verb=verb):
-                expected = "node ${PLUGIN_ROOT}/hooks/zmem-launch.js %s" % verb
+                expected = 'node "${PLUGIN_ROOT}/hooks/zmem-launch.js" %s' % verb
                 self.assertEqual(
                     entry.get("commandWindows"), expected,
-                    "entry %r commandWindows must be the exact quote-free "
+                    "entry %r commandWindows must be the exact quoted "
                     "launcher invocation %r" % (verb, expected),
-                )
-                self.assertNotIn(
-                    '"', entry.get("commandWindows", ""),
-                    "commandWindows must contain no nested double quotes",
                 )
                 if event in self.CONTEXT_FAMILIES:
                     self.assertEqual(
@@ -157,8 +169,19 @@ class CodexManifestContractTest(unittest.TestCase):
                     )
         self.assertEqual(
             verbs, self.EXPECTED_VERBS,
-            "the ten entries must keep their existing verbs in manifest order",
+            "the eleven entries must keep their existing verbs in manifest order",
         )
+
+        session_end = [entry for event, entry in entries if event == "SessionEnd"]
+        self.assertEqual(len(session_end), 1,
+                         "Codex must declare exactly one SessionEnd command")
+        self.assertEqual(session_end[0].get("timeout"), 2)
+        self.assertEqual(session_end[0].get("commandWindows"),
+                         'node "${PLUGIN_ROOT}/hooks/zmem-launch.js" session-end')
+        self.assertNotIn("additionalContextLimit", session_end[0])
+        self.assertNotIn("Interrupt", json.loads(
+            (REPO_ROOT / "hooks" / "hooks.codex.json").read_text(encoding="utf-8")
+        )["hooks"])
 
     def test_codex_limit_matches_launcher_constant(self):
         probe = (

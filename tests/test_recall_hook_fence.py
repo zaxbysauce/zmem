@@ -70,8 +70,15 @@ class PrivatePretoolMarkerBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
             rows = [json.loads(line) for line in capture.read_text(
                 encoding="utf-8").splitlines()]
-            clears = [row for row in rows if row["argv"][:1] == ["ledger-clear"]]
-            self.assertEqual(len(clears), 2)
+            clears = [row for row in rows
+                      if row["argv"][:1] in (["delivery-clear"], ["ledger-clear"])]
+            self.assertEqual(
+                [row["argv"][:1] for row in clears],
+                [["delivery-clear"], ["ledger-clear"]],
+                "SessionEnd clears delivery state while PreCompact keeps the ledger-only verb",
+            )
+            self.assertTrue(all(row["argv"][1] == "--session-id=marker-boundary"
+                                for row in clears))
             self.assertTrue(all(row["marker"] is None for row in rows), rows)
 
 
