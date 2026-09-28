@@ -380,11 +380,11 @@ class EvidenceReadCliTest(unittest.TestCase):
         )
 
     def test_evidence_associations_keyset_page_is_lossless(self):
-        _add(
+        first_memory = _add(
             self.scratch, "association cursor first", namespace="project:cursor-a",
             evidence=EVIDENCE_1,
         )
-        _add(
+        second_memory = _add(
             self.scratch, "association cursor second", namespace="project:cursor-b",
             evidence=EVIDENCE_1,
         )
@@ -396,6 +396,11 @@ class EvidenceReadCliTest(unittest.TestCase):
         first_payload = json.loads(first.stdout)
         self.assertEqual(len(first_payload["associations"]), 2)
         self.assertTrue(first_payload["has_more"])
+        expected_ids = [MEMORY_1, first_memory, second_memory]
+        self.assertEqual(
+            [row["memory_id"] for row in first_payload["associations"]],
+            expected_ids[:2],
+        )
         cursor = first_payload["next_association_cursor"]
         self.assertEqual(set(cursor), {"namespace", "memory_id"})
 
@@ -407,10 +412,15 @@ class EvidenceReadCliTest(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         second_payload = json.loads(second.stdout)
         self.assertFalse(second_payload["has_more"])
+        self.assertEqual(len(second_payload["associations"]), 1)
+        self.assertEqual(
+            [row["memory_id"] for row in second_payload["associations"]],
+            expected_ids[2:],
+        )
         observed = first_payload["associations"] + second_payload["associations"]
-        expected = sorted(observed, key=lambda row: (row["namespace"], row["memory_id"]))
-        self.assertEqual(observed, expected)
-        self.assertEqual(len({row["memory_id"] for row in observed}), 3)
+        self.assertEqual([row["memory_id"] for row in observed], expected_ids)
+        self.assertEqual(len(observed), len(expected_ids))
+        self.assertEqual(len(set(row["memory_id"] for row in observed)), 3)
 
 
 class RecallJsonTest(unittest.TestCase):

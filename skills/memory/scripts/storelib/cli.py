@@ -583,7 +583,7 @@ def _render_untrusted_evidence_text(
     lines.extend("\t".join(_display_field(row.get(field, "")) for field in fields)
                  for row in rows)
     if more_note:
-        lines.append(f"# {more_note}")
+        lines.append(f"# {_display_field(more_note)}")
     lines.append(ZMEM_FENCE_CLOSE)
     return "\n".join(lines) + "\n"
 

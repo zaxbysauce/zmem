@@ -559,6 +559,24 @@ class EvidenceSchemaTest(_StoreCase):
             evidence.evidence_ids_for_memory(legacy, "missing")
         legacy.close()
 
+    def test_pre_v14_bounded_association_lookup_returns_empty_ids(self):
+        legacy = sqlite3.connect(self.root / "pre-v14-bounded.sqlite")
+        schema.init_db(legacy)
+        try:
+            version = legacy.execute(
+                "SELECT value FROM meta WHERE key=?", ("schema_version",)
+            ).fetchone()[0]
+            self.assertLess(int(version), 14)
+            values, truncated = evidence.evidence_ids_for_memories_bounded(
+                legacy, ["missing-a", "missing-b"], limit=2
+            )
+            self.assertEqual(
+                values, {"missing-a": [], "missing-b": []}
+            )
+            self.assertEqual(truncated, set())
+        finally:
+            legacy.close()
+
     def test_fresh_init_and_v13_upgrade(self):
         version = self.conn.execute(
             "SELECT value FROM meta WHERE key=?", ("schema_version",)
@@ -908,23 +926,57 @@ class EvidenceExportCompatibilityTest(_StoreCase):
             0,
         )
         records = [json.loads(line) for line in out.read_text().splitlines()]
-        self.assertIn(selected_memory, {r.get("id") for r in records})
-        self.assertNotIn(outside_memory, {r.get("id") for r in records})
-        self.assertIn(selected_episode, {r.get("id") for r in records})
-        self.assertNotIn(outside_episode, {r.get("id") for r in records})
-        assoc = [r for r in records if r.get("table") in {
-            "episode_evidence", "memory_evidence"
-        }]
-        self.assertTrue(assoc)
-        self.assertTrue(all(
-            r.get("memory_id", selected_memory) == selected_memory
-            and r.get("episode_id", selected_episode) == selected_episode
-            for r in assoc
-        ))
-        self.assertNotIn(
-            "00000000-0000-4000-8000-000000000806",
-            {r.get("id") for r in records},
+        shared_evidence = "00000000-0000-4000-8000-000000000805"
+        outside_evidence = "00000000-0000-4000-8000-000000000806"
+        self.assertEqual(len(records), 5)
+        self.assertEqual(
+            [r["id"] for r in records if r.get("kind") == "memory"],
+            [selected_memory],
         )
+        self.assertEqual(
+            [r["id"] for r in records if r.get("kind") == "episode"],
+            [selected_episode],
+        )
+        evidence_rows = [
+            r for r in records if r.get("table") == "evidence"
+        ]
+        association_rows = [
+            r for r in records if r.get("table") in {
+                "episode_evidence", "memory_evidence"
+            }
+        ]
+        self.assertEqual(len(evidence_rows), 1)
+        self.assertEqual(evidence_rows, [{
+            "table": "evidence",
+            "id": shared_evidence,
+            "session_id": "s",
+            "lane": "codex",
+            "moment": "user_prompt",
+            "kind": "turn",
+            "ts": "2026-09-10T00:00:00Z",
+            "hash": hashlib.sha256(
+                b"turn|2026-09-10T00:00:00Z|shared"
+            ).hexdigest(),
+            "excerpt": "shared",
+            "ref_path": "x",
+            "ref_offset": 0,
+        }])
+        self.assertEqual(len(association_rows), 2)
+        self.assertEqual(association_rows, [
+            {
+                "table": "episode_evidence",
+                "episode_id": selected_episode,
+                "evidence_id": shared_evidence,
+            },
+            {
+                "table": "memory_evidence",
+                "memory_id": selected_memory,
+                "evidence_id": shared_evidence,
+            },
+        ])
+        self.assertNotIn(outside_memory, {r.get("id") for r in records})
+        self.assertNotIn(outside_episode, {r.get("id") for r in records})
+        self.assertNotIn(outside_evidence, {r.get("id") for r in records})
 
 
 class EvidenceRetentionTest(_StoreCase):

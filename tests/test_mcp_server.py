@@ -595,10 +595,18 @@ class McpServerToolSurfaceTest(unittest.TestCase):
                 self.mcp_server._bounded_evidence_selector(at_limit, "id"),
                 (at_limit, None),
             )
+            utf8_at_limit = "é" * 128
+            self.assertEqual(len(utf8_at_limit.encode("utf-8")), 256)
+            self.assertEqual(
+                self.mcp_server._bounded_evidence_selector(utf8_at_limit, "id"),
+                (utf8_at_limit, None),
+            )
             for name, args, expected_error in (
                 ("evidence_for", {"memory_id": "x" * 257},
                  "at most 256 UTF-8 bytes"),
                 ("evidence_show", {"id": "x" * 257},
+                 "at most 256 UTF-8 bytes"),
+                ("evidence_show", {"id": "é" * 129},
                  "at most 256 UTF-8 bytes"),
                 ("evidence_show", {"id": "ok", "namespace": "n" * 257},
                  "at most 256 UTF-8 bytes"),

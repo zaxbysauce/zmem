@@ -121,7 +121,7 @@ DATA_SHA = {
     # saturating ar/(1+ar) back-solve, so the fixture rows' `_score` values
     # (and their order at the top-5 boundary) legitimately moved.
     # stats/list/export_jsonl are byte-identical to their prior freezes.
-    # issue #171 (release 0.70.0): non-injection recall --json rows gained
+    # issue #171 (release 0.71.0): non-injection recall --json rows gained
     # `evidence_ids` for the new association read surface. A dual-tree capture
     # at #170 head 6223a42 and #171 head 38ec242 proved that removing exactly
     # `evidence_ids` from the parsed #171 envelope reproduces the #170 parsed
