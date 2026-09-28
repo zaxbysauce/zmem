@@ -458,12 +458,19 @@ def _needles(conn: sqlite3.Connection, applied: dict[str, Any]) -> list[str]:
             "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL"):
         surviving |= _tokens(r["sql"] or "")
 
+    # Full-content needle: a memory whose ENTIRE content is a substring of
+    # the store's own DDL text (contrived single-word contents like
+    # "namespace") would false-exit 5 on bytes that are schema, not residue.
+    schema_blob = " ".join(
+        (r["sql"] or "") for r in conn.execute(
+            "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL")).lower()
     needles: set[str] = set()
     for pid in chain:
         content = rows[pid].get("content") or ""
         if not content:
             continue
-        needles.add(content.lower())
+        if content.lower() not in schema_blob:
+            needles.add(content.lower())
         needles |= (_tokens(content) - surviving)
     needles.discard("")
     return sorted(needles)
@@ -638,8 +645,9 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
               out_dir: str | None = None, as_json: bool = False) -> int:
     """`store.py purge --id <id> [...] [--scrub-backups --out-dir DIR]`.
 
-    Exit ladder: 0 clean; 2 bad usage; 3 unknown id; 4 maintenance/writer
-    refusal; 5 residue detected; 6 compaction/scrub failure."""
+    Exit ladder: 0 clean; 2 bad usage; 3 unknown id; 4 maintenance, schema,
+    backup, consolidate, or live-writer refusal; 5 residue detected; 6
+    compaction/scrub failure."""
     from storelib import schema as schema_mod
 
     if not ids:
