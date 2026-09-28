@@ -7,10 +7,13 @@ It deliberately imports only the partial-capture and delivery-snapshot APIs:
 acknowledgement and completion belong to a later trusted workflow and are not
 available on this host path.
 
-The adapter keeps a short-lived, hashed-session sidecar containing the store
-capture id.  The id is a local correlation value; it is never used as a host
-task id and never appears in a host response.  All failures return an empty
-object and exit zero so a capture problem cannot block a host callback.
+The adapter keeps a short-lived, hashed per-turn sidecar containing the store
+capture id when the host supplies a stable turn key.  Hosts that do
+not supply one still create fresh partials, but their later callbacks cannot be
+associated automatically.  The id is a local correlation value; it is never
+used as a host task id and never appears in a host response.  All failures
+return an empty object and exit zero so a capture problem cannot block a host
+callback.
 """
 
 from __future__ import annotations
@@ -20,12 +23,16 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
 
 _MAX_INPUT_BYTES = 64 * 1024
 _MAX_OBSERVATION_BYTES = 4_000
+_STATE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 _DEFAULT_GOVERNANCE_SOURCE = "configured_local_policy"
 _OBSERVATION_KINDS = frozenset({
     "pre_tool", "post_tool", "post_tool_failure", "stop", "user_prompt",
@@ -91,25 +98,65 @@ def _state_path(session_id: str, env: Mapping[str, str] | None = None) -> Path:
     return _data_dir(env) / "training-capture" / f"{digest}.json"
 
 
-def _read_state(session_id: str, env: Mapping[str, str] | None = None) -> str:
-    if not session_id:
-        return ""
+def _valid_capture_id(value: object) -> str:
+    text = _text(value, limit=80)
     try:
-        value = json.loads(_state_path(session_id, env).read_text(encoding="utf-8"))
-        capture_id = value.get("capture_id") if isinstance(value, dict) else ""
-        return _text(capture_id, limit=80)
-    except (OSError, ValueError, TypeError):
+        parsed = uuid.UUID(text)
+    except (AttributeError, TypeError, ValueError):
         return ""
+    return str(parsed) if str(parsed) == text.lower() else ""
 
 
-def _write_state(session_id: str, capture_id: str,
-                 env: Mapping[str, str] | None = None) -> None:
-    path = _state_path(session_id, env)
+def _read_state_record(state_key: str, env: Mapping[str, str] | None = None) -> dict[str, str]:
+    if not state_key:
+        return {}
+    path = _state_path(state_key, env)
+    try:
+        if time.time() - path.stat().st_mtime > _STATE_MAX_AGE_SECONDS:
+            path.unlink(missing_ok=True)
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            return {}
+        capture_id = _valid_capture_id(value.get("capture_id"))
+        generation = _valid_capture_id(value.get("generation"))
+        if not capture_id or not generation:
+            return {}
+        delivery_snapshot_id = _valid_capture_id(value.get("delivery_snapshot_id"))
+        result = {"capture_id": capture_id, "generation": generation}
+        if delivery_snapshot_id:
+            result["delivery_snapshot_id"] = delivery_snapshot_id
+        return result
+    except (OSError, ValueError, TypeError, OverflowError):
+        return {}
+
+
+def _read_state(state_key: str, env: Mapping[str, str] | None = None) -> str:
+    """Return only the store-owned capture id for compatibility callers."""
+    return _read_state_record(state_key, env).get("capture_id", "")
+
+
+def _write_state(state_key: str, capture_id: str, env: Mapping[str, str] | None = None,
+                 *, generation: str | None = None, delivery_snapshot_id: str = "") -> None:
+    generation = generation or str(uuid.uuid4())
+    path = _state_path(state_key, env)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps({"capture_id": capture_id}, separators=(",", ":")),
-                         encoding="utf-8", newline="\n")
-    os.replace(temporary, path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            state = {"capture_id": capture_id, "generation": generation}
+            if delivery_snapshot_id:
+                state["delivery_snapshot_id"] = delivery_snapshot_id
+            json.dump(state, handle, separators=(",", ":"))
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _clear_state(session_id: str, env: Mapping[str, str] | None = None) -> None:
@@ -173,17 +220,54 @@ def _session(payload: Mapping[str, Any]) -> str:
 
 
 def _state_key(payload: Mapping[str, Any]) -> str:
-    """Choose a local-only sidecar key when hosts omit a session id."""
+    """Choose an immutable per-turn sidecar key.
+
+    Session ids identify a conversation, not a turn.  A sidecar is therefore
+    written only when the host supplies an explicit turn identity.
+    Keyless starts still create a fresh partial, but later callbacks cannot
+    attach to it through a session or host fallback.
+    """
+    explicit = _first_text(
+        payload, "capture_key", "captureKey", "turn_id", "turnId",
+        limit=512,
+    )
+    if not explicit:
+        return ""
     session_id = _session(payload)
-    if session_id:
-        return session_id
-    host = _first_text(payload, "host", limit=80).lower() or "unknown"
-    task_id = _first_text(payload, "host_task_id", "hostTaskId", "task_id", "taskId", limit=512)
-    return f"{host}:task:{task_id}" if task_id else f"{host}:unknown"
+    return f"{session_id}:turn:{explicit}" if session_id else f"turn:{explicit}"
+
+
+def _correlated_capture_id(payload: Mapping[str, Any], env: Mapping[str, str]) -> str:
+    """Resolve only the store-issued id bound to an explicit sidecar key.
+
+    A callback supplied capture_id is a consistency check, never an authority.
+    A valid but mismatched id fails closed; malformed values are ignored so a
+    keyed host callback can still use its store-owned sidecar correlation.
+    """
+    state_key = _state_key(payload)
+    if not state_key:
+        return ""
+    stored = _read_state_record(state_key, env)
+    if not stored:
+        return ""
+    supplied = payload.get("capture_id")
+    supplied_text = _text(supplied, limit=80)
+    supplied_id = _valid_capture_id(supplied)
+    if supplied_text and supplied_id and supplied_id != stored["capture_id"]:
+        return ""
+    return stored["capture_id"]
 
 
 def _start(payload: Mapping[str, Any], env: Mapping[str, str],
            api: Mapping[str, Any]) -> dict[str, Any]:
+    state_key = _state_key(payload)
+    existing = _read_state_record(state_key, env) if state_key else {}
+    if existing:
+        return {
+            "capture_id": existing["capture_id"],
+            "state": "partial",
+            "redaction_status": "",
+        }
     session_id = _session(payload)
     host = _first_text(payload, "host", limit=80).lower()
     namespace = _first_text(payload, "namespace", limit=512)
@@ -205,10 +289,14 @@ def _start(payload: Mapping[str, Any], env: Mapping[str, str],
         )
     finally:
         conn.close()
-    capture_id = _text(row.get("capture_id") if isinstance(row, dict) else "", limit=80)
+    capture_id = _valid_capture_id(
+        row.get("capture_id") if isinstance(row, dict) else ""
+    )
     if not capture_id:
         return {}
-    _write_state(_state_key(payload), capture_id, env)
+    generation = str(uuid.uuid4())
+    if state_key:
+        _write_state(state_key, capture_id, env, generation=generation)
     return {
         "capture_id": capture_id,
         "state": _text(row.get("state") if isinstance(row, dict) else "", limit=64),
@@ -225,7 +313,7 @@ def _observation_kind(payload: Mapping[str, Any]) -> str:
 
 def _observe(payload: Mapping[str, Any], env: Mapping[str, str],
              api: Mapping[str, Any]) -> dict[str, Any]:
-    capture_id = _read_state(_state_key(payload), env)
+    capture_id = _correlated_capture_id(payload, env)
     if not capture_id:
         return {}
     observation = payload.get("observation")
@@ -246,8 +334,10 @@ def _observe(payload: Mapping[str, Any], env: Mapping[str, str],
 
 def _snapshot(payload: Mapping[str, Any], env: Mapping[str, str],
               api: Mapping[str, Any]) -> dict[str, Any]:
-    capture_id = _read_state(_state_key(payload), env)
-    if not capture_id:
+    state_key = _state_key(payload)
+    before = _read_state_record(state_key, env)
+    capture_id = _correlated_capture_id(payload, env)
+    if not capture_id or not before:
         return {}
     rendered = payload.get("rendered")
     if not isinstance(rendered, str):
@@ -255,7 +345,8 @@ def _snapshot(payload: Mapping[str, Any], env: Mapping[str, str],
     effective_ops = payload.get("effective_ops")
     if not isinstance(effective_ops, list):
         effective_ops = []
-    effective_ops = [item for item in effective_ops if isinstance(item, str)][:128]
+    if len(effective_ops) > 128 or not all(isinstance(item, str) for item in effective_ops):
+        return {}
     conn = _connection(api)
     try:
         row = api["snapshot"](
@@ -267,11 +358,25 @@ def _snapshot(payload: Mapping[str, Any], env: Mapping[str, str],
         )
     finally:
         conn.close()
+    delivery_snapshot_id = _valid_capture_id(
+        row.get("delivery_snapshot_id") if isinstance(row, dict) else ""
+    )
+    # A detached snapshot may finish after a newer start has replaced this
+    # sidecar.  Only preserve its immutable delivery identity when the state
+    # still names the same generation and store-issued capture id.
+    after = _read_state_record(state_key, env)
+    if (delivery_snapshot_id and after.get("capture_id") == before["capture_id"]
+            and after.get("generation") == before["generation"]):
+        _write_state(
+            state_key,
+            before["capture_id"],
+            env,
+            generation=before["generation"],
+            delivery_snapshot_id=delivery_snapshot_id,
+        )
     return {
         "capture_id": capture_id,
-        "delivery_snapshot_id": (
-            _text(row.get("delivery_snapshot_id") if isinstance(row, dict) else "", limit=80)
-        ),
+        "delivery_snapshot_id": delivery_snapshot_id,
         "state": _text(row.get("state") if isinstance(row, dict) else "", limit=64),
     }
 
@@ -281,6 +386,8 @@ def run_action(payload: Mapping[str, Any], *, env: Mapping[str, str] | None = No
     """Run one adapter action; all host-facing errors are fail-open."""
     values = env if env is not None else os.environ
     try:
+        if _text(values.get("ZMEM_CAPTURE"), limit=32).strip() == "0":
+            return {}
         action = _first_text(payload, "action", limit=32)
         if action == "clear":
             _clear_state(_state_key(payload), values)

@@ -20,6 +20,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -84,6 +85,7 @@ class SessionCadenceTests(unittest.TestCase):
         self.assertEqual(self._run("init").returncode, 0)
         expired_id = str(uuid.uuid4())
         partial_id = str(uuid.uuid4())
+        recent_update = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         conn = sqlite3.connect(self.store)
         for capture_id, state, finalized_at in (
             (expired_id, "completed", "2000-01-01T00:00:00Z"),
@@ -93,9 +95,10 @@ class SessionCadenceTests(unittest.TestCase):
                 "INSERT INTO training_capture("
                 "capture_id, host, created_at, updated_at, finalized_at, state, "
                 "redaction_status, governance_source) VALUES (?, 'test', "
-                "'2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z', ?, ?, "
+                "'2000-01-01T00:00:00Z', ?, ?, ?, "
                 "'metadata_only', 'test')",
-                (capture_id, finalized_at, state),
+                (capture_id, recent_update if capture_id == partial_id else "2000-01-01T00:00:00Z",
+                 finalized_at, state),
             )
         conn.commit()
         conn.close()

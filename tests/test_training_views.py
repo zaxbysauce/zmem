@@ -43,6 +43,66 @@ STORE = ROOT / "skills" / "memory" / "scripts" / "store.py"
 class TrainingViewsContractTests(unittest.TestCase):
     """Verify the public export surface and its read-only artifact contract."""
 
+    def _domain_store_snapshot(self) -> dict[str, object]:
+        """Capture canonical tables while excluding the export binding row."""
+        ignored = {"training_export_snapshot_binding", "sqlite_sequence"}
+        conn = sqlite3.connect(self.store)
+        try:
+            tables = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                )
+                if str(row[0]) not in ignored
+            ]
+            snapshot: dict[str, object] = {}
+            for table in tables:
+                quoted = '"' + table.replace('"', '""') + '"'
+                schema = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone()[0]
+                try:
+                    columns = tuple(
+                        row[1]
+                        for row in conn.execute(f"PRAGMA table_info({quoted})")
+                    )
+                    rows = tuple(conn.execute(f"SELECT * FROM {quoted}"))
+                except sqlite3.OperationalError as exc:
+                    # The optional vec0 extension is not loaded by the
+                    # standard-library test process.  Preserve its schema in
+                    # the comparison and mark opaque contents as inaccessible.
+                    self.assertIn("no such module: vec0", str(exc))
+                    columns = ("<opaque-virtual-table>",)
+                    rows = (("<opaque-virtual-table>",),)
+                snapshot[table] = {"schema": schema, "columns": columns, "rows": rows}
+            return snapshot
+        finally:
+            conn.close()
+
+    def _assert_snapshot_binding(self, snapshot_id: str) -> None:
+        conn = sqlite3.connect(self.store)
+        try:
+            columns = [
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(training_export_snapshot_binding)"
+                )
+            ]
+            self.assertEqual(columns, ["snapshot_id", "binding_sha256", "created_at"])
+            rows = conn.execute(
+                "SELECT snapshot_id, binding_sha256, created_at "
+                "FROM training_export_snapshot_binding"
+            ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0], snapshot_id)
+            self.assertIsInstance(rows[0][1], str)
+            self.assertEqual(len(rows[0][1]), 64)
+            self.assertTrue(rows[0][2])
+        finally:
+            conn.close()
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="zmem-training-views-")
         self.root = Path(self._tmp.name)
@@ -209,15 +269,19 @@ class TrainingViewsContractTests(unittest.TestCase):
                     json.dumps([memory_id]),
                 ),
             )
+            observation_payload = json.dumps(
+                {"source_event_id": event_id}
+            )
             conn.execute(
                 "INSERT INTO training_capture_observation (observation_id, "
-                "capture_id, observation_kind, payload, observed_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "capture_id, observation_kind, payload, payload_sha256, observed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     f"observation-{capture_id}",
                     capture_id,
                     "event",
-                    json.dumps({"source_event_id": event_id}),
+                    observation_payload,
+                    hashlib.sha256(observation_payload.encode("utf-8")).hexdigest(),
                     "2026-01-01T00:00:00Z",
                 ),
             )
@@ -230,7 +294,7 @@ class TrainingViewsContractTests(unittest.TestCase):
 
     def test_empty_export_is_schema_only_and_store_bytes_are_unchanged(self) -> None:
         self._init_store()
-        before = self.store.read_bytes()
+        before = self._domain_store_snapshot()
         output = self.root / "training-empty"
         result = self._run(
             "export-training",
@@ -240,7 +304,8 @@ class TrainingViewsContractTests(unittest.TestCase):
             "--reviewer-confirmed",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.store.read_bytes(), before)
+        self.assertEqual(self._domain_store_snapshot(), before)
+        self._assert_snapshot_binding("empty-contract")
 
         import pyarrow.parquet as pq
 
@@ -324,7 +389,7 @@ class TrainingViewsContractTests(unittest.TestCase):
             task_id="task-other",
             session_id="session-other",
         )
-        before = self.store.read_bytes()
+        before = self._domain_store_snapshot()
         output = self.root / "training-selected"
         result = self._run(
             "export-training",
@@ -336,19 +401,50 @@ class TrainingViewsContractTests(unittest.TestCase):
             "project:selected",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.store.read_bytes(), before)
+        self.assertEqual(self._domain_store_snapshot(), before)
+        self._assert_snapshot_binding("selected-contract")
 
         import pyarrow.parquet as pq
 
         rows = pq.read_table(output / "sft-000.parquet").to_pylist()
         self.assertEqual(len(rows), 1)
         row = rows[0]
-        self.assertEqual(row["task_id"], "task-selected")
+        self.assertEqual(row["task_id"], "cap-selected")
         self.assertEqual(row["source_memory_ids"], ["mem-selected"])
-        self.assertEqual(row["source_event_ids"], ["event-selected"])
+        self.assertEqual(row["source_event_ids"], ["evidence-selected"])
         self.assertEqual(row["evidence_ref"], "evidence-selected")
         self.assertNotIn("event-other", row["source_event_ids"])
         self.assertEqual(self._manifest(output)["namespace"], "project:selected")
+
+    def test_unknown_delivery_snapshot_fails_closed_without_forking_capture(self) -> None:
+        self._init_store()
+        payload = self.root / "unknown-delivery.json"
+        payload.write_text(
+            json.dumps(
+                {
+                    "delivery_snapshot_id": "delivery-does-not-exist",
+                    "consent_scope": "fixture-scope",
+                    "content_license": "fixture-license",
+                    "redaction_policy_version": "policy-v1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = self._run(
+            "capture-training-delivery",
+            "--input",
+            str(payload),
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("delivery", result.stderr.lower())
+        conn = sqlite3.connect(self.store)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM training_capture").fetchone()[0],
+                0,
+            )
+        finally:
+            conn.close()
 
     def test_manifest_is_last_completion_marker_and_checksums_bind_artifacts(self) -> None:
         self._init_store()

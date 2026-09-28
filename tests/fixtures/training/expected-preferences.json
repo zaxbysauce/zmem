@@ -1,0 +1,42 @@
+[
+  {
+    "task_id": "cap-pref",
+    "project_key": "fixture",
+    "session_id": "fixture-session",
+    "episode_id": "fixture-episode",
+    "prompt": "Review the corrected migration procedure.",
+    "context_fence": "<context>correction</context>",
+    "chosen": {
+      "memory_id": "mem-new",
+      "content": "Use the safe deploy command",
+      "source_event_ids": [
+        "ev-pref",
+        "event-pref"
+      ],
+      "evidence_ref": "ev-pref"
+    },
+    "rejected": {
+      "memory_id": "mem-old",
+      "content": "Use the old deploy command",
+      "source_event_ids": [],
+      "evidence_ref": "ev-old"
+    },
+    "update_of": "mem-old",
+    "supersede_reason": "explicit correction",
+    "source_memory_ids": [
+      "mem-new"
+    ],
+    "source_event_ids": [
+      "ev-pref",
+      "event-pref"
+    ],
+    "evidence_ref": "ev-pref",
+    "consent_scope": "fixture-export",
+    "content_license": "fixture-license",
+    "redaction_status": "redacted",
+    "redaction_policy_version": "policy-v1",
+    "split_key": "7d68cc11d5ee2fa7bfa8d2e7933505a3080bd70a7f09caa9ba35b56fd067ce57",
+    "transform_version": "fixture-transform",
+    "row_checksum": "55fe6319af1387f636ee99f2e378c81ccdfa58ee969d2c49dcfb93fd09a96ed1"
+  }
+]

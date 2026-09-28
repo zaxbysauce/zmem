@@ -58,6 +58,26 @@ class RedactTextHelperTest(unittest.TestCase):
         self.assertEqual(redacted, text)
         self.assertEqual(n, 0)
 
+    def test_bearer_boundary_is_16_characters(self):
+        short = "Bearer " + "A" * 15
+        exact = "Bearer " + "A" * 16
+        self.assertEqual(redact_text(short), (short, 0))
+        redacted, count = redact_text(exact)
+        self.assertEqual((redacted, count), ("[REDACTED_SECRET]", 1))
+
+    def test_bearer_accepts_supported_delimiters_and_mixed_case(self):
+        token = "A._+/~-" + "B" * 16
+        text = f"before bEaReR {token}, after"
+        redacted, count = redact_text(text)
+        self.assertEqual(count, 1)
+        self.assertEqual(redacted, "before [REDACTED_SECRET], after")
+
+    def test_non_bearer_scheme_is_not_redacted_by_bearer_rule(self):
+        text = "Basic " + "A" * 16
+        redacted, count = redact_text(text)
+        self.assertEqual(redacted, text)
+        self.assertEqual(count, 0)
+
 
 class WritePathRedactionTest(unittest.TestCase):
     """CLI add/update in auto mode redact; manual mode warns advisories."""

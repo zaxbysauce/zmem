@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import sys
 import uuid
@@ -33,9 +34,19 @@ MAX_CAPTURE_TEXT_BYTES = 16_000
 MAX_OPS_JSON_BYTES = 400
 MAX_OBSERVATION_BYTES = 4_000
 MAX_OUTCOME_BYTES = 4_096
+MAX_OBSERVATIONS_PER_CAPTURE = 256
+MAX_EVENT_IDS = 128
+MAX_EVENT_ID_BYTES = 128
 OUTCOME_KINDS = frozenset({
     "test", "compile", "lint", "user_acceptance", "reviewer_acceptance",
 })
+_EVIDENCE_KINDS_BY_OUTCOME = {
+    "test": frozenset({"test_result"}),
+    "compile": frozenset({"test_result"}),
+    "lint": frozenset({"test_result"}),
+    "user_acceptance": frozenset({"turn"}),
+    "reviewer_acceptance": frozenset({"turn", "correction"}),
+}
 FINAL_STATES = frozenset({"completed"})
 
 
@@ -45,6 +56,28 @@ class CaptureBusyError(RuntimeError):
 
 class TrainingCaptureConflict(ValueError):
     """An idempotency identity was replayed with different immutable data."""
+
+
+class TrainingCaptureInputRefusal(ValueError):
+    """A bounded capture input was refused before content persistence."""
+
+    def __init__(self, reason: str, message: str | None = None) -> None:
+        self.reason = reason
+        super().__init__(message or reason)
+
+
+def evidence_kind_compatible(
+    outcome_kind: object,
+    evidence_kind: object,
+    *,
+    correction_closeout: bool = False,
+) -> bool:
+    """Validate the evidence type allowed to prove a completion outcome."""
+    outcome = str(outcome_kind or "")
+    kind = str(evidence_kind or "")
+    if correction_closeout:
+        return outcome == "reviewer_acceptance" and kind == "correction"
+    return kind in _EVIDENCE_KINDS_BY_OUTCOME.get(outcome, frozenset())
 
 
 def _required_text(value: object, field: str, *, max_bytes: int = 4096) -> str:
@@ -66,8 +99,23 @@ def _optional_text(value: object, field: str, *, max_bytes: int = 4096) -> str |
 
 
 def _timestamp(value: object | None, field: str) -> str:
-    if value is None:
-        return now_iso()
+    """Return the store clock for capture state, never a caller supplied time.
+
+    The optional argument remains for direct-library compatibility.  CLI entry
+    points reject timestamp keys, while old callers cannot backdate or advance
+    the retention/state clock by passing one here.
+    """
+    del value, field
+    return now_iso()
+
+
+def _retention_timestamp(value: object, field: str) -> str:
+    """Validate the maintenance scheduler's comparison clock.
+
+    This is not persisted state and is intentionally separate from `_timestamp`.
+    It keeps retention tests and the local purge scheduler deterministic without
+    accepting a caller-owned finalization timestamp.
+    """
     text = _required_text(value, field, max_bytes=64)
     try:
         datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -88,6 +136,34 @@ def _uuid(value: object, field: str) -> str:
     return str(parsed)
 
 
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_WINDOWS_PATH_RE = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>]+")
+_POSIX_PATH_RE = re.compile(
+    r"(?<!:)(?<![A-Za-z0-9])/(?:Users|home|private|tmp|var|workspace|workspaces|mnt|opt|root)(?:/[^\s\"'<>]+)*"
+)
+_SAFE_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _redact_training_text(value: str) -> tuple[str, int]:
+    """Apply the shared secret scanner plus conservative training PII rules."""
+    redacted, count = redact_secret_like_text(value)
+    for pattern, replacement in (
+        (_EMAIL_RE, "[REDACTED_EMAIL]"),
+        (_WINDOWS_PATH_RE, "[REDACTED_PATH]"),
+        (_POSIX_PATH_RE, "[REDACTED_PATH]"),
+    ):
+        redacted, changed = pattern.subn(replacement, redacted)
+        count += changed
+    return redacted, count
+
+
+def _opaque_identifier(value: str | None) -> str | None:
+    """Keep a stable, non-reversible correlation token for host identifiers."""
+    if value is None:
+        return None
+    return "opaque:" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
 def _redacted_bounded(value: object, field: str, limit: int) -> str | None:
     if value is None:
         return None
@@ -97,9 +173,17 @@ def _redacted_bounded(value: object, field: str, limit: int) -> str | None:
     # are then redacted before the persisted size cap is applied.
     if len(value.encode("utf-8")) > 65_536:
         raise ValueError(f"{field} exceeds 65536 UTF-8 bytes")
-    redacted, _ = redact_secret_like_text(value)
+    redacted, _ = _redact_training_text(value)
     raw = redacted.encode("utf-8")[:limit]
     return raw.decode("utf-8", errors="ignore")
+
+
+def _redacted_cwd(value: object) -> str | None:
+    """Retain only the fact that a working directory was supplied."""
+    if value is None:
+        return None
+    text = _optional_text(value, "cwd", max_bytes=4096)
+    return "[REDACTED_PATH]" if text else None
 
 
 def _canonical_json(value: object, field: str, *, max_bytes: int = 4096) -> str:
@@ -135,15 +219,93 @@ def _redacted_ops(value: object) -> str:
     for item in values:
         if not isinstance(item, str):
             raise ValueError("effective_ops must be a list of strings")
-        candidate = _redacted_bounded(item, "effective_ops item", 320) or ""
-        candidate_values = [*result, candidate]
-        encoded = json.dumps(candidate_values, ensure_ascii=False,
-                             separators=(",", ":"))
-        if len(encoded.encode("utf-8")) <= MAX_OPS_JSON_BYTES:
-            result.append(candidate)
-        else:
-            break
-    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        if len(item.encode("utf-8")) > 65_536:
+            raise TrainingCaptureInputRefusal(
+                "effective_ops_over_limit",
+                f"effective_ops exceeds {MAX_OPS_JSON_BYTES} UTF-8 bytes",
+            )
+        candidate = _redact_training_text(item)[0]
+        result.append(candidate)
+    encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_OPS_JSON_BYTES:
+        raise TrainingCaptureInputRefusal(
+            "effective_ops_over_limit",
+            f"effective_ops exceeds {MAX_OPS_JSON_BYTES} UTF-8 bytes",
+        )
+    return encoded
+
+
+def _bounded_event_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or len(candidate.encode("utf-8")) > MAX_EVENT_ID_BYTES:
+        return None
+    redacted, _ = _redact_training_text(candidate)
+    if redacted != candidate or not _SAFE_EVENT_ID_RE.fullmatch(candidate):
+        return _opaque_identifier(candidate)
+    return candidate
+
+
+def _bounded_observation_json(value: str | None) -> str | None:
+    """Redact JSON observations and cap event-id fanout before persistence."""
+    if value is None:
+        return None
+    if len(value.encode("utf-8")) > 65_536:
+        raise ValueError("observation payload exceeds 65536 UTF-8 bytes")
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, UnicodeError):
+        return _redacted_bounded(value, "observation payload", MAX_OBSERVATION_BYTES)
+    seen_ids = 0
+
+    def visit(item: object) -> object:
+        nonlocal seen_ids
+        if isinstance(item, str):
+            return _redact_training_text(item)[0]
+        if isinstance(item, list):
+            return [visit(child) for child in item]
+        if not isinstance(item, dict):
+            return item
+        result: dict[str, object] = {}
+        for key, child in item.items():
+            if not isinstance(key, str):
+                continue
+            key_lower = key.lower()
+            if key_lower in {"host_task_id", "hosttaskid"}:
+                if isinstance(child, str):
+                    result[key] = _opaque_identifier(child)
+                continue
+            if key_lower == "cwd":
+                result[key] = "[REDACTED_PATH]" if isinstance(child, str) and child else None
+                continue
+            if key_lower in {"event_id", "source_event_id", "source_event_ids"}:
+                if isinstance(child, list):
+                    bounded: list[str] = []
+                    for candidate in child:
+                        if seen_ids >= MAX_EVENT_IDS:
+                            break
+                        normalized = _bounded_event_id(candidate)
+                        if normalized is not None:
+                            bounded.append(normalized)
+                            seen_ids += 1
+                    result[key] = bounded
+                else:
+                    if seen_ids >= MAX_EVENT_IDS:
+                        continue
+                    normalized = _bounded_event_id(child)
+                    if normalized is not None:
+                        result[key] = normalized
+                        seen_ids += 1
+                continue
+            result[key] = visit(child)
+        return result
+
+    encoded = json.dumps(visit(decoded), ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_OBSERVATION_BYTES:
+        return json.dumps({"truncated": True}, separators=(",", ":"))
+    return encoded
 
 
 def _begin(conn: sqlite3.Connection) -> bool | str:
@@ -217,10 +379,12 @@ def assert_training_capture_replay_binding(
     capture = _capture_row(conn, capture_id)
     normalizers = {
         "host": lambda value: _required_text(value, "host", max_bytes=80).lower(),
-        "host_task_id": lambda value: _optional_text(value, "host_task_id", max_bytes=512),
+        # The compatibility column is always NULL.  Host task IDs are never a
+        # persisted capture identity, including in hashed form.
+        "host_task_id": lambda value: None,
         "session_id": lambda value: _required_text(value, "session_id", max_bytes=512),
         "namespace": lambda value: _required_text(value, "namespace", max_bytes=512),
-        "cwd": lambda value: _optional_text(value, "cwd", max_bytes=4096),
+        "cwd": _redacted_cwd,
         "prompt": lambda value: _redacted_bounded(value, "prompt", MAX_CAPTURE_TEXT_BYTES),
         "assistant_response": lambda value: _redacted_bounded(
             value, "assistant_response", MAX_CAPTURE_TEXT_BYTES
@@ -249,10 +413,10 @@ def _content_governance(
            for value in values):
         return None, None, None, False
     if any(not isinstance(value, str) or not value.strip() for value in values):
-        missing = next(name for name, value in zip(
-            ("consent_scope", "content_license", "redaction_policy_version"), values
-        ) if not isinstance(value, str) or not value.strip())
-        raise ValueError(f"missing governance field: {missing}")
+        # Hooks are intentionally allowed to create an auditable partial even
+        # when configuration is only partly present.  Treat that exactly like
+        # absent governance: keep metadata only and deny export.
+        return None, None, None, False
     return (
         _required_text(consent_scope, "consent_scope", max_bytes=512),
         _required_text(content_license, "content_license", max_bytes=512),
@@ -303,13 +467,13 @@ def start_training_capture(
     persisted_response = _redacted_bounded(
         assistant_response, "assistant_response", MAX_CAPTURE_TEXT_BYTES
     ) if permitted else None
-    # A default-deny partial is deliberately a minimal audit marker.  Opaque
-    # host task/session values and cwd can contain prompt-like private data, so
-    # they are not retained unless capture governance explicitly permits text.
+    # A default-deny partial is deliberately a minimal audit marker.  Host task
+    # IDs are never retained; session values and cwd can contain prompt-like
+    # private data, so they are retained only under capture governance.
     persisted_session = session_id if permitted else None
     persisted_namespace = namespace if permitted else None
-    persisted_host_task_id = host_task_id if permitted else None
-    persisted_cwd = cwd if permitted else None
+    persisted_host_task_id = None
+    persisted_cwd = _redacted_cwd(cwd) if permitted else None
     quarantine_reason = None if permitted else "capture_governance_denied"
     ts = now_iso()
     capture_id = str(uuid.uuid4())
@@ -344,15 +508,25 @@ def append_training_capture_observation(
         capture = _capture_row(conn, capture_id)
         if capture["state"] == "completed" or capture["revoked_at"] is not None:
             raise ValueError("cannot append an observation to a final training capture")
+        observation_count = conn.execute(
+            "SELECT count(*) FROM training_capture_observation WHERE capture_id=?",
+            (capture_id,),
+        ).fetchone()[0]
+        if observation_count >= MAX_OBSERVATIONS_PER_CAPTURE:
+            raise ValueError("training capture observation limit exceeded")
         stored_payload = None
         if capture["redaction_status"] == "redacted":
-            stored_payload = _redacted_bounded(payload, "observation payload", MAX_OBSERVATION_BYTES)
+            stored_payload = _bounded_observation_json(payload)
+        payload_sha256 = (
+            hashlib.sha256(stored_payload.encode("utf-8")).hexdigest()
+            if stored_payload is not None else None
+        )
         observation_id = str(uuid.uuid4())
         conn.execute(
             "INSERT INTO training_capture_observation "
-            "(observation_id, capture_id, observation_kind, payload, observed_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (observation_id, capture_id, observation_kind, stored_payload, observed_at),
+            "(observation_id, capture_id, observation_kind, payload, payload_sha256, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (observation_id, capture_id, observation_kind, stored_payload, payload_sha256, observed_at),
         )
         conn.execute("UPDATE training_capture SET updated_at=? WHERE capture_id=?", (observed_at, capture_id))
         _finish(conn, owns_tx)
@@ -377,14 +551,27 @@ def record_training_delivery_snapshot(
         capture = _capture_row(conn, capture_id)
         if capture["revoked_at"] is not None:
             raise ValueError("training capture cannot receive a delivery snapshot in its current state")
-        if capture["redaction_status"] == "redacted":
-            stored_rendered = _redacted_bounded(rendered, "rendered", MAX_CAPTURE_TEXT_BYTES)
-            stored_ops = _redacted_ops(effective_ops)
-            rendered_hash = hashlib.sha256((stored_rendered or "").encode("utf-8")).hexdigest()
-        else:
-            # Default-deny captures can record that a delivery occurred, but
-            # cannot retain any emitted content, token list, or content hash.
-            stored_rendered = stored_ops = rendered_hash = None
+        try:
+            if capture["redaction_status"] == "redacted":
+                stored_rendered = _redacted_bounded(rendered, "rendered", MAX_CAPTURE_TEXT_BYTES)
+                stored_ops = _redacted_ops(effective_ops)
+                rendered_hash = hashlib.sha256((stored_rendered or "").encode("utf-8")).hexdigest()
+            else:
+                # Default-deny captures can record that a delivery occurred, but
+                # cannot retain any emitted content, token list, or content hash.
+                stored_rendered = stored_ops = rendered_hash = None
+        except TrainingCaptureInputRefusal as exc:
+            # Preserve the partial capture and commit a durable, non-exportable
+            # refusal marker.  The caller still receives the refusal so a hook can
+            # fail open without silently prefix-truncating the delivered ops.
+            ts = now_iso()
+            conn.execute(
+                "UPDATE training_capture SET quarantine_reason=?, updated_at=? "
+                "WHERE capture_id=? AND state='partial'",
+                (exc.reason, ts, capture_id),
+            )
+            _finish(conn, owns_tx)
+            raise
         existing = conn.execute(
             "SELECT * FROM training_delivery_snapshot WHERE capture_id=?", (capture_id,)
         ).fetchone()
@@ -402,7 +589,9 @@ def record_training_delivery_snapshot(
             if actual != expected:
                 raise TrainingCaptureConflict("conflicting delivery snapshot replay")
             _finish(conn, owns_tx)
-            return _row_dict(existing)
+            replay = _row_dict(existing)
+            replay["state"] = "emitted_to_host"
+            return replay
         if capture["state"] != "partial":
             raise ValueError("training capture cannot receive a delivery snapshot in its current state")
         snapshot_id = delivery_snapshot_id or str(uuid.uuid4())
@@ -424,9 +613,14 @@ def record_training_delivery_snapshot(
     except Exception:
         _rollback(conn, owns_tx)
         raise
-    return _row_dict(conn.execute(
+    result = _row_dict(conn.execute(
         "SELECT * FROM training_delivery_snapshot WHERE delivery_snapshot_id=?", (snapshot_id,)
     ).fetchone())
+    # Adapters need an explicit nonempty delivery result.  This describes the
+    # persisted delivery event even if a later acknowledgement has advanced the
+    # capture's lifecycle state.
+    result["state"] = "emitted_to_host"
+    return result
 
 
 def acknowledge_training_delivery(
@@ -500,8 +694,8 @@ def complete_training_capture(
         raise ValueError("reviewer_confirmed and correction_closeout must be booleans")
     reviewer_id = _optional_text(reviewer_id, "reviewer_id", max_bytes=512)
     correction_chain_id = _optional_text(correction_chain_id, "correction_chain_id", max_bytes=512)
-    if outcome_kind == "reviewer_acceptance" and (not reviewer_confirmed or not reviewer_id):
-        raise ValueError("reviewer_acceptance requires reviewer_id and reviewer_confirmed=true")
+    if outcome_kind == "reviewer_acceptance" and (reviewer_confirmed or reviewer_id is not None):
+        raise ValueError("reviewer acceptance requires a separate local review transition")
     ts = _timestamp(verified_at, "verified_at")
     owns_tx = _begin(conn)
     try:
@@ -513,12 +707,12 @@ def complete_training_capture(
             if completion is None:
                 raise TrainingCaptureConflict("completed capture lacks completion record")
             expected = (evidence_id, json.dumps(ids, separators=(",", ":")), verifier_id, outcome_kind, outcome_value,
-                        export_consent_scope, export_content_license, reviewer_id,
-                        int(reviewer_confirmed), int(correction_closeout), correction_chain_id)
+                        export_consent_scope, export_content_license,
+                        int(correction_closeout), correction_chain_id)
             actual = tuple(completion[key] for key in (
                 "evidence_id", "associated_memory_ids_json", "verifier_id", "outcome_kind", "outcome_value",
-                "export_consent_scope", "export_content_license", "reviewer_id",
-                "reviewer_confirmed", "correction_closeout", "correction_chain_id",
+                "export_consent_scope", "export_content_license",
+                "correction_closeout", "correction_chain_id",
             ))
             if actual == expected:
                 _finish(conn, owns_tx)
@@ -537,12 +731,16 @@ def complete_training_capture(
         if snapshot is None or snapshot["rendered"] is None or snapshot["effective_ops_json"] is None:
             raise ValueError("training capture lacks a redacted delivery snapshot")
         evidence = conn.execute(
-            "SELECT session_id FROM evidence WHERE id=?", (evidence_id,)
+            "SELECT session_id, kind FROM evidence WHERE id=?", (evidence_id,)
         ).fetchone()
         if evidence is None:
             raise ValueError("evidence_id does not exist")
         if evidence["session_id"] != capture["session_id"]:
             raise ValueError("evidence_id is outside the capture session")
+        if not evidence_kind_compatible(
+                outcome_kind, evidence["kind"],
+                correction_closeout=correction_closeout):
+            raise ValueError("evidence kind is incompatible with outcome_kind")
         placeholders = ",".join("?" for _ in ids)
         memory_rows = conn.execute(
             "SELECT id, namespace FROM memory WHERE id IN (" + placeholders + ")", ids
@@ -588,6 +786,71 @@ def complete_training_capture(
     ).fetchone())
 
 
+def review_training_capture(
+    conn: sqlite3.Connection, capture_id: str, *, evidence_id: str,
+    reviewer_id: str, allowed_reviewer_ids: Sequence[str],
+    reviewed_at: str | None = None,
+) -> dict[str, Any]:
+    """Record the independent local reviewer transition for one completion.
+
+    This protects against accidental self-review in a local host process.  It
+    is not an authentication boundary against a hostile local administrator,
+    who can change that process's configured caller identity.
+    """
+    capture_id = _uuid(capture_id, "capture_id")
+    evidence_id = _uuid(evidence_id, "evidence_id")
+    reviewer_id = _required_text(reviewer_id, "reviewer_id", max_bytes=512)
+    allowed = {
+        _required_text(item, "allowed reviewer id", max_bytes=512)
+        for item in allowed_reviewer_ids
+    }
+    if reviewer_id not in allowed:
+        raise ValueError("trusted local caller is not an authorized reviewer")
+    ts = _timestamp(reviewed_at, "reviewed_at")
+    owns_tx = _begin(conn)
+    try:
+        capture = _capture_row(conn, capture_id)
+        if capture["revoked_at"] is not None:
+            raise ValueError("cannot review a revoked training capture")
+        completion = conn.execute(
+            "SELECT * FROM training_capture_completion WHERE capture_id=?", (capture_id,)
+        ).fetchone()
+        if completion is None:
+            raise ValueError("training capture has no completion to review")
+        if completion["outcome_kind"] != "reviewer_acceptance":
+            raise ValueError("only reviewer_acceptance completions require local review")
+        if completion["evidence_id"] != evidence_id:
+            raise TrainingCaptureConflict("review evidence does not match completion evidence")
+        if completion["verifier_id"] == reviewer_id:
+            raise ValueError("reviewer must differ from verifier")
+        existing = conn.execute(
+            "SELECT * FROM training_capture_review WHERE capture_id=?", (capture_id,)
+        ).fetchone()
+        if existing is not None:
+            if (existing["completion_evidence_id"], existing["reviewer_id"]) == (evidence_id, reviewer_id):
+                _finish(conn, owns_tx)
+                return _row_dict(existing)
+            raise TrainingCaptureConflict("conflicting training review replay")
+        conn.execute(
+            "INSERT INTO training_capture_review "
+            "(capture_id, completion_evidence_id, reviewer_id, reviewed_at) VALUES (?, ?, ?, ?)",
+            (capture_id, evidence_id, reviewer_id, ts),
+        )
+        # The legacy exporter already gates on these completion columns.  They
+        # are updated only after the durable independent-review record exists.
+        conn.execute(
+            "UPDATE training_capture_completion SET reviewer_id=?, reviewer_confirmed=1 "
+            "WHERE capture_id=?", (reviewer_id, capture_id),
+        )
+        _finish(conn, owns_tx)
+    except Exception:
+        _rollback(conn, owns_tx)
+        raise
+    return _row_dict(conn.execute(
+        "SELECT * FROM training_capture_review WHERE capture_id=?", (capture_id,)
+    ).fetchone())
+
+
 def revoke_training_capture(
     conn: sqlite3.Connection, capture_id: str, *, reason: str, revoked_by: str = "local_governance",
     revoked_at: str | None = None,
@@ -620,20 +883,27 @@ def revoke_training_capture(
 def purge_expired_training_captures(
     conn: sqlite3.Connection, *, now_ts: str, retention_days: int = 30,
 ) -> dict[str, int]:
-    """Purge final/revoked local capture rows after the fixed retention window."""
+    """Purge every local capture after 30 days of finalization or inactivity.
+
+    Automatic hooks are allowed to produce partial and emitted rows without a
+    trusted completion callback.  Those rows therefore use ``updated_at`` as
+    their retention clock; completed or revoked rows use ``finalized_at``.
+    """
     if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days != 30:
         raise ValueError("training capture retention is fixed at 30 days")
-    now_ts = _timestamp(now_ts, "now_ts")
+    now_ts = _retention_timestamp(now_ts, "now_ts")
     owns_tx = _begin(conn)
     try:
         rows = conn.execute(
-            "SELECT capture_id FROM training_capture WHERE finalized_at IS NOT NULL "
-            "AND datetime(finalized_at, '+30 days') <= datetime(?)", (now_ts,)
+            "SELECT capture_id FROM training_capture WHERE "
+            "datetime(COALESCE(finalized_at, updated_at), '+30 days') <= datetime(?)",
+            (now_ts,),
         ).fetchall()
         ids = [row[0] for row in rows]
         if ids:
             placeholders = ",".join("?" for _ in ids)
             conn.execute("DELETE FROM training_capture_observation WHERE capture_id IN (" + placeholders + ")", ids)
+            conn.execute("DELETE FROM training_capture_review WHERE capture_id IN (" + placeholders + ")", ids)
             conn.execute("DELETE FROM training_capture_completion WHERE capture_id IN (" + placeholders + ")", ids)
             conn.execute("DELETE FROM training_delivery_snapshot WHERE capture_id IN (" + placeholders + ")", ids)
             conn.execute("DELETE FROM training_capture WHERE capture_id IN (" + placeholders + ")", ids)

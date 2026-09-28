@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "delivery_snapshot_id": "00000000-0000-4000-8000-000000000311",
+  "task_id": "task-135-reviewer",
+  "source_event_id": "event-135-reviewer",
+  "project_key": "preferences",
+  "session_id": "session-135-correction",
+  "context_fence": "<zmem>\n- correction memory\n</zmem>\n",
+  "ops_tokens": ["review"],
+  "prompt": "Review the correction.",
+  "assistant_response": "The correction is accepted.",
+  "outcome_kind": "reviewer_acceptance",
+  "outcome_value": "accepted",
+  "evidence_ref": "00000000-0000-4000-8000-000000000311",
+  "consent_scope": "explicit-training-opt-in",
+  "content_license": "internal-review",
+  "redaction_status": "redacted",
+  "redaction_policy_version": "capture-v1",
+  "reviewer_confirmed": true,
+  "correction_chain_id": "correction-135-reviewer"
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "delivery_snapshot_id": "00000000-0000-4000-8000-000000000601",
+  "task_id": "task-135-missing-governance",
+  "source_event_id": "event-135-missing-governance",
+  "project_key": "zmem",
+  "session_id": "session-135-missing-governance",
+  "prompt": "Capture this text.",
+  "assistant_response": "The candidate is verified.",
+  "outcome_kind": "test",
+  "outcome_value": "passed",
+  "evidence_ref": "00000000-0000-4000-8000-000000000602",
+  "consent_scope": "explicit-training-opt-in",
+  "redaction_status": "redacted",
+  "redaction_policy_version": "capture-v1"
+}

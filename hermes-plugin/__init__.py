@@ -84,6 +84,11 @@ _CAPTURE_STORE_ENV: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 
+def _capture_disabled() -> bool:
+    """The operator kill switch is authoritative across Hermes wrappers."""
+    return os.environ.get("ZMEM_CAPTURE", "").strip() == "0"
+
+
 def _resolve_zmem_home() -> Optional[Path]:
     """Resolve the zmem checkout root.
 
@@ -542,7 +547,9 @@ def _run_store(
     cmd = [_python_bin(), str(store_py), *args]
     if env is None and _CAPTURE_STORE_ENV.get():
         env = os.environ.copy()
-        env["ZMEM_CAPTURE"] = "1"
+        # Capture mode is parent-owned.  Preserve an explicit disabled value;
+        # the wrapper must never turn the global kill switch back on.
+        env["ZMEM_CAPTURE"] = os.environ.get("ZMEM_CAPTURE", "1")
     # Start at the exact subprocess boundary.  Path resolution is outside this
     # interval, matching the MCP server's attributed timing contract.
     started = time.perf_counter()
@@ -601,6 +608,8 @@ def _training_capture_script() -> Optional[Path]:
 
 def _run_training_capture(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Invoke the shared partial-capture adapter without exposing failures."""
+    if _capture_disabled():
+        return {}
     script = _training_capture_script()
     if script is None or action not in {"start", "observe", "snapshot", "clear"}:
         return {}
@@ -627,12 +636,19 @@ def _run_training_capture(action: str, payload: Dict[str, Any]) -> Dict[str, Any
 
 def _background_training_capture(action: str, payload: Dict[str, Any]) -> None:
     """Bound post-tool capture work so the Hermes callback stays fail-open."""
+    if _capture_disabled():
+        return
     if not _TRAINING_CAPTURE_INFLIGHT.acquire(blocking=False):
         return
 
     def _worker() -> None:
         try:
             _run_training_capture(action, payload)
+        except Exception as exc:
+            # Background capture is observational.  Keep unexpected adapter
+            # failures out of the host's thread exception hook and preserve the
+            # callback's fail-open contract.
+            logger.debug("zmem background training capture failed: %s", exc)
         finally:
             _TRAINING_CAPTURE_INFLIGHT.release()
 
@@ -1447,7 +1463,7 @@ class ZmemMemoryProvider(MemoryProvider):
             return ""
         # Capture the store-owned delivery snapshot; hooks never infer
         # acknowledgement or an outcome from this envelope.
-        _run_training_capture("snapshot", {
+        _background_training_capture("snapshot", {
             "host": "hermes",
             "hook_name": "prefetch",
             "session_id": sid,
@@ -1478,6 +1494,10 @@ class ZmemMemoryProvider(MemoryProvider):
                 "hook_name": "post_tool_call",
                 "session_id": session_id,
                 "namespace": self._namespace,
+                "capture_key": (
+                    kwargs.get("capture_key") or kwargs.get("captureKey")
+                    or kwargs.get("turn_id") or kwargs.get("turnId")
+                ),
                 "host_task_id": kwargs.get("task_id") or kwargs.get("taskId"),
                 "observation_kind": "post_tool_call",
                 "observation": dict(kwargs),
@@ -2065,11 +2085,18 @@ class ZmemMemoryProvider(MemoryProvider):
         """
         sid = str(session_id or self._session_id or "").strip()
         try:
+            # Establish the per-turn sidecar before later detached observations
+            # or snapshots can run; the start subprocess itself has a strict
+            # 1.2-second bound and never asserts acknowledgement or outcome.
             _run_training_capture("start", {
                 "host": "hermes",
                 "hook_name": "sync_turn",
                 "session_id": sid,
                 "namespace": self._namespace,
+                "capture_key": (
+                    kwargs.get("capture_key") or kwargs.get("captureKey")
+                    or kwargs.get("turn_id") or kwargs.get("turnId")
+                ),
                 "cwd": os.getcwd(),
                 "prompt": user_content if isinstance(user_content, str) else "",
                 "assistant_response": (

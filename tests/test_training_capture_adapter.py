@@ -93,7 +93,7 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "observation_kind": "stop",
             "observation": {"status": "unknown"},
         }, env=self.env, api=self.api)
-        self.assertEqual(observed["capture_id"], self.capture_id)
+        self.assertEqual(observed, {})
 
     def test_opt_in_forwards_all_governance_values(self):
         env = {
@@ -123,6 +123,7 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "host": "zcode",
             "session_id": "session-3",
             "namespace": "project:hook-test",
+            "turn_id": "turn-3",
         }
         ADAPTER.run_action({"action": "start", **base}, env=self.env, api=self.api)
         observed = ADAPTER.run_action({
@@ -161,11 +162,147 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "host": "claude",
             "session_id": "session-4",
             "namespace": "project:hook-test",
+            "turn_id": "turn-4",
             "prompt": "private prompt",
         }, env=self.env, api=self.api)
         state_files = list((Path(self.tmp.name) / "training-capture").glob("*.json"))
         self.assertEqual(len(state_files), 1)
-        self.assertEqual(json.loads(state_files[0].read_text()), {"capture_id": self.capture_id})
+        state = json.loads(state_files[0].read_text())
+        self.assertEqual(state["capture_id"], self.capture_id)
+        self.assertIsInstance(state["generation"], str)
+        self.assertEqual(set(state), {"capture_id", "generation"})
+
+    def test_snapshot_delivery_identity_is_preserved_in_the_sidecar(self):
+        base = {
+            "host": "claude", "session_id": "session-delivery",
+            "namespace": "project:hook-test", "turn_id": "turn-delivery",
+        }
+        ADAPTER.run_action({"action": "start", **base}, env=self.env, api=self.api)
+        result = ADAPTER.run_action({
+            "action": "snapshot", **base, "rendered": "context",
+        }, env=self.env, api=self.api)
+        self.assertEqual(
+            result["delivery_snapshot_id"],
+            "22222222-2222-4222-8222-222222222222",
+        )
+        state_file = next((Path(self.tmp.name) / "training-capture").glob("*.json"))
+        state = json.loads(state_file.read_text())
+        self.assertEqual(state["capture_id"], self.capture_id)
+        self.assertEqual(state["delivery_snapshot_id"], result["delivery_snapshot_id"])
+
+    def test_delayed_snapshot_cannot_publish_against_a_newer_generation(self):
+        base = {
+            "host": "claude", "session_id": "session-generation",
+            "namespace": "project:hook-test", "turn_id": "turn-generation",
+        }
+        ADAPTER.run_action({"action": "start", **base}, env=self.env, api=self.api)
+        state_key = ADAPTER._state_key(base)
+        replacement_capture = "33333333-3333-4333-8333-333333333333"
+        replacement_generation = "44444444-4444-4444-8444-444444444444"
+
+        def delayed_snapshot(conn, capture_id, **kwargs):
+            ADAPTER._write_state(
+                state_key, replacement_capture, self.env,
+                generation=replacement_generation,
+            )
+            return {
+                "capture_id": capture_id,
+                "delivery_snapshot_id": "22222222-2222-4222-8222-222222222222",
+                "state": "emitted_to_host",
+            }
+
+        self.api["snapshot"] = delayed_snapshot
+        result = ADAPTER.run_action({
+            "action": "snapshot", **base, "rendered": "old context",
+        }, env=self.env, api=self.api)
+        self.assertEqual(result["capture_id"], self.capture_id)
+        state_file = next((Path(self.tmp.name) / "training-capture").glob("*.json"))
+        state = json.loads(state_file.read_text())
+        self.assertEqual(state, {
+            "capture_id": replacement_capture,
+            "generation": replacement_generation,
+        })
+
+    def test_keyless_starts_are_fresh_and_never_create_reusable_sidecar(self):
+        first = ADAPTER.run_action({
+            "action": "start", "host": "claude", "session_id": "same-session",
+        }, env=self.env, api=self.api)
+        self.capture_id = "22222222-2222-4222-8222-222222222222"
+        second = ADAPTER.run_action({
+            "action": "start", "host": "claude", "session_id": "same-session",
+        }, env=self.env, api=self.api)
+
+        self.assertEqual(first["capture_id"], "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(second["capture_id"], "22222222-2222-4222-8222-222222222222")
+        self.assertFalse((Path(self.tmp.name) / "training-capture").exists())
+        self.assertEqual(ADAPTER.run_action({
+            "action": "snapshot", "host": "claude", "session_id": "same-session",
+            "capture_id": first["capture_id"], "rendered": "must not attach",
+        }, env=self.env, api=self.api), {})
+
+    def test_caller_capture_id_cannot_override_keyed_sidecar(self):
+        base = {
+            "host": "claude", "session_id": "keyed", "turn_id": "turn-a",
+        }
+        ADAPTER.run_action({"action": "start", **base}, env=self.env, api=self.api)
+        self.assertEqual(ADAPTER.run_action({
+            "action": "observe", **base,
+            "capture_id": "22222222-2222-4222-8222-222222222222",
+            "observation": {"status": "wrong-target"},
+        }, env=self.env, api=self.api), {})
+        self.assertEqual(len(self.calls), 1)
+
+    def test_kill_switch_is_authoritative_and_does_not_create_state(self):
+        env = {**self.env, "ZMEM_CAPTURE": "0"}
+        result = ADAPTER.run_action({
+            "action": "start",
+            "host": "claude",
+            "session_id": "disabled",
+            "turn_id": "turn-disabled",
+            "prompt": "must not be captured",
+        }, env=env, api=self.api)
+        self.assertEqual(result, {})
+        self.assertEqual(self.calls, [])
+        self.assertFalse((Path(self.tmp.name) / "training-capture").exists())
+
+    def test_immutable_turn_keys_keep_delayed_callbacks_on_their_capture(self):
+        base = {
+            "host": "claude",
+            "session_id": "overlapping",
+            "namespace": "project:hook-test",
+        }
+        first = ADAPTER.run_action({
+            "action": "start", **base, "turn_id": "turn-a", "host_task_id": "task-shared",
+        }, env=self.env, api=self.api)
+        self.capture_id = "22222222-2222-4222-8222-222222222222"
+        ADAPTER.run_action({
+            "action": "start", **base, "turn_id": "turn-b", "host_task_id": "task-shared",
+        }, env=self.env, api=self.api)
+        observed = ADAPTER.run_action({
+            "action": "observe", **base, "turn_id": "turn-a", "host_task_id": "task-shared",
+            "capture_id": "malformed-capture-id",
+            "observation_kind": "post_tool",
+            "observation": {"status": "delayed"},
+        }, env=self.env, api=self.api)
+        self.assertEqual(observed["capture_id"], first["capture_id"])
+
+    def test_repeated_turns_sharing_task_and_session_do_not_reuse_sidecar(self):
+        base = {
+            "host": "claude", "session_id": "shared-session",
+            "namespace": "project:hook-test", "host_task_id": "task-shared",
+        }
+        first = ADAPTER.run_action({
+            "action": "start", **base, "turn_id": "turn-one",
+        }, env=self.env, api=self.api)
+        self.capture_id = "22222222-2222-4222-8222-222222222222"
+        second = ADAPTER.run_action({
+            "action": "start", **base, "turn_id": "turn-two",
+        }, env=self.env, api=self.api)
+        self.assertNotEqual(first["capture_id"], second["capture_id"])
+        self.assertEqual(ADAPTER.run_action({
+            "action": "observe", **base,
+            "observation": {"status": "no-turn-key"},
+        }, env=self.env, api=self.api), {})
 
 
 if __name__ == "__main__":

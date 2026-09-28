@@ -1829,6 +1829,11 @@ evidence id, scoped memory ids, current export governance, and any required
 reviewer correction fields. Hook observations, Stop, tool success/failure,
 and displayed text never complete a capture.
 
+Completion evidence must match the outcome: test, compile, and lint require
+test_result evidence; user_acceptance requires turn evidence; reviewer_acceptance
+accepts turn or correction evidence. correction_closeout requires
+reviewer_acceptance with correction evidence.
+
 The explicit trusted local adapters accept reviewed JSON input and keep the
 state transitions separate:
 
@@ -1842,13 +1847,17 @@ The delivery response contains the local `capture_id` and immutable
 `delivery_snapshot_id`; later adapters resolve the capture through the snapshot
 id. `host_task_id` is correlation metadata only when the host supplies it.
 Replayed compatible inputs are idempotent, while conflicting snapshots or
-completion data are refused.
+completion data are refused. The current redaction masks credential-like,
+email, and filesystem-path classes; it is not comprehensive PII anonymization.
+Reviewer trust on this local completion path means a local operator's
+attestation; no external reviewer registry is implied.
 
 Finalized and revoked capture records, their local delivery/completion/
 observation rows, remain for 30 days. The detached `session-cadence` task
 attempts the purge before its backup step; a successful purge keeps expired
-records out of new backups. Doctor reports overdue rows but stays
-read-only; an operator can run the explicit cleanup instead:
+records out of new backups. Doctor reports an intentional expired-retention
+warning with output status `warn` and stays read-only; an operator can run the
+explicit cleanup instead:
 
 ```bash
 python <store.py> purge-training-captures --confirm
@@ -1884,18 +1893,24 @@ python <store.py> export-training DIR --snapshot-id ID \
 before SQLite opens or output is created. `DIR` is the training output
 directory itself and contains the fixed `sft-000.parquet`,
 `preferences-000.parquet`, `manifest.json`, and `deletion-map.json` artifacts
-directly. Empty eligible selections still produce schema-only Parquet files. A
+directly. `deletion-map.json` is derived deduplication and exclusion metadata;
+it does not delete canonical SQLite rows or prior operator-owned output
+folders. Empty eligible selections still produce schema-only Parquet files. A
 missing PyArrow dependency or unavailable local model for a nonempty semantic
 export fails closed before publish.
 
 `--quarantine-raw` writes a separate bounded, redacted derived dump under
-`DIR/quarantine/` with `DIR/quarantine-manifest.json`. It does not change
-capture state or make denied, revoked, incomplete, or otherwise excluded
-captures eligible. Training vectors are in-memory only and never sync or back
-up. Output is published from a validated same-volume staging
-directory, with the final manifest written last; consumers must reject output
-without a valid manifest. Doctor reports abandoned staging directories but is
-read-only by default. After confirming no export is running, an operator can
+`DIR/quarantine/` with `DIR/quarantine-manifest.json`. It uses the same
+verified, acknowledged completion gate as the Parquet views; partial, denied,
+revoked, incomplete, or capture-quarantined records never reach any derived
+artifact. Training vectors are in-memory only and never sync or back up.
+Output is published from a validated same-volume staging directory, with one
+advisory per-output lock and the final manifest written last; consumers must
+reject output without a valid manifest. Parquet, quarantine, deletion-map, and
+staging files are operator-owned disposable artifacts outside canonical-row
+retention; purging SQLite capture rows does not delete prior published output
+folders. Doctor reports abandoned staging directories but is read-only by
+default. After confirming no export is running, an operator can
 explicitly remove only stale direct, non-symlink `.training-staging-*` siblings
 of `DIR`:
 
@@ -1905,8 +1920,13 @@ python <doctor.py> --project . --training-output ./training \
 ```
 
 The cleanup skips candidates newer than 24 hours and rechecks mtimes before
-removal. For `./training`, a candidate is `./.training-staging-*`. The
-exporter has no cross-process lock that doctor could use to prove an export is
+removal. For `./training`, a candidate is `./.training-staging-*`. The remedy
+for an expired-retention warning is `python <store.py>
+purge-training-captures --confirm`, followed by another doctor run. The
+exporter bounds work at 10,000 source captures by default. Set
+ZMEM_TRAINING_MAX_ROWS to a lower positive limit when needed; exceeding the
+limit fails before publication and leaves no new manifest. The exporter has no
+cross-process lock that doctor could use to prove an export is
 inactive, so the confirmation flag is an operator assertion. Revoked captures
 are reported as an informational count and remain ineligible for export.
 
@@ -2274,6 +2294,7 @@ one warning).
 | Stage | Value | Override env var | Notes |
 |---|---|---|---|
 | Launcher watchdog | 12000 ms | `ZMEM_LAUNCHER_WATCHDOG_MS` | Kills the child tree at the deadline, emits the retained Tier 0 sentinel, logs `outer_timeout=1 reason=omitted`, exits 0. |
+| Automatic capture start | 1200 ms | - | Synchronous only when the store-issued capture id is needed; observe/snapshot helpers are detached and fail open. This is inside the 12,000 ms launcher watchdog and never asserts acknowledgement or outcome. |
 | Namespace resolution | 2000 ms | `ZMEM_NAMESPACE_RESOLVE_MS` | Per interpreter attempt; successful non-empty REMOTE namespaces are cached per process. |
 | Namespace cache TTL | 60000 ms | `ZMEM_NAMESPACE_CACHE_TTL_MS` | Entry expires at exactly TTL; path-key resolutions are never cached. |
 | Store recall | 8000 ms (8.0 s) | `ZMEM_STORE_RECALL_TIMEOUT_S` | SessionStart + the shared recall body. Finite positive float; values above 8.0 clamp to 8.0 (one warning); values below 8.0 are honored. ONE store attempt at SessionStart (no retry loop). |

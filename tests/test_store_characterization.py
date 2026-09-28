@@ -170,6 +170,11 @@ KNOWN_SUBCMDS = [
     "export-pack",
     "export-jsonl", "ingest-jsonl", "failures", "corrections", "queue-list",
     "queue-clear", "mine-history", "sweep",
+    # Issue #135: governed capture adapters and the read-only training view.
+    "capture-training-delivery", "capture-training-acknowledge",
+    "capture-training-completion", "capture-training-review",
+    "capture-training-revoke", "purge-training-captures",
+    "export-training",
     # v10 (issue #60): the entity identity inspection/reconciliation surface.
     "entity-list", "entity-merge",
     # v11 (issue #61): the associative-link inspection/curation surface.
@@ -431,21 +436,23 @@ class CharacterizationTests(unittest.TestCase):
         # would be self-referential -- cubic review round 1).
         # 36 -> 37: promote-store joined the surface (issue #71 E).
         # 37 -> 40: the governed dataset commands joined (issue #134).
-        self.assertEqual(len(KNOWN_SUBCMDS), 40)
+        # 40 -> 45: governed training capture/export commands joined (issue #135).
+        # 45 -> 47: independent review and trusted terminal revoke joined.
+        self.assertEqual(len(KNOWN_SUBCMDS), 47)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
     def test_organize_and_consolidate_expose_belief_flags(self):
         # Issue #137: --belief-heads and --llm-local are FLAGS on the two
         # maintenance subcommands (never new subcommands — KNOWN_SUBCMDS
-        # stays frozen at 40).
+        # stays frozen at 47 after the #135 review/revoke additions).
         for cmd in ("organize", "consolidate"):
             r = _run_cli({}, cmd, "--help")
             self.assertEqual(r.returncode, 0, f"{cmd} --help rc={r.returncode}")
             for flag in ("--belief-heads", "--llm-local"):
                 self.assertIn(flag, r.stdout,
                               f"{cmd} --help must expose {flag} (issue #137)")
-        self.assertEqual(len(KNOWN_SUBCMDS), 40)
+        self.assertEqual(len(KNOWN_SUBCMDS), 47)
 
     def test_recall_clock_seam_is_honored_and_deterministic(self):
         """ZMEM_TEST_NOW pins the scoring clock (see _run_env). Two pins of

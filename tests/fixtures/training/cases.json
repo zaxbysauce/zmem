@@ -1,0 +1,67 @@
+{
+  "namespace": "project:fixture",
+  "snapshot_id": "fixture-golden-v1",
+  "memories": [
+    {"id": "mem-exact-a", "namespace": "project:fixture", "content": "Safe deploy command A"},
+    {"id": "mem-exact-b", "namespace": "project:fixture", "content": "Safe deploy command B"},
+    {"id": "mem-sem-a", "namespace": "project:fixture", "content": "Safe deploy command C"},
+    {"id": "mem-sem-b", "namespace": "project:fixture", "content": "Safe deploy command D"},
+    {"id": "mem-old", "namespace": "project:fixture", "content": "Use the old deploy command", "supersede_reason": "explicit correction"},
+    {"id": "mem-new", "namespace": "project:fixture", "content": "Use the safe deploy command", "update_of": "mem-old", "supersede_reason": "explicit correction"}
+  ],
+  "episodes": [
+    {"id": "fixture-episode", "namespace": "project:fixture", "started_at": "2026-01-01T00:00:00Z"}
+  ],
+  "episode_memory": [
+    {"episode_id": "fixture-episode", "memory_id": "mem-exact-a"},
+    {"episode_id": "fixture-episode", "memory_id": "mem-exact-b"},
+    {"episode_id": "fixture-episode", "memory_id": "mem-sem-a"},
+    {"episode_id": "fixture-episode", "memory_id": "mem-sem-b"},
+    {"episode_id": "fixture-episode", "memory_id": "mem-old"},
+    {"episode_id": "fixture-episode", "memory_id": "mem-new"}
+  ],
+  "evidence": [
+    {"id": "ev-exact-a", "session_id": "fixture-session", "kind": "test_result", "ts": "2026-01-01T00:00:00Z"},
+    {"id": "ev-exact-b", "session_id": "fixture-session", "kind": "test_result", "ts": "2026-01-01T00:00:01Z"},
+    {"id": "ev-sem-a", "session_id": "fixture-session", "kind": "test_result", "ts": "2026-01-01T00:00:02Z"},
+    {"id": "ev-sem-b", "session_id": "fixture-session", "kind": "test_result", "ts": "2026-01-01T00:00:03Z"},
+    {"id": "ev-pref", "session_id": "fixture-session", "kind": "correction", "ts": "2026-01-01T00:00:04Z"},
+    {"id": "ev-old", "session_id": "fixture-session", "kind": "correction", "ts": "2025-12-31T23:59:59Z"}
+  ],
+  "memory_evidence": [
+    {"memory_id": "mem-exact-a", "evidence_id": "ev-exact-a"},
+    {"memory_id": "mem-exact-b", "evidence_id": "ev-exact-b"},
+    {"memory_id": "mem-sem-a", "evidence_id": "ev-sem-a"},
+    {"memory_id": "mem-sem-b", "evidence_id": "ev-sem-b"},
+    {"memory_id": "mem-old", "evidence_id": "ev-old"},
+    {"memory_id": "mem-new", "evidence_id": "ev-pref"}
+  ],
+  "captures": [
+    {"capture_id": "cap-exact-a", "host_task_id": "task-exact-a", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "Which command should I use for safe deploy?", "assistant_response": "Run deploy --safe."},
+    {"capture_id": "cap-exact-b", "host_task_id": "task-exact-b", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "Which command should I use for safe deploy?", "assistant_response": "Run deploy --safe."},
+    {"capture_id": "cap-sem-a", "host_task_id": "task-sem-a", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "How do I deploy this safely?", "assistant_response": "Run deploy --safe."},
+    {"capture_id": "cap-sem-b", "host_task_id": "task-sem-b", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "How do I deploy this safely? ", "assistant_response": "Run deploy --safe."},
+    {"capture_id": "cap-pref", "host_task_id": "task-preference", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "Review the corrected migration procedure.", "assistant_response": "The corrected procedure is deploy --safe."}
+  ],
+  "deliveries": [
+    {"delivery_snapshot_id": "delivery-exact-a", "capture_id": "cap-exact-a", "rendered": "<context>safe</context>", "ops": ["deploy --safe"]},
+    {"delivery_snapshot_id": "delivery-exact-b", "capture_id": "cap-exact-b", "rendered": "<context>safe</context>", "ops": ["deploy --safe"]},
+    {"delivery_snapshot_id": "delivery-sem-a", "capture_id": "cap-sem-a", "rendered": "<context>safe</context>", "ops": ["deploy --safe"]},
+    {"delivery_snapshot_id": "delivery-sem-b", "capture_id": "cap-sem-b", "rendered": "<context>safe</context>", "ops": ["deploy --safe"]},
+    {"delivery_snapshot_id": "delivery-pref", "capture_id": "cap-pref", "rendered": "<context>correction</context>", "ops": ["deploy --safe"]}
+  ],
+  "completions": [
+    {"capture_id": "cap-exact-a", "evidence_id": "ev-exact-a", "memory_ids": ["mem-exact-a"], "outcome_kind": "test", "outcome_value": "passed"},
+    {"capture_id": "cap-exact-b", "evidence_id": "ev-exact-b", "memory_ids": ["mem-exact-b"], "outcome_kind": "test", "outcome_value": "passed"},
+    {"capture_id": "cap-sem-a", "evidence_id": "ev-sem-a", "memory_ids": ["mem-sem-a"], "outcome_kind": "test", "outcome_value": "passed"},
+    {"capture_id": "cap-sem-b", "evidence_id": "ev-sem-b", "memory_ids": ["mem-sem-b"], "outcome_kind": "test", "outcome_value": "passed"},
+    {"capture_id": "cap-pref", "evidence_id": "ev-pref", "memory_ids": ["mem-new"], "outcome_kind": "reviewer_acceptance", "outcome_value": "accepted", "reviewer_id": "fixture-reviewer", "reviewer_confirmed": true, "correction_closeout": true, "correction_chain_id": "fixture-correction"}
+  ],
+  "observations": [
+    {"observation_id": "obs-exact-a", "capture_id": "cap-exact-a", "payload": {"source_event_id": "event-exact-a"}},
+    {"observation_id": "obs-exact-b", "capture_id": "cap-exact-b", "payload": {"source_event_id": "event-exact-b"}},
+    {"observation_id": "obs-sem-a", "capture_id": "cap-sem-a", "payload": {"source_event_id": "event-sem-a"}},
+    {"observation_id": "obs-sem-b", "capture_id": "cap-sem-b", "payload": {"source_event_id": "event-sem-b"}},
+    {"observation_id": "obs-pref", "capture_id": "cap-pref", "payload": {"source_event_id": "event-pref"}}
+  ]
+}

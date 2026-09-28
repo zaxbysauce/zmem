@@ -1,14 +1,15 @@
 """Governed SFT and preference views for training capture records.
 
-The SQLite store is authoritative.  This module only reads canonical memory,
-evidence and capture tables, then writes disposable Parquet/JSON artifacts in
-a staged directory.  It deliberately does not create an export snapshot row,
-update counters, or persist deduplication vectors.
+The SQLite store is authoritative. This module reads canonical memory,
+evidence and capture tables, then writes
+disposable Parquet/JSON artifacts in a staged directory. It also records a
+content-free snapshot-id binding in SQLite to prevent reuse for different inputs.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -16,8 +17,10 @@ import shutil
 import sqlite3
 import struct
 import tempfile
+import threading
 import uuid
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -25,6 +28,11 @@ try:
     from redaction import redact_secret_like_text
 except ImportError:  # pragma: no cover - installed scripts layout
     from ..redaction import redact_secret_like_text  # type: ignore
+
+try:
+    from .training_capture import evidence_kind_compatible
+except ImportError:  # pragma: no cover - direct script-layout imports
+    from training_capture import evidence_kind_compatible  # type: ignore
 
 
 SFT_COLUMNS = (
@@ -47,12 +55,15 @@ PREFERENCE_COLUMNS = (
     "split_key", "transform_version", "row_checksum",
 )
 
-TRANSFORM_VERSION = "zmem-training-v1"
+TRANSFORM_VERSION = "training-v1"
 SPLIT_SALT_ENV = "ZMEM_TRAINING_SPLIT_SALT"
+FIXED_SPLIT_SALT = "zmem-training-v1"
 TRUST_FLOOR_ENV = "ZMEM_INJECT_FLOOR_TRUST"
 DEDUP_THRESHOLD_ENV = "ZMEM_DEDUP_THRESHOLD"
+MAX_EXPORT_ROWS_ENV = "ZMEM_TRAINING_MAX_ROWS"
 DEFAULT_TRUST_FLOOR = 0.2
 DEFAULT_DEDUP_THRESHOLD = 0.85
+DEFAULT_MAX_EXPORT_ROWS = 10_000
 _OUTCOME_KINDS = frozenset({
     "test", "compile", "lint", "user_acceptance", "reviewer_acceptance",
 })
@@ -60,6 +71,9 @@ QUARANTINE_MAX_EVENTS = 50
 QUARANTINE_EVENT_MAX_BYTES = 400
 MAX_CONTEXT_BYTES = 16_000
 MAX_OPS_BYTES = 400
+
+_PROCESS_LOCK_GUARD = threading.Lock()
+_ACTIVE_OUTPUT_LOCKS: set[str] = set()
 
 
 class TrainingExportError(RuntimeError):
@@ -108,6 +122,17 @@ def _parse_float_env(name: str, default: float) -> float:
     return value if math.isfinite(value) else default
 
 
+def _max_export_rows() -> int:
+    try:
+        value = int(os.environ.get(MAX_EXPORT_ROWS_ENV,
+                                   str(DEFAULT_MAX_EXPORT_ROWS)))
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_EXPORT_ROWS
+    if value < 1:
+        value = DEFAULT_MAX_EXPORT_ROWS
+    return value
+
+
 def _embedding_identity() -> tuple[str, str]:
     """Return the local text-embedding model and immutable revision marker."""
     try:
@@ -127,27 +152,42 @@ def _embedding_identity() -> tuple[str, str]:
         return "unknown", "unknown"
 
 
-def _parse_ops(value: object) -> list[str] | None:
+def _parse_ops(value: object, *, capture_id: str) -> list[str]:
+    """Parse one persisted operation list without changing its contents.
+
+    The delivery snapshot is an immutable input to an export.  Truncating a
+    token or dropping trailing operations would make the derived view disagree
+    with the acknowledged snapshot, so every malformed or oversized value is a
+    hard, capture-specific export failure.
+    """
+    diagnostic = f"invalid persisted operations for capture {capture_id}"
     if value is None:
-        return None
+        raise TrainingExportError(f"{diagnostic}: missing value")
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except (TypeError, ValueError):
-            return None
+            raise TrainingExportError(f"{diagnostic}: malformed JSON") from None
     if not isinstance(value, list):
-        return None
+        raise TrainingExportError(f"{diagnostic}: expected a JSON array")
+    persisted = list(value)
+    if any(not isinstance(item, str) for item in persisted):
+        raise TrainingExportError(f"{diagnostic}: array items must be strings")
+    persisted_encoded = json.dumps(
+        persisted, ensure_ascii=False, separators=(",", ":")
+    )
+    if len(persisted_encoded.encode("utf-8")) > MAX_OPS_BYTES:
+        raise TrainingExportError(
+            f"{diagnostic}: encoded value exceeds {MAX_OPS_BYTES} bytes"
+        )
     result: list[str] = []
-    for item in value:
-        if not isinstance(item, str):
-            return None
-        result.append(_redact(item, max_bytes=320) or "")
+    for item in persisted:
+        result.append(_redact(item) or "")
     encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_OPS_BYTES:
-        while result and len(json.dumps(result, ensure_ascii=False,
-                                         separators=(",", ":")).encode("utf-8")) > MAX_OPS_BYTES:
-            result.pop()
-        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        raise TrainingExportError(
+            f"{diagnostic}: encoded value exceeds {MAX_OPS_BYTES} bytes"
+        )
     return result
 
 
@@ -172,22 +212,73 @@ def _walk_event_ids(value: object, *, key_hint: str = "") -> list[str]:
     return found
 
 
-def _observation_event_ids(rows: Iterable[sqlite3.Row]) -> list[str]:
+def _observation_event_ids(
+    rows: Iterable[sqlite3.Row], *, capture_id: str
+) -> list[str]:
+    """Return event references only from payloads whose stored digest verifies."""
     found: set[str] = set()
     for row in rows:
         payload = row["payload"]
+        if payload is None:
+            continue
+        if not isinstance(payload, str):
+            raise TrainingExportError(
+                f"invalid observation payload for capture {capture_id}"
+            )
+        expected = row["payload_sha256"] if "payload_sha256" in row.keys() else None
+        actual = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if not isinstance(expected, str) or not hmac.compare_digest(expected, actual):
+            raise TrainingExportError(
+                f"observation payload digest mismatch for capture {capture_id}"
+            )
         parsed: object = payload
-        if isinstance(payload, str):
-            try:
-                parsed = json.loads(payload)
-            except (TypeError, ValueError):
-                parsed = payload
+        try:
+            parsed = json.loads(payload)
+        except (TypeError, ValueError):
+            pass
         ids = _walk_event_ids(parsed)
         kind = str(row["observation_kind"] or "").casefold()
         if not ids and kind in {"source_event_id", "event_id", "event"} and isinstance(parsed, str):
             ids = [parsed.strip()]
         found.update(item for item in ids if item)
     return sorted(found)
+
+
+def _validated_source_event_ids(
+    conn: sqlite3.Connection, item: Mapping[str, Any]
+) -> list[str]:
+    """Bind provenance to the completion and same-session store evidence.
+
+    Host observations may suggest IDs, but only an ID that resolves to an
+    evidence row in this capture's session is eligible for export. The
+    completion's store-validated evidence ID is always included.
+    """
+    capture = item["capture"]
+    completion = item.get("completion")
+    if completion is None:
+        return []
+    session_id = str(capture["session_id"] or "")
+    completion_evidence_id = str(completion["evidence_id"] or "")
+    observed_ids = sorted({
+        str(event_id) for event_id in item.get("source_event_ids", [])
+        if str(event_id)
+    })
+    all_ids = sorted(set(observed_ids) | {completion_evidence_id})
+    if not all_ids:
+        return []
+    placeholders = ",".join("?" for _ in all_ids)
+    evidence_rows = conn.execute(
+        f"SELECT id, session_id FROM evidence WHERE id IN ({placeholders})",
+        all_ids,
+    ).fetchall()
+    evidence_by_id = {str(row["id"]): str(row["session_id"] or "")
+                      for row in evidence_rows}
+    if evidence_by_id.get(completion_evidence_id) != session_id:
+        return []
+    return sorted({
+        event_id for event_id in all_ids
+        if evidence_by_id.get(event_id) == session_id
+    })
 
 
 def _row_json(row: sqlite3.Row | None) -> dict[str, object] | None:
@@ -202,7 +293,8 @@ def _row_json(row: sqlite3.Row | None) -> dict[str, object] | None:
     return values
 
 
-def _load_snapshot_rows(conn: sqlite3.Connection, namespace: str | None) -> list[dict[str, Any]]:
+def _load_snapshot_rows(conn: sqlite3.Connection, namespace: str | None,
+                        *, limit: int | None = None) -> list[dict[str, Any]]:
     """Read all delivery snapshots in the requested namespace for one view."""
     query = (
         "SELECT c.*, s.delivery_snapshot_id, s.rendered, s.effective_ops_json, "
@@ -215,17 +307,34 @@ def _load_snapshot_rows(conn: sqlite3.Connection, namespace: str | None) -> list
         query += " WHERE c.namespace=?"
         params.append(namespace)
     query += " ORDER BY c.capture_id"
+    params_with_limit = list(params)
+    if limit is not None:
+        query += " LIMIT ?"
+        params_with_limit.append(limit + 1)
     snapshot_rows: list[dict[str, Any]] = []
-    for snapshot_row in conn.execute(query, params).fetchall():
+    selected_rows = conn.execute(query, params_with_limit).fetchall()
+    if limit is not None and len(selected_rows) > limit:
+        raise TrainingExportError(
+            f"training export exceeds maximum of {limit} source captures"
+        )
+    for snapshot_row in selected_rows:
         capture_id = str(snapshot_row["capture_id"])
         observations = conn.execute(
-            "SELECT observation_kind, payload, observed_at, observation_id "
+            "SELECT observation_kind, payload, payload_sha256, observed_at, observation_id "
             "FROM training_capture_observation "
             "WHERE capture_id=? ORDER BY observed_at, observation_id", (capture_id,)
         ).fetchall()
         snapshot_rows.append({
             "capture": snapshot_row,
-            "source_event_ids": _observation_event_ids(observations),
+            "completion": conn.execute(
+                "SELECT * FROM training_capture_completion "
+                "WHERE capture_id=?", (capture_id,)
+            ).fetchone(),
+            "review": conn.execute(
+                "SELECT * FROM training_capture_review WHERE capture_id=?",
+                (capture_id,),
+            ).fetchone(),
+            "source_event_ids": _observation_event_ids(observations, capture_id=capture_id),
             "observations": observations,
         })
     return snapshot_rows
@@ -243,6 +352,12 @@ def _selection_fingerprint(conn: sqlite3.Connection,
             "SELECT * FROM training_capture_completion WHERE capture_id=?",
             (capture_id,),
         ).fetchone()
+        review = item.get("review")
+        if "review" not in item:
+            review = conn.execute(
+                "SELECT * FROM training_capture_review WHERE capture_id=?",
+                (capture_id,),
+            ).fetchone()
         evidence_id = str(completion["evidence_id"]) if completion is not None else None
         association = conn.execute(
             "SELECT memory_id FROM memory_evidence WHERE evidence_id=? ORDER BY memory_id",
@@ -269,6 +384,14 @@ def _selection_fingerprint(conn: sqlite3.Connection,
         evidence = conn.execute(
             "SELECT * FROM evidence WHERE id=?", (evidence_id,)
         ).fetchone() if evidence_id is not None else None
+        observation_ids = item.get("source_event_ids", [])
+        observation_evidence: list[sqlite3.Row] = []
+        if observation_ids:
+            marks = ",".join("?" for _ in observation_ids)
+            observation_evidence = conn.execute(
+                f"SELECT * FROM evidence WHERE id IN ({marks}) ORDER BY id",
+                list(observation_ids),
+            ).fetchall()
         episode_memberships = conn.execute(
             f"SELECT episode_id, memory_id FROM episode_memory "
             f"WHERE memory_id IN ({','.join('?' for _ in memory_ids)}) "
@@ -287,7 +410,9 @@ def _selection_fingerprint(conn: sqlite3.Connection,
         rows.append({
             "capture_snapshot": _row_json(capture),
             "completion": _row_json(completion),
+            "review": _row_json(review),
             "evidence": _row_json(evidence),
+            "observation_evidence": [_row_json(row) for row in observation_evidence],
             "association": memory_ids,
             # Keep the fingerprint bounded and avoid touching persisted
             # embedding/vector columns; semantic dedup is text-only and
@@ -321,6 +446,29 @@ def _memory_rows(conn: sqlite3.Connection, ids: Sequence[str]) -> list[sqlite3.R
     return conn.execute(
         f"SELECT * FROM memory WHERE id IN ({marks}) ORDER BY id", list(ids)
     ).fetchall()
+
+
+def _validate_update_lineage(conn: sqlite3.Connection,
+                             memory_rows: Sequence[sqlite3.Row]) -> None:
+    """Refuse missing or cross-namespace memory predecessors."""
+    predecessor_ids = sorted({
+        str(memory["update_of"])
+        for memory in memory_rows
+        if memory["update_of"]
+    })
+    if not predecessor_ids:
+        return
+    predecessors = _memory_rows(conn, predecessor_ids)
+    predecessor_by_id = {str(row["id"]): row for row in predecessors}
+    if len(predecessor_by_id) != len(predecessor_ids):
+        raise TrainingExportError("memory update_of references a missing predecessor")
+    for memory in memory_rows:
+        predecessor_id = str(memory["update_of"] or "")
+        if not predecessor_id:
+            continue
+        predecessor = predecessor_by_id[predecessor_id]
+        if str(predecessor["namespace"] or "") != str(memory["namespace"] or ""):
+            raise TrainingExportError("memory update_of crosses project namespace")
 
 
 def _episode_for_memories(conn: sqlite3.Connection, memory_ids: Sequence[str]) -> tuple[str | None, str | None]:
@@ -376,16 +524,30 @@ def _lineage_groups(candidates: Sequence[dict[str, Any]]) -> dict[int, str]:
     uf = _UnionFind(len(candidates))
     key_owner: dict[tuple[str, str], int] = {}
     for index, item in enumerate(candidates):
-        keys = {
-            ("namespace", item.get("namespace", "")),
-            ("session", item.get("session_id", "")),
-            ("episode", item.get("episode_id") or ""),
-        }
-        keys.update(("memory", memory_id) for memory_id in item.get("source_memory_ids", []))
+        namespace = str(item.get("namespace", ""))
+        keys: set[tuple[str, str]] = set()
+        session_id = str(item.get("session_id") or "")
+        if session_id:
+            keys.add(("session", f"{namespace}\0{session_id}"))
+        episode_id = str(item.get("episode_id") or "")
+        if episode_id:
+            keys.add(("episode", f"{namespace}\0{episode_id}"))
+        keys.update(
+            ("memory", f"{namespace}\0{memory_id}")
+            for memory_id in item.get("source_memory_ids", [])
+        )
         for memory in item.get("memory_rows", []):
             predecessor = str(memory["update_of"] or "")
             if predecessor:
-                keys.add(("update", predecessor))
+                # update_of and source_memory_ids describe the same memory
+                # identity.  Use one key type so a predecessor links to the
+                # candidate that sourced it, and scope it to the namespace so
+                # malformed cross-project references cannot merge groups.
+                memory_namespace = str(
+                    memory["namespace"] or namespace
+                    if "namespace" in memory.keys() else namespace
+                )
+                keys.add(("memory", f"{memory_namespace}\0{predecessor}"))
         for key in keys:
             if key[1] and key in key_owner:
                 uf.union(index, key_owner[key])
@@ -403,17 +565,103 @@ def _lineage_groups(candidates: Sequence[dict[str, Any]]) -> dict[int, str]:
     return result
 
 
-def _split_key(group_id: str, split_salt: str) -> str:
-    return hashlib.sha256((split_salt + "\0" + group_id).encode("utf-8")).hexdigest()
+def _split_key(project_key: str, split_salt: str | None = None) -> str:
+    """Return the stable split identity for one project.
+
+    Split assignment is deliberately a function of the canonical project key
+    only.  Capture ids, session labels, episode membership and export snapshot
+    labels are mutable selection details and must never move an existing
+    project's rows between buckets.  ``split_salt`` remains accepted for API
+    compatibility, but the v1 contract pins the salt to the transform version.
+    The compact sorted-key JSON is the frozen cross-runtime canonical form.
+    """
+    del split_salt
+    payload = {
+        "kind": "project",
+        "value": str(project_key),
+        "salt": FIXED_SPLIT_SALT,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _split_bucket(split_key: str) -> str:
-    value = int(split_key[:8], 16) / 0x100000000
-    if value < 0.8:
+    first_byte = int(str(split_key)[:2], 16)
+    if first_byte <= 0xCB:
         return "train"
-    if value < 0.9:
+    if first_byte <= 0xE5:
         return "validation"
     return "test"
+
+
+def _completion_is_exportable(conn: sqlite3.Connection,
+                              item: Mapping[str, Any]) -> bool:
+    """Apply the one completion gate shared by views and quarantine.
+
+    Automatic hooks only create redacted partials.  A derived artifact may
+    contain a capture after it has a verified completion, an acknowledgement
+    attestation bound to that completion, valid export-time governance and a
+    real same-session evidence row.  Capture-time quarantine and revocation
+    remain hard exclusions from every training output.
+    """
+    capture = item["capture"]
+    completion = item.get("completion")
+    if completion is None:
+        return False
+    for key in (
+        "namespace", "session_id", "acknowledged_at", "finalized_at", "prompt",
+        "assistant_response", "consent_scope", "content_license",
+        "redaction_policy_version", "governance_source",
+        "acknowledgement_attestation",
+    ):
+        if not str(capture[key] or "").strip():
+            return False
+    if capture["state"] != "completed" or capture["revoked_at"] is not None:
+        return False
+    if capture["quarantine_reason"] is not None:
+        return False
+    if capture["redaction_status"] != "redacted":
+        return False
+    attestation = str(capture["acknowledgement_attestation"] or "")
+    if not attestation or str(completion["acknowledgement_attestation"] or "") != attestation:
+        return False
+    if not all(str(completion[key] or "").strip() for key in (
+            "evidence_id", "verifier_id", "verified_at", "outcome_kind",
+            "outcome_value", "export_consent_scope",
+            "export_content_license")):
+        return False
+    evidence = conn.execute(
+        "SELECT session_id, kind FROM evidence WHERE id=?",
+        (completion["evidence_id"],),
+    ).fetchone()
+    if (
+        evidence is None
+        or evidence["session_id"] != capture["session_id"]
+        or not evidence_kind_compatible(
+            completion["outcome_kind"],
+            evidence["kind"],
+            correction_closeout=bool(completion["correction_closeout"]),
+        )
+    ):
+        return False
+    if str(completion["outcome_kind"]) == "reviewer_acceptance":
+        if "review" in item:
+            review = item["review"]
+        else:
+            review = conn.execute(
+                "SELECT completion_evidence_id, reviewer_id FROM training_capture_review "
+                "WHERE capture_id=?",
+                (capture["capture_id"],),
+            ).fetchone()
+        return (
+            review is not None
+            and str(review["completion_evidence_id"]) == str(completion["evidence_id"])
+            and str(review["reviewer_id"]) == str(completion["reviewer_id"])
+            and str(review["reviewer_id"]) != str(completion["verifier_id"])
+            and bool(completion["reviewer_confirmed"])
+        )
+    return True
 
 
 def _canonical_event_text(item: Mapping[str, object]) -> str:
@@ -515,25 +763,55 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
         "WHERE c.state='completed' AND c.revoked_at IS NULL "
         "AND c.redaction_status='redacted'"
     )
+    max_rows = _max_export_rows()
     params: list[object] = []
     if namespace is not None:
         query += " AND c.namespace=?"
         params.append(namespace)
-    rows = conn.execute(query, params).fetchall()
+    rows = conn.execute(query + " ORDER BY c.capture_id LIMIT ?",
+                        [*params, max_rows + 1]).fetchall()
+    if len(rows) > max_rows:
+        raise TrainingExportError(
+            f"training export exceeds maximum of {max_rows} eligible captures"
+        )
+    revoked_query = (
+        "SELECT count(*) FROM training_capture "
+        "WHERE state='completed' AND revoked_at IS NOT NULL"
+    )
+    revoked_params: list[object] = []
+    if namespace is not None:
+        revoked_query += " AND namespace=?"
+        revoked_params.append(namespace)
+    revoked_count = int(conn.execute(revoked_query, revoked_params).fetchone()[0])
     excluded: Counter = Counter()
-    all_snapshot_rows = _load_snapshot_rows(conn, namespace)
+    if revoked_count:
+        excluded["revoked"] = revoked_count
+    all_snapshot_rows = _load_snapshot_rows(conn, namespace, limit=max_rows)
     candidates: list[dict[str, Any]] = []
     for row in rows:
         capture_id = str(row["capture_id"])
+        completion = conn.execute(
+            "SELECT * FROM training_capture_completion WHERE capture_id=?",
+            (capture_id,),
+        ).fetchone()
+        review = conn.execute(
+            "SELECT * FROM training_capture_review WHERE capture_id=?",
+            (capture_id,),
+        ).fetchone()
         observations = conn.execute(
-            "SELECT observation_kind, payload FROM training_capture_observation "
+            "SELECT observation_kind, payload, payload_sha256 FROM training_capture_observation "
             "WHERE capture_id=? ORDER BY observed_at, observation_id", (capture_id,)
         ).fetchall()
-        source_event_ids = _observation_event_ids(observations)
+        source_event_ids = _observation_event_ids(
+            observations, capture_id=capture_id
+        )
         # The independent snapshot query above deliberately includes captures
         # that are incomplete or excluded; this join only builds eligible rows.
         reason: str | None = None
-        if row["revoked_at"] is not None:
+        if not _completion_is_exportable(
+                conn, {"capture": row, "completion": completion, "review": review}):
+            reason = "missing_governance_or_outcome"
+        elif row["revoked_at"] is not None:
             reason = "revoked"
         elif row["quarantine_reason"]:
             reason = "quarantine"
@@ -543,16 +821,16 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
             "namespace", "session_id", "prompt", "assistant_response", "rendered", "effective_ops_json",
             "rendered_hash", "transform_version", "emitted_at",
             "consent_scope", "content_license", "redaction_policy_version",
-            "export_consent_scope", "export_content_license", "host_task_id",
+            "export_consent_scope", "export_content_license",
             "evidence_id", "verifier_id", "verified_at",
             "acknowledgement_attestation", "outcome_kind", "outcome_value",
         )):
             reason = "missing_governance_or_outcome"
         elif str(row["outcome_kind"]) not in _OUTCOME_KINDS:
             reason = "invalid_outcome_kind"
-        ops_tokens = _parse_ops(row["effective_ops_json"])
-        if reason is None and ops_tokens is None:
-            reason = "invalid_ops_snapshot"
+        ops_tokens = _parse_ops(
+            row["effective_ops_json"], capture_id=capture_id
+        )
         evidence = None
         if reason is None:
             evidence = conn.execute("SELECT * FROM evidence WHERE id=?", (row["evidence_id"],)).fetchone()
@@ -571,6 +849,8 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
                 memory_rows = _memory_rows(conn, source_memory_ids)
                 if len(memory_rows) != len(source_memory_ids):
                     reason = "missing_association"
+                else:
+                    _validate_update_lineage(conn, memory_rows)
                 associated_json = row["associated_memory_ids_json"] if "associated_memory_ids_json" in row.keys() else None
                 if reason is None and "associated_memory_ids_json" in completion_columns:
                     try:
@@ -585,8 +865,16 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
             project_key, reason = _project_key(memory_rows)
         if reason is None:
             episode_id, reason = _episode_for_memories(conn, source_memory_ids)
-        if reason is None and not source_event_ids:
-            reason = "missing_source_event"
+        if reason is None:
+            source_event_ids = _validated_source_event_ids(
+                conn, {
+                    "capture": row,
+                    "completion": completion,
+                    "source_event_ids": source_event_ids,
+                }
+            )
+            if not source_event_ids:
+                reason = "missing_source_event"
         label_status = None
         exclusion_reason = reason
         if reason is None:
@@ -607,7 +895,7 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
             continue
         row_item: dict[str, Any] = {
             "capture_id": capture_id,
-            "task_id": str(row["host_task_id"]),
+            "task_id": capture_id,
             "namespace": str(row["namespace"]),
             "project_key": project_key,
             "session_id": str(row["session_id"]),
@@ -621,27 +909,35 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
             "evidence_ref": str(row["evidence_id"]),
             "source_memory_ids": source_memory_ids,
             "source_event_ids": source_event_ids,
-            "consent_scope": str(row["consent_scope"]),
-            "content_license": str(row["content_license"]),
+             # Export authorization is recorded at completion time.  Capture
+             # opt-in fields remain in SQLite for audit but never advertise
+             # the license under which a row was released.
+             "consent_scope": str(completion["export_consent_scope"]),
+             "content_license": str(completion["export_content_license"]),
+             "export_consent_scope": str(completion["export_consent_scope"]),
+             "export_content_license": str(completion["export_content_license"]),
             "redaction_status": str(row["redaction_status"]),
             "redaction_policy_version": str(row["redaction_policy_version"]),
             "transform_version": str(row["transform_version"]),
             "label_status": label_status,
             "exclusion_reason": exclusion_reason,
             "memory_rows": memory_rows,
-            "completion": row,
+             "completion": completion,
             "correction_closeout": bool(row["correction_closeout"]),
         }
         candidates.append(row_item)
     if candidates:
         groups = _lineage_groups(candidates)
-        split_salt = (split_salt if split_salt is not None
-                      else os.environ.get(SPLIT_SALT_ENV, snapshot_id))
         for index, item in enumerate(candidates):
             item["lineage_group"] = groups[index]
-            item["split_key"] = _split_key(groups[index], split_salt)
-            item["split_bucket"] = _split_bucket(item["split_key"])
     return candidates, excluded, all_snapshot_rows
+
+
+def _assign_stable_splits(rows: Sequence[dict[str, Any]]) -> None:
+    """Assign one immutable project split after lineage deduplication."""
+    for item in rows:
+        item["split_key"] = _split_key(str(item["project_key"]))
+        item["split_bucket"] = _split_bucket(str(item["split_key"]))
 
 
 def _materialize_sft(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -659,6 +955,7 @@ def _build_rows(conn: sqlite3.Connection, *, namespace: str | None,
         split_salt=split_salt,
     )
     deduped, deletion_map = _deduplicate(candidates)
+    _assign_stable_splits(deduped)
     for deletion in deletion_map:
         excluded[deletion["reason"]] += 1
     return [_materialize_sft(item) for item in deduped], excluded, deletion_map, snapshot_rows
@@ -752,12 +1049,8 @@ def _build_preference_rows(conn: sqlite3.Connection, *, namespace: str | None,
                                        snapshot_id=snapshot_id,
                                        split_salt=split_salt)
     groups = _lineage_groups(candidates) if candidates else {}
-    split_salt = (split_salt if split_salt is not None
-                  else os.environ.get(SPLIT_SALT_ENV, snapshot_id))
     for index, item in enumerate(candidates):
         item["lineage_group"] = groups[index]
-        item["split_key"] = _split_key(groups[index], split_salt)
-        item["split_bucket"] = _split_bucket(item["split_key"])
         predecessor_rows: dict[str, sqlite3.Row] = {}
         predecessor_events: dict[str, list[str]] = {}
         predecessor_evidence: dict[str, str | None] = {}
@@ -782,6 +1075,7 @@ def _build_preference_rows(conn: sqlite3.Connection, *, namespace: str | None,
     # Dedup is required before preference output as well.  The list returned by
     # `_deduplicate` retains all canonical provenance in its keeper.
     deduped, _ = _deduplicate(candidates)
+    _assign_stable_splits(deduped)
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for item in deduped:
@@ -833,28 +1127,33 @@ def _write_parquet(path: Path, rows: Sequence[Mapping[str, Any]], schema, pa, pq
     columns = {field.name: [row.get(field.name) for row in rows]
                for field in schema}
     table = pa.table(columns, schema=schema)
+    metadata = dict(table.schema.metadata or {})
+    metadata[b"created_by"] = b"zmem-training-v1"
+    table = table.replace_schema_metadata(metadata)
     pq.write_table(table, path, compression="zstd", use_dictionary=False,
                    row_group_size=max(1, len(rows)))
 
 
 def _bounded_quarantine_event(item: Mapping[str, Any], event_id: str) -> bytes:
+    capture_id = str(item["capture"]["capture_id"])
     payload: dict[str, Any] = {
         "event_id": event_id,
-        "capture_id": item["capture"]["capture_id"],
-        "task_id": item["capture"]["host_task_id"],
+        "capture_id": capture_id,
+        "task_id": capture_id,
         "prompt": _redact(item["capture"]["prompt"], max_bytes=64),
         "assistant_response": _redact(item["capture"]["assistant_response"], max_bytes=64),
         "context_fence": _redact(item["capture"]["rendered"], max_bytes=64),
-        "ops_tokens": _parse_ops(item["capture"]["effective_ops_json"]) or [],
+        "ops_tokens": _parse_ops(
+            item["capture"]["effective_ops_json"], capture_id=capture_id
+        ),
     }
-    payload["ops_tokens"] = [str(value)[:32] for value in payload["ops_tokens"]]
     raw = _json_bytes(payload)
     if len(raw) <= QUARANTINE_EVENT_MAX_BYTES:
         return raw
     # Preserve valid JSON while meeting the strict byte cap by dropping large
     # content fields in a deterministic order, then shrinking the remainder.
-    for key in ("assistant_response", "context_fence", "prompt", "ops_tokens", "task_id"):
-        payload[key] = "" if key != "ops_tokens" else []
+    for key in ("assistant_response", "context_fence", "prompt", "task_id"):
+        payload[key] = ""
         raw = _json_bytes(payload)
         if len(raw) <= QUARANTINE_EVENT_MAX_BYTES:
             return raw
@@ -864,46 +1163,103 @@ def _bounded_quarantine_event(item: Mapping[str, Any], event_id: str) -> bytes:
         payload[key] = str(payload[key])[:48]
     raw = _json_bytes(payload)
     if len(raw) > QUARANTINE_EVENT_MAX_BYTES:
-        raise TrainingExportError("unable to bound quarantine event")
+        raise TrainingExportError(
+            f"unable to bound quarantine event for capture {capture_id}"
+        )
     return raw
 
 
-def _write_quarantine(staging: Path, snapshot_rows: Sequence[Mapping[str, Any]]) -> list[str]:
-    entries: list[tuple[str, Mapping[str, Any]]] = []
+def _write_quarantine(conn: sqlite3.Connection, staging: Path,
+                      snapshot_rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    # Keep only the deterministic lowest 50 event ids as input is streamed.
+    # This bounds memory even when every capture has its full observation cap.
+    selected: list[tuple[str, str, Mapping[str, Any]]] = []
+    selected_ids: set[str] = set()
     for item in snapshot_rows:
-        ids = item.get("source_event_ids") or [str(item["capture"]["capture_id"])]
-        for event_id in ids:
-            entries.append((str(event_id), item))
-    entries.sort(key=lambda pair: pair[0])
-    selected = entries[:QUARANTINE_MAX_EVENTS]
+        # The user-facing export contract is completion-gated for every
+        # derived artifact. In particular, --quarantine-raw is not a side
+        # channel for automatic partial captures.
+        if not _completion_is_exportable(conn, item):
+            continue
+        capture_id = str(item["capture"]["capture_id"])
+        ids = _validated_source_event_ids(conn, item)
+        for event_id_value in ids:
+            event_id = str(event_id_value)
+            if event_id in selected_ids:
+                continue
+            if (len(selected) >= QUARANTINE_MAX_EVENTS
+                    and event_id >= selected[-1][0]):
+                continue
+            selected.append((event_id, capture_id, item))
+            selected.sort(key=lambda entry: (entry[0], entry[1]))
+            selected_ids.add(event_id)
+            if len(selected) > QUARANTINE_MAX_EVENTS:
+                removed = selected.pop()
+                selected_ids.discard(removed[0])
     qdir = staging / "quarantine"
     qdir.mkdir(parents=True, exist_ok=True)
     event_ids: list[str] = []
-    for index, (event_id, item) in enumerate(selected):
+    for index, (event_id, _capture_id, item) in enumerate(selected):
         safe = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:16]
         (qdir / f"{index:03d}-{safe}.json").write_bytes(_bounded_quarantine_event(item, event_id))
         event_ids.append(event_id)
     return sorted(event_ids)
 
 
-def write_training_views(conn: sqlite3.Connection, *, out_dir: str,
-                         namespace: str | None, snapshot_id: str,
-                         reviewer_confirmed: bool = False,
-                         quarantine_raw: bool = False,
-                         split_salt: str | None = None) -> dict:
+def _bind_export_snapshot(conn: sqlite3.Connection, *, snapshot_id: str,
+                          binding_sha256: str) -> None:
+    """Persist a one-way snapshot identity binding using SQLite's clock."""
+    owns_tx = False
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+        owns_tx = True
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO training_export_snapshot_binding "
+            "(snapshot_id, binding_sha256, created_at) "
+            "VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            (snapshot_id, binding_sha256),
+        )
+        row = conn.execute(
+            "SELECT binding_sha256 FROM training_export_snapshot_binding "
+            "WHERE snapshot_id=?", (snapshot_id,),
+        ).fetchone()
+        if row is None or not hmac.compare_digest(
+            str(row["binding_sha256"]), binding_sha256
+        ):
+            raise TrainingExportError(
+                "snapshot_id is already bound to different export inputs"
+            )
+        if owns_tx:
+            conn.commit()
+    except Exception:
+        if owns_tx and conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _write_training_views_unlocked(conn: sqlite3.Connection, *, out_dir: str,
+                                   namespace: str | None, snapshot_id: str,
+                                   reviewer_confirmed: bool = False,
+                                   quarantine_raw: bool = False,
+                                   split_salt: str | None = None) -> dict:
     """Publish one immutable read view directly under ``out_dir``.
 
     ``snapshot_id`` is the caller-assigned identity of this export read, and
-    is deliberately distinct from each delivery snapshot id in SQLite.  All
-    source rows for the view are selected in one bounded SQLite read
-    transaction, so the manifest binds this id to one consistent selection;
-    the exporter never treats it as a delivery id or writes an export row.
+    is deliberately distinct from each delivery snapshot id in SQLite. All
+    source rows for the view are selected and rechecked in bounded SQLite read
+    transactions, then this id is immutably bound to the selected inputs and
+    output configuration before artifacts are published.
     """
     _require_confirmation(reviewer_confirmed)
     if not isinstance(out_dir, str) or not out_dir.strip():
         raise ValueError("out_dir must be a non-empty path")
     if not isinstance(snapshot_id, str) or not snapshot_id.strip():
         raise ValueError("snapshot_id must be a non-empty string")
+    if conn.in_transaction:
+        raise TrainingExportError(
+            "training export requires a connection without an active transaction"
+        )
     try:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -914,8 +1270,10 @@ def write_training_views(conn: sqlite3.Connection, *, out_dir: str,
         conn.execute("BEGIN")
         read_transaction_started = True
     try:
-        effective_split_salt = (str(split_salt) if split_salt is not None
-                                else os.environ.get(SPLIT_SALT_ENV, snapshot_id))
+        # v1 split identity is immutable across callers, snapshots and
+        # capture-set growth.  Keep the argument for source compatibility but
+        # record the fixed contract value in every manifest.
+        effective_split_salt = FIXED_SPLIT_SALT
         sft_rows, excluded, deletion_map, snapshot_rows = _build_rows(
             conn, namespace=namespace, snapshot_id=snapshot_id,
             quarantine_raw=quarantine_raw,
@@ -932,6 +1290,23 @@ def write_training_views(conn: sqlite3.Connection, *, out_dir: str,
         sft_schema, preference_schema = _parquet_schemas(pa)
         destination = Path(out_dir).resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
+        embedding_model, embedding_revision = _embedding_identity()
+        binding_sha256 = hashlib.sha256(_json_bytes({
+            "destination": os.path.normcase(str(destination)),
+            "namespace": namespace,
+            "quarantine_raw": bool(quarantine_raw),
+            "selection_sha256": source_fingerprint,
+            "split_salt": effective_split_salt,
+            "transform_version": TRANSFORM_VERSION,
+            "manifest_schema_version": 1,
+            "max_export_rows": _max_export_rows(),
+            "trust_floor": _parse_float_env(TRUST_FLOOR_ENV, DEFAULT_TRUST_FLOOR),
+            "dedup_threshold": _parse_float_env(
+                DEDUP_THRESHOLD_ENV, DEFAULT_DEDUP_THRESHOLD
+            ),
+            "embedding_model": embedding_model,
+            "embedding_revision": embedding_revision,
+        })).hexdigest()
         staging = Path(tempfile.mkdtemp(prefix=".training-staging-", dir=str(destination.parent)))
         try:
             _write_parquet(staging / "sft-000.parquet", sft_rows, sft_schema, pa, pq)
@@ -941,20 +1316,33 @@ def write_training_views(conn: sqlite3.Connection, *, out_dir: str,
             (staging / "deletion-map.json").write_bytes(deletion_bytes)
             sft_bytes = (staging / "sft-000.parquet").read_bytes()
             preference_bytes = (staging / "preferences-000.parquet").read_bytes()
-            # Re-read the complete bounded input set after derived files are
-            # staged.  A concurrent capture/evidence/governance update must
-            # fail before the destination's old completion marker is removed.
+            if quarantine_raw:
+                # Quarantine is derived from the same bounded source snapshot,
+                # and only store-validated same-session evidence IDs survive.
+                event_ids = _write_quarantine(conn, staging, snapshot_rows)
+                quarantine_manifest = {"event_ids": event_ids}
+                (staging / "quarantine-manifest.json").write_bytes(
+                    _json_bytes(quarantine_manifest)
+                )
+            # Re-read the complete bounded input set after all artifacts are
+            # staged. Keep the writer transaction through comparison and
+            # snapshot registration so no source write can slip between them.
             verify_started = False
             if not conn.in_transaction:
-                conn.execute("BEGIN")
+                conn.execute("BEGIN IMMEDIATE")
                 verify_started = True
             try:
-                current_snapshot_rows = _load_snapshot_rows(conn, namespace)
+                current_snapshot_rows = _load_snapshot_rows(
+                    conn, namespace, limit=_max_export_rows()
+                )
                 current_fingerprint = _selection_fingerprint(
                     conn, current_snapshot_rows, namespace
                 )
                 if current_fingerprint != source_fingerprint:
                     raise TrainingExportError("training source changed during export")
+                _bind_export_snapshot(
+                    conn, snapshot_id=snapshot_id, binding_sha256=binding_sha256
+                )
                 if verify_started:
                     conn.commit()
                     verify_started = False
@@ -964,10 +1352,9 @@ def write_training_views(conn: sqlite3.Connection, *, out_dir: str,
                 raise
             split_counts = Counter(_split_bucket(str(row["split_key"]))
                                    for row in sft_rows)
-            embedding_model, embedding_revision = _embedding_identity()
             manifest: dict[str, Any] = {
                 "schema_version": 1,
-                "format": "zmem-training-v1",
+                "format": "parquet",
                 "snapshot_id": snapshot_id,
                 "selection_sha256": source_fingerprint,
                 "namespace": namespace,
@@ -990,20 +1377,12 @@ def write_training_views(conn: sqlite3.Connection, *, out_dir: str,
                 "governance": {
                     "policy": "SQLite authoritative; Parquet disposable; export requires reviewer confirmation",
                     "semantic_dedup": "in-memory only",
-                    "canonical_store_mutated": False,
+                    "canonical_training_content_mutated": False,
+                    "snapshot_binding_registry_written": True,
                 },
             }
             manifest_bytes = _json_bytes(manifest)
             (staging / "manifest.json").write_bytes(manifest_bytes)
-            if quarantine_raw:
-                # Build every optional derived file in staging before touching
-                # the destination.  A malformed capture must not leave a new
-                # data generation without its completion manifest.
-                event_ids = _write_quarantine(staging, snapshot_rows)
-                quarantine_manifest = {"event_ids": event_ids}
-                (staging / "quarantine-manifest.json").write_bytes(
-                    _json_bytes(quarantine_manifest)
-                )
             if destination.exists() and not destination.is_dir():
                 raise TrainingExportError("refusing to overwrite non-directory training output")
             existing_manifest = destination / "manifest.json"
@@ -1049,6 +1428,102 @@ def write_training_views(conn: sqlite3.Connection, *, out_dir: str,
         if read_transaction_started:
             conn.rollback()
         raise
+
+
+@contextmanager
+def _training_output_lock(destination: Path):
+    """Take a persistent sibling advisory lock for one output directory.
+
+    The marker is intentionally never unlinked.  Its byte contents are only a
+    durable operator hint; ownership is the OS lock, which releases when a
+    process exits.  This is designed for local filesystems.  The process guard
+    is needed because some advisory-lock implementations are process-scoped
+    and would otherwise allow duplicate callers in one interpreter.
+    """
+    lock_path = destination.parent / f".{destination.name}.training-export.lock"
+    canonical = str(lock_path.resolve())
+    fd: int | None = None
+    acquired = False
+    try:
+        with _PROCESS_LOCK_GUARD:
+            if canonical in _ACTIVE_OUTPUT_LOCKS:
+                raise TrainingExportError("training export already in progress")
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            os.set_inheritable(fd, False)
+            if os.name == "nt":
+                import msvcrt
+
+                # msvcrt.locking requires a byte range.  Preserve any legacy
+                # marker contents and only seed an empty marker when needed.
+                if os.fstat(fd).st_size == 0:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.write(fd, b"0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    raise TrainingExportError(
+                        "training export already in progress"
+                    ) from exc
+            else:
+                import fcntl
+
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    raise TrainingExportError(
+                        "training export already in progress"
+                    ) from exc
+            _ACTIVE_OUTPUT_LOCKS.add(canonical)
+            acquired = True
+    except TrainingExportError:
+        if fd is not None and not acquired:
+            os.close(fd)
+        raise
+    except OSError as exc:
+        if fd is not None and not acquired:
+            os.close(fd)
+        raise TrainingExportError(
+            f"unable to lock training export destination: {lock_path}"
+        ) from exc
+    try:
+        yield
+    finally:
+        if fd is not None:
+            if os.name == "nt":
+                import msvcrt
+
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
+        with _PROCESS_LOCK_GUARD:
+            _ACTIVE_OUTPUT_LOCKS.discard(canonical)
+
+
+def write_training_views(conn: sqlite3.Connection, *, out_dir: str,
+                         namespace: str | None, snapshot_id: str,
+                         reviewer_confirmed: bool = False,
+                         quarantine_raw: bool = False,
+                         split_salt: str | None = None) -> dict:
+    """Publish a completion-gated, coherently locked derived view."""
+    destination = Path(out_dir).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with _training_output_lock(destination):
+        return _write_training_views_unlocked(
+            conn, out_dir=out_dir, namespace=namespace,
+            snapshot_id=snapshot_id, reviewer_confirmed=reviewer_confirmed,
+            quarantine_raw=quarantine_raw, split_salt=split_salt,
+        )
 
 
 __all__ = [

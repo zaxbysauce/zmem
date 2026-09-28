@@ -66,6 +66,7 @@ from storelib.training_capture import (
     capture_id_for_delivery_snapshot,
     complete_training_capture,
     purge_expired_training_captures, record_training_delivery_snapshot,
+    review_training_capture, revoke_training_capture,
     start_training_capture,
 )
 from storelib.tune import tune_weights
@@ -121,6 +122,20 @@ def _read_cli_or_report_value_error(call, *args, **kwargs):
     except ValueError as exc:
         print(f"[zmem] {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
+
+
+def _load_training_exporter():
+    """Load the optional exporter without coupling its error class to import.
+
+    The exporter remains lazy so ordinary capture commands do not need its
+    optional dependencies. Keep the ImportError handling separate: a failed
+    import cannot bind TrainingExportError for an exception tuple.
+    """
+    try:
+        from storelib.training_export import TrainingExportError, write_training_views
+    except ImportError as exc:
+        raise RuntimeError(str(exc)) from None
+    return TrainingExportError, write_training_views
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +302,21 @@ def _require_capture_governance(payload: Mapping[str, object]) -> None:
     ))
 
 
+def _has_capture_governance(payload: Mapping[str, object]) -> bool:
+    return all(isinstance(payload.get(field), str) and payload[field].strip()
+               for field in ("consent_scope", "content_license", "redaction_policy_version"))
+
+
+def _reject_training_timestamps(payload: Mapping[str, object]) -> None:
+    """Keep untrusted JSON clocks outside the local capture state machine."""
+    forbidden = {
+        "observed_at", "acknowledged_at", "verified_at", "revoked_at",
+        "reviewed_at", "finalized_at", "created_at", "updated_at", "emitted_at",
+    }
+    if any(field in payload for field in forbidden):
+        raise ValueError("training capture timestamps are assigned by the local store")
+
+
 def _require_completion_governance(payload: Mapping[str, object]) -> None:
     # The user-facing completion schema uses the same names as capture-time
     # governance.  Accept the internal-prefixed aliases for installed callers
@@ -323,6 +353,19 @@ def _capture_replay_identity(payload: Mapping[str, object]) -> dict[str, object]
     elif "task_id" in payload:
         identity["host_task_id"] = payload["task_id"]
     return identity
+
+
+def _canonical_delivery_snapshot_id(value: object) -> str:
+    """Validate an optional caller-supplied delivery identity before capture."""
+    if not isinstance(value, str):
+        raise ValueError("delivery_snapshot_id must be a UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("delivery_snapshot_id must be a UUID") from exc
+    if str(parsed) != value.lower():
+        raise ValueError("delivery_snapshot_id must be a canonical UUID")
+    return str(parsed)
 
 
 def _trusted_training_caller() -> str:
@@ -440,29 +483,28 @@ def _trusted_completion_fields(payload: Mapping[str, object]) -> tuple[str, str 
     claimed_verifier = payload.get("verifier_id")
     if claimed_verifier is not None and claimed_verifier != caller:
         raise ValueError("verifier_id must match the trusted local caller")
-    outcome_kind = payload.get("outcome_kind")
-    if outcome_kind != "reviewer_acceptance":
-        if payload.get("reviewer_id") is not None or payload.get("reviewer_confirmed", False):
-            raise ValueError("reviewer fields are only valid for reviewer_acceptance")
-        return caller, None, False
-    claimed_reviewer = payload.get("reviewer_id")
-    if claimed_reviewer is not None and (
-            not isinstance(claimed_reviewer, str) or
-            not claimed_reviewer.strip() or
-            len(claimed_reviewer.encode("utf-8")) > 512):
-        raise ValueError("reviewer_id must be a non-empty string")
-    configured = {
+    if payload.get("reviewer_id") is not None or payload.get("reviewer_confirmed", False):
+        raise ValueError("reviewer confirmation requires capture-training-review")
+    # Completion proves an outcome.  A distinct local review command is the
+    # only path that can make reviewer_acceptance exportable.
+    return caller, None, False
+
+
+def _trusted_review_fields(payload: Mapping[str, object]) -> tuple[str, tuple[str, ...]]:
+    caller = _trusted_training_caller()
+    claimed = payload.get("reviewer_id", payload.get("reviewer_label"))
+    if claimed is not None and claimed != caller:
+        raise ValueError("reviewer identity must match the trusted local caller")
+    configured = tuple(
         item.strip() for item in os.environ.get("ZMEM_TRAINING_REVIEWER_IDS", "").split(",")
         if item.strip()
-    }
-    if configured and caller not in configured:
+    )
+    if caller not in configured:
         raise ValueError("trusted local caller is not an authorized reviewer")
-    if payload.get("reviewer_confirmed") is not True:
-        raise ValueError("reviewer_acceptance requires reviewer_confirmed=true")
-    # The local caller remains both verifier and reviewer authority.  A host
-    # payload may carry a display-only reviewer label, but cannot make itself
-    # trusted by claiming another identity.
-    return caller, caller, True
+    # A same-user host process can forge its configured caller identity and run
+    # this command.  The allowlist prevents accidental self-review; it is not a
+    # hostile-host or local-admin authentication boundary.
+    return caller, configured
 
 
 def cmd_hermes_reflect(*, payload: object) -> int:
@@ -1570,6 +1612,19 @@ def main():
     p_capture_completion = _add_parser("capture-training-completion",
                                        help="complete an acknowledged training capture")
     p_capture_completion.add_argument("--input", required=True, help="JSON input file")
+    p_capture_review = _add_parser(
+        "capture-training-review",
+        help="record an independent local review (protects against accidental self-review)",
+    )
+    p_capture_review.add_argument("--input", required=True, help="JSON input file")
+    p_capture_revoke = _add_parser(
+        "capture-training-revoke",
+        help="terminally revoke one local training capture by capture or delivery id",
+    )
+    revoke_target = p_capture_revoke.add_mutually_exclusive_group(required=True)
+    revoke_target.add_argument("--capture-id")
+    revoke_target.add_argument("--delivery-snapshot-id")
+    p_capture_revoke.add_argument("--reason", required=True)
     p_purge_training = _add_parser(
         "purge-training-captures",
         help="purge finalized or revoked local captures past the 30-day retention window",
@@ -2759,12 +2814,12 @@ def main():
     # avoiding an unwanted first-run store, this keeps the frozen completion
     # missing-governance path side-effect free.
     training_capture_payload: dict[str, object] | None = None
-    if args.cmd in {"capture-training-delivery", "capture-training-completion"}:
+    if args.cmd in {"capture-training-delivery", "capture-training-acknowledge",
+                    "capture-training-completion", "capture-training-review"}:
         try:
             training_capture_payload = _read_training_capture_input(args.input)
-            if args.cmd == "capture-training-delivery":
-                _require_capture_governance(training_capture_payload)
-            else:
+            _reject_training_timestamps(training_capture_payload)
+            if args.cmd == "capture-training-completion":
                 _require_completion_governance(training_capture_payload)
         except (ValueError, OSError, json.JSONDecodeError) as exc:
             print(str(exc), file=sys.stderr)
@@ -2795,7 +2850,7 @@ def main():
     # remediation work, and the auto pass running first would consume the rows
     # their command targets — turning --dry-run into an empty preview and
     # --confirm into "no matching live rows found".
-    if args.cmd not in ("rekey-namespace", "export-dataset") \
+    if args.cmd not in ("rekey-namespace", "export-dataset", "export-training") \
             and not existing_only_evidence_write:
         # export-dataset joins the exemption (issue #134): it is a pure-read
         # surface and must not trigger the near-miss rekey's writes against
@@ -2834,7 +2889,8 @@ def main():
     if (
         args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl",
                      "capture-training-delivery", "capture-training-acknowledge",
-                     "capture-training-completion", "purge-training-captures"}
+                     "capture-training-completion", "capture-training-review",
+                     "capture-training-revoke", "purge-training-captures"}
         or (args.cmd == "evidence" and args.evidence_cmd == "write")
         or args.cmd == "hermes-convention"
         # v12 (issue #64, 9.4): feedback is a write surface — it takes the
@@ -2928,15 +2984,31 @@ def main():
                 delivery_id = payload.get("delivery_snapshot_id")
                 capture_id = None
                 if delivery_id is not None:
-                    try:
-                        capture_id = capture_id_for_delivery_snapshot(conn, delivery_id)
-                    except ValueError:
-                        pass
+                    # Explicit identities are accepted for a first delivery by
+                    # trusted local services.  Look up an existing row only to
+                    # bind a replay to its original capture; the delivery API
+                    # owns uniqueness and replay checks for a new row.
+                    delivery_id = _canonical_delivery_snapshot_id(delivery_id)
+                # Keep replay binding, optional observation, and snapshot
+                # insertion in one command-owned transaction. The state-machine
+                # writers use savepoints when composed here, so a failed replay
+                # cannot leave a durable observation or partial capture behind.
+                conn.execute("BEGIN IMMEDIATE")
+                if delivery_id is not None:
+                    existing = conn.execute(
+                        "SELECT capture_id FROM training_delivery_snapshot "
+                        "WHERE delivery_snapshot_id=?",
+                        (delivery_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        capture_id = str(existing["capture_id"])
                 if capture_id is None:
                     # ``project_key`` is a dataset-facing label.  Resolve the
                     # canonical store namespace only from the store-owned
                     # evidence association, with session binding enforced.
-                    namespace = _capture_namespace_from_evidence(conn, payload)
+                    namespace = (_capture_namespace_from_evidence(conn, payload)
+                                 if _has_capture_governance(payload)
+                                 else payload.get("namespace"))
                     capture = start_training_capture(
                         conn, host=payload.get("host", "service"),
                         session_id=payload.get("session_id"), namespace=namespace,
@@ -2987,22 +3059,23 @@ def main():
                     transform_version=payload.get("transform_version", "v1"),
                     delivery_snapshot_id=delivery_id,
                 )
+                conn.commit()
                 print(json.dumps({"capture_id": capture_id,
-                                  "delivery_snapshot_id": snapshot["delivery_snapshot_id"],
-                                  "state": "emitted_to_host"}, sort_keys=True))
+                                   "delivery_snapshot_id": snapshot["delivery_snapshot_id"],
+                                   "state": snapshot["state"]}, sort_keys=True))
             except (ValueError, TrainingCaptureConflict, CaptureBusyError, OSError,
-                    json.JSONDecodeError) as exc:
+                    json.JSONDecodeError, sqlite3.Error) as exc:
                 conn.rollback()
                 print(str(exc), file=sys.stderr)
                 sys.exit(1)
         elif args.cmd == "capture-training-acknowledge":
             try:
-                payload = _read_training_capture_input(args.input)
+                payload = training_capture_payload
+                assert payload is not None
                 capture_id = capture_id_for_delivery_snapshot(conn, payload.get("delivery_snapshot_id"))
                 caller = _trusted_training_caller()
                 capture = acknowledge_training_delivery(
                     conn, capture_id, attestation=_trusted_acknowledgement(payload, caller),
-                    acknowledged_at=payload.get("acknowledged_at"),
                 )
                 print(json.dumps({
                     "capture_id": capture_id,
@@ -3040,10 +3113,44 @@ def main():
                     reviewer_id=reviewer_id, reviewer_confirmed=reviewer_confirmed,
                     correction_closeout=payload.get("correction_closeout", False),
                     correction_chain_id=payload.get("correction_chain_id"),
-                    verified_at=payload.get("verified_at"),
                 )
                 print(json.dumps({"capture_id": capture_id, "evidence_id": completion["evidence_id"],
                                   "state": "completed"}, sort_keys=True))
+            except (ValueError, TrainingCaptureConflict, CaptureBusyError, OSError,
+                    json.JSONDecodeError) as exc:
+                conn.rollback()
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
+        elif args.cmd == "capture-training-review":
+            try:
+                payload = training_capture_payload
+                assert payload is not None
+                capture_id = capture_id_for_delivery_snapshot(conn, payload.get("delivery_snapshot_id"))
+                reviewer_id, allowlist = _trusted_review_fields(payload)
+                evidence_id = payload.get("evidence_id", payload.get("evidence_ref"))
+                review = review_training_capture(
+                    conn, capture_id, evidence_id=evidence_id, reviewer_id=reviewer_id,
+                    allowed_reviewer_ids=allowlist,
+                )
+                print(json.dumps({"capture_id": capture_id,
+                                  "evidence_id": review["completion_evidence_id"],
+                                  "state": "reviewed"}, sort_keys=True))
+            except (ValueError, TrainingCaptureConflict, CaptureBusyError, OSError,
+                    json.JSONDecodeError) as exc:
+                conn.rollback()
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
+        elif args.cmd == "capture-training-revoke":
+            try:
+                capture_id = args.capture_id
+                if capture_id is None:
+                    capture_id = capture_id_for_delivery_snapshot(conn, args.delivery_snapshot_id)
+                revoked = revoke_training_capture(
+                    conn, capture_id, reason=args.reason,
+                    revoked_by=_trusted_training_caller(),
+                )
+                print(json.dumps({"capture_id": capture_id, "state": "revoked",
+                                  "reason": revoked["revocation_reason"]}, sort_keys=True))
             except (ValueError, TrainingCaptureConflict, CaptureBusyError, OSError,
                     json.JSONDecodeError) as exc:
                 conn.rollback()
@@ -3064,7 +3171,11 @@ def main():
             # Derived Parquet construction remains separately owned; import it
             # lazily so ordinary capture starts have no exporter dependency.
             try:
-                from storelib.training_export import TrainingExportError, write_training_views
+                TrainingExportError, write_training_views = _load_training_exporter()
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
+            try:
                 result = write_training_views(
                     conn, out_dir=args.dir, namespace=args.namespace,
                     snapshot_id=args.snapshot_id, reviewer_confirmed=True,

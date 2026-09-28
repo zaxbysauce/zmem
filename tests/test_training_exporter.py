@@ -4,19 +4,29 @@ import json
 import hashlib
 import os
 import sqlite3
+import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import sys
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "skills" / "memory" / "scripts"))
 
 from storelib import schema
+from storelib import training as training_module
 from storelib.training import (
     PREFERENCE_COLUMNS,
     SFT_COLUMNS,
     TrainingExportError,
+    _bounded_quarantine_event,
+    _load_snapshot_rows,
+    _lineage_groups,
+    _split_bucket,
+    _split_key,
+    _training_output_lock,
     build_preference_rows,
     build_sft_rows,
     write_training_views,
@@ -42,7 +52,8 @@ class TrainingExporterTests(unittest.TestCase):
     def _seed_capture(self, *, capture_id: str = "cap-1", task_id: str = "task-1",
                       memory_id: str = "mem-1", evidence_id: str = "ev-1",
                       event_id: str = "event-1", applied: int = 3,
-                      violated: int = 0, trust: float = 1.0) -> None:
+                      violated: int = 0, trust: float = 1.0,
+                      evidence_kind: str = "test_result") -> None:
         self.conn.execute(
             "INSERT INTO memory (id, namespace, type, content, ingestion_ts, "
             "trust_score, applied_count, violated_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -60,13 +71,20 @@ class TrainingExporterTests(unittest.TestCase):
         self.conn.execute(
             "INSERT INTO evidence (id, session_id, lane, moment, kind, ts, hash, excerpt, ref_path) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (evidence_id, "session-1", "test", "stop", "test_result",
+            (evidence_id, "session-1", "test", "stop", evidence_kind,
              "2026-01-01T00:00:00Z", "hash", "passed", "fixture"),
         )
         self.conn.execute(
             "INSERT INTO memory_evidence (memory_id, evidence_id) VALUES (?, ?)",
             (memory_id, evidence_id),
         )
+        if event_id != evidence_id:
+            self.conn.execute(
+                "INSERT INTO evidence (id, session_id, lane, moment, kind, ts, hash, excerpt, ref_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_id, "session-1", "test", "event", evidence_kind,
+                 "2026-01-01T00:00:01Z", "event-hash", "event", "fixture"),
+            )
         self.conn.execute(
             "INSERT INTO training_capture (capture_id, host, host_task_id, session_id, namespace, "
             "created_at, updated_at, finalized_at, acknowledged_at, acknowledgement_attestation, state, "
@@ -92,10 +110,13 @@ class TrainingExporterTests(unittest.TestCase):
              "{}", "fixture-export-scope", "fixture-export-license", 0, 0,
              json.dumps([memory_id])),
         )
+        observation_payload = json.dumps({"source_event_id": event_id})
         self.conn.execute(
-            "INSERT INTO training_capture_observation (observation_id, capture_id, observation_kind, payload, observed_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            ("obs-1", capture_id, "event", json.dumps({"source_event_id": event_id}),
+            "INSERT INTO training_capture_observation "
+            "(observation_id, capture_id, observation_kind, payload, payload_sha256, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("obs-1", capture_id, "event", observation_payload,
+             hashlib.sha256(observation_payload.encode("utf-8")).hexdigest(),
              "2026-01-01T00:00:00Z"),
         )
         self.conn.commit()
@@ -139,7 +160,17 @@ class TrainingExporterTests(unittest.TestCase):
                 ],
             )
             manifest = json.loads((training / "manifest.json").read_text())
+            self.assertEqual(manifest["format"], "parquet")
+            self.assertEqual(manifest["transform_version"], "training-v1")
+            self.assertFalse(manifest["governance"]["canonical_training_content_mutated"])
+            self.assertTrue(manifest["governance"]["snapshot_binding_registry_written"])
+            self.assertFalse(manifest["governance"]["canonical_training_content_mutated"])
+            self.assertTrue(manifest["governance"]["snapshot_binding_registry_written"])
             self.assertEqual(manifest["row_counts"], {"preferences": 0, "sft": 0})
+            self.assertEqual(
+                pq.read_schema(training / "sft-000.parquet").metadata[b"created_by"],
+                b"zmem-training-v1",
+            )
 
     def test_completed_capture_exports_redacted_sft_row(self) -> None:
         self._seed_capture()
@@ -154,12 +185,657 @@ class TrainingExporterTests(unittest.TestCase):
             import pyarrow.parquet as pq
 
             row = pq.read_table(Path(tmp) / "sft-000.parquet").to_pylist()[0]
-            self.assertEqual(row["task_id"], "task-1")
+            self.assertEqual(row["task_id"], "cap-1")
             self.assertEqual(row["source_memory_ids"], ["mem-1"])
-            self.assertEqual(row["source_event_ids"], ["event-1"])
+            self.assertEqual(row["source_event_ids"], ["ev-1", "event-1"])
             self.assertEqual(row["label_status"], "candidate_positive")
             self.assertEqual(len(row["row_checksum"]), 64)
             self.assertEqual(before, self.conn.execute("SELECT count(*) FROM memory").fetchone()[0])
+
+    def test_completed_row_binds_export_governance_and_full_projection(self) -> None:
+        self._seed_capture()
+        row = build_sft_rows(
+            self.conn, namespace="project:demo", snapshot_id="projection",
+            reviewer_confirmed=True,
+        )[0]
+        self.assertEqual(
+            {key: row[key] for key in (
+                "prompt", "context_fence", "ops_tokens", "assistant_response",
+                "outcome_kind", "outcome_value", "evidence_ref",
+                "consent_scope", "content_license", "redaction_status",
+                "redaction_policy_version",
+            )},
+            {
+                "prompt": "What command should I use?",
+                "context_fence": "<context>safe</context>",
+                "ops_tokens": ["deploy --safe"],
+                "assistant_response": "Use the safe deploy command.",
+                "outcome_kind": "test",
+                "outcome_value": "passed",
+                "evidence_ref": "ev-1",
+                "consent_scope": "fixture-export-scope",
+                "content_license": "fixture-export-license",
+                "redaction_status": "redacted",
+                "redaction_policy_version": "policy-v1",
+            },
+        )
+        self.assertRegex(row["split_key"], r"^[0-9a-f]{64}$")
+        checksum_input = {key: row[key] for key in SFT_COLUMNS
+                          if key != "row_checksum"}
+        expected = hashlib.sha256(
+            (json.dumps(checksum_input, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":")) + "\n").encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(row["row_checksum"], expected)
+
+    def test_export_enforces_evidence_outcome_compatibility(self) -> None:
+        self._seed_capture(evidence_kind="turn")
+        self.conn.execute(
+            "UPDATE training_capture_completion SET outcome_kind=?, outcome_value=? "
+            "WHERE capture_id=?",
+            ("user_acceptance", "accepted", "cap-1"),
+        )
+        self.conn.commit()
+        accepted = build_sft_rows(
+            self.conn, namespace="project:demo", snapshot_id="user-accepted",
+            reviewer_confirmed=True,
+        )
+        self.assertEqual(len(accepted), 1)
+
+        self.conn.execute(
+            "UPDATE training_capture_completion SET outcome_kind=?, outcome_value=? "
+            "WHERE capture_id=?",
+            ("test", "passed", "cap-1"),
+        )
+        self.conn.commit()
+        self.assertEqual(
+            build_sft_rows(
+                self.conn, namespace="project:demo", snapshot_id="mismatched",
+                reviewer_confirmed=True,
+            ),
+            [],
+        )
+
+    def test_capture_uuid_fallback_exports_without_host_task_id(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "UPDATE training_capture SET host_task_id=NULL WHERE capture_id=?",
+            ("cap-1",),
+        )
+        self.conn.commit()
+        row = build_sft_rows(
+            self.conn, namespace="project:demo", snapshot_id="no-host-task",
+            reviewer_confirmed=True,
+        )[0]
+        self.assertEqual(row["task_id"], "cap-1")
+
+    def test_snapshot_binding_includes_output_affecting_thresholds(self) -> None:
+        self._seed_capture(trust=0.25, applied=3)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"ZMEM_INJECT_FLOOR_TRUST": "0.2"}):
+                write_training_views(
+                    self.conn, out_dir=tmp, namespace="project:demo",
+                    snapshot_id="threshold-bound", reviewer_confirmed=True,
+                )
+            before = (Path(tmp) / "manifest.json").read_bytes()
+            with patch.dict(os.environ, {"ZMEM_INJECT_FLOOR_TRUST": "0.3"}):
+                with self.assertRaisesRegex(
+                    TrainingExportError, "different export inputs"
+                ):
+                    write_training_views(
+                        self.conn, out_dir=tmp, namespace="project:demo",
+                        snapshot_id="threshold-bound", reviewer_confirmed=True,
+                    )
+            self.assertEqual((Path(tmp) / "manifest.json").read_bytes(), before)
+
+    def test_missing_pyarrow_fails_before_creating_output(self) -> None:
+        self._seed_capture()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                "sys.modules", {"pyarrow": None, "pyarrow.parquet": None}
+            ):
+                with self.assertRaisesRegex(TrainingExportError, "pyarrow is required"):
+                    write_training_views(
+                        self.conn, out_dir=tmp, namespace="project:demo",
+                        snapshot_id="without-pyarrow", reviewer_confirmed=True,
+                    )
+            self.assertFalse((Path(tmp) / "manifest.json").exists())
+            self.assertFalse(any(Path(tmp).glob(".training-staging-*")))
+
+    def test_observation_payload_digest_tampering_fails_closed(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "UPDATE training_capture_observation SET payload=? WHERE observation_id=?",
+            (json.dumps({"source_event_id": "forged-event"}), "obs-1"),
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(TrainingExportError, "digest mismatch"):
+            build_sft_rows(
+                self.conn, namespace="project:demo", snapshot_id="tampered-observation",
+                reviewer_confirmed=True,
+            )
+
+    def test_unknown_and_foreign_observation_ids_are_not_exported(self) -> None:
+        self._seed_capture()
+        foreign_payload = json.dumps({
+            "source_event_ids": ["unknown-event", "foreign-event"]
+        })
+        self.conn.execute(
+            "INSERT INTO evidence (id, session_id, lane, moment, kind, ts, hash, excerpt, ref_path) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("foreign-event", "another-session", "test", "event", "test_result",
+             "2026-01-01T00:00:02Z", "foreign-hash", "foreign", "fixture"),
+        )
+        self.conn.execute(
+            "UPDATE training_capture_observation SET payload=?, payload_sha256=? "
+            "WHERE observation_id=?",
+            (foreign_payload, hashlib.sha256(foreign_payload.encode("utf-8")).hexdigest(),
+             "obs-1"),
+        )
+        self.conn.commit()
+        row = build_sft_rows(
+            self.conn, namespace="project:demo", snapshot_id="foreign-observation",
+            reviewer_confirmed=True,
+        )[0]
+        self.assertEqual(row["source_event_ids"], ["ev-1"])
+
+    def test_reviewer_acceptance_without_distinct_review_is_not_exportable(self) -> None:
+        self._seed_capture(evidence_kind="correction")
+        self.conn.execute(
+            "UPDATE training_capture_completion SET outcome_kind=?, outcome_value=?, "
+            "reviewer_id=?, reviewer_confirmed=1, correction_closeout=1 WHERE capture_id=?",
+            ("reviewer_acceptance", "accepted", "verifier", "cap-1"),
+        )
+        self.conn.commit()
+        self.assertEqual(
+            build_sft_rows(
+                self.conn, namespace="project:demo", snapshot_id="self-reviewed",
+                reviewer_confirmed=True,
+            ),
+            [],
+        )
+
+    def test_revoked_completion_is_reported_in_exclusion_counts(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "UPDATE training_capture SET revoked_at=? WHERE capture_id=?",
+            ("2026-01-02T00:00:00Z", "cap-1"),
+        )
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as tmp:
+            write_training_views(
+                self.conn, out_dir=tmp, namespace="project:demo",
+                snapshot_id="revoked-count", reviewer_confirmed=True,
+            )
+            manifest = json.loads((Path(tmp) / "manifest.json").read_text())
+        self.assertEqual(manifest["excluded_counts"].get("revoked"), 1)
+
+    def test_snapshot_id_cannot_be_reused_for_a_second_destination(self) -> None:
+        self._seed_capture()
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "first"
+            second = Path(tmp) / "second"
+            write_training_views(
+                self.conn, out_dir=str(first), namespace="project:demo",
+                snapshot_id="destination-bound", reviewer_confirmed=True,
+            )
+            with self.assertRaisesRegex(TrainingExportError, "different export inputs"):
+                write_training_views(
+                    self.conn, out_dir=str(second), namespace="project:demo",
+                    snapshot_id="destination-bound", reviewer_confirmed=True,
+                )
+            self.assertFalse((second / "manifest.json").exists())
+
+    def test_project_split_is_stable_and_uses_frozen_byte_buckets(self) -> None:
+        key_a = _split_key("demo", "caller-salt")
+        key_b = _split_key("demo", "different-snapshot")
+        self.assertEqual(key_a, key_b)
+        self.assertEqual(
+            _split_key("fixture", "ignored"),
+            "7d68cc11d5ee2fa7bfa8d2e7933505a3080bd70a7f09caa9ba35b56fd067ce57",
+        )
+        self.assertEqual(_split_bucket("00" + "0" * 62), "train")
+        self.assertEqual(_split_bucket("cb" + "0" * 62), "train")
+        self.assertEqual(_split_bucket("cc" + "0" * 62), "validation")
+        self.assertEqual(_split_bucket("e5" + "0" * 62), "validation")
+        self.assertEqual(_split_bucket("e6" + "0" * 62), "test")
+        self.assertEqual(_split_bucket("ff" + "0" * 62), "test")
+
+    def test_update_of_joins_same_namespace_source_memory_lineage(self) -> None:
+        groups = _lineage_groups([
+            {
+                "capture_id": "capture-source",
+                "namespace": "project:demo",
+                "session_id": "session-source",
+                "episode_id": None,
+                "source_memory_ids": ["mem-predecessor"],
+                "memory_rows": [],
+            },
+            {
+                "capture_id": "capture-update",
+                "namespace": "project:demo",
+                "session_id": "session-update",
+                "episode_id": None,
+                "source_memory_ids": ["mem-update"],
+                "memory_rows": [{
+                    "id": "mem-update",
+                    "namespace": "project:demo",
+                    "update_of": "mem-predecessor",
+                }],
+            },
+        ])
+        self.assertEqual(groups[0], groups[1])
+
+    def test_update_of_does_not_join_memory_lineage_across_namespaces(self) -> None:
+        groups = _lineage_groups([
+            {
+                "capture_id": "capture-source",
+                "namespace": "project:one",
+                "session_id": "shared-session",
+                "episode_id": "shared-episode",
+                "source_memory_ids": ["mem-predecessor"],
+                "memory_rows": [],
+            },
+            {
+                "capture_id": "capture-update",
+                "namespace": "project:two",
+                "session_id": "shared-session",
+                "episode_id": "shared-episode",
+                "source_memory_ids": ["mem-update"],
+                "memory_rows": [{
+                    "id": "mem-update",
+                    "namespace": "project:two",
+                    "update_of": "mem-predecessor",
+                }],
+            },
+        ])
+        self.assertNotEqual(groups[0], groups[1])
+
+    def test_same_namespace_unrelated_sessions_and_episodes_remain_separate(self) -> None:
+        groups = _lineage_groups([
+            {
+                "capture_id": "capture-one",
+                "namespace": "project:demo",
+                "session_id": "session-one",
+                "episode_id": "episode-one",
+                "source_memory_ids": ["mem-one"],
+                "memory_rows": [],
+            },
+            {
+                "capture_id": "capture-two",
+                "namespace": "project:demo",
+                "session_id": "session-two",
+                "episode_id": "episode-two",
+                "source_memory_ids": ["mem-two"],
+                "memory_rows": [],
+            },
+        ])
+        self.assertNotEqual(groups[0], groups[1])
+
+    def test_same_session_id_is_scoped_by_namespace(self) -> None:
+        groups = _lineage_groups([
+            {
+                "capture_id": "capture-one",
+                "namespace": "project:one",
+                "session_id": "shared-session",
+                "episode_id": "shared-episode",
+                "source_memory_ids": [],
+                "memory_rows": [],
+            },
+            {
+                "capture_id": "capture-two",
+                "namespace": "project:two",
+                "session_id": "shared-session",
+                "episode_id": "shared-episode",
+                "source_memory_ids": [],
+                "memory_rows": [],
+            },
+        ])
+        self.assertNotEqual(groups[0], groups[1])
+
+    def test_export_rejects_missing_or_cross_namespace_update_predecessor(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "INSERT INTO memory (id, namespace, type, content, ingestion_ts, "
+            "trust_score, applied_count, violated_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("mem-other-project", "project:other", "fact", "Other project memory",
+             "2026-01-01T00:00:00Z", 1.0, 0, 0),
+        )
+        self.conn.execute(
+            "UPDATE memory SET update_of=? WHERE id=?",
+            ("mem-other-project", "mem-1"),
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(TrainingExportError, "crosses project namespace"):
+            build_sft_rows(
+                self.conn, namespace="project:demo", snapshot_id="cross-project-update",
+                reviewer_confirmed=True,
+            )
+
+        self.conn.execute(
+            "UPDATE memory SET update_of=? WHERE id=?",
+            ("missing-predecessor", "mem-1"),
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(TrainingExportError, "missing predecessor"):
+            build_sft_rows(
+                self.conn, namespace="project:demo", snapshot_id="missing-update",
+                reviewer_confirmed=True,
+            )
+
+    def test_tracked_training_goldens_regenerate_deterministically(self) -> None:
+        fixture_dir = Path(__file__).parent / "fixtures" / "training"
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(fixture_dir / "build_fixtures.py"),
+                    "--output",
+                    tmp,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            for name in (
+                "expected-sft.json",
+                "expected-preferences.json",
+                "expected-deletion-map.json",
+            ):
+                self.assertEqual(
+                    (Path(tmp) / name).read_bytes(),
+                    (fixture_dir / name).read_bytes(),
+                )
+
+    def test_export_refuses_source_growth_beyond_bounded_limit(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "INSERT INTO training_capture (capture_id, host, session_id, namespace, "
+            "created_at, updated_at, state, prompt, assistant_response, "
+            "consent_scope, content_license, redaction_status, "
+            "redaction_policy_version, governance_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("partial-growth", "fixture", "session-growth", "project:demo",
+             "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "partial",
+             "partial prompt", "partial answer", "scope", "license",
+             "redacted", "policy-v1", "fixture"),
+        )
+        self.conn.execute(
+            "INSERT INTO training_delivery_snapshot (delivery_snapshot_id, capture_id, "
+            "rendered, effective_ops_json, rendered_hash, transform_version, emitted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("delivery-growth", "partial-growth", "partial context", "[]", "hash",
+             "transform-v1", "2026-01-01T00:00:00Z"),
+        )
+        self.conn.commit()
+        previous = os.environ.get("ZMEM_TRAINING_MAX_ROWS")
+        os.environ["ZMEM_TRAINING_MAX_ROWS"] = "1"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(TrainingExportError, "maximum of 1"):
+                    write_training_views(
+                        self.conn, out_dir=tmp, namespace="project:demo",
+                        snapshot_id="bounded", reviewer_confirmed=True,
+                    )
+                self.assertFalse((Path(tmp) / "manifest.json").exists())
+        finally:
+            if previous is None:
+                os.environ.pop("ZMEM_TRAINING_MAX_ROWS", None)
+            else:
+                os.environ["ZMEM_TRAINING_MAX_ROWS"] = previous
+
+    def test_quarantine_requires_verified_completion(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "INSERT INTO training_capture (capture_id, host, session_id, namespace, "
+            "created_at, updated_at, state, prompt, assistant_response, "
+            "consent_scope, content_license, redaction_status, "
+            "redaction_policy_version, governance_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("partial", "fixture", "session-partial", "project:demo",
+             "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "partial",
+             "partial prompt", "partial answer", "scope", "license",
+             "redacted", "policy-v1", "fixture"),
+        )
+        self.conn.execute(
+            "INSERT INTO training_delivery_snapshot (delivery_snapshot_id, capture_id, "
+            "rendered, effective_ops_json, rendered_hash, transform_version, emitted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("delivery-partial", "partial", "partial context", "[]", "hash",
+             "transform-v1", "2026-01-01T00:00:00Z"),
+        )
+        partial_payload = json.dumps({"source_event_id": "partial-event"})
+        self.conn.execute(
+            "INSERT INTO training_capture_observation "
+            "(observation_id, capture_id, observation_kind, payload, payload_sha256, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("obs-partial", "partial", "event", partial_payload,
+             hashlib.sha256(partial_payload.encode("utf-8")).hexdigest(),
+             "2026-01-01T00:00:00Z"),
+        )
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as tmp:
+            write_training_views(
+                self.conn, out_dir=tmp, namespace="project:demo",
+                snapshot_id="quarantine-gate", reviewer_confirmed=True,
+                quarantine_raw=True,
+            )
+            manifest = json.loads(
+                (Path(tmp) / "quarantine-manifest.json").read_text()
+            )
+            self.assertEqual(manifest["event_ids"], ["ev-1", "event-1"])
+
+    def test_quarantine_excludes_revoked_completion(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "UPDATE training_capture SET revoked_at=? WHERE capture_id=?",
+            ("2026-01-02T00:00:00Z", "cap-1"),
+        )
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as tmp:
+            write_training_views(
+                self.conn, out_dir=tmp, namespace="project:demo",
+                snapshot_id="quarantine-revoked", reviewer_confirmed=True,
+                quarantine_raw=True,
+            )
+            manifest = json.loads(
+                (Path(tmp) / "quarantine-manifest.json").read_text()
+            )
+            self.assertEqual(manifest["event_ids"], [])
+
+    def test_quarantine_excludes_capture_time_quarantine(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "UPDATE training_capture SET quarantine_reason=? WHERE capture_id=?",
+            ("operator-review", "cap-1"),
+        )
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as tmp:
+            write_training_views(
+                self.conn, out_dir=tmp, namespace="project:demo",
+                snapshot_id="quarantine-capture-time", reviewer_confirmed=True,
+                quarantine_raw=True,
+            )
+            manifest = json.loads(
+                (Path(tmp) / "quarantine-manifest.json").read_text()
+            )
+            self.assertEqual(manifest["event_ids"], [])
+
+    def test_quarantine_excludes_governance_invalid_capture(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "UPDATE training_capture SET governance_source=? WHERE capture_id=?",
+            ("", "cap-1"),
+        )
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as tmp:
+            write_training_views(
+                self.conn, out_dir=tmp, namespace="project:demo",
+                snapshot_id="quarantine-governance", reviewer_confirmed=True,
+                quarantine_raw=True,
+            )
+            manifest = json.loads(
+                (Path(tmp) / "quarantine-manifest.json").read_text()
+            )
+            self.assertEqual(manifest["event_ids"], [])
+
+    def test_quarantine_includes_gate_passing_negative_label(self) -> None:
+        self._seed_capture(violated=2, applied=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_training_views(
+                self.conn, out_dir=tmp, namespace="project:demo",
+                snapshot_id="quarantine-negative", reviewer_confirmed=True,
+                quarantine_raw=True,
+            )
+            manifest = json.loads(
+                (Path(tmp) / "quarantine-manifest.json").read_text()
+            )
+            self.assertEqual(manifest["event_ids"], ["ev-1", "event-1"])
+
+    def test_persisted_ops_fail_closed_with_capture_id(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "UPDATE training_delivery_snapshot SET effective_ops_json=? "
+            "WHERE capture_id=?",
+            (json.dumps(["valid", 17]), "cap-1"),
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(
+            TrainingExportError, "invalid persisted operations for capture cap-1"
+        ):
+            build_sft_rows(
+                self.conn, namespace="project:demo", snapshot_id="bad-ops",
+                reviewer_confirmed=True,
+            )
+
+    def test_oversized_persisted_ops_fail_closed_without_truncation(self) -> None:
+        self._seed_capture()
+        oversized = json.dumps(["safe-operation " * 30, "y"])
+        self.conn.execute(
+            "UPDATE training_delivery_snapshot SET effective_ops_json=? "
+            "WHERE capture_id=?", (oversized, "cap-1")
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(
+            TrainingExportError, "invalid persisted operations for capture cap-1"
+        ):
+            build_sft_rows(
+                self.conn, namespace="project:demo", snapshot_id="large-ops",
+                reviewer_confirmed=True,
+            )
+
+    def test_quarantine_ops_failure_names_capture_id(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "UPDATE training_delivery_snapshot SET effective_ops_json=? "
+            "WHERE capture_id=?", ("{not-json", "cap-1")
+        )
+        self.conn.commit()
+        item = _load_snapshot_rows(self.conn, "project:demo")[0]
+        with self.assertRaisesRegex(
+            TrainingExportError, "invalid persisted operations for capture cap-1"
+        ):
+            _bounded_quarantine_event(item, "event-1")
+
+    def test_training_output_lock_persists_and_ignores_legacy_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "out"
+            lock_path = destination.parent / ".out.training-export.lock"
+            lock_path.write_text("legacy-marker")
+            with _training_output_lock(destination):
+                self.assertTrue(lock_path.is_file())
+                with self.assertRaisesRegex(
+                    TrainingExportError, "already in progress"
+                ):
+                    with _training_output_lock(destination):
+                        pass
+            self.assertTrue(lock_path.is_file())
+            self.assertEqual(lock_path.read_text(), "legacy-marker")
+            with _training_output_lock(destination):
+                self.assertTrue(lock_path.is_file())
+
+    def test_training_output_lock_rejects_distinct_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "out"
+            result: list[BaseException | None] = []
+
+            def contend() -> None:
+                try:
+                    with _training_output_lock(destination):
+                        result.append(None)
+                except BaseException as exc:  # captured for the main assertion
+                    result.append(exc)
+
+            with _training_output_lock(destination):
+                thread = threading.Thread(target=contend)
+                thread.start()
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(len(result), 1)
+            self.assertIsInstance(result[0], TrainingExportError)
+
+    def test_training_output_lock_is_held_through_manifest_last_install(self) -> None:
+        self._seed_capture()
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp).resolve()
+            result: list[BaseException | None] = []
+            original_replace = training_module.os.replace
+
+            def replace_with_contention(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+                if Path(target).resolve() == destination / "manifest.json":
+                    def contend() -> None:
+                        try:
+                            with _training_output_lock(destination):
+                                result.append(None)
+                        except BaseException as exc:  # captured for the main assertion
+                            result.append(exc)
+
+                    thread = threading.Thread(target=contend)
+                    thread.start()
+                    thread.join(timeout=5)
+                    self.assertFalse(thread.is_alive())
+                original_replace(source, target)
+
+            with patch.object(training_module.os, "replace", replace_with_contention):
+                write_training_views(
+                    self.conn, out_dir=str(destination), namespace="project:demo",
+                    snapshot_id="manifest-lock", reviewer_confirmed=True,
+                )
+            self.assertEqual(len(result), 1)
+            self.assertIsInstance(result[0], TrainingExportError)
+            self.assertTrue((destination / "manifest.json").is_file())
+
+    def test_training_output_lock_releases_after_child_is_killed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "out"
+            child_code = (
+                "import sys, time\n"
+                "sys.path.insert(0, sys.argv[2])\n"
+                "from pathlib import Path\n"
+                "from storelib.training import _training_output_lock\n"
+                "with _training_output_lock(Path(sys.argv[1])):\n"
+                " print('ready', flush=True)\n"
+                " time.sleep(30)\n"
+            )
+            script_root = str(Path(__file__).parents[1] / "skills" / "memory" / "scripts")
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_code, str(destination), script_root],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "ready")
+                with self.assertRaisesRegex(
+                    TrainingExportError, "already in progress"
+                ):
+                    with _training_output_lock(destination):
+                        pass
+            finally:
+                child.kill()
+                child.wait(timeout=5)
+                child.stdout.close()
+                child.stderr.close()
+            with _training_output_lock(destination):
+                self.assertTrue(
+                    (destination.parent / ".out.training-export.lock").is_file()
+                )
 
     def test_reexport_cleans_quarantine_and_keeps_process_split_salt(self) -> None:
         self._seed_capture()
@@ -208,7 +884,7 @@ class TrainingExporterTests(unittest.TestCase):
         self.assertEqual(rows[0]["exclusion_reason"], "violated_count")
 
     def test_explicit_correction_reviewer_completion_emits_preference(self) -> None:
-        self._seed_capture()
+        self._seed_capture(evidence_kind="correction")
         self.conn.execute(
             "INSERT INTO memory (id, namespace, type, content, ingestion_ts, "
             "trust_score, applied_count, violated_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -231,6 +907,12 @@ class TrainingExporterTests(unittest.TestCase):
             "UPDATE training_capture_completion SET outcome_kind=?, outcome_value=?, "
             "reviewer_id=?, reviewer_confirmed=1, correction_closeout=1 WHERE capture_id=?",
             ("reviewer_acceptance", "accepted", "reviewer-1", "cap-1"),
+        )
+        self.conn.execute(
+            "INSERT INTO training_capture_review "
+            "(capture_id, completion_evidence_id, reviewer_id, reviewed_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("cap-1", "ev-1", "reviewer-1", "2026-01-01T00:00:01Z"),
         )
         self.conn.commit()
         rows = build_preference_rows(
@@ -273,7 +955,7 @@ class TrainingExporterTests(unittest.TestCase):
             )
             self.conn.commit()
             with self.assertRaisesRegex(
-                TrainingExportError, "different selection"
+                TrainingExportError, "different export inputs"
             ):
                 write_training_views(
                     self.conn, out_dir=tmp, namespace="project:demo",

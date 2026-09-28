@@ -657,11 +657,10 @@ const EVIDENCE_RAW_MAX_BYTES = 64 * 1024;
 const EVIDENCE_WRITER_MAX_INFLIGHT = 8;
 const EVIDENCE_WRITER_TIMEOUT_MS = 15000;
 let evidenceWritersInFlight = 0;
-// Issue #135: automatic training capture is a bounded, fail-open adapter.  A
-// start must be synchronous so the store-generated capture id is available to
-// later observation/snapshot callbacks; snapshots are likewise issued only
-// after the child produced the exact sentinel payload.  The adapter itself
-// owns redaction and default-deny governance.
+// Issue #135: automatic training capture is a bounded, fail-open adapter.  The
+// start action remains synchronous so the store can allocate the per-turn
+// correlation id; observations and snapshots use a detached writer and never
+// hold up the host callback.  The adapter owns redaction and governance.
 const TRAINING_CAPTURE_HOSTS = new Set(["claude", "codex", "zcode"]);
 const TRAINING_CAPTURE_TIMEOUT_MS = 1200;
 const EDIT_TOOL_NAMES = new Set([
@@ -765,13 +764,17 @@ function _sanitizeRefPath(value) {
     return clean.slice(0, 4096);
 }
 
-function resolvePython(env = process.env) {
+function resolvePython(env = process.env, platform = process.platform,
+                       probe = execFileSync) {
     const explicit = env && typeof env.ZMEM_PYTHON === "string" ? env.ZMEM_PYTHON.trim() : "";
     if (explicit) return explicit;
-    const candidates = process.platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+    const candidates = platform === "win32" ? ["python", "python3"] : ["python3", "python"];
     for (const candidate of candidates) {
         try {
-            execFileSync("where", [candidate], { stdio: "ignore" });
+            // `where` is Windows-only.  Probing the interpreter itself works
+            // on both POSIX and Windows and does not select a missing POSIX
+            // command merely because the lookup utility is absent.
+            probe(candidate, ["--version"], { stdio: "ignore" });
             return candidate;
         } catch {
             // Try the next interpreter name; the caller remains fail-open.
@@ -1190,6 +1193,11 @@ function _trainingCaptureInput(host, hookName, meta, env, action, extra = {}) {
         ),
         ...extra,
     };
+    const captureKey = _firstNonEmptyString(
+        callback.capture_key, callback.captureKey,
+        callback.turn_id, callback.turnId,
+    );
+    if (captureKey) input.capture_key = captureKey;
     if (action === "observe") {
         input.observation_kind = extra.observation_kind || "post_tool";
         input.observation = _trainingCaptureObservation(callback, hookName);
@@ -1197,15 +1205,62 @@ function _trainingCaptureInput(host, hookName, meta, env, action, extra = {}) {
     return input;
 }
 
+function _captureDisabled(env = process.env) {
+    return Boolean(env && typeof env.ZMEM_CAPTURE === "string" &&
+        env.ZMEM_CAPTURE.trim() === "0");
+}
+
+function _runTrainingCaptureDetached(host, hookName, meta, env, action, extra, encoded,
+                                     spawnFn = spawn) {
+    try {
+        const script = _trainingCaptureScript(env);
+        const child = spawnFn(resolvePython(env), [script, "--action", action], {
+            detached: true,
+            stdio: ["pipe", "ignore", "ignore"],
+            env: { ...(env || {}), ZMEM_HOST: host },
+        });
+        let finished = false;
+        let reaper = null;
+        const clearReaper = () => {
+            if (finished) return;
+            finished = true;
+            if (reaper !== null) clearTimeout(reaper);
+        };
+        child.on("error", clearReaper);
+        child.on("close", clearReaper);
+        reaper = setTimeout(() => {
+            try { if (typeof child.kill === "function") child.kill(); } catch { /* fail open */ }
+            clearReaper();
+        }, TRAINING_CAPTURE_TIMEOUT_MS);
+        if (finished) clearTimeout(reaper);
+        if (typeof reaper.unref === "function") reaper.unref();
+        if (child.stdin) {
+            child.stdin.on("error", () => {});
+            child.stdin.end(encoded + "\n");
+        }
+        child.unref();
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function runTrainingCapture(host, hookName, meta, env = process.env,
-                            action = "observe", extra = {}, execFn = execFileSync) {
+                            action = "observe", extra = {}, execFn = execFileSync,
+                            spawnFn = spawn) {
     try {
         if (!TRAINING_CAPTURE_HOSTS.has(host)) return {};
+        if (_captureDisabled(env)) return {};
         const script = _trainingCaptureScript(env);
         if (!script || typeof execFn !== "function") return {};
         const input = _trainingCaptureInput(host, hookName, meta, env, action, extra);
         const encoded = safeJsonStringify(input, EVIDENCE_RAW_MAX_BYTES);
         if (!encoded) return {};
+        if (execFn === execFileSync && action !== "start") {
+            _runTrainingCaptureDetached(host, hookName, meta, env, action, extra, encoded,
+                spawnFn);
+            return {};
+        }
         const output = execFn(resolvePython(env), [script, "--action", action], {
             input: encoded + "\n",
             encoding: "utf8",
@@ -2036,6 +2091,7 @@ module.exports = {
     recordEvidence,
     runTrainingCapture,
     snapshotTrainingDelivery,
+    _trainingCaptureAction,
     extractPayload,
     makeEnvelope,
     encodedSize,

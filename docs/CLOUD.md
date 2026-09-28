@@ -151,19 +151,38 @@ stores only capture metadata and a reason; it does not store prompt,
 response, fence, ops-token text, hashes, or embeddings. Capture consent allows
 local redacted partial storage, but does not grant export consent.
 
+The Claude, Codex, and ZCode launcher callbacks are keyless unless their
+payload explicitly supplies the supported stable `capture_key` or `turn_id`.
+Keyless callbacks create fresh partials without a reusable sidecar; under
+default-deny they contain metadata only, while configured capture consent
+permits bounded redacted content. Later observations or delivery snapshots
+cannot bind to those partials automatically. The current masking covers
+credential-like values,
+email addresses, and filesystem paths. It is not comprehensive PII
+anonymization; hostnames, usernames, and other identifying values may remain
+and must not be treated as masked by default.
+
 The state machine is deliberately staged:
 
 1. The hook stores a `capture_id` and, when the actual injection result is
    emitted, an immutable delivery snapshot. `capture_id` is local store
    correlation; `host_task_id` is used only when the host supplied one.
-2. A trusted local workflow acknowledges the delivery snapshot. Host
-   observations, Stop, tool success/failure, and displayed text do not count
-   as acknowledgement or an outcome.
+2. A trusted local workflow acknowledges the delivery snapshot. This is a
+   local-operator attestation, not an external reviewer or display receipt.
+   Host observations, Stop, tool success/failure, and displayed text do not
+   count as acknowledgement or an outcome.
 3. A trusted verifier completes the capture with a supported outcome, evidence
    id, and scoped memory ids. Completion validates the current export
    governance and associates the exact evidence/memory pairs in one
    transaction. Reviewer accepted correction pairs also require the configured
-   reviewer fields and correction closeout.
+   reviewer fields and correction closeout. Reviewer trust is local-operator
+   trust for this workflow; no external reviewer registry is implied.
+
+Completion evidence is type checked against the outcome: test, compile, and
+lint outcomes require test_result evidence; user_acceptance requires turn
+evidence; reviewer_acceptance accepts turn or correction evidence. When
+correction_closeout is true, the outcome must be reviewer_acceptance and the
+evidence must be correction evidence.
 
 The explicit local adapters use JSON input files so the attestation and
 completion fields can be reviewed before the write:
@@ -219,16 +238,28 @@ python skills/memory/scripts/store.py export-training ./training \
 
 `DIR` is the training output directory itself. It contains
 `sft-000.parquet`, `preferences-000.parquet`, `manifest.json`, and
-`deletion-map.json` directly. With `--quarantine-raw`, a bounded redacted
+`deletion-map.json` directly. `deletion-map.json` is derived deduplication and
+exclusion metadata for the export; it does not delete canonical SQLite rows or
+prior output directories. With `--quarantine-raw`, a bounded redacted
 derived dump is written under `DIR/quarantine/` with its own
-`quarantine-manifest.json`; the option does not make refused, revoked, or
-incomplete captures eligible. The main manifest records row counts and the
-export snapshot identity. A missing PyArrow dependency or failed nonempty
-semantic dedup closes the export before output is published.
+`quarantine-manifest.json`. It uses the same verified, acknowledged
+completion gate as SFT and preference output; partial, refused, revoked,
+incomplete, or capture-quarantined records never reach any derived artifact.
+The main manifest records row counts and the export snapshot identity. A
+missing PyArrow dependency or failed nonempty semantic dedup closes the export
+before output is published.
 
-Training output is staged on the same volume and validated before publish; data
-files are replaced first and the manifest is written last as the completion
-marker. Consumers must reject a directory without a valid final manifest.
+Training output is staged on the same volume and validated before publish; a
+persistent sibling advisory lock serializes writers on supported local
+filesystems. NFS and SMB support is not promised. Data files are replaced
+first and the manifest is written last as the completion marker. Parquet,
+quarantine, deletion-map, and staging files are operator-owned disposable
+artifacts; canonical SQLite rows remain the retention authority. SQLite capture
+purge does not delete operator-owned published export folders. Consumers must
+reject a directory without a valid final manifest.
+The exporter bounds work at 10,000 source captures by default; operators can
+set ZMEM_TRAINING_MAX_ROWS to a lower positive limit. Exceeding the limit
+fails before publication and leaves no new manifest.
 Doctor reports incomplete staging output, illegal capture states, missing
 redaction metadata, and stale local capture records for cleanup. Revoked rows
 are counted informationally and remain excluded from export.
@@ -244,9 +275,26 @@ python skills/memory/scripts/doctor.py \
 
 The cleanup skips candidates newer than 24 hours and rechecks their mtimes
 before removal. For `./training`, a candidate is `./.training-staging-*`.
-Because the exporter has no cross-process lock that doctor can use to prove an
-export is inactive, the confirmation flag is an operator assertion; consumers
-still reject any output missing its final manifest.
+Doctor does not inspect the writer lock and cannot prove that an export is
+inactive, so the confirmation flag is an operator assertion; consumers still
+reject any output missing its final manifest.
+
+The Hermes `sync_turn` callback always records a fresh partial. It establishes a
+reusable association before detached observations only when the host supplies
+an explicit `capture_key` or `turn_id`; otherwise the partial remains keyless.
+The capture subprocess is intentionally synchronous and has a 1.2-second bound,
+and it can still contend with the store's 5-second SQLite busy timeout.
+Capture failures remain fail-open to the host. The Claude, Codex, and ZCode
+launcher start path is also synchronous with the same 1.2-second subprocess
+bound and the same possible SQLite contention. The outer launcher watchdog is
+12 seconds (12000 ms); it protects the host hook process and does not turn a
+partial capture into an acknowledgement, outcome, or verified export.
+
+Capture retention is local SQLite retention. Purging expired rows does not
+remove earlier operator-owned training output folders or their published
+copies. Doctor reports an intentional expired-retention warning with
+`status: "warn"`; after checking that no export is active, run
+`python <store.py> purge-training-captures --confirm` and rerun doctor.
 
 ## Tier 1 — Memory pack (read-only snapshot, committed to the repo)
 

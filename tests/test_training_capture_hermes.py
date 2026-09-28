@@ -58,7 +58,8 @@ class HermesTrainingCaptureTests(unittest.TestCase):
 
             with mock.patch.object(plugin, "_run_training_capture", side_effect=capture):
                 self.assertIsNone(provider.sync_turn(
-                    "prompt text", "assistant text", task_id="task-hermes"
+                    "prompt text", "assistant text", task_id="task-hermes",
+                    turn_id="turn-hermes",
                 ))
 
             self.assertEqual(len(calls), 1)
@@ -67,6 +68,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             self.assertEqual(payload["host"], "hermes")
             self.assertEqual(payload["session_id"], "session-hermes")
             self.assertEqual(payload["host_task_id"], "task-hermes")
+            self.assertEqual(payload["capture_key"], "turn-hermes")
             self.assertEqual(payload["prompt"], "prompt text")
             self.assertEqual(payload["assistant_response"], "assistant text")
 
@@ -81,6 +83,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                  mock.patch.object(plugin, "_enqueue_native_evidence"):
                 self.assertEqual(provider.post_tool_call(
                     session_id="session-hermes", task_id="task-hermes",
+                    turn_id="turn-hermes",
                     tool_name="read_file", result="ok",
                 ), {})
 
@@ -89,6 +92,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             self.assertEqual(action, "observe")
             self.assertEqual(payload["observation_kind"], "post_tool_call")
             self.assertEqual(payload["host_task_id"], "task-hermes")
+            self.assertEqual(payload["capture_key"], "turn-hermes")
             self.assertEqual(payload["observation"]["result"], "ok")
 
     def test_prefetch_snapshots_exact_store_rendering_and_ops(self):
@@ -102,10 +106,10 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                 "effective_ops": ["zmem_search"],
                 "transform_version": "v2",
             }
-            store_result = {"ok": True, "stdout": json.dumps(envelope)}
+            provider._transport = mock.Mock()
+            provider._transport.prefetch.return_value = envelope
             with mock.patch.dict(os.environ, {"ZMEM_QUERY_CONTEXT": "0", "ZMEM_INJECT": "1"}, clear=False), \
-                 mock.patch.object(plugin, "_run_passive_store", return_value=store_result), \
-                 mock.patch.object(plugin, "_run_training_capture",
+                 mock.patch.object(plugin, "_background_training_capture",
                                    side_effect=lambda action, payload: calls.append((action, payload)) or {}):
                 self.assertEqual(provider.prefetch("prompt", session_id="session-hermes"),
                                  envelope["rendered"])
@@ -127,6 +131,23 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                 child_env = run.call_args.kwargs["env"]
                 self.assertEqual(child_env["ZMEM_CAPTURE"], "1")
                 self.assertNotIn("ZMEM_CAPTURE", os.environ)
+
+    def test_sync_and_background_capture_fail_open_without_worker_traceback(self):
+        with _plugin_context() as plugin:
+            provider = plugin.ZmemMemoryProvider()
+            provider._session_id = "session-hermes"
+            with mock.patch.object(plugin, "_run_training_capture",
+                                   side_effect=RuntimeError("capture exploded")):
+                self.assertIsNone(provider.sync_turn("prompt", "response"))
+                class InlineThread:
+                    def __init__(self, *, target, **_kwargs):
+                        self.target = target
+
+                    def start(self):
+                        self.target()
+
+                with mock.patch.object(plugin.threading, "Thread", InlineThread):
+                    plugin._background_training_capture("observe", {"session_id": "session-hermes"})
 
 
 if __name__ == "__main__":

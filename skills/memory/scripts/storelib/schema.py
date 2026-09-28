@@ -1338,11 +1338,32 @@ _TRAINING_CAPTURE_SCHEMA_DDL = (
     "CREATE INDEX IF NOT EXISTS training_completion_evidence_idx "
     "ON training_capture_completion(evidence_id)",
     """
+    CREATE TABLE IF NOT EXISTS training_capture_review (
+      capture_id TEXT PRIMARY KEY REFERENCES training_capture(capture_id),
+      completion_evidence_id TEXT NOT NULL REFERENCES evidence(id),
+      reviewer_id TEXT NOT NULL,
+      reviewed_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_review_evidence_idx "
+    "ON training_capture_review(completion_evidence_id)",
+    """
+    CREATE TABLE IF NOT EXISTS training_export_snapshot_binding (
+      snapshot_id TEXT PRIMARY KEY,
+      binding_sha256 TEXT NOT NULL CHECK (
+        length(binding_sha256)=64 AND
+        binding_sha256 NOT GLOB '*[^0-9A-Fa-f]*'
+      ),
+      created_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS training_capture_observation (
       observation_id TEXT PRIMARY KEY,
       capture_id TEXT NOT NULL REFERENCES training_capture(capture_id),
       observation_kind TEXT NOT NULL,
       payload TEXT,
+      payload_sha256 TEXT,
       observed_at TEXT NOT NULL
     )
     """,
@@ -1351,12 +1372,48 @@ _TRAINING_CAPTURE_SCHEMA_DDL = (
 )
 
 
+def _schema_objects_missing(conn: sqlite3.Connection, expected: set[str]) -> set[str]:
+    """Return absent additive schema objects without acquiring a writer lock.
+
+    Additive side tables deliberately keep schema version 14.  Their hot path
+    must therefore be a read-only sqlite_master probe: ``CREATE ... IF NOT
+    EXISTS`` still needs schema/write coordination on some SQLite builds.
+    """
+    if not expected:
+        return set()
+    placeholders = ",".join("?" for _ in expected)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE name IN (" + placeholders + ")",
+        tuple(expected),
+    ).fetchall()
+    return expected - {str(row[0]) for row in rows}
+
+
+_BELIEF_SCHEMA_OBJECTS = {
+    "belief_head", "belief_head_source", "belief_head_evidence",
+    "belief_head_namespace_idx", "belief_head_source_source_idx",
+    "belief_head_evidence_evidence_idx",
+}
+
+
+_TRAINING_CAPTURE_SCHEMA_OBJECTS = {
+    "training_capture", "training_capture_state_idx", "training_capture_session_idx",
+    "training_delivery_snapshot", "training_delivery_capture_idx",
+    "training_capture_completion", "training_completion_evidence_idx",
+    "training_capture_review", "training_review_evidence_idx",
+    "training_export_snapshot_binding",
+    "training_capture_observation", "training_observation_capture_idx",
+}
+
+
 def _ensure_belief_tables(conn: sqlite3.Connection) -> None:
     """Create the additive belief-head side tables atomically (issue #137).
 
     A failure at any DDL boundary must leave both the table set and the
     version marker byte-for-byte unchanged, so the whole block runs inside
     one transaction (or savepoint, when a caller transaction is open)."""
+    if not _schema_objects_missing(conn, _BELIEF_SCHEMA_OBJECTS):
+        return
     savepoint = "zmem_belief_ddl"
     own_transaction = not conn.in_transaction
     if own_transaction:
@@ -1387,6 +1444,25 @@ def _ensure_training_capture_tables(conn: sqlite3.Connection) -> None:
     This must stay version-independent: a numbered migration would violate the
     v14 compatibility contract for automatic partial capture.
     """
+    missing = _schema_objects_missing(conn, _TRAINING_CAPTURE_SCHEMA_OBJECTS)
+    observation_columns: set[str] = set()
+    if "training_capture_observation" not in missing:
+        observation_columns = {
+            str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(training_capture_observation)"
+            ).fetchall()
+        }
+    observation_digest_missing = (
+        "training_capture_observation" not in missing
+        and "payload_sha256" not in observation_columns
+    )
+    if not missing and not observation_digest_missing:
+        return
+    # A v14 store created before independent reviews has all the original
+    # capture objects but lacks this table.  Its old in-row reviewer flag did
+    # not prove an independent transition, so it is intentionally not
+    # grandfathered.  This runs only during that one additive upgrade.
+    review_table_missing = "training_capture_review" in missing
     savepoint = "zmem_training_capture_ddl"
     own_transaction = not conn.in_transaction
     if own_transaction:
@@ -1396,6 +1472,28 @@ def _ensure_training_capture_tables(conn: sqlite3.Connection) -> None:
     try:
         for ddl in _TRAINING_CAPTURE_SCHEMA_DDL:
             conn.execute(ddl)
+        if observation_digest_missing:
+            conn.execute(
+                "ALTER TABLE training_capture_observation ADD COLUMN payload_sha256 TEXT"
+            )
+        # SQLite has no built-in SHA-256 scalar.  Backfill only this additive
+        # integrity field while the one-time upgrade transaction owns the
+        # schema, hashing the exact UTF-8 bytes retained in SQLite.
+        rows = conn.execute(
+            "SELECT observation_id, payload FROM training_capture_observation "
+            "WHERE payload IS NOT NULL AND payload_sha256 IS NULL"
+        ).fetchall()
+        for row in rows:
+            digest = hashlib.sha256(str(row[1]).encode("utf-8")).hexdigest()
+            conn.execute(
+                "UPDATE training_capture_observation SET payload_sha256=? WHERE observation_id=?",
+                (digest, row[0]),
+            )
+        if review_table_missing:
+            conn.execute(
+                "UPDATE training_capture_completion SET reviewer_confirmed=0 "
+                "WHERE reviewer_confirmed<>0"
+            )
         if own_transaction:
             conn.commit()
         else:
