@@ -494,7 +494,20 @@ class EvidenceRetentionTest(_StoreCase):
             ],
         )
 
-    def test_invalid_env_uses_documented_default(self):
+    def test_invalid_env_disables_sweep_without_mutation(self):
+        memory_id = "00000000-0000-4000-8000-000000000506"
+        evidence_id = "00000000-0000-4000-8000-000000000507"
+        self.conn.execute(
+            "INSERT INTO memory(id, namespace, type, content, ingestion_ts) "
+            "VALUES (?, 'project:p', 'fact', 'retention', ?)",
+            (memory_id, "2026-09-10T00:00:00Z"),
+        )
+        self._write(evidence_id, "2026-08-01T00:00:00Z")
+        self.conn.execute(
+            "INSERT INTO memory_evidence(memory_id, evidence_id) VALUES (?, ?)",
+            (memory_id, evidence_id),
+        )
+        self.conn.commit()
         os.environ["ZMEM_EVIDENCE_DAYS"] = "abc"
         with contextlib.redirect_stderr(__import__("io").StringIO()) as err:
             result = evidence.sweep_evidence(
@@ -505,8 +518,16 @@ class EvidenceRetentionTest(_StoreCase):
         })
         self.assertEqual(
             err.getvalue(),
-            "evidence retention: invalid ZMEM_EVIDENCE_DAYS; using default 30\n",
+            "evidence retention disabled: invalid ZMEM_EVIDENCE_DAYS\n",
         )
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM evidence WHERE id=?", (evidence_id,)
+        ).fetchone())
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM memory_evidence WHERE memory_id=? AND evidence_id=?",
+            (memory_id, evidence_id),
+        ).fetchone())
+        self.assertFalse(self.conn.in_transaction)
 
     def test_sql_failure_rolls_back_evidence_and_links(self):
         class FailingConnection(sqlite3.Connection):
@@ -562,7 +583,7 @@ class EvidenceRetentionTest(_StoreCase):
             (
                 "ZMEM_EVIDENCE_DAYS", str(2**63),
                 "2026-09-10T00:00:00Z",
-                "evidence retention: invalid ZMEM_EVIDENCE_DAYS; using default 30\n",
+                "evidence retention disabled: invalid ZMEM_EVIDENCE_DAYS\n",
             ),
             (
                 "ZMEM_EVIDENCE_DAYS", None,
@@ -572,7 +593,7 @@ class EvidenceRetentionTest(_StoreCase):
             (
                 "ZMEM_EVIDENCE_CAP", str(2**63),
                 "2026-09-10T00:00:00Z",
-                "evidence retention: invalid ZMEM_EVIDENCE_CAP; using default 50000\n",
+                "evidence retention disabled: invalid ZMEM_EVIDENCE_CAP\n",
             ),
         ):
             with self.subTest(env_name=env_name, env_value=env_value):

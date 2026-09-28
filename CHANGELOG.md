@@ -10,34 +10,63 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.69.0] - 2026-09-27
+## [0.71.0] - 2026-09-28
 
 ### Added
+- **Governed training capture and deterministic export (issue #135)**: existing
+  host hooks automatically retain bounded, redacted partial captures; only
+  acknowledged captures with verified outcomes are exportable. Added local
+  governance and revocation controls, independent reviewer acceptance,
+  deterministic SFT and preference Parquet, bounded quarantine, and
+  manifest-last publication.
 
-- **Governed training views (issue #135):** automatic host hooks now create
-  default-deny partial capture records. A trusted delivery acknowledgement and
-  verifier-backed completion are required before a capture can become eligible
-  for export. Capture, delivery, acknowledgement and completion state is kept
-  in additive local tables without changing the schema version or syncing
-  transcript content.
-- **Deterministic training export:** `export-training DIR` writes the fixed SFT
-  and preference Parquet schemas plus `manifest.json` and `deletion-map.json`
-  directly in `DIR` through a staged publish. The export derives
-  evidence and source-memory provenance from the store, applies the configured
-  governance and redaction policy, and keeps semantic dedup vectors in memory.
-  The optional `--quarantine-raw` artifact is bounded and redacted; it does not
-  make a refused or incomplete capture exportable.
-- **Training dependency packaging and diagnostics:** the PyArrow range is
-  declared in `skills/memory/scripts/requirements-training.txt` and the Hermes
-  server requirements. Doctor reports the dependency state and the exact
-  requirements-file install command so each host can enable training export in
-  its store-host interpreter.
+## [0.70.0] - 2026-09-27
 
-### Changed
+### Fixed
+- **Type-diverse injection eval reseed + strict per-moment precision ratchet
+  restored (issue #234)**: `tests/fixtures/eval_store.py` gained a
+  `project:eval-typeboost` bucket (12 rows: one `constraint` and one
+  `decision` row with fact decoys, seeded at a lower confidence so the
+  pretool multipliers — constraint 1.1628 / decision 1.1163 vs fact 0.8372 —
+  demonstrably move the labeled row across the k=5 cut); the corpus grew to
+  82 rows / 67 live. `eval/injection_gold.jsonl` gained two pretool
+  type-boost items (112 items, 102 positives), so the #126 per-moment type
+  profiles are finally measurable: pretool precision improves 0.885 → 0.895
+  under the profiles while the other three moments are identical. The strict
+  `>= 1e-6` improvement cell in `test_per_moment_deltas_meet_ratchet` is
+  restored (the PR #230 no-regression amendment is superseded — its root
+  cause was the type-poor fixture, and amending the ratchet instead of
+  reseeding the fixture is the pattern this restore guards against), and a
+  new `EndToEndReportTest.test_eval_pools_are_type_diverse` fails on any
+  future fact/lesson-only reseed.
+- **Split-basis injection baseline (issue #234)**:
+  `eval/baseline-injection.json` re-measured on the reseeded corpus — the
+  `metrics` block records the weighted run (the `--compare-baseline` drift
+  basis, precision@k 0.8792) and the `per_moment` block records the
+  weights-neutral run, so per-moment `precision_delta` measures exactly the
+  per-moment profiles' contribution. The neutral basis is reproducible via a
+  new authoring-only `scripts/eval_inject_runner.py
+  --moment-weights-neutral` flag (pins `storelib.recall.type_preference` to
+  1.0 for the run; refuses `--profile-json-out` and the ratchet flags so a
+  neutral run can never be pinned as a fixture or produce a gate verdict,
+  and stamps the report `moment_weights: neutral`).
+  `tests/fixtures/issue126/profile-expected.json` regenerated against the
+  new gold (digest 7386570a…) and baseline.
+- **Cross-encoder promotion-gate provenance (issue #234)**: the
+  `PASSIVE_PROMOTION_GATE` comment now records that its 0.8978… threshold
+  was measured on the pre-reseed type-poor gold; the threshold value and
+  `reorder_enabled: False` are unchanged.
 
-- **Release surfaces:** all seven host-facing manifests target 0.69.0. The
-  release manifest and five-lane decision fixtures are regenerated from the
-  final tracked runtime tree before release publication.
+## [0.69.0] - 2026-09-27
+
+### Fixed
+- **Fail-closed evidence retention (issue #170):** malformed non-base-10
+  integer or out-of-range `ZMEM_EVIDENCE_DAYS` and `ZMEM_EVIDENCE_CAP` values
+  (`30.0` is invalid) now disable the complete retention sweep before any
+  transaction or deletion, emit one setting-only diagnostic, and leave evidence
+  and association rows unchanged. When both settings are invalid, the DAYS
+  diagnostic is reported first. Valid expiry, cap ordering, rollback, and the
+  shipped #183 evidence writer behavior remain covered.
 
 ## [0.68.0] - 2026-09-27
 

@@ -37,7 +37,10 @@ from typing import Any
 # target corpus mints ids at import time) + the three issue-#82 honesty
 # buckets. Documented exception to the ">= 5 items per bucket" rule: the
 # three #82 buckets carry >= 3 items each (tests/test_eval_runner.py pins
-# the split: original six >= 5, new three >= 3).
+# the split: original six >= 5, new three >= 3). Issue #234 adds the
+# type-boost bucket with 2 items — each item is one labeled constraint /
+# decision row plus its decoy pool, and the pair exists to make the #126
+# per-moment profiles measurable, not to broaden bucket coverage.
 BUCKETS = (
     "as-of",
     "injection",
@@ -50,6 +53,7 @@ BUCKETS = (
     "polarity",
     "change-intent",
     "decision-point",
+    "type-boost",
     "negative-control",
 )
 

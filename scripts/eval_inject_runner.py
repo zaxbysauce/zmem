@@ -33,9 +33,9 @@ side by side, per issue #111.
 Isolation + determinism contract (mirrors scripts/eval_runner.py):
 * ``--store`` is REQUIRED — the operator home store is never touched.
 * A missing store is built at the exact --store path by
-  ``tests/fixtures/eval_store.py`` (the same deterministic 70-row corpus the
-  recall gold uses — the four moments are different queries against the
-  SAME store).
+  ``tests/fixtures/eval_store.py`` (the same deterministic corpus the
+  recall gold uses — 82 rows since the issue #234 type-boost reseed;
+  the four moments are different queries against the SAME store).
 * The fixture BASE_ENV determinism pins (fake embedder, no model
   downloads) are forced BEFORE storelib is imported; ZMEM_TEST_NOW is
   pinned to the corpus sentinel.
@@ -45,7 +45,7 @@ Isolation + determinism contract (mirrors scripts/eval_runner.py):
   operational errors (missing --store value, invalid gold, unbuildable
   store, a bypass-invariant violation, an unreadable baseline).
 
-Provenance note (issue #111 scope 2): the ~100 labeled positives and the
+Provenance note (issue #111 scope 2): the 102 labeled positives (100 pre-#234 + the 2 type-boost items) and the
 negative-control seed in ``eval/injection_gold.jsonl`` are committed,
 deterministic fixtures. The maintainer's REAL prompt log window is operator
 content and stays uncommitted (same convention as ``self-corpus-results.json``
@@ -305,7 +305,39 @@ def main() -> int:
         default=None,
         help="write the stable issue-126 report projection to " "this path",
     )
+    ap.add_argument(
+        "--moment-weights-neutral",
+        dest="moment_weights_neutral",
+        action="store_true",
+        help="AUTHORING-ONLY (issue #234 baseline measurement): pin "
+        "storelib.recall.type_preference to a neutral 1.0 multiplier for "
+        "this run so the report's per-moment metrics measure the lane "
+        "WITHOUT the per-moment type profiles. Refuses --profile-json-out "
+        "and the ratchet flags so a neutral run can never be pinned as a "
+        "fixture or serve as a scoring gate run; stamps the report "
+        "moment_weights=neutral.",
+    )
     args = ap.parse_args()
+    if args.moment_weights_neutral:
+        if args.profile_json_out:
+            ap.error(
+                "--moment-weights-neutral refuses --profile-json-out: a "
+                "weights-neutral run is a baseline-authoring measurement, "
+                "never a pinnable projection"
+            )
+        if args.compare_baseline:
+            ap.error(
+                "--moment-weights-neutral refuses --compare-baseline: a "
+                "weights-neutral run cannot serve as the drift ratchet"
+            )
+        if (
+            args.fail_under_precision is not None
+            or args.fail_under_false_injection is not None
+        ):
+            ap.error(
+                "--moment-weights-neutral refuses the ratchet flags: a "
+                "weights-neutral run cannot produce a gate verdict"
+            )
     if args.k < 1:
         ap.error(f"--k must be a positive integer, got {args.k}")
     for _stream in (sys.stdout, sys.stderr):
@@ -327,6 +359,22 @@ def main() -> int:
         load_gold,
     )
     from storelib.schema import connect  # noqa: E402
+
+    if args.moment_weights_neutral:
+        # Issue #234 authoring mode: both type_preference call sites resolve
+        # the name through storelib.recall's module globals at call time, so
+        # this pin (and ONLY this pin) makes the whole run weights-neutral
+        # without touching the production ranking code.
+        import storelib.recall as _recall_mod  # noqa: E402
+
+        _recall_mod.type_preference = (
+            lambda *a, **k: 1.0  # noqa: E731 - authoring-mode neutral pin
+        )
+        print(
+            "[eval] WEIGHTS-NEUTRAL authoring run (issue #234): "
+            "type_preference pinned to 1.0; not a scoring run",
+            file=sys.stderr,
+        )
 
     try:
         items = load_gold(args.gold)
@@ -375,6 +423,11 @@ def main() -> int:
             {key: it[key] for key in INJECTION_PER_ITEM_REPORT_KEYS} for it in per_item
         ],
     }
+    if args.moment_weights_neutral:
+        # Issue #234: only neutral authoring runs carry the stamp, so normal
+        # reports keep the pre-#234 report key set (metrics values still
+        # change with the reseed, as intended).
+        report["moment_weights"] = "neutral"
     text = json.dumps(report, ensure_ascii=False, indent=2)
     # Same line-terminator escaping sync.py's export applies (U+2028/2029/0085
     # are not escaped by json.dumps but terminate lines for splitlines-based

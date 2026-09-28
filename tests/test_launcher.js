@@ -99,7 +99,11 @@ function captureEvidence(payload, meta = payload) {
     let data = "";
     const child = {
         stdin: { write(value) { data += value; }, end() {}, on() {} },
-        on() {}, unref() {},
+        on(eventName, callback) {
+            if (eventName === "close" && typeof callback === "function") callback();
+            return this;
+        },
+        unref() {},
     };
     const ok = launch.recordEvidence(
         "codex", "convention-capture", payload, meta,
@@ -107,6 +111,162 @@ function captureEvidence(payload, meta = payload) {
     );
     return { ok, row: data ? JSON.parse(data) : null };
 }
+
+// Issue #170 acceptance seam: exercise the three closed launcher lanes with
+// deterministic IDs and the later #183 edit/user_prompt semantics preserved.
+function testEvidenceCaptureForHost(host) {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-evidence-" + host + "-"));
+    const session = "fixture-session-" + host;
+    const expected = JSON.parse(fs.readFileSync(
+        path.join(REPO, "tests", "fixtures", "evidence", "expected-" + host + ".json"),
+        "utf8",
+    ));
+    const refPath = "fixture/" + host + ".json";
+    const events = [
+        {
+            hook: "convention-capture",
+            payload: { session_id: session, tool_name: "Bash", tool_input: { command: "git status" } },
+        },
+        {
+            hook: "convention-capture",
+            payload: { session_id: session, tool_name: "Bash", tool_input: { command: "python -m unittest" } },
+        },
+        {
+            hook: "capture-failure",
+            payload: {
+                session_id: session, tool_name: "Bash",
+                tool_input: { command: "exit 1" }, error: "permission denied",
+            },
+        },
+        {
+            hook: "reflect",
+            payload: { session_id: session, stop_hook_active: false, result: "complete" },
+        },
+    ];
+    const env = {
+        ZMEM_ROOT: REPO,
+        ZMEM_STORE: path.join(scratch, "store.sqlite"),
+        ZMEM_DATA: scratch,
+        ZMEM_MODELS_DIR: path.join(scratch, "missing-models"),
+        ZMEM_MODEL_AUTODOWNLOAD: "0",
+        ZMEM_NAMESPACE: "project:issue170",
+        ZMEM_HOST: host,
+    };
+    const rows = [];
+    events.forEach((event, index) => {
+        let input = "";
+        const calls = [];
+        const child = {
+            stdin: {
+                write(value) { input += String(value); },
+                end() {},
+            },
+            on(eventName, callback) {
+                if (eventName === "close") callback();
+                return this;
+            },
+            unref() {},
+        };
+        const id = expected[index].id;
+        event.payload.evidence_id = id;
+        event.payload.ref_path = refPath;
+        if (event.hook === "capture-failure") event.payload.error = "permission denied";
+        const accepted = launch.recordEvidence(
+            host,
+            event.hook,
+            event.payload,
+            { session_id: session, evidence_id: id },
+            env,
+            () => "2026-09-10T00:00:00Z",
+            (...args) => { calls.push(args); return child; },
+        );
+        ok("issue #170 " + host + " writer accepts " + event.hook, accepted, "writer rejected");
+        eq("issue #170 " + host + " writer emits one detached call", calls.length, 1);
+        const row = input ? JSON.parse(input) : null;
+        rows.push(row);
+        eq("issue #170 " + host + " lane is closed host", row && row.lane, host);
+        eq("issue #170 " + host + " kind is deterministic", row && row.kind, expected[index].kind);
+        eq("issue #170 " + host + " moment is deterministic", row && row.moment, expected[index].moment);
+        eq("issue #170 " + host + " timestamp has second precision", row && row.ts, "2026-09-10T00:00:00Z");
+        eq("issue #170 " + host + " fixture ID is preserved", row && row.id, id);
+        ok("issue #170 " + host + " writer is detached", calls[0] && calls[0][2] && calls[0][2].detached,
+            JSON.stringify(calls[0] && calls[0][2]));
+        eq("issue #170 " + host + " writer stdio is ignored", JSON.stringify(calls[0] && calls[0][2] && calls[0][2].stdio),
+            JSON.stringify(["pipe", "ignore", "ignore"]));
+    });
+    const hydrated = rows.map((row) => ({
+        id: row.id,
+        session_id: row.session_id,
+        lane: row.lane,
+        moment: row.moment,
+        kind: row.kind,
+        ts: row.ts,
+        hash: crypto.createHash("sha256").update(`${row.kind}|${row.ts}|${row.excerpt}`).digest("hex"),
+        excerpt: row.excerpt,
+        ref_path: row.ref_path,
+        ref_offset: row.ref_offset,
+    }));
+    eq("issue #170 " + host + " four rows match committed expected fixture",
+        JSON.stringify(hydrated), JSON.stringify(expected));
+
+    // Preserve the later #183 edit classification alongside the canonical
+    // host fixture, whose two successful events intentionally use Bash.
+    let editInput = "";
+    const editChild = {
+        stdin: { write(value) { editInput += String(value); }, end() {} },
+        on(eventName, callback) {
+            if (eventName === "close" && typeof callback === "function") callback();
+            return this;
+        },
+        unref() {},
+    };
+    launch.recordEvidence(
+        host,
+        "convention-capture",
+        { session_id: session, tool_name: "Edit", tool_input: { file_path: "src/main.py" } },
+        { session_id: session, evidence_id: "00000000-0000-4000-8000-000000009999" },
+        env,
+        () => "2026-09-10T00:00:00Z",
+        () => editChild,
+    );
+    eq("issue #170 " + host + " preserves #183 edit kind", JSON.parse(editInput).kind, "edit");
+    fs.rmSync(scratch, { recursive: true, force: true });
+}
+
+function testEvidenceFailureIsolation() {
+    let attempts = 0;
+    const payload = {
+        session_id: "issue170-isolation",
+        tool_name: "Bash",
+        tool_input: { command: "git status" },
+    };
+    let threw = false;
+    let accepted = false;
+    try {
+        accepted = launch.recordEvidence(
+            "codex", "convention-capture", payload,
+            { session_id: payload.session_id, evidence_id: "00000000-0000-4000-8000-000000001899" },
+            { ZMEM_ROOT: REPO },
+            () => "2026-09-10T00:00:00Z",
+            () => { attempts++; throw new Error("writer unavailable"); },
+        );
+    } catch (error) {
+        threw = true;
+    }
+    eq("issue #170 writer failure returns fail-open false", accepted, false);
+    eq("issue #170 writer failure does not throw", threw, false);
+    eq("issue #170 writer failure attempts one spawn", attempts, 1);
+    const invalid = launch.recordEvidence(
+        "codex", "convention-capture", { tool_name: "Bash" }, {},
+        { ZMEM_ROOT: REPO }, () => "2026-09-10T00:00:00Z",
+        () => { throw new Error("must not spawn"); },
+    );
+    eq("issue #170 invalid writer payload fails open", invalid, false);
+}
+
+console.log("\n[issue #170] named evidence-writer acceptance seams");
+for (const host of ["claude", "codex", "zcode"]) testEvidenceCaptureForHost(host);
+testEvidenceFailureIsolation();
 
 {
     const nestedFailure = {

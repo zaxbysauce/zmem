@@ -108,3 +108,5 @@
 {"id": "neg-pt-status", "bucket": "negative-control", "moment": "pretool", "namespace": "project:eval-decision", "expect": "silent", "query": "git status"}
 {"id": "neg-pt-ls", "bucket": "negative-control", "moment": "pretool", "namespace": "project:eval-injection", "expect": "silent", "query": "ls -la"}
 {"id": "neg-sa-done", "bucket": "negative-control", "moment": "subagent", "namespace": "project:eval-decision", "expect": "silent", "query": "just say done when finished"}
+{"id": "ig-pt-tbconstraint", "bucket": "type-boost", "moment": "pretool", "namespace": "project:eval-typeboost", "expect": "inject", "must_include_ids": ["e0000000-0000-4000-8000-000000000071"], "query": "terraform apply zqtbalpha"}
+{"id": "ig-pt-tbdecision", "bucket": "type-boost", "moment": "pretool", "namespace": "project:eval-typeboost", "expect": "inject", "must_include_ids": ["e0000000-0000-4000-8000-000000000077"], "query": "gh pr merge zqtbbeta"}
