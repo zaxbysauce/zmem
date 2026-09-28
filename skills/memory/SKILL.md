@@ -1725,6 +1725,64 @@ completed one. This does *not* serialize against a live interactive session's
 own `add`/`recall` writes, which take no lock: still run `restore` when no
 session is actively writing.
 
+### purge — durably remove a memory's content (issue #255)
+```
+python <store.py> purge --id <id> [--id <id2> ...] [--scrub-backups --out-dir DIR] [--json]
+```
+`update`/`invalidate` **tombstone** a row — the plaintext survives in the row,
+the FTS index, side tables, derived copies and ledger files. `purge` is the
+operator primitive that actually removes content, and it takes **ids ONLY**.
+**Never pass secret text on a command line in a hooked session**: the evidence
+writer records tool-call input into `evidence` rows and would re-insert the
+fragment.
+
+What one purge does:
+- resolves the id plus its verified `update_of` predecessor chain and deletes
+  those `memory` rows, their FTS entries, their `memory_vec` rows (by
+  `memory_id`) and every id-keyed side-table row (`memory_link`, both
+  endpoints; `memory_entity`, `episode_memory`, `memory_evidence`,
+  `belief_head_source`, `belief_head_evidence`);
+- deletes evidence rows and entity/alias rows the purge orphaned (evidence a
+  surviving row still references is kept);
+- **rewrites, deletes, or refuses** derived copies that carry the text
+  verbatim: consolidation keepers (the `\n\n--- merged from <id> ---\n` block
+  is stripped and entities re-linked), belief heads (rebuilt from surviving
+  sources, or deleted when sourceless), and extractive episode-summary rows
+  (episodes that contained a purged member lose their summary row — expect
+  deletion, not surgical editing). A derived row that can be neither rewritten
+  nor deleted refuses the whole purge, naming the row;
+- compacts the store (FTS `'optimize'`, `VACUUM`, WAL checkpoint) and
+  **byte-verifies** the result: a case-insensitive scan of `store.sqlite` and
+  `-wal` must find no copy of the purged content. Exit **5** means the text
+  still lives somewhere outside the memory rows (the message names the
+  needle): typically an evidence row no memory references — the rescan that
+  owns those is issue #181;
+- scrubs the ids (and any needle-bearing entry) from the `<data>/ops/*.ledger`
+  delivery ledgers and removes orphaned `.ledger.tmp.*` partial writes. The
+  `.pending`/`.tasktext`/`.compact`/`.feedback.jsonl` ops sidecars are NOT
+  scrubbed (outside the ledger contract) — treat them as residue surfaces;
+- records the ids in the `purged_id` deny-list so `ingest-jsonl` will not
+  re-insert them from a peer export (child records referencing a purged id
+  are skipped or blanked, never fatal);
+- `--scrub-backups --out-dir DIR` applies the same removal inside every
+  `store-*.sqlite` **and** `prerestore-*.sqlite` snapshot in DIR, rewriting
+  files **in place** (never deleted, truncated, or renamed) and re-verifying
+  each with `integrity_check`.
+
+Locking: the full `restore` posture (maintenance → schema → backup →
+consolidate locks, plus a live-writer refusal), so nothing can write between
+the deletes and the byte verification.
+
+Exit codes: **0** purged and verified clean; **2** bad usage; **3** unknown
+id (named); **4** refused (lock or live writer); **5** residue remains (store
+or ledger); **6** compaction/scrub step failed.
+
+Caveats: `import-store.py --force` and `restore` from a pre-purge snapshot are
+explicit whole-store replacements — they supersede both the removal and the
+deny-list, so **re-run purge after either**. Surviving rows that still quote
+purged-content tokens (e.g. a mid-chain `update` successor, kept by design)
+are listed as WARNINGs in the summary.
+
 ### sweep — prune stale per-session cooldown sentinels
 ```
 python <store.py> sweep [--marker-dir DIR] [--max-age-days 7] [--dry-run]
