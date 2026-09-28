@@ -5,7 +5,7 @@ exactly those ids, deterministically, in a store that lives wherever the
 caller says — never the operator's home store (scripts/eval_runner.py passes
 an explicit --store path; CI uses a workspace-relative path).
 
-Layout: 70 rows across 11 namespaces, one fixed id per rowid:
+Layout: 82 rows across 12 namespaces, one fixed id per rowid:
     e0000000-0000-4000-8000-{rowid:012d}
 
   rowids  1-10  as-of chains   (5 topics x old/new; historical windows)
@@ -20,6 +20,9 @@ Layout: 70 rows across 11 namespaces, one fixed id per rowid:
   rowids 62-64  change heads   (issue #82: live successors with update_of)
   rowids 65-70  decision-point (issue #88: operation-adjacent hazard lessons,
                                 queried by prose + tool-command ops context)
+  rowids 71-82  type-boost     (issue #234: 1 constraint + 1 decision row with
+                                fact decoys, exercising the #126 per-moment
+                                type profiles on the pretool lane)
 
 Ids 1-50 are the frozen contract of the issue #64 gold set; 51+ extend it.
 
@@ -67,6 +70,7 @@ NS_RETRACT = "project:eval-retract"
 NS_POLAR = "project:eval-polarity"
 NS_CHANGE = "project:eval-change"
 NS_DECISION = "project:eval-decision"
+NS_TYPEBOOST = "project:eval-typeboost"
 
 BASE_ENV = {
     "ZMEM_MODEL_AUTODOWNLOAD": "0",
@@ -328,6 +332,58 @@ DECISION_ROWS = (
      "git worktree add ../check main"),
 )
 
+# Type-boost bucket (issue #234): the per-moment type profiles (#126) boost
+# `constraint` (pretool 1.25) and `decision` (pretool 1.20) hardest, but the
+# original corpus seeded neither type, so every precision_delta was exactly
+# 0.0 and the strict ratchet cell was unsatisfiable (amended in PR #230).
+# Two groups, each = 1 labeled row + 5 fact decoys; the pool (6) exceeds the
+# eval k (5) so the cut binds. Measured roles (see the frozen phase-4 runs):
+# the DECISION row is the cut-crosser — neutral rank 6 (out of the cut, item
+# precision 0.0), weighted rank 1 (in, 0.2), which alone supplies the +0.01
+# pretool precision_delta; the CONSTRAINT row renders in both bases
+# (neutral rank 3 -> weighted rank 1) and contributes the rank shift the mrr
+# movement rides on. The labeled rows seed at TYPEBOOST_LABELED_CONFIDENCE
+# (below the decoys' signal default) so the neutral ordering puts every
+# decoy above the labeled decision row. Distinctive zq-tokens keep the two
+# groups from cross-matching; contents are injection-pattern-free.
+# The labeled rows seed at a lower confidence than their decoys so that
+# UNWEIGHTED the labeled composite sits strictly below every decoy (out of
+# the k=5 cut) while staying above the 0.72 crossover (constraint 1.1628 /
+# fact 0.8372 = 1.389 => 1/1.389 = 0.72): WEIGHTED the pretool multiplier
+# flips the labeled row back into the cut. Confidence is the deterministic
+# lever — wording alone left the labeled row at neutral rank 2-3 of 6.
+TYPEBOOST_LABELED_CONFIDENCE = 0.75
+TYPEBOOST_CONSTRAINT_ROWS = (
+    (71, "constraint", "zqtbalpha guardrail: export the plan and require a "
+     "reviewer sign-off before any terraform apply against shared state",
+     "eval,typeboost"),
+    (72, "fact", "zqtbalpha note: terraform apply zqtbalpha dry runs print "
+     "the planned actions for the workspace every time", "eval,typeboost"),
+    (73, "fact", "zqtbalpha note: terraform apply zqtbalpha from the release "
+     "runner archives the log under the tag name", "eval,typeboost"),
+    (74, "fact", "zqtbalpha note: terraform apply zqtbalpha twice in a row "
+     "reports zero changes when the state is clean", "eval,typeboost"),
+    (75, "fact", "zqtbalpha note: terraform apply zqtbalpha with fresh "
+     "credentials avoids the stale-token provider error", "eval,typeboost"),
+    (76, "fact", "zqtbalpha note: terraform apply zqtbalpha queues a second "
+     "lock wait when another agent holds the state", "eval,typeboost"),
+)
+TYPEBOOST_DECISION_ROWS = (
+    (77, "decision", "zqtbbeta ruling: adopting the merge-queue-first flow "
+     "for every gh pr merge on release day, recorded for the team",
+     "eval,typeboost"),
+    (78, "fact", "zqtbbeta note: gh pr merge zqtbbeta on a draft PR fails "
+     "fast with a not-ready error from the queue", "eval,typeboost"),
+    (79, "fact", "zqtbbeta note: gh pr merge zqtbbeta after a rebase "
+     "re-runs the full check matrix on the group head", "eval,typeboost"),
+    (80, "fact", "zqtbbeta note: gh pr merge zqtbbeta prints the queue "
+     "position when checks are still pending", "eval,typeboost"),
+    (81, "fact", "zqtbbeta note: gh pr merge zqtbbeta with --auto leaves a "
+     "reminder comment on the pull request", "eval,typeboost"),
+    (82, "fact", "zqtbbeta note: gh pr merge zqtbbeta on a merged PR is a "
+     "no-op with an already-merged message", "eval,typeboost"),
+)
+
 
 # ------------------------------------------------------------------- EVAL_IDS
 
@@ -338,7 +394,8 @@ def _build_eval_ids() -> dict:
            "injection_row": {}, "ns_alpha": {}, "ns_beta": {},
            "contested_winner": {}, "contested_loser": {},
            "entity": {}, "fts": {}, "retraction": {}, "polarity": {},
-           "change_pred": {}, "change_head": {}, "decision": {}}
+           "change_pred": {}, "change_head": {}, "decision": {},
+           "typeboost": {}}
     for i in range(5):
         ids["asof_old"][ASOF_TOPICS[i]] = eval_id(2 * i + 1)
         ids["asof_new"][ASOF_TOPICS[i]] = eval_id(2 * i + 2)
@@ -359,7 +416,9 @@ def _build_eval_ids() -> dict:
         ids["change_head"][head_rowid] = eval_id(head_rowid)
     for rowid, content, _ops in DECISION_ROWS:
         ids["decision"][content.split()[0]] = eval_id(rowid)
-    ids["all"] = [eval_id(n) for n in range(1, 71)]
+    ids["typeboost"]["constraint"] = eval_id(TYPEBOOST_CONSTRAINT_ROWS[0][0])
+    ids["typeboost"]["decision"] = eval_id(TYPEBOOST_DECISION_ROWS[0][0])
+    ids["all"] = [eval_id(n) for n in range(1, 83)]
     return ids
 
 
@@ -409,15 +468,26 @@ def build_eval_store(dest: str) -> str:
     for _rowid, content, _ops in DECISION_ROWS:
         _add(dest, NS_DECISION, "lesson", "test", content, "eval,decision")
     _pin_decision_rows(dest)
+    # Issue #234: type-boost bucket, seeded last (CLI rowids 71-82) so the
+    # pre-#234 rowid arithmetic (61 at pin time; decision rows 65-70) is
+    # untouched; remapped to fixed ids the same way.
+    for _rowid, type_, content, tags in (TYPEBOOST_CONSTRAINT_ROWS + TYPEBOOST_DECISION_ROWS):
+        labeled = type_ != "fact"
+        _add(dest, NS_TYPEBOOST, type_, "test", content, tags,
+             confidence=TYPEBOOST_LABELED_CONFIDENCE if labeled else None)
+    _pin_typeboost_rows(dest)
     _verify(dest)
     return str(dest_path)
 
 
 def _add(store: str, ns: str, type_: str, signal: str, content: str,
-         tags: str) -> None:
-    r = _run(store, "add", "--namespace", ns, "--type", type_,
-             "--content", content, "--tags", tags, "--signal", signal,
-             "--source-ref", "session:eval-seed")
+         tags: str, confidence: float | None = None) -> None:
+    argv = ["add", "--namespace", ns, "--type", type_,
+            "--content", content, "--tags", tags, "--signal", signal,
+            "--source-ref", "session:eval-seed"]
+    if confidence is not None:
+        argv += ["--confidence", str(confidence)]
+    r = _run(store, *argv)
     if r.returncode != 0:
         raise RuntimeError(f"eval seed add failed rc={r.returncode} "
                            f"for {content[:40]!r}\n{r.stderr}")
@@ -627,6 +697,31 @@ def _pin_decision_rows(store: str) -> None:
         conn.close()
 
 
+def _pin_typeboost_rows(store: str) -> None:
+    """Issue #234: remap the type-boost rows (seeded last, CLI rowids
+    71-82) to their fixed eval ids, remapping the derived tables the CLI
+    wrote (same contract as _pin_decision_rows)."""
+    conn = sqlite3.connect(store)
+    try:
+        rows = conn.execute(
+            "SELECT id, rowid FROM memory WHERE namespace=? ORDER BY rowid",
+            (NS_TYPEBOOST,)).fetchall()
+        expected = TYPEBOOST_CONSTRAINT_ROWS + TYPEBOOST_DECISION_ROWS
+        if len(rows) != len(expected):
+            raise AssertionError(
+                f"eval corpus: expected {len(expected)} typeboost rows, "
+                f"found {len(rows)}")
+        for (old_id, rowid), (want_rowid, _t, _c, _g) in zip(rows, expected):
+            if rowid != want_rowid:
+                raise AssertionError(
+                    f"eval corpus: typeboost row landed at rowid {rowid}, "
+                    f"expected {want_rowid} (seed order drifted)")
+            _remap_id(conn, old_id, eval_id(want_rowid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _verify(store: str) -> None:
     conn = sqlite3.connect(store)
     try:
@@ -660,18 +755,36 @@ def _verify(store: str) -> None:
             "SELECT count(*) FROM memory WHERE namespace=? AND "
             "superseded_at IS NULL",
             (NS_DECISION,)).fetchone()[0]
+        # Issue #234: type-boost census — the pool MUST contain the two
+        # boosted types or the per-moment profiles again measure nothing.
+        tb_types = dict(conn.execute(
+            "SELECT type, COUNT(*) FROM memory WHERE namespace=? "
+            "GROUP BY type", (NS_TYPEBOOST,)).fetchall())
+        n_tb_live = conn.execute(
+            "SELECT count(*) FROM memory WHERE namespace=? AND "
+            "superseded_at IS NULL",
+            (NS_TYPEBOOST,)).fetchone()[0]
     finally:
         conn.close()
-    if n_total != 70:
-        raise AssertionError(f"eval corpus: expected 70 rows, got {n_total}")
+    if n_total != 82:
+        raise AssertionError(f"eval corpus: expected 82 rows, got {n_total}")
     # 5 as-of old + 5 contested losers + 2 retracted + 3 change predecessors
-    # are tombstoned; 70 - 15 = 55 live.
-    if n_live != 55:
-        raise AssertionError(f"eval corpus: expected 55 live rows, got {n_live}")
+    # are tombstoned; 82 - 15 = 67 live.
+    if n_live != 67:
+        raise AssertionError(f"eval corpus: expected 67 live rows, got {n_live}")
     if n_decision != len(DECISION_ROWS):
         raise AssertionError(
             f"eval corpus: expected {len(DECISION_ROWS)} live decision rows, "
             f"got {n_decision}")
+    if tb_types.get("constraint", 0) != 1 or tb_types.get("decision", 0) != 1:
+        raise AssertionError(
+            f"eval corpus: typeboost bucket must hold exactly 1 constraint "
+            f"and 1 decision row (got {tb_types}) — the #234 reseed "
+            f"regressed")
+    if n_tb_live != len(TYPEBOOST_CONSTRAINT_ROWS) + len(TYPEBOOST_DECISION_ROWS):
+        raise AssertionError(
+            f"eval corpus: expected {len(TYPEBOOST_CONSTRAINT_ROWS) + len(TYPEBOOST_DECISION_ROWS)} "
+            f"live typeboost rows, got {n_tb_live}")
     if n_ent == 0:
         raise AssertionError("eval corpus: no entity links were derived")
     if n_contradicts != 16:  # 10 contested + 6 polarity (both directions x3)
