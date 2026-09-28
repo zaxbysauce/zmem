@@ -130,9 +130,15 @@ def _resolve(conn: sqlite3.Connection, ids: list[str]) -> dict[str, Any]:
             rows[r["id"]] = dict(r)
 
     ph = _placeholders(chain) if chain else "NULL"
-    successor_updates = [dict(r) for r in conn.execute(
-        "SELECT id, content FROM memory WHERE update_of IN (%s)" % ph,
-        chain or [None])]
+    # Bind-safe on an empty chain (all ids unknown / already purged): the
+    # two IN () queries are skipped entirely so _resolve RETURNS an empty
+    # result instead of raising a binding-count error — exit 3 and the
+    # snapshot "skipped (no purged id present)" path must stay reachable.
+    successor_updates: list[dict[str, Any]] = []
+    if chain:
+        successor_updates = [dict(r) for r in conn.execute(
+            "SELECT id, content FROM memory WHERE update_of IN (%s)" % ph,
+            chain)]
 
     keepers: list[dict[str, Any]] = []
     for r in conn.execute(
@@ -145,11 +151,11 @@ def _resolve(conn: sqlite3.Connection, ids: list[str]) -> dict[str, Any]:
             keepers.append({"row": dict(r), "purged": hit, "merged": mids})
 
     heads: list[dict[str, Any]] = []
-    if _table_exists(conn, "belief_head_source"):
+    if chain and _table_exists(conn, "belief_head_source"):
         q = ("SELECT DISTINCT h.* FROM belief_head h "
              "JOIN belief_head_source s ON s.head_id = h.id "
              "WHERE s.source_id IN (%s)" % ph)
-        for r in conn.execute(q, chain or [None]):
+        for r in conn.execute(q, chain):
             heads.append(dict(r))
 
     summary_deletes: list[dict[str, Any]] = []
@@ -443,6 +449,14 @@ def _needles(conn: sqlite3.Connection, applied: dict[str, Any]) -> list[str]:
     if _table_exists(conn, "belief_head"):
         for r in conn.execute("SELECT content FROM belief_head"):
             surviving |= _tokens(r["content"] or "")
+    # The store's own DDL vocabulary (CREATE TABLE/INDEX/VIRTUAL TABLE text in
+    # sqlite_schema) outlives every purge and byte-matches ordinary words
+    # ("namespace", "confidence", "evidence", ...) — those tokens are not
+    # purge residue by definition, or purging any content that mentions a
+    # schema word would false-exit 5 on a fully-removed store.
+    for r in conn.execute(
+            "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL"):
+        surviving |= _tokens(r["sql"] or "")
 
     needles: set[str] = set()
     for pid in chain:
@@ -465,8 +479,14 @@ def compact_and_verify(store_path: Path, needles: list[str]) -> dict[str, int]:
 
     c = _open()
     try:
-        c.execute("INSERT INTO memory_fts(memory_fts) VALUES('optimize')")
-        c.commit()
+        # Old snapshots may predate the FTS table entirely; the delete trigger
+        # is what keeps a real store in sync, so optimize only when present.
+        has_fts = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_fts'"
+        ).fetchone() is not None
+        if has_fts:
+            c.execute("INSERT INTO memory_fts(memory_fts) VALUES('optimize')")
+            c.commit()
     finally:
         c.close()
     c = _open()
@@ -512,7 +532,6 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
     for path in ops.glob("*.ledger.tmp.*"):
         path.unlink()
         stats["tmp_removed"] += 1
-    low_needles = [n for n in needles]
     for path in ops.glob("*.ledger"):
         doc = json.loads(path.read_text(encoding="utf-8"))
         entries = doc.get("entries")
@@ -525,7 +544,7 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
                     stats["entries_dropped"] += 1
                     continue
                 text = str(e.get("text") or "").lower()
-                if any(n in text for n in low_needles):
+                if any(n in text for n in needles):
                     stats["entries_dropped"] += 1
                     continue
             kept.append(e)
@@ -568,6 +587,16 @@ def _scrub_snapshot(path: Path, chain: list[str],
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA busy_timeout=30000")
+        # Pre-v9 snapshots lack the lineage/dedup columns the resolution
+        # reads; fail that snapshot with a named remediation, not a traceback.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
+        missing_cols = {"update_of", "merged_from", "content_norm"} - cols
+        if missing_cols:
+            raise RuntimeError(
+                "snapshot %s predates the v9 schema (missing %s); cannot "
+                "scrub it in place - restore it to a scratch store, or "
+                "delete it and re-run --scrub-backups" % (
+                    path.name, ", ".join(sorted(missing_cols))))
         res = _resolve(conn, chain)
         res["missing"] = []  # ids absent from an older snapshot are fine
         res["chain"] = [i for i in res["chain"]
@@ -644,7 +673,15 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                   "is running; re-run when it finishes", file=sys.stderr)
             return 4
         b_token = _acquire_lock("backup", BACKUP_LOCK_STALE_SECONDS)
+        if b_token is None:
+            print("[zmem] purge REFUSED: a backup is currently running - "
+                  "re-run when it finishes", file=sys.stderr)
+            return 4
         c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+        if c_token is None:
+            print("[zmem] purge REFUSED: a consolidation is currently "
+                  "running - re-run when it finishes", file=sys.stderr)
+            return 4
         live = _cleanup_stale_writer_leases()
         if live:
             print("[zmem] purge REFUSED: a normal writer is currently "
