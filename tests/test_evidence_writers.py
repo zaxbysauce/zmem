@@ -305,8 +305,10 @@ class CliEvidenceTest(unittest.TestCase):
             self.assertEqual(rows[1]["moment"], "user_prompt")
             self.assertEqual(list(rows[0]), [
                 "id", "session_id", "lane", "moment", "kind", "ts",
-                "excerpt", "ref_path", "ref_offset",
+                "excerpt", "ref_path", "ref_offset", "untrusted", "content_type",
             ])
+            self.assertTrue(rows[0]["untrusted"])
+            self.assertEqual(rows[0]["content_type"], "untrusted_evidence")
             shown = _run_store(env, [
                 "evidence", "show", "--namespace", "project:issue170",
                 "--id", first["id"], "--json",
