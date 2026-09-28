@@ -28,6 +28,7 @@ from storelib.evidence import (
     EVIDENCE_KINDS,
     EVIDENCE_LANES,
     EVIDENCE_MOMENTS,
+    normalize_evidence_ids,
     sweep_evidence,
     write_evidence,
 )
@@ -610,19 +611,16 @@ def _parse_evidence_ids(value: str | None) -> list[str]:
     """Parse the comma-separated add/update association flag."""
     if value is None:
         return []
-    ids = [part.strip() for part in value.split(",")]
-    if any(not evidence_id for evidence_id in ids):
-        raise argparse.ArgumentTypeError(
-            "evidence ids must not contain empty tokens"
+    try:
+        return normalize_evidence_ids(
+            value.split(","), error_type=argparse.ArgumentTypeError
         )
-    seen: set[str] = set()
-    for evidence_id in ids:
-        if evidence_id in seen:
+    except argparse.ArgumentTypeError as exc:
+        if str(exc) == "evidence id is empty":
             raise argparse.ArgumentTypeError(
-                f"duplicate evidence id: {evidence_id}"
-            )
-        seen.add(evidence_id)
-    return sorted(ids)
+                "evidence ids must not contain empty tokens"
+            ) from exc
+        raise
 
 
 def cmd_query_rewrite(*, prompt: str, session_id: str, namespace: str) -> int:

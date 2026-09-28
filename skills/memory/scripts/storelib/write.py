@@ -849,18 +849,10 @@ def _validated_evidence_ids(
     conn: sqlite3.Connection, evidence_ids: list[str] | tuple[str, ...] | None
 ) -> list[str]:
     """Canonicalize and prevalidate association endpoints before write effects."""
-    ids = [str(value).strip() for value in (evidence_ids or [])]
-    for evidence_id in ids:
-        if not evidence_id:
-            raise ValueError("evidence id is empty")
-    seen: set[str] = set()
-    for evidence_id in ids:
-        if evidence_id in seen:
-            raise ValueError(f"duplicate evidence id: {evidence_id}")
-        seen.add(evidence_id)
-    ids.sort()
+    from storelib.evidence import _missing_evidence_ids, normalize_evidence_ids
+
+    ids = normalize_evidence_ids(evidence_ids)
     if ids:
-        from storelib.evidence import _missing_evidence_ids
         missing = _missing_evidence_ids(conn, ids)
         if missing:
             raise ValueError(f"evidence id not found: {missing[0]}")

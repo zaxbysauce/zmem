@@ -218,6 +218,63 @@ class EvidenceAssociationWriteTest(_StoreCase):
         ):
             _parse_evidence_ids("evidence-a,evidence-a")
 
+    def test_evidence_id_normalizer_boundaries(self):
+        from storelib.cli import _parse_evidence_ids
+
+        ids = [f"evidence-{index:03d}" for index in range(256)]
+        self.assertEqual(evidence.normalize_evidence_ids(list(reversed(ids))), ids)
+        self.assertEqual(_parse_evidence_ids(",".join(reversed(ids))), ids)
+        with self.assertRaisesRegex(
+            ValueError, "^at most 256 evidence ids"
+        ):
+            evidence.normalize_evidence_ids(ids + ["evidence-256"])
+        with self.assertRaisesRegex(
+            argparse.ArgumentTypeError, "^at most 256 evidence ids"
+        ):
+            _parse_evidence_ids(",".join(ids + ["evidence-256"]))
+
+    def test_writer_and_attach_reject_257_without_mutation(self):
+        too_many = [f"evidence-{index:03d}" for index in range(257)]
+        before_memory = self.conn.execute(
+            "SELECT COUNT(*) FROM memory"
+        ).fetchone()[0]
+        with self.assertRaisesRegex(ValueError, "^at most 256 evidence ids"):
+            write.add_memory(
+                self.conn,
+                namespace="project:evidence-association",
+                type_="fact",
+                content="too many evidence ids",
+                signal="test",
+                evidence_ids=too_many,
+            )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0],
+            before_memory,
+        )
+
+        memory_id = str(write.add_memory(
+            self.conn,
+            namespace="project:evidence-association",
+            type_="fact",
+            content="association cap target",
+            signal="test",
+        ))
+        before_pairs = self.conn.execute(
+            "SELECT COUNT(*) FROM memory_evidence WHERE memory_id=?",
+            (memory_id,),
+        ).fetchone()[0]
+        with self.assertRaisesRegex(ValueError, "^at most 256 evidence ids"):
+            evidence.attach_memory_evidence(
+                self.conn, memory_id=memory_id, evidence_ids=too_many
+            )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM memory_evidence WHERE memory_id=?",
+                (memory_id,),
+            ).fetchone()[0],
+            before_pairs,
+        )
+
     def test_evidence_for_accepts_positional_and_legacy_option_ids(self):
         evidence_id = "00000000-0000-4000-8000-000000000705"
         self._evidence(evidence_id)

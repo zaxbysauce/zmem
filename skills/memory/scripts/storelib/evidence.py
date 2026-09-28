@@ -29,6 +29,10 @@ EVIDENCE_MAX_EXCERPT_CHARS = 400
 EVIDENCE_INPUT_MAX_EXCERPT_CHARS = 4096
 EVIDENCE_DEFAULT_RETENTION_DAYS = 30
 EVIDENCE_DEFAULT_CAP = 50_000
+# Keep one memory write's association list bounded at every local trust
+# boundary. The CLI, writer, and direct association helper all use the
+# canonical normalizer below so their count and ordering rules cannot drift.
+MAX_EVIDENCE_IDS_PER_WRITE = 256
 # Keep untrusted ``IN`` query inputs below SQLite's common host-parameter
 # ceilings (999 in legacy builds, 32766 in newer builds).  These are
 # conservative per-query limits; custom builds with a lower compiled cap may
@@ -48,6 +52,33 @@ EVIDENCE_KINDS = (
 _UTC_SECOND_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _UUID_SHAPED_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 _SQLITE_INT_MAX = 2**63 - 1
+
+
+def normalize_evidence_ids(
+    evidence_ids: list[object] | tuple[object, ...] | None,
+    *,
+    error_type: type[Exception] = ValueError,
+) -> list[str]:
+    """Canonicalize and bound evidence IDs for one memory write.
+
+    ``error_type`` lets the CLI retain its ``ArgumentTypeError`` contract while
+    writer and direct association callers continue to raise ``ValueError``.
+    Endpoint existence is checked separately at each write trust boundary.
+    """
+    ids = [str(value).strip() for value in (evidence_ids or [])]
+    for evidence_id in ids:
+        if not evidence_id:
+            raise error_type("evidence id is empty")
+    seen: set[str] = set()
+    for evidence_id in ids:
+        if evidence_id in seen:
+            raise error_type(f"duplicate evidence id: {evidence_id}")
+        seen.add(evidence_id)
+    if len(ids) > MAX_EVIDENCE_IDS_PER_WRITE:
+        raise error_type(
+            "at most 256 evidence ids may be attached to one memory write"
+        )
+    return sorted(ids)
 
 
 def _validate_ts(value: str, field: str = "ts") -> str:
@@ -291,16 +322,7 @@ def attach_memory_evidence(
     association from partially changing a caller-owned transaction. Returns
     the number of newly inserted pairs; existing pairs contribute zero.
     """
-    ids = [str(value).strip() for value in evidence_ids]
-    for evidence_id in ids:
-        if not evidence_id:
-            raise ValueError("evidence id is empty")
-    seen: set[str] = set()
-    for evidence_id in ids:
-        if evidence_id in seen:
-            raise ValueError(f"duplicate evidence id: {evidence_id}")
-        seen.add(evidence_id)
-    ids.sort()
+    ids = normalize_evidence_ids(evidence_ids)
     if not ids:
         return 0
 

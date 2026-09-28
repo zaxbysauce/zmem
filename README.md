@@ -220,10 +220,10 @@ Association rows are removed in the same transaction, and stale associations
 are repaired. An invalid retention setting disables that sweep rather than
 guessing a limit.
 
-`add` and `update` accept `--evidence ID[,ID...]`. The writer emits any
-capture-policy advisory before opening its transaction, then validates every
-supplied ID before memory mutation and links it to the resulting memory before
-commit;
+`add` and `update` accept `--evidence ID[,ID...]`, with at most 256 evidence
+IDs per memory write. The writer emits any capture-policy advisory before
+opening its transaction, then validates every supplied ID before memory
+mutation and links it to the resulting memory before commit;
 repeated links are idempotent. `evidence for MEMORY_ID --json` returns that
 memory's namespace and its hash-free evidence rows; the legacy
 `evidence for --memory-id MEMORY_ID --json` form is also accepted. If both forms

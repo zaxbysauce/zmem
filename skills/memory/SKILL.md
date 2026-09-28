@@ -2068,10 +2068,10 @@ Associations are deleted with their evidence and stale associations are swept.
 Invalid retention settings disable the evidence sweep rather than selecting a
 surprising limit.
 
-`add` and `update` accept `--evidence ID[,ID...]`. Capture-policy advisories
-are emitted before the transaction opens; the writer then validates each
-supplied ID before memory mutation and attaches the ids to the resulting
-memory before commit; existing
+`add` and `update` accept `--evidence ID[,ID...]` with at most 256 evidence
+IDs per memory write. Capture-policy advisories are emitted before the
+transaction opens; the writer then validates each supplied ID before memory
+mutation and attaches the ids to the resulting memory before commit; existing
 pairs are ignored. Explicit JSON `recall`, `recent`, and `recall --explain`
 rows include sorted `evidence_ids`. Passive injection and human fenced output
 do not gain that field. `evidence for MEMORY_ID --json` (or the legacy
