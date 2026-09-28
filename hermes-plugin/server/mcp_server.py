@@ -1080,6 +1080,73 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return True
         return "user:global" in (token_config.namespaces or frozenset())
 
+    def _scoped_evidence_denial(
+        namespace: Optional[str], detail: str
+    ) -> dict[str, Any]:
+        """Return the stable non-oracular scoped evidence refusal."""
+        return {
+            "error": NAMESPACE_NOT_ALLOWED,
+            "namespace": namespace,
+            "detail": detail,
+        }
+
+    def _is_expected_scoped_evidence_denial(result: dict[str, Any]) -> bool:
+        """Recognize only the store's explicit non-oracular denial marker."""
+        return (
+            result.get("returncode") == 1
+            and result.get("stderr") == "namespace_not_allowed\n"
+        )
+
+    def _scoped_evidence_failure_class(
+        result: Optional[dict[str, Any]], *, invalid_response: bool = False,
+        namespace_mismatch: bool = False,
+    ) -> str:
+        """Return a fixed, non-request-derived class for server diagnostics."""
+        if invalid_response:
+            return "invalid_response"
+        if namespace_mismatch:
+            return "namespace_mismatch"
+        returncode = result.get("returncode") if result else None
+        if returncode == 124:
+            return "timeout"
+        if returncode == 503:
+            return "overloaded"
+        if returncode == 2:
+            return "invalid_request"
+        if isinstance(returncode, int) and not isinstance(returncode, bool):
+            if returncode < 0:
+                return "terminated"
+            return "store_failure"
+        return "unknown_failure"
+
+    def _scoped_evidence_returncode(
+        result: Optional[dict[str, Any]],
+    ) -> Optional[int]:
+        """Keep the log field numeric and bounded to subprocess status space."""
+        returncode = result.get("returncode") if result else None
+        if (isinstance(returncode, int) and not isinstance(returncode, bool)
+                and -128 <= returncode <= 255):
+            return returncode
+        return None
+
+    def _scoped_evidence_operational_denial(
+        namespace: Optional[str], detail: str, *,
+        result: Optional[dict[str, Any]] = None,
+        invalid_response: bool = False,
+        namespace_mismatch: bool = False,
+    ) -> dict[str, Any]:
+        """Hide failures while logging only fixed operational metadata."""
+        failure_class = _scoped_evidence_failure_class(
+            result, invalid_response=invalid_response,
+            namespace_mismatch=namespace_mismatch,
+        )
+        logger.warning(
+            "zmem_mcp_scoped_evidence_lookup_failed "
+            "failure_class=%s returncode=%s",
+            failure_class, _scoped_evidence_returncode(result),
+        )
+        return _scoped_evidence_denial(namespace, detail)
+
     mcp = FastMCP(
         "zmem",
         host=host,
@@ -1159,6 +1226,110 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         args += _namespace_flag(namespace)
         args += _legacy_unscoped_flag(namespace)
         return _parse_results(await _run_store_async(args))
+
+    @mcp.tool()
+    async def evidence_for(memory_id: str) -> dict[str, Any]:
+        """Return evidence for one memory after deriving and checking its namespace."""
+        mid = (memory_id or "").strip()
+        if not mid:
+            return _error("memory_id is required")
+        scoped_detail = "memory is not associated with an allowed namespace"
+        if token_config.scoped:
+            result_args = ["evidence", "scoped-for", "--memory-id", mid]
+            for allowed_namespace in sorted(token_config.namespaces or ()):
+                result_args += ["--namespace", allowed_namespace]
+            result_args += ["--json"]
+        else:
+            result_args = ["evidence", "for", "--memory-id", mid, "--json"]
+        result = await _run_store_async(result_args)
+        if not result["ok"]:
+            if token_config.scoped:
+                if _is_expected_scoped_evidence_denial(result):
+                    return _scoped_evidence_denial(None, scoped_detail)
+                return _scoped_evidence_operational_denial(
+                    None, scoped_detail, result=result
+                )
+            return _error(_sanitize_store_error(result) or "memory id not found")
+        try:
+            payload = json.loads(result["stdout"])
+            namespace = str(payload.get("namespace") or "")
+        except (json.JSONDecodeError, AttributeError):
+            if token_config.scoped:
+                return _scoped_evidence_operational_denial(
+                    None, scoped_detail, result=result, invalid_response=True
+                )
+            return _error("invalid evidence response")
+        if not isinstance(payload, dict):
+            if token_config.scoped:
+                return _scoped_evidence_operational_denial(
+                    None, scoped_detail, result=result, invalid_response=True
+                )
+            return _error("invalid evidence response")
+        denied = _guard_namespace(namespace)
+        if denied:
+            if token_config.scoped:
+                return _scoped_evidence_operational_denial(
+                    None, scoped_detail, result=result, namespace_mismatch=True
+                )
+            return denied
+        return payload
+
+    @mcp.tool()
+    async def evidence_show(
+        id: str, namespace: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Show one evidence row without leaking foreign-ID existence.
+
+        Scoped tokens receive one identical namespace denial for both a missing
+        id and an id unassociated with their allowed namespace.  Operators are
+        unscoped and retain the existing not-found response.
+        """
+        evidence_id = (id or "").strip()
+        if not evidence_id:
+            return _error("id is required")
+        denied = _guard_namespace(namespace)
+        if denied:
+            return denied
+        if token_config.scoped:
+            scoped_namespace = (namespace or "").strip()
+            scoped_detail = "evidence id is not associated with the requested namespace"
+            result = await _run_store_async([
+                "evidence", "scoped-show", "--namespace", scoped_namespace,
+                "--id", evidence_id, "--json",
+            ])
+            if not result["ok"]:
+                if _is_expected_scoped_evidence_denial(result):
+                    return _scoped_evidence_denial(scoped_namespace, scoped_detail)
+                return _scoped_evidence_operational_denial(
+                    scoped_namespace, scoped_detail, result=result
+                )
+        else:
+            result = await _run_store_async([
+                "evidence", "show-with-associations", "--namespace", namespace or "",
+                "--id", evidence_id, "--json",
+            ])
+            if not result["ok"]:
+                detail = _sanitize_store_error(result)
+                if detail in {"evidence id not found", "[zmem] evidence id not found"}:
+                    return {"error": "evidence id not found"}
+                return _error(detail or "evidence lookup failed")
+        try:
+            payload = json.loads(result["stdout"])
+        except (json.JSONDecodeError, TypeError):
+            if token_config.scoped:
+                return _scoped_evidence_operational_denial(
+                    scoped_namespace, scoped_detail, result=result,
+                    invalid_response=True,
+                )
+            return _error("invalid evidence response")
+        if not isinstance(payload, dict):
+            if token_config.scoped:
+                return _scoped_evidence_operational_denial(
+                    scoped_namespace, scoped_detail, result=result,
+                    invalid_response=True,
+                )
+            return _error("invalid evidence response")
+        return payload
 
     @mcp.tool()
     async def add(

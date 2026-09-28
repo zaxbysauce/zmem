@@ -19,6 +19,7 @@ import glob
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.entity import entities_for_memory, entities_for_memories, entity_match_ids
+from storelib.evidence import evidence_ids_for_memories
 from storelib.links import expand_recall_links, graph_seed_ids
 from storelib import beliefs as _beliefs
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
@@ -41,6 +42,17 @@ from storelib.cross_encoder import (maybe_rerank as _cross_maybe_rerank,
                                     emit_reason as _ce_emit_reason,
                                     passive_reorder_promoted
                                     as _ce_passive_promoted)
+
+
+def _attach_evidence_ids(
+    conn: sqlite3.Connection, rows: list[dict]
+) -> None:
+    """Attach association IDs to a rendered result set in bounded batches."""
+    evidence_by_memory = evidence_ids_for_memories(
+        conn, [row["id"] for row in rows]
+    )
+    for row in rows:
+        row["evidence_ids"] = evidence_by_memory.get(row["id"], [])
 
 
 def _shadow_log_path() -> str | None:
@@ -2771,6 +2783,8 @@ def _recall_memory_impl(
         # without parsing stderr. In-repo consumers unwrap via
         # storelib.inject.envelope_results (hooks body, Hermes, MCP); a bare
         # list keeps working for every library caller (the return value below).
+        if not for_injection:
+            _attach_evidence_ids(conn, results)
         tokens_used = sum(estimate_tokens(r.get("content", "") or "") for r in results)
         envelope = {
             "results": results,
@@ -3674,6 +3688,8 @@ def explain_recall(
         "verdicts": verdicts,
     }
     if as_json:
+        if not for_injection:
+            _attach_evidence_ids(conn, results)
         tokens_used = sum(estimate_tokens(r.get("content", "") or "")
                           for r in results)
         injection_risk_count = sum(
@@ -4068,6 +4084,8 @@ def _recent_memory_impl(
                         disabled=no_telemetry)
     if as_json:
         # v13 (issue #65, 10.8/10.9): read envelope, same shape as recall.
+        if not for_injection:
+            _attach_evidence_ids(conn, results)
         tokens_used = sum(estimate_tokens(r.get("content", "") or "") for r in results)
         envelope = {
             "results": results,

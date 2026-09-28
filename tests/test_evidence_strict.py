@@ -277,6 +277,19 @@ class StrictStagingAndLegacyTest(_StrictEvidenceCase):
 
 
 class StrictReferenceAtomicityTest(_StrictEvidenceCase):
+    def test_duplicate_evidence_primary_keys_reject(self):
+        evidence_id = _uuid(1299)
+        path = self.root / "duplicate-evidence.jsonl"
+        _write_rows(path, [_evidence_row(evidence_id), _evidence_row(evidence_id)])
+        diagnostic = io.StringIO()
+        with contextlib.redirect_stderr(diagnostic):
+            result = sync.cmd_ingest_jsonl_strict(
+                self.conn, in_path=str(path), source_ref=None,
+            )
+        self.assertEqual(result, 2)
+        self.assertIn("duplicate evidence primary key", diagnostic.getvalue())
+        self._assert_empty("evidence")
+
     def test_duplicate_association_and_membership_primary_keys_reject(self):
         memory_id = _uuid(1301)
         evidence_id = _uuid(1302)

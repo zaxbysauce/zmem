@@ -170,6 +170,17 @@ class _PreV14Evidence(Exception):
     """Internal sentinel for a genuinely absent pre-v14 table set."""
 
 
+class _MemoryEvidenceEndpointMissing(ValueError):
+    def __init__(self, lineno: int) -> None:
+        self.lineno = lineno
+        super().__init__("memory_evidence endpoint not found")
+
+
+def _missing_memory_evidence_endpoint(obj: dict) -> _MemoryEvidenceEndpointMissing:
+    """Format an association endpoint failure with its physical input line."""
+    return _MemoryEvidenceEndpointMissing(obj["_source_lineno"])
+
+
 def _cmd_export_jsonl_body(
     conn: sqlite3.Connection,
     *,
@@ -1430,11 +1441,13 @@ def _strict_staged_rows(spool: tempfile.SpooledTemporaryFile) -> list[tuple[str,
     spool.seek(0)
     text = io.TextIOWrapper(spool, encoding="utf-8", newline="\n")
     rows: list[tuple[str, dict]] = []
+    physical_lineno = 0
     try:
         while True:
             raw_line = text.readline(MAX_LINE_CHARS + 1)
             if raw_line == "":
                 break
+            physical_lineno += 1
             if len(raw_line) > MAX_LINE_CHARS:
                 if not raw_line.endswith("\n"):
                     while True:
@@ -1452,20 +1465,25 @@ def _strict_staged_rows(spool: tempfile.SpooledTemporaryFile) -> list[tuple[str,
             obj = json.loads(line, object_pairs_hook=_strict_object_pairs)
             if not isinstance(obj, dict):
                 raise ValueError("line is not a JSON object")
-            lineno = len(rows) + 1
+            lineno = physical_lineno
             if "table" in obj:
                 table_obj = _strict_table_for_object(obj, lineno)
+                table_obj["_source_lineno"] = lineno
                 rows.append((str(table_obj["table"]), table_obj))
                 continue
             kind = obj.get("kind", "memory")
             if kind == "episode":
                 _validate_episode_row(obj, lineno)
+                obj["_source_lineno"] = lineno
                 rows.append(("episode", obj))
             elif kind == "episode_memory":
                 _validate_membership_row(obj, lineno)
+                obj["_source_lineno"] = lineno
                 rows.append(("episode_memory", obj))
             elif kind == "memory":
-                rows.append(("memory", _validate_sync_row(obj, lineno)))
+                memory = _validate_sync_row(obj, lineno)
+                memory["_source_lineno"] = lineno
+                rows.append(("memory", memory))
             else:
                 raise ValueError(f"unknown kind {kind!r}")
     finally:
@@ -1522,35 +1540,32 @@ def _strict_ingest_staged(
     # take the main path below; evidence ids are also skipped so an export
     # captured before purge cannot resurrect an orphaned excerpt.
     purged_ids = _purged_ids(conn)
+    available_memory = memory_ids | existing_memory | purged_ids
+    available_episode = episode_ids | existing_episode
+    available_evidence = evidence_ids | existing_evidence | purged_ids
     for table, obj in rows:
         if table == "episode" and obj.get("summary_memory_id"):
-            if obj["summary_memory_id"] not in (
-                    memory_ids | existing_memory | purged_ids):
+            if obj["summary_memory_id"] not in available_memory:
                 raise ValueError("episode summary references an unknown memory")
         elif table == "memory":
             for entry in obj.get("_links", []):
-                if entry["dst"] not in (
-                        memory_ids | existing_memory | purged_ids):
+                if entry["dst"] not in available_memory:
                     raise ValueError("memory link references an unknown memory")
         elif table == "episode_memory":
-            if obj["episode_id"] not in episode_ids | existing_episode:
+            if obj["episode_id"] not in available_episode:
                 raise ValueError("episode_memory references an unknown episode")
-            if obj["memory_id"] not in (
-                    memory_ids | existing_memory | purged_ids):
+            if obj["memory_id"] not in available_memory:
                 raise ValueError("episode_memory references an unknown memory")
         elif table == "episode_evidence":
-            if obj["episode_id"] not in episode_ids | existing_episode:
+            if obj["episode_id"] not in available_episode:
                 raise ValueError("episode_evidence references an unknown episode")
-            if obj["evidence_id"] not in (
-                    evidence_ids | existing_evidence | purged_ids):
+            if obj["evidence_id"] not in available_evidence:
                 raise ValueError("episode_evidence references unknown evidence")
         elif table == "memory_evidence":
-            if obj["memory_id"] not in (
-                    memory_ids | existing_memory | purged_ids):
-                raise ValueError("memory_evidence references an unknown memory")
-            if obj["evidence_id"] not in (
-                    evidence_ids | existing_evidence | purged_ids):
-                raise ValueError("memory_evidence references unknown evidence")
+            if obj["memory_id"] not in available_memory:
+                raise _missing_memory_evidence_endpoint(obj)
+            if obj["evidence_id"] not in available_evidence:
+                raise _missing_memory_evidence_endpoint(obj)
 
     savepoint = "zmem_strict_ingest"
     own_transaction = not conn.in_transaction
@@ -1694,7 +1709,7 @@ def _strict_ingest_staged(
                     "SELECT 1 FROM evidence WHERE id=?", (obj["evidence_id"],)
                 ).fetchone()
                 if parent is None or evidence is None:
-                    raise ValueError("memory_evidence reference disappeared during import")
+                    raise _missing_memory_evidence_endpoint(obj)
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_evidence "
                     "(memory_id, evidence_id) VALUES (?, ?)",
@@ -1741,6 +1756,12 @@ def cmd_ingest_jsonl_strict(
             conn, spool, source_ref=source_ref,
             allow_tombstones=allow_tombstones, capture_mode=capture_mode,
         )
+    except _MemoryEvidenceEndpointMissing as exc:
+        print(
+            f"[zmem] ingest-jsonl: line {exc.lineno}: memory_evidence endpoint not found",
+            file=sys.stderr,
+        )
+        return 2
     except Exception as exc:
         print(
             f"[zmem] ingest-jsonl: strict import rejected: "

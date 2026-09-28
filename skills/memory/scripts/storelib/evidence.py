@@ -29,6 +29,12 @@ EVIDENCE_MAX_EXCERPT_CHARS = 400
 EVIDENCE_INPUT_MAX_EXCERPT_CHARS = 4096
 EVIDENCE_DEFAULT_RETENTION_DAYS = 30
 EVIDENCE_DEFAULT_CAP = 50_000
+# Keep untrusted ``IN`` query inputs below SQLite's common host-parameter
+# ceilings (999 in legacy builds, 32766 in newer builds).  These are
+# conservative per-query limits; custom builds with a lower compiled cap may
+# require smaller values.
+EVIDENCE_LOOKUP_CHUNK_SIZE = 400
+EVIDENCE_ASSOCIATION_LOOKUP_CHUNK_SIZE = 900
 EVIDENCE_LANES = (
     "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
 )
@@ -275,14 +281,132 @@ def sweep_evidence(
         return zero
 
 
-def evidence_ids_for_memory(conn, memory_id: str) -> list:
+def attach_memory_evidence(
+    conn: sqlite3.Connection, *, memory_id: str, evidence_ids: list[str] | tuple[str, ...]
+) -> int:
+    """Attach evidence rows to one memory atomically and idempotently.
+
+    Writer callers normally already own a transaction.  The standalone form is
+    useful to administrative callers, while the savepoint keeps a failed
+    association from partially changing a caller-owned transaction. Returns
+    the number of newly inserted pairs; existing pairs contribute zero.
+    """
+    ids = [str(value).strip() for value in evidence_ids]
+    for evidence_id in ids:
+        if not evidence_id:
+            raise ValueError("evidence id is empty")
+    seen: set[str] = set()
+    for evidence_id in ids:
+        if evidence_id in seen:
+            raise ValueError(f"duplicate evidence id: {evidence_id}")
+        seen.add(evidence_id)
+    ids.sort()
+    if not ids:
+        return 0
+
+    own_transaction = not conn.in_transaction
+    savepoint = "zmem_attach_memory_evidence"
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        if conn.execute("SELECT 1 FROM memory WHERE id=?", (memory_id,)).fetchone() is None:
+            raise ValueError(f"memory id not found: {memory_id}")
+        missing = _missing_evidence_ids(conn, ids)
+        if missing:
+            raise ValueError(f"evidence id not found: {missing[0]}")
+        inserted = 0
+        for evidence_id in ids:
+            inserted += conn.execute(
+                "INSERT OR IGNORE INTO memory_evidence(memory_id, evidence_id) VALUES (?, ?)",
+                (memory_id, evidence_id),
+            ).rowcount
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return inserted
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
+def evidence_ids_for_memory(conn, memory_id: str) -> list[str]:
     """Issue #124: association read for the operation-feedback loop — the
     evidence ids linked to one memory via the schema-14 memory_evidence
     table. Read-only; the association WRITE API and the MCP surfaces remain
     issue #171's scope. Sorted for deterministic membership checks."""
-    rows = conn.execute(
-        "SELECT evidence_id FROM memory_evidence WHERE memory_id = ? "
-        "ORDER BY evidence_id",
-        (memory_id,),
-    ).fetchall()
-    return [r[0] for r in rows]
+    return evidence_ids_for_memories(conn, [memory_id]).get(memory_id, [])
+
+
+def _missing_evidence_ids(
+    conn: sqlite3.Connection, evidence_ids: list[str] | tuple[str, ...]
+) -> list[str]:
+    """Return missing evidence IDs in caller-supplied deterministic order.
+
+    The writer validates association endpoints at its own trust boundary and
+    the association helper validates them again inside its transaction. Keep
+    those checks, but use bounded ``IN`` queries so large imports do not hold
+    the write lock across one query per untrusted ID.
+    """
+    missing: list[str] = []
+    for offset in range(0, len(evidence_ids), EVIDENCE_LOOKUP_CHUNK_SIZE):
+        chunk = list(evidence_ids[offset:offset + EVIDENCE_LOOKUP_CHUNK_SIZE])
+        placeholders = ",".join("?" for _ in chunk)
+        found = {
+            row[0] for row in conn.execute(
+                f"SELECT id FROM evidence WHERE id IN ({placeholders})", chunk
+            ).fetchall()
+        }
+        missing.extend(evidence_id for evidence_id in chunk if evidence_id not in found)
+    return missing
+
+
+def evidence_ids_for_memories(
+    conn: sqlite3.Connection, memory_ids: list[str] | tuple[str, ...]
+) -> dict[str, list[str]]:
+    """Fetch associations for many memories with bounded queries.
+
+    Pre-v14 stores have no association table. Probe the schema marker once per
+    call when that table is absent, preserving the single-memory helper's
+    fail-open legacy behavior while still surfacing damaged v14 stores.
+    """
+    result = {memory_id: [] for memory_id in memory_ids}
+    if not memory_ids:
+        return result
+    unique_ids = list(dict.fromkeys(memory_ids))
+    try:
+        for offset in range(0, len(unique_ids), EVIDENCE_ASSOCIATION_LOOKUP_CHUNK_SIZE):
+            chunk = unique_ids[offset:offset + EVIDENCE_ASSOCIATION_LOOKUP_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                "SELECT memory_id, evidence_id FROM memory_evidence "
+                f"WHERE memory_id IN ({placeholders}) "
+                "ORDER BY memory_id, evidence_id",
+                chunk,
+            ).fetchall()
+            for memory_id, evidence_id in rows:
+                result[memory_id].append(evidence_id)
+    except sqlite3.OperationalError as exc:
+        # Older, schema-initialized stores can legitimately lack this v14
+        # side table. Do not hide a damaged v14 schema or unrelated SQL error.
+        if "no such table: memory_evidence" not in str(exc):
+            raise
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        try:
+            pre_v14 = version is not None and int(version[0]) < 14
+        except (TypeError, ValueError):
+            pre_v14 = False
+        if not pre_v14:
+            raise
+        return result
+    return result

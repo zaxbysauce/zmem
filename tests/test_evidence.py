@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import contextlib
 import atexit
+import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -38,7 +41,7 @@ _IMPORT_VALUES = {
     "LOCALAPPDATA": str(_IMPORT_SANDBOX / "localappdata"),
 }
 with patch.dict(os.environ, _IMPORT_VALUES, clear=False):
-    from storelib import evidence, schema, sync  # noqa: E402
+    from storelib import evidence, recall, schema, sync, write  # noqa: E402
 
 
 class _StoreCase(unittest.TestCase):
@@ -70,7 +73,350 @@ class _StoreCase(unittest.TestCase):
         self.tmp.cleanup()
 
 
+class EvidenceAssociationWriteTest(_StoreCase):
+    def _evidence(self, evidence_id: str) -> None:
+        evidence.write_evidence(
+            self.conn, id=evidence_id, session_id="association-test",
+            lane="codex", moment="pretool", kind="tool_call",
+            ts="2026-09-10T00:00:00Z", excerpt="association evidence",
+            ref_path="tests/test_evidence.py", ref_offset=1,
+        )
+
+    def test_add_attaches_sorted_ids_and_missing_id_rolls_back(self):
+        first = "00000000-0000-4000-8000-000000000701"
+        second = "00000000-0000-4000-8000-000000000702"
+        missing = "00000000-0000-4000-8000-000000000799"
+        self._evidence(first)
+        self._evidence(second)
+        memory_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="association write", signal="test", evidence_ids=[second, first],
+        ))
+        self.assertEqual(evidence.evidence_ids_for_memory(self.conn, memory_id), [first, second])
+        before = self.conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+        with self.assertRaisesRegex(ValueError, f"evidence id not found: {missing}"):
+            write.add_memory(
+                self.conn, namespace="project:evidence-association", type_="fact",
+                content="must not persist", signal="test", evidence_ids=[missing],
+            )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0], before)
+
+    def test_capture_warning_precedes_begin_immediate_lock_failure(self):
+        """Capture-policy notices remain visible when the writer cannot lock."""
+        self.conn.commit()
+        self.conn.execute("PRAGMA busy_timeout=0")
+        blocker = sqlite3.connect(self.root / "store.sqlite", timeout=0)
+        blocker.execute("BEGIN EXCLUSIVE")
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(sqlite3.OperationalError):
+                    write.add_memory(
+                        self.conn, namespace="project:evidence-association",
+                        type_="fact", content="api_key=abcdefghijk",
+                        signal="test", capture_mode="auto",
+                    )
+        finally:
+            blocker.rollback()
+            blocker.close()
+        rendered = stderr.getvalue()
+        self.assertIn("automatic capture redacted 1 secret-like value(s)", rendered)
+        self.assertNotIn("abcdefghijk", rendered)
+
+    def test_update_capture_warning_precedes_begin_immediate_lock_failure(self):
+        """Updates also report safe redaction counts before a lock failure."""
+        memory_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="original update target", signal="test",
+        ))
+        self.conn.commit()
+        self.conn.execute("PRAGMA busy_timeout=0")
+        blocker = sqlite3.connect(self.root / "store.sqlite", timeout=0)
+        blocker.execute("BEGIN IMMEDIATE")
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(sqlite3.OperationalError):
+                    write.update_memory(
+                        self.conn, mid=memory_id,
+                        content="api_key=abcdefghijk", signal="test",
+                        capture_mode="auto",
+                    )
+        finally:
+            blocker.rollback()
+            blocker.close()
+        rendered = stderr.getvalue()
+        self.assertIn("automatic capture redacted 1 secret-like value(s)", rendered)
+        self.assertNotIn("abcdefghijk", rendered)
+
+    def test_successful_capture_warning_is_printed_once(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            write.add_memory(
+                self.conn, namespace="project:evidence-association", type_="fact",
+                content="api_key=abcdefghijk", signal="test", capture_mode="auto",
+            )
+        rendered = stderr.getvalue()
+        self.assertEqual(
+            rendered.count("automatic capture redacted 1 secret-like value(s)"), 1
+        )
+        self.assertNotIn("abcdefghijk", rendered)
+
+    def test_attach_returns_new_pair_count_and_exact_input_errors(self):
+        first = "00000000-0000-4000-8000-000000000703"
+        second = "00000000-0000-4000-8000-000000000704"
+        self._evidence(first)
+        self._evidence(second)
+        memory_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="direct association helper", signal="test",
+        ))
+        self.assertEqual(
+            evidence.attach_memory_evidence(
+                self.conn, memory_id=memory_id, evidence_ids=[first, second]
+            ),
+            2,
+        )
+        self.assertEqual(
+            evidence.attach_memory_evidence(
+                self.conn, memory_id=memory_id, evidence_ids=[second, first]
+            ),
+            0,
+        )
+        with self.assertRaisesRegex(ValueError, "^evidence id is empty$"):
+            evidence.attach_memory_evidence(
+                self.conn, memory_id=memory_id, evidence_ids=["  "]
+            )
+        with self.assertRaisesRegex(
+            ValueError, f"^duplicate evidence id: {first}$"
+        ):
+            evidence.attach_memory_evidence(
+                self.conn, memory_id=memory_id, evidence_ids=[first, f" {first} "]
+            )
+
+    def test_attach_rejects_missing_memory_before_writing_pairs(self):
+        evidence_id = "00000000-0000-4000-8000-000000000799"
+        self._evidence(evidence_id)
+        with self.assertRaisesRegex(
+            ValueError, "^memory id not found: missing-memory$"
+        ):
+            evidence.attach_memory_evidence(
+                self.conn, memory_id="missing-memory", evidence_ids=[evidence_id]
+            )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM memory_evidence").fetchone()[0],
+            0,
+        )
+
+    def test_evidence_id_parser_rejects_empty_and_duplicate_tokens(self):
+        from storelib.cli import _parse_evidence_ids
+
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "empty tokens"):
+            _parse_evidence_ids("evidence-a, ,evidence-b")
+        with self.assertRaisesRegex(
+            argparse.ArgumentTypeError, "duplicate evidence id: evidence-a"
+        ):
+            _parse_evidence_ids("evidence-a,evidence-a")
+
+    def test_evidence_for_accepts_positional_and_legacy_option_ids(self):
+        evidence_id = "00000000-0000-4000-8000-000000000705"
+        self._evidence(evidence_id)
+        memory_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="evidence reader alias", signal="test", evidence_ids=[evidence_id],
+        ))
+        store = ROOT / "skills" / "memory" / "scripts" / "store.py"
+
+        def run(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, str(store), "evidence", "for", *args],
+                cwd=ROOT, env=os.environ.copy(), text=True,
+                capture_output=True, check=False,
+            )
+
+        self.conn.commit()
+        self.conn.close()
+        try:
+            positional = run(memory_id, "--json")
+            legacy = run("--memory-id", memory_id, "--json")
+            self.assertEqual(positional.returncode, 0, positional.stderr)
+            self.assertEqual(legacy.returncode, 0, legacy.stderr)
+            self.assertEqual(json.loads(positional.stdout), json.loads(legacy.stdout))
+            self.assertEqual(json.loads(positional.stdout)["memory_id"], memory_id)
+
+            missing = run("--json")
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("evidence for requires a memory id", missing.stderr)
+            conflicting = run(memory_id, "--memory-id", "other-memory", "--json")
+            self.assertEqual(conflicting.returncode, 2)
+            self.assertIn(
+                "evidence for positional id conflicts with --memory-id",
+                conflicting.stderr,
+            )
+        finally:
+            self.conn = sqlite3.connect(self.root / "store.sqlite")
+            self.conn.row_factory = sqlite3.Row
+
+    def test_update_keeps_historical_links_and_attaches_to_replacement(self):
+        old_evidence = "00000000-0000-4000-8000-000000000711"
+        new_evidence = "00000000-0000-4000-8000-000000000712"
+        self._evidence(old_evidence)
+        self._evidence(new_evidence)
+        old_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="original association", signal="test", evidence_ids=[old_evidence],
+        ))
+        replacement_id, created_new = write.update_memory(
+            self.conn, mid=old_id, content="replacement association",
+            evidence_ids=[new_evidence],
+        )
+        self.assertTrue(created_new)
+        self.assertEqual(evidence.evidence_ids_for_memory(self.conn, old_id), [old_evidence])
+        self.assertEqual(
+            evidence.evidence_ids_for_memory(self.conn, str(replacement_id)), [new_evidence]
+        )
+
+    def test_passive_injection_capture_does_not_gain_evidence_ids(self):
+        evidence_id = "00000000-0000-4000-8000-000000000713"
+        self._evidence(evidence_id)
+        memory_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-passive", type_="fact",
+            content="passive injection evidence preservation", signal="test",
+            evidence_ids=[evidence_id],
+        ))
+        captured: dict = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            recall.recent_memory(
+                self.conn, namespace="project:evidence-passive", limit=5,
+                as_json=True, for_injection=True, no_telemetry=True,
+                _capture=captured,
+            )
+        rows = captured.get("results", [])
+        self.assertEqual([row["id"] for row in rows], [memory_id], captured)
+        self.assertNotIn("evidence_ids", rows[0], captured)
+
+    def test_multi_row_recall_explain_recent_attach_evidence_ids(self):
+        first_evidence = "00000000-0000-4000-8000-000000000714"
+        second_evidence = "00000000-0000-4000-8000-000000000715"
+        self._evidence(first_evidence)
+        self._evidence(second_evidence)
+        first_memory = str(write.add_memory(
+            self.conn, namespace="project:evidence-multi", type_="fact",
+            content="batch-evidence alpha marker", signal="test",
+            evidence_ids=[first_evidence],
+        ))
+        second_memory = str(write.add_memory(
+            self.conn, namespace="project:evidence-multi", type_="fact",
+            content="batch-evidence beta marker", signal="test",
+            evidence_ids=[second_evidence],
+        ))
+        empty_memory = str(write.add_memory(
+            self.conn, namespace="project:evidence-multi", type_="fact",
+            content="batch-evidence empty marker", signal="test",
+        ))
+
+        calls = (
+            lambda: recall.recall_memory(
+                self.conn, query="batch-evidence", namespace="project:evidence-multi",
+                limit=5, as_json=True, no_bump=True, no_telemetry=True,
+                hybrid=False,
+            ),
+            lambda: recall.explain_recall(
+                self.conn, query="batch-evidence", namespace="project:evidence-multi",
+                limit=5, as_json=True, hybrid=False,
+            ),
+            lambda: recall.recent_memory(
+                self.conn, namespace="project:evidence-multi", limit=5,
+                as_json=True, no_bump=True, no_telemetry=True,
+            ),
+        )
+        expected = {
+            first_memory: [first_evidence],
+            second_memory: [second_evidence],
+            empty_memory: [],
+        }
+        for call in calls:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                call()
+            rows = json.loads(output.getvalue())["results"]
+            observed = {row["id"]: row["evidence_ids"] for row in rows}
+            self.assertEqual(observed, expected)
+
+
 class EvidenceSchemaTest(_StoreCase):
+    def test_batch_association_lookup_chunks_and_sorts(self):
+        memory_ids = [f"memory-{index:04d}" for index in range(901)]
+        self.conn.executemany(
+            "INSERT INTO memory(id, namespace, type, content, ingestion_ts) "
+            "VALUES (?, 'project:batch', 'fact', ?, '2026-09-10T00:00:00Z')",
+            [(memory_id, memory_id) for memory_id in memory_ids],
+        )
+        first_evidence = "00000000-0000-4000-8000-000000000801"
+        second_evidence = "00000000-0000-4000-8000-000000000802"
+        self._write_batch_evidence(first_evidence)
+        self._write_batch_evidence(second_evidence)
+        self.conn.executemany(
+            "INSERT INTO memory_evidence(memory_id, evidence_id) VALUES (?, ?)",
+            [
+                (memory_ids[0], second_evidence),
+                (memory_ids[0], first_evidence),
+            ],
+        )
+        self.conn.commit()
+        statements: list[str] = []
+        self.conn.set_trace_callback(statements.append)
+        values = evidence.evidence_ids_for_memories(self.conn, memory_ids)
+        self.conn.set_trace_callback(None)
+        association_queries = [
+            statement for statement in statements if "FROM memory_evidence" in statement
+        ]
+        self.assertEqual(len(association_queries), 2)
+        self.assertEqual(values[memory_ids[0]], [first_evidence, second_evidence])
+        self.assertEqual(values[memory_ids[-1]], [])
+
+    def _write_batch_evidence(self, evidence_id: str) -> None:
+        evidence.write_evidence(
+            self.conn, id=evidence_id, session_id="batch-test", lane="codex",
+            moment="pretool", kind="tool_call", ts="2026-09-10T00:00:00Z",
+            excerpt="batch evidence", ref_path="tests/test_evidence.py", ref_offset=1,
+        )
+
+    def test_pre_v14_batch_lookup_probes_schema_marker_once(self):
+        legacy = sqlite3.connect(self.root / "pre-v14-batch.sqlite")
+        schema.init_db(legacy)
+        statements: list[str] = []
+        legacy.set_trace_callback(statements.append)
+        self.assertEqual(
+            evidence.evidence_ids_for_memories(legacy, ["missing-a", "missing-b"]),
+            {"missing-a": [], "missing-b": []},
+        )
+        legacy.set_trace_callback(None)
+        association_queries = [
+            statement for statement in statements if "FROM memory_evidence" in statement
+        ]
+        marker_queries = [
+            statement for statement in statements if "FROM meta" in statement
+        ]
+        # SQLite's trace callback omits statements that fail during prepare;
+        # the failed missing-table probe is therefore not trace-visible.
+        self.assertEqual(len(association_queries), 0)
+        self.assertEqual(len(marker_queries), 1)
+        legacy.close()
+
+    def test_pre_v14_association_lookup_returns_empty_without_hiding_v14_damage(self):
+        legacy = sqlite3.connect(self.root / "pre-v14.sqlite")
+        schema.init_db(legacy)
+        version = legacy.execute(
+            "SELECT value FROM meta WHERE key=?", ("schema_version",)
+        ).fetchone()[0]
+        self.assertLess(int(version), 14)
+        self.assertEqual(evidence.evidence_ids_for_memory(legacy, "missing"), [])
+        legacy.execute("UPDATE meta SET value='14' WHERE key='schema_version'")
+        with self.assertRaisesRegex(sqlite3.OperationalError, "no such table"):
+            evidence.evidence_ids_for_memory(legacy, "missing")
+        legacy.close()
+
     def test_fresh_init_and_v13_upgrade(self):
         version = self.conn.execute(
             "SELECT value FROM meta WHERE key=?", ("schema_version",)

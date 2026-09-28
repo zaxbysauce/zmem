@@ -606,6 +606,25 @@ def _query_rewrite_has_evidence(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def _parse_evidence_ids(value: str | None) -> list[str]:
+    """Parse the comma-separated add/update association flag."""
+    if value is None:
+        return []
+    ids = [part.strip() for part in value.split(",")]
+    if any(not evidence_id for evidence_id in ids):
+        raise argparse.ArgumentTypeError(
+            "evidence ids must not contain empty tokens"
+        )
+    seen: set[str] = set()
+    for evidence_id in ids:
+        if evidence_id in seen:
+            raise argparse.ArgumentTypeError(
+                f"duplicate evidence id: {evidence_id}"
+            )
+        seen.add(evidence_id)
+    return sorted(ids)
+
+
 def cmd_query_rewrite(*, prompt: str, session_id: str, namespace: str) -> int:
     """Run the deterministic query rewrite before any store initialization."""
     del namespace  # Selection is session-based; namespace is an input marker only.
@@ -783,6 +802,183 @@ def cmd_evidence_show(
     return 0
 
 
+def cmd_evidence_show_with_associations(
+    conn: sqlite3.Connection,
+    *,
+    namespace: str,
+    evidence_id: str,
+    as_json: bool,
+) -> int:
+    """Return an evidence row and its associations from one read snapshot.
+
+    This hidden MCP bridge keeps the public ``evidence show`` compatibility
+    shape unchanged.
+    """
+    del namespace  # see cmd_evidence_list
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+            started_tx = True
+        row = conn.execute(
+            "SELECT id, session_id, lane, moment, kind, ts, excerpt, ref_path, ref_offset "
+            "FROM evidence WHERE id = ?",
+            (evidence_id,),
+        ).fetchone()
+        if row is None:
+            print("evidence id not found", file=sys.stderr)
+            return 1
+        associations = conn.execute(
+            "SELECT m.id AS memory_id, m.namespace FROM memory m JOIN memory_evidence me "
+            "ON me.memory_id=m.id WHERE me.evidence_id=? ORDER BY m.namespace, m.id",
+            (evidence_id,),
+        ).fetchall()
+        value = _evidence_row(row)
+        value["associations"] = [dict(item) for item in associations]
+        if as_json:
+            print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        else:
+            print("\t".join(_display_field(value[key]) for key in (
+                "id", "session_id", "lane", "moment", "kind", "ts",
+                "excerpt", "ref_path", "ref_offset",
+            )))
+        return 0
+    finally:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+
+
+def cmd_evidence_for(conn: sqlite3.Connection, *, memory_id: str, as_json: bool) -> int:
+    """Return evidence associated with one memory, including its namespace."""
+    memory = conn.execute(
+        "SELECT id, namespace FROM memory WHERE id=?", (memory_id,)
+    ).fetchone()
+    if memory is None:
+        print("memory id not found", file=sys.stderr)
+        return 1
+    rows = conn.execute(
+        "SELECT e.id, e.session_id, e.lane, e.moment, e.kind, e.ts, e.excerpt, "
+        "e.ref_path, e.ref_offset FROM evidence e JOIN memory_evidence me "
+        "ON me.evidence_id=e.id WHERE me.memory_id=? ORDER BY e.id",
+        (memory_id,),
+    ).fetchall()
+    value = {
+        "memory_id": memory_id,
+        "namespace": memory["namespace"],
+        "evidence": [_evidence_row(row) for row in rows],
+    }
+    if as_json:
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    else:
+        for row in value["evidence"]:
+            print("\t".join(_display_field(row[key]) for key in (
+                "id", "session_id", "lane", "moment", "kind", "ts",
+                "excerpt", "ref_path", "ref_offset",
+            )))
+    return 0
+
+
+def cmd_evidence_scoped_for(
+    conn: sqlite3.Connection,
+    *,
+    namespaces: list[str],
+    memory_id: str,
+    as_json: bool,
+) -> int:
+    """Return memory evidence only when its namespace is in ``namespaces``.
+
+    Missing and foreign memories share the same marker so scoped callers
+    cannot use this operation as a global existence oracle.
+    """
+    if not namespaces:
+        print("namespace_not_allowed", file=sys.stderr)
+        return 1
+    placeholders = ",".join("?" for _ in namespaces)
+    memory = conn.execute(
+        f"SELECT id, namespace FROM memory WHERE id=? AND namespace IN ({placeholders})",
+        (memory_id, *namespaces),
+    ).fetchone()
+    if memory is None:
+        print("namespace_not_allowed", file=sys.stderr)
+        return 1
+    rows = conn.execute(
+        "SELECT e.id, e.session_id, e.lane, e.moment, e.kind, e.ts, e.excerpt, "
+        "e.ref_path, e.ref_offset FROM evidence e JOIN memory_evidence me "
+        "ON me.evidence_id=e.id WHERE me.memory_id=? ORDER BY e.id",
+        (memory_id,),
+    ).fetchall()
+    value = {
+        "memory_id": memory_id,
+        "namespace": memory["namespace"],
+        "evidence": [_evidence_row(row) for row in rows],
+    }
+    if as_json:
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    else:
+        for row in value["evidence"]:
+            print("\t".join(_display_field(row[key]) for key in (
+                "id", "session_id", "lane", "moment", "kind", "ts",
+                "excerpt", "ref_path", "ref_offset",
+            )))
+    return 0
+
+
+def cmd_evidence_scoped_show(
+    conn: sqlite3.Connection, *, namespace: str, evidence_id: str, as_json: bool
+) -> int:
+    """Show evidence only when a requested namespace owns an association.
+
+    The failure is deliberately identical for missing and unassociated IDs so
+    a scoped MCP token cannot use this command as an existence oracle.
+    """
+    row = conn.execute(
+        "SELECT e.id, e.session_id, e.lane, e.moment, e.kind, e.ts, e.excerpt, "
+        "e.ref_path, e.ref_offset FROM evidence e WHERE e.id=? AND EXISTS "
+        "(SELECT 1 FROM memory_evidence me JOIN memory m ON m.id=me.memory_id "
+        "WHERE me.evidence_id=e.id AND m.namespace=?)",
+        (evidence_id, namespace),
+    ).fetchone()
+    if row is None:
+        print("namespace_not_allowed", file=sys.stderr)
+        return 1
+    associations = conn.execute(
+        "SELECT m.id AS memory_id, m.namespace FROM memory m JOIN memory_evidence me "
+        "ON me.memory_id=m.id WHERE me.evidence_id=? AND m.namespace=? ORDER BY m.id",
+        (evidence_id, namespace),
+    ).fetchall()
+    value = _evidence_row(row)
+    value["associations"] = [dict(item) for item in associations]
+    if as_json:
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print("\t".join(_display_field(value[key]) for key in (
+            "id", "session_id", "lane", "moment", "kind", "ts",
+            "excerpt", "ref_path", "ref_offset",
+        )))
+    return 0
+
+
+def cmd_evidence_associations(
+    conn: sqlite3.Connection, *, evidence_id: str, as_json: bool
+) -> int:
+    """Return association rows for an unscoped operator or MCP bridge."""
+    if conn.execute("SELECT 1 FROM evidence WHERE id=?", (evidence_id,)).fetchone() is None:
+        print("evidence id not found", file=sys.stderr)
+        return 1
+    rows = conn.execute(
+        "SELECT m.id AS memory_id, m.namespace FROM memory m JOIN memory_evidence me "
+        "ON me.memory_id=m.id WHERE me.evidence_id=? ORDER BY m.namespace, m.id",
+        (evidence_id,),
+    ).fetchall()
+    value = [dict(row) for row in rows]
+    if as_json:
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    else:
+        for row in value:
+            print(f"{row['memory_id']}\t{row['namespace']}")
+    return 0
+
+
 def cmd_hermes_convention(
     conn: sqlite3.Connection, *, payload: dict[str, object]
 ) -> int:
@@ -954,7 +1150,9 @@ def main():
                             "`none` is untrusted_tool. Unknown values are refused.")
     p_add.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
                        help="manual/reviewed keep the original text with warnings; "
-                            "auto redacts likely secrets by default before writing")
+                             "auto redacts likely secrets by default before writing")
+    p_add.add_argument("--evidence", default=None,
+                       help="comma-separated existing evidence ids to attach")
     p_add.add_argument("--json", action="store_true",
                        help="print a structured write result (id, result, warnings) "
                             "as JSON on stdout instead of the human lines "
@@ -1294,7 +1492,9 @@ def main():
                             "target's lineage, worst-of with the caller's origin)")
     p_upd.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
                        help="same capture policy as `add` (manual/reviewed keep text "
-                            "with warnings; auto redacts secrets)")
+                             "with warnings; auto redacts secrets)")
+    p_upd.add_argument("--evidence", default=None,
+                       help="comma-separated existing evidence ids to attach")
     p_upd.add_argument("--json", action="store_true",
                        help="print a structured write result (id, result, created_new, "
                             "warnings) as JSON on stdout instead of the human lines "
@@ -1344,7 +1544,36 @@ def main():
     p_evidence_show.add_argument("--id", dest="evidence_id", type=str,
                                  required=True, help="evidence identifier")
     p_evidence_show.add_argument("--json", dest="as_json", action="store_true",
-                                 default=False, help="emit JSON")
+                                  default=False, help="emit JSON")
+    p_evidence_show_with_associations = evidence_sub.add_parser(
+        "show-with-associations", help=argparse.SUPPRESS
+    )
+    p_evidence_show_with_associations.add_argument("--namespace", dest="namespace", required=True)
+    p_evidence_show_with_associations.add_argument("--id", dest="evidence_id", required=True)
+    p_evidence_show_with_associations.add_argument("--json", dest="as_json", action="store_true", default=False)
+    p_evidence_for = evidence_sub.add_parser("for", help="list evidence for one memory")
+    p_evidence_for.add_argument("memory_id_positional", nargs="?",
+                                help="memory identifier")
+    p_evidence_for.add_argument("--memory-id", dest="memory_id_option",
+                                help="backward-compatible memory identifier")
+    p_evidence_for.add_argument("--json", dest="as_json", action="store_true", default=False)
+    p_evidence_scoped_show = evidence_sub.add_parser(
+        "scoped-show", help="show evidence associated with one namespace"
+    )
+    p_evidence_scoped_show.add_argument("--namespace", required=True)
+    p_evidence_scoped_show.add_argument("--id", dest="evidence_id", required=True)
+    p_evidence_scoped_show.add_argument("--json", dest="as_json", action="store_true", default=False)
+    p_evidence_scoped_for = evidence_sub.add_parser(
+        "scoped-for", help=argparse.SUPPRESS
+    )
+    p_evidence_scoped_for.add_argument("--namespace", dest="namespaces", action="append", required=True)
+    p_evidence_scoped_for.add_argument("--memory-id", dest="memory_id", required=True)
+    p_evidence_scoped_for.add_argument("--json", dest="as_json", action="store_true", default=False)
+    p_evidence_associations = evidence_sub.add_parser(
+        "associations", help=argparse.SUPPRESS
+    )
+    p_evidence_associations.add_argument("--id", dest="evidence_id", required=True)
+    p_evidence_associations.add_argument("--json", dest="as_json", action="store_true", default=False)
 
     _add_parser("stats", help="store statistics")
 
@@ -2546,6 +2775,21 @@ def main():
     if getattr(args, "content", None) == "-":
         args.content = sys.stdin.read()
 
+    if args.cmd in {"add", "update"}:
+        try:
+            args.evidence_ids = _parse_evidence_ids(args.evidence)
+        except argparse.ArgumentTypeError as exc:
+            ap.error(str(exc))
+
+    if args.cmd == "evidence" and args.evidence_cmd == "for":
+        positional = args.memory_id_positional
+        option = args.memory_id_option
+        if positional is None and option is None:
+            ap.error("evidence for requires a memory id")
+        if positional is not None and option is not None and positional != option:
+            ap.error("evidence for positional id conflicts with --memory-id")
+        args.memory_id = option or positional
+
     try:
         _wait_for_maintenance_clear(args.cmd)
         conn = _connect_existing_store() if existing_only_evidence_write else connect()
@@ -2682,6 +2926,29 @@ def main():
                     lane=args.lane, moment=args.moment, limit=args.limit,
                     as_json=args.as_json,
                 ))
+            if args.evidence_cmd == "for":
+                sys.exit(cmd_evidence_for(
+                    conn, memory_id=args.memory_id, as_json=args.as_json,
+                ))
+            if args.evidence_cmd == "scoped-for":
+                sys.exit(cmd_evidence_scoped_for(
+                    conn, namespaces=args.namespaces, memory_id=args.memory_id,
+                    as_json=args.as_json,
+                ))
+            if args.evidence_cmd == "scoped-show":
+                sys.exit(cmd_evidence_scoped_show(
+                    conn, namespace=args.namespace, evidence_id=args.evidence_id,
+                    as_json=args.as_json,
+                ))
+            if args.evidence_cmd == "show-with-associations":
+                sys.exit(cmd_evidence_show_with_associations(
+                    conn, namespace=args.namespace, evidence_id=args.evidence_id,
+                    as_json=args.as_json,
+                ))
+            if args.evidence_cmd == "associations":
+                sys.exit(cmd_evidence_associations(
+                    conn, evidence_id=args.evidence_id, as_json=args.as_json,
+                ))
             sys.exit(cmd_evidence_show(
                 conn, namespace=args.namespace, evidence_id=args.evidence_id,
                 as_json=args.as_json,
@@ -2711,6 +2978,7 @@ def main():
                         signal=args.signal,
                         taint=args.taint,
                         capture_mode=args.capture_mode,
+                        evidence_ids=args.evidence_ids,
                     )
                 finally:
                     if _human_out is not None:
@@ -2733,6 +3001,9 @@ def main():
                 # change stdio-encoding failure behavior) (#36 M17).
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(1)
+            except ValueError as exc:
+                print(f"[zmem] {exc}", file=sys.stderr)
+                sys.exit(2)
         elif args.cmd == "invalidate":
             # `invalidate` IS `supersede` with a required reason (--reason is
             # required=True on the parser, so argparse refuses missing at rc 2
@@ -2777,6 +3048,7 @@ def main():
                         taint=args.taint,
                         capture_mode=args.capture_mode,
                         expected_old_namespace=args.expected_old_namespace,
+                        evidence_ids=args.evidence_ids,
                     )
                 finally:
                     if _human_out is not None:

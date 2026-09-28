@@ -66,6 +66,14 @@ README.
   `purge` section in the memory skill docs for operator caveats (never pass
   secret text on a command line; restore/`import-store --force` supersede a
   purge).
+## [0.71.0] - 2026-09-28
+
+### Added
+- **Evidence association and scoped lookup (issue #171):** associate evidence with
+  memories, include matching evidence IDs in recall, explain, and recent JSON,
+  and expose namespace-scoped MCP lookup tools with indistinguishable denials
+  for missing and out-of-scope IDs. Human CLI evidence output marks captured
+  content as untrusted data and fences it from surrounding instructions.
 
 ## [0.70.0] - 2026-09-27
 
