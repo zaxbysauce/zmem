@@ -1099,9 +1099,11 @@ def select_and_budget_for_injection(
                    if not row.get("link_relation")
                    and not row.get("_graph_arrival_only")]
         # Issue #256: a withheld row is not rendered content (#114 rendered-row
-        # law) — never bumped, never ledgered. Load-bearing, not belt-and-
-        # braces: rows_present_in's marker-prefix whitelist would only drop
-        # the marker for THIS fence shape; an id-token match would not.
+        # law) — never bumped, never ledgered. Shape-dependent backstop: today
+        # the [WITHHELD: SECRET] prefix already fails rows_present_in's
+        # marker whitelist, but that auto-drop depends on the fence shape; if
+        # the marker ever matched, this filter is the sole bump/ledger guard
+        # (proven by the c-iso mutation probe).
         present = [row for row in present
                    if not row.get("withheld_for_secret")]
         if present:
