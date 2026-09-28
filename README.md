@@ -61,8 +61,11 @@ The passive `--for-injection --json` lane of `recall` and `recent` accepts
 `--session-id`, `--moment`, `--lane`, and repeatable `--ops-token` attribution
 flags. An empty query selects recent memories; `pretool` is the only moment
 that composes the store-side operation ring. Use
-`python <store.py> ledger-clear --session-id <id>` to reset delivery at a
-session lifecycle boundary; this command does not open SQLite. The former
+`python <store.py> delivery-clear --session-id=<id>` for terminal session
+cleanup of both the ledger and pending sidecars. Use
+`python <store.py> ledger-clear --session-id=<id>` for the reusable,
+ledger-only PreCompact path; the equals form supports ids beginning with `-`.
+Neither command opens SQLite. The former
 hook-owned pending, compact-summary, and task-text sidecars, plus the
 UserPromptSubmit operation tail, are intentionally retired. The MCP server's
 passive surface now rides the same selector — see *Query-aware passive
@@ -167,7 +170,8 @@ complete selector envelope plus the additive `context` alias equal to
 budget on both surfaces; like every passive lane, prefetch never advances
 `retrieval_count`. Delivery is session-attributed: a second turn for the same
 session whose delivery ledger already holds the candidate rows returns the
-silent `already-delivered` envelope (`ledger-clear --session-id` resets it).
+silent `already-delivered` envelope (`ledger-clear --session-id` resets the
+ledger; terminal session cleanup uses `delivery-clear --session-id`).
 The MCP `session_start` tool rides the same store-owned queryless selector
 path (`recent --for-injection --json --session-id ... --moment session_start`),
 returning that envelope with the same `context` alias plus the back-compat

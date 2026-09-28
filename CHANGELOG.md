@@ -10,7 +10,7 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.68.0] - 2026-09-27
+## [0.69.0] - 2026-09-27
 
 ### Fixed
 - **Fail-closed evidence retention (issue #170):** malformed non-base-10
@@ -20,6 +20,16 @@ README.
   and association rows unchanged. When both settings are invalid, the DAYS
   diagnostic is reported first. Valid expiry, cap ordering, rollback, and the
   shipped #183 evidence writer behavior remain covered.
+
+## [0.68.0] - 2026-09-27
+
+### Added
+- **Codex SessionEnd delivery cleanup (issue #189):** register the existing
+  session-end launcher on Codex's main thread with a two-second timeout and
+  clear both the session delivery ledger and legacy pending sidecar without
+  opening SQLite. The Codex Windows commands quote the launcher path so plugin
+  roots containing spaces still dispatch correctly. The exact empty JSON
+  response and fail-open behavior remain intact across the launcher boundary.
 
 ## [0.67.0] - 2026-09-27
 

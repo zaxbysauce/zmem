@@ -329,14 +329,21 @@ def _maybe_log_drift(session_id: str) -> None:
         pass
 
 
-def _clear_delivery_state(store_py: str, session_id: str) -> None:
-    """Clear per-session delivery state through the CLI only."""
+def _clear_delivery_state(store_py: str, session_id: str,
+                          command: str = "delivery-clear") -> None:
+    """Clear per-session delivery state through the CLI only.
+
+    SessionEnd owns both sidecars; PreCompact retains the historical
+    ledger-only behavior. Keep the command as one argv token so a session id
+    beginning with ``-`` remains data rather than an argparse option.
+    """
     if not session_id or not store_py or not os.path.isfile(store_py):
         return
     try:
         child_env = os.environ.copy()
         child_env.pop(_PRIVATE_PRETOOL_STDIN_MARKER, None)
-        subprocess.run([sys.executable, store_py, "ledger-clear", "--session-id", session_id],
+        subprocess.run([sys.executable, store_py, command,
+                        f"--session-id={session_id}"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        timeout=5, check=False, env=child_env)
     except Exception:
@@ -628,7 +635,7 @@ def main() -> int:
         session_id = event_session_id
         log_session_id = event_session_id
     if mode == "session_end":
-        _clear_delivery_state(store_py, session_id)
+        _clear_delivery_state(store_py, session_id, "delivery-clear")
         _emit("")
         return 0
     if not lane or not os.path.isfile(store_py):
@@ -650,7 +657,7 @@ def main() -> int:
             "--include-global", "--global-limit",
             recent_global_limit if command == "recent" else "3",
             "--no-bump", "--for-injection", "--json",
-            "--session-id", session_id, "--moment", moment, "--lane", lane]
+            f"--session-id={session_id}", "--moment", moment, "--lane", lane]
     if command == "recall":
         args[1:1] = _free_text_arg("--query", query)
     # Issue #98: forward the cross-project tier flag per its surface matrix.
@@ -746,7 +753,7 @@ def main() -> int:
     )
     _emit(rendered)
     if mode == "precompact":
-        _clear_delivery_state(store_py, session_id)
+        _clear_delivery_state(store_py, session_id, "ledger-clear")
     return 0
 
 

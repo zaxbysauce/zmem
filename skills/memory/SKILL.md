@@ -868,24 +868,29 @@ The exact session-aware CLI forms are:
 
 ```
 python <store.py> recall --query "<text>" --for-injection --json \
-  --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
+  --session-id=<id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
   [--ops-token <token>]...
 python <store.py> recent --for-injection --json \
-  --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
+  --session-id=<id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
   [--ops-token <token>]...
-python <store.py> ledger-clear --session-id <id>
+python <store.py> ledger-clear --session-id=<id>
+python <store.py> delivery-clear --session-id=<id>
 ```
 
 The passive `recall` and `recent` commands accept the additive attribution
-flags `--session-id`, `--moment`, `--lane`, and repeatable `--ops-token` when
+flags `--session-id=<id>`, `--moment`, `--lane`, and repeatable `--ops-token` when
 called with `--for-injection --json`. An empty query dispatches to recent
 selection. An omitted `--ops-token` list lets the store read the pre-tool ring;
 the ring is composed only for `pretool`, not for UserPromptSubmit or other
-moments. `ledger-clear --session-id <id>` clears one delivery ledger without
-opening SQLite and is idempotent for an absent ledger. A session id requires a
-moment, and a moment requires a session id.
+moments. For passive `recall` and `recent`, a session id requires a moment, and
+a moment requires a session id. The equals form keeps session ids beginning
+with `-` unambiguous. `ledger-clear --session-id=<id>` clears one
+session's delivery ledger without opening SQLite. `delivery-clear
+--session-id=<id>` clears the ledger and legacy pending sidecar for SessionEnd
+cleanup, also without opening SQLite; both commands are idempotent when their
+target sidecars are absent.
 
 The old hook-owned pending, compact-summary, and task-text sidecars are no
 longer produced or consumed by these adapters. The D-2 #118 compaction-snapshot
@@ -921,7 +926,8 @@ relevance/trust gate and the 1,500-token budget; prefetch never advances
 `retrieval_count` (only `surfaced_count` and the delivery ledger may move).
 Delivery is session-attributed: a second turn for the same session whose
 ledger already holds the candidate rows returns the silent
-`already-delivered` envelope; `ledger-clear --session-id` resets it.
+`already-delivered` envelope; `ledger-clear --session-id` resets the ledger,
+while SessionEnd uses `delivery-clear --session-id` to retire both sidecars.
 
 The MCP server exposes the same one-call envelope as the `prefetch` tool
 (`query`, `namespace`, `session_id`, `moment` required; optional `lane` —
