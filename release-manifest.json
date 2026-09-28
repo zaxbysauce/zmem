@@ -1,13 +1,13 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "dca447f6b000a800810419139d45b5e9e41e5f01fcd0ced0514e0b3880ca3ffb",
+  "digest": "dde69d7a08dade7f80b099ca92f3e5a328b1c2e698ecd6173353efc3fba0b5cd",
   "files": {
     "hermes-plugin/__init__.py": "1da167c053b8a58a43b5a536d49e93efae1c18a4059d296d3c2cd7aedeee30e1",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "3d85bcfe63f601c0ecc93faa0765fe9435c0124fe416ac1f4ae43643e4cacf1b",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "fb4362d885142bf743c3a5c4aa12ae92c9a1274ca445f307e4b4dc699b4f69bd",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "eb3776b108529e197407211539efa266cda28305ff6ac5129861109cb602a309",
+    "hermes-plugin/plugin.yaml": "c37bdef8c129e64de801186d3029ac953b95f90ae31e738b797a72286ee907c9",
     "hermes-plugin/server/auth.py": "50f23542b04ac05004d8d86182064d68501afae3d37efe4ea63ccc2d6996bcb8",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
@@ -41,7 +41,7 @@
     "scripts/canary-schema.json": "ae41f4f6acc728d911ef38826eab51f2670dac63369c2e5f4ce30601be95deff",
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",
     "scripts/eval_counterfactual.py": "8a3d30350c294c17cdc617efe40f390f39e8d213a665ff7aaeb88f67c3dd1860",
-    "scripts/eval_inject_runner.py": "323f2221c54c6e73668b4e33f1d4f0bccbc257259f93aba7c4633d1cacc1d984",
+    "scripts/eval_inject_runner.py": "8323141ca4044e90e51277e6b12e5763c7a0ac6b09d9790a27c75dc7db5181db",
     "scripts/eval_replay.py": "9ae986efa10c6d991f0084cabe99656647e5aa2abb5526fcad8e4c12d27d208f",
     "scripts/eval_runner.py": "6e9b355425644f38795068259a69bb9c1ca02cdd57509511824ac10ac721ce3a",
     "scripts/eval_self_corpus.py": "ead3aece0562da0fe588ea4d4994aa7ec8fece3ae4d0a7554766e9933e4e76e6",
@@ -75,12 +75,12 @@
     "skills/memory/scripts/storelib/beliefs.py": "ebfc03f9be2b12cddfbad0185b0348406d924d04b2a704b1aebe595048d6ddb4",
     "skills/memory/scripts/storelib/cli.py": "78b6bd88f5c56ddcb3015a54cfab1f4da5dec9217112000a1f369cedfb7b5068",
     "skills/memory/scripts/storelib/consolidate.py": "6180c42e25dcd644aff2053a223d76eab56c5a8cf96f72ae96169f64f9396f75",
-    "skills/memory/scripts/storelib/cross_encoder.py": "8441325ab8f6ef904f2cfa0205e76fce4808f92337da736bef0363d07f5a3e28",
+    "skills/memory/scripts/storelib/cross_encoder.py": "ade337864a64e697178792426c442aaa5e01a5002526e18531eb6da4c001e6d2",
     "skills/memory/scripts/storelib/dataset.py": "1851e337dfb3e4974395ced0dc6271ef621e686e4f78cf9e150f2931f4d6f466",
     "skills/memory/scripts/storelib/delivery_ledger.py": "836963630eb0dd11dba491547b4e40a90c0fee9d64cc3ce6cf6152ca3ecaadf7",
     "skills/memory/scripts/storelib/entity.py": "915fdbafdbe79f1643af751a19ed366e3e2bec3beddcef42e881122310527949",
     "skills/memory/scripts/storelib/episodes.py": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb",
-    "skills/memory/scripts/storelib/eval_gold.py": "bd003185c99cc35b08547f2ec7d4d3e809c236d44fe7b734660ce207b951fcd8",
+    "skills/memory/scripts/storelib/eval_gold.py": "2bda0c1689480550853de7659800c400b2b575a639d19ae368534a582066c14b",
     "skills/memory/scripts/storelib/evidence.py": "0e5b4d9e6c6d8a92c2ad0aad1677d8f6934d59cdbe74ad153edc9b875218f893",
     "skills/memory/scripts/storelib/false_inject.py": "21bfc993a36454b8b89a3c32c5f6d404e2663177182094209d5b96c6e34e4211",
     "skills/memory/scripts/storelib/feedback.py": "d5b432b4250ee6eec5e612e4841a1dd5e4f83215e139914b067adf573b947463",
@@ -102,5 +102,5 @@
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
     "skills/memory/scripts/storelib/write.py": "4541f144417b55ddfb6366ab4a4bed09c37671cd608b34add8a9a48c887fef4f"
   },
-  "version": "0.69.0"
+  "version": "0.70.0"
 }

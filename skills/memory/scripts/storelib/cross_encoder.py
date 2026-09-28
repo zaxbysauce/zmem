@@ -79,11 +79,17 @@ CROSS_ENCODER_BUDGET_ENV = "ZMEM_CROSS_ENCODER_BUDGET_MS"
 #   - the #155 real-corpus gate decision exists (it does: PR #218,
 #     eval/real-corpus-2026-09-19.json), AND
 #   - a #111 gold run WITH the reranker reports
-#     precision_at_k > 0.8978333333333333 (the committed baseline value), AND
+#     precision_at_k > 0.8978333333333333 (the pre-#234 committed baseline value, measured on the type-poor gold), AND
 #   - that run's p95 rerank latency is <= 250 ms, AND
 #   - a #129 measurement reports false_injection_rate <= 0.0.
 # Until a future PR records those measured values and flips
 # passive_reorder_promoted(), shadow mode is the ONLY passive evaluation mode.
+# Provenance (issue #234, 2026-09-27): the 0.8978333333333333 threshold was
+# measured on the PRE-reseed, type-poor gold (fact/lesson-only pools, 110
+# items). The #234 reseed changed the metric basis (112 items, type-diverse
+# pools; weighted precision_at_k 0.8792). The threshold value is
+# deliberately UNCHANGED — re-measuring it with the reranker on the
+# reseeded gold is future work for whichever PR attempts promotion.
 PASSIVE_PROMOTION_GATE = {
     "reorder_enabled": False,
     "requires": "#155 decision; #111 precision_at_k > 0.8978333333333333; "

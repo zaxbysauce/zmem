@@ -1,6 +1,6 @@
 {
   "baseline_for": "scripts/eval_inject_runner.py",
-  "issue": "112+111+113",
+  "issue": "112+111+113+234",
   "gold": "eval/injection_gold.jsonl",
   "profile": "fake (model-absent)",
   "clock": "2026-06-01T00:00:00Z",
@@ -8,12 +8,12 @@
   "lane": "for-injection",
   "metrics": {
     "hit_at_k": 1.0,
-    "precision_at_k": 0.8978333333333333,
+    "precision_at_k": 0.8792483660130719,
     "false_injection_rate": 0.0,
-    "empty_pool_rate": 0.08181818181818182,
-    "mrr": 0.98,
-    "items": 110,
-    "positive_items": 100,
+    "empty_pool_rate": 0.08035714285714286,
+    "mrr": 0.9901960784313726,
+    "items": 112,
+    "positive_items": 102,
     "negative_items": 10,
     "silent_reasons": {
       "empty-pool": 9,
@@ -29,20 +29,20 @@
       "positive_items": 65,
       "negative_items": 6,
       "hit_at_k": 1.0,
-      "precision_at_k": 0.8735897435897435,
+      "precision_at_k": 0.8658974358974358,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.08450704225352113,
-      "mrr": 0.9846153846153847
+      "mrr": 1.0
     },
     "pretool": {
-      "items": 20,
-      "positive_items": 18,
+      "items": 22,
+      "positive_items": 20,
       "negative_items": 2,
-      "hit_at_k": 1.0,
-      "precision_at_k": 0.9722222222222222,
+      "hit_at_k": 0.95,
+      "precision_at_k": 0.885,
       "false_injection_rate": 0.0,
-      "empty_pool_rate": 0.05,
-      "mrr": 1.0
+      "empty_pool_rate": 0.045454545454545456,
+      "mrr": 0.9166666666666666
     },
     "subagent": {
       "items": 17,
@@ -65,5 +65,5 @@
       "mrr": 1.0
     }
   },
-  "note": "Committed HEAD baseline (issue #113, supersedes the #112 baseline): metrics from the real for-injection lane on the deterministic fixture corpus AFTER the #113 relevance composition (lane-max of lexical coverage-x-rank-ratio / cosine / entity feeding compute_score) and the per-lane inject relevance floors (lex 0.30 with >=2-term eligibility, cos 0.50, ent 0.50) plus the below-relevance silent reason. vs the #112 baseline: false_injection_rate 0.1 -> 0.0 (the one previously injected control, neg-pt-status / 'git status', matched a single generic token and is now silent with reason below-relevance); precision_at_k 0.6032 -> 0.8978; mrr 0.97 -> 0.98; hit_at_k 1.0 unchanged; empty-pool silent reasons unchanged at 9 (the 10th negative moved from injected to below-relevance). Later phases diff against this via --compare-baseline; regenerate deliberately when the gold or the lane changes."
+  "note": "Committed HEAD baseline after the issue #234 type-diverse reseed (2026-09-27; supersedes the #113 baseline). SPLIT BASIS, disclosed: the metrics block is the WEIGHTED run of the reseeded 82-row corpus + 112-item gold (per-moment type profiles live, the same numbers the byte-pinned projection carries) and is the --compare-baseline drift basis; the per_moment block is the WEIGHTS-NEUTRAL run of the SAME corpus and gold (storelib.recall.type_preference pinned to 1.0 via scripts/eval_inject_runner.py --moment-weights-neutral) so per-moment precision_delta measures exactly the #126 profiles' contribution — pretool improves 0.885 -> 0.895 (the labeled decision row re-enters the k=5 cut under the 1.1163-vs-0.8372 multipliers), the other three moments are identical under both bases. Negative controls: false_injection_rate 0.0 on both bases. Reproduce either basis with the runner command plus/minus --moment-weights-neutral against a fresh --store."
 }

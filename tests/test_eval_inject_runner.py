@@ -96,8 +96,8 @@ class EndToEndReportTest(unittest.TestCase):
         self.assertEqual(self.report["lane"], "for-injection")
         self.assertEqual(self.report["profile"], "fake (model-absent)")
         self.assertEqual(self.report["clock"], EVAL_PIN_TS)
-        self.assertEqual(self.report["metrics"]["items"], 110)
-        self.assertEqual(self.report["metrics"]["positive_items"], 100)
+        self.assertEqual(self.report["metrics"]["items"], 112)
+        self.assertEqual(self.report["metrics"]["positive_items"], 102)
         self.assertEqual(self.report["metrics"]["negative_items"], 10)
 
     def test_profile_metrics_match_recorded_artifact(self):
@@ -158,13 +158,18 @@ class EndToEndReportTest(unittest.TestCase):
         )
 
     def test_per_moment_deltas_meet_ratchet(self):
-        """Issue #126 ratchet (AMENDED, AC_CHANGED_BY_USER 2026-09-23):
+        """Issue #126 ratchet, STRICT CELL RESTORED (issue #234, 2026-09-27):
         hit_at_k == 1.0 for all four historical moments, false_injection_rate
         0.0 overall and per moment, every precision_delta >= 0.0 and every
-        false_injection_delta == 0.0 — the no-regression cell. The strict
-        '>= 1e-6 improvement' expectation was unsatisfiable with the
-        contract's own map+gold (deltas are exactly 0.0: the candidate pools
-        contain only fact/lesson rows); see the trace amendment record."""
+        false_injection_delta == 0.0 — AND at least one precision_delta >=
+        1e-6, proving the per-moment type profiles can actually move a
+        rendered set on the type-diverse corpus. The PR #230 amendment
+        (2026-09-23) weakened this cell to no-regression because the
+        pre-reseed pools were fact/lesson-only (deltas exactly 0.0); the
+        #234 reseed added the constraint/decision rows the profiles boost,
+        and the committed baseline now records the weights-neutral per-moment
+        basis so the delta measures exactly the profiles' contribution (see
+        eval/baseline-injection.json's note)."""
         out = SCRATCH / "issue126-profile-ratchet.json"
         if out.exists():
             out.unlink()
@@ -173,6 +178,7 @@ class EndToEndReportTest(unittest.TestCase):
         projection = json.loads(out.read_text(encoding="utf-8"))
         metrics = projection["metrics"]
         self.assertEqual(metrics["false_injection_rate"], 0.0)
+        max_delta = 0.0
         for moment, block in projection["per_moment"].items():
             self.assertIn(moment, ("user-prompt", "pretool", "subagent", "precompact"))
             self.assertEqual(block["hit_at_k"], 1.0, f"{moment} hit_at_k regressed")
@@ -189,6 +195,176 @@ class EndToEndReportTest(unittest.TestCase):
                 0.0,
                 f"{moment} false-injection regressed",
             )
+            max_delta = max(max_delta, block["precision_delta"])
+        self.assertGreaterEqual(
+            max_delta,
+            0.000001,
+            "no per-moment precision_delta >= 1e-6 — the per-moment type "
+            "profiles no longer move any rendered set (type-poor reseed "
+            "regression; issue #234)",
+        )
+
+    def test_eval_pools_are_type_diverse(self):
+        """Issue #234 guardrail: the eval store's candidate pools AND the
+        gold's labels must contain at least one `constraint` and one
+        `decision` row. A fact/lesson-only reseed silently re-kills the
+        per-moment precision ratchet (every delta returns to exactly 0.0 —
+        the PR #230 amendment shape), so the class cannot regress quietly."""
+        import sqlite3
+
+        conn = sqlite3.connect(os.environ["ZMEM_STORE"])
+        try:
+            total = dict(
+                conn.execute(
+                    "SELECT type, COUNT(*) FROM memory GROUP BY type"
+                ).fetchall()
+            )
+            live = dict(
+                conn.execute(
+                    "SELECT type, COUNT(*) FROM memory "
+                    "WHERE superseded_at IS NULL GROUP BY type"
+                ).fetchall()
+            )
+            id_type = dict(
+                conn.execute("SELECT id, type FROM memory").fetchall()
+            )
+            # Issue #265 review (V3): the confidence lever is load-bearing —
+            # the crossover premise needs every decoy strictly above every
+            # labeled row (a TYPEBOOST_LABELED_CONFIDENCE drift to 0.9 makes
+            # weighted == neutral and no other test catches it). Pin it via
+            # the built artifact, not the constant.
+            tb_conf = dict(
+                conn.execute(
+                    "SELECT id, confidence FROM memory WHERE namespace=?",
+                    ("project:eval-typeboost",),
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+        for scope, counts in (("total", total), ("live", live)):
+            for wanted in ("constraint", "decision"):
+                self.assertGreaterEqual(
+                    counts.get(wanted, 0),
+                    1,
+                    f"eval store {scope} rows lost the '{wanted}' type — "
+                    f"type-poor reseed regression (issue #234); census: "
+                    f"{sorted(total.items())}",
+                )
+        labeled_types = set()
+        for ids in self.labels.values():
+            for mid in ids:
+                self.assertIn(
+                    mid, id_type, f"gold labels unknown id {mid}"
+                )
+                labeled_types.add(id_type[mid])
+        for wanted in ("constraint", "decision"):
+            self.assertIn(
+                wanted,
+                labeled_types,
+                f"no gold must_include_id resolves to '{wanted}' — the "
+                f"profiles again have nothing to move (issue #234)",
+            )
+        # The builder's pinned id map is the gold authoring contract: the
+        # labeled type-boost rows ARE the rows the two items name.
+        from eval_store import EVAL_IDS as _EVAL_IDS
+
+        self.assertEqual(
+            set(_EVAL_IDS["typeboost"].values()),
+            {"e0000000-0000-4000-8000-000000000071",
+             "e0000000-0000-4000-8000-000000000077"},
+            "typeboost id map drifted from the pinned gold ids",
+        )
+        self.assertEqual(
+            id_type["e0000000-0000-4000-8000-000000000071"], "constraint")
+        self.assertEqual(
+            id_type["e0000000-0000-4000-8000-000000000077"], "decision")
+        labeled_ids = {"e0000000-0000-4000-8000-000000000071",
+                       "e0000000-0000-4000-8000-000000000077"}
+        labeled_conf = [tb_conf[i] for i in labeled_ids]
+        decoy_conf = [c for i, c in tb_conf.items() if i not in labeled_ids]
+        self.assertEqual(len(tb_conf), 12, "typeboost census drifted")
+        self.assertEqual(
+            sorted(labeled_conf), [0.75, 0.75],
+            "labeled typeboost rows must seed at the 0.75 crossover lever "
+            "(issue #234); a drift here silently collapses the strict cell",
+        )
+        self.assertLess(
+            max(labeled_conf), min(decoy_conf),
+            "every fact decoy must outrank every labeled typeboost row "
+            "unweighted, or the weighted/neutral crossover disappears",
+        )
+
+    def test_baseline_note_discloses_split_basis(self):
+        """Issue #234: the committed baseline's note must keep disclosing the
+        split basis (weighted metrics for the drift ratchet, weights-neutral
+        per_moment for the improvement ratchet) or the per-moment deltas lose
+        their documented meaning."""
+        doc = json.loads(BASELINE.read_text(encoding="utf-8"))
+        note = doc.get("note", "")
+        self.assertIn("234", note)
+        self.assertIn("2026-09-27", note)
+        self.assertIn("--moment-weights-neutral", note)
+        self.assertIn("WEIGHTS-NEUTRAL", note)
+
+    def test_neutral_weights_flag_refuses_scoring_surfaces(self):
+        """Issue #234 guardrails: the --moment-weights-neutral authoring flag
+        must refuse to produce a pinnable projection or a gate verdict."""
+        for forbidden in (
+            ("--profile-json-out", str(SCRATCH / "must-not-exist.json")),
+            ("--compare-baseline", str(BASELINE)),
+            ("--fail-under-precision", "0.5"),
+            ("--fail-under-false-injection", "0.1"),
+        ):
+            proc, _report = run_runner(
+                "--moment-weights-neutral", *forbidden
+            )
+            self.assertEqual(
+                proc.returncode,
+                2,
+                f"--moment-weights-neutral must refuse {forbidden[0]}",
+            )
+            # Issue #265 review (C1): argparse also exits 2 for unrecognized
+            # arguments, so the exit code alone cannot distinguish a real
+            # refusal from the flag being deleted — pin the refusal text.
+            self.assertIn(
+                "--moment-weights-neutral refuses",
+                proc.stderr,
+                f"refusal of {forbidden[0]} must carry the explicit "
+                f"refusal message, not a generic argparse error",
+            )
+            self.assertNotIn(
+                "Traceback",
+                proc.stderr,
+                "the refusal must be argparse-clean, not a crash",
+            )
+
+    def test_neutral_run_stamps_and_matches_baseline_per_moment(self):
+        """Issue #265 review (C2/C6): the authoring flag must actually
+        neutralize — a successful run carries the stamp and its per-moment
+        precisions equal the committed baseline's weights-neutral basis, so
+        a silently-broken pin (weighted numbers under the flag) fails here
+        instead of only at the next baseline re-authoring."""
+        proc, report = run_runner("--moment-weights-neutral")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            report.get("moment_weights"),
+            "neutral",
+            "a --moment-weights-neutral run must stamp the report",
+        )
+        baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
+        for moment, block in baseline["per_moment"].items():
+            self.assertEqual(
+                report["per_moment"][moment]["precision_at_k"],
+                block["precision_at_k"],
+                f"{moment}: neutral-run precision drifted from the "
+                f"committed weights-neutral baseline basis",
+            )
+        # And the weighted path must NOT carry the stamp.
+        self.assertNotIn(
+            "moment_weights",
+            self.report,
+            "normal (weighted) reports must not carry the neutral stamp",
+        )
 
     def test_per_item_rendered_facts(self):
         for it in self.report["per_item"]:
