@@ -97,8 +97,13 @@ def _env(scratch: Path) -> dict[str, str]:
     return env
 
 
-def build(out: Path) -> tuple[str, str]:
+def _build(out: Path) -> tuple[str, str]:
     out = out.expanduser().resolve()
+    if out == FIXTURE_DIR.resolve():
+        raise ValueError(
+            "refusing to overwrite the checked-in fixture directory; "
+            "pass a scratch --out directory"
+        )
     out.mkdir(parents=True, exist_ok=True)
     input_path = out / ASSOCIATION_INPUT_NAME
     expected_path = out / "expected-association.jsonl"
@@ -130,10 +135,18 @@ def build(out: Path) -> tuple[str, str]:
     )
 
 
+def build(out: Path | None = None) -> tuple[str, str]:
+    """Build into a scratch directory unless an explicit output is supplied."""
+    if out is not None:
+        return _build(out)
+    with tempfile.TemporaryDirectory(prefix="zmem-171-fixtures-") as td:
+        return _build(Path(td))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", type=Path, default=FIXTURE_DIR,
-                        help="fixture directory (defaults to the checked-in path)")
+    parser.add_argument("--out", type=Path, default=None,
+                        help="scratch output directory (defaults to a temporary directory)")
     args = parser.parse_args()
     input_digest, expected_digest = build(args.out)
     print(f"{ASSOCIATION_INPUT_NAME} sha256={input_digest}")

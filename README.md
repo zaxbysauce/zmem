@@ -225,10 +225,20 @@ IDs per memory write. The writer emits any capture-policy advisory before
 opening its transaction, then validates every supplied ID before memory
 mutation and links it to the resulting memory before commit;
 repeated links are idempotent. `evidence for MEMORY_ID --json` returns that
-memory's namespace and its hash-free evidence rows; the legacy
+memory's namespace and its hash-free evidence rows. It accepts `--limit`
+(1–256, default 100) and `--after-id` for keyset pagination and returns
+`has_more` plus `next_cursor`, so no association is silently omitted. Reverse
+association output accepts `--limit`, `--after-namespace`, and
+`--after-memory-id`, and reports `associations_has_more` with
+`next_association_cursor`. The legacy
 `evidence for --memory-id MEMORY_ID --json` form is also accepted. If both forms
 are supplied, their IDs must match; conflicting IDs exit 2. Explicit JSON
 `recall`, `recent`, and `recall --explain` rows include sorted `evidence_ids`;
+when more than 256 links exist, a row adds `evidence_ids_truncated: true` and
+the remaining IDs are available through the paged `evidence for` command.
+The hidden `evidence associations --json` helper now returns an object with
+`associations` and pagination metadata instead of its former bare JSON list;
+this is a breaking shape change within the still-unmerged #171 surface.
 human and passive-injection output stay unchanged. Strict JSONL import
 prevalidates `memory_evidence` endpoints and rejects a missing endpoint with
 its physical input line before inserting any staged association.

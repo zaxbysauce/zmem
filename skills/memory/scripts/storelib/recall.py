@@ -19,7 +19,7 @@ import glob
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.entity import entities_for_memory, entities_for_memories, entity_match_ids
-from storelib.evidence import evidence_ids_for_memories
+from storelib.evidence import evidence_ids_for_memories_bounded
 from storelib.links import expand_recall_links, graph_seed_ids
 from storelib import beliefs as _beliefs
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
@@ -48,11 +48,15 @@ def _attach_evidence_ids(
     conn: sqlite3.Connection, rows: list[dict]
 ) -> None:
     """Attach association IDs to a rendered result set in bounded batches."""
-    evidence_by_memory = evidence_ids_for_memories(
+    evidence_by_memory, truncated_memory_ids = evidence_ids_for_memories_bounded(
         conn, [row["id"] for row in rows]
     )
     for row in rows:
         row["evidence_ids"] = evidence_by_memory.get(row["id"], [])
+        # Provenance decoration must never make recall's JSON response
+        # unbounded.  The evidence-for cursor surface can retrieve every
+        # remaining id; this explicit Boolean prevents a silent partial view.
+        row["evidence_ids_truncated"] = row["id"] in truncated_memory_ids
 
 
 def _shadow_log_path() -> str | None:

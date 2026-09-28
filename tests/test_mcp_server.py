@@ -402,9 +402,9 @@ class McpServerToolSurfaceTest(unittest.TestCase):
             )
             self.assertEqual(calls, [
                 ["evidence", "scoped-show", "--namespace", "project:allowed",
-                 "--id", "missing-evidence", "--json"],
+                 "--id", "missing-evidence", "--limit", "100", "--json"],
                 ["evidence", "scoped-show", "--namespace", "project:allowed",
-                 "--id", "unassociated-evidence", "--json"],
+                 "--id", "unassociated-evidence", "--limit", "100", "--json"],
             ])
         finally:
             self.mcp_server._run_store = original
@@ -577,8 +577,45 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         ])
         self.assertEqual(calls, [[
             "evidence", "show-with-associations", "--namespace", "",
-            "--id", "evidence-bridge", "--json",
+            "--id", "evidence-bridge", "--limit", "100", "--json",
         ]])
+
+    def test_evidence_selector_utf8_bounds_reject_before_store_subprocess(self):
+        calls = []
+        original = self.mcp_server._run_store
+
+        def capture(args, input_text=None):
+            calls.append(list(args))
+            return {"ok": True, "stdout": "{}", "stderr": "", "returncode": 0}
+
+        self.mcp_server._run_store = capture
+        try:
+            at_limit = "x" * 256
+            self.assertEqual(
+                self.mcp_server._bounded_evidence_selector(at_limit, "id"),
+                (at_limit, None),
+            )
+            for name, args, expected_error in (
+                ("evidence_for", {"memory_id": "x" * 257},
+                 "at most 256 UTF-8 bytes"),
+                ("evidence_show", {"id": "x" * 257},
+                 "at most 256 UTF-8 bytes"),
+                ("evidence_show", {"id": "ok", "namespace": "n" * 257},
+                 "at most 256 UTF-8 bytes"),
+                ("evidence_show", {"id": "ok", "namespace": " " * 257},
+                 "at most 256 UTF-8 bytes"),
+                ("evidence_show", {"id": chr(0)}, "must not contain NUL"),
+                ("evidence_show", {"id": chr(0xD800)},
+                 "must be valid UTF-8 text"),
+            ):
+                result = asyncio.run(self.server._tool_manager.call_tool(
+                    name, args, context=None
+                ))
+                with self.subTest(tool=name, expected_error=expected_error):
+                    self.assertIn(expected_error, result["error"])
+            self.assertEqual(calls, [])
+        finally:
+            self.mcp_server._run_store = original
 
     # -- recall -------------------------------------------------------------
 

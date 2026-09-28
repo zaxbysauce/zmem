@@ -49,6 +49,13 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 # Stable error token for scope denials (issue #65, 10.2). A stable machine-
 # readable constant, not a human message, so clients can branch on it.
 NAMESPACE_NOT_ALLOWED = "namespace_not_allowed"
+_MAX_TOKEN_NAMESPACES = 128
+_MAX_TOKEN_NAMESPACE_UTF8_BYTES = 256
+_MAX_TOKEN_NAMESPACES_TOTAL_UTF8_BYTES = 8192
+# Fits below common 8 KiB HTTP header limits after the Authorization scheme,
+# while leaving room for ordinary proxy/server header overhead.  It also makes
+# the presented-token verification path bounded before hmac.compare_digest.
+_MAX_BEARER_TOKEN_UTF8_BYTES = 4096
 
 # Namespace grammar is loaded directly from the same selected checkout as the
 # MCP store subprocess.  auth.py remains dependency-free and fails closed for
@@ -137,6 +144,7 @@ def _parse_token_file(raw: str, source: str) -> TokenConfig:
         tok = raw.strip()
         if not tok:
             _fail_config(f"{source} is empty")
+        _validate_config_token(tok, source)
         return TokenConfig(token=tok, namespaces=None, source=source)
     try:
         obj = _json.loads(raw)
@@ -151,6 +159,7 @@ def _parse_token_file(raw: str, source: str) -> TokenConfig:
     if not isinstance(tok, str) or not tok.strip():
         _fail_config(f"{source} JSON object must carry a non-empty string 'token'")
     tok = tok.strip()
+    _validate_config_token(tok, source)
     scopes = obj.get("namespaces")
     if scopes is None:
         return TokenConfig(token=tok, namespaces=None, source=source)
@@ -159,8 +168,30 @@ def _parse_token_file(raw: str, source: str) -> TokenConfig:
             f"{source} 'namespaces' must be a NON-EMPTY list of namespace "
             "strings (omit the key entirely for an unscoped operator token)"
         )
+    if len(scopes) > _MAX_TOKEN_NAMESPACES:
+        _fail_config(
+            f"{source} 'namespaces' exceeds the maximum of "
+            f"{_MAX_TOKEN_NAMESPACES} entries"
+        )
     cleaned: list[str] = []
+    total_namespace_bytes = 0
     for ns in scopes:
+        # Character length cheaply rejects pathological input before encoding;
+        # UTF-8 byte length is the actual subprocess/SQLite safety contract.
+        if not isinstance(ns, str) or len(ns) > _MAX_TOKEN_NAMESPACE_UTF8_BYTES:
+            _fail_config(
+                f"{source} 'namespaces' entries must be strings no longer than "
+                f"{_MAX_TOKEN_NAMESPACE_UTF8_BYTES} UTF-8 bytes"
+            )
+        try:
+            ns_bytes = len(ns.encode("utf-8"))
+        except UnicodeEncodeError:
+            _fail_config(f"{source} namespace entries must be valid UTF-8 text")
+        if ns_bytes > _MAX_TOKEN_NAMESPACE_UTF8_BYTES:
+            _fail_config(
+                f"{source} 'namespaces' entries must be strings no longer than "
+                f"{_MAX_TOKEN_NAMESPACE_UTF8_BYTES} UTF-8 bytes"
+            )
         if (_NAMESPACE_VALIDATOR is None
                 and isinstance(ns, str)
                 and ns.strip() != "user:global"):
@@ -174,7 +205,18 @@ def _parse_token_file(raw: str, source: str) -> TokenConfig:
                 "shape (expected project:<name>, user:<name>, fleet:<name>, "
                 "host:<name>, agent:<name>, domain:<name>, or user:global)"
             )
-        cleaned.append(str(ns).strip())
+        normalized_ns = ns.strip()
+        try:
+            normalized_ns_bytes = normalized_ns.encode("utf-8")
+        except UnicodeEncodeError:
+            _fail_config(f"{source} namespace entries must be valid UTF-8 text")
+        total_namespace_bytes += len(normalized_ns_bytes)
+        if total_namespace_bytes > _MAX_TOKEN_NAMESPACES_TOTAL_UTF8_BYTES:
+            _fail_config(
+                f"{source} 'namespaces' exceeds the maximum aggregate of "
+                f"{_MAX_TOKEN_NAMESPACES_TOTAL_UTF8_BYTES} UTF-8 bytes"
+            )
+        cleaned.append(normalized_ns)
     return TokenConfig(
         token=tok, namespaces=frozenset(cleaned), source=source
     )
@@ -183,6 +225,24 @@ def _parse_token_file(raw: str, source: str) -> TokenConfig:
 def _fail_config(message: str) -> None:
     sys.stderr.write(f"zmem-mcp: {message}\n")
     sys.exit(2)
+
+
+def _validate_config_token(token: str, source: str) -> None:
+    """Reject oversized configured bearer material without echoing a secret."""
+    if len(token) > _MAX_BEARER_TOKEN_UTF8_BYTES:
+        _fail_config(
+            f"{source} token exceeds the maximum of "
+            f"{_MAX_BEARER_TOKEN_UTF8_BYTES} UTF-8 bytes"
+        )
+    try:
+        token_bytes = token.encode("utf-8")
+    except UnicodeEncodeError:
+        _fail_config(f"{source} token must be valid UTF-8 text")
+    if len(token_bytes) > _MAX_BEARER_TOKEN_UTF8_BYTES:
+        _fail_config(
+            f"{source} token exceeds the maximum of "
+            f"{_MAX_BEARER_TOKEN_UTF8_BYTES} UTF-8 bytes"
+        )
 
 
 def load_token_config() -> TokenConfig:
@@ -195,6 +255,7 @@ def load_token_config() -> TokenConfig:
     """
     tok = os.environ.get("ZMEM_MCP_TOKEN", "").strip()
     if tok:
+        _validate_config_token(tok, "ZMEM_MCP_TOKEN")
         return TokenConfig(token=tok, namespaces=None, source="ZMEM_MCP_TOKEN")
     tok_file = os.environ.get("ZMEM_MCP_TOKEN_FILE", "").strip()
     if tok_file:
@@ -242,8 +303,19 @@ class StaticTokenVerifier(TokenVerifier):
     async def verify_token(self, token: str) -> Optional[AccessToken]:  # noqa: D401
         if not isinstance(token, str) or not token:
             return None
-        # Constant-time comparison to resist timing probes.
-        if hmac.compare_digest(token, self._expected):
+        # Reject oversized Authorization credentials before comparing them. Do
+        # not log the value or its length: both can be sensitive request data.
+        if len(token) > _MAX_BEARER_TOKEN_UTF8_BYTES:
+            return None
+        try:
+            token_bytes = token.encode("utf-8")
+            expected_bytes = self._expected.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        if len(token_bytes) > _MAX_BEARER_TOKEN_UTF8_BYTES:
+            return None
+        # Constant-time byte comparison supports valid non-ASCII UTF-8 tokens.
+        if hmac.compare_digest(token_bytes, expected_bytes):
             return AccessToken(
                 token=token,
                 client_id="zmem-operator",

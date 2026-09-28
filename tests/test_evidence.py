@@ -101,6 +101,24 @@ class EvidenceAssociationWriteTest(_StoreCase):
             )
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0], before)
 
+    def test_add_dedup_attaches_to_existing_survivor(self):
+        evidence_id = "00000000-0000-4000-8000-000000000706"
+        self._evidence(evidence_id)
+        survivor = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="add dedup evidence survivor", signal="test",
+        ))
+        result = write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="add dedup evidence survivor", signal="test",
+            evidence_ids=[evidence_id],
+        )
+        self.assertTrue(result.deduped)
+        self.assertEqual(str(result), survivor)
+        self.assertEqual(
+            evidence.evidence_ids_for_memory(self.conn, survivor), [evidence_id]
+        )
+
     def test_capture_warning_precedes_begin_immediate_lock_failure(self):
         """Capture-policy notices remain visible when the writer cannot lock."""
         self.conn.commit()
@@ -232,6 +250,16 @@ class EvidenceAssociationWriteTest(_StoreCase):
             argparse.ArgumentTypeError, "^at most 256 evidence ids"
         ):
             _parse_evidence_ids(",".join(ids + ["evidence-256"]))
+        consumed = []
+
+        def unbounded_ids():
+            for index in range(1000):
+                consumed.append(index)
+                yield f"stream-{index}"
+
+        with self.assertRaisesRegex(ValueError, "^at most 256 evidence ids"):
+            evidence.normalize_evidence_ids(unbounded_ids())
+        self.assertEqual(len(consumed), 257)
 
     def test_writer_and_attach_reject_257_without_mutation(self):
         too_many = [f"evidence-{index:03d}" for index in range(257)]
@@ -333,6 +361,32 @@ class EvidenceAssociationWriteTest(_StoreCase):
             evidence.evidence_ids_for_memory(self.conn, str(replacement_id)), [new_evidence]
         )
 
+    def test_update_dedup_attaches_to_existing_survivor(self):
+        evidence_id = "00000000-0000-4000-8000-000000000716"
+        self._evidence(evidence_id)
+        survivor = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="update dedup evidence survivor", signal="test",
+        ))
+        old_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-association", type_="fact",
+            content="update dedup evidence source", signal="test",
+        ))
+        result, created_new = write.update_memory(
+            self.conn, mid=old_id, content="update dedup evidence survivor",
+            signal="test", evidence_ids=[evidence_id],
+        )
+        self.assertFalse(created_new)
+        self.assertEqual(str(result), survivor)
+        self.assertEqual(
+            evidence.evidence_ids_for_memory(self.conn, survivor), [evidence_id]
+        )
+        self.assertIsNotNone(
+            self.conn.execute(
+                "SELECT superseded_at FROM memory WHERE id=?", (old_id,)
+            ).fetchone()[0]
+        )
+
     def test_passive_injection_capture_does_not_gain_evidence_ids(self):
         evidence_id = "00000000-0000-4000-8000-000000000713"
         self._evidence(evidence_id)
@@ -351,6 +405,37 @@ class EvidenceAssociationWriteTest(_StoreCase):
         rows = captured.get("results", [])
         self.assertEqual([row["id"] for row in rows], [memory_id], captured)
         self.assertNotIn("evidence_ids", rows[0], captured)
+
+    def test_passive_injection_recall_and_explain_omit_evidence_ids(self):
+        evidence_id = "00000000-0000-4000-8000-000000000717"
+        self._evidence(evidence_id)
+        memory_id = str(write.add_memory(
+            self.conn, namespace="project:evidence-passive", type_="fact",
+            content="passive recall explain evidence preservation", signal="test",
+            evidence_ids=[evidence_id],
+        ))
+        captured: dict = {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            recall.recall_memory(
+                self.conn, query="passive recall explain evidence preservation",
+                namespace="project:evidence-passive", limit=5, as_json=True,
+                for_injection=True, no_bump=True, no_telemetry=True, hybrid=False,
+                _capture=captured,
+            )
+        rows = captured.get("results", [])
+        self.assertEqual([row["id"] for row in rows], [memory_id], captured)
+        self.assertNotIn("evidence_ids", rows[0], captured)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            recall.explain_recall(
+                self.conn, query="passive recall explain evidence preservation",
+                namespace="project:evidence-passive", limit=5, as_json=True,
+                for_injection=True, hybrid=False,
+            )
+        explain_rows = json.loads(output.getvalue())["results"]
+        self.assertEqual([row["id"] for row in explain_rows], [memory_id])
+        self.assertNotIn("evidence_ids", explain_rows[0])
 
     def test_multi_row_recall_explain_recent_attach_evidence_ids(self):
         first_evidence = "00000000-0000-4000-8000-000000000714"
@@ -690,6 +775,25 @@ class EvidenceMigrationAtomicityTest(_StoreCase):
 
 
 class EvidenceExportCompatibilityTest(_StoreCase):
+    def test_export_preserves_caller_owned_transaction(self):
+        self.conn.execute("CREATE TABLE caller_sentinel(value TEXT)")
+        self.conn.commit()
+        self.conn.execute("BEGIN")
+        self.conn.execute("INSERT INTO caller_sentinel(value) VALUES ('keep')")
+        out = self.root / "caller-owned-export.jsonl"
+
+        self.assertEqual(sync.cmd_export_jsonl(self.conn, out=str(out)), 0)
+        self.assertTrue(self.conn.in_transaction)
+        self.assertEqual(
+            self.conn.execute("SELECT value FROM caller_sentinel").fetchone()[0],
+            "keep",
+        )
+
+        self.conn.rollback()
+        self.assertIsNone(
+            self.conn.execute("SELECT 1 FROM caller_sentinel").fetchone()
+        )
+
     def test_partial_v14_schema_fails_closed(self):
         self.conn.execute("DROP TABLE memory_evidence")
         self.conn.commit()
@@ -1011,6 +1115,40 @@ class EvidenceRetentionTest(_StoreCase):
 
 
 class EvidenceJsonlTest(_StoreCase):
+    def test_auto_strict_missing_endpoint_preserves_physical_line(self):
+        memory = {
+            "kind": "memory", "id": "00000000-0000-4000-8000-000000000725",
+            "namespace": "project:evidence-auto-strict", "type": "fact",
+            "content": "auto strict association diagnostic", "tags": "",
+            "source_ref": "", "confidence": 0.9, "signal": "test",
+            "valid_from": "2026-09-10T00:00:00Z", "valid_until": "",
+            "update_of": "", "taint": "trusted_internal",
+            "ingestion_ts": "2026-09-10T00:00:00Z", "superseded_at": None,
+            "supersede_reason": "", "merged_from": None, "trust_score": 1.0,
+            "applied_count": 0, "violated_count": 0, "links": [],
+        }
+        path = self.root / "auto-strict-missing-association.jsonl"
+        path.write_text(
+            json.dumps(memory) + "\n\n" + json.dumps({
+                "table": "memory_evidence", "memory_id": memory["id"],
+                "evidence_id": "00000000-0000-4000-8000-000000000799",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            result = sync.cmd_ingest_jsonl(
+                self.conn, in_path=str(path), source_ref=None,
+            )
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "[zmem] ingest-jsonl: line 3: memory_evidence endpoint not found\n",
+        )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0], 0
+        )
+
     def test_strict_timestamp_and_offset_match_writer_contract(self):
         for index, ts in enumerate((
             "2026-9-10T00:00:00Z", "2026-09-10T00:00:60Z",

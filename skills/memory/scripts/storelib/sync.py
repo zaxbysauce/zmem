@@ -1824,6 +1824,12 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 allow_tombstones=allow_tombstones,
                 capture_mode=capture_mode,
             )
+        except _MemoryEvidenceEndpointMissing as e:
+            print(
+                f"[zmem] ingest-jsonl: line {e.lineno}: memory_evidence endpoint not found",
+                file=sys.stderr,
+            )
+            return 2
         except Exception as e:
             print(
                 f"[zmem] ingest-jsonl: strict import rejected: "
