@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from tests.test_evidence_association import (
+# The CI loop executes this file directly, where the repository root is not
+# guaranteed to expose ``tests`` as an importable package.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_evidence_association import (  # noqa: E402
     EVIDENCE_1,
     MEMORY_1,
     MEMORY_2,
