@@ -1727,6 +1727,25 @@ blocked for the restore's duration (writers wait on the maintenance gate and
 fail clearly after a short timeout): still run `restore` when no session is
 actively writing.
 
+### Passive-lane credential withhold (issue #256)
+The hook-driven `recall --for-injection` path re-scans every selected row
+with the **credential** patterns from the write-time registry
+(`SECRET_CREDENTIAL_PATTERNS` — key=value shapes, PEM headers, `gh*_`
+tokens, AKIA keys; plus whatever shapes issue #180 adds). A matching row is
+delivered as an id+type-only bullet marked `[WITHHELD: SECRET]`: its
+content, source_ref, tags, and entity names never reach the hook payload or
+the model context, it is not counted in `surfaced_count`, and the delivery
+ledger entry for it carries no credential text. The JSON envelope gains
+`secret_withheld` (a count) **only when a withhold happened** — clean runs
+stay byte-identical. Ordinary rows are untouched: rows carrying plain
+40-hex git SHAs render normally (the generic hex/base64 detectors are
+deliberately NOT used at read time). Explicit `recall`/`recent`/`get`
+without `--session-id` (the no-session variant) is an explicit call, not
+the passive lane, and is not filtered. Sibling envelopes the selector
+builds for silent/kill-switch reasons never carry the key. To remove a
+confirmed secret from the store entirely, use `purge` (#255); rotation of
+any credential that was ever passively delivered remains mandatory.
+
 ### purge — durably remove a memory's content (issue #255)
 ```
 python <store.py> purge --id <id> [--id <id2> ...] [--scrub-backups --out-dir DIR] [--json]

@@ -49,6 +49,8 @@ INJECTION_ENVELOPE_REQUIRED = frozenset({
 })
 INJECTION_ENVELOPE_OPTIONAL = frozenset({
     "injection_risk", "candidate_lanes", "budget_note",
+    # Issue #256: present only when a credential withhold happened.
+    "secret_withheld",
 })
 
 # Best-effort single-source-of-truth for the protected type literals; the
@@ -1048,6 +1050,30 @@ def select_and_budget_for_injection(
         if not candidate_ids:
             candidate_ids = [r.get("id") for r in rows
                              if isinstance(r, dict) and isinstance(r.get("id"), str)]
+        # Issue #256: read-time credential re-scan on the passive lane —
+        # the defense-in-depth twin of the prompt-injection re-scan. Every
+        # selected row matching SECRET_CREDENTIAL_PATTERNS (content /
+        # source_ref / tags) is replaced by an id+type-only withheld marker
+        # BEFORE rendering, the bump list, and the ledger. No new store
+        # writes: the row is never mutated, only its delivery is filtered.
+        withheld_rows = []
+        displayed_rows = []
+        for row in rows:
+            if isinstance(row, dict) and recall_module._classify_credential(row):
+                withheld_rows.append(row)
+                displayed_rows.append({
+                    "id": row.get("id", ""),
+                    "type": row.get("type", ""),
+                    "confidence": row.get("confidence", 0.0),
+                    "signal": row.get("signal", "none"),
+                    "namespace": row.get("namespace", ""),
+                    "content": "",
+                    "withheld_for_secret": True,
+                })
+            else:
+                displayed_rows.append(row)
+        rows = displayed_rows
+        secret_withheld_count = len(withheld_rows)
         excluded = [rid for rid in exclusions if rid in candidate_ids]
         if not rows and candidate_ids and excluded and set(candidate_ids) <= set(excluded):
             reason = "already-delivered"
@@ -1072,6 +1098,12 @@ def select_and_budget_for_injection(
         present = [row for row in present
                    if not row.get("link_relation")
                    and not row.get("_graph_arrival_only")]
+        # Issue #256: a withheld row is not rendered content (#114 rendered-row
+        # law) — never bumped, never ledgered. Load-bearing, not belt-and-
+        # braces: rows_present_in's marker-prefix whitelist would only drop
+        # the marker for THIS fence shape; an id-token match would not.
+        present = [row for row in present
+                   if not row.get("withheld_for_secret")]
         if present:
             try:
                 recall_module._bump_telemetry(
@@ -1095,6 +1127,7 @@ def select_and_budget_for_injection(
             budget_dropped_protected=parsed.get("budget_dropped_protected", 0),
             arms=parsed.get("arms", {}), rendered=rendered,
             injection_risk=parsed.get("injection_risk"),
+            secret_withheld=secret_withheld_count or None,
             candidate_lanes=parsed.get("candidate_lanes"),
             budget_note=parsed.get("budget_note") if rows else None,
         )

@@ -570,12 +570,19 @@ class PurgeDerivedCopiesTest(_PurgeBase):
 # ---------------------------------------------------------------------------
 class PurgeLedgerTest(_PurgeBase):
     def test_purge_scrubs_delivery_ledgers(self):
-        target = self.add_row(TARGET_CONTENT)
+        # CHECK_WRONG amendment (issue #256 landing): the original fixture
+        # seeded TARGET_CONTENT, whose ghp_ fake token is a CREDENTIAL shape
+        # — the passive lane now withholds exactly that row (issue #256), so
+        # it can no longer reach the delivery ledger to be scrubbed. The
+        # ledger-scrub contract is pinned with a zebraquux-only target the
+        # passive lane still delivers; FAKE needles stay in C3/C9.
+        target = self.add_row(
+            "deploy checklist zebraquux marker for the release runner")
         clean = self.add_row(
             "deploy token marker checklist for the release runner")
         # One passive recall mirroring the hook argv — this is what writes
         # the delivery ledger for the session.
-        r = self._run("recall", "--query", "deploy token marker",
+        r = self._run("recall", "--query", "deploy checklist marker",
                       "--namespace", NS, "--limit", "5", "--no-bump",
                       "--for-injection", "--json", "--session-id", "sess-q01",
                       "--moment", "user_prompt", "--lane", "claude")

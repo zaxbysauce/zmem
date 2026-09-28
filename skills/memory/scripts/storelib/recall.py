@@ -255,6 +255,7 @@ def build_injection_envelope(
     arms: dict,
     rendered: str,
     injection_risk: int | None = None,
+    secret_withheld: int | None = None,
     candidate_lanes: dict | None = None,
     budget_note: str | None = None,
 ) -> dict:
@@ -277,6 +278,12 @@ def build_injection_envelope(
     }
     if injection_risk is not None:
         envelope["injection_risk"] = injection_risk
+    # Issue #256: emitted ONLY when a withhold happened (the call site passes
+    # `count or None`) so zero-withhold envelopes stay byte-identical to the
+    # pre-#256 wire (the #183 full-wire pin and the injection-parity fixtures
+    # are untouched).
+    if secret_withheld is not None:
+        envelope["secret_withheld"] = secret_withheld
     if candidate_lanes is not None:
         envelope["candidate_lanes"] = candidate_lanes
     if budget_note is not None:
@@ -1943,6 +1950,11 @@ def _format_fenced_recall(rows: list[dict], header: str,
         # carry `contested_link`, so non-expansion output is unchanged.
         if r.get("contested_link"):
             _markers.append("[CONTESTED LINK]")
+        # Issue #256: a row withheld for a credential shape renders its id and
+        # type only — never content, source_ref, tags, or entity names. The
+        # key is new, so non-withheld rows render byte-identically (#183 pin).
+        if r.get("withheld_for_secret"):
+            _markers.append("[WITHHELD: SECRET]")
         inj_prefix = (" " + " ".join(_markers)) if _markers else ""
         # Issue #98: only cross-project rows carry the tier marker, right
         # after the source-namespace token, so the reader sees the row came
@@ -1969,6 +1981,10 @@ def _format_fenced_recall(rows: list[dict], header: str,
             f"[ns={r['namespace']}]{_tier_token} [type={r['type']}]"
             f"{r.get('_stale_note', '')}"
         )
+        if r.get("withheld_for_secret"):
+            # id/type bullet only — the credential text must not reach the
+            # fence (the only text the hook delivers to the model).
+            continue
         lines.append(f"    {r['content']}")
         if r.get("source_ref"):
             lines.append(f"    source_ref: {r['source_ref']}")
@@ -1993,6 +2009,23 @@ def _format_fenced_recall(rows: list[dict], header: str,
     # payload.  Keep one terminal LF so the canonical fence is byte-stable
     # across hook and provider boundaries.
     return "\n".join(lines) + "\n"
+
+def _classify_credential(item: dict) -> bool:
+    """Issue #256: read-time credential re-scan for the passive lane.
+
+    Mirrors ``_classify_injection``'s input set (content / source_ref /
+    tags) but re-runs the CREDENTIAL half of the write-time registry only —
+    never ``SECRET_GENERIC_PATTERNS``/``SECRET_PATTERNS``: their 32+ hex /
+    40+ base64 shapes match every full git SHA and would withhold ordinary
+    rows. Pure string/regex; no model, no store writes. The shapes issue
+    #180 adds to ``SECRET_CREDENTIAL_PATTERNS`` are picked up here
+    automatically (the registry is consumed verbatim).
+    """
+    from redaction import SECRET_CREDENTIAL_PATTERNS
+    blob = " \n".join(
+        str(item.get(k) or "") for k in ("content", "source_ref", "tags"))
+    return any(pat.search(blob) for pat in SECRET_CREDENTIAL_PATTERNS)
+
 
 def _classify_injection(item: dict) -> bool:
     """Classify a recall item as injection-risk (issue #58, 3.4).

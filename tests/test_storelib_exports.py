@@ -313,7 +313,10 @@ class EnvelopeContractTest(unittest.TestCase):
             "budget_dropped", "budget_admission", "budget_truncated",
             "budget_dropped_protected", "arms", "rendered",
         }
-        expected_optional = {"injection_risk", "candidate_lanes", "budget_note"}
+        # issue #256: secret_withheld is an optional envelope key (present
+        # only when a credential withhold happened).
+        expected_optional = {"injection_risk", "candidate_lanes", "budget_note",
+                             "secret_withheld"}
         self.assertEqual(set(INJECTION_ENVELOPE_REQUIRED), expected_required)
         self.assertEqual(set(INJECTION_ENVELOPE_OPTIONAL), expected_optional)
 
