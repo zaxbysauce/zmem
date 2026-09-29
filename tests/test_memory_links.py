@@ -674,13 +674,22 @@ class RecallExpansionTest(_Store):
         )
         self.assertEqual(recall_first_raw, recall_second_raw)
         self.assertEqual(explain_first_raw, explain_second_raw)
+        # Issue #171 adds bounded evidence-association metadata to every
+        # non-injection result, including rows with no associated evidence.
+        self.assertTrue(
+            all(
+                row["evidence_ids"] == []
+                and row["evidence_ids_truncated"] is False
+                for row in recall_first["results"]
+            )
+        )
         self.assertEqual(
             hashlib.sha256(recall_first_raw).hexdigest(),
-            "ed7b46ef462e974796a9f5d7c966481d174bf6056225ea52f55363634b273b82",
+            "b553698456c5a29e47bda99de0e1d739b1d86a219e0a3529a1be6cad9bda17f9",
         )
         self.assertEqual(
             hashlib.sha256(explain_first_raw).hexdigest(),
-            "dff6a68104aa332b1b3d5ce1115e8377ce342233110af3506df062ff0ee3110a",
+            "c2d7107515fd7c6df1367fc92d45357486c2d4dbc3eb4cf7f3e8d5d03b7e5ab4",
         )
         self.assertEqual(self._expansion_ids(recall_first), expected["present"])
         self.assertEqual(self._expansion_ids(recall_second), expected["present"])
