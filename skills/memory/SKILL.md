@@ -1742,7 +1742,14 @@ stay byte-identical. Ordinary rows are untouched: rows carrying plain
 deliberately NOT used at read time). Explicit `recall`/`recent`/`get`
 without `--session-id` (the no-session variant) is an explicit call, not
 the passive lane, and is not filtered. Sibling envelopes the selector
-builds for silent/kill-switch reasons never carry the key. To remove a
+builds for silent/kill-switch reasons never carry the key. Known residuals:
+a credential stored ONLY as an entity `canonical_name`/alias is not
+detected — it renders in the fence's entity line and rides into the
+delivery ledger via the entry text (issue #180-adjacent; purge covers the
+store rows, not the entity tables, for those shapes); and the withheld
+bullet's metadata (id, type, namespace, confidence, signal) plus the
+`secret_withheld` counter still reveal to the model THAT a secret exists,
+by design. To remove a
 confirmed secret from the store entirely, use `purge` (#255); rotation of
 any credential that was ever passively delivered remains mandatory.
 

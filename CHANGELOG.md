@@ -26,8 +26,14 @@ README.
   byte-identical). No new store writes; the prompt-injection re-scan and the
   #114 rendered-row law are untouched. Shapes issue #180 adds to the
   registry are picked up automatically; until then the `sshpass -p` shape
-  stays unwithheld (CI runs the dependency-independent test classes; see the
-  ci.yml comment). Removal of a confirmed secret is `purge` (#255, 0.71.0).
+  stays unwithheld (CI runs the dependency-independent test classes; no
+  workflow executes the gated AC6 class — the trace gates that replay it
+  are human-run, not CI; see the ci.yml comment). Documented residuals: a
+  credential stored only as an entity name is not withheld (it renders in
+  the entity line and its text reaches the delivery ledger), and the
+  withheld bullet's metadata plus the `secret_withheld` counter reveal
+  that a secret exists. Removal of a confirmed secret is `purge`
+  (#255, 0.71.0).
 
 ## [0.71.0] - 2026-09-28
 

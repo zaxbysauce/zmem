@@ -611,6 +611,62 @@ class PurgeLedgerTest(_PurgeBase):
             "purge must scrub the purged row's text from the delivery "
             "ledgers while the surviving row's delivery record stays intact")
 
+    def test_ledger_needle_branch_drops_survivor_quoting_entries(self):
+        # PRR-267-001: exercise the scrub_ledgers NEEDLE branch — an entry
+        # dropped because its TEXT quotes purged content, while its id is
+        # NOT in drop_ids. Reachable shape: a consolidation keeper delivered
+        # BEFORE the purge — its stale ledger entry still holds the absorbed
+        # block, while the purge rewrites the store copy clean (rc 0). (A
+        # LIVE surviving row quoting the purged sentence verbatim cannot
+        # reach this branch: the byte-verify refuses with exit 5 before the
+        # ledger scrub ever runs.)
+        target = self.add_row(
+            "deployment checklist zebraquux marker r two probe")
+        keeper = self.add_row("runbook kept for the r two probe team")
+        clean = self.add_row(
+            "deploy token marker checklist for the release runner")
+        self._exec(
+            ("UPDATE memory SET content=?, content_norm=?, merged_from=? "
+             "WHERE id=?",
+             ("runbook kept for the r two probe team"
+              "\n\n--- merged from %s ---\n" % target
+              + "deployment checklist zebraquux marker r two probe",
+              "runbook kept for the r two probe team",
+              target, keeper)),
+        )
+        r = self._run("recall", "--query", "deploy checklist marker",
+                      "--namespace", NS, "--limit", "5", "--no-bump",
+                      "--for-injection", "--json", "--session-id",
+                      "sess-q01-needle", "--moment", "user_prompt",
+                      "--lane", "claude")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        delivered = self._delivered_ids("sess-q01-needle")
+        self.assertIn(keeper, delivered,
+                      "precondition: the keeper (block included) must have "
+                      "been delivered before the purge")
+        self.assertIn(clean, delivered,
+                      "precondition: the clean row must have been delivered")
+
+        r = self._purge(target)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        delivered = self._delivered_ids("sess-q01-needle")
+        self.assertNotIn(
+            keeper, delivered,
+            "the keeper's ledger entry still quotes the absorbed block; the "
+            "needle branch must drop it even though the keeper id survives")
+        self.assertIn(clean, delivered,
+                      "an entry with no needle text must stay recorded")
+        kept = self.qone("SELECT content FROM memory WHERE id=?",
+                         (keeper,))
+        self.assertIsNotNone(
+            kept, "the needle branch drops the LEDGER entry, never the row")
+        self.assertNotIn("zebraquux", (kept or [""])[0].lower(),
+                         "the store copy of the keeper must be rewritten")
+        ledger_files = glob.glob(
+            os.path.join(self.data_dir, "ops", "*.ledger*"))
+        self.assertEqual(self._needle_count(ledger_files), 0)
+
 
 # ---------------------------------------------------------------------------
 # AC8: the deny list — a pre-purge sync file cannot resurrect the id
