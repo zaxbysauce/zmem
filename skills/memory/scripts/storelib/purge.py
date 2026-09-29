@@ -193,11 +193,15 @@ def _plan_keeper(keeper: dict[str, Any], rows: dict[str, Any]):
 
     PR-review fix (PRR-002): remove the STORED merged-from blocks by their
     header (whatever body they hold — the stored text may have drifted from
-    the purged row's current content), then refuse when any token that lived
-    inside a removed block still appears in the stripped content (i.e. the
-    absorbed text was duplicated outside the block). The previous leak test
-    compared against the post-merge content's own tokens and could never
-    fire."""
+    the purged row's current content), then refuse when the purged row's
+    full text is still present verbatim in the stripped content (merged_from
+    names it but the content block header names something else, or the strip
+    was incomplete). Shared short fragments between the keeper's own base
+    text and the absorbed text are unattributable after the merge — the
+    byte-verify's surviving-row token suppression plus the full-content
+    needle are the enforceable bar for those (documented in SKILL.md). The
+    previous leak test compared against the post-merge content's own tokens
+    and could never fire."""
     content = keeper["row"]["content"] or ""
     merged = list(keeper["merged"])
     removed_tokens: set[str] = set()
@@ -214,15 +218,13 @@ def _plan_keeper(keeper: dict[str, Any], rows: dict[str, Any]):
             r"\n*--- merged from %s(?::truncated)? ---\n?" % base,
             "", content, count=1)
         merged = [m for m in merged if _base_id(m) != pid]
-    # Residue test 1 (removed-block tokens): any >=8-char token that lived
-    # inside a removed block and still appears verbatim in the stripped
-    # content means a phrase of the absorbed text was duplicated outside the
-    # block. Shared vocabulary that only exists in the keeper's own base text
-    # is unattributable after the merge and is handled by the byte-verify's
-    # surviving-row token suppression instead of a refusal (a real lexical
-    # consolidate cluster shares phrases between base and absorbed text, so a
-    # stricter test would refuse ordinary consolidations).
-    removed_tokens: set[str] = set()
+    # Strip every stored merged-from block for the purged ids (drift-
+    # tolerant: the stored body may hold an older version of the text). What
+    # remains in the keeper is its own base content; shared vocabulary
+    # between base and absorbed text is unattributable after the merge and
+    # is policed by the byte-verify (surviving-row token suppression plus
+    # the full-content needle), not by a refusal — a phrase/token-level test
+    # here would refuse ordinary lexical consolidations.
     for pid in keeper["purged"]:
         base = re.escape(_base_id(pid))
         block = re.search(
@@ -230,16 +232,13 @@ def _plan_keeper(keeper: dict[str, Any], rows: dict[str, Any]):
             r"(?=\n*--- merged from |\Z)" % base,
             content, flags=re.DOTALL)
         if block is not None:
-            removed_tokens |= _tokens(block.group("body"))
             content = content[:block.start()] + "\n" + content[block.end():]
         content = re.sub(
             r"\n*--- merged from %s(?::truncated)? ---\n?" % base,
             "", content, count=1)
         merged = [m for m in merged if _base_id(m) != pid]
-    if removed_tokens & _tokens(content):
-        return None
-    # Residue test 2 (PRR-002 follow-up): if the purged row's full current
-    # text is still present verbatim (merged_from names it but the content
+    # Residue refusal: if the purged row's full current text is still
+    # present verbatim in the keeper (merged_from names it but the content
     # block header names something else, or the strip was incomplete), the
     # rewrite would silently keep the text — refuse naming the row.
     for pid in keeper["purged"]:
@@ -711,6 +710,17 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
     if scrub_backups and not out_dir:
         print("[zmem] purge: --scrub-backups requires --out-dir", file=sys.stderr)
         return 2
+    if scrub_backups:
+        # PRR-006/F3: validate the backup dir BEFORE any lock or mutation so
+        # a UNC/network/OneDrive path is a clean pre-flight refusal (matching
+        # cmd_restore's overwrite guard) instead of a post-mutation failure.
+        from storelib.schema import _host
+        if _host is not None:
+            try:
+                _host.assert_local_fs(Path(out_dir))
+            except ValueError as e:
+                print("[zmem] purge REFUSED: %s" % e, file=sys.stderr)
+                return 4
 
     # Full cmd_restore ladder (backup.py:647-701): maintenance -> schema ->
     # backup -> consolidate -> live-writer refusal. Maintenance gates writers
@@ -829,9 +839,6 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         snapshots: list[dict[str, str]] = []
         if scrub_backups:
             bdir = Path(out_dir)
-            from storelib.schema import _host
-            if _host is not None:
-                _host.assert_local_fs(bdir)
             try:
                 for snap in sorted(list(bdir.glob("store-*.sqlite"))
                                    + list(bdir.glob("prerestore-*.sqlite"))):

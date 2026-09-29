@@ -1798,7 +1798,14 @@ surviving carrier) so peer imports stay denied only while content exists.
 Detection scope note: the read-time-style scan here covers the row's
 content, source_ref and tags; a credential stored ONLY as an entity
 name is not detected by purge's needle scan or by the passive lane's
-withhold (issue #180-adjacent residual).
+withhold (issue #180-adjacent residual). Keeper rewrite note: a
+consolidation keeper whose own base text shares words or short phrases
+with the absorbed text keeps those shared fragments after the strip —
+they are indistinguishable from the keeper's own vocabulary; the
+full purged text is always removed or the purge refuses, and the
+byte-verify's novel-token needles cover genuinely novel residue. Peer
+imports skip evidence rows that were junctioned to a purged memory
+(including their episode junctions), so purged excerpts stay gone.
 
 ### sweep — prune stale per-session cooldown sentinels
 ```

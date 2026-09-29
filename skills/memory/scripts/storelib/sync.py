@@ -1662,6 +1662,8 @@ def _strict_ingest_staged(
 
         for table, obj in rows:
             if table == "episode_evidence":
+                if obj["evidence_id"] in purged_orphan_evidence:
+                    continue  # issue #255: junction dropped with its skipped evidence
                 parent = conn.execute(
                     "SELECT 1 FROM episode WHERE id=?", (obj["episode_id"],)
                 ).fetchone()
