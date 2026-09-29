@@ -846,6 +846,38 @@ class PurgeFeedbackRound5Test(_PurgeBase):
             "strict import rejected", r.stderr,
             "a junction naming deny-listed evidence drops, never aborts")
 
+    def test_mixed_batch_scopes_the_clean_claim(self):
+        # A deny-listed id (its exit-5 residue unremediated) riding along
+        # with a fresh id in one batch: the clean claim covers the fresh
+        # purge only, and the output notes the rider is not re-scanned.
+        stale = self.add_row(TARGET_CONTENT)
+        keeper = self.add_row(OTHER_CONTENT)
+        evidence_id = "00000000-0000-4000-8000-00000000e11f"
+        self._exec(
+            ("INSERT INTO evidence "
+             "(id, session_id, lane, moment, kind, ts, hash, excerpt, "
+             "ref_path, ref_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (evidence_id, "sess-purge", "zcode", "user_prompt", "tool_call",
+              "2026-09-29T00:00:00Z",
+              "0eb95917368d3681285c9136f01cd350a385e20026cdb746b3cbd6cdbef86926",
+              TARGET_CONTENT,
+              "tests/test_q01_purge.py", 1)),
+            ("INSERT INTO memory_evidence (memory_id, evidence_id) "
+             "VALUES (?, ?)", (stale, evidence_id)),
+            ("INSERT INTO memory_evidence (memory_id, evidence_id) "
+             "VALUES (?, ?)", (keeper, evidence_id)),
+        )
+        first = self._purge(stale)
+        self.assertEqual(first.returncode, 5, first.stderr + first.stdout)
+        fresh = self.add_row("fresh row purged alongside the rider")
+        mixed = self._purge(stale, fresh)
+        self.assertEqual(mixed.returncode, 0, mixed.stderr)
+        self.assertIn("byte-verified clean", mixed.stdout)
+        self.assertIn("not re-scanned", mixed.stdout)
+        self.assertIn(fresh, mixed.stdout)
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM memory WHERE id=?", (fresh,)), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

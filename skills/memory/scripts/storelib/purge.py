@@ -983,6 +983,14 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             payload["scrub_retry_ids"] = retry_ids
             payload["live_byte_verify"] = (
                 "skipped: purged rows absent, no live needles derivable")
+        elif retry_ids:
+            # Mixed batch: fresh ids were purged, deny-listed ids rode along.
+            # Their residue is not re-scannable here (no needles derivable),
+            # so scope the clean claim (review round 5, residual edge).
+            payload["scrub_retry_ids"] = retry_ids
+            payload["scrub_retry_note"] = (
+                "deny-listed id(s) rode along; their live residue is not "
+                "re-scanned in this run")
         if as_json:
             print(json.dumps(payload, indent=2))
         else:
@@ -997,6 +1005,10 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                 print("[zmem] purge: removed %d row(s): %s" % (
                     len(applied["chain"]), ", ".join(applied["chain"])))
                 print("[zmem] purge: store compacted and byte-verified clean")
+                if retry_ids:
+                    print("[zmem] purge: note: deny-listed id(s) %s rode "
+                          "along; their live residue is not re-scanned in "
+                          "this run" % ", ".join(retry_ids))
             if led["entries_dropped"]:
                 print("[zmem] purge: scrubbed %d ledger entr%s across %d "
                       "file(s)" % (led["entries_dropped"],
