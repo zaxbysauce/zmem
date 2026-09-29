@@ -30,7 +30,8 @@ README.
   `purge --scrub-backups --out-dir DIR` rewrites `store-*` AND `prerestore-*`
   snapshots in place (never deleted/truncated) with the same removal and an
   `integrity_check` re-verify. Exit ladder: 0 clean, 2 usage, 3 unknown id,
-  4 lock/live-writer refusal, 5 residue remains, 6 compaction failure. See the
+  4 lock/live-writer refusal, 5 residue remains, 6 compaction or
+  backup-scrub failure. See the
   `purge` section in the memory skill docs for operator caveats (never pass
   secret text on a command line; restore/`import-store --force` supersede a
   purge).

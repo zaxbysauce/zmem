@@ -189,32 +189,46 @@ def _resolve(conn: sqlite3.Connection, ids: list[str]) -> dict[str, Any]:
 
 
 def _plan_keeper(keeper: dict[str, Any], rows: dict[str, Any]):
-    """(new_content, new_merged_from) for a keeper, or None => delete it."""
+    """(new_content, new_merged_from) for a keeper, or None => delete it.
+
+    PR-review fix (PRR-002): remove the STORED merged-from blocks by their
+    header (whatever body they hold — the stored text may have drifted from
+    the purged row's current content), then refuse when any token that lived
+    inside a removed block still appears in the stripped content (i.e. the
+    absorbed text was duplicated outside the block). The previous leak test
+    compared against the post-merge content's own tokens and could never
+    fire."""
     content = keeper["row"]["content"] or ""
     merged = list(keeper["merged"])
+    removed_tokens: set[str] = set()
     for pid in keeper["purged"]:
-        absorbed = rows[pid]["content"] if pid in rows else ""
-        block = re.compile(
-            r"\n*--- merged from %s ---\n%s" % (
-                re.escape(pid), re.escape(absorbed)))
-        content = block.sub("", content, count=1)
-        content = re.sub(r"\n*--- merged from %s ---\n?" % re.escape(pid),
-                         "", content, count=1)
+        base = re.escape(_base_id(pid))
+        block = re.search(
+            r"\n*--- merged from %s(?::truncated)? ---\n(?P<body>.*?)"
+            r"(?=\n*--- merged from |\Z)" % base,
+            content, flags=re.DOTALL)
+        if block is not None:
+            removed_tokens |= _tokens(block.group("body"))
+            content = content[:block.start()] + "\n" + content[block.end():]
+        content = re.sub(
+            r"\n*--- merged from %s(?::truncated)? ---\n?" % base,
+            "", content, count=1)
         merged = [m for m in merged if _base_id(m) != pid]
-    # Residue test (Round-3): a token counts as leaked only when it came in
-    # via an absorbed block AND still remains after the strip. Tokens the
-    # keeper's own pre-merge content already had are not purge residue, so a
-    # shared long word ("deployment") no longer deletes a cleanly stripped
-    # keeper.
-    own_tokens: set[str] = set()
-    for pid in keeper["purged"]:
-        own_tokens |= _tokens(keeper["row"]["content"] or "")
-    leaked: set[str] = set()
-    for pid in keeper["purged"]:
-        absorbed = rows[pid]["content"] if pid in rows else ""
-        leaked |= ((_tokens(absorbed) - own_tokens) & _tokens(content))
-    if leaked:
+    # Residue test 1: any token that lived inside a removed block and still
+    # appears in the stripped content means the absorbed text was duplicated
+    # outside the block — the keeper keeps quoting the purged row. Tokens the
+    # keeper's own base content already had (never inside a block) are not
+    # residue, so a shared long word ("deployment") does not force a delete.
+    if removed_tokens & _tokens(content):
         return None
+    # Residue test 2 (PRR-002 follow-up): if the purged row's full current
+    # text is still present verbatim (merged_from names it but the content
+    # block header names something else, or the strip was incomplete), the
+    # rewrite would silently keep the text — refuse naming the row.
+    for pid in keeper["purged"]:
+        absorbed = (rows[pid]["content"] or "") if pid in rows else ""
+        if absorbed and absorbed.lower() in content.lower():
+            return None
     return content, ",".join(merged)
 
 
@@ -247,7 +261,6 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
     chain_set = set(chain)
 
     keeper_rewrites: list[tuple[str, str, str]] = []
-    keeper_deletes: list[str] = []
     for k in res["keepers"]:
         if k["row"]["id"] in chain_set:
             continue
@@ -270,7 +283,9 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
             head_rebuilds.append(h["id"])
 
     summary_ids = [sd["summary_id"] for sd in res["summary_deletes"]]
-    all_deleted = chain + [kid for kid in keeper_deletes] + summary_ids
+    # Keeper residue cases REFUSE (raise) rather than delete, so the deleted
+    # set is exactly the chain plus derived summary rows.
+    all_deleted = chain + summary_ids
     dph = _placeholders(all_deleted) if all_deleted else "NULL"
     dargs = all_deleted or [None]
 
@@ -394,18 +409,31 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
 
     # Entity orphans AFTER relinks: every entity left with no link goes,
     # together with its aliases; shared entities survive by construction.
+    # Enveloped in its own transaction (PRR-007): a mid-loop failure rolls
+    # back cleanly and is reported as a warning instead of escaping as a raw
+    # traceback — the main purge is already committed and orphans are
+    # cosmetic.
     gone_entities: list[str] = []
     if _table_exists(conn, "entity"):
-        for r in conn.execute(
-                "SELECT id FROM entity WHERE id NOT IN "
-                "(SELECT entity_id FROM memory_entity)"):
-            gone_entities.append(r["id"])
-            conn.execute("DELETE FROM entity WHERE id=?", (r["id"],))
-        if gone_entities and _table_exists(conn, "entity_alias"):
-            conn.execute(
-                "DELETE FROM entity_alias WHERE entity_id IN (%s)"
-                % _placeholders(gone_entities), gone_entities)
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for r in conn.execute(
+                    "SELECT id FROM entity WHERE id NOT IN "
+                    "(SELECT entity_id FROM memory_entity)"):
+                gone_entities.append(r["id"])
+                conn.execute("DELETE FROM entity WHERE id=?", (r["id"],))
+            if gone_entities and _table_exists(conn, "entity_alias"):
+                conn.execute(
+                    "DELETE FROM entity_alias WHERE entity_id IN (%s)"
+                    % _placeholders(gone_entities), gone_entities)
+            conn.commit()
+        except sqlite3.Error as e:
+            conn.rollback()
+            gone_entities = []
+            print(
+                "[zmem] purge: WARNING - entity orphan reaping failed (%s); "
+                "orphan entity rows may remain (cosmetic; the purged content "
+                "is unaffected)" % e, file=sys.stderr)
 
     return {
         "chain": chain,
@@ -476,7 +504,7 @@ def _needles(conn: sqlite3.Connection, applied: dict[str, Any]) -> list[str]:
     return sorted(needles)
 
 
-def compact_and_verify(store_path: Path, needles: list[str]) -> dict[str, int]:
+def compact_and_verify(store_path: Path, needles: list[str]) -> tuple[dict[str, int], dict[str, str]]:
     """optimize -> VACUUM -> checkpoint (busy flag checked) -> byte-verify."""
 
     def _open():
@@ -513,13 +541,17 @@ def compact_and_verify(store_path: Path, needles: list[str]) -> dict[str, int]:
         c.close()
 
     residue: dict[str, int] = {}
+    residue_files: dict[str, str] = {}
     for name in (store_path, Path(str(store_path) + "-wal")):
         if not name.exists():
             continue
         data = name.read_bytes().lower()
         for n in needles:
-            residue[n] = residue.get(n, 0) + data.count(n.encode("utf-8"))
-    return residue
+            c = data.count(n.encode("utf-8"))
+            if c:
+                residue[n] = residue.get(n, 0) + c
+                residue_files.setdefault(n, name.name)
+    return residue, residue_files
 
 
 # --------------------------------------------------------------------------
@@ -558,9 +590,11 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
         if len(kept) == len(entries):
             continue
         doc["entries"] = kept
-        tmp = path.with_name(path.name + ".tmp." + uuid.uuid4().hex)
-        tmp.write_text(json.dumps(doc), encoding="utf-8")
-        os.replace(tmp, path)
+        # PRR-001: reuse the delivery-ledger atomic writer so the scrubbed
+        # ledger keeps its 0600-at-open + fsync + chmod contract (a plain
+        # write_text + replace regressed the file to umask perms).
+        from storelib.delivery_ledger import _atomic_write_json
+        _atomic_write_json(str(path), doc)
         stats["files_scrubbed"] += 1
     return stats
 
@@ -610,7 +644,8 @@ def _scrub_snapshot(path: Path, chain: list[str],
                         if conn.execute("SELECT 1 FROM memory WHERE id=?",
                                         (i,)).fetchone() is not None]
         if not res["chain"]:
-            return "skipped %s (no purged id present)" % path.name
+            return {"snapshot": path.name, "status": "skipped",
+                    "detail": "no purged id present"}
         _apply_purge_transaction(conn, res)
     finally:
         conn.close()
@@ -634,7 +669,8 @@ def _scrub_snapshot(path: Path, chain: list[str],
         raise RuntimeError(
             "snapshot %s holds %d needle byte(s) after scrub" % (
                 path.name, residue))
-    return "scrubbed %s (integrity ok, no residue)" % path.name
+    return {"snapshot": path.name, "status": "scrubbed",
+            "detail": "integrity ok, no residue"}
 
 
 # --------------------------------------------------------------------------
@@ -702,18 +738,31 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         conn = schema_mod.connect()
         try:
             schema_mod.init_db(conn)
+            # PRR-X2: purge may be the very first command run on a store
+            # upgraded from pre-0.71 — init_db does not create purged_id
+            # (only migrate does), and a silent deny-list no-op here would
+            # lose the recording behind a success exit.
+            schema_mod._ensure_purged_table(conn)
             res = _resolve(conn, ids)
             if res["missing"]:
                 print("[zmem] purge REFUSED: unknown id(s): %s"
                       % ", ".join(res["missing"]), file=sys.stderr)
                 return 3
-            applied = _apply_purge_transaction(conn, res)
+            try:
+                applied = _apply_purge_transaction(conn, res)
+            except RuntimeError as e:
+                # AC6 refusal: a derived row (keeper/belief head/summary)
+                # still quotes the purged text and can neither be rewritten
+                # nor deleted autonomously. Nothing was modified; the named
+                # row needs operator action first.
+                print("[zmem] %s" % e, file=sys.stderr)
+                return 4
             needles = _needles(conn, applied)
         finally:
             conn.close()
 
         try:
-            residue = compact_and_verify(STORE_PATH, needles)
+            residue, residue_files = compact_and_verify(STORE_PATH, needles)
         except (sqlite3.Error, OSError) as e:
             print("[zmem] purge FAILED: compaction step failed (%s); the "
                   "purge is incomplete - do NOT assume the content is gone"
@@ -724,7 +773,13 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             print("[zmem] purge FAILED: %s still holds %d byte(s) of purged "
                   "content (needle %r) - the text still lives somewhere "
                   "outside the memory rows; do NOT assume it is gone" % (
-                      STORE_PATH.name, worst[1], worst[0]), file=sys.stderr)
+                      residue_files.get(worst[0], STORE_PATH.name),
+                      worst[1], worst[0]), file=sys.stderr)
+            print("[zmem] purge: the purged ids ARE recorded in the "
+                  "purged_id deny-list; after cleaning up the remaining "
+                  "surface, clear those rows from purged_id (or re-run "
+                  "purge on the surviving carrier) so peer imports stay "
+                  "denied only while content exists", file=sys.stderr)
             return 5
 
         data_dir = STORE_PATH.parent
@@ -737,7 +792,8 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             # lock here makes any concurrent delivery write drop harmlessly
             # instead of re-recording needle text after the scrub/scan.
             from storelib import delivery_ledger as _dl
-            led = {"files_scrubbed": 0, "entries_dropped": 0, "tmp_removed": 0}
+            led: dict[str, int] = {"files_scrubbed": 0, "entries_dropped": 0,
+                               "tmp_removed": 0}
             lres: dict[str, int] = {}
             with _dl._delivery_state_lock(str(data_dir)):
                 led = scrub_ledgers(data_dir, drop_ids, needles)
@@ -753,7 +809,7 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                   file=sys.stderr)
             return 5
 
-        snapshots: list[str] = []
+        snapshots: list[dict[str, str]] = []
         if scrub_backups:
             bdir = Path(out_dir)
             try:

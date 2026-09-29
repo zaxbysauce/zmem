@@ -1625,7 +1625,7 @@ def main():
             "  0  purged, compacted, byte-verified clean\n"
             "  2  bad usage (missing --id / --scrub-backups without --out-dir)\n"
             "  3  unknown id (names the ids; nothing was changed)\n"
-            "  4  refused: maintenance/backup/consolidate lock or live writer\n"
+            "  4  refused: maintenance/schema/backup/consolidate lock or live writer\n"
             "  5  residue detected after compaction (store or ledger)\n"
             "  6  compaction or backup-scrub step failed\n"
         ))

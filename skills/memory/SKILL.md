@@ -1716,14 +1716,15 @@ own `integrity_check` **before** touching the destination, then takes a
 deliberately outside the retention glob so rotation can never prune it), clears
 stale `-wal`/`-shm` sidecars, copies, and re-verifies the restored store.
 
-Takes **both** maintenance locks (`backup` and `consolidate`) for its whole
-duration, so it cannot race the automated background snapshot/consolidation the
-SessionStart hook fires, and refuses a destination that is not on a local
-filesystem (no UNC/network/OneDrive path). If either lock is held it exits **2**
+Takes the **full maintenance lock ladder** — `maintenance`, `schema`, `backup`,
+and `consolidate` — for its whole duration, and refuses when a live writer
+lease exists, so it cannot race the automated background snapshot/consolidation
+the SessionStart hook fires, and refuses a destination that is not on a local
+filesystem (no UNC/network/OneDrive path). If any lock is held it exits **2**
 without touching the destination — a skipped restore must never look like a
-completed one. This does *not* serialize against a live interactive session's
-own `add`/`recall` writes, which take no lock: still run `restore` when no
-session is actively writing.
+completed one. A live interactive session's own `add`/`recall` writes are
+blocked for the restore's duration by the live-writer refusal: still run
+`restore` when no session is actively writing.
 
 ### purge — durably remove a memory's content (issue #255)
 ```
@@ -1774,14 +1775,29 @@ consolidate locks, plus a live-writer refusal), so nothing can write between
 the deletes and the byte verification.
 
 Exit codes: **0** purged and verified clean; **2** bad usage; **3** unknown
-id (named); **4** refused (lock or live writer); **5** residue remains (store
-or ledger); **6** compaction/scrub step failed.
+id (named); **4** refused (maintenance/schema/backup/consolidate lock or live
+writer); **5** residue remains in the store or ledgers — OR transient
+delivery-ledger lock contention (re-run; the message names which); **6**
+compaction/scrub step failed.
 
 Caveats: `import-store.py --force` and `restore` from a pre-purge snapshot are
 explicit whole-store replacements — they supersede both the removal and the
-deny-list, so **re-run purge after either**. Surviving rows that still quote
-purged-content tokens (e.g. a mid-chain `update` successor, kept by design)
-are listed as WARNINGs in the summary.
+deny-list, so **re-run purge after either** (a restore's `prerestore-*` safety
+copy of the pre-restore store preserves the deny-list rows recorded between
+snapshot and restore, so the ids to re-purge are recoverable by SQL from that
+copy). Purge is also honest about a structural carve-out in the byte
+verification: memory content that is a substring of SQLite's own schema DDL
+text (contrived single-word contents like `namespace`) cannot be
+distinguished from schema bytes, so no needle is scanned for it. Surviving
+rows that still quote purged-content tokens (e.g. a mid-chain `update`
+successor, kept by design) are listed as WARNINGs in the summary. On exit **5**
+the deny-list rows are already recorded while content may remain: clean the
+named surface, then delete those rows from `purged_id` (or re-purge the
+surviving carrier) so peer imports stay denied only while content exists.
+Detection scope note: the read-time-style scan here covers the row's
+content, source_ref and tags; a credential stored ONLY as an entity
+name is not detected by purge's needle scan or by the passive lane's
+withhold (issue #180-adjacent residual).
 
 ### sweep — prune stale per-session cooldown sentinels
 ```

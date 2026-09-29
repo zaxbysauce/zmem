@@ -1666,6 +1666,8 @@ def _strict_ingest_staged(
                     (obj["episode_id"], obj["evidence_id"]),
                 )
             elif table == "memory_evidence":
+                if obj["memory_id"] in purged_memory:
+                    continue  # issue #255/#256: evidence for a purged memory is dropped
                 parent = conn.execute(
                     "SELECT 1 FROM memory WHERE id=?", (obj["memory_id"],)
                 ).fetchone()

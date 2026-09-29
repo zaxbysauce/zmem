@@ -37,7 +37,9 @@ class PurgeVecTest(unittest.TestCase):
         self.env["ZMEM_CAPTURE_MODE"] = "manual"
         for var in ("ZMEM_TEST_NOW", "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET",
                     "ZMEM_BACKUP_DIR", "ZMEM_BACKUP_INTERVAL_DAYS",
-                    "ZMEM_CROSS_PROJECT", "ZMEM_AUTO_REKEY"):
+                    "ZMEM_CROSS_PROJECT", "ZMEM_CROSS_PROJECT_HAZARD_VERBS",
+                    "ZMEM_AUTO_REKEY", "ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP",
+                    "ZMEM_QUERY_CONTEXT", "ZMEM_CROSS_ENCODER"):
             self.env.pop(var, None)
 
     def _run(self, *args):
