@@ -152,5 +152,96 @@ class PurgeJsonSnapshotsContractTest(unittest.TestCase):
             self.assertIsInstance(entry["detail"], str)
 
 
+class PurgeKeeperResidueContractTest(unittest.TestCase):
+    """Final-critic follow-ups: the keeper refusal (verbatim purged text
+    retained) and the shared-fragment rc-0 contract get permanent coverage
+    here (the frozen q01 C6 constants are lexically disjoint, so neither
+    shape is reachable from that suite)."""
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-purge-keep-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        env = {**os.environ}
+        env.update({"ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+                    "ZMEM_DATA": tmp,
+                    "ZMEM_MODELS_DIR": os.path.join(tmp, "nm"),
+                    "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                    "ZMEM_CAPTURE_MODE": "manual"})
+        self.env = env
+        self.tmp = tmp
+
+    def _add(self, content):
+        r = subprocess.run(
+            [sys.executable, str(STORE_PY), "add", "--namespace", NS,
+             "--type", "lesson", "--content", content, "--signal",
+             "test", "--confidence", "0.9", "--json"],
+            capture_output=True, text=True, env=self.env, timeout=120,
+            cwd=str(REPO_ROOT))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)["id"]
+
+    def _purge(self, mid):
+        return subprocess.run(
+            [sys.executable, str(STORE_PY), "purge", "--id", mid],
+            capture_output=True, text=True, env=self.env, timeout=180,
+            cwd=str(REPO_ROOT))
+
+    def _content(self, mid):
+        conn = sqlite3.connect(
+            "file:" + self.env["ZMEM_STORE"].replace(os.sep, "/")
+            + "?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT content FROM memory WHERE id=?",
+                               (mid,)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    def test_verbatim_quoting_keeper_is_refused_by_name(self):
+        # keeper FIRST: adding the keeper after target would dedup (its
+        # content will contain the full target text). Refusal shape: the
+        # stored block HEADER names some other id, so the header-keyed strip
+        # cannot remove the purged text and it survives verbatim — the purge
+        # must refuse (exit 4) naming the keeper, not silently keep the text
+        # (a block whose header names the target is removed cleanly and is
+        # the rc-0 contract exercised by the next test).
+        keeper = self._add("keeper quotes zebraquux marker again outside")
+        target = self._add("deploy checklist zebraquux marker duplication case")
+        decoy = "00000000-0000-4000-8000-00000000decoy"
+        sep = chr(10) * 2 + "--- merged from %s ---" % decoy + chr(10)
+        dup = "keeper quotes zebraquux marker again outside" + sep + (
+            "deploy checklist zebraquux marker duplication case")
+        conn = sqlite3.connect(self.env["ZMEM_STORE"])
+        conn.execute("UPDATE memory SET content=?, content_norm=?,"
+                     " merged_from=? WHERE id=?",
+                     (dup, dup.lower(), target, keeper))
+        conn.commit()
+        conn.close()
+        r = self._purge(target)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn(keeper, r.stderr)
+        self.assertIsNotNone(self._content(keeper))
+        self.assertIn("zebraquux", (self._content(keeper) or "").lower())
+
+    def test_shared_fragment_keeper_rewrites_cleanly(self):
+        target = self._add("deployment checklist zebraquux marker r two probe")
+        keeper = self._add("deployment runbook kept for the r two probe team")
+        sep = chr(10) * 2 + "--- merged from %s ---" % target + chr(10)
+        merged = ("deployment runbook kept for the r two probe team" + sep +
+                  "deployment checklist zebraquux marker r two probe")
+        conn = sqlite3.connect(self.env["ZMEM_STORE"])
+        conn.execute("UPDATE memory SET content=?, content_norm=?,"
+                     " merged_from=? WHERE id=?",
+                     (merged, merged.lower(), target, keeper))
+        conn.commit()
+        conn.close()
+        r = self._purge(target)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        kept = self._content(keeper)
+        self.assertIsNotNone(kept)
+        self.assertNotIn("zebraquux", kept.lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
