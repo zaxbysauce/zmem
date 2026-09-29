@@ -10,6 +10,35 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.71.0] - 2026-09-28
+
+### Added
+- **`purge --id`: durable, byte-level removal of a memory's content** (issue
+  #255). `update`/`invalidate` tombstone; `purge` removes: the `memory` rows
+  (plus the verified `update_of` predecessor chain), FTS entries, `memory_vec`
+  rows by `memory_id`, and every id-keyed side-table row. Derived copies that
+  carry the text verbatim (consolidation keepers, belief heads, extractive
+  episode summaries) are rewritten — keepers re-link their entities — deleted,
+  or the purge refuses naming the row. The store is compacted (FTS `'optimize'`,
+  `VACUUM`, WAL checkpoint) under the full `restore` lock ladder and
+  **byte-verified**: a case-insensitive scan of `store.sqlite`/`-wal` (and the
+  `<data>/ops/*.ledger` delivery ledgers, which are scrubbed by id and by
+  needle) must find no copy of the purged content. Purged ids land in a
+  `purged_id` deny-list (additive, schema-version-independent) that
+  `ingest-jsonl` consults so a peer export cannot re-insert them; strict
+  imports skip child records referencing a purged id instead of aborting.
+  `purge --scrub-backups --out-dir DIR` rewrites `store-*` AND `prerestore-*`
+  snapshots in place (never deleted/truncated) with the same removal and an
+  `integrity_check` re-verify. Exit ladder: 0 clean, 2 usage, 3 unknown id,
+  4 lock/live-writer refusal, 5 residue remains, 6 compaction or
+  backup-scrub failure; a retry of a deny-listed id resumes post-commit
+  cleanup, vector erasure fails closed when sqlite-vec cannot be loaded,
+  and a keeper still quoting an absorbed token outside its merged block
+  refuses the purge rather than passing byte-verify. See the
+  `purge` section in the memory skill docs for operator caveats (never pass
+  secret text on a command line; restore/`import-store --force` supersede a
+  purge).
+
 ## [0.70.0] - 2026-09-27
 
 ### Fixed
