@@ -878,6 +878,53 @@ class PurgeFeedbackRound5Test(_PurgeBase):
         self.assertEqual(
             self.qone("SELECT COUNT(*) FROM memory WHERE id=?", (fresh,)), 0)
 
+    def test_byte_verify_sees_non_ascii_case_and_report_redacts(self):
+        # F-266-8: needles keep the ORIGINAL bytes and the byte scan folds
+        # both sides ASCII-only, so non-ASCII text ('Ü') is still detected in
+        # a surviving surface (a str.lower()-ed needle could never meet the
+        # original bytes). F-266-9: the exit-5 report redacts the needle —
+        # length + sha256 prefix, never the plaintext (hooked sessions
+        # re-capture tool text).
+        target = self.add_row("Übung checklist zebraquux verschlüsselt probe")
+        keeper = self.add_row(OTHER_CONTENT)
+        evidence_id = "00000000-0000-4000-8000-00000000e120"
+        self._exec(
+            ("INSERT INTO evidence "
+             "(id, session_id, lane, moment, kind, ts, hash, excerpt, "
+             "ref_path, ref_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (evidence_id, "sess-purge", "zcode", "user_prompt", "tool_call",
+              "2026-09-29T00:00:00Z",
+              "0eb95917368d3681285c9136f01cd350a385e20026cdb746b3cbd6cdbef86926",
+              "Übung checklist zebraquux verschlüsselt probe",
+              "tests/test_q01_purge.py", 1)),
+            ("INSERT INTO memory_evidence (memory_id, evidence_id) "
+             "VALUES (?, ?)", (target, evidence_id)),
+            ("INSERT INTO memory_evidence (memory_id, evidence_id) "
+             "VALUES (?, ?)", (keeper, evidence_id)),
+        )
+        first = self._purge(target)
+        self.assertEqual(first.returncode, 5,
+                         first.stderr + first.stdout)
+        self.assertNotIn("Übung", first.stderr)
+        self.assertNotIn("zebraquux", first.stderr)
+        self.assertIn("sha256", first.stderr)
+        self.assertIn("still holds", first.stderr)
+        # The deny-list is committed even on the residue exit (documented
+        # state); the evidence excerpt stays (shared with a survivor).
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM purged_id WHERE id=?",
+                      (target,)), 1)
+
+    def test_scrub_backups_warns_when_dir_has_no_snapshots(self):
+        # F-266-10: a typo'd or empty --out-dir must not silently report a
+        # successful scrub of zero snapshots.
+        target = self.add_row(TARGET_CONTENT)
+        empty = os.path.join(self.tmp, "no-such-backups")
+        r = self._purge(target, extra=["--scrub-backups", "--out-dir", empty])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("found no", r.stderr)
+        self.assertIn("no-such-backups", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

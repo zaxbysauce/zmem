@@ -27,6 +27,7 @@ session: the host evidence writer records tool-call input into
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -84,6 +85,17 @@ def _tokens(text: str) -> set[str]:
         t for t in re.split(r"\s+", (text or "").lower())
         if len(t) >= _MIN_TOKEN_LEN
     }
+
+
+def _ascii_fold(text: str) -> str:
+    """bytes.lower()-equivalent fold for str (ASCII A-Z only), so a folded
+    string encodes to exactly what folding its UTF-8 bytes would produce.
+    Non-ASCII characters are kept verbatim: a needle must match the
+    original-case bytes, which an ASCII-only byte fold never rewrites
+    (review F-266-8: str.lower on the needle + bytes.lower on the file
+    could never meet for 'Ü' — exit 0 while the text remained)."""
+    return "".join(
+        chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text)
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -563,8 +575,17 @@ def _needles(conn: sqlite3.Connection, applied: dict[str, Any]) -> list[str]:
         if not content:
             continue
         if content.lower() not in schema_blob:
-            needles.add(content.lower())
-        needles |= (_tokens(content) - surviving)
+            # Original-case full content: the byte scans ASCII-fold BOTH
+            # sides, so a str.lower()-ed needle could never meet non-ASCII
+            # bytes ('Ü') — the F-266-8 false-clean.
+            needles.add(content)
+        # Cased token needles: suppression is decided on the lowercase fold
+        # (a survivor holding the token in any case sanctions it), but the
+        # emitted needle keeps the original bytes.
+        needles |= {
+            t for t in re.split(r"\s+", content)
+            if len(t) >= _MIN_TOKEN_LEN and t.lower() not in surviving
+        }
     needles.discard("")
     return sorted(needles)
 
@@ -612,7 +633,7 @@ def compact_and_verify(store_path: Path, needles: list[str]) -> tuple[dict[str, 
             continue
         data = name.read_bytes().lower()
         for n in needles:
-            c = data.count(n.encode("utf-8"))
+            c = data.count(n.encode("utf-8").lower())
             if c:
                 residue[n] = residue.get(n, 0) + c
                 residue_files.setdefault(n, name.name)
@@ -647,8 +668,8 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
                 if e.get("id") in drop_ids:
                     stats["entries_dropped"] += 1
                     continue
-                text = str(e.get("text") or "").lower()
-                if any(n in text for n in needles):
+                text = _ascii_fold(str(e.get("text") or ""))
+                if any(_ascii_fold(n) in text for n in needles):
                     stats["entries_dropped"] += 1
                     continue
             kept.append(e)
@@ -672,7 +693,7 @@ def _verify_ledgers_clean(data_dir: Path, needles: list[str]) -> dict[str, int]:
     for path in ops.glob("*.ledger*"):
         data = path.read_bytes().lower()
         for n in needles:
-            c = data.count(n.encode("utf-8"))
+            c = data.count(n.encode("utf-8").lower())
             if c:
                 residue[str(path.name)] = residue.get(str(path.name), 0) + c
     return residue
@@ -730,11 +751,12 @@ def _scrub_snapshot(path: Path, chain: list[str],
         raise RuntimeError(
             "snapshot %s integrity_check=%s after scrub" % (path.name, integrity))
     data = path.read_bytes().lower()
-    residue = sum(data.count(n.encode("utf-8")) for n in local_needles)
+    residue = sum(data.count(n.encode("utf-8").lower())
+                  for n in local_needles)
     wal = Path(str(path) + "-wal")
     if wal.exists():
         wdata = wal.read_bytes().lower()
-        residue += sum(wdata.count(n.encode("utf-8"))
+        residue += sum(wdata.count(n.encode("utf-8").lower())
                        for n in local_needles)
     if residue:
         raise RuntimeError(
@@ -875,11 +897,18 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             return 6
         if any(residue.values()):
             worst = max(residue.items(), key=lambda kv: kv[1])
+            worst_n = worst[0]
+            # F-266-9: exit 5 is a routine outcome, and hooked sessions
+            # re-capture tool text — never echo the needle plaintext; report
+            # its length and a sha256 prefix so the operator can correlate.
             print("[zmem] purge FAILED: %s still holds %d byte(s) of purged "
-                  "content (needle %r) - the text still lives somewhere "
-                  "outside the memory rows; do NOT assume it is gone" % (
-                      residue_files.get(worst[0], STORE_PATH.name),
-                      worst[1], worst[0]), file=sys.stderr)
+                  "content (needle: %d chars, sha256 %s) - the text still "
+                  "lives somewhere outside the memory rows; do NOT assume it "
+                  "is gone" % (
+                      residue_files.get(worst_n, STORE_PATH.name), worst[1],
+                      len(worst_n),
+                      hashlib.sha256(worst_n.encode("utf-8")).hexdigest()[:16]),
+                  file=sys.stderr)
             print("[zmem] purge: the purged ids ARE recorded in the "
                   "purged_id deny-list; after cleaning up the remaining "
                   "surface, clear those rows from purged_id (or re-run "
@@ -931,6 +960,12 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                 print("[zmem] purge FAILED: backup scrub failed (%s)"
                       % e, file=sys.stderr)
                 return 6
+            if not snapshots:
+                # F-266-10: a typo'd or empty out-dir must not silently
+                # report a successful scrub of zero snapshots.
+                print("[zmem] purge: WARNING: --scrub-backups found no "
+                      "store-*/prerestore-* snapshots in %s" % bdir,
+                      file=sys.stderr)
 
         # AC2-vs-AC3 tension made visible: survivors that still carry
         # purged-content tokens (mid-chain successors) are by design kept.
@@ -938,7 +973,7 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         for s in applied["successor_updates"]:
             if s["id"] in set(applied["chain"]):
                 continue
-            if _tokens(s.get("content") or "") & set(needles):
+            if _tokens(s.get("content") or "") & {n.lower() for n in needles}:
                 warnings.append("row " + s["id"])
         # Round-3: sanctioned survivors outside the memory table (kept
         # evidence excerpts, kept entity/alias names) may carry the needle by
