@@ -732,5 +732,120 @@ class PurgeBackupScrubTest(_PurgeBase):
             "a retry must scrub the snapshot using its own copy of the row")
 
 
+# ---------------------------------------------------------------------------
+# Review round 5 follow-ups: honest scrub-retry reporting, soft
+# episode_evidence skip for deny-listed evidence, dangling synced predecessor
+# ---------------------------------------------------------------------------
+class PurgeFeedbackRound5Test(_PurgeBase):
+    def test_scrub_retry_does_not_claim_byte_verified(self):
+        # Exit-5 shape: the evidence excerpt (shared with a survivor, so kept
+        # per AC5) holds the purged text. The first purge commits and reports
+        # residue; the retry must complete the recovery phases WITHOUT
+        # claiming the live store was re-verified.
+        target = self.add_row(TARGET_CONTENT)
+        keeper = self.add_row(OTHER_CONTENT)
+        evidence_id = "00000000-0000-4000-8000-00000000e11e"
+        self._exec(
+            ("INSERT INTO evidence "
+             "(id, session_id, lane, moment, kind, ts, hash, excerpt, "
+             "ref_path, ref_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (evidence_id, "sess-purge", "zcode", "user_prompt", "tool_call",
+              "2026-09-29T00:00:00Z",
+              "0eb95917368d3681285c9136f01cd350a385e20026cdb746b3cbd6cdbef86926",
+              TARGET_CONTENT,
+              "tests/test_q01_purge.py", 1)),
+            ("INSERT INTO memory_evidence (memory_id, evidence_id) "
+             "VALUES (?, ?)", (target, evidence_id)),
+            ("INSERT INTO memory_evidence (memory_id, evidence_id) "
+             "VALUES (?, ?)", (keeper, evidence_id)),
+        )
+        first = self._purge(target)
+        self.assertEqual(first.returncode, 5,
+                         first.stderr + first.stdout)
+        retry = self._purge(target)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertNotIn(
+            "byte-verified clean", retry.stdout,
+            "a scrub retry has no live needles and cannot re-verify the "
+            "store; it must say so instead of printing the clean claim")
+        self.assertIn("scrub retry", retry.stdout)
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM evidence WHERE id=?",
+                      (evidence_id,)), 1,
+            "evidence shared with a survivor stays (AC5); the retry must "
+            "not delete it or claim it is gone")
+
+    def test_purge_successor_with_absent_tombstoned_predecessor(self):
+        # Default exports drop tombstoned rows while the live successor still
+        # names them, so a synced store legitimately dangles the predecessor.
+        # The walk must end there (nothing local to purge), not refuse.
+        predecessor = self.add_row(TARGET_CONTENT)
+        r = self._run("update", "--id", predecessor, "--content",
+                      "replacement lineage row", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        successor = json.loads(r.stdout)["id"]
+        # Simulate a peer store: the tombstoned predecessor is absent (never
+        # ingested there), while the live successor still names it.
+        self._exec(
+            ("UPDATE memory SET update_of=? WHERE id=?",
+             ("00000000-0000-4000-8000-00000000dang", successor)),
+        )
+        r = self._purge(successor)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM memory WHERE id=?",
+                      (successor,)), 0)
+
+    def test_episode_evidence_for_purged_evidence_imports_soft(self):
+        # The deny-list widening must cover the episode_evidence apply loop
+        # too: a peer file whose episode junction names evidence that was
+        # deny-listed after the export imports cleanly (junction dropped),
+        # never aborts the whole import.
+        target = self.add_row(TARGET_CONTENT)
+        episode_id = "00000000-0000-4000-8000-00000000e105"
+        evidence_id = "00000000-0000-4000-8000-00000000e110"
+        self._exec(
+            ("INSERT INTO episode (id, namespace, started_at) VALUES "
+             "(?, ?, '2026-09-29T00:00:00Z')", (episode_id, NS)),
+            ("INSERT INTO evidence "
+             "(id, session_id, lane, moment, kind, ts, hash, excerpt, "
+             "ref_path, ref_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (evidence_id, "sess-purge", "zcode", "user_prompt", "tool_call",
+              "2026-09-29T00:00:00Z",
+              "0eb95917368d3681285c9136f01cd350a385e20026cdb746b3cbd6cdbef86926",
+              "evidence excerpt zebraquux",
+              "tests/test_q01_purge.py", 1)),
+            ("INSERT INTO episode_evidence (episode_id, evidence_id) "
+             "VALUES (?, ?)", (episode_id, evidence_id)),
+        )
+        peer = os.path.join(self.tmp, "peer-ep-evidence.jsonl")
+        r = self._run("export-jsonl", "--out", peer, "--namespace", NS)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(evidence_id, Path(peer).read_text(encoding="utf-8"))
+
+        # Post-export the evidence becomes orphaned-only-to the purged
+        # memory: junction it now, then purge. The evidence is deleted and
+        # deny-listed with the memory.
+        self._exec(
+            ("INSERT INTO memory_evidence (memory_id, evidence_id) "
+             "VALUES (?, ?)", (target, evidence_id)),
+        )
+        r = self._purge(target)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM purged_id WHERE id=?",
+                      (evidence_id,)), 1)
+
+        r = self._run("ingest-jsonl", "--in", peer)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM evidence WHERE id=?",
+                      (evidence_id,)), 0,
+            "the deny-listed evidence must stay gone")
+        self.assertNotIn(
+            "strict import rejected", r.stderr,
+            "a junction naming deny-listed evidence drops, never aborts")
+
+
 if __name__ == "__main__":
     unittest.main()

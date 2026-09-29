@@ -137,10 +137,11 @@ def _resolve(conn: sqlite3.Connection, ids: list[str]) -> dict[str, Any]:
                 "SELECT id, update_of, namespace, superseded_at "
                 "FROM memory WHERE id=?", (cur,)).fetchone()
             if row is None:
-                if cur != rid:
-                    raise RuntimeError(
-                        "purge REFUSED: update_of predecessor %s is missing"
-                        % cur)
+                # A missing predecessor carries no local content to purge:
+                # default exports drop tombstoned rows while the live
+                # successor still names them, so synced lineages legitimately
+                # dangle here (and rekey skips tombstones too). End the walk;
+                # predecessors that DO exist are still verified below.
                 break
             if cur != rid and (
                     row["namespace"] != root_namespace
@@ -271,13 +272,12 @@ def _plan_keeper(keeper: dict[str, Any], rows: dict[str, Any]):
             "", content, count=1)
         merged = [m for m in merged if _base_id(m) != pid]
     # Residue test 1 (removed-block tokens): any >=8-char token that lived
-    # inside a removed block and still appears verbatim in the stripped
-    # content means a phrase of the absorbed text was duplicated outside the
-    # block. Shared vocabulary that only exists in the keeper's own base text
-    # is unattributable after the merge and is handled by the byte-verify's
-    # surviving-row token suppression instead of a refusal (a real lexical
-    # consolidate cluster shares phrases between base and absorbed text, so a
-    # stricter test would refuse ordinary consolidations).
+    # inside a removed block and still appears in the stripped content is
+    # residue the byte-verify could never see (its survivor-token suppression
+    # drops needles a surviving row holds), so refuse. Tokens below the
+    # 8-char floor are unattributable after a merge and stay legal — a real
+    # lexical consolidate cluster shares its short vocabulary, and refusing
+    # those would block ordinary consolidations.
     if removed_tokens & _tokens(content):
         return None
     # Residue test 2 (PRR-002 follow-up): if the purged row's full current
@@ -959,8 +959,12 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         finally:
             conn2.close()
 
+        # A scrub retry has no live rows, so no live needles can be derived
+        # and the byte-verify below would be vacuous — report that honestly
+        # instead of printing a clean-verify claim (review round 5, probe A).
+        is_scrub_retry = bool(retry_ids) and not applied["chain"]
         payload = {
-            "result": "purged",
+            "result": "scrub-retry" if is_scrub_retry else "purged",
             "purged": applied["chain"],
             "rewritten_keepers": [k[0] for k in applied["keeper_rewrites"]],
             "rebuilt_heads": applied["head_rebuilds"],
@@ -975,12 +979,24 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             "snapshots": snapshots,
             "survivors_still_quoting": warnings,
         }
+        if is_scrub_retry:
+            payload["scrub_retry_ids"] = retry_ids
+            payload["live_byte_verify"] = (
+                "skipped: purged rows absent, no live needles derivable")
         if as_json:
             print(json.dumps(payload, indent=2))
         else:
-            print("[zmem] purge: removed %d row(s): %s" % (
-                len(applied["chain"]), ", ".join(applied["chain"])))
-            print("[zmem] purge: store compacted and byte-verified clean")
+            if is_scrub_retry:
+                print("[zmem] purge: scrub retry for deny-listed id(s): %s"
+                      % ", ".join(retry_ids))
+                print("[zmem] purge: recovery phases completed; live "
+                      "byte-verify NOT re-run (rows absent, no live needles "
+                      "derivable; --scrub-backups verifies each snapshot "
+                      "against its own copy of the row)")
+            else:
+                print("[zmem] purge: removed %d row(s): %s" % (
+                    len(applied["chain"]), ", ".join(applied["chain"])))
+                print("[zmem] purge: store compacted and byte-verified clean")
             if led["entries_dropped"]:
                 print("[zmem] purge: scrubbed %d ledger entr%s across %d "
                       "file(s)" % (led["entries_dropped"],

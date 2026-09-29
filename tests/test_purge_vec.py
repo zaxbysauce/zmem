@@ -86,8 +86,9 @@ class PurgeVecTest(unittest.TestCase):
         finally:
             conn.close()
 
-        # The vec delete is wrapped in try/except OperationalError in purge,
-        # so a sqlite-vec-shaped failure must not mask the delete either.
+        # The vec delete is fail-closed in purge (load-or-refuse, then a
+        # post-delete COUNT check), so a sqlite-vec-shaped failure must not
+        # mask the delete either.
         r = self._run("purge", "--id", mid)
         self.assertEqual(r.returncode, 0, r.stderr)
 

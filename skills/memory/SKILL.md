@@ -1774,7 +1774,9 @@ What one purge does:
 - if a post-commit compaction, ledger scrub, or snapshot scrub fails, a later
   `purge --id` for the deny-listed id resumes the cleanup phases. The retry
   derives its scrub needles from each surviving snapshot row, so it does not
-  require the original plaintext as a command-line argument;
+  require the original plaintext as a command-line argument. A scrub retry
+  never re-verifies the live store (the purged rows are absent, so no live
+  needles can be derived) and says so instead of claiming a clean verify;
 - `--scrub-backups --out-dir DIR` applies the same removal inside every
   `store-*.sqlite` **and** `prerestore-*.sqlite` snapshot in DIR, rewriting
   files **in place** (never deleted, truncated, or renamed) and re-verifying
