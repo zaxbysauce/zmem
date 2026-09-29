@@ -117,16 +117,22 @@ def _resolve(conn: sqlite3.Connection, ids: list[str]) -> dict[str, Any]:
         "SELECT 1 FROM memory WHERE id=?", (i,)).fetchone() is None]
 
     chain: list[str] = []
-    seen: set[str] = set()
+    chain_seen: set[str] = set()
     for rid in requested:
         root = conn.execute(
             "SELECT namespace FROM memory WHERE id=?", (rid,)).fetchone()
         root_namespace = root["namespace"] if root is not None else None
         cur = rid
+        path_seen: set[str] = set()
         while cur:
-            if cur in seen:
+            # A shared predecessor is legitimate when several requested ids
+            # belong to the same lineage.  Cycle detection is a property of
+            # each root-to-predecessor walk; using the global result set here
+            # rejects that harmless overlap as a cycle.
+            if cur in path_seen:
                 raise RuntimeError(
                     "purge REFUSED: cyclic update_of chain at %s" % cur)
+            path_seen.add(cur)
             row = conn.execute(
                 "SELECT id, update_of, namespace, superseded_at "
                 "FROM memory WHERE id=?", (cur,)).fetchone()
@@ -142,8 +148,9 @@ def _resolve(conn: sqlite3.Connection, ids: list[str]) -> dict[str, Any]:
                 raise RuntimeError(
                     "purge REFUSED: update_of predecessor %s is not a "
                     "superseded row in namespace %s" % (cur, root_namespace))
-            seen.add(cur)
-            chain.append(cur)
+            if cur not in chain_seen:
+                chain_seen.add(cur)
+                chain.append(cur)
             cur = row["update_of"] or ""
 
     rows = {}
@@ -172,7 +179,7 @@ def _resolve(conn: sqlite3.Connection, ids: list[str]) -> dict[str, Any]:
         mids = [m.strip() for m in (r["merged_from"] or "").split(",")
                 if m.strip()]
         all_keepers.append({"row": dict(r), "ids": mids})
-    absorbed = set(seen)
+    absorbed = set(chain_seen)
     remaining = list(all_keepers)
     while remaining:
         next_remaining: list[dict[str, Any]] = []
@@ -263,27 +270,18 @@ def _plan_keeper(keeper: dict[str, Any], rows: dict[str, Any]):
             r"\n*--- merged from %s(?::truncated)? ---\n?" % base,
             "", content, count=1)
         merged = [m for m in merged if _base_id(m) != pid]
-    # Strip every stored merged-from block for the purged ids (drift-
-    # tolerant: the stored body may hold an older version of the text). What
-    # remains in the keeper is its own base content; shared vocabulary
-    # between base and absorbed text is unattributable after the merge and
-    # is policed by the byte-verify (surviving-row token suppression plus
-    # the full-content needle), not by a refusal — a phrase/token-level test
-    # here would refuse ordinary lexical consolidations.
-    for pid in keeper["purged"]:
-        base = re.escape(_base_id(pid))
-        block = re.search(
-            r"\n*--- merged from %s(?::truncated)? ---\n(?P<body>.*?)"
-            r"(?=\n*--- merged from |\Z)" % base,
-            content, flags=re.DOTALL)
-        if block is not None:
-            content = content[:block.start()] + "\n" + content[block.end():]
-        content = re.sub(
-            r"\n*--- merged from %s(?::truncated)? ---\n?" % base,
-            "", content, count=1)
-        merged = [m for m in merged if _base_id(m) != pid]
-    # Residue refusal: if the purged row's full current text is still
-    # present verbatim in the keeper (merged_from names it but the content
+    # Residue test 1 (removed-block tokens): any >=8-char token that lived
+    # inside a removed block and still appears verbatim in the stripped
+    # content means a phrase of the absorbed text was duplicated outside the
+    # block. Shared vocabulary that only exists in the keeper's own base text
+    # is unattributable after the merge and is handled by the byte-verify's
+    # surviving-row token suppression instead of a refusal (a real lexical
+    # consolidate cluster shares phrases between base and absorbed text, so a
+    # stricter test would refuse ordinary consolidations).
+    if removed_tokens & _tokens(content):
+        return None
+    # Residue test 2 (PRR-002 follow-up): if the purged row's full current
+    # text is still present verbatim (merged_from names it but the content
     # block header names something else, or the strip was incomplete), the
     # rewrite would silently keep the text — refuse naming the row.
     for pid in keeper["purged"]:
@@ -396,21 +394,16 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
             conn.execute("DELETE FROM memory WHERE id IN (%s)"
                          % _placeholders(summary_ids), summary_ids)
         if has_vec:
-            try:
-                conn.execute(
-                    "DELETE FROM memory_vec WHERE memory_id IN (%s)" % dph,
-                    dargs)
-            except sqlite3.OperationalError as exc:
-                if "no such table" not in str(exc).lower():
-                    raise
-            else:
-                remaining_vec = conn.execute(
-                    "SELECT COUNT(*) FROM memory_vec WHERE memory_id IN (%s)"
-                    % dph, dargs).fetchone()[0]
-                if remaining_vec:
-                    raise RuntimeError(
-                        "purge REFUSED: memory_vec still contains %d row(s) "
-                        "for the purged id(s)" % remaining_vec)
+            conn.execute(
+                "DELETE FROM memory_vec WHERE memory_id IN (%s)" % dph,
+                dargs)
+            remaining_vec = conn.execute(
+                "SELECT COUNT(*) FROM memory_vec WHERE memory_id IN (%s)"
+                % dph, dargs).fetchone()[0]
+            if remaining_vec:
+                raise RuntimeError(
+                    "purge REFUSED: memory_vec still contains %d row(s) "
+                    "for the purged id(s)" % remaining_vec)
 
         for table, col in _ID_SIDE_TABLES:
             if _table_exists(conn, table):
@@ -478,6 +471,22 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
                 conn.execute("UPDATE meta SET value=? WHERE key=?",
                              (value, key))
 
+        # Reap orphaned entities before the transaction commits.  Canonical
+        # names and aliases can carry the purge needle, so an orphan cleanup
+        # failure must roll back the memory deletion instead of returning a
+        # successful purge that verification later suppresses as a survivor.
+        gone_entities: list[str] = []
+        if _table_exists(conn, "entity"):
+            gone_entities = [r["id"] for r in conn.execute(
+                "SELECT id FROM entity WHERE id NOT IN "
+                "(SELECT entity_id FROM memory_entity)")]
+            if gone_entities and _table_exists(conn, "entity_alias"):
+                conn.execute(
+                    "DELETE FROM entity_alias WHERE entity_id IN (%s)"
+                    % _placeholders(gone_entities), gone_entities)
+            for entity_id in gone_entities:
+                conn.execute("DELETE FROM entity WHERE id=?", (entity_id,))
+
         if _table_exists(conn, "purged_id"):
             # Every id deleted by this purge joins the deny-list, not just the
             # requested chain: derived-deleted rows (summaries, keepers) carry
@@ -490,34 +499,6 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
     except Exception:
         conn.rollback()
         raise
-
-    # Entity orphans AFTER relinks: every entity left with no link goes,
-    # together with its aliases; shared entities survive by construction.
-    # Enveloped in its own transaction (PRR-007): a mid-loop failure rolls
-    # back cleanly and is reported as a warning instead of escaping as a raw
-    # traceback — the main purge is already committed and orphans are
-    # cosmetic.
-    gone_entities: list[str] = []
-    if _table_exists(conn, "entity"):
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            for r in conn.execute(
-                    "SELECT id FROM entity WHERE id NOT IN "
-                    "(SELECT entity_id FROM memory_entity)"):
-                gone_entities.append(r["id"])
-                conn.execute("DELETE FROM entity WHERE id=?", (r["id"],))
-            if gone_entities and _table_exists(conn, "entity_alias"):
-                conn.execute(
-                    "DELETE FROM entity_alias WHERE entity_id IN (%s)"
-                    % _placeholders(gone_entities), gone_entities)
-            conn.commit()
-        except sqlite3.Error as e:
-            conn.rollback()
-            gone_entities = []
-            print(
-                "[zmem] purge: WARNING - entity orphan reaping failed (%s); "
-                "orphan entity rows may remain (cosmetic; the purged content "
-                "is unaffected)" % e, file=sys.stderr)
 
     return {
         "chain": chain,
@@ -863,11 +844,9 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             if res["chain"]:
                 try:
                     applied = _apply_purge_transaction(conn, res)
-                except RuntimeError as e:
-                    # AC6 refusal: a derived row (belief head/summary)
-                    # still quotes the purged text and can neither be
-                    # rewritten nor deleted autonomously. Nothing was
-                    # modified; the named row needs operator action first.
+                except (RuntimeError, sqlite3.Error) as e:
+                    # A transaction refusal or SQLite failure rolls back all
+                    # writes, including the target deletion and entity reaping.
                     print("[zmem] %s" % e, file=sys.stderr)
                     return 4
             else:

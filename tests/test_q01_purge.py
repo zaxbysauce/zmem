@@ -257,6 +257,20 @@ class PurgeLineageTest(_PurgeBase):
             "purging the update successor must also remove the tombstoned "
             "predecessor it quotes — the secret lives in both contents")
 
+    def test_purge_accepts_requested_descendant_and_predecessor(self):
+        predecessor = self.add_row(TARGET_CONTENT)
+        r = self._run("update", "--id", predecessor, "--content",
+                      "replacement lineage row", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        descendant = json.loads(r.stdout)["id"]
+
+        r = self._purge(descendant, predecessor)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM memory WHERE id IN (?, ?)",
+                      (descendant, predecessor)), 0,
+            "overlapping requested lineage roots are deduplicated, not a cycle")
+
 
 # ---------------------------------------------------------------------------
 # AC3: no needle bytes left in the store file or its WAL
@@ -361,6 +375,33 @@ class PurgeSideTablesTest(_PurgeBase):
             (sidecount, otherlink), (0, 1),
             "every side-table row naming the purged id must go with it; "
             "the survivor-to-survivor link must survive")
+
+    def test_entity_cleanup_failure_rolls_back_memory_deletion(self):
+        target = self.add_row(TARGET_CONTENT)
+        now = "2026-09-28T00:00:00Z"
+        self._exec(
+            ("INSERT INTO entity (id, kind, canonical_name, created_at, "
+             "updated_at) VALUES ('ent-fault', 'other', 'zebraquux', ?, ?)",
+             (now, now)),
+            ("INSERT INTO entity_alias (entity_id, alias_norm) "
+             "VALUES ('ent-fault', 'zebraquux')", ()),
+            ("INSERT INTO memory_entity (memory_id, entity_id, role) "
+             "VALUES (?, 'ent-fault', 'mentions')", (target,)),
+            ("CREATE TRIGGER reject_entity_alias_delete BEFORE DELETE ON "
+             "entity_alias BEGIN SELECT RAISE(ABORT, 'fault injected'); END", ()),
+        )
+
+        r = self._purge(target)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("fault injected", r.stderr)
+        self.assertEqual(
+            (self.qone("SELECT COUNT(*) FROM memory WHERE id=?", (target,)),
+             self.qone("SELECT COUNT(*) FROM entity WHERE id='ent-fault'"),
+             self.qone("SELECT COUNT(*) FROM entity_alias "
+                       "WHERE entity_id='ent-fault'")),
+            (1, 1, 1),
+            "entity cleanup is part of the purge transaction and cannot leave "
+            "a successful purge with an orphaned secret-bearing entity")
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +545,24 @@ class PurgeDerivedCopiesTest(_PurgeBase):
         self.assertEqual(
             self.qone("SELECT COUNT(*) FROM memory WHERE id=?", (target,)), 1,
             "keeper residue refusal must happen before the purge transaction")
+
+    def test_keeper_residual_token_refuses_before_delete(self):
+        target = self.add_row(TARGET_CONTENT)
+        keeper = self.add_row("keeper base text")
+        merged = ("keeper base residual %s\n\n--- merged from %s ---\n%s"
+                  % (FAKE, target, TARGET_CONTENT))
+        self._exec(
+            ("UPDATE memory SET content=?, merged_from=? WHERE id=?",
+             (merged, target, keeper)),
+        )
+
+        r = self._purge(target)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn(keeper, r.stderr)
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM memory WHERE id=?", (target,)), 1,
+            "a long secret token duplicated outside its stored merged block "
+            "must refuse before deleting the source row")
 
 
 # ---------------------------------------------------------------------------
