@@ -10,6 +10,34 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.72.0] - 2026-09-28
+
+### Added
+- **Read-time credential withhold on the passive injection lane** (issue
+  #256). The injection lane (`recall --for-injection` as the hooks drive it)
+  now re-scans every selected row with `SECRET_CREDENTIAL_PATTERNS` — the
+  credential half of the write-time registry only, never the generic
+  hex/base64 half, so rows carrying plain 40-hex git SHAs still render. On a
+  match the row is replaced by an id+type-only `[WITHHELD: SECRET]` marker
+  before rendering, telemetry, and the delivery ledger: no credential text
+  reaches the hook payload, the model context, `surfaced_count`, or
+  `<data>/ops/*.ledger`. Classification runs BEFORE the token budget — a
+  credential straddling the budget cut is withheld whole, never leaked as a
+  clipped fragment — and covers the no-session `--for-injection` lane as
+  well. A `secret_withheld` count joins the JSON envelope
+  (only when a withhold happened — zero-withhold envelopes stay
+  byte-identical). No new store writes; the prompt-injection re-scan and the
+  #114 rendered-row law are untouched. Shapes issue #180 adds to the
+  registry are picked up automatically; until then the `sshpass -p` shape
+  stays unwithheld (CI runs the dependency-independent test classes; no
+  workflow executes the gated AC6 class — the trace gates that replay it
+  are human-run, not CI; see the ci.yml comment). Documented residuals: a
+  credential stored only as an entity name is not withheld (it renders in
+  the entity line and its text reaches the delivery ledger), and the
+  withheld bullet's metadata plus the `secret_withheld` counter reveal
+  that a secret exists. Removal of a confirmed secret is `purge`
+  (#255, 0.71.0).
+
 ## [0.71.0] - 2026-09-28
 
 ### Added
