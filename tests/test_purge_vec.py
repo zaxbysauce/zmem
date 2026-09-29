@@ -222,13 +222,17 @@ class PurgeKeeperResidueContractTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn(keeper, r.stderr)
         self.assertIsNotNone(self._content(keeper))
+        self.assertIsNotNone(self._content(target))
         self.assertIn("zebraquux", (self._content(keeper) or "").lower())
 
     def test_shared_fragment_keeper_rewrites_cleanly(self):
+        # Shared vocabulary BELOW the 8-char needle floor (r/two/probe/marker)
+        # still rewrites cleanly: short fragments are unattributable after a
+        # merge and refusing them would block ordinary lexical consolidations.
         target = self._add("deployment checklist zebraquux marker r two probe")
-        keeper = self._add("deployment runbook kept for the r two probe team")
+        keeper = self._add("runbook kept for the r two probe team")
         sep = chr(10) * 2 + "--- merged from %s ---" % target + chr(10)
-        merged = ("deployment runbook kept for the r two probe team" + sep +
+        merged = ("runbook kept for the r two probe team" + sep +
                   "deployment checklist zebraquux marker r two probe")
         conn = sqlite3.connect(self.env["ZMEM_STORE"])
         conn.execute("UPDATE memory SET content=?, content_norm=?,"
@@ -241,6 +245,30 @@ class PurgeKeeperResidueContractTest(unittest.TestCase):
         kept = self._content(keeper)
         self.assertIsNotNone(kept)
         self.assertNotIn("zebraquux", kept.lower())
+        self.assertNotIn("deployment", kept.lower())
+
+    def test_distinctive_token_outside_block_refuses_before_delete(self):
+        # Fail-closed contract (F-266-3 class): a keeper whose OWN text holds
+        # an 8+-char token of the absorbed block cannot be distinguished from
+        # residue by the byte-verify (its survivor tokens suppress the
+        # needle), so the purge refuses before deleting anything instead of
+        # reporting a clean rewrite.
+        keeper = self._add("keeper notes zebraquux rollout separately")
+        target = self._add("deploy checklist zebraquux marker duplication case")
+        sep = chr(10) * 2 + "--- merged from %s ---" % target + chr(10)
+        merged = ("keeper notes zebraquux rollout separately" + sep +
+                  "deploy checklist zebraquux marker duplication case")
+        conn = sqlite3.connect(self.env["ZMEM_STORE"])
+        conn.execute("UPDATE memory SET content=?, content_norm=?,"
+                     " merged_from=? WHERE id=?",
+                     (merged, merged.lower(), target, keeper))
+        conn.commit()
+        conn.close()
+        r = self._purge(target)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn(keeper, r.stderr)
+        self.assertIsNotNone(self._content(keeper))
+        self.assertIsNotNone(self._content(target))
 
 
 if __name__ == "__main__":

@@ -1746,13 +1746,18 @@ What one purge does:
   `belief_head_source`, `belief_head_evidence`);
 - deletes evidence rows and entity/alias rows the purge orphaned (evidence a
   surviving row still references is kept);
-- **rewrites, deletes, or refuses** derived copies that carry the text
-  verbatim: consolidation keepers (the `\n\n--- merged from <id> ---\n` block
+- **rewrites, deletes, or refuses** derived copies that carry the text:
+  consolidation keepers (the `\n\n--- merged from <id> ---\n` block
   is stripped and entities re-linked), belief heads (rebuilt from surviving
   sources, or deleted when sourceless), and extractive episode-summary rows
   (episodes that contained a purged member lose their summary row — expect
-  deletion, not surgical editing). A derived row that can be neither rewritten
-  nor deleted refuses the whole purge, naming the row;
+  deletion, not surgical editing). A keeper refuses the whole purge (exit 4,
+  naming the row, nothing deleted) when `merged_from` names a purged id but
+  its stored block header is missing (the content was compressed or drifted),
+  or when an 8+-character token of the absorbed block still appears in the
+  keeper's own text — the byte-verify suppresses needles that a surviving row
+  holds, so that residue could not otherwise be distinguished from a clean
+  rewrite;
 - compacts the store (FTS `'optimize'`, `VACUUM`, WAL checkpoint) and
   **byte-verifies** the result: a case-insensitive scan of `store.sqlite` and
   `-wal` must find no copy of the purged content. Exit **5** means the text

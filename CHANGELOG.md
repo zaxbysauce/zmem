@@ -32,8 +32,9 @@ README.
   `integrity_check` re-verify. Exit ladder: 0 clean, 2 usage, 3 unknown id,
   4 lock/live-writer refusal, 5 residue remains, 6 compaction or
   backup-scrub failure; a retry of a deny-listed id resumes post-commit
-  cleanup, and vector erasure fails closed when sqlite-vec cannot be
-  loaded. See the
+  cleanup, vector erasure fails closed when sqlite-vec cannot be loaded,
+  and a keeper still quoting an absorbed token outside its merged block
+  refuses the purge rather than passing byte-verify. See the
   `purge` section in the memory skill docs for operator caveats (never pass
   secret text on a command line; restore/`import-store --force` supersede a
   purge).
